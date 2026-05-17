@@ -26,8 +26,8 @@ cp .env.example .env
 # 4. Register the pre-commit hook (one-time, per checkout)
 git config core.hooksPath .githooks
 
-# 5. Run the bot locally (socket mode for dev, HTTP for prod)
-uv run cora
+# 5. Run the bot (Socket Mode — no tunnel needed for dev)
+uv run python -m cora.main
 ```
 
 ---

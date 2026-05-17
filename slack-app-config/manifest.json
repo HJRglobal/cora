@@ -25,11 +25,10 @@
   },
   "settings": {
     "event_subscriptions": {
-      "request_url": "https://YOUR-CLOUDFLARE-TUNNEL-URL/slack/events",
       "bot_events": ["app_mention"]
     },
     "org_deploy_enabled": false,
-    "socket_mode_enabled": false,
+    "socket_mode_enabled": true,
     "token_rotation_enabled": false
   }
 }
