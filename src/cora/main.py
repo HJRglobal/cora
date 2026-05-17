@@ -48,3 +48,7 @@ def main() -> None:
         handler.start()
     except KeyboardInterrupt:
         log.info("Cora shutting down.")
+
+
+if __name__ == "__main__":
+    main()
