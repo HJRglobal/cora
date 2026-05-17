@@ -1,0 +1,33 @@
+# Channel-name → entity routing for Cora.
+# Patterns are matched top-to-bottom; first match wins.
+# Supports fnmatch glob syntax (*, ?) on channel names (without the # prefix).
+# Add exceptions above the catch-all wildcard.
+
+routes:
+  # F3 Energy — covers f3e-* and the f3-pure-launch exception
+  - pattern: "f3e-*"
+    entity: F3E
+  - pattern: "f3-*"
+    entity: F3E
+
+  # Lexington Services
+  - pattern: "lex-*"
+    entity: LEX
+
+  # OSN (4-store group)
+  - pattern: "osn-*"
+    entity: OSN
+
+  # BDM
+  - pattern: "bdm-*"
+    entity: BDM
+
+  # HJR Global / Founder-level channels
+  - pattern: "hjrg-*"
+    entity: FNDR
+  - pattern: "fndr*"
+    entity: FNDR
+
+  # Catch-all → founder-level context with explicit framing in response
+  - pattern: "*"
+    entity: FNDR

@@ -1,0 +1,6 @@
+# Default: normalize to LF on checkin, checkout as-is on Windows
+* text=auto
+
+# Shell scripts must stay LF — CRLF breaks sh shebang on Git Bash / Unix
+*.sh text eol=lf
+.githooks/* text eol=lf
