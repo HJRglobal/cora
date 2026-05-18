@@ -1,7 +1,7 @@
 # remove-windows-task.ps1
 #
 # Removes the cowork-cora-service scheduled task from Task Scheduler.
-# Does NOT stop a currently running instance — kill that separately if needed.
+# Does NOT stop a currently running instance - kill that separately if needed.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File "C:\Users\Harri\code\cora\deployment\remove-windows-task.ps1"
@@ -20,7 +20,7 @@ Write-Host ""
 Write-Host "[1/2] Looking for task '$TASK_NAME'..."
 $task = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if (-not $task) {
-    Write-Host "  Task not found — nothing to remove."
+    Write-Host "  Task not found - nothing to remove."
     Write-Host ""
     Write-Host "=== Done (no-op) ==="
     Write-Host ""

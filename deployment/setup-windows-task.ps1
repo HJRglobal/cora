@@ -3,7 +3,7 @@
 # Registers cowork-cora-service as a Windows Task Scheduler task.
 # The task launches "uv run cora" at logon and auto-restarts on failure.
 #
-# Usage (run from any directory, as the current user — no elevation needed):
+# Usage (run from any directory, as the current user - no elevation needed):
 #   powershell -ExecutionPolicy Bypass -File "C:\Users\Harri\code\cora\deployment\setup-windows-task.ps1"
 #
 # To remove the task:
@@ -63,14 +63,14 @@ if (-not $uvExe) {
 Write-Host "  OK  $uvExe"
 
 # ------------------------------------------------------------------
-# [4/5] Build and register the task (idempotent — remove then re-add)
+# [4/5] Build and register the task (idempotent - remove then re-add)
 # ------------------------------------------------------------------
 Write-Host "[4/5] Registering scheduled task '$TASK_NAME'..."
 
 # Remove existing task silently if present
 $existing = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  Found existing task — removing before re-registration."
+    Write-Host "  Found existing task - removing before re-registration."
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
 }
 
@@ -126,5 +126,5 @@ Write-Host "To start it NOW without rebooting:"
 Write-Host "  Start-ScheduledTask -TaskName '$TASK_NAME'"
 Write-Host ""
 Write-Host "IMPORTANT: If Cora is already running as a foreground process,"
-Write-Host "stop it first, then start the task — do not run both at once."
+Write-Host "stop it first, then start the task - do not run both at once."
 Write-Host ""
