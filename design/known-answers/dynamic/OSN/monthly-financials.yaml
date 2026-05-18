@@ -1,0 +1,34 @@
+# Dynamic known-answer: OSN monthly profit margin + store-level P&L
+# Loaded by context_loader when entity=OSN. Interpolates from data/snapshots/osn-monthly-financials/latest.yaml.
+# Phase 2 will auto-refresh snapshot from Hayden's monthly close pack in Drive.
+topic: "OSN monthly profit margin, store-level P&L, breakeven trend, customer count trend"
+snapshot_path: data/snapshots/osn-monthly-financials/latest.yaml
+source:
+  type: manual                          # Phase 2 will switch to hayden_monthly_metrics_sweep
+  cadence: monthly                      # refreshed when Hayden's deck lands after month-end close
+  staleness_threshold_hours: 1440       # 60 days - if monthly deck is missing >2 months, use fallback
+fallback: |
+  Latest OSN financials live in Hayden's monthly OSN Metrics deck. Ping Hayden directly
+  or check the Drive folder at 09-One-Stop-Nutrition/financials/ for the current month.
+  Operational questions go to Matt; financial detail goes to Hayden.
+template: |
+  ## OSN financial status - {reporting_month} (snapshot as of {last_updated})
+
+  **Overall:**
+  {overall_summary}
+
+  **Breakeven trend:**
+  {breakeven_trend}
+
+  **By store:**
+  {by_store_summary}
+
+  **Customer count:**
+  {customer_count_trend}
+
+  **Pending action:**
+  {pending_action}
+
+  **Data owners:** Operational = {data_owners[operational]} - Financial = {data_owners[financial]} - Founder = {data_owners[founder]}
+
+  Source: {source_location}
