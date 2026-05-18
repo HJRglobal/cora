@@ -71,17 +71,87 @@ Start-ScheduledTask -TaskName "cowork-cora-service"
 
 ## Rotating Tokens
 
-All token rotations require a task restart for new values to load from `.env`.
+All token rotations require a task restart for new values to load from `.env`. After updating `.env`, run:
 
-**Anthropic API key:**
-1. console.anthropic.com -> API Keys -> revoke old, create new
-2. Update `ANTHROPIC_API_KEY` in `.env`
-3. Restart task
+```powershell
+Stop-ScheduledTask -TaskName "cowork-cora-service"
+# Wait for python processes to fully exit:
+Get-Process python* -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 3
+Start-ScheduledTask -TaskName "cowork-cora-service"
+```
 
-**Slack tokens (xoxb / xapp / signing secret):**
-1. api.slack.com/apps -> Cora app -> revoke + reinstall to workspace
-2. Update `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` in `.env`
-3. Restart task
+Each token can be rotated independently. **You don't need to rotate all four at once** unless you suspect compromise of multiple. For full disaster-recovery scenarios (new machine), see `deployment/bootstrap-new-machine.md`.
+
+### Token 1: Anthropic API key (`ANTHROPIC_API_KEY`)
+
+**Where:** https://console.anthropic.com
+
+1. Sign in.
+2. Left sidebar -> **API Keys**.
+3. Find the `cora-phase-1` (or whatever you named it) key. Three-dot menu next to it -> **Delete** or **Revoke**. Confirm.
+4. **Create Key** -> name it `cora-production` (or reuse the old name) -> **Create**.
+5. **Copy the key immediately** (starts with `sk-ant-***`). Anthropic shows it only once.
+6. Open `.env` in Notepad: `notepad C:\Users\Harri\code\cora\.env`
+7. Replace the value after `ANTHROPIC_API_KEY=` with the new key. Save.
+8. Restart task (see top of section).
+
+**Verify:** check `Get-ScheduledTaskInfo -TaskName "cowork-cora-service"` shows recent run, and `@Cora ping` in Slack returns a reply.
+
+### Token 2: Slack Signing Secret (`SLACK_SIGNING_SECRET`)
+
+Note: under Socket Mode, signing secret is technically unused. We rotate it anyway for future HTTPS migration.
+
+**Where:** https://api.slack.com/apps -> click **Cora** app
+
+1. Left sidebar -> **Basic Information** -> scroll to **App Credentials**.
+2. Next to **Signing Secret**, click **Regenerate** (or **Show** if you trust the existing one and just need to copy it).
+3. Confirm the warning if prompted. Copy the new value.
+4. Update `SLACK_SIGNING_SECRET=` in `.env`. Save.
+5. Restart task.
+
+### Token 3: Slack App-Level Token (`SLACK_APP_TOKEN`, the `xapp-` one)
+
+**Where:** https://api.slack.com/apps -> click **Cora** app
+
+1. Left sidebar -> **Basic Information** -> scroll to **App-Level Tokens**.
+2. Click the existing `cora-socket` token entry -> **Delete** -> confirm.
+3. Back at **App-Level Tokens** -> click **Generate Token and Scopes**.
+4. Name: `cora-socket` -> click **Add Scope** -> select `connections:write` -> click **Generate**.
+5. Copy the new `xapp-1-...` value.
+6. Update `SLACK_APP_TOKEN=` in `.env`. Save.
+7. Restart task.
+
+**Note:** Socket Mode breaks immediately when this token is revoked, so the bot will be offline for the few seconds between revoke and task restart. Expected.
+
+### Token 4: Slack Bot User OAuth Token (`SLACK_BOT_TOKEN`, the `xoxb-` one)
+
+**Where:** https://api.slack.com/apps -> click **Cora** app
+
+1. Left sidebar -> **OAuth & Permissions**.
+2. Scroll to find **Revoke Tokens** (or **Revoke Token** singular, depending on Slack UI version). Click it. Confirm.
+3. After revoke, navigate to **Install App** -> **Reinstall to HJR Global Workspace** -> approve in the OAuth dialog.
+4. After install, you'll see the new **Bot User OAuth Token** at the top of OAuth & Permissions. Copy `xoxb-...` value.
+5. Update `SLACK_BOT_TOKEN=` in `.env`. Save.
+6. Restart task.
+
+**Note:** This is the only rotation that briefly affects Cora's installation state in the workspace. The bot app stays installed; the OAuth token changes. Channel membership is preserved across token rotation.
+
+### After any rotation
+
+Smoke test in #cora-build:
+
+```
+@Cora ping after token rotation
+```
+
+Expect a threaded reply within 5-10 seconds. If no reply, check logs for auth errors:
+
+```powershell
+Get-Content "C:\Users\Harri\code\cora\logs\cora-$(Get-Date -Format yyyy-MM-dd).log" -Tail 30
+```
+
+Most likely failure: token mis-pasted into `.env` (missing leading prefix, trailing whitespace, line break in middle). Re-check and retry.
 
 ---
 
