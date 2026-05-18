@@ -11,6 +11,7 @@ from .config import config
 from .context_loader import load_context
 from .entity_router import route
 from .prompt_loader import load_prompt
+from . import rate_limiter
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,15 @@ def handle_mention(event: dict, say: callable, client) -> None:
     user_id = event.get("user")
     thread_ts = event.get("ts")
     raw_text = event.get("text", "")
+
+    allowed, cap_type = rate_limiter.check(user_id, channel_id)
+    if not allowed:
+        log.warning("rate_limited user=%s channel=%s cap=%s", user_id, channel_id, cap_type)
+        if cap_type == "user":
+            say(text="You've hit the per-user mention cap (10/hour). I'll be back shortly.", thread_ts=thread_ts)
+        else:
+            say(text="This channel has hit the mention cap (50/hour). Try again in a bit.", thread_ts=thread_ts)
+        return
 
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
