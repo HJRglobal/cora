@@ -93,6 +93,41 @@ def test_load_context_no_known_answers_file(monkeypatch, tmp_path):
     assert "Known Answers" not in result
 
 
+def test_load_context_includes_dynamic_answers(monkeypatch, tmp_path):
+    _clear_cache()
+
+    f3e_path = tmp_path / "F3E.md"
+    f3e_path.write_text("F3E entity content", encoding="utf-8")
+    founder_path = tmp_path / "FNDR.md"
+    founder_path.write_text("FNDR founder content", encoding="utf-8")
+
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e_path)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder_path)
+    monkeypatch.setattr(cl, "load_dynamic_answers", lambda entity: "Live revenue: $42k MRR.")
+
+    result = cl.load_context("F3E")
+
+    assert "Dynamic Known Answers" in result
+    assert "Live revenue: $42k MRR." in result
+
+
+def test_load_context_no_dynamic_answers_section_when_empty(monkeypatch, tmp_path):
+    _clear_cache()
+
+    f3e_path = tmp_path / "F3E.md"
+    f3e_path.write_text("F3E entity content", encoding="utf-8")
+    founder_path = tmp_path / "FNDR.md"
+    founder_path.write_text("FNDR founder content", encoding="utf-8")
+
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e_path)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder_path)
+    monkeypatch.setattr(cl, "load_dynamic_answers", lambda entity: "")
+
+    result = cl.load_context("F3E")
+
+    assert "Dynamic Known Answers" not in result
+
+
 def test_cache_returns_same_instance_within_ttl(monkeypatch, tmp_path):
     _clear_cache()
 

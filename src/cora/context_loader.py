@@ -4,6 +4,8 @@ import logging
 import time
 from pathlib import Path
 
+from cora.dynamic_answers import load_dynamic_answers
+
 log = logging.getLogger(__name__)
 
 _DRIVE_ROOT = Path("G:/My Drive/HJR-Founder-OS")
@@ -74,7 +76,7 @@ def load_context(entity: str) -> str:
 
     parts.append(_FOUNDER_PATH.read_text(encoding="utf-8"))
 
-    # Append known-answers if available
+    # Append static known-answers if available
     ka_path = _KNOWN_ANSWERS_PATHS.get(entity)
     if ka_path is not None and ka_path.exists():
         ka_content = ka_path.read_text(encoding="utf-8").strip()
@@ -82,6 +84,11 @@ def load_context(entity: str) -> str:
             parts.append("# Known Answers (from prior gap reviews)\n\n" + ka_content)
     else:
         log.info("no known-answers file for entity %s", entity)
+
+    # Append dynamic answers interpolated from snapshots
+    dynamic = load_dynamic_answers(entity)
+    if dynamic:
+        parts.append("# Dynamic Known Answers (refreshed from snapshots)\n\n" + dynamic)
 
     text = "\n\n---\n\n".join(parts)
     ka_mtime = _known_answers_mtime(entity)

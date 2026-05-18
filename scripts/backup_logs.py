@@ -26,6 +26,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = REPO_ROOT / "logs"
 RESOLVED_FILE = REPO_ROOT / "design" / "known-answers" / ".resolved-gaps.jsonl"
+SNAPSHOTS_DIR = REPO_ROOT / "data" / "snapshots"
 
 DEFAULT_BACKUP_ROOT = Path(
     "G:/My Drive/HJR-Founder-OS/_shared/projects/cora/backups"
@@ -81,10 +82,31 @@ def copy_file(src: Path, dst: Path, dry_run: bool) -> bool:
     return True
 
 
+def backup_snapshots(dest_dir: Path, dry_run: bool) -> int:
+    """Copy data/snapshots/ recursively to <dest_dir>/snapshots/. Skip if absent."""
+    print("[3/4] Backing up snapshots...")
+    if not SNAPSHOTS_DIR.exists():
+        print(f"  SKIP: {SNAPSHOTS_DIR} does not exist yet.")
+        return 0
+
+    snap_dest = dest_dir / "snapshots"
+    if dry_run:
+        count = sum(1 for _ in SNAPSHOTS_DIR.rglob("*") if _.is_file())
+        print(f"  [dry-run] would copy {count} snapshot file(s) to {snap_dest}")
+        return count
+
+    if snap_dest.exists():
+        shutil.rmtree(snap_dest)
+    shutil.copytree(SNAPSHOTS_DIR, snap_dest)
+    count = sum(1 for _ in snap_dest.rglob("*") if _.is_file())
+    print(f"  Snapshot files backed up: {count}")
+    return count
+
+
 def backup_critical_files(dest_dir: Path, dry_run: bool) -> int:
     """Back up the critical files: knowledge-gaps.jsonl and .resolved-gaps.jsonl."""
     count = 0
-    print("[1/3] Backing up critical knowledge-gap files...")
+    print("[1/4] Backing up critical knowledge-gap files...")
 
     # knowledge-gaps.jsonl — the captured-gaps queue
     kg_path = LOGS_DIR / "knowledge-gaps.jsonl"
@@ -100,7 +122,7 @@ def backup_critical_files(dest_dir: Path, dry_run: bool) -> int:
 
 def backup_recent_main_logs(dest_dir: Path, days: int, dry_run: bool) -> int:
     """Back up cora-YYYY-MM-DD.log files from the last `days` days."""
-    print(f"[2/3] Backing up main logs (last {days} days)...")
+    print(f"[2/4] Backing up main logs (last {days} days)...")
     if not LOGS_DIR.exists():
         print(f"  Logs directory does not exist: {LOGS_DIR}")
         return 0
@@ -128,10 +150,10 @@ def backup_recent_main_logs(dest_dir: Path, days: int, dry_run: bool) -> int:
 def prune_old_backups(backup_root: Path, keep_days: int, dry_run: bool) -> int:
     """Delete backup directories older than `keep_days` days. Returns count pruned."""
     if keep_days <= 0:
-        print("[3/3] Pruning disabled (keep_days=0).")
+        print("[4/4] Pruning disabled (keep_days=0).")
         return 0
 
-    print(f"[3/3] Pruning backups older than {keep_days} days...")
+    print(f"[4/4] Pruning backups older than {keep_days} days...")
     if not backup_root.exists():
         return 0
 
@@ -183,6 +205,7 @@ def main() -> int:
 
     critical_count = backup_critical_files(dest_dir, args.dry_run)
     main_log_count = backup_recent_main_logs(dest_dir, args.include_main_logs_days, args.dry_run)
+    snapshot_count = backup_snapshots(dest_dir, args.dry_run)
     pruned_count = prune_old_backups(args.backup_root, args.keep_days, args.dry_run)
 
     print()
@@ -191,6 +214,7 @@ def main() -> int:
     print("=" * 60)
     print(f"  Critical files backed up: {critical_count}")
     print(f"  Main log files backed up: {main_log_count}")
+    print(f"  Snapshot files backed up: {snapshot_count}")
     print(f"  Old backups pruned:       {pruned_count}")
     print()
 

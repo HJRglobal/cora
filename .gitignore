@@ -15,6 +15,9 @@ build/
 # Logs (runtime output — not source)
 logs/
 
+# Snapshots (local data backed up via backup_logs.py, not committed)
+data/snapshots/
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
 
