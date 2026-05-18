@@ -7,6 +7,7 @@ import time
 from slack_bolt import App
 
 from .claude_client import ClaudeClientError, generate_response
+from . import channel_classifier
 from .config import config
 from .context_loader import load_context
 from .entity_router import route
@@ -50,14 +51,29 @@ def handle_mention(event: dict, say: callable, client) -> None:
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
     user_message = _MENTION_RE.sub("", raw_text).strip()
+    function = channel_classifier.classify_function(channel_name)
+    tier = channel_classifier.tier_label(entity, function)
 
-    log.info("app_mention routed channel=#%s user=%s → entity=%s", channel_name, user_id, entity)
+    log.info(
+        "app_mention routed channel=#%s user=%s → entity=%s function=%s tier=%s",
+        channel_name, user_id, entity, function, tier,
+    )
+
+    runtime_context = (
+        f"## Runtime channel context\n\n"
+        f"This channel (#{channel_name}) has these properties:\n"
+        f"- Entity: {entity}\n"
+        f"- Function: {function}\n"
+        f"- Financial-access tier: {tier}\n\n"
+        f"Apply the cross-entity and financial guardrails accordingly.\n\n"
+        f"---\n\n"
+    )
 
     t0 = time.monotonic()
     try:
         context = load_context(entity)
         prompt = load_prompt(entity)
-        response_text = generate_response(prompt, context, user_message)
+        response_text = generate_response(prompt, runtime_context + context, user_message)
     except ClaudeClientError as exc:
         log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
         say(
