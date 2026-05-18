@@ -26,6 +26,7 @@ DEFAULT_LOG = REPO_ROOT / "logs" / "knowledge-gaps.jsonl"
 DEFAULT_OUTPUT_DIR = Path(
     "G:/My Drive/HJR-Founder-OS/_shared/projects/cora/knowledge-gaps"
 )
+RESOLVED_PATH = REPO_ROOT / "design" / "known-answers" / ".resolved-gaps.jsonl"
 
 # Entity display ordering — FNDR last because it's the catch-all
 ENTITY_ORDER = ["F3E", "LEX", "OSN", "BDM", "HJRG", "FNDR"]
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "ISO date (YYYY-MM-DD) — include gaps with ts >= this date. "
+            "ISO date (YYYY-MM-DD) -- include gaps with ts >= this date. "
             "Default: last 24 hours."
         ),
     )
@@ -72,11 +73,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the digest to stdout instead of writing to a file.",
     )
+    parser.add_argument(
+        "--resolved-path",
+        type=Path,
+        default=RESOLVED_PATH,
+        help="Path to .resolved-gaps.jsonl (default: design/known-answers/.resolved-gaps.jsonl)",
+    )
     return parser.parse_args()
 
 
-def load_gaps(log_path: Path) -> list[dict]:
-    """Read all gap records from the JSONL log. Skip malformed lines."""
+def load_resolved_ids(resolved_path: Path) -> set[str]:
+    """Return set of gap IDs (full ISO timestamps) that have already been processed."""
+    if not resolved_path.exists():
+        return set()
+    ids: set[str] = set()
+    with resolved_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if "id" in record:
+                    ids.add(record["id"])
+            except json.JSONDecodeError:
+                pass
+    return ids
+
+
+def load_gaps(log_path: Path, resolved_ids: set[str] | None = None) -> list[dict]:
+    """Read all gap records from the JSONL log. Skip malformed lines and resolved gaps."""
     if not log_path.exists():
         return []
     gaps: list[dict] = []
@@ -86,7 +112,10 @@ def load_gaps(log_path: Path) -> list[dict]:
             if not raw:
                 continue
             try:
-                gaps.append(json.loads(raw))
+                record = json.loads(raw)
+                if resolved_ids and record.get("ts") in resolved_ids:
+                    continue
+                gaps.append(record)
             except json.JSONDecodeError as exc:
                 print(f"  WARNING: malformed JSON on line {line_num}: {exc}")
     return gaps
@@ -120,7 +149,7 @@ def group_by_entity(gaps: list[dict]) -> dict[str, list[dict]]:
 def render_digest(grouped: dict[str, list[dict]], since: datetime | None, total: int) -> str:
     today = date.today().isoformat()
     lines: list[str] = []
-    lines.append(f"# Cora Knowledge Gaps Digest — {today}")
+    lines.append(f"# Cora Knowledge Gaps Digest -- {today}")
     lines.append("")
     if since is not None:
         lines.append(f"_Range: gaps captured since {since.isoformat()}_")
@@ -141,9 +170,9 @@ def render_digest(grouped: dict[str, list[dict]], since: datetime | None, total:
     lines.append("")
     lines.append("For each gap below, you have three options:")
     lines.append("")
-    lines.append("1. **Trivial / one-off** — write `SKIP` in the **Your answer** block. The gap will be marked resolved without feeding back to Cora.")
-    lines.append("2. **Real gap, here's the answer** — write the answer in the **Your answer** block. This text will be appended to the entity's known-answers file when the ingestion script runs (Phase 2).")
-    lines.append("3. **Routing rule, not a fact** — write `ROUTE: ask [person/system]` in the **Your answer** block. Future asks of this type will be routed accordingly.")
+    lines.append("1. **Trivial / one-off** -- write `SKIP` in the **Your answer** block. The gap will be marked resolved without feeding back to Cora.")
+    lines.append("2. **Real gap, here's the answer** -- write the answer in the **Your answer** block. This text will be appended to the entity's known-answers file when the ingestion script runs.")
+    lines.append("3. **Routing rule, not a fact** -- write `ROUTE: ask [person/system]` in the **Your answer** block. Future asks of this type will be routed accordingly.")
     lines.append("")
     lines.append("Leave the **Your answer** block empty to defer the gap to tomorrow's digest.")
     lines.append("")
@@ -165,11 +194,12 @@ def render_digest(grouped: dict[str, list[dict]], since: datetime | None, total:
 
 def _render_entity_block(lines: list[str], entity: str, gaps: list[dict]) -> None:
     label = ENTITY_LABELS.get(entity, entity)
-    lines.append(f"## {label} ({entity}) — {len(gaps)} gap(s)")
+    lines.append(f"## {label} ({entity}) -- {len(gaps)} gap(s)")
     lines.append("")
     for idx, g in enumerate(gaps, start=1):
-        ts = g.get("ts", "")
-        # Truncate microseconds for display
+        gap_id = g.get("ts", "")  # full ISO timestamp with microseconds -- used as machine ID
+        ts = gap_id
+        # Truncate microseconds for human-readable display
         if "." in ts:
             ts = ts.split(".", 1)[0] + ts[ts.rfind("+"):] if "+" in ts else ts.split(".", 1)[0]
         channel = g.get("channel", "?")
@@ -179,6 +209,7 @@ def _render_entity_block(lines: list[str], entity: str, gaps: list[dict]) -> Non
         latency = g.get("latency_ms", "?")
         response_chars = g.get("response_chars", "?")
 
+        lines.append(f"<!-- GAP_ID: {gap_id} -->")
         lines.append(f"### {entity}-{idx}: {gap[:80]}")
         lines.append("")
         lines.append(f"- **When:** {ts}")
@@ -226,8 +257,15 @@ def main() -> int:
         print(f"  Log file does not exist yet. Nothing to digest.")
         return 0
 
-    all_gaps = load_gaps(args.log)
-    print(f"  Found {len(all_gaps)} total gaps in log")
+    # Load raw count before resolved filter
+    all_gaps_raw = load_gaps(args.log)
+    print(f"  Found {len(all_gaps_raw)} total gaps in log")
+
+    resolved_ids = load_resolved_ids(args.resolved_path)
+    all_gaps = load_gaps(args.log, resolved_ids)
+    already_resolved = len(all_gaps_raw) - len(all_gaps)
+    if already_resolved:
+        print(f"  {already_resolved} gaps already resolved (filtered out)")
 
     in_window = filter_by_date(all_gaps, since)
     print(f"  {len(in_window)} gaps in selected window")

@@ -47,6 +47,52 @@ def test_osn_missing_falls_back_to_founder_with_warning(monkeypatch, tmp_path, c
     assert "OSN" in caplog.text
 
 
+def test_load_context_with_known_answers(monkeypatch, tmp_path):
+    _clear_cache()
+
+    f3e_path = tmp_path / "F3E.md"
+    f3e_path.write_text("F3E entity content", encoding="utf-8")
+
+    founder_path = tmp_path / "FNDR.md"
+    founder_path.write_text("FNDR founder content", encoding="utf-8")
+
+    ka_path = tmp_path / "f3e-known.md"
+    ka_path.write_text("## Known facts\n\nSprouts buyer is John Smith.", encoding="utf-8")
+
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e_path)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder_path)
+    monkeypatch.setitem(cl._KNOWN_ANSWERS_PATHS, "F3E", ka_path)
+
+    result = cl.load_context("F3E")
+
+    assert "F3E entity content" in result
+    assert "FNDR founder content" in result
+    assert "Sprouts buyer is John Smith" in result
+    assert "Known Answers" in result
+
+
+def test_load_context_no_known_answers_file(monkeypatch, tmp_path):
+    _clear_cache()
+
+    f3e_path = tmp_path / "F3E.md"
+    f3e_path.write_text("F3E entity content", encoding="utf-8")
+
+    founder_path = tmp_path / "FNDR.md"
+    founder_path.write_text("FNDR founder content", encoding="utf-8")
+
+    missing_ka = tmp_path / "nonexistent-known.md"  # intentionally not created
+
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e_path)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder_path)
+    monkeypatch.setitem(cl._KNOWN_ANSWERS_PATHS, "F3E", missing_ka)
+
+    result = cl.load_context("F3E")
+
+    assert "F3E entity content" in result
+    assert "FNDR founder content" in result
+    assert "Known Answers" not in result
+
+
 def test_cache_returns_same_instance_within_ttl(monkeypatch, tmp_path):
     _clear_cache()
 

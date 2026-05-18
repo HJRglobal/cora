@@ -18,22 +18,44 @@ _ENTITY_PATHS: dict[str, Path] = {
 
 _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_KNOWN_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers"
+
+_KNOWN_ANSWERS_PATHS: dict[str, Path] = {
+    "F3E":  _KNOWN_ANSWERS_DIR / "f3e.md",
+    "LEX":  _KNOWN_ANSWERS_DIR / "lex.md",
+    "OSN":  _KNOWN_ANSWERS_DIR / "osn.md",
+    "BDM":  _KNOWN_ANSWERS_DIR / "bdm.md",
+    "HJRG": _KNOWN_ANSWERS_DIR / "fndr.md",
+    "FNDR": _KNOWN_ANSWERS_DIR / "fndr.md",
+}
+
 _TTL = 300  # seconds
 
-_cache: dict[str, tuple[str, float]] = {}
+# (content, cached_at, known_answers_mtime | None)
+_cache: dict[str, tuple[str, float, float | None]] = {}
+
+
+def _known_answers_mtime(entity: str) -> float | None:
+    path = _KNOWN_ANSWERS_PATHS.get(entity)
+    if path is None or not path.exists():
+        return None
+    return path.stat().st_mtime
 
 
 def load_context(entity: str) -> str:
     """Return CLAUDE.md text for the entity, always appending founder-level below.
 
-    In-memory cache with 5-minute TTL. Falls back to founder-level only when the
-    entity-specific file is missing, logging a warning.
+    Also appends design/known-answers/{entity}.md if it exists.
+    In-memory cache with 5-minute TTL, invalidated early if the known-answers
+    file is modified (mtime check). Falls back to founder-level only when the
+    entity-specific CLAUDE.md is missing, logging a warning.
     """
     now = time.monotonic()
     cached = _cache.get(entity)
     if cached is not None:
-        text, cached_at = cached
-        if now - cached_at < _TTL:
+        text, cached_at, ka_mtime = cached
+        if now - cached_at < _TTL and _known_answers_mtime(entity) == ka_mtime:
             return text
 
     parts: list[str] = []
@@ -45,13 +67,23 @@ def load_context(entity: str) -> str:
                 parts.append(entity_path.read_text(encoding="utf-8"))
             else:
                 log.warning(
-                    "No CLAUDE.md for entity %s at %s — falling back to founder-level only",
+                    "No CLAUDE.md for entity %s at %s -- falling back to founder-level only",
                     entity,
                     entity_path,
                 )
 
     parts.append(_FOUNDER_PATH.read_text(encoding="utf-8"))
 
+    # Append known-answers if available
+    ka_path = _KNOWN_ANSWERS_PATHS.get(entity)
+    if ka_path is not None and ka_path.exists():
+        ka_content = ka_path.read_text(encoding="utf-8").strip()
+        if ka_content:
+            parts.append("# Known Answers (from prior gap reviews)\n\n" + ka_content)
+    else:
+        log.info("no known-answers file for entity %s", entity)
+
     text = "\n\n---\n\n".join(parts)
-    _cache[entity] = (text, now)
+    ka_mtime = _known_answers_mtime(entity)
+    _cache[entity] = (text, now, ka_mtime)
     return text
