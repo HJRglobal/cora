@@ -1,0 +1,27 @@
+# Dynamic known-answer: F3 Pure launch status
+# Loaded by context_loader when entity=F3E. Interpolates from data/snapshots/f3-pure/latest.yaml.
+topic: "F3 Pure launch status, timeline, blockers, owners"
+snapshot_path: data/snapshots/f3-pure/latest.yaml
+source:
+  type: manual                       # informational only
+  cadence: weekly                    # informational only
+  staleness_threshold_hours: 240     # 10 days - Pure launch info changes weekly
+fallback: |
+  F3 Pure launch is in flight. Live status data not currently available - check the
+  founder OS CLAUDE.md Top of Mind item #5 for the latest, or ping Tommy / Larry directly.
+template: |
+  ## F3 Pure launch - current status (as of {last_updated})
+
+  **Launch + product:**
+  {launch_summary}
+
+  **Production:**
+  {production_summary}
+
+  **Distribution:**
+  {distribution_summary}
+
+  **Active risks:**
+  {known_risks}
+
+  **Owners:** Product = {owners[product]} - Field sampling = {owners[field_sampling]} - Creative = {owners[creative]} - Ingredients = {owners[ingredients]}
