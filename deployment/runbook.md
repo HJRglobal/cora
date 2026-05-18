@@ -117,6 +117,43 @@ A user hit the per-user (10/hr) or the channel hit the per-channel (50/hr) cap. 
 
 ---
 
+## Knowledge Gaps review workflow
+
+Cora appends a `[CORA_KNOWLEDGE_GAP: ...]` marker to responses when her context was too thin to answer confidently. The marker is stripped before posting to Slack. Gaps are logged to `logs/knowledge-gaps.jsonl` (one JSON line per gap).
+
+**When to run:** Nightly, or any time you want to review what Cora has been uncertain about.
+
+**How to run:**
+
+```powershell
+# Default: last 24 hours
+uv run python scripts/generate_knowledge_gaps_digest.py
+
+# Specific date window
+uv run python scripts/generate_knowledge_gaps_digest.py --since 2026-05-18
+
+# All gaps from all time
+uv run python scripts/generate_knowledge_gaps_digest.py --all
+
+# Dry-run: print to terminal, don't write to Drive
+uv run python scripts/generate_knowledge_gaps_digest.py --dry-run
+```
+
+**Where the digest lands:**
+`G:\My Drive\HJR-Founder-OS\_shared\projects\cora\knowledge-gaps\YYYY-MM-DD-digest.md`
+
+**How to review the digest:**
+
+Each gap entry has a **Your answer** block. Three actions:
+
+1. **SKIP** — gap is trivial or one-off. Marked resolved, no feedback to Cora.
+2. **Write the answer** — fill in the real context. This text is the source of truth and will be manually copied into `design/known-answers/{entity}.md` files when ready (see Phase 2 note below).
+3. **ROUTE: ask [person/system]** — future questions of this type should go to a person or tool. Write the routing note so you remember.
+
+Leave the block empty to defer the gap to the next digest run.
+
+**Phase 2 note:** Automated ingestion of your written answers back into Cora's context is deferred to Phase 2. For now, answers you write in the digest are the source of truth — copy them manually into `design/known-answers/{entity}.md` files when you're ready to feed them to Cora. The digest builder reads `knowledge-gaps.jsonl` each time from scratch, so un-ingested gaps will reappear in future digests until you SKIP or answer them.
+
 ## Escalation
 
 - Anthropic API issues: https://status.anthropic.com + Anthropic support
