@@ -38,6 +38,8 @@ def _load() -> "Config":
     anthropic_key = get("ANTHROPIC_API_KEY")
     # Asana PAT is optional — bot boots without it, Asana tool-use becomes a no-op
     asana_pat = get("ASANA_PAT", required=False, default="")
+    # HubSpot Private App token — optional, HubSpot tool-use disabled if missing
+    hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
 
     if errors:
@@ -49,6 +51,7 @@ def _load() -> "Config":
         slack_signing_secret=signing_secret,
         anthropic_api_key=anthropic_key,
         asana_pat=asana_pat,
+        hubspot_private_app_token=hubspot_token,
         log_level=log_level,
     )
 
@@ -60,6 +63,7 @@ class Config:
     slack_signing_secret: str
     anthropic_api_key: str
     asana_pat: str
+    hubspot_private_app_token: str
     log_level: str
 
 

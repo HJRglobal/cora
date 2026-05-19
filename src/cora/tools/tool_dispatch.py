@@ -18,13 +18,22 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client
+from . import asana_client, hubspot_client
 
 log = logging.getLogger(__name__)
 
-# Path to slack→asana mapping. Resolves relative to repo root (parent of src/).
+# Path to slack→tool mappings. Resolves relative to repo root (parent of src/).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+_HUBSPOT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-hubspot.yaml"
+
+# HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
+HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
+    "F3E": hubspot_client.PIPELINE_F3E_RETAIL,
+    "UFL": hubspot_client.PIPELINE_UFL_SPONSORSHIPS,
+    # OSN / LEX / BDM / HJRG don't currently have HubSpot pipelines; return all-pipeline
+    # results in those channels (or empty if no deals match).
+}
 
 
 # --- Entity scope filter ---
@@ -74,11 +83,22 @@ def _filter_tasks_by_entity(
 
 
 def _load_slack_asana_map() -> dict[str, dict[str, Any]]:
-    """Load the mapping, returning a dict keyed by slack_user_id."""
+    """Load the Asana mapping, returning a dict keyed by slack_user_id."""
     if not _MAP_PATH.exists():
         log.warning("slack-to-asana.yaml not found at %s", _MAP_PATH)
         return {}
     with open(_MAP_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    users = data.get("users") or []
+    return {u["slack_user_id"]: u for u in users if u.get("slack_user_id")}
+
+
+def _load_slack_hubspot_map() -> dict[str, dict[str, Any]]:
+    """Load the HubSpot mapping, returning a dict keyed by slack_user_id."""
+    if not _HUBSPOT_MAP_PATH.exists():
+        log.warning("slack-to-hubspot.yaml not found at %s", _HUBSPOT_MAP_PATH)
+        return {}
+    with open(_HUBSPOT_MAP_PATH, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     users = data.get("users") or []
     return {u["slack_user_id"]: u for u in users if u.get("slack_user_id")}
@@ -130,6 +150,56 @@ def _tool_get_my_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
     )
 
 
+def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Resolve user → HubSpot owner_id → fetch deals → channel-scope by pipeline → format."""
+    mapping = _load_slack_hubspot_map()
+    user = mapping.get(slack_user_id)
+    if not user:
+        return (
+            f"HubSpot lookup failed: Slack user {slack_user_id} is not mapped to a HubSpot "
+            f"owner yet. Harrison can run scripts/build_hubspot_user_map.py and paste the "
+            f"results into data/maps/slack-to-hubspot.yaml. Reply explaining this and offer a "
+            f"non-HubSpot answer if possible."
+        )
+
+    # Coerce to str — YAML parses bare-number ids as int
+    owner_id = str(user.get("hubspot_owner_id", "") or "")
+    if not owner_id or "REPLACE" in owner_id:
+        return (
+            f"HubSpot lookup failed: user {user.get('display_name', slack_user_id)} has "
+            f"a placeholder hubspot_owner_id in the mapping. Tell the user Harrison needs "
+            f"to finish populating data/maps/slack-to-hubspot.yaml."
+        )
+
+    # Channel-scope by pipeline. F3E channels → F3E Retail pipeline only. UFL → UFL Sponsors
+    # (paused, will likely return zero). Other entities (OSN/LEX/BDM/HJRG/FNDR) → no pipeline
+    # filter, all deals owned by the user.
+    pipeline_id = HUBSPOT_PIPELINE_BY_ENTITY.get(entity)
+    pipeline_filter_applied = pipeline_id is not None
+
+    try:
+        deals = hubspot_client.get_owner_deals(owner_id, pipeline_id=pipeline_id)
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning(
+            "HubSpot tool error for slack_user=%s owner=%s: %s",
+            slack_user_id, owner_id, exc,
+        )
+        return (
+            f"HubSpot error: {exc}. Tell the user there's a temporary issue reaching HubSpot."
+        )
+
+    log.info(
+        "hubspot_get_my_deals user=%s entity=%s pipeline=%s deals=%d",
+        slack_user_id, entity, pipeline_id or "(all)", len(deals),
+    )
+
+    return hubspot_client.format_deals_for_llm(
+        deals,
+        entity_scope=entity if entity != "FNDR" else None,
+        pipeline_filter_applied=pipeline_filter_applied,
+    )
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -141,10 +211,33 @@ TOOL_DEFINITIONS = [
             "Use this when the user asks about their workload, priorities, or what they "
             "should work on — phrases like 'what's on my plate', 'what should I work on', "
             "'show me my tasks', 'what's due this week'. Returns up to 25 tasks with name, "
-            "due date, project, and notes preview. Do not call for questions about another "
+            "due date, project, and notes preview. Each task name is wrapped in a Slack "
+            "hyperlink (`<url|task name>`) — preserve these verbatim in your reply so the "
+            "user can click through to edit in Asana. Do not call for questions about another "
             "person's tasks — only the asking user's. The tool automatically scopes the "
             "result to the channel's entity (e.g. in #osn-leadership only OSN-tagged tasks "
             "are returned). FNDR channels (founder + catch-all) see all entities."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "hubspot_get_my_deals",
+        "description": (
+            "Fetch the open HubSpot deals owned by the user who @-mentioned Cora. "
+            "Use this when the user asks about their pipeline, deals, sales activity, "
+            "or specific accounts — phrases like 'what's in my pipeline', 'show me my "
+            "deals', 'how's the sales pipeline looking', 'what deals do I have'. Returns "
+            "up to 25 open deals (closed-won and closed-lost excluded) with name, amount, "
+            "stage, pipeline, close date, and F3E custom-field meta. Each deal name is "
+            "wrapped in a Slack hyperlink (`<url|deal name>`) — preserve these verbatim in "
+            "your reply so the user can click through to edit in HubSpot. In F3E channels "
+            "the tool scopes to the F3E Retail pipeline only; in UFL channels it scopes to "
+            "the (paused) UFL Sponsorships pipeline; other channels return all pipelines. "
+            "Do not call for questions about another person's deals — only the asking user's."
         ),
         "input_schema": {
             "type": "object",
@@ -158,6 +251,7 @@ TOOL_DEFINITIONS = [
 # Name → callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
+    "hubspot_get_my_deals": _tool_get_my_deals,
 }
 
 

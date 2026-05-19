@@ -57,6 +57,7 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
             "memberships.section.name",
             "memberships.project.name",
             "notes",
+            "permalink_url",  # Slack deep link — user clicks to edit in Asana
         ]),
     }
     headers = {"Authorization": f"Bearer {_pat()}"}
@@ -114,9 +115,14 @@ def format_tasks_for_llm(
         header = f"Found {len(tasks)} incomplete Asana task(s):"
 
     lines = [header]
+    lines.append(
+        "(Task names below are Slack-formatted hyperlinks — preserve the `<url|name>` "
+        "syntax verbatim in your reply so the user can click through to edit in Asana.)"
+    )
     for t in tasks:
         name = t.get("name", "(no name)")
         due = t.get("due_on") or t.get("due_at") or "no due date"
+        permalink = t.get("permalink_url") or ""
 
         # Resolve project / section from memberships (richer than top-level projects)
         memberships = t.get("memberships") or []
@@ -135,7 +141,13 @@ def format_tasks_for_llm(
         notes = (t.get("notes") or "").replace("\n", " ").strip()
         notes_preview = f" — {notes[:120]}..." if len(notes) > 120 else (f" — {notes}" if notes else "")
 
-        lines.append(f"- [{due}] {name} ({project_str}){notes_preview}")
+        # Wrap task name in Slack mrkdwn hyperlink (renders as clickable in Slack)
+        if permalink:
+            name_with_link = f"<{permalink}|{name}>"
+        else:
+            name_with_link = name
+
+        lines.append(f"- [{due}] {name_with_link} ({project_str}){notes_preview}")
 
     # Footer for scoped results — helps the LLM mention the scope to the user
     if entity_scope and total_before_filter and total_before_filter > len(tasks):

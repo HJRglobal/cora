@@ -1,0 +1,31 @@
+# Slack user ID → HubSpot owner ID mapping for Cora tool-use.
+#
+# Cora resolves the @-mentioning Slack user to their HubSpot owner_id via this file,
+# then queries HubSpot deals on their behalf using Harrison's Private App token.
+#
+# Auto-populated by scripts/build_hubspot_user_map.py (matches Slack ↔ HubSpot on email).
+#
+# Manual cross-refs may be needed for users whose Slack/HubSpot emails differ
+# (same pattern as slack-to-asana.yaml — BDM users typically use @bigd.media in Slack
+# but @hjrglobal.com in HubSpot).
+#
+# Phase 3+ migration path: replace this file with OAuth per-user tokens, drop the owner_id lookup.
+
+users:
+  # --- Manually seeded from /settings/v3/users (2026-05-18) ---
+  # crm.objects.owners.read scope not yet granted — run build_hubspot_user_map.py once it is.
+
+  - slack_user_id: U0B2RM2JYJ1
+    hubspot_owner_id: 160459333
+    hubspot_email: harrison@hjrglobal.com
+    display_name: Harrison Rogers
+
+  - slack_user_id: U0B3PS7RFJA
+    hubspot_owner_id: 83346026
+    hubspot_email: matt@hjrglobal.com
+    display_name: Matt Petrovich
+
+  - slack_user_id: U0B3RU5Q55G
+    hubspot_owner_id: 162944825
+    hubspot_email: tommy@f3energy.com
+    display_name: Tommy Anderson

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Architecture decision #10 rider — non-negotiable from commit 1.
-# Blocks commits containing real Anthropic / Slack / Asana key material.
+# Blocks commits containing real Anthropic / Slack / Asana / HubSpot key material.
 #
 # Patterns match actual key formats, not human-readable placeholder text:
 #   sk-ant-api      — all live Anthropic keys start with sk-ant-api (e.g. sk-ant-api03-)
@@ -8,6 +8,7 @@
 #   xoxp-[0-9]      — real Slack user tokens (same format)
 #   xapp-1-A[0-9]   — Slack app-level tokens for Socket Mode
 #   2/[0-9]{10,}/   — Asana PATs (format: 2/{user_gid}/{token}, gid is 10+ digits)
+#   pat-na[0-9]-    — HubSpot Private App tokens (e.g. pat-na1-..., pat-na2-...)
 
 STAGED=$(git diff --cached --name-only | grep -v "^\.githooks/")
 
@@ -15,7 +16,7 @@ if [ -z "$STAGED" ]; then
   exit 0
 fi
 
-FOUND=$(printf '%s\n' $STAGED | xargs grep -lE "sk-ant-api|xoxb-[0-9]|xoxp-[0-9]|xapp-1-A[0-9]|2/[0-9]{10,}/" 2>/dev/null)
+FOUND=$(printf '%s\n' $STAGED | xargs grep -lE "sk-ant-api|xoxb-[0-9]|xoxp-[0-9]|xapp-1-A[0-9]|2/[0-9]{10,}/|pat-na[0-9]-" 2>/dev/null)
 
 if [ -n "$FOUND" ]; then
   echo ""
