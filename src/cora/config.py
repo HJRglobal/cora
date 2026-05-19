@@ -40,6 +40,8 @@ def _load() -> "Config":
     asana_pat = get("ASANA_PAT", required=False, default="")
     # HubSpot Private App token — optional, HubSpot tool-use disabled if missing
     hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")
+    # Google Service Account JSON path — optional, Calendar tool-use disabled if missing
+    google_sa_json = get("GOOGLE_SERVICE_ACCOUNT_JSON", required=False, default="")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
 
     if errors:
@@ -52,6 +54,7 @@ def _load() -> "Config":
         anthropic_api_key=anthropic_key,
         asana_pat=asana_pat,
         hubspot_private_app_token=hubspot_token,
+        google_service_account_json=google_sa_json,
         log_level=log_level,
     )
 
@@ -64,6 +67,7 @@ class Config:
     anthropic_api_key: str
     asana_pat: str
     hubspot_private_app_token: str
+    google_service_account_json: str
     log_level: str
 
 

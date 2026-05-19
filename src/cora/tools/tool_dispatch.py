@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, hubspot_client
+from . import asana_client, calendar_client, hubspot_client
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +150,53 @@ def _tool_get_my_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
     )
 
 
+def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Resolve user → Google email (from slack-to-asana mapping) → fetch calendar events → format.
+
+    Reuses asana_email field from slack-to-asana.yaml as the Google identity, since most
+    HJR team members share their @hjrglobal.com email across both. Domain-wide Delegation
+    impersonates that email to read their primary calendar.
+    """
+    mapping = _load_slack_asana_map()
+    user = mapping.get(slack_user_id)
+    if not user:
+        return (
+            f"Calendar lookup failed: Slack user {slack_user_id} is not mapped to a Google "
+            f"identity yet. Harrison can add a row to data/maps/slack-to-asana.yaml (the same "
+            f"file Cora uses for Asana — the asana_email field doubles as the Google identity)."
+        )
+
+    user_email = (user.get("asana_email") or "").strip()
+    if not user_email:
+        return (
+            f"Calendar lookup failed: user {user.get('display_name', slack_user_id)} has "
+            f"no asana_email (Google identity) in the mapping."
+        )
+
+    # Accept tool input for 'when' (today, tomorrow, this_week, next_week, YYYY-MM-DD).
+    # Default to today if not provided.
+    when = (_input or {}).get("when") or "today"
+
+    try:
+        events, window_label = calendar_client.get_user_events(user_email, when=when)
+    except calendar_client.CalendarClientError as exc:
+        log.warning(
+            "Calendar tool error for slack_user=%s email=%s: %s",
+            slack_user_id, user_email, exc,
+        )
+        return (
+            f"Calendar error: {exc}. Tell the user there's a temporary issue reaching Google "
+            f"Calendar — they may want to check Google Calendar directly."
+        )
+
+    log.info(
+        "calendar_get_my_events user=%s email=%s when=%s events=%d",
+        slack_user_id, user_email, when, len(events),
+    )
+
+    return calendar_client.format_events_for_llm(events, window_label)
+
+
 def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → HubSpot owner_id → fetch deals → channel-scope by pipeline → format."""
     mapping = _load_slack_hubspot_map()
@@ -225,6 +272,31 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "calendar_get_my_events",
+        "description": (
+            "Fetch calendar events from the user's Google Calendar primary calendar. "
+            "Use this when the user asks about their schedule, meetings, calendar, or availability "
+            "— phrases like 'what's on my calendar today', 'what meetings do I have this week', "
+            "'am I free Friday', 'what's my schedule tomorrow'. Returns up to 25 events with "
+            "title, time, duration, attendees, and location. Each event title is wrapped in a "
+            "Slack hyperlink (`<url|event title>`) — preserve these verbatim in your reply so "
+            "the user can click through to open in Google Calendar. The 'when' parameter accepts: "
+            "'today' (default), 'tomorrow', 'this_week', 'next_week', or a specific date as "
+            "'YYYY-MM-DD'. Do not call for questions about another person's calendar — only the "
+            "asking user's."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "when": {
+                    "type": "string",
+                    "description": "Time window for events. Accepts: 'today', 'tomorrow', 'this_week', 'next_week', or a specific date as 'YYYY-MM-DD'. Defaults to 'today' if omitted.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "hubspot_get_my_deals",
         "description": (
             "Fetch the open HubSpot deals owned by the user who @-mentioned Cora. "
@@ -252,6 +324,7 @@ TOOL_DEFINITIONS = [
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "hubspot_get_my_deals": _tool_get_my_deals,
+    "calendar_get_my_events": _tool_get_my_events,
 }
 
 
