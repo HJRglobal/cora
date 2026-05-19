@@ -67,12 +67,16 @@ def generate_response(
     context: str,
     user_message: str,
     slack_user_id: str = "",
+    entity: str = "FNDR",
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
     slack_user_id is bound into the tool dispatcher so tools like asana_get_my_tasks
     resolve to the right Asana account. Pass empty string if there's no asking user
     (in which case tools that need a user will return a graceful error).
+
+    entity is the routed channel entity (F3E, LEX, OSN, BDM, FNDR, etc.) — passed
+    through to the dispatcher so tools can scope their results to the channel's entity.
 
     Raises ClaudeClientError on hard failure after retries.
     """
@@ -116,10 +120,10 @@ def generate_response(
             tool_name = block.name
             tool_input = block.input or {}
             log.info(
-                "tool_use iter=%d tool=%s slack_user=%s input=%s",
-                iteration, tool_name, slack_user_id or "(none)", tool_input,
+                "tool_use iter=%d tool=%s slack_user=%s entity=%s input=%s",
+                iteration, tool_name, slack_user_id or "(none)", entity, tool_input,
             )
-            result_str = dispatch(tool_name, tool_input, slack_user_id)
+            result_str = dispatch(tool_name, tool_input, slack_user_id, entity)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,

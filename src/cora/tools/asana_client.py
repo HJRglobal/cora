@@ -78,15 +78,42 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
     return r.json().get("data", []) or []
 
 
-def format_tasks_for_llm(tasks: list[dict[str, Any]]) -> str:
+def format_tasks_for_llm(
+    tasks: list[dict[str, Any]],
+    entity_scope: str | None = None,
+    total_before_filter: int | None = None,
+) -> str:
     """Render task list as a string suitable for a tool_result content block.
 
     Format: one line per task. Optimized for Claude to skim + prioritize, not for pretty-print.
+
+    entity_scope: if set (e.g. "OSN"), prepends/appends a scope note so Claude knows the
+    list has been filtered to a specific entity. total_before_filter is the count before
+    the entity filter ran — used to render "showing N of M" framing when filtering reduced
+    the count.
     """
+    # Empty-list case
     if not tasks:
+        if entity_scope and total_before_filter and total_before_filter > 0:
+            return (
+                f"No incomplete {entity_scope}-tagged tasks assigned. "
+                f"User has {total_before_filter} task(s) across other entities — "
+                f"they can ask in a #fndr-* channel to see the full list."
+            )
         return "No incomplete tasks assigned in Asana."
 
-    lines = [f"Found {len(tasks)} incomplete Asana task(s):"]
+    # Header — vary by whether scope filter is active
+    if entity_scope and total_before_filter and total_before_filter > len(tasks):
+        header = (
+            f"Found {len(tasks)} incomplete Asana task(s) tagged for {entity_scope} "
+            f"(filtered from {total_before_filter} total assigned tasks):"
+        )
+    elif entity_scope:
+        header = f"Found {len(tasks)} incomplete Asana task(s) tagged for {entity_scope}:"
+    else:
+        header = f"Found {len(tasks)} incomplete Asana task(s):"
+
+    lines = [header]
     for t in tasks:
         name = t.get("name", "(no name)")
         due = t.get("due_on") or t.get("due_at") or "no due date"
@@ -109,5 +136,14 @@ def format_tasks_for_llm(tasks: list[dict[str, Any]]) -> str:
         notes_preview = f" — {notes[:120]}..." if len(notes) > 120 else (f" — {notes}" if notes else "")
 
         lines.append(f"- [{due}] {name} ({project_str}){notes_preview}")
+
+    # Footer for scoped results — helps the LLM mention the scope to the user
+    if entity_scope and total_before_filter and total_before_filter > len(tasks):
+        lines.append("")
+        lines.append(
+            f"[Scope: showing {entity_scope}-tagged tasks only. "
+            f"{total_before_filter - len(tasks)} other tasks exist across other entities — "
+            f"user can ask in a #fndr-* channel to see them all.]"
+        )
 
     return "\n".join(lines)
