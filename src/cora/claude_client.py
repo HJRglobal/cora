@@ -12,7 +12,9 @@ log = logging.getLogger(__name__)
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 2048
-_TIMEOUT = 25.0
+_TIMEOUT = 60.0  # bumped 25→60 for tool-use loops where the second pass synthesizes
+                 # large tool results (e.g. 25-event week calendar). Anthropic SDK has
+                 # its own internal retries; we just need to give them headroom.
 _RETRY_DELAYS = (1, 2)  # seconds before attempt 1 and attempt 2
 _MAX_TOOL_ITERATIONS = 3  # safety cap on tool-use loop
 
