@@ -36,6 +36,8 @@ def _load() -> "Config":
     app_token = get("SLACK_APP_TOKEN")
     signing_secret = get("SLACK_SIGNING_SECRET")
     anthropic_key = get("ANTHROPIC_API_KEY")
+    # Asana PAT is optional — bot boots without it, Asana tool-use becomes a no-op
+    asana_pat = get("ASANA_PAT", required=False, default="")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
 
     if errors:
@@ -46,6 +48,7 @@ def _load() -> "Config":
         slack_app_token=app_token,
         slack_signing_secret=signing_secret,
         anthropic_api_key=anthropic_key,
+        asana_pat=asana_pat,
         log_level=log_level,
     )
 
@@ -56,6 +59,7 @@ class Config:
     slack_app_token: str
     slack_signing_secret: str
     anthropic_api_key: str
+    asana_pat: str
     log_level: str
 
 

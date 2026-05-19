@@ -73,7 +73,9 @@ def handle_mention(event: dict, say: callable, client) -> None:
     try:
         context = load_context(entity)
         prompt = load_prompt(entity)
-        response_text = generate_response(prompt, runtime_context + context, user_message)
+        response_text = generate_response(
+            prompt, runtime_context + context, user_message, slack_user_id=user_id or "",
+        )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
         say(

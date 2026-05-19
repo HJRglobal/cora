@@ -1,0 +1,34 @@
+# Slack user ID → Asana user mapping for Cora tool-use.
+#
+# Cora resolves the @-mentioning Slack user to their Asana gid + email via this file,
+# then queries Asana on their behalf using Harrison's PAT (single-PAT MVP model).
+#
+# To add a user:
+# 1. In Slack, click their profile → "..." → Copy Member ID (starts with U)
+# 2. In Asana, click their profile → URL has /0/{gid}/list — copy {gid} (numeric)
+# 3. Their email (used for display/logging only) is on their Asana profile
+#
+# Phase 3+ migration path: replace this file with OAuth per-user tokens, drop the gid lookup.
+
+users:
+  # MVP seed — expand after smoke test passes
+  - slack_user_id: U0B2RM2JYJ1
+    asana_user_gid: 1204525779609669
+    asana_email: harrison@hjrglobal.com
+    display_name: Harrison Rogers
+
+  # Pending — uncomment + populate after Harrison's MVP works:
+  # - slack_user_id: U_TOMMY_SLACK_ID
+  #   asana_user_gid: REPLACE_WITH_TOMMY_ASANA_GID
+  #   asana_email: tommy@hjrglobal.com
+  #   display_name: Tommy
+  #
+  # - slack_user_id: U_HANNAH_SLACK_ID
+  #   asana_user_gid: REPLACE_WITH_HANNAH_ASANA_GID
+  #   asana_email: hannah@hjrglobal.com
+  #   display_name: Hannah Grant
+  #
+  # - slack_user_id: U_LARRY_SLACK_ID
+  #   asana_user_gid: REPLACE_WITH_LARRY_ASANA_GID
+  #   asana_email: larry@bigdmedia.co
+  #   display_name: Larry Stone
