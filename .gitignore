@@ -24,3 +24,6 @@ data/snapshots/
 # OS
 .DS_Store
 Thumbs.db
+
+# Credentials (private keys)
+.credentials/
