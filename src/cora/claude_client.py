@@ -11,7 +11,7 @@ from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch
 log = logging.getLogger(__name__)
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 1024
+_MAX_TOKENS = 2048
 _TIMEOUT = 25.0
 _RETRY_DELAYS = (1, 2)  # seconds before attempt 1 and attempt 2
 _MAX_TOOL_ITERATIONS = 3  # safety cap on tool-use loop

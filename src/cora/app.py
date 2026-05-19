@@ -113,4 +113,12 @@ def handle_mention(event: dict, say: callable, client) -> None:
         len(response_text),
     )
 
-    say(text=response_text, thread_ts=thread_ts)
+    # unfurl_links/media False: suppresses Slack's auto-preview cards for every URL
+    # in the response (was polluting calendar/asana/hubspot replies with "Google
+    # Calendar — Easier Time Management..." stubs for every event link).
+    say(
+        text=response_text,
+        thread_ts=thread_ts,
+        unfurl_links=False,
+        unfurl_media=False,
+    )
