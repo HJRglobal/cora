@@ -48,7 +48,8 @@ def _tool_get_my_tasks(slack_user_id: str, _input: dict) -> str:
             f"Reply explaining this and offer a non-Asana answer if possible."
         )
 
-    asana_gid = user.get("asana_user_gid", "")
+    # Coerce to str — YAML parses bare-number gids as int, which breaks the substring check.
+    asana_gid = str(user.get("asana_user_gid", "") or "")
     if not asana_gid or "REPLACE" in asana_gid:
         return (
             f"Asana lookup failed: user {user.get('display_name', slack_user_id)} has "
