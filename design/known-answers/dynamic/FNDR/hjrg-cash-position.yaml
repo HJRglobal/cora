@@ -1,0 +1,33 @@
+# Dynamic known-answer: HJR Global cross-portfolio cash position
+# Loaded by context_loader when entity=FNDR (includes #hjrg-* channels per YAML routing).
+# Phase 2 will auto-refresh snapshot from Visibility's weekly Google Sheet.
+topic: "HJR Global cross-portfolio cash position + 13-week forecast + active escalations"
+snapshot_path: data/snapshots/hjrg-cash-position/latest.yaml
+source:
+  type: manual                          # Phase 2 will switch to visibility_weekly_sheet_sweep
+  cadence: weekly                       # refreshed when Visibility updates 13-week rolling forecast
+  staleness_threshold_hours: 336        # 2 weeks — if Visibility goes >2 weeks without update, use fallback
+fallback: |
+  Latest HJR Global cash position lives in Visibility's 13-week rolling forecast at
+  https://docs.google.com/spreadsheets/d/1bkMFetsIW-cLtYwLorgio01gLm7EOdJ7UgGHj_lTqPI/edit.
+  Ping Justin Moran for current consolidated figures. Hayden Greber handles OSN-specific. Emily Stubbs handles legal.
+template: |
+  ## HJR Global cross-portfolio cash position - {reporting_period} (snapshot as of {last_updated})
+
+  **Overall:**
+  {total_cash_summary}
+
+  **By entity:**
+  {by_entity_summary}
+
+  **13-week forecast trend:**
+  {forecast_trend}
+
+  **Active escalations:**
+  {escalations}
+
+  **Owners:** Financial master = {owners[financial_master]} - Visibility lead = {owners[visibility_lead]} - OSN-specific = {owners[osn_specific]} - Legal = {owners[legal]} - Founder = {owners[founder]}
+
+  **Canonical source:** {source_link}
+
+  **Refresh protocol:** {refresh_protocol}
