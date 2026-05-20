@@ -42,6 +42,8 @@ def _load() -> "Config":
     hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")
     # Google Service Account JSON path — optional, Calendar tool-use disabled if missing
     google_sa_json = get("GOOGLE_SERVICE_ACCOUNT_JSON", required=False, default="")
+    # OpenAI API key — for embeddings (Phase 3 KB). Optional; KB ingest/retrieval no-ops if missing.
+    openai_api_key = get("OPENAI_API_KEY", required=False, default="")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
 
     if errors:
@@ -55,6 +57,7 @@ def _load() -> "Config":
         asana_pat=asana_pat,
         hubspot_private_app_token=hubspot_token,
         google_service_account_json=google_sa_json,
+        openai_api_key=openai_api_key,
         log_level=log_level,
     )
 
@@ -68,6 +71,7 @@ class Config:
     asana_pat: str
     hubspot_private_app_token: str
     google_service_account_json: str
+    openai_api_key: str
     log_level: str
 
 

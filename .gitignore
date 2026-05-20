@@ -18,6 +18,11 @@ logs/
 # Snapshots (local data backed up via backup_logs.py, not committed)
 data/snapshots/
 
+# Knowledge Base sqlite + sqlite-vec database (local, backed up via backup_logs.py)
+data/cora_kb.db
+data/cora_kb.db-shm
+data/cora_kb.db-wal
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
 

@@ -11,6 +11,10 @@ dependencies = [
     "httpx>=0.27",
     "google-auth>=2.30",
     "google-api-python-client>=2.140",
+    # Phase 3 — Knowledge Base + RAG
+    "openai>=1.50",          # embeddings via text-embedding-3-small
+    "tiktoken>=0.7",         # token counting for chunker (cl100k_base encoding)
+    "sqlite-vec>=0.1.6",     # vector search extension for sqlite
 ]
 
 [project.scripts]
