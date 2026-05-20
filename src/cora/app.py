@@ -71,7 +71,10 @@ def handle_mention(event: dict, say: callable, client) -> None:
 
     t0 = time.monotonic()
     try:
-        context = load_context(entity)
+        # Phase 3: pass user_message as query so context_loader can augment with
+        # KB retrieval (top-K semantically-relevant chunks from cora_kb.db).
+        # If KB isn't initialized or retrieval fails, falls back to static context.
+        context = load_context(entity, query=user_message)
         prompt = load_prompt(entity)
         response_text = generate_response(
             prompt,
