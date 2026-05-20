@@ -101,7 +101,7 @@ def _request(entity: str, path: str, params: dict[str, Any] | None = None) -> di
         # happen often given get_valid_access_token's lead-time refresh, but covers the
         # narrow race where another process refreshed mid-request.
         from ..connectors.qbo_oauth import _refresh_access_token  # noqa: PLC0415
-        log.warning("QBO returned 401 for entity=%s — forcing refresh and retrying", entity)
+        log.warning("QBO returned 401 for entity=%s - forcing refresh and retrying", entity)
         _refresh_access_token(entity)
         access_token, realm_id = get_valid_access_token(entity)
         headers["Authorization"] = f"Bearer {access_token}"
@@ -109,7 +109,7 @@ def _request(entity: str, path: str, params: dict[str, Any] | None = None) -> di
 
     if resp.status_code != 200:
         raise QboClientError(
-            f"QBO API error for entity={entity}: HTTP {resp.status_code} — {resp.text[:400]}"
+            f"QBO API error for entity={entity}: HTTP {resp.status_code} - {resp.text[:400]}"
         )
 
     try:
@@ -140,6 +140,56 @@ def _default_date_range(days_back: int = 30) -> tuple[str, str]:
     today = datetime.date.today()
     start = today - datetime.timedelta(days=days_back)
     return start.isoformat(), today.isoformat()
+
+
+def parse_period(period: str | None) -> tuple[str, str]:
+    """Resolve a user-supplied period string to (start_date, end_date) ISO strings.
+
+    Accepts (case-insensitive):
+      - "this_month"      first of current month through today
+      - "last_month"      first through last day of previous month
+      - "ytd"             Jan 1 of current year through today
+      - "last_year"       Jan 1 through Dec 31 of previous year
+      - "last_30_days"    today - 30 days through today
+      - "last_90_days"    today - 90 days through today
+      - "YYYY-MM-DD to YYYY-MM-DD"  explicit range
+      - None / unrecognized  defaults to last_30_days
+
+    Raises ValueError only if the explicit range parses to invalid dates.
+    """
+    today = datetime.date.today()
+    norm = (period or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    if not norm or norm == "last_30_days":
+        return (today - datetime.timedelta(days=30)).isoformat(), today.isoformat()
+    if norm == "last_90_days":
+        return (today - datetime.timedelta(days=90)).isoformat(), today.isoformat()
+    if norm == "this_month":
+        return today.replace(day=1).isoformat(), today.isoformat()
+    if norm == "last_month":
+        first_this = today.replace(day=1)
+        last_prev = first_this - datetime.timedelta(days=1)
+        first_prev = last_prev.replace(day=1)
+        return first_prev.isoformat(), last_prev.isoformat()
+    if norm == "ytd":
+        return today.replace(month=1, day=1).isoformat(), today.isoformat()
+    if norm == "last_year":
+        last_year = today.year - 1
+        return f"{last_year}-01-01", f"{last_year}-12-31"
+
+    # Explicit "YYYY-MM-DD to YYYY-MM-DD" form (normalize separator)
+    raw = (period or "").lower().replace("_to_", " to ").replace(" to ", "|")
+    parts = raw.split("|")
+    if len(parts) == 2:
+        try:
+            start = datetime.date.fromisoformat(parts[0].strip())
+            end = datetime.date.fromisoformat(parts[1].strip())
+            return start.isoformat(), end.isoformat()
+        except ValueError:
+            pass
+
+    # Unrecognized - fall back to last 30 days
+    return (today - datetime.timedelta(days=30)).isoformat(), today.isoformat()
 
 
 def get_profit_loss(

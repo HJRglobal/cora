@@ -18,7 +18,8 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, calendar_client, hubspot_client
+from . import asana_client, calendar_client, hubspot_client, qbo_client
+from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +248,140 @@ def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
     )
 
 
+# --- QBO tool helpers ---
+
+# Entities that COULD have QBO data eventually. The tool checks list_provisioned_entities()
+# at call time, so this is just for the "please specify entity" disambiguation prompt
+# when the model calls a QBO tool from FNDR without naming an entity.
+_KNOWN_QBO_CAPABLE_ENTITIES = ("HJRG", "F3E", "F3C", "BDM", "LEX", "OSN", "HJRP", "HJRPROD", "UFL")
+
+
+def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str | None, str | None]:
+    """Resolve which QBO entity a tool call should run against.
+
+    Returns (target_entity, error_message). If target_entity is None, the caller
+    should return error_message to the model as the tool_result.
+
+    Rules:
+      - If override is given and provisioned -> use it.
+      - If override is given but NOT provisioned -> error with hint.
+      - If channel_entity is FNDR/HJRG/etc. and no override -> ask the model to specify.
+      - If channel_entity is a real entity (F3E, OSN, etc.) -> use it (and check provisioning).
+    """
+    try:
+        provisioned = set(qbo_oauth.list_provisioned_entities())
+    except Exception as exc:
+        log.warning("Could not read QBO provisioned entities: %s", exc)
+        return None, (
+            "QBO tokens cannot be loaded right now (tokens file unreadable or missing). "
+            "Tell the user QBO is temporarily unavailable."
+        )
+
+    if not provisioned:
+        return None, (
+            "No QBO entities are provisioned yet. Tell the user Harrison needs to run "
+            "`uv run python scripts/qbo_oauth_flow.py --entity <CODE>` for each company first."
+        )
+
+    if override:
+        norm = override.strip().upper()
+        if norm in provisioned:
+            return norm, None
+        return None, (
+            f"QBO entity {norm!r} is not provisioned. Available: {sorted(provisioned)}. "
+            f"Ask the user which one they want, or pick the closest match if obvious."
+        )
+
+    # No override - use channel entity if it's a concrete entity with QBO tokens
+    if channel_entity in provisioned:
+        return channel_entity, None
+
+    # FNDR / HJRG-as-fndr-fallback / unprovisioned channel entity -> ask user
+    return None, (
+        f"This channel is scoped to '{channel_entity}', which doesn't have its own QBO data. "
+        f"Ask the user which entity's QBO data to pull. Provisioned entities: "
+        f"{sorted(provisioned)}."
+    )
+
+
+def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch Profit and Loss for an entity over a period. Returns a Slack-mrkdwn summary + QBO link."""
+    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    if err:
+        return err
+    period = (_input or {}).get("period")
+    start_date, end_date = qbo_client.parse_period(period)
+    try:
+        report = qbo_client.get_profit_loss(target, start_date, end_date)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO P&L tool error entity=%s: %s", target, exc)
+        return f"QBO error fetching P&L for {target}: {exc}. Tell the user there's a temporary QBO issue."
+    log.info("qbo_get_profit_loss entity=%s period=%s..%s", target, start_date, end_date)
+    return qbo_client.format_pnl_for_llm(report, target, start_date, end_date)
+
+
+def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch Balance Sheet snapshot for an entity as-of a date (defaults to today)."""
+    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    if err:
+        return err
+    as_of = (_input or {}).get("as_of_date")
+    try:
+        report = qbo_client.get_balance_sheet(target, as_of)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO Balance Sheet tool error entity=%s: %s", target, exc)
+        return f"QBO error fetching Balance Sheet for {target}: {exc}. Tell the user there's a temporary QBO issue."
+    log.info("qbo_get_balance_sheet entity=%s as_of=%s", target, as_of or "today")
+    return qbo_client.format_balance_sheet_for_llm(report, target, as_of or "today")
+
+
+def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch AR aging summary for an entity."""
+    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    if err:
+        return err
+    try:
+        report = qbo_client.get_ar_aging(target)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO AR Aging tool error entity=%s: %s", target, exc)
+        return f"QBO error fetching AR Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+    log.info("qbo_get_ar_aging entity=%s", target)
+    return qbo_client.format_ar_aging_for_llm(report, target)
+
+
+def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch AP aging summary for an entity."""
+    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    if err:
+        return err
+    try:
+        report = qbo_client.get_ap_aging(target)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO AP Aging tool error entity=%s: %s", target, exc)
+        return f"QBO error fetching AP Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+    log.info("qbo_get_ap_aging entity=%s", target)
+    return qbo_client.format_ap_aging_for_llm(report, target)
+
+
+def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch a digest of recent Invoice / Bill / Payment activity for an entity."""
+    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    if err:
+        return err
+    try:
+        days = int((_input or {}).get("days") or 30)
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 180))  # clamp to sane range
+    try:
+        payload = qbo_client.get_recent_transactions(target, days=days)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO Recent Transactions tool error entity=%s: %s", target, exc)
+        return f"QBO error fetching recent transactions for {target}: {exc}. Tell the user there's a temporary QBO issue."
+    log.info("qbo_get_recent_transactions entity=%s days=%d", target, days)
+    return qbo_client.format_recent_transactions_for_llm(payload, target, days)
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -317,6 +452,132 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "qbo_get_profit_loss",
+        "description": (
+            "Fetch a QuickBooks Online Profit & Loss summary for a portfolio entity over "
+            "a date range. Use this when a user in a TIER_1 channel (any #*-finance, "
+            "#*-leadership, #hjrg-*, or #fndr-* channel) asks about revenue, expenses, "
+            "profitability, margin, or P&L performance — phrases like 'what's our P&L', "
+            "'how much did we make last month', 'what's revenue YTD', 'profit this month'. "
+            "Returns top-line section totals (Income, COGS, Net Income) plus a clickable "
+            "QBO deep link to the full report. The tool defaults to the channel's entity, "
+            "but the `entity` parameter can override (use it in FNDR/HJRG channels where "
+            "the user names a specific entity). The `period` parameter controls the date "
+            "range — defaults to last_30_days. Refuse and don't call this tool in TIER_3 "
+            "channels per the financial guardrail."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code override (e.g. HJRG, F3E, OSN, LEX, BDM). If omitted, uses the channel's entity. Required when the channel is FNDR/HJRG and the user names a specific business.",
+                },
+                "period": {
+                    "type": "string",
+                    "description": "Time period for the P&L. Accepts: 'this_month', 'last_month', 'ytd', 'last_year', 'last_30_days' (default), 'last_90_days', or an explicit range like '2026-01-01 to 2026-03-31'.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "qbo_get_balance_sheet",
+        "description": (
+            "Fetch a QuickBooks Online Balance Sheet snapshot for a portfolio entity as of "
+            "a specific date (defaults to today). Use this when a user in a TIER_1 channel "
+            "asks about assets, liabilities, equity, cash position, balance sheet, or "
+            "financial position. Returns top-level section totals (Total Assets, Total "
+            "Liabilities, Equity) plus a clickable QBO deep link to the full report. The "
+            "`entity` parameter overrides the channel's entity. Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code override. If omitted, uses the channel's entity.",
+                },
+                "as_of_date": {
+                    "type": "string",
+                    "description": "ISO date (YYYY-MM-DD) for the snapshot. Defaults to today if omitted.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "qbo_get_ar_aging",
+        "description": (
+            "Fetch a QuickBooks Online Accounts Receivable Aging summary for a portfolio "
+            "entity. Use this when a user in a TIER_1 channel asks about open invoices, "
+            "money owed to the business, customer collections, or AR aging buckets — "
+            "phrases like 'who owes us money', 'what's outstanding on receivables', 'AR "
+            "aging report'. Returns aging buckets (current, 1-30, 31-60, 61-90, 91+) plus "
+            "a clickable QBO deep link. The `entity` parameter overrides the channel's "
+            "entity. Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code override. If omitted, uses the channel's entity.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "qbo_get_ap_aging",
+        "description": (
+            "Fetch a QuickBooks Online Accounts Payable Aging summary for a portfolio "
+            "entity. Use this when a user in a TIER_1 channel asks about unpaid vendor "
+            "bills, money we owe, payables aging buckets, or upcoming vendor payments — "
+            "phrases like 'what do we owe', 'AP aging', 'vendor balances outstanding'. "
+            "Returns aging buckets (current, 1-30, 31-60, 61-90, 91+) plus a clickable "
+            "QBO deep link. The `entity` parameter overrides the channel's entity. "
+            "Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code override. If omitted, uses the channel's entity.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "qbo_get_recent_transactions",
+        "description": (
+            "Fetch a QuickBooks Online recent activity digest for a portfolio entity — "
+            "counts of recently updated Invoices, Bills, and Payments over a configurable "
+            "lookback window (defaults to 30 days). Use this when a user in a TIER_1 "
+            "channel asks about recent QBO activity, what's been entered recently, or "
+            "wants a high-level pulse on the books — phrases like 'what's been happening "
+            "in QBO', 'any new invoices this week', 'recent activity'. Returns counts per "
+            "type plus a clickable QBO transactions deep link. The `entity` parameter "
+            "overrides the channel's entity. Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code override. If omitted, uses the channel's entity.",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window in days (1-180). Defaults to 30.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -325,6 +586,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
+    "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
+    "qbo_get_balance_sheet": _tool_qbo_get_balance_sheet,
+    "qbo_get_ar_aging": _tool_qbo_get_ar_aging,
+    "qbo_get_ap_aging": _tool_qbo_get_ap_aging,
+    "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
 }
 
 

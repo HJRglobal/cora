@@ -134,9 +134,9 @@ def _client_creds() -> tuple[str, str]:
     from ..config import config  # local import to avoid circular import at module load
     if not config.qbo_client_id or not config.qbo_client_secret:
         raise QboAuthError(
-            "QBO_CLIENT_ID and/or QBO_CLIENT_SECRET missing from .env — "
+            "QBO_CLIENT_ID and/or QBO_CLIENT_SECRET missing from .env - "
             "QBO tool-use disabled. Create an Intuit Developer app at "
-            "https://developer.intuit.com → My Apps → Create an app → "
+            "https://developer.intuit.com > My Apps > Create an app > "
             "QuickBooks Online and Payments."
         )
     return config.qbo_client_id, config.qbo_client_secret
@@ -189,8 +189,8 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if state != self.expected_state:
-            self.captured["error"] = "state mismatch — possible CSRF"
-            self._respond("State mismatch — refusing. You can close this tab.")
+            self.captured["error"] = "state mismatch - possible CSRF"
+            self._respond("State mismatch - refusing. You can close this tab.")
             return
 
         if not code or not realm_id:
@@ -233,7 +233,7 @@ def _run_callback_server(state: str, timeout_sec: int = 300) -> dict[str, str]:
                 time.sleep(0.5)
             else:
                 raise QboAuthError(
-                    f"OAuth callback timed out after {timeout_sec}s — no redirect received"
+                    f"OAuth callback timed out after {timeout_sec}s - no redirect received"
                 )
         finally:
             server.shutdown()
@@ -262,7 +262,7 @@ def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
     )
     if resp.status_code != 200:
         raise QboAuthError(
-            f"Token exchange failed: HTTP {resp.status_code} — {resp.text[:300]}"
+            f"Token exchange failed: HTTP {resp.status_code} - {resp.text[:300]}"
         )
     return resp.json()
 
@@ -296,9 +296,9 @@ def start_oauth_flow(entity: str, environment: str | None = None) -> dict[str, A
     log.info("Opening browser to: %s", authorize_url)
     webbrowser.open(authorize_url, new=2)
     print(
-        "\n  → A browser window should have opened. Sign in to Intuit, pick the "
+        "\n  -> A browser window should have opened. Sign in to Intuit, pick the "
         f"QBO company that maps to '{entity}', authorize the app.\n"
-        "  → If the browser didn't open, paste this URL manually:\n\n"
+        "  -> If the browser didn't open, paste this URL manually:\n\n"
         f"    {authorize_url}\n"
     )
 
@@ -306,7 +306,7 @@ def start_oauth_flow(entity: str, environment: str | None = None) -> dict[str, A
     code = captured["code"]
     realm_id = captured["realm_id"]
 
-    log.info("Captured auth code (realm_id=%s) — exchanging for tokens", realm_id)
+    log.info("Captured auth code (realm_id=%s) - exchanging for tokens", realm_id)
     token_resp = _exchange_code_for_tokens(code)
 
     now = int(time.time())
@@ -336,7 +336,7 @@ def _refresh_access_token(entity: str) -> dict[str, Any]:
     refresh_token = entry.get("refresh_token")
     if not refresh_token:
         raise QboAuthError(
-            f"No refresh token stored for entity {entity!r} — re-run start_oauth_flow."
+            f"No refresh token stored for entity {entity!r} - re-run start_oauth_flow."
         )
 
     resp = httpx.post(
@@ -354,7 +354,7 @@ def _refresh_access_token(entity: str) -> dict[str, Any]:
     )
     if resp.status_code != 200:
         raise QboAuthError(
-            f"Refresh failed for entity={entity}: HTTP {resp.status_code} — {resp.text[:300]}"
+            f"Refresh failed for entity={entity}: HTTP {resp.status_code} - {resp.text[:300]}"
         )
 
     payload = resp.json()
@@ -381,7 +381,7 @@ def get_valid_access_token(entity: str) -> tuple[str, str]:
 
     if entry["access_token_expires_at"] - now < _REFRESH_LEAD_TIME_SEC:
         log.info(
-            "Access token for entity=%s within %ds of expiry — refreshing",
+            "Access token for entity=%s within %ds of expiry - refreshing",
             entity, _REFRESH_LEAD_TIME_SEC,
         )
         entry = _refresh_access_token(entity)
