@@ -42,19 +42,19 @@ $Tasks = @(
         Name        = "cowork-cora-kb-sync-asana"
         Script      = "scripts\incremental_sync_asana.py"
         HourMin     = "03:00"
-        Description = "Cora KB daily incremental sync — Asana tasks + comments + project descriptions"
+        Description = "Cora KB daily incremental sync - Asana tasks + comments + project descriptions"
     },
     @{
         Name        = "cowork-cora-kb-sync-fireflies"
         Script      = "scripts\incremental_sync_fireflies.py"
         HourMin     = "03:30"
-        Description = "Cora KB daily incremental sync — Fireflies meeting transcripts"
+        Description = "Cora KB daily incremental sync - Fireflies meeting transcripts"
     },
     @{
         Name        = "cowork-cora-kb-sync-static"
         Script      = "scripts\incremental_sync_static.py"
         HourMin     = "04:00"
-        Description = "Cora KB daily incremental sync — Founder OS static markdown (CLAUDE.md, decisions.md, etc.)"
+        Description = "Cora KB daily incremental sync - Founder OS static markdown (CLAUDE.md, decisions.md, etc.)"
     }
 )
 
@@ -73,16 +73,17 @@ foreach ($task in $Tasks) {
     # Build the action: invoke uv via cmd.exe wrapper so output redirection works
     # cd to repo root, run the script, redirect to log file
     $scriptPath = Join-Path $RepoRoot $task.Script
-    $cmdArgs = "/c cd /d `"$RepoRoot`" && `"$UvExe`" run python `"$scriptPath`""
-    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdArgs
+    $cmdArgs = "/c cd /d `"$RepoRoot`" `& `"$UvExe`" run python `"$scriptPath`""
+    $action = New-ScheduledTaskAction -Execute "cmd.exe" -WorkingDirectory $RepoRoot -Argument $cmdArgs
 
     # Trigger: daily at the specified time
     $trigger = New-ScheduledTaskTrigger -Daily -At $task.HourMin
 
-    # Run as current user, whether logged in or not, with highest privileges
+    # Run as current user while logged in (InteractiveToken — no admin required to register,
+    # consistent with cowork-cora-service which uses the same logon type).
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
-        -LogonType S4U `
+        -LogonType Interactive `
         -RunLevel Highest
 
     # Settings: don't run if on batteries, allow start-on-demand, retry once on failure
@@ -115,4 +116,5 @@ Write-Host "Force a test run for any task:" -ForegroundColor Cyan
 Write-Host "  Start-ScheduledTask -TaskName 'cowork-cora-kb-sync-asana'"
 Write-Host ""
 Write-Host "Watch logs at:" -ForegroundColor Cyan
-Write-Host "  $RepoRoot\logs\kb-sync-*-$(Get-Date -Format 'yyyy-MM-dd').log"
+$today = Get-Date -Format "yyyy-MM-dd"
+Write-Host "  $RepoRoot\logs\kb-sync-*-$today.log"
