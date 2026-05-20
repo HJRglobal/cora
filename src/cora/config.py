@@ -44,6 +44,14 @@ def _load() -> "Config":
     google_sa_json = get("GOOGLE_SERVICE_ACCOUNT_JSON", required=False, default="")
     # OpenAI API key — for embeddings (Phase 3 KB). Optional; KB ingest/retrieval no-ops if missing.
     openai_api_key = get("OPENAI_API_KEY", required=False, default="")
+    # QuickBooks Online OAuth (Phase 2 #10). All four optional; QBO tool-use disabled if any missing.
+    # Single Intuit Developer app — per-entity tokens stored in .credentials/qbo-tokens.json.
+    qbo_client_id = get("QBO_CLIENT_ID", required=False, default="")
+    qbo_client_secret = get("QBO_CLIENT_SECRET", required=False, default="")
+    qbo_redirect_uri = get(
+        "QBO_REDIRECT_URI", required=False, default="http://localhost:8765/qbo-oauth-callback"
+    )
+    qbo_environment = get("QBO_ENVIRONMENT", required=False, default="production")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
 
     if errors:
@@ -58,6 +66,10 @@ def _load() -> "Config":
         hubspot_private_app_token=hubspot_token,
         google_service_account_json=google_sa_json,
         openai_api_key=openai_api_key,
+        qbo_client_id=qbo_client_id,
+        qbo_client_secret=qbo_client_secret,
+        qbo_redirect_uri=qbo_redirect_uri,
+        qbo_environment=qbo_environment,
         log_level=log_level,
     )
 
@@ -72,6 +84,10 @@ class Config:
     hubspot_private_app_token: str
     google_service_account_json: str
     openai_api_key: str
+    qbo_client_id: str
+    qbo_client_secret: str
+    qbo_redirect_uri: str
+    qbo_environment: str
     log_level: str
 
 
