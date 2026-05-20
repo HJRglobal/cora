@@ -37,9 +37,13 @@ _KB_DB_PATH = _REPO_ROOT / "data" / "cora_kb.db"
 _KB_TOP_K = 8
 _KB_MAX_AGE_DAYS = 365
 # Cosine distance threshold — anything above this is likely irrelevant noise.
-# text-embedding-3-small typically returns dist 0.4-0.6 for strong matches,
-# 0.8-1.0 for marginal, >1.1 for unrelated.
-_KB_MAX_DISTANCE = 1.10
+# Tuned 2026-05-19 based on Phase 3A+B smoke-test data: text-embedding-3-small
+# returns higher absolute distances than initial estimates assumed. Real
+# relevant matches across portfolio queries run 0.85-1.10 (not 0.4-0.6 as
+# initially guessed). Bumping threshold 1.10 → 1.30 captures meaningful
+# matches without flooding context with noise. >1.30 is genuinely unrelated.
+# Revisit after Phase 3C eval suite collects measured precision/recall data.
+_KB_MAX_DISTANCE = 1.30
 
 _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
     "F3E":  _KNOWN_ANSWERS_DIR / "f3e.md",
