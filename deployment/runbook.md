@@ -12,16 +12,17 @@ Start-ScheduledTask -TaskName "cowork-cora-service"
 Stop-ScheduledTask -TaskName "cowork-cora-service"
 ```
 
-**Stop (hard kill):**
+**Stop (hard kill — use when Stop-ScheduledTask leaves zombie processes):**
 ```powershell
-Get-Process python* | Stop-Process -Force
+Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "cora.exe" -or ($_.Name -eq "python.exe" -and $_.CommandLine -like "*cora*") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
-**Verify she's alive:**
+**Verify she's alive (single instance):**
 ```powershell
-Get-Process python*
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "cora.exe" } | Select-Object ProcessId, CreationDate
 ```
-Or check the log file for a `heartbeat alive` entry within the last 2 minutes.
+Or check the log for a single `heartbeat alive` sequence. Multiple interleaved uptime values = multiple instances running (use hard kill above).
 
 **Invite to a new channel:** `/invite @Cora` in the Slack channel (manual Slack action — no code change needed).
 
