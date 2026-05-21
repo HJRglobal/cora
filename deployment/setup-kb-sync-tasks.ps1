@@ -90,7 +90,7 @@ foreach ($task in $Tasks) {
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType Interactive `
-        -RunLevel Highest
+        -RunLevel Limited
 
     # Settings: don't run if on batteries, allow start-on-demand, retry once on failure
     $settings = New-ScheduledTaskSettingsSet `
