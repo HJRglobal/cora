@@ -70,10 +70,35 @@ _DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 _ACCESS_TOKEN_TTL_SEC = 3600
 _REFRESH_LEAD_TIME_SEC = 600
 
-# Local callback server (used during start_oauth_flow only).
-_CALLBACK_HOST = "localhost"
-_CALLBACK_PORT = 8765
-_CALLBACK_PATH = "/qbo-oauth-callback"
+# Local callback server (used during start_oauth_flow only). Host/port/path are
+# parsed from QBO_REDIRECT_URI at runtime so .env is the single source of truth.
+# Defaults below are used only if QBO_REDIRECT_URI is missing or malformed.
+_CALLBACK_HOST_DEFAULT = "localhost"
+_CALLBACK_PORT_DEFAULT = 8765
+_CALLBACK_PATH_DEFAULT = "/qbo-oauth-callback"
+
+
+def _callback_uri_parts() -> tuple[str, int, str]:
+    """Parse (host, port, path) from QBO_REDIRECT_URI in config.
+
+    Falls back to localhost:8765/qbo-oauth-callback if the URI is missing or
+    can't be parsed. This lets us change ports between dev and prod by editing
+    only QBO_REDIRECT_URI in .env (Intuit's uniqueness rule requires distinct
+    URIs across dev and prod environments per app).
+    """
+    from ..config import config  # local import to avoid circular import at module load
+    try:
+        parsed = urllib.parse.urlparse(config.qbo_redirect_uri or "")
+        host = parsed.hostname or _CALLBACK_HOST_DEFAULT
+        port = parsed.port or _CALLBACK_PORT_DEFAULT
+        path = parsed.path or _CALLBACK_PATH_DEFAULT
+        return host, port, path
+    except Exception as exc:
+        log.warning(
+            "Could not parse QBO_REDIRECT_URI=%r, falling back to defaults: %s",
+            config.qbo_redirect_uri, exc,
+        )
+        return _CALLBACK_HOST_DEFAULT, _CALLBACK_PORT_DEFAULT, _CALLBACK_PATH_DEFAULT
 
 # Token store location — kept in repo as gitignored `.credentials/` dir, alongside the
 # Calendar service-account JSON (existing pattern).
@@ -171,7 +196,8 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 — std lib name
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != _CALLBACK_PATH:
+        _, _, expected_path = _callback_uri_parts()
+        if parsed.path != expected_path:
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -220,7 +246,9 @@ def _run_callback_server(state: str, timeout_sec: int = 300) -> dict[str, str]:
         {"expected_state": state, "captured": {}},
     )
 
-    with socketserver.TCPServer((_CALLBACK_HOST, _CALLBACK_PORT), handler_class) as server:
+    host, port, _ = _callback_uri_parts()
+    log.info("OAuth callback server binding to %s:%d", host, port)
+    with socketserver.TCPServer((host, port), handler_class) as server:
         server.timeout = 1
         deadline = time.monotonic() + timeout_sec
 
