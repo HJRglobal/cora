@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -78,17 +79,66 @@ _INDEXABLE_MIME_TYPES = frozenset({
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 
 # Skip these path segments entirely (PHI + archives + system noise). Case-
-# insensitive. Mirrors the static_md PHI guardrail with Drive-specific adds.
+# insensitive. Exact-match on each segment of the path.
+# Expanded 2026-05-21 after live Drive backfill spot-check surfaced
+# Explanation-of-Benefits subfolders, payroll detail folders, personal-finance
+# tax-return folders, and labor-distribution folders that contain employee /
+# member PII not appropriate for an internal Slack assistant.
 _BLACKLIST_SEGMENTS = frozenset({
-    # PHI guardrail — same as static_md
+    # PHI guardrail - clinical / EHR / client-named content (matches static_md)
     "consumers", "clients", "phi", "clinical", "ehr",
+    # Payroll, labor allocations, employee compensation - employee PII / wage data
+    "payroll", "payroll-detail", "payroll detail",
+    "labor distribution", "labor-distribution",
+    # Insurance / EOBs - member names, claim numbers, diagnosis codes
+    "eob", "eobs", "eob's",
+    # Personal finances - Harrison's K-1s, 1065s, IRS correspondence, SSN risk
+    "personal-finances", "personal_finances", "personal finances",
+    "taxes", "tax-returns", "tax returns",
+    # Medical
+    "medical",
     # Archives (we don't index legacy folders that have been retired)
     "_archive", "_archive_external", "archive",
     # System / hidden
     ".trash", ".obsidian",
-    # Personal medical / payroll detail (defense-in-depth)
-    "medical", "payroll-detail",
 })
+
+
+# File-level sensitive patterns - catches filenames like "Payroll 10-10
+# detail.xlsx" that live in non-blacklisted folders. Three alternation arms,
+# all case-insensitive, each calibrated to the real-world filename shapes we
+# saw in the live backfill audit:
+#
+# Arm 1 (most patterns): both-side word boundary so "tax" doesn't match
+#   "Texas". Catches "Payroll 10-10.xlsx", "Tax Return 2024.pdf", etc.
+#
+# Arm 2 (1065 / k-1 tax forms): leading boundary, then 1065 with optional
+#   "x" suffix (1065x = amended return), then trailing boundary. Catches
+#   "1065 filing.pdf" and "1065x amendment.pdf". Does NOT catch invoice
+#   numbers like "10654" or "651065" because those break the boundary.
+#
+# Arm 3 (EOB - end-bounded only): catches filenames like
+#   "HealthCareClaimEOB.xlsx" and "AetnaEOB.pdf" where EOB is glued onto a
+#   preceding word with no separator. Requires only a trailing boundary
+#   (end of name OR separator). Tradeoff is a small false-positive risk,
+#   but Explanation-of-Benefits docs are PHI-shaped enough to justify
+#   the broader catch.
+_BLACKLIST_FILENAME_PATTERNS = re.compile(
+    # Arm 1: standard both-side word boundary
+    r"(?:^|[\s_.\-/])"
+    r"(?:payroll|labor[\s_-]distribution|tax[\s_-]return|"
+    r"w-?2|w-?9|ssn|paystub|pay[\s_-]stub|garnishment|"
+    r"medical[\s_-]records?|client[\s_-]records?|treatment[\s_-]plan|"
+    r"behavior[\s_-]plan|incident[\s_-]report)"
+    r"(?:$|[\s_.\-/])"
+    r"|"
+    # Arm 2: 1065 (with optional x suffix for amendments) / k-1 — strict boundary
+    r"(?:^|[\s_.\-/])(?:1065[x]?|k-?1)(?:$|[\s_.\-/])"
+    r"|"
+    # Arm 3: EOB — end-bounded only (catches HealthCareClaimEOB, AetnaEOB)
+    r"eob(?:$|[\s_.\-/])",
+    re.IGNORECASE,
+)
 
 
 class DriveConnectorError(Exception):
@@ -190,9 +240,27 @@ def _resolve_root_folder_id(service) -> str:
 
 
 def _is_blacklisted_path(path_segments: list[str]) -> bool:
-    """Return True if any path segment is in the blacklist (case-insensitive)."""
-    lower = {s.lower() for s in path_segments}
-    return bool(lower & _BLACKLIST_SEGMENTS)
+    """Return True if the path should be skipped due to PHI/PII blacklist.
+
+    Two checks:
+    1. Exact-match: any path segment that exactly matches a folder name in
+       _BLACKLIST_SEGMENTS (lowercased). Catches blacklisted folder trees.
+    2. Filename pattern: the LAST segment (filename) matches the sensitive
+       filename pattern (catches loose files like "Payroll 10-10.xlsx" that
+       live in otherwise non-blacklisted folders).
+    """
+    lower_segments = [s.lower() for s in path_segments]
+
+    # Check 1: any segment exactly matches a blacklist entry
+    if set(lower_segments) & _BLACKLIST_SEGMENTS:
+        return True
+
+    # Check 2: the last segment (filename) matches a sensitive-file pattern
+    if lower_segments:
+        if _BLACKLIST_FILENAME_PATTERNS.search(lower_segments[-1]):
+            return True
+
+    return False
 
 
 def _list_children(service, folder_id: str) -> list[dict]:
