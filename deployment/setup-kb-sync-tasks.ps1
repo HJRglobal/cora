@@ -55,6 +55,12 @@ $Tasks = @(
         Script      = "scripts\incremental_sync_static.py"
         HourMin     = "04:00"
         Description = "Cora KB daily incremental sync - Founder OS static markdown (CLAUDE.md, decisions.md, etc.)"
+    },
+    @{
+        Name        = "cowork-cora-kb-sync-drive"
+        Script      = "scripts\incremental_sync_drive.py"
+        HourMin     = "04:30"
+        Description = "Cora KB daily incremental sync - Google Drive deliverable files (docx/xlsx/pptx/pdf/images) via Drive API DWD"
     }
 )
 
