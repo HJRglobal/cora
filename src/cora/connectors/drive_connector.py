@@ -415,19 +415,35 @@ def _classify_entity(path: str) -> str:
     return _ENTITY_FOLDERS.get(candidate, "FNDR")
 
 
-def drive_file_to_document(df: DriveFile):
-    """Convert a DriveFile to a knowledge_base Document for ingestion.
+# MIME type -> natural-language description for embedding richness.
+_MIME_HUMAN_NAMES = {
+    "application/vnd.google-apps.document": "Google Doc",
+    "application/vnd.google-apps.spreadsheet": "Google Sheet",
+    "application/vnd.google-apps.presentation": "Google Slides deck",
+    "application/vnd.google-apps.form": "Google Form",
+    "application/vnd.google-apps.drawing": "Google Drawing",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel spreadsheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint presentation",
+    "application/msword": "Word document",
+    "application/vnd.ms-excel": "Excel spreadsheet",
+    "application/vnd.ms-powerpoint": "PowerPoint presentation",
+    "application/pdf": "PDF document",
+    "image/png": "PNG image",
+    "image/jpeg": "JPEG image",
+    "image/svg+xml": "SVG image",
+}
 
-    Local import to avoid circular dependency at module load.
-    The 'content' field is synthetic metadata text - the filename plus path
-    carries the semantic signal for search. Real content extraction is Phase 5.
-    """
-    from ..knowledge_base.store import Document  # noqa: PLC0415
 
-    entity = _classify_entity(df.path)
+# Strips a leading date prefix like "2026-04_" or "2026-04-15_" from a filename.
+_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}(?:-\d{2})?[_\- ]")
 
-    # Human-readable title — strip extension, replace separators
-    title = df.name
+
+def _natural_title(name: str) -> str:
+    """De-kebab + de-snake + drop date prefix + drop extension. Returns a
+    natural-language title that embeds well as a search target."""
+    title = name
+    # Strip extension
     for ext in (
         ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf",
         ".png", ".jpg", ".jpeg", ".svg",
@@ -435,21 +451,54 @@ def drive_file_to_document(df: DriveFile):
         if title.lower().endswith(ext):
             title = title[: -len(ext)]
             break
+    # Strip leading YYYY-MM(-DD)_ prefix that's noise for semantic match
+    title = _DATE_PREFIX_RE.sub("", title)
+    # Normalize separators to spaces
     title = title.replace("_", " ").replace("-", " ").strip()
+    # Compress multiple spaces
+    title = " ".join(title.split())
+    return title
 
-    # Synthetic content: filename + path + type. This is what gets embedded.
-    # Future Phase 5 will append actual file body text here.
-    content_parts = [
-        f"Drive file: {df.name}",
-        f"Path: {df.path}",
-        f"Type: {df.mime_type}",
+
+def _parent_folder_name(path: str) -> str:
+    """Extract the parent folder name from a / -delimited path. Returns '' if
+    the path has no parent (root-level files)."""
+    parts = path.rstrip("/").split("/")
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def drive_file_to_document(df: DriveFile):
+    """Convert a DriveFile to a knowledge_base Document for ingestion.
+
+    The `content` field is natural-language text built from filename + parent
+    folder + MIME type + modified date. This embeds substantially better than
+    raw "Path: X / Type: Y / Owner: Z" labels because semantic search compares
+    the query embedding against this text directly.
+
+    Real file body extraction (xlsx/docx/pdf contents) is Phase 5+.
+    """
+    from ..knowledge_base.store import Document  # noqa: PLC0415
+
+    entity = _classify_entity(df.path)
+    natural_title = _natural_title(df.name)
+    human_type = _MIME_HUMAN_NAMES.get(df.mime_type, "file")
+    parent = _parent_folder_name(df.path) or "HJR-Founder-OS"
+    modified_iso = datetime.date.fromtimestamp(df.modified_time).isoformat()
+
+    # Build natural-language content for embedding. The pattern:
+    # "{Title}. {type} in {parent folder}. Filename: {raw}. Modified {date}{by author}."
+    # This reads as a sentence to the embedding model. The title + parent
+    # folder carry the strongest semantic signal; the raw filename + path
+    # below are for human verification when the chunk is surfaced.
+    content_lines = [
+        f"{natural_title}.",
+        f"{human_type} in the {parent} folder of the HJR portfolio.",
+        f"Filename: {df.name}.",
+        f"Full Drive path: {df.path}.",
+        f"Last modified {modified_iso}"
+        + (f" by {df.owner_email}." if df.owner_email else "."),
     ]
-    if df.owner_email:
-        content_parts.append(f"Owner: {df.owner_email}")
-    content_parts.append(
-        f"Modified: {datetime.date.fromtimestamp(df.modified_time).isoformat()}"
-    )
-    content = "\n".join(content_parts)
+    content = " ".join(content_lines)
 
     return Document(
         source="drive_asset",
@@ -459,7 +508,7 @@ def drive_file_to_document(df: DriveFile):
         date_created=df.created_time,
         date_modified=df.modified_time,
         author=df.owner_email,
-        title=title,
+        title=natural_title,
         deep_link=df.web_view_link,
         metadata={
             "path": df.path,
