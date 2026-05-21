@@ -11,6 +11,8 @@ from . import channel_classifier
 from .config import config
 from .context_loader import load_context
 from .entity_router import route
+from . import feedback_log
+from . import help_responder
 from . import knowledge_gaps
 from .prompt_loader import load_prompt
 from . import rate_limiter
@@ -21,6 +23,25 @@ app = App(token=config.slack_bot_token, signing_secret=config.slack_signing_secr
 
 _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
+
+# Resolved at first event via auth.test() - the bot's own user ID. Used to
+# filter reaction_added events down to "user reacted to a Cora message" only.
+_CORA_BOT_USER_ID: str | None = None
+
+
+def _resolve_bot_user_id(client) -> str | None:
+    """Lazy-resolve Cora's bot user ID via auth.test(). Cached after first call."""
+    global _CORA_BOT_USER_ID
+    if _CORA_BOT_USER_ID is not None:
+        return _CORA_BOT_USER_ID
+    try:
+        resp = client.auth_test()
+        _CORA_BOT_USER_ID = resp.get("user_id")
+        log.info("Resolved Cora bot user_id=%s", _CORA_BOT_USER_ID)
+    except Exception as exc:
+        log.warning("Could not resolve bot user_id via auth.test(): %s", exc)
+        _CORA_BOT_USER_ID = None
+    return _CORA_BOT_USER_ID
 
 
 def _resolve_channel_name(client, channel_id: str) -> str:
@@ -58,6 +79,15 @@ def handle_mention(event: dict, say: callable, client) -> None:
         "app_mention routed channel=#%s user=%s → entity=%s function=%s tier=%s",
         channel_name, user_id, entity, function, tier,
     )
+
+    # Help-intent interception: if the user asked "what can you do" or similar,
+    # short-circuit before the Claude call with a deterministic capability blurb.
+    # Saves tokens, ensures consistent onboarding messaging across channels.
+    if help_responder.is_help_intent(user_message):
+        log.info("help-intent detected channel=#%s user=%s", channel_name, user_id)
+        help_text = help_responder.build_message(entity, function, tier)
+        say(text=help_text, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+        return
 
     runtime_context = (
         f"## Runtime channel context\n\n"
@@ -125,3 +155,53 @@ def handle_mention(event: dict, say: callable, client) -> None:
         unfurl_links=False,
         unfurl_media=False,
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Reaction-based feedback capture
+#
+# When a user reacts to one of Cora's own messages, log the signal to
+# logs/feedback.jsonl for downstream digesting. Only reactions on messages
+# whose author is Cora (item_user == _CORA_BOT_USER_ID) get logged — other
+# reactions in channels Cora is in are ignored.
+#
+# Requires Slack scope: reactions:read
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _handle_reaction(event: dict, client, event_type: str) -> None:
+    """Shared logic for reaction_added and reaction_removed events."""
+    item = event.get("item") or {}
+    if item.get("type") != "message":
+        return  # ignore reactions on files, channel boundaries, etc.
+
+    item_user = event.get("item_user", "")
+    bot_user_id = _resolve_bot_user_id(client)
+    if not bot_user_id or item_user != bot_user_id:
+        # Reaction on a non-Cora message - not our signal to capture
+        return
+
+    channel_id = item.get("channel", "")
+    channel_name = _resolve_channel_name(client, channel_id) if channel_id else ""
+    reactor = event.get("user", "")
+    reaction = event.get("reaction", "")
+    message_ts = item.get("ts", "")
+
+    feedback_log.log_reaction(
+        channel=channel_id,
+        channel_name=channel_name,
+        reactor=reactor,
+        reaction=reaction,
+        message_ts=message_ts,
+        event_type=event_type,
+    )
+
+
+@app.event("reaction_added")
+def handle_reaction_added(event: dict, client) -> None:
+    _handle_reaction(event, client, "reaction_added")
+
+
+@app.event("reaction_removed")
+def handle_reaction_removed(event: dict, client) -> None:
+    _handle_reaction(event, client, "reaction_removed")
