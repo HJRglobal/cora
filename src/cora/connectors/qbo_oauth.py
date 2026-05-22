@@ -43,6 +43,7 @@ import logging
 import os
 import secrets
 import socketserver
+import ssl
 import threading
 import time
 import urllib.parse
@@ -100,10 +101,45 @@ def _callback_uri_parts() -> tuple[str, int, str]:
         )
         return _CALLBACK_HOST_DEFAULT, _CALLBACK_PORT_DEFAULT, _CALLBACK_PATH_DEFAULT
 
+
+def _callback_scheme() -> str:
+    """Return 'https' or 'http' from QBO_REDIRECT_URI; defaults to 'http'.
+
+    Intuit's Production app config requires HTTPS for the redirect URI; Sandbox
+    accepts plain HTTP. We read the scheme from .env so a single value swap
+    (http → https) plus a self-signed cert is the entire production switch.
+    """
+    from ..config import config
+    try:
+        parsed = urllib.parse.urlparse(config.qbo_redirect_uri or "")
+        return (parsed.scheme or "http").lower()
+    except Exception:
+        return "http"
+
 # Token store location — kept in repo as gitignored `.credentials/` dir, alongside the
 # Calendar service-account JSON (existing pattern).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TOKEN_FILE = _REPO_ROOT / ".credentials" / "qbo-tokens.json"
+
+# Self-signed TLS cert for the local OAuth callback when QBO_REDIRECT_URI uses
+# https://. Intuit's portal REJECTS https://localhost:* redirect URIs (their
+# validator treats localhost as an IP address and forbids IP redirects), so
+# the HTTPS branch below is unreachable via Intuit's app config today.
+#
+# Kept for two future scenarios:
+#   1. Intuit relaxes the localhost+HTTPS restriction.
+#   2. We terminate TLS locally instead of at a Cloudflare Tunnel edge
+#      (unusual but valid — would let us register a real-domain HTTPS URI
+#      that resolves to a public IP forwarding to this local TLS port).
+#
+# If/when needed, generate with:
+#   openssl req -x509 -newkey rsa:2048 -nodes \
+#     -keyout .credentials/oauth-cert.key \
+#     -out .credentials/oauth-cert.crt \
+#     -days 3650 -subj "/CN=localhost"
+# Browser warns once per profile on first connect — click through.
+_CERT_FILE = _REPO_ROOT / ".credentials" / "oauth-cert.crt"
+_KEY_FILE = _REPO_ROOT / ".credentials" / "oauth-cert.key"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -247,9 +283,28 @@ def _run_callback_server(state: str, timeout_sec: int = 300) -> dict[str, str]:
     )
 
     host, port, _ = _callback_uri_parts()
-    log.info("OAuth callback server binding to %s:%d", host, port)
+    scheme = _callback_scheme()
+    log.info("OAuth callback server binding to %s://%s:%d", scheme, host, port)
     with socketserver.TCPServer((host, port), handler_class) as server:
         server.timeout = 1
+
+        # When the redirect URI is https:// (required by Intuit Production),
+        # wrap the listening socket in TLS using the self-signed cert in
+        # .credentials/. Cert is single-host for localhost; the browser will
+        # show a one-time warning that the user clicks through.
+        if scheme == "https":
+            if not _CERT_FILE.exists() or not _KEY_FILE.exists():
+                raise QboAuthError(
+                    "QBO_REDIRECT_URI uses https:// but TLS cert files are missing. "
+                    f"Expected: {_CERT_FILE} and {_KEY_FILE}. Generate them with:\n"
+                    f"  openssl req -x509 -newkey rsa:2048 -nodes "
+                    f"-keyout {_KEY_FILE} -out {_CERT_FILE} "
+                    f"-days 3650 -subj \"/CN=localhost\""
+                )
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=str(_CERT_FILE), keyfile=str(_KEY_FILE))
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+
         deadline = time.monotonic() + timeout_sec
 
         thread = threading.Thread(target=server.serve_forever, daemon=True)
