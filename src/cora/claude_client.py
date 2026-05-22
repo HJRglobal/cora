@@ -22,7 +22,87 @@ _client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
 
 class ClaudeClientError(Exception):
-    """Raised when the Claude API fails after all retries."""
+    """Raised when the Claude API fails after all retries.
+
+    The underlying anthropic exception is preserved on `__cause__` (via
+    `raise ... from exc` below) so callers can classify the failure for
+    user-facing messages via user_facing_message().
+    """
+
+
+def user_facing_message(exc: ClaudeClientError) -> str:
+    """Return a user-readable message for a ClaudeClientError.
+
+    Classifies the underlying anthropic exception and returns a specific
+    message per failure mode so the user knows whether to retry, whether
+    it's their problem, or whether Harrison needs to intervene.
+
+    Falls back to the generic "trouble reaching Claude" string when the
+    underlying exception is unknown or missing.
+    """
+    underlying = exc.__cause__
+
+    # Anthropic exception hierarchy:
+    #   anthropic.APIStatusError  (parent of HTTP-status errors)
+    #     - anthropic.AuthenticationError    → 401
+    #     - anthropic.PermissionDeniedError  → 403
+    #     - anthropic.BadRequestError        → 400
+    #     - anthropic.NotFoundError          → 404
+    #     - anthropic.RateLimitError         → 429
+    #     - anthropic.InternalServerError    → 5xx (including 529 overloaded)
+    #   anthropic.APIConnectionError  (network)
+    #     - anthropic.APITimeoutError
+
+    if isinstance(underlying, anthropic.APIStatusError):
+        status = getattr(underlying, "status_code", 0)
+        if status == 529:
+            return (
+                "Anthropic's API is overloaded right now (HTTP 529). This usually "
+                "clears in a minute or two — please retry."
+            )
+        if status in (401, 403):
+            return (
+                f"Cora's API key is failing (HTTP {status}). Harrison needs to check "
+                f"the Anthropic API key — Cora can't recover from this without intervention."
+            )
+        if status == 429:
+            return (
+                "Hit Anthropic's rate limit (HTTP 429). Wait about 30 seconds and "
+                "retry — Cora will throttle herself if this keeps happening."
+            )
+        if status == 400:
+            return (
+                "Cora sent a request Anthropic didn't accept (HTTP 400). This is "
+                "likely a bug — Harrison should check Cora's logs. Try rephrasing "
+                "your question in case it helps."
+            )
+        if status >= 500:
+            return (
+                f"Anthropic's API is having upstream issues (HTTP {status}). Try "
+                f"again in a few minutes."
+            )
+        # Any other status code we didn't explicitly map
+        return (
+            f"Claude API returned HTTP {status} — usually transient. Try again in a "
+            f"moment; if it persists, Harrison should check the logs."
+        )
+
+    if isinstance(underlying, anthropic.APITimeoutError):
+        return (
+            "Anthropic took too long to respond. Try a shorter or simpler question, "
+            "or retry — Cora may have hit a complexity wall on this request."
+        )
+
+    if isinstance(underlying, anthropic.APIConnectionError):
+        return (
+            "Network trouble reaching Anthropic. If this keeps happening, the host "
+            "machine's internet might be having issues — Harrison should check."
+        )
+
+    # Fallback for any other failure mode (including ClaudeClientError raised
+    # without an underlying exception, e.g. the "Tool-use loop exited unexpectedly"
+    # path at the bottom of generate_response).
+    return "I'm having trouble reaching Claude right now — try again in a moment."
 
 
 def _is_retryable(exc: Exception) -> bool:

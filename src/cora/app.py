@@ -6,7 +6,7 @@ import time
 
 from slack_bolt import App
 
-from .claude_client import ClaudeClientError, generate_response
+from .claude_client import ClaudeClientError, generate_response, user_facing_message
 from . import channel_classifier
 from .config import config
 from .context_loader import load_context
@@ -116,7 +116,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
     except ClaudeClientError as exc:
         log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
         say(
-            text="I'm having trouble reaching Claude right now — try again in a moment.",
+            text=user_facing_message(exc),
             thread_ts=thread_ts,
         )
         return

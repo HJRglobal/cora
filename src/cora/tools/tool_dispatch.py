@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, calendar_client, hubspot_client, qbo_client
+from . import asana_client, calendar_client, gmail_client, hubspot_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -551,6 +551,104 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     return asana_client.format_created_task_for_llm(created)
 
 
+def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Create a Gmail draft in the asker's own Drafts folder.
+
+    Cora's second write tool. Same staged-write doctrine as asana_create_task:
+    refuses to fire without confirmed=true; the tool description tells Claude
+    to show a preview block first and get explicit user approval.
+
+    The draft is impersonated AS the asker via Domain-wide Delegation, so it
+    lands in the asker's personal Gmail Drafts — not a shared mailbox.
+    The user must open Gmail and send the draft themselves; Cora never sends.
+    """
+    input_data = _input or {}
+
+    # Confirmation gate (same pattern as asana_create_task)
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "gmail_create_draft refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a preview block (to, cc, subject, body) "
+            "AND received their explicit approval in their next message "
+            "('yes', 'draft it', 'create it', or similar). If you have NOT done "
+            "that yet, format a clear preview NOW and ask the user to confirm "
+            "before drafting."
+        )
+
+    to = input_data.get("to")
+    subject = (input_data.get("subject") or "").strip()
+    body = input_data.get("body") or ""
+    cc = input_data.get("cc")
+    bcc = input_data.get("bcc")
+
+    if not to:
+        return "gmail_create_draft: missing required field `to`. Ask the user who the recipient(s) should be."
+    if not subject:
+        return "gmail_create_draft: missing required field `subject`. Ask the user for a subject line."
+    if not body.strip():
+        return "gmail_create_draft: missing required field `body`. Ask the user what the email should say."
+
+    # Resolve sender = the asking user
+    asker = _load_slack_asana_map().get(slack_user_id)
+    if not asker:
+        return (
+            f"gmail_create_draft: asker {slack_user_id} is not in the Slack-to-Asana "
+            f"map, so I can't impersonate them for Gmail. Either ask Harrison to add "
+            f"a row to data/maps/slack-to-asana.yaml (the asana_email field doubles "
+            f"as the Google identity)."
+        )
+
+    sender_email = (asker.get("asana_email") or "").strip()
+    if not sender_email:
+        return (
+            f"gmail_create_draft: user {asker.get('display_name', slack_user_id)} has "
+            f"no asana_email in the user map. Tell the user there's a configuration issue."
+        )
+
+    try:
+        draft = gmail_client.create_draft(
+            sender_email=sender_email,
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+        )
+    except gmail_client.GmailClientError as exc:
+        log.warning(
+            "gmail_create_draft FAILED asker=%s sender=%s subject=%r exc=%s",
+            slack_user_id, sender_email, subject, exc,
+        )
+        return (
+            f"Gmail draft error: {exc}. Tell the user the draft wasn't created. "
+            f"If the error mentions a bad recipient or auth, suggest they check the "
+            f"details and try again."
+        )
+
+    # Normalize recipient lists for the response/log
+    to_list = gmail_client._normalize_recipients(to)
+    cc_list = gmail_client._normalize_recipients(cc) if cc else None
+
+    log.info(
+        "gmail_create_draft CREATED asker=%s sender=%s draft_id=%s subject=%r recipient_count=%d cc_count=%d",
+        slack_user_id,
+        sender_email,
+        draft.get("id", ""),
+        subject,
+        len(to_list),
+        len(cc_list) if cc_list else 0,
+    )
+
+    return gmail_client.format_created_draft_for_llm(
+        draft,
+        sender_email=sender_email,
+        to=to_list,
+        subject=subject,
+        cc=cc_list,
+    )
+
+
 def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → Google email (from slack-to-asana mapping) → fetch calendar events → format.
 
@@ -892,6 +990,73 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "gmail_create_draft",
+        "description": (
+            "Create a Gmail draft in the asking user's own Gmail Drafts folder. Cora "
+            "does NOT send — the user opens Gmail and sends manually. This is a "
+            "human-in-the-loop write tool.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write — never skip):\n"
+            "1. When the user asks to draft an email, FORMAT a preview block in your "
+            "   reply showing: to, cc/bcc if any, subject, body. DO NOT call this tool "
+            "   on the first turn — just show the preview and ask the user to confirm.\n"
+            "2. Wait for the user's next message. If they say 'yes', 'draft it', 'create "
+            "   it', 'looks good', 'go ahead', or similar explicit affirmation, call this "
+            "   tool with confirmed=true.\n"
+            "3. If they want edits, re-show the preview with changes and ask again. "
+            "   Do not call this tool until they explicitly approve.\n"
+            "4. If they reject ('no', 'cancel'), don't call this tool at all.\n"
+            "\n"
+            "Use this tool when the user asks Cora to draft, write, compose, or queue "
+            "an email — phrases like 'draft an email to X', 'write a reply to Y', "
+            "'compose a note to the team', 'queue an email about Z'. The draft lands "
+            "in the asker's own Gmail Drafts (impersonated via service account + DWD); "
+            "they open Gmail and click Send when ready. Cora returns a clickable link "
+            "to the Drafts folder — preserve the <url|name> syntax verbatim.\n"
+            "\n"
+            "Recipients: 'to' is required (string or list of email addresses). 'cc' and "
+            "'bcc' are optional. Subject + body are required. Plain text body only "
+            "(no HTML in v1). If the user mentions a name instead of an email and you "
+            "don't know the email, ask them for the address — don't guess.\n"
+            "\n"
+            "If you call without confirmed=true, the tool refuses and reminds you to "
+            "confirm first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": ["string", "array"],
+                    "description": "Recipient email address(es). String (comma-separated) or array.",
+                    "items": {"type": "string"},
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Subject line. Required, non-empty.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Plain-text email body. Required, non-empty. Sign with the asker's name unless they say otherwise.",
+                },
+                "cc": {
+                    "type": ["string", "array"],
+                    "description": "Optional Cc recipient(s).",
+                    "items": {"type": "string"},
+                },
+                "bcc": {
+                    "type": ["string", "array"],
+                    "description": "Optional Bcc recipient(s).",
+                    "items": {"type": "string"},
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Required. Set to true ONLY after you have shown the user a preview and received explicit approval. If false or omitted, the tool refuses.",
+                },
+            },
+            "required": ["to", "subject", "body", "confirmed"],
+        },
+    },
+    {
         "name": "calendar_get_my_events",
         "description": (
             "Fetch calendar events from the user's Google Calendar primary calendar. "
@@ -1071,6 +1236,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "asana_get_user_tasks": _tool_get_user_tasks,
     "asana_create_task": _tool_asana_create_task,
+    "gmail_create_draft": _tool_gmail_create_draft,
     "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
