@@ -146,6 +146,58 @@ def main() -> int:
             print(f"#   {u.get('name')}  <{u.get('email')}>  (asana_gid: {u.get('gid')})")
         print()
 
+    # === Known manual cross-refs (email differs Slack vs Asana) ===
+    # These users exist in BOTH systems but with different emails, so the auto-matcher
+    # above shows them as "Slack-only" AND "Asana-only" simultaneously. They need
+    # manual rows in data/maps/slack-to-asana.yaml. This reminder section ensures
+    # the cross-refs survive a fresh re-run of the script.
+    print("# === KNOWN MANUAL CROSS-REFS — re-add these to data/maps/slack-to-asana.yaml: ===")
+    print("# These users have different emails in Slack vs Asana, so they appear in BOTH")
+    print("# 'Slack-only' and 'Asana-only' lists above. They must be added manually.")
+    print("# Source: data/maps/slack-to-asana.yaml comments + memory/people.md aliases.")
+    print()
+    known_cross_refs = [
+        {
+            "display_name": "Tommy Anderson",
+            "slack_email": "tommy@f3energy.com",
+            "asana_email": "tommy@hjrglobal.com",
+        },
+        {
+            "display_name": "Larry Stone",
+            "slack_email": "larry@bigd.media",
+            "asana_email": "larry@hjrglobal.com",
+        },
+        {
+            "display_name": "Micah Kessler",
+            "slack_email": "micah@bigd.media",
+            "asana_email": "micah@hjrglobal.com",
+        },
+        {
+            "display_name": "Jake Lichtman",
+            "slack_email": "Jake@bigd.media",
+            "asana_email": "jake@hjrglobal.com",
+        },
+        {
+            "display_name": "Alex Cordova",
+            "slack_email": "alex@f3energy.com",
+            "asana_email": "alex@hjrglobal.com",
+            "notes": (
+                "Has duplicate Asana accounts (older Alex@UnitedFightLeague.com / GID "
+                "1204525928002377 is dormant; alex@hjrglobal.com / GID 1210991768665805 "
+                "is active). Use the active one."
+            ),
+        },
+    ]
+    for x in known_cross_refs:
+        line = f"#   {x['display_name']}: Slack {x['slack_email']} / Asana {x['asana_email']}"
+        if "notes" in x:
+            line += f" — {x['notes']}"
+        print(line)
+    print()
+    print("# To find the Asana GID for each: search the Asana-only section above by display_name.")
+    print("# To find the Slack ID for each: search the Slack-only section above by display_name.")
+    print()
+
     return 0
 
 

@@ -2,27 +2,51 @@
 # Patterns are matched top-to-bottom; first match wins.
 # Supports fnmatch glob syntax (*, ?) on channel names (without the # prefix).
 # Add exceptions above the catch-all wildcard.
+#
+# Bare-name pattern: every entity has a bare entity-name channel (e.g. #osn, #f3e, #lex)
+# in addition to functional channels (#osn-leadership etc.). Each entity block lists
+# the bare-name pattern FIRST, then the dash-prefix pattern, then any non-prefixed
+# OSN/F3E-owned channels (e.g. #clover-daily belongs to OSN, #polar-metrics to F3E).
+# Bug history: prior to 2026-05-22, `osn-*` glob did NOT match bare `#osn` channel,
+# causing @-mentions in the entity catch-all channel to fall through to FNDR scope.
 
 routes:
-  # F3 Energy — covers f3e-* and the f3-pure-launch exception
+  # F3 Energy — covers bare #f3e, f3e-*, the f3-* exception (Pure launch etc.),
+  # plus #polar-metrics (F3E ad spend dashboard, non-standard naming)
+  - pattern: "f3e"
+    entity: F3E
   - pattern: "f3e-*"
     entity: F3E
   - pattern: "f3-*"
     entity: F3E
+  - pattern: "polar-metrics"
+    entity: F3E
 
-  # Lexington Services
+  # Lexington Services — covers bare #lex and lex-*
+  - pattern: "lex"
+    entity: LEX
   - pattern: "lex-*"
     entity: LEX
 
-  # OSN (4-store group)
+  # OSN (4-store group) — covers bare #osn, osn-*, plus #clover-daily
+  # (OSN cross-store sales summary, non-standard naming)
+  - pattern: "osn"
+    entity: OSN
   - pattern: "osn-*"
     entity: OSN
+  - pattern: "clover-daily"
+    entity: OSN
 
-  # BDM
+  # BDM — covers bare #bdm and bdm-*
+  - pattern: "bdm"
+    entity: BDM
   - pattern: "bdm-*"
     entity: BDM
 
-  # HJR Global / Founder-level channels
+  # HJR Global / Founder-level channels — HJRG functional channels route to FNDR
+  # because Cora's FNDR system-prompt has the cross-entity holdco lens.
+  - pattern: "hjrg"
+    entity: FNDR
   - pattern: "hjrg-*"
     entity: FNDR
   - pattern: "fndr*"

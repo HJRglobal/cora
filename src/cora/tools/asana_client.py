@@ -1,15 +1,30 @@
-"""Asana REST client — read-only, single-PAT auth model.
+"""Asana REST client — single-PAT auth model.
 
 Phase 2 #7 MVP scope:
-- One endpoint: GET /tasks (filtered by assignee + workspace + incomplete)
+- GET /tasks (filtered by assignee + workspace + incomplete) — read path
+- POST /tasks — create_task added 2026-05-21 (first write capability;
+  read-only doctrine deliberately reversed per Harrison decision after
+  5/21 Lex Progress meeting verbal commitments)
 - One workspace hard-coded (HJR Global, gid 682743441507584)
 - PAT inherited from .env (ASANA_PAT)
-- No write methods (deliberate — write-back is a different risk class)
+
+Write doctrine (LOCKED 2026-05-21):
+- All writes go through the staged-write pattern: Claude MUST show the
+  user a draft preview and get explicit confirmation BEFORE calling the
+  write tool. The `confirmed=true` parameter on create_task is the
+  contract enforcement — it's set only after Claude observes the user's
+  approval in conversation.
+- Writes are logged at INFO with the requesting slack_user_id, the
+  created task's GID, and a permalink.
+- Workspace is fixed to HJR Global; cross-workspace writes are not
+  supported in v1.
 
 Phase 3+ paths (deferred):
-- OAuth per-user (replaces single PAT)
-- Project filtering by entity (cross-entity scope rules)
-- Tool: search_tasks, get_task, create_task
+- OAuth per-user (replaces single PAT — writes attributed to the asker
+  not Harrison)
+- search_tasks, update_task, complete_task
+- Project resolution by name (today: optional project_gid passed in,
+  no name-to-gid resolver)
 """
 
 import logging
@@ -77,6 +92,117 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
         raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
 
     return r.json().get("data", []) or []
+
+
+def create_task(
+    *,
+    name: str,
+    assignee_gid: str | None = None,
+    project_gid: str | None = None,
+    notes: str | None = None,
+    due_on: str | None = None,
+) -> dict[str, Any]:
+    """Create a task in the HJR Global Asana workspace.
+
+    Required: `name` (the task title). All other fields optional.
+
+    Returns the created task dict (including gid + permalink_url).
+    Raises AsanaClientError on auth / network / 4xx / 5xx failure.
+
+    Asana API note: Tasks must belong to either a workspace or a project.
+    We always set the workspace; project is optional. If no project is
+    given, the task lands in the assignee's "My Tasks" within the
+    workspace.
+    """
+    if not name or not name.strip():
+        raise AsanaClientError("create_task requires a non-empty `name`")
+
+    data: dict[str, Any] = {
+        "name": name.strip(),
+        "workspace": _WORKSPACE_GID,
+    }
+    if assignee_gid:
+        data["assignee"] = str(assignee_gid)
+    if project_gid:
+        # Asana wants projects as an array even for one project
+        data["projects"] = [str(project_gid)]
+    if notes:
+        data["notes"] = notes
+    if due_on:
+        # Light validation: must be YYYY-MM-DD shape
+        if len(due_on) != 10 or due_on[4] != "-" or due_on[7] != "-":
+            raise AsanaClientError(
+                f"create_task: due_on must be YYYY-MM-DD format, got {due_on!r}"
+            )
+        data["due_on"] = due_on
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    opt_fields = ",".join([
+        "name",
+        "assignee.name",
+        "due_on",
+        "projects.name",
+        "notes",
+        "permalink_url",
+    ])
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/tasks",
+                params={"opt_fields": opt_fields},
+                json={"data": data},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(
+            f"Asana 403 — PAT lacks permission to create tasks (or "
+            f"to assign to the requested user)"
+        )
+    if r.status_code == 400:
+        # Bad request — likely an invalid GID. Surface Asana's error message.
+        raise AsanaClientError(
+            f"Asana 400 — bad request: {r.text[:400]}"
+        )
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
+def format_created_task_for_llm(task: dict[str, Any]) -> str:
+    """Render a freshly-created task as a Slack-mrkdwn confirmation line."""
+    name = task.get("name", "(no name)")
+    permalink = task.get("permalink_url") or ""
+    assignee = (task.get("assignee") or {}).get("name") or "(unassigned)"
+    due = task.get("due_on") or "(no due date)"
+    projects = ", ".join(p.get("name", "") for p in (task.get("projects") or [])) or "(no project — in assignee's My Tasks)"
+
+    if permalink:
+        name_link = f"<{permalink}|{name}>"
+    else:
+        name_link = name
+
+    return (
+        f"Asana task CREATED. Surface this confirmation to the user:\n"
+        f"- Title: {name_link}\n"
+        f"- Assignee: {assignee}\n"
+        f"- Due: {due}\n"
+        f"- Project: {projects}\n"
+        f"\n"
+        f"Tell the user the task was created. Show them the title as a clickable link "
+        f"(preserve the <url|name> syntax verbatim). Ask if they want anything else."
+    )
 
 
 def format_tasks_for_llm(

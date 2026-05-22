@@ -31,6 +31,11 @@ users:
     asana_email: justin@hjrglobal.com
     display_name: Justin Moran
 
+  # Tessa Miller: transitioning to ~10 hrs/wk remote 2026-05-23 (last in-office Fri 5/22).
+  # NOT in HJR Slack workspace as of 5/22, so her slack_user_id won't generate
+  # @-mention requests Cora needs to handle. Scheduled task `remove-tessa-from-cora-asana-mapping`
+  # fires 2026-05-23 7am AZ and will drop this row programmatically.
+  # Keeping the row until the task fires so any lingering references resolve cleanly.
   - slack_user_id: U0B3KH5UZJ7
     asana_user_gid: 1209086957506919
     asana_email: tessa@hjrglobal.com
@@ -96,3 +101,11 @@ users:
     asana_user_gid: 1211306578489633
     asana_email: jake@hjrglobal.com
     display_name: Jake Lichtman
+
+  # Alex: Slack alex@f3energy.com / Asana alex@hjrglobal.com
+  # NOTE: Alex has TWO Asana accounts (1210991768665805 = alex@hjrglobal.com ACTIVE; 1204525928002377 = Alex@UnitedFightLeague.com DORMANT older UFL-era).
+  # Using the active @hjrglobal.com GID. If task queries return empty when he has work, swap to the UFL GID.
+  - slack_user_id: U0B3VGWJTMJ
+    asana_user_gid: 1210991768665805
+    asana_email: alex@hjrglobal.com
+    display_name: Alex Cordova

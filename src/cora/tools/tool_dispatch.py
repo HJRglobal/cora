@@ -385,17 +385,13 @@ def _tool_get_user_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
             f"If they're a new hire, Harrison can add them to data/maps/slack-to-asana.yaml + user-aliases.yaml."
         )
 
-    # --- Authorization check: only direct/transitive supervisors can query reports ---
-    authorized, refusal = is_authorized_to_query_user(slack_user_id, resolved_slack_id)
-    if not authorized:
-        log.info(
-            "asana_get_user_tasks UNAUTHORIZED asker=%s target=%r resolved=%s entity=%s",
-            slack_user_id, name, info, entity,
-        )
-        return refusal or (
-            "Not authorized to look up that teammate's tasks. Tell the user this is "
-            "a privacy / hierarchy rule."
-        )
+    # Peer-visibility allowed (Harrison 2026-05-21 follow-up): anyone in the
+    # slack-to-asana map can query any other mapped teammate's tasks. Rationale:
+    # if peer A depends on peer B to ship a deliverable, A can transparently
+    # check status — coordination benefit > privacy cost at HJR's scale.
+    # The supervisor-hierarchy artifact + is_authorized_to_query_user function
+    # stay in the codebase (dormant) in case a future feature wants the org
+    # chart for non-gating purposes (escalation routing, etc.).
 
     mapping = _load_slack_asana_map()
     user = mapping.get(resolved_slack_id)
@@ -436,6 +432,123 @@ def _tool_get_user_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
     )
     # Prepend the resolved-name context so Claude's reply attributes the tasks correctly
     return f"[Looking up tasks for: {info}]\n\n{formatted}"
+
+
+def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Create a new Asana task in the HJR Global workspace.
+
+    First Cora write tool. Reverses 2026-05-18 read-only doctrine per Harrison
+    2026-05-21 decision after Lex Progress meeting verbal commitments.
+
+    Safety pattern (LOCKED):
+    - Tool description tells Claude to ALWAYS show the user a draft preview
+      first and get explicit 'yes/approve/create it' before calling this tool
+      with confirmed=true.
+    - Tool refuses to fire if confirmed != true — defense in depth against
+      Claude skipping the preview step.
+    - Default assignee = the @-mentioning user. Cross-assignments require
+      assignee_name to be set explicitly.
+    - All creates audit-logged with asker slack_user_id, created task gid +
+      permalink.
+    """
+    input_data = _input or {}
+    title = (input_data.get("title") or "").strip()
+    if not title:
+        return (
+            "asana_create_task called without a `title`. Tell the user what the "
+            "task should be named — Cora won't create unnamed tasks."
+        )
+
+    # The confirmation gate
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "asana_create_task refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a preview block (title, assignee, "
+            "project, due date, notes) AND received their explicit approval "
+            "in their next message ('yes', 'approve', 'create it', or similar). "
+            "If you have NOT done that yet, do it now: format a clear preview "
+            "and ask the user to confirm. If you HAVE shown a preview and the "
+            "user approved, call this tool again with confirmed=true."
+        )
+
+    # Resolve assignee
+    assignee_name = (input_data.get("assignee_name") or "").strip()
+    if assignee_name:
+        resolved_slack_id, info = resolve_name_to_slack_user_id(
+            assignee_name, channel_entity=entity
+        )
+        if not resolved_slack_id:
+            if info:
+                return info
+            return (
+                f"asana_create_task: assignee '{assignee_name}' didn't match anyone "
+                f"in the Slack-to-Asana map. Either use a full name / common alias, "
+                f"or omit assignee_name to default to the asking user."
+            )
+        target_user = _load_slack_asana_map().get(resolved_slack_id)
+        if not target_user:
+            return (
+                f"asana_create_task: resolved '{assignee_name}' to a user but "
+                f"their Asana mapping is incomplete. Tell the user there's a "
+                f"configuration issue."
+            )
+        assignee_gid = str(target_user.get("asana_user_gid", "") or "")
+        assignee_display = target_user.get("display_name", assignee_name)
+    else:
+        # Default: assign to the asking user
+        asker = _load_slack_asana_map().get(slack_user_id)
+        if not asker:
+            return (
+                f"asana_create_task: asker {slack_user_id} is not in the Slack-to-Asana "
+                f"map, so I can't default the assignee to you. Either ask Harrison to add "
+                f"your row to data/maps/slack-to-asana.yaml, or specify assignee_name "
+                f"explicitly."
+            )
+        assignee_gid = str(asker.get("asana_user_gid", "") or "")
+        assignee_display = asker.get("display_name", "(self)")
+
+    if not assignee_gid or "REPLACE" in assignee_gid:
+        return (
+            f"asana_create_task: assignee_user_gid is missing or a placeholder for "
+            f"{assignee_display}. Tell the user Harrison needs to finish populating "
+            f"data/maps/slack-to-asana.yaml."
+        )
+
+    # Optional fields
+    project_gid = (input_data.get("project_gid") or "").strip() or None
+    notes = input_data.get("notes") or None
+    due_on = (input_data.get("due_on") or "").strip() or None
+
+    try:
+        created = asana_client.create_task(
+            name=title,
+            assignee_gid=assignee_gid,
+            project_gid=project_gid,
+            notes=notes,
+            due_on=due_on,
+        )
+    except asana_client.AsanaClientError as exc:
+        log.warning(
+            "asana_create_task FAILED asker=%s title=%r assignee=%s exc=%s",
+            slack_user_id, title, assignee_gid, exc,
+        )
+        return (
+            f"Asana create_task error: {exc}. Tell the user the task wasn't created. "
+            f"If the error mentions an invalid project or assignee, suggest they check "
+            f"the details and try again."
+        )
+
+    log.info(
+        "asana_create_task CREATED asker=%s title=%r assignee=%s task_gid=%s permalink=%s",
+        slack_user_id,
+        title,
+        assignee_display,
+        created.get("gid", ""),
+        created.get("permalink_url", ""),
+    )
+
+    return asana_client.format_created_task_for_llm(created)
 
 
 def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -705,11 +818,9 @@ TOOL_DEFINITIONS = [
             "identically to asana_get_my_tasks. Channel entity scope still applies — in "
             "#osn-leadership, only OSN-tagged tasks will be returned; FNDR channels see "
             "all entities. For the asking user's own tasks, use asana_get_my_tasks instead. "
-            "ACCESS CONTROL: only direct or transitive supervisors of the target can query "
-            "their tasks (per HJR access doctrine 2026-05-21). Harrison (founder) can query "
-            "anyone. If the asker is not authorized, the tool returns a refusal message — "
-            "surface it warmly: explain the privacy rule, suggest they ask the person directly "
-            "or escalate to a shared supervisor."
+            "Peer-visible by design (per HJR 2026-05-21 doctrine): any mapped teammate can "
+            "check any other mapped teammate's task status — coordination benefit outweighs "
+            "the privacy cost at HJR's current team size."
         ),
         "input_schema": {
             "type": "object",
@@ -720,6 +831,64 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["user_name"],
+        },
+    },
+    {
+        "name": "asana_create_task",
+        "description": (
+            "Create a new Asana task in the HJR Global workspace. This is Cora's FIRST write "
+            "tool — use with care.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write — never skip):\n"
+            "1. When the user asks to create a task, DRAFT it as a preview block in your "
+            "   reply. Show: title, assignee (default: the asker), due date if mentioned, "
+            "   notes if mentioned, project if mentioned. DO NOT call this tool on the first "
+            "   turn — just show the preview and ask the user to confirm.\n"
+            "2. Wait for the user's next message. If they say 'yes', 'approve', 'create it', "
+            "   'go ahead', or similar explicit affirmation, call this tool with confirmed=true.\n"
+            "3. If the user wants changes, re-show the preview with the changes and ask again. "
+            "   Do not call this tool until they explicitly approve.\n"
+            "4. If they reject ('no', 'cancel', 'don't'), don't call this tool at all.\n"
+            "\n"
+            "Use this tool when the user asks Cora to create, add, or queue a task — phrases like "
+            "'create a task to...', 'add a task for Sean to...', 'remind me to...', 'set up a task '"
+            "to do X', 'queue a task for Hannah'. The default assignee is the @-mentioning user. "
+            "Cross-assignment is allowed (any teammate in slack-to-asana.yaml; aliases supported). "
+            "The tool returns a clickable Slack link to the created task — preserve the <url|name> "
+            "syntax verbatim in your reply.\n"
+            "\n"
+            "If you call without confirmed=true, the tool will refuse and remind you to confirm "
+            "first. That's the safety net."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Task title / name. Required. Should be action-oriented (start with a verb).",
+                },
+                "assignee_name": {
+                    "type": "string",
+                    "description": "Optional. Name of the teammate to assign the task to (first name, full name, or common alias — 'Sean' / 'Shaun' / 'Shaun Hawkins' all resolve). If omitted, the task is assigned to the @-mentioning user.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional. Task description / context. Becomes the Asana task notes field.",
+                },
+                "due_on": {
+                    "type": "string",
+                    "description": "Optional. Due date in YYYY-MM-DD format.",
+                },
+                "project_gid": {
+                    "type": "string",
+                    "description": "Optional. Asana project GID. If omitted, task lands in the assignee's My Tasks. Cora's v1 doesn't resolve project names automatically — if the user wants a specific project, they can move the task in Asana after creation.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Required. Set to true ONLY after you have shown the user a preview and received explicit approval. If false or omitted, the tool refuses.",
+                },
+            },
+            "required": ["title", "confirmed"],
         },
     },
     {
@@ -901,6 +1070,7 @@ TOOL_DEFINITIONS = [
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "asana_get_user_tasks": _tool_get_user_tasks,
+    "asana_create_task": _tool_asana_create_task,
     "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
