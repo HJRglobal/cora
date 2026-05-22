@@ -9,6 +9,7 @@ Two public entry points:
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 import anthropic
@@ -18,10 +19,13 @@ from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch
 
 log = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-6"
+_MODEL = "claude-sonnet-4-6"  # default; per-request override via `model` kwarg.
 _MAX_TOKENS = 1024  # lowered 2048→1024 on 2026-05-21 — Cora replies are almost
                     # always <500 tokens; tighter ceiling = faster streaming + lower
                     # tail latency. If a reply gets clipped at max_tokens, bump back up.
+_TOOL_DISPATCH_MAX_WORKERS = 4  # parallel cap when an iteration emits multiple
+                                # tool_use blocks. Most iterations have 1-2 tools;
+                                # 4 covers the pathological case without thrashing.
 _TIMEOUT = 60.0  # bumped 25→60 for tool-use loops where the second pass synthesizes
                  # large tool results (e.g. 25-event week calendar). Anthropic SDK has
                  # its own internal retries; we just need to give them headroom.
@@ -226,12 +230,64 @@ def _log_usage(response: anthropic.types.Message, iteration: int) -> None:
         pass
 
 
+def _dispatch_tools_parallel(
+    tool_use_blocks: list,
+    slack_user_id: str,
+    entity: str,
+    iteration: int,
+    log_prefix: str = "tool_use",
+) -> list[dict]:
+    """Dispatch a batch of tool_use blocks, in parallel when there are 2+.
+
+    Returns a list of tool_result dicts in the SAME ORDER as the input blocks
+    (Anthropic's API requires tool_result blocks to match tool_use_id order).
+
+    Logging: a single tool_use log line per block is emitted BEFORE dispatch so
+    the trace stays readable even when tools run concurrently. The dispatch()
+    function inside tool_dispatch.py already catches per-tool exceptions and
+    returns error strings, so parallel failures stay isolated.
+    """
+    # Always log up front so the trace order is deterministic
+    for block in tool_use_blocks:
+        log.info(
+            "%s iter=%d tool=%s slack_user=%s entity=%s input=%s",
+            log_prefix, iteration, block.name, slack_user_id or "(none)", entity, block.input or {},
+        )
+
+    if not tool_use_blocks:
+        return []
+
+    if len(tool_use_blocks) == 1:
+        block = tool_use_blocks[0]
+        result_str = dispatch(block.name, block.input or {}, slack_user_id, entity)
+        return [{
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": result_str,
+        }]
+
+    # 2+ tool calls — run concurrently
+    max_workers = min(len(tool_use_blocks), _TOOL_DISPATCH_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cora-tool") as executor:
+        futures = [
+            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity)
+            for b in tool_use_blocks
+        ]
+        results = [f.result() for f in futures]
+
+    return [
+        {"type": "tool_result", "tool_use_id": b.id, "content": r}
+        for b, r in zip(tool_use_blocks, results)
+    ]
+
+
 def generate_response(
     system_prompt: str,
     context: str,
     user_message: str,
     slack_user_id: str = "",
     entity: str = "FNDR",
+    model: str | None = None,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
@@ -251,6 +307,7 @@ def generate_response(
     """
     system_blocks = _build_cached_system(system_prompt, context)
     cached_tools = _build_cached_tools()
+    effective_model = model or _MODEL
 
     # Conversation accumulator — starts with the user's message, grows with each
     # tool_use / tool_result exchange.
@@ -258,7 +315,7 @@ def generate_response(
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         response = _create_with_retry(
-            model=_MODEL,
+            model=effective_model,
             max_tokens=_MAX_TOKENS,
             system=system_blocks,
             messages=messages,
@@ -283,23 +340,13 @@ def generate_response(
         # Capture assistant turn (must include tool_use blocks verbatim per API contract)
         messages.append({"role": "assistant", "content": response.content})
 
-        # Execute each tool_use block in this turn
-        tool_results = []
-        for block in response.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            tool_name = block.name
-            tool_input = block.input or {}
-            log.info(
-                "tool_use iter=%d tool=%s slack_user=%s entity=%s input=%s",
-                iteration, tool_name, slack_user_id or "(none)", entity, tool_input,
-            )
-            result_str = dispatch(tool_name, tool_input, slack_user_id, entity)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result_str,
-            })
+        # Execute each tool_use block in this turn (parallel when 2+)
+        tool_use_blocks = [
+            b for b in response.content if getattr(b, "type", None) == "tool_use"
+        ]
+        tool_results = _dispatch_tools_parallel(
+            tool_use_blocks, slack_user_id, entity, iteration, log_prefix="tool_use",
+        )
 
         messages.append({"role": "user", "content": tool_results})
 
@@ -348,6 +395,7 @@ def generate_response_streaming(
     update_callback: Optional[UpdateCallback] = None,
     slack_user_id: str = "",
     entity: str = "FNDR",
+    model: str | None = None,
 ) -> str:
     """Streaming variant of generate_response.
 
@@ -374,6 +422,7 @@ def generate_response_streaming(
     """
     system_blocks = _build_cached_system(system_prompt, context)
     cached_tools = _build_cached_tools()
+    effective_model = model or _MODEL
 
     messages: list[dict] = [{"role": "user", "content": user_message}]
     accumulated_text = ""
@@ -385,7 +434,7 @@ def generate_response_streaming(
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         try:
             with _stream_with_retry(
-                model=_MODEL,
+                model=effective_model,
                 max_tokens=_MAX_TOKENS,
                 system=system_blocks,
                 messages=messages,
@@ -440,23 +489,13 @@ def generate_response_streaming(
         # Capture assistant turn (must include tool_use blocks verbatim per API contract)
         messages.append({"role": "assistant", "content": final.content})
 
-        # Execute each tool_use block in this turn (sequential, same as non-streaming)
-        tool_results = []
-        for block in final.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            tool_name = block.name
-            tool_input = block.input or {}
-            log.info(
-                "tool_use (stream) iter=%d tool=%s slack_user=%s entity=%s input=%s",
-                iteration, tool_name, slack_user_id or "(none)", entity, tool_input,
-            )
-            result_str = dispatch(tool_name, tool_input, slack_user_id, entity)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result_str,
-            })
+        # Execute each tool_use block in this turn (parallel when 2+)
+        tool_use_blocks = [
+            b for b in final.content if getattr(b, "type", None) == "tool_use"
+        ]
+        tool_results = _dispatch_tools_parallel(
+            tool_use_blocks, slack_user_id, entity, iteration, log_prefix="tool_use (stream)",
+        )
 
         messages.append({"role": "user", "content": tool_results})
 

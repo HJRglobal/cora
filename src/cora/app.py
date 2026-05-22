@@ -19,6 +19,7 @@ from .entity_router import route
 from . import feedback_log
 from . import help_responder
 from . import knowledge_gaps
+from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
 from . import slack_update_throttle
@@ -113,6 +114,15 @@ def handle_mention(event: dict, say: callable, client) -> None:
     context = load_context(entity, query=user_message)
     prompt = load_prompt(entity)
 
+    # Phase 6: route simple lookups to Haiku for ~3-5x speed-up; keep Sonnet for
+    # reasoning-heavy / analytical / drafting requests. Heuristic-only — see
+    # model_router.choose_model() for the rules.
+    chosen_model = model_router.choose_model(user_message)
+    log.info(
+        "model_routing channel=#%s user=%s model=%s msg_chars=%d",
+        channel_name, user_id, model_router.short_label(chosen_model), len(user_message),
+    )
+
     # Phase 5: streaming. Post a placeholder so the user sees instant activity,
     # then progressively edit it as text streams from Claude. If the placeholder
     # post itself fails, fall back to the original non-streaming path so the user
@@ -146,6 +156,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
                 user_message,
                 slack_user_id=user_id or "",
                 entity=entity,
+                model=chosen_model,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -203,6 +214,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
             update_callback=update_callback,
             slack_user_id=user_id or "",
             entity=entity,
+            model=chosen_model,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
