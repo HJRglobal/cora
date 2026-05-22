@@ -6,7 +6,12 @@ import time
 
 from slack_bolt import App
 
-from .claude_client import ClaudeClientError, generate_response, user_facing_message
+from .claude_client import (
+    ClaudeClientError,
+    generate_response,
+    generate_response_streaming,
+    user_facing_message,
+)
 from . import channel_classifier
 from .config import config
 from .context_loader import load_context
@@ -16,6 +21,7 @@ from . import help_responder
 from . import knowledge_gaps
 from .prompt_loader import load_prompt
 from . import rate_limiter
+from . import slack_update_throttle
 
 log = logging.getLogger(__name__)
 
@@ -100,61 +106,183 @@ def handle_mention(event: dict, say: callable, client) -> None:
     )
 
     t0 = time.monotonic()
+
+    # Phase 3: pass user_message as query so context_loader can augment with
+    # KB retrieval (top-K semantically-relevant chunks from cora_kb.db).
+    # If KB isn't initialized or retrieval fails, falls back to static context.
+    context = load_context(entity, query=user_message)
+    prompt = load_prompt(entity)
+
+    # Phase 5: streaming. Post a placeholder so the user sees instant activity,
+    # then progressively edit it as text streams from Claude. If the placeholder
+    # post itself fails, fall back to the original non-streaming path so the user
+    # still gets *some* reply.
+    placeholder_ts: str | None = None
+    placeholder_channel: str = channel_id
     try:
-        # Phase 3: pass user_message as query so context_loader can augment with
-        # KB retrieval (top-K semantically-relevant chunks from cora_kb.db).
-        # If KB isn't initialized or retrieval fails, falls back to static context.
-        context = load_context(entity, query=user_message)
-        prompt = load_prompt(entity)
-        response_text = generate_response(
+        placeholder_resp = say(
+            text=":thought_balloon: thinking…",
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        placeholder_ts = placeholder_resp.get("ts")
+        # Bolt's say() returns the chat.postMessage response shape; channel may
+        # be echoed back or absent (Slack omits it if same as request). Default
+        # to channel_id we already have.
+        placeholder_channel = placeholder_resp.get("channel") or channel_id
+    except Exception as exc:  # noqa: BLE001 — Slack errors are diverse; we just want to fall back
+        log.warning(
+            "Placeholder post failed for channel=%s user=%s: %s — falling back to non-streaming",
+            channel_id, user_id, exc,
+        )
+
+    if placeholder_ts is None:
+        # ── Fallback: non-streaming path (placeholder unavailable) ──
+        try:
+            response_text = generate_response(
+                prompt,
+                runtime_context + context,
+                user_message,
+                slack_user_id=user_id or "",
+                entity=entity,
+            )
+        except ClaudeClientError as exc:
+            log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
+            say(text=user_facing_message(exc), thread_ts=thread_ts)
+            return
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        response_text = _extract_and_log_gap(
+            response_text, entity, channel_name, user_id, user_message, latency_ms,
+        )
+        log.info(
+            "responded (fallback non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
+            entity, channel_name, user_id, latency_ms, len(response_text),
+        )
+        say(
+            text=response_text,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        return
+
+    # ── Streaming path ──
+    stream_id = placeholder_ts  # ts is unique per stream
+    throttle = slack_update_throttle.default_throttle
+
+    def update_callback(cumulative_text: str) -> None:
+        """Push the partial response to Slack via chat_update, gated by throttle.
+
+        Called by generate_response_streaming on every text delta. Cheap when the
+        throttle blocks (just a clock check + lock). Failure to update is logged
+        but does NOT raise — the next batch will carry the cumulative text.
+        """
+        if not cumulative_text:
+            return
+        if not throttle.acquire(stream_id):
+            return
+        try:
+            client.chat_update(
+                channel=placeholder_channel,
+                ts=placeholder_ts,
+                text=cumulative_text,
+            )
+        except Exception as upd_exc:  # noqa: BLE001 — Slack errors are diverse
+            log.warning(
+                "chat_update mid-stream failed for ts=%s: %s — stream continues",
+                placeholder_ts, upd_exc,
+            )
+
+    try:
+        response_text = generate_response_streaming(
             prompt,
             runtime_context + context,
             user_message,
+            update_callback=update_callback,
             slack_user_id=user_id or "",
             entity=entity,
         )
     except ClaudeClientError as exc:
-        log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
-        say(
-            text=user_facing_message(exc),
-            thread_ts=thread_ts,
-        )
+        log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
+        # Replace placeholder with the classified error message
+        error_msg = user_facing_message(exc)
+        try:
+            client.chat_update(
+                channel=placeholder_channel,
+                ts=placeholder_ts,
+                text=error_msg,
+            )
+        except Exception as upd_exc:  # noqa: BLE001
+            log.error(
+                "Final error chat_update failed for ts=%s: %s — sending fresh reply",
+                placeholder_ts, upd_exc,
+            )
+            say(text=error_msg, thread_ts=thread_ts)
+        throttle.release_stream(stream_id)
         return
 
     latency_ms = int((time.monotonic() - t0) * 1000)
+    response_text = _extract_and_log_gap(
+        response_text, entity, channel_name, user_id, user_message, latency_ms,
+    )
 
-    match = _GAP_RE.search(response_text)
-    if match:
-        gap_desc = match.group(1).strip()
-        response_text = _GAP_RE.sub("", response_text).rstrip()
-        knowledge_gaps.log_gap(
-            entity=entity,
-            channel=channel_name,
-            user=user_id,
-            question=user_message,
-            response_chars=len(response_text),
-            gap=gap_desc,
-            latency_ms=latency_ms,
+    skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
+    log.info(
+        "responded (streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d updates_skipped=%d",
+        entity, channel_name, user_id, latency_ms, len(response_text), skipped,
+    )
+
+    # Final chat_update with the definitive text. force_acquire bypasses the
+    # per-stream interval gate (the previous update was probably < 0.8s ago).
+    # If the workspace budget is exhausted we still try — Slack will tell us if
+    # it actually rejects the call.
+    throttle.force_acquire(stream_id + "-final")
+    try:
+        client.chat_update(
+            channel=placeholder_channel,
+            ts=placeholder_ts,
+            text=response_text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "Final chat_update failed for ts=%s: %s — sending fresh reply as fallback",
+            placeholder_ts, exc,
+        )
+        say(
+            text=response_text,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
         )
 
-    log.info(
-        "responded entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
-        entity,
-        channel_name,
-        user_id,
-        latency_ms,
-        len(response_text),
-    )
 
-    # unfurl_links/media False: suppresses Slack's auto-preview cards for every URL
-    # in the response (was polluting calendar/asana/hubspot replies with "Google
-    # Calendar — Easier Time Management..." stubs for every event link).
-    say(
-        text=response_text,
-        thread_ts=thread_ts,
-        unfurl_links=False,
-        unfurl_media=False,
+def _extract_and_log_gap(
+    response_text: str,
+    entity: str,
+    channel_name: str,
+    user_id: str | None,
+    user_message: str,
+    latency_ms: int,
+) -> str:
+    """Pull the [CORA_KNOWLEDGE_GAP: ...] sentinel out of the response (if present),
+    log the gap, and return the cleaned response text."""
+    match = _GAP_RE.search(response_text)
+    if not match:
+        return response_text
+    gap_desc = match.group(1).strip()
+    cleaned = _GAP_RE.sub("", response_text).rstrip()
+    knowledge_gaps.log_gap(
+        entity=entity,
+        channel=channel_name,
+        user=user_id,
+        question=user_message,
+        response_chars=len(cleaned),
+        gap=gap_desc,
+        latency_ms=latency_ms,
     )
+    return cleaned
 
 
 # ────────────────────────────────────────────────────────────────────────────

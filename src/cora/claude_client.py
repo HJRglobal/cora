@@ -1,7 +1,15 @@
-"""Anthropic Claude API client with retry logic + tool-use loop."""
+"""Anthropic Claude API client with retry logic + tool-use loop.
+
+Two public entry points:
+  - generate_response()           — blocking, returns full text after model completes
+  - generate_response_streaming() — same contract + a per-delta update_callback so
+                                    callers can progressively edit a Slack message
+                                    or surface partial output elsewhere
+"""
 
 import logging
 import time
+from typing import Callable, Optional
 
 import anthropic
 
@@ -11,7 +19,9 @@ from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch
 log = logging.getLogger(__name__)
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 2048
+_MAX_TOKENS = 1024  # lowered 2048→1024 on 2026-05-21 — Cora replies are almost
+                    # always <500 tokens; tighter ceiling = faster streaming + lower
+                    # tail latency. If a reply gets clipped at max_tokens, bump back up.
 _TIMEOUT = 60.0  # bumped 25→60 for tool-use loops where the second pass synthesizes
                  # large tool results (e.g. 25-event week calendar). Anthropic SDK has
                  # its own internal retries; we just need to give them headroom.
@@ -144,6 +154,78 @@ def _extract_text(response: anthropic.types.Message) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+def _build_cached_system(system_prompt: str, context: str) -> list[dict]:
+    """Build the system field as a 2-block array for prompt caching.
+
+    Block 1: the entity system prompt + voice — deterministic per entity, cached.
+    Block 2: the KB / runtime context — query-specific, NOT cached.
+
+    Anthropic's prompt cache will hit on block 1 for any subsequent request
+    in the same entity within the ~5-minute ephemeral cache window. The cache
+    miss rate is dominated by block 2 (different KB chunks per question), but
+    that's the smaller block; block 1 carries most of the prompt mass.
+
+    Cache-control rules (Anthropic):
+      - cache_control on a block caches that block AND everything before it.
+      - Putting cache_control only on block 1 makes block 1 cacheable while
+        block 2 stays per-request. That's what we want.
+    """
+    return [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": "\n\n---\n\n# Context\n\n" + context,
+        },
+    ]
+
+
+def _build_cached_tools() -> list[dict]:
+    """Return TOOL_DEFINITIONS with cache_control on the last tool.
+
+    Caches the full tool-definitions block for the ephemeral cache window.
+    Tool definitions are large (~3-5k tokens) and static across all requests,
+    so this is a free win.
+
+    Anthropic rule: cache_control on the last tool caches the entire tools
+    array as a single cacheable unit.
+    """
+    if not TOOL_DEFINITIONS:
+        return []
+    tools = list(TOOL_DEFINITIONS)
+    tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    return tools
+
+
+def _log_usage(response: anthropic.types.Message, iteration: int) -> None:
+    """Log token usage including cache hit/miss accounting.
+
+    Wrapped in try/except so a mock or malformed Usage object never breaks the
+    request — logging is observability, not a correctness contract.
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        # Coerce to int defensively — in production these are always ints from
+        # the Anthropic SDK Usage object, but tests use MagicMock where the
+        # attributes auto-generate as Mock instances.
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        cache_create = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        log.info(
+            "claude usage iter=%d input=%d cache_create=%d cache_read=%d output=%d",
+            iteration, input_tokens, cache_create, cache_read, output_tokens,
+        )
+    except (TypeError, ValueError, AttributeError):
+        # Mock usage objects, missing fields, etc. — skip silently.
+        pass
+
+
 def generate_response(
     system_prompt: str,
     context: str,
@@ -160,9 +242,15 @@ def generate_response(
     entity is the routed channel entity (F3E, LEX, OSN, BDM, FNDR, etc.) — passed
     through to the dispatcher so tools can scope their results to the channel's entity.
 
+    Uses Anthropic prompt caching: the system_prompt + tool definitions are cached
+    ephemerally (~5min TTL). Cache hits across iterations within one request AND
+    across requests within the same entity. Expect ~5-10x faster input processing
+    on cache hits.
+
     Raises ClaudeClientError on hard failure after retries.
     """
-    system = system_prompt + "\n\n---\n\n# Context\n\n" + context
+    system_blocks = _build_cached_system(system_prompt, context)
+    cached_tools = _build_cached_tools()
 
     # Conversation accumulator — starts with the user's message, grows with each
     # tool_use / tool_result exchange.
@@ -172,11 +260,12 @@ def generate_response(
         response = _create_with_retry(
             model=_MODEL,
             max_tokens=_MAX_TOKENS,
-            system=system,
+            system=system_blocks,
             messages=messages,
-            tools=TOOL_DEFINITIONS,
+            tools=cached_tools,
             timeout=_TIMEOUT,
         )
+        _log_usage(response, iteration)
 
         if response.stop_reason != "tool_use":
             # Model is done — return whatever text it produced
@@ -216,3 +305,159 @@ def generate_response(
 
     # Should not reach here given the iteration check above, but defensive fallback
     raise ClaudeClientError("Tool-use loop exited unexpectedly")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Streaming variant
+# ───────────────────────────────────────────────────────────────────────────
+
+# Type alias for the update callback. Receives the cumulative response text so far
+# (NOT just the latest delta). Caller decides whether/how to push to a UI surface
+# (e.g., Slack chat_update with rate-limiting).
+UpdateCallback = Callable[[str], None]
+
+
+def _stream_with_retry(**kwargs):
+    """Open a streaming response context with retry on transient errors.
+
+    Returns the stream context manager. Caller is responsible for iterating it
+    and calling `get_final_message()`. Same retry semantics as _create_with_retry.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return _client.messages.stream(**kwargs)
+        except Exception as exc:
+            if _is_retryable(exc) and attempt < 2:
+                delay = _RETRY_DELAYS[attempt]
+                log.warning(
+                    "Claude streaming transient error (attempt %d/3), retrying in %ds: %s",
+                    attempt + 1, delay, exc,
+                )
+                time.sleep(delay)
+                last_exc = exc
+            else:
+                raise ClaudeClientError(f"Claude API error: {exc}") from exc
+    raise ClaudeClientError(f"Claude streaming failed after 3 attempts: {last_exc}") from last_exc
+
+
+def generate_response_streaming(
+    system_prompt: str,
+    context: str,
+    user_message: str,
+    update_callback: Optional[UpdateCallback] = None,
+    slack_user_id: str = "",
+    entity: str = "FNDR",
+) -> str:
+    """Streaming variant of generate_response.
+
+    Calls Claude with `messages.stream()` and invokes `update_callback(text)` on
+    every text-delta event with the CUMULATIVE response text so far (not just the
+    new delta). Caller is responsible for:
+      - Rate-limiting actual UI updates (Slack chat_update etc.) — this function
+        calls the callback on EVERY text delta, which could be many per second.
+      - Handling callback exceptions — they propagate out of this function. If
+        the caller wants to swallow them, they should wrap update_callback.
+
+    Returns the final accumulated text (same string the callback was last called
+    with, unless the final iteration emitted text after the last callback fired).
+
+    Tool-use loop: identical to generate_response. On stop_reason=tool_use,
+    dispatch tools and loop. Text accumulates across iterations — if iter 0
+    emits "Let me check that..." and iter 1 emits "Here's what I found...",
+    the user sees the concatenation. Matches the model's intent.
+
+    update_callback may be None (e.g., during tests) — in that case no
+    progressive updates fire, but the function still returns the final text.
+
+    Raises ClaudeClientError on hard failure after retries.
+    """
+    system_blocks = _build_cached_system(system_prompt, context)
+    cached_tools = _build_cached_tools()
+
+    messages: list[dict] = [{"role": "user", "content": user_message}]
+    accumulated_text = ""
+
+    def _maybe_push(text: str) -> None:
+        if update_callback is not None:
+            update_callback(text)
+
+    for iteration in range(_MAX_TOOL_ITERATIONS + 1):
+        try:
+            with _stream_with_retry(
+                model=_MODEL,
+                max_tokens=_MAX_TOKENS,
+                system=system_blocks,
+                messages=messages,
+                tools=cached_tools,
+                timeout=_TIMEOUT,
+            ) as stream:
+                for event in stream:
+                    # Two event shapes carry text:
+                    #   content_block_delta with delta.type == text_delta
+                    #   (some SDK versions also expose a `.text` attribute on event)
+                    event_type = getattr(event, "type", None)
+                    if event_type != "content_block_delta":
+                        continue
+                    delta = getattr(event, "delta", None)
+                    if delta is None:
+                        continue
+                    if getattr(delta, "type", None) != "text_delta":
+                        continue
+                    chunk = getattr(delta, "text", "") or ""
+                    if chunk:
+                        accumulated_text += chunk
+                        _maybe_push(accumulated_text)
+
+                final = stream.get_final_message()
+        except ClaudeClientError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — defensive; SDK errors should be caught above
+            raise ClaudeClientError(f"Streaming error: {exc}") from exc
+
+        _log_usage(final, iteration)
+
+        if final.stop_reason != "tool_use":
+            # Model is done — return the cumulative text.
+            # `accumulated_text` should already match the final message's text
+            # content, but extract from final as a safety net if streaming dropped events.
+            final_text = _extract_text(final)
+            if final_text and final_text != accumulated_text:
+                # Stream missed some text — push the corrected final
+                accumulated_text = final_text
+                _maybe_push(accumulated_text)
+            return accumulated_text or "(Cora returned no text)"
+
+        if iteration >= _MAX_TOOL_ITERATIONS:
+            log.warning(
+                "Tool-use iteration cap (%d) hit during streaming — returning partial response",
+                _MAX_TOOL_ITERATIONS,
+            )
+            return accumulated_text or (
+                "I tried to look that up but couldn't finish in time — try rephrasing."
+            )
+
+        # Capture assistant turn (must include tool_use blocks verbatim per API contract)
+        messages.append({"role": "assistant", "content": final.content})
+
+        # Execute each tool_use block in this turn (sequential, same as non-streaming)
+        tool_results = []
+        for block in final.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            tool_name = block.name
+            tool_input = block.input or {}
+            log.info(
+                "tool_use (stream) iter=%d tool=%s slack_user=%s entity=%s input=%s",
+                iteration, tool_name, slack_user_id or "(none)", entity, tool_input,
+            )
+            result_str = dispatch(tool_name, tool_input, slack_user_id, entity)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_str,
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    raise ClaudeClientError("Tool-use loop exited unexpectedly during streaming")
