@@ -1,0 +1,98 @@
+# Supervisor hierarchy — drives access control on Cora's third-party Asana lookup tool.
+#
+# Rule (per Harrison 2026-05-21): only direct or transitive supervisors of a person
+# can query that person's Asana tasks via `asana_get_user_tasks`. Self-query is
+# always allowed (and uses `asana_get_my_tasks` anyway). Harrison (founder) is
+# implicit supervisor of everyone — universal override.
+#
+# Structure: `reports_to` is a list of (report → supervisor) pairs. Each
+# slack_user_id can appear as a report in exactly ONE row (single-supervisor
+# model). Transitive supervision is computed at query time by walking up the
+# chain until we hit the founder.
+#
+# Source of truth for the org structure: G:\My Drive\HJR-Founder-OS\memory\people.md
+# (manually mirrored here — when memory/people.md changes, update this file too).
+#
+# To add a new user:
+# 1. Add them to data/maps/slack-to-asana.yaml first.
+# 2. Add a `report:` row here pointing at their supervisor's slack_user_id.
+# 3. Optionally add aliases for them in data/maps/user-aliases.yaml.
+# 4. Restart Cora to refresh the cached hierarchy.
+#
+# Edge cases to revisit (currently strict — peer-query denied):
+# - Larry Stone (BDM Creative Director) cannot query Daniel Sion's tasks even
+#   though they both work on BDM content. Both report to Demi. If cross-functional
+#   peer visibility becomes a need, consider adding a `peer_visibility` rule.
+# - Cross-entity managers (e.g., Hannah Grant as ops anchor spanning entities)
+#   have no transitive authority over entity-specific reports they don't manage.
+#   Hannah cannot query Larry's tasks even though she touches BDM workflow.
+
+founder_slack_id: U0B2RM2JYJ1   # Harrison Rogers — universal supervisor override
+
+reports_to:
+
+  # === Reports to Harrison (founder) ===
+
+  - report: U0B3AEQS0NB           # Hannah Grant
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B3RU5Q55G           # Tommy Anderson
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B3AEJCYGP           # Justin Moran
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B3PS82G30           # Shaun Hawkins
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B3TPD2MEV           # Alina Thomas
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B4L78SZHN           # Micah Kessler
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  - report: U0B3KH5UZJ7           # Tessa Miller (transitioning to part-time remote 2026-05-23; still reports to Harrison during transition)
+    supervisor: U0B2RM2JYJ1       # Harrison Rogers
+
+  # === Reports to Micah Kessler ===
+
+  - report: U0B3PS7RFJA           # Matt Petrovich (OSN ops + reconciliation)
+    supervisor: U0B4L78SZHN       # Micah Kessler
+
+  - report: U0B3RU65TFU           # Demi Bagby
+    supervisor: U0B4L78SZHN       # Micah Kessler
+
+  # === Reports to Demi Bagby ===
+
+  - report: U0B3NGR1Y85           # Larry Stone (BDM Creative Director)
+    supervisor: U0B3RU65TFU       # Demi Bagby
+
+  - report: U0B3PS63F1C           # Daniel Sion (BDM team manager)
+    supervisor: U0B3RU65TFU       # Demi Bagby
+
+  # === Reports to Daniel Sion (BDM content team) ===
+
+  - report: U0B3AER7NUF           # Jake Lichtman
+    supervisor: U0B3PS63F1C       # Daniel Sion
+
+  # === Reports to Shaun Hawkins (Lex Services leadership) ===
+
+  - report: U0B3VGT8RE0           # Jen Mortensen (Lex HCBS Director)
+    supervisor: U0B3PS82G30       # Shaun Hawkins
+
+  # === Reports to Justin Moran (HJR Global accounting staff) ===
+
+  - report: U0B3PRZMBCN           # Eric Canku (HJR Global AP Staff Accountant)
+    supervisor: U0B3AEJCYGP       # Justin Moran
+
+# === Not yet in slack-to-asana.yaml (no slack_user_id available) ===
+# When these are added to the user map, add their supervisor rows here too:
+#
+# - Alex Cordova → Harrison (UFL Operations + F3E logistics)
+# - Jeff Montgomery → Harrison (HJRG IT + Lex 20% owner)
+# - Casey Cooper → Micah (BDM multi-entity support)
+# - Jacob DeGeer → Daniel (BDM content team)
+# - Adam Shaw → Daniel (BDM content team)
+# - Brei Pebley → Daniel (BDM content team)
+# - Aaron Ferrucci → Shaun (Lex Program Director)
+# - Jerry Rieck → Justin (HJR Global AR Staff Accountant)

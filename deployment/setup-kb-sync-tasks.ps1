@@ -1,9 +1,10 @@
-# Setup Windows Scheduled Tasks for KB incremental sync (Phase 3E).
+# Setup Windows Scheduled Tasks for KB incremental sync (Phase 3E + Phase 4 Layer 2).
 #
-# Registers three tasks that run nightly to keep the KB fresh:
+# Registers four tasks that run nightly to keep the KB fresh:
 #   cowork-cora-kb-sync-asana       — 3:00 AM AZ daily
 #   cowork-cora-kb-sync-fireflies   — 3:30 AM AZ daily
 #   cowork-cora-kb-sync-static      — 4:00 AM AZ daily
+#   cowork-cora-kb-sync-drive       — 4:30 AM AZ daily (Phase 4 Layer 2)
 #
 # Each task runs `uv run python scripts/incremental_sync_<source>.py`, logging
 # stdout+stderr to logs/kb-sync-<source>-YYYY-MM-DD.log inside the cora repo.
@@ -113,7 +114,7 @@ foreach ($task in $Tasks) {
 }
 
 Write-Host ""
-Write-Host "All 3 KB sync tasks registered." -ForegroundColor Green
+Write-Host "All 4 KB sync tasks registered." -ForegroundColor Green
 Write-Host ""
 Write-Host "Verify with:" -ForegroundColor Cyan
 Write-Host "  Get-ScheduledTask -TaskName 'cowork-cora-kb-sync-*' | Format-Table TaskName, State, NextRunTime"

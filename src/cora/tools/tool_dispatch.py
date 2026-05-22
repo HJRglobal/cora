@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 _HUBSPOT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-hubspot.yaml"
+_ALIASES_PATH = _REPO_ROOT / "data" / "maps" / "user-aliases.yaml"
+_HIERARCHY_PATH = _REPO_ROOT / "data" / "maps" / "supervisor-hierarchy.yaml"
 
 # HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
 HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
@@ -105,6 +107,208 @@ def _load_slack_hubspot_map() -> dict[str, dict[str, Any]]:
     return {u["slack_user_id"]: u for u in users if u.get("slack_user_id")}
 
 
+# --- Name → user resolution (third-party lookups) ---
+
+
+def _load_user_aliases() -> dict[str, Any]:
+    """Load the user-aliases.yaml, returning the raw config dict.
+
+    Returns an empty dict (with empty aliases / rules) if the file is missing —
+    callers fall back to display_name lookup only.
+    """
+    if not _ALIASES_PATH.exists():
+        log.warning("user-aliases.yaml not found at %s — name lookup will only match display_name exactly", _ALIASES_PATH)
+        return {"aliases": {}, "disambiguation_rules": []}
+    with open(_ALIASES_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return {
+        "aliases": data.get("aliases") or {},
+        "disambiguation_rules": data.get("disambiguation_rules") or [],
+    }
+
+
+def resolve_name_to_slack_user_id(name: str, channel_entity: str | None = None) -> tuple[str | None, str | None]:
+    """Resolve a free-text name ("Sean", "Shaun Hawkins", "Tommy Anderson") to a slack_user_id.
+
+    Returns: (slack_user_id, canonical_display_name) tuple.
+    If no match, returns (None, None).
+    If ambiguous (an alias collides across multiple canonical names) and the
+    disambiguation rule covers the channel_entity, returns the routed user.
+    Otherwise returns (None, ambiguity_message_for_llm).
+
+    Lookup order:
+      1. Exact match (case-insensitive) on display_name in slack-to-asana.yaml.
+      2. Alias match in user-aliases.yaml → resolve to canonical display_name → lookup.
+      3. Substring match on display_name (e.g. "Shaun" matches "Shaun Hawkins").
+         Only used when neither 1 nor 2 hit, to handle aliases we haven't added yet.
+      4. No match — return (None, None).
+    """
+    if not name or not name.strip():
+        return None, None
+
+    needle = name.strip().lower()
+    slack_asana_map = _load_slack_asana_map()
+    aliases_config = _load_user_aliases()
+
+    # Build a display_name → user record lookup
+    by_display: dict[str, dict[str, Any]] = {}
+    for user in slack_asana_map.values():
+        display = (user.get("display_name") or "").strip()
+        if display:
+            by_display[display.lower()] = user
+
+    # 1. Exact match on display_name
+    if needle in by_display:
+        user = by_display[needle]
+        return user["slack_user_id"], user.get("display_name")
+
+    # 2. Alias match — find which canonical name(s) this alias maps to
+    aliases_map: dict[str, list[str]] = aliases_config.get("aliases", {})
+    canonical_matches: list[str] = []
+    for canonical, variants in aliases_map.items():
+        # Include the canonical itself as an implicit alias
+        all_variants = [canonical] + list(variants)
+        if any(v.strip().lower() == needle for v in all_variants):
+            canonical_matches.append(canonical)
+
+    if len(canonical_matches) == 1:
+        canonical = canonical_matches[0]
+        user = by_display.get(canonical.lower())
+        if user:
+            return user["slack_user_id"], user.get("display_name")
+        log.warning(
+            "Alias %r resolved to canonical %r but no user with that display_name in slack-to-asana.yaml",
+            name, canonical,
+        )
+        return None, None
+
+    if len(canonical_matches) > 1:
+        # Try disambiguation rules
+        rules = aliases_config.get("disambiguation_rules", [])
+        for rule in rules:
+            if rule.get("alias", "").strip().lower() == needle:
+                routing = rule.get("channel_entity_routing") or {}
+                target = routing.get(channel_entity) if channel_entity else None
+                target = target or routing.get("default")
+                if target:
+                    user = by_display.get(target.lower())
+                    if user:
+                        return user["slack_user_id"], user.get("display_name")
+        # No rule covered it
+        log.info("Ambiguous name %r matches multiple canonical users: %s", name, canonical_matches)
+        return None, f"Multiple users match '{name}': {canonical_matches}. Tell the user which one they meant."
+
+    # 3. Substring match on display_name (fallback for un-aliased nicknames)
+    substring_hits = [u for key, u in by_display.items() if needle in key]
+    if len(substring_hits) == 1:
+        user = substring_hits[0]
+        return user["slack_user_id"], user.get("display_name")
+    if len(substring_hits) > 1:
+        names = [u.get("display_name", "?") for u in substring_hits]
+        log.info("Substring lookup for %r ambiguous, matches: %s", name, names)
+        return None, f"Multiple users match '{name}': {names}. Tell the user which one they meant."
+
+    # 4. No match
+    return None, None
+
+
+# --- Supervisor hierarchy / authorization ---
+
+
+def _load_supervisor_hierarchy() -> dict[str, Any]:
+    """Load supervisor-hierarchy.yaml. Returns {founder_slack_id, reports_to_map}.
+
+    reports_to_map: dict mapping report_slack_id -> supervisor_slack_id.
+    """
+    if not _HIERARCHY_PATH.exists():
+        log.warning(
+            "supervisor-hierarchy.yaml not found at %s — third-party Asana lookups will be "
+            "restricted to founder only (Harrison hardcoded if found in slack-to-asana map)",
+            _HIERARCHY_PATH,
+        )
+        return {"founder_slack_id": None, "reports_to_map": {}}
+    with open(_HIERARCHY_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    rows = data.get("reports_to") or []
+    reports_to_map: dict[str, str] = {}
+    for row in rows:
+        report = (row.get("report") or "").strip()
+        supervisor = (row.get("supervisor") or "").strip()
+        if report and supervisor:
+            if report in reports_to_map:
+                log.warning(
+                    "supervisor-hierarchy.yaml: %s listed as report under multiple supervisors "
+                    "(keeping first: %s, ignoring: %s)",
+                    report, reports_to_map[report], supervisor,
+                )
+                continue
+            reports_to_map[report] = supervisor
+    return {
+        "founder_slack_id": (data.get("founder_slack_id") or "").strip() or None,
+        "reports_to_map": reports_to_map,
+    }
+
+
+def _get_supervisor_chain(target_slack_id: str) -> list[str]:
+    """Walk up the supervisor chain from `target_slack_id`.
+
+    Returns the list of slack_user_ids that are (direct or transitive) supervisors
+    of the target. Founder is the last entry if the chain reaches the top.
+    Returns empty list if the target has no supervisor record.
+
+    Cycle-safe: stops if a slack_user_id repeats.
+    """
+    hierarchy = _load_supervisor_hierarchy()
+    reports_to_map = hierarchy["reports_to_map"]
+
+    chain: list[str] = []
+    seen: set[str] = {target_slack_id}
+    current = target_slack_id
+    while True:
+        supervisor = reports_to_map.get(current)
+        if not supervisor:
+            break
+        if supervisor in seen:
+            log.warning("supervisor-hierarchy.yaml: cycle detected at %s — truncating chain", supervisor)
+            break
+        chain.append(supervisor)
+        seen.add(supervisor)
+        current = supervisor
+    return chain
+
+
+def is_authorized_to_query_user(
+    asker_slack_id: str, target_slack_id: str
+) -> tuple[bool, str | None]:
+    """Check whether `asker` is allowed to query `target`'s Asana tasks.
+
+    Rules (per Harrison 2026-05-21):
+      1. Self-query -> True. (Path normally uses asana_get_my_tasks, but if called
+         here we don't refuse.)
+      2. Founder -> True. (Universal override.)
+      3. Asker is in target's supervisor chain -> True. (Direct or transitive.)
+      4. Else -> False, with a refusal message the LLM should surface.
+    """
+    if asker_slack_id == target_slack_id:
+        return True, None
+
+    hierarchy = _load_supervisor_hierarchy()
+    founder = hierarchy.get("founder_slack_id")
+    if founder and asker_slack_id == founder:
+        return True, None
+
+    chain = _get_supervisor_chain(target_slack_id)
+    if asker_slack_id in chain:
+        return True, None
+
+    return False, (
+        "Not authorized to look up that teammate's tasks. Per HJR's access doctrine, "
+        "only direct or transitive supervisors of a person can query their Asana tasks. "
+        "Tell the user this is a privacy / hierarchy rule — they can ask the person directly, "
+        "or escalate to a shared supervisor (ultimately Harrison) if the information is needed."
+    )
+
+
 # --- Tool implementations (bound to the requesting slack user + entity scope via dispatch) ---
 
 
@@ -149,6 +353,89 @@ def _tool_get_my_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
         entity_scope=entity if entity != "FNDR" else None,
         total_before_filter=total,
     )
+
+
+def _tool_get_user_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Look up another teammate's Asana tasks by name.
+
+    Distinct from _tool_get_my_tasks: takes a `user_name` parameter and resolves
+    it to a slack_user_id via data/maps/user-aliases.yaml. Then runs the same
+    Asana query path as the first-person tool.
+
+    Use cases (per 2026-05-21 doctrine clarification): Harrison can ask Cora
+    "what is Sean's latest tasks?" in a #fndr or #hjrg-* channel and Cora
+    returns Shaun Hawkins's tasks. In entity-scoped channels, the same entity
+    filter applies (tasks filtered to the channel's entity prefix).
+    """
+    name = (_input or {}).get("user_name", "").strip()
+    if not name:
+        return (
+            "asana_get_user_tasks called without a user_name parameter. "
+            "Tell the user which teammate you want to look up."
+        )
+
+    resolved_slack_id, info = resolve_name_to_slack_user_id(name, channel_entity=entity)
+    if not resolved_slack_id:
+        if info:  # ambiguity message
+            return info
+        return (
+            f"No teammate found matching '{name}'. Tell the user the name didn't match "
+            f"anyone in the Slack-to-Asana map. Suggest using their full name or a "
+            f"common nickname (Sean, Shaun, Tommy, etc.). "
+            f"If they're a new hire, Harrison can add them to data/maps/slack-to-asana.yaml + user-aliases.yaml."
+        )
+
+    # --- Authorization check: only direct/transitive supervisors can query reports ---
+    authorized, refusal = is_authorized_to_query_user(slack_user_id, resolved_slack_id)
+    if not authorized:
+        log.info(
+            "asana_get_user_tasks UNAUTHORIZED asker=%s target=%r resolved=%s entity=%s",
+            slack_user_id, name, info, entity,
+        )
+        return refusal or (
+            "Not authorized to look up that teammate's tasks. Tell the user this is "
+            "a privacy / hierarchy rule."
+        )
+
+    mapping = _load_slack_asana_map()
+    user = mapping.get(resolved_slack_id)
+    if not user:
+        # This shouldn't happen — resolver pulls from the same map — but guard anyway.
+        return (
+            f"Found '{info}' but their Asana mapping is incomplete. "
+            f"Tell the user there's a configuration issue."
+        )
+
+    asana_gid = str(user.get("asana_user_gid", "") or "")
+    if not asana_gid or "REPLACE" in asana_gid:
+        return (
+            f"Found '{info}' but their asana_user_gid is a placeholder. "
+            f"Tell the user Harrison needs to finish populating data/maps/slack-to-asana.yaml."
+        )
+
+    try:
+        all_tasks = asana_client.get_user_tasks(asana_gid)
+    except asana_client.AsanaClientError as exc:
+        log.warning("Asana third-party lookup error name=%r resolved=%s gid=%s: %s", name, info, asana_gid, exc)
+        return f"Asana error: {exc}. Tell the user there's a temporary issue reaching Asana."
+
+    # Apply entity scope filter (same as first-person tool)
+    filtered = _filter_tasks_by_entity(all_tasks, entity)
+    total = len(all_tasks)
+    shown = len(filtered)
+
+    log.info(
+        "asana_get_user_tasks asker=%s target=%r resolved=%s entity=%s total=%d shown=%d",
+        slack_user_id, name, info, entity, total, shown,
+    )
+
+    formatted = asana_client.format_tasks_for_llm(
+        filtered,
+        entity_scope=entity if entity != "FNDR" else None,
+        total_before_filter=total,
+    )
+    # Prepend the resolved-name context so Claude's reply attributes the tasks correctly
+    return f"[Looking up tasks for: {info}]\n\n{formatted}"
 
 
 def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -407,6 +694,35 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "asana_get_user_tasks",
+        "description": (
+            "Fetch the incomplete Asana tasks assigned to ANOTHER teammate (not the "
+            "asking user). Use this when the user asks about a specific named teammate's "
+            "workload — phrases like 'what is Sean's latest tasks', 'show me Tommy's open work', "
+            "'what's Hannah working on', 'how busy is Larry'. Accepts common first-name aliases "
+            "and misspellings (Sean → Shaun Hawkins, Tommy → Tommy Anderson, etc.) via "
+            "data/maps/user-aliases.yaml. Returns up to 25 incomplete tasks formatted "
+            "identically to asana_get_my_tasks. Channel entity scope still applies — in "
+            "#osn-leadership, only OSN-tagged tasks will be returned; FNDR channels see "
+            "all entities. For the asking user's own tasks, use asana_get_my_tasks instead. "
+            "ACCESS CONTROL: only direct or transitive supervisors of the target can query "
+            "their tasks (per HJR access doctrine 2026-05-21). Harrison (founder) can query "
+            "anyone. If the asker is not authorized, the tool returns a refusal message — "
+            "surface it warmly: explain the privacy rule, suggest they ask the person directly "
+            "or escalate to a shared supervisor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_name": {
+                    "type": "string",
+                    "description": "Name of the teammate to look up. Accepts first name, full name, or common nickname (e.g. 'Sean', 'Shaun', 'Shaun Hawkins', 'Tommy', 'Tommy Anderson').",
+                },
+            },
+            "required": ["user_name"],
+        },
+    },
+    {
         "name": "calendar_get_my_events",
         "description": (
             "Fetch calendar events from the user's Google Calendar primary calendar. "
@@ -584,6 +900,7 @@ TOOL_DEFINITIONS = [
 # Name → callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
+    "asana_get_user_tasks": _tool_get_user_tasks,
     "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,

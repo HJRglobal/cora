@@ -1,0 +1,96 @@
+# User name aliases for Cora third-party lookups.
+#
+# When a Slack user asks Cora about another teammate by name ("what is Sean's
+# latest tasks?", "show me Tommy's open deals"), Cora needs to resolve that
+# name to a slack_user_id so the existing slack-to-asana / slack-to-hubspot
+# maps can do their work.
+#
+# This file is the resolution layer. Each entry is:
+#   canonical_display_name: <must match a display_name in slack-to-asana.yaml>
+#   aliases: <list of common variants — first-name only, misspellings, nicknames>
+#
+# Convention:
+# - canonical_display_name MUST equal a `display_name` in slack-to-asana.yaml.
+#   That's the foreign key — if the canonical name drifts, the lookup breaks.
+# - Aliases are case-insensitive at lookup time.
+# - The canonical name itself is implicitly an alias (you don't need to repeat it).
+# - Order doesn't matter; first match wins.
+#
+# When adding a new user to slack-to-asana.yaml, also add their alias row here.
+#
+# Disambiguation: if a single alias maps to multiple canonical names (e.g. "Jake"
+# could be Jake Lichtman OR Jacob DeGeer when he joins), add a disambiguation
+# rule below. The current map has unique first names so no rules needed yet.
+
+aliases:
+  # HJR Global
+  Harrison Rogers:
+    - Harrison
+    - HJR
+    - Harrison J Rogers
+  Hannah Grant:
+    - Hannah
+  Justin Moran:
+    - Justin
+  Tessa Miller:
+    - Tessa
+  Matt Petrovich:
+    - Matt
+    - Matthew
+    - Matthew Petrovich
+  Daniel Sion:
+    - Daniel
+    - Dan
+  Eric Canku:
+    - Eric
+  Alina Thomas:
+    - Alina
+
+  # Lexington Services
+  Shaun Hawkins:
+    - Sean
+    - Sean Hawkins
+    - Shawn
+    - Shawn Hawkins
+    - Shaun
+  Jennifer Mortensen:
+    - Jen
+    - Jen Mortensen
+    - Jennifer
+    - Jenn
+    - Jenny
+
+  # F3 Energy
+  Tommy Anderson:
+    - Tommy
+    - Thomas
+    - Thomas Anderson
+    - Tom
+
+  # Big D Media
+  Larry Stone:
+    - Larry
+    - Lawrence
+  Micah Kessler:
+    - Micah
+    - Michah
+  Demi Bagby:
+    - Demi
+    - Demetra
+  Jake Lichtman:
+    - Jake
+    - Jake L
+    - Jacob Lichtman
+
+# Disambiguation rules — applied when one alias maps to multiple canonical names.
+# Currently empty (single-Jake / single-Sean / etc. — no collisions yet).
+# When adding: prefer the canonical user routed by the channel's entity scope.
+#
+# Example shape:
+#   disambiguation_rules:
+#     - alias: Jake
+#       channel_entity_routing:
+#         BDM: Jake Lichtman
+#         HJRG: Jacob DeGeer
+#         default: Jake Lichtman
+disambiguation_rules: []

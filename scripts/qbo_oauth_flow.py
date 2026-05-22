@@ -59,11 +59,11 @@ def _cmd_bootstrap(entity: str, environment: str) -> int:
         return 1
 
     print()
-    print(f"  ✓ QBO authorized for entity={entity!r}")
-    print(f"  ✓ realm_id={entry['realm_id']}")
-    print(f"  ✓ environment={entry['environment']}")
-    print(f"  ✓ access token valid for ~1 hour; refresh token valid ~100 days")
-    print(f"  ✓ Tokens persisted to .credentials/qbo-tokens.json (gitignored)")
+    print(f"  [OK] QBO authorized for entity={entity!r}")
+    print(f"  [OK] realm_id={entry['realm_id']}")
+    print(f"  [OK] environment={entry['environment']}")
+    print(f"  [OK] access token valid for ~1 hour; refresh token valid ~100 days")
+    print(f"  [OK] Tokens persisted to .credentials/qbo-tokens.json (gitignored)")
     print()
     return 0
 
@@ -75,19 +75,19 @@ def _cmd_list() -> int:
         return 0
     print(f"Provisioned QBO entities ({len(entities)}):")
     for e in entities:
-        print(f"  • {e}")
+        print(f"  - {e}")
     return 0
 
 
 def _cmd_refresh_all() -> int:
     results = refresh_all_entities()
     if not results:
-        print("No entities provisioned — nothing to refresh.")
+        print("No entities provisioned - nothing to refresh.")
         return 0
     print(f"Refreshed {len(results)} entities:")
     failures = 0
     for entity, status in results.items():
-        marker = "✓" if status == "ok" else "✗"
+        marker = "[OK]" if status == "ok" else "[FAIL]"
         print(f"  {marker} {entity}: {status}")
         if status != "ok":
             failures += 1

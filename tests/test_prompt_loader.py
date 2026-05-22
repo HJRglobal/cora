@@ -8,7 +8,7 @@ import cora.prompt_loader as pl
 
 
 def _clear_cache():
-    pl._cache.clear()
+    pl.clear_cache()
 
 
 def test_load_f3e(monkeypatch, tmp_path):
