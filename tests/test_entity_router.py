@@ -69,6 +69,29 @@ def test_bdm_leadership():
     assert route("bdm-leadership") == "BDM"
 
 
+# --- HJR Properties ---
+
+
+def test_hjrp_bare():
+    """Bare #hjrp channel routes to HJRP (regression: 2026-05-22 evening add)."""
+    assert route("hjrp") == "HJRP"
+
+
+def test_hjrp_finance():
+    """#hjrp-finance routes to HJRP."""
+    assert route("hjrp-finance") == "HJRP"
+
+
+def test_rogers_ranch_bare():
+    """Bare #rogers-ranch (HJRP-RR sub-entity catch-all) routes to HJRP."""
+    assert route("rogers-ranch") == "HJRP"
+
+
+def test_rogers_ranch_bookings():
+    """#rogers-ranch-bookings routes to HJRP."""
+    assert route("rogers-ranch-bookings") == "HJRP"
+
+
 # --- HJR Global / Founder-level ---
 
 

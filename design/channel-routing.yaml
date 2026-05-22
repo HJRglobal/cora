@@ -43,6 +43,19 @@ routes:
   - pattern: "bdm-*"
     entity: BDM
 
+  # HJR Properties — covers bare #hjrp, hjrp-*, plus #rogers-ranch (HJRP-RR sub-entity catch-all)
+  # and #rogers-ranch-* (operational booking + future sub-channels). Cora loads
+  # 06-HJR-Properties/CLAUDE.md as HJRP context, plus rogers-ranch/CLAUDE.md when
+  # routing to a rogers-ranch-* channel (sub-entity context layered on parent).
+  - pattern: "hjrp"
+    entity: HJRP
+  - pattern: "hjrp-*"
+    entity: HJRP
+  - pattern: "rogers-ranch"
+    entity: HJRP
+  - pattern: "rogers-ranch-*"
+    entity: HJRP
+
   # HJR Global / Founder-level channels — HJRG functional channels route to FNDR
   # because Cora's FNDR system-prompt has the cross-entity holdco lens.
   - pattern: "hjrg"
