@@ -32,7 +32,21 @@ _TIMEOUT = 60.0  # bumped 25→60 for tool-use loops where the second pass synth
 _RETRY_DELAYS = (1, 2)  # seconds before attempt 1 and attempt 2
 _MAX_TOOL_ITERATIONS = 3  # safety cap on tool-use loop
 
-_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+_client: "anthropic.Anthropic | None" = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    """Return the shared Anthropic client, creating it on first use.
+
+    Lazy initialization avoids an import-time failure when the API key is not
+    present in the environment (e.g. unit tests, fresh installs).  The client
+    is effectively a singleton — once created it is reused for the process
+    lifetime.
+    """
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+    return _client
 
 
 class ClaudeClientError(Exception):
@@ -134,7 +148,7 @@ def _create_with_retry(**kwargs) -> anthropic.types.Message:
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            return _client.messages.create(**kwargs)
+            return _get_client().messages.create(**kwargs)
         except Exception as exc:
             if _is_retryable(exc) and attempt < 2:
                 delay = _RETRY_DELAYS[attempt]
@@ -373,7 +387,7 @@ def _stream_with_retry(**kwargs):
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            return _client.messages.stream(**kwargs)
+            return _get_client().messages.stream(**kwargs)
         except Exception as exc:
             if _is_retryable(exc) and attempt < 2:
                 delay = _RETRY_DELAYS[attempt]
