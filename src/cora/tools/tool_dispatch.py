@@ -696,6 +696,104 @@ def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
     return calendar_client.format_events_for_llm(events, window_label)
 
 
+def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Create a Calendar event in the asker's own primary calendar.
+
+    Cora's third write tool. Same staged-write doctrine as asana_create_task
+    and gmail_create_draft: refuses without confirmed=True; tool description
+    instructs Claude to show a preview block and get explicit user approval first.
+
+    The event is created via DWD impersonation AS the asker, so it lands in
+    their own Google Calendar. Attendees receive Google invitations automatically
+    when sendUpdates='all' (the default).
+    """
+    input_data = _input or {}
+
+    # Confirmation gate — same pattern as the other write tools
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "calendar_create_event refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a clear preview block (title, start, end, "
+            "attendees, description, location) AND received their explicit approval "
+            "('yes', 'create it', 'add it', 'looks good', or similar). "
+            "If you have NOT done that yet, format a preview NOW and wait for confirmation."
+        )
+
+    summary = (input_data.get("summary") or "").strip()
+    start = (input_data.get("start") or "").strip()
+    end = (input_data.get("end") or "").strip()
+    attendees = input_data.get("attendees")  # list[str] or None
+    description = (input_data.get("description") or "").strip() or None
+    location = (input_data.get("location") or "").strip() or None
+    time_zone = (input_data.get("time_zone") or calendar_client._DEFAULT_TZ).strip()
+
+    if not summary:
+        return "calendar_create_event: missing required field `summary`. Ask the user for an event title."
+    if not start:
+        return "calendar_create_event: missing required field `start`. Ask the user for a start date/time."
+    if not end:
+        return "calendar_create_event: missing required field `end`. Ask the user for an end date/time."
+
+    # Resolve caller's Google identity from the Slack→Asana map
+    asker = _load_slack_asana_map().get(slack_user_id)
+    if not asker:
+        return (
+            f"calendar_create_event: Slack user {slack_user_id} is not mapped to a Google "
+            f"identity. Harrison can add a row to data/maps/slack-to-asana.yaml (the "
+            f"asana_email field doubles as the Google identity)."
+        )
+    user_email = (asker.get("asana_email") or "").strip()
+    if not user_email:
+        return (
+            f"calendar_create_event: user {asker.get('display_name', slack_user_id)} has "
+            f"no asana_email in the user map. Tell the user there's a configuration issue."
+        )
+
+    # Normalize attendees
+    attendee_list: list[str] | None = None
+    if attendees:
+        if isinstance(attendees, str):
+            attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
+        elif isinstance(attendees, list):
+            attendee_list = [str(a).strip() for a in attendees if str(a).strip()]
+
+    try:
+        event = calendar_client.create_event(
+            user_email=user_email,
+            summary=summary,
+            start=start,
+            end=end,
+            attendees=attendee_list,
+            description=description,
+            location=location,
+            time_zone=time_zone,
+        )
+    except calendar_client.CalendarClientError as exc:
+        log.warning(
+            "calendar_create_event FAILED asker=%s email=%s summary=%r exc=%s",
+            slack_user_id, user_email, summary, exc,
+        )
+        return (
+            f"Calendar event error: {exc}. Tell the user the event wasn't created. "
+            f"If the error mentions a missing DWD scope, Harrison needs to update "
+            f"Domain-wide Delegation in admin.google.com."
+        )
+
+    log.info(
+        "calendar_create_event CREATED asker=%s email=%s event_id=%s summary=%r "
+        "start=%s attendee_count=%d",
+        slack_user_id,
+        user_email,
+        event.get("id", ""),
+        summary,
+        start,
+        len(attendee_list) if attendee_list else 0,
+    )
+
+    return calendar_client.format_created_event_for_llm(event, user_email=user_email)
+
+
 def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → HubSpot owner_id → fetch deals → channel-scope by pipeline → format."""
     mapping = _load_slack_hubspot_map()
@@ -1082,6 +1180,81 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "calendar_create_event",
+        "description": (
+            "Create a new event in the user's Google Calendar primary calendar. "
+            "Use this when the user asks to schedule, book, add, or create a meeting or event — "
+            "phrases like 'schedule a meeting with X', 'add a call to my calendar', "
+            "'book time for Y', 'create a calendar event for Z'. "
+            "IMPORTANT: You MUST show the user a clear preview block (title, start time, "
+            "end time, attendees, description, location) and receive their EXPLICIT approval "
+            "before setting confirmed=true. Never set confirmed=true on the first call — "
+            "always preview first. "
+            "The event is created in the asking user's own primary Google Calendar. "
+            "If attendees are provided, Google sends them invitations automatically. "
+            "The tool returns a clickable link to the created event — preserve the "
+            "`<url|name>` Slack hyperlink syntax verbatim in your reply. "
+            "Default time zone is America/Phoenix. "
+            "Do not call this tool for questions about reading or viewing a calendar — "
+            "use calendar_get_my_events for that."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Event title / name. Required.",
+                },
+                "start": {
+                    "type": "string",
+                    "description": (
+                        "Start date and time in ISO 8601 format. Examples: "
+                        "'2026-05-25T14:00' (naive, treated as America/Phoenix), "
+                        "'2026-05-25T14:00:00-07:00' (explicit offset). Required."
+                    ),
+                },
+                "end": {
+                    "type": "string",
+                    "description": (
+                        "End date and time. Same format as start. Must be after start. Required."
+                    ),
+                },
+                "attendees": {
+                    "type": ["array", "string"],
+                    "description": (
+                        "Optional list (or comma-separated string) of attendee email addresses. "
+                        "Google will send each attendee an invitation."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional free-text event body / notes.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Optional location — address, room name, or video link.",
+                },
+                "time_zone": {
+                    "type": "string",
+                    "description": (
+                        "IANA time zone name for the event. Defaults to 'America/Phoenix'. "
+                        "Use this if the user specifies a different city or time zone."
+                    ),
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Required. Set to true ONLY after you have shown the user a preview "
+                        "block AND received their explicit approval. If false or omitted, "
+                        "the tool refuses and instructs you to show a preview first."
+                    ),
+                },
+            },
+            "required": ["summary", "start", "end", "confirmed"],
+        },
+    },
+    {
         "name": "hubspot_get_my_deals",
         "description": (
             "Fetch the open HubSpot deals owned by the user who @-mentioned Cora. "
@@ -1239,6 +1412,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "gmail_create_draft": _tool_gmail_create_draft,
     "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
+    "calendar_create_event": _tool_calendar_create_event,
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
     "qbo_get_balance_sheet": _tool_qbo_get_balance_sheet,
     "qbo_get_ar_aging": _tool_qbo_get_ar_aging,

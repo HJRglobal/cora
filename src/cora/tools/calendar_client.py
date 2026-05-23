@@ -1,20 +1,32 @@
-"""Google Calendar v3 client — read-only, Service Account + Domain-wide Delegation.
+"""Google Calendar v3 client — read + write, Service Account + Domain-wide Delegation.
 
 Phase 2 #9 part 2 scope:
-- Single endpoint: events.list (per-user, via DWD impersonation)
-- Service Account credentials from .credentials/cora-calendar-sa.json
-- DWD impersonation: with_subject(user_email) — service account acts AS the user
-- No write methods (read-only by design)
+- Read endpoint: events.list (per-user, via DWD impersonation)
+- Write endpoint: events.insert (staged-write pattern — confirmed=True gate)
+
+Write tool added 2026-05-23:
+- create_event() mirrors gmail_client.create_draft() staged-write pattern.
+- DWD impersonation: event lands in the asker's own primary calendar.
+- Required DWD scope: https://www.googleapis.com/auth/calendar.events
+  (supersedes calendar.readonly — Harrison must add this scope in
+  admin.google.com → Security → API controls → Domain-wide Delegation,
+  same DWD entry as gmail.compose).
 
 Architecture:
 - Service Account `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com`
 - Unique ID 108247979419622966179 (registered in Workspace admin DWD)
-- Authorized scope: https://www.googleapis.com/auth/calendar.readonly
-- Service account impersonates the asking Slack user's Google identity to read
-  THEIR calendar (not the service account's own — service accounts have no calendar).
+- Authorized scopes: https://www.googleapis.com/auth/calendar.events
+  (calendar.events is a superset of calendar.readonly — one scope covers both)
+- Service account impersonates the asking Slack user's Google identity.
 
 Deep-link pattern: Google's `htmlLink` field returned per event. Looks like:
   https://www.google.com/calendar/event?eid=...
+
+Write doctrine (mirrors gmail_create_draft / asana_create_task):
+- Cora shows a preview block first and requires confirmed=True before calling.
+- Audit log: asker / event_id / summary / attendee_count / start_datetime.
+  Event body / description is NOT logged.
+- Default time zone: America/Phoenix (AZ — no DST).
 """
 
 import logging
@@ -28,7 +40,8 @@ from googleapiclient.errors import HttpError
 
 log = logging.getLogger(__name__)
 
-_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+# calendar.events is a superset of calendar.readonly — covers both read + write.
+_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 _DEFAULT_MAX_EVENTS = 25
 # Default to America/Phoenix — Harrison + HJR portfolio is AZ-based
 _DEFAULT_TZ = "America/Phoenix"
@@ -166,6 +179,189 @@ def get_user_events(
         raise CalendarClientError(f"Calendar API error: {exc}") from exc
 
     return result.get("items", []) or [], label
+
+
+# ---------------------------------------------------------------------------
+# Write — create_event (staged-write, confirmed=True gate)
+# ---------------------------------------------------------------------------
+
+def _parse_datetime_input(value: str, tz_name: str = _DEFAULT_TZ) -> str:
+    """Accept a datetime string in several common formats and return RFC 3339.
+
+    Accepted inputs:
+      - "2026-05-25T14:00" or "2026-05-25T14:00:00"  (naive — treated as tz_name)
+      - "2026-05-25T14:00:00-07:00"                   (already offset-aware — returned as-is)
+      - "2026-05-25 14:00"                             (space separator — normalised)
+
+    Always returns a string like "2026-05-25T14:00:00-07:00".
+    Raises CalendarClientError on unrecognisable input.
+    """
+    value = value.strip().replace(" ", "T")
+
+    # Try offset-aware parse first (Python 3.7+ fromisoformat handles +HH:MM)
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            return dt.isoformat()
+        # Naive — apply the requested timezone
+    except ValueError:
+        raise CalendarClientError(
+            f"Cannot parse datetime {value!r}. Use ISO format, e.g. '2026-05-25T14:00' "
+            f"or '2026-05-25T14:00:00-07:00'."
+        )
+
+    # Phoenix is UTC-7 year-round (no DST)
+    tz_offset = timedelta(hours=-7) if "Phoenix" in tz_name else timedelta(hours=0)
+    tz = timezone(tz_offset)
+    return dt.replace(tzinfo=tz).isoformat()
+
+
+def create_event(
+    *,
+    user_email: str,
+    summary: str,
+    start: str,
+    end: str,
+    attendees: list[str] | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    time_zone: str = _DEFAULT_TZ,
+) -> dict[str, Any]:
+    """Create a Calendar event in user_email's primary calendar.
+
+    Parameters
+    ----------
+    user_email   : Google Workspace email to impersonate (DWD).
+    summary      : Event title.
+    start        : Start datetime — ISO 8601, e.g. "2026-05-25T14:00" or
+                   "2026-05-25T14:00:00-07:00". Naive datetimes treated as time_zone.
+    end          : End datetime — same format as start.
+    attendees    : Optional list of email addresses. Invites are sent by Google
+                   if notification settings allow.
+    description  : Optional free-text event body.
+    location     : Optional location string.
+    time_zone    : IANA tz name — default "America/Phoenix".
+
+    Returns the created event resource dict (includes `id` and `htmlLink`).
+    Raises CalendarClientError on validation or API failure.
+    """
+    if not summary or not summary.strip():
+        raise CalendarClientError("create_event requires a non-empty summary (title).")
+    if not start:
+        raise CalendarClientError("create_event requires a start datetime.")
+    if not end:
+        raise CalendarClientError("create_event requires an end datetime.")
+
+    start_rfc = _parse_datetime_input(start, time_zone)
+    end_rfc = _parse_datetime_input(end, time_zone)
+
+    # Validate end > start
+    try:
+        start_dt = datetime.fromisoformat(start_rfc)
+        end_dt = datetime.fromisoformat(end_rfc)
+        if end_dt <= start_dt:
+            raise CalendarClientError(
+                f"Event end ({end_rfc}) must be after start ({start_rfc})."
+            )
+    except CalendarClientError:
+        raise
+    except Exception:
+        pass  # fromisoformat edge-case; let the API catch it
+
+    body: dict[str, Any] = {
+        "summary": summary.strip(),
+        "start": {"dateTime": start_rfc, "timeZone": time_zone},
+        "end": {"dateTime": end_rfc, "timeZone": time_zone},
+    }
+    if description:
+        body["description"] = description
+    if location:
+        body["location"] = location
+    if attendees:
+        # Validate + de-dup
+        clean: list[str] = []
+        for addr in attendees:
+            addr = (addr or "").strip()
+            if not addr:
+                continue
+            if "@" not in addr:
+                raise CalendarClientError(
+                    f"Attendee {addr!r} doesn't look like an email address."
+                )
+            clean.append(addr)
+        if clean:
+            body["attendees"] = [{"email": a} for a in clean]
+
+    try:
+        service = _build_service(user_email)
+        event = (
+            service.events()
+            .insert(calendarId="primary", body=body, sendUpdates="all")
+            .execute()
+        )
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        if status == 403:
+            raise CalendarClientError(
+                f"Calendar 403 for {user_email} — service account lacks "
+                f"calendar.events DWD scope. Harrison needs to update Domain-wide "
+                f"Delegation in admin.google.com: replace calendar.readonly with "
+                f"https://www.googleapis.com/auth/calendar.events for the SA "
+                f"(Unique ID 108247979419622966179)."
+            ) from exc
+        if status == 400:
+            raise CalendarClientError(
+                f"Calendar 400 — API rejected the event body: {exc}"
+            ) from exc
+        raise CalendarClientError(f"Calendar API HTTP {status}: {exc}") from exc
+    except CalendarClientError:
+        raise
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error: {exc}") from exc
+
+    return event
+
+
+def format_created_event_for_llm(
+    event: dict[str, Any],
+    *,
+    user_email: str,
+) -> str:
+    """Render a freshly-created event as a Slack-mrkdwn confirmation block."""
+    event_id = event.get("id") or "(no id)"
+    html_link = event.get("htmlLink") or ""
+    summary = event.get("summary") or "(no title)"
+    start_raw = (event.get("start") or {}).get("dateTime") or ""
+    attendees_raw = event.get("attendees") or []
+
+    # Format start for display
+    start_display = start_raw
+    if start_raw:
+        try:
+            dt = datetime.fromisoformat(start_raw)
+            phoenix_tz = timezone(timedelta(hours=-7))
+            start_display = dt.astimezone(phoenix_tz).strftime("%a %Y-%m-%d %H:%M AZ")
+        except Exception:
+            pass
+
+    attendee_list = [a.get("email", "") for a in attendees_raw if a.get("email")]
+    attendees_str = (
+        f"\n- Attendees: {', '.join(attendee_list)}" if attendee_list else ""
+    )
+
+    link_str = f"<{html_link}|Open in Google Calendar>" if html_link else "(no link)"
+
+    return (
+        f"Calendar event CREATED in {user_email}'s primary calendar. Surface this to the user:\n"
+        f"- Title: {summary}\n"
+        f"- Start: {start_display}{attendees_str}\n"
+        f"- Event ID: {event_id}\n"
+        f"- {link_str}\n"
+        f"\n"
+        f"Tell the user the event is live on their calendar. Format the Open link as a "
+        f"Slack hyperlink (preserve the <url|name> syntax). If attendees were invited, "
+        f"mention that Google sent them invitations."
+    )
 
 
 def format_events_for_llm(events: list[dict[str, Any]], window_label: str) -> str:
