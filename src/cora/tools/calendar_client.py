@@ -14,7 +14,7 @@ Write tool added 2026-05-23:
 
 Architecture:
 - Service Account `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com`
-- Unique ID 108247979419622966179 (registered in Workspace admin DWD)
+- Unique ID 117814221557902200858 (registered in Workspace admin DWD)
 - Authorized scopes: https://www.googleapis.com/auth/calendar.events
   (calendar.events is a superset of calendar.readonly — one scope covers both)
 - Service account impersonates the asking Slack user's Google identity.

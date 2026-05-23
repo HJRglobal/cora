@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, calendar_client, gmail_client, hubspot_client, qbo_client
+from . import asana_client, calendar_client, gmail_client, hubspot_client, influencer_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -794,6 +794,182 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
     return calendar_client.format_created_event_for_llm(event, user_email=user_email)
 
 
+def _tool_influencer_get_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return an influencer deliverable status or compliance report.
+
+    Read-only. Surfaces overdue + pending deliverables (or a per-athlete compliance
+    breakdown) for Alex / Harrison to act on. Entity-scoped by channel — in F3E
+    channels only F3E deliverables surface; FNDR sees all entities.
+    """
+    input_data = _input or {}
+    report_type = (input_data.get("report_type") or "status").strip().lower()
+    athlete = (input_data.get("athlete") or "").strip() or None
+
+    # Resolve entity scope: tool param overrides channel entity; FNDR = no filter
+    entity_filter = entity if entity != "FNDR" else None
+
+    log.info(
+        "influencer_get_status actor=%s report_type=%s athlete=%r entity=%s",
+        slack_user_id, report_type, athlete, entity_filter or "ALL",
+    )
+
+    try:
+        if report_type == "compliance":
+            rows = influencer_client.get_compliance_report(
+                entity=entity_filter,
+                athlete=athlete,
+            )
+            return influencer_client.format_compliance_report_for_llm(
+                rows, entity_scope=entity_filter
+            )
+        else:
+            # status or overdue — both read the open list; overdue just changes the label
+            rows = influencer_client.get_deliverables(
+                entity=entity_filter,
+                athlete=athlete,
+                include_complete=False,
+                include_waived=False,
+            )
+            if report_type == "overdue":
+                rows = [r for r in rows if r["display_status"] == "overdue"]
+                label = "Overdue Influencer Deliverables"
+            else:
+                label = "Influencer Deliverables"
+            return influencer_client.format_status_report_for_llm(
+                rows,
+                entity_scope=entity_filter,
+                report_label=label,
+            )
+    except influencer_client.InfluencerClientError as exc:
+        log.warning("influencer_get_status error actor=%s: %s", slack_user_id, exc)
+        return f"Influencer tracker error: {exc}. Tell the user there was a problem reading the deliverable data."
+
+
+def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Add, complete, or waive an influencer deliverable.
+
+    Write tool — same staged-write doctrine as asana_create_task / gmail_create_draft.
+    Refuses to fire without confirmed=True. Claude must show a preview block first.
+
+    action=add:      Register a new promised deliverable.
+    action=complete: Mark an existing deliverable as done.
+    action=waive:    Mark an existing deliverable as excused / cancelled.
+    """
+    input_data = _input or {}
+
+    # Confirmation gate
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "influencer_log_deliverable refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a preview block AND received their explicit "
+            "approval ('yes', 'log it', 'mark it done', 'waive it', or similar). "
+            "If you have NOT done that yet, format a clear preview NOW and ask the user "
+            "to confirm before writing to the tracker."
+        )
+
+    action = (input_data.get("action") or "add").strip().lower()
+    if action not in ("add", "complete", "waive"):
+        return (
+            f"influencer_log_deliverable: unknown action {action!r}. "
+            f"Valid actions are: add, complete, waive."
+        )
+
+    # Resolve actor display name for audit log
+    asker_map = _load_slack_asana_map()
+    actor_display = (asker_map.get(slack_user_id) or {}).get("display_name", slack_user_id)
+
+    try:
+        if action == "add":
+            athlete_name = (input_data.get("athlete_name") or "").strip()
+            platform = (input_data.get("platform") or "").strip()
+            deliverable_type = (input_data.get("deliverable_type") or "").strip()
+            due_date = (input_data.get("due_date") or "").strip() or None
+            notes = input_data.get("notes") or None
+            hubspot_deal_id = (input_data.get("hubspot_deal_id") or "").strip() or None
+            # Entity: prefer tool-provided override, fall back to channel entity
+            row_entity = (input_data.get("entity") or entity or "F3E").strip().upper()
+
+            if not athlete_name:
+                return "influencer_log_deliverable: `athlete_name` is required for action=add."
+            if not platform:
+                return "influencer_log_deliverable: `platform` is required for action=add (e.g. instagram, tiktok)."
+            if not deliverable_type:
+                return "influencer_log_deliverable: `deliverable_type` is required for action=add (e.g. post, story, reel)."
+
+            row = influencer_client.add_deliverable(
+                athlete_name=athlete_name,
+                platform=platform,
+                deliverable_type=deliverable_type,
+                due_date=due_date,
+                notes=notes,
+                hubspot_deal_id=hubspot_deal_id,
+                entity=row_entity,
+                created_by=slack_user_id,
+            )
+            row["display_status"] = "pending"
+            log.info(
+                "influencer_log_deliverable ADD actor=%s id=%d athlete=%r",
+                actor_display, row["id"], row["athlete_name"],
+            )
+            return influencer_client.format_logged_deliverable_for_llm(row, action="add")
+
+        else:  # complete or waive
+            deliverable_id_raw = input_data.get("deliverable_id")
+            if not deliverable_id_raw:
+                return (
+                    f"influencer_log_deliverable: `deliverable_id` is required for action={action}. "
+                    f"Ask the user for the deliverable ID (shown in status reports as #N)."
+                )
+            try:
+                deliverable_id = int(deliverable_id_raw)
+            except (TypeError, ValueError):
+                return (
+                    f"influencer_log_deliverable: `deliverable_id` must be a number. "
+                    f"Got {deliverable_id_raw!r}."
+                )
+
+            if action == "complete":
+                completion_link = (input_data.get("completion_link") or "").strip() or None
+                notes = input_data.get("notes") or None
+                row = influencer_client.mark_complete(
+                    deliverable_id=deliverable_id,
+                    completion_link=completion_link,
+                    notes=notes,
+                    actor=actor_display,
+                )
+                row["display_status"] = "complete"
+                log.info(
+                    "influencer_log_deliverable COMPLETE actor=%s id=%d athlete=%r",
+                    actor_display, deliverable_id, row["athlete_name"],
+                )
+                return influencer_client.format_logged_deliverable_for_llm(row, action="complete")
+
+            else:  # waive
+                notes = input_data.get("notes") or None
+                row = influencer_client.mark_waived(
+                    deliverable_id=deliverable_id,
+                    notes=notes,
+                    actor=actor_display,
+                )
+                row["display_status"] = "waived"
+                log.info(
+                    "influencer_log_deliverable WAIVE actor=%s id=%d athlete=%r",
+                    actor_display, deliverable_id, row["athlete_name"],
+                )
+                return influencer_client.format_logged_deliverable_for_llm(row, action="waive")
+
+    except influencer_client.InfluencerClientError as exc:
+        log.warning(
+            "influencer_log_deliverable FAILED actor=%s action=%s: %s",
+            actor_display, action, exc,
+        )
+        return (
+            f"Influencer tracker error: {exc}. Tell the user the action wasn't completed "
+            f"and suggest they check the deliverable ID or input values."
+        )
+
+
 def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → HubSpot owner_id → fetch deals → channel-scope by pipeline → format."""
     mapping = _load_slack_hubspot_map()
@@ -1255,6 +1431,118 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "influencer_get_status",
+        "description": (
+            "Fetch the current status of influencer / sponsored-athlete deliverables tracked "
+            "in Cora's influencer tracker. Use this when Alex, Harrison, or any team member "
+            "asks about influencer compliance, pending posts, overdue deliverables, or wants "
+            "a compliance report — phrases like 'what influencer deliverables are pending', "
+            "'who's overdue on their posts', 'show me the influencer tracker', 'compliance "
+            "report for our athletes', 'has [athlete] posted yet', 'what's outstanding for "
+            "[name]'. Returns a Slack-formatted list or per-athlete compliance breakdown. "
+            "Channel entity scope applies — in F3E channels only F3E-tagged deliverables "
+            "appear; FNDR channels see all entities. Does NOT require confirmation — read-only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "report_type": {
+                    "type": "string",
+                    "description": (
+                        "Type of report to generate. "
+                        "'status' (default) — all open (pending + overdue) deliverables. "
+                        "'overdue' — only past-due deliverables. "
+                        "'compliance' — per-athlete compliance percentage table (complete / total owed)."
+                    ),
+                },
+                "athlete": {
+                    "type": "string",
+                    "description": "Optional. Filter to a specific athlete by name (partial match). If omitted, returns all athletes.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "influencer_log_deliverable",
+        "description": (
+            "Add, complete, or waive an influencer deliverable in Cora's sponsored-athlete "
+            "tracker. This is a WRITE tool — same staged-write pattern as other Cora write tools.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write — never skip):\n"
+            "1. When the user asks to log, add, complete, or waive a deliverable, show a "
+            "   PREVIEW BLOCK in your reply first. For add: show athlete, platform, type, due date. "
+            "   For complete: show the deliverable ID, athlete, and optional link. "
+            "   For waive: show the deliverable ID, athlete, and reason. "
+            "   DO NOT call this tool on the first turn.\n"
+            "2. Wait for the user's explicit approval ('yes', 'log it', 'mark it done', "
+            "   'looks good', etc.). Then call with confirmed=true.\n"
+            "3. If they want changes, re-show the preview and wait again.\n"
+            "\n"
+            "Use this tool when:\n"
+            "- action=add: 'add a deliverable for [athlete]', 'log that [athlete] owes us a post', "
+            "  'track a sponsored reel from [name] due [date]'.\n"
+            "- action=complete: '[athlete] posted their story', 'mark #5 as done', "
+            "  'log that [athlete] delivered their reel — here's the link'.\n"
+            "- action=waive: 'waive [athlete]'s post this month', 'cancel the deliverable for [name]', "
+            "  'mark #7 as excused — they had an injury'.\n"
+            "\n"
+            "For action=complete or action=waive, you need the deliverable_id (shown as #N in "
+            "status reports). If the user doesn't know the ID, call influencer_get_status first "
+            "to find it, then confirm the right one with the user before completing/waiving."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Required. One of: 'add' (create new deliverable), 'complete' (mark as done), 'waive' (mark as excused/cancelled).",
+                },
+                "athlete_name": {
+                    "type": "string",
+                    "description": "Full name of the sponsored athlete / influencer. Required for action=add.",
+                },
+                "platform": {
+                    "type": "string",
+                    "description": "Social platform. Required for action=add. Examples: instagram, tiktok, youtube, twitter, podcast.",
+                },
+                "deliverable_type": {
+                    "type": "string",
+                    "description": "Type of deliverable. Required for action=add. Examples: post, story, reel, video, tweet, shoutout, podcast_mention.",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "Optional. Due date in YYYY-MM-DD format. Used for action=add.",
+                },
+                "deliverable_id": {
+                    "type": "integer",
+                    "description": "ID of an existing deliverable. Required for action=complete and action=waive. Shown as #N in status reports.",
+                },
+                "completion_link": {
+                    "type": "string",
+                    "description": "Optional. URL to the completed post. Used for action=complete.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional. Free-text context (reason for waive, post caption, deal notes, etc.).",
+                },
+                "hubspot_deal_id": {
+                    "type": "string",
+                    "description": "Optional. HubSpot deal ID to link this deliverable to the source sponsorship deal. Used for action=add.",
+                },
+                "entity": {
+                    "type": "string",
+                    "description": "Optional. Entity code for the deal (e.g. F3E, UFL). Defaults to channel entity. Used for action=add.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Required. Set to true ONLY after you have shown the user a preview and received explicit approval. If false or omitted, the tool refuses.",
+                },
+            },
+            "required": ["action", "confirmed"],
+        },
+    },
+    {
         "name": "hubspot_get_my_deals",
         "description": (
             "Fetch the open HubSpot deals owned by the user who @-mentioned Cora. "
@@ -1410,9 +1698,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_user_tasks": _tool_get_user_tasks,
     "asana_create_task": _tool_asana_create_task,
     "gmail_create_draft": _tool_gmail_create_draft,
-    "hubspot_get_my_deals": _tool_get_my_deals,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
+    "influencer_get_status": _tool_influencer_get_status,
+    "influencer_log_deliverable": _tool_influencer_log_deliverable,
+    "hubspot_get_my_deals": _tool_get_my_deals,
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
     "qbo_get_balance_sheet": _tool_qbo_get_balance_sheet,
     "qbo_get_ar_aging": _tool_qbo_get_ar_aging,
