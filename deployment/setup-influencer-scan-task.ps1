@@ -52,7 +52,7 @@ Register-ScheduledTask `
     -Action     $Action `
     -Trigger    $Trigger `
     -Settings   $Settings `
-    -Description "Cora influencer scan — polls F3 brand IG accounts every 2h for athlete post detections" `
+    -Description "Cora influencer scan - polls F3 brand IG accounts every 2h for athlete post detections" `
     | Out-Null
 
 Write-Host ""
