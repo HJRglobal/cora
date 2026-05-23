@@ -794,6 +794,70 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
     return calendar_client.format_created_event_for_llm(event, user_email=user_email)
 
 
+def _tool_influencer_add_handle(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Register an athlete's social media handle in the influencer tracker.
+
+    Write tool — confirmed=True gate. Once registered, the automated Instagram
+    scanner can match detected mentions/tags directly to the athlete's name
+    and deliverable record without Alex having to identify them manually.
+
+    Alex uses this when onboarding a new sponsored athlete:
+        '@Cora add handle for Luis Pena — instagram @luispena_ufc'
+    """
+    input_data = _input or {}
+
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "influencer_add_handle refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a preview (athlete name, platform, handle) "
+            "AND received their explicit approval. Show the preview first, then re-call "
+            "with confirmed=true."
+        )
+
+    athlete_name = (input_data.get("athlete_name") or "").strip()
+    platform = (input_data.get("platform") or "").strip().lower()
+    handle = (input_data.get("handle") or "").strip()
+    row_entity = (input_data.get("entity") or entity or "F3E").strip().upper()
+
+    if not athlete_name:
+        return "influencer_add_handle: `athlete_name` is required."
+    if not platform:
+        return "influencer_add_handle: `platform` is required (instagram or tiktok)."
+    if not handle:
+        return "influencer_add_handle: `handle` is required (the athlete's account handle, with or without @)."
+
+    try:
+        row = influencer_client.register_handle(
+            athlete_name=athlete_name,
+            platform=platform,
+            handle=handle,
+            entity=row_entity,
+            added_by=slack_user_id,
+        )
+    except influencer_client.InfluencerClientError as exc:
+        log.warning(
+            "influencer_add_handle FAILED actor=%s athlete=%r: %s",
+            slack_user_id, athlete_name, exc,
+        )
+        return f"Influencer tracker error: {exc}. Tell the user the handle wasn't registered."
+
+    clean_handle = row["handle"]
+    log.info(
+        "influencer_add_handle REGISTERED actor=%s athlete=%r platform=%s handle=%s entity=%s",
+        slack_user_id, athlete_name, platform, clean_handle, row_entity,
+    )
+    return (
+        f"Handle REGISTERED. Surface this to the user:\n"
+        f"- *{athlete_name}* → {platform.capitalize()} @{clean_handle} [{row_entity}]\n"
+        f"The Instagram scanner will now automatically match this athlete when they tag "
+        f"the F3 brand accounts. Any new detections will appear in <#{_NOTIFY_CHANNEL_HINT}>."
+    )
+
+
+_NOTIFY_CHANNEL_HINT = "f3-sales"  # display hint only; actual channel set via INFLUENCER_SCAN_NOTIFY_CHANNEL env var
+
+
 def _tool_influencer_get_status(slack_user_id: str, entity: str, _input: dict) -> str:
     """Return an influencer deliverable status or compliance report.
 
@@ -1431,6 +1495,51 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "influencer_add_handle",
+        "description": (
+            "Register a sponsored athlete's social media handle in Cora's influencer tracker. "
+            "Once registered, the automated Instagram scanner can automatically match that "
+            "athlete's posts to their deliverables without Alex having to identify them. "
+            "Use this when onboarding a new sponsored athlete or adding a platform handle for "
+            "an existing athlete — phrases like 'add handle for [athlete]', 'register [athlete]'s "
+            "Instagram', '[athlete] is @handle on TikTok', 'add [name] to the influencer tracker'.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write — never skip):\n"
+            "1. Show a preview: Athlete name, platform, handle. Ask the user to confirm.\n"
+            "2. Wait for explicit approval ('yes', 'register it', 'add it').\n"
+            "3. Then call with confirmed=true.\n"
+            "\n"
+            "Platform values: 'instagram', 'tiktok'. "
+            "Handle: the athlete's account username, with or without the @ symbol."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "athlete_name": {
+                    "type": "string",
+                    "description": "Full name of the sponsored athlete as it appears in their contract / deliverable records.",
+                },
+                "platform": {
+                    "type": "string",
+                    "description": "Social platform: 'instagram' or 'tiktok'.",
+                },
+                "handle": {
+                    "type": "string",
+                    "description": "The athlete's account handle on that platform (with or without @). Example: '@luispena_ufc' or 'luispena_ufc'.",
+                },
+                "entity": {
+                    "type": "string",
+                    "description": "Optional entity code for the sponsoring brand (default: F3E). Use UFL for fight-league athletes.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Required. Set to true ONLY after preview and explicit user approval.",
+                },
+            },
+            "required": ["athlete_name", "platform", "handle", "confirmed"],
+        },
+    },
+    {
         "name": "influencer_get_status",
         "description": (
             "Fetch the current status of influencer / sponsored-athlete deliverables tracked "
@@ -1700,6 +1809,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "gmail_create_draft": _tool_gmail_create_draft,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
+    "influencer_add_handle": _tool_influencer_add_handle,
     "influencer_get_status": _tool_influencer_get_status,
     "influencer_log_deliverable": _tool_influencer_log_deliverable,
     "hubspot_get_my_deals": _tool_get_my_deals,

@@ -19,9 +19,15 @@ Write doctrine (same as other Cora write tools):
 - Audit log: actor / athlete / deliverable_id / action / status.
   Post content / notes NOT logged.
 
+Automated monitoring:
+- instagram_monitor.py (src/cora/connectors/) polls the F3 brand accounts' tagged
+  media and brand hashtags every 2 hours via a Windows scheduled task.
+- Detections are deduped via the detection_log table and posted to Slack for Alex to confirm.
+- Athlete social handles are registered via the influencer_add_handle Cora tool.
+
 Deferred for follow-up:
-- Automated delivery link scraping (would need social API tokens).
 - Recurring deliverable templates (e.g. "2 posts/month" auto-generates rows each cycle).
+- TikTok monitoring (pending TikTok Research API approval — scaffold in tiktok_monitor.py).
 - Bulk import from HubSpot (sync all deals tagged as influencer deals → seed deliverables).
 """
 
@@ -66,6 +72,37 @@ def _get_conn() -> sqlite3.Connection:
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Create tables if they don't exist. Safe to run on every connection open."""
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS influencer_handles (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_name    TEXT    NOT NULL,
+            platform        TEXT    NOT NULL,
+            handle          TEXT    NOT NULL,
+            entity          TEXT    NOT NULL DEFAULT 'F3E',
+            added_by        TEXT,
+            added_at        TEXT    NOT NULL,
+            UNIQUE(platform, handle)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hdl_athlete  ON influencer_handles(athlete_name);
+        CREATE INDEX IF NOT EXISTS idx_hdl_platform ON influencer_handles(platform, handle);
+
+        CREATE TABLE IF NOT EXISTS detection_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform        TEXT    NOT NULL,
+            post_id         TEXT    NOT NULL,
+            brand_handle    TEXT    NOT NULL,
+            athlete_name    TEXT,
+            athlete_handle  TEXT,
+            media_type      TEXT,
+            post_url        TEXT,
+            caption_snippet TEXT,
+            detected_at     TEXT    NOT NULL,
+            slack_notified  INTEGER NOT NULL DEFAULT 0,
+            deliverable_id  INTEGER,
+            UNIQUE(platform, post_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_det_platform    ON detection_log(platform, post_id);
+        CREATE INDEX IF NOT EXISTS idx_det_detected_at ON detection_log(detected_at);
+
         CREATE TABLE IF NOT EXISTS influencer_deliverables (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             athlete_name    TEXT    NOT NULL,
@@ -87,6 +124,182 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_inf_entity    ON influencer_deliverables(entity);
     """)
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Handle registry
+# ---------------------------------------------------------------------------
+
+def register_handle(
+    *,
+    athlete_name: str,
+    platform: str,
+    handle: str,
+    entity: str = "F3E",
+    added_by: str | None = None,
+) -> dict[str, Any]:
+    """Register a social media handle for an athlete.
+
+    Handles are stored without the leading '@'. If the (platform, handle) pair
+    already exists the row is updated with the new athlete_name / entity mapping
+    (upsert semantics — one handle can only belong to one athlete per platform).
+
+    Raises InfluencerClientError on blank inputs.
+    """
+    if not athlete_name or not athlete_name.strip():
+        raise InfluencerClientError("athlete_name is required.")
+    if not platform or not platform.strip():
+        raise InfluencerClientError("platform is required (e.g. instagram, tiktok).")
+    if not handle or not handle.strip():
+        raise InfluencerClientError("handle is required.")
+
+    clean_handle = handle.strip().lstrip("@").lower()
+    clean_platform = platform.strip().lower()
+    now_str = date.today().isoformat()
+
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO influencer_handles
+                (athlete_name, platform, handle, entity, added_by, added_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, handle) DO UPDATE SET
+                athlete_name = excluded.athlete_name,
+                entity       = excluded.entity,
+                added_by     = excluded.added_by,
+                added_at     = excluded.added_at
+            """,
+            (
+                athlete_name.strip(),
+                clean_platform,
+                clean_handle,
+                entity.strip().upper(),
+                added_by,
+                now_str,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM influencer_handles WHERE platform = ? AND handle = ?",
+            (clean_platform, clean_handle),
+        ).fetchone()
+
+    log.info(
+        "influencer register_handle athlete=%r platform=%s handle=%s entity=%s added_by=%s",
+        row["athlete_name"], row["platform"], row["handle"], row["entity"],
+        added_by or "(unknown)",
+    )
+    return dict(row)
+
+
+def get_athlete_by_handle(platform: str, handle: str) -> dict[str, Any] | None:
+    """Look up an athlete record by their platform handle. Returns None if not registered.
+
+    Accepts handles with or without the leading '@'.
+    """
+    clean_handle = handle.strip().lstrip("@").lower()
+    clean_platform = platform.strip().lower()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM influencer_handles WHERE platform = ? AND handle = ?",
+            (clean_platform, clean_handle),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_handles(
+    *,
+    entity: str | None = None,
+    platform: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return all registered handles, optionally filtered by entity or platform."""
+    clauses, params = [], []
+    if entity and entity.upper() != "FNDR":
+        clauses.append("entity = ?")
+        params.append(entity.upper())
+    if platform:
+        clauses.append("platform = ?")
+        params.append(platform.strip().lower())
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM influencer_handles {where} ORDER BY athlete_name, platform",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Detection log (dedup for the automated scanner)
+# ---------------------------------------------------------------------------
+
+def is_already_detected(platform: str, post_id: str) -> bool:
+    """Return True if this platform post_id has already been logged."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM detection_log WHERE platform = ? AND post_id = ?",
+            (platform.lower(), str(post_id)),
+        ).fetchone()
+    return row is not None
+
+
+def log_detection(
+    *,
+    platform: str,
+    post_id: str,
+    brand_handle: str,
+    athlete_name: str | None = None,
+    athlete_handle: str | None = None,
+    media_type: str | None = None,
+    post_url: str | None = None,
+    caption_snippet: str | None = None,
+    slack_notified: bool = False,
+    deliverable_id: int | None = None,
+) -> dict[str, Any]:
+    """Insert a detection event. Silently ignores duplicate (platform, post_id) pairs.
+
+    Returns the inserted or existing row.
+    """
+    now_str = date.today().isoformat()
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO detection_log
+                (platform, post_id, brand_handle, athlete_name, athlete_handle,
+                 media_type, post_url, caption_snippet, detected_at,
+                 slack_notified, deliverable_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                platform.lower(),
+                str(post_id),
+                brand_handle,
+                athlete_name,
+                athlete_handle,
+                media_type,
+                post_url,
+                caption_snippet,
+                now_str,
+                1 if slack_notified else 0,
+                deliverable_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM detection_log WHERE platform = ? AND post_id = ?",
+            (platform.lower(), str(post_id)),
+        ).fetchone()
+    return dict(row)
+
+
+def mark_detection_notified(platform: str, post_id: str) -> None:
+    """Mark a detection row as Slack-notified after the message is posted."""
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE detection_log SET slack_notified = 1 WHERE platform = ? AND post_id = ?",
+            (platform.lower(), str(post_id)),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
