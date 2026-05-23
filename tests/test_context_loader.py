@@ -85,6 +85,7 @@ def test_load_context_no_known_answers_file(monkeypatch, tmp_path):
     monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e_path)
     monkeypatch.setattr(cl, "_FOUNDER_PATH", founder_path)
     monkeypatch.setitem(cl._KNOWN_ANSWERS_PATHS, "F3E", missing_ka)
+    monkeypatch.setattr(cl, "load_dynamic_answers", lambda entity: "")
 
     result = cl.load_context("F3E")
 
