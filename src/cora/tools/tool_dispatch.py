@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, calendar_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from . import asana_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -1218,6 +1218,38 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
     return qbo_client.format_recent_transactions_for_llm(payload, target, days)
 
 
+# --- Financial / cashflow tools ---
+
+
+def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch current-week cash flow from the Standing ACTUALS sheet."""
+    entity_filter = (_input or {}).get("entity_filter") or None
+    # If the entity_filter wasn't provided but we're in a specific entity channel,
+    # offer to scope automatically (but don't force-scope — portfolio view is useful too)
+    result = financial_client.get_cashflow_text(
+        entity_filter=entity_filter,
+        channel=entity,
+        user=slack_user_id,
+    )
+    log.info(
+        "financial_get_cashflow entity=%s entity_filter=%s result_len=%d",
+        entity,
+        entity_filter,
+        len(result),
+    )
+    return result
+
+
+def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Post a finance data gap alert to #hjrg-finance and return the fixed response."""
+    topic = (_input or {}).get("topic") or "unspecified financial question"
+    return financial_client.notify_gap(
+        topic=topic,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -1798,6 +1830,66 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "financial_get_cashflow",
+        "description": (
+            "Fetch the current week's cash flow data from the portfolio's Standing ACTUALS "
+            "sheet. Use this when a user in a TIER_1 or FNDR channel asks about cash "
+            "position, weekly cash flow, how much cash we have, entity net cash, opening "
+            "or closing balances, or portfolio-wide cash status — phrases like 'what's our "
+            "cash this week', 'how is OSN doing on cash', 'portfolio cash position', 'what "
+            "does the cash flow look like'. "
+            "Returns the most recent week with actual data for all 18 portfolio entities "
+            "plus portfolio totals and opening/closing balances. "
+            "The `entity_filter` parameter scopes output to a single entity or entity group "
+            "(e.g. 'OSN', 'LEX', 'LEX-LBHS'). Omit for portfolio-wide view. "
+            "IMPORTANT: if this tool returns the UNKNOWN_RESPONSE string (starts with "
+            "'I don\\'t have that right now'), immediately call financial_notify_gap. "
+            "NEVER call this tool in TIER_3 (sales/ops) channels — financial guardrail applies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_filter": {
+                    "type": "string",
+                    "description": (
+                        "Optional entity code to scope output. Examples: 'OSN' (all OSN "
+                        "stores), 'LEX' (all Lex entities), 'OSN-GW' (Gilbert & Warner), "
+                        "'F3E', 'BDM', 'UFL'. Omit for full portfolio view."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "financial_notify_gap",
+        "description": (
+            "Post a finance data gap alert to the #hjrg-finance channel and return the "
+            "standard unknown-answer response string. Call this tool when: "
+            "(1) financial_get_cashflow returned the UNKNOWN_RESPONSE string, OR "
+            "(2) the user asked a financial question that financial_get_cashflow cannot "
+            "answer (e.g. a specific month's P&L, QBO balance sheet, or a question about "
+            "data that isn't in the Standing ACTUALS sheet). "
+            "The notification is throttled to one per topic per 24 hours — call it freely, "
+            "the tool handles deduplication. Always return the tool's output verbatim to "
+            "the user — do not rephrase or soften it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "Short description of what the user asked for that could not be "
+                        "answered. Example: 'OSN April P&L', 'QBO balance sheet for F3E', "
+                        "'weekly cash flow (connector error)'. Used in the Slack alert."
+                    ),
+                },
+            },
+            "required": ["topic"],
+        },
+    },
 ]
 
 
@@ -1818,6 +1910,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_ar_aging": _tool_qbo_get_ar_aging,
     "qbo_get_ap_aging": _tool_qbo_get_ap_aging,
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
+    "financial_get_cashflow": _tool_financial_get_cashflow,
+    "financial_notify_gap": _tool_financial_notify_gap,
 }
 
 
