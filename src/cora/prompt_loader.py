@@ -26,7 +26,7 @@ _ENTITY_FILES: dict[str, str] = {
     "BDM":      "bdm.md",
     "FNDR":     "fndr.md",
     "HJRG":     "fndr.md",      # HJRG uses FNDR prompt
-    "HJRP":     "fndr.md",      # HJRP uses FNDR prompt (no dedicated prompt yet)
+    "HJRP":     "hjrp.md",      # HJR Properties entity prompt
 }
 
 _cache: dict[str, str] = {}
