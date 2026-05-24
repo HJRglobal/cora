@@ -19,6 +19,7 @@ from .entity_router import route
 from . import feedback_log
 from . import help_responder
 from . import knowledge_gaps
+from . import sibling_guard
 from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
@@ -94,6 +95,24 @@ def handle_mention(event: dict, say: callable, client) -> None:
         log.info("help-intent detected channel=#%s user=%s", channel_name, user_id)
         help_text = help_responder.build_message(entity, function, tier)
         say(text=help_text, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+        return
+
+    # Sibling-entity redirect interception: for LEX sub-entity channels, if the
+    # message asks about a sibling entity (e.g. LLA question in #llc channel),
+    # return the one-sentence redirect deterministically — no LLM call needed.
+    # This bypasses the LLM's helpfulness bias overriding format instructions.
+    sibling_redirect = sibling_guard.check_redirect(entity, user_message)
+    if sibling_redirect:
+        log.info(
+            "sibling-entity redirect fired channel=#%s entity=%s",
+            channel_name, entity,
+        )
+        say(
+            text=sibling_redirect,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
         return
 
     runtime_context = (
