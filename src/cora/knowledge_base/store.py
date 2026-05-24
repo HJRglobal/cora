@@ -68,15 +68,24 @@ _LEX_SUB_ENTITY_VISIBILITY: dict[str, tuple[str, ...]] = {
 def build_sub_entity_filter(sub_entity: str) -> tuple[str, list[str]] | None:
     """Return (sql_fragment, params) to scope KB results to a LEX sub-entity, or None.
 
-    Untagged chunks (sub_entity IS NULL) are always visible — they represent
-    GM-level / cross-sub-entity content that all sub-entities can see.
-    Tagged chunks are only visible to the matching sub-entity channel.
+    STRICT MODE — only chunks explicitly tagged for this sub-entity are returned.
+    Untagged chunks (sub_entity IS NULL) are excluded.
+
+    Rationale: the LEX parent CLAUDE.md, Asana tasks, and Fireflies transcripts
+    are all indexed with sub_entity=NULL (GM-level tagging). Those documents
+    contain financial data, cap tables, and ownership details for ALL Lex
+    sub-entities. Allowing NULL-tagged chunks to pass through is the vector
+    by which sibling entity data leaks into sub-entity channels.
+
+    Tradeoff: fewer KB results until sub-entity tagging coverage improves.
+    That is acceptable — the sub-entity CLAUDE.md stub provides essential
+    context, and an empty KB result is safer than a leaking one.
     """
     visibility = _LEX_SUB_ENTITY_VISIBILITY.get(sub_entity)
     if not visibility:
         return None
     placeholders = ",".join("?" * len(visibility))
-    return f"(sub_entity IS NULL OR sub_entity IN ({placeholders}))", list(visibility)
+    return f"sub_entity IN ({placeholders})", list(visibility)
 
 
 class KnowledgeBaseError(Exception):

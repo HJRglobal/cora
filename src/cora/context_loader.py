@@ -193,6 +193,10 @@ def _try_kb_retrieve(entity: str, query: str) -> str | None:
         # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX".
         kb_entity = _LEX_PARENT.get(entity, entity)
         sub_entity_scope = entity if entity in _LEX_PARENT else None
+        # LEX sub-entity channels must NOT receive FNDR-entity KB chunks.
+        # The founder CLAUDE.md is indexed under entity=FNDR and contains
+        # cross-entity financial data for all portfolio entities.
+        include_fndr = entity not in _NO_FOUNDER_CONTEXT
         kb = KnowledgeBase(_KB_DB_PATH)
         try:
             results = kb.search(
@@ -200,6 +204,7 @@ def _try_kb_retrieve(entity: str, query: str) -> str | None:
                 entity=kb_entity,
                 k=_KB_TOP_K,
                 max_age_days=_KB_MAX_AGE_DAYS,
+                include_fndr=include_fndr,
                 sub_entity=sub_entity_scope,
             )
         finally:
