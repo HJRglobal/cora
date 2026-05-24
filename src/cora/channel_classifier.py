@@ -1,6 +1,6 @@
 """Channel function classification and financial-access tier assignment."""
 
-KNOWN_FUNCTIONS = {"leadership", "finance", "hr", "sales", "ops", "clients", "founder", "build"}
+KNOWN_FUNCTIONS = {"leadership", "finance", "hr", "sales", "ops", "clients", "founder", "build", "legal"}
 
 _SPECIAL_CHANNELS = {
     "cora-build": "build",
@@ -34,4 +34,4 @@ def is_tier_1(entity: str, function: str) -> bool:
 
 
 def tier_label(entity: str, function: str) -> str:
-    return "TIER_1" if is_tier_1(entity, function) else "TIER_3"
+    return "TIER_1" if is_tier_1(entity, function) else 
