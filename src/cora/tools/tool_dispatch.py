@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, clover_client, financial_client, gmail_client, hubspot_client, influencer_client, inventory_client, notion_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -1299,6 +1299,113 @@ def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) ->
     )
 
 
+
+# --- OSN Clover tools ---
+
+
+def _tool_osn_sales_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return OSN sales summary from Clover POS for one or all stores."""
+    store = (_input.get("store") or "all").upper()
+    period = _input.get("period") or "today"
+
+    if period not in clover_client.VALID_PERIODS:
+        period = "today"
+
+    try:
+        if store == "ALL":
+            summaries = clover_client.get_all_stores_sales_pulse(period)
+        elif store in clover_client.VALID_STORES:
+            summaries = [clover_client.get_sales_pulse(store, period)]
+        else:
+            return (
+                f"Unknown store code {store!r}. "
+                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
+            )
+    except clover_client.CloverConfigError as exc:
+        log.warning("osn_sales_pulse config error: %s", exc)
+        return "I don't have that right now."
+    except clover_client.CloverConnectorError as exc:
+        log.warning("osn_sales_pulse connector error user=%s: %s", slack_user_id, exc)
+        return "I don't have that right now."
+
+    if not summaries:
+        return "No sales data returned for that period."
+
+    log.info(
+        "osn_sales_pulse user=%s entity=%s store=%s period=%s stores_returned=%d",
+        slack_user_id, entity, store, period, len(summaries),
+    )
+    return clover_client.format_sales_for_llm(summaries, period)
+
+
+def _tool_osn_inventory_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return OSN inventory levels from Clover POS with low-stock flags."""
+    store = (_input.get("store") or "all").upper()
+    low_stock_only = _input.get("low_stock_only", True)
+    threshold = int(_input.get("threshold") or clover_client.DEFAULT_LOW_STOCK_THRESHOLD)
+
+    try:
+        if store == "ALL":
+            summaries = clover_client.get_all_stores_inventory(threshold)
+        elif store in clover_client.VALID_STORES:
+            summaries = [clover_client.get_inventory(store, threshold)]
+        else:
+            return (
+                f"Unknown store code {store!r}. "
+                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
+            )
+    except clover_client.CloverConfigError as exc:
+        log.warning("osn_inventory_status config error: %s", exc)
+        return "I don't have that right now."
+    except clover_client.CloverConnectorError as exc:
+        log.warning("osn_inventory_status connector error user=%s: %s", slack_user_id, exc)
+        return "I don't have that right now."
+
+    if not summaries:
+        return "No inventory data returned."
+
+    log.info(
+        "osn_inventory_status user=%s entity=%s store=%s low_stock_only=%s",
+        slack_user_id, entity, store, low_stock_only,
+    )
+    return clover_client.format_inventory_for_llm(summaries, bool(low_stock_only))
+
+
+def _tool_osn_customer_trends(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return OSN customer trend data from Clover POS with MoM delta."""
+    store = (_input.get("store") or "all").upper()
+    period = _input.get("period") or "30d"
+
+    if period not in clover_client.VALID_PERIODS:
+        period = "30d"
+
+    try:
+        if store == "ALL":
+            summaries = clover_client.get_all_stores_customer_trends(period)
+        elif store in clover_client.VALID_STORES:
+            summaries = [clover_client.get_customer_trends(store, period)]
+        else:
+            return (
+                f"Unknown store code {store!r}. "
+                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
+            )
+    except clover_client.CloverConfigError as exc:
+        log.warning("osn_customer_trends config error: %s", exc)
+        return "I don't have that right now."
+    except clover_client.CloverConnectorError as exc:
+        log.warning("osn_customer_trends connector error user=%s: %s", slack_user_id, exc)
+        return "I don't have that right now."
+
+    if not summaries:
+        return "No customer data returned for that period."
+
+    log.info(
+        "osn_customer_trends user=%s entity=%s store=%s period=%s",
+        slack_user_id, entity, store, period,
+    )
+    return clover_client.format_customer_trends_for_llm(summaries)
+
+
 # --- FNDR-specific tools ---
 
 
@@ -1426,6 +1533,14 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
     return "\n".join(lines)
 
 
+def _tool_fndr_contracts_dashboard(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return upcoming contract renewals ≤75d + all Escalate-flag items from the registry."""
+    result = notion_client.get_contracts_dashboard_text()
+    log.info("fndr_contracts_dashboard user=%s entity=%s result_len=%d",
+             slack_user_id, entity, len(result))
+    return result
+
+
 def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
     """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
 
@@ -1522,50 +1637,23 @@ def _tool_ads_get_cm_waterfall(slack_user_id: str, entity: str, _input: dict) ->
     )
 
 
-# --- F3 brand voice check ---
-
-
-def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
-
-    Read-only, no external calls. Returns a structured findings report (CRITICAL / WARNING / INFO)
-    plus the brand's locked voice-pillar summary so Claude can synthesize a helpful reply.
-
-    Checks:
-      - Health/nutrition claims (universal — all three brands)
-      - Cross-entity UFL pause (universal — F3-UFL crossover blocked)
-      - Sleep positioning (Mood ONLY — CRITICAL anti-pattern)
-      - Sibling-brand drift (Energy-lane or Mood-lane language in the wrong brand's copy)
-      - Anti-positioning (competitor brand names in Energy copy, etc.)
-    """
-    input_data = _input or {}
-    brand = (input_data.get("brand") or "").strip().lower()
-    copy = (input_data.get("copy") or "").strip()
-
-    if not brand:
+def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return a full F3E Retail pipeline summary: stage breakdown, hot list, owner split, closed."""
+    log.info("f3e_hubspot_pipeline_summary user=%s entity=%s", slack_user_id, entity)
+    try:
+        return hubspot_client.get_f3e_pipeline_summary_text()
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning("f3e_hubspot_pipeline_summary HubSpot error: %s", exc)
         return (
-            "f3e_brand_voice_check called without `brand`. "
-            "Ask the user which F3 sub-brand the copy is for: pure, mood, or energy."
-        )
-    if not copy:
-        return (
-            "f3e_brand_voice_check called without `copy`. "
-            "Ask the user to paste the draft copy they want checked."
-        )
-    if brand not in brand_voice_client.VALID_BRANDS:
-        return (
-            f"f3e_brand_voice_check: unknown brand {brand!r}. "
-            f"Must be one of: {', '.join(brand_voice_client.VALID_BRANDS)}. "
-            "Ask the user which F3 sub-brand the copy is for."
+            f"f3e_hubspot_pipeline_summary: HubSpot call failed — {exc}. "
+            "Apologize to the user and suggest checking HubSpot directly or trying again shortly."
         )
 
-    log.info(
-        "f3e_brand_voice_check brand=%s copy_len=%d user=%s entity=%s",
-        brand, len(copy), slack_user_id, entity,
-    )
 
-    result = brand_voice_client.check_copy(brand, copy)
-    return brand_voice_client.format_result_for_llm(result)
+def _tool_f3e_inventory_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return a formatted F3E inventory pulse: Cotton + Nimbl + office stock per SKU with flags."""
+    log.info("f3e_inventory_pulse user=%s entity=%s", slack_user_id, entity)
+    return inventory_client.get_f3e_inventory_pulse_text()
 
 
 # --- Catalog: tool definitions exposed to Claude ---
@@ -2255,6 +2343,76 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "fndr_contracts_dashboard",
+        "description": (
+            "Return upcoming contract renewals within 75 days and all Escalate-flag contract "
+            "items from the Contracts & Renewals Registry. "
+            "Use when Harrison asks about contracts, renewals, what's expiring, what needs "
+            "attention, contract risk — phrases like 'what contracts are expiring', 'show me "
+            "contract risk', 'what renewals are coming up', 'contract dashboard', 'what "
+            "contracts need attention', 'any Escalate contracts', 'what's on the contracts "
+            "watchlist', 'which contracts are at risk'. "
+            "Returns 🚨 for Escalate or already-expired items, 🔴 for ≤30d, 🟡 for ≤75d. "
+            "Includes deep links to individual Notion contract pages. "
+            "Read-only — no confirmation needed. "
+            "Only call in FNDR or HJRG channels (#fndr, #hjrg-*, or any founder-level "
+            "channel). Do NOT call for entity-specific operational questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    # ── F3E sales / pipeline tools ──
+    {
+        "name": "f3e_hubspot_pipeline_summary",
+        "description": (
+            "Return a structured summary of the F3 Energy Retail sales pipeline: active deal "
+            "count and total pipeline value by stage, a hot list of deals in Qualified / "
+            "Proposal / Negotiation, owner split between Tommy and Harrison, and Closed Won / "
+            "Closed Lost tallies. "
+            "Use this when a user asks for a sales update, pipeline health, deal status, or "
+            "retail progress — phrases like '@Cora sales summary', 'how's the pipeline', "
+            "'what deals are hot', 'what's Tommy working on', 'pipeline update', 'how many "
+            "deals do we have', 'what's our total pipeline value', 'sales check-in', "
+            "'who has the most deals', 'what's in proposal stage'. "
+            "All output is source-opaque — never mention HubSpot, CRM, API, or account IDs. "
+            "Deal names are wrapped in Slack mrkdwn deep links — preserve them verbatim. "
+            "Read-only — no confirmation needed. "
+            "Only call in F3E or FNDR channels (#f3e-sales, #f3e-leadership, #fndr, #hjrg-*, "
+            "or any #f3e-* channel). Do NOT call for OSN, LEX, BDM, or UFL pipeline questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    # ── F3E inventory / ops tools ──
+    {
+        "name": "f3e_inventory_pulse",
+        "description": (
+            "Return the current F3 Energy inventory levels across all fulfilment locations: "
+            "Cotton 3PL warehouse, Nimbl DTC centre, and the 117 office. Shows available cases "
+            "per SKU with safety-stock flags (🚨 Critical ≤50 cs, ⚠️  Low ≤200 cs, ✅ Healthy). "
+            "Use this when a user asks about inventory, stock levels, how many cases we have, "
+            "reorder status, or SKU availability — phrases like '@Cora inventory check', "
+            "'how many cases of Original do we have', 'what's our stock level', "
+            "'do we have enough for the Sprouts order', 'inventory pulse', "
+            "'what SKUs are running low', '@Cora stock update', 'are we low on anything'. "
+            "All output is source-opaque — never mention Drive, file names, or storage systems. "
+            "Read-only — no confirmation needed. "
+            "Only call in F3E or FNDR channels (#f3e-ops, #f3e-leadership, #fndr, #hjrg-*, "
+            "or any #f3e-* channel). Do NOT call for OSN, LEX, BDM, or UFL inventory questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──
     {
         "name": "f3e_brand_voice_check",
@@ -2453,37 +2611,4 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_profit_loss": _tool_qbo_get_profit_loss,
     "qbo_get_balance_sheet": _tool_qbo_get_balance_sheet,
     "qbo_get_ar_aging": _tool_qbo_get_ar_aging,
-    "qbo_get_ap_aging": _tool_qbo_get_ap_aging,
-    "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
-    "financial_get_cashflow": _tool_financial_get_cashflow,
-    "financial_notify_gap": _tool_financial_notify_gap,
-    "fndr_open_decisions": _tool_fndr_open_decisions,
-    "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
-    "ads_get_performance_summary": _tool_ads_get_performance_summary,
-    "ads_get_channel_breakdown": _tool_ads_get_channel_breakdown,
-    "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
-    "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
-    "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
-}
-
-
-def dispatch(
-    tool_name: str,
-    tool_input: dict[str, Any],
-    slack_user_id: str,
-    entity: str = "FNDR",
-) -> str:
-    """Run a tool by name. Always returns a string for tool_result content.
-
-    entity is the routed entity code for the channel the @mention came from
-    (F3E, LEX, OSN, BDM, FNDR, etc.) -- tools may use this to scope results.
-    """
-    fn = _TOOL_FUNCTIONS.get(tool_name)
-    if not fn:
-        log.warning("Unknown tool name requested by model: %s", tool_name)
-        return f"Unknown tool: {tool_name}. Available tools: {list(_TOOL_FUNCTIONS)}"
-    try:
-        return fn(slack_user_id, entity, tool_input or {})
-    except Exception as exc:
-        log.exception("Tool %s raised unexpected error", tool_name)
-        return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."
+    "qbo_get_ap_aging": _tool_qbo_get_a

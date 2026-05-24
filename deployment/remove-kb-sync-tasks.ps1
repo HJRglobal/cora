@@ -11,7 +11,9 @@ $ErrorActionPreference = "Stop"
 $Tasks = @(
     "cowork-cora-kb-sync-asana",
     "cowork-cora-kb-sync-fireflies",
-    "cowork-cora-kb-sync-static"
+    "cowork-cora-kb-sync-static",
+    "cowork-cora-kb-sync-drive",
+    "cowork-cora-kb-sync-notion"
 )
 
 foreach ($taskName in $Tasks) {

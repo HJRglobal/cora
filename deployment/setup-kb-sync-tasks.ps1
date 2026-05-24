@@ -1,10 +1,11 @@
-# Setup Windows Scheduled Tasks for KB incremental sync (Phase 3E + Phase 4 Layer 2).
+# Setup Windows Scheduled Tasks for KB incremental sync (Phase 3E + Phase 4 Layer 2 + Notion).
 #
-# Registers four tasks that run nightly to keep the KB fresh:
+# Registers five tasks that run nightly to keep the KB fresh:
 #   cowork-cora-kb-sync-asana       — 3:00 AM AZ daily
 #   cowork-cora-kb-sync-fireflies   — 3:30 AM AZ daily
 #   cowork-cora-kb-sync-static      — 4:00 AM AZ daily
 #   cowork-cora-kb-sync-drive       — 4:30 AM AZ daily (Phase 4 Layer 2)
+#   cowork-cora-kb-sync-notion      — 5:00 AM AZ daily (Contracts & Renewals Registry)
 #
 # Each task runs `uv run python scripts/incremental_sync_<source>.py`, logging
 # stdout+stderr to logs/kb-sync-<source>-YYYY-MM-DD.log inside the cora repo.
@@ -62,6 +63,12 @@ $Tasks = @(
         Script      = "scripts\incremental_sync_drive.py"
         HourMin     = "04:30"
         Description = "Cora KB daily incremental sync - Google Drive deliverable files (docx/xlsx/pptx/pdf/images) via Drive API DWD"
+    },
+    @{
+        Name        = "cowork-cora-kb-sync-notion"
+        Script      = "scripts\incremental_sync_notion.py"
+        HourMin     = "05:00"
+        Description = "Cora KB daily incremental sync - Notion Contracts & Renewals Registry (DB 7820cd3689ae4596bd8f965f2bf96d5d)"
     }
 )
 
@@ -114,7 +121,7 @@ foreach ($task in $Tasks) {
 }
 
 Write-Host ""
-Write-Host "All 4 KB sync tasks registered." -ForegroundColor Green
+Write-Host "All 5 KB sync tasks registered." -ForegroundColor Green
 Write-Host ""
 Write-Host "Verify with:" -ForegroundColor Cyan
 Write-Host "  Get-ScheduledTask -TaskName 'cowork-cora-kb-sync-*' | Format-Table TaskName, State, NextRunTime"
