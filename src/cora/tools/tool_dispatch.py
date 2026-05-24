@@ -1426,6 +1426,49 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
     return "\n".join(lines)
 
 
+def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
+
+    Read-only, no external calls. Returns a structured findings report (CRITICAL / WARNING / INFO)
+    plus the brand's locked voice-pillar summary so Claude can synthesize a helpful reply.
+
+    Checks:
+      - Health/nutrition claims (universal — all three brands)
+      - Cross-entity UFL pause (universal — F3-UFL crossover blocked)
+      - Sleep positioning (Mood ONLY — CRITICAL anti-pattern)
+      - Sibling-brand drift (Energy-lane or Mood-lane language in the wrong brand's copy)
+      - Anti-positioning (competitor brand names in Energy copy, etc.)
+    """
+    input_data = _input or {}
+    brand = (input_data.get("brand") or "").strip().lower()
+    copy = (input_data.get("copy") or "").strip()
+
+    if not brand:
+        return (
+            "f3e_brand_voice_check called without `brand`. "
+            "Ask the user which F3 sub-brand the copy is for: pure, mood, or energy."
+        )
+    if not copy:
+        return (
+            "f3e_brand_voice_check called without `copy`. "
+            "Ask the user to paste the draft copy they want checked."
+        )
+    if brand not in brand_voice_client.VALID_BRANDS:
+        return (
+            f"f3e_brand_voice_check: unknown brand {brand!r}. "
+            f"Must be one of: {', '.join(brand_voice_client.VALID_BRANDS)}. "
+            "Ask the user which F3 sub-brand the copy is for."
+        )
+
+    log.info(
+        "f3e_brand_voice_check brand=%s copy_len=%d user=%s entity=%s",
+        brand, len(copy), slack_user_id, entity,
+    )
+
+    result = brand_voice_client.check_copy(brand, copy)
+    return brand_voice_client.format_result_for_llm(result)
+
+
 # --- Ad performance tool handlers ---
 
 
