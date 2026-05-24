@@ -18,12 +18,34 @@ log = logging.getLogger(__name__)
 _DRIVE_ROOT = Path("G:/My Drive/HJR-Founder-OS")
 
 _ENTITY_PATHS: dict[str, Path] = {
-    "F3E":  _DRIVE_ROOT / "02-F3-Energy" / "CLAUDE.md",
-    "LEX":  _DRIVE_ROOT / "08-Lexington-Services" / "CLAUDE.md",
-    "OSN":  _DRIVE_ROOT / "09-One-Stop-Nutrition" / "CLAUDE.md",
-    "BDM":  _DRIVE_ROOT / "07-Big-D-Media" / "CLAUDE.md",
-    "HJRG": _DRIVE_ROOT / "01-HJR-Global" / "CLAUDE.md",
+    "F3E":      _DRIVE_ROOT / "02-F3-Energy" / "CLAUDE.md",
+    "LEX":      _DRIVE_ROOT / "08-Lexington-Services" / "CLAUDE.md",
+    # LEX sub-entity CLAUDE.md stubs — contain ONLY sub-entity-specific context.
+    # These are intentionally narrow: no sibling entity financial data.
+    "LEX-LLC":  _DRIVE_ROOT / "08-Lexington-Services" / "llc" / "CLAUDE.md",
+    "LEX-LTS":  _DRIVE_ROOT / "08-Lexington-Services" / "lts" / "CLAUDE.md",
+    "LEX-LBHS": _DRIVE_ROOT / "08-Lexington-Services" / "lbhs" / "CLAUDE.md",
+    "LEX-LLA":  _DRIVE_ROOT / "08-Lexington-Services" / "lla" / "CLAUDE.md",
+    "OSN":      _DRIVE_ROOT / "09-One-Stop-Nutrition" / "CLAUDE.md",
+    "BDM":      _DRIVE_ROOT / "07-Big-D-Media" / "CLAUDE.md",
+    "HJRG":     _DRIVE_ROOT / "01-HJR-Global" / "CLAUDE.md",
 }
+
+# LEX sub-entity channels receive their own stub CLAUDE.md only — NOT the
+# founder CLAUDE.md and NOT the LEX parent CLAUDE.md.
+#
+# Why: the founder CLAUDE.md contains the entire TOM section with financial
+# data, cap tables, and ownership details for ALL portfolio entities. The LEX
+# parent CLAUDE.md similarly lists ALL sub-entity cap tables. Both documents
+# are the vector for cross-entity data leaking into sub-entity channels.
+#
+# Sub-entity stubs (08-Lexington-Services/{llc,lts,lbhs,lla}/CLAUDE.md) are
+# intentionally narrow: sub-entity-specific context only, no sibling data.
+# The sub-entity system prompt (design/system-prompts/{llc,lts,...}.md) carries
+# the knowledge of HJR Global back-office context that Cora needs.
+_NO_FOUNDER_CONTEXT: frozenset[str] = frozenset({
+    "LEX-LLC", "LEX-LTS", "LEX-LBHS", "LEX-LLA",
+})
 
 _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 
@@ -121,7 +143,13 @@ def _load_static_context(entity: str) -> str:
                     entity_path,
                 )
 
-    parts.append(_FOUNDER_PATH.read_text(encoding="utf-8"))
+    # LEX sub-entity channels are firewalled from the founder context.
+    # The founder CLAUDE.md and LEX parent CLAUDE.md both contain cross-entity
+    # financial data (cap tables, cash flow, ownership) for ALL sub-entities.
+    # Sub-entity channels must not receive that data — their own stub CLAUDE.md
+    # is the only entity context they get.
+    if entity not in _NO_FOUNDER_CONTEXT:
+        parts.append(_FOUNDER_PATH.read_text(encoding="utf-8"))
 
     # Append static known-answers if available
     ka_path = _KNOWN_ANSWERS_PATHS.get(entity)
