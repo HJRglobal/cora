@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from . import ads_client, asana_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -1299,133 +1299,6 @@ def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) ->
     )
 
 
-# --- FNDR-specific tools ---
-
-
-def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return P0/P1 stalled decisions from memory/decisions-pending.md with age."""
-    import re
-    from datetime import date, datetime
-
-    _DRIVE_ROOT = Path("G:/My Drive/HJR-Founder-OS")
-    decisions_path = _DRIVE_ROOT / "memory" / "decisions-pending.md"
-
-    try:
-        content = decisions_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        log.warning("fndr_open_decisions: decisions-pending.md not found at %s", decisions_path)
-        return "I don't have that right now."
-    except Exception as exc:
-        log.warning("fndr_open_decisions: error reading decisions-pending.md: %s", exc)
-        return "I don't have that right now."
-
-    today = date.today()
-
-    # Extract only the ## Active section (stop at the next ## heading — e.g. Gmail Deep Dive)
-    active_match = re.search(r"^## Active\b", content, re.MULTILINE)
-    if not active_match:
-        return "No active decisions found in the pending queue."
-
-    rest_after_active = content[active_match.end():]
-    next_section_match = re.search(r"^## ", rest_after_active, re.MULTILINE)
-    active_section = (
-        rest_after_active[: next_section_match.start()]
-        if next_section_match
-        else rest_after_active
-    )
-
-    # Parse each ### entry block
-    entries: list[dict] = []
-    topic_blocks = re.split(r"\n(?=### )", active_section)
-
-    for block in topic_blocks:
-        if not block.startswith("### "):
-            continue
-
-        topic = block.split("\n", 1)[0][4:].strip()  # strip "### " prefix
-
-        sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)", block)
-        if not sev_match:
-            continue
-        severity = sev_match.group(1)
-        if severity not in ("P0", "P1"):
-            continue
-
-        # Parse Last touched — handles "2026-05-23", "2026-05-12 (note)", "~2026-04"
-        touched_match = re.search(r"\*\*Last touched\*\*:\s*([^\n]+)", block)
-        age_days: int | None = None
-        if touched_match:
-            raw = touched_match.group(1).strip()
-            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
-            month_match = re.search(r"~?(\d{4}-\d{2})$", raw.strip())
-            if date_match:
-                try:
-                    touched = datetime.strptime(date_match.group(1), "%Y-%m-%d").date()
-                    age_days = (today - touched).days
-                except ValueError:
-                    pass
-            elif month_match:
-                try:
-                    touched = datetime.strptime(month_match.group(1) + "-01", "%Y-%m-%d").date()
-                    age_days = (today - touched).days
-                except ValueError:
-                    pass
-
-        owner_match = re.search(r"\*\*Owner of next nudge\*\*:\s*([^\n]+)", block)
-        owner = owner_match.group(1).strip() if owner_match else "unassigned"
-
-        entries.append(
-            {"topic": topic, "severity": severity, "age_days": age_days, "owner": owner}
-        )
-
-    if not entries:
-        return "No P0 or P1 decisions are currently pending."
-
-    p0 = sorted(
-        [e for e in entries if e["severity"] == "P0"],
-        key=lambda x: x["age_days"] or 0,
-        reverse=True,
-    )
-    p1 = sorted(
-        [e for e in entries if e["severity"] == "P1"],
-        key=lambda x: x["age_days"] or 0,
-        reverse=True,
-    )
-
-    def _fmt(e: dict) -> str:
-        age = e["age_days"]
-        if age is None:
-            age_str = "age unknown"
-        elif age == 0:
-            age_str = "touched today"
-        elif age == 1:
-            age_str = "1d stale"
-        else:
-            age_str = f"{age}d stale"
-        # 🚨 = P0 >14d, 🔴 = P0 ≤14d, 🟡 = P1
-        if e["severity"] == "P0" and (age or 0) > 14:
-            marker = "🚨"
-        elif e["severity"] == "P0":
-            marker = "🔴"
-        else:
-            marker = "🟡"
-        return f"{marker} *{e['topic']}* ({age_str}) — {e['owner']}"
-
-    lines = [f"*Open decisions — {len(p0)} P0, {len(p1)} P1:*", ""]
-    for e in p0:
-        lines.append(_fmt(e))
-    if p0 and p1:
-        lines.append("")
-    for e in p1:
-        lines.append(_fmt(e))
-
-    log.info(
-        "fndr_open_decisions user=%s entity=%s p0=%d p1=%d",
-        slack_user_id, entity, len(p0), len(p1),
-    )
-    return "\n".join(lines)
-
-
 # --- Ad performance tool handlers ---
 
 
@@ -1477,52 +1350,6 @@ def _tool_ads_get_cm_waterfall(slack_user_id: str, entity: str, _input: dict) ->
         channel=entity,
         user=slack_user_id,
     )
-
-
-# --- F3 brand voice check ---
-
-
-def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
-
-    Read-only, no external calls. Returns a structured findings report (CRITICAL / WARNING / INFO)
-    plus the brand's locked voice-pillar summary so Claude can synthesize a helpful reply.
-
-    Checks:
-      - Health/nutrition claims (universal — all three brands)
-      - Cross-entity UFL pause (universal — F3-UFL crossover blocked)
-      - Sleep positioning (Mood ONLY — CRITICAL anti-pattern)
-      - Sibling-brand drift (Energy-lane or Mood-lane language in the wrong brand's copy)
-      - Anti-positioning (competitor brand names in Energy copy, etc.)
-    """
-    input_data = _input or {}
-    brand = (input_data.get("brand") or "").strip().lower()
-    copy = (input_data.get("copy") or "").strip()
-
-    if not brand:
-        return (
-            "f3e_brand_voice_check called without `brand`. "
-            "Ask the user which F3 sub-brand the copy is for: pure, mood, or energy."
-        )
-    if not copy:
-        return (
-            "f3e_brand_voice_check called without `copy`. "
-            "Ask the user to paste the draft copy they want checked."
-        )
-    if brand not in brand_voice_client.VALID_BRANDS:
-        return (
-            f"f3e_brand_voice_check: unknown brand {brand!r}. "
-            f"Must be one of: {', '.join(brand_voice_client.VALID_BRANDS)}. "
-            "Ask the user which F3 sub-brand the copy is for."
-        )
-
-    log.info(
-        "f3e_brand_voice_check brand=%s copy_len=%d user=%s entity=%s",
-        brand, len(copy), slack_user_id, entity,
-    )
-
-    result = brand_voice_client.check_copy(brand, copy)
-    return brand_voice_client.format_result_for_llm(result)
 
 
 # --- Catalog: tool definitions exposed to Claude ---
@@ -2189,77 +2016,6 @@ TOOL_DEFINITIONS = [
             "required": ["topic"],
         },
     },
-    # ── FNDR-specific tools (founder / HJRG channels only) ──
-    {
-        "name": "fndr_open_decisions",
-        "description": (
-            "Return all P0 and P1 stalled decisions from the pending decisions queue, "
-            "with days-stale age and the owner of the next nudge. "
-            "Use this when Harrison asks about open or stalled decisions, what decisions "
-            "are pending, what's blocking progress, what needs a decision this week/month "
-            "— phrases like 'what decisions are pending', 'what's stalled', 'show me the "
-            "decision queue', 'what P0s do I have', 'what do I need to decide', 'what's "
-            "been waiting on me'. "
-            "Returns a structured list: 🚨 for P0 items stale >14 days (must decide this "
-            "week), 🔴 for P0 items <14 days, 🟡 for P1 items. "
-            "Read-only — no confirmation needed. "
-            "Only call in FNDR or HJRG channels (#fndr, #hjrg-*, or any founder-level "
-            "channel). Do NOT call for entity-specific operational questions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──
-    {
-        "name": "f3e_brand_voice_check",
-        "description": (
-            "Check a draft piece of copy (caption, email, web copy, ad creative) against "
-            "F3 Energy brand-guidelines V1 voice spec for a specified sub-brand (Pure, Mood, "
-            "or Energy). Use this when a user asks whether copy is on-brand, requests a brand "
-            "check, or shares draft content for review — phrases like '@Cora is this copy "
-            "on-brand?', '@Cora does this caption fit Pure's voice?', '@Cora check this for "
-            "Mood', 'is this content on-brand for Energy?', '@Cora brand check:', 'does this "
-            "fit Lauren's voice?', 'is this Marcus-level tone?', 'check this against our brand "
-            "guidelines', 'review this copy for F3 Pure'. "
-            "Returns a structured analysis: CRITICAL issues (health claims, sleep positioning "
-            "for Mood, competitor brand names, UFL crossover, anti-positioning violations), "
-            "WARNINGS (sibling-brand drift — Energy-lane language in Pure copy, etc.), and a "
-            "verdict. Also returns the brand's locked voice-pillar summary so you can give "
-            "informed, specific guidance. "
-            "Read-only — no confirmation needed. "
-            "Call in #f3-pure-social, #f3-mood-social, #f3-energy-social, any #f3e-* or #f3-* "
-            "channel, or any FNDR channel when copy is explicitly for an F3 brand. "
-            "After presenting findings, always offer to help revise if issues are found."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "brand": {
-                    "type": "string",
-                    "description": (
-                        "The F3 sub-brand this copy is for. Required. "
-                        "Must be one of: 'pure', 'mood', or 'energy' (case-insensitive). "
-                        "If the user is in #f3-pure-social, default to 'pure'; "
-                        "#f3-mood-social → 'mood'; #f3-energy-social → 'energy'. "
-                        "If ambiguous, ask the user which brand before calling."
-                    ),
-                },
-                "copy": {
-                    "type": "string",
-                    "description": (
-                        "The draft copy to check — caption, email body, web copy, ad creative, "
-                        "or any text intended for an F3 brand surface. "
-                        "Include the FULL text (no truncation) so the check is complete. "
-                        "If the user pastes copy in their message, extract it verbatim."
-                    ),
-                },
-            },
-            "required": ["brand", "copy"],
-        },
-    },
     # ── Ad performance tools (F3E only — scoped by entity check in f3e.md prompt) ──
     {
         "name": "ads_get_performance_summary",
@@ -2414,8 +2170,6 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
-    "fndr_open_decisions": _tool_fndr_open_decisions,
-    "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "ads_get_performance_summary": _tool_ads_get_performance_summary,
     "ads_get_channel_breakdown": _tool_ads_get_channel_breakdown,
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
@@ -2433,7 +2187,7 @@ def dispatch(
     """Run a tool by name. Always returns a string for tool_result content.
 
     entity is the routed entity code for the channel the @mention came from
-    (F3E, LEX, OSN, BDM, FNDR, etc.) -- tools may use this to scope results.
+    (F3E, LEX, OSN, BDM, FNDR, etc.) — tools may use this to scope results.
     """
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if not fn:
