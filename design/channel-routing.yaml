@@ -67,10 +67,14 @@ routes:
   - pattern: "clover-daily"
     entity: OSN
 
-  # BDM — covers bare #bdm and bdm-*
+  # BDM — covers bare #bdm, bdm-*, and #media (BDM client work catch-all, C0B2Z7Z7C84).
+  # Note: #media is a non-standard channel name owned by BDM for cross-client production
+  # work. Added 2026-05-24 per bdm.md wishlist Category 4.
   - pattern: "bdm"
     entity: BDM
   - pattern: "bdm-*"
+    entity: BDM
+  - pattern: "media"
     entity: BDM
 
   # HJR Properties — covers bare #hjrp, hjrp-*, plus #rogers-ranch (HJRP-RR sub-entity catch-all)
