@@ -56,6 +56,15 @@ _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
 
 _TTL = 300  # seconds
 
+# LEX sub-entity channels route to e.g. "LEX-LLC"; the KB stores documents under "LEX".
+# Map sub-entity codes → their parent entity so KB searches hit the right rows.
+_LEX_PARENT: dict[str, str] = {
+    "LEX-LLC":  "LEX",
+    "LEX-LTS":  "LEX",
+    "LEX-LBHS": "LEX",
+    "LEX-LLA":  "LEX",
+}
+
 # (content, cached_at, known_answers_mtime | None)
 _cache: dict[str, tuple[str, float, float | None]] = {}
 
@@ -153,13 +162,17 @@ def _try_kb_retrieve(entity: str, query: str) -> str | None:
 
     try:
         from cora.knowledge_base import KnowledgeBase
+        # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX".
+        kb_entity = _LEX_PARENT.get(entity, entity)
+        sub_entity_scope = entity if entity in _LEX_PARENT else None
         kb = KnowledgeBase(_KB_DB_PATH)
         try:
             results = kb.search(
                 query,
-                entity=entity,
+                entity=kb_entity,
                 k=_KB_TOP_K,
                 max_age_days=_KB_MAX_AGE_DAYS,
+                sub_entity=sub_entity_scope,
             )
         finally:
             kb.close()

@@ -38,6 +38,7 @@ class Document:
     title: str = ""
     deep_link: str = ""        # clickable URL (raw or Slack mrkdwn-wrapped)
     metadata: dict[str, Any] | None = None
+    sub_entity: str | None = None       # intra-entity scope (e.g. "LEX-LLC", "LEX-LTS")
 
 
 @dataclass
@@ -52,6 +53,30 @@ class SearchResult:
     deep_link: str
     date_modified: int | None
     distance: float            # cosine distance (0 = identical, 2 = opposite)
+
+
+# LEX sub-entity visibility: which sub_entity values a given sub-entity channel can see.
+# "LEX" (no sub_entity tag) means the chunk is GM-level / cross-sub-entity, always visible.
+_LEX_SUB_ENTITY_VISIBILITY: dict[str, tuple[str, ...]] = {
+    "LEX-LLC":  ("LEX-LLC",),
+    "LEX-LTS":  ("LEX-LTS",),
+    "LEX-LBHS": ("LEX-LBHS",),
+    "LEX-LLA":  ("LEX-LLA",),
+}
+
+
+def build_sub_entity_filter(sub_entity: str) -> tuple[str, list[str]] | None:
+    """Return (sql_fragment, params) to scope KB results to a LEX sub-entity, or None.
+
+    Untagged chunks (sub_entity IS NULL) are always visible — they represent
+    GM-level / cross-sub-entity content that all sub-entities can see.
+    Tagged chunks are only visible to the matching sub-entity channel.
+    """
+    visibility = _LEX_SUB_ENTITY_VISIBILITY.get(sub_entity)
+    if not visibility:
+        return None
+    placeholders = ",".join("?" * len(visibility))
+    return f"(sub_entity IS NULL OR sub_entity IN ({placeholders}))", list(visibility)
 
 
 class KnowledgeBaseError(Exception):
@@ -143,14 +168,15 @@ class KnowledgeBase:
         for (doc, chunk_str, chunk_id), vec in zip(chunk_tuples, vectors):
             cur.execute(
                 """INSERT INTO knowledge_chunks
-                   (chunk_id, source, source_id, entity, date_created, date_modified,
+                   (chunk_id, source, source_id, entity, sub_entity, date_created, date_modified,
                     author, title, content, deep_link, metadata, ingested_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     chunk_id,
                     doc.source,
                     doc.source_id,
                     doc.entity,
+                    doc.sub_entity,
                     doc.date_created,
                     doc.date_modified,
                     doc.author,
@@ -182,6 +208,7 @@ class KnowledgeBase:
         k: int = 10,
         max_age_days: int | None = 365,
         include_fndr: bool = True,
+        sub_entity: str | None = None,
     ) -> list[SearchResult]:
         """Vector search top-K chunks. Filters by entity (incl. FNDR) and recency.
 
@@ -189,6 +216,8 @@ class KnowledgeBase:
         AND for FNDR (when include_fndr=True) are eligible.
         k: number of results to return after filtering.
         max_age_days: drop chunks with date_modified older than this. None disables.
+        sub_entity: when set (e.g. "LEX-LLC"), apply intra-entity visibility scoping
+        so only chunks tagged for that sub-entity (or untagged) are returned.
         """
         try:
             query_vec = embeddings.embed_query(query)
@@ -200,6 +229,14 @@ class KnowledgeBase:
             entity_filter = (entity,)
         else:
             entity_filter = (entity, "FNDR")
+
+        # Build optional sub-entity visibility clause
+        sub_entity_clause = ""
+        sub_entity_params: list[Any] = []
+        if sub_entity:
+            result = build_sub_entity_filter(sub_entity)
+            if result:
+                sub_entity_clause, sub_entity_params = result
 
         # sqlite-vec requires LIMIT to be on the vec0 scan directly (not an outer JOIN).
         # Use a CTE to do the knn scan first, then join+filter metadata.
@@ -219,6 +256,7 @@ class KnowledgeBase:
             JOIN knowledge_chunks k ON k.chunk_id = vk.chunk_id
             WHERE k.entity IN ({','.join('?' * len(entity_filter))})
               {f'AND (k.date_modified IS NULL OR k.date_modified > ?)' if max_age_days else ''}
+              {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
             ORDER BY vk.distance
             LIMIT {int(k)}
         """
@@ -226,6 +264,7 @@ class KnowledgeBase:
         if max_age_days:
             cutoff = int(time.time()) - (max_age_days * 86400)
             params.append(cutoff)
+        params.extend(sub_entity_params)
 
         rows = self._conn.execute(sql, params).fetchall()
 

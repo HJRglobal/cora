@@ -104,6 +104,26 @@ def _paginate(path: str, params: dict) -> Iterator[dict]:
         params["offset"] = offset
 
 
+# Maps Asana team GIDs to LEX sub-entity codes.
+# LTS has no dedicated team GID (shared team) — identified by project name keywords instead.
+_ASANA_TEAM_SUB_ENTITY: dict[str, str] = {
+    "1209152915815732": "LEX-LLC",
+    "1209152923740446": "LEX-LLA",
+    "1209152923740451": "LEX-LBHS",
+}
+
+
+def _tag_asana_sub_entity_for_project(project: dict) -> str | None:
+    """Resolve LEX sub-entity from a project's team GID or name keywords."""
+    team_gid = (project.get("team") or {}).get("gid", "")
+    if team_gid in _ASANA_TEAM_SUB_ENTITY:
+        return _ASANA_TEAM_SUB_ENTITY[team_gid]
+    project_name = project.get("name", "")
+    if any(kw in project_name for kw in ("LTS", "Therapies", "Lexington Therapies")):
+        return "LEX-LTS"
+    return None
+
+
 def _is_phi_project(project_name: str) -> bool:
     """Return True if the project should be excluded for PHI/clinical reasons."""
     name_lower = project_name.lower()
@@ -171,7 +191,7 @@ def _list_projects() -> Iterator[dict]:
         f"/workspaces/{_WORKSPACE_GID}/projects",
         params={
             "archived": "false",
-            "opt_fields": "name,archived,notes,modified_at,team.name",
+            "opt_fields": "name,archived,notes,modified_at,team.name,team.gid",
         },
     )
 
@@ -227,6 +247,7 @@ def backfill(since: datetime) -> Iterator[Document]:
             continue
 
         entity = _entity_for_project(project_name)
+        sub_entity = _tag_asana_sub_entity_for_project(project) if entity == "LEX" else None
         project_modified_ts = _ts(project.get("modified_at"))
         project_permalink = f"https://app.asana.com/0/{project_gid}/list"
 
@@ -237,6 +258,7 @@ def backfill(since: datetime) -> Iterator[Document]:
                 source="asana",
                 source_id=f"project:{project_gid}",
                 entity=entity,
+                sub_entity=sub_entity,
                 content=f"[Asana Project] {project_name}\n\n{project_notes}",
                 date_created=project_modified_ts,
                 date_modified=project_modified_ts,
@@ -286,6 +308,7 @@ def backfill(since: datetime) -> Iterator[Document]:
                 source="asana",
                 source_id=f"task:{task_gid}",
                 entity=entity,
+                sub_entity=sub_entity,
                 content=content,
                 date_created=task_modified_ts,
                 date_modified=effective_ts,

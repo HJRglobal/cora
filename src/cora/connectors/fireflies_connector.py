@@ -80,6 +80,40 @@ _PHI_TITLE_KEYWORDS = {
 }
 
 
+# Participant email/name fragments that identify a LEX sub-entity.
+# Order matters: more specific sub-entities first. Shaun Hawkins is LEX-LLC GM;
+# if he's the only named participant, it's an LLC meeting.
+_FIREFLIES_PARTICIPANT_SUB_ENTITY: list[tuple[list[str], str]] = [
+    (["justin.gilmore", "Justin Gilmore"], "LEX-LTS"),
+    (["jared.harker",  "Jared Harker"],   "LEX-LBHS"),
+    (["sandy.patel",   "Sandy Patel"],    "LEX-LLA"),
+]
+_SHAUN_IDENTIFIERS = ["shaun.hawkins", "Shaun Hawkins"]
+
+
+def _tag_fireflies_sub_entity(transcript: dict) -> str | None:
+    """Resolve LEX sub-entity from transcript attendee names/emails.
+
+    Returns None for cross-sub-entity meetings (multiple matched) or when
+    no sub-entity signals are present (untagged = GM-level / shared LEX content).
+    """
+    attendees = transcript.get("meeting_attendees") or []
+    participant_text = " ".join(
+        a.get("displayName", "") + " " + a.get("email", "") for a in attendees
+    ).lower()
+    matched = []
+    for identifiers, code in _FIREFLIES_PARTICIPANT_SUB_ENTITY:
+        if any(ident.lower() in participant_text for ident in identifiers):
+            matched.append(code)
+    if len(matched) == 1:
+        return matched[0]
+    if len(matched) > 1:
+        return None  # cross-sub-entity meeting — leave untagged so all LEX can see it
+    if any(s.lower() in participant_text for s in _SHAUN_IDENTIFIERS):
+        return "LEX-LLC"
+    return None
+
+
 class FirefliesConnectorError(Exception):
     pass
 
@@ -329,11 +363,13 @@ def backfill(since: datetime) -> Iterator[Document]:
 
             meeting_ts = _parse_date(t.get("date"))
             permalink = t.get("transcript_url") or f"https://app.fireflies.ai/view/{transcript_id}"
+            sub_entity = _tag_fireflies_sub_entity(t) if entity == "LEX" else None
 
             yield Document(
                 source="fireflies",
                 source_id=transcript_id,
                 entity=entity,
+                sub_entity=sub_entity,
                 content=content,
                 date_created=meeting_ts,
                 date_modified=meeting_ts,

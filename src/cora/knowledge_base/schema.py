@@ -41,6 +41,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             source        TEXT NOT NULL,
             source_id     TEXT NOT NULL,
             entity        TEXT NOT NULL,
+            sub_entity    TEXT,
             date_created  INTEGER,
             date_modified INTEGER,
             author        TEXT,
@@ -53,6 +54,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_chunks_source       ON knowledge_chunks(source);
         CREATE INDEX IF NOT EXISTS idx_chunks_entity       ON knowledge_chunks(entity);
+        CREATE INDEX IF NOT EXISTS idx_chunks_sub_entity   ON knowledge_chunks(sub_entity);
         CREATE INDEX IF NOT EXISTS idx_chunks_date_mod     ON knowledge_chunks(date_modified DESC);
         CREATE INDEX IF NOT EXISTS idx_chunks_source_id    ON knowledge_chunks(source, source_id);
 
@@ -63,6 +65,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+    # Migration: add sub_entity column to existing databases (idempotent)
+    try:
+        conn.execute("ALTER TABLE knowledge_chunks ADD COLUMN sub_entity TEXT")
+        conn.commit()
+        log.info("Migrated knowledge_chunks: added sub_entity column")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     # Virtual vec0 table — must be created separately (DDL has its own syntax)
     conn.execute(
