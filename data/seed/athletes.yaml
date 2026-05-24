@@ -1,0 +1,72 @@
+# Cora Influencer Handle Registry — Seed Data
+#
+# This file pre-populates the athlete handle registry so the Instagram scanner
+# can match brand tags to sponsored athletes without Alex having to register
+# each one manually via Slack.
+#
+# After editing this file, run:
+#   uv run python scripts/seed_athletes.py
+#
+# The script is IDEMPOTENT — re-running it updates existing rows in place
+# (by athlete_name + platform) rather than duplicating them. Safe to re-run
+# whenever this file is updated.
+#
+# Format per athlete:
+#   - athlete_name: "Full Name"          # matches deliverable records in Cora
+#     entity: F3E                        # F3E, UFL, OSN, or other entity code
+#     handles:
+#       instagram: "handle_without_at"   # omit if they don't have that platform
+#       tiktok: "handle_without_at"      # omit if not applicable
+#
+# Handles: enter WITHOUT the @ symbol. The scanner adds it.
+# Entity codes: F3E = F3 Energy / Mood / Pure brand athletes
+#               UFL = United Fight League athletes (roster-level)
+#               HJRG = cross-portfolio / brand ambassador
+#
+# -----------------------------------------------------------------------------
+# POPULATE THIS FILE with your real sponsored athletes before running the
+# seed script. The examples below are placeholders — replace with actuals.
+# -----------------------------------------------------------------------------
+
+athletes:
+
+  # --- F3 Energy / Mood / Pure Brand Athletes ---
+
+  - athlete_name: "Harrison Rogers"
+    entity: F3E
+    handles:
+      instagram: "harrisonjrogers"
+
+  - athlete_name: "HJR Podcast"
+    entity: F3E
+    handles:
+      instagram: "hjrpodcast"
+
+  - athlete_name: "MMA Lab Elite"
+    entity: F3E
+    handles:
+      instagram: "mmalabelite"
+
+  - athlete_name: "The MMA Lab"
+    entity: F3E
+    handles:
+      instagram: "themmalab"
+
+  - athlete_name: "Red Hawk Academy AZ"
+    entity: F3E
+    handles:
+      instagram: "redhawkacademyaz"
+
+  # --- Add more F3E athletes below as they come in ---
+  # - athlete_name: "Full Name"
+  #   entity: F3E
+  #   handles:
+  #     instagram: "handle_without_at"
+
+  # --- United Fight League Roster Athletes ---
+  # Add UFL-contracted fighters here (entity: UFL)
+  # - athlete_name: "Fighter Name"
+  #   entity: UFL
+  #   handles:
+  #     instagram: "fightername_mma"
+  #     tiktok: "fightername_mma"
