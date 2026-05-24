@@ -24,7 +24,7 @@ def test_polar_metrics():
     assert route("polar-metrics") == "F3E"
 
 
-# --- Lexington Services ---
+# --- Lexington Services — GM level ---
 
 
 def test_lex_bare():
@@ -34,6 +34,71 @@ def test_lex_bare():
 
 def test_lex_clients():
     assert route("lex-clients") == "LEX"
+
+
+def test_lex_leadership():
+    """GM-level #lex-leadership still routes to LEX, not a sub-entity."""
+    assert route("lex-leadership") == "LEX"
+
+
+def test_lex_finance():
+    assert route("lex-finance") == "LEX"
+
+
+def test_lex_cora_build():
+    assert route("lex-cora-build") == "LEX"
+
+
+# --- Lexington LLC sub-entity (LEX-LLC) ---
+
+
+def test_llc_bare():
+    """Bare #llc routes to LEX-LLC (sub-entity siloing fix 2026-05-23)."""
+    assert route("llc") == "LEX-LLC"
+
+
+def test_llc_operations():
+    assert route("llc-operations") == "LEX-LLC"
+
+
+def test_llc_finance():
+    assert route("llc-finance") == "LEX-LLC"
+
+
+# --- Lexington Therapies sub-entity (LEX-LTS) ---
+
+
+def test_lts_bare():
+    """Bare #lts routes to LEX-LTS."""
+    assert route("lts") == "LEX-LTS"
+
+
+def test_lts_operations():
+    assert route("lts-operations") == "LEX-LTS"
+
+
+# --- Lexington Behavioral Health sub-entity (LEX-LBHS) ---
+
+
+def test_lbhs_bare():
+    """Bare #lbhs routes to LEX-LBHS."""
+    assert route("lbhs") == "LEX-LBHS"
+
+
+def test_lbhs_finance():
+    assert route("lbhs-finance") == "LEX-LBHS"
+
+
+# --- Lex Life Academy sub-entity (LEX-LLA) ---
+
+
+def test_lla_bare():
+    """Bare #lla routes to LEX-LLA."""
+    assert route("lla") == "LEX-LLA"
+
+
+def test_lla_leadership():
+    assert route("lla-leadership") == "LEX-LLA"
 
 
 # --- One Stop Nutrition ---

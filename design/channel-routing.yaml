@@ -22,7 +22,37 @@ routes:
   - pattern: "polar-metrics"
     entity: F3E
 
-  # Lexington Services — covers bare #lex and lex-*
+  # Lexington LLC sub-entity — bare #llc and llc-* channels
+  # Must appear BEFORE the lex-* block (first match wins; llc-* ≠ lex-* but ordering makes intent explicit).
+  - pattern: "llc"
+    entity: LEX-LLC
+  - pattern: "llc-*"
+    entity: LEX-LLC
+
+  # Lexington Therapies sub-entity — bare #lts and lts-* channels
+  - pattern: "lts"
+    entity: LEX-LTS
+  - pattern: "lts-*"
+    entity: LEX-LTS
+
+  # Lexington Behavioral Health Services sub-entity — bare #lbhs and lbhs-* channels
+  - pattern: "lbhs"
+    entity: LEX-LBHS
+  - pattern: "lbhs-*"
+    entity: LEX-LBHS
+
+  # Lex Life Academy sub-entity — bare #lla and lla-* channels
+  - pattern: "lla"
+    entity: LEX-LLA
+  - pattern: "lla-*"
+    entity: LEX-LLA
+
+  # Lexington Services GM-level — bare #lex and lex-* channels
+  # Catches #lex, #lex-leadership, #lex-finance, #lex-hr, #lex-hcbs, #lex-dta, #lex-cora-build, etc.
+  # Uses the GM-level LEX prompt (Shaun's cross-sub-entity view; no sub-entity private detail).
+  # Bug history: prior to 2026-05-22, bare #lex fell through to FNDR; bare-name pattern added then.
+  # Bug history: prior to 2026-05-23, single LEX entity had no sub-entity siloing — caused LLA equity
+  # disclosure in an LLC channel. Sub-entity routing above fixes the root cause.
   - pattern: "lex"
     entity: LEX
   - pattern: "lex-*"

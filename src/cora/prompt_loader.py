@@ -16,12 +16,17 @@ _PROMPTS_DIR = Path(__file__).parent.parent.parent / "design" / "system-prompts"
 _VOICE_YAML_FILENAME = "_voice.yaml"
 
 _ENTITY_FILES: dict[str, str] = {
-    "F3E":  "f3e.md",
-    "LEX":  "lex.md",
-    "OSN":  "osn.md",
-    "BDM":  "bdm.md",
-    "FNDR": "fndr.md",
-    "HJRG": "fndr.md",  # HJRG uses FNDR prompt in Phase 1
+    "F3E":      "f3e.md",
+    "LEX":      "lex.md",       # GM-level: #lex, #lex-leadership, #lex-finance, etc.
+    "LEX-LLC":  "llc.md",       # Lexington LLC sub-entity: #llc-*
+    "LEX-LTS":  "lts.md",       # Lexington Therapies sub-entity: #lts-*
+    "LEX-LBHS": "lbhs.md",      # Lexington Behavioral Health: #lbhs-*
+    "LEX-LLA":  "lla.md",       # Lex Life Academy sub-entity: #lla-*
+    "OSN":      "osn.md",
+    "BDM":      "bdm.md",
+    "FNDR":     "fndr.md",
+    "HJRG":     "fndr.md",      # HJRG uses FNDR prompt
+    "HJRP":     "fndr.md",      # HJRP uses FNDR prompt (no dedicated prompt yet)
 }
 
 _cache: dict[str, str] = {}
