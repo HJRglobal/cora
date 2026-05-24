@@ -1,12 +1,14 @@
 """Google Sheets financial connector — Standing ACTUALS cashflow reader.
 
 Reads the HJR-Lexco_ENTITIES_Weekly Cash Flow Requirements_Standing ACTUALS
-Google Sheet via Drive API CSV export (drive.readonly scope — no Sheets API
-scope required). Returns a structured CashflowSummary with the most recent
-week that has actual data, all entity rows, and portfolio totals.
+Google Sheet via Sheets API v4 values.get (spreadsheets.readonly scope).
+Targets the CF_SUMMARY tab by name so the first/active tab does not matter.
+Returns a structured CashflowSummary with the most recent week that has
+actual data, all entity rows, and portfolio totals.
 
 Auth: reuses GOOGLE_SERVICE_ACCOUNT_JSON + CORA_DRIVE_IMPERSONATE from
-drive_connector.py. drive.readonly is sufficient for files.export_media().
+drive_connector.py. Requires both drive.readonly (modifiedTime) and
+spreadsheets.readonly (values read) scopes.
 
 Behavioral contract (locked 2026-05-21):
   - Source-opaque: never log or surface file IDs, sheet names, or Drive links
@@ -15,9 +17,10 @@ Behavioral contract (locked 2026-05-21):
     invoke financial_notify_gap instead of surfacing a traceback
 
 Configuration:
-  GSHEETS_CASHFLOW_FILE_ID  — Drive file ID for the Standing ACTUALS sheet
+  GSHEETS_CASHFLOW_FILE_ID   — Drive file ID for the Standing ACTUALS sheet
+  GSHEETS_CASHFLOW_SHEET_NAME — Tab name to read (default: CF_SUMMARY)
   GOOGLE_SERVICE_ACCOUNT_JSON — path to service account JSON key file
-  CORA_DRIVE_IMPERSONATE    — email to impersonate (default harrison@hjrglobal.com)
+  CORA_DRIVE_IMPERSONATE     — email to impersonate (default harrison@hjrglobal.com)
 """
 
 from __future__ import annotations
@@ -34,7 +37,6 @@ from typing import Optional
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,10 @@ log = logging.getLogger(__name__)
 # Constants
 # ────────────────────────────────────────────────────────────────────────────
 
-_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+_DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
 _DEFAULT_IMPERSONATE = "harrison@hjrglobal.com"
 
 # Env var that pins the Standing ACTUALS file ID
@@ -50,6 +55,10 @@ _CASHFLOW_FILE_ID_ENV = "GSHEETS_CASHFLOW_FILE_ID"
 
 # Canonical file ID (Standing ACTUALS — last modified 2026-05-22)
 _DEFAULT_CASHFLOW_FILE_ID = "1bkMFetsIW-cLtYwLorgio01gLm7EOdJ7UgGHj_lTqPI"
+
+# Env var + default for which tab to read inside the workbook
+_CASHFLOW_SHEET_NAME_ENV = "GSHEETS_CASHFLOW_SHEET_NAME"
+_DEFAULT_CASHFLOW_SHEET_NAME = "CF_SUMMARY"
 
 # Cache TTL: 30 minutes. The sheet is updated weekly; we refresh aggressively
 # enough that Justin/Hayden edits surface within the hour.
@@ -200,8 +209,8 @@ def _impersonate() -> str:
     return os.environ.get("CORA_DRIVE_IMPERSONATE", _DEFAULT_IMPERSONATE).strip()
 
 
-def _build_drive_service():
-    """Build a Drive v3 API service via service account DWD."""
+def _build_delegated_creds():
+    """Build delegated service-account credentials with Drive + Sheets scopes."""
     try:
         creds = service_account.Credentials.from_service_account_file(
             _sa_path(),
@@ -211,18 +220,29 @@ def _build_drive_service():
         raise GsheetsConnectorError(
             f"Failed to load service account credentials: {exc}"
         ) from exc
-    delegated = creds.with_subject(_impersonate())
-    return build("drive", "v3", credentials=delegated, cache_discovery=False)
+    return creds.with_subject(_impersonate())
+
+
+def _build_drive_service(delegated_creds=None):
+    """Build a Drive v3 API service via service account DWD."""
+    creds = delegated_creds or _build_delegated_creds()
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _build_sheets_service(delegated_creds=None):
+    """Build a Sheets v4 API service via service account DWD."""
+    creds = delegated_creds or _build_delegated_creds()
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Drive API calls
+# Drive + Sheets API calls
 # ────────────────────────────────────────────────────────────────────────────
 
-def _get_modified_time(service, file_id: str) -> str:
+def _get_modified_time(drive_service, file_id: str) -> str:
     """Return the modifiedTime field as an ISO date string (YYYY-MM-DD)."""
     try:
-        meta = service.files().get(
+        meta = drive_service.files().get(
             fileId=file_id,
             fields="modifiedTime",
         ).execute()
@@ -233,28 +253,47 @@ def _get_modified_time(service, file_id: str) -> str:
         return "unknown"
 
 
-def _export_csv(service, file_id: str) -> str:
-    """Export a Google Sheet as CSV text (first/default tab)."""
+def _cashflow_sheet_name() -> str:
+    return os.environ.get(_CASHFLOW_SHEET_NAME_ENV, _DEFAULT_CASHFLOW_SHEET_NAME).strip()
+
+
+def _export_sheet_as_csv(sheets_service, file_id: str, sheet_name: str) -> str:
+    """Read a named sheet tab via Sheets API and return CSV text.
+
+    Uses spreadsheets.values.get with FORMATTED_VALUE so currency strings
+    are preserved in the format the existing parser expects.
+    """
     try:
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="text/csv",
-        )
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        return buf.getvalue().decode("utf-8", errors="replace")
+        # Single-quote the sheet name to handle spaces and special chars
+        range_spec = f"'{sheet_name}'"
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=file_id,
+            range=range_spec,
+            valueRenderOption="FORMATTED_VALUE",
+            dateTimeRenderOption="FORMATTED_STRING",
+        ).execute()
     except HttpError as exc:
         status = exc.resp.status if hasattr(exc, "resp") else "?"
         raise GsheetsConnectorError(
-            f"Drive export_media failed (HTTP {status}): {exc}"
+            f"Sheets API values.get failed (HTTP {status}): {exc}"
         ) from exc
     except Exception as exc:
         raise GsheetsConnectorError(
-            f"Unexpected error exporting CSV: {exc}"
+            f"Unexpected error reading sheet tab: {exc}"
         ) from exc
+
+    rows = result.get("values", [])
+    if not rows:
+        raise GsheetsConnectorError(
+            f"Sheet tab returned no data (check tab name and permissions)"
+        )
+
+    # Convert list-of-lists to CSV text for the existing parser
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -538,6 +577,9 @@ def cashflow_file_id() -> str:
 def get_cashflow(file_id: Optional[str] = None) -> CashflowSummary:
     """Return a CashflowSummary for the Standing ACTUALS sheet.
 
+    Reads the CF_SUMMARY tab (or GSHEETS_CASHFLOW_SHEET_NAME override) via
+    the Sheets API so the active/first tab of the workbook does not matter.
+
     Results are cached in-process for _CACHE_TTL_SECONDS (30 min).
     Raises GsheetsConnectorError on auth/API/parse failure.
     """
@@ -548,15 +590,18 @@ def get_cashflow(file_id: Optional[str] = None) -> CashflowSummary:
         log.debug("Returning cached cashflow summary (file_id redacted)")
         return cached
 
-    log.info("Fetching cashflow sheet from Drive (file_id redacted)")
+    log.info("Fetching cashflow sheet from Sheets API (file_id redacted)")
     try:
-        service = _build_drive_service()
-        modified_date = _get_modified_time(service, fid)
-        csv_text = _export_csv(service, fid)
+        delegated_creds = _build_delegated_creds()
+        drive_service = _build_drive_service(delegated_creds)
+        sheets_service = _build_sheets_service(delegated_creds)
+        modified_date = _get_modified_time(drive_service, fid)
+        sheet_name = _cashflow_sheet_name()
+        csv_text = _export_sheet_as_csv(sheets_service, fid, sheet_name)
     except GsheetsConnectorError:
         raise
     except Exception as exc:
-        raise GsheetsConnectorError(f"Drive API error: {exc}") from exc
+        raise GsheetsConnectorError(f"Sheets API error: {exc}") from exc
 
     summary = _parse_cashflow_csv(csv_text, modified_date)
 
