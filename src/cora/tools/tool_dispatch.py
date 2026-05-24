@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import asana_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from . import ads_client, asana_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
 from ..connectors import qbo_oauth
 
 log = logging.getLogger(__name__)
@@ -1034,6 +1034,55 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
         )
 
 
+def _tool_influencer_list_handles(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return all registered athlete handles, optionally filtered by platform.
+
+    Read-only roster view. Alex uses this to see who's already in the tracker
+    before registering a new athlete, or to confirm handle spellings before
+    filing a deliverable.
+    """
+    input_data = _input or {}
+    platform = (input_data.get("platform") or "").strip().lower() or None
+    # Entity scope: in entity channels filter to that entity; FNDR sees all
+    entity_filter = entity if entity != "FNDR" else None
+
+    try:
+        rows = influencer_client.list_handles(entity=entity_filter, platform=platform)
+    except influencer_client.InfluencerClientError as exc:
+        log.warning("influencer_list_handles error actor=%s: %s", slack_user_id, exc)
+        return f"Influencer tracker error: {exc}. Tell the user there was a problem reading the handle registry."
+
+    if not rows:
+        scope_note = f" for {entity_filter}" if entity_filter else ""
+        plat_note = f" on {platform}" if platform else ""
+        return (
+            f"No athlete handles are registered{scope_note}{plat_note} yet. "
+            f"Use `influencer_add_handle` to register an athlete's Instagram or TikTok."
+        )
+
+    # Group by athlete for compact display
+    by_athlete: dict[str, list[str]] = {}
+    for r in rows:
+        name = r["athlete_name"]
+        tag = f"{r['platform'].capitalize()} @{r['handle']}"
+        if r.get("entity"):
+            tag += f" [{r['entity']}]"
+        by_athlete.setdefault(name, []).append(tag)
+
+    lines = [f"*Registered athlete handles ({len(rows)} total):*"]
+    for name, handles in sorted(by_athlete.items()):
+        lines.append(f"• *{name}*: {' | '.join(handles)}")
+
+    if entity_filter:
+        lines.append(f"_(scoped to {entity_filter} — use #fndr to see all entities)_")
+
+    log.info(
+        "influencer_list_handles actor=%s entity=%s platform=%s rows=%d",
+        slack_user_id, entity_filter or "ALL", platform or "all", len(rows),
+    )
+    return "\n".join(lines)
+
+
 def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → HubSpot owner_id → fetch deals → channel-scope by pipeline → format."""
     mapping = _load_slack_hubspot_map()
@@ -1245,6 +1294,59 @@ def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) ->
     topic = (_input or {}).get("topic") or "unspecified financial question"
     return financial_client.notify_gap(
         topic=topic,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
+# --- Ad performance tool handlers ---
+
+
+def _tool_ads_get_performance_summary(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch blended ad performance summary (spend, ROAS, CAC, POAS, Amazon)."""
+    lookback_days = int((_input or {}).get("lookback_days") or 30)
+    return ads_client.get_performance_summary_text(
+        lookback_days=lookback_days,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
+def _tool_ads_get_channel_breakdown(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch per-channel ad performance breakdown."""
+    lookback_days = int((_input or {}).get("lookback_days") or 30)
+    return ads_client.get_channel_breakdown_text(
+        lookback_days=lookback_days,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
+def _tool_ads_get_subbrand_performance(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch per-sub-brand (Pure / Mood / Energy) ad performance."""
+    lookback_days = int((_input or {}).get("lookback_days") or 30)
+    return ads_client.get_subbrand_performance_text(
+        lookback_days=lookback_days,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
+def _tool_ads_get_pixel_attribution(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch first-party pixel attribution vs platform-reported ROAS."""
+    lookback_days = int((_input or {}).get("lookback_days") or 30)
+    return ads_client.get_pixel_attribution_text(
+        lookback_days=lookback_days,
+        channel=entity,
+        user=slack_user_id,
+    )
+
+
+def _tool_ads_get_cm_waterfall(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch CM1 → CM4 contribution margin waterfall."""
+    lookback_days = int((_input or {}).get("lookback_days") or 30)
+    return ads_client.get_cm_waterfall_text(
+        lookback_days=lookback_days,
         channel=entity,
         user=slack_user_id,
     )
@@ -1524,6 +1626,30 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["summary", "start", "end", "confirmed"],
+        },
+    },
+    {
+        "name": "influencer_list_handles",
+        "description": (
+            "List all sponsored athletes registered in Cora's influencer tracker — their "
+            "names, platforms, and handles. Use this when Alex or Harrison wants to see "
+            "the current athlete roster before registering someone new, confirm a handle "
+            "spelling, or just audit who's being tracked — phrases like 'who are our "
+            "registered athletes', 'show me the athlete handles', 'what athletes do we "
+            "have in the tracker', 'is [athlete] registered already', 'list our influencers'. "
+            "Read-only — no confirmation needed. Channel entity scope applies (in F3E "
+            "channels only F3E athletes appear; FNDR channels see all entities). Optionally "
+            "filter to a single platform with the `platform` parameter."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {
+                    "type": "string",
+                    "description": "Optional. Filter to a specific platform: 'instagram' or 'tiktok'. Omit to see all platforms.",
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -1890,6 +2016,137 @@ TOOL_DEFINITIONS = [
             "required": ["topic"],
         },
     },
+    # ── Ad performance tools (F3E only — scoped by entity check in f3e.md prompt) ──
+    {
+        "name": "ads_get_performance_summary",
+        "description": (
+            "Fetch F3 Energy's blended ad performance summary across all paid channels. "
+            "Use this when a user asks about overall ad spend, ROAS, CAC, POAS, or ad "
+            "efficiency — phrases like 'how are our ads doing', 'what's our ROAS', "
+            "'what did we spend on ads', 'how's our CAC looking', 'are ads profitable', "
+            "'what's our ad performance this month', 'how's paid performing'. "
+            "Returns total spend, blended ROAS, new-customer ROAS, POAS, blended CAC, "
+            "paid CPO, net revenue after ads, and Amazon ad metrics. "
+            "All output is source-opaque — no platform names, no account references. "
+            "Defaults to last 30 days; user can request a different window. "
+            "Only call in F3E or FNDR channels. Do NOT call for OSN, LEX, BDM, or UFL."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_days": {
+                    "type": "integer",
+                    "description": (
+                        "Number of days to look back from yesterday (default 30). "
+                        "Use 7 for 'this week', 30 for 'this month', 90 for 'last quarter'. "
+                        "Max 365."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "ads_get_channel_breakdown",
+        "description": (
+            "Fetch F3 Energy ad performance broken down by marketing channel. "
+            "Use this when a user asks which channels are working, channel-level ROAS or "
+            "spend allocation — phrases like 'which channels are performing best', "
+            "'how is Meta vs Google', 'where should we shift budget', 'channel breakdown', "
+            "'what's our spend by channel', 'paid social vs paid search performance'. "
+            "Returns spend, ROAS, and CAC per channel group. "
+            "Output is source-opaque — channel names come from the custom dimension "
+            "configured in Polar (set by Harrison in Settings → Custom Dimensions → "
+            "Default channel grouping). Never name the underlying platforms directly. "
+            "NOTE: Amazon channels will appear only after Harrison adds an 'Amazon' rule "
+            "to the Polar custom channel grouping (pre-build gate). "
+            "Only call in F3E or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Number of days to look back from yesterday (default 30).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "ads_get_subbrand_performance",
+        "description": (
+            "Fetch F3 Energy ad performance split by sub-brand: F3 Pure, F3 Mood, and "
+            "F3 Energy (core). Use this when a user asks about brand-level performance, "
+            "which product line is driving results, or wants to compare brands — phrases "
+            "like 'how is F3 Pure doing on ads', 'which brand has the best ROAS', "
+            "'Pure vs Energy ad performance', 'sub-brand breakdown', 'brand-level spend'. "
+            "Returns spend, blended ROAS, CAC, net revenue after ads, and subscription "
+            "share per brand. Output is source-opaque. "
+            "Only call in F3E or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Number of days to look back from yesterday (default 30).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "ads_get_pixel_attribution",
+        "description": (
+            "Fetch first-party pixel attribution data vs platform-reported ROAS for F3 "
+            "Energy. Use this when a user asks about attribution accuracy, platform "
+            "over-reporting, true ROAS, or pixel vs platform discrepancies — phrases like "
+            "'what does the pixel say', 'is Meta over-reporting', 'true ROAS vs reported', "
+            "'first-party attribution', 'how accurate are the platform numbers', "
+            "'pixel CAC'. "
+            "Returns pixel ROAS (blended + paid), pixel CAC, pixel CPO, platform-reported "
+            "ROAS, and the attribution gap delta. Output is source-opaque. "
+            "Only call in F3E or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Number of days to look back from yesterday (default 30).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "ads_get_cm_waterfall",
+        "description": (
+            "Fetch the F3 Energy contribution margin waterfall (CM1 through CM4). "
+            "Use this when a user asks about profitability after marketing spend, "
+            "contribution margin, CM3, whether marketing is eating into margin — phrases "
+            "like 'what's our CM3', 'contribution margin after ads', 'how much margin "
+            "are we left with after marketing', 'CM waterfall', 'are we hitting our "
+            "margin targets', 'profitability after ad spend'. "
+            "Returns CM1 (after COGS), CM2 (after variable opex), CM3 (after marketing "
+            "— primary health metric), and CM4 (after fixed opex) as both $ and %. "
+            "CM3 is compared against the target floor set in the Manus snapshot. "
+            "Output is source-opaque. Only call in F3E or FNDR channels. "
+            "This is a financial-adjacent question — apply TIER_3 guardrail in non-"
+            "leadership channels: refuse and redirect to #f3e-finance or #f3e-leadership."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Number of days to look back from yesterday (default 30).",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -1901,6 +2158,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "gmail_create_draft": _tool_gmail_create_draft,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
+    "influencer_list_handles": _tool_influencer_list_handles,
     "influencer_add_handle": _tool_influencer_add_handle,
     "influencer_get_status": _tool_influencer_get_status,
     "influencer_log_deliverable": _tool_influencer_log_deliverable,
@@ -1912,6 +2170,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
+    "ads_get_performance_summary": _tool_ads_get_performance_summary,
+    "ads_get_channel_breakdown": _tool_ads_get_channel_breakdown,
+    "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
+    "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
+    "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
 }
 
 
