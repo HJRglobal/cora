@@ -32,3 +32,7 @@ Thumbs.db
 
 # Credentials (private keys)
 .credentials/
+
+# Temporary fix/debug scripts (FUSE workarounds — safe to delete from Windows side)
+tmp_*.py
+tmp_*.txt
