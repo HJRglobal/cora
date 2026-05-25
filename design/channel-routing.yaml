@@ -70,6 +70,19 @@ routes:
   # BDM — covers bare #bdm, bdm-*, and #media (BDM client work catch-all, C0B2Z7Z7C84).
   # Note: #media is a non-standard channel name owned by BDM for cross-client production
   # work. Added 2026-05-24 per bdm.md wishlist Category 4.
+  #
+  # Per-client channels (all private, all covered by bdm-* wildcard):
+  #   #bdm-f3energy      C0B610J3PH7  — F3 Energy (all 3 brands) [created 2026-05-24]
+  #   #bdm-osn           C0B5X49CN6A  — One Stop Nutrition [created 2026-05-24]
+  #   #bdm-hjrpodcast    C0B5X5D3QQN  — HJR Podcast / HJR Productions [created 2026-05-24]
+  #   #bdm-arie-lauren   C0B5X5BK39U  — Arie + Lauren (external couple client) [created 2026-05-24]
+  #   #bdm-demi-brand    C0B5SRVGWRZ  — Demi Bagby personal brand [created 2026-05-24]
+  #   #bdm-lac           C0B5Z7CAW74  — Luxury Auto Collection (external) [created 2026-05-24]
+  #   #bdm-berry-divine  C0B5SQS9X7D  — Berry Divine (external, confidential) [created 2026-05-24]
+  #   #bdm-redbull       C0B5Z68FBNE  — Red Bull (external, confidential) [created 2026-05-24]
+  #   #bdm-mclaren       C0B6TEUMMB2  — McLaren (external, confidential) [created 2026-05-24]
+  #   #bdm-lifted-trucks C0B6TEUV0RE  — Lifted Trucks (external, confidential) [created 2026-05-24]
+  # Archived (superseded): #bdm-lexington C0B5SQQGSAX, #bdm-podcast C0B611CE17T, #bdm-properties C0B6TESPS3A
   - pattern: "bdm"
     entity: BDM
   - pattern: "bdm-*"

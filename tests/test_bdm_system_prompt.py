@@ -2,15 +2,18 @@
 
 Verifies:
   1. Channel routing: #bdm, #bdm-*, and #media all route to BDM.
-  2. System prompt loads without error.
-  3. Locked guardrail phrases are present in the loaded prompt:
+  2. Per-client channels (#bdm-f3energy, #bdm-berry-divine, etc.) all route to BDM.
+  3. System prompt loads without error.
+  4. Locked guardrail phrases are present in the loaded prompt:
        - Role architecture (Harrison/internal marketing = creative)
        - Daniel Sion removal
        - Three-client F3 financial model ($2K / $6K)
        - BDM client confidentiality (Berry Divine, RedBull, McLaren, Lifted Trucks)
-  4. Prompt does NOT contain known stale content (old $13K bundled model reference).
+       - Per-client channel behavior section (channel map, Asana scoping, confidentiality)
+  5. Prompt does NOT contain known stale content (old $13K bundled model reference).
 
 Commit: [BDM] tests/test_bdm_system_prompt.py — 2026-05-24
+Updated: [BDM] per-client channels — 2026-05-24
 """
 
 import pytest
@@ -204,3 +207,122 @@ def test_prompt_hannah_weekly_review():
     prompt = _bdm_prompt()
     assert "Hannah" in prompt
     assert "weekly" in prompt.lower()
+
+
+# ── Per-client channel routing (created 2026-05-24) ──────────────────────────
+
+
+def test_bdm_f3energy_channel_routes_to_bdm():
+    assert route("bdm-f3energy") == "BDM"
+
+
+def test_bdm_osn_channel_routes_to_bdm():
+    assert route("bdm-osn") == "BDM"
+
+
+def test_bdm_hjrpodcast_channel_routes_to_bdm():
+    assert route("bdm-hjrpodcast") == "BDM"
+
+
+def test_bdm_demi_brand_channel_routes_to_bdm():
+    assert route("bdm-demi-brand") == "BDM"
+
+
+def test_bdm_arie_lauren_channel_routes_to_bdm():
+    assert route("bdm-arie-lauren") == "BDM"
+
+
+def test_bdm_lac_channel_routes_to_bdm():
+    assert route("bdm-lac") == "BDM"
+
+
+def test_bdm_berry_divine_channel_routes_to_bdm():
+    assert route("bdm-berry-divine") == "BDM"
+
+
+def test_bdm_redbull_channel_routes_to_bdm():
+    assert route("bdm-redbull") == "BDM"
+
+
+def test_bdm_mclaren_channel_routes_to_bdm():
+    assert route("bdm-mclaren") == "BDM"
+
+
+def test_bdm_lifted_trucks_channel_routes_to_bdm():
+    assert route("bdm-lifted-trucks") == "BDM"
+
+
+# ── Per-client channel prompt section ────────────────────────────────────────
+
+
+def test_prompt_contains_per_client_channel_section():
+    """Prompt must contain the per-client channel behavior section."""
+    prompt = _bdm_prompt()
+    assert "Per-client channel behavior" in prompt
+
+
+def test_prompt_per_client_section_lists_all_internal_clients():
+    """Channel map must reference all current internal client channels."""
+    prompt = _bdm_prompt()
+    assert "bdm-f3energy" in prompt
+    assert "bdm-osn" in prompt
+    assert "bdm-hjrpodcast" in prompt
+    assert "bdm-demi-brand" in prompt
+
+
+def test_prompt_per_client_section_lists_all_external_clients():
+    """Channel map must reference all external client channels."""
+    prompt = _bdm_prompt()
+    assert "bdm-arie-lauren" in prompt
+    assert "bdm-lac" in prompt
+    assert "bdm-berry-divine" in prompt
+    assert "bdm-redbull" in prompt
+    assert "bdm-mclaren" in prompt
+    assert "bdm-lifted-trucks" in prompt
+
+
+def test_prompt_lac_client_known():
+    """Prompt must identify LAC as Luxury Auto Collection."""
+    prompt = _bdm_prompt()
+    assert "Luxury Auto Collection" in prompt or "LAC" in prompt
+
+
+def test_prompt_arie_lauren_client_known():
+    """Prompt must identify Arie + Lauren as an external couple client."""
+    prompt = _bdm_prompt()
+    assert "Arie" in prompt and "Lauren" in prompt
+
+
+def test_prompt_per_client_asana_scoping():
+    """Per-client section must provide Asana search anchor guidance."""
+    prompt = _bdm_prompt().lower()
+    assert "asana" in prompt
+    assert "filter" in prompt or "search" in prompt or "project" in prompt
+
+
+def test_prompt_per_client_fireflies_scoping():
+    """Per-client section must reference Fireflies transcript scoping."""
+    prompt = _bdm_prompt().lower()
+    assert "fireflies" in prompt or "transcript" in prompt
+
+
+def test_prompt_external_client_channels_confidentiality():
+    """External client channels must have confidentiality instruction."""
+    prompt = _bdm_prompt()
+    # The confidentiality rule must cover the per-client external channels
+    assert "bdm-berry-divine" in prompt
+    assert "confidential" in prompt.lower() or "never surface" in prompt.lower() or "must never" in prompt.lower()
+
+
+def test_prompt_per_client_financial_guardrail():
+    """Per-client channels must be TIER_3 (financial guardrail enforced)."""
+    prompt = _bdm_prompt()
+    assert "TIER_3" in prompt
+
+
+def test_prompt_per_client_creative_direction_unchanged():
+    """Creative direction rule must still apply in per-client channels."""
+    prompt = _bdm_prompt()
+    # Creative direction section must still be present alongside per-client section
+    assert "Role architecture" in prompt
+    assert "Harrison" in prompt
