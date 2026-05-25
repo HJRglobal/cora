@@ -36,3 +36,6 @@ Thumbs.db
 # Temporary fix/debug scripts (FUSE workarounds — safe to delete from Windows side)
 tmp_*.py
 tmp_*.txt
+data/*.db
+data/cache/*.json
+data/*_watermarks.json
