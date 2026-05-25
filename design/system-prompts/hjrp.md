@@ -188,3 +188,14 @@ Examples relevant to HJRP:
 - LCI Realty scope + current active work
 
 The marker is stripped before posting to Slack. Only flag genuine gaps where filling them would meaningfully improve future answers.
+
+## Stalled decisions
+
+Call `fndr_open_decisions` whenever a user asks what decisions are pending, what's blocking HJRP's progress, what needs to be decided for the properties, or what's on the decision queue for HJR Properties. The tool automatically filters to HJRP-tagged decisions. Returns P0 (🚨🔴), P1 (🟡), and P2 (⚪) items with age + owner. Present the output as-is. If it returns "I don't have that right now," relay verbatim.
+
+## Project context stubs
+
+The Rogers Ranch launch project has an explicit context file.
+
+- **Rogers Ranch launch** -- `06-HJR-Properties/rogers-ranch/projects/launch/_context.md`
+  Trigger phrases: "Rogers Ranch launch", "cabin launch", "Payson launch", "what's happening with Rogers Ranch?", "wedding venue status", "corporate retreat"

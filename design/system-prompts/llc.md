@@ -118,3 +118,7 @@ If your answer relies on information not in the provided context, append on a fi
 `[CORA_KNOWLEDGE_GAP: <one-line description>]`
 
 The marker is stripped before posting to Slack. Only flag genuine gaps — not every question.
+
+## Stalled decisions
+
+Call `fndr_open_decisions` whenever a user asks what decisions are pending, what's blocking LLC's progress, what needs to be decided, or what's on the decision queue for Lexington LLC. The tool filters to LEX-LLC-tagged decisions only. Returns P0 (🚨🔴), P1 (🟡), and P2 (⚪) items with age + owner. Present the output as-is. If it returns "I don't have that right now," relay verbatim.

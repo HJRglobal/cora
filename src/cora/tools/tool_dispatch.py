@@ -1393,7 +1393,16 @@ def _tool_osn_customer_trends(slack_user_id: str, entity: str, _input: dict) -> 
 
 
 def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return P0/P1 stalled decisions from memory/decisions-pending.md with age."""
+    """Return stalled decisions from memory/decisions-pending.md, entity-filtered.
+
+    When called from a FNDR/HJRG channel (or entity is empty), returns ALL P0/P1 items
+    across the full portfolio.  When called from an entity-specific channel (e.g. OSN,
+    F3E, LEX-LLC) returns only items whose Entity tag matches that entity — plus any
+    FNDR-tagged items (those are portfolio-level and visible everywhere).
+
+    Reads the entire file — covers the main ## Active section AND the Gmail Deep Dive
+    open-questions sections.  Skips the ## Recently resolved section.
+    """
     import re
     from datetime import date, datetime
 
@@ -1411,22 +1420,35 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
 
     today = date.today()
 
-    # Extract only the ## Active section (stop at the next ## heading — e.g. Gmail Deep Dive)
-    active_match = re.search(r"^## Active\b", content, re.MULTILINE)
-    if not active_match:
-        return "No active decisions found in the pending queue."
+    # Determine whether this is a portfolio-wide (FNDR/HJRG) or entity-scoped call.
+    # Lex sub-entity channels (LEX-LLC, LEX-LLA, etc.) narrow to that sub-entity.
+    calling_entity = (entity or "FNDR").upper().strip()
+    portfolio_wide = calling_entity in ("FNDR", "HJRG", "")
 
-    rest_after_active = content[active_match.end():]
-    next_section_match = re.search(r"^## ", rest_after_active, re.MULTILINE)
-    active_section = (
-        rest_after_active[: next_section_match.start()]
-        if next_section_match
-        else rest_after_active
-    )
+    # Normalize caller entity for matching (e.g. "OSN", "F3E", "LEX-LLC")
+    def _entity_matches(entry_entity_raw: str) -> bool:
+        """True if the entry's Entity field covers the calling channel's entity."""
+        if portfolio_wide:
+            return True
+        # Parse comma-separated entity codes from the entry
+        entry_entities = [e.strip().upper() for e in entry_entity_raw.split(",")]
+        # Direct match OR portfolio-level items (FNDR visible everywhere)
+        if "FNDR" in entry_entities:
+            return True
+        if calling_entity in entry_entities:
+            return True
+        # Lex parent channel (#lex-*) sees all sub-entities
+        if calling_entity == "LEX":
+            return any(e.startswith("LEX") for e in entry_entities)
+        return False
 
-    # Parse each ### entry block
+    # Strip the ## Recently resolved section before parsing
+    resolved_match = re.search(r"^## Recently resolved\b", content, re.MULTILINE)
+    parseable = content[: resolved_match.start()] if resolved_match else content
+
+    # Parse every ### block in the file (covers Active + Gmail Deep Dive sections)
     entries: list[dict] = []
-    topic_blocks = re.split(r"\n(?=### )", active_section)
+    topic_blocks = re.split(r"\n(?=### )", parseable)
 
     for block in topic_blocks:
         if not block.startswith("### "):
@@ -1434,11 +1456,20 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
 
         topic = block.split("\n", 1)[0][4:].strip()  # strip "### " prefix
 
+        # Entity tag (required for filtering; absent = treat as FNDR/visible everywhere)
+        entity_match = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
+        entry_entity_raw = entity_match.group(1).strip() if entity_match else "FNDR"
+        if not _entity_matches(entry_entity_raw):
+            continue
+
         sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)", block)
         if not sev_match:
             continue
         severity = sev_match.group(1)
-        if severity not in ("P0", "P1"):
+        # Portfolio-wide: P0+P1 only. Entity-scoped: P0+P1+P2 for the full picture.
+        if portfolio_wide and severity not in ("P0", "P1"):
+            continue
+        if not portfolio_wide and severity not in ("P0", "P1", "P2"):
             continue
 
         # Parse Last touched — handles "2026-05-23", "2026-05-12 (note)", "~2026-04"
@@ -1465,11 +1496,19 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
         owner = owner_match.group(1).strip() if owner_match else "unassigned"
 
         entries.append(
-            {"topic": topic, "severity": severity, "age_days": age_days, "owner": owner}
+            {
+                "topic": topic,
+                "severity": severity,
+                "age_days": age_days,
+                "owner": owner,
+                "entity": entry_entity_raw,
+            }
         )
 
     if not entries:
-        return "No P0 or P1 decisions are currently pending."
+        if portfolio_wide:
+            return "No P0 or P1 decisions are currently pending."
+        return f"No open decisions found for {calling_entity}."
 
     p0 = sorted(
         [e for e in entries if e["severity"] == "P0"],
@@ -1478,6 +1517,11 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
     )
     p1 = sorted(
         [e for e in entries if e["severity"] == "P1"],
+        key=lambda x: x["age_days"] or 0,
+        reverse=True,
+    )
+    p2 = sorted(
+        [e for e in entries if e["severity"] == "P2"],
         key=lambda x: x["age_days"] or 0,
         reverse=True,
     )
@@ -1492,26 +1536,42 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
             age_str = "1d stale"
         else:
             age_str = f"{age}d stale"
-        # 🚨 = P0 >14d, 🔴 = P0 ≤14d, 🟡 = P1
+        # 🚨 = P0 >14d, 🔴 = P0 <=14d, 🟡 = P1, ⚪ = P2
         if e["severity"] == "P0" and (age or 0) > 14:
             marker = "🚨"
         elif e["severity"] == "P0":
             marker = "🔴"
-        else:
+        elif e["severity"] == "P1":
             marker = "🟡"
+        else:
+            marker = "⚪"
         return f"{marker} *{e['topic']}* ({age_str}) — {e['owner']}"
 
-    lines = [f"*Open decisions — {len(p0)} P0, {len(p1)} P1:*", ""]
+    scope_label = "portfolio" if portfolio_wide else calling_entity
+    header_parts = []
+    if p0:
+        header_parts.append(f"{len(p0)} P0")
+    if p1:
+        header_parts.append(f"{len(p1)} P1")
+    if p2 and not portfolio_wide:
+        header_parts.append(f"{len(p2)} P2")
+    header = f"*Open decisions ({scope_label}) — {', '.join(header_parts) or 'none'}:*"
+
+    lines = [header, ""]
     for e in p0:
         lines.append(_fmt(e))
-    if p0 and p1:
+    if p0 and (p1 or p2):
         lines.append("")
     for e in p1:
         lines.append(_fmt(e))
+    if p1 and p2 and not portfolio_wide:
+        lines.append("")
+    for e in p2:
+        lines.append(_fmt(e))
 
     log.info(
-        "fndr_open_decisions user=%s entity=%s p0=%d p1=%d",
-        slack_user_id, entity, len(p0), len(p1),
+        "fndr_open_decisions user=%s entity=%s scope=%s p0=%d p1=%d p2=%d",
+        slack_user_id, entity, scope_label, len(p0), len(p1), len(p2),
     )
     return "\n".join(lines)
 
@@ -2326,18 +2386,18 @@ TOOL_DEFINITIONS = [
     {
         "name": "fndr_open_decisions",
         "description": (
-            "Return all P0 and P1 stalled decisions from the pending decisions queue, "
-            "with days-stale age and the owner of the next nudge. "
-            "Use this when Harrison asks about open or stalled decisions, what decisions "
-            "are pending, what's blocking progress, what needs a decision this week/month "
-            "— phrases like 'what decisions are pending', 'what's stalled', 'show me the "
-            "decision queue', 'what P0s do I have', 'what do I need to decide', 'what's "
-            "been waiting on me'. "
-            "Returns a structured list: 🚨 for P0 items stale >14 days (must decide this "
-            "week), 🔴 for P0 items <14 days, 🟡 for P1 items. "
-            "Read-only — no confirmation needed. "
-            "Only call in FNDR or HJRG channels (#fndr, #hjrg-*, or any founder-level "
-            "channel). Do NOT call for entity-specific operational questions."
+            "Return stalled decisions from the pending decisions queue, entity-scoped to "
+            "the calling channel. In FNDR/HJRG channels returns all portfolio P0+P1 items. "
+            "In entity-specific channels (OSN, F3E, LEX-LLC, LEX-LLA, HJRP, UFL, etc.) "
+            "returns only that entity's open decisions — P0, P1, and P2 — so operators "
+            "see exactly what's blocking their entity this week. "
+            "Use this when someone asks about open or stalled decisions, what decisions "
+            "are pending, what's blocking progress, what needs to be decided — phrases like "
+            "'what decisions are pending', 'what's stalled', 'show me the decision queue', "
+            "'what P0s do I have', 'what do I need to decide', 'what's blocking us', "
+            "'what's been waiting on me', 'what decisions are open for OSN/F3E/Lex'. "
+            "Returns: 🚨 P0 stale >14d (decide this week), 🔴 P0 <=14d, 🟡 P1, ⚪ P2. "
+            "Read-only — no confirmation needed. Call in any channel."
         ),
         "input_schema": {
             "type": "object",
