@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
 from ..connectors import clover_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
@@ -1717,6 +1717,15 @@ def _tool_f3e_shopify_inventory(slack_user_id: str, entity: str, _input: dict) -
     return shopify_client.format_inventory_for_llm(variants, bool(low_stock_only))
 
 
+# --- F3E warehouse inventory pulse ---
+
+
+def _tool_f3e_inventory_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return F3E warehouse/3PL stock levels from the Cotton weekly batch report."""
+    log.info("f3e_inventory_pulse user=%s entity=%s", slack_user_id, entity)
+    return inventory_client.get_f3e_inventory_pulse_text()
+
+
 # --- F3 brand voice check ---
 
 
@@ -2505,6 +2514,27 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── F3E warehouse inventory (batch report, not live DTC) ──
+    {
+        "name": "f3e_inventory_pulse",
+        "description": (
+            "Use this for WAREHOUSE STOCK LEVELS from the weekly batch report (Cotton 3PL "
+            "warehouse, Nimbl lot totals, 117 office). Do NOT use for live DTC inventory — "
+            "use f3e_shopify_inventory for that. Use when user explicitly asks about warehouse "
+            "stock, weekly inventory report, Cotton 3PL levels, or total cans across all "
+            "locations — phrases like 'what does the inventory report say', 'how many cans "
+            "do we have total', 'what's in the warehouse', 'Cotton 3PL stock', 'Nimbl inventory', "
+            "'how many cases do we have across all locations'. "
+            "Returns case counts by SKU across UNIS warehouse, Nimbl 3PL lot, and 117 office, "
+            "with 🚨 Critical (≤50 cases), ⚠️ Low (≤200 cases), ✅ Healthy flags. "
+            "Read-only. Only call in F3E or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──
     {
         "name": "f3e_brand_voice_check",
@@ -2807,6 +2837,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "fndr_open_decisions": _tool_fndr_open_decisions,
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
+    "f3e_inventory_pulse": _tool_f3e_inventory_pulse,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "osn_sales_pulse": _tool_osn_sales_pulse,
     "osn_inventory_status": _tool_osn_inventory_status,
