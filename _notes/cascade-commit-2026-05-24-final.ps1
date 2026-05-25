@@ -1,9 +1,9 @@
-# cascade-commit-2026-05-24-final.ps1
+﻿# cascade-commit-2026-05-24-final.ps1
 # Final cascade for all uncommitted Cora work as of 2026-05-24 evening.
 # Covers Groups A (LEX sub-entity siloing), B (F3E/OSN tools + app.py guard fix),
 # C (infra, config, test restore, deployment scripts).
 #
-# Run from PowerShell in ANY directory — script cd's to repo root.
+# Run from PowerShell in ANY directory -- script cd's to repo root.
 # Execute: .\cascade-commit-2026-05-24-final.ps1
 
 Set-StrictMode -Version Latest
@@ -12,9 +12,9 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = 'C:\Users\Harri\code\cora'
 Set-Location $repoRoot
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # 0. PRE-FLIGHT
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 $lockFile = Join-Path $repoRoot '.git\index.lock'
 if (Test-Path $lockFile) {
     Write-Host '[PRE-FLIGHT] Removing stale .git/index.lock ...'
@@ -28,13 +28,13 @@ function Commit-WithMessage {
     git commit -F $msgFile
 }
 
-# ─────────────────────────────────────────────────────────────
-# GROUP A — LEX sub-entity siloing
+# -------------------------------------------------------------
+# GROUP A -- LEX sub-entity siloing
 # system prompts + channel routing + context_loader + KB store
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 Write-Host ''
 Write-Host '======================================================'
-Write-Host ' GROUP A — LEX sub-entity siloing + routing + KB'
+Write-Host ' GROUP A -- LEX sub-entity siloing + routing + KB'
 Write-Host '======================================================'
 
 $groupA = @(
@@ -65,17 +65,17 @@ if ($sgStatus -and $sgStatus.Substring(0,2).Trim() -in @('?', '??', 'A')) {
     Write-Host '  git add src/cora/sibling_guard.py  [modified]'
     git add 'src/cora/sibling_guard.py'
 } else {
-    Write-Host '  [sibling_guard.py already committed or clean — skipping]'
+    Write-Host '  [sibling_guard.py already committed or clean -- skipping]'
 }
 
 Commit-WithMessage '[LEX] Sub-entity siloing: system prompts (llc/lts/lbhs/lla), channel routing, context_loader firewall, KB strict sub_entity filter'
 
-# ─────────────────────────────────────────────────────────────
-# GROUP B — F3E/OSN tools + app.py sibling guard wire-up
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
+# GROUP B -- F3E/OSN tools + app.py sibling guard wire-up
+# -------------------------------------------------------------
 Write-Host ''
 Write-Host '======================================================'
-Write-Host ' GROUP B — F3E/OSN tools + app.py sibling guard'
+Write-Host ' GROUP B -- F3E/OSN tools + app.py sibling guard'
 Write-Host '======================================================'
 
 $groupBRequired = @(
@@ -103,7 +103,7 @@ $groupBOptional = @(
 
 foreach ($f in $groupBOptional) {
     if (Test-Path (Join-Path $repoRoot $f)) {
-        Write-Host "  git add $f  [optional — found]"
+        Write-Host "  git add $f  [optional -- found]"
         git add $f
     } else {
         Write-Host "  [OPTIONAL SKIP] not found: $f"
@@ -112,13 +112,13 @@ foreach ($f in $groupBOptional) {
 
 Commit-WithMessage '[F3E/OSN/APP] app.py sibling guard wire-up; F3E inventory + HubSpot tools; OSN Clover connector; tool_dispatch updates'
 
-# ─────────────────────────────────────────────────────────────
-# GROUP C — Infrastructure + system prompts (BDM/OSN/FNDR) +
+# -------------------------------------------------------------
+# GROUP C -- Infrastructure + system prompts (BDM/OSN/FNDR) +
 #            deployment scripts + test restore + config
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 Write-Host ''
 Write-Host '======================================================'
-Write-Host ' GROUP C — Infra, BDM/OSN/FNDR prompts, test restore'
+Write-Host ' GROUP C -- Infra, BDM/OSN/FNDR prompts, test restore'
 Write-Host '======================================================'
 
 # C-1: System prompts not in Group A
@@ -213,9 +213,9 @@ foreach ($f in $groupCTests) {
 
 Commit-WithMessage '[INFRA] BDM/OSN/FNDR prompts, deployment scripts, pyproject/uv.lock, .gitignore, slack-to-asana, restore test files'
 
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 # PUSH
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 Write-Host ''
 Write-Host '======================================================'
 Write-Host ' PUSH'
@@ -224,7 +224,7 @@ git push origin main
 
 Write-Host ''
 Write-Host '======================================================'
-Write-Host ' DONE — recent commits'
+Write-Host ' DONE -- recent commits'
 Write-Host '======================================================'
 git log --oneline -6
 
