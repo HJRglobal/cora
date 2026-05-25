@@ -18,8 +18,8 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, clover_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
-from ..connectors import qbo_oauth
+from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
+from ..connectors import clover_client, qbo_oauth
 
 log = logging.getLogger(__name__)
 
