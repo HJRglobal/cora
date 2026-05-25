@@ -1,4 +1,4 @@
-"""Financial data client — behavioral contract + Slack notification.
+"""Financial data client -- behavioral contract + Slack notification.
 
 Wraps gsheets_financials.get_cashflow() with:
   1. Source-opaque formatting: never expose file IDs, sheet names, Drive links
@@ -108,7 +108,7 @@ def _set_throttled(topic: str) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Slack client (built from env — avoids circular import with app.py)
+# Slack client (built from env -- avoids circular import with app.py)
 # ────────────────────────────────────────────────────────────────────────────
 
 def _slack_client() -> SlackWebClient:
@@ -151,15 +151,15 @@ def _audit(
 
 def _fmt_currency(val: Optional[float]) -> str:
     if val is None:
-        return "—"
+        return "-"
     sign = "-" if val < 0 else ""
     return f"{sign}${abs(val):,.0f}"
 
 
 def _fmt_diff(val: Optional[float]) -> str:
-    """Format a variance: negative = red (over budget), positive = green."""
+    """Format a variance: negative = over budget, positive = under."""
     if val is None:
-        return "—"
+        return "-"
     symbol = "+" if val >= 0 else ""
     return f"{symbol}{_fmt_currency(val)}"
 
@@ -177,10 +177,25 @@ def _entity_line(row: EntityRow) -> str:
     return " | ".join(parts)
 
 
-def _format_summary_full(s: CashflowSummary, entity_filter: Optional[str] = None) -> str:
-    """Format a CashflowSummary for Slack. entity_filter scopes to one entity code."""
+def _format_summary_full(
+    s: CashflowSummary,
+    entity_filter: Optional[str] = None,
+    entity_label: Optional[str] = None,
+) -> str:
+    """Format a CashflowSummary for Slack.
+
+    entity_filter: if set, filters rows to this entity code only (used for CF_SUMMARY reads).
+    entity_label:  human label for the header and totals, e.g. "OSN", "LEX-LLC", "Portfolio".
+                   Defaults to "Portfolio" when reading the CF_SUMMARY tab.
+    """
+    label = entity_label or "Portfolio"
+    is_portfolio = label == "Portfolio"
+
     lines: list[str] = []
-    lines.append(f"*Cash Flow — {s.week_label}* (as of {s.as_of_date})")
+    if is_portfolio:
+        lines.append(f"*Cash Flow -- {s.week_label}* (as of {s.as_of_date})")
+    else:
+        lines.append(f"*{label} Cash Flow -- {s.week_label}* (as of {s.as_of_date})")
     lines.append("")
 
     entities_to_show = s.entities
@@ -193,7 +208,7 @@ def _format_summary_full(s: CashflowSummary, entity_filter: Optional[str] = None
         ]
         if not entities_to_show:
             return (
-                f"No cash flow data found for *{entity_filter}* "
+                f"No cash flow data found for *{label}* "
                 f"in {s.week_label} (as of {s.as_of_date}). "
                 "Ask Hayden or Justin to confirm the sheet has been updated."
             )
@@ -203,26 +218,25 @@ def _format_summary_full(s: CashflowSummary, entity_filter: Optional[str] = None
             lines.append(_entity_line(row))
         lines.append("")
 
-    if entity_filter is None:
-        # Portfolio totals
-        if any(
-            v is not None for v in
-            [s.portfolio_forecast, s.portfolio_actual, s.portfolio_diff]
-        ):
-            lines.append("*Portfolio Total*")
-            if s.portfolio_forecast is not None:
-                lines.append(f"  Forecast: {_fmt_currency(s.portfolio_forecast)}")
-            if s.portfolio_actual is not None:
-                lines.append(f"  Actual:   {_fmt_currency(s.portfolio_actual)}")
-            if s.portfolio_diff is not None:
-                lines.append(f"  Diff:     {_fmt_diff(s.portfolio_diff)}")
-            lines.append("")
+    # Totals -- show for all tabs; label them by entity not "Portfolio"
+    if any(
+        v is not None for v in
+        [s.portfolio_forecast, s.portfolio_actual, s.portfolio_diff]
+    ):
+        lines.append(f"*{label} Total*")
+        if s.portfolio_forecast is not None:
+            lines.append(f"  Forecast: {_fmt_currency(s.portfolio_forecast)}")
+        if s.portfolio_actual is not None:
+            lines.append(f"  Actual:   {_fmt_currency(s.portfolio_actual)}")
+        if s.portfolio_diff is not None:
+            lines.append(f"  Diff:     {_fmt_diff(s.portfolio_diff)}")
+        lines.append("")
 
-        # Balances
-        if s.opening_balance is not None:
-            lines.append(f"  Opening balance: {_fmt_currency(s.opening_balance)}")
-        if s.closing_balance is not None:
-            lines.append(f"  Closing balance: {_fmt_currency(s.closing_balance)}")
+    # Balances
+    if s.opening_balance is not None:
+        lines.append(f"  Opening balance: {_fmt_currency(s.opening_balance)}")
+    if s.closing_balance is not None:
+        lines.append(f"  Closing balance: {_fmt_currency(s.closing_balance)}")
 
     return "\n".join(lines).strip()
 
@@ -242,15 +256,21 @@ def get_cashflow_text(
 
     entity_filter: entity code used to select the correct tab (e.g. "OSN", "LEX-LLC").
                    Reads the entity-specific tab directly rather than filtering CF_SUMMARY.
-    question: raw user question — used to detect OSN Core4 (distribution/partner) intent.
+    question: raw user question -- used to detect OSN Core4 (distribution/partner) intent.
     Returns UNKNOWN_RESPONSE on any error (caller should then call notify_gap).
     """
     try:
-        tab = entity_to_tab(entity_filter or "FNDR", question=question)
+        entity_code = entity_filter or "FNDR"
+        tab = entity_to_tab(entity_code, question=question)
         summary = get_cashflow(tab_name=tab)
-        # For entity-specific tabs the data is already scoped; pass entity_filter=None
-        # so the formatter shows all rows rather than trying to re-filter.
-        result = _format_summary_full(summary, entity_filter=None)
+        # Entity label for formatter: FNDR/HJRG reads CF_SUMMARY -> "Portfolio";
+        # all other entities use their code as the label (e.g. "OSN", "LEX-LLC").
+        if entity_code.upper() in ("FNDR", "HJRG", ""):
+            e_label = "Portfolio"
+        else:
+            e_label = entity_code.upper()
+        # Tab is already entity-scoped -- no row filtering needed, only labeling.
+        result = _format_summary_full(summary, entity_filter=None, entity_label=e_label)
         _audit(
             channel=channel,
             user=user,
@@ -264,7 +284,7 @@ def get_cashflow_text(
         _audit(
             channel=channel,
             user=user,
-            query_summary=f"cashflow entity_filter={entity_filter}",
+            query_summary=f"cashflow entity={entity_filter}",
             result_type="connector_error",
             entity_filter=entity_filter,
         )
@@ -274,7 +294,7 @@ def get_cashflow_text(
         _audit(
             channel=channel,
             user=user,
-            query_summary=f"cashflow entity_filter={entity_filter}",
+            query_summary=f"cashflow entity={entity_filter}",
             result_type="unexpected_error",
             entity_filter=entity_filter,
         )
@@ -288,7 +308,7 @@ def notify_gap(
 ) -> str:
     """Post a finance gap alert to #hjrg-finance (throttled to once per 24h per topic).
 
-    Returns UNKNOWN_RESPONSE exactly — this string should be passed back to the
+    Returns UNKNOWN_RESPONSE exactly -- this string should be passed back to the
     Slack user as Cora's response. Call freely; deduplication is handled internally.
     """
     _audit(
@@ -306,7 +326,7 @@ def notify_gap(
     try:
         user_ref = f"<@{user}>" if user else "(unknown user)"
         msg = (
-            f":warning: *Finance data gap — Cora could not answer*\n"
+            f":warning: *Finance data gap -- Cora could not answer*\n"
             f"> Topic: {topic}\n"
             f"> Channel: {channel or '(unknown)'}\n"
             f"> Requested by: {user_ref}\n"
