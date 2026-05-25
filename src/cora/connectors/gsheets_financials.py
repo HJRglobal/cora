@@ -158,26 +158,83 @@ class GsheetsConnectorError(Exception):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Entity -> tab mapping (Standing ACTUALS workbook)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Maps Cora entity codes to the specific CF_* tab in the Standing ACTUALS sheet.
+# Locked 2026-05-24: Harrison confirmed tab names + entity assignments.
+# CF_HR LLC excluded (personal expense tracking, not business data).
+ENTITY_TO_TAB: dict[str, str] = {
+    "FNDR":        "CF_SUMMARY",
+    "HJRG":        "CF_HJR GS",
+    "F3E":         "CF_F3",
+    "F3C":         "CF_F3",        # F3 Community shares F3 tab
+    "OSN":         "OSN Consolidated",
+    "OSN-WR":      "CF_OSN Warner",
+    "OSN-GF":      "CF_OSN Greenfield",
+    "OSN-VV":      "CF_OSN ValVista",
+    "OSN-MK":      "CF_OSN McKellips",
+    "OSN-CORE4":   "CF_OSN Core4",  # Partner distributions / loan lens
+    "LEX":         "CF_LEXCORP",
+    "LEX-LLC":     "CF_LLC",
+    "LEX-LBHS":    "CF_LBHS",
+    "LEX-LTS":     "CF_LTS",
+    "LEX-LLA":     "CF_LLA_MV",
+    "HJRP":        "CF_HJR Prop",
+    "BDM":         "CF_BigDM",
+    "UFL":         "CF_UFL",
+    "HJRPROD":     "CF_HJR PROD",
+    "HJRPROD-POD": "CF_HJR Podcast",
+}
+
+# Keywords in a user question that trigger the OSN Core4 (partner/distribution) tab
+# instead of the default OSN Consolidated tab.
+_OSN_CORE4_KEYWORDS = frozenset([
+    "distribution", "distributions", "partner", "partners",
+    "loan", "loans", "core4", "core 4",
+])
+
+
+def entity_to_tab(entity: str, question: str = "") -> str:
+    """Return the correct tab name for the given entity code.
+
+    Falls back to CF_SUMMARY for unknown entities.
+    For OSN, switches to CF_OSN Core4 if the question mentions
+    distributions, partner payments, or loans.
+    """
+    code = entity.upper().strip()
+
+    # OSN special case: partner/distribution questions use Core4 tab
+    if code == "OSN" and question:
+        q_lower = question.lower()
+        if any(kw in q_lower for kw in _OSN_CORE4_KEYWORDS):
+            return ENTITY_TO_TAB["OSN-CORE4"]
+
+    return ENTITY_TO_TAB.get(code, "CF_SUMMARY")
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # In-memory cache
 # ────────────────────────────────────────────────────────────────────────────
 
-# {file_id: (fetched_at_unix, CashflowSummary)}
-_CACHE: dict[str, tuple[float, CashflowSummary]] = {}
+# {(file_id, tab_name): (fetched_at_unix, CashflowSummary)}
+_CACHE: dict[tuple[str, str], tuple[float, CashflowSummary]] = {}
 
 
-def _cache_get(file_id: str) -> Optional[CashflowSummary]:
-    entry = _CACHE.get(file_id)
+def _cache_get(file_id: str, tab_name: str) -> Optional[CashflowSummary]:
+    key = (file_id, tab_name)
+    entry = _CACHE.get(key)
     if entry is None:
         return None
     fetched_at, summary = entry
     if time.monotonic() - fetched_at > _CACHE_TTL_SECONDS:
-        del _CACHE[file_id]
+        del _CACHE[key]
         return None
     return summary
 
 
-def _cache_set(file_id: str, summary: CashflowSummary) -> None:
-    _CACHE[file_id] = (time.monotonic(), summary)
+def _cache_set(file_id: str, tab_name: str, summary: CashflowSummary) -> None:
+    _CACHE[(file_id, tab_name)] = (time.monotonic(), summary)
 
 
 def invalidate_cache(file_id: Optional[str] = None) -> None:
@@ -312,9 +369,12 @@ def _parse_float(val: str) -> Optional[float]:
 
 
 def _is_date_like(val: str) -> bool:
-    """Return True if the cell looks like a week date (e.g. '5/19/2026', '5/19')."""
+    """Return True if the cell looks like a week date (e.g. '5/19/2026', '10-17')."""
     val = val.strip()
-    return bool(re.match(r"^\d{1,2}/\d{1,2}(/\d{2,4})?$", val))
+    return bool(
+        re.match(r"^\d{1,2}/\d{1,2}(/\d{2,4})?$", val)   # slash: 5/19 or 5/19/2026
+        or re.match(r"^\d{1,2}-\d{1,2}(-\d{2,4})?$", val) # dash:  10-17 or 10-17-2026
+    )
 
 
 def _normalize_label(val: str) -> str:
@@ -368,8 +428,13 @@ def _find_header_rows(rows: list[list[str]]) -> tuple[int, int]:
                     return i, i + 1
 
         if has_fc_ac and not has_date:
-            # FORECAST/ACTUAL row found with no preceding date row identified;
-            # date row is the row immediately above (if it exists)
+            # FORECAST/ACTUAL row found with no preceding date row.
+            # Look forward up to 5 rows for the date row (sheet layout: headers above, dates below).
+            # Fall back to the row immediately above if nothing found ahead.
+            for j in range(i + 1, min(i + 6, len(rows))):
+                fwd_count = sum(1 for cell in rows[j] if _is_date_like(cell))
+                if fwd_count >= 1:
+                    return j, i
             date_row = i - 1 if i > 0 else i
             return date_row, i
 
@@ -574,30 +639,35 @@ def cashflow_file_id() -> str:
     return os.environ.get(_CASHFLOW_FILE_ID_ENV, _DEFAULT_CASHFLOW_FILE_ID)
 
 
-def get_cashflow(file_id: Optional[str] = None) -> CashflowSummary:
+def get_cashflow(
+    file_id: Optional[str] = None,
+    tab_name: Optional[str] = None,
+) -> CashflowSummary:
     """Return a CashflowSummary for the Standing ACTUALS sheet.
 
-    Reads the CF_SUMMARY tab (or GSHEETS_CASHFLOW_SHEET_NAME override) via
-    the Sheets API so the active/first tab of the workbook does not matter.
+    tab_name: specific tab to read (e.g. "CF_LLC", "OSN Consolidated").
+              Defaults to GSHEETS_CASHFLOW_SHEET_NAME env var, then "CF_SUMMARY".
+              Pass the result of entity_to_tab(entity) to get the right tab per channel.
 
-    Results are cached in-process for _CACHE_TTL_SECONDS (30 min).
+    Results are cached in-process for _CACHE_TTL_SECONDS (30 min), keyed by
+    (file_id, tab_name) so different entity tabs cache independently.
     Raises GsheetsConnectorError on auth/API/parse failure.
     """
     fid = file_id or cashflow_file_id()
+    tab = tab_name or _cashflow_sheet_name()
 
-    cached = _cache_get(fid)
+    cached = _cache_get(fid, tab)
     if cached is not None:
-        log.debug("Returning cached cashflow summary (file_id redacted)")
+        log.debug("Returning cached cashflow summary tab=%s (file_id redacted)", tab)
         return cached
 
-    log.info("Fetching cashflow sheet from Sheets API (file_id redacted)")
+    log.info("Fetching cashflow sheet tab=%s from Sheets API (file_id redacted)", tab)
     try:
         delegated_creds = _build_delegated_creds()
         drive_service = _build_drive_service(delegated_creds)
         sheets_service = _build_sheets_service(delegated_creds)
         modified_date = _get_modified_time(drive_service, fid)
-        sheet_name = _cashflow_sheet_name()
-        csv_text = _export_sheet_as_csv(sheets_service, fid, sheet_name)
+        csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
         raise
     except Exception as exc:
@@ -607,11 +677,12 @@ def get_cashflow(file_id: Optional[str] = None) -> CashflowSummary:
 
     if summary.parse_warnings:
         for w in summary.parse_warnings:
-            log.warning("Cashflow CSV parse warning: %s", w)
+            log.warning("Cashflow CSV parse warning (tab=%s): %s", tab, w)
 
-    _cache_set(fid, summary)
+    _cache_set(fid, tab, summary)
     log.info(
-        "Cashflow summary loaded: %s, %d entities, as_of=%s",
+        "Cashflow summary loaded: tab=%s %s, %d entities, as_of=%s",
+        tab,
         summary.week_label,
         len(summary.entities),
         summary.as_of_date,
