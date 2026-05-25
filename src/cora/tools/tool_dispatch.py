@@ -19,7 +19,7 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, qbo_client
-from ..connectors import clover_client, qbo_oauth
+from ..connectors import clover_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
 
@@ -1675,6 +1675,48 @@ def _tool_ads_get_cm_waterfall(slack_user_id: str, entity: str, _input: dict) ->
     )
 
 
+# --- F3E Shopify DTC tools ---
+
+
+def _tool_f3e_shopify_sales_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return F3E DTC sales summary from Shopify for a period."""
+    period = (_input.get("period") or "today").lower()
+    if period not in shopify_client.VALID_PERIODS:
+        period = "today"
+    try:
+        summary = shopify_client.get_sales_pulse(period)
+    except shopify_client.ShopifyConfigError as exc:
+        log.warning("f3e_shopify_sales_pulse config error: %s", exc)
+        return "I don't have that right now."
+    except shopify_client.ShopifyConnectorError as exc:
+        log.warning("f3e_shopify_sales_pulse connector error user=%s: %s", slack_user_id, exc)
+        return "I don't have that right now."
+    log.info(
+        "f3e_shopify_sales_pulse user=%s entity=%s period=%s orders=%d net=%.2f",
+        slack_user_id, entity, period, summary.order_count, summary.net_revenue_usd,
+    )
+    return shopify_client.format_sales_for_llm(summary)
+
+
+def _tool_f3e_shopify_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return F3E inventory levels from Shopify with low-stock flags."""
+    low_stock_only = _input.get("low_stock_only", True)
+    threshold = int(_input.get("threshold") or shopify_client.LOW_STOCK_THRESHOLD)
+    try:
+        variants = shopify_client.get_inventory_status(threshold)
+    except shopify_client.ShopifyConfigError as exc:
+        log.warning("f3e_shopify_inventory config error: %s", exc)
+        return "I don't have that right now."
+    except shopify_client.ShopifyConnectorError as exc:
+        log.warning("f3e_shopify_inventory connector error user=%s: %s", slack_user_id, exc)
+        return "I don't have that right now."
+    log.info(
+        "f3e_shopify_inventory user=%s entity=%s variants=%d low_stock_only=%s",
+        slack_user_id, entity, len(variants), low_stock_only,
+    )
+    return shopify_client.format_inventory_for_llm(variants, bool(low_stock_only))
+
+
 # --- F3 brand voice check ---
 
 
@@ -2408,6 +2450,61 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── F3E Shopify DTC tools ──
+    {
+        "name": "f3e_shopify_sales_pulse",
+        "description": (
+            "Fetch F3 Energy DTC sales data from the Shopify store for a time period. "
+            "Use this when a user asks about DTC orders, online revenue, Shopify sales, "
+            "e-commerce performance, or top-selling products -- phrases like 'how are DTC "
+            "sales today', 'what did we do online yesterday', 'Shopify revenue this week', "
+            "'how many orders today', 'what's our AOV', 'what products are selling', "
+            "'how are online sales', 'DTC numbers'. "
+            "Returns order count, gross revenue, discounts, refunds, net revenue, AOV, "
+            "and top 5 products by revenue. Output is source-opaque -- never mention "
+            "Shopify, platform names, or store URLs in your reply. "
+            "Only call in F3E or FNDR channels. Apply TIER_1 guardrail for revenue figures."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "yesterday", "7d", "30d"],
+                    "description": "Time window for sales data. Defaults to 'today'.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "f3e_shopify_inventory",
+        "description": (
+            "Fetch F3 Energy product inventory levels from the Shopify store. "
+            "Use this when a user asks about DTC inventory, stock levels, what's in stock, "
+            "low stock SKUs, or how many units we have -- phrases like 'what's our inventory', "
+            "'what SKUs are low', 'how much Pure do we have', 'stock check', 'inventory status', "
+            "'what's running low', 'are we out of anything'. "
+            "Returns variant-level inventory with low-stock flags (default threshold: 10 units). "
+            "Defaults to low-stock-only view; set low_stock_only=false for full inventory. "
+            "Note: Nimbl 3PL syncs to Shopify in real time -- this is the canonical inventory. "
+            "Output is source-opaque. Only call in F3E or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "low_stock_only": {
+                    "type": "boolean",
+                    "description": "If true (default), return only SKUs at or below the threshold. Set false for full inventory.",
+                },
+                "threshold": {
+                    "type": "integer",
+                    "description": "Units-remaining threshold for 'low stock' flag. Defaults to 10.",
+                },
+            },
+            "required": [],
+        },
+    },
     # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──
     {
         "name": "f3e_brand_voice_check",
@@ -2708,6 +2805,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
     "fndr_open_decisions": _tool_fndr_open_decisions,
+    "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
+    "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "osn_sales_pulse": _tool_osn_sales_pulse,
     "osn_inventory_status": _tool_osn_inventory_status,

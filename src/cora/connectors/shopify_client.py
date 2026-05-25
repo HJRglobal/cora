@@ -1,0 +1,397 @@
+"""Shopify connector for F3 Energy DTC store.
+
+Reads orders and inventory from the Shopify Admin REST API on-demand.
+5-minute in-memory cache prevents hammering the API on back-to-back questions.
+
+Store: f3energy.myshopify.com (one store, three domains: F3Energy.com / F3Pure.com / F3Mood.com)
+
+Auth: SHOPIFY_F3E_ACCESS_TOKEN + SHOPIFY_F3E_STORE env vars.
+
+Behavioral contract (mirrors clover_client.py):
+  - Source-opaque: never surface store URLs, token values, or "Shopify" unless asked
+  - All monetary values returned as float USD
+  - Raises ShopifyConnectorError on auth/API failure
+  - AZ timezone (America/Phoenix, UTC-7, no DST) for period calculations
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import requests
+
+log = logging.getLogger(__name__)
+
+_API_VERSION = "2024-10"
+_CACHE_TTL_SECONDS = 300
+_PAGE_SIZE = 250
+_AZ_UTC_OFFSET = -7  # America/Phoenix, no DST
+
+LOW_STOCK_THRESHOLD = 10
+VALID_PERIODS = ("today", "yesterday", "7d", "30d")
+
+
+class ShopifyConnectorError(Exception):
+    """Raised when the Shopify API is unreachable or returns an error."""
+
+
+class ShopifyConfigError(ShopifyConnectorError):
+    """Raised when required env vars are missing."""
+
+
+@dataclass
+class TopProduct:
+    title: str
+    quantity_sold: int
+    revenue_usd: float
+
+
+@dataclass
+class SalesSummary:
+    period: str
+    order_count: int
+    gross_revenue_usd: float
+    discounts_usd: float
+    refunds_usd: float
+    net_revenue_usd: float
+    avg_order_value_usd: float
+    top_products: list[TopProduct] = field(default_factory=list)
+
+
+@dataclass
+class InventoryVariant:
+    product_title: str
+    variant_title: str
+    sku: str
+    qty_on_hand: int
+    low_stock: bool
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cache_get(key: str) -> Optional[object]:
+    entry = _cache.get(key)
+    if entry and (time.monotonic() - entry[0]) < _CACHE_TTL_SECONDS:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: object) -> None:
+    _cache[key] = (time.monotonic(), value)
+
+
+def _cache_clear() -> None:
+    _cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _store_config() -> tuple[str, str]:
+    """Return (store_domain, access_token). Raises ShopifyConfigError if not set."""
+    store = os.getenv("SHOPIFY_F3E_STORE", "")
+    token = os.getenv("SHOPIFY_F3E_ACCESS_TOKEN", "")
+    if not store or not token:
+        raise ShopifyConfigError(
+            "SHOPIFY_F3E_STORE and/or SHOPIFY_F3E_ACCESS_TOKEN not set."
+        )
+    return store, token
+
+
+def _base_url(store: str) -> str:
+    return f"https://{store}/admin/api/{_API_VERSION}"
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+
+
+# ---------------------------------------------------------------------------
+# Period helpers (AZ time, UTC-7, no DST)
+# ---------------------------------------------------------------------------
+
+def _az_now() -> datetime:
+    return datetime.now(tz=timezone(timedelta(hours=_AZ_UTC_OFFSET)))
+
+
+def _period_to_iso(period: str) -> tuple[str, str]:
+    """Return (start_iso, end_iso) in UTC for a named period based on AZ clock."""
+    now = _az_now()
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    elif period == "yesterday":
+        yesterday = now - timedelta(days=1)
+        start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = yesterday.replace(hour=23, minute=59, second=59, microsecond=999999)
+    elif period == "7d":
+        start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    elif period == "30d":
+        start = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    else:
+        raise ShopifyConfigError(
+            f"Unknown period {period!r}. Valid: {', '.join(VALID_PERIODS)}"
+        )
+    utc = timezone.utc
+    return (
+        start.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _get_paginated(url: str, token: str, params: Optional[dict] = None) -> list[dict]:
+    """Paginate through a Shopify list endpoint using Link-header cursor pagination."""
+    headers = _headers(token)
+    results: list[dict] = []
+    current_url = url
+    current_params: Optional[dict] = dict(params or {})
+
+    while True:
+        try:
+            resp = requests.get(
+                current_url,
+                headers=headers,
+                params=current_params,
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            raise ShopifyConnectorError(f"Network error: {exc}") from exc
+
+        if resp.status_code == 401:
+            raise ShopifyConnectorError(
+                "Auth failed (HTTP 401). Check SHOPIFY_F3E_ACCESS_TOKEN."
+            )
+        if not resp.ok:
+            raise ShopifyConnectorError(
+                f"Shopify API error {resp.status_code}: {resp.text[:200]}"
+            )
+
+        data = resp.json()
+        list_key = next((k for k, v in data.items() if isinstance(v, list)), None)
+        if list_key:
+            results.extend(data[list_key])
+
+        # Cursor pagination via Link header
+        next_url = None
+        for part in resp.headers.get("Link", "").split(","):
+            part = part.strip()
+            if 'rel="next"' in part:
+                next_url = part.split(";")[0].strip().strip("<>")
+                break
+
+        if not next_url:
+            break
+        current_url = next_url
+        current_params = None  # params are embedded in the cursor URL
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Public API: Sales Pulse
+# ---------------------------------------------------------------------------
+
+def get_sales_pulse(period: str = "today") -> SalesSummary:
+    """Return DTC sales summary for the F3E Shopify store over a period."""
+    cache_key = f"sales:{period}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    store, token = _store_config()
+    start_iso, end_iso = _period_to_iso(period)
+
+    orders = _get_paginated(
+        f"{_base_url(store)}/orders.json",
+        token,
+        params={
+            "status": "any",
+            "financial_status": "paid",
+            "created_at_min": start_iso,
+            "created_at_max": end_iso,
+            "limit": _PAGE_SIZE,
+            "fields": "id,total_price,subtotal_price,total_discounts,refunds,line_items",
+        },
+    )
+
+    gross = 0.0
+    discounts = 0.0
+    refunds = 0.0
+    product_sales: dict[str, list] = {}  # title -> [qty, revenue]
+
+    for order in orders:
+        gross += float(order.get("total_price") or 0)
+        discounts += float(order.get("total_discounts") or 0)
+
+        for refund in order.get("refunds") or []:
+            for rt in refund.get("refund_line_items") or []:
+                refunds += float(rt.get("subtotal") or 0)
+
+        for item in order.get("line_items") or []:
+            title = item.get("title") or "Unknown"
+            qty = int(item.get("quantity") or 0)
+            price = float(item.get("price") or 0) * qty
+            if title in product_sales:
+                product_sales[title][0] += qty
+                product_sales[title][1] += price
+            else:
+                product_sales[title] = [qty, price]
+
+    order_count = len(orders)
+    net = gross - refunds
+    aov = gross / order_count if order_count > 0 else 0.0
+
+    top_raw = sorted(product_sales.items(), key=lambda x: x[1][1], reverse=True)[:5]
+    top_products = [
+        TopProduct(title=t, quantity_sold=v[0], revenue_usd=round(v[1], 2))
+        for t, v in top_raw
+    ]
+
+    result = SalesSummary(
+        period=period,
+        order_count=order_count,
+        gross_revenue_usd=round(gross, 2),
+        discounts_usd=round(discounts, 2),
+        refunds_usd=round(refunds, 2),
+        net_revenue_usd=round(net, 2),
+        avg_order_value_usd=round(aov, 2),
+        top_products=top_products,
+    )
+    _cache_set(cache_key, result)
+    log.info(
+        "shopify sales_pulse period=%s orders=%d gross=%.2f net=%.2f",
+        period, order_count, gross, net,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API: Inventory
+# ---------------------------------------------------------------------------
+
+def get_inventory_status(
+    low_stock_threshold: int = LOW_STOCK_THRESHOLD,
+) -> list[InventoryVariant]:
+    """Return variant-level inventory for all F3E products."""
+    cache_key = f"inventory:{low_stock_threshold}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    store, token = _store_config()
+    products = _get_paginated(
+        f"{_base_url(store)}/products.json",
+        token,
+        params={"limit": _PAGE_SIZE, "fields": "id,title,variants"},
+    )
+
+    variants: list[InventoryVariant] = []
+    for product in products:
+        product_title = product.get("title") or "Unknown product"
+        for v in product.get("variants") or []:
+            variant_title = (v.get("title") or "").strip()
+            if variant_title.lower() in ("default title", "default"):
+                variant_title = ""
+            sku = v.get("sku") or ""
+            qty = int(v.get("inventory_quantity") or 0)
+            variants.append(InventoryVariant(
+                product_title=product_title,
+                variant_title=variant_title,
+                sku=sku,
+                qty_on_hand=qty,
+                low_stock=(qty <= low_stock_threshold),
+            ))
+
+    _cache_set(cache_key, variants)
+    low_count = sum(1 for v in variants if v.low_stock)
+    log.info(
+        "shopify inventory total_variants=%d low_stock=%d threshold=%d",
+        len(variants), low_count, low_stock_threshold,
+    )
+    return variants
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def format_sales_for_llm(summary: SalesSummary) -> str:
+    """Format sales summary into source-opaque Slack-voice text."""
+    period_label = {
+        "today": "Today so far",
+        "yesterday": "Yesterday",
+        "7d": "Last 7 days",
+        "30d": "Last 30 days",
+    }.get(summary.period, summary.period)
+
+    lines = [f"*F3E DTC sales -- {period_label}:*", ""]
+    lines.append(f"*Orders:* {summary.order_count}")
+    lines.append(f"*Gross revenue:* ${summary.gross_revenue_usd:,.2f}")
+    if summary.discounts_usd > 0:
+        lines.append(f"*Discounts:* ${summary.discounts_usd:,.2f}")
+    if summary.refunds_usd > 0:
+        lines.append(f"*Refunds:* ${summary.refunds_usd:,.2f}")
+    lines.append(f"*Net revenue:* ${summary.net_revenue_usd:,.2f}")
+    if summary.order_count > 0:
+        lines.append(f"*AOV:* ${summary.avg_order_value_usd:.2f}")
+
+    if summary.top_products:
+        lines.append("")
+        lines.append("*Top products:*")
+        for p in summary.top_products:
+            lines.append(f"  - {p.title}: {p.quantity_sold} units, ${p.revenue_usd:,.2f}")
+
+    return "\n".join(lines)
+
+
+def format_inventory_for_llm(
+    variants: list[InventoryVariant],
+    low_stock_only: bool = True,
+) -> str:
+    """Format inventory into source-opaque Slack-voice text."""
+    if not variants:
+        return "No inventory data available."
+
+    if low_stock_only:
+        flagged = [v for v in variants if v.low_stock]
+        if not flagged:
+            return f"*F3E inventory:* All {len(variants)} SKUs adequately stocked."
+        lines = [f"*F3E inventory -- low stock ({len(flagged)} SKUs):*", ""]
+        for v in sorted(flagged, key=lambda x: x.qty_on_hand):
+            label = v.product_title
+            if v.variant_title:
+                label += f" ({v.variant_title})"
+            entry = f"  - {label}: {v.qty_on_hand} units left"
+            if v.sku:
+                entry += f" [SKU: {v.sku}]"
+            lines.append(entry)
+    else:
+        lines = [f"*F3E inventory ({len(variants)} SKUs):*", ""]
+        by_product: dict[str, list[InventoryVariant]] = {}
+        for v in variants:
+            by_product.setdefault(v.product_title, []).append(v)
+        for product_title, pvariants in sorted(by_product.items()):
+            lines.append(f"*{product_title}*")
+            for v in sorted(pvariants, key=lambda x: x.variant_title or ""):
+                label = v.variant_title or "Default"
+                flag = " [LOW]" if v.low_stock else ""
+                lines.append(f"  - {label}: {v.qty_on_hand} units{flag}")
+
+    return "\n".join(lines)
