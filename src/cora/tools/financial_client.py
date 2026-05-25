@@ -26,6 +26,7 @@ from ..connectors.gsheets_financials import (
     CashflowSummary,
     EntityRow,
     GsheetsConnectorError,
+    entity_to_tab,
     get_cashflow,
 )
 
@@ -235,19 +236,25 @@ def get_cashflow_text(
     entity_filter: Optional[str] = None,
     channel: str = "",
     user: str = "",
+    question: str = "",
 ) -> str:
     """Fetch the cashflow sheet and return a Slack-formatted summary string.
 
-    entity_filter: optional entity code to scope output (e.g. "OSN", "LEX-LBHS").
+    entity_filter: entity code used to select the correct tab (e.g. "OSN", "LEX-LLC").
+                   Reads the entity-specific tab directly rather than filtering CF_SUMMARY.
+    question: raw user question — used to detect OSN Core4 (distribution/partner) intent.
     Returns UNKNOWN_RESPONSE on any error (caller should then call notify_gap).
     """
     try:
-        summary = get_cashflow()
-        result = _format_summary_full(summary, entity_filter=entity_filter)
+        tab = entity_to_tab(entity_filter or "FNDR", question=question)
+        summary = get_cashflow(tab_name=tab)
+        # For entity-specific tabs the data is already scoped; pass entity_filter=None
+        # so the formatter shows all rows rather than trying to re-filter.
+        result = _format_summary_full(summary, entity_filter=None)
         _audit(
             channel=channel,
             user=user,
-            query_summary=f"cashflow entity_filter={entity_filter}",
+            query_summary=f"cashflow entity={entity_filter} tab={tab}",
             result_type="success",
             entity_filter=entity_filter,
         )

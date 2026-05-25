@@ -1272,13 +1272,16 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
 
 def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch current-week cash flow from the Standing ACTUALS sheet."""
-    entity_filter = (_input or {}).get("entity_filter") or None
-    # If the entity_filter wasn't provided but we're in a specific entity channel,
-    # offer to scope automatically (but don't force-scope — portfolio view is useful too)
+    inp = _input or {}
+    entity_filter = inp.get("entity_filter") or entity or "FNDR"
+    question = inp.get("question") or ""
+    # entity_to_tab() inside financial_client selects the correct tab for this entity.
+    # For OSN, if the question mentions distributions/partners it switches to Core4 tab.
     result = financial_client.get_cashflow_text(
         entity_filter=entity_filter,
         channel=entity,
         user=slack_user_id,
+        question=question,
     )
     log.info(
         "financial_get_cashflow entity=%s entity_filter=%s result_len=%d",
