@@ -32,6 +32,20 @@ _ENTITY_FILES: dict[str, str] = {
 _cache: dict[str, str] = {}
 _voice_cache: dict | None = None
 
+# Universal rules appended to EVERY system prompt — existing and future.
+# Edit here, not in individual .md files. Restart to pick up changes.
+_UNIVERSAL_RULES = """
+
+---
+
+## Universal response rules (non-negotiable — applies in every channel)
+
+- **Hard cap: 280 characters.** Lead with the answer — number, status, or direction — then stop. No unsolicited analysis, context, or elaboration. If the user wants more, they ask. Exception: tool outputs (financial data, sales pulse, decision queues) are presented as-is without truncation.
+- **Never encourage breaks, sleep, or pauses.** Harrison sets the cadence. No "sleep on it," "take a break," or concern-coded check-ins about energy or workload.
+- **Never name data sources.** No system names, file names, or sheet names in replies. "I don't have that right now" and stop.
+- **No filler openings.** Never start a reply with "Great question," "Sure," "Of course," or any acknowledgment of the question. Lead with the answer.
+"""
+
 
 def load_prompt(entity: str) -> str:
     """Return the system prompt text for the given entity code.
@@ -51,7 +65,7 @@ def load_prompt(entity: str) -> str:
 
     if path.exists():
         text = path.read_text(encoding="utf-8")
-        composed = _compose_with_voice(text, entity)
+        composed = _compose_with_voice(text, entity) + _UNIVERSAL_RULES
         _cache[entity] = composed
         return composed
 
@@ -79,7 +93,7 @@ def _load_fndr_fallback() -> str:
         )
 
     text = fndr_path.read_text(encoding="utf-8")
-    composed = _compose_with_voice(text, "FNDR")
+    composed = _compose_with_voice(text, "FNDR") + _UNIVERSAL_RULES
     _cache["FNDR"] = composed
     return composed
 
