@@ -27,6 +27,7 @@ from .prompt_loader import load_prompt
 from . import rate_limiter
 from . import semantic_cache as sc
 from . import slack_update_throttle
+from . import team_learning
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,17 @@ def handle_mention(event: dict, say: callable, client) -> None:
     user_message = _MENTION_RE.sub("", raw_text).strip()
     function = channel_classifier.classify_function(channel_name)
     tier = channel_classifier.tier_label(entity, function)
+
+    # ── Write-back interception: @Cora note: <content> ────────────────────────
+    # Handled before Q&A pipeline — no KB retrieval, no Claude call.
+    note_content = team_learning.parse_note(user_message)
+    if note_content:
+        _handle_note(
+            client=client, say=say,
+            entity=entity, channel_id=channel_id, channel_name=channel_name,
+            user_id=user_id or "", content=note_content, original_ts=thread_ts or "",
+        )
+        return
 
     log.info(
         "app_mention routed channel=#%s user=%s → entity=%s function=%s tier=%s",
@@ -384,6 +396,116 @@ def _extract_and_log_gap(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Team learning helpers — write-back, corrections, approval processing
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _handle_note(
+    *,
+    client,
+    say,
+    entity: str,
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    content: str,
+    original_ts: str,
+    kind: str = "note",
+) -> None:
+    """Store a pending write-back/correction and post an approval card to #hjrg-leadership."""
+    cid = team_learning.store_contribution(
+        kind=kind,
+        entity=entity,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        author=user_id,
+        content=content,
+        original_ts=original_ts,
+    )
+
+    # Acknowledge in the source channel
+    ack = "✅ Got it — pending Harrison's approval." if kind == "note" else "🔄 Correction noted — pending Harrison's approval."
+    say(text=ack, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
+
+    # Post approval card to #hjrg-leadership
+    card_text = team_learning.build_approval_card(
+        kind=kind,
+        entity=entity,
+        channel_name=channel_name,
+        author=user_id,
+        content=content,
+        contribution_id=cid,
+    )
+    try:
+        # Look up #hjrg-leadership channel ID dynamically
+        search_resp = client.conversations_list(types="public_channel,private_channel", limit=200)
+        approval_ch_id = channel_id  # fallback to source channel
+        for ch in search_resp.get("channels", []):
+            if ch.get("name") == team_learning.APPROVAL_CHANNEL:
+                approval_ch_id = ch["id"]
+                break
+
+        post_resp = client.chat_postMessage(
+            channel=approval_ch_id,
+            text=card_text,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        approval_ts = post_resp.get("ts", "")
+        team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
+        log.info(
+            "team_learning: posted approval card cid=%s kind=%s ts=%s",
+            cid[:8], kind, approval_ts,
+        )
+    except Exception as exc:
+        log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
+
+
+# Correction capture: message event in a thread where Cora replied last.
+# Bolt requires an explicit event listener for "message" events.
+@app.event("message")
+def handle_message_event(event: dict, client) -> None:
+    """Capture correction-intent thread replies directed at Cora's output."""
+    # Only interested in thread replies (has thread_ts != ts)
+    thread_ts = event.get("thread_ts")
+    msg_ts = event.get("ts")
+    if not thread_ts or thread_ts == msg_ts:
+        return  # top-level message, not a reply
+
+    # Skip bot messages
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return
+
+    text = event.get("text", "").strip()
+    if not team_learning.is_correction(text):
+        return
+
+    channel_id = event.get("channel", "")
+    user_id = event.get("user", "")
+    if not channel_id or not user_id:
+        return
+
+    channel_name = _resolve_channel_name(client, channel_id)
+    entity = route(channel_name)
+
+    log.info(
+        "team_learning: correction detected channel=#%s user=%s",
+        channel_name, user_id,
+    )
+    _handle_note(
+        client=client,
+        say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
+        entity=entity,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        user_id=user_id,
+        content=text,
+        original_ts=thread_ts,
+        kind="correction",
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Reaction-based feedback capture
 #
 # When a user reacts to one of Cora's own messages, log the signal to
@@ -413,6 +535,21 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     reaction = event.get("reaction", "")
     message_ts = item.get("ts", "")
 
+    # ── Team learning: approval/decline of pending contributions ──────────────
+    # Only process ✅ / ❌ on reaction_added (not removal). Look up by the ts
+    # of the approval card Cora posted.
+    if event_type == "reaction_added" and reaction in ("white_check_mark", "x"):
+        contribution = team_learning.lookup_by_approval_ts(message_ts)
+        if contribution:
+            _process_contribution_reaction(
+                client=client,
+                contribution=contribution,
+                reaction=reaction,
+                approval_channel_id=channel_id,
+                approval_msg_ts=message_ts,
+            )
+            # Fall through to also log the reaction as normal feedback
+
     feedback_log.log_reaction(
         channel=channel_id,
         channel_name=channel_name,
@@ -421,6 +558,46 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         message_ts=message_ts,
         event_type=event_type,
     )
+
+
+def _process_contribution_reaction(
+    *,
+    client,
+    contribution: dict,
+    reaction: str,
+    approval_channel_id: str,
+    approval_msg_ts: str,
+) -> None:
+    """Process a ✅ or ❌ on a pending contribution approval card."""
+    cid = contribution["contribution_id"]
+    if reaction == "white_check_mark":
+        # Approve: ingest to KB
+        success = team_learning.ingest_contribution(contribution)
+        team_learning.resolve_contribution(cid, "approved")
+        if success:
+            reply = f"✅ Contribution `[{cid[:8]}]` approved and added to Cora's knowledge base."
+        else:
+            reply = (
+                f"⚠️ Approved `[{cid[:8]}]` but KB ingest failed — "
+                "check logs. Contribution marked approved but not in KB."
+            )
+        log.info("team_learning: contribution %s approved ingest_ok=%s", cid[:8], success)
+    else:
+        # Decline
+        team_learning.resolve_contribution(cid, "declined")
+        reply = f"❌ Contribution `[{cid[:8]}]` declined. Nothing added to KB."
+        log.info("team_learning: contribution %s declined", cid[:8])
+
+    try:
+        client.chat_postMessage(
+            channel=approval_channel_id,
+            thread_ts=approval_msg_ts,
+            text=reply,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except Exception as exc:
+        log.warning("team_learning: failed to post resolution reply: %s", exc)
 
 
 @app.event("reaction_added")
