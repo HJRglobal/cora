@@ -68,6 +68,8 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
             "due_on",
             "due_at",
             "completed",
+            "assignee.gid",   # needed for user_identity reverse lookup (@mention in digests)
+            "assignee.name",  # human-readable fallback when reverse lookup misses
             "projects.name",
             "memberships.section.name",
             "memberships.project.name",

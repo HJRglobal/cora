@@ -28,6 +28,7 @@ from . import rate_limiter
 from . import semantic_cache as sc
 from . import slack_update_throttle
 from . import team_learning
+from . import user_feedback_tracker as uft
 
 log = logging.getLogger(__name__)
 
@@ -392,6 +393,16 @@ def _extract_and_log_gap(
         gap=gap_desc,
         latency_ms=latency_ms,
     )
+    # Per-user feedback attribution — enriches gap event with display name.
+    # channel_id not available in this helper scope; best-effort with channel_name.
+    uft.log_knowledge_gap(
+        slack_user_id=user_id or "",
+        channel=channel_name,   # may be name rather than ID here; tolerated
+        channel_name=channel_name,
+        entity=entity,
+        question=user_message,
+        gap_description=gap_desc,
+    )
     return cleaned
 
 
@@ -492,6 +503,14 @@ def handle_message_event(event: dict, client) -> None:
         "team_learning: correction detected channel=#%s user=%s",
         channel_name, user_id,
     )
+    # Attribute the correction to this person for per-user feedback tracking.
+    uft.log_correction(
+        slack_user_id=user_id,
+        channel=channel_id,
+        channel_name=channel_name,
+        entity=entity,
+        correction_text=text,
+    )
     _handle_note(
         client=client,
         say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
@@ -558,6 +577,21 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         message_ts=message_ts,
         event_type=event_type,
     )
+
+    # Per-user feedback attribution — only track negative reactions to Cora messages.
+    if (
+        event_type == "reaction_added"
+        and feedback_log.classify_sentiment(reaction) == "negative"
+        and reactor
+    ):
+        entity = route(channel_name) if channel_name else "FNDR"
+        uft.log_thumbsdown(
+            slack_user_id=reactor,
+            channel=channel_id,
+            channel_name=channel_name,
+            entity=entity,
+            message_ts=message_ts,
+        )
 
 
 def _process_contribution_reaction(

@@ -46,7 +46,12 @@ aliases:
   Alina Thomas:
     - Alina
 
-  # Lexington Services
+  # Lexington Services + HJR Global cross-entity
+  Jeff Montgomery:
+    - Jeff
+    - Jeffrey
+    - Jeffrey Montgomery
+    - Jeff M
   Shaun Hawkins:
     - Sean
     - Sean Hawkins
@@ -86,6 +91,15 @@ aliases:
     - Jake
     - Jake L
     - Jacob Lichtman
+
+# ── Pending additions ─────────────────────────────────────────────────────────
+# Aaron Ferrucci (Lex LLC build team) — Slack ID + Asana GID not yet confirmed.
+# TOM #24 (2026-05-24) notes Jeff + Aaron need Asana team adds + slack-to-asana.yaml entries.
+# Once confirmed, add entry to slack-to-asana.yaml first, then uncomment below:
+#
+# Aaron Ferrucci:
+#   - Aaron
+#   - Aaron F
 
 # Disambiguation rules — applied when one alias maps to multiple canonical names.
 # Currently empty (single-Jake / single-Sean / etc. — no collisions yet).

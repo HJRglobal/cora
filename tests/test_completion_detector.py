@@ -130,12 +130,13 @@ def _make_task(
     name: str = "[F3E] Ship inventory to Nimbl",
     permalink: str = "https://app.asana.com/0/p/123456",
     assignee_name: str = "Hannah Grant",
+    assignee_gid: str = "1209060959783860",
 ) -> dict:
     return {
         "gid": gid,
         "name": name,
         "permalink_url": permalink,
-        "assignee": {"name": assignee_name},
+        "assignee": {"name": assignee_name, "gid": assignee_gid},
         "projects": [{"name": "[F3E] Ops"}],
     }
 
@@ -403,6 +404,7 @@ class TestMatchSignalsToTasks:
             name="[HJRG] Execute vendor contract",
             permalink="https://app.asana.com/0/t/999",
             assignee_name="Justin Moran",
+            assignee_gid="1209093537787112",
         )
         candidates = match_signals_to_tasks([signal], [task], apply_dedup=False)
         if candidates:
@@ -410,6 +412,7 @@ class TestMatchSignalsToTasks:
             assert c.task_gid == "999"
             assert c.task_url == "https://app.asana.com/0/t/999"
             assert c.assignee_name == "Justin Moran"
+            assert c.assignee_gid == "1209093537787112"
             assert 0 < c.fuzzy_ratio <= 1.0
             assert 0 < c.confidence <= 1.0
 
@@ -471,6 +474,7 @@ class TestCompletionCandidateHelpers:
             task_name="[F3E] Ship Pure",
             task_url="https://app.asana.com/0/t/t1",
             assignee_name="Hannah",
+            assignee_gid="1209060959783860",
             project_name="[F3E] Ops",
             fuzzy_ratio=0.75,
             confidence=confidence,
@@ -511,13 +515,21 @@ class TestCompletionCandidateHelpers:
 
 class TestFormatSweepDigest:
 
-    def _candidate(self, confidence: float, task_name: str = "Task", gid: str = "t1") -> CompletionCandidate:
+    def _candidate(
+        self,
+        confidence: float,
+        task_name: str = "Task",
+        gid: str = "t1",
+        assignee_name: str = "",
+        assignee_gid: str = "",
+    ) -> CompletionCandidate:
         return CompletionCandidate(
             signal=_make_signal(),
             task_gid=gid,
             task_name=task_name,
             task_url=f"https://app.asana.com/0/t/{gid}",
-            assignee_name="",
+            assignee_name=assignee_name,
+            assignee_gid=assignee_gid,
             project_name="",
             fuzzy_ratio=0.75,
             confidence=confidence,
@@ -532,15 +544,15 @@ class TestFormatSweepDigest:
         msg = format_sweep_digest([c])
         assert "Completion candidates" in msg
 
-    def test_high_confidence_section_heading(self):
+    def test_high_confidence_green_dot_present(self):
         c = self._candidate(0.85)
         msg = format_sweep_digest([c])
-        assert "High confidence" in msg
+        assert "🟢" in msg
 
-    def test_mid_confidence_section_heading(self):
+    def test_mid_confidence_yellow_dot_present(self):
         c = self._candidate(0.70)
         msg = format_sweep_digest([c])
-        assert "Medium confidence" in msg
+        assert "🟡" in msg
 
     def test_task_name_in_output(self):
         c = self._candidate(0.85, task_name="[OSN] Close reconciliation")
@@ -554,14 +566,39 @@ class TestFormatSweepDigest:
 
     def test_multiple_candidates_all_appear(self):
         candidates = [
-            self._candidate(0.90, "Task A", "g1"),
-            self._candidate(0.75, "Task B", "g2"),
-            self._candidate(0.62, "Task C", "g3"),
+            self._candidate(0.90, "Task A", "g1", assignee_name="Hannah"),
+            self._candidate(0.75, "Task B", "g2", assignee_name="Hannah"),
+            self._candidate(0.62, "Task C", "g3", assignee_name="Justin"),
         ]
         msg = format_sweep_digest(candidates)
         assert "Task A" in msg
         assert "Task B" in msg
         assert "Task C" in msg
+
+    def test_grouped_by_assignee(self):
+        """Candidates for the same assignee should be grouped together."""
+        candidates = [
+            self._candidate(0.85, "Task A", "g1", assignee_name="Hannah"),
+            self._candidate(0.85, "Task B", "g2", assignee_name="Justin"),
+            self._candidate(0.70, "Task C", "g3", assignee_name="Hannah"),
+        ]
+        msg = format_sweep_digest(candidates)
+        # Both Hannah's tasks should appear after her name mention
+        hannah_pos = msg.find("Hannah")
+        justin_pos = msg.find("Justin")
+        task_a_pos = msg.find("Task A")
+        task_b_pos = msg.find("Task B")
+        task_c_pos = msg.find("Task C")
+        assert hannah_pos != -1 and justin_pos != -1
+        # Task A and Task C (both Hannah's) should appear on the same side of Justin's block
+        # — i.e. both before Justin's block or Task C in Hannah's second block
+        assert task_a_pos < task_b_pos  # Task A (Hannah, high) before Justin's Task B
+        assert task_c_pos < task_b_pos  # Task C (Hannah, mid) before Justin's Task B
+
+    def test_unassigned_fallback_label(self):
+        c = self._candidate(0.85, "Task X", "gx", assignee_name="", assignee_gid="")
+        msg = format_sweep_digest([c])
+        assert "Unassigned" in msg
 
 
 # ── detect_candidates (integration) ───────────────────────────────────────
@@ -605,6 +642,7 @@ class TestMarkCandidatesSent:
                 task_name=f"Task {i}",
                 task_url="",
                 assignee_name="",
+                assignee_gid="",
                 project_name="",
                 fuzzy_ratio=0.8,
                 confidence=0.85,

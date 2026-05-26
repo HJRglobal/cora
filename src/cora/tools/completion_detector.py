@@ -24,6 +24,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -124,7 +125,8 @@ class CompletionCandidate:
     task_gid: str
     task_name: str
     task_url: str          # Asana permalink (for deep link)
-    assignee_name: str     # "" if unassigned
+    assignee_name: str     # display name, "" if unassigned
+    assignee_gid: str      # Asana user GID — used for Slack @mention reverse lookup
     project_name: str      # first project name, "" if none
     fuzzy_ratio: float     # SequenceMatcher ratio (signal ↔ task name)
     confidence: float      # final blended score
@@ -138,11 +140,31 @@ class CompletionCandidate:
         return 0.60 <= self.confidence < 0.80
 
     def slack_line(self) -> str:
-        """Format one candidate as a Slack mrkdwn bullet."""
+        """Format one candidate as a Slack mrkdwn bullet.
+
+        Uses user_identity.slack_id_from_asana() to render a live @mention
+        when the assignee's Asana GID maps to a known Slack user ID.
+        Falls back to plain display_name when the mapping is absent.
+        """
+        # Lazy import avoids circular deps and keeps the module testable
+        # without a fully wired identity cache.
+        try:
+            from cora.tools import user_identity as _uid
+            slack_sid = _uid.slack_id_from_asana(self.assignee_gid) if self.assignee_gid else None
+        except Exception:
+            slack_sid = None
+
         task_link = f"<{self.task_url}|{self.task_name}>" if self.task_url else self.task_name
         source_back = f" (<{self.signal.deep_link}|source>)" if self.signal.deep_link else ""
         conf_tag = "🟢" if self.is_high_confidence else "🟡"
-        assignee_tag = f" · {self.assignee_name}" if self.assignee_name else ""
+
+        if slack_sid:
+            assignee_tag = f" · <@{slack_sid}>"
+        elif self.assignee_name:
+            assignee_tag = f" · {self.assignee_name}"
+        else:
+            assignee_tag = ""
+
         project_tag = f" · _{self.project_name}_" if self.project_name else ""
         excerpt = self.signal.signal_text[:120].replace("\n", " ")
         return (
@@ -393,7 +415,9 @@ def match_signals_to_tasks(
 
         # Extract task metadata
         permalink = task.get("permalink_url") or ""
-        assignee = (task.get("assignee") or {}).get("name") or ""
+        assignee_obj = task.get("assignee") or {}
+        assignee_name = assignee_obj.get("name") or ""
+        assignee_gid = str(assignee_obj.get("gid") or "")
         projects = task.get("projects") or task.get("memberships") or []
         project_name = ""
         if projects:
@@ -406,7 +430,8 @@ def match_signals_to_tasks(
                 task_gid=task_gid,
                 task_name=task.get("name") or "",
                 task_url=permalink,
-                assignee_name=assignee,
+                assignee_name=assignee_name,
+                assignee_gid=assignee_gid,
                 project_name=project_name,
                 fuzzy_ratio=round(ratio, 4),
                 confidence=conf,
@@ -461,20 +486,40 @@ def mark_candidates_sent(candidates: list[CompletionCandidate]) -> None:
 
 # ── Slack formatting ───────────────────────────────────────────────────────
 
+def _assignee_mention(candidate: CompletionCandidate) -> str:
+    """Return the best available mention string for a candidate's assignee.
+
+    Priority:
+      1. Slack @mention (<@Uxxx>) when Asana GID resolves via user_identity
+      2. Plain display name
+      3. "Unassigned"
+    """
+    try:
+        from cora.tools import user_identity as _uid
+        sid = _uid.slack_id_from_asana(candidate.assignee_gid) if candidate.assignee_gid else None
+    except Exception:
+        sid = None
+    if sid:
+        return f"<@{sid}>"
+    return candidate.assignee_name or "Unassigned"
+
+
 def format_sweep_digest(
     candidates: list[CompletionCandidate],
     *,
     lookback_hours: float = DEFAULT_LOOKBACK_SECONDS / 3600,
 ) -> str:
-    """Build the full Slack mrkdwn digest message for the daily sweep post."""
+    """Build the full Slack mrkdwn digest message for the daily sweep post.
+
+    Candidates are grouped by assignee so each person's tasks appear together,
+    making it easy for whoever reads #hjrg-leadership to forward / @mention.
+    Within each assignee group, HIGH confidence appears before MEDIUM.
+    """
     if not candidates:
         return (
             f"✅ *Completion sweep — last {int(lookback_hours)}h*\n"
             "No completion candidates found. All open tasks look genuinely open."
         )
-
-    high = [c for c in candidates if c.is_high_confidence]
-    mid  = [c for c in candidates if c.is_mid_confidence]
 
     lines = [
         f"🧹 *Completion candidates — last {int(lookback_hours)}h* "
@@ -482,14 +527,27 @@ def format_sweep_digest(
         "",
     ]
 
-    if high:
-        lines.append("*🟢 High confidence*")
+    # Group by assignee_gid (fall back to assignee_name for tasks without GID)
+    # Key: (assignee_gid, assignee_name) — keeps ordering stable
+    by_assignee: dict[tuple[str, str], list[CompletionCandidate]] = defaultdict(list)
+    for c in candidates:
+        key = (c.assignee_gid or "", c.assignee_name or "Unassigned")
+        by_assignee[key].append(c)
+
+    # Sort assignee groups: assigned first (alphabetically by name), unassigned last
+    def _group_sort_key(item: tuple[tuple[str, str], list]) -> tuple[int, str]:
+        (_, name), _ = item
+        return (0 if name and name != "Unassigned" else 1, name.lower())
+
+    for (ag_gid, ag_name), group_candidates in sorted(by_assignee.items(), key=_group_sort_key):
+        mention = _assignee_mention(group_candidates[0])
+        high = [c for c in group_candidates if c.is_high_confidence]
+        mid  = [c for c in group_candidates if c.is_mid_confidence]
+
+        lines.append(f"*{mention}*")
         for c in high:
             lines.append(c.slack_line())
             lines.append("")
-
-    if mid:
-        lines.append("*🟡 Medium confidence — verify before closing*")
         for c in mid:
             lines.append(c.slack_line())
             lines.append("")
