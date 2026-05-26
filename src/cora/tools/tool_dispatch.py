@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, financial_client, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
 from ..connectors import clover_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
@@ -1587,6 +1587,73 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
     return "\n".join(lines)
 
 
+def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Scan KB for recent completion signals and match against open Asana tasks.
+
+    Pulls KB chunks from the last 25 hours that contain completion language
+    (completed, shipped, signed, paid, launched, etc.), fuzzy-matches each
+    signal against the caller's open Asana tasks, and returns a formatted
+    digest with clickable Asana deep links.
+
+    Read-only — never marks tasks complete. Intended for FNDR/HJRG channels.
+    """
+    log.info("fndr_completion_candidates user=%s entity=%s", slack_user_id, entity)
+
+    # 1. Fetch open tasks for the requesting user (same pattern as get_my_tasks)
+    user_map_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+    try:
+        user_map: dict = yaml.safe_load(user_map_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("fndr_completion_candidates: could not load user map: %s", exc)
+        user_map = {}
+
+    asana_gid = user_map.get(slack_user_id, {}).get("asana_gid") if isinstance(user_map.get(slack_user_id), dict) else user_map.get(slack_user_id)
+
+    open_tasks: list[dict] = []
+    if asana_gid:
+        try:
+            open_tasks = asana_client.get_user_tasks(asana_gid, max_tasks=100)
+        except asana_client.AsanaClientError as exc:
+            log.warning("fndr_completion_candidates: Asana error: %s", exc)
+            return "I don't have that right now — couldn't reach Asana."
+    else:
+        # FNDR sweep: pull tasks for all known users and pool them
+        all_gids: set[str] = set()
+        for v in user_map.values():
+            gid = v.get("asana_gid") if isinstance(v, dict) else v
+            if gid:
+                all_gids.add(gid)
+        for gid in list(all_gids)[:10]:  # cap at 10 users to avoid rate limits
+            try:
+                open_tasks.extend(asana_client.get_user_tasks(gid, max_tasks=50))
+            except asana_client.AsanaClientError:
+                pass
+
+    if not open_tasks:
+        return "No open Asana tasks found — can't run completion matching."
+
+    # 2. Scope entity list for KB query
+    entity_list: list[str] | None = None
+    if entity and entity != "FNDR":
+        entity_list = [entity, "FNDR"]
+
+    # 3. Run detection
+    candidates = completion_detector.detect_candidates(
+        open_tasks,
+        entities=entity_list,
+        apply_dedup=True,
+    )
+
+    # 4. Record dedup timestamps so the same candidates don't resurface immediately
+    completion_detector.mark_candidates_sent(candidates)
+
+    log.info(
+        "fndr_completion_candidates user=%s entity=%s tasks=%d candidates=%d",
+        slack_user_id, entity, len(open_tasks), len(candidates),
+    )
+    return completion_detector.format_sweep_digest(candidates)
+
+
 def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
     """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
 
@@ -2446,6 +2513,29 @@ TOOL_DEFINITIONS = [
     },
     # ── FNDR-specific tools (founder / HJRG channels only) ──
     {
+        "name": "fndr_completion_candidates",
+        "description": (
+            "Scan recent KB activity (Fireflies transcripts, Slack, email, HubSpot) for "
+            "signals that a task or project was completed, then cross-reference those signals "
+            "against open Asana tasks and return a digest of completion candidates with "
+            "clickable Asana links. "
+            "Use this when someone asks: 'what tasks should be closed?', 'any tasks that look "
+            "done?', 'run a completion sweep', 'what can we mark complete?', 'hygiene sweep', "
+            "'what's been finished that's still showing as open?', 'check for stale open tasks', "
+            "'what did we complete this week?', 'anything we forgot to close out?'. "
+            "Returns 🟢 High and 🟡 Medium confidence candidates with the triggering excerpt "
+            "and a deep link to open the task in Asana. Never auto-completes — the human "
+            "clicks the link and marks done. "
+            "Read-only. Preferred in FNDR or HJRG channels for cross-entity sweep; "
+            "also works in entity channels (OSN, F3E, LEX, etc.) for entity-scoped results."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "fndr_open_decisions",
         "description": (
             "Return stalled decisions from the pending decisions queue, entity-scoped to "
@@ -2871,6 +2961,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
+    "fndr_completion_candidates": _tool_fndr_completion_candidates,
     "fndr_open_decisions": _tool_fndr_open_decisions,
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
