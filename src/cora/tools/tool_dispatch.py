@@ -1302,6 +1302,14 @@ def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) ->
     )
 
 
+def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch OSN store-by-store financial snapshot from the OSN Consolidated cashflow tab."""
+    log.info("osn_financial_pulse user=%s entity=%s", slack_user_id, entity)
+    return financial_client.get_osn_pulse_text(
+        channel=entity,
+        user=slack_user_id,
+    )
+
 
 # --- OSN Clover tools ---
 
@@ -2527,7 +2535,7 @@ TOOL_DEFINITIONS = [
             "'how many cases do we have across all locations'. "
             "Returns case counts by SKU across UNIS warehouse, Nimbl 3PL lot, and 117 office, "
             "with 🚨 Critical (≤50 cases), ⚠️ Low (≤200 cases), ✅ Healthy flags. "
-            "Read-only. Only call in F3E or FNDR channels."
+            "Read-only. Only call in F3E or FNDR channels (#f3e-ops, #f3e-leadership, #fndr-*)."
         ),
         "input_schema": {
             "type": "object",
@@ -2581,6 +2589,35 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["brand", "copy"],
+        },
+    },
+    # ── OSN financial tools (OSN and FNDR channels) ──
+    {
+        "name": "osn_financial_pulse",
+        "description": (
+            "Fetch a store-by-store financial snapshot for all four OSN locations from the "
+            "13-week rolling cash-flow sheet. Use this when a user asks about OSN's overall "
+            "financial health, cash position, how stores compare, which store is performing "
+            "best or worst, weekly cash flow, or breakeven trajectory -- phrases like 'how is "
+            "OSN doing financially', 'give me the OSN financial pulse', 'how are the stores "
+            "tracking vs forecast', 'which OSN location is negative', 'OSN cash position', "
+            "'how is G Warner vs forecast', 'store-by-store P&L', 'what's OSN's financial "
+            "picture this week'. "
+            "Returns actual vs forecast vs diff for each store (Gilbert & Warner, "
+            "Gilbert & McKellips, Greenfield & 60, Val Vista & Pecos) plus the OSN "
+            "portfolio total. Negative-variance stores are flagged with a warning indicator. "
+            "Data is sourced from the 13-week Standing ACTUALS sheet maintained by Hayden / "
+            "Justin. Output is source-opaque -- never mention sheet names, file IDs, or Drive. "
+            "If data is unavailable, returns the standard UNKNOWN_RESPONSE and Cora notifies "
+            "the finance channel. "
+            "MANDATORY TOOL CALL for any OSN financial health question -- do NOT answer from "
+            "KB memory or prior context. Always call this tool to get current data. "
+            "Only call in OSN or FNDR channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
     # ── OSN Clover POS tools (OSN channels only) ──
@@ -2839,6 +2876,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
     "f3e_inventory_pulse": _tool_f3e_inventory_pulse,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
+    "osn_financial_pulse": _tool_osn_financial_pulse,
     "osn_sales_pulse": _tool_osn_sales_pulse,
     "osn_inventory_status": _tool_osn_inventory_status,
     "osn_customer_trends": _tool_osn_customer_trends,

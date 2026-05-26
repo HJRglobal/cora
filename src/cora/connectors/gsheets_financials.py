@@ -143,10 +143,10 @@ class CashflowSummary:
         )
 
     def osn_entities(self) -> list[EntityRow]:
-        return [e for e in self.entities if e.entity_code.startswith("OSN")]
+        return [e for e in self.entities if e.entity_code.upper().startswith("OSN")]
 
     def lex_entities(self) -> list[EntityRow]:
-        return [e for e in self.entities if e.entity_code.startswith("LEX")]
+        return [e for e in self.entities if e.entity_code.upper().startswith("LEX")]
 
 
 # ────────────────────────────────────────────────────────────────────────────

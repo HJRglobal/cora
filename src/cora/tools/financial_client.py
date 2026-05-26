@@ -301,6 +301,118 @@ def get_cashflow_text(
         return UNKNOWN_RESPONSE
 
 
+def get_osn_pulse_text(
+    *,
+    channel: str = "",
+    user: str = "",
+) -> str:
+    """Fetch the OSN Consolidated cashflow tab and return a store-by-store financial snapshot.
+
+    Purpose-built for OSN's multi-store structure. Reads the OSN Consolidated tab, uses
+    osn_entities() to extract per-store rows, and formats a store-level comparison with
+    actual vs forecast variance flags. Source-opaque -- no sheet/file names surfaced.
+
+    Returns UNKNOWN_RESPONSE on any connector or parse error.
+    """
+    # OSN store code → human-readable label for the Slack output
+    _OSN_STORE_LABELS: dict[str, str] = {
+        "OSN-GW":  "Gilbert & Warner",
+        "OSN-WR":  "Gilbert & Warner",   # alternate code
+        "OSN-MK":  "Gilbert & McKellips",
+        "OSN-GM":  "Gilbert & McKellips", # alternate code
+        "OSN-GF":  "Greenfield & 60",
+        "OSN-VV":  "Val Vista & Pecos",
+        "OSN-VVP": "Val Vista & Pecos",   # alternate code
+    }
+
+    try:
+        tab = entity_to_tab("OSN", question="")
+        summary = get_cashflow(tab_name=tab)
+        store_rows = summary.osn_entities()
+
+        lines: list[str] = [
+            f"*OSN Financial Pulse -- {summary.week_label}* (as of {summary.as_of_date})",
+            "",
+        ]
+
+        if not store_rows:
+            lines.append("No store-level rows found in the OSN financial data.")
+            lines.append(
+                "Ask Hayden or Justin to confirm the OSN Consolidated tab is populated."
+            )
+        else:
+            lines.append("*Store breakdown:*")
+            for row in store_rows:
+                store_label = _OSN_STORE_LABELS.get(row.entity_code.upper(), row.label)
+                parts = [f"  *{store_label}*"]
+                if row.actual is not None:
+                    parts.append(f"actual {_fmt_currency(row.actual)}")
+                if row.forecast is not None:
+                    parts.append(f"forecast {_fmt_currency(row.forecast)}")
+                if row.diff is not None:
+                    diff_str = _fmt_diff(row.diff)
+                    # Flag negative actuals vs forecast with a warning emoji
+                    flag = " :rotating_light:" if (row.diff is not None and row.diff < 0) else ""
+                    parts.append(f"diff {diff_str}{flag}")
+                lines.append(" | ".join(parts))
+
+        lines.append("")
+
+        # Portfolio total line
+        if any(v is not None for v in [
+            summary.portfolio_forecast,
+            summary.portfolio_actual,
+            summary.portfolio_diff,
+        ]):
+            lines.append("*OSN Total*")
+            if summary.portfolio_forecast is not None:
+                lines.append(f"  Forecast: {_fmt_currency(summary.portfolio_forecast)}")
+            if summary.portfolio_actual is not None:
+                lines.append(f"  Actual:   {_fmt_currency(summary.portfolio_actual)}")
+            if summary.portfolio_diff is not None:
+                diff_str = _fmt_diff(summary.portfolio_diff)
+                flag = " :rotating_light:" if summary.portfolio_diff < 0 else ""
+                lines.append(f"  Diff:     {diff_str}{flag}")
+
+        result = "\n".join(lines).strip()
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary=f"osn_financial_pulse tab={tab}",
+            result_type="success",
+            entity_filter="OSN",
+        )
+        log.info(
+            "osn_financial_pulse tab=%s week=%s store_rows=%d as_of=%s",
+            tab,
+            summary.week_label,
+            len(store_rows),
+            summary.as_of_date,
+        )
+        return result
+
+    except GsheetsConnectorError as exc:
+        log.error("GsheetsConnectorError in get_osn_pulse_text: %s", exc)
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary="osn_financial_pulse",
+            result_type="connector_error",
+            entity_filter="OSN",
+        )
+        return UNKNOWN_RESPONSE
+    except Exception as exc:
+        log.exception("Unexpected error in get_osn_pulse_text: %s", exc)
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary="osn_financial_pulse",
+            result_type="unexpected_error",
+            entity_filter="OSN",
+        )
+        return UNKNOWN_RESPONSE
+
+
 def notify_gap(
     topic: str,
     channel: str = "",
