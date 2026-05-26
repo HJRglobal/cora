@@ -98,7 +98,7 @@ def _known_answers_mtime(entity: str) -> float | None:
     return path.stat().st_mtime
 
 
-def load_context(entity: str, query: str | None = None) -> str:
+def load_context(entity: str, query: str | None = None, skip_kb: bool = False, kb_k: int | None = None) -> str:
     """Return CLAUDE.md text for the entity, always appending founder-level below.
 
     Also appends design/known-answers/{entity}.md if it exists, plus dynamic
@@ -110,10 +110,11 @@ def load_context(entity: str, query: str | None = None) -> str:
     """
     static_text = _load_static_context(entity)
 
-    if not query:
+    if not query or skip_kb:
         return static_text
 
-    kb_section = _try_kb_retrieve(entity, query)
+    effective_k = kb_k if kb_k is not None else _KB_TOP_K
+    kb_section = _try_kb_retrieve(entity, query, k=effective_k)
     if not kb_section:
         return static_text
 
@@ -171,7 +172,7 @@ def _load_static_context(entity: str) -> str:
     return text
 
 
-def _try_kb_retrieve(entity: str, query: str) -> str | None:
+def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K) -> str | None:
     """Search the KB and return a formatted context block. Returns None on any failure.
 
     Failure modes that should return None (not raise):
@@ -202,7 +203,7 @@ def _try_kb_retrieve(entity: str, query: str) -> str | None:
             results = kb.search(
                 query,
                 entity=kb_entity,
-                k=_KB_TOP_K,
+                k=k,
                 max_age_days=_KB_MAX_AGE_DAYS,
                 include_fndr=include_fndr,
                 sub_entity=sub_entity_scope,

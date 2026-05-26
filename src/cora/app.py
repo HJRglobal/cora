@@ -18,11 +18,14 @@ from .context_loader import load_context
 from .entity_router import route
 from . import feedback_log
 from . import help_responder
+from . import intent_classifier as ic
 from . import knowledge_gaps
+from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
+from . import semantic_cache as sc
 from . import slack_update_throttle
 
 log = logging.getLogger(__name__)
@@ -127,10 +130,50 @@ def handle_mention(event: dict, say: callable, client) -> None:
 
     t0 = time.monotonic()
 
+    # ── Intent classification + semantic cache ─────────────────────────────
+    # 1. Classify the question to get routing hints (no LLM call — regex only).
+    # 2. Embed the question once — reused for both cache lookup and KB search.
+    # 3. Check the semantic cache before touching the KB or Claude.
+    intent = ic.classify(user_message, entity)
+    hints  = ic.routing_hints(intent)
+
+    log.info(
+        "intent_classify channel=#%s user=%s intent=%s skip_kb=%s bypass_cache=%s",
+        channel_name, user_id, intent, hints.skip_kb, hints.bypass_cache,
+    )
+
+    question_embedding: list[float] | None = None
+    if not hints.bypass_cache:
+        try:
+            question_embedding = kb_embeddings.embed_query(user_message)
+            cached_response = sc.get_cache().lookup(entity, question_embedding)
+            if cached_response:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                log.info(
+                    "semantic_cache served channel=#%s user=%s entity=%s latency_ms=%d",
+                    channel_name, user_id, entity, latency_ms,
+                )
+                say(
+                    text=cached_response,
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+                return
+        except Exception as exc:
+            # Cache miss due to error — not fatal; proceed normally
+            log.warning("semantic_cache lookup error for entity=%s: %s", entity, exc)
+
+    # ── Context loading (KB-augmented or static-only) ─────────────────────
     # Phase 3: pass user_message as query so context_loader can augment with
     # KB retrieval (top-K semantically-relevant chunks from cora_kb.db).
-    # If KB isn't initialized or retrieval fails, falls back to static context.
-    context = load_context(entity, query=user_message)
+    # Intent routing: FINANCIAL skips KB; SIMPLE/TASK_LOOKUP reduce k.
+    context = load_context(
+        entity,
+        query=user_message,
+        skip_kb=hints.skip_kb,
+        kb_k=hints.kb_k_override,
+    )
     prompt = load_prompt(entity)
 
     # Phase 6: route simple lookups to Haiku for ~3-5x speed-up; keep Sonnet for
@@ -186,6 +229,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
         response_text = _extract_and_log_gap(
             response_text, entity, channel_name, user_id, user_message, latency_ms,
         )
+        _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
             "responded (fallback non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
@@ -258,6 +302,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
     response_text = _extract_and_log_gap(
         response_text, entity, channel_name, user_id, user_message, latency_ms,
     )
+    _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
     log.info(
@@ -287,6 +332,28 @@ def handle_mention(event: dict, say: callable, client) -> None:
             unfurl_links=False,
             unfurl_media=False,
         )
+
+
+def _try_cache_store(
+    entity: str,
+    question: str,
+    question_embedding: "list[float] | None",
+    response: str,
+    hints: "ic.RoutingHints",
+) -> None:
+    """Store response in semantic cache if routing allows it. Never raises."""
+    if hints.bypass_cache or question_embedding is None or hints.cache_ttl <= 0:
+        return
+    try:
+        sc.get_cache().store(
+            entity=entity,
+            question=question,
+            question_embedding=question_embedding,
+            response=response,
+            ttl_seconds=hints.cache_ttl,
+        )
+    except Exception as exc:
+        log.warning("semantic_cache store failed for entity=%s: %s", entity, exc)
 
 
 def _extract_and_log_gap(
