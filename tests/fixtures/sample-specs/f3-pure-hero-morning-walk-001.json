@@ -1,0 +1,45 @@
+{
+  "spec_id": "f3-pure-hero-morning-walk-2026-05-26-001",
+  "brand": "pure",
+  "scene_name": "morning-walk",
+  "feature": "ai_backgrounds",
+  "main_image": {
+    "type": "url",
+    "value": "https://cdn.shopify.com/s/files/1/0000/0000/0000/files/f3-pure-strawberry-lemonade-hero-01.png"
+  },
+  "background": {
+    "prompt": "A woman in her early 30s on a sunlit morning walk through a tree-lined suburban neighborhood, golden hour light, warm and peaceful, natural green surroundings, soft bokeh background",
+    "guidance": {
+      "image_ref": null,
+      "scale": 0.7
+    },
+    "negative_prompt": "text, watermark, logo overlay, dark scene, gym, office, indoors",
+    "seed": null
+  },
+  "edit_with_ai": {
+    "enabled": false,
+    "additional_images": []
+  },
+  "output": {
+    "format": "PNG",
+    "size": "1920x900",
+    "filename": "f3-pure-hero-morning-walk-01.png",
+    "alt_text": "F3 Pure — Lauren on morning walk, calm energy for real life"
+  },
+  "destination": {
+    "type": "homepage_hero_section",
+    "shopify_target": {
+      "section_id": "pure-hero",
+      "template_file": "templates/index.json",
+      "product_handle": null,
+      "collection_handle": null
+    },
+    "wire_strategy": "replace_or_insert"
+  },
+  "metadata": {
+    "requester": "harrison via #f3-pure-launch",
+    "strategy_chat_session": "test-fixture",
+    "brand_lineage": "Path A -- clean-sweetened functional energy",
+    "tier": 1
+  }
+}

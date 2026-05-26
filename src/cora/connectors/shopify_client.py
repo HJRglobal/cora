@@ -395,3 +395,91 @@ def format_inventory_for_llm(
                 lines.append(f"  - {label}: {v.qty_on_hand} units{flag}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# GraphQL helper (used by photoroom_client and other connectors that need
+# mutations or queries not available via the REST Admin API)
+# ---------------------------------------------------------------------------
+
+
+def graphql(mutation: str, variables: dict) -> dict:
+    """
+    Execute a Shopify Admin GraphQL query or mutation.
+
+    Returns the parsed JSON response body as a dict.
+    Raises ShopifyConnectorError on HTTP error or Shopify-level errors.
+    """
+    store, token = _store_config()
+    url = f"https://{store}/admin/api/{_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+    }
+    payload = {"query": mutation, "variables": variables}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        raise ShopifyConnectorError(f"GraphQL network error: {exc}") from exc
+
+    if resp.status_code == 401:
+        raise ShopifyConnectorError(
+            "Shopify GraphQL auth failed (HTTP 401). Check SHOPIFY_F3E_ACCESS_TOKEN."
+        )
+    if not resp.ok:
+        raise ShopifyConnectorError(
+            f"Shopify GraphQL HTTP {resp.status_code}: {resp.text[:300]}"
+        )
+
+    body = resp.json()
+    if "errors" in body:
+        msg = "; ".join(
+            e.get("message", str(e)) for e in body["errors"]
+        )
+        raise ShopifyConnectorError(f"Shopify GraphQL errors: {msg}")
+
+    return body
+
+
+# ---------------------------------------------------------------------------
+# GraphQL helper (used by photoroom_client and other connectors that need
+# mutations or queries not available via the REST Admin API)
+# ---------------------------------------------------------------------------
+
+
+def graphql(mutation: str, variables: dict) -> dict:
+    """
+    Execute a Shopify Admin GraphQL query or mutation.
+
+    Returns the parsed JSON response body as a dict.
+    Raises ShopifyConnectorError on HTTP error or Shopify-level errors.
+    """
+    store, token = _store_config()
+    url = f"https://{store}/admin/api/{_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+    }
+    payload = {"query": mutation, "variables": variables}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        raise ShopifyConnectorError(f"GraphQL network error: {exc}") from exc
+
+    if resp.status_code == 401:
+        raise ShopifyConnectorError(
+            "Shopify GraphQL auth failed (HTTP 401). Check SHOPIFY_F3E_ACCESS_TOKEN."
+        )
+    if not resp.ok:
+        raise ShopifyConnectorError(
+            f"Shopify GraphQL HTTP {resp.status_code}: {resp.text[:300]}"
+        )
+
+    body = resp.json()
+    if "errors" in body:
+        msg = "; ".join(
+            e.get("message", str(e)) for e in body["errors"]
+        )
+        raise ShopifyConnectorError(f"Shopify GraphQL errors: {msg}")
+
+    return body

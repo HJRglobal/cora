@@ -53,6 +53,15 @@ def _load() -> "Config":
     )
     qbo_environment = get("QBO_ENVIRONMENT", required=False, default="production")
     log_level = get("LOG_LEVEL", required=False, default="INFO")
+    # PhotoRoom API (image generation orchestrator). All optional; PhotoRoom tool-use
+    # disabled if PHOTOROOM_API_KEY is missing.
+    photoroom_api_key = get("PHOTOROOM_API_KEY", required=False, default="")
+    photoroom_base_url = get(
+        "PHOTOROOM_BASE_URL", required=False, default="https://image-api.photoroom.com/v2"
+    )
+    photoroom_rate_limit_per_min = get("PHOTOROOM_RATE_LIMIT_PER_MIN", required=False, default="60")
+    photoroom_use_sandbox = get("PHOTOROOM_USE_SANDBOX", required=False, default="false")
+    photoroom_weekly_budget_usd = get("PHOTOROOM_WEEKLY_BUDGET_USD", required=False, default="50")
 
     if errors:
         raise RuntimeError("Cora config errors:\n" + "\n".join(errors))
@@ -71,6 +80,11 @@ def _load() -> "Config":
         qbo_redirect_uri=qbo_redirect_uri,
         qbo_environment=qbo_environment,
         log_level=log_level,
+        photoroom_api_key=photoroom_api_key,
+        photoroom_base_url=photoroom_base_url,
+        photoroom_rate_limit_per_min=int(photoroom_rate_limit_per_min or "60"),
+        photoroom_use_sandbox=photoroom_use_sandbox.lower() in ("true", "1", "yes"),
+        photoroom_weekly_budget_usd=float(photoroom_weekly_budget_usd or "50"),
     )
 
 
@@ -89,6 +103,11 @@ class Config:
     qbo_redirect_uri: str
     qbo_environment: str
     log_level: str
+    photoroom_api_key: str
+    photoroom_base_url: str
+    photoroom_rate_limit_per_min: int
+    photoroom_use_sandbox: bool
+    photoroom_weekly_budget_usd: float
 
 
 config = _load()

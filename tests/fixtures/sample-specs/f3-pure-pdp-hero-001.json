@@ -1,0 +1,45 @@
+{
+  "spec_id": "f3-pure-pdp-strawberry-lemonade-2026-05-26-001",
+  "brand": "pure",
+  "scene_name": "pdp-lifestyle",
+  "feature": "ai_backgrounds",
+  "main_image": {
+    "type": "url",
+    "value": "https://cdn.shopify.com/s/files/1/0000/0000/0000/files/f3-pure-strawberry-lemonade-hero-01.png"
+  },
+  "background": {
+    "prompt": "Bright kitchen counter, white marble, natural sunlight streaming through a window, fresh strawberries and lemons artfully arranged, clean minimal aesthetic",
+    "guidance": {
+      "image_ref": null,
+      "scale": 0.6
+    },
+    "negative_prompt": "dark, cluttered, gym, MMA, masculine energy",
+    "seed": null
+  },
+  "edit_with_ai": {
+    "enabled": false,
+    "additional_images": []
+  },
+  "output": {
+    "format": "PNG",
+    "size": "1200x1200",
+    "filename": "f3-pure-pdp-strawberry-lemonade-01.png",
+    "alt_text": "F3 Pure Strawberry Lemonade — product lifestyle shot on bright kitchen counter"
+  },
+  "destination": {
+    "type": "pdp_hero",
+    "shopify_target": {
+      "section_id": null,
+      "template_file": null,
+      "product_handle": "f3-pure-strawberry-lemonade",
+      "collection_handle": null
+    },
+    "wire_strategy": "replace_or_insert"
+  },
+  "metadata": {
+    "requester": "harrison via #f3-pure-launch",
+    "strategy_chat_session": "test-fixture",
+    "brand_lineage": "Path A -- clean-sweetened functional energy",
+    "tier": 1
+  }
+}

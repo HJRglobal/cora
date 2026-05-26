@@ -18,8 +18,8 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
-from ..connectors import clover_client, qbo_oauth, shopify_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
+from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
 
@@ -1847,6 +1847,21 @@ def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -
     return brand_voice_client.format_result_for_llm(result)
 
 
+# ---------------------------------------------------------------------------
+# PhotoRoom image generation tool handlers
+# ---------------------------------------------------------------------------
+
+
+def _tool_f3_generate_image(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate to generate_image.handle_f3_generate_image."""
+    return generate_image.handle_f3_generate_image(slack_user_id, entity, _input)
+
+
+def _tool_f3_batch_image_run(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate to generate_image.handle_f3_batch_image_run."""
+    return generate_image.handle_f3_batch_image_run(slack_user_id, entity, _input)
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -2938,6 +2953,64 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ---------------------------------------------------------------------------
+    # PhotoRoom image generation tools (Session 2 wiring — stubs registered here,
+    # handlers in tools/generate_image.py once that file is written)
+    # ---------------------------------------------------------------------------
+    {
+        "name": "f3_generate_image",
+        "description": (
+            "Generate an F3 brand image via PhotoRoom AI Backgrounds and wire it to "
+            "Shopify. Accepts a spec JSON (per the image spec schema) or a Drive file "
+            "ID pointing to a spec. Returns Shopify File GID + cost summary. "
+            "Supports dry_run=true to estimate cost without consuming an API credit. "
+            "Scope: F3E channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "description": "Image spec JSON per the PhotoRoom spec schema.",
+                },
+                "spec_drive_file_id": {
+                    "type": "string",
+                    "description": "Alternative: Google Drive file ID of a spec JSON file.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, validates the spec and estimates cost without calling "
+                        "PhotoRoom. Returns 'Would generate 1 image. Cost: $0.10.'"
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "f3_batch_image_run",
+        "description": (
+            "Run a batch of F3 image generation specs from a Google Drive folder. "
+            "Processes all JSON spec files in the folder in series, respecting rate "
+            "limits. Posts a batch summary to Slack when done. Hard cap: 50 images "
+            "per batch. Scope: FNDR or F3E channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "spec_folder_drive_id": {
+                    "type": "string",
+                    "description": "Google Drive folder ID containing JSON spec files.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, validates all specs and estimates total cost only.",
+                },
+            },
+            "required": ["spec_folder_drive_id"],
+        },
+    },
 ]
 
 
@@ -2976,6 +3049,9 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
     "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
     "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
+    # PhotoRoom image generation — wired in Session 2
+    "f3_generate_image": _tool_f3_generate_image,
+    "f3_batch_image_run": _tool_f3_batch_image_run,
 }
 
 

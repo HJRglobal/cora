@@ -1,0 +1,45 @@
+{
+  "spec_id": "f3-pure-collection-hero-2026-05-26-001",
+  "brand": "pure",
+  "scene_name": "collection-header",
+  "feature": "ai_backgrounds",
+  "main_image": {
+    "type": "url",
+    "value": "https://cdn.shopify.com/s/files/1/0000/0000/0000/files/f3-pure-variety-pack-hero.png"
+  },
+  "background": {
+    "prompt": "Farmer's market scene, early morning, warm golden light, fresh produce in background, relaxed weekend energy, teal and coral color tones",
+    "guidance": {
+      "image_ref": null,
+      "scale": 0.5
+    },
+    "negative_prompt": "text, watermark, gym, dark",
+    "seed": null
+  },
+  "edit_with_ai": {
+    "enabled": false,
+    "additional_images": []
+  },
+  "output": {
+    "format": "PNG",
+    "size": "1920x600",
+    "filename": "f3-pure-collection-hero-01.png",
+    "alt_text": "F3 Pure collection -- real energy for real life"
+  },
+  "destination": {
+    "type": "collection_hero",
+    "shopify_target": {
+      "section_id": null,
+      "template_file": null,
+      "product_handle": null,
+      "collection_handle": "f3-pure"
+    },
+    "wire_strategy": "replace_or_insert"
+  },
+  "metadata": {
+    "requester": "harrison via #f3-pure-launch",
+    "strategy_chat_session": "test-fixture",
+    "brand_lineage": "Path A -- clean-sweetened functional energy",
+    "tier": 2
+  }
+}
