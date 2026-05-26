@@ -85,11 +85,14 @@ def _load_asana_gids() -> list[str]:
 
     gids: list[str] = []
     seen: set[str] = set()
-    for v in data.values():
-        gid = v.get("asana_gid") if isinstance(v, dict) else v
-        if gid and gid not in seen:
-            seen.add(gid)
-            gids.append(gid)
+    users = data.get("users", []) if isinstance(data, dict) else []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        gid = entry.get("asana_user_gid") or entry.get("asana_gid")
+        if gid and str(gid) not in seen:
+            seen.add(str(gid))
+            gids.append(str(gid))
     return gids
 
 
