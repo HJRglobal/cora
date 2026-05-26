@@ -19,6 +19,7 @@ Coverage:
  13. Verdict helpers
  14. format_result_for_llm output structure
  15. Dispatch-layer integration — _tool_f3e_brand_voice_check via tool_dispatch
+ 16. HJRP-RR venue boundary — wedding/retreat/venue is Rogers Ranch territory, not F3E
 """
 
 import sys
@@ -688,4 +689,178 @@ class TestDispatchIntegration:
         assert isinstance(result, str)
         assert "WARNING" in result or "CRITICAL" in result, (
             "Beast mode in Pure copy must surface at least a WARNING"
+        )
+
+
+# ─── Category 16: HJRP-RR venue boundary ─────────────────────────────────────
+
+
+class TestHJRPRRVenueBoundary:
+    """Wedding, retreat, and venue content is Rogers Ranch (HJRP-RR) territory.
+
+    F3 Energy brand alignment with venue/wedding/retreat copy is BLOCKED.
+    These patterns must fire as CRITICAL with a Rogers Ranch redirect message.
+    Applies universally to all three F3 sub-brands.
+    """
+
+    # ── wedding venue ─────────────────────────────────────────────────────────
+
+    def test_wedding_venue_is_critical_in_pure(self):
+        result = check_copy("pure", "The official drink of your wedding venue experience.")
+        assert _has_critical(result, "wedding venue"), (
+            "wedding venue must be CRITICAL in Pure copy — HJRP-RR boundary"
+        )
+
+    def test_wedding_venue_is_critical_in_mood(self):
+        result = check_copy("mood", "F3 Mood — perfect for wedding venue cocktail hours.")
+        assert _has_critical(result, "wedding venue"), (
+            "wedding venue must be CRITICAL in Mood copy — HJRP-RR boundary"
+        )
+
+    def test_wedding_venue_is_critical_in_energy(self):
+        result = check_copy("energy", "F3 Energy: the wedding venue partner you didn't know you needed.")
+        assert _has_critical(result, "wedding venue"), (
+            "wedding venue must be CRITICAL in Energy copy — HJRP-RR boundary"
+        )
+
+    # ── corporate retreat ─────────────────────────────────────────────────────
+
+    def test_corporate_retreat_is_critical_in_pure(self):
+        result = check_copy("pure", "Fuel your next corporate retreat with F3 Pure.")
+        assert _has_critical(result, "corporate retreat"), (
+            "corporate retreat must be CRITICAL in Pure copy — HJRP-RR boundary"
+        )
+
+    def test_corporate_retreat_is_critical_in_mood(self):
+        result = check_copy("mood", "Trusted by leadership teams at corporate retreats everywhere.")
+        assert _has_critical(result, "corporate retreat"), (
+            "corporate retreat must be CRITICAL in Mood copy — HJRP-RR boundary"
+        )
+
+    def test_corporate_retreat_is_critical_in_energy(self):
+        result = check_copy("energy", "The energy drink choice for corporate retreat teams.")
+        assert _has_critical(result, "corporate retreat"), (
+            "corporate retreat must be CRITICAL in Energy copy — HJRP-RR boundary"
+        )
+
+    # ── ranch retreat ─────────────────────────────────────────────────────────
+
+    def test_ranch_retreat_is_critical(self):
+        result = check_copy("energy", "F3 Energy at the ranch retreat — fuel the off-site.")
+        assert _has_critical(result, "ranch retreat"), (
+            "ranch retreat must be CRITICAL — Rogers Ranch (HJRP-RR) territory"
+        )
+
+    # ── wedding day ───────────────────────────────────────────────────────────
+
+    def test_wedding_day_is_critical_in_pure(self):
+        result = check_copy("pure", "Keep your energy up on the wedding day with F3 Pure.")
+        assert _has_critical(result, "wedding day"), (
+            "wedding day framing must be CRITICAL in Pure copy — HJRP-RR boundary"
+        )
+
+    def test_wedding_day_is_critical_in_mood(self):
+        result = check_copy("mood", "Calm the Noise on your wedding day.")
+        assert _has_critical(result, "wedding day"), (
+            "wedding day must be CRITICAL in Mood copy — HJRP-RR boundary"
+        )
+
+    # ── venue sponsor ─────────────────────────────────────────────────────────
+
+    def test_venue_sponsor_is_critical(self):
+        result = check_copy("energy", "F3 Energy — proud venue sponsor of events in Arizona.")
+        assert _has_critical(result, "venue sponsor"), (
+            "venue sponsor language must be CRITICAL — HJRP-RR boundary"
+        )
+
+    # ── category label and routing ────────────────────────────────────────────
+
+    def test_hjrp_rr_finding_uses_cross_entity_category(self):
+        result = check_copy("pure", "F3 Pure is the official drink of this wedding venue.")
+        cats = _categories(result)
+        assert any("Cross-entity" in c for c in cats), (
+            "HJRP-RR venue findings must use 'Cross-entity' category (same as UFL pause)"
+        )
+
+    def test_hjrp_rr_message_mentions_rogers_ranch(self):
+        result = check_copy("energy", "Perfect for your corporate retreat team.")
+        hjrp_findings = [
+            f for f in result.findings
+            if "corporate retreat" in f.term_found.lower() or "hjrp" in f.message.lower()
+        ]
+        assert hjrp_findings, "HJRP-RR finding must be present for 'corporate retreat'"
+        assert any("Rogers Ranch" in f.message or "HJRP-RR" in f.message for f in hjrp_findings), (
+            "HJRP-RR finding message must mention 'Rogers Ranch' or 'HJRP-RR' for redirect clarity"
+        )
+
+    def test_hjrp_rr_verdict_needs_revision(self):
+        result = check_copy("mood", "The best drink for wedding venue receptions.")
+        assert "NEEDS REVISION" in result.verdict, (
+            "HJRP-RR CRITICAL finding must trigger NEEDS REVISION verdict"
+        )
+
+    # ── false-positive guards ─────────────────────────────────────────────────
+
+    def test_mma_event_does_not_trigger_hjrp_rr(self):
+        """MMA events, gym activations, and fight nights are F3E territory — must not flag."""
+        result = check_copy("energy", "F3 Energy — the official fuel of MMA Lab's next fight night.")
+        hjrp_findings = [
+            f for f in result.findings
+            if "HJRP" in f.message or "Rogers Ranch" in f.message
+        ]
+        assert not hjrp_findings, "MMA fight night events must NOT trigger HJRP-RR findings"
+
+    def test_retail_activation_does_not_trigger_hjrp_rr(self):
+        """Sampling events and retail activations are fine for F3E — must not flag."""
+        result = check_copy("pure", "Join us for a sampling event at your local Sprouts this Saturday.")
+        hjrp_findings = [
+            f for f in result.findings
+            if "HJRP" in f.message or "Rogers Ranch" in f.message
+        ]
+        assert not hjrp_findings, "Retail sampling events must NOT trigger HJRP-RR findings"
+
+    def test_clean_energy_copy_no_hjrp_rr_false_positive(self):
+        """Standard F3 Energy performance copy should never trigger HJRP-RR."""
+        result = check_copy("energy", "Fuel. Focus. Finish. F3 Energy is built for the fight.")
+        hjrp_findings = [
+            f for f in result.findings
+            if "HJRP" in f.message or "Rogers Ranch" in f.message
+        ]
+        assert not hjrp_findings, "Standard Energy copy must not trigger HJRP-RR findings"
+
+    def test_gym_partnership_does_not_trigger_hjrp_rr(self):
+        """Gym partnerships are explicitly F3E territory per the guardrail."""
+        result = check_copy("energy", "F3 Energy is now the official gym partner at MMA Lab Arizona.")
+        hjrp_findings = [
+            f for f in result.findings
+            if "HJRP" in f.message or "Rogers Ranch" in f.message
+        ]
+        assert not hjrp_findings, "Gym partnership language must NOT trigger HJRP-RR findings"
+
+    # ── dispatch integration ──────────────────────────────────────────────────
+
+    def test_dispatch_surfaces_wedding_venue_critical(self):
+        """Dispatch layer must surface HJRP-RR CRITICAL for wedding venue copy."""
+        from cora.tools.tool_dispatch import dispatch
+        result = dispatch(
+            "f3e_brand_voice_check",
+            {"brand": "pure", "copy": "F3 Pure — the official drink of Arizona wedding venues."},
+            slack_user_id="U_TEST",
+            entity="F3E",
+        )
+        assert "CRITICAL" in result, (
+            "Wedding venue in Pure copy must surface CRITICAL through dispatch"
+        )
+
+    def test_dispatch_surfaces_corporate_retreat_critical(self):
+        """Dispatch layer must surface HJRP-RR CRITICAL for corporate retreat copy."""
+        from cora.tools.tool_dispatch import dispatch
+        result = dispatch(
+            "f3e_brand_voice_check",
+            {"brand": "mood", "copy": "Trusted by executive teams at corporate retreats."},
+            slack_user_id="U_TEST",
+            entity="F3E",
+        )
+        assert "CRITICAL" in result, (
+            "Corporate retreat in Mood copy must surface CRITICAL through dispatch"
         )

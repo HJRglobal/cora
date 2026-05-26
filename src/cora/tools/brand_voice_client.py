@@ -131,12 +131,15 @@ def _check_health_claims(copy: str) -> list[Finding]:
     return findings
 
 
-# ─── Cross-entity: UFL pause (all brands) ────────────────────────────────────
+# ─── Cross-entity: UFL pause + HJRP-RR venue boundary (all brands) ──────────
 #
-# F3-UFL crossover content is blocked per 2026-05-10 directive.
-# No UFL athlete partnerships, no F3/UFL joint content.
+# UFL: F3-UFL crossover content is blocked per 2026-05-10 directive.
+# HJRP-RR: Rogers Ranch (wedding venue / corporate retreat / vacation rental)
+#   is a separate HJR Properties sub-entity. F3 Energy brand alignment with
+#   venue/wedding/retreat content is BLOCKED — redirect to HJRP-RR.
 
 _CROSS_ENTITY_BANNED: list[tuple[str, str]] = [
+    # UFL pause (2026-05-10)
     (
         "ufl",
         "Cross-entity: F3-UFL crossover content is BLOCKED per 2026-05-10 pause directive. "
@@ -145,6 +148,31 @@ _CROSS_ENTITY_BANNED: list[tuple[str, str]] = [
     (
         "united fight league",
         "Cross-entity: F3-UFL crossover content is BLOCKED per 2026-05-10 pause directive.",
+    ),
+    # HJRP-RR venue boundary
+    (
+        "wedding venue",
+        "Cross-entity: wedding venue content is Rogers Ranch (HJRP-RR) territory, not F3 Energy. "
+        "Do not position F3 as a venue partner or wedding drink. Route to #rogers-ranch or #hjrp-leadership.",
+    ),
+    (
+        "corporate retreat",
+        "Cross-entity: corporate retreat positioning is Rogers Ranch (HJRP-RR) territory, not F3 Energy. "
+        "Retreat event sponsorships belong to HJRP-RR — redirect there.",
+    ),
+    (
+        "ranch retreat",
+        "Cross-entity: ranch retreat content is Rogers Ranch (HJRP-RR) territory, not F3 Energy.",
+    ),
+    (
+        "wedding day",
+        "Cross-entity: wedding-day framing positions F3 as a wedding/venue product — "
+        "that's Rogers Ranch (HJRP-RR) territory. Do not align F3 brand with wedding event copy.",
+    ),
+    (
+        "venue sponsor",
+        "Cross-entity: venue sponsorship is Rogers Ranch (HJRP-RR) territory, not F3 Energy. "
+        "Retail activations and gym partnerships are fine; venue-business sponsorships are not.",
     ),
 ]
 
