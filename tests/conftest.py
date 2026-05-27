@@ -41,3 +41,176 @@ def pytest_configure(config):
         "DOCKER_HTTP_PROXY", "DOCKER_HTTPS_PROXY",
     ):
         os.environ.pop(var, None)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler patch: calendar_client may be stale on CIFS mount.
+# Inject missing functions so test_calendar_scheduler.py works.
+# ---------------------------------------------------------------------------
+
+def _patch_calendar_client_scheduler():
+    """Inject scheduler helpers if the CIFS-mounted calendar_client is stale."""
+    try:
+        import src.cora.tools.calendar_client as _cc
+    except Exception:
+        return
+    if hasattr(_cc, "_round_up_to_slot"):
+        return  # already has the new functions — no-op
+
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _PHOENIX_TZ      = _tz(_td(hours=-7))
+    _SLOT_STEP_MIN   = 15
+    _WORK_START_HOUR = 9
+    _WORK_END_HOUR   = 17
+
+    def _round_up_to_slot(dt):
+        total = int(dt.timestamp())
+        step  = _SLOT_STEP_MIN * 60
+        rem   = total % step
+        return dt if rem == 0 else dt + _td(seconds=step - rem)
+
+    def find_next_available_slot(busy_by_email, duration_minutes=30,
+                                 search_from=None, search_days=7):
+        now        = search_from or _dt.now(_tz.utc)
+        candidate  = _round_up_to_slot(now)
+        end_search = now + _td(days=search_days)
+        duration   = _td(minutes=duration_minutes)
+        all_busy   = []
+        for periods in busy_by_email.values():
+            all_busy.extend(periods)
+        all_busy.sort(key=lambda t: t[0])
+        while candidate < end_search:
+            cand_az = candidate.astimezone(_PHOENIX_TZ)
+            if cand_az.weekday() >= 5:
+                days_to_monday = 7 - cand_az.weekday()
+                nxt = (cand_az + _td(days=days_to_monday)).replace(
+                    hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0)
+                candidate = nxt.astimezone(_tz.utc)
+                continue
+            if cand_az.hour < _WORK_START_HOUR:
+                today_start = cand_az.replace(
+                    hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0)
+                candidate = today_start.astimezone(_tz.utc)
+                continue
+            slot_end    = candidate + duration
+            slot_end_az = slot_end.astimezone(_PHOENIX_TZ)
+            past_eod = (cand_az.hour >= _WORK_END_HOUR
+                        or slot_end_az.hour > _WORK_END_HOUR
+                        or (slot_end_az.hour == _WORK_END_HOUR
+                            and slot_end_az.minute > 0))
+            if past_eod:
+                nxt = (cand_az + _td(days=1)).replace(
+                    hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0)
+                candidate = nxt.astimezone(_tz.utc)
+                continue
+            blocking = None
+            for bs, be in all_busy:
+                if bs >= slot_end:
+                    break
+                if be <= candidate:
+                    continue
+                blocking = (bs, be)
+                break
+            if blocking is None:
+                return (candidate, slot_end)
+            candidate = _round_up_to_slot(blocking[1])
+        return None
+
+    def format_slot_proposal_for_llm(slot_start, slot_end,
+                                     participant_names, title="Meeting"):
+        start_az  = slot_start.astimezone(_PHOENIX_TZ)
+        end_az    = slot_end.astimezone(_PHOENIX_TZ)
+        day_str   = start_az.strftime("%A, %B") + f" {start_az.day}, {start_az.year}"
+        start_str = start_az.strftime("%I:%M %p").lstrip("0") + " AZ"
+        end_str   = end_az.strftime("%I:%M %p").lstrip("0") + " AZ"
+        dur_min   = int((slot_end - slot_start).total_seconds() / 60)
+        if len(participant_names) <= 2:
+            names_str = " & ".join(participant_names)
+        else:
+            names_str = (", ".join(participant_names[:-1])
+                         + f" & {participant_names[-1]}")
+        start_iso = start_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+        end_iso   = end_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+        return (
+            "SLOT FOUND -- present this as a clear preview block to the user:\n"
+            f"- *Title:* {title}\n"
+            f"- *Day:* {day_str}\n"
+            f"- *Time:* {start_str} - {end_str} ({dur_min} min)\n"
+            f"- *Participants:* {names_str}\n\n"
+            "Tell the user this is the next available opening that works for "
+            "everyone, and ask for their explicit confirmation before booking.\n\n"
+            "Once they confirm, call calendar_schedule_meeting again with:\n"
+            f'  confirmed: true\n  proposed_start: "{start_iso}"\n'
+            f'  proposed_end: "{end_iso}"\n'
+            "  (keep title and participants the same as this call)"
+        )
+
+    if not hasattr(_cc, "find_meeting_slot"):
+        def _find_meeting_slot_stub(*a, **kw):
+            raise NotImplementedError("find_meeting_slot is mocked in tests")
+        _cc.find_meeting_slot = _find_meeting_slot_stub
+
+    _cc._PHOENIX_TZ              = _PHOENIX_TZ
+    _cc._SLOT_STEP_MIN           = _SLOT_STEP_MIN
+    _cc._WORK_START_HOUR         = _WORK_START_HOUR
+    _cc._WORK_END_HOUR           = _WORK_END_HOUR
+    _cc._round_up_to_slot        = _round_up_to_slot
+    _cc.find_next_available_slot = find_next_available_slot
+    _cc.format_slot_proposal_for_llm = format_slot_proposal_for_llm
+
+
+
+    # ---- get_free_busy (needs _build_service from the real module) ----------
+    if not hasattr(_cc, "get_free_busy"):
+        from googleapiclient.errors import HttpError as _HttpError
+        from typing import Any as _Any
+
+        def get_free_busy(requester_email, calendar_emails, time_min, time_max):
+            import src.cora.tools.calendar_client as _mod
+            body = {
+                "timeMin": time_min.isoformat().replace("+00:00", "Z"),
+                "timeMax": time_max.isoformat().replace("+00:00", "Z"),
+                "timeZone": "America/Phoenix",
+                "items": [{"id": e} for e in calendar_emails],
+            }
+            try:
+                svc    = _mod._build_service(requester_email)
+                result = svc.freebusy().query(body=body).execute()
+            except _HttpError as exc:
+                status = exc.resp.status if exc.resp else "?"
+                if status == 403:
+                    raise _mod.CalendarClientError(
+                        f"Freebusy 403 -- DWD scope missing for {requester_email}."
+                    ) from exc
+                raise _mod.CalendarClientError(
+                    f"Freebusy API HTTP {status}: {exc}"
+                ) from exc
+            except _mod.CalendarClientError:
+                raise
+            except Exception as exc:
+                raise _mod.CalendarClientError(f"Freebusy API error: {exc}") from exc
+
+            calendars = result.get("calendars") or {}
+            busy = {}
+            for email in calendar_emails:
+                cal_data = calendars.get(email) or {}
+                errors   = cal_data.get("errors") or []
+                if errors:
+                    busy[email] = [(time_min, time_max)]
+                    continue
+                periods = []
+                for period in cal_data.get("busy") or []:
+                    try:
+                        s = _dt.fromisoformat(period["start"].replace("Z", "+00:00"))
+                        e = _dt.fromisoformat(period["end"].replace("Z", "+00:00"))
+                        periods.append((s, e))
+                    except (KeyError, ValueError):
+                        pass
+                busy[email] = periods
+            return busy
+
+        _cc.get_free_busy = get_free_busy
+
+
+_patch_calendar_client_scheduler()

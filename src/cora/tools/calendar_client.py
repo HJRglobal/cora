@@ -438,3 +438,242 @@ def format_events_for_llm(events: list[dict[str, Any]], window_label: str) -> st
         )
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# freebusy query + meeting-slot finder
+# ---------------------------------------------------------------------------
+
+_WORK_START_HOUR = 9    # 9 AM America/Phoenix
+_WORK_END_HOUR   = 17   # 5 PM America/Phoenix
+_SLOT_STEP_MIN   = 15   # 15-minute granularity
+_PHOENIX_TZ      = timezone(timedelta(hours=-7))  # Arizona never observes DST
+
+
+def get_free_busy(
+    requester_email: str,
+    calendar_emails: list[str],
+    time_min: datetime,
+    time_max: datetime,
+) -> dict[str, list[tuple[datetime, datetime]]]:
+    """Query the Google Calendar freebusy API for multiple calendars.
+
+    Returns {email: [(busy_start_utc, busy_end_utc), ...]} for each email.
+    Uses DWD impersonation as requester_email so only one service build is needed.
+
+    If a calendar returns API errors (e.g. user not in domain), that calendar is
+    treated as *fully busy* for the window -- safe over-approximation avoids
+    double-booking at the cost of possibly missing a slot.
+    """
+    body: dict[str, Any] = {
+        "timeMin": time_min.isoformat().replace("+00:00", "Z"),
+        "timeMax": time_max.isoformat().replace("+00:00", "Z"),
+        "timeZone": _DEFAULT_TZ,
+        "items": [{"id": email} for email in calendar_emails],
+    }
+
+    try:
+        service = _build_service(requester_email)
+        result  = service.freebusy().query(body=body).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        if status == 403:
+            raise CalendarClientError(
+                f"Freebusy 403 -- service account lacks DWD scope for {requester_email}. "
+                "Harrison must ensure https://www.googleapis.com/auth/calendar.events "
+                "is listed in Domain-wide Delegation (admin.google.com)."
+            ) from exc
+        raise CalendarClientError(f"Freebusy API HTTP {status}: {exc}") from exc
+    except CalendarClientError:
+        raise
+    except Exception as exc:
+        raise CalendarClientError(f"Freebusy API error: {exc}") from exc
+
+    calendars = result.get("calendars") or {}
+    busy: dict[str, list[tuple[datetime, datetime]]] = {}
+
+    for email in calendar_emails:
+        cal_data = calendars.get(email) or {}
+        errors   = cal_data.get("errors") or []
+        if errors:
+            log.warning(
+                "get_free_busy: calendar %s returned errors %s -- treating as fully busy",
+                email, errors,
+            )
+            busy[email] = [(time_min, time_max)]
+            continue
+        periods: list[tuple[datetime, datetime]] = []
+        for period in cal_data.get("busy") or []:
+            try:
+                s = datetime.fromisoformat(period["start"].replace("Z", "+00:00"))
+                e = datetime.fromisoformat(period["end"].replace("Z", "+00:00"))
+                periods.append((s, e))
+            except (KeyError, ValueError) as exc:
+                log.warning("get_free_busy: could not parse busy period %s: %s", period, exc)
+        busy[email] = periods
+
+    return busy
+
+
+def _round_up_to_slot(dt: datetime) -> datetime:
+    """Round a UTC-aware datetime UP to the next _SLOT_STEP_MIN (15-min) boundary.
+
+    If the datetime is already on a boundary it is returned unchanged.
+    """
+    total_seconds = int(dt.timestamp())
+    step_seconds  = _SLOT_STEP_MIN * 60
+    remainder     = total_seconds % step_seconds
+    if remainder == 0:
+        return dt
+    return dt + timedelta(seconds=(step_seconds - remainder))
+
+
+def find_next_available_slot(
+    busy_by_email: dict[str, list[tuple[datetime, datetime]]],
+    duration_minutes: int = 30,
+    search_from: "datetime | None" = None,
+    search_days: int = 7,
+) -> "tuple[datetime, datetime] | None":
+    """Scan forward to find the first slot free for ALL calendars.
+
+    Rules:
+    - Mon-Fri only (weekends skipped)
+    - 9 AM to 5 PM America/Phoenix (UTC-7, no DST)
+    - 15-minute slot steps
+    - slot must not overlap any busy block for any participant
+
+    Returns (slot_start_utc, slot_end_utc) or None if no slot found in window.
+    """
+    now        = search_from or datetime.now(timezone.utc)
+    candidate  = _round_up_to_slot(now)
+    end_search = now + timedelta(days=search_days)
+    duration   = timedelta(minutes=duration_minutes)
+
+    # Flatten all busy periods into one sorted list for efficient skip-ahead
+    all_busy: list[tuple[datetime, datetime]] = []
+    for periods in busy_by_email.values():
+        all_busy.extend(periods)
+    all_busy.sort(key=lambda t: t[0])
+
+    while candidate < end_search:
+        cand_az = candidate.astimezone(_PHOENIX_TZ)
+
+        # --- Skip weekends ---
+        if cand_az.weekday() >= 5:  # 5=Sat, 6=Sun
+            days_to_monday = 7 - cand_az.weekday()  # Sat->2, Sun->1
+            next_monday_az = (cand_az + timedelta(days=days_to_monday)).replace(
+                hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0
+            )
+            candidate = next_monday_az.astimezone(timezone.utc)
+            continue
+
+        # --- Before work hours -- jump to 9 AM same day ---
+        if cand_az.hour < _WORK_START_HOUR:
+            today_start_az = cand_az.replace(
+                hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0
+            )
+            candidate = today_start_az.astimezone(timezone.utc)
+            continue
+
+        # --- Slot end would bleed past 5 PM -- jump to next workday 9 AM ---
+        slot_end    = candidate + duration
+        slot_end_az = slot_end.astimezone(_PHOENIX_TZ)
+        past_eod = (
+            cand_az.hour >= _WORK_END_HOUR
+            or slot_end_az.hour > _WORK_END_HOUR
+            or (slot_end_az.hour == _WORK_END_HOUR and slot_end_az.minute > 0)
+        )
+        if past_eod:
+            next_day_az = (cand_az + timedelta(days=1)).replace(
+                hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0
+            )
+            candidate = next_day_az.astimezone(timezone.utc)
+            continue
+
+        # --- Check for overlap with any busy block ---
+        blocking: "tuple[datetime, datetime] | None" = None
+        for busy_start, busy_end in all_busy:
+            if busy_start >= slot_end:
+                break   # sorted -- no further period can overlap
+            if busy_end <= candidate:
+                continue
+            blocking = (busy_start, busy_end)
+            break
+
+        if blocking is None:
+            return (candidate, slot_end)
+
+        # Jump past the end of the blocking busy period (round up to next slot)
+        candidate = _round_up_to_slot(blocking[1])
+
+    return None
+
+
+def find_meeting_slot(
+    requester_email: str,
+    calendar_emails: list[str],
+    duration_minutes: int = 30,
+    search_days: int = 7,
+) -> "tuple[datetime, datetime] | None":
+    """High-level convenience: freebusy query + slot scan in one call.
+
+    Returns (slot_start_utc, slot_end_utc) or None.
+    Raises CalendarClientError on API failure.
+    """
+    now      = datetime.now(timezone.utc)
+    time_max = now + timedelta(days=search_days)
+    busy     = get_free_busy(requester_email, calendar_emails, now, time_max)
+    return find_next_available_slot(
+        busy,
+        duration_minutes=duration_minutes,
+        search_from=now,
+        search_days=search_days,
+    )
+
+
+def format_slot_proposal_for_llm(
+    slot_start: datetime,
+    slot_end: datetime,
+    participant_names: list[str],
+    title: str = "Meeting",
+) -> str:
+    """Render the proposed slot as a Slack-friendly preview block.
+
+    Returns a string Claude should present to the user verbatim.
+    Embeds proposed_start / proposed_end as ISO strings so Claude can pass
+    them straight back in the Phase 2 confirmed=true call without re-parsing.
+    """
+    start_az = slot_start.astimezone(_PHOENIX_TZ)
+    end_az   = slot_end.astimezone(_PHOENIX_TZ)
+
+    # Windows-safe strftime (no %-d padding trick)
+    day_str   = start_az.strftime("%A, %B") + f" {start_az.day}, {start_az.year}"
+    start_str = start_az.strftime("%I:%M %p").lstrip("0") + " AZ"
+    end_str   = end_az.strftime("%I:%M %p").lstrip("0") + " AZ"
+    dur_min   = int((slot_end - slot_start).total_seconds() / 60)
+
+    if len(participant_names) <= 2:
+        names_str = " & ".join(participant_names)
+    else:
+        names_str = ", ".join(participant_names[:-1]) + f" & {participant_names[-1]}"
+
+    # Explicit -07:00 offset (Phoenix, no DST) for Phase 2 passback
+    start_iso = start_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+    end_iso   = end_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+
+    return (
+        "SLOT FOUND -- present this as a clear preview block to the user:\n"
+        f"- *Title:* {title}\n"
+        f"- *Day:* {day_str}\n"
+        f"- *Time:* {start_str} - {end_str} ({dur_min} min)\n"
+        f"- *Participants:* {names_str}\n"
+        "\n"
+        "Tell the user this is the next available opening that works for everyone, "
+        "and ask for their explicit confirmation before booking.\n"
+        "\n"
+        "Once they confirm, call calendar_schedule_meeting again with:\n"
+        f'  confirmed: true\n'
+        f'  proposed_start: "{start_iso}"\n'
+        f'  proposed_end: "{end_iso}"\n'
+        "  (keep title and participants the same as this call)"
+    )
