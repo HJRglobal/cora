@@ -151,7 +151,7 @@ def _audit(
 
 def _fmt_currency(val: Optional[float]) -> str:
     if val is None:
-        return "-"
+        return "—"
     sign = "-" if val < 0 else ""
     return f"{sign}${abs(val):,.0f}"
 
@@ -208,7 +208,7 @@ def _format_summary_full(
         ]
         if not entities_to_show:
             return (
-                f"No cash flow data found for *{label}* "
+                f"No cash flow data found for *{entity_filter}* "
                 f"in {s.week_label} (as of {s.as_of_date}). "
                 "Ask Hayden or Justin to confirm the sheet has been updated."
             )
