@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 # Constants
 # ────────────────────────────────────────────────────────────────────────────
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _ACCOUNTS_PATH = _REPO_ROOT / "data" / "maps" / "monitored-email-accounts.yaml"
 _WATERMARKS_PATH = _REPO_ROOT / "data" / "cache" / "email-filing-watermarks.json"
 
@@ -241,6 +241,10 @@ def classify_attachments(
         raise AttachmentFilerError(f"Claude classification failed: {exc}") from exc
 
     raw = response.content[0].text.strip()
+    # Strip markdown code fences if Claude wrapped the JSON (e.g. ```json ... ```)
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]  # drop opening fence line
+        raw = raw.rsplit("```", 1)[0].strip()  # drop closing fence
 
     try:
         parsed = json.loads(raw)

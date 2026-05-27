@@ -57,15 +57,16 @@ $Settings = New-ScheduledTaskSettingsSet `
 $Principal = New-ScheduledTaskPrincipal `
     -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -LogonType Interactive `
-    -RunLevel Highest
+    -RunLevel Limited
 
-Register-ScheduledTask `
+$result = Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
     -Principal $Principal `
-    -Force
+    -Force `
+    -ErrorAction Stop 2>&1
 
 Write-Host ""
 Write-Host "Task registered: '$TaskName'" -ForegroundColor Green
