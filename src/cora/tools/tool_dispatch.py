@@ -2502,6 +2502,77 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "calendar_schedule_meeting",
+        "description": (
+            "Find the next available time when ALL participants are free, propose it "
+            "for confirmation, then book the meeting in Google Calendar. "
+            "Use this when anyone says things like 'schedule a meeting for Larry and me', "
+            "'find a time for Harrison and Hannah', 'when can Tommy and I meet', "
+            "'set up a call with Alex at the next opening', or similar. "
+            "TWO-PHASE FLOW: "
+            "Phase 1 (confirmed=false) -- call with participant names; the tool queries "
+            "everyone's Google Calendar freebusy and returns the next open slot as a "
+            "preview block. You MUST show the user this preview and ask for confirmation. "
+            "Phase 2 (confirmed=true) -- once the user says yes, call again with "
+            "confirmed=true plus the exact proposed_start and proposed_end strings from "
+            "Phase 1. The tool then creates the Google Calendar event and sends invites. "
+            "The requester is always auto-included -- pass only OTHER participants. "
+            "Working hours: Mon-Fri 9 AM to 5 PM America/Phoenix. "
+            "Default duration: 30 minutes. Search window: next 7 days."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "participants": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Names (or Slack display names) of people to include, "
+                        "NOT including the requester (they are auto-added). "
+                        "Example: ['Larry', 'Hannah']. Required."
+                    ),
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "description": (
+                        "Meeting length in minutes. Defaults to 30. "
+                        "Minimum 15. Example: 60 for a one-hour meeting."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Optional event title / meeting name. "
+                        "Defaults to 'Meeting' if omitted."
+                    ),
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Phase gate. Set false (or omit) for Phase 1 (find + propose). "
+                        "Set true for Phase 2 (book) -- only after user confirms. "
+                        "NEVER set true on the first call."
+                    ),
+                },
+                "proposed_start": {
+                    "type": "string",
+                    "description": (
+                        "Phase 2 only. The exact proposed_start ISO string returned by "
+                        "Phase 1. Example: '2026-06-02T09:00:00-07:00'."
+                    ),
+                },
+                "proposed_end": {
+                    "type": "string",
+                    "description": (
+                        "Phase 2 only. The exact proposed_end ISO string returned by "
+                        "Phase 1. Example: '2026-06-02T09:30:00-07:00'."
+                    ),
+                },
+            },
+            "required": ["participants"],
+        },
+    },
+    {
         "name": "influencer_list_handles",
         "description": (
             "List all sponsored athletes registered in Cora's influencer tracker — their "
@@ -3600,6 +3671,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "gmail_create_draft": _tool_gmail_create_draft,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
+    "calendar_schedule_meeting": _tool_calendar_schedule_meeting,
     "influencer_list_handles": _tool_influencer_list_handles,
     "influencer_add_handle": _tool_influencer_add_handle,
     "influencer_get_status": _tool_influencer_get_status,

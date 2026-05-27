@@ -72,6 +72,14 @@ class InventoryVariant:
     low_stock: bool
 
 
+@dataclass
+class LocationSKU:
+    """Per-SKU inventory at a specific Shopify fulfillment location."""
+    product_title: str
+    sku: str
+    available: int
+
+
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
@@ -398,47 +406,205 @@ def format_inventory_for_llm(
 
 
 # ---------------------------------------------------------------------------
-# GraphQL helper (used by photoroom_client and other connectors that need
-# mutations or queries not available via the REST Admin API)
+# Location-aware inventory (Nimbl real-time, etc.)
 # ---------------------------------------------------------------------------
 
 
-def graphql(mutation: str, variables: dict) -> dict:
-    """
-    Execute a Shopify Admin GraphQL query or mutation.
+def _get_locations() -> dict[str, int]:
+    """Return {location_name_lower: location_id} for all active Shopify locations.
 
-    Returns the parsed JSON response body as a dict.
-    Raises ShopifyConnectorError on HTTP error or Shopify-level errors.
+    Cached for the standard TTL (5 min) -- locations rarely change but
+    using the shared cache keeps invalidation simple.
     """
+    cache_key = "locations"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
     store, token = _store_config()
-    url = f"https://{store}/admin/api/{_API_VERSION}/graphql.json"
-    headers = {
-        "X-Shopify-Access-Token": token,
-        "Content-Type": "application/json",
-    }
-    payload = {"query": mutation, "variables": variables}
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.get(
+            f"{_base_url(store)}/locations.json",
+            headers=_headers(token),
+            timeout=15,
+        )
     except requests.RequestException as exc:
-        raise ShopifyConnectorError(f"GraphQL network error: {exc}") from exc
+        raise ShopifyConnectorError(f"Network error fetching locations: {exc}") from exc
 
     if resp.status_code == 401:
         raise ShopifyConnectorError(
-            "Shopify GraphQL auth failed (HTTP 401). Check SHOPIFY_F3E_ACCESS_TOKEN."
+            "Auth failed (HTTP 401) fetching locations. Check SHOPIFY_F3E_ACCESS_TOKEN."
         )
     if not resp.ok:
         raise ShopifyConnectorError(
-            f"Shopify GraphQL HTTP {resp.status_code}: {resp.text[:300]}"
+            f"Shopify locations API error {resp.status_code}: {resp.text[:200]}"
         )
 
-    body = resp.json()
-    if "errors" in body:
-        msg = "; ".join(
-            e.get("message", str(e)) for e in body["errors"]
-        )
-        raise ShopifyConnectorError(f"Shopify GraphQL errors: {msg}")
+    locations = resp.json().get("locations", [])
+    result: dict[str, int] = {}
+    for loc in locations:
+        if loc.get("active") and loc.get("name") and loc.get("id"):
+            result[loc["name"].lower()] = loc["id"]
+    _cache_set(cache_key, result)
+    log.info("shopify locations loaded: %d active", len(result))
+    return result
 
-    return body
+
+def _infer_brand_from_title(product_title: str) -> str:
+    """Infer F3 brand bucket (Energy / Mood / Pure) from a Shopify product title."""
+    t = product_title.lower()
+    if "pure" in t:
+        return "Pure"
+    if "mood" in t:
+        return "Mood"
+    return "Energy"
+
+
+def get_inventory_by_location(
+    location_name: str,
+    brand: Optional[str] = None,
+) -> list[LocationSKU]:
+    """Return live inventory at a specific Shopify fulfillment location.
+
+    Looks up the location by name (case-insensitive, partial match OK), then
+    fetches inventory_levels for that location and cross-references products /
+    variants to return per-SKU available counts.
+
+    Args:
+        location_name: Location name fragment -- e.g. "nimbl" or "Nimbl 3PL".
+        brand: Optional filter -- "Pure", "Mood", or "Energy".
+
+    Returns:
+        List of LocationSKU sorted by product_title.
+
+    Raises:
+        ShopifyConnectorError: if the location is unknown / ambiguous or API fails.
+        ShopifyConfigError: if env vars are missing.
+    """
+    cache_key = f"location_inventory:{location_name.lower()}:{(brand or '').lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    store, token = _store_config()
+
+    # Resolve location ID (exact match first, then partial)
+    locations = _get_locations()
+    needle = location_name.lower()
+    location_id: Optional[int] = locations.get(needle)
+    if location_id is None:
+        matches = {k: v for k, v in locations.items() if needle in k}
+        if len(matches) == 0:
+            raise ShopifyConnectorError(
+                f"Location {location_name!r} not found. "
+                f"Known locations: {sorted(locations.keys())}"
+            )
+        if len(matches) > 1:
+            raise ShopifyConnectorError(
+                f"Location {location_name!r} is ambiguous -- matches: {sorted(matches.keys())}. "
+                f"Use a more specific name."
+            )
+        location_id = list(matches.values())[0]
+
+    # Fetch inventory levels for this location
+    inv_levels = _get_paginated(
+        f"{_base_url(store)}/inventory_levels.json",
+        token,
+        params={"location_ids": str(location_id), "limit": _PAGE_SIZE},
+    )
+    inv_by_item: dict[int, int] = {}
+    for lvl in inv_levels:
+        if lvl.get("inventory_item_id") is not None:
+            inv_by_item[int(lvl["inventory_item_id"])] = int(lvl.get("available") or 0)
+
+    if not inv_by_item:
+        empty: list[LocationSKU] = []
+        _cache_set(cache_key, empty)
+        return empty
+
+    # Fetch products to map inventory_item_id -> display title + SKU
+    products = _get_paginated(
+        f"{_base_url(store)}/products.json",
+        token,
+        params={"limit": _PAGE_SIZE, "fields": "id,title,variants"},
+    )
+    item_map: dict[int, tuple[str, str]] = {}  # item_id -> (display_title, sku)
+    for product in products:
+        product_title = product.get("title") or "Unknown"
+        for v in product.get("variants") or []:
+            item_id = v.get("inventory_item_id")
+            if not item_id:
+                continue
+            sku = v.get("sku") or ""
+            variant_title = (v.get("title") or "").strip()
+            if variant_title.lower() in ("default title", "default", ""):
+                display_title = product_title
+            else:
+                display_title = f"{product_title} - {variant_title}"
+            item_map[int(item_id)] = (display_title, sku)
+
+    # Build result, optionally filtered by brand
+    brand_lower = (brand or "").lower()
+    skus: list[LocationSKU] = []
+    for item_id, available in inv_by_item.items():
+        if item_id not in item_map:
+            continue
+        display_title, sku = item_map[item_id]
+        inferred_brand = _infer_brand_from_title(display_title)
+        if brand_lower and inferred_brand.lower() != brand_lower:
+            continue
+        skus.append(LocationSKU(
+            product_title=display_title,
+            sku=sku,
+            available=available,
+        ))
+
+    skus.sort(key=lambda x: x.product_title)
+    _cache_set(cache_key, skus)
+    log.info(
+        "shopify location_inventory location_id=%s location=%r brand=%s skus=%d",
+        location_id, location_name, brand or "ALL", len(skus),
+    )
+    return skus
+
+
+def format_location_inventory_for_llm(
+    skus: list[LocationSKU],
+    location_name: str,
+    brand: Optional[str] = None,
+) -> str:
+    """Format location-specific inventory into source-opaque Slack-voice text."""
+    brand_label = f"F3 {brand.capitalize()}" if brand else "F3E"
+    loc_display = location_name.capitalize()
+
+    if not skus:
+        return (
+            f"*{brand_label} inventory at {loc_display}:* "
+            f"No stock on hand at this location."
+        )
+
+    lines = [f"*{brand_label} inventory at {loc_display} (live):*", ""]
+
+    # Group by inferred brand
+    by_brand: dict[str, list[LocationSKU]] = {}
+    for s in skus:
+        b = _infer_brand_from_title(s.product_title)
+        by_brand.setdefault(b, []).append(s)
+
+    for b in ("Energy", "Mood", "Pure"):
+        b_skus = by_brand.get(b)
+        if not b_skus:
+            continue
+        if not brand:  # multi-brand: show brand header
+            lines.append(f"*F3 {b}*")
+        for s in b_skus:
+            flag = "\U0001f6a8" if s.available <= 10 else "\u26a0\ufe0f" if s.available <= 50 else "\u2705"
+            lines.append(f"{flag} {s.product_title}: *{s.available:,}* units")
+        if not brand:
+            lines.append("")
+
+    lines.append("_Live Shopify data. Units = individual cans._")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
