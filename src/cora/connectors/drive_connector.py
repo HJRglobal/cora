@@ -15,7 +15,7 @@ Delegation, impersonating Harrison's @hjrglobal.com identity to access the
 HJR-Founder-OS Drive folders.
 
 Required DWD scope (add to existing admin config):
-    https://www.googleapis.com/auth/drive.readonly
+    https://www.googleapis.com/auth/drive
 
 Deep-link pattern: Drive API returns `webViewLink` per file. Looks like:
     https://drive.google.com/file/d/<file_id>/view
@@ -40,7 +40,9 @@ from googleapiclient.errors import HttpError
 log = logging.getLogger(__name__)
 
 
-_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+_DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",  # full access — needed for writing to arbitrary folders
+]
 
 # Impersonation identity. The service account doesn't own files; it acts AS
 # Harrison's @hjrglobal.com identity to access shared / owned files. Override
