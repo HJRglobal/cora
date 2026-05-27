@@ -1,24 +1,34 @@
-"""Polar Analytics connector — reporting API client.
+"""Polar Analytics connector -- reporting API client.
 
 Calls the Polar Analytics REST API (/api/v2/reports) to fetch ad performance
 data across all connected channels (Meta, TikTok, Google Ads, Amazon Ads,
 Shopify, Polar Pixel, Recharge).
 
-Auth: POLAR_API_KEY env var. Generate at:
-  app.polaranalytics.com → Settings → API → Create API Key
+Auth: OAuth2 client-credentials flow. Reads POLAR_CLIENT_ID + POLAR_CLIENT_SECRET
+from env (preferred). Falls back to parsing POLAR_API_KEY as
+"{client_id}|{client_secret}" (the Polar MCP key format). If POLAR_API_KEY
+contains no "|", treats it as a static Bearer token for legacy compatibility.
+
+Token exchange endpoint: POLAR_OAUTH_URL env var, default
+  https://api.polaranalytics.com/oauth/token
 
 Behavioral contract (locked 2026-05-23):
   - Source-opaque: never log or surface platform names, account IDs, or deep links
     in the rendered answer layer. Deep links ARE passed through for creative assets
-    (Option A doctrine) — the ads_client layer decides when to surface them.
-  - 15-minute in-memory cache keyed by query fingerprint
+    (Option A doctrine) -- the ads_client layer decides when to surface them.
+  - 15-minute in-memory cache keyed by query fingerprint (report data)
+  - In-memory token cache with expiry; auto-refresh on 401; 60s buffer before expiry
   - Raises PolarConnectorError on any auth/API/parse failure so the caller
     can return UNKNOWN_RESPONSE instead of surfacing a traceback
 
-Configuration (all optional — bot boots without them, tools gracefully fail):
-  POLAR_API_KEY        — API key from app.polaranalytics.com settings
-  POLAR_VIEW_ID        — view ID for F3 Energy brand filter (default: 31499-mot5h6ya)
-  POLAR_API_BASE_URL   — override API base URL (default: https://api.polaranalytics.com)
+Configuration (all optional -- bot boots without them, tools gracefully fail):
+  POLAR_CLIENT_ID      -- OAuth2 client ID (preferred)
+  POLAR_CLIENT_SECRET  -- OAuth2 client secret (preferred)
+  POLAR_API_KEY        -- Legacy: "{client_id}|{client_secret}" pipe-delimited,
+                          OR static Bearer token if no "|" present
+  POLAR_OAUTH_URL      -- Override token endpoint (default as above)
+  POLAR_VIEW_ID        -- View ID for F3 Energy brand filter (default: 31499-mot5h6ya)
+  POLAR_API_BASE_URL   -- Override API base URL (default: https://api.polaranalytics.com)
 """
 
 from __future__ import annotations
@@ -35,14 +45,15 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 # Constants
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 
 _API_BASE_URL_DEFAULT = "https://api.polaranalytics.com"
 _REPORT_ENDPOINT = "/api/v2/reports"
+_OAUTH_TOKEN_URL_DEFAULT = "https://api.polaranalytics.com/oauth/token"
 
-# F3 Energy brand view — scopes all queries to F3 brand data only
+# F3 Energy brand view -- scopes all queries to F3 brand data only
 _DEFAULT_VIEW_ID = "31499-mot5h6ya"
 
 # Default attribution model for cross-channel queries
@@ -55,10 +66,13 @@ _CACHE_TTL_SECONDS = 900
 # HTTP timeout for Polar API calls
 _HTTP_TIMEOUT_SECONDS = 30
 
+# Refresh the OAuth token 60s before it actually expires
+_TOKEN_EXPIRY_BUFFER_SECONDS = 60
 
-# ────────────────────────────────────────────────────────────────────────────
+
+# -------------------------------------------------------------------------
 # Data structures
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 
 @dataclass
 class PolarReport:
@@ -73,17 +87,17 @@ class PolarReport:
     dimensions: list[str] = field(default_factory=list)
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 # Error type
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 
 class PolarConnectorError(Exception):
     """Raised when the Polar API call or response parse fails."""
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# In-memory cache
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# In-memory report cache
+# -------------------------------------------------------------------------
 
 # {fingerprint: (fetched_at_unix, PolarReport)}
 _CACHE: dict[str, tuple[float, PolarReport]] = {}
@@ -130,22 +144,153 @@ def _cache_set(key: str, report: PolarReport) -> None:
 
 
 def invalidate_cache() -> None:
-    """Force-expire entire cache. Useful for tests."""
+    """Force-expire entire report cache and OAuth token. Useful for tests."""
     _CACHE.clear()
+    _invalidate_token()
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Config helpers
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# OAuth2 token cache
+# -------------------------------------------------------------------------
 
-def _api_key() -> str:
-    val = os.environ.get("POLAR_API_KEY", "").strip()
-    if not val:
+# {"access_token": str, "expires_at": float}  -- monotonic clock
+_TOKEN: dict[str, Any] = {}
+
+
+def _invalidate_token() -> None:
+    """Force-expire the cached OAuth token (e.g. on 401)."""
+    _TOKEN.clear()
+
+
+def _token_is_valid() -> bool:
+    if not _TOKEN:
+        return False
+    return time.monotonic() < _TOKEN["expires_at"]
+
+
+# -------------------------------------------------------------------------
+# OAuth2 token exchange
+# -------------------------------------------------------------------------
+
+def _exchange_token(client_id: str, client_secret: str) -> None:
+    """POST to the OAuth token endpoint and populate the _TOKEN cache."""
+    oauth_url = os.environ.get("POLAR_OAUTH_URL", _OAUTH_TOKEN_URL_DEFAULT).strip()
+
+    log.info("Exchanging Polar OAuth token via %s", oauth_url)
+
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            response = client.post(
+                oauth_url,
+                json={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.TimeoutException as exc:
         raise PolarConnectorError(
-            "POLAR_API_KEY not set — Polar Analytics connector disabled. "
-            "Generate a key at app.polaranalytics.com → Settings → API."
+            f"Polar OAuth token exchange timed out: {exc}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise PolarConnectorError(
+            f"Polar OAuth token exchange request failed: {exc}"
+        ) from exc
+
+    if response.status_code == 401:
+        raise PolarConnectorError(
+            "Polar OAuth token exchange returned 401 -- "
+            "check POLAR_CLIENT_ID and POLAR_CLIENT_SECRET are correct."
         )
-    return val
+    if response.status_code not in (200, 201):
+        raise PolarConnectorError(
+            f"Polar OAuth token exchange returned HTTP {response.status_code}: "
+            f"{response.text[:200]}"
+        )
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise PolarConnectorError(
+            f"Failed to parse Polar OAuth token response: {exc}"
+        ) from exc
+
+    access_token = data.get("access_token")
+    if not access_token:
+        raise PolarConnectorError(
+            f"Polar OAuth token response missing access_token: {str(data)[:200]}"
+        )
+
+    expires_in = data.get("expires_in", 3600)
+    try:
+        expires_in = int(expires_in)
+    except (TypeError, ValueError):
+        expires_in = 3600
+
+    _TOKEN["access_token"] = access_token
+    _TOKEN["expires_at"] = time.monotonic() + expires_in - _TOKEN_EXPIRY_BUFFER_SECONDS
+
+    log.info(
+        "Polar OAuth token obtained (expires_in=%ds, buffer=%ds)",
+        expires_in,
+        _TOKEN_EXPIRY_BUFFER_SECONDS,
+    )
+
+
+# -------------------------------------------------------------------------
+# Config helpers
+# -------------------------------------------------------------------------
+
+def _client_credentials() -> tuple[str, str]:
+    """Return (client_id, client_secret) from env.
+
+    Priority:
+      1. POLAR_CLIENT_ID + POLAR_CLIENT_SECRET (explicit, preferred)
+      2. POLAR_API_KEY as "client_id|client_secret" (Polar MCP key format)
+      3. POLAR_API_KEY as static Bearer token -- returned as ("__static__", raw_key)
+
+    Raises PolarConnectorError if no credentials are available.
+    """
+    client_id = os.environ.get("POLAR_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("POLAR_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    api_key = os.environ.get("POLAR_API_KEY", "").strip()
+    if not api_key:
+        raise PolarConnectorError(
+            "No Polar credentials found. Set POLAR_CLIENT_ID + POLAR_CLIENT_SECRET "
+            "(preferred), or POLAR_API_KEY as client_id|client_secret. "
+            "Generate at app.polaranalytics.com -> Settings -> API."
+        )
+
+    if "|" in api_key:
+        parts = api_key.split("|", 1)
+        return parts[0].strip(), parts[1].strip()
+
+    # Legacy: treat POLAR_API_KEY as a static Bearer token
+    return "__static__", api_key
+
+
+def _get_bearer_token_any() -> str:
+    """Return a valid Bearer token, handling both OAuth and legacy static modes."""
+    client_id, secret_or_key = _client_credentials()
+
+    if client_id == "__static__":
+        # Legacy static Bearer key -- no token exchange
+        log.debug("Polar: using static Bearer token (legacy mode)")
+        return secret_or_key
+
+    # OAuth2 mode
+    if _token_is_valid():
+        return _TOKEN["access_token"]
+
+    _exchange_token(client_id, secret_or_key)
+    return _TOKEN["access_token"]
 
 
 def _api_base_url() -> str:
@@ -156,9 +301,9 @@ def _view_id() -> str:
     return os.environ.get("POLAR_VIEW_ID", _DEFAULT_VIEW_ID).strip()
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# API call
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# API call helpers
+# -------------------------------------------------------------------------
 
 def _build_request_body(
     metrics: list[str],
@@ -214,9 +359,28 @@ def _parse_response(resp_json: dict, date_from: str, date_to: str,
     )
 
 
-# ────────────────────────────────────────────────────────────────────────────
+def _do_report_request(url: str, body: dict, bearer_token: str) -> httpx.Response:
+    """Execute a single POST /api/v2/reports request."""
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            return client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {bearer_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=body,
+            )
+    except httpx.TimeoutException as exc:
+        raise PolarConnectorError(f"Polar API request timed out: {exc}") from exc
+    except httpx.RequestError as exc:
+        raise PolarConnectorError(f"Polar API request failed: {exc}") from exc
+
+
+# -------------------------------------------------------------------------
 # Public API
-# ────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 
 def generate_report(
     metrics: list[str],
@@ -232,9 +396,11 @@ def generate_report(
 ) -> PolarReport:
     """Fetch a report from Polar Analytics.
 
-    Parameters mirror the Polar `generate_report` MCP tool.
-    Metrics and dimensions use the exact Polar key names (e.g.
-    'total_marketing_spend', 'custom_5621').
+    Parameters mirror the Polar generate_report MCP tool.
+    Metrics and dimensions use Polar key names (e.g. total_marketing_spend).
+
+    Auth: OAuth2 client-credentials (auto-refreshed). Falls back to static
+    Bearer token if POLAR_API_KEY is set without a pipe character.
 
     Caches results for _CACHE_TTL_SECONDS (15 min).
     Raises PolarConnectorError on auth/API/parse failure.
@@ -250,7 +416,6 @@ def generate_report(
         log.debug("Returning cached Polar report (fingerprint redacted)")
         return cached
 
-    api_key = _api_key()  # raises PolarConnectorError if missing
     url = _api_base_url() + _REPORT_ENDPOINT
     body = _build_request_body(
         metrics=metrics,
@@ -266,33 +431,32 @@ def generate_report(
     )
 
     log.info(
-        "Fetching Polar report: metrics=%s dimensions=%s %s→%s",
+        "Fetching Polar report: metrics=%s dimensions=%s %s->%s",
         metrics, dimensions, date_from, date_to,
     )
 
-    try:
-        with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            response = client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                json=body,
-            )
-    except httpx.TimeoutException as exc:
-        raise PolarConnectorError(f"Polar API request timed out: {exc}") from exc
-    except httpx.RequestError as exc:
-        raise PolarConnectorError(f"Polar API request failed: {exc}") from exc
+    # First attempt
+    bearer = _get_bearer_token_any()
+    response = _do_report_request(url, body, bearer)
 
+    # 401: invalidate token + retry once (OAuth mode only)
+    if response.status_code == 401:
+        client_id, _ = _client_credentials()
+        if client_id != "__static__":
+            log.info("Polar API returned 401 -- invalidating token and retrying")
+            _invalidate_token()
+            bearer = _get_bearer_token_any()
+            response = _do_report_request(url, body, bearer)
+
+    # Error handling
     if response.status_code == 401:
         raise PolarConnectorError(
-            "Polar API returned 401 — check POLAR_API_KEY is valid and not expired."
+            "Polar API returned 401 after token refresh -- "
+            "check credentials are valid and have reporting permissions."
         )
     if response.status_code == 403:
         raise PolarConnectorError(
-            "Polar API returned 403 — key may lack reporting permissions."
+            "Polar API returned 403 -- credentials may lack reporting permissions."
         )
     if response.status_code != 200:
         raise PolarConnectorError(
