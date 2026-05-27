@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 220 15% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 15% 15%;
+    --primary: 199 74% 53%;       /* #29ABE2 Lexington Blue */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 199 74% 95%;
+    --secondary-foreground: 199 74% 35%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 10% 50%;
+    --accent: 199 74% 95%;
+    --accent-foreground: 199 74% 35%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 199 74% 53%;
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-gray-50 text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Smooth scrolling */
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@layer components {
+  /* Status dot */
+  .status-dot {
+    @apply inline-block w-2 h-2 rounded-full;
+  }
+
+  /* Phone OTP input boxes */
+  .otp-input {
+    @apply w-12 h-14 text-center text-xl font-bold border-2 border-gray-200 rounded-xl
+           focus:border-lex-blue focus:ring-2 focus:ring-lex-blue/20 outline-none
+           transition-colors;
+  }
+
+  /* Portal header */
+  .portal-header {
+    @apply sticky top-0 z-40 bg-white/90 backdrop-blur-sm border-b border-gray-100
+           px-4 py-3 flex items-center justify-between;
+  }
+
+  /* Full-page loading state */
+  .page-loader {
+    @apply min-h-screen flex items-center justify-center bg-gray-50;
+  }
+}
