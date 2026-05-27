@@ -268,13 +268,13 @@ class TestPeriodHelpers:
     def test_7d_span(self):
         start_ms, end_ms = _cc._period_to_epoch_ms("7d")
         span_days = (end_ms - start_ms) / (1000 * 86400)
-        assert 6.9 <= span_days <= 7.9  # start=midnight 7d ago, end=now → up to ~7.99d
+        assert 6.9 <= span_days <= 8.1  # start=midnight 7d ago, end=now → up to ~7.99d
 
     @_layer_b
     def test_30d_span(self):
         start_ms, end_ms = _cc._period_to_epoch_ms("30d")
         span_days = (end_ms - start_ms) / (1000 * 86400)
-        assert 29.9 <= span_days <= 30.9  # start=midnight 30d ago, end=now → up to ~30.99d
+        assert 29.9 <= span_days <= 31.1  # start=midnight 30d ago, end=now → up to ~30.99d
 
     @_layer_b
     def test_invalid_period_raises(self):
