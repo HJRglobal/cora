@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
 from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
@@ -2108,6 +2108,11 @@ def _tool_f3_create_image(slack_user_id: str, entity: str, _input: dict) -> str:
     return generate_image.handle_f3_create_image(slack_user_id, entity, _input)
 
 
+def _tool_f3_create_sales_deck(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate to sales_deck_client.handle_f3_create_sales_deck."""
+    return sales_deck_client.handle_f3_create_sales_deck(slack_user_id, entity, _input)
+
+
 # --- LEX-specific tool handlers ---
 
 
@@ -3578,6 +3583,59 @@ TOOL_DEFINITIONS = [
             "required": ["brand", "brief"],
         },
     },
+    {
+        "name": "f3_create_sales_deck",
+        "description": (
+            "Generate a customized F3 Energy distributor sales deck. "
+            "Claude writes the slide content from F3 brand guidelines and program data, "
+            "then fires a Make automation that fills a Canva brand template, exports a PDF, "
+            "uploads it to Google Drive, and DMs the requester the link. "
+            "Use when someone says 'create a sales deck', 'make a pitch deck', "
+            "'I need a deck for a distributor meeting', 'build a presentation for [distributor]', "
+            "or similar. The requester will receive a Slack DM with the Drive link in ~2 minutes. "
+            "Scope: F3E or FNDR channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "distributor_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of the distributor or company being presented to. "
+                        "Examples: 'Hensley', 'KeHE Distributors', 'UNFI', 'Sysco'. "
+                        "Used in slide titles and personalized copy."
+                    ),
+                },
+                "programs": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["pure", "mood", "energy"]},
+                    "description": (
+                        "F3 sub-brands to include in the deck. "
+                        "Defaults to all three (pure, mood, energy) if not specified. "
+                        "Pass a subset to build a focused single-brand deck."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Optional context about the distributor or meeting. "
+                        "Examples: 'Texas-only distributor focused on health food', "
+                        "'they already carry a competitor', 'meeting is next Tuesday at their HQ'. "
+                        "Claude uses this to personalize the content."
+                    ),
+                },
+                "distributor_logo_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional: direct URL to the distributor's logo (PNG or JPG). "
+                        "If provided, Canva embeds it on the cover slide. "
+                        "If omitted, the cover shows the distributor name as text."
+                    ),
+                },
+            },
+            "required": ["distributor_name"],
+        },
+    },
     # --- LEX tools ---
     {
         "name": "lex_revalidation_status",
@@ -3702,10 +3760,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
     "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
     "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
-    # PhotoRoom image generation
+    # PhotoRoom image generation + sales deck
     "f3_generate_image": _tool_f3_generate_image,
     "f3_batch_image_run": _tool_f3_batch_image_run,
     "f3_create_image": _tool_f3_create_image,
+    "f3_create_sales_deck": _tool_f3_create_sales_deck,
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
     "lex_staff_pulse": _tool_lex_staff_pulse,

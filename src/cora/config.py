@@ -63,6 +63,9 @@ def _load() -> "Config":
     photoroom_use_sandbox = get("PHOTOROOM_USE_SANDBOX", required=False, default="false")
     photoroom_weekly_budget_usd = get("PHOTOROOM_WEEKLY_BUDGET_USD", required=False, default="50")
     photoroom_outputs_drive_folder_id = get("PHOTOROOM_OUTPUTS_DRIVE_FOLDER_ID", required=False, default="")
+    # Make webhook URL for sales deck generation (Canva → Drive → Slack DM pipeline).
+    # Optional; sales deck tool responds with a config error if missing.
+    make_sales_deck_webhook_url = get("MAKE_SALES_DECK_WEBHOOK_URL", required=False, default="")
 
     if errors:
         raise RuntimeError("Cora config errors:\n" + "\n".join(errors))
@@ -87,6 +90,7 @@ def _load() -> "Config":
         photoroom_use_sandbox=photoroom_use_sandbox.lower() in ("true", "1", "yes"),
         photoroom_weekly_budget_usd=float(photoroom_weekly_budget_usd or "50"),
         photoroom_outputs_drive_folder_id=photoroom_outputs_drive_folder_id,
+        make_sales_deck_webhook_url=make_sales_deck_webhook_url,
     )
 
 
@@ -111,6 +115,7 @@ class Config:
     photoroom_use_sandbox: bool
     photoroom_weekly_budget_usd: float
     photoroom_outputs_drive_folder_id: str  # Drive folder ID for review uploads
+    make_sales_deck_webhook_url: str       # Make webhook — sales deck Canva pipeline
 
 
 config = _load()
