@@ -66,6 +66,7 @@ import anthropic
 import httpx
 
 from ..config import config
+from . import hubspot_client
 
 log = logging.getLogger(__name__)
 
@@ -259,29 +260,74 @@ def _generate_deck_content(
     distributor_name: str,
     programs: list[str],
     notes: str,
+    hubspot_data: dict | None = None,
 ) -> dict:
     """Call Claude to generate structured slide content. Returns parsed dict."""
     selected = {k: _F3_PROGRAM_CATALOG[k] for k in programs if k in _F3_PROGRAM_CATALOG}
 
+    # Build HubSpot context block for Claude
+    if hubspot_data:
+        contact_line = ""
+        if hubspot_data.get("primary_contact_name"):
+            contact_line = (
+                f"  Primary contact: {hubspot_data['primary_contact_name']}"
+                + (f", {hubspot_data['primary_contact_title']}" if hubspot_data.get("primary_contact_title") else "")
+            )
+        location_line = ""
+        if hubspot_data.get("city") or hubspot_data.get("state"):
+            parts = [p for p in [hubspot_data.get("city"), hubspot_data.get("state")] if p]
+            location_line = f"  Location: {', '.join(parts)}"
+        deals_line = ""
+        if hubspot_data.get("open_deals"):
+            deals_line = "  Existing F3E deals in CRM:\n" + "\n".join(
+                f"    - {d}" for d in hubspot_data["open_deals"]
+            )
+        industry_line = f"  Industry: {hubspot_data['industry']}" if hubspot_data.get("industry") else ""
+        website_line = f"  Website: {hubspot_data['website']}" if hubspot_data.get("website") else ""
+        crm_block = "\n".join(
+            line for line in [
+                "CRM record found for this distributor:",
+                f"  Name: {hubspot_data['name']}",
+                website_line, industry_line, location_line, contact_line, deals_line,
+            ]
+            if line
+        )
+    else:
+        crm_block = "No CRM record found — proceed with the provided info only."
+
+    family_slide = "3. Product family overview (one slide showing all programs side-by-side)" if len(programs) > 1 else ""
+    product_start = 3 + (1 if len(programs) > 1 else 0)
+    product_slides = "\n".join(
+        f"{product_start + i}. {_F3_PROGRAM_CATALOG[p]['display_name']} product slide"
+        for i, p in enumerate(programs)
+        if p in _F3_PROGRAM_CATALOG
+    )
+
     user_message = f"""Generate a distributor sales deck for: {distributor_name}
 
 Programs to include: {', '.join(p.upper() for p in programs)}
-Additional context: {notes or 'None provided'}
+Additional context from requester: {notes or 'None provided'}
 
-Company context:
+{crm_block}
+
+F3 Energy company context:
 {_F3_COMPANY_CONTEXT}
 
 Program details:
 {json.dumps(selected, indent=2)}
 
-Build a {len(programs) + 5}-slide deck:
+Build the following slides:
 1. Cover slide
 2. F3 Energy brand story / who we are
-{"3. Product family overview (if 3 programs)" if len(programs) > 1 else ""}
-{chr(10).join(f"{3 + (1 if len(programs) > 1 else 0) + i}. {_F3_PROGRAM_CATALOG[p]['display_name']} product slide" for i, p in enumerate(programs) if p in _F3_PROGRAM_CATALOG)}
+{family_slide}
+{product_slides}
 - Why partner with F3 slide
 - Support programs slide
 - Next steps / CTA slide
+
+If a CRM contact name is available, address the deck to them on the cover and next-steps slides.
+If there are existing deals in the CRM, reference the existing relationship warmly in the next-steps slide.
+If location/territory is known, tailor any regional references accordingly.
 """
 
     client = anthropic.Anthropic(api_key=config.anthropic_api_key)
@@ -340,9 +386,19 @@ def handle_f3_create_sales_deck(
     notes: str = (tool_input.get("notes") or "").strip()
     distributor_logo_url: str | None = tool_input.get("distributor_logo_url") or None
 
+    # --- HubSpot enrichment (best-effort; never blocks deck generation) ---
+    hubspot_data = hubspot_client.search_distributor_company(distributor_name)
+    if hubspot_data:
+        log.info(
+            "sales_deck: HubSpot enrichment found company=%r contact=%r",
+            hubspot_data.get("name"), hubspot_data.get("primary_contact_name"),
+        )
+    else:
+        log.info("sales_deck: no HubSpot record for distributor=%r", distributor_name)
+
     # --- Generate slide content via Claude ---
     try:
-        deck_content = _generate_deck_content(distributor_name, programs, notes)
+        deck_content = _generate_deck_content(distributor_name, programs, notes, hubspot_data)
     except json.JSONDecodeError as exc:
         log.exception("sales_deck: Claude returned non-JSON for distributor=%s", distributor_name)
         return f"Failed to generate slide content (unexpected model output): {exc}"
@@ -359,6 +415,9 @@ def handle_f3_create_sales_deck(
         "programs": programs,
         "notes": notes,
         "deck_content": deck_content,
+        # hubspot_data gives Make the contact name/title for the Canva "Prepared for:" field,
+        # the territory for any regional slide variables, and the HubSpot URL for auto-logging.
+        "hubspot_data": hubspot_data,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -395,10 +454,31 @@ def handle_f3_create_sales_deck(
     lines = [
         f"Your *{distributor_name}* sales deck is being built now.",
         f"Programs: {program_labels}  |  {slide_count} slides generated",
+    ]
+
+    if hubspot_data:
+        crm_bits = []
+        if hubspot_data.get("primary_contact_name"):
+            contact_str = hubspot_data["primary_contact_name"]
+            if hubspot_data.get("primary_contact_title"):
+                contact_str += f", {hubspot_data['primary_contact_title']}"
+            crm_bits.append(f"addressed to *{contact_str}*")
+        location_parts = [p for p in [hubspot_data.get("city"), hubspot_data.get("state")] if p]
+        if location_parts:
+            crm_bits.append(f"territory: {', '.join(location_parts)}")
+        if hubspot_data.get("open_deals"):
+            crm_bits.append(f"{len(hubspot_data['open_deals'])} existing deal(s) referenced")
+        if crm_bits:
+            lines.append(f"CRM match found — {' · '.join(crm_bits)}")
+    else:
+        lines.append("_No CRM record found for this distributor — deck uses provided info only._")
+
+    lines += [
         "",
         "Canva is filling the brand template and the finished PDF will be saved to "
         "Google Drive. I'll DM you the link when it's ready — usually under 2 minutes.",
     ]
+
     if distributor_logo_url:
         lines.append("Distributor logo will be embedded on the cover slide.")
     else:
