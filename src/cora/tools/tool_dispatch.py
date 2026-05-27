@@ -1801,6 +1801,223 @@ def _tool_f3e_inventory_pulse(slack_user_id: str, entity: str, _input: dict) -> 
     return inventory_client.get_f3e_inventory_pulse_text()
 
 
+# --- F3E location-aware inventory ---
+
+
+def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return F3E inventory for a named location.
+
+    Routes by location:
+      nimbl            -> live Shopify inventory_levels (real-time Nimbl sync)
+      unis/warehouse   -> weekly Excel batch report (Cotton 3PL snapshot)
+      office/117       -> weekly Excel batch report (117 office snapshot)
+
+    Optional brand filter narrows to Pure / Mood / Energy.
+    """
+    location = (_input.get("location") or "").strip().lower()
+    brand = (_input.get("brand") or "").strip() or None
+
+    if not location:
+        return (
+            "f3e_inventory_by_location called without `location`. "
+            "Ask the user which location to check: 'Nimbl', 'UNIS' (warehouse), or 'office'."
+        )
+
+    # Nimbl = live Shopify inventory_levels
+    if location == "nimbl":
+        try:
+            skus = shopify_client.get_inventory_by_location(location, brand)
+        except shopify_client.ShopifyConfigError as exc:
+            log.warning("f3e_inventory_by_location nimbl config error: %s", exc)
+            return "I don't have that right now."
+        except shopify_client.ShopifyConnectorError as exc:
+            log.warning(
+                "f3e_inventory_by_location nimbl connector error user=%s: %s",
+                slack_user_id, exc,
+            )
+            return "I don't have that right now."
+        log.info(
+            "f3e_inventory_by_location user=%s location=nimbl brand=%s skus=%d (live Shopify)",
+            slack_user_id, brand or "ALL", len(skus),
+        )
+        return shopify_client.format_location_inventory_for_llm(skus, location, brand)
+
+    # UNIS / warehouse / cotton, office / 117 -> weekly Excel snapshot
+    log.info(
+        "f3e_inventory_by_location user=%s location=%s brand=%s (weekly Excel)",
+        slack_user_id, location, brand or "ALL",
+    )
+    return inventory_client.get_f3e_location_inventory_text(location, brand)
+
+
+# --- Calendar meeting scheduling ---
+
+
+def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Find the next available slot for all participants and propose or book a meeting.
+
+    Two-phase staged-write:
+    Phase 1 (confirmed=False): resolves participants, calls freebusy, finds the
+    next common open slot in the next 7 working days (Mon-Fri 9am-5pm AZ), and
+    returns a preview block for the user to confirm.
+    Phase 2 (confirmed=True): creates the Google Calendar event using the
+    proposed_start and proposed_end passed by Claude from Phase 1, sends invites.
+
+    Participant names are resolved via the same alias system as other tools.
+    The requester is always included automatically.
+    """
+    input_data       = _input or {}
+    confirmed        = input_data.get("confirmed", False)
+    duration_minutes = max(15, int(input_data.get("duration_minutes") or 30))
+    title            = (input_data.get("title") or "").strip() or "Meeting"
+
+    # --- Resolve requester ---
+    user_map  = _load_slack_asana_map()
+    requester = user_map.get(slack_user_id)
+    if not requester:
+        return (
+            f"calendar_schedule_meeting: requesting user {slack_user_id} is not in "
+            f"the user map. Harrison can add them to data/maps/slack-to-asana.yaml "
+            f"(the asana_email field doubles as the Google Calendar identity)."
+        )
+    requester_email = (requester.get("asana_email") or "").strip()
+    requester_name  = (requester.get("display_name") or slack_user_id).strip()
+    if not requester_email:
+        return (
+            f"calendar_schedule_meeting: {requester_name} has no asana_email in "
+            f"the user map -- cannot resolve their Google Calendar identity."
+        )
+
+    # --- Resolve named participants ---
+    participant_raw = input_data.get("participants") or []
+    if isinstance(participant_raw, str):
+        participant_raw = [p.strip() for p in participant_raw.split(",") if p.strip()]
+
+    # resolved = [(display_name, google_email), ...], requester always first
+    resolved: list[tuple[str, str]] = [(requester_name, requester_email)]
+    unresolved: list[str] = []
+
+    for name_or_id in participant_raw:
+        name_or_id = str(name_or_id).strip()
+        if not name_or_id:
+            continue
+        # Skip if the user named themselves
+        if name_or_id == slack_user_id or name_or_id.lower() == requester_name.lower():
+            continue
+        sid, _ = resolve_name_to_slack_user_id(name_or_id, entity)
+        if sid and sid in user_map:
+            u       = user_map[sid]
+            email   = (u.get("asana_email") or "").strip()
+            display = (u.get("display_name") or name_or_id).strip()
+            if email:
+                resolved.append((display, email))
+            else:
+                unresolved.append(name_or_id)
+        else:
+            unresolved.append(name_or_id)
+
+    if unresolved:
+        known = sorted(
+            u.get("display_name", "") for u in user_map.values() if u.get("display_name")
+        )
+        return (
+            f"calendar_schedule_meeting: could not find these participants in the team "
+            f"roster: {', '.join(unresolved)}. "
+            f"Known team members: {', '.join(known)}. "
+            f"Ask the user to clarify who they meant, or confirm the person is listed in "
+            f"data/maps/slack-to-asana.yaml."
+        )
+
+    if len(resolved) < 2:
+        return (
+            "calendar_schedule_meeting: at least 2 participants are needed. "
+            "The requester is included automatically -- ask the user to name at least "
+            "one other person."
+        )
+
+    names  = [n for n, _ in resolved]
+    emails = [e for _, e in resolved]
+
+    # -- Phase 2: Book the confirmed slot -------------------------------------
+    if confirmed is True:
+        proposed_start = (input_data.get("proposed_start") or "").strip()
+        proposed_end   = (input_data.get("proposed_end") or "").strip()
+        if not proposed_start or not proposed_end:
+            return (
+                "calendar_schedule_meeting: confirmed=true but proposed_start or "
+                "proposed_end is missing. Re-run with confirmed=false first to find a "
+                "slot, then pass the exact start/end strings from that proposal."
+            )
+        try:
+            event = calendar_client.create_event(
+                user_email=requester_email,
+                summary=title,
+                start=proposed_start,
+                end=proposed_end,
+                attendees=emails,
+                description=f"Scheduled by Cora on behalf of {requester_name}.",
+                time_zone=calendar_client._DEFAULT_TZ,
+            )
+        except calendar_client.CalendarClientError as exc:
+            log.warning(
+                "calendar_schedule_meeting BOOK FAILED requester=%s title=%r exc=%s",
+                slack_user_id, title, exc,
+            )
+            return (
+                f"Meeting booking failed: {exc}. "
+                f"Tell the user the event was not created. "
+                f"If the error mentions a missing DWD scope, Harrison needs to update "
+                f"Domain-wide Delegation in admin.google.com to include "
+                f"https://www.googleapis.com/auth/calendar.events."
+            )
+        log.info(
+            "calendar_schedule_meeting BOOKED requester=%s event_id=%s title=%r "
+            "attendee_count=%d start=%s",
+            slack_user_id, event.get("id", ""), title, len(emails), proposed_start,
+        )
+        return calendar_client.format_created_event_for_llm(event, user_email=requester_email)
+
+    # -- Phase 1: Find the next available slot --------------------------------
+    try:
+        slot = calendar_client.find_meeting_slot(
+            requester_email=requester_email,
+            calendar_emails=emails,
+            duration_minutes=duration_minutes,
+        )
+    except calendar_client.CalendarClientError as exc:
+        log.warning(
+            "calendar_schedule_meeting FREEBUSY FAILED requester=%s exc=%s",
+            slack_user_id, exc,
+        )
+        return (
+            f"Could not check calendar availability: {exc}. "
+            f"If the error mentions a missing DWD scope, Harrison needs to ensure "
+            f"https://www.googleapis.com/auth/calendar.events is in Domain-wide "
+            f"Delegation for the Cora service account (admin.google.com)."
+        )
+
+    if slot is None:
+        log.info(
+            "calendar_schedule_meeting NO SLOT requester=%s participants=%s dur=%dmin",
+            slack_user_id, emails, duration_minutes,
+        )
+        return (
+            f"No common opening found in the next 7 working days for: "
+            f"{', '.join(names)}. "
+            f"Tell the user no slot was available and ask if they would like to look "
+            f"further out (2 weeks) or pick a specific time manually."
+        )
+
+    slot_start, slot_end = slot
+    log.info(
+        "calendar_schedule_meeting SLOT FOUND requester=%s participants=%s start=%s dur=%dmin",
+        slack_user_id, emails, slot_start.isoformat(), duration_minutes,
+    )
+    return calendar_client.format_slot_proposal_for_llm(
+        slot_start, slot_end, names, title=title
+    )
+
+
 # --- F3 brand voice check ---
 
 
@@ -1917,6 +2134,95 @@ def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """
     log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
     return lex_client.get_staff_pulse()
+
+
+def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Send a Slack DM to a named teammate on behalf of Cora.
+
+    Fourth write tool. Same staged-write doctrine as the other write tools:
+    refuses to fire without confirmed=true; Claude must show a preview and
+    get explicit user approval before calling with confirmed=true.
+
+    Guardrails:
+    - LEX channels are blocked (PHI risk -- no DMs triggered from Lex context).
+    - Only sends to users present in slack-to-asana.yaml (mapped teammates).
+    - Cora signs the message as itself -- no impersonation.
+    - No PHI, no financial data, no cross-entity information in DMs.
+    """
+    import os
+    from slack_sdk import WebClient as _SlackWebClient
+    from slack_sdk.errors import SlackApiError as _SlackApiError
+
+    input_data = _input or {}
+
+    # PHI / LEX guardrail
+    if entity and entity.upper().startswith("LEX"):
+        return (
+            "slack_send_dm blocked: DMs cannot be triggered from Lex channels "
+            "due to PHI guardrails. If this is non-PHI coordination, ask Harrison "
+            "to send the message from a non-Lex channel."
+        )
+
+    # Confirmation gate
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "slack_send_dm refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user a preview (recipient + full message text) "
+            "AND received their explicit approval ('yes', 'send it', 'go ahead', or "
+            "similar). Format a clear preview NOW if you have not done that yet."
+        )
+
+    recipient_name = (input_data.get("recipient_name") or "").strip()
+    message = (input_data.get("message") or "").strip()
+
+    if not recipient_name:
+        return "slack_send_dm: missing `recipient_name`. Ask the user who should receive the DM."
+    if not message:
+        return "slack_send_dm: missing `message`. Ask the user what the DM should say."
+
+    # Resolve recipient to Slack user ID
+    resolved_id, info = resolve_name_to_slack_user_id(recipient_name, channel_entity=entity)
+    if not resolved_id:
+        return (
+            f"slack_send_dm: could not resolve '{recipient_name}' to a Slack user. "
+            f"{info or 'Check the name and try again.'}"
+        )
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        return "slack_send_dm: SLACK_BOT_TOKEN not configured. Tell Harrison."
+
+    try:
+        client = _SlackWebClient(token=token)
+        # Open (or reuse) a DM channel with the recipient
+        open_resp = client.conversations_open(users=[resolved_id])
+        dm_channel = open_resp["channel"]["id"]
+        send_resp = client.chat_postMessage(channel=dm_channel, text=message)
+    except _SlackApiError as exc:
+        log.warning(
+            "slack_send_dm FAILED asker=%s recipient=%s (%s) exc=%s",
+            slack_user_id, recipient_name, resolved_id, exc,
+        )
+        return (
+            f"Slack DM error: {exc.response.get('error', str(exc))}. "
+            f"Tell the user the message wasn't sent and suggest they send it manually."
+        )
+
+    ts = send_resp.get("ts", "")
+    log.info(
+        "slack_send_dm SENT asker=%s recipient=%s (%s) ts=%s chars=%d",
+        slack_user_id, recipient_name, resolved_id, ts, len(message),
+    )
+
+    recipient_map = _load_slack_asana_map().get(resolved_id, {})
+    display_name = recipient_map.get("display_name", recipient_name)
+
+    return (
+        f"WRITE_CONFIRMED -- post the following lines as your entire response "
+        f"(no preamble, no meta-commentary, just these lines):\n\n"
+        f"DM sent to {display_name}."
+    )
 
 
 # --- Catalog: tool definitions exposed to Claude ---
@@ -2705,6 +3011,52 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── F3E location-specific inventory ──
+    {
+        "name": "f3e_inventory_by_location",
+        "description": (
+            "Return F3E inventory for a specific named location. "
+            "Use when a user asks about stock at a particular location -- phrases like "
+            "'how much Pure do we have at Nimbl', 'how many Mood cases at UNIS', "
+            "'what's the Energy inventory at the warehouse', 'office stock for Pure', "
+            "'Nimbl inventory for Mood', 'how many cases at Cotton', "
+            "'what's in the UNIS warehouse for Energy', 'live Nimbl stock'.\n"
+            "\n"
+            "Location routing:\n"
+            "  - 'nimbl'  -> LIVE Shopify inventory (real-time; Nimbl syncs with Shopify).\n"
+            "  - 'unis', 'warehouse', or 'cotton' -> weekly Excel batch report (snapshot).\n"
+            "  - 'office' or '117' -> weekly Excel batch report (snapshot).\n"
+            "\n"
+            "The optional `brand` parameter filters to one F3 sub-brand. "
+            "If the user says 'Pure inventory at Nimbl', set brand=pure and location=nimbl. "
+            "If they say 'Nimbl inventory' with no brand, omit brand to return all SKUs. "
+            "Read-only -- no confirmation needed. "
+            "Call in any #f3e-*, #f3-*, or FNDR channel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "Which location to query. Required. Case-insensitive. "
+                        "Valid values: 'nimbl' (live Shopify data), "
+                        "'unis' / 'warehouse' / 'cotton' (weekly Excel snapshot), "
+                        "'office' / '117' (weekly Excel snapshot)."
+                    ),
+                },
+                "brand": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Filter to one F3 sub-brand. "
+                        "Values: 'Pure', 'Mood', or 'Energy' (case-insensitive). "
+                        "Omit to return all brands at that location."
+                    ),
+                },
+            },
+            "required": ["location"],
+        },
+    },
     # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──
     {
         "name": "f3e_brand_voice_check",
@@ -3177,7 +3529,6 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {},
-            "required": [],
         },
     },
     {
@@ -3201,10 +3552,47 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # --- Cross-entity write tools ---
+    {
+        "name": "slack_send_dm",
+        "description": (
+            "Send a Slack DM to a named teammate on behalf of Cora. "
+            "STAGED-WRITE TOOL -- you MUST show a preview (recipient name + full message text) "
+            "and receive the user's explicit approval before calling with confirmed=true.\n"
+            "\n"
+            "Guardrails:\n"
+            "- LEX channels are BLOCKED (PHI risk). Do not attempt from any LEX context.\n"
+            "- Recipient must be a mapped teammate (in slack-to-asana.yaml).\n"
+            "- Message must be non-PHI, non-financial, non-cross-entity.\n"
+            "\n"
+            "Trigger phrases: 'message Larry', 'DM Sean', 'send Tommy a note', "
+            "'let Hannah know', 'ping Shaun', 'message the team'.\n"
+            "\n"
+            "Scope: FNDR, F3E, OSN, BDM, HJRG channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recipient_name": {
+                    "type": "string",
+                    "description": "Name of the teammate to DM. Accepts first name, full name, or alias (e.g. 'Larry', 'Larry Jackson', 'Sean', 'Shaun Hawkins').",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Full text of the DM to send. Write the complete message -- no placeholders.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true. Only set after showing user a preview (recipient + message) and receiving explicit approval.",
+                },
+            },
+            "required": ["recipient_name", "message", "confirmed"],
+        },
+    },
 ]
 
 
-# Name → callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.
+# Name -> callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "asana_get_user_tasks": _tool_get_user_tasks,
@@ -3229,6 +3617,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
     "f3e_inventory_pulse": _tool_f3e_inventory_pulse,
+    "f3e_inventory_by_location": _tool_f3e_inventory_by_location,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
     "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
@@ -3248,6 +3637,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
     "lex_staff_pulse": _tool_lex_staff_pulse,
+    # Cross-entity write tools
+    "slack_send_dm": _tool_slack_send_dm,
 }
 
 

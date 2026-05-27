@@ -1,4 +1,4 @@
-"""F3E inventory pulse — reads the latest Cotton 3PL weekly inventory report from Drive.
+﻿"""F3E inventory pulse — reads the latest Cotton 3PL weekly inventory report from Drive.
 
 The report is an xlsx file named 'F3 Energy LLC - Weekly Inventory Report.xlsx'
 stored in Google Drive.  It has 6 sheets; we consume three:
@@ -375,37 +375,225 @@ def format_inventory_pulse(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Public entry point
+# Location-filtered formatters (UNIS / NIMBL / office)
 # ────────────────────────────────────────────────────────────────────────────
 
-_UNKNOWN_RESPONSE = (
-    "I don't have that right now. I will notify the operations team immediately "
-    "to obtain the information and provide the correct and updated answer when you ask again."
+
+
+
+def _format_unis_for_llm(
+    unis: dict[str, dict[str, int]],
+    report_date: str,
+    brand: str | None = None,
+) -> str:
+    """Format UNIS warehouse data as Slack text, optionally filtered by brand."""
+    brand_label = f"F3 {brand.capitalize()}" if brand else "F3E"
+    lines = [f"*{brand_label} warehouse inventory (UNIS) — as of {report_date}:*", ""]
+
+    any_found = False
+    for b in _BRAND_ORDER:
+        if brand and b.lower() != brand.lower():
+            continue
+        b_items = sorted(
+            (item_id for item_id in unis if item_id in _SKU_META and _SKU_META[item_id][1] == b)
+        )
+        if not b_items:
+            continue
+        if not brand:
+            lines.append(f"*F3 {b}*")
+        for item_id in b_items:
+            name = _SKU_META[item_id][0]
+            data = unis[item_id]
+            avail = data["available"]
+            alloc = data["allocated"]
+            dmg = data["damaged"]
+            flag = _flag(avail)
+            entry = f"{flag}{name}: *{avail:,} cs* available"
+            extras = []
+            if alloc:
+                extras.append(f"{alloc:,} allocated")
+            if dmg:
+                extras.append(f"{dmg:,} damaged")
+            if extras:
+                entry += f"  _({', '.join(extras)})_"
+            lines.append(entry)
+            any_found = True
+        if not brand:
+            lines.append("")
+
+    if not any_found:
+        lines.append("No stock on hand for this brand.")
+    lines.append("_Weekly snapshot. cs = cases of 12._")
+    return "\n".join(lines)
+
+
+def _format_nimbl_weekly_for_llm(
+    nimbl: dict[str, int],
+    report_date: str,
+    brand: str | None = None,
+) -> str:
+    """Format NIMBL lot-total data from the weekly Excel snapshot."""
+    brand_label = f"F3 {brand.capitalize()}" if brand else "F3E"
+    lines = [f"*{brand_label} Nimbl inventory — as of {report_date}:*", ""]
+
+    any_found = False
+    for b in _BRAND_ORDER:
+        if brand and b.lower() != brand.lower():
+            continue
+        b_items = sorted(
+            (item_id for item_id in nimbl if item_id in _SKU_META and _SKU_META[item_id][1] == b)
+        )
+        if not b_items:
+            continue
+        if not brand:
+            lines.append(f"*F3 {b}*")
+        for item_id in b_items:
+            name = _SKU_META[item_id][0]
+            qty = nimbl[item_id]
+            flag = _flag(qty)
+            lines.append(f"{flag}{name}: *{qty:,} cs*")
+            any_found = True
+        if not brand:
+            lines.append("")
+
+    if not any_found:
+        lines.append("No stock on hand for this brand.")
+    lines.append(
+        "_Note: This is the weekly Excel snapshot. "
+        "For real-time Nimbl stock, ask for ‘live Nimbl inventory’._"
+    )
+    return "\n".join(lines)
+
+
+def _format_office_for_llm(
+    office: dict[str, dict[str, int]],
+    report_date: str,
+    brand: str | None = None,
+) -> str:
+    """Format 117 office sheet data, optionally filtered by brand."""
+    brand_label = f"F3 {brand.capitalize()}" if brand else "F3E"
+    lines = [f"*{brand_label} office stock (117) — as of {report_date}:*", ""]
+
+    any_found = False
+    for b in _BRAND_ORDER:
+        if brand and b.lower() != brand.lower():
+            continue
+        b_items = sorted(
+            (item_id for item_id in office if item_id in _SKU_META and _SKU_META[item_id][1] == b)
+        )
+        if not b_items:
+            continue
+        if not brand:
+            lines.append(f"*F3 {b}*")
+        for item_id in b_items:
+            name = _SKU_META[item_id][0]
+            data = office[item_id]
+            avail = data["available"]
+            dmg = data["damaged"]
+            flag = _flag(avail)
+            entry = f"{flag}{name}: *{avail:,} cs* available"
+            if dmg:
+                entry += f"  _({dmg:,} damaged)_"
+            lines.append(entry)
+            any_found = True
+        if not brand:
+            lines.append("")
+
+    if not any_found:
+        lines.append("No stock on hand for this brand.")
+    lines.append("_Weekly snapshot. cs = cases of 12._")
+    return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Unknown-answer response (mirrors financial_client.UNKNOWN_RESPONSE)
+# ────────────────────────────────────────────────────────────────────────────
+
+UNKNOWN_RESPONSE = (
+    "I don't have that right now. I will notify the team "
+    "immediately to obtain the information and provide the correct and "
+    "updated answer when you ask again."
 )
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Public entry points
+# ────────────────────────────────────────────────────────────────────────────
+
+def _download_report() -> tuple[bytes, str]:
+    """Download the latest inventory report from Drive.
+
+    Returns:
+        (file_bytes, modified_iso) tuple.
+
+    Raises:
+        InventoryClientError on Drive or auth errors.
+    """
+    service = _build_service()
+    file_id, modified_iso = _find_latest_file(service)
+    data = _download_file(service, file_id)
+    return data, modified_iso
+
+
 def get_f3e_inventory_pulse_text() -> str:
-    """Fetch + parse + format the F3E inventory pulse.  Returns Slack-ready string."""
-    try:
-        service = _build_service()
-    except Exception as exc:
-        log.error("inventory_client: Drive service build failed: %s", exc)
-        return _UNKNOWN_RESPONSE
+    """Return the full F3E inventory pulse as Slack-formatted text.
 
-    try:
-        file_id, modified_iso = _find_latest_file(service)
-        data = _download_file(service, file_id)
-    except InventoryClientError as exc:
-        log.error("inventory_client: Drive fetch failed: %s", exc)
-        return _UNKNOWN_RESPONSE
+    Downloads the latest weekly Drive report, parses all three sheets
+    (UNIS / NIMBL / 117 office), and returns a formatted summary.
 
+    Returns UNKNOWN_RESPONSE on any Drive or parse error.
+    """
     try:
+        data, modified_iso = _download_report()
         unis, nimbl, office = _parse_xlsx(data)
+        return format_inventory_pulse(unis, nimbl, office, modified_iso)
     except InventoryClientError as exc:
-        log.error("inventory_client: xlsx parse failed: %s", exc)
-        return _UNKNOWN_RESPONSE
-    except Exception as exc:
-        log.exception("inventory_client: unexpected parse error")
-        return _UNKNOWN_RESPONSE
+        log.error("inventory_pulse Drive error: %s", exc)
+        return UNKNOWN_RESPONSE
+    except Exception as exc:  # noqa: BLE001
+        log.error("inventory_pulse unexpected error: %s", exc)
+        return UNKNOWN_RESPONSE
 
-    return format_inventory_pulse(unis, nimbl, office, modified_iso)
+
+def get_f3e_location_inventory_text(
+    location: str,
+    brand: str | None = None,
+) -> str:
+    """Return location-specific inventory as Slack-formatted text.
+
+    Routes:
+      - "nimbl" / "nimbl*"         → _format_nimbl_weekly_for_llm (weekly Excel)
+      - "unis" / "warehouse" / "cotton" / "cotton 3pl" → _format_unis_for_llm
+      - "office" / "117" / "117 office" → _format_office_for_llm
+
+    Note: Caller handles Nimbl live-Shopify routing. This function always
+    reads the weekly Excel snapshot for all three locations.
+
+    Returns UNKNOWN_RESPONSE on Drive/parse errors.
+    Returns an error string for unknown location names.
+    """
+    loc = location.strip().lower()
+    try:
+        data, modified_iso = _download_report()
+        unis, nimbl, office = _parse_xlsx(data)
+        report_date = _report_date(modified_iso)
+    except InventoryClientError as exc:
+        log.error("location_inventory Drive error location=%r: %s", location, exc)
+        return UNKNOWN_RESPONSE
+    except Exception as exc:  # noqa: BLE001
+        log.error("location_inventory unexpected error location=%r: %s", location, exc)
+        return UNKNOWN_RESPONSE
+
+    if loc in ("unis", "warehouse", "cotton", "cotton 3pl"):
+        return _format_unis_for_llm(unis, report_date, brand)
+    if loc in ("nimbl",):
+        return _format_nimbl_weekly_for_llm(nimbl, report_date, brand)
+    if loc in ("office", "117", "117 office"):
+        return _format_office_for_llm(office, report_date, brand)
+
+    known = ["nimbl", "unis", "warehouse", "cotton", "office", "117"]
+    return (
+        f"Unknown location {location!r}. "
+        f"Supported: {', '.join(known)}. "
+        "Ask the user to clarify."
+    )

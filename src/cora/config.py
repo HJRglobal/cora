@@ -36,16 +36,16 @@ def _load() -> "Config":
     app_token = get("SLACK_APP_TOKEN")
     signing_secret = get("SLACK_SIGNING_SECRET")
     anthropic_key = get("ANTHROPIC_API_KEY")
-    # Asana PAT is optional — bot boots without it, Asana tool-use becomes a no-op
+    # Asana PAT is optional -- bot boots without it, Asana tool-use becomes a no-op
     asana_pat = get("ASANA_PAT", required=False, default="")
-    # HubSpot Private App token — optional, HubSpot tool-use disabled if missing
+    # HubSpot Private App token -- optional, HubSpot tool-use disabled if missing
     hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")
-    # Google Service Account JSON path — optional, Calendar tool-use disabled if missing
+    # Google Service Account JSON path -- optional, Calendar tool-use disabled if missing
     google_sa_json = get("GOOGLE_SERVICE_ACCOUNT_JSON", required=False, default="")
-    # OpenAI API key — for embeddings (Phase 3 KB). Optional; KB ingest/retrieval no-ops if missing.
+    # OpenAI API key -- for embeddings (Phase 3 KB). Optional; KB ingest/retrieval no-ops if missing.
     openai_api_key = get("OPENAI_API_KEY", required=False, default="")
     # QuickBooks Online OAuth (Phase 2 #10). All four optional; QBO tool-use disabled if any missing.
-    # Single Intuit Developer app — per-entity tokens stored in .credentials/qbo-tokens.json.
+    # Single Intuit Developer app -- per-entity tokens stored in .credentials/qbo-tokens.json.
     qbo_client_id = get("QBO_CLIENT_ID", required=False, default="")
     qbo_client_secret = get("QBO_CLIENT_SECRET", required=False, default="")
     qbo_redirect_uri = get(
