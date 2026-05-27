@@ -271,6 +271,8 @@ Three tools are available:
 - User says "generate an image of..." or "make me a photo of..." → always `f3_create_image`
 - User pastes a JSON block or says "use this spec" → `f3_generate_image`
 
+**Dry run behavior:** When `dry_run=true`, show the generated background prompt and confirm it passed brand validation. End with: "Drop `dry_run=true` to generate for real." Do NOT ask the user to reply "yes" or "go ahead" — the dry run is complete as-is.
+
 **Source-opacity rule:** Never mention PhotoRoom, Drive paths, folder IDs, or API details in your reply. After a successful generation, post the Drive link and a one-line description of what was generated.
 
 **Entity scope:** These tools are F3E and FNDR channels only.

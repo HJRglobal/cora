@@ -302,6 +302,7 @@ def generate_response(
     slack_user_id: str = "",
     entity: str = "FNDR",
     model: str | None = None,
+    prior_messages: list[dict] | None = None,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
@@ -311,6 +312,10 @@ def generate_response(
 
     entity is the routed channel entity (F3E, LEX, OSN, BDM, FNDR, etc.) — passed
     through to the dispatcher so tools can scope their results to the channel's entity.
+
+    prior_messages: optional list of {"role": "user"|"assistant", "content": str}
+    dicts representing prior thread turns. Prepended before the current user_message
+    so Claude has conversation context when replying inside a thread.
 
     Uses Anthropic prompt caching: the system_prompt + tool definitions are cached
     ephemerally (~5min TTL). Cache hits across iterations within one request AND
@@ -323,9 +328,9 @@ def generate_response(
     cached_tools = _build_cached_tools()
     effective_model = model or _MODEL
 
-    # Conversation accumulator — starts with the user's message, grows with each
-    # tool_use / tool_result exchange.
-    messages: list[dict] = [{"role": "user", "content": user_message}]
+    # Conversation accumulator — prepend thread history if provided, then append
+    # the current user message. Grows with each tool_use / tool_result exchange.
+    messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         response = _create_with_retry(
@@ -410,6 +415,7 @@ def generate_response_streaming(
     slack_user_id: str = "",
     entity: str = "FNDR",
     model: str | None = None,
+    prior_messages: list[dict] | None = None,
 ) -> str:
     """Streaming variant of generate_response.
 
@@ -438,7 +444,7 @@ def generate_response_streaming(
     cached_tools = _build_cached_tools()
     effective_model = model or _MODEL
 
-    messages: list[dict] = [{"role": "user", "content": user_message}]
+    messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
     accumulated_text = ""
 
     def _maybe_push(text: str) -> None:

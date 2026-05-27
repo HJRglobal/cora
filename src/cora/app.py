@@ -66,12 +66,92 @@ def _resolve_channel_name(client, channel_id: str) -> str:
         return channel_id
 
 
+def _fetch_thread_history(
+    client,
+    channel_id: str,
+    thread_root_ts: str,
+    current_msg_ts: str,
+    limit: int = 12,
+) -> list[dict]:
+    """Fetch prior messages in a Slack thread and convert to Claude message format.
+
+    Returns a list of {"role": "user"|"assistant", "content": str} dicts suitable
+    for prepending to the Claude messages array. The current message is excluded
+    (it will be appended as the final user turn by generate_response).
+
+    Errors are swallowed — thread context is best-effort; a cold-start response
+    is always better than a crash.
+    """
+    try:
+        resp = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_root_ts,
+            limit=limit,
+        )
+        raw_messages = resp.get("messages", [])
+    except Exception as exc:
+        log.warning(
+            "thread_history: conversations_replies failed channel=%s thread_ts=%s: %s",
+            channel_id, thread_root_ts, exc,
+        )
+        return []
+
+    bot_id = _CORA_BOT_USER_ID  # may be None before first auth.test()
+    history: list[dict] = []
+    for msg in raw_messages:
+        if msg.get("ts") == current_msg_ts:
+            continue  # skip the current message — it's appended separately
+        if msg.get("subtype"):
+            continue  # skip channel joins, leaves, etc.
+        text = msg.get("text", "").strip()
+        if not text:
+            continue
+        # Strip @Cora mention prefix from user messages
+        text = _MENTION_RE.sub("", text).strip()
+        if not text:
+            continue
+        is_bot = bool(msg.get("bot_id")) or (bot_id and msg.get("user") == bot_id)
+        role = "assistant" if is_bot else "user"
+        history.append({"role": role, "content": text})
+
+    # Anthropic requires alternating user/assistant turns. Merge consecutive
+    # same-role messages (e.g. two user turns if Cora didn't respond to one).
+    merged: list[dict] = []
+    for turn in history:
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["content"] += "\n" + turn["content"]
+        else:
+            merged.append({"role": turn["role"], "content": turn["content"]})
+
+    # Ensure history starts with a user turn (Claude API requirement)
+    while merged and merged[0]["role"] == "assistant":
+        merged.pop(0)
+
+    log.info(
+        "thread_history: fetched %d turns for channel=%s thread_ts=%s",
+        len(merged), channel_id, thread_root_ts,
+    )
+    return merged
+
+
 @app.event("app_mention")
 def handle_mention(event: dict, say: callable, client) -> None:
     channel_id = event.get("channel", "")
     user_id = event.get("user")
-    thread_ts = event.get("ts")
+    thread_ts = event.get("ts")          # ts of THIS message (used for reply threading)
+    event_thread_ts = event.get("thread_ts")  # root ts if this is inside a thread
     raw_text = event.get("text", "")
+
+    # Lazy-resolve bot user ID (needed for thread history role assignment)
+    _resolve_bot_user_id(client)
+
+    # If this @mention is inside an existing thread, fetch prior messages so
+    # Claude has conversation context (e.g. "go ahead" after a dry-run reply).
+    prior_messages: list[dict] = []
+    if event_thread_ts and event_thread_ts != thread_ts:
+        prior_messages = _fetch_thread_history(
+            client, channel_id, event_thread_ts, thread_ts
+        )
 
     allowed, cap_type = rate_limiter.check(user_id, channel_id)
     if not allowed:
@@ -232,6 +312,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
                 slack_user_id=user_id or "",
                 entity=entity,
                 model=chosen_model,
+                prior_messages=prior_messages,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -291,6 +372,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
             slack_user_id=user_id or "",
             entity=entity,
             model=chosen_model,
+            prior_messages=prior_messages,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
