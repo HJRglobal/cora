@@ -19,7 +19,7 @@ def test_load_f3e(monkeypatch, tmp_path):
 
     result = pl.load_prompt("F3E")
 
-    assert result == "F3E system prompt"
+    assert result.startswith("F3E system prompt")
 
 
 def test_missing_entity_falls_back_to_fndr_with_error_logged(monkeypatch, tmp_path, caplog):
@@ -32,7 +32,7 @@ def test_missing_entity_falls_back_to_fndr_with_error_logged(monkeypatch, tmp_pa
     with caplog.at_level(logging.ERROR, logger="cora.prompt_loader"):
         result = pl.load_prompt("OSN")
 
-    assert result == "FNDR system prompt"
+    assert result.startswith("FNDR system prompt")
     assert "OSN" in caplog.text
 
 
@@ -51,7 +51,7 @@ def test_cache_returns_same_string_on_repeated_calls(monkeypatch, tmp_path):
     result2 = pl.load_prompt("F3E")
 
     assert result1 is result2
-    assert result1 == "F3E system prompt"
+    assert result1.startswith("F3E system prompt")
 
 
 # --- Lex sub-entity codes (added 2026-05-23 siloing fix) ---

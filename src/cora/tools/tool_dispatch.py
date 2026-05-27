@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, notion_client, qbo_client
 from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
@@ -1862,6 +1862,29 @@ def _tool_f3_batch_image_run(slack_user_id: str, entity: str, _input: dict) -> s
     return generate_image.handle_f3_batch_image_run(slack_user_id, entity, _input)
 
 
+def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return the F3E HubSpot retail pipeline summary (source-opaque)."""
+    try:
+        return hubspot_client.get_f3e_pipeline_summary_text()
+    except hubspot_client.HubSpotClientError as exc:
+        log.error("f3e_hubspot_pipeline_summary HubSpot call failed: %s", exc)
+        return (
+            f"f3e_hubspot_pipeline_summary: HubSpot call failed ({exc}). "
+            "Apologize to the user and suggest they try again in a moment."
+        )
+
+
+def _tool_fndr_contracts_dashboard(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return the FNDR/HJRG contracts dashboard (Notion, source-opaque)."""
+    try:
+        return notion_client.get_contracts_dashboard_text()
+    except notion_client.NotionClientError as exc:
+        log.error("fndr_contracts_dashboard Notion call failed: %s", exc)
+        return (
+            "I don't have that right now. Escalate to Harrison if contract renewals are urgent."
+        )
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -3011,6 +3034,36 @@ TOOL_DEFINITIONS = [
             "required": ["spec_folder_drive_id"],
         },
     },
+    {
+        "name": "f3e_hubspot_pipeline_summary",
+        "description": (
+            "Return the F3E retail HubSpot pipeline summary. Use when the user asks for a "
+            "sales summary, pipeline update, deal overview, or '@Cora sales summary' in an "
+            "F3E or FNDR channel. Returns a source-opaque Slack-formatted breakdown by stage, "
+            "owner split, and hot-list deals. Never expose HubSpot stage IDs or owner IDs. "
+            "Scope: F3E and FNDR channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "fndr_contracts_dashboard",
+        "description": (
+            "Return the FNDR/HJRG contracts dashboard from Notion — lists active contracts "
+            "by entity, upcoming renewals, and any flagged risk items. Use when Harrison or "
+            "FNDR/HJRG channel users ask about contract status, renewal deadlines, or "
+            "Escalate-flagged items. Source-opaque: do not name Notion or the database ID. "
+            "Scope: FNDR and HJRG channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -3052,6 +3105,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     # PhotoRoom image generation — wired in Session 2
     "f3_generate_image": _tool_f3_generate_image,
     "f3_batch_image_run": _tool_f3_batch_image_run,
+    "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
+    "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
 }
 
 
