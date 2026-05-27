@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client
 from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
 
 log = logging.getLogger(__name__)
@@ -1847,6 +1847,30 @@ def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -
     return brand_voice_client.format_result_for_llm(result)
 
 
+def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch the F3E HubSpot pipeline summary and return formatted text for Claude."""
+    try:
+        return hubspot_client.get_f3e_pipeline_summary_text()
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning("f3e_hubspot_pipeline_summary error user=%s: %s", slack_user_id, exc)
+        return (
+            f"f3e_hubspot_pipeline_summary: HubSpot call failed -- {exc}. "
+            "Apologize to the user and suggest they try again in a moment."
+        )
+
+
+def _tool_fndr_contracts_dashboard(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch the FNDR/HJRG contracts and renewals dashboard from Notion."""
+    try:
+        return notion_client.get_contracts_dashboard_text()
+    except notion_client.NotionClientError as exc:
+        log.warning("fndr_contracts_dashboard error user=%s: %s", slack_user_id, exc)
+        return (
+            f"fndr_contracts_dashboard: I don't have that right now -- {exc}. "
+            "Apologize to the user and suggest they check back shortly."
+        )
+
+
 # ---------------------------------------------------------------------------
 # PhotoRoom image generation tool handlers
 # ---------------------------------------------------------------------------
@@ -1865,6 +1889,34 @@ def _tool_f3_batch_image_run(slack_user_id: str, entity: str, _input: dict) -> s
 def _tool_f3_create_image(slack_user_id: str, entity: str, _input: dict) -> str:
     """Delegate to generate_image.handle_f3_create_image."""
     return generate_image.handle_f3_create_image(slack_user_id, entity, _input)
+
+
+# --- LEX-specific tool handlers ---
+
+
+def _tool_lex_revalidation_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return AZ DDD Therapy Revalidation status from Asana.
+
+    Reads task 1215070649606664 (root task + subtasks + latest comment).
+    Returns days-remaining to 2026-06-30, open sub-task blockers, last-comment
+    age, and a deep link to the Asana task.
+
+    Scoped to LEX / LEX-* entities and FNDR/HJRG. Tool description instructs
+    Claude to ALWAYS call this tool for revalidation questions rather than
+    answering from KB memory.
+    """
+    log.info("lex_revalidation_status user=%s entity=%s", slack_user_id, entity)
+    return lex_client.get_revalidation_status()
+
+
+def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return Lex staffing pulse from the Drive upload pipeline.
+
+    BLOCKED until Sean/Jen staffing Drive folder is configured. Returns a
+    structured stub message explaining the dependency.
+    """
+    log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
+    return lex_client.get_staff_pulse()
 
 
 # --- Catalog: tool definitions exposed to Claude ---
@@ -2701,6 +2753,40 @@ TOOL_DEFINITIONS = [
             "required": ["brand", "copy"],
         },
     },
+    {
+        "name": "fndr_contracts_dashboard",
+        "description": (
+            "Fetch the FNDR/HJRG Contracts and Renewals Registry from Notion. "
+            "Use this when a user asks about contract status, upcoming renewals, "
+            "lease expirations, or risk flags -- phrases like 'what contracts are "
+            "expiring', 'show me renewals', 'any Escalate-flagged contracts', "
+            "'contracts dashboard', 'what leases are up'. "
+            "Returns contracts sorted by days remaining with risk flags and Escalate "
+            "notices for items requiring Harrison's attention. "
+            "Call in any FNDR or HJRG channel. No inputs required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "f3e_hubspot_pipeline_summary",
+        "description": (
+            "Fetch a source-opaque sales summary of the F3E HubSpot pipeline. "
+            "Use this when a user asks for a sales summary, pipeline overview, or deal status "
+            "in F3E channels -- phrases like '@Cora sales summary', 'what's in the pipeline', "
+            "'show me our deals', 'pipeline update', 'how are sales looking'. "
+            "Returns stage breakdown, hot deals, and total pipeline value. "
+            "Call in any F3E or FNDR channel. No inputs required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     # ── OSN financial tools (OSN and FNDR channels) ──
     {
         "name": "osn_financial_pulse",
@@ -3069,6 +3155,52 @@ TOOL_DEFINITIONS = [
             "required": ["brand", "brief"],
         },
     },
+    # --- LEX tools ---
+    {
+        "name": "lex_revalidation_status",
+        "description": (
+            "Return the live AZ DDD Therapy Revalidation status from Asana. "
+            "ALWAYS call this tool when any user asks about revalidation status, "
+            "days remaining to the deadline, open blockers, sub-task progress, "
+            "or whether the revalidation is on track. Do NOT answer from KB memory -- "
+            "the tool fetches live Asana data and returns days-remaining to 2026-06-30, "
+            "open sub-task blockers with assignees and due dates, and the age of the "
+            "last comment. Present its output as-is without truncating or summarizing.\n"
+            "\n"
+            "Trigger phrases: 'revalidation', 'DDD revalidation', 'AHCCCS revalidation', "
+            "'Provider Type 15', 'June 30 deadline', '6/30 deadline', 'revalidation status', "
+            "'what's happening with the revalidation', 'are we on track for June 30'.\n"
+            "\n"
+            "Scope: LEX / LEX-* channels and FNDR/HJRG. Always surface in the "
+            "Sunday-evening #lex-leadership brief."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "lex_staff_pulse",
+        "description": (
+            "Return Lexington staffing pulse data (open positions, recent terminations, "
+            "training compliance counts). BLOCKED pending Sean/Jen Drive upload pipeline "
+            "configuration. Call this when users ask about Lex staffing levels, open roles, "
+            "recent staff departures, or training compliance status. Returns a structured "
+            "stub message explaining the pipeline dependency until the Drive folder is "
+            "configured.\n"
+            "\n"
+            "Trigger phrases: 'staffing', 'open positions', 'staff turnover', 'training "
+            "compliance', 'how many staff', 'driver safety compliance'.\n"
+            "\n"
+            "Scope: LEX / LEX-* channels and FNDR/HJRG."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -3098,6 +3230,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
     "f3e_inventory_pulse": _tool_f3e_inventory_pulse,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
+    "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
+    "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
     "osn_financial_pulse": _tool_osn_financial_pulse,
     "osn_sales_pulse": _tool_osn_sales_pulse,
     "osn_inventory_status": _tool_osn_inventory_status,
@@ -3111,6 +3245,9 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3_generate_image": _tool_f3_generate_image,
     "f3_batch_image_run": _tool_f3_batch_image_run,
     "f3_create_image": _tool_f3_create_image,
+    # LEX tools
+    "lex_revalidation_status": _tool_lex_revalidation_status,
+    "lex_staff_pulse": _tool_lex_staff_pulse,
 }
 
 
