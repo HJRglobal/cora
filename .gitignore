@@ -23,6 +23,9 @@ data/cora_kb.db
 data/cora_kb.db-shm
 data/cora_kb.db-wal
 
+# Security monitor runtime data (machine-specific file hashes and alert history)
+data/security/
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
 
