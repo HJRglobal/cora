@@ -364,7 +364,7 @@ def process_email(
         drive_path_display = f"{entity_folder}/{subfolder}/{canonical}"
 
         if dry_run:
-            log.info("[DRY RUN] Would file %r → %s", orig_filename, drive_path_display)
+            log.info("[DRY RUN] Would file %r -> %s", orig_filename, drive_path_display)
             results.append({
                 "original_filename": orig_filename,
                 "canonical_filename": canonical,
@@ -399,7 +399,7 @@ def process_email(
             log.warning("Upload failed for %r: %s", canonical, exc)
             continue
 
-        log.info("Filed %r → %s (%s)", orig_filename, drive_path_display, web_link)
+        log.info("Filed %r -> %s (%s)", orig_filename, drive_path_display, web_link)
 
         # Immediate KB indexing so Cora can answer questions without waiting for next sync
         if kb is not None:
@@ -547,7 +547,7 @@ def run_filer(
         if not dry_run and summary["errors"] == 0:
             watermarks[account["email"]] = run_start
             log.info(
-                "Watermark advanced for %s → %d", account["email"], run_start
+                "Watermark advanced for %s -> %d", account["email"], run_start
             )
 
     if not dry_run:
@@ -576,11 +576,11 @@ def post_slack_summary(summaries: list[dict[str, Any]]) -> bool:
         for item in summary["filed_items"]:
             if item.get("web_link"):
                 lines.append(
-                    f"  • <{item['web_link']}|{item['canonical_filename']}> → `{item['drive_path'].rsplit('/', 1)[0]}`"
+                    f"  • <{item['web_link']}|{item['canonical_filename']}> -> `{item['drive_path'].rsplit('/', 1)[0]}`"
                 )
             else:
                 lines.append(
-                    f"  • `{item['canonical_filename']}` → `{item['drive_path'].rsplit('/', 1)[0]}`"
+                    f"  • `{item['canonical_filename']}` -> `{item['drive_path'].rsplit('/', 1)[0]}`"
                 )
             lines.append(f"    _{item.get('reason', '')}_")
 
