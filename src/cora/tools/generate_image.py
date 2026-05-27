@@ -1,19 +1,20 @@
-"""generate_image.py — Slack handler for PhotoRoom image generation tools.
+"""generate_image.py — Slack handlers for PhotoRoom image generation tools.
 
 Wired into tool_dispatch.py as:
   "f3_generate_image"   → _tool_f3_generate_image
   "f3_batch_image_run"  → _tool_f3_batch_image_run
+  "f3_create_image"     → _tool_f3_create_image
 
-Entity scope:
-  f3_generate_image  — F3E or FNDR channels only
-  f3_batch_image_run — F3E or FNDR channels only
+Entity scope: all tools require F3E or FNDR channel.
 
-Drive file download:
-  When spec_drive_file_id is provided, we download the JSON bytes directly
-  via the Drive Files.get(alt=media) endpoint, using _build_drive_service()
-  from drive_connector.  No file-system write — bytes → str → dict in memory.
+f3_create_image flow:
+  1. Accept brand + brief (plain English) from Slack
+  2. spec_generator calls Claude → generates PhotoRoom background prompt from brand guidelines
+  3. photoroom_client calls PhotoRoom API → PNG bytes
+  4. PNG uploaded to Drive photoroom-outputs/ folder → webViewLink returned
+  5. Cora posts the Drive link in Slack for Harrison / BDM review
 
-Source-opacity: all Slack output delegates to photoroom_client formatters.
+Source-opacity: Slack output never mentions PhotoRoom, Shopify, Drive paths, or token values.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from ..connectors.photoroom_specs import (
     ImageSpec,
     validate_spec,
 )
+from ..connectors import spec_generator
 
 log = logging.getLogger(__name__)
 
@@ -305,3 +307,104 @@ def handle_f3_batch_image_run(
         summary += "\n".join(validation_errors)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Slack handler: f3_create_image (brief → Claude → PhotoRoom → Drive)
+# ---------------------------------------------------------------------------
+
+_VALID_BRANDS = frozenset({"pure", "mood", "energy"})
+_VALID_SIZES = frozenset({"1920x900", "1080x1080", "1200x628", "1920x1080"})
+
+
+def handle_f3_create_image(
+    slack_user_id: str,
+    entity: str,
+    tool_input: dict[str, Any],
+) -> str:
+    """Slack tool handler for f3_create_image.
+
+    Accepts:
+      brand (str)         — "pure" | "mood" | "energy"
+      brief (str)         — plain-English scene description
+      output_size (str)   — optional, default "1920x900"
+      main_image_url (str)— optional override for the product can image URL
+      dry_run (bool)      — validate + preview prompt, no API call
+
+    Returns source-opaque Slack mrkdwn with Drive link on success.
+    """
+    # --- Entity scope guard ---
+    if entity not in _ALLOWED_ENTITIES:
+        return (
+            "Image generation is only available in F3 channels. "
+            "Please use this tool from #f3-pure-launch or #f3e-leadership."
+        )
+
+    brand: str = (tool_input.get("brand") or "").lower().strip()
+    brief: str = (tool_input.get("brief") or "").strip()
+    output_size: str = (tool_input.get("output_size") or "1920x900").strip()
+    main_image_url: str | None = tool_input.get("main_image_url")
+    dry_run: bool = bool(tool_input.get("dry_run", False))
+
+    # --- Validate inputs ---
+    if not brand:
+        return "Missing `brand`. Specify: `pure`, `mood`, or `energy`."
+    if brand not in _VALID_BRANDS:
+        return f"Unknown brand `{brand}`. Valid options: pure, mood, energy."
+    if not brief:
+        return "Missing `brief`. Describe the scene in plain English."
+    if len(brief) < 10:
+        return "Brief is too short. Describe the scene with at least a few words."
+    if output_size not in _VALID_SIZES:
+        valid = ", ".join(sorted(_VALID_SIZES))
+        return f"Unknown output_size `{output_size}`. Valid: {valid}."
+
+    # --- Generate spec via Claude ---
+    try:
+        image_spec = spec_generator.generate_spec_from_brief(
+            brand=brand,
+            brief=brief,
+            output_size=output_size,
+            main_image_url=main_image_url or None,
+            requester=slack_user_id,
+        )
+    except ValueError as exc:
+        return f"Could not generate image spec: {exc}"
+    except Exception as exc:
+        log.exception("f3_create_image: spec_generator failed brand=%s", brand)
+        return f"Unexpected error generating spec: {exc}"
+
+    # --- Dry run: show what would be sent to PhotoRoom ---
+    if dry_run:
+        bg = image_spec.background
+        return (
+            f"🔍 *Dry run — F3 {brand.capitalize()} image brief*\n\n"
+            f"*Generated background prompt:*\n_{bg.prompt}_\n\n"
+            f"*Negative prompt:* {bg.negative_prompt}\n"
+            f"*Guidance:* {bg.guidance.scale}\n"
+            f"*Output:* {image_spec.output.size} {image_spec.output.format}\n"
+            f"*Filename:* `{image_spec.output.filename}`\n\n"
+            "Confirm with `dry_run=false` to generate and save to Drive."
+        )
+
+    # --- Execute: PhotoRoom → Drive ---
+    try:
+        result: GenerateResult = run_spec(image_spec, dry_run=False)
+    except PhotoroomBudgetError as exc:
+        return f"Weekly budget cap reached — no image generated. ({exc})"
+    except PhotoroomConfigError as exc:
+        return f"Image generation not configured: {exc}"
+    except PhotoroomError as exc:
+        return f"Image generation failed: {exc}"
+    except Exception as exc:
+        log.exception("f3_create_image: run_spec failed spec_id=%s", image_spec.spec_id)
+        return f"Unexpected error during image generation: {exc}"
+
+    # --- Format response ---
+    base = format_result_for_slack(result)
+    # Append brief summary so the reviewer knows what they're looking at
+    return (
+        f"{base}\n"
+        f"*Brief:* _{brief[:120]}_\n"
+        f"*Brand:* F3 {brand.capitalize()}"
+    )

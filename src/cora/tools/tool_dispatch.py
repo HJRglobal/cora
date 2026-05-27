@@ -1862,6 +1862,11 @@ def _tool_f3_batch_image_run(slack_user_id: str, entity: str, _input: dict) -> s
     return generate_image.handle_f3_batch_image_run(slack_user_id, entity, _input)
 
 
+def _tool_f3_create_image(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate to generate_image.handle_f3_create_image."""
+    return generate_image.handle_f3_create_image(slack_user_id, entity, _input)
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -3011,6 +3016,59 @@ TOOL_DEFINITIONS = [
             "required": ["spec_folder_drive_id"],
         },
     },
+    {
+        "name": "f3_create_image",
+        "description": (
+            "Generate an F3 brand image from a plain-English creative brief. "
+            "Claude writes a PhotoRoom-quality background prompt from the F3 brand "
+            "guidelines, PhotoRoom renders the scene behind the product can, and the "
+            "finished PNG is uploaded to the team's Drive review folder. Cora posts "
+            "the Drive link in Slack so Harrison and BDM can review before publishing. "
+            "Use when someone says 'generate an image of...', 'create a photo of...', "
+            "'make a lifestyle shot of...', or describes a desired scene. "
+            "Scope: F3E or FNDR channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brand": {
+                    "type": "string",
+                    "enum": ["pure", "mood", "energy"],
+                    "description": "F3 sub-brand for this image.",
+                },
+                "brief": {
+                    "type": "string",
+                    "description": (
+                        "Plain-English description of the desired scene. "
+                        "Examples: 'person holding a can next to a pool', "
+                        "'woman on a morning walk through a suburban neighborhood', "
+                        "'outdoor farmers market, golden hour'. "
+                        "Min 10 characters."
+                    ),
+                },
+                "output_size": {
+                    "type": "string",
+                    "enum": ["1920x900", "1080x1080", "1200x628", "1920x1080"],
+                    "description": "Output dimensions. Default: 1920x900 (hero banner).",
+                },
+                "main_image_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional: override the default product can image URL. "
+                        "Use a Shopify CDN URL for a specific SKU."
+                    ),
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, shows the Claude-generated background prompt "
+                        "without calling PhotoRoom. Useful for prompt review."
+                    ),
+                },
+            },
+            "required": ["brand", "brief"],
+        },
+    },
 ]
 
 
@@ -3049,9 +3107,10 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
     "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
     "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
-    # PhotoRoom image generation — wired in Session 2
+    # PhotoRoom image generation
     "f3_generate_image": _tool_f3_generate_image,
     "f3_batch_image_run": _tool_f3_batch_image_run,
+    "f3_create_image": _tool_f3_create_image,
 }
 
 

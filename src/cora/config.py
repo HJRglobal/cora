@@ -62,6 +62,7 @@ def _load() -> "Config":
     photoroom_rate_limit_per_min = get("PHOTOROOM_RATE_LIMIT_PER_MIN", required=False, default="60")
     photoroom_use_sandbox = get("PHOTOROOM_USE_SANDBOX", required=False, default="false")
     photoroom_weekly_budget_usd = get("PHOTOROOM_WEEKLY_BUDGET_USD", required=False, default="50")
+    photoroom_outputs_drive_folder_id = get("PHOTOROOM_OUTPUTS_DRIVE_FOLDER_ID", required=False, default="")
 
     if errors:
         raise RuntimeError("Cora config errors:\n" + "\n".join(errors))
@@ -85,6 +86,7 @@ def _load() -> "Config":
         photoroom_rate_limit_per_min=int(photoroom_rate_limit_per_min or "60"),
         photoroom_use_sandbox=photoroom_use_sandbox.lower() in ("true", "1", "yes"),
         photoroom_weekly_budget_usd=float(photoroom_weekly_budget_usd or "50"),
+        photoroom_outputs_drive_folder_id=photoroom_outputs_drive_folder_id,
     )
 
 
@@ -108,6 +110,7 @@ class Config:
     photoroom_rate_limit_per_min: int
     photoroom_use_sandbox: bool
     photoroom_weekly_budget_usd: float
+    photoroom_outputs_drive_folder_id: str  # Drive folder ID for review uploads
 
 
 config = _load()

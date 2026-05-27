@@ -342,6 +342,52 @@ def upload_to_shopify(png_bytes: bytes, alt: str, filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Drive upload helper
+# ---------------------------------------------------------------------------
+
+
+def upload_to_drive(png_bytes: bytes, filename: str, folder_id: str) -> str:
+    """Upload PNG bytes to a Google Drive folder.
+
+    Returns the webViewLink (shareable Drive URL) for the uploaded file.
+    Uses drive_connector._build_drive_service() — same auth as KB sync.
+    Raises ShopifyUploadError (reused) on failure.
+    """
+    try:
+        import io
+        from googleapiclient.http import MediaIoBaseUpload
+        from .drive_connector import _build_drive_service
+    except ImportError as exc:
+        raise ShopifyUploadError(f"Drive dependencies not available: {exc}") from exc
+
+    try:
+        service = _build_drive_service()
+    except Exception as exc:
+        raise ShopifyUploadError(f"Drive auth failed: {exc}") from exc
+
+    file_metadata: dict = {
+        "name": filename,
+        "parents": [folder_id],
+        "mimeType": "image/png",
+    }
+    media = MediaIoBaseUpload(
+        io.BytesIO(png_bytes), mimetype="image/png", resumable=False
+    )
+    try:
+        result = (
+            service.files()
+            .create(body=file_metadata, media_body=media, fields="id,webViewLink,name")
+            .execute()
+        )
+    except Exception as exc:
+        raise ShopifyUploadError(f"Drive upload failed: {exc}") from exc
+
+    link = result.get("webViewLink") or f"https://drive.google.com/file/d/{result['id']}/view"
+    log.info("Drive upload OK: %s → %s", filename, link)
+    return link
+
+
 def wire_to_destination(shopify_file_gid: str, spec: ImageSpec) -> None:
     """
     Wire an uploaded Shopify File to its target resource.
@@ -350,6 +396,7 @@ def wire_to_destination(shopify_file_gid: str, spec: ImageSpec) -> None:
 
     Destination types:
       - shopify_file_only: no-op after upload
+      - drive_review_folder: handled separately in run_spec (no Shopify upload)
       - pdp_hero: productCreateMedia + productReorderMedia
       - collection_hero: read+modify+upsert collection template JSON
       - homepage_hero_section: read+modify+upsert index template JSON
@@ -359,8 +406,8 @@ def wire_to_destination(shopify_file_gid: str, spec: ImageSpec) -> None:
     st = dest.shopify_target
     filename = spec.output.filename
 
-    if dt == "shopify_file_only":
-        log.info("Destination is shopify_file_only — no theme wiring needed.")
+    if dt in ("shopify_file_only", "drive_review_folder"):
+        log.info("Destination %r — no Shopify theme wiring needed.", dt)
         return
 
     if dt == "pdp_hero":
@@ -562,8 +609,9 @@ def _upsert_theme_json_image(
 @dataclass
 class GenerateResult:
     spec_id: str
-    status: str  # "ok" | "error"
+    status: str  # "ok" | "dry_run" | "error"
     shopify_file_gid: Optional[str] = None
+    drive_link: Optional[str] = None      # set when destination=drive_review_folder
     preview_url: Optional[str] = None
     cost_usd: float = 0.0
     cumulative_weekly_usd: float = 0.0
@@ -601,13 +649,31 @@ def run_spec(spec: ImageSpec, dry_run: bool = False) -> GenerateResult:
     _rate_limiter.wait_if_needed()
     t0 = time.monotonic()
     prompt_hash = "sha256:" + hashlib.sha256(spec.background.prompt.encode()).hexdigest()[:16]
+    dest_type = spec.destination.type
 
     try:
         png_bytes = generate_ai_background(spec)
-        file_gid = upload_to_shopify(
-            png_bytes, spec.output.alt_text, spec.output.filename
-        )
-        wire_to_destination(file_gid, spec)
+
+        if dest_type == "drive_review_folder":
+            # Drive-first review path — no Shopify upload
+            folder_id = (
+                spec.destination.drive_folder_id
+                or config.photoroom_outputs_drive_folder_id
+            )
+            if not folder_id:
+                raise PhotoroomError(
+                    "drive_review_folder destination requires PHOTOROOM_OUTPUTS_DRIVE_FOLDER_ID "
+                    "in .env or destination.drive_folder_id in the spec."
+                )
+            drive_link = upload_to_drive(png_bytes, spec.output.filename, folder_id)
+            file_gid = None
+        else:
+            # Shopify path
+            file_gid = upload_to_shopify(
+                png_bytes, spec.output.alt_text, spec.output.filename
+            )
+            wire_to_destination(file_gid, spec)
+            drive_link = None
 
     except ShopifyUploadError as exc:
         # Image was generated but upload failed — save locally as rescue artefact
@@ -615,7 +681,6 @@ def run_spec(spec: ImageSpec, dry_run: bool = False) -> GenerateResult:
         rescue_dir.mkdir(parents=True, exist_ok=True)
         rescue_path = rescue_dir / spec.output.filename
         try:
-            # png_bytes may not be defined if exception was from a retry
             rescue_path.write_bytes(locals().get("png_bytes", b""))
         except Exception:
             pass
@@ -626,7 +691,7 @@ def run_spec(spec: ImageSpec, dry_run: bool = False) -> GenerateResult:
                 "spec_id": spec.spec_id,
                 "brand": spec.brand,
                 "feature": spec.feature,
-                "status": "shopify_upload_failed",
+                "status": "upload_failed",
                 "duration_ms": elapsed_ms,
                 "cost_usd": COST_PER_IMAGE_USD,
                 "error": str(exc),
@@ -655,10 +720,6 @@ def run_spec(spec: ImageSpec, dry_run: bool = False) -> GenerateResult:
         raise
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    dest_label = (
-        f"{spec.destination.shopify_target.template_file or 'n/a'}"
-        f"#{spec.destination.shopify_target.section_id or spec.destination.type}"
-    )
     spent = _load_weekly_spend() + COST_PER_IMAGE_USD
 
     _log_spend(
@@ -670,23 +731,23 @@ def run_spec(spec: ImageSpec, dry_run: bool = False) -> GenerateResult:
             "status": "ok",
             "duration_ms": elapsed_ms,
             "cost_usd": COST_PER_IMAGE_USD,
+            "destination": dest_type,
             "shopify_file_gid": file_gid,
-            "shopify_destination": dest_label,
+            "drive_link": drive_link,
             "week": _iso_week_key(),
             "prompt_hash": prompt_hash,
         }
     )
 
     log.info(
-        "run_spec OK: spec_id=%s gid=%s elapsed=%dms",
-        spec.spec_id,
-        file_gid,
-        elapsed_ms,
+        "run_spec OK: spec_id=%s dest=%s elapsed=%dms",
+        spec.spec_id, dest_type, elapsed_ms,
     )
     return GenerateResult(
         spec_id=spec.spec_id,
         status="ok",
         shopify_file_gid=file_gid,
+        drive_link=drive_link,
         cost_usd=COST_PER_IMAGE_USD,
         cumulative_weekly_usd=spent,
         duration_ms=elapsed_ms,
@@ -723,7 +784,7 @@ def batch_run(specs: list[ImageSpec], dry_run: bool = False) -> BatchResults:
     Process N specs in series, respecting the rate limit.
 
     Hard cap: BATCH_HARD_CAP images per call to prevent runaway costs.
-    Per-spec errors are captured and logged; the batch continues.
+ batch continues.
     """
     if len(specs) > BATCH_HARD_CAP:
         raise PhotoroomError(
@@ -764,13 +825,16 @@ def format_result_for_slack(result: GenerateResult) -> str:
             "Confirm with `dry_run=false`."
         )
     if result.status == "ok":
-        return (
-            f"✅ Generated `{result.spec_id}`\n"
+        lines = [f"✅ *Image ready* — `{result.spec_id}`"]
+        if result.drive_link:
+            lines.append(f"🗂 <{result.drive_link}|Open in Drive for review>")
+        lines.append(
             f"💰 API cost: ${result.cost_usd:.2f} | "
-            f"Cumulative this week: ${result.cumulative_weekly_usd:.2f} / "
-            f"${config.photoroom_weekly_budget_usd:.2f} budget\n"
-            f"⏱ {result.duration_ms:,}ms"
+            f"Running this week: ${result.cumulative_weekly_usd:.2f} / "
+            f"${config.photoroom_weekly_budget_usd:.2f} budget"
         )
+        lines.append(f"⏱ {result.duration_ms:,}ms")
+        return "\n".join(lines)
     return f"❌ `{result.spec_id}` failed: {result.error}"
 
 

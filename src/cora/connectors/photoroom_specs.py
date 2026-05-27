@@ -87,9 +87,13 @@ class Destination(BaseModel):
         "homepage_hero_section",
         "collection_hero",
         "pdp_hero",
+        "drive_review_folder",  # upload to Drive for human review; no Shopify wiring
     ]
     shopify_target: ShopifyTarget = Field(default_factory=ShopifyTarget)
     wire_strategy: Literal["replace_or_insert", "insert_only", "replace_only"] = "replace_or_insert"
+    # For drive_review_folder: override the default outputs folder from config.
+    # If omitted, photoroom_client falls back to config.photoroom_outputs_drive_folder_id.
+    drive_folder_id: Optional[str] = None
 
     @model_validator(mode="after")
     def check_required_fields(self) -> "Destination":
