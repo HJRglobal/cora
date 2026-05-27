@@ -76,7 +76,7 @@ def test_create_task_with_confirmation_calls_asana_client():
     assert call_kwargs["project_gid"] is None
     assert call_kwargs["due_on"] is None
     # The formatted response surfaces the task to the LLM
-    assert "CREATED" in result
+    assert "WRITE_CONFIRMED" in result
     assert "999888777" in result  # permalink fragment
 
 
@@ -104,7 +104,7 @@ def test_create_task_resolves_assignee_via_aliases():
     call_kwargs = mock.call_args.kwargs
     # Shaun's Asana GID from the real slack-to-asana.yaml shipped in the repo
     assert call_kwargs["assignee_gid"] == "1209093544422692"
-    assert "CREATED" in result
+    assert "WRITE_CONFIRMED" in result
 
 
 def test_create_task_refuses_unresolvable_assignee():

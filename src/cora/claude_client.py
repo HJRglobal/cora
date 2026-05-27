@@ -446,6 +446,7 @@ def generate_response_streaming(
 
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
     accumulated_text = ""
+    _last_tool_result_text: str = ""  # safety net: fallback if Claude emits no text after a write
 
     def _maybe_push(text: str) -> None:
         if update_callback is not None:
@@ -495,6 +496,21 @@ def generate_response_streaming(
                 # Stream missed some text — push the corrected final
                 accumulated_text = final_text
                 _maybe_push(accumulated_text)
+            if not accumulated_text and _last_tool_result_text:
+                # Claude produced no text after a tool call (silent-completion).
+                # Extract the WRITE_CONFIRMED payload if present, otherwise
+                # surface the raw tool result so the user sees something.
+                raw = _last_tool_result_text
+                if "WRITE_CONFIRMED" in raw:
+                    # Strip the instruction prefix — only post the user-facing lines
+                    parts = raw.split("\n\n", 1)
+                    accumulated_text = parts[1].strip() if len(parts) > 1 else raw
+                else:
+                    accumulated_text = raw
+                log.warning(
+                    "Silent-completion fallback triggered: extracted %d chars from last tool result",
+                    len(accumulated_text),
+                )
             return accumulated_text or "(Cora returned no text)"
 
         if iteration >= _MAX_TOOL_ITERATIONS:
@@ -518,5 +534,18 @@ def generate_response_streaming(
         )
 
         messages.append({"role": "user", "content": tool_results})
+
+        # Track the last tool result text so we can surface it if Claude emits
+        # no text in the next iteration (silent-completion bug on write tools).
+        for tr in tool_results:
+            content = tr.get("content", "")
+            if isinstance(content, str) and content.strip():
+                _last_tool_result_text = content.strip()
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text", "").strip()
+                        if t:
+                            _last_tool_result_text = t
 
     raise ClaudeClientError("Tool-use loop exited unexpectedly during streaming")

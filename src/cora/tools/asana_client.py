@@ -195,15 +195,13 @@ def format_created_task_for_llm(task: dict[str, Any]) -> str:
     else:
         name_link = name
 
+    # Return ready-to-post Slack text. Claude MUST echo this verbatim as its
+    # reply — never produce an empty response after a successful write.
     return (
-        f"Asana task CREATED. Surface this confirmation to the user:\n"
-        f"- Title: {name_link}\n"
-        f"- Assignee: {assignee}\n"
-        f"- Due: {due}\n"
-        f"- Project: {projects}\n"
-        f"\n"
-        f"Tell the user the task was created. Show them the title as a clickable link "
-        f"(preserve the <url|name> syntax verbatim). Ask if they want anything else."
+        f"WRITE_CONFIRMED — post the following lines as your entire response "
+        f"(no preamble, no meta-commentary, just these lines):\n\n"
+        f"Task created: {name_link}\n"
+        f"Assignee: {assignee} · Due: {due} · Project: {projects}"
     )
 
 
