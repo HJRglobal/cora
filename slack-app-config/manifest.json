@@ -19,13 +19,17 @@
         "groups:read",
         "users:read",
         "channels:history",
-        "groups:history"
+        "groups:history",
+        "im:history",
+        "im:read",
+        "im:write",
+        "reactions:read"
       ]
     }
   },
   "settings": {
     "event_subscriptions": {
-      "bot_events": ["app_mention"]
+      "bot_events": ["app_mention", "message.im", "reaction_added", "reaction_removed"]
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,

@@ -23,6 +23,7 @@ from . import knowledge_gaps
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import model_router
+from .tools import osn_shift_handler
 from .prompt_loader import load_prompt
 from . import rate_limiter
 from . import semantic_cache as sc
@@ -178,6 +179,18 @@ def handle_mention(event: dict, say: callable, client) -> None:
             user_id=user_id or "", content=note_content, original_ts=thread_ts or "",
         )
         return
+
+    # ── OSN shift scheduler admin commands ────────────────────────────────────
+    if entity == "OSN":
+        sched_reply = osn_shift_handler.handle_admin_command(
+            text=user_message,
+            slack_user_id=user_id or "",
+            channel_id=channel_id,
+            client=client,
+        )
+        if sched_reply is not None:
+            say(text=sched_reply, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+            return
 
     log.info(
         "app_mention routed channel=#%s user=%s → entity=%s function=%s tier=%s",
@@ -558,24 +571,32 @@ def _handle_note(
 # Bolt requires an explicit event listener for "message" events.
 @app.event("message")
 def handle_message_event(event: dict, client) -> None:
-    """Capture correction-intent thread replies directed at Cora's output."""
-    # Only interested in thread replies (has thread_ts != ts)
+    """Route DMs to OSN shift scheduler; capture correction-intent thread replies."""
+    # Skip bot messages
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return
+
+    channel_id = event.get("channel", "")
+    user_id = event.get("user", "")
+    text = event.get("text", "").strip()
+
+    if not channel_id or not user_id or not text:
+        return
+
+    # ── DM routing: channel_type "im" means it's a direct message ────────────
+    channel_type = event.get("channel_type", "")
+    if channel_type == "im":
+        log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
+        osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+        return
+
+    # ── Correction capture (thread replies only) ──────────────────────────────
     thread_ts = event.get("thread_ts")
     msg_ts = event.get("ts")
     if not thread_ts or thread_ts == msg_ts:
         return  # top-level message, not a reply
 
-    # Skip bot messages
-    if event.get("bot_id") or event.get("subtype") == "bot_message":
-        return
-
-    text = event.get("text", "").strip()
     if not team_learning.is_correction(text):
-        return
-
-    channel_id = event.get("channel", "")
-    user_id = event.get("user", "")
-    if not channel_id or not user_id:
         return
 
     channel_name = _resolve_channel_name(client, channel_id)
@@ -635,6 +656,26 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     reactor = event.get("user", "")
     reaction = event.get("reaction", "")
     message_ts = item.get("ts", "")
+
+    # ── OSN schedule approval via ✅ reaction ─────────────────────────────────
+    if event_type == "reaction_added" and reaction == "white_check_mark":
+        sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
+            reaction=reaction,
+            message_ts=message_ts,
+            reactor_user_id=reactor,
+            client=client,
+        )
+        if sched_reply:
+            try:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=message_ts,
+                    text=sched_reply,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+            except Exception as exc:
+                log.error("osn schedule approval reply failed: %s", exc)
 
     # ── Team learning: approval/decline of pending contributions ──────────────
     # Only process ✅ / ❌ on reaction_added (not removal). Look up by the ts
