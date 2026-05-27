@@ -26,6 +26,7 @@ Deep-link pattern: Drive API returns `webViewLink` per file. Looks like:
 from __future__ import annotations
 
 import datetime
+import io
 import logging
 import os
 import re
@@ -36,6 +37,7 @@ from typing import Iterator
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 log = logging.getLogger(__name__)
 
@@ -547,3 +549,120 @@ def backfill(modified_after: int | None = None) -> Iterator:
             log.info("Drive walk progress: %d indexable files yielded so far", count)
 
     log.info("Drive walk complete: %d total indexable files", count)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Write helpers — folder creation + file upload (used by attachment_filer)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def ensure_folder_path(path_segments: list[str]) -> str:
+    """Find or create a nested folder path under HJR-Founder-OS. Returns the leaf folder ID.
+
+    path_segments is a list of folder names relative to the root, e.g.:
+        ["02-F3-Energy", "contracts"]
+
+    Each segment is looked up as an immediate child of the current folder. If the
+    child folder doesn't exist, it is created. The function is idempotent — calling
+    it twice with the same path returns the same folder ID without duplicating folders.
+    """
+    service = _build_drive_service()
+    current_id = _resolve_root_folder_id(service)
+
+    for segment in path_segments:
+        try:
+            resp = service.files().list(
+                q=(
+                    f"name = '{segment}' "
+                    f"and mimeType = '{_FOLDER_MIME}' "
+                    f"and '{current_id}' in parents "
+                    f"and trashed = false"
+                ),
+                fields="files(id, name)",
+                pageSize=5,
+            ).execute()
+        except HttpError as exc:
+            raise DriveConnectorError(
+                f"Folder search failed for {segment!r}: {exc}"
+            ) from exc
+
+        files = resp.get("files", [])
+        if files:
+            current_id = files[0]["id"]
+        else:
+            try:
+                folder = service.files().create(
+                    body={
+                        "name": segment,
+                        "mimeType": _FOLDER_MIME,
+                        "parents": [current_id],
+                    },
+                    fields="id",
+                ).execute()
+                current_id = folder["id"]
+                log.info("Created Drive folder %r (id=%s)", segment, current_id)
+            except HttpError as exc:
+                raise DriveConnectorError(
+                    f"Folder creation failed for {segment!r}: {exc}"
+                ) from exc
+
+    return current_id
+
+
+def upload_file(
+    parent_folder_id: str,
+    filename: str,
+    content: bytes,
+    mime_type: str,
+) -> tuple[str, str]:
+    """Upload bytes as a new file in parent_folder_id. Returns (file_id, web_view_link).
+
+    If a file with the same name already exists in that folder, the upload is skipped
+    and the existing file's ID + link are returned to preserve idempotency.
+    """
+    service = _build_drive_service()
+
+    # Dedup: check for existing file with same name in same folder
+    try:
+        resp = service.files().list(
+            q=(
+                f"name = '{filename}' "
+                f"and '{parent_folder_id}' in parents "
+                f"and trashed = false"
+            ),
+            fields="files(id, webViewLink)",
+            pageSize=2,
+        ).execute()
+    except HttpError as exc:
+        raise DriveConnectorError(f"Dedup check failed for {filename!r}: {exc}") from exc
+
+    existing = resp.get("files", [])
+    if existing:
+        log.info(
+            "Drive dedup: %r already exists in folder %s — skipping upload",
+            filename, parent_folder_id,
+        )
+        return existing[0]["id"], existing[0].get("webViewLink", "")
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(content),
+        mimetype=mime_type,
+        resumable=False,
+    )
+
+    try:
+        result = service.files().create(
+            body={"name": filename, "parents": [parent_folder_id]},
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+    except HttpError as exc:
+        raise DriveConnectorError(
+            f"Drive upload failed for {filename!r}: {exc}"
+        ) from exc
+
+    log.info(
+        "Uploaded %r to Drive folder %s (file_id=%s)",
+        filename, parent_folder_id, result["id"],
+    )
+    return result["id"], result.get("webViewLink", "")

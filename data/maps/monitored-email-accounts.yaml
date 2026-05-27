@@ -1,0 +1,23 @@
+# Email accounts to monitor for attachment auto-filing.
+#
+# The Google Workspace service account needs gmail.modify DWD scope for every
+# account listed here. Add the scope in:
+#   Google Admin → Security → API Controls → Domain-wide Delegation
+#   → Edit the Cora service account entry → add:
+#     https://www.googleapis.com/auth/gmail.modify
+#
+# All filed attachments go to the shared HJR-Founder-OS Drive (accessed as
+# harrison@hjrglobal.com regardless of which account the email arrived in).
+#
+# To add an org member: copy the block below, set enabled: true, push, and ensure
+# the DWD scope is granted before the next scheduled run.
+
+accounts:
+  - email: harrison@hjrglobal.com
+    name: Harrison
+    enabled: true
+
+  # Uncomment and fill in as the team expands:
+  # - email: teammate@hjrglobal.com
+  #   name: Teammate Name
+  #   enabled: false
