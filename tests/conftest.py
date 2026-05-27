@@ -12,6 +12,72 @@ when the client creation is under test mocks.
 """
 
 import os
+import sys
+import types
+from unittest.mock import patch
+
+
+def _install_fake_tiktoken() -> None:
+    """Register a network-free tiktoken stub in sys.modules before any source
+    module is imported.
+
+    chunker.py calls tiktoken.get_encoding("cl100k_base") at module load time.
+    In CI / sandbox environments the encoding file cannot be fetched from
+    openaipublic.blob.core.windows.net (403 / network-blocked), which causes a
+    collection error for any test that transitively imports chunker.
+
+    The stub treats each Unicode code-point as one token (len(text) tokens),
+    which is deterministic and sufficient for the chunker's correctness tests.
+    The encode/decode pair is reversible for ASCII inputs so the hard-truncation
+    path in chunk_text() also works correctly.
+    """
+    if "tiktoken" in sys.modules:
+        return
+
+    class _FakeEncoder:
+        def encode(self, text, disallowed_special=()):
+            return [ord(c) for c in text]
+
+        def decode(self, tokens):
+            return "".join(chr(t) for t in tokens)
+
+    _encoder = _FakeEncoder()
+    fake = types.SimpleNamespace(get_encoding=lambda name: _encoder)
+    sys.modules["tiktoken"] = fake  # type: ignore[assignment]
+
+
+_install_fake_tiktoken()
+
+
+def _mock_slack_auth_test() -> None:
+    """Prevent the Bolt App() constructor from making a live auth.test call.
+
+    Bolt calls slack_sdk's auth.test immediately when App(token=...) is
+    constructed.  In tests we use a dummy token, so that call would reach
+    Slack's servers and fail.  This patch intercepts it at the SDK level and
+    returns a minimal successful response so any test file that imports
+    cora.app can do so safely without a network connection.
+
+    The patcher is never stopped — the mock remains in effect for the whole
+    pytest session.  Real Slack interaction is never needed in unit tests.
+    """
+    fake_response = {
+        "ok": True,
+        "url": "https://test.slack.com/",
+        "user_id": "U_CORA_TEST",
+        "team": "TestWorkspace",
+        "user": "testbot",
+        "team_id": "T_TEST",
+        "bot_id": "B_TEST",
+    }
+    patcher = patch(
+        "slack_sdk.web.client.WebClient.auth_test",
+        return_value=fake_response,
+    )
+    patcher.start()
+
+
+_mock_slack_auth_test()
 
 
 def pytest_configure(config):
