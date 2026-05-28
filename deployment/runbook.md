@@ -1,5 +1,34 @@
 # Cora Operations Runbook
 
+## Scheduled Tasks Registry
+
+| Task Name | Schedule | Script | Channel | Setup Script |
+|---|---|---|---|---|
+| `cowork-cora-service` | On logon + RestartOnFailure | `cora.main` (bot process) | All Slack channels | `deployment/runbook.md` |
+| `cowork-cora-influencer-scan` | Every 2 hours | `scripts/run_influencer_scan.py` | `#f3-sales` | `deployment/setup-influencer-scan-task.ps1` |
+| `Cora - Email Attachment Filer` | Every 4 hours | `scripts/run_attachment_filer.py` | n/a (files to Drive) | `deployment/setup-attachment-filer-task.ps1` |
+| `Cora - LinkedIn Spy` | Every Monday at 8:00 AM | `scripts/run_linkedin_spy.py` | `#f3e-sales` | `deployment/setup-linkedin-spy-task.ps1` |
+
+**LinkedIn Spy quick ops:**
+```powershell
+# Run immediately (posts to #f3e-sales)
+Start-ScheduledTask -TaskName "Cora - LinkedIn Spy"
+
+# Check last run
+Get-ScheduledTaskInfo -TaskName "Cora - LinkedIn Spy" | Select LastRunTime, LastTaskResult
+
+# Expand prospect pool (edit then save — no restart needed)
+notepad data\maps\linkedin-spy-search-config.yaml
+
+# Remove task
+.\deployment\remove-linkedin-spy-task.ps1
+```
+
+**Apollo trial expires June 10, 2026.** After that, scanner silently returns 0 results.
+Upgrade at https://app.apollo.io/#/settings/billing before June 7.
+
+---
+
 ## Operating Cora
 
 **Start:**
