@@ -82,11 +82,11 @@ $action = New-ScheduledTaskAction `
     -Argument "run python `"$SCRIPT`"" `
     -WorkingDirectory $REPO_DIR
 
-# Fire at logon, then repeat every 15 minutes indefinitely
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$trigger.RepetitionInterval = [TimeSpan]::FromMinutes(15)
-$trigger.RepetitionDuration = [TimeSpan]::MaxValue
-$trigger.StopAtDurationEnd  = $false
+# Repeat every 15 minutes; StartWhenAvailable covers missed firings (logon, wake from sleep)
+$trigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 15)
 
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances   IgnoreNew `
