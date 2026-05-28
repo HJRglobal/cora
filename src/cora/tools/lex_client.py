@@ -7,13 +7,13 @@ lex_revalidation_status
     #lex-leadership brief and any in-thread revalidation question.
 
 lex_staff_pulse
-    BLOCKED — depends on Sean/Jen Drive upload pipeline (Sean + Jen upload
-    DDD staffing reports + driver safety CSVs to a shared Drive folder;
-    Cora ingests for context). Returns a stub message until the pipeline is
-    configured. Placeholder wiring keeps the tool in the catalog so it can
-    be activated without a restart once the pipeline is ready.
+    Reads the most-recently modified files from the Sean/Jen DDD staffing +
+    driver safety Drive folder (ID: 1uU-nHtEz5bFNu-JTV4k5BidkfmKAqVfG).
+    Parses CSV and Excel uploads and returns a staffing summary.
 """
 
+import csv
+import io
 import logging
 import os
 from datetime import date, datetime, timezone
@@ -245,24 +245,249 @@ def get_revalidation_status() -> str:
     return "\n".join(lines)
 
 
+_STAFF_PULSE_FOLDER_ID = "1uU-nHtEz5bFNu-JTV4k5BidkfmKAqVfG"
+
+# Column-name synonyms for common staffing fields (case-insensitive substring match)
+_COL_OPEN_POSITION = ("open position", "vacancy", "vacant", "unfilled", "opening")
+_COL_TERMINATION   = ("terminat", "separated", "resigned", "left", "exit")
+_COL_TRAINING      = ("training", "compliance", "certif", "expir")
+_COL_STATUS        = ("status", "active", "inactive", "employed")
+_COL_NAME          = ("name", "employee", "staff", "worker", "driver")
+
+
+def _drive_service():
+    """Build a Drive v3 service via the shared drive_connector helper."""
+    try:
+        from ..connectors.drive_connector import _build_drive_service
+        return _build_drive_service()
+    except ImportError as exc:
+        raise LexClientError(f"Drive connector not available: {exc}") from exc
+    except Exception as exc:
+        raise LexClientError(f"Drive auth failed: {exc}") from exc
+
+
+def _list_folder_files(service, folder_id: str) -> list[dict[str, Any]]:
+    """Return files in the folder sorted newest-first (by modifiedTime)."""
+    try:
+        from googleapiclient.errors import HttpError
+    except ImportError as exc:
+        raise LexClientError(f"Google API client not available: {exc}") from exc
+
+    try:
+        resp = (
+            service.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="files(id,name,mimeType,modifiedTime,size)",
+                orderBy="modifiedTime desc",
+                pageSize=20,
+            )
+            .execute()
+        )
+    except Exception as exc:
+        raise LexClientError(f"Drive folder listing failed: {exc}") from exc
+
+    return resp.get("files", [])
+
+
+def _download_file_bytes(service, file_id: str, mime_type: str) -> bytes:
+    """Download a file's raw bytes, exporting Google Sheets as CSV if needed."""
+    try:
+        from googleapiclient.errors import HttpError
+        from googleapiclient.http import MediaIoBaseDownload
+    except ImportError as exc:
+        raise LexClientError(f"Google API client not available: {exc}") from exc
+
+    buf = io.BytesIO()
+    try:
+        if mime_type == "application/vnd.google-apps.spreadsheet":
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType="text/csv",
+            )
+        else:
+            request = service.files().get_media(fileId=file_id)
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    except Exception as exc:
+        raise LexClientError(f"Drive download failed for {file_id}: {exc}") from exc
+
+    return buf.getvalue()
+
+
+def _col_index(headers: list[str], synonyms: tuple[str, ...]) -> int | None:
+    """Return the first column index whose header contains any synonym (case-insensitive)."""
+    for i, h in enumerate(headers):
+        h_lower = h.lower()
+        if any(s in h_lower for s in synonyms):
+            return i
+    return None
+
+
+def _parse_csv_bytes(raw: bytes, filename: str) -> str:
+    """Parse CSV bytes and return a human-readable summary."""
+    try:
+        text = raw.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+    except Exception as exc:
+        return f"Could not parse {filename}: {exc}"
+
+    if not rows:
+        return f"{filename}: empty file"
+
+    headers = [h.strip() for h in rows[0]]
+    data = rows[1:]
+    total_rows = len(data)
+
+    if total_rows == 0:
+        return f"{filename}: header only, no data rows"
+
+    lines = [f"*{filename}* — {total_rows} records"]
+
+    # Find and summarize key columns
+    name_col   = _col_index(headers, _COL_NAME)
+    status_col = _col_index(headers, _COL_STATUS)
+    train_col  = _col_index(headers, _COL_TRAINING)
+    term_col   = _col_index(headers, _COL_TERMINATION)
+    open_col   = _col_index(headers, _COL_OPEN_POSITION)
+
+    # Active vs inactive count
+    if status_col is not None:
+        statuses = [r[status_col].strip().lower() for r in data if len(r) > status_col]
+        active = sum(1 for s in statuses if "active" in s or "employed" in s or s == "yes" or s == "1")
+        inactive = sum(1 for s in statuses if "inactive" in s or "terminat" in s or s == "no" or s == "0")
+        lines.append(f"  Active: {active}  |  Inactive/termed: {inactive}")
+
+    # Open positions
+    if open_col is not None:
+        open_vals = [r[open_col].strip() for r in data if len(r) > open_col]
+        open_count = sum(1 for v in open_vals if v.lower() in ("yes", "true", "1", "open", "vacant"))
+        if open_count:
+            lines.append(f"  Open positions: {open_count}")
+
+    # Recent terminations — rows where term_col is non-empty
+    if term_col is not None:
+        termed = [r for r in data if len(r) > term_col and r[term_col].strip() and r[term_col].strip().lower() not in ("", "no", "false", "0")]
+        if termed:
+            lines.append(f"  Recent terminations/separations: {len(termed)}")
+            if name_col is not None:
+                for r in termed[:5]:
+                    n = r[name_col].strip() if len(r) > name_col else "?"
+                    t = r[term_col].strip()
+                    lines.append(f"    - {n}: {t}")
+
+    # Training compliance
+    if train_col is not None:
+        train_vals = [r[train_col].strip() for r in data if len(r) > train_col]
+        compliant = sum(1 for v in train_vals if v.lower() in ("yes", "true", "1", "current", "complete", "compliant"))
+        expired   = sum(1 for v in train_vals if v.lower() in ("no", "false", "0", "expired", "overdue", "non-compliant"))
+        if compliant or expired:
+            lines.append(f"  Training compliance: {compliant} current, {expired} expired/overdue")
+
+    # If no known columns found, show column names so Harrison can update the parser
+    if all(c is None for c in [name_col, status_col, train_col, term_col, open_col]):
+        lines.append(f"  Columns found: {', '.join(headers[:10])}")
+        lines.append("  (No standard staffing columns detected — update _COL_* mappings in lex_client.py)")
+
+    return "\n".join(lines)
+
+
+def _parse_excel_bytes(raw: bytes, filename: str) -> str:
+    """Parse Excel bytes and return a human-readable summary."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+    except Exception as exc:
+        return f"Could not parse Excel {filename}: {exc}"
+
+    if not rows:
+        return f"{filename}: empty workbook"
+
+    # Convert to list of string rows — same path as CSV parser
+    str_rows = [[str(c) if c is not None else "" for c in row] for row in rows]
+    # Write to an in-memory CSV and re-use the CSV parser
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerows(str_rows)
+    return _parse_csv_bytes(buf.getvalue().encode("utf-8"), filename)
+
+
+_PARSEABLE_MIMES = {
+    "text/csv",
+    "text/plain",
+    "application/csv",
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+}
+
+
 def get_staff_pulse() -> str:
-    """Return LEX staffing pulse from the Drive upload pipeline.
+    """Return LEX staffing pulse from the Sean/Jen Drive upload folder.
 
-    BLOCKED -- depends on Sean/Jen DDD staffing + driver safety Drive upload
-    pipeline. Until the pipeline folder is configured and the nightly sync is
-    pointed at it, this tool returns a structured stub.
-
-    Wire-up checklist (Harrison):
-      1. Lock the Drive folder path for Sean/Jen uploads.
-      2. Add STAFF_PULSE_DRIVE_FILE_ID to .env.
-      3. Implement the actual read + parse in this function.
-      4. Remove the BLOCKED stub below.
+    Reads the most-recently modified files from the staffing Drive folder,
+    parses CSV and Excel uploads, and returns a staffing summary.
     """
-    log.info("lex_staff_pulse called -- pipeline not yet configured (BLOCKED)")
-    return (
-        "Lex staffing pulse is not yet available. The staffing data pipeline (Sean + Jen "
-        "Drive upload folder) has not been configured. Once the folder is set up and the "
-        "nightly sync is pointed at it, this tool will return open positions, recent "
-        "terminations, and training compliance counts. Ask Harrison to lock the Drive folder "
-        "path to unblock this."
-    )
+    log.info("lex_staff_pulse: reading Drive folder %s", _STAFF_PULSE_FOLDER_ID)
+
+    try:
+        service = _drive_service()
+    except LexClientError as exc:
+        log.warning("lex_staff_pulse: drive auth failed: %s", exc)
+        return "I don't have that right now — Drive credentials are not available."
+
+    try:
+        files = _list_folder_files(service, _STAFF_PULSE_FOLDER_ID)
+    except LexClientError as exc:
+        log.warning("lex_staff_pulse: folder listing failed: %s", exc)
+        return "I don't have that right now — couldn't read the staffing folder."
+
+    if not files:
+        return (
+            "The LEX staffing folder exists but contains no files yet. "
+            "Ask Sean or Jen to upload a DDD staffing report or driver safety CSV."
+        )
+
+    parseable = [f for f in files if f.get("mimeType") in _PARSEABLE_MIMES]
+    if not parseable:
+        names = [f.get("name", "?") for f in files[:5]]
+        return (
+            f"The staffing folder has {len(files)} file(s) but none are CSV or spreadsheet format. "
+            f"Files found: {', '.join(names)}. "
+            "Ask Sean or Jen to upload CSV or Excel files."
+        )
+
+    summaries: list[str] = []
+    # Parse up to 3 most-recent parseable files
+    for f in parseable[:3]:
+        fid   = f["id"]
+        fname = f.get("name", fid)
+        fmime = f.get("mimeType", "")
+        mtime = f.get("modifiedTime", "")[:10]  # YYYY-MM-DD
+
+        try:
+            raw = _download_file_bytes(service, fid, fmime)
+        except LexClientError as exc:
+            summaries.append(f"*{fname}* — could not download: {exc}")
+            continue
+
+        if fmime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ):
+            summaries.append(_parse_excel_bytes(raw, fname) + f" _(updated {mtime})_")
+        else:
+            summaries.append(_parse_csv_bytes(raw, fname) + f" _(updated {mtime})_")
+
+    if not summaries:
+        return "I don't have that right now — could not read any files from the staffing folder."
+
+    header = "*LEX Staffing Pulse*\n"
+    log.info("lex_staff_pulse: parsed %d file(s) from folder", len(summaries))
+    return header + "\n\n".join(summaries)

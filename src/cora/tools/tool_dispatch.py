@@ -1334,7 +1334,7 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
     """Fetch current-week cash flow from the Standing ACTUALS sheet."""
     inp = _input or {}
     channel_name = inp.get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
+    if not _is_tier1_channel(entity, channel_name):
         return _FINANCE_CHANNEL_REQUIRED
     # Cross-entity gate: FNDR/HJRG can override entity_filter; all others are
     # locked to their own entity — prevents e.g. #osn-finance querying LEX data.
@@ -1372,7 +1372,7 @@ def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) ->
 def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch OSN store-by-store financial snapshot from the OSN Consolidated cashflow tab."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
+    if not _is_tier1_channel(entity, channel_name):
         return _FINANCE_CHANNEL_REQUIRED
     log.info("osn_financial_pulse user=%s entity=%s", slack_user_id, entity)
     return financial_client.get_osn_pulse_text(
@@ -2188,11 +2188,7 @@ def _tool_lex_revalidation_status(slack_user_id: str, entity: str, _input: dict)
 
 
 def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return Lex staffing pulse from the Drive upload pipeline.
-
-    BLOCKED until Sean/Jen staffing Drive folder is configured. Returns a
-    structured stub message explaining the dependency.
-    """
+    """Return Lex staffing pulse from the Sean/Jen Drive upload folder."""
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_hr_channel(channel_name) and not _is_founder_entity(entity):
         return _HR_CHANNEL_REQUIRED
@@ -3783,17 +3779,18 @@ TOOL_DEFINITIONS = [
     {
         "name": "lex_staff_pulse",
         "description": (
-            "Return Lexington staffing pulse data (open positions, recent terminations, "
-            "training compliance counts). BLOCKED pending Sean/Jen Drive upload pipeline "
-            "configuration. Call this when users ask about Lex staffing levels, open roles, "
-            "recent staff departures, or training compliance status. Returns a structured "
-            "stub message explaining the pipeline dependency until the Drive folder is "
-            "configured.\n"
+            "Return Lexington staffing pulse data from the Sean/Jen Drive upload folder — "
+            "open positions, recent terminations, and training compliance counts. "
+            "ALWAYS call this tool when a user asks about Lex staffing levels, open roles, "
+            "recent staff departures, driver safety, or training compliance status. "
+            "Do NOT answer from KB memory — this tool fetches the most-recently uploaded "
+            "staffing and driver safety reports and returns a live summary.\n"
             "\n"
             "Trigger phrases: 'staffing', 'open positions', 'staff turnover', 'training "
-            "compliance', 'how many staff', 'driver safety compliance'.\n"
+            "compliance', 'how many staff', 'driver safety compliance', 'who left', "
+            "'recent terminations', 'staffing report'.\n"
             "\n"
-            "Scope: LEX / LEX-* channels and FNDR/HJRG."
+            "Scope: LEX / LEX-* channels and FNDR/HJRG. HR channel required or founder entity."
         ),
         "input_schema": {
             "type": "object",
