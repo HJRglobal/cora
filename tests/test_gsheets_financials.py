@@ -524,10 +524,18 @@ class TestCashflowCache:
         )
 
     def _patches(self, fake_export_csv):
-        """Return an ExitStack with the three standard patches applied."""
+        """Return an ExitStack with the standard patches applied."""
         stack = ExitStack()
         stack.enter_context(patch(
+            "cora.connectors.gsheets_financials._build_delegated_creds",
+            return_value=MagicMock(),
+        ))
+        stack.enter_context(patch(
             "cora.connectors.gsheets_financials._build_drive_service",
+            return_value=MagicMock(),
+        ))
+        stack.enter_context(patch(
+            "cora.connectors.gsheets_financials._build_sheets_service",
             return_value=MagicMock(),
         ))
         stack.enter_context(patch(
@@ -535,18 +543,18 @@ class TestCashflowCache:
             return_value="2026-05-22",
         ))
         stack.enter_context(patch(
-            "cora.connectors.gsheets_financials._export_csv",
+            "cora.connectors.gsheets_financials._export_sheet_as_csv",
             side_effect=fake_export_csv,
         ))
         return stack
 
     def test_cache_hit_skips_second_drive_call(self):
-        """Second get_cashflow() call within TTL should NOT call _export_csv again."""
+        """Second get_cashflow() call within TTL should NOT call _export_sheet_as_csv again."""
         invalidate_cache()
         csv_text = self._make_standard_csv()
         call_count = {"n": 0}
 
-        def fake_export_csv(service, file_id):
+        def fake_export_csv(service, file_id, sheet_name):
             call_count["n"] += 1
             return csv_text
 
@@ -564,7 +572,7 @@ class TestCashflowCache:
         csv_text = self._make_standard_csv()
         call_count = {"n": 0}
 
-        def fake_export_csv(service, file_id):
+        def fake_export_csv(service, file_id, sheet_name):
             call_count["n"] += 1
             return csv_text
 
@@ -577,12 +585,12 @@ class TestCashflowCache:
 
     def test_cache_ttl_expiry(self):
         """A cache entry older than TTL should be re-fetched."""
-        from cora.connectors.gsheets_financials import _CACHE, cashflow_file_id, _CACHE_TTL_SECONDS
+        from cora.connectors.gsheets_financials import _CACHE, cashflow_file_id, _CACHE_TTL_SECONDS, _cashflow_sheet_name
         invalidate_cache()
         csv_text = self._make_standard_csv()
         call_count = {"n": 0}
 
-        def fake_export_csv(service, file_id):
+        def fake_export_csv(service, file_id, sheet_name):
             call_count["n"] += 1
             return csv_text
 
@@ -590,9 +598,11 @@ class TestCashflowCache:
             get_cashflow()
             # Backdate the cache entry so it looks expired
             fid = cashflow_file_id()
-            if fid in _CACHE:
-                old_ts, summary = _CACHE[fid]
-                _CACHE[fid] = (old_ts - _CACHE_TTL_SECONDS - 1, summary)
+            tab = _cashflow_sheet_name()
+            cache_key = (fid, tab)
+            if cache_key in _CACHE:
+                old_ts, summary = _CACHE[cache_key]
+                _CACHE[cache_key] = (old_ts - _CACHE_TTL_SECONDS - 1, summary)
             get_cashflow()  # stale → should re-fetch
 
         assert call_count["n"] == 2
