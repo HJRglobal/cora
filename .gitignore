@@ -41,4 +41,5 @@ tmp_*.py
 tmp_*.txt
 data/*.db
 data/cache/*.json
+data/cache/*.db
 data/*_watermarks.json
