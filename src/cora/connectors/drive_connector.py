@@ -99,6 +99,8 @@ _BLACKLIST_SEGMENTS = frozenset({
     # Personal finances - Harrison's K-1s, 1065s, IRS correspondence, SSN risk
     "personal-finances", "personal_finances", "personal finances",
     "taxes", "tax-returns", "tax returns",
+    # Tax planning workbooks — contain SSNs, K-1 amounts, personal income data
+    "monthly tax conversions", "monthly-tax-conversions",
     # Medical
     "medical",
     # Archives (we don't index legacy folders that have been retired)
