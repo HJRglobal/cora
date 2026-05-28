@@ -12,6 +12,7 @@ from .claude_client import (
     generate_response_streaming,
     user_facing_message,
 )
+from . import active_thread_store
 from . import channel_classifier
 from .config import config
 from .context_loader import load_context
@@ -135,6 +136,245 @@ def _fetch_thread_history(
     return merged
 
 
+def _dispatch_qa(
+    *,
+    channel_id: str,
+    channel_name: str,
+    user_id: str | None,
+    user_message: str,
+    reply_thread_ts: str,
+    entity: str,
+    client,
+    say,
+    prior_messages: list[dict] | None = None,
+    root_thread_ts: str | None = None,
+) -> None:
+    """Core Q&A pipeline — intent → cache → KB → Claude → post response.
+
+    Shared between handle_mention (for @-mention triggers) and the thread
+    follow-up path in handle_message_event (for replies in active threads
+    without a fresh @-mention). After a successful response the thread is
+    registered in active_thread_store so subsequent replies stay in context.
+
+    Args:
+        channel_id:       Slack channel ID.
+        channel_name:     Resolved channel name (without #).
+        user_id:          Slack user ID of the person who sent the message.
+        user_message:     Cleaned message text (no @Cora prefix).
+        reply_thread_ts:  The thread_ts to reply into.
+        entity:           Resolved entity code (e.g. "F3E", "OSN").
+        client:           Slack WebClient from Bolt.
+        say:              Callable that posts to the current channel (Bolt's
+                          say() or a lambda wrapping chat_postMessage).
+        prior_messages:   List of prior {role, content} dicts for thread context.
+        root_thread_ts:   Thread root to register in active_thread_store after
+                          responding. Defaults to reply_thread_ts if None.
+    """
+    if prior_messages is None:
+        prior_messages = []
+    register_ts = root_thread_ts or reply_thread_ts
+
+    function = channel_classifier.classify_function(channel_name)
+    tier = channel_classifier.tier_label(entity, function)
+
+    runtime_context = (
+        f"## Runtime channel context\n\n"
+        f"This channel (#{channel_name}) has these properties:\n"
+        f"- Entity: {entity}\n"
+        f"- Function: {function}\n"
+        f"- Financial-access tier: {tier}\n\n"
+        f"Apply the cross-entity and financial guardrails accordingly.\n\n"
+        f"---\n\n"
+    )
+
+    t0 = time.monotonic()
+
+    # ── Intent classification + semantic cache ─────────────────────────────
+    intent = ic.classify(user_message, entity)
+    hints  = ic.routing_hints(intent)
+
+    log.info(
+        "intent_classify channel=#%s user=%s intent=%s skip_kb=%s bypass_cache=%s",
+        channel_name, user_id, intent, hints.skip_kb, hints.bypass_cache,
+    )
+
+    question_embedding: list[float] | None = None
+    if not hints.bypass_cache:
+        try:
+            question_embedding = kb_embeddings.embed_query(user_message)
+            cached_response = sc.get_cache().lookup(entity, question_embedding)
+            if cached_response:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                log.info(
+                    "semantic_cache served channel=#%s user=%s entity=%s latency_ms=%d",
+                    channel_name, user_id, entity, latency_ms,
+                )
+                say(
+                    text=cached_response,
+                    thread_ts=reply_thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+                active_thread_store.register(channel_id, register_ts)
+                return
+        except Exception as exc:
+            log.warning("semantic_cache lookup error for entity=%s: %s", entity, exc)
+
+    # ── Context + prompt loading ───────────────────────────────────────────
+    context = load_context(
+        entity,
+        query=user_message,
+        skip_kb=hints.skip_kb,
+        kb_k=hints.kb_k_override,
+    )
+    prompt = load_prompt(entity)
+    chosen_model = model_router.choose_model(user_message)
+    log.info(
+        "model_routing channel=#%s user=%s model=%s msg_chars=%d",
+        channel_name, user_id, model_router.short_label(chosen_model), len(user_message),
+    )
+
+    # ── Streaming: post placeholder, then update it as Claude streams ──────
+    placeholder_ts: str | None = None
+    placeholder_channel: str = channel_id
+    try:
+        placeholder_resp = say(
+            text=":thought_balloon: thinking…",
+            thread_ts=reply_thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        placeholder_ts = placeholder_resp.get("ts")
+        placeholder_channel = placeholder_resp.get("channel") or channel_id
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Placeholder post failed for channel=%s user=%s: %s — falling back to non-streaming",
+            channel_id, user_id, exc,
+        )
+
+    if placeholder_ts is None:
+        # ── Fallback: non-streaming path ──
+        try:
+            response_text = generate_response(
+                prompt,
+                runtime_context + context,
+                user_message,
+                slack_user_id=user_id or "",
+                entity=entity,
+                model=chosen_model,
+                prior_messages=prior_messages,
+                channel_name=channel_name,
+            )
+        except ClaudeClientError as exc:
+            log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
+            say(text=user_facing_message(exc), thread_ts=reply_thread_ts)
+            return
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        response_text = _extract_and_log_gap(
+            response_text, entity, channel_name, user_id, user_message, latency_ms,
+        )
+        _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+        log.info(
+            "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
+            entity, channel_name, user_id, latency_ms, len(response_text),
+        )
+        say(
+            text=response_text,
+            thread_ts=reply_thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        active_thread_store.register(channel_id, register_ts)
+        return
+
+    # ── Streaming path ──
+    stream_id = placeholder_ts
+    throttle = slack_update_throttle.default_throttle
+
+    def update_callback(cumulative_text: str) -> None:
+        if not cumulative_text:
+            return
+        if not throttle.acquire(stream_id):
+            return
+        try:
+            client.chat_update(
+                channel=placeholder_channel,
+                ts=placeholder_ts,
+                text=cumulative_text,
+            )
+        except Exception as upd_exc:  # noqa: BLE001
+            log.warning(
+                "chat_update mid-stream failed for ts=%s: %s — stream continues",
+                placeholder_ts, upd_exc,
+            )
+
+    try:
+        response_text = generate_response_streaming(
+            prompt,
+            runtime_context + context,
+            user_message,
+            update_callback=update_callback,
+            slack_user_id=user_id or "",
+            entity=entity,
+            model=chosen_model,
+            prior_messages=prior_messages,
+            channel_name=channel_name,
+        )
+    except ClaudeClientError as exc:
+        log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
+        error_msg = user_facing_message(exc)
+        try:
+            client.chat_update(
+                channel=placeholder_channel,
+                ts=placeholder_ts,
+                text=error_msg,
+            )
+        except Exception as upd_exc:  # noqa: BLE001
+            log.error(
+                "Final error chat_update failed for ts=%s: %s — sending fresh reply",
+                placeholder_ts, upd_exc,
+            )
+            say(text=error_msg, thread_ts=reply_thread_ts)
+        throttle.release_stream(stream_id)
+        return
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    response_text = _extract_and_log_gap(
+        response_text, entity, channel_name, user_id, user_message, latency_ms,
+    )
+    _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+
+    skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
+    log.info(
+        "responded (streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d updates_skipped=%d",
+        entity, channel_name, user_id, latency_ms, len(response_text), skipped,
+    )
+
+    throttle.force_acquire(stream_id + "-final")
+    try:
+        client.chat_update(
+            channel=placeholder_channel,
+            ts=placeholder_ts,
+            text=response_text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "Final chat_update failed for ts=%s: %s — sending fresh reply as fallback",
+            placeholder_ts, exc,
+        )
+        say(
+            text=response_text,
+            thread_ts=reply_thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+
+    # Register AFTER the response is confirmed posted so only successful
+    # interactions activate the thread follow-up window.
+    active_thread_store.register(channel_id, register_ts)
+
+
 @app.event("app_mention")
 def handle_mention(event: dict, say: callable, client) -> None:
     channel_id = event.get("channel", "")
@@ -166,11 +406,8 @@ def handle_mention(event: dict, say: callable, client) -> None:
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
     user_message = _MENTION_RE.sub("", raw_text).strip()
-    function = channel_classifier.classify_function(channel_name)
-    tier = channel_classifier.tier_label(entity, function)
 
     # ── Write-back interception: @Cora note: <content> ────────────────────────
-    # Handled before Q&A pipeline — no KB retrieval, no Claude call.
     note_content = team_learning.parse_note(user_message)
     if note_content:
         _handle_note(
@@ -181,255 +418,42 @@ def handle_mention(event: dict, say: callable, client) -> None:
         return
 
     log.info(
-        "app_mention routed channel=#%s user=%s → entity=%s function=%s tier=%s",
-        channel_name, user_id, entity, function, tier,
+        "app_mention routed channel=#%s user=%s → entity=%s",
+        channel_name, user_id, entity,
     )
 
-    # Help-intent interception: if the user asked "what can you do" or similar,
-    # short-circuit before the Claude call with a deterministic capability blurb.
-    # Saves tokens, ensures consistent onboarding messaging across channels.
+    # Help-intent interception
     if help_responder.is_help_intent(user_message):
         log.info("help-intent detected channel=#%s user=%s", channel_name, user_id)
+        function = channel_classifier.classify_function(channel_name)
+        tier = channel_classifier.tier_label(entity, function)
         help_text = help_responder.build_message(entity, function, tier)
         say(text=help_text, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
         return
 
-    # Sibling-entity redirect interception: for LEX sub-entity channels, if the
-    # message asks about a sibling entity (e.g. LLA question in #llc channel),
-    # return the one-sentence redirect deterministically — no LLM call needed.
-    # This bypasses the LLM's helpfulness bias overriding format instructions.
+    # Sibling-entity redirect interception (LEX sub-entity channels)
     sibling_redirect = sibling_guard.check_redirect(entity, user_message)
     if sibling_redirect:
-        log.info(
-            "sibling-entity redirect fired channel=#%s entity=%s",
-            channel_name, entity,
-        )
-        say(
-            text=sibling_redirect,
-            thread_ts=thread_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        log.info("sibling-entity redirect fired channel=#%s entity=%s", channel_name, entity)
+        say(text=sibling_redirect, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
         return
 
-    runtime_context = (
-        f"## Runtime channel context\n\n"
-        f"This channel (#{channel_name}) has these properties:\n"
-        f"- Entity: {entity}\n"
-        f"- Function: {function}\n"
-        f"- Financial-access tier: {tier}\n\n"
-        f"Apply the cross-entity and financial guardrails accordingly.\n\n"
-        f"---\n\n"
+    # Root thread ts: if @mention is inside an existing thread use that root,
+    # otherwise this message IS the root.
+    root_thread_ts = event_thread_ts or thread_ts
+
+    _dispatch_qa(
+        channel_id=channel_id,
+        channel_name=channel_name,
+        user_id=user_id,
+        user_message=user_message,
+        reply_thread_ts=thread_ts,
+        entity=entity,
+        client=client,
+        say=say,
+        prior_messages=prior_messages,
+        root_thread_ts=root_thread_ts,
     )
-
-    t0 = time.monotonic()
-
-    # ── Intent classification + semantic cache ─────────────────────────────
-    # 1. Classify the question to get routing hints (no LLM call — regex only).
-    # 2. Embed the question once — reused for both cache lookup and KB search.
-    # 3. Check the semantic cache before touching the KB or Claude.
-    intent = ic.classify(user_message, entity)
-    hints  = ic.routing_hints(intent)
-
-    log.info(
-        "intent_classify channel=#%s user=%s intent=%s skip_kb=%s bypass_cache=%s",
-        channel_name, user_id, intent, hints.skip_kb, hints.bypass_cache,
-    )
-
-    question_embedding: list[float] | None = None
-    if not hints.bypass_cache:
-        try:
-            question_embedding = kb_embeddings.embed_query(user_message)
-            cached_response = sc.get_cache().lookup(entity, question_embedding)
-            if cached_response:
-                latency_ms = int((time.monotonic() - t0) * 1000)
-                log.info(
-                    "semantic_cache served channel=#%s user=%s entity=%s latency_ms=%d",
-                    channel_name, user_id, entity, latency_ms,
-                )
-                say(
-                    text=cached_response,
-                    thread_ts=thread_ts,
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
-                return
-        except Exception as exc:
-            # Cache miss due to error — not fatal; proceed normally
-            log.warning("semantic_cache lookup error for entity=%s: %s", entity, exc)
-
-    # ── Context loading (KB-augmented or static-only) ─────────────────────
-    # Phase 3: pass user_message as query so context_loader can augment with
-    # KB retrieval (top-K semantically-relevant chunks from cora_kb.db).
-    # Intent routing: FINANCIAL skips KB; SIMPLE/TASK_LOOKUP reduce k.
-    context = load_context(
-        entity,
-        query=user_message,
-        skip_kb=hints.skip_kb,
-        kb_k=hints.kb_k_override,
-    )
-    prompt = load_prompt(entity)
-
-    # Phase 6: route simple lookups to Haiku for ~3-5x speed-up; keep Sonnet for
-    # reasoning-heavy / analytical / drafting requests. Heuristic-only — see
-    # model_router.choose_model() for the rules.
-    chosen_model = model_router.choose_model(user_message)
-    log.info(
-        "model_routing channel=#%s user=%s model=%s msg_chars=%d",
-        channel_name, user_id, model_router.short_label(chosen_model), len(user_message),
-    )
-
-    # Phase 5: streaming. Post a placeholder so the user sees instant activity,
-    # then progressively edit it as text streams from Claude. If the placeholder
-    # post itself fails, fall back to the original non-streaming path so the user
-    # still gets *some* reply.
-    placeholder_ts: str | None = None
-    placeholder_channel: str = channel_id
-    try:
-        placeholder_resp = say(
-            text=":thought_balloon: thinking…",
-            thread_ts=thread_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        placeholder_ts = placeholder_resp.get("ts")
-        # Bolt's say() returns the chat.postMessage response shape; channel may
-        # be echoed back or absent (Slack omits it if same as request). Default
-        # to channel_id we already have.
-        placeholder_channel = placeholder_resp.get("channel") or channel_id
-    except Exception as exc:  # noqa: BLE001 — Slack errors are diverse; we just want to fall back
-        log.warning(
-            "Placeholder post failed for channel=%s user=%s: %s — falling back to non-streaming",
-            channel_id, user_id, exc,
-        )
-
-    if placeholder_ts is None:
-        # ── Fallback: non-streaming path (placeholder unavailable) ──
-        try:
-            response_text = generate_response(
-                prompt,
-                runtime_context + context,
-                user_message,
-                slack_user_id=user_id or "",
-                entity=entity,
-                model=chosen_model,
-                prior_messages=prior_messages,
-                channel_name=channel_name,
-            )
-        except ClaudeClientError as exc:
-            log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
-            say(text=user_facing_message(exc), thread_ts=thread_ts)
-            return
-
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        response_text = _extract_and_log_gap(
-            response_text, entity, channel_name, user_id, user_message, latency_ms,
-        )
-        _try_cache_store(entity, user_message, question_embedding, response_text, hints)
-        log.info(
-            "responded (fallback non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
-            entity, channel_name, user_id, latency_ms, len(response_text),
-        )
-        say(
-            text=response_text,
-            thread_ts=thread_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        return
-
-    # ── Streaming path ──
-    stream_id = placeholder_ts  # ts is unique per stream
-    throttle = slack_update_throttle.default_throttle
-
-    def update_callback(cumulative_text: str) -> None:
-        """Push the partial response to Slack via chat_update, gated by throttle.
-
-        Called by generate_response_streaming on every text delta. Cheap when the
-        throttle blocks (just a clock check + lock). Failure to update is logged
-        but does NOT raise — the next batch will carry the cumulative text.
-        """
-        if not cumulative_text:
-            return
-        if not throttle.acquire(stream_id):
-            return
-        try:
-            client.chat_update(
-                channel=placeholder_channel,
-                ts=placeholder_ts,
-                text=cumulative_text,
-            )
-        except Exception as upd_exc:  # noqa: BLE001 — Slack errors are diverse
-            log.warning(
-                "chat_update mid-stream failed for ts=%s: %s — stream continues",
-                placeholder_ts, upd_exc,
-            )
-
-    try:
-        response_text = generate_response_streaming(
-            prompt,
-            runtime_context + context,
-            user_message,
-            update_callback=update_callback,
-            slack_user_id=user_id or "",
-            entity=entity,
-            model=chosen_model,
-            prior_messages=prior_messages,
-            channel_name=channel_name,
-        )
-    except ClaudeClientError as exc:
-        log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
-        # Replace placeholder with the classified error message
-        error_msg = user_facing_message(exc)
-        try:
-            client.chat_update(
-                channel=placeholder_channel,
-                ts=placeholder_ts,
-                text=error_msg,
-            )
-        except Exception as upd_exc:  # noqa: BLE001
-            log.error(
-                "Final error chat_update failed for ts=%s: %s — sending fresh reply",
-                placeholder_ts, upd_exc,
-            )
-            say(text=error_msg, thread_ts=thread_ts)
-        throttle.release_stream(stream_id)
-        return
-
-    latency_ms = int((time.monotonic() - t0) * 1000)
-    response_text = _extract_and_log_gap(
-        response_text, entity, channel_name, user_id, user_message, latency_ms,
-    )
-    _try_cache_store(entity, user_message, question_embedding, response_text, hints)
-
-    skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
-    log.info(
-        "responded (streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d updates_skipped=%d",
-        entity, channel_name, user_id, latency_ms, len(response_text), skipped,
-    )
-
-    # Final chat_update with the definitive text. force_acquire bypasses the
-    # per-stream interval gate (the previous update was probably < 0.8s ago).
-    # If the workspace budget is exhausted we still try — Slack will tell us if
-    # it actually rejects the call.
-    throttle.force_acquire(stream_id + "-final")
-    try:
-        client.chat_update(
-            channel=placeholder_channel,
-            ts=placeholder_ts,
-            text=response_text,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.error(
-            "Final chat_update failed for ts=%s: %s — sending fresh reply as fallback",
-            placeholder_ts, exc,
-        )
-        say(
-            text=response_text,
-            thread_ts=thread_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
 
 
 def _try_cache_store(
@@ -557,11 +581,19 @@ def _handle_note(
         log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
 
 
-# Correction capture: message event in a thread where Cora replied last.
+# Message event handler — correction capture + active-thread follow-up routing.
 # Bolt requires an explicit event listener for "message" events.
 @app.event("message")
 def handle_message_event(event: dict, client) -> None:
-    """Capture correction-intent thread replies directed at Cora's output."""
+    """Thread reply handler: correction capture and active-thread follow-up routing.
+
+    Two paths:
+      1. Correction path — if the reply matches a correction pattern, queue it
+         for Harrison's approval (existing behaviour, unchanged).
+      2. Active-thread path — if the reply is in a thread where Cora previously
+         responded (within TTL_SECONDS), treat it as a follow-up question and
+         run the full Q&A pipeline without requiring a fresh @mention.
+    """
     # Only interested in thread replies (has thread_ts != ts)
     thread_ts = event.get("thread_ts")
     msg_ts = event.get("ts")
@@ -572,40 +604,71 @@ def handle_message_event(event: dict, client) -> None:
     if event.get("bot_id") or event.get("subtype") == "bot_message":
         return
 
-    text = event.get("text", "").strip()
-    if not team_learning.is_correction(text):
-        return
-
     channel_id = event.get("channel", "")
     user_id = event.get("user", "")
     if not channel_id or not user_id:
         return
 
+    text = event.get("text", "").strip()
+    if not text:
+        return
+
+    # ── Path 1: Correction capture ────────────────────────────────────────────
+    if team_learning.is_correction(text):
+        channel_name = _resolve_channel_name(client, channel_id)
+        entity = route(channel_name)
+        log.info(
+            "team_learning: correction detected channel=#%s user=%s",
+            channel_name, user_id,
+        )
+        # Attribute the correction to this person for per-user feedback tracking.
+        uft.log_correction(
+            slack_user_id=user_id,
+            channel=channel_id,
+            channel_name=channel_name,
+            entity=entity,
+            correction_text=text,
+        )
+        _handle_note(
+            client=client,
+            say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
+            entity=entity,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            user_id=user_id,
+            content=text,
+            original_ts=thread_ts,
+            kind="correction",
+        )
+        return
+
+    # ── Path 2: Active-thread follow-up (no @mention required) ───────────────
+    # Only trigger if Cora is known to be active in this thread (within TTL).
+    if not active_thread_store.is_active(channel_id, thread_ts):
+        return
+
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
 
+    active_thread_store.touch(channel_id, thread_ts)
+    prior_messages = _fetch_thread_history(client, channel_id, thread_ts, msg_ts)
+
     log.info(
-        "team_learning: correction detected channel=#%s user=%s",
-        channel_name, user_id,
+        "thread_followup: active thread channel=#%s user=%s thread_ts=%s",
+        channel_name, user_id, thread_ts,
     )
-    # Attribute the correction to this person for per-user feedback tracking.
-    uft.log_correction(
-        slack_user_id=user_id,
-        channel=channel_id,
-        channel_name=channel_name,
-        entity=entity,
-        correction_text=text,
-    )
-    _handle_note(
-        client=client,
-        say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
-        entity=entity,
+
+    _dispatch_qa(
         channel_id=channel_id,
         channel_name=channel_name,
         user_id=user_id,
-        content=text,
-        original_ts=thread_ts,
-        kind="correction",
+        user_message=text,
+        reply_thread_ts=thread_ts,
+        entity=entity,
+        client=client,
+        say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
+        prior_messages=prior_messages,
+        root_thread_ts=thread_ts,
     )
 
 
