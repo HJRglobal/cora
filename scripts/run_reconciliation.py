@@ -81,7 +81,7 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
             logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
+            logging.StreamHandler(open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)),
         ],
     )
 
@@ -277,7 +277,7 @@ def main() -> int:
 
     # ─── Propose updates to Harrison via knowledge_review ─────────────────────
     high_med = [g for g in gaps if g.confidence in _REVIEW_CONFIDENCES]
-    log.info("Queuing %d HIGH/MED gaps for Harrison's 👍/👎 review", len(high_med))
+    log.info("Queuing %d HIGH/MED gaps for Harrison review (+1/-1)", len(high_med))
 
     proposed = 0
     skipped = 0

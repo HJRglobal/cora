@@ -228,6 +228,11 @@ def _fetch_pipeline_deals(pipeline_id: str) -> list[dict[str, Any]]:
     return all_deals
 
 
+def get_deals_by_pipeline(pipeline_id: str) -> list[dict[str, Any]]:
+    """Public alias for _fetch_pipeline_deals — returns raw deal objects from HubSpot API."""
+    return _fetch_pipeline_deals(pipeline_id)
+
+
 def get_f3e_pipeline_summary_text() -> str:
     """Fetch the F3E Retail pipeline and return a structured summary string for Claude.
 

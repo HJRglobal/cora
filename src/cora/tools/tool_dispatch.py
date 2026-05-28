@@ -1191,6 +1191,9 @@ def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str 
 
 def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Profit and Loss for an entity over a period. Returns a Slack-mrkdwn summary + QBO link."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
     if err:
         return err
@@ -1207,6 +1210,9 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
 
 def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Balance Sheet snapshot for an entity as-of a date (defaults to today)."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
     if err:
         return err
@@ -1222,6 +1228,9 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
 
 def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AR aging summary for an entity."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
     if err:
         return err
@@ -1236,6 +1245,9 @@ def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str
 
 def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AP aging summary for an entity."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
     if err:
         return err
@@ -1250,6 +1262,9 @@ def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str
 
 def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch a digest of recent Invoice / Bill / Payment activity for an entity."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
     if err:
         return err
@@ -1267,19 +1282,32 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
     return qbo_client.format_recent_transactions_for_llm(payload, target, days)
 
 
+# --- Finance channel enforcement ---
+
+def _is_finance_channel(channel_name: str) -> bool:
+    """Return True only if channel_name ends with '-finance' (e.g. osn-finance)."""
+    return bool(channel_name) and channel_name.lower().endswith("-finance")
+
+
+_FINANCE_CHANNEL_REQUIRED = (
+    "Financial details are only available in this entity's dedicated finance channel."
+)
+
+
 # --- Financial / cashflow tools ---
 
 
 def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch current-week cash flow from the Standing ACTUALS sheet."""
     inp = _input or {}
+    channel_name = inp.get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     entity_filter = inp.get("entity_filter") or entity or "FNDR"
     question = inp.get("question") or ""
-    # entity_to_tab() inside financial_client selects the correct tab for this entity.
-    # For OSN, if the question mentions distributions/partners it switches to Core4 tab.
     result = financial_client.get_cashflow_text(
         entity_filter=entity_filter,
-        channel=entity,
+        channel=channel_name,
         user=slack_user_id,
         question=question,
     )
@@ -1295,18 +1323,58 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
 def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) -> str:
     """Post a finance data gap alert to #hjrg-finance and return the fixed response."""
     topic = (_input or {}).get("topic") or "unspecified financial question"
+    channel_name = (_input or {}).get("_channel_name", "")
     return financial_client.notify_gap(
         topic=topic,
-        channel=entity,
+        channel=channel_name or entity,
         user=slack_user_id,
     )
 
 
 def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch OSN store-by-store financial snapshot from the OSN Consolidated cashflow tab."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     log.info("osn_financial_pulse user=%s entity=%s", slack_user_id, entity)
     return financial_client.get_osn_pulse_text(
-        channel=entity,
+        channel=channel_name,
+        user=slack_user_id,
+    )
+
+
+def _tool_financial_get_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read the weekly financial pulse .md file for the entity from Drive."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    log.info("financial_get_pulse user=%s entity=%s", slack_user_id, entity)
+    return financial_client.get_entity_pulse_text(
+        entity=entity,
+        channel=channel_name,
+        user=slack_user_id,
+    )
+
+
+def _tool_financial_get_close_pack(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read a monthly close pack xlsx (P&L, balance sheet, cash flow, AR, or AP) from Drive."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    inp = _input or {}
+    period = (inp.get("period") or "").strip()
+    if not period:
+        return "Period is required (format: YYYY-MM, e.g. '2026-04')."
+    doctype = (inp.get("doctype") or "pl").strip().lower()
+    log.info(
+        "financial_get_close_pack user=%s entity=%s period=%s doctype=%s",
+        slack_user_id, entity, period, doctype,
+    )
+    return financial_client.get_close_pack_text(
+        entity=entity,
+        period=period,
+        doctype=doctype,
+        channel=channel_name,
         user=slack_user_id,
     )
 
@@ -3244,6 +3312,66 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── Drive-based financial pulse + monthly close pack ──
+    {
+        "name": "financial_get_pulse",
+        "description": (
+            "Read the weekly financial pulse summary for an entity from the live-sheets "
+            "Drive folder. Use this when a user in a *-finance channel asks about current "
+            "financial health, weekly performance, or wants a high-level financial snapshot "
+            "-- phrases like 'give me the financial pulse', 'how are we doing financially', "
+            "'weekly financial summary', 'what's the latest on financials'. "
+            "Supported entities: OSN (all stores), F3E, LEX (and all sub-entities). "
+            "Returns the .md pulse file content as-is. Data is maintained by Hayden/Justin "
+            "and updated weekly. Output is source-opaque -- never mention file names or Drive. "
+            "FINANCE CHANNEL ONLY: returns an access-denied message in any non-finance channel. "
+            "If data is unavailable, returns the standard UNKNOWN_RESPONSE."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "financial_get_close_pack",
+        "description": (
+            "Read a monthly close pack report (P&L, Balance Sheet, Cash Flow, AR aging, "
+            "or AP aging) for an entity from the Drive monthly-reports folder. "
+            "Use this when a user in a *-finance channel asks about a specific month's "
+            "financials -- phrases like 'show me the April P&L', 'what was net income in "
+            "March', 'balance sheet for Q1', 'AR aging for February', 'what's on the "
+            "balance sheet', 'how was cash flow last month', 'what do we owe (AP)'. "
+            "Reports cover all portfolio entities. Files are named {YYYY-MM}_{entity}_{type}.xlsx. "
+            "FINANCE CHANNEL ONLY: returns an access-denied message in any non-finance channel. "
+            "If the report is not found, returns the standard UNKNOWN_RESPONSE and Cora notifies "
+            "the finance channel. "
+            "When the user says 'last month', resolve to the prior calendar month (e.g. if today "
+            "is May, last month = April = '2026-04'). Default doctype is 'pl' if not specified."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": (
+                        "Data period in YYYY-MM format (e.g. '2026-04' for April 2026). "
+                        "Required. Resolve relative references: 'last month', 'March', etc."
+                    ),
+                },
+                "doctype": {
+                    "type": "string",
+                    "enum": ["pl", "bs", "cf", "ar", "ap"],
+                    "description": (
+                        "Report type: pl=Profit & Loss, bs=Balance Sheet, cf=Cash Flow, "
+                        "ar=Accounts Receivable Aging, ap=Accounts Payable Aging. "
+                        "Default: pl."
+                    ),
+                },
+            },
+            "required": ["period"],
+        },
+    },
     # ── OSN Clover POS tools (OSN channels only) ──
     {
         "name": "osn_sales_pulse",
@@ -3742,6 +3870,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
+    "financial_get_pulse": _tool_financial_get_pulse,
+    "financial_get_close_pack": _tool_financial_get_close_pack,
     "fndr_completion_candidates": _tool_fndr_completion_candidates,
     "fndr_open_decisions": _tool_fndr_open_decisions,
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
@@ -3778,18 +3908,24 @@ def dispatch(
     tool_input: dict[str, Any],
     slack_user_id: str,
     entity: str = "FNDR",
+    channel_name: str = "",
 ) -> str:
     """Run a tool by name. Always returns a string for tool_result content.
 
     entity is the routed entity code for the channel the @mention came from
     (F3E, LEX, OSN, BDM, FNDR, etc.) -- tools may use this to scope results.
+
+    channel_name is injected into tool_input as '_channel_name' so financial
+    tools can enforce the finance-channel access rule without changing signatures.
     """
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if not fn:
         log.warning("Unknown tool name requested by model: %s", tool_name)
         return f"Unknown tool: {tool_name}. Available tools: {list(_TOOL_FUNCTIONS)}"
+    injected = dict(tool_input or {})
+    injected["_channel_name"] = channel_name
     try:
-        return fn(slack_user_id, entity, tool_input or {})
+        return fn(slack_user_id, entity, injected)
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
         return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."
