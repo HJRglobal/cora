@@ -524,8 +524,18 @@ class TestCashflowCache:
         )
 
     def _patches(self, fake_export_csv):
-        """Return an ExitStack with the standard patches applied."""
+        """Return an ExitStack with the standard patches applied.
+
+        Patches _build_direct_sa_creds (used since 2026-05-28 direct-SA fix)
+        instead of the old _build_delegated_creds path. The delegated/drive/
+        modifiedTime patches are kept defensively but are no longer on the
+        hot path inside get_cashflow().
+        """
         stack = ExitStack()
+        stack.enter_context(patch(
+            "cora.connectors.gsheets_financials._build_direct_sa_creds",
+            return_value=MagicMock(),
+        ))
         stack.enter_context(patch(
             "cora.connectors.gsheets_financials._build_delegated_creds",
             return_value=MagicMock(),
