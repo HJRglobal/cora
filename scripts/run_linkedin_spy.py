@@ -53,7 +53,7 @@ from cora.tools.linkedin_spy_client import (
 log = logging.getLogger(__name__)
 
 _CONFIG_PATH = _REPO_ROOT / "data" / "maps" / "linkedin-spy-search-config.yaml"
-_NOTIFY_CHANNEL = os.environ.get("LINKEDIN_SPY_CHANNEL", "f3-sales")
+_NOTIFY_CHANNEL = os.environ.get("LINKEDIN_SPY_CHANNEL", "f3e-sales")
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +155,8 @@ def _generate_outreach(prospects: list[dict]) -> list[dict]:
             ],
         )
         raw = msg.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         result = json.loads(raw)
         if isinstance(result, list):
             return result
@@ -199,7 +201,7 @@ def _post_to_slack(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _format_report(prospects: list[dict], new_found: int, total_seen: int) -> str:
-    week_str = datetime.now(tz=timezone.utc).strftime("%-d %b %Y")
+    week_str = datetime.now(tz=timezone.utc).strftime("%#d %b %Y")
     lines = [
         f"📋 *F3 LinkedIn Prospect Report — {week_str}*",
         f"Found *{new_found} new* retail buyers & executives this week. "

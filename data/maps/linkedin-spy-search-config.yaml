@@ -75,4 +75,4 @@ max_pages: 3        # pages to pull per run → up to 300 candidates evaluated
 max_report_items: 10  # max new prospects to surface in the Slack report each week
 
 # --- Slack delivery -----------------------------------------------------------
-notify_channel: "f3-sales"
+notify_channel: "f3e-sales"

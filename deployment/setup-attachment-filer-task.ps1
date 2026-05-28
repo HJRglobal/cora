@@ -21,11 +21,15 @@
 $TaskName = "Cora - Email Attachment Filer"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $ScriptPath = Join-Path $RepoRoot "scripts\run_attachment_filer.py"
-$UvPath = "uv"  # assumes uv is on PATH; replace with full path if needed
+$PythonPath = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
-# Verify script exists before registering
+# Verify script and interpreter exist before registering
 if (-not (Test-Path $ScriptPath)) {
     Write-Error "Script not found: $ScriptPath"
+    exit 1
+}
+if (-not (Test-Path $PythonPath)) {
+    Write-Error "Venv python not found: $PythonPath  (run 'uv sync' first)"
     exit 1
 }
 
@@ -35,10 +39,10 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Removed existing task: $TaskName"
 }
 
-# Action: run the filer script via uv
+# Action: run the filer script via the venv python (full path -- Task Scheduler has no user PATH)
 $Action = New-ScheduledTaskAction `
-    -Execute $UvPath `
-    -Argument "run python `"$ScriptPath`"" `
+    -Execute $PythonPath `
+    -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot
 
 # Trigger: every 4 hours starting at the next :00 mark
@@ -71,6 +75,7 @@ $result = Register-ScheduledTask `
 Write-Host ""
 Write-Host "Task registered: '$TaskName'" -ForegroundColor Green
 Write-Host "  Schedule:   Every 4 hours"
+Write-Host "  Python:     $PythonPath"
 Write-Host "  Script:     $ScriptPath"
 Write-Host "  Working dir: $RepoRoot"
 Write-Host ""

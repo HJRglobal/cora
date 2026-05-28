@@ -50,7 +50,7 @@ def _headers() -> dict[str, str]:
 def search_people(
     *,
     person_titles: list[str],
-    keywords: str = "",
+    keywords: str = "",  # intentionally unused in API call -- see note below
     person_locations: list[str] | None = None,
     page: int = 1,
     per_page: int = 100,
@@ -61,6 +61,11 @@ def search_people(
         id, title, organization.name, linkedin_url, city, state, country
         (first_name / last_name come back null until a credit reveal is triggered)
 
+    NOTE: q_keywords is NOT sent to Apollo. When combined with person_titles and
+    person_locations it returns 0 results (Apollo phrase-matches against profile
+    content, not as a relevance signal). Title targeting + channel_fit YAML
+    provide sufficient narrowing without keywords.
+
     Raises ApolloClientError on HTTP or API errors.
     """
     body: dict[str, Any] = {
@@ -69,8 +74,6 @@ def search_people(
     }
     if person_titles:
         body["person_titles"] = person_titles
-    if keywords:
-        body["q_keywords"] = keywords
     if person_locations:
         body["person_locations"] = person_locations
 
@@ -111,8 +114,8 @@ def iter_people_pages(
             time.sleep(_MIN_REQUEST_INTERVAL)
 
         log.info(
-            "apollo: fetching page %d (titles=%d, kw=%r)",
-            page_num, len(person_titles), keywords[:40],
+            "apollo: fetching page %d (titles=%d)",
+            page_num, len(person_titles),
         )
         try:
             data = search_people(
