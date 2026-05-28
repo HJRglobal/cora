@@ -20,6 +20,7 @@ import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
 from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
+from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
 log = logging.getLogger(__name__)
 
@@ -1192,8 +1193,8 @@ def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str 
 def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Profit and Loss for an entity over a period. Returns a Slack-mrkdwn summary + QBO link."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
-        return _FINANCE_CHANNEL_REQUIRED
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
     override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
     target, err = _resolve_qbo_entity(entity, override)
     if err:
@@ -1212,8 +1213,8 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
 def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Balance Sheet snapshot for an entity as-of a date (defaults to today)."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
-        return _FINANCE_CHANNEL_REQUIRED
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
     override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
     target, err = _resolve_qbo_entity(entity, override)
     if err:
@@ -1231,8 +1232,8 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
 def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AR aging summary for an entity."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
-        return _FINANCE_CHANNEL_REQUIRED
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
     override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
     target, err = _resolve_qbo_entity(entity, override)
     if err:
@@ -1249,8 +1250,8 @@ def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str
 def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AP aging summary for an entity."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
-        return _FINANCE_CHANNEL_REQUIRED
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
     override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
     target, err = _resolve_qbo_entity(entity, override)
     if err:
@@ -1267,8 +1268,8 @@ def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str
 def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch a digest of recent Invoice / Bill / Payment activity for an entity."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
-        return _FINANCE_CHANNEL_REQUIRED
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
     override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
     target, err = _resolve_qbo_entity(entity, override)
     if err:
@@ -1308,9 +1309,22 @@ _FINANCE_CHANNEL_REQUIRED = (
     "Financial details are only available in this entity's dedicated finance channel."
 )
 
+_QBO_TIER1_REQUIRED = (
+    "QuickBooks financial data is available in TIER_1 channels only "
+    "(finance, leadership, founder, or build channels)."
+)
+
 _HR_CHANNEL_REQUIRED = (
     "HR and staff information is only available in this entity's dedicated HR channel."
 )
+
+
+def _is_tier1_channel(entity: str, channel_name: str) -> bool:
+    """Return True if the channel + entity combination grants TIER_1 access."""
+    if not channel_name:
+        return False
+    func = _classify_channel_function(channel_name)
+    return _channel_is_tier1(entity, func)
 
 
 # --- Financial / cashflow tools ---
@@ -1692,17 +1706,13 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
     log.info("fndr_completion_candidates user=%s entity=%s", slack_user_id, entity)
 
     # 1. Fetch open tasks for the requesting user (same pattern as get_my_tasks)
-    user_map_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
-    try:
-        user_map: dict = yaml.safe_load(user_map_path.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        log.warning("fndr_completion_candidates: could not load user map: %s", exc)
-        user_map = {}
+    user_map = _load_slack_asana_map()
 
-    asana_gid = user_map.get(slack_user_id, {}).get("asana_gid") if isinstance(user_map.get(slack_user_id), dict) else user_map.get(slack_user_id)
+    user_entry = user_map.get(slack_user_id)
+    asana_gid = str(user_entry.get("asana_user_gid", "") or "") if user_entry else ""
 
     open_tasks: list[dict] = []
-    if asana_gid:
+    if asana_gid and "REPLACE" not in asana_gid:
         try:
             open_tasks = asana_client.get_user_tasks(asana_gid, max_tasks=100)
         except asana_client.AsanaClientError as exc:
@@ -1712,8 +1722,8 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
         # FNDR sweep: pull tasks for all known users and pool them
         all_gids: set[str] = set()
         for v in user_map.values():
-            gid = v.get("asana_gid") if isinstance(v, dict) else v
-            if gid:
+            gid = str(v.get("asana_user_gid", "") or "") if isinstance(v, dict) else ""
+            if gid and "REPLACE" not in gid:
                 all_gids.add(gid)
         for gid in list(all_gids)[:10]:  # cap at 10 users to avoid rate limits
             try:
@@ -2108,52 +2118,6 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
     return calendar_client.format_slot_proposal_for_llm(
         slot_start, slot_end, names, title=title
     )
-
-
-# --- F3 brand voice check ---
-
-
-def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
-
-    Read-only, no external calls. Returns a structured findings report (CRITICAL / WARNING / INFO)
-    plus the brand's locked voice-pillar summary so Claude can synthesize a helpful reply.
-
-    Checks:
-      - Health/nutrition claims (universal — all three brands)
-      - Cross-entity UFL pause (universal — F3-UFL crossover blocked)
-      - Sleep positioning (Mood ONLY — CRITICAL anti-pattern)
-      - Sibling-brand drift (Energy-lane or Mood-lane language in the wrong brand's copy)
-      - Anti-positioning (competitor brand names in Energy copy, etc.)
-    """
-    input_data = _input or {}
-    brand = (input_data.get("brand") or "").strip().lower()
-    copy = (input_data.get("copy") or "").strip()
-
-    if not brand:
-        return (
-            "f3e_brand_voice_check called without `brand`. "
-            "Ask the user which F3 sub-brand the copy is for: pure, mood, or energy."
-        )
-    if not copy:
-        return (
-            "f3e_brand_voice_check called without `copy`. "
-            "Ask the user to paste the draft copy they want checked."
-        )
-    if brand not in brand_voice_client.VALID_BRANDS:
-        return (
-            f"f3e_brand_voice_check: unknown brand {brand!r}. "
-            f"Must be one of: {', '.join(brand_voice_client.VALID_BRANDS)}. "
-            "Ask the user which F3 sub-brand the copy is for."
-        )
-
-    log.info(
-        "f3e_brand_voice_check brand=%s copy_len=%d user=%s entity=%s",
-        brand, len(copy), slack_user_id, entity,
-    )
-
-    result = brand_voice_client.check_copy(brand, copy)
-    return brand_voice_client.format_result_for_llm(result)
 
 
 def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3459,7 +3423,7 @@ TOOL_DEFINITIONS = [
                     "type": "boolean",
                     "description": (
                         "If true, return only items at or below the low-stock threshold. "
-                        "Defaults to false (return all items)."
+                        "Defaults to true (low stock only)."
                     ),
                 },
             },
@@ -3813,6 +3777,7 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+            "required": [],
         },
     },
     {

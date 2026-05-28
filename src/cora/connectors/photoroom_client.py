@@ -798,6 +798,8 @@ def batch_run(specs: list[ImageSpec], dry_run: bool = False) -> BatchResults:
             result = run_spec(spec, dry_run=dry_run)
         except PhotoroomBudgetError:
             raise  # stop the whole batch on budget hit
+        except PhotoroomConfigError:
+            raise  # stop the whole batch on missing config
         except Exception as exc:
             log.error("batch_run: spec %s failed: %s", spec.spec_id, exc)
             results.append(
