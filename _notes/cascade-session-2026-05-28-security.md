@@ -4,6 +4,22 @@ _Paste blocks ready for Drive files. Branch: `claude/cora-infrastructure-securit
 
 ---
 
+## ⚠️ STANDING DOCTRINE — One decisions.md, always in Drive
+
+**Code sessions must NOT write to `C:\Users\Harri\code\cora\decisions.md`.**
+That file is uncommitted, not in git, not in Drive, and will be lost if the desktop dies.
+
+**Correct pattern for all future Code sessions:**
+- Architecture decisions → paste-ready block for `memory/decisions.md` in Drive
+- Format: `### YYYY-MM-DD [TAG] — Headline` (same as Drive format)
+- Deliver as a paste block in the session cascade notes (`_notes/cascade-session-YYYY-MM-DD-*.md`)
+- Never create or append to a local `decisions.md`
+
+**Pending action:** D-001 through D-007 in the local `decisions.md` need to be cascaded to Drive, then the local file deleted.
+To retrieve: `cat C:\Users\Harri\code\cora\decisions.md` on the desktop → paste to Cowork for cascade.
+
+---
+
 ## 1. decisions.md APPEND (paste into Drive decisions.md under `## 2026-05 decisions`)
 
 ```markdown
