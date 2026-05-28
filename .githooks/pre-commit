@@ -15,6 +15,7 @@
 #   sk-[A-Za-z0-9]{20,}   — OpenAI legacy user keys (broader pattern as backstop)
 #   FIREFLIES_API_KEY=    — Fireflies API keys are UUIDs (no unique prefix), so we
 #                            match the env-var-assignment pattern with a UUID-shaped value.
+#   IGQV / EAAG           — Instagram Graph API long-lived user tokens (Phase 3)
 
 STAGED=$(git diff --cached --name-only | grep -v "^\.githooks/")
 
@@ -22,7 +23,7 @@ if [ -z "$STAGED" ]; then
   exit 0
 fi
 
-FOUND=$(printf '%s\n' $STAGED | xargs grep -lE "sk-ant-api|xoxb-[0-9]|xoxp-[0-9]|xapp-1-A[0-9]|2/[0-9]{10,}/|pat-na[0-9]-|BEGIN PRIVATE KEY|sk-proj-[A-Za-z0-9]|FIREFLIES_API_KEY=[0-9a-f]{8}-[0-9a-f]{4}" 2>/dev/null)
+FOUND=$(printf '%s\n' $STAGED | xargs grep -lE "sk-ant-api|xoxb-[0-9]|xoxp-[0-9]|xapp-1-A[0-9]|2/[0-9]{10,}/|pat-na[0-9]-|BEGIN PRIVATE KEY|sk-proj-[A-Za-z0-9]|FIREFLIES_API_KEY=[0-9a-f]{8}-[0-9a-f]{4}|IGQV[A-Za-z0-9]|EAAG[A-Za-z0-9]" 2>/dev/null)
 
 if [ -n "$FOUND" ]; then
   echo ""
