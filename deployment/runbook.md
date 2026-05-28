@@ -18,6 +18,10 @@ Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "cora.exe" -or ($_.Name -eq "python.exe" -and $_.CommandLine -like "*cora*") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
+> **WARNING — `schtasks /End` does NOT kill the Python process.** It only signals the task wrapper. Always use `Stop-ScheduledTask` + `Get-Process python* | Stop-Process -Force` as shown above. After stopping, confirm with `Get-Process python*` — if any python processes remain, kill them explicitly before restarting.
+
+> **WARNING — Task Scheduler `State: Ready` is unreliable as a liveness check.** A task can show "Ready" while no Python process is actually running (e.g. after a crash that exhausted the restart retries). The only reliable liveness confirmation is a `heartbeat alive` line in the current log within the last 2 minutes. If the task shows Ready but there is no recent heartbeat, Cora is down — restart the task manually.
+
 **Verify she's alive (single instance):**
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "cora.exe" } | Select-Object ProcessId, CreationDate
@@ -169,6 +173,38 @@ After editing: commit + push to GitHub, then restart the scheduled task.
 
 ---
 
+## Startup Diagnosis
+
+When Cora is unresponsive and the cause is unknown, run this 4-step sequence in order:
+
+**Step 1 — Tail the log:**
+```powershell
+cd C:\Users\Harri\code\cora
+Get-Content "logs\cora-$(Get-Date -Format yyyy-MM-dd).log" -Tail 30
+```
+> **Log-naming edge case:** The log file is named by the date Cora *started*, not today's date. If Cora started yesterday and ran past midnight, today's log file will not exist. Check the previous day's file: `Get-Content "logs\cora-$((Get-Date).AddDays(-1).ToString('yyyy-MM-dd')).log" -Tail 30`
+
+**Step 2 — Pattern match in the log:**
+```powershell
+Select-String -Path "logs\cora-$(Get-Date -Format yyyy-MM-dd).log" -Pattern "heartbeat alive|ERROR|CRITICAL|AuthenticationError|Restarting in" | Select-Object -Last 20
+```
+Look for: recent `heartbeat alive` (alive), absence of heartbeat (dead), `AuthenticationError` (bad token), repeated `Restarting in` (crash loop).
+
+**Step 3 — Process check:**
+```powershell
+Get-Process python* -ErrorAction SilentlyContinue | Select-Object Id, CPU, StartTime, MainWindowTitle
+```
+No output = no Python process running = Cora is down. Multiple entries = possible duplicate instance (use hard kill above, then restart once).
+
+**Step 4 — Manual terminal start (last resort to see live output):**
+```powershell
+cd C:\Users\Harri\code\cora
+uv run python -m cora.main
+```
+Run this in a terminal to see startup errors that may not make it into the log (e.g. import failures, config validation errors at boot). Kill with Ctrl+C when done, then restart via Task Scheduler.
+
+---
+
 ## Troubleshooting
 
 **Cora not responding to @-mentions:**
@@ -228,6 +264,36 @@ Each gap entry has a **Your answer** block. Three actions:
 Leave the block empty to defer the gap to the next digest run.
 
 **Phase 2 note:** Automated ingestion of your written answers back into Cora's context is deferred to Phase 2. For now, answers you write in the digest are the source of truth — copy them manually into `design/known-answers/{entity}.md` files when you're ready to feed them to Cora. The digest builder reads `knowledge-gaps.jsonl` each time from scratch, so un-ingested gaps will reappear in future digests until you SKIP or answer them.
+
+## .env Recovery (byte corruption)
+
+**Cause:** PowerShell 5.1's `Add-Content` and some text-writing cmdlets inject Windows-1252 characters (e.g. byte `0x97`, the Windows-1252 em dash) when the file or terminal encoding is not explicitly UTF-8. The corrupted byte is invisible in most editors but causes token parse failures at Cora startup (`AuthenticationError` or config validation error).
+
+**Symptoms:** Cora starts then dies immediately; log shows `AuthenticationError` or `Config validation failed`; token looks correct when you open `.env` in Notepad but doesn't work.
+
+**Manual fix:**
+1. Open `.env` in Notepad (not VS Code or PowerShell ISE — Notepad shows raw bytes most reliably):
+   ```powershell
+   notepad C:\Users\Harri\code\cora\.env
+   ```
+2. Find the corrupted line. Position the cursor at the start of the value and use the right-arrow key to step through each character. Any position where the cursor skips two steps for one keypress is a hidden non-ASCII byte.
+3. Delete the invisible character(s). Retype the value from scratch if unsure.
+4. Save as: **File → Save As → Encoding: UTF-8** (NOT "UTF-8 with BOM"). Overwrite the existing `.env`.
+
+**Byte-level verification (confirms no corruption):**
+```powershell
+$raw = [System.IO.File]::ReadAllBytes("C:\Users\Harri\code\cora\.env")
+$nonAscii = $raw | Where-Object { $_ -gt 127 }
+if ($nonAscii) { Write-Host "NON-ASCII BYTES FOUND: $nonAscii" } else { Write-Host "Clean — all ASCII" }
+```
+
+**Prevention:**
+- Always edit `.env` in Notepad or a proper UTF-8 editor, never via PowerShell `Add-Content` / `Set-Content` without `-Encoding UTF8`
+- If scripting `.env` updates, always use: `Set-Content -Encoding UTF8 -Path ".env" -Value $content`
+
+**PowerShell .NET CurrentDirectory warning:** `[System.IO.File]` and similar .NET methods resolve relative paths against the *process launch directory*, not the current `$PWD`. Always use absolute paths (e.g. `C:\Users\Harri\code\cora\.env`) when calling .NET file APIs. `cd` does not affect .NET path resolution.
+
+---
 
 ## Escalation
 
