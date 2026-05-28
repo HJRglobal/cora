@@ -14,9 +14,20 @@
 
 $TaskName   = "cowork-cora-influencer-scan"
 $RepoRoot   = "C:\Users\Harri\code\cora"
-$UvExe      = "uv"   # assumes `uv` is on PATH; adjust if needed
+$PythonPath = "$RepoRoot\.venv\Scripts\python.exe"
 $ScriptPath = "$RepoRoot\scripts\run_influencer_scan.py"
 $LogDir     = "$RepoRoot\logs"
+
+# Verify script + interpreter exist before registering (Task Scheduler has NO user PATH;
+# absolute paths to both are required to avoid silent ERROR_FILE_NOT_FOUND 0x80070002 on every tick)
+if (-not (Test-Path $ScriptPath)) {
+    Write-Error "Script not found: $ScriptPath"
+    exit 1
+}
+if (-not (Test-Path $PythonPath)) {
+    Write-Error "Venv python not found: $PythonPath  (run 'uv sync' first)"
+    exit 1
+}
 
 # Ensure log directory exists
 if (-not (Test-Path $LogDir)) {
@@ -31,8 +42,8 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 $Action  = New-ScheduledTaskAction `
-    -Execute $UvExe `
-    -Argument "run python `"$ScriptPath`"" `
+    -Execute $PythonPath `
+    -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot
 
 # Every 2 hours, starting at the next even hour
@@ -58,6 +69,7 @@ Register-ScheduledTask `
 Write-Host ""
 Write-Host "Task registered: $TaskName"
 Write-Host "  Schedule : Every 2 hours"
+Write-Host "  Python   : $PythonPath"
 Write-Host "  Script   : $ScriptPath"
 Write-Host "  Logs     : $LogDir\influencer-scan-YYYY-MM-DD.log"
 Write-Host ""
