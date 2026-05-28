@@ -34,7 +34,7 @@ Write-Host "  OK  $REPO_DIR"
 # ------------------------------------------------------------------
 Write-Host "[2/5] Checking prerequisites..."
 if (-not (Test-Path "$REPO_DIR\.env" -PathType Leaf)) {
-    Write-Host "  ERROR: .env not found — copy .env.example and fill in tokens first." -ForegroundColor Red
+    Write-Host "  ERROR: .env not found - copy .env.example and fill in tokens first." -ForegroundColor Red
     exit 1
 }
 if (-not (Test-Path $SCRIPT -PathType Leaf)) {
@@ -67,13 +67,13 @@ if (-not $uvExe) {
 Write-Host "  OK  $uvExe"
 
 # ------------------------------------------------------------------
-# [4/5] Register task (idempotent — remove then re-add)
+# [4/5] Register task (idempotent - remove then re-add)
 # ------------------------------------------------------------------
 Write-Host "[4/5] Registering scheduled task '$TASK_NAME'..."
 
 $existing = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  Found existing task — removing before re-registration."
+    Write-Host "  Found existing task - removing before re-registration."
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
 }
 
@@ -108,7 +108,7 @@ Register-ScheduledTask `
     -Trigger     $trigger `
     -Settings    $settings `
     -Principal   $principal `
-    -Description "Cora security monitor — scans logs and file integrity every 15 minutes, Slack-alerts on anomalies." `
+    -Description "Cora security monitor - scans logs and file integrity every 15 minutes, Slack-alerts on anomalies." `
     | Out-Null
 
 Write-Host "  OK  Task registered."
@@ -119,7 +119,7 @@ Write-Host "  OK  Task registered."
 Write-Host "[5/5] Initializing file-integrity baseline..."
 & $uvExe run python "$SCRIPT" --init
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "  WARNING: Baseline init returned exit code $LASTEXITCODE — check manually." -ForegroundColor Yellow
+    Write-Host "  WARNING: Baseline init returned exit code $LASTEXITCODE - check manually." -ForegroundColor Yellow
 } else {
     Write-Host "  OK  Baseline recorded in data\security\file_hashes.json"
 }

@@ -2,10 +2,10 @@
 #
 # Read-only security posture check for the Cora host machine.
 # Prints a checklist of what is and isn't configured correctly.
-# Does NOT change any system settings — safe to run anytime.
+# Does NOT change any system settings - safe to run anytime.
 #
 # Run as Administrator for the most complete results
-# (some checks — BitLocker, audit policy — need elevation):
+# (some checks - BitLocker, audit policy - need elevation):
 #   powershell -ExecutionPolicy Bypass -File "C:\Users\Harri\code\cora\deployment\check-windows-security.ps1"
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -23,7 +23,7 @@ function Show-Result($status, $label, $detail = "") {
         default { "Cyan"  }
     }
     $line = "  [$status] $label"
-    if ($detail) { $line += " — $detail" }
+    if ($detail) { $line += " - $detail" }
     Write-Host $line -ForegroundColor $color
 }
 
@@ -177,8 +177,8 @@ Write-Host ""
 # 9. API key budget alerts (manual reminder)
 # ------------------------------------------------------------------
 Write-Host "[ API Budget Alerts (manual check) ]"
-Show-Result $INFO "Anthropic — check at: https://console.anthropic.com → Settings → Billing"
-Show-Result $INFO "OpenAI    — check at: https://platform.openai.com/usage/limits"
+Show-Result $INFO "Anthropic - check at: https://console.anthropic.com > Settings > Billing"
+Show-Result $INFO "OpenAI    - check at: https://platform.openai.com/usage/limits"
 Show-Result $INFO "Set a monthly hard cap on both to limit blast radius if a key is stolen"
 
 Write-Host ""
@@ -192,9 +192,9 @@ foreach ($t in $tasks) {
     $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue
     $lastResult = if ($info) { $info.LastTaskResult } else { "unknown" }
     if ($t.State -eq "Running" -or $t.State -eq "Ready") {
-        Show-Result $PASS "$($t.TaskName) — $($t.State) (last result: $lastResult)"
+        Show-Result $PASS "$($t.TaskName) - $($t.State) (last result: $lastResult)"
     } else {
-        Show-Result $WARN "$($t.TaskName) — $($t.State)"
+        Show-Result $WARN "$($t.TaskName) - $($t.State)"
     }
 }
 
