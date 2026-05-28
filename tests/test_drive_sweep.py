@@ -272,7 +272,7 @@ class TestExtractContent:
 class TestIngestFile:
     def _make_kb(self):
         kb = MagicMock()
-        kb.upsert = MagicMock()
+        kb.upsert_documents = MagicMock(return_value=1)
         return kb
 
     def test_ingests_single_chunk(self):
@@ -283,11 +283,12 @@ class TestIngestFile:
         content = "This is the contract text"
         n = _ingest_file(kb, file_meta, content, classification, user)
         assert n == 1
-        kb.upsert.assert_called_once()
-        call_kwargs = kb.upsert.call_args.kwargs
-        assert call_kwargs["source"] == "drive_sweep"
-        assert call_kwargs["entity"] == "F3E"
-        assert call_kwargs["source_id"] == "file1"
+        kb.upsert_documents.assert_called_once()
+        docs = kb.upsert_documents.call_args[0][0]
+        doc = docs[0]
+        assert doc.source == "drive_sweep"
+        assert doc.entity == "F3E"
+        assert doc.source_id == "file1"
 
     def test_lex_sub_entity_split(self):
         kb = self._make_kb()
@@ -295,22 +296,25 @@ class TestIngestFile:
         classification = {"score": 8, "entity": "LEX-LLC", "summary": "LLC operations manual", "discard_reason": ""}
         user = {"email": "shaun@lexingtonservices.com", "name": "Shaun Hawkins", "entity_default": "LEX"}
         n = _ingest_file(kb, file_meta, "LLC SOP content", classification, user)
-        call_kwargs = kb.upsert.call_args.kwargs
-        assert call_kwargs["entity"] == "LEX"
-        assert call_kwargs["sub_entity"] == "LEX-LLC"
+        docs = kb.upsert_documents.call_args[0][0]
+        doc = docs[0]
+        assert doc.entity == "LEX"
+        assert doc.sub_entity == "LEX-LLC"
 
     def test_multiple_chunks_for_long_content(self):
         kb = self._make_kb()
+        kb.upsert_documents = MagicMock(return_value=4)
         file_meta = {"id": "file3", "name": "big.txt", "mimeType": "text/plain", "modifiedTime": "2026-01-01T00:00:00Z"}
         classification = {"score": 7, "entity": "HJRG", "summary": "Big document", "discard_reason": ""}
         user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR"}
         long_content = "x" * 5000
         n = _ingest_file(kb, file_meta, long_content, classification, user)
-        assert n > 1
-        # Chunk source_ids use __c suffix
-        call_args_list = kb.upsert.call_args_list
-        second_call = call_args_list[1].kwargs
-        assert "__c" in second_call["source_id"]
+        assert n == 4
+        # Full content passed as single Document — KB handles chunking internally
+        kb.upsert_documents.assert_called_once()
+        docs = kb.upsert_documents.call_args[0][0]
+        assert len(docs) == 1
+        assert docs[0].content == long_content
 
     def test_drive_link_format(self):
         kb = self._make_kb()
@@ -318,8 +322,8 @@ class TestIngestFile:
         classification = {"score": 6, "entity": "FNDR", "summary": "A doc", "discard_reason": ""}
         user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR"}
         _ingest_file(kb, file_meta, "content here", classification, user)
-        call_kwargs = kb.upsert.call_args.kwargs
-        assert "drive.google.com/file/d/abc123" in call_kwargs["deep_link"]
+        docs = kb.upsert_documents.call_args[0][0]
+        assert "drive.google.com/file/d/abc123" in docs[0].deep_link
 
 
 # ── sweep_user ────────────────────────────────────────────────────────────────
@@ -329,7 +333,7 @@ class TestSweepUser:
         kb = MagicMock()
         kb.get_sync_state.return_value = None
         kb.set_sync_state = MagicMock()
-        kb.upsert = MagicMock()
+        kb.upsert_documents = MagicMock(return_value=1)
         return kb
 
     def _make_anthropic(self, score: int = 8):
@@ -386,7 +390,7 @@ class TestSweepUser:
                 sweep_user(user, "/fake/sa.json", kb, anthropic_client,
                            freshness_days=30, dry_run=True)
 
-        kb.upsert.assert_not_called()
+        kb.upsert_documents.assert_not_called()
 
     def test_phi_guard_skips_lex_phi_content(self):
         user = {"email": "shaun@lexingtonservices.com", "name": "Shaun", "entity_default": "LEX",
@@ -408,7 +412,7 @@ class TestSweepUser:
                                    freshness_days=30, dry_run=False)
 
         assert stats["phi_skipped"] >= 1
-        kb.upsert.assert_not_called()
+        kb.upsert_documents.assert_not_called()
 
     def test_dedup_skips_shared_files(self):
         user = {"email": "gaelan@f3energy.com", "name": "Gaelan", "entity_default": "F3E",
@@ -428,7 +432,7 @@ class TestSweepUser:
                                freshness_days=30, dry_run=False, seen_file_ids=seen)
 
         assert stats["dedup_skipped"] == 1
-        kb.upsert.assert_not_called()
+        kb.upsert_documents.assert_not_called()
 
     def test_noise_filtered_when_score_below_4(self):
         user = {"email": "tommy@f3energy.com", "name": "Tommy", "entity_default": "F3E",
@@ -448,7 +452,7 @@ class TestSweepUser:
                                    freshness_days=30, dry_run=False)
 
         assert stats["noise_filtered"] >= 1
-        kb.upsert.assert_not_called()
+        kb.upsert_documents.assert_not_called()
 
     def test_build_service_failure_returns_empty_stats(self):
         user = {"email": "nonexistent@nowhere.com", "name": "X", "entity_default": "FNDR",
@@ -462,7 +466,7 @@ class TestSweepUser:
                                freshness_days=30, dry_run=False)
 
         assert stats["files_enumerated"] == 0
-        kb.upsert.assert_not_called()
+        kb.upsert_documents.assert_not_called()
 
 
 # ── run_sweep ─────────────────────────────────────────────────────────────────

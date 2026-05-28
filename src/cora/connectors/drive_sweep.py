@@ -41,6 +41,8 @@ from typing import Any
 
 import yaml
 
+from cora.knowledge_base.store import Document
+
 log = logging.getLogger("cora.drive_sweep")
 
 # ── MIME type routing ──────────────────────────────────────────────────────────
@@ -294,9 +296,8 @@ def _chunk_text(text: str) -> list[str]:
 
 def _ingest_file(kb: Any, file_meta: dict, content: str,
                  classification: dict, user: dict) -> int:
-    """Store classified content chunks in the KB. Returns chunk count ingested."""
+    """Store classified content in the KB as a single Document. Returns chunk count ingested."""
     entity = classification.get("entity") or user.get("entity_default", "FNDR")
-    # Normalise sub-entity vs entity
     sub_entity: str | None = None
     if "-" in entity and entity.startswith("LEX"):
         sub_entity = entity
@@ -304,42 +305,41 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
 
     summary = classification.get("summary", file_meta["name"])
     file_id = file_meta["id"]
-    modified = file_meta.get("modifiedTime", "")
+    modified_iso = file_meta.get("modifiedTime", "")
     drive_link = f"https://drive.google.com/file/d/{file_id}/view"
 
-    metadata_json = json.dumps({
-        "mime_type": file_meta.get("mimeType", ""),
-        "user_email": user["email"],
-        "user_name": user.get("name", user["email"]),
-        "haiku_score": classification.get("score", 5),
-        "haiku_summary": summary,
-        "modified_time": modified,
-        "drive_link": drive_link,
-    })
-
-    chunks = _chunk_text(content)
-    ingested = 0
-    for i, chunk in enumerate(chunks):
-        # Use chunk index suffix so each chunk has a unique source_id
-        chunk_source_id = file_id if len(chunks) == 1 else f"{file_id}__c{i}"
+    date_modified: int | None = None
+    if modified_iso:
         try:
-            kb.upsert(
-                source="drive_sweep",
-                source_id=chunk_source_id,
-                entity=entity,
-                sub_entity=sub_entity,
-                title=file_meta["name"],
-                content=chunk,
-                deep_link=drive_link,
-                author=user.get("name", user["email"]),
-                metadata=metadata_json,
-                date_modified=modified,
-            )
-            ingested += 1
-        except Exception as exc:
-            log.warning("drive_sweep: upsert failed for %s chunk %d: %s",
-                        file_meta["name"], i, exc)
-    return ingested
+            date_modified = int(datetime.fromisoformat(modified_iso.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            pass
+
+    doc = Document(
+        source="drive_sweep",
+        source_id=file_id,
+        entity=entity,
+        sub_entity=sub_entity,
+        title=file_meta["name"],
+        content=content,
+        deep_link=drive_link,
+        author=user.get("name", user["email"]),
+        date_modified=date_modified,
+        metadata={
+            "mime_type": file_meta.get("mimeType", ""),
+            "user_email": user["email"],
+            "user_name": user.get("name", user["email"]),
+            "haiku_score": classification.get("score", 5),
+            "haiku_summary": summary,
+            "modified_time": modified_iso,
+            "drive_link": drive_link,
+        },
+    )
+    try:
+        return kb.upsert_documents([doc])
+    except Exception as exc:
+        log.warning("drive_sweep: upsert_documents failed for %s: %s", file_meta["name"], exc)
+        return 0
 
 
 # ── Per-user sweep ────────────────────────────────────────────────────────────
