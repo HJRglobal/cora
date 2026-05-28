@@ -27,7 +27,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
+import httpx
 
 CORA_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = CORA_ROOT / "logs"
@@ -268,7 +268,7 @@ def send_alert(token: str, channel: str, issues: list[dict]) -> bool:
     ]
 
     try:
-        resp = requests.post(
+        resp = httpx.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"channel": channel, "text": "\n".join(lines)},
@@ -279,7 +279,7 @@ def send_alert(token: str, channel: str, issues: list[dict]) -> bool:
             print(f"Slack error: {data.get('error')}", file=sys.stderr)
             return False
         return True
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         print(f"Slack request failed: {e}", file=sys.stderr)
         return False
 
