@@ -31,6 +31,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: FNDR
     asana_gid: "1204525779609669"
     slack_user_id: U0B2RM2JYJ1
@@ -41,6 +42,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: FNDR
     asana_gid: "1209060959783860"
     slack_user_id: U0B3AEQS0NB
@@ -51,6 +53,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: FNDR
     asana_gid: "1209093537787112"
     slack_user_id: U0B3AEJCYGP
@@ -61,6 +64,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: LEX
     asana_gid: "1212753858765058"
     slack_user_id: U0B3KHBJJ91
@@ -71,9 +75,24 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: FNDR
     asana_gid: "1211363033856346"
     slack_user_id: U0B3TPD2MEV
+
+  # Larry Stone: primary @hjrglobal.com; also larry@bigd.media (not DWD eligible -- @bigd.media not in HJR workspace)
+  - email: larry@hjrglobal.com
+    name: Larry Stone
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: BDM
+    known_aliases:
+      - larry@bigd.media
+    asana_gid: "1211265856484421"
+    slack_user_id: U0B3NGR1Y85
 
   # ── @f3energy.com -- DWD confirmed active 2026-05-27 ────────────────────
 
@@ -83,6 +102,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: F3E
     asana_gid: "1213638047870465"
     slack_user_id: U0B3RU5Q55G
@@ -93,9 +113,41 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: F3E
     asana_gid: "1210991768665805"
     slack_user_id: U0B3VGWJTMJ
+
+  # Jason@f3energy.com -- identity TBD (flagged as open question in TOM 2026-05-14)
+  - email: jason@f3energy.com
+    name: Jason (F3E)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: true
+    entity_default: F3E
+
+  # Gaelan -- dual-domain (F3E + UFL); sweep both accounts
+  - email: gaelan@f3energy.com
+    name: Gaelan
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: true
+    entity_default: F3E
+    known_aliases:
+      - gaelan@unitedfightleague.com
+
+  - email: brett@f3energy.com
+    name: Brett (F3E)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: true
+    entity_default: F3E
 
   # ── @lexingtonservices.com -- DWD confirmed active 2026-05-27 ───────────
   # PHI guardrail active in sweep + reconciliation (subject-keyword filter).
@@ -107,6 +159,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: LEX
     asana_gid: "1209093537787112"
     slack_user_id: U0B3AEJCYGP
@@ -117,6 +170,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: LEX
     asana_gid: "1212753858765058"
     slack_user_id: U0B3KHBJJ91
@@ -127,6 +181,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: LEX
     asana_gid: "1209093544422692"
     slack_user_id: U0B3PS82G30
@@ -137,6 +192,7 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: LEX
     asana_gid: "1212929353819846"
     slack_user_id: U0B3VGT8RE0
@@ -149,5 +205,28 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
+    drive_sweep: true
     entity_default: UFL
     asana_gid: "1204525928002377"
+
+  # Sophia -- UFL, aliases unknown (add here when confirmed)
+  - email: sophia@unitedfightleague.com
+    name: Sophia (UFL)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: true
+    entity_default: UFL
+
+  # Gaelan UFL alias -- same person as gaelan@f3energy.com above
+  - email: gaelan@unitedfightleague.com
+    name: Gaelan (UFL)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: true
+    entity_default: UFL
+    known_aliases:
+      - gaelan@f3energy.com

@@ -1194,7 +1194,8 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     period = (_input or {}).get("period")
@@ -1213,7 +1214,8 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     as_of = (_input or {}).get("as_of_date")
@@ -1231,7 +1233,8 @@ def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
@@ -1248,7 +1251,8 @@ def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
@@ -1265,7 +1269,8 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
@@ -1289,8 +1294,22 @@ def _is_finance_channel(channel_name: str) -> bool:
     return bool(channel_name) and channel_name.lower().endswith("-finance")
 
 
+def _is_hr_channel(channel_name: str) -> bool:
+    """Return True only if channel_name ends with '-hr' (e.g. lex-hr)."""
+    return bool(channel_name) and channel_name.lower().endswith("-hr")
+
+
+def _is_founder_entity(entity: str) -> bool:
+    """Return True for founder-level entities that can access cross-entity data."""
+    return entity.upper() in ("FNDR", "HJRG")
+
+
 _FINANCE_CHANNEL_REQUIRED = (
     "Financial details are only available in this entity's dedicated finance channel."
+)
+
+_HR_CHANNEL_REQUIRED = (
+    "HR and staff information is only available in this entity's dedicated HR channel."
 )
 
 
@@ -1303,7 +1322,12 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
     channel_name = inp.get("_channel_name", "")
     if not _is_finance_channel(channel_name):
         return _FINANCE_CHANNEL_REQUIRED
-    entity_filter = inp.get("entity_filter") or entity or "FNDR"
+    # Cross-entity gate: FNDR/HJRG can override entity_filter; all others are
+    # locked to their own entity — prevents e.g. #osn-finance querying LEX data.
+    if _is_founder_entity(entity):
+        entity_filter = inp.get("entity_filter") or entity or "FNDR"
+    else:
+        entity_filter = entity
     question = inp.get("question") or ""
     result = financial_client.get_cashflow_text(
         entity_filter=entity_filter,
@@ -2205,6 +2229,9 @@ def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     BLOCKED until Sean/Jen staffing Drive folder is configured. Returns a
     structured stub message explaining the dependency.
     """
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_hr_channel(channel_name) and not _is_founder_entity(entity):
+        return _HR_CHANNEL_REQUIRED
     log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
     return lex_client.get_staff_pulse()
 

@@ -595,7 +595,7 @@ class TestCashflowCache:
 
     def test_cache_ttl_expiry(self):
         """A cache entry older than TTL should be re-fetched."""
-        from cora.connectors.gsheets_financials import _CACHE, cashflow_file_id, _CACHE_TTL_SECONDS
+        from cora.connectors.gsheets_financials import _CACHE, cashflow_file_id, _CACHE_TTL_SECONDS, _cashflow_sheet_name
         invalidate_cache()
         csv_text = self._make_standard_csv()
         call_count = {"n": 0}
