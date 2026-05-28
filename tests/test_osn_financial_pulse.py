@@ -413,7 +413,7 @@ class TestToolDispatchHandler:
             result = _TOOL_FUNCTIONS["osn_financial_pulse"](
                 slack_user_id="U123",
                 entity="OSN",
-                _input={},
+                _input={"_channel_name": "osn-finance"},
             )
         assert "OSN Financial Pulse" in result
 

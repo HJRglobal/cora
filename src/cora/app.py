@@ -313,6 +313,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
                 entity=entity,
                 model=chosen_model,
                 prior_messages=prior_messages,
+                channel_name=channel_name,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -373,6 +374,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
             entity=entity,
             model=chosen_model,
             prior_messages=prior_messages,
+            channel_name=channel_name,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)

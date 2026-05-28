@@ -27,7 +27,7 @@ def test_single_tool_block_dispatches_sequentially():
         )
 
     mock_dispatch.assert_called_once_with(
-        "asana_get_my_tasks", {}, "U123", "FNDR",
+        "asana_get_my_tasks", {}, "U123", "FNDR", "",
     )
     assert results == [{
         "type": "tool_result",
@@ -46,7 +46,7 @@ def test_multi_tool_blocks_dispatched_in_parallel():
         _make_block("toolu_c", "hubspot_get_my_deals"),
     ]
 
-    def fake_dispatch(name, _input, _user, _entity):
+    def fake_dispatch(name, _input, _user, _entity, _channel=""):
         # Each tool "takes" some work — verify they actually run concurrently
         return f"result for {name}"
 
@@ -69,7 +69,7 @@ def test_parallel_dispatch_actually_runs_concurrently():
         _make_block("toolu_b", "slow_tool_2"),
     ]
 
-    def slow_dispatch(name, _input, _user, _entity):
+    def slow_dispatch(name, _input, _user, _entity, _channel=""):
         time.sleep(0.3)
         return f"result for {name}"
 
@@ -92,7 +92,7 @@ def test_results_preserve_order_when_tools_finish_out_of_order():
         _make_block("second_fast", "fast"),
     ]
 
-    def staggered(name, _input, _user, _entity):
+    def staggered(name, _input, _user, _entity, _channel=""):
         if name == "slow":
             time.sleep(0.2)
             return "slow result"
