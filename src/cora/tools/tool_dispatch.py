@@ -2189,11 +2189,14 @@ def _tool_lex_revalidation_status(slack_user_id: str, entity: str, _input: dict)
 
 def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Return Lex staffing pulse from the Sean/Jen Drive upload folder."""
-    channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_hr_channel(channel_name) and not _is_founder_entity(entity):
+    entity_upper = (entity or "").upper()
+    # Aggregate staffing counts are not PHI — allow any LEX context or founder
+    if not (entity_upper.startswith("LEX") or entity_upper in ("FNDR", "HJRG")):
         return _HR_CHANNEL_REQUIRED
     log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
-    return lex_client.get_staff_pulse()
+    result = lex_client.get_staff_pulse()
+    log.info("lex_staff_pulse result_len=%d preview=%r", len(result), result[:120])
+    return result
 
 
 def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:

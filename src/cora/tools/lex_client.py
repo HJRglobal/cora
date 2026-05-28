@@ -452,6 +452,10 @@ def get_staff_pulse() -> str:
         log.warning("lex_staff_pulse: folder listing failed: %s", exc)
         return "I don't have that right now — couldn't read the staffing folder."
 
+    log.info("lex_staff_pulse: folder %s returned %d file(s)", _STAFF_PULSE_FOLDER_ID, len(files))
+    if files:
+        log.info("lex_staff_pulse: files=%s", [(f.get("name"), f.get("mimeType")) for f in files[:5]])
+
     if not files:
         return (
             "The LEX staffing folder exists but contains no files yet. "
