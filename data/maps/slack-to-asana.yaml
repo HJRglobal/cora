@@ -73,24 +73,32 @@ users:
     asana_user_gid: 1213638047870465
     asana_email: tommy@hjrglobal.com
     display_name: Tommy Anderson
+    email_aliases:
+      - tommy@f3energy.com
 
   # Larry: Slack larry@bigd.media / Asana larry@hjrglobal.com
   - slack_user_id: U0B3NGR1Y85
     asana_user_gid: 1211265856484421
     asana_email: larry@hjrglobal.com
     display_name: Larry Stone
+    email_aliases:
+      - larry@bigd.media
 
   # Micah: Slack micah@bigd.media / Asana micah@hjrglobal.com
   - slack_user_id: U0B4L78SZHN
     asana_user_gid: 1209079709678901
     asana_email: micah@hjrglobal.com
     display_name: Micah Kessler
+    email_aliases:
+      - micah@bigd.media
 
   # Jake: Slack Jake@bigd.media / Asana jake@hjrglobal.com
   - slack_user_id: U0B3AER7NUF
     asana_user_gid: 1211306578489633
     asana_email: jake@hjrglobal.com
     display_name: Jake Lichtman
+    email_aliases:
+      - Jake@bigd.media
 
   # Alex: Slack alex@f3energy.com / Asana alex@hjrglobal.com
   # NOTE: Alex has TWO Asana accounts (1210991768665805 = alex@hjrglobal.com ACTIVE; 1204525928002377 = Alex@UnitedFightLeague.com DORMANT older UFL-era).
@@ -99,6 +107,8 @@ users:
     asana_user_gid: 1210991768665805
     asana_email: alex@hjrglobal.com
     display_name: Alex Cordova
+    email_aliases:
+      - alex@f3energy.com
 
   # Jeff: Slack Jeff@LexingtonServices.com / Asana jeff@hjrglobal.com
   - slack_user_id: U0B3KHBJJ91

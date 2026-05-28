@@ -18,6 +18,7 @@ from .context_loader import load_context
 from .entity_router import route
 from . import feedback_log
 from . import help_responder
+from . import knowledge_review
 from . import intent_classifier as ic
 from . import knowledge_gaps
 from .knowledge_base import embeddings as kb_embeddings
@@ -650,6 +651,24 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
                 approval_msg_ts=message_ts,
             )
             # Fall through to also log the reaction as normal feedback
+
+    # ── Knowledge-review: capture Harrison 👍/👎/💬 on proposed-update DMs ──
+    # Only log when Harrison (sole-authority reactor) reacts with an actionable
+    # emoji AND the update corresponds to a DM channel (starts with "D").
+    # We capture ALL reaction_added AND reaction_removed events — the
+    # correlate_reactions_to_updates() function uses the first APPROVED/DISMISSED
+    # on a given message_ts, so order is stable.
+    if reactor == knowledge_review.HARRISON_SLACK_USER_ID:
+        action = knowledge_review.classify_reaction(reaction)
+        if action in ("APPROVED", "DISMISSED", "COMMENT_REQUESTED"):
+            knowledge_review.log_reply_reaction(
+                reactor_id=reactor,
+                reaction=reaction,
+                message_ts=message_ts,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                event_type=event_type,
+            )
 
     feedback_log.log_reaction(
         channel=channel_id,
