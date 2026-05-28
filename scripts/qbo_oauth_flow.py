@@ -19,6 +19,14 @@ Usage:
     uv run python scripts/qbo_oauth_flow.py --entity HJRG
     uv run python scripts/qbo_oauth_flow.py --entity F3E --sandbox
 
+If localhost redirect is blocked (Intuit Production rejects http://localhost):
+    1. In the Intuit Developer Portal → Settings → Redirect URIs → Production, add:
+           https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl
+    2. Run with --manual:
+           uv run python scripts/qbo_oauth_flow.py --entity HJRG --manual
+       The browser will redirect to the Playground page. Copy the FULL URL from the
+       address bar (it contains ?code=...&realmId=...) and paste it into the terminal.
+
 List provisioned entities:
     uv run python scripts/qbo_oauth_flow.py --list
 
@@ -50,10 +58,10 @@ logging.basicConfig(
 log = logging.getLogger("qbo_oauth_flow")
 
 
-def _cmd_bootstrap(entity: str, environment: str) -> int:
-    log.info("Beginning QBO OAuth bootstrap for entity=%s env=%s", entity, environment)
+def _cmd_bootstrap(entity: str, environment: str, manual: bool = False) -> int:
+    log.info("Beginning QBO OAuth bootstrap for entity=%s env=%s manual=%s", entity, environment, manual)
     try:
-        entry = start_oauth_flow(entity, environment=environment)
+        entry = start_oauth_flow(entity, environment=environment, manual_callback=manual)
     except QboAuthError as exc:
         log.error("OAuth flow failed: %s", exc)
         return 1
@@ -108,6 +116,16 @@ def main() -> int:
         action="store_true",
         help="Force-refresh access tokens for all provisioned entities",
     )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help=(
+            "Manual copy-paste OAuth flow — skips the local callback server. "
+            "Use when Intuit Production Redirect URIs reject http://localhost. "
+            "Requires https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl "
+            "to be registered in the app's Production Redirect URIs."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -120,7 +138,7 @@ def main() -> int:
         return 2
 
     environment = "sandbox" if args.sandbox else "production"
-    return _cmd_bootstrap(args.entity.upper(), environment)
+    return _cmd_bootstrap(args.entity.upper(), environment, manual=args.manual)
 
 
 if __name__ == "__main__":

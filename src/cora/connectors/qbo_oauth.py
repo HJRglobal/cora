@@ -121,6 +121,13 @@ def _callback_scheme() -> str:
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TOKEN_FILE = _REPO_ROOT / ".credentials" / "qbo-tokens.json"
 
+# Manual-callback fallback: when Production Redirect URIs don't allow localhost,
+# use the Intuit OAuth2 Playground URI (always accepted by Intuit's validator
+# since it's an Intuit-owned domain). The browser lands on the Playground page
+# with ?code=...&realmId=...&state=... in the URL; user pastes it into the
+# terminal and the script extracts the auth code.
+_PLAYGROUND_REDIRECT_URI = "https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl"
+
 # Self-signed TLS cert for the local OAuth callback when QBO_REDIRECT_URI uses
 # https://. Intuit's portal REJECTS https://localhost:* redirect URIs (their
 # validator treats localhost as an IP address and forbids IP redirects), so
@@ -327,8 +334,12 @@ def _run_callback_server(state: str, timeout_sec: int = 300) -> dict[str, str]:
     return captured
 
 
-def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
-    """POST to Intuit's token endpoint, exchanging an auth code for access+refresh tokens."""
+def _exchange_code_for_tokens(code: str, redirect_uri: str | None = None) -> dict[str, Any]:
+    """POST to Intuit's token endpoint, exchanging an auth code for access+refresh tokens.
+
+    redirect_uri must match exactly what was used in the authorization request.
+    Defaults to QBO_REDIRECT_URI from .env; pass _PLAYGROUND_REDIRECT_URI for manual-callback flows.
+    """
     resp = httpx.post(
         _TOKEN_URL,
         headers={
@@ -339,7 +350,7 @@ def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": _redirect_uri(),
+            "redirect_uri": redirect_uri or _redirect_uri(),
         },
         timeout=30.0,
     )
@@ -350,8 +361,60 @@ def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
     return resp.json()
 
 
-def start_oauth_flow(entity: str, environment: str | None = None) -> dict[str, Any]:
+def _capture_manual_callback(expected_state: str) -> dict[str, str]:
+    """Prompt user to paste the redirect URL from the browser address bar.
+
+    Used when the local callback server can't be started (e.g. Production Redirect URIs
+    reject localhost). The browser lands on the Playground page with ?code=...&realmId=...
+    in the URL; user copies it and pastes it here.
+    """
+    print(
+        "\n  -> Intuit will redirect your browser to the OAuth2 Playground page.\n"
+        "  -> After the redirect, look at the browser's ADDRESS BAR — it will contain\n"
+        "       ?code=<auth-code>&realmId=<id>&state=<state>\n"
+        "  -> Copy the ENTIRE URL from the address bar and paste it below.\n"
+    )
+    redirect_url = input("  Paste the full redirect URL: ").strip()
+
+    parsed = urllib.parse.urlparse(redirect_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    state = (params.get("state") or [""])[0]
+    code = (params.get("code") or [""])[0]
+    realm_id = (params.get("realmId") or [""])[0]
+    error = (params.get("error") or [""])[0]
+
+    if error:
+        raise QboAuthError(f"Authorization error from Intuit: {error}")
+    if state != expected_state:
+        raise QboAuthError(
+            "State mismatch — paste the full URL exactly as it appears in the address bar "
+            "(including ?code=...&realmId=...&state=...)."
+        )
+    if not code or not realm_id:
+        raise QboAuthError(
+            f"Could not find 'code' and 'realmId' in the URL you pasted.\n"
+            f"Expected format: ...?code=<code>&realmId=<id>&state=<state>\n"
+            f"Got: {redirect_url[:300]}"
+        )
+    return {"code": code, "realm_id": realm_id}
+
+
+def start_oauth_flow(
+    entity: str,
+    environment: str | None = None,
+    manual_callback: bool = False,
+) -> dict[str, Any]:
     """Run the full browser-based OAuth flow for a single entity, persist tokens.
+
+    Args:
+        entity:          Entity code (e.g. "HJRG", "F3E").
+        environment:     "production" or "sandbox". Defaults to QBO_ENVIRONMENT in .env.
+        manual_callback: If True, skip the local callback server and instead prompt the
+                         user to paste the redirect URL from their browser address bar.
+                         Use this when Intuit's Production Redirect URIs reject localhost.
+                         Prerequisite: add _PLAYGROUND_REDIRECT_URI to the app's Redirect
+                         URIs (Settings → Redirect URIs → Production → Add URI).
 
     Returns the saved token entry (including realm_id, access_token, refresh_token).
     Raises QboAuthError on any failure.
@@ -367,15 +430,19 @@ def start_oauth_flow(entity: str, environment: str | None = None) -> dict[str, A
     client_id, _ = _client_creds()
     state = secrets.token_urlsafe(16)
 
+    # Manual-callback mode uses the Intuit Playground as redirect URI
+    # (always accepted by Intuit's portal since it's an Intuit-owned domain).
+    callback_redirect_uri = _PLAYGROUND_REDIRECT_URI if manual_callback else _redirect_uri()
+
     authorize_url = _AUTHORIZE_URL + "?" + urllib.parse.urlencode({
         "client_id": client_id,
         "response_type": "code",
         "scope": _DEFAULT_SCOPE,
-        "redirect_uri": _redirect_uri(),
+        "redirect_uri": callback_redirect_uri,
         "state": state,
     })
 
-    log.info("Starting QBO OAuth flow for entity=%s env=%s", entity, env)
+    log.info("Starting QBO OAuth flow for entity=%s env=%s manual=%s", entity, env, manual_callback)
     log.info("Opening browser to: %s", authorize_url)
     webbrowser.open(authorize_url, new=2)
     print(
@@ -385,12 +452,15 @@ def start_oauth_flow(entity: str, environment: str | None = None) -> dict[str, A
         f"    {authorize_url}\n"
     )
 
-    captured = _run_callback_server(state)
+    if manual_callback:
+        captured = _capture_manual_callback(state)
+    else:
+        captured = _run_callback_server(state)
     code = captured["code"]
     realm_id = captured["realm_id"]
 
     log.info("Captured auth code (realm_id=%s) - exchanging for tokens", realm_id)
-    token_resp = _exchange_code_for_tokens(code)
+    token_resp = _exchange_code_for_tokens(code, redirect_uri=callback_redirect_uri)
 
     now = int(time.time())
     entry = {
