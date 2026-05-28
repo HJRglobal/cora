@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 _DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 _DEFAULT_IMPERSONATE = "harrison@hjrglobal.com"
