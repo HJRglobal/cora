@@ -7,8 +7,9 @@ Returns a structured CashflowSummary with the most recent week that has
 actual data, all entity rows, and portfolio totals.
 
 Auth: reuses GOOGLE_SERVICE_ACCOUNT_JSON + CORA_DRIVE_IMPERSONATE from
-drive_connector.py. Requires both drive.readonly (modifiedTime) and
-spreadsheets.readonly (values read) scopes.
+drive_connector.py. Requires spreadsheets.readonly scope only.
+(Drive scope removed 2026-05-28 — modifiedTime is non-critical and the
+two-scope combination triggered unauthorized_client on DWD token fetch.)
 
 Behavioral contract (locked 2026-05-21):
   - Source-opaque: never log or surface file IDs, sheet names, or Drive links
@@ -45,7 +46,6 @@ log = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 _DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 _DEFAULT_IMPERSONATE = "harrison@hjrglobal.com"
@@ -664,9 +664,10 @@ def get_cashflow(
     log.info("Fetching cashflow sheet tab=%s from Sheets API (file_id redacted)", tab)
     try:
         delegated_creds = _build_delegated_creds()
-        drive_service = _build_drive_service(delegated_creds)
         sheets_service = _build_sheets_service(delegated_creds)
-        modified_date = _get_modified_time(drive_service, fid)
+        # Drive scope removed — modifiedTime not needed for core cashflow read.
+        # Pass "unknown" as as_of_date; parser handles it gracefully.
+        modified_date = "unknown"
         csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
         raise
