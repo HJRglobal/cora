@@ -256,10 +256,14 @@ _COL_NAME          = ("name", "employee", "staff", "worker", "driver")
 
 
 def _drive_service():
-    """Build a Drive v3 service via the shared drive_connector helper."""
+    """Build a Drive v3 service via direct SA credentials.
+
+    Uses impersonate=False because the LEX staffing folder is shared directly
+    with the SA email, not necessarily accessible via DWD as Harrison.
+    """
     try:
         from ..connectors.drive_connector import _build_drive_service
-        return _build_drive_service()
+        return _build_drive_service(impersonate=False)
     except ImportError as exc:
         raise LexClientError(f"Drive connector not available: {exc}") from exc
     except Exception as exc:

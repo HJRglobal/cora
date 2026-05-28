@@ -20,13 +20,15 @@ class DriveClientError(Exception):
     pass
 
 
-def download_file_bytes(file_id: str) -> bytes:
+def download_file_bytes(file_id: str, impersonate: bool = True) -> bytes:
     """Download a Drive file by ID and return raw bytes.
 
+    impersonate=False uses direct SA credentials instead of DWD — use this for
+    files in folders shared directly with the SA email.
     Raises DriveClientError on auth failure or HTTP error.
     """
     try:
-        service = _build_drive_service()
+        service = _build_drive_service(impersonate=impersonate)
     except DriveConnectorError as exc:
         raise DriveClientError(f"Drive auth failed: {exc}") from exc
 
@@ -42,18 +44,19 @@ def download_file_bytes(file_id: str) -> bytes:
         raise DriveClientError(f"Drive download failed for file {file_id!r}: {exc}") from exc
 
 
-def list_folder_files(folder_id: str, name_contains: str = "") -> list[dict]:
+def list_folder_files(folder_id: str, name_contains: str = "", impersonate: bool = True) -> list[dict]:
     """Return files in a Drive folder, newest-first.
 
     Args:
         folder_id:     Drive folder ID to list.
         name_contains: Optional case-insensitive substring filter on filename.
+        impersonate:   False = direct SA credentials (for SA-shared folders).
 
     Returns list of dicts with keys: id, name, mimeType, modifiedTime.
     Raises DriveClientError on failure.
     """
     try:
-        service = _build_drive_service()
+        service = _build_drive_service(impersonate=impersonate)
     except DriveConnectorError as exc:
         raise DriveClientError(f"Drive auth failed: {exc}") from exc
 

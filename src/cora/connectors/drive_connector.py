@@ -187,8 +187,15 @@ def _impersonate_email() -> str:
     return os.environ.get("CORA_DRIVE_IMPERSONATE", _DEFAULT_IMPERSONATE).strip()
 
 
-def _build_drive_service():
-    """Build a Drive v3 service impersonating Harrison via DWD."""
+def _build_drive_service(impersonate: bool = True):
+    """Build a Drive v3 service.
+
+    impersonate=True  (default): DWD — acts as Harrison's @hjrglobal.com identity.
+                                  Used for calendar, KB indexing, PhotoRoom upload, etc.
+    impersonate=False:            Direct SA credentials — accesses files shared
+                                  explicitly with the SA email. Used for brand assets
+                                  and LEX staffing folders shared directly with the SA.
+    """
     try:
         creds = service_account.Credentials.from_service_account_file(
             _service_account_path(),
@@ -199,8 +206,9 @@ def _build_drive_service():
             f"Failed to load service account credentials: {exc}"
         ) from exc
 
-    delegated = creds.with_subject(_impersonate_email())
-    return build("drive", "v3", credentials=delegated, cache_discovery=False)
+    if impersonate:
+        creds = creds.with_subject(_impersonate_email())
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 # ────────────────────────────────────────────────────────────────────────────

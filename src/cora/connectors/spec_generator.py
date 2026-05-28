@@ -147,7 +147,7 @@ def _get_brand_image_ref(brand: str, override_url: str | None = None) -> ImageRe
         raise ValueError(f"Drive client not available: {exc}") from exc
 
     try:
-        files = list_folder_files(_F3_BRAND_ASSETS_FOLDER_ID)
+        files = list_folder_files(_F3_BRAND_ASSETS_FOLDER_ID, impersonate=False)
     except Exception as exc:
         raise ValueError(
             f"Could not list F3 brand assets folder from Drive: {exc}"

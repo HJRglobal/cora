@@ -179,8 +179,9 @@ def _resolve_image(ref: ImageRef) -> bytes:
         return resp.content
     elif ref.type == "drive_file_id":
         # Import lazily to avoid circular deps; Drive connector lives in connectors/
+        # Use direct SA credentials — brand asset files are shared with the SA email.
         from ..connectors import drive_client  # type: ignore[attr-defined]
-        return drive_client.download_file_bytes(ref.value)
+        return drive_client.download_file_bytes(ref.value, impersonate=False)
     else:
         raise PhotoroomError(f"Unknown image ref type: {ref.type!r}")
 
