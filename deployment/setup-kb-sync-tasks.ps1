@@ -38,7 +38,7 @@ if (-not (Test-Path $UvExe)) {
     }
 }
 
-# Define the three tasks
+# Define the sync tasks
 $Tasks = @(
     @{
         Name        = "cowork-cora-kb-sync-asana"
@@ -69,6 +69,24 @@ $Tasks = @(
         Script      = "scripts\incremental_sync_notion.py"
         HourMin     = "05:00"
         Description = "Cora KB daily incremental sync - Notion Contracts & Renewals Registry (DB 7820cd3689ae4596bd8f965f2bf96d5d)"
+    },
+    @{
+        Name        = "cowork-cora-kb-sync-slack"
+        Script      = "scripts\incremental_sync_slack.py"
+        HourMin     = "02:00"
+        Description = "Cora KB daily incremental sync - Slack channel history (all channels Cora is a member of)"
+    },
+    @{
+        Name        = "cowork-cora-kb-sync-gmail"
+        Script      = "scripts\gmail_threaded_sweep.py"
+        HourMin     = "02:30"
+        Description = "Cora KB daily incremental sync - Gmail full thread text (multi-user DWD sweep)"
+    },
+    @{
+        Name        = "cowork-cora-reconciliation"
+        Script      = "scripts\run_reconciliation.py"
+        HourMin     = "05:30"
+        Description = "Cora cross-source reconciliation - detects gaps across Slack/Gmail/Asana/HubSpot, proposes to Harrison for approval"
     }
 )
 
@@ -121,7 +139,7 @@ foreach ($task in $Tasks) {
 }
 
 Write-Host ""
-Write-Host "All 5 KB sync tasks registered." -ForegroundColor Green
+Write-Host "All 9 KB sync tasks registered." -ForegroundColor Green
 Write-Host ""
 Write-Host "Verify with:" -ForegroundColor Cyan
 Write-Host "  Get-ScheduledTask -TaskName 'cowork-cora-kb-sync-*' | Format-Table TaskName, State, NextRunTime"

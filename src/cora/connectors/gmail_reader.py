@@ -337,3 +337,158 @@ def apply_label(user_email: str, message_id: str, label_id: str) -> None:
         raise GmailReaderError(
             f"Apply label failed for message {message_id}: {exc}"
         ) from exc
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Full-thread text extraction (for KB ingestion)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def list_threads_since(
+    user_email: str,
+    since_ts: int,
+    max_results: int = 200,
+) -> list[str]:
+    """Return thread IDs whose messages were received/updated after since_ts.
+
+    Uses Gmail's `after:` search operator (Unix timestamp). Returns thread IDs,
+    NOT message IDs — one thread may contain many messages.
+
+    Requires gmail.modify (or gmail.readonly) DWD scope.
+    """
+    service = _build_service(user_email)
+    query = f"after:{since_ts}"
+    thread_ids: list[str] = []
+    page_token: str | None = None
+
+    while len(thread_ids) < max_results:
+        batch = min(max_results - len(thread_ids), 100)
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "q": query,
+            "maxResults": batch,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        try:
+            resp = service.users().threads().list(**kwargs).execute()
+        except HttpError as exc:
+            status = exc.resp.status if exc.resp else "?"
+            if status == 403:
+                raise GmailReaderError(
+                    f"Gmail threads.list 403 for {user_email} — check DWD scope."
+                ) from exc
+            raise GmailReaderError(
+                f"Gmail threads.list failed for {user_email} (HTTP {status}): {exc}"
+            ) from exc
+
+        for t in resp.get("threads", []):
+            thread_ids.append(t["id"])
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    log.debug(
+        "list_threads_since(%s, after=%d): found %d threads",
+        user_email, since_ts, len(thread_ids),
+    )
+    return thread_ids[:max_results]
+
+
+def _extract_text_from_part(part: dict[str, Any]) -> str:
+    """Recursively extract plain-text body from a MIME part."""
+    mime = part.get("mimeType", "")
+    body = part.get("body", {})
+
+    if mime == "text/plain":
+        raw = body.get("data", "")
+        if raw:
+            try:
+                padded = raw + "=" * (-len(raw) % 4)
+                return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+    elif mime == "text/html":
+        # Skip HTML parts — we prefer plain text
+        return ""
+    elif mime.startswith("multipart/"):
+        parts = part.get("parts", [])
+        texts = [_extract_text_from_part(p) for p in parts]
+        return "\n".join(t for t in texts if t.strip())
+
+    return ""
+
+
+def get_full_thread_text(
+    user_email: str,
+    thread_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch full thread and return per-message metadata + body text.
+
+    Returns a list of message dicts:
+      {
+        "message_id": str,
+        "thread_id": str,
+        "sender": str,
+        "recipients": str,
+        "subject": str,
+        "date_ts": int,       Unix seconds
+        "body_text": str,     plain text body (may be empty for HTML-only emails)
+        "attachment_names": list[str],
+        "label_ids": list[str],
+      }
+
+    All messages in the thread are returned, oldest first.
+    Uses FULL format to get complete MIME tree.
+    """
+    service = _build_service(user_email)
+    try:
+        resp = service.users().threads().get(
+            userId="me",
+            id=thread_id,
+            format="full",
+        ).execute()
+    except HttpError as exc:
+        raise GmailReaderError(
+            f"Gmail threads.get failed for {thread_id}: {exc}"
+        ) from exc
+
+    messages = resp.get("messages", [])
+    results: list[dict[str, Any]] = []
+
+    for msg in messages:
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+
+        date_str = headers.get("date", "")
+        try:
+            date_ts = int(email.utils.parsedate_to_datetime(date_str).timestamp())
+        except Exception:
+            date_ts = int(msg.get("internalDate", "0")) // 1000
+
+        payload = msg.get("payload", {})
+        body_text = _extract_text_from_part(payload).strip()
+
+        # Collect attachment names (non-inline)
+        att_parts = _extract_attachment_parts(payload)
+        attachment_names = [a["filename"] for a in att_parts if a.get("filename")]
+
+        results.append({
+            "message_id": msg["id"],
+            "thread_id": thread_id,
+            "sender": headers.get("from", ""),
+            "recipients": headers.get("to", ""),
+            "subject": headers.get("subject", "(no subject)"),
+            "date_ts": date_ts,
+            "body_text": body_text[:4000],  # Cap at 4KB per message for KB chunk size
+            "attachment_names": attachment_names,
+            "label_ids": msg.get("labelIds", []),
+        })
+
+    # Oldest first (Gmail returns newest-first in thread)
+    results.sort(key=lambda m: m["date_ts"])
+    return results

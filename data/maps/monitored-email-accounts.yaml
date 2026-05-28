@@ -1,23 +1,71 @@
-# Email accounts to monitor for attachment auto-filing.
+# Email accounts monitored by Cora for two purposes:
+#   1. Attachment auto-filing (run_attachment_filer.py — every 4h)
+#   2. Full-thread KB ingestion (gmail_threaded_sweep.py — nightly 2:30am AZ)
 #
 # The Google Workspace service account needs gmail.modify DWD scope for every
 # account listed here. Add the scope in:
-#   Google Admin → Security → API Controls → Domain-wide Delegation
-#   → Edit the Cora service account entry → add:
+#   Google Admin -> Security -> API Controls -> Domain-wide Delegation
+#   -> Edit the Cora service account entry -> add:
 #     https://www.googleapis.com/auth/gmail.modify
 #
-# All filed attachments go to the shared HJR-Founder-OS Drive (accessed as
-# harrison@hjrglobal.com regardless of which account the email arrived in).
+# DWD eligibility rules:
+#   - Only works for accounts within Google Workspace orgs that Harrison
+#     administers directly. The service account's DWD grant must cover the
+#     account's domain.
+#   - @hjrglobal.com — covered (primary HJR workspace).
+#   - @f3energy.com / @bigdmedia.com — only if that domain is a separate
+#     Google Workspace org that shares the same DWD grant. If it is a separate
+#     Workspace admin, set dwd_eligible: false until confirmed.
+#   - Personal Gmail (@gmail.com) — NOT eligible for DWD ever.
 #
-# To add an org member: copy the block below, set enabled: true, push, and ensure
-# the DWD scope is granted before the next scheduled run.
+# Harrison: confirm the f3energy.com / bigdmedia.com accounts before enabling.
+# Set enabled: true once DWD scope is confirmed active for that account.
+#
+# thread_sweep: true — include in gmail_threaded_sweep.py nightly KB run
+# attachment_filer: true — include in run_attachment_filer.py 4h run
 
 accounts:
   - email: harrison@hjrglobal.com
     name: Harrison
     enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
 
-  # Uncomment and fill in as the team expands:
-  # - email: teammate@hjrglobal.com
-  #   name: Teammate Name
-  #   enabled: false
+  # Hannah Grant — ops anchor, HJRG/BDM/F3E scope
+  # Harrison: confirm @hjrglobal.com DWD is active for this account before enabling
+  - email: hannah@hjrglobal.com
+    name: Hannah Grant
+    enabled: false
+    dwd_eligible: true
+    thread_sweep: false
+    attachment_filer: false
+    entity_default: FNDR
+    asana_gid: "1209060959783860"
+    slack_user_id: U0B3AEQS0NB
+
+  # Tommy Anderson — F3E retail sales
+  # Harrison: confirm @f3energy.com is under HJR Workspace admin (or its own org)
+  - email: tommy@f3energy.com
+    name: Tommy Anderson
+    enabled: false
+    dwd_eligible: false
+    thread_sweep: false
+    attachment_filer: false
+    entity_default: F3E
+    asana_gid: "1213638047870465"
+    slack_user_id: U0B3RU5Q55G
+    note: "f3energy.com domain -- confirm DWD coverage before enabling"
+
+  # Alex Cordova — UFL/F3E account manager + athlete relations
+  # Harrison: confirm @f3energy.com domain DWD coverage
+  - email: alex@f3energy.com
+    name: Alex Cordova
+    enabled: false
+    dwd_eligible: false
+    thread_sweep: false
+    attachment_filer: false
+    entity_default: F3E
+    asana_gid: "1210991768665805"
+    slack_user_id: U0B3PS63F1C
+    note: "f3energy.com domain -- confirm DWD coverage before enabling"
