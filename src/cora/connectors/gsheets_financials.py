@@ -280,6 +280,29 @@ def _build_delegated_creds():
     return creds.with_subject(_impersonate())
 
 
+def _build_direct_sa_creds():
+    """Build direct service-account credentials (no DWD / no impersonation).
+
+    The Standing ACTUALS sheet is shared directly with the SA email as Editor,
+    so the SA can authenticate as itself without needing to impersonate a user.
+    This bypasses DWD entirely and avoids unauthorized_client errors on the
+    Sheets scope, which affects only Sheets not Calendar/Gmail.
+
+    Added 2026-05-28 after DWD remained broken for spreadsheets.readonly
+    despite the scope being listed in the Google Admin grant.
+    """
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            _sa_path(),
+            scopes=_DRIVE_SCOPES,
+        )
+    except Exception as exc:
+        raise GsheetsConnectorError(
+            f"Failed to load service account credentials: {exc}"
+        ) from exc
+    return creds  # No .with_subject() — direct SA authentication
+
+
 def _build_drive_service(delegated_creds=None):
     """Build a Drive v3 API service via service account DWD."""
     creds = delegated_creds or _build_delegated_creds()
@@ -663,10 +686,11 @@ def get_cashflow(
 
     log.info("Fetching cashflow sheet tab=%s from Sheets API (file_id redacted)", tab)
     try:
-        delegated_creds = _build_delegated_creds()
-        sheets_service = _build_sheets_service(delegated_creds)
-        # Drive scope removed — modifiedTime not needed for core cashflow read.
-        # Pass "unknown" as as_of_date; parser handles it gracefully.
+        # Use direct SA auth — sheet is shared with SA email directly.
+        # DWD (.with_subject) remains broken for spreadsheets.readonly scope;
+        # direct SA creds sidestep that entirely.
+        sa_creds = _build_direct_sa_creds()
+        sheets_service = _build_sheets_service(sa_creds)
         modified_date = "unknown"
         csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
