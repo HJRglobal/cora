@@ -168,19 +168,24 @@ ENTITY_TO_TAB: dict[str, str] = {
     "FNDR":        "CF_SUMMARY",
     "HJRG":        "CF_HJR GS",
     "F3E":         "CF_F3",
-    "F3C":         "CF_F3",        # F3 Community shares F3 tab
+    "F3C":         "CF_F3",          # F3 Community shares F3 tab
     "OSN":         "OSN Consolidated",
-    "OSN-WR":      "CF_OSN Warner",
+    "OSN-GW":      "CF_OSN Warner",   # Gilbert & Warner (canonical code fixed 2026-05-28; was OSN-WR)
     "OSN-GF":      "CF_OSN Greenfield",
     "OSN-VV":      "CF_OSN ValVista",
     "OSN-MK":      "CF_OSN McKellips",
-    "OSN-CORE4":   "CF_OSN Core4",  # Partner distributions / loan lens
+    "OSN-CORE4":   "CF_OSN Core4",    # Partner distributions / loan lens
     "LEX":         "CF_LEXCORP",
+    "LEX-CORP":    "CF_LEXCORP",      # explicit sub-entity alias
     "LEX-LLC":     "CF_LLC",
     "LEX-LBHS":    "CF_LBHS",
     "LEX-LTS":     "CF_LTS",
-    "LEX-LLA":     "CF_LLA_MV",
+    "LEX-LLA":     "CF_LLA_MV",       # Maryvale + all LLA locations share one tab
+    "LEX-LLA-MV":  "CF_LLA_MV",
     "HJRP":        "CF_HJR Prop",
+    "HJRP-CL":     "CF_HJR Prop",     # Cinema Lanes — no dedicated tab
+    "HJRP-LCI":    "CF_HJR Prop",     # LCI Realty — no dedicated tab
+    "HJRP-RR":     "CF_HJR Prop",     # Rogers Ranch — no dedicated tab
     "BDM":         "CF_BigDM",
     "UFL":         "CF_UFL",
     "HJRPROD":     "CF_HJR PROD",
