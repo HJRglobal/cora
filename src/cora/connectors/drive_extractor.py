@@ -228,6 +228,11 @@ def extract_facts_for_file(
         log.error("drive_extractor: Haiku call failed for %s: %s", filename, exc)
         return []
 
+    # Strip markdown code fences if the model wrapped its JSON output
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        raw = raw.rsplit("```", 1)[0].strip()
+
     try:
         parsed = json.loads(raw)
         facts = parsed.get("facts") or []
