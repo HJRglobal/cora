@@ -17,6 +17,7 @@ Rules are intentionally conservative: when uncertain, classify COMPLEX (full pip
 rather than skipping retrieval that might be needed.
 """
 
+import html
 import re
 from enum import Enum
 from dataclasses import dataclass
@@ -130,13 +131,14 @@ def classify(user_message: str, entity: str = "") -> Intent:
     entity is accepted for future entity-specific rule variants (e.g., OSN questions
     about "store count" are operational, not financial). Currently unused.
     """
-    if _FINANCIAL_RE.search(user_message):
+    text = html.unescape(user_message)
+    if _FINANCIAL_RE.search(text):
         return Intent.FINANCIAL
-    if _IDENTITY_RE.search(user_message):
+    if _IDENTITY_RE.search(text):
         return Intent.IDENTITY
-    if _TASK_RE.search(user_message):
+    if _TASK_RE.search(text):
         return Intent.TASK_LOOKUP
-    if _SIMPLE_RE.search(user_message):
+    if _SIMPLE_RE.search(text):
         return Intent.SIMPLE
     return Intent.COMPLEX
 

@@ -1205,7 +1205,7 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
         report = qbo_client.get_profit_loss(target, start_date, end_date)
     except qbo_client.QboClientError as exc:
         log.warning("QBO P&L tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching P&L for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_profit_loss entity=%s period=%s..%s", target, start_date, end_date)
     return qbo_client.format_pnl_for_llm(report, target, start_date, end_date)
 
@@ -1224,7 +1224,7 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
         report = qbo_client.get_balance_sheet(target, as_of)
     except qbo_client.QboClientError as exc:
         log.warning("QBO Balance Sheet tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching Balance Sheet for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_balance_sheet entity=%s as_of=%s", target, as_of or "today")
     return qbo_client.format_balance_sheet_for_llm(report, target, as_of or "today")
 
@@ -1242,7 +1242,7 @@ def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str
         report = qbo_client.get_ar_aging(target)
     except qbo_client.QboClientError as exc:
         log.warning("QBO AR Aging tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching AR Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_ar_aging entity=%s", target)
     return qbo_client.format_ar_aging_for_llm(report, target)
 
@@ -1260,7 +1260,7 @@ def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str
         report = qbo_client.get_ap_aging(target)
     except qbo_client.QboClientError as exc:
         log.warning("QBO AP Aging tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching AP Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_ap_aging entity=%s", target)
     return qbo_client.format_ap_aging_for_llm(report, target)
 
@@ -1283,7 +1283,7 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
         payload = qbo_client.get_recent_transactions(target, days=days)
     except qbo_client.QboClientError as exc:
         log.warning("QBO Recent Transactions tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching recent transactions for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_recent_transactions entity=%s days=%d", target, days)
     return qbo_client.format_recent_transactions_for_llm(payload, target, days)
 
@@ -1317,6 +1317,21 @@ _QBO_TIER1_REQUIRED = (
 _HR_CHANNEL_REQUIRED = (
     "HR and staff information is only available in this entity's dedicated HR channel."
 )
+
+
+def _qbo_error_message(entity: str, exc: Exception) -> str:
+    """Return a clean, user-facing error string for a QBO failure.
+
+    Distinguishes auth failures (not connected / needs re-auth) from transient
+    API errors so Claude doesn't hallucinate remediation steps.
+    """
+    exc_str = str(exc).lower()
+    if "auth error" in exc_str or "invalid_grant" in exc_str or "refresh failed" in exc_str:
+        return (
+            f"QuickBooks for {entity} isn't connected or needs re-authorization. "
+            f"I don't have that data right now."
+        )
+    return f"QuickBooks is temporarily unavailable for {entity}. I don't have that data right now."
 
 
 def _is_tier1_channel(entity: str, channel_name: str) -> bool:
