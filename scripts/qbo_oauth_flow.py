@@ -71,11 +71,11 @@ _KNOWN_REALM_IDS: dict[str, str] = {
     "HJRG":  "9130349690118516",   # HJR GS
     "HJRP":  "123145677834422",    # HJR Properties
     "HRLLC": "9130351363051036",   # Harrison Rogers, LLC
-    # OSN individual store QBO companies — realm IDs filled in after OAuth (May 2026)
-    # "OSNGM": "...",              # OSN Gilbert & McKellips
-    # "OSNVV": "...",              # OSN Val Vista & Pecos
-    # "OSNGF": "...",              # OSN Greenfield & 60
-    # "OSNGW": "...",              # OSN Gilbert & Warner
+    # OSN individual store QBO companies — realm IDs confirmed May 2026
+    "OSNGM": "9341455849403910",   # OSN Gilbert & McKellips
+    "OSNVV": "9341455849381038",   # OSN Val Vista & Pecos
+    "OSNGF": "9341455603559062",   # OSN Greenfield & 60
+    "OSNGW": "9341455739750491",   # OSN Gilbert & Warner
 }
 
 _KNOWN_REALM_NAMES: dict[str, str] = {
@@ -86,6 +86,10 @@ _KNOWN_REALM_NAMES: dict[str, str] = {
     "9130349690118516": "HJR GS",
     "123145677834422":  "HJR Properties",
     "9130351363051036": "Harrison Rogers, LLC",
+    "9341455849403910": "OSN Gilbert & McKellips",
+    "9341455849381038": "OSN Val Vista & Pecos",
+    "9341455603559062": "OSN Greenfield & 60",
+    "9341455739750491": "OSN Gilbert & Warner",
     _LEXINGTON_FIRM_REALM: "Lexington Firm (accountant's own company — NOT an entity client)",
 }
 
