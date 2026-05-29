@@ -230,9 +230,8 @@ def extract_facts_for_file(
 
     # Strip markdown code fences if the model wrapped its JSON output
     if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]  # drop the opening ```json line
-        raw = raw.rsplit("```", 1)[0]  # drop the closing ```
-        raw = raw.strip()
+        raw = raw.split("\n", 1)[-1]
+        raw = raw.rsplit("```", 1)[0].strip()
 
     try:
         parsed = json.loads(raw)
