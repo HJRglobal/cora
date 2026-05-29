@@ -29,6 +29,7 @@ from ..connectors.gsheets_financials import (
     entity_to_tab,
     get_cashflow,
 )
+from ..connectors import drive_financial_reader
 
 log = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ def _audit(
 
 def _fmt_currency(val: Optional[float]) -> str:
     if val is None:
-        return "-"
+        return "—"
     sign = "-" if val < 0 else ""
     return f"{sign}${abs(val):,.0f}"
 
@@ -208,7 +209,7 @@ def _format_summary_full(
         ]
         if not entities_to_show:
             return (
-                f"No cash flow data found for *{label}* "
+                f"No cash flow data found for *{entity_filter}* "
                 f"in {s.week_label} (as of {s.as_of_date}). "
                 "Ask Hayden or Justin to confirm the sheet has been updated."
             )
@@ -460,3 +461,96 @@ def notify_gap(
         log.warning("Failed to post finance gap notification: %s", exc)
 
     return UNKNOWN_RESPONSE
+
+
+def get_entity_pulse_text(
+    *,
+    entity: str,
+    channel: str = "",
+    user: str = "",
+) -> str:
+    """Read the financial pulse .md file for an entity from Drive.
+
+    Returns the pulse file content (markdown), or UNKNOWN_RESPONSE if the
+    file is unavailable or the read fails. Source-opaque.
+    """
+    try:
+        text = drive_financial_reader.get_pulse_text(entity)
+        if text:
+            _audit(
+                channel=channel,
+                user=user,
+                query_summary=f"pulse entity={entity}",
+                result_type="success",
+                entity_filter=entity,
+            )
+            return text
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary=f"pulse entity={entity}",
+            result_type="not_found",
+            entity_filter=entity,
+        )
+        return UNKNOWN_RESPONSE
+    except Exception as exc:
+        log.exception("Unexpected error in get_entity_pulse_text entity=%s: %s", entity, exc)
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary=f"pulse entity={entity}",
+            result_type="unexpected_error",
+            entity_filter=entity,
+        )
+        return UNKNOWN_RESPONSE
+
+
+def get_close_pack_text(
+    *,
+    entity: str,
+    period: str,
+    doctype: str,
+    channel: str = "",
+    user: str = "",
+) -> str:
+    """Read a monthly close pack xlsx file for an entity/period/doctype.
+
+    entity:  Cora entity code (e.g. "F3E", "LEX-LLC", "OSN")
+    period:  Data period in YYYY-MM format (e.g. "2026-04")
+    doctype: pl, bs, cf, ar, or ap
+
+    Returns formatted Slack text, or UNKNOWN_RESPONSE if the file is not
+    found or the parse produces no output. Source-opaque.
+    """
+    try:
+        text = drive_financial_reader.get_monthly_report_text(entity, period, doctype)
+        if text:
+            _audit(
+                channel=channel,
+                user=user,
+                query_summary=f"close_pack entity={entity} period={period} doctype={doctype}",
+                result_type="success",
+                entity_filter=entity,
+            )
+            return text
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary=f"close_pack entity={entity} period={period} doctype={doctype}",
+            result_type="not_found",
+            entity_filter=entity,
+        )
+        return UNKNOWN_RESPONSE
+    except Exception as exc:
+        log.exception(
+            "Unexpected error in get_close_pack_text entity=%s period=%s doctype=%s: %s",
+            entity, period, doctype, exc,
+        )
+        _audit(
+            channel=channel,
+            user=user,
+            query_summary=f"close_pack entity={entity} period={period} doctype={doctype}",
+            result_type="unexpected_error",
+            entity_filter=entity,
+        )
+        return UNKNOWN_RESPONSE

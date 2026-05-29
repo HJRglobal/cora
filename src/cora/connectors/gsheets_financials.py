@@ -7,8 +7,9 @@ Returns a structured CashflowSummary with the most recent week that has
 actual data, all entity rows, and portfolio totals.
 
 Auth: reuses GOOGLE_SERVICE_ACCOUNT_JSON + CORA_DRIVE_IMPERSONATE from
-drive_connector.py. Requires both drive.readonly (modifiedTime) and
-spreadsheets.readonly (values read) scopes.
+drive_connector.py. Requires spreadsheets.readonly scope only.
+(Drive scope removed 2026-05-28 — modifiedTime is non-critical and the
+two-scope combination triggered unauthorized_client on DWD token fetch.)
 
 Behavioral contract (locked 2026-05-21):
   - Source-opaque: never log or surface file IDs, sheet names, or Drive links
@@ -45,7 +46,6 @@ log = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 _DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 _DEFAULT_IMPERSONATE = "harrison@hjrglobal.com"
@@ -168,19 +168,24 @@ ENTITY_TO_TAB: dict[str, str] = {
     "FNDR":        "CF_SUMMARY",
     "HJRG":        "CF_HJR GS",
     "F3E":         "CF_F3",
-    "F3C":         "CF_F3",        # F3 Community shares F3 tab
+    "F3C":         "CF_F3",          # F3 Community shares F3 tab
     "OSN":         "OSN Consolidated",
-    "OSN-WR":      "CF_OSN Warner",
+    "OSN-GW":      "CF_OSN Warner",   # Gilbert & Warner (canonical code fixed 2026-05-28; was OSN-WR)
     "OSN-GF":      "CF_OSN Greenfield",
     "OSN-VV":      "CF_OSN ValVista",
     "OSN-MK":      "CF_OSN McKellips",
-    "OSN-CORE4":   "CF_OSN Core4",  # Partner distributions / loan lens
+    "OSN-CORE4":   "CF_OSN Core4",    # Partner distributions / loan lens
     "LEX":         "CF_LEXCORP",
+    "LEX-CORP":    "CF_LEXCORP",      # explicit sub-entity alias
     "LEX-LLC":     "CF_LLC",
     "LEX-LBHS":    "CF_LBHS",
     "LEX-LTS":     "CF_LTS",
-    "LEX-LLA":     "CF_LLA_MV",
+    "LEX-LLA":     "CF_LLA_MV",       # Maryvale + all LLA locations share one tab
+    "LEX-LLA-MV":  "CF_LLA_MV",
     "HJRP":        "CF_HJR Prop",
+    "HJRP-CL":     "CF_HJR Prop",     # Cinema Lanes — no dedicated tab
+    "HJRP-LCI":    "CF_HJR Prop",     # LCI Realty — no dedicated tab
+    "HJRP-RR":     "CF_HJR Prop",     # Rogers Ranch — no dedicated tab
     "BDM":         "CF_BigDM",
     "UFL":         "CF_UFL",
     "HJRPROD":     "CF_HJR PROD",
@@ -278,6 +283,29 @@ def _build_delegated_creds():
             f"Failed to load service account credentials: {exc}"
         ) from exc
     return creds.with_subject(_impersonate())
+
+
+def _build_direct_sa_creds():
+    """Build direct service-account credentials (no DWD / no impersonation).
+
+    The Standing ACTUALS sheet is shared directly with the SA email as Editor,
+    so the SA can authenticate as itself without needing to impersonate a user.
+    This bypasses DWD entirely and avoids unauthorized_client errors on the
+    Sheets scope, which affects only Sheets not Calendar/Gmail.
+
+    Added 2026-05-28 after DWD remained broken for spreadsheets.readonly
+    despite the scope being listed in the Google Admin grant.
+    """
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            _sa_path(),
+            scopes=_DRIVE_SCOPES,
+        )
+    except Exception as exc:
+        raise GsheetsConnectorError(
+            f"Failed to load service account credentials: {exc}"
+        ) from exc
+    return creds  # No .with_subject() — direct SA authentication
 
 
 def _build_drive_service(delegated_creds=None):
@@ -663,10 +691,12 @@ def get_cashflow(
 
     log.info("Fetching cashflow sheet tab=%s from Sheets API (file_id redacted)", tab)
     try:
-        delegated_creds = _build_delegated_creds()
-        drive_service = _build_drive_service(delegated_creds)
-        sheets_service = _build_sheets_service(delegated_creds)
-        modified_date = _get_modified_time(drive_service, fid)
+        # Use direct SA auth — sheet is shared with SA email directly.
+        # DWD (.with_subject) remains broken for spreadsheets.readonly scope;
+        # direct SA creds sidestep that entirely.
+        sa_creds = _build_direct_sa_creds()
+        sheets_service = _build_sheets_service(sa_creds)
+        modified_date = "unknown"
         csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
         raise

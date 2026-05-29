@@ -25,6 +25,7 @@ def pytest_configure(config):
     os.environ.setdefault("SLACK_APP_TOKEN", "xapp-1-test-dummy-token-for-ci")
     os.environ.setdefault("SLACK_SIGNING_SECRET", "test-signing-secret-for-ci")
     os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key-for-ci")
+    os.environ.setdefault("ASANA_PAT", "0/dummy-asana-pat-for-ci")
 
     # ── Proxy vars that break anthropic/httpx in sandbox/CI environments ──────
     # The Cowork sandbox sets all_proxy=socks5h://localhost:1080 which causes

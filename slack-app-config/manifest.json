@@ -17,15 +17,25 @@
         "chat:write",
         "channels:read",
         "groups:read",
+        "im:read",
+        "mpim:read",
         "users:read",
+        "users:read.email",
         "channels:history",
-        "groups:history"
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "reactions:read"
       ]
     }
   },
   "settings": {
     "event_subscriptions": {
-      "bot_events": ["app_mention"]
+      "bot_events": [
+        "app_mention",
+        "reaction_added",
+        "reaction_removed"
+      ]
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,

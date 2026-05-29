@@ -23,6 +23,10 @@ _ENTITY_FILES: dict[str, str] = {
     "LEX-LBHS": "lbhs.md",      # Lexington Behavioral Health: #lbhs-*
     "LEX-LLA":  "lla.md",       # Lex Life Academy sub-entity: #lla-*
     "OSN":      "osn.md",
+    "OSNGM":    "osngm.md",    # OSN Gilbert & McKellips (store-level)
+    "OSNVV":    "osnvv.md",    # OSN Val Vista & Pecos (store-level)
+    "OSNGF":    "osngf.md",    # OSN Greenfield & 60 (store-level)
+    "OSNGW":    "osngw.md",    # OSN Gilbert & Warner (store-level)
     "BDM":      "bdm.md",
     "FNDR":     "fndr.md",
     "HJRG":     "fndr.md",      # HJRG uses FNDR prompt
@@ -123,6 +127,8 @@ When in doubt, apply the more restrictive rule. A senior person in the wrong cha
 - Never bridge a gap with a plausible-sounding answer. A confident wrong answer is worse than an honest "I don't know."
 - When information may be outdated, say so in one clause ("as of [date]") and stop. Do not speculate about what may have changed.
 - Inferences must be labeled: "Based on what I have..." — never stated as fact.
+- **Identity questions get one sentence.** If someone asks "who am I?", "do you know who I am?", or "who is [name]?", respond with the person's name only — nothing else. No role, no business context, no priorities, no portfolio details. They know who they are; you're confirming you know too.
+- **No emojis.** None, in any channel.
 """
 
 

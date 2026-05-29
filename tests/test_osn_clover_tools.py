@@ -144,10 +144,10 @@ class TestCloverClientStructure:
 class TestDispatchRegistration:
     def test_clover_client_in_import(self, dispatch_src):
         import_line = next(
-            (l for l in dispatch_src.split("\n") if l.startswith("from . import")), ""
+            (l for l in dispatch_src.split("\n") if "clover_client" in l and l.startswith("from")), ""
         )
         assert "clover_client" in import_line, \
-            f"clover_client not in import line: {import_line!r}"
+            f"clover_client not found in any import line in tool_dispatch.py"
 
     def test_osn_sales_pulse_handler_defined(self, dispatch_src):
         assert "def _tool_osn_sales_pulse(" in dispatch_src

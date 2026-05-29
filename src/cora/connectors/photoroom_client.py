@@ -179,8 +179,9 @@ def _resolve_image(ref: ImageRef) -> bytes:
         return resp.content
     elif ref.type == "drive_file_id":
         # Import lazily to avoid circular deps; Drive connector lives in connectors/
+        # Use direct SA credentials — brand asset files are shared with the SA email.
         from ..connectors import drive_client  # type: ignore[attr-defined]
-        return drive_client.download_file_bytes(ref.value)
+        return drive_client.download_file_bytes(ref.value, impersonate=False)
     else:
         raise PhotoroomError(f"Unknown image ref type: {ref.type!r}")
 
@@ -798,6 +799,8 @@ def batch_run(specs: list[ImageSpec], dry_run: bool = False) -> BatchResults:
             result = run_spec(spec, dry_run=dry_run)
         except PhotoroomBudgetError:
             raise  # stop the whole batch on budget hit
+        except PhotoroomConfigError:
+            raise  # stop the whole batch on missing config
         except Exception as exc:
             log.error("batch_run: spec %s failed: %s", spec.spec_id, exc)
             results.append(

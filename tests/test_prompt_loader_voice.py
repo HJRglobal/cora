@@ -50,9 +50,8 @@ def test_voice_block_skipped_when_voice_yaml_missing(monkeypatch, tmp_path):
 
     result = pl.load_prompt("F3E")
 
-    # Voice block uses defaults (sparingly/balanced) and no voice text — composer
-    # returns the prompt unchanged.
-    assert result == "F3E plain prompt"
+    # Voice block uses defaults; _UNIVERSAL_RULES appended but prompt body unchanged.
+    assert result.startswith("F3E plain prompt")
 
 
 def test_lex_inherits_voice_from_defaults_via_inherits_key(monkeypatch, tmp_path):

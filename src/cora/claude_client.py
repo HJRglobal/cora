@@ -250,6 +250,7 @@ def _dispatch_tools_parallel(
     entity: str,
     iteration: int,
     log_prefix: str = "tool_use",
+    channel_name: str = "",
 ) -> list[dict]:
     """Dispatch a batch of tool_use blocks, in parallel when there are 2+.
 
@@ -273,7 +274,7 @@ def _dispatch_tools_parallel(
 
     if len(tool_use_blocks) == 1:
         block = tool_use_blocks[0]
-        result_str = dispatch(block.name, block.input or {}, slack_user_id, entity)
+        result_str = dispatch(block.name, block.input or {}, slack_user_id, entity, channel_name)
         return [{
             "type": "tool_result",
             "tool_use_id": block.id,
@@ -284,7 +285,7 @@ def _dispatch_tools_parallel(
     max_workers = min(len(tool_use_blocks), _TOOL_DISPATCH_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cora-tool") as executor:
         futures = [
-            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity)
+            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity, channel_name)
             for b in tool_use_blocks
         ]
         results = [f.result() for f in futures]
@@ -303,6 +304,7 @@ def generate_response(
     entity: str = "FNDR",
     model: str | None = None,
     prior_messages: list[dict] | None = None,
+    channel_name: str = "",
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
@@ -364,7 +366,8 @@ def generate_response(
             b for b in response.content if getattr(b, "type", None) == "tool_use"
         ]
         tool_results = _dispatch_tools_parallel(
-            tool_use_blocks, slack_user_id, entity, iteration, log_prefix="tool_use",
+            tool_use_blocks, slack_user_id, entity, iteration,
+            log_prefix="tool_use", channel_name=channel_name,
         )
 
         messages.append({"role": "user", "content": tool_results})
@@ -416,6 +419,7 @@ def generate_response_streaming(
     entity: str = "FNDR",
     model: str | None = None,
     prior_messages: list[dict] | None = None,
+    channel_name: str = "",
 ) -> str:
     """Streaming variant of generate_response.
 
@@ -530,7 +534,8 @@ def generate_response_streaming(
             b for b in final.content if getattr(b, "type", None) == "tool_use"
         ]
         tool_results = _dispatch_tools_parallel(
-            tool_use_blocks, slack_user_id, entity, iteration, log_prefix="tool_use (stream)",
+            tool_use_blocks, slack_user_id, entity, iteration,
+            log_prefix="tool_use (stream)", channel_name=channel_name,
         )
 
         messages.append({"role": "user", "content": tool_results})

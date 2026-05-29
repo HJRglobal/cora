@@ -13,7 +13,8 @@ def test_filter_lex_llc():
     result = build_sub_entity_filter("LEX-LLC")
     assert result is not None
     sql, params = result
-    assert "sub_entity IS NULL" in sql
+    # Strict mode: only explicitly-tagged chunks; NULL (GM-level) excluded to prevent leakage.
+    assert "sub_entity IN" in sql
     assert "LEX-LLC" in params
 
 

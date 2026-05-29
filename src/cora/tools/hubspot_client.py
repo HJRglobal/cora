@@ -228,6 +228,11 @@ def _fetch_pipeline_deals(pipeline_id: str) -> list[dict[str, Any]]:
     return all_deals
 
 
+def get_deals_by_pipeline(pipeline_id: str) -> list[dict[str, Any]]:
+    """Public alias for _fetch_pipeline_deals — returns raw deal objects from HubSpot API."""
+    return _fetch_pipeline_deals(pipeline_id)
+
+
 def get_f3e_pipeline_summary_text() -> str:
     """Fetch the F3E Retail pipeline and return a structured summary string for Claude.
 
@@ -365,6 +370,137 @@ def get_f3e_pipeline_summary_text() -> str:
         "Source-opaque: do not mention HubSpot, CRM, API, or any platform name.",
     ]
     return "\n".join(lines)
+
+
+def search_distributor_company(name: str) -> dict | None:
+    """Search HubSpot for a company matching `name` and return an enrichment dict.
+
+    Pulls company record + primary contact + associated deals. Used to enrich
+    sales deck generation with CRM context before Claude writes slide content.
+
+    Returns None (never raises) if HubSpot is unconfigured, the company isn't
+    found, or any API call fails — callers proceed with the info they have.
+    """
+    try:
+        token = _token()
+    except HubSpotClientError:
+        return None
+
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Search companies by name (CONTAINS_TOKEN = case-insensitive substring match)
+    search_body = {
+        "filterGroups": [{"filters": [{
+            "propertyName": "name",
+            "operator": "CONTAINS_TOKEN",
+            "value": name,
+        }]}],
+        "properties": [
+            "name", "website", "industry", "phone",
+            "city", "state", "description", "numberofemployees",
+        ],
+        "limit": 3,
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/crm/v3/objects/companies/search", headers=hdrs, json=search_body)
+        if r.status_code != 200:
+            log.warning("HubSpot company search HTTP %s for %r", r.status_code, name)
+            return None
+        results = r.json().get("results", []) or []
+        if not results:
+            return None
+        company = results[0]
+    except Exception as exc:
+        log.warning("HubSpot company search failed for %r: %s", name, exc)
+        return None
+
+    company_id = company.get("id", "")
+    props = company.get("properties") or {}
+
+    enrichment: dict = {
+        "company_id": company_id,
+        "name": props.get("name") or name,
+        "website": props.get("website") or "",
+        "industry": props.get("industry") or "",
+        "phone": props.get("phone") or "",
+        "city": props.get("city") or "",
+        "state": props.get("state") or "",
+        "description": props.get("description") or "",
+        "num_employees": props.get("numberofemployees") or "",
+        "primary_contact_name": "",
+        "primary_contact_title": "",
+        "primary_contact_email": "",
+        "open_deals": [],
+        "hubspot_url": f"https://app.hubspot.com/contacts/{_PORTAL_ID}/company/{company_id}",
+    }
+
+    if not company_id:
+        return enrichment
+
+    # Fetch primary contact via company → contacts association
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/crm/v3/objects/companies/{company_id}/associations/contacts",
+                headers=hdrs,
+            )
+        if r.status_code == 200:
+            contact_refs = r.json().get("results", []) or []
+            if contact_refs:
+                contact_id = contact_refs[0].get("id", "")
+                if contact_id:
+                    with httpx.Client(timeout=_TIMEOUT) as c:
+                        rc = c.get(
+                            f"{_BASE}/crm/v3/objects/contacts/{contact_id}",
+                            headers=hdrs,
+                            params={"properties": "firstname,lastname,jobtitle,email"},
+                        )
+                    if rc.status_code == 200:
+                        cp = rc.json().get("properties") or {}
+                        first = (cp.get("firstname") or "").strip()
+                        last = (cp.get("lastname") or "").strip()
+                        enrichment["primary_contact_name"] = f"{first} {last}".strip()
+                        enrichment["primary_contact_title"] = cp.get("jobtitle") or ""
+                        enrichment["primary_contact_email"] = cp.get("email") or ""
+    except Exception as exc:
+        log.warning("HubSpot contact fetch failed for company %s: %s", company_id, exc)
+
+    # Fetch associated deals (surface existing F3E relationship if any)
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/crm/v3/objects/companies/{company_id}/associations/deals",
+                headers=hdrs,
+            )
+        if r.status_code == 200:
+            deal_refs = (r.json().get("results", []) or [])[:5]
+            for dr in deal_refs:
+                deal_id = dr.get("id", "")
+                if not deal_id:
+                    continue
+                with httpx.Client(timeout=_TIMEOUT) as c:
+                    rd = c.get(
+                        f"{_BASE}/crm/v3/objects/deals/{deal_id}",
+                        headers=hdrs,
+                        params={"properties": "dealname,dealstage,amount,closedate"},
+                    )
+                if rd.status_code == 200:
+                    dp = rd.json().get("properties") or {}
+                    deal_name = dp.get("dealname") or ""
+                    stage_id = dp.get("dealstage") or ""
+                    stage = _STAGE_NAME_CACHE.get(stage_id, stage_id)
+                    amount = dp.get("amount") or ""
+                    amount_str = f" · ${float(amount):,.0f}" if amount else ""
+                    enrichment["open_deals"].append(f"{deal_name} — {stage}{amount_str}")
+    except Exception as exc:
+        log.warning("HubSpot deal fetch failed for company %s: %s", company_id, exc)
+
+    log.info(
+        "HubSpot enrichment found company=%r contact=%r deals=%d",
+        enrichment["name"], enrichment["primary_contact_name"], len(enrichment["open_deals"]),
+    )
+    return enrichment
 
 
 def format_deals_for_llm(

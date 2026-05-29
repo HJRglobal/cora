@@ -16,6 +16,7 @@ dependencies = [
     "tiktoken>=0.7",         # token counting for chunker (cl100k_base encoding)
     "sqlite-vec>=0.1.6",     # vector search extension for sqlite
     "openpyxl>=3.1",         # xlsx parsing for inventory_client (Weekly Inventory Report)
+    "pdfplumber>=0.10",      # PDF text extraction for drive_sweep connector
 ]
 
 [project.scripts]

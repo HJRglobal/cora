@@ -219,8 +219,9 @@ def handle_f3_generate_image(
         result: GenerateResult = run_spec(spec, dry_run=False)
     except PhotoroomBudgetError as exc:
         return f"Weekly budget cap reached — no image generated. ({exc})"
-    except PhotoroomConfigError as exc:
-        return f"Image generation not configured: {exc}"
+    except PhotoroomConfigError:
+        log.warning("f3_generate_image: image generation API not configured")
+        return "Image generation is not configured. Ask Harrison to set up the API credentials."
     except PhotoroomError as exc:
         return f"Image generation failed: {exc}"
     except Exception as exc:
@@ -293,8 +294,9 @@ def handle_f3_batch_image_run(
         results: BatchResults = batch_run(valid_specs, dry_run=False)
     except PhotoroomBudgetError as exc:
         return f"Weekly budget cap reached before batch started: {exc}"
-    except PhotoroomConfigError as exc:
-        return f"Image generation not configured: {exc}"
+    except PhotoroomConfigError:
+        log.warning("f3_batch_image_run: image generation API not configured")
+        return "Image generation is not configured. Ask Harrison to set up the API credentials."
     except Exception as exc:
         log.exception("f3_batch_image_run unexpected error, folder %s", folder_id)
         return f"Unexpected error during batch run: {exc}"
@@ -378,7 +380,7 @@ def handle_f3_create_image(
     if dry_run:
         bg = image_spec.background
         return (
-            f"🔍 *Dry run — F3 {brand.capitalize()} image brief*\n\n"
+            f"*Dry run — F3 {brand.capitalize()} image brief*\n\n"
             f"*Generated background prompt:*\n_{bg.prompt}_\n\n"
             f"*Negative prompt:* {bg.negative_prompt}\n"
             f"*Guidance:* {bg.guidance.scale}\n"
@@ -392,8 +394,9 @@ def handle_f3_create_image(
         result: GenerateResult = run_spec(image_spec, dry_run=False)
     except PhotoroomBudgetError as exc:
         return f"Weekly budget cap reached — no image generated. ({exc})"
-    except PhotoroomConfigError as exc:
-        return f"Image generation not configured: {exc}"
+    except PhotoroomConfigError:
+        log.warning("f3_create_image: image generation API not configured spec_id=%s", image_spec.spec_id)
+        return "Image generation is not configured. Ask Harrison to set up the API credentials."
     except PhotoroomError as exc:
         return f"Image generation failed: {exc}"
     except Exception as exc:

@@ -18,8 +18,9 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
 from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
+from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
 log = logging.getLogger(__name__)
 
@@ -1191,7 +1192,11 @@ def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str 
 
 def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Profit and Loss for an entity over a period. Returns a Slack-mrkdwn summary + QBO link."""
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     period = (_input or {}).get("period")
@@ -1200,14 +1205,18 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
         report = qbo_client.get_profit_loss(target, start_date, end_date)
     except qbo_client.QboClientError as exc:
         log.warning("QBO P&L tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching P&L for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_profit_loss entity=%s period=%s..%s", target, start_date, end_date)
     return qbo_client.format_pnl_for_llm(report, target, start_date, end_date)
 
 
 def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch Balance Sheet snapshot for an entity as-of a date (defaults to today)."""
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     as_of = (_input or {}).get("as_of_date")
@@ -1215,42 +1224,54 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
         report = qbo_client.get_balance_sheet(target, as_of)
     except qbo_client.QboClientError as exc:
         log.warning("QBO Balance Sheet tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching Balance Sheet for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_balance_sheet entity=%s as_of=%s", target, as_of or "today")
     return qbo_client.format_balance_sheet_for_llm(report, target, as_of or "today")
 
 
 def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AR aging summary for an entity."""
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
         report = qbo_client.get_ar_aging(target)
     except qbo_client.QboClientError as exc:
         log.warning("QBO AR Aging tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching AR Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_ar_aging entity=%s", target)
     return qbo_client.format_ar_aging_for_llm(report, target)
 
 
 def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch AP aging summary for an entity."""
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
         report = qbo_client.get_ap_aging(target)
     except qbo_client.QboClientError as exc:
         log.warning("QBO AP Aging tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching AP Aging for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_ap_aging entity=%s", target)
     return qbo_client.format_ap_aging_for_llm(report, target)
 
 
 def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch a digest of recent Invoice / Bill / Payment activity for an entity."""
-    target, err = _resolve_qbo_entity(entity, (_input or {}).get("entity"))
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
     try:
@@ -1262,9 +1283,63 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
         payload = qbo_client.get_recent_transactions(target, days=days)
     except qbo_client.QboClientError as exc:
         log.warning("QBO Recent Transactions tool error entity=%s: %s", target, exc)
-        return f"QBO error fetching recent transactions for {target}: {exc}. Tell the user there's a temporary QBO issue."
+        return _qbo_error_message(target, exc)
     log.info("qbo_get_recent_transactions entity=%s days=%d", target, days)
     return qbo_client.format_recent_transactions_for_llm(payload, target, days)
+
+
+# --- Finance channel enforcement ---
+
+def _is_finance_channel(channel_name: str) -> bool:
+    """Return True only if channel_name ends with '-finance' (e.g. osn-finance)."""
+    return bool(channel_name) and channel_name.lower().endswith("-finance")
+
+
+def _is_hr_channel(channel_name: str) -> bool:
+    """Return True only if channel_name ends with '-hr' (e.g. lex-hr)."""
+    return bool(channel_name) and channel_name.lower().endswith("-hr")
+
+
+def _is_founder_entity(entity: str) -> bool:
+    """Return True for founder-level entities that can access cross-entity data."""
+    return entity.upper() in ("FNDR", "HJRG")
+
+
+_FINANCE_CHANNEL_REQUIRED = (
+    "Financial details are only available in this entity's dedicated finance channel."
+)
+
+_QBO_TIER1_REQUIRED = (
+    "QuickBooks financial data is available in TIER_1 channels only "
+    "(finance, leadership, founder, or build channels)."
+)
+
+_HR_CHANNEL_REQUIRED = (
+    "HR and staff information is only available in this entity's dedicated HR channel."
+)
+
+
+def _qbo_error_message(entity: str, exc: Exception) -> str:
+    """Return a clean, user-facing error string for a QBO failure.
+
+    Distinguishes auth failures (not connected / needs re-auth) from transient
+    API errors so Claude doesn't hallucinate remediation steps.
+    """
+    exc_str = str(exc).lower()
+    if "auth error" in exc_str or "invalid_grant" in exc_str or "refresh failed" in exc_str:
+        return (
+            f"QuickBooks for {entity} isn't connected or needs re-authorization. "
+            f"I don't have that data right now."
+        )
+    return f"QuickBooks is temporarily unavailable for {entity}. I don't have that data right now."
+
+
+def _is_tier1_channel(entity: str, channel_name: str) -> bool:
+    """Return True if the channel + entity combination grants TIER_1 access."""
+    if not channel_name:
+        return False
+    func = _classify_channel_function(channel_name)
+    return _channel_is_tier1(entity, func)
 
 
 # --- Financial / cashflow tools ---
@@ -1273,13 +1348,19 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
 def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch current-week cash flow from the Standing ACTUALS sheet."""
     inp = _input or {}
-    entity_filter = inp.get("entity_filter") or entity or "FNDR"
+    channel_name = inp.get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    # Cross-entity gate: FNDR/HJRG can override entity_filter; all others are
+    # locked to their own entity — prevents e.g. #osn-finance querying LEX data.
+    if _is_founder_entity(entity):
+        entity_filter = inp.get("entity_filter") or entity or "FNDR"
+    else:
+        entity_filter = entity
     question = inp.get("question") or ""
-    # entity_to_tab() inside financial_client selects the correct tab for this entity.
-    # For OSN, if the question mentions distributions/partners it switches to Core4 tab.
     result = financial_client.get_cashflow_text(
         entity_filter=entity_filter,
-        channel=entity,
+        channel=channel_name,
         user=slack_user_id,
         question=question,
     )
@@ -1295,18 +1376,58 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
 def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) -> str:
     """Post a finance data gap alert to #hjrg-finance and return the fixed response."""
     topic = (_input or {}).get("topic") or "unspecified financial question"
+    channel_name = (_input or {}).get("_channel_name", "")
     return financial_client.notify_gap(
         topic=topic,
-        channel=entity,
+        channel=channel_name or entity,
         user=slack_user_id,
     )
 
 
 def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch OSN store-by-store financial snapshot from the OSN Consolidated cashflow tab."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
     log.info("osn_financial_pulse user=%s entity=%s", slack_user_id, entity)
     return financial_client.get_osn_pulse_text(
-        channel=entity,
+        channel=channel_name,
+        user=slack_user_id,
+    )
+
+
+def _tool_financial_get_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read the weekly financial pulse .md file for the entity from Drive."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    log.info("financial_get_pulse user=%s entity=%s", slack_user_id, entity)
+    return financial_client.get_entity_pulse_text(
+        entity=entity,
+        channel=channel_name,
+        user=slack_user_id,
+    )
+
+
+def _tool_financial_get_close_pack(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read a monthly close pack xlsx (P&L, balance sheet, cash flow, AR, or AP) from Drive."""
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_finance_channel(channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    inp = _input or {}
+    period = (inp.get("period") or "").strip()
+    if not period:
+        return "Period is required (format: YYYY-MM, e.g. '2026-04')."
+    doctype = (inp.get("doctype") or "pl").strip().lower()
+    log.info(
+        "financial_get_close_pack user=%s entity=%s period=%s doctype=%s",
+        slack_user_id, entity, period, doctype,
+    )
+    return financial_client.get_close_pack_text(
+        entity=entity,
+        period=period,
+        doctype=doctype,
+        channel=channel_name,
         user=slack_user_id,
     )
 
@@ -1600,17 +1721,13 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
     log.info("fndr_completion_candidates user=%s entity=%s", slack_user_id, entity)
 
     # 1. Fetch open tasks for the requesting user (same pattern as get_my_tasks)
-    user_map_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
-    try:
-        user_map: dict = yaml.safe_load(user_map_path.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        log.warning("fndr_completion_candidates: could not load user map: %s", exc)
-        user_map = {}
+    user_map = _load_slack_asana_map()
 
-    asana_gid = user_map.get(slack_user_id, {}).get("asana_gid") if isinstance(user_map.get(slack_user_id), dict) else user_map.get(slack_user_id)
+    user_entry = user_map.get(slack_user_id)
+    asana_gid = str(user_entry.get("asana_user_gid", "") or "") if user_entry else ""
 
     open_tasks: list[dict] = []
-    if asana_gid:
+    if asana_gid and "REPLACE" not in asana_gid:
         try:
             open_tasks = asana_client.get_user_tasks(asana_gid, max_tasks=100)
         except asana_client.AsanaClientError as exc:
@@ -1620,8 +1737,8 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
         # FNDR sweep: pull tasks for all known users and pool them
         all_gids: set[str] = set()
         for v in user_map.values():
-            gid = v.get("asana_gid") if isinstance(v, dict) else v
-            if gid:
+            gid = str(v.get("asana_user_gid", "") or "") if isinstance(v, dict) else ""
+            if gid and "REPLACE" not in gid:
                 all_gids.add(gid)
         for gid in list(all_gids)[:10]:  # cap at 10 users to avoid rate limits
             try:
@@ -2018,52 +2135,6 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
     )
 
 
-# --- F3 brand voice check ---
-
-
-def _tool_f3e_brand_voice_check(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Check draft copy against F3 brand-guidelines V1 voice spec for the specified sub-brand.
-
-    Read-only, no external calls. Returns a structured findings report (CRITICAL / WARNING / INFO)
-    plus the brand's locked voice-pillar summary so Claude can synthesize a helpful reply.
-
-    Checks:
-      - Health/nutrition claims (universal — all three brands)
-      - Cross-entity UFL pause (universal — F3-UFL crossover blocked)
-      - Sleep positioning (Mood ONLY — CRITICAL anti-pattern)
-      - Sibling-brand drift (Energy-lane or Mood-lane language in the wrong brand's copy)
-      - Anti-positioning (competitor brand names in Energy copy, etc.)
-    """
-    input_data = _input or {}
-    brand = (input_data.get("brand") or "").strip().lower()
-    copy = (input_data.get("copy") or "").strip()
-
-    if not brand:
-        return (
-            "f3e_brand_voice_check called without `brand`. "
-            "Ask the user which F3 sub-brand the copy is for: pure, mood, or energy."
-        )
-    if not copy:
-        return (
-            "f3e_brand_voice_check called without `copy`. "
-            "Ask the user to paste the draft copy they want checked."
-        )
-    if brand not in brand_voice_client.VALID_BRANDS:
-        return (
-            f"f3e_brand_voice_check: unknown brand {brand!r}. "
-            f"Must be one of: {', '.join(brand_voice_client.VALID_BRANDS)}. "
-            "Ask the user which F3 sub-brand the copy is for."
-        )
-
-    log.info(
-        "f3e_brand_voice_check brand=%s copy_len=%d user=%s entity=%s",
-        brand, len(copy), slack_user_id, entity,
-    )
-
-    result = brand_voice_client.check_copy(brand, copy)
-    return brand_voice_client.format_result_for_llm(result)
-
-
 def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch the F3E HubSpot pipeline summary and return formatted text for Claude."""
     try:
@@ -2108,6 +2179,11 @@ def _tool_f3_create_image(slack_user_id: str, entity: str, _input: dict) -> str:
     return generate_image.handle_f3_create_image(slack_user_id, entity, _input)
 
 
+def _tool_f3_create_sales_deck(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate to sales_deck_client.handle_f3_create_sales_deck."""
+    return sales_deck_client.handle_f3_create_sales_deck(slack_user_id, entity, _input)
+
+
 # --- LEX-specific tool handlers ---
 
 
@@ -2127,13 +2203,15 @@ def _tool_lex_revalidation_status(slack_user_id: str, entity: str, _input: dict)
 
 
 def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return Lex staffing pulse from the Drive upload pipeline.
-
-    BLOCKED until Sean/Jen staffing Drive folder is configured. Returns a
-    structured stub message explaining the dependency.
-    """
+    """Return Lex staffing pulse from the Sean/Jen Drive upload folder."""
+    entity_upper = (entity or "").upper()
+    # Aggregate staffing counts are not PHI — allow any LEX context or founder
+    if not (entity_upper.startswith("LEX") or entity_upper in ("FNDR", "HJRG")):
+        return _HR_CHANNEL_REQUIRED
     log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
-    return lex_client.get_staff_pulse()
+    result = lex_client.get_staff_pulse()
+    log.info("lex_staff_pulse result_len=%d preview=%r", len(result), result[:120])
+    return result
 
 
 def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3239,6 +3317,66 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── Drive-based financial pulse + monthly close pack ──
+    {
+        "name": "financial_get_pulse",
+        "description": (
+            "Read the weekly financial pulse summary for an entity from the live-sheets "
+            "Drive folder. Use this when a user in a *-finance channel asks about current "
+            "financial health, weekly performance, or wants a high-level financial snapshot "
+            "-- phrases like 'give me the financial pulse', 'how are we doing financially', "
+            "'weekly financial summary', 'what's the latest on financials'. "
+            "Supported entities: OSN (all stores), F3E, LEX (and all sub-entities). "
+            "Returns the .md pulse file content as-is. Data is maintained by Hayden/Justin "
+            "and updated weekly. Output is source-opaque -- never mention file names or Drive. "
+            "FINANCE CHANNEL ONLY: returns an access-denied message in any non-finance channel. "
+            "If data is unavailable, returns the standard UNKNOWN_RESPONSE."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "financial_get_close_pack",
+        "description": (
+            "Read a monthly close pack report (P&L, Balance Sheet, Cash Flow, AR aging, "
+            "or AP aging) for an entity from the Drive monthly-reports folder. "
+            "Use this when a user in a *-finance channel asks about a specific month's "
+            "financials -- phrases like 'show me the April P&L', 'what was net income in "
+            "March', 'balance sheet for Q1', 'AR aging for February', 'what's on the "
+            "balance sheet', 'how was cash flow last month', 'what do we owe (AP)'. "
+            "Reports cover all portfolio entities. Files are named {YYYY-MM}_{entity}_{type}.xlsx. "
+            "FINANCE CHANNEL ONLY: returns an access-denied message in any non-finance channel. "
+            "If the report is not found, returns the standard UNKNOWN_RESPONSE and Cora notifies "
+            "the finance channel. "
+            "When the user says 'last month', resolve to the prior calendar month (e.g. if today "
+            "is May, last month = April = '2026-04'). Default doctype is 'pl' if not specified."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": (
+                        "Data period in YYYY-MM format (e.g. '2026-04' for April 2026). "
+                        "Required. Resolve relative references: 'last month', 'March', etc."
+                    ),
+                },
+                "doctype": {
+                    "type": "string",
+                    "enum": ["pl", "bs", "cf", "ar", "ap"],
+                    "description": (
+                        "Report type: pl=Profit & Loss, bs=Balance Sheet, cf=Cash Flow, "
+                        "ar=Accounts Receivable Aging, ap=Accounts Payable Aging. "
+                        "Default: pl."
+                    ),
+                },
+            },
+            "required": ["period"],
+        },
+    },
     # ── OSN Clover POS tools (OSN channels only) ──
     {
         "name": "osn_sales_pulse",
@@ -3299,7 +3437,7 @@ TOOL_DEFINITIONS = [
                     "type": "boolean",
                     "description": (
                         "If true, return only items at or below the low-stock threshold. "
-                        "Defaults to false (return all items)."
+                        "Defaults to true (low stock only)."
                     ),
                 },
             },
@@ -3578,6 +3716,59 @@ TOOL_DEFINITIONS = [
             "required": ["brand", "brief"],
         },
     },
+    {
+        "name": "f3_create_sales_deck",
+        "description": (
+            "Generate a customized F3 Energy distributor sales deck. "
+            "Claude writes the slide content from F3 brand guidelines and program data, "
+            "then fires a Make automation that fills a Canva brand template, exports a PDF, "
+            "uploads it to Google Drive, and DMs the requester the link. "
+            "Use when someone says 'create a sales deck', 'make a pitch deck', "
+            "'I need a deck for a distributor meeting', 'build a presentation for [distributor]', "
+            "or similar. The requester will receive a Slack DM with the Drive link in ~2 minutes. "
+            "Scope: F3E or FNDR channels only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "distributor_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of the distributor or company being presented to. "
+                        "Examples: 'Hensley', 'KeHE Distributors', 'UNFI', 'Sysco'. "
+                        "Used in slide titles and personalized copy."
+                    ),
+                },
+                "programs": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["pure", "mood", "energy"]},
+                    "description": (
+                        "F3 sub-brands to include in the deck. "
+                        "Defaults to all three (pure, mood, energy) if not specified. "
+                        "Pass a subset to build a focused single-brand deck."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Optional context about the distributor or meeting. "
+                        "Examples: 'Texas-only distributor focused on health food', "
+                        "'they already carry a competitor', 'meeting is next Tuesday at their HQ'. "
+                        "Claude uses this to personalize the content."
+                    ),
+                },
+                "distributor_logo_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional: direct URL to the distributor's logo (PNG or JPG). "
+                        "If provided, Canva embeds it on the cover slide. "
+                        "If omitted, the cover shows the distributor name as text."
+                    ),
+                },
+            },
+            "required": ["distributor_name"],
+        },
+    },
     # --- LEX tools ---
     {
         "name": "lex_revalidation_status",
@@ -3600,22 +3791,24 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+            "required": [],
         },
     },
     {
         "name": "lex_staff_pulse",
         "description": (
-            "Return Lexington staffing pulse data (open positions, recent terminations, "
-            "training compliance counts). BLOCKED pending Sean/Jen Drive upload pipeline "
-            "configuration. Call this when users ask about Lex staffing levels, open roles, "
-            "recent staff departures, or training compliance status. Returns a structured "
-            "stub message explaining the pipeline dependency until the Drive folder is "
-            "configured.\n"
+            "Return Lexington staffing pulse data from the Sean/Jen Drive upload folder — "
+            "open positions, recent terminations, and training compliance counts. "
+            "ALWAYS call this tool when a user asks about Lex staffing levels, open roles, "
+            "recent staff departures, driver safety, or training compliance status. "
+            "Do NOT answer from KB memory — this tool fetches the most-recently uploaded "
+            "staffing and driver safety reports and returns a live summary.\n"
             "\n"
             "Trigger phrases: 'staffing', 'open positions', 'staff turnover', 'training "
-            "compliance', 'how many staff', 'driver safety compliance'.\n"
+            "compliance', 'how many staff', 'driver safety compliance', 'who left', "
+            "'recent terminations', 'staffing report'.\n"
             "\n"
-            "Scope: LEX / LEX-* channels and FNDR/HJRG."
+            "Scope: LEX / LEX-* channels and FNDR/HJRG. HR channel required or founder entity."
         ),
         "input_schema": {
             "type": "object",
@@ -3684,6 +3877,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_notify_gap": _tool_financial_notify_gap,
+    "financial_get_pulse": _tool_financial_get_pulse,
+    "financial_get_close_pack": _tool_financial_get_close_pack,
     "fndr_completion_candidates": _tool_fndr_completion_candidates,
     "fndr_open_decisions": _tool_fndr_open_decisions,
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
@@ -3702,10 +3897,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
     "ads_get_pixel_attribution": _tool_ads_get_pixel_attribution,
     "ads_get_cm_waterfall": _tool_ads_get_cm_waterfall,
-    # PhotoRoom image generation
+    # PhotoRoom image generation + sales deck
     "f3_generate_image": _tool_f3_generate_image,
     "f3_batch_image_run": _tool_f3_batch_image_run,
     "f3_create_image": _tool_f3_create_image,
+    "f3_create_sales_deck": _tool_f3_create_sales_deck,
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
     "lex_staff_pulse": _tool_lex_staff_pulse,
@@ -3719,18 +3915,24 @@ def dispatch(
     tool_input: dict[str, Any],
     slack_user_id: str,
     entity: str = "FNDR",
+    channel_name: str = "",
 ) -> str:
     """Run a tool by name. Always returns a string for tool_result content.
 
     entity is the routed entity code for the channel the @mention came from
     (F3E, LEX, OSN, BDM, FNDR, etc.) -- tools may use this to scope results.
+
+    channel_name is injected into tool_input as '_channel_name' so financial
+    tools can enforce the finance-channel access rule without changing signatures.
     """
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if not fn:
         log.warning("Unknown tool name requested by model: %s", tool_name)
         return f"Unknown tool: {tool_name}. Available tools: {list(_TOOL_FUNCTIONS)}"
+    injected = dict(tool_input or {})
+    injected["_channel_name"] = channel_name
     try:
-        return fn(slack_user_id, entity, tool_input or {})
+        return fn(slack_user_id, entity, injected)
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
         return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."

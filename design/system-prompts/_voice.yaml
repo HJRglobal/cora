@@ -64,6 +64,18 @@ entities:
   OSN:
     inherits: defaults
 
+  OSNGM:
+    inherits: defaults
+
+  OSNVV:
+    inherits: defaults
+
+  OSNGF:
+    inherits: defaults
+
+  OSNGW:
+    inherits: defaults
+
   BDM:
     inherits: defaults
 
