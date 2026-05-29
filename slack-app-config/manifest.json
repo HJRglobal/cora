@@ -24,6 +24,7 @@
         "channels:history",
         "groups:history",
         "im:history",
+        "im:write",
         "mpim:history",
         "reactions:read"
       ]
@@ -33,6 +34,7 @@
     "event_subscriptions": {
       "bot_events": [
         "app_mention",
+        "message.im",
         "reaction_added",
         "reaction_removed"
       ]
