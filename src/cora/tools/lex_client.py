@@ -309,6 +309,11 @@ def _download_file_bytes(service, file_id: str, mime_type: str) -> bytes:
                 fileId=file_id,
                 mimeType="text/csv",
             )
+        elif mime_type == "application/vnd.google-apps.document":
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType="text/plain",
+            )
         else:
             request = service.files().get_media(fileId=file_id)
         downloader = MediaIoBaseDownload(buf, request)
@@ -324,10 +329,43 @@ def _download_file_bytes(service, file_id: str, mime_type: str) -> bytes:
 def _col_index(headers: list[str], synonyms: tuple[str, ...]) -> int | None:
     """Return the first column index whose header contains any synonym (case-insensitive)."""
     for i, h in enumerate(headers):
-        h_lower = h.lower()
+        h_lower = h.lower().replace("\n", " ")
         if any(s in h_lower for s in synonyms):
             return i
     return None
+
+
+_TODAY = None  # Refreshed per-call via _today()
+
+def _today() -> date:
+    return date.today()
+
+
+def _compliance_status(val: str) -> str:
+    """Classify a compliance cell value as 'current', 'expired', or 'missing'.
+
+    LEX spreadsheets use three conventions:
+      - Dates (mm/dd/yyyy or mm/dd/yy): future = current, past = expired
+      - 'x' or 'X': checkbox-style compliant marker
+      - 'NEED', 'NDD', 'N/A', 'pending': missing / not done
+    """
+    v = val.strip()
+    if not v:
+        return "missing"
+    vl = v.lower()
+    if vl in ("x",):
+        return "current"
+    if vl in ("need", "ndd", "n/a", "na", "pending", "tbd"):
+        return "missing"
+    # Try to parse as a date
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(v, fmt).date()
+            return "current" if d >= _today() else "expired"
+        except ValueError:
+            continue
+    # Unknown value — treat as current if non-empty to avoid false alarms
+    return "current"
 
 
 def _parse_csv_bytes(raw: bytes, filename: str) -> str:
@@ -383,13 +421,22 @@ def _parse_csv_bytes(raw: bytes, filename: str) -> str:
                     t = r[term_col].strip()
                     lines.append(f"    - {n}: {t}")
 
-    # Training compliance
+    # Training compliance — handles dates, "NEED"/"NDD"/"x" (LEX spreadsheet conventions)
     if train_col is not None:
         train_vals = [r[train_col].strip() for r in data if len(r) > train_col]
-        compliant = sum(1 for v in train_vals if v.lower() in ("yes", "true", "1", "current", "complete", "compliant"))
-        expired   = sum(1 for v in train_vals if v.lower() in ("no", "false", "0", "expired", "overdue", "non-compliant"))
-        if compliant or expired:
-            lines.append(f"  Training compliance: {compliant} current, {expired} expired/overdue")
+        statuses = [_compliance_status(v) for v in train_vals]
+        compliant = statuses.count("current")
+        expired   = statuses.count("expired")
+        missing   = statuses.count("missing")
+        parts = []
+        if compliant:
+            parts.append(f"{compliant} current")
+        if expired:
+            parts.append(f"{expired} expired")
+        if missing:
+            parts.append(f"{missing} missing/needed")
+        if parts:
+            lines.append(f"  Training/compliance: {', '.join(parts)}")
 
     # If no known columns found, show column names so Harrison can update the parser
     if all(c is None for c in [name_col, status_col, train_col, term_col, open_col]):
@@ -427,9 +474,24 @@ _PARSEABLE_MIMES = {
     "text/plain",
     "application/csv",
     "application/vnd.google-apps.spreadsheet",
+    "application/vnd.google-apps.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
 }
+
+
+def _parse_text_bytes(raw: bytes, filename: str) -> str:
+    """Return a truncated plain-text summary for Google Docs and text files."""
+    try:
+        text = raw.decode("utf-8-sig", errors="replace").strip()
+    except Exception as exc:
+        return f"Could not read {filename}: {exc}"
+    if not text:
+        return f"{filename}: empty document"
+    # Return first 800 chars — enough for Claude to summarize the doc's purpose
+    preview = text[:800].replace("\r\n", "\n")
+    truncated = " _(truncated)_" if len(text) > 800 else ""
+    return f"*{filename}*\n{preview}{truncated}"
 
 
 def get_staff_pulse() -> str:
@@ -472,8 +534,8 @@ def get_staff_pulse() -> str:
         )
 
     summaries: list[str] = []
-    # Parse up to 3 most-recent parseable files
-    for f in parseable[:3]:
+    # Parse up to 5 most-recent parseable files
+    for f in parseable[:5]:
         fid   = f["id"]
         fname = f.get("name", fid)
         fmime = f.get("mimeType", "")
@@ -490,7 +552,10 @@ def get_staff_pulse() -> str:
             "application/vnd.ms-excel",
         ):
             summaries.append(_parse_excel_bytes(raw, fname) + f" _(updated {mtime})_")
+        elif fmime == "application/vnd.google-apps.document":
+            summaries.append(_parse_text_bytes(raw, fname) + f" _(updated {mtime})_")
         else:
+            # CSV, text/plain, Google Sheets (exported as CSV)
             summaries.append(_parse_csv_bytes(raw, fname) + f" _(updated {mtime})_")
 
     if not summaries:
