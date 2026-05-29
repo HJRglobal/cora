@@ -27,6 +27,7 @@ from dataclasses import dataclass
 class Intent(str, Enum):
     FINANCIAL   = "financial"     # cash, P&L, margins, financial pulse
     TASK_LOOKUP = "task_lookup"   # tasks, Asana, what's on my plate
+    IDENTITY    = "identity"      # who am I, do you know me — never cache (user-specific)
     SIMPLE      = "simple"        # quick factual: tagline, colors, who is X
     COMPLEX     = "complex"       # default — full pipeline
 
@@ -85,6 +86,15 @@ _TASK_PATTERNS = [
     r"\basana\b",
 ]
 
+_IDENTITY_PATTERNS = [
+    r"\bwho\s+am\s+i\b",
+    r"\bdo\s+you\s+know\s+who\s+i\s+am\b",
+    r"\bdo\s+you\s+know\s+me\b",
+    r"\bwhat\s+is\s+my\s+name\b",
+    r"\bwho\s+are\s+you\s+talking\s+to\b",
+    r"\bwho\s+is\s+asking\b",
+]
+
 _SIMPLE_PATTERNS = [
     r"\btagline\b",
     r"\bbrand\s*(colors?|palette|fonts?|typography|voice)\b",
@@ -105,6 +115,7 @@ _SIMPLE_PATTERNS = [
 # Compile once at import time
 _FINANCIAL_RE = re.compile("|".join(_FINANCIAL_PATTERNS), re.IGNORECASE)
 _TASK_RE      = re.compile("|".join(_TASK_PATTERNS),      re.IGNORECASE)
+_IDENTITY_RE  = re.compile("|".join(_IDENTITY_PATTERNS),  re.IGNORECASE)
 _SIMPLE_RE    = re.compile("|".join(_SIMPLE_PATTERNS),    re.IGNORECASE)
 
 
@@ -121,6 +132,8 @@ def classify(user_message: str, entity: str = "") -> Intent:
     """
     if _FINANCIAL_RE.search(user_message):
         return Intent.FINANCIAL
+    if _IDENTITY_RE.search(user_message):
+        return Intent.IDENTITY
     if _TASK_RE.search(user_message):
         return Intent.TASK_LOOKUP
     if _SIMPLE_RE.search(user_message):
@@ -143,6 +156,14 @@ def routing_hints(intent: Intent) -> RoutingHints:
             skip_kb=True,       # live financial tool provides the data; KB adds noise
             kb_k_override=None,
             bypass_cache=True,  # financial data changes; never serve stale
+            cache_ttl=0,
+        )
+    if intent == Intent.IDENTITY:
+        return RoutingHints(
+            intent=intent,
+            skip_kb=True,       # identity is injected in runtime_context; KB irrelevant
+            kb_k_override=None,
+            bypass_cache=True,  # answer is per-user — caching would serve wrong person
             cache_ttl=0,
         )
     if intent == Intent.TASK_LOOKUP:
