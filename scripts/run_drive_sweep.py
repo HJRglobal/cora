@@ -167,7 +167,7 @@ def main() -> int:
             ]
         for email in accounts_to_backfill:
             try:
-                kb.set_sync_state(f"drive_sweep_{email}", None)
+                kb.set_sync_state(f"drive_sweep_{email}", 0)
                 log.info("Cleared watermark for %s (backfill mode)", email)
             except Exception:
                 pass

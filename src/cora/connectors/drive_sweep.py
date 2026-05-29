@@ -400,20 +400,19 @@ def sweep_user(
 
     # Watermark for incremental sync
     watermark_key = f"drive_sweep_{email}"
-    last_run_iso: str | None = None
+    last_run_ts: int | None = None
     try:
-        last_run_iso = kb.get_sync_state(watermark_key)
+        state = kb.get_sync_state(watermark_key)
+        if state and isinstance(state[0], int):
+            last_run_ts = state[0]
     except Exception:
         pass
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
-    if last_run_iso:
-        try:
-            watermark_dt = datetime.fromisoformat(last_run_iso.replace("Z", "+00:00"))
-            # Use the more recent of freshness cutoff vs watermark
-            cutoff = max(cutoff, watermark_dt)
-        except ValueError:
-            pass
+    if last_run_ts:
+        watermark_dt = datetime.fromtimestamp(last_run_ts, tz=timezone.utc)
+        # Use the more recent of freshness cutoff vs watermark
+        cutoff = max(cutoff, watermark_dt)
 
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
     log.info("drive_sweep: sweeping %s (%s) modified since %s", email, name, cutoff_str)
@@ -513,7 +512,7 @@ def sweep_user(
     # Advance watermark only on successful (non-dry-run) sweep
     if not dry_run:
         try:
-            kb.set_sync_state(watermark_key, run_start.isoformat())
+            kb.set_sync_state(watermark_key, int(run_start.timestamp()))
         except Exception as exc:
             log.warning("drive_sweep: could not advance watermark for %s: %s", email, exc)
 
