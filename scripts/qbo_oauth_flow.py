@@ -64,12 +64,20 @@ log = logging.getLogger("qbo_oauth_flow")
 _LEXINGTON_FIRM_REALM = "416205631"
 
 _KNOWN_REALM_IDS: dict[str, str] = {
-    "F3E":  "9341454160552149",   # F3 Energy Holdings Inc
-    # Add others as confirmed: LEX, OSN, BDM, HJRG
+    "F3E":   "9341454160552149",   # F3 Energy Holdings Inc
+    "LEX":   "476503710",          # LLC Lexington LLC
+    "OSN":   "9341456036989538",   # OSN CORE 4 LLC
+    "BDM":   "9341454760124312",   # Big D Media
+    "HJRG":  "9130349690118516",   # HJR GS
+    # HJRP and HRLLC — realm IDs to be added after OAuth confirmation
 }
 
 _KNOWN_REALM_NAMES: dict[str, str] = {
-    "F3E":  "F3 Energy Holdings Inc",
+    "9341454160552149": "F3 Energy Holdings Inc",
+    "476503710":        "LLC Lexington LLC",
+    "9341456036989538": "OSN CORE 4 LLC",
+    "9341454760124312": "Big D Media",
+    "9130349690118516": "HJR GS",
     _LEXINGTON_FIRM_REALM: "Lexington Firm (accountant's own company — NOT an entity client)",
 }
 
