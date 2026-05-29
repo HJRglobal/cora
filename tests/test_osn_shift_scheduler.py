@@ -284,3 +284,115 @@ def test_format_employee_schedule_no_shifts(tmp_path, monkeypatch):
     text = sched_mod.format_employee_schedule_slack(s, "U001", employees)
     assert "Dana" in text
     assert "no shifts" in text.lower()
+
+
+# ── Employee management command tests ─────────────────────────────────────────
+
+def test_cmd_list_employees_empty(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    result = handler._cmd_list_employees()
+    assert "No employees" in result
+
+
+def test_cmd_list_employees_populated(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.upsert_employee(db.Employee("U001", "Alice High", "high", ["GW", "GM"]))
+    db.upsert_employee(db.Employee("U002", "Bob Low", "low", ["GF"]))
+    result = handler._cmd_list_employees()
+    assert "Alice High" in result
+    assert "Bob Low" in result
+    assert "high" in result
+    assert "low" in result
+
+
+def test_cmd_upsert_employee_add(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    text = 'add employee <@U999> name="Sam Test" tier=mid locations=GW,VVP'
+    result = handler._cmd_upsert_employee(text, action="add")
+    assert "Sam Test" in result
+    assert "✅" in result
+    emp = db.get_employee("U999")
+    assert emp is not None
+    assert emp.tier == "mid"
+    assert "GW" in emp.preferred_locations
+    assert "VVP" in emp.preferred_locations
+
+
+def test_cmd_upsert_employee_update_tier(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.upsert_employee(db.Employee("U111", "Old Name", "low", ["GW"]))
+    text = "update employee <@U111> tier=high"
+    result = handler._cmd_upsert_employee(text, action="update")
+    assert "✅" in result
+    emp = db.get_employee("U111")
+    assert emp.tier == "high"
+
+
+def test_cmd_upsert_employee_all_locations(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    text = 'add employee <@U222> name="Flex Worker" tier=high locations=all'
+    handler._cmd_upsert_employee(text, action="add")
+    emp = db.get_employee("U222")
+    assert set(emp.preferred_locations) == {"GW", "GM", "GF", "VVP"}
+
+
+def test_cmd_upsert_employee_missing_mention(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    result = handler._cmd_upsert_employee("add employee tier=high locations=GW", action="add")
+    assert "mention" in result.lower()
+
+
+def test_cmd_deactivate_employee(tmp_path, monkeypatch):
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.upsert_employee(db.Employee("U333", "Leaving Soon", "mid", ["GW"]))
+    result = handler._cmd_deactivate_employee("remove employee <@U333>")
+    assert "✅" in result
+    emp = db.get_employee("U333")
+    assert emp is None or not emp.is_active
+
+
+def test_dm_state_slot_fix(tmp_path, monkeypatch):
+    """Regression: state must survive the asking_slots → asking_locs transition."""
+    import cora.tools.osn_shift_db as db
+    import cora.tools.osn_shift_handler as handler
+    monkeypatch.setattr(db, "_DB_PATH", tmp_path / "test.db")
+    db.init_db()
+
+    uid = "U_SLOT_TEST"
+    # Simulate state just before final slot response (one day left)
+    state = {
+        "step": "asking_slots",
+        "week_start": "2026-06-01",
+        "days": {"mon": {}},
+        "pending_days": ["mon"],
+    }
+    db.set_dm_state(uid, state)
+
+    messages = []
+    handler._handle_slots_response(uid, "open", state, lambda msg: messages.append(msg))
+
+    # State should now be "asking_locs" and persisted correctly
+    saved = db.get_dm_state(uid)
+    assert saved.get("step") == "asking_locs", f"Expected asking_locs, got {saved.get('step')}"
+    assert "mon" in saved.get("days", {})

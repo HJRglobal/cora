@@ -43,6 +43,7 @@ from .osn_shift_db import (
     VALID_DAYS,
     VALID_SLOTS,
     VALID_STORES,
+    VALID_TIERS,
     DAY_NAMES,
     STORE_NAMES,
     get_all_active_employees,
@@ -271,15 +272,14 @@ def _handle_days_response(slack_user_id: str, text: str, state: dict, reply) -> 
     state["pending_days"] = list(days)
     state["step"] = "asking_slots"
     set_dm_state(slack_user_id, state)
-    _ask_slots_for_next_day(state, reply)
+    _ask_slots_for_next_day(slack_user_id, state, reply)
 
 
-def _ask_slots_for_next_day(state: dict, reply) -> None:
+def _ask_slots_for_next_day(slack_user_id: str, state: dict, reply) -> None:
     pending = state.get("pending_days", [])
     if not pending:
-        # Move on to locations
         state["step"] = "asking_locs"
-        set_dm_state(state.get("_uid", ""), state)  # caller sets uid
+        set_dm_state(slack_user_id, state)
         _ask_locs(state, reply)
         return
     day = pending[0]
@@ -312,7 +312,7 @@ def _handle_slots_response(slack_user_id: str, text: str, state: dict, reply) ->
 
     if state["pending_days"]:
         set_dm_state(slack_user_id, state)
-        _ask_slots_for_next_day(state, reply)
+        _ask_slots_for_next_day(slack_user_id, state, reply)
     else:
         state["step"] = "asking_locs"
         set_dm_state(slack_user_id, state)
@@ -447,12 +447,29 @@ def handle_admin_command(
         employees = {e.slack_user_id: e for e in get_all_active_employees()}
         return format_schedule_slack(sched, employees)
 
-    # Add/update employee profile
-    m = re.search(r"\badd\b.*\bemployee\b|\bupdate\b.*\bemployee\b|\bset\b.*\btier\b", t_lower)
-    if m:
+    # List employees
+    if re.search(r"\blist\b.*\bemployee\b|\bemployee\b.*\blist\b|\bstaff\b|\bshow\b.*\bemployee\b", t_lower):
         if not _is_admin(slack_user_id):
-            return "Only admins can manage employee profiles."
-        return _cmd_manage_employee_help()
+            return "Only admins can view the employee list."
+        return _cmd_list_employees()
+
+    # Add employee:  add employee <@U123> name="Jane Doe" tier=high locations=GW,GM
+    if re.search(r"\badd\b.*\bemployee\b", t_lower):
+        if not _is_admin(slack_user_id):
+            return "Only admins can add employees."
+        return _cmd_upsert_employee(text, action="add")
+
+    # Update employee:  update employee <@U123> tier=mid  OR  update employee <@U123> locations=GW,VVP
+    if re.search(r"\bupdate\b.*\bemployee\b|\bedit\b.*\bemployee\b", t_lower):
+        if not _is_admin(slack_user_id):
+            return "Only admins can update employees."
+        return _cmd_upsert_employee(text, action="update")
+
+    # Remove / deactivate employee
+    if re.search(r"\bremove\b.*\bemployee\b|\bdeactivate\b.*\bemployee\b", t_lower):
+        if not _is_admin(slack_user_id):
+            return "Only admins can remove employees."
+        return _cmd_deactivate_employee(text)
 
     return None  # Not an OSN scheduler command
 
@@ -603,15 +620,115 @@ def _cmd_publish(schedule_id: Optional[str], week_start: str, client) -> str:
     return result
 
 
-def _cmd_manage_employee_help() -> str:
-    return (
-        "*Employee management — coming via DM commands:*\n"
-        "To add or update an employee, DM me:\n"
-        "  `add employee @Name tier=high locations=GW,GM`\n"
-        "  `update employee @Name tier=mid locations=all`\n\n"
-        "*Tier values:* `high`, `mid`, `low`\n"
-        f"*Location codes:* `{'`, `'.join(VALID_STORES)}`"
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+# Quoted name="Full Name" OR unquoted name=FirstOnly
+_NAME_RE    = re.compile(r'name=["\']([^"\']+)["\']|name=(\S+)', re.IGNORECASE)
+_TIER_RE    = re.compile(r"tier=(\w+)", re.IGNORECASE)
+_LOCS_RE    = re.compile(r"locations?=([\w,\s]+?)(?:\s|$)", re.IGNORECASE)
+
+
+def _cmd_list_employees() -> str:
+    employees = get_all_active_employees()
+    if not employees:
+        return (
+            "No employees in the system yet.\n"
+            "Use `@Cora add employee <@SlackUser> name=\"Full Name\" tier=high locations=GW,GM` to add them."
+        )
+    tier_order = {"high": 0, "mid": 1, "low": 2}
+    employees.sort(key=lambda e: (tier_order.get(e.tier, 9), e.name))
+
+    lines = [f"*OSN Employees ({len(employees)}):*\n"]
+    for e in employees:
+        loc_str = ", ".join(e.preferred_locations) if e.preferred_locations else "none set"
+        lines.append(f"  • *{e.name}* — tier: `{e.tier}` | locations: {loc_str} | <@{e.slack_user_id}>")
+    return "\n".join(lines)
+
+
+def _cmd_upsert_employee(text: str, action: str) -> str:
+    uid_match = _MENTION_RE.search(text)
+    if not uid_match:
+        return (
+            f"Please mention the employee's Slack account.\n"
+            f"Example: `@Cora {action} employee <@U123ABC> name=\"Jane Doe\" tier=high locations=GW,GM`"
+        )
+    uid = uid_match.group(1)
+
+    tier_match = _TIER_RE.search(text)
+    locs_match = _LOCS_RE.search(text)
+    name_match = _NAME_RE.search(text)
+
+    existing = get_employee(uid)
+
+    # For add, name is required unless updating
+    if name_match:
+        name = (name_match.group(1) or name_match.group(2) or "").strip()
+    else:
+        name = existing.name if existing else None
+    if not name:
+        return (
+            "Please include the employee's name.\n"
+            "Example: `name=\"Jane Doe\"`"
+        )
+
+    tier_raw = tier_match.group(1).lower() if tier_match else (existing.tier if existing else None)
+    if not tier_raw or tier_raw not in VALID_TIERS:
+        return (
+            f"Please specify a valid tier: `tier=high`, `tier=mid`, or `tier=low`.\n"
+            f"Example: `@Cora {action} employee <@{uid}> tier=high`"
+        )
+
+    if locs_match:
+        locs_raw = locs_match.group(1)
+        if re.search(r"\ball\b", locs_raw, re.IGNORECASE):
+            locs = list(VALID_STORES)
+        else:
+            locs = [s.strip().upper() for s in re.split(r"[,\s]+", locs_raw) if s.strip()]
+            locs = [l for l in locs if l in VALID_STORES]
+    else:
+        locs = existing.preferred_locations if existing else []
+
+    if not locs:
+        return (
+            f"Please specify at least one location.\n"
+            f"Valid codes: `{', '.join(VALID_STORES)}` or `all`.\n"
+            f"Example: `locations=GW,GM`"
+        )
+
+    emp = Employee(
+        slack_user_id=uid,
+        name=name,
+        tier=tier_raw,
+        preferred_locations=locs,
+        is_active=True,
     )
+    upsert_employee(emp)
+
+    verb = "Added" if action == "add" and not existing else "Updated"
+    loc_display = ", ".join(f"{c} ({STORE_NAMES[c]})" for c in locs)
+    return (
+        f"✅ {verb} *{name}* (<@{uid}>)\n"
+        f"  Tier: `{tier_raw}` | Locations: {loc_display}"
+    )
+
+
+def _cmd_deactivate_employee(text: str) -> str:
+    import sqlite3
+    from .osn_shift_db import _DB_PATH
+
+    uid_match = _MENTION_RE.search(text)
+    if not uid_match:
+        return "Please mention the employee to remove: `@Cora remove employee <@U123ABC>`"
+    uid = uid_match.group(1)
+
+    existing = get_employee(uid)
+    if not existing:
+        return f"No employee found with Slack ID `{uid}`."
+
+    conn = sqlite3.connect(str(_DB_PATH))
+    conn.execute("UPDATE osn_employees SET is_active = 0 WHERE slack_user_id = ?", (uid,))
+    conn.commit()
+    conn.close()
+    return f"✅ *{existing.name}* has been deactivated and won't appear in future schedules."
 
 
 # ── Approval card ─────────────────────────────────────────────────────────────
