@@ -186,6 +186,16 @@ def _dispatch_qa(
     if caller_record and caller_record.asana_email:
         caller_role_hint = f" ({caller_record.asana_email})"
 
+    # Founder (Harrison) gets cross-entity access from any channel. His questions
+    # about UFL, LEX, OSN etc. from an F3E channel should not be blocked by entity scope.
+    _FOUNDER_ID = "U0B2RM2JYJ1"
+    is_founder = (user_id == _FOUNDER_ID)
+    founder_note = (
+        "\n**Cross-entity access ENABLED:** This user is the portfolio founder. "
+        "Answer questions about any HJR Global entity regardless of this channel's "
+        "entity scope. Do not redirect to other channels based on entity scoping.\n"
+    ) if is_founder else ""
+
     runtime_context = (
         f"## Runtime channel context\n\n"
         f"This channel (#{channel_name}) has these properties:\n"
@@ -195,7 +205,8 @@ def _dispatch_qa(
         f"**The person asking this question is: {caller_name}{caller_role_hint}** "
         f"(Slack ID: {user_id or 'unknown'}).\n"
         f"Address them by their first name if relevant. Do NOT assume the asker is "
-        f"Harrison Rogers unless their Slack ID is U0B2RM2JYJ1.\n\n"
+        f"Harrison Rogers unless their Slack ID is U0B2RM2JYJ1.\n"
+        f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
         f"---\n\n"
     )
