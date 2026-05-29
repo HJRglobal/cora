@@ -635,3 +635,186 @@ class TestReconcileOrchestration:
         for g in gaps:
             assert "hayden" not in g.source_evidence.lower()
             assert "hayden" not in g.description.lower()
+
+    def test_reconcile_pass5_skipped_without_client(self):
+        """Pass 5 should silently skip when no anthropic_client is provided."""
+        db_path = _make_db([])
+        # Should not raise even with pass 5 in the list
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=None,
+        )
+        assert gaps == []
+
+
+class TestPass5DriveInsights:
+    """Layer B — pass5_drive_insights() via reconcile()."""
+
+    def _make_drive_db(self, chunks: list[dict]) -> Path:
+        """Create a temp DB with drive_sweep chunks."""
+        tmp = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(tmp)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                chunk_id   TEXT PRIMARY KEY,
+                source     TEXT,
+                source_id  TEXT,
+                entity     TEXT,
+                sub_entity TEXT,
+                content    TEXT,
+                deep_link  TEXT,
+                title      TEXT,
+                metadata   TEXT DEFAULT '{}',
+                ingested_at INTEGER
+            )
+            """
+        )
+        now = int(time.time())
+        for i, c in enumerate(chunks):
+            conn.execute(
+                "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    c.get("chunk_id", f"chunk_{i}"),
+                    c.get("source", "drive_sweep"),
+                    c.get("source_id", f"drive_{i}"),
+                    c.get("entity", "F3E"),
+                    c.get("sub_entity", None),
+                    c.get("content", ""),
+                    c.get("deep_link", ""),
+                    c.get("title", ""),
+                    c.get("metadata", "{}"),
+                    c.get("ingested_at", now),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        return Path(tmp)
+
+    def _make_haiku_client(self, result: dict) -> MagicMock:
+        from types import SimpleNamespace
+        client = MagicMock()
+        client.messages.create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(text=json.dumps(result))]
+        )
+        return client
+
+    def test_pass5_returns_missing_task_gaps(self):
+        db_path = self._make_drive_db([
+            {
+                "source": "drive_sweep",
+                "entity": "F3E",
+                "content": "F3 Energy signed a new retail distribution agreement with Pacific Foods.",
+            }
+        ])
+        haiku_result = {
+            "missing_tasks": [{"subject": "Follow up on Pacific Foods agreement", "source_filename": "deal.pdf", "entity": "F3E", "confidence": "HIGH"}],
+            "decisions": [],
+            "completed_tasks": [],
+        }
+        client = self._make_haiku_client(haiku_result)
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert any(g.gap_type == "missing_asana_task" for g in gaps)
+
+    def test_pass5_returns_decision_gaps(self):
+        db_path = self._make_drive_db([
+            {"source": "drive_sweep", "entity": "FNDR", "content": "Decision made to move forward with Rogers Ranch renovation."}
+        ])
+        haiku_result = {
+            "missing_tasks": [],
+            "decisions": [{"summary": "Rogers Ranch renovation approved", "source_filename": "notes.pdf", "entity": "FNDR", "confidence": "HIGH"}],
+            "completed_tasks": [],
+        }
+        client = self._make_haiku_client(haiku_result)
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert any(g.gap_type == "uncaptured_decision" for g in gaps)
+
+    def test_pass5_excludes_lex_entity_chunks(self):
+        db_path = self._make_drive_db([
+            {"source": "drive_sweep", "entity": "LEX", "content": "Staff meeting notes for Lexington services client care management."}
+        ])
+        client = self._make_haiku_client({"missing_tasks": [], "decisions": [], "completed_tasks": []})
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert gaps == []
+        client.messages.create.assert_not_called()
+
+    def test_pass5_handles_haiku_api_error(self):
+        db_path = self._make_drive_db([
+            {"source": "drive_sweep", "entity": "F3E", "content": "F3 Energy signed new distribution deal with Pacific Foods regional buyer."}
+        ])
+        client = MagicMock()
+        client.messages.create.side_effect = RuntimeError("API down")
+        # Should not raise — errors are caught per-entity
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert gaps == []
+
+    def test_pass5_handles_non_json_response(self):
+        db_path = self._make_drive_db([
+            {"source": "drive_sweep", "entity": "F3E", "content": "F3 Energy signed new distribution deal with Pacific Foods regional buyer."}
+        ])
+        from types import SimpleNamespace
+        client = MagicMock()
+        client.messages.create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(text="Not JSON at all.")]
+        )
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert gaps == []
+
+    def test_pass5_filters_low_confidence_items(self):
+        db_path = self._make_drive_db([
+            {"source": "drive_sweep", "entity": "F3E", "content": "F3 Energy signed new distribution deal with Pacific Foods buyer group."}
+        ])
+        haiku_result = {
+            "missing_tasks": [{"subject": "Maybe follow up", "source_filename": "vague.pdf", "entity": "F3E", "confidence": "LOW"}],
+            "decisions": [],
+            "completed_tasks": [],
+        }
+        client = self._make_haiku_client(haiku_result)
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert gaps == []
+
+    def test_pass5_skips_non_drive_sweep_chunks(self):
+        db_path = self._make_drive_db([
+            {"source": "slack", "entity": "F3E", "content": "F3 Energy signed new distribution deal with Pacific Foods in Slack."}
+        ])
+        client = self._make_haiku_client({"missing_tasks": [], "decisions": [], "completed_tasks": []})
+        gaps = _re.reconcile(
+            open_tasks=[], active_deals=[],
+            db_path=db_path,
+            passes=[5],
+            anthropic_client=client,
+        )
+        assert gaps == []
+        client.messages.create.assert_not_called()

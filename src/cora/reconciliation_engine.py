@@ -40,6 +40,7 @@ Harrison sole-authority doctrine (LOCKED 2026-05-21):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -727,6 +728,248 @@ def pass4_stale_open_tasks(
     return gaps
 
 
+# ── Pass 5: Drive synthesis ────────────────────────────────────────────────────
+
+# Max characters of Drive chunk content fed to Haiku per entity group
+_PASS5_MAX_CHARS = 4000
+# Max Drive files per Haiku call (keeps prompt bounded)
+_PASS5_MAX_FILES = 10
+
+# Entity codes that represent real Drive-accessible entities (excludes LEX — PHI)
+_DRIVE_ENTITY_CODES = {"FNDR", "HJRG", "F3E", "OSN", "BDM", "HJRP", "HJRPROD", "UFL"}
+
+_DRIVE_SYNTHESIS_PROMPT = """You are a cross-reference analyst for a portfolio of businesses.
+
+Below is a sample of recently-ingested Drive documents grouped by entity.
+Also provided are the entity's open Asana tasks (if any) and active HubSpot deals (if any).
+
+Your job: identify gaps — documents or decisions in Drive that suggest:
+  (a) A missing Asana task (action/commitment with no matching open task), or
+  (b) A decision that isn't yet captured in any task, or
+  (c) A completed milestone that would close or update an open task.
+
+Rules:
+- Return ONLY a JSON object with three keys: "missing_tasks", "decisions", "completed_tasks".
+- Each key maps to a list of objects. If none found, return an empty list for that key.
+- missing_tasks items: {"subject": str, "source_filename": str, "entity": str, "confidence": "HIGH"|"MED"}
+- decisions items: {"summary": str, "source_filename": str, "entity": str, "confidence": "HIGH"|"MED"}
+- completed_tasks items: {"task_name_hint": str, "source_filename": str, "entity": str, "confidence": "HIGH"|"MED"}
+- Exclude anything involving PHI, client health data, diagnoses, or care plans.
+- Exclude Visibility CPA team members (Hayden Greber, Andrew Stubbs, Sarah Bertoglio, Emily Stubbs).
+- Max 3 items per key. Prefer HIGH-confidence, obvious gaps over speculative ones.
+- If nothing actionable is found, return {"missing_tasks": [], "decisions": [], "completed_tasks": []}.
+
+Return ONLY the JSON object. No preamble. No explanation.
+"""
+
+
+def pass5_drive_insights(
+    open_tasks: list[dict[str, Any]],
+    active_deals: list[dict[str, Any]],
+    anthropic_client: Any,
+    *,
+    lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
+    db_path: Path | None = None,
+) -> list[ReconciliationGap]:
+    """Pass 5: Cross-reference recently-ingested Drive chunks against open tasks + deals.
+
+    Groups Drive KB chunks by entity, feeds each group to Claude Haiku with the
+    entity's open tasks and active deals as context, and returns gaps. LEX is
+    excluded entirely (PHI).
+    """
+    gaps: list[ReconciliationGap] = []
+    db = db_path or _kb_db_path()
+    cutoff_ts = int(time.time()) - int(lookback_seconds)
+
+    # Query recently-ingested drive_sweep chunks, excluding LEX
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT source_id, entity, sub_entity, content, metadata
+            FROM knowledge_chunks
+            WHERE source = 'drive_sweep'
+              AND ingested_at >= ?
+            ORDER BY ingested_at DESC
+            LIMIT 200
+            """,
+            (cutoff_ts,),
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        log.error("pass5: DB query failed: %s", exc)
+        return gaps
+
+    if not rows:
+        log.info("pass5: no recent drive_sweep chunks found in lookback window")
+        return gaps
+
+    # Group by entity, skip LEX (PHI) and unknown entities
+    by_entity: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        entity = row["entity"] or "FNDR"
+        if entity.startswith("LEX"):
+            continue  # PHI guardrail — always skip
+        if entity not in _DRIVE_ENTITY_CODES:
+            continue
+        by_entity.setdefault(entity, []).append(row)
+
+    log.info("pass5: %d entities with recent drive chunks", len(by_entity))
+
+    # Build entity → task/deal lookup strings for context injection
+    task_by_entity: dict[str, str] = {}
+    for task in open_tasks:
+        name = (task.get("name") or "").strip()
+        if not name:
+            continue
+        # Entity tag is the first bracketed prefix, e.g. "[F3E]"
+        m = re.match(r"\[([A-Z0-9\-]+)\]", name)
+        if m:
+            ent = m.group(1)
+            task_by_entity.setdefault(ent, "")
+            task_by_entity[ent] += f"- {name}\n"
+
+    deal_by_entity: dict[str, str] = {}
+    for deal in active_deals:
+        name = (deal.get("name") or deal.get("dealname") or "").strip()
+        if not name:
+            continue
+        # Map deals roughly — F3E retail pipeline to F3E
+        deal_by_entity.setdefault("F3E", "")
+        deal_by_entity["F3E"] += f"- {name}\n"
+
+    for entity, chunk_rows in by_entity.items():
+        if len(gaps) >= MAX_GAPS_PER_PASS:
+            break
+
+        # Build a bounded document summary block for this entity
+        doc_blocks: list[str] = []
+        total_chars = 0
+        for row in chunk_rows[:_PASS5_MAX_FILES]:
+            content = (row["content"] or "").strip()
+            if not content:
+                continue
+            # PHI check on content (belt-and-suspenders)
+            if _PHI_RE.search(content[:500]):
+                continue
+            # Skip if Visibility CPA names appear
+            content_lower = content.lower()
+            if any(name in content_lower for name in _VIS_CPA_NAMES):
+                continue
+
+            try:
+                meta = json.loads(row["metadata"] or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            filename = meta.get("filename") or row["source_id"] or "unknown"
+            snippet = content[:400]
+            block = f"[{filename}]\n{snippet}\n"
+            if total_chars + len(block) > _PASS5_MAX_CHARS:
+                break
+            doc_blocks.append(block)
+            total_chars += len(block)
+
+        if not doc_blocks:
+            continue
+
+        docs_text = "\n---\n".join(doc_blocks)
+        tasks_text = task_by_entity.get(entity, "(none)")
+        deals_text = deal_by_entity.get(entity, "(none)")
+
+        user_msg = (
+            f"ENTITY: {entity}\n\n"
+            f"OPEN ASANA TASKS:\n{tasks_text}\n\n"
+            f"ACTIVE HUBSPOT DEALS:\n{deals_text}\n\n"
+            f"RECENT DRIVE DOCUMENTS:\n{docs_text}"
+        )
+
+        try:
+            resp = anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                system=_DRIVE_SYNTHESIS_PROMPT,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = (resp.content[0].text or "").strip()
+        except Exception as exc:
+            log.error("pass5: Haiku call failed for entity %s: %s", entity, exc)
+            continue
+
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            log.warning("pass5: Haiku returned non-JSON for entity %s: %.120s", entity, raw)
+            continue
+
+        # Convert parsed items to ReconciliationGap objects
+        for item in (parsed.get("missing_tasks") or [])[:3]:
+            subj = (item.get("subject") or "").strip()
+            src_file = item.get("source_filename", "")
+            conf = item.get("confidence", "MED")
+            if not subj or conf not in ("HIGH", "MED"):
+                continue
+            gap_id = f"pass5:drive:{hash(subj + entity) & 0xFFFFFFFF:08x}"
+            gaps.append(ReconciliationGap(
+                gap_id=gap_id,
+                gap_type="missing_asana_task",
+                description=f"[{entity}] Drive doc suggests missing task: {subj}",
+                source_evidence=f"Source: {src_file}",
+                source="drive_sweep",
+                source_id=src_file,
+                entity=entity,
+                confidence=conf,
+                proposed_action=f"Create Asana task: [{entity}] {subj}",
+                title=subj,
+            ))
+
+        for item in (parsed.get("decisions") or [])[:3]:
+            summary = (item.get("summary") or "").strip()
+            src_file = item.get("source_filename", "")
+            conf = item.get("confidence", "MED")
+            if not summary or conf not in ("HIGH", "MED"):
+                continue
+            gap_id = f"pass5:decision:{hash(summary + entity) & 0xFFFFFFFF:08x}"
+            gaps.append(ReconciliationGap(
+                gap_id=gap_id,
+                gap_type="uncaptured_decision",
+                description=f"[{entity}] Uncaptured decision in Drive: {summary}",
+                source_evidence=f"Source: {src_file}",
+                source="drive_sweep",
+                source_id=src_file,
+                entity=entity,
+                confidence=conf,
+                proposed_action=f"Capture decision in decisions.md: {summary}",
+                title=summary,
+            ))
+
+        for item in (parsed.get("completed_tasks") or [])[:3]:
+            hint = (item.get("task_name_hint") or "").strip()
+            src_file = item.get("source_filename", "")
+            conf = item.get("confidence", "MED")
+            if not hint or conf not in ("HIGH", "MED"):
+                continue
+            gap_id = f"pass5:complete:{hash(hint + entity) & 0xFFFFFFFF:08x}"
+            gaps.append(ReconciliationGap(
+                gap_id=gap_id,
+                gap_type="stale_open_task",
+                description=f"[{entity}] Drive doc suggests task may be done: {hint}",
+                source_evidence=f"Source: {src_file}",
+                source="drive_sweep",
+                source_id=src_file,
+                entity=entity,
+                confidence=conf,
+                proposed_action=f"Review and close Asana task matching: {hint}",
+                title=hint,
+            ))
+
+        if len(gaps) >= MAX_GAPS_PER_PASS:
+            break
+
+    log.info("pass5 (drive insights): %d gaps found", len(gaps))
+    return gaps
+
+
 # ── Top-level orchestration ────────────────────────────────────────────────────
 
 def reconcile(
@@ -736,8 +979,9 @@ def reconcile(
     lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
     db_path: Path | None = None,
     passes: list[int] | None = None,
+    anthropic_client: Any | None = None,
 ) -> list[ReconciliationGap]:
-    """Run all four reconciliation passes and return actionable gaps.
+    """Run all reconciliation passes and return actionable gaps.
 
     Parameters
     ----------
@@ -752,15 +996,18 @@ def reconcile(
     db_path:
         Override KB DB path (for testing).
     passes:
-        Which passes to run (1-4). Default: all four. Useful for targeted
+        Which passes to run (1-5). Default: all five. Useful for targeted
         runs or testing.
+    anthropic_client:
+        Anthropic client instance for Pass 5 (Drive synthesis). Required if
+        5 is in passes; Pass 5 is silently skipped if None.
 
     Returns
     -------
     List of ReconciliationGap objects with confidence HIGH or MED, sorted by
     confidence desc. LOW confidence gaps are filtered out.
     """
-    passes = passes or [1, 2, 3, 4]
+    passes = passes or [1, 2, 3, 4, 5]
     all_gaps: list[ReconciliationGap] = []
 
     kwargs = {"lookback_seconds": lookback_seconds, "db_path": db_path}
@@ -788,6 +1035,18 @@ def reconcile(
             all_gaps.extend(pass4_stale_open_tasks(open_tasks, **kwargs))
         except Exception as exc:
             log.error("reconciliation pass4 failed: %s", exc, exc_info=True)
+
+    if 5 in passes and anthropic_client is not None:
+        try:
+            all_gaps.extend(
+                pass5_drive_insights(
+                    open_tasks, active_deals, anthropic_client, **kwargs
+                )
+            )
+        except Exception as exc:
+            log.error("reconciliation pass5 failed: %s", exc, exc_info=True)
+    elif 5 in passes and anthropic_client is None:
+        log.info("reconciliation pass5 skipped: no anthropic_client provided")
 
     # Filter to actionable only (HIGH + MED), sort by confidence desc
     actionable = [g for g in all_gaps if g.is_actionable]

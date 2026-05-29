@@ -211,8 +211,8 @@ def main() -> int:
         help="Run reconciliation but do NOT propose updates to knowledge_review",
     )
     parser.add_argument(
-        "--passes", type=str, default="1,2,3,4",
-        help="Comma-separated list of passes to run (default: 1,2,3,4)",
+        "--passes", type=str, default="1,2,3,4,5",
+        help="Comma-separated list of passes to run (default: 1,2,3,4,5)",
     )
     parser.add_argument(
         "--lookback-hours", type=float, default=25.0,
@@ -244,6 +244,21 @@ def main() -> int:
     active_deals = _fetch_active_deals()
     log.info("Fetched %d active HubSpot deals", len(active_deals))
 
+    # ─── Build Anthropic client for pass 5 ───────────────────────────────────
+    anthropic_client = None
+    if 5 in passes:
+        import os
+        import anthropic as _anthropic
+        _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if _api_key:
+            try:
+                anthropic_client = _anthropic.Anthropic(api_key=_api_key)
+                log.info("Anthropic client ready for pass 5")
+            except Exception as exc:
+                log.warning("Could not build Anthropic client for pass 5: %s", exc)
+        else:
+            log.warning("ANTHROPIC_API_KEY not set — pass 5 will be skipped")
+
     # ─── Run reconciliation ───────────────────────────────────────────────────
     log.info("Running reconciliation passes %s over last %.0fh of KB...", passes, args.lookback_hours)
     try:
@@ -253,6 +268,7 @@ def main() -> int:
             lookback_seconds=lookback_seconds,
             db_path=KB_DB_PATH if KB_DB_PATH.exists() else None,
             passes=passes,
+            anthropic_client=anthropic_client,
         )
     except Exception as exc:
         log.error("reconciliation_engine.reconcile() failed: %s", exc, exc_info=True)

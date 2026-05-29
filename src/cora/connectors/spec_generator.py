@@ -20,6 +20,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 
+import time
+
 import anthropic
 
 from ..config import config
@@ -102,16 +104,84 @@ _BRAND_GUIDES: dict[str, dict] = {
     },
 }
 
-# Default can image URLs (Shopify CDN) for each brand.
-# These are real production images used for compositing.
-_DEFAULT_CAN_URLS: dict[str, str] = {
-    "pure": (
-        "https://cdn.shopify.com/s/files/1/0747/7084/1920/files/"
-        "F3_StrawberryLemonade_Front_Pure.png?v=1765900041"
-    ),
-    "mood": "",   # TODO: fill when Mood Shopify assets are uploaded
-    "energy": "", # TODO: fill when Energy Shopify assets are uploaded
-}
+# Drive folder containing highest-quality F3 brand can PNGs (Pure, Mood, Energy).
+# Files in this folder are named with the brand name — e.g. "F3_Pure_Can_Front.png".
+_F3_BRAND_ASSETS_FOLDER_ID = "1sbMb57XdQO_uWgfSdTtczV3crRVe9or0"
+
+# Brand file ID cache: brand → (drive_file_id, cached_at_unix_ts)
+_brand_file_id_cache: dict[str, tuple[str, float]] = {}
+_BRAND_FILE_CACHE_TTL = 3600.0  # re-check Drive once per hour
+
+_IMAGE_MIME_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/jpg",
+})
+
+def _get_brand_image_ref(brand: str, override_url: str | None = None) -> ImageRef:
+    """Return an ImageRef for the brand's can PNG.
+
+    Priority order:
+      1. override_url (explicit caller override) — returned as type="url"
+      2. Cached Drive file ID (TTL = 1 hour)
+      3. Fresh Drive folder lookup by brand name
+
+    Raises ValueError if no matching image is found.
+    """
+    if override_url:
+        return ImageRef(type="url", value=override_url)
+
+    # Check cache
+    cached = _brand_file_id_cache.get(brand)
+    if cached:
+        file_id, ts = cached
+        if time.monotonic() - ts < _BRAND_FILE_CACHE_TTL:
+            log.debug("spec_generator: brand=%s image from cache file_id=%s", brand, file_id)
+            return ImageRef(type="drive_file_id", value=file_id)
+
+    # Fresh Drive lookup
+    try:
+        from .drive_client import DriveClientError, list_folder_files
+    except ImportError as exc:
+        raise ValueError(f"Drive client not available: {exc}") from exc
+
+    try:
+        files = list_folder_files(_F3_BRAND_ASSETS_FOLDER_ID, impersonate=False)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not list F3 brand assets folder from Drive: {exc}"
+        ) from exc
+
+    # Filter to image files whose name contains the brand name (case-insensitive)
+    brand_lower = brand.lower()
+    matches = [
+        f for f in files
+        if brand_lower in f.get("name", "").lower()
+        and f.get("mimeType") in _IMAGE_MIME_TYPES
+    ]
+
+    # Prefer PNG, then any image
+    png_matches = [f for f in matches if f.get("mimeType") == "image/png"]
+    best = png_matches[0] if png_matches else (matches[0] if matches else None)
+
+    if best is None:
+        # Log what files ARE in the folder to help diagnose naming mismatches
+        all_names = [f.get("name", "?") for f in files[:10]]
+        raise ValueError(
+            f"No image found for brand '{brand}' in the F3 brand assets folder. "
+            f"Files in folder: {all_names}. "
+            f"Make sure a PNG or image file with '{brand}' in the name is uploaded."
+        )
+
+    file_id = best["id"]
+    _brand_file_id_cache[brand] = (file_id, time.monotonic())
+    log.info(
+        "spec_generator: brand=%s resolved to Drive file %s (%s)",
+        brand, file_id, best.get("name"),
+    )
+    return ImageRef(type="drive_file_id", value=file_id)
+
 
 _SYSTEM_PROMPT = """\
 You are a senior creative director for F3, a premium functional energy drink brand.
@@ -238,20 +308,18 @@ def generate_spec_from_brief(
         safe_brief = re.sub(r"[^a-z0-9]+", "-", brief.lower())[:40].strip("-")
         output_filename = f"f3-{brand}-{safe_brief}-{short_id}.png"
 
-    # Can image URL
-    image_url = main_image_url or _DEFAULT_CAN_URLS.get(brand, "")
-    if not image_url:
-        raise ValueError(
-            f"No default can image URL configured for brand '{brand}'. "
-            "Pass main_image_url explicitly."
-        )
+    # Resolve can image — Drive folder lookup with optional URL override
+    try:
+        main_image_ref = _get_brand_image_ref(brand, override_url=main_image_url or None)
+    except ValueError as exc:
+        raise ValueError(f"Could not resolve brand image for '{brand}': {exc}") from exc
 
     return ImageSpec(
         spec_id=spec_id,
         brand=brand,
         scene_name=f"brief-{ts}",
         feature="ai_backgrounds",
-        main_image=ImageRef(type="url", value=image_url),
+        main_image=main_image_ref,
         background=Background(
             prompt=background_prompt,
             guidance=BackgroundGuidance(scale=guidance_scale),

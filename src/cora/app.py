@@ -31,6 +31,7 @@ from . import semantic_cache as sc
 from . import slack_update_throttle
 from . import team_learning
 from . import user_feedback_tracker as uft
+from .tools import user_identity
 
 log = logging.getLogger(__name__)
 
@@ -177,12 +178,35 @@ def _dispatch_qa(
     function = channel_classifier.classify_function(channel_name)
     tier = channel_classifier.tier_label(entity, function)
 
+    # Resolve who is asking — ALWAYS inject caller identity so Claude never
+    # confuses one team member for another (e.g. Hannah for Harrison).
+    caller_name = user_identity.display_name(user_id or "") if user_id else "Unknown"
+    caller_record = user_identity.get_user(user_id or "") if user_id else None
+    caller_role_hint = ""
+    if caller_record and caller_record.asana_email:
+        caller_role_hint = f" ({caller_record.asana_email})"
+
+    # Founder (Harrison) gets cross-entity access from any channel. His questions
+    # about UFL, LEX, OSN etc. from an F3E channel should not be blocked by entity scope.
+    _FOUNDER_ID = "U0B2RM2JYJ1"
+    is_founder = (user_id == _FOUNDER_ID)
+    founder_note = (
+        "\n**Cross-entity access ENABLED:** This user is the portfolio founder. "
+        "Answer questions about any HJR Global entity regardless of this channel's "
+        "entity scope. Do not redirect to other channels based on entity scoping.\n"
+    ) if is_founder else ""
+
     runtime_context = (
         f"## Runtime channel context\n\n"
         f"This channel (#{channel_name}) has these properties:\n"
         f"- Entity: {entity}\n"
         f"- Function: {function}\n"
         f"- Financial-access tier: {tier}\n\n"
+        f"**The person asking this question is: {caller_name}{caller_role_hint}** "
+        f"(Slack ID: {user_id or 'unknown'}).\n"
+        f"Address them by their first name if relevant. Do NOT assume the asker is "
+        f"Harrison Rogers unless their Slack ID is U0B2RM2JYJ1.\n"
+        f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
         f"---\n\n"
     )
