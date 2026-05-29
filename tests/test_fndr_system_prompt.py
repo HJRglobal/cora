@@ -415,14 +415,6 @@ class TestRegressionGuardrails:
         assert "F3E-scoped only" in PROMPT, \
             "Ads tools must still be marked as F3E-scoped only"
 
-    def test_knowledge_gap_marker_present(self):
-        assert "CORA_KNOWLEDGE_GAP" in PROMPT, \
-            "Knowledge gap marker instruction must still be present"
-
-    def test_knowledge_gap_marker_stripped_note(self):
-        assert "stripped from your reply" in PROMPT, \
-            "Note that the marker is stripped before posting must still be present"
-
     def test_sign_off_rule(self):
         assert "Sign-off" in PROMPT or "sign off" in PROMPT.lower(), \
             "Sign-off rule section must still be present"

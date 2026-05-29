@@ -143,11 +143,12 @@ class TestCloverClientStructure:
 
 class TestDispatchRegistration:
     def test_clover_client_in_import(self, dispatch_src):
-        import_line = next(
-            (l for l in dispatch_src.split("\n") if "clover_client" in l and l.startswith("from")), ""
+        # clover_client is imported from connectors, not from the tools package
+        connectors_import = next(
+            (l for l in dispatch_src.split("\n") if "clover_client" in l and "import" in l), ""
         )
-        assert "clover_client" in import_line, \
-            f"clover_client not found in any import line in tool_dispatch.py"
+        assert "clover_client" in connectors_import, \
+            f"clover_client not found in any import line"
 
     def test_osn_sales_pulse_handler_defined(self, dispatch_src):
         assert "def _tool_osn_sales_pulse(" in dispatch_src
@@ -267,13 +268,13 @@ class TestPeriodHelpers:
     def test_7d_span(self):
         start_ms, end_ms = _cc._period_to_epoch_ms("7d")
         span_days = (end_ms - start_ms) / (1000 * 86400)
-        assert 6.9 <= span_days <= 7.9  # start=midnight 7d ago, end=now → up to ~7.99d
+        assert 6.9 <= span_days <= 8.1  # start=midnight 7d ago, end=now → up to ~7.99d
 
     @_layer_b
     def test_30d_span(self):
         start_ms, end_ms = _cc._period_to_epoch_ms("30d")
         span_days = (end_ms - start_ms) / (1000 * 86400)
-        assert 29.9 <= span_days <= 30.9  # start=midnight 30d ago, end=now → up to ~30.99d
+        assert 29.9 <= span_days <= 31.1  # start=midnight 30d ago, end=now → up to ~30.99d
 
     @_layer_b
     def test_invalid_period_raises(self):

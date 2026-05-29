@@ -49,7 +49,7 @@ VALID_SPEC_JSON = json.dumps(VALID_SPEC_DICT)
 
 @pytest.fixture
 def mock_run_spec():
-    """Patch photoroom_client.run_spec to return a successful GenerateResult."""
+    """Patch photoroom_client.run_spec and _api_key to return a successful GenerateResult."""
     from cora.connectors import photoroom_client as pc
     result = pc.GenerateResult(
         spec_id="test-pure-hero-001",
@@ -58,13 +58,14 @@ def mock_run_spec():
         cost_usd=0.10,
         error=None,
     )
-    with patch.object(pc, "run_spec", return_value=result) as mock:
+    with patch.object(pc, "_api_key", return_value="test-api-key"), \
+         patch.object(pc, "run_spec", return_value=result) as mock:
         yield mock
 
 
 @pytest.fixture
 def mock_batch_run():
-    """Patch photoroom_client.batch_run to return a successful BatchResults."""
+    """Patch photoroom_client.batch_run and _api_key to return a successful BatchResults."""
     from cora.connectors import photoroom_client as pc
     results = pc.BatchResults(
         results=[
@@ -84,7 +85,8 @@ def mock_batch_run():
             ),
         ],
     )
-    with patch.object(pc, "batch_run", return_value=results) as mock:
+    with patch.object(pc, "_api_key", return_value="test-api-key"), \
+         patch.object(pc, "batch_run", return_value=results) as mock:
         yield mock
 
 

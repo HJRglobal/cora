@@ -18,8 +18,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ── Import under test ──────────────────────────────────────────────────────
-from src.cora.tools import ads_client
-from src.cora.connectors.polar_client import PolarConnectorError, PolarReport
+from cora.tools import ads_client
+from cora.connectors.polar_client import PolarConnectorError, PolarReport
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ def mock_polar_channel_ok():
 
 class TestGetPerformanceSummary:
     def test_happy_path_contains_key_metrics(self, mock_polar_ok):
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
             result = ads_client.get_performance_summary_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -137,7 +137,7 @@ class TestGetPerformanceSummary:
         assert "7,500" in result          # net revenue after ads
 
     def test_amazon_block_appears(self, mock_polar_ok):
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
             result = ads_client.get_performance_summary_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -146,7 +146,7 @@ class TestGetPerformanceSummary:
 
     def test_source_opacity_no_platform_names(self, mock_polar_ok):
         """Output must not name underlying ad platforms."""
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
             result = ads_client.get_performance_summary_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -156,17 +156,17 @@ class TestGetPerformanceSummary:
 
     def test_polar_error_returns_unknown_response(self):
         with patch(
-            "src.cora.tools.ads_client.generate_report",
+            "cora.tools.ads_client.generate_report",
             side_effect=PolarConnectorError("API key missing"),
         ):
-            with patch("src.cora.tools.ads_client.notify_gap", return_value=ads_client.UNKNOWN_RESPONSE):
+            with patch("cora.tools.ads_client.notify_gap", return_value=ads_client.UNKNOWN_RESPONSE):
                 result = ads_client.get_performance_summary_text(
                     lookback_days=30, channel="F3E", user="U123"
                 )
         assert result == ads_client.UNKNOWN_RESPONSE
 
     def test_audit_log_written_on_success(self, tmp_path, mock_polar_ok):
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
             ads_client.get_performance_summary_text(
                 lookback_days=30, channel="F3E", user="U456"
             )
@@ -191,7 +191,7 @@ class TestGetPerformanceSummary:
                 "amazon_acos_target": 65.0,
             },
         }))
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_ok):
             result = ads_client.get_performance_summary_text(
                 lookback_days=30, channel="F3E", user="U789"
             )
@@ -205,7 +205,7 @@ class TestGetPerformanceSummary:
 
 class TestGetChannelBreakdown:
     def test_happy_path_shows_channel_rows(self, mock_polar_channel_ok):
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_channel_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_channel_ok):
             result = ads_client.get_channel_breakdown_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -215,7 +215,7 @@ class TestGetChannelBreakdown:
         assert "500" in result     # paid search spend
 
     def test_no_platform_names_in_channel_output(self, mock_polar_channel_ok):
-        with patch("src.cora.tools.ads_client.generate_report", return_value=mock_polar_channel_ok):
+        with patch("cora.tools.ads_client.generate_report", return_value=mock_polar_channel_ok):
             result = ads_client.get_channel_breakdown_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -230,7 +230,7 @@ class TestGetChannelBreakdown:
             deep_link="", date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=[],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=empty_report):
+        with patch("cora.tools.ads_client.generate_report", return_value=empty_report):
             result = ads_client.get_channel_breakdown_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -256,7 +256,7 @@ class TestGetSubbrandPerformance:
             date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=["custom_5621"],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=report):
+        with patch("cora.tools.ads_client.generate_report", return_value=report):
             result = ads_client.get_subbrand_performance_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -291,7 +291,7 @@ class TestGetPixelAttribution:
             date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=[],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=report):
+        with patch("cora.tools.ads_client.generate_report", return_value=report):
             result = ads_client.get_pixel_attribution_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -309,7 +309,7 @@ class TestGetPixelAttribution:
             deep_link="", date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=[],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=report):
+        with patch("cora.tools.ads_client.generate_report", return_value=report):
             result = ads_client.get_pixel_attribution_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -351,7 +351,7 @@ class TestGetCmWaterfall:
             date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=[],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=report):
+        with patch("cora.tools.ads_client.generate_report", return_value=report):
             result = ads_client.get_cm_waterfall_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -381,7 +381,7 @@ class TestGetCmWaterfall:
             deep_link="", date_from="2026-04-23", date_to="2026-05-22",
             metrics=[], dimensions=[],
         )
-        with patch("src.cora.tools.ads_client.generate_report", return_value=report):
+        with patch("cora.tools.ads_client.generate_report", return_value=report):
             result = ads_client.get_cm_waterfall_text(
                 lookback_days=30, channel="F3E", user="U123"
             )
@@ -397,7 +397,7 @@ class TestThrottleAndGapNotification:
         topic = "test ads topic"
         assert not ads_client.is_throttled(topic)
 
-        with patch("src.cora.tools.ads_client.SlackWebClient") as mock_slack:
+        with patch("cora.tools.ads_client.SlackWebClient") as mock_slack:
             mock_client = MagicMock()
             mock_slack.return_value = mock_client
             with patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-test"}):
@@ -410,7 +410,7 @@ class TestThrottleAndGapNotification:
         assert ads_client.is_throttled(topic)
 
     def test_gap_notification_returns_unknown_response(self, tmp_path):
-        with patch("src.cora.tools.ads_client.SlackWebClient") as mock_slack:
+        with patch("cora.tools.ads_client.SlackWebClient") as mock_slack:
             mock_client = MagicMock()
             mock_slack.return_value = mock_client
             with patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-test"}):
