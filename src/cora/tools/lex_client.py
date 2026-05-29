@@ -284,7 +284,7 @@ def _list_folder_files(service, folder_id: str) -> list[dict[str, Any]]:
                 q=f"'{folder_id}' in parents and trashed=false",
                 fields="files(id,name,mimeType,modifiedTime,size)",
                 orderBy="modifiedTime desc",
-                pageSize=20,
+                pageSize=50,
             )
             .execute()
         )
@@ -479,6 +479,20 @@ _PARSEABLE_MIMES = {
     "application/vnd.ms-excel",
 }
 
+# Spreadsheets carry structured operational data (staff counts, hours, compliance).
+# Policy docs (Google Docs) are reference material — useful fallback, not primary.
+_SPREADSHEET_MIMES = {
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "text/csv",
+    "application/csv",
+}
+_DOCUMENT_MIMES = {
+    "application/vnd.google-apps.document",
+    "text/plain",
+}
+
 
 def _parse_text_bytes(raw: bytes, filename: str) -> str:
     """Return a truncated plain-text summary for Google Docs and text files."""
@@ -528,14 +542,23 @@ def get_staff_pulse() -> str:
     if not parseable:
         names = [f.get("name", "?") for f in files[:5]]
         return (
-            f"The staffing folder has {len(files)} file(s) but none are CSV or spreadsheet format. "
-            f"Files found: {', '.join(names)}. "
-            "Ask Sean or Jen to upload CSV or Excel files."
+            f"The staffing folder has {len(files)} file(s) but none are CSV, spreadsheet, or document format. "
+            f"Files found: {', '.join(names)}."
         )
 
+    # Prioritize spreadsheets (operational data) over policy docs.
+    # The folder may have recently-uploaded PDFs or Docs near the top
+    # of the modifiedTime-sorted list that aren't staffing pulse data.
+    spreadsheets = [f for f in parseable if f.get("mimeType") in _SPREADSHEET_MIMES]
+    docs = [f for f in parseable if f.get("mimeType") in _DOCUMENT_MIMES]
+    to_parse = (spreadsheets[:5] if spreadsheets else docs[:3])
+    log.info(
+        "lex_staff_pulse: prioritized %d spreadsheet(s) + %d doc(s) from %d parseable",
+        len(spreadsheets), len(docs), len(parseable),
+    )
+
     summaries: list[str] = []
-    # Parse up to 5 most-recent parseable files
-    for f in parseable[:5]:
+    for f in to_parse:
         fid   = f["id"]
         fname = f.get("name", fid)
         fmime = f.get("mimeType", "")
