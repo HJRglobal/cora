@@ -58,6 +58,22 @@ logging.basicConfig(
 log = logging.getLogger("qbo_oauth_flow")
 
 
+# Known realm IDs from Chrome Agent research (May 2026).
+# Used to warn when the wrong company was selected during OAuth.
+# LEXINGTON_FIRM_REALM is the accountant's own books — never correct for an entity client.
+_LEXINGTON_FIRM_REALM = "416205631"
+
+_KNOWN_REALM_IDS: dict[str, str] = {
+    "F3E":  "9341454160552149",   # F3 Energy Holdings Inc
+    # Add others as confirmed: LEX, OSN, BDM, HJRG
+}
+
+_KNOWN_REALM_NAMES: dict[str, str] = {
+    "F3E":  "F3 Energy Holdings Inc",
+    _LEXINGTON_FIRM_REALM: "Lexington Firm (accountant's own company — NOT an entity client)",
+}
+
+
 def _cmd_bootstrap(entity: str, environment: str, manual: bool = False) -> int:
     log.info("Beginning QBO OAuth bootstrap for entity=%s env=%s manual=%s", entity, environment, manual)
     try:
@@ -66,13 +82,39 @@ def _cmd_bootstrap(entity: str, environment: str, manual: bool = False) -> int:
         log.error("OAuth flow failed: %s", exc)
         return 1
 
+    realm_id = entry["realm_id"]
     print()
     print(f"  [OK] QBO authorized for entity={entity!r}")
-    print(f"  [OK] realm_id={entry['realm_id']}")
+    print(f"  [OK] realm_id={realm_id}")
     print(f"  [OK] environment={entry['environment']}")
     print(f"  [OK] access token valid for ~1 hour; refresh token valid ~100 days")
     print(f"  [OK] Tokens persisted to .credentials/qbo-tokens.json (gitignored)")
     print()
+
+    # Warn if Lexington Firm's realm was captured (wrong company selected during auth)
+    if realm_id == _LEXINGTON_FIRM_REALM:
+        print(f"  [WARN] realm_id {realm_id} is Lexington Firm's accountant company.")
+        print(f"  [WARN] This is almost certainly WRONG for entity={entity!r}.")
+        print(f"  [WARN] During the OAuth browser flow, you need to select the")
+        print(f"  [WARN] {entity} client company — NOT 'Lexington Firm'.")
+        print(f"  [WARN] See instructions: before pasting the OAuth URL, open QBOA,")
+        print(f"  [WARN] click into the {entity} company, THEN paste the OAuth URL")
+        print(f"  [WARN] in a new tab so Intuit shows that company for authorization.")
+        print()
+        return 1
+
+    # Warn if the realm_id doesn't match the known expected value for this entity
+    expected = _KNOWN_REALM_IDS.get(entity.upper())
+    if expected and realm_id != expected:
+        known_name = _KNOWN_REALM_NAMES.get(realm_id, f"unknown company (realm {realm_id})")
+        print(f"  [WARN] realm_id mismatch for entity={entity!r}.")
+        print(f"  [WARN] Expected: {expected} ({_KNOWN_REALM_NAMES.get(expected, entity)})")
+        print(f"  [WARN] Got:      {realm_id} ({known_name})")
+        print(f"  [WARN] Wrong QBO company was selected. Re-run after entering the")
+        print(f"  [WARN] correct company in QBOA first.")
+        print()
+        return 1
+
     return 0
 
 
