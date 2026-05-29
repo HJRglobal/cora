@@ -66,11 +66,16 @@ _LEXINGTON_FIRM_REALM = "416205631"
 _KNOWN_REALM_IDS: dict[str, str] = {
     "F3E":   "9341454160552149",   # F3 Energy Holdings Inc
     "LEX":   "476503710",          # LLC Lexington LLC
-    "OSN":   "9341456036989538",   # OSN CORE 4 LLC
+    "OSN":   "9341456036989538",   # OSN CORE 4 LLC (parent / group)
     "BDM":   "9341454760124312",   # Big D Media
     "HJRG":  "9130349690118516",   # HJR GS
     "HJRP":  "123145677834422",    # HJR Properties
     "HRLLC": "9130351363051036",   # Harrison Rogers, LLC
+    # OSN individual store QBO companies — realm IDs filled in after OAuth (May 2026)
+    # "OSNGM": "...",              # OSN Gilbert & McKellips
+    # "OSNVV": "...",              # OSN Val Vista & Pecos
+    # "OSNGF": "...",              # OSN Greenfield & 60
+    # "OSNGW": "...",              # OSN Gilbert & Warner
 }
 
 _KNOWN_REALM_NAMES: dict[str, str] = {

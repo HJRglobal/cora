@@ -58,7 +58,29 @@ routes:
   - pattern: "lex-*"
     entity: LEX
 
-  # OSN (4-store group) — covers bare #osn, osn-*, plus #clover-daily
+  # OSN individual stores — each store has its own entity code, QBO account, and channel set.
+  # Channel prefix matches the entity code (e.g. #osngm-finance → OSNGM).
+  # These sit above the osn-* catch-all; osngm-* etc. don't technically match osn-*
+  # (fnmatch requires the literal dash), but explicit ordering makes intent clear.
+  # Store codes align with the shift scheduler (GM / VVP / GF / GW).
+  - pattern: "osngm"
+    entity: OSNGM
+  - pattern: "osngm-*"
+    entity: OSNGM
+  - pattern: "osnvv"
+    entity: OSNVV
+  - pattern: "osnvv-*"
+    entity: OSNVV
+  - pattern: "osngf"
+    entity: OSNGF
+  - pattern: "osngf-*"
+    entity: OSNGF
+  - pattern: "osngw"
+    entity: OSNGW
+  - pattern: "osngw-*"
+    entity: OSNGW
+
+  # OSN (4-store group parent) — covers bare #osn, osn-*, plus #clover-daily
   # (OSN cross-store sales summary, non-standard naming)
   - pattern: "osn"
     entity: OSN

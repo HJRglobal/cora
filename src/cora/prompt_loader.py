@@ -23,6 +23,10 @@ _ENTITY_FILES: dict[str, str] = {
     "LEX-LBHS": "lbhs.md",      # Lexington Behavioral Health: #lbhs-*
     "LEX-LLA":  "lla.md",       # Lex Life Academy sub-entity: #lla-*
     "OSN":      "osn.md",
+    "OSNGM":    "osngm.md",    # OSN Gilbert & McKellips (store-level)
+    "OSNVV":    "osnvv.md",    # OSN Val Vista & Pecos (store-level)
+    "OSNGF":    "osngf.md",    # OSN Greenfield & 60 (store-level)
+    "OSNGW":    "osngw.md",    # OSN Gilbert & Warner (store-level)
     "BDM":      "bdm.md",
     "FNDR":     "fndr.md",
     "HJRG":     "fndr.md",      # HJRG uses FNDR prompt
