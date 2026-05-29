@@ -32,6 +32,7 @@ from . import slack_update_throttle
 from . import team_learning
 from . import user_feedback_tracker as uft
 from .tools import user_identity
+from .tools import osn_shift_handler
 
 log = logging.getLogger(__name__)
 
@@ -618,6 +619,16 @@ def handle_message_event(event: dict, client) -> None:
          responded (within TTL_SECONDS), treat it as a follow-up question and
          run the full Q&A pipeline without requiring a fresh @mention.
     """
+    # ── DM path — route to OSN shift scheduler ───────────────────────────────
+    channel_type = event.get("channel_type", "")
+    if channel_type == "im":
+        user_id = event.get("user", "")
+        text = event.get("text", "").strip()
+        if user_id and text and not event.get("bot_id"):
+            log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
+            osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+        return
+
     # Only interested in thread replies (has thread_ts != ts)
     thread_ts = event.get("thread_ts")
     msg_ts = event.get("ts")
@@ -725,6 +736,14 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     reactor = event.get("user", "")
     reaction = event.get("reaction", "")
     message_ts = item.get("ts", "")
+
+    # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
+    if event_type == "reaction_added" and reaction == "white_check_mark":
+        sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
+            message_ts=message_ts, channel_id=channel_id, client=client
+        )
+        if sched_reply:
+            client.chat_postMessage(channel=channel_id, text=sched_reply)
 
     # ── Team learning: approval/decline of pending contributions ──────────────
     # Only process ✅ / ❌ on reaction_added (not removal). Look up by the ts
