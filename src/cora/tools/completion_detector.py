@@ -54,6 +54,16 @@ DEDUP_WINDOW_HOURS = 48
 # Maximum candidates returned per sweep (cap noise on low-threshold runs).
 MAX_CANDIDATES = 30
 
+# Shorter lookback for interactive (on-demand) tool calls. 25h sweeps pull the
+# full night's Fireflies + Gmail batch; 4h interactive calls only need recent
+# Slack/DM chatter to answer "what did I just finish?".
+INTERACTIVE_LOOKBACK_SECONDS = 4 * 3600
+
+# Hard cap on signals fed to fuzzy matching in one call. Without this, a large
+# KB (16K+ chunks) can produce 10K+ signals and matching becomes O(n×tasks)
+# with SequenceMatcher, taking 60-90s. Cap here; log when hit so we can tune.
+_SIGNAL_MATCH_CAP = 500
+
 # ── Completion signal vocabulary ───────────────────────────────────────────
 
 # Verbs that strongly imply completion. Applied as whole-word regex.
@@ -347,19 +357,52 @@ def _fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+# Minimum significant word length for the word-intersection pre-filter.
+_MIN_WORD_LEN = 4
+
+# Stopwords that are too common to count as meaningful overlap.
+_STOPWORDS = frozenset({
+    "that", "this", "with", "from", "have", "been", "will", "would", "could",
+    "should", "they", "their", "them", "then", "than", "when", "what", "your",
+    "which", "were", "also", "into", "over", "just", "some", "more", "very",
+})
+
+
+def _word_set(text: str) -> frozenset[str]:
+    """Return lowercase words ≥ _MIN_WORD_LEN, excluding stopwords."""
+    return frozenset(
+        w for w in re.findall(r"[a-z]{4,}", text.lower())
+        if w not in _STOPWORDS
+    )
+
+
+# Pre-compute task word sets once per call by caching on the task list id.
+def _build_task_word_sets(open_tasks: list[dict]) -> list[tuple[dict, frozenset[str]]]:
+    return [(t, _word_set(t.get("name") or "")) for t in open_tasks]
+
+
 def _best_task_match(
     signal: CompletionSignal,
-    open_tasks: list[dict],
+    task_word_pairs: list[tuple[dict, frozenset[str]]],
 ) -> tuple[dict, float] | None:
     """Return the (task_dict, fuzzy_ratio) pair with the highest ratio above
-    MIN_FUZZY_RATIO, or None if no task clears the threshold."""
+    MIN_FUZZY_RATIO, or None if no task clears the threshold.
+
+    Word-intersection pre-filter: skip SequenceMatcher entirely when the signal
+    shares no significant words with the task name — makes the inner loop ~10×
+    faster on large signal sets.
+    """
     text = signal.signal_text
+    sig_words = _word_set(text)
     best_task: dict | None = None
     best_ratio = MIN_FUZZY_RATIO  # anything below this is ignored
 
-    for task in open_tasks:
+    for task, task_words in task_word_pairs:
         name = task.get("name") or ""
         if not name:
+            continue
+        # Skip SequenceMatcher when there's no word overlap at all.
+        if sig_words and task_words and not sig_words.intersection(task_words):
             continue
         ratio = _fuzzy_ratio(text, name)
         if ratio > best_ratio:
@@ -397,10 +440,21 @@ def match_signals_to_tasks(
     MAX_CANDIDATES. Dedup is applied when apply_dedup=True (always in prod;
     disable in tests).
     """
+    if len(signals) > _SIGNAL_MATCH_CAP:
+        log.warning(
+            "match_signals_to_tasks: %d signals exceeds cap %d — truncating to "
+            "highest-weight sources to keep latency under 5s",
+            len(signals), _SIGNAL_MATCH_CAP,
+        )
+        signals = sorted(signals, key=lambda s: s.source_weight, reverse=True)[:_SIGNAL_MATCH_CAP]
+
+    # Pre-compute word sets for all tasks once (avoids re-tokenising per signal).
+    task_word_pairs = _build_task_word_sets(open_tasks)
+
     candidates: list[CompletionCandidate] = []
 
     for signal in signals:
-        match = _best_task_match(signal, open_tasks)
+        match = _best_task_match(signal, task_word_pairs)
         if match is None:
             continue
         task, ratio = match

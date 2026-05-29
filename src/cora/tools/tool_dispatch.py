@@ -1754,9 +1754,11 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
     if entity and entity != "FNDR":
         entity_list = [entity, "FNDR"]
 
-    # 3. Run detection
+    # 3. Run detection — use shorter interactive lookback (4h vs 25h sweep) so
+    # the fuzzy-match loop finishes in <5s even on a large KB.
     candidates = completion_detector.detect_candidates(
         open_tasks,
+        lookback_seconds=completion_detector.INTERACTIVE_LOOKBACK_SECONDS,
         entities=entity_list,
         apply_dedup=True,
     )
