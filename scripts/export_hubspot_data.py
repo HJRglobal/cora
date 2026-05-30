@@ -65,7 +65,8 @@ def _get(path: str, params: dict | None = None) -> dict:
 def _post(path: str, body: dict) -> dict:
     with httpx.Client(timeout=_TIMEOUT) as c:
         r = c.post(f"{_BASE}{path}", headers=_headers(), json=body)
-    if r.status_code not in (200, 201):
+    # 207 Multi-Status is normal for HubSpot v4 batch endpoints — partial results + per-item errors
+    if r.status_code not in (200, 201, 207):
         raise RuntimeError(f"POST {path} → {r.status_code}: {r.text[:200]}")
     return r.json()
 
