@@ -1,42 +1,31 @@
 """Team learning module — write-back, correction capture, approval queue, KB ingest.
 
 Enables the team to contribute knowledge to Cora directly from Slack and have
-Harrison approve it before it enters the KB.
+designated entity approvers review it before it enters the KB.
 
 Flows:
 
-1. Write-back
-   @Cora note: <content>
-   → Cora stores the pending contribution and posts an approval card to
-     #hjrg-leadership. Harrison reacts ✅ to approve (ingests to KB) or
-     ❌ to decline.
+1. Write-back  (@Cora note: / @Cora remember:)
+   → Cora paraphrases what she understood and asks the author to confirm.
+   → Author replies "yes" / "correct" → contribution queued in entity KQ channel.
+   → Author replies with a correction → Cora re-paraphrases and repeats.
 
-2. Correction capture
-   A reply in a Cora thread that starts with a correction signal
-   ("actually", "correction:", "that's wrong", "to clarify", etc.)
-   → Same approval flow as write-back, but labelled as a correction.
+2. Bookmark (📚 reaction on any message)
+   → Same confirm loop as write-back, sourced from the reacted message text.
 
-3. Approval processing
-   Called from app.py when reaction_added fires on a Cora message.
-   Checks if the reacted message is a pending-contribution approval card.
+3. Correction capture
+   A reply in a Cora thread starting with a correction signal.
+   → Same confirm loop, labelled as a correction.
+
+4. Approval processing
+   Called from app.py when reaction_added fires on an approval card.
    ✅ → embed + ingest to KB, mark approved.
    ❌ → mark declined, no ingest.
 
-Table: pending_contributions (in cora_kb.db, not the vec table)
+Tables in cora_kb.db:
 
-    contribution_id  TEXT PRIMARY KEY
-    kind             TEXT  ("note" | "correction")
-    entity           TEXT
-    channel_id       TEXT
-    channel_name     TEXT
-    author           TEXT  (Slack user ID)
-    content          TEXT
-    original_ts      TEXT  (ts of the original user message, for thread linking)
-    approval_msg_ts  TEXT  (ts of Cora's approval card message, used as lookup key)
-    approval_channel TEXT  (channel where the approval card was posted)
-    status           TEXT  ("pending" | "approved" | "declined")
-    created_at       INTEGER
-    resolved_at      INTEGER | NULL
+  pending_contributions   — queued items waiting for approver ✅/❌
+  pending_note_confirms   — items waiting for author to confirm Cora's paraphrase
 """
 
 import logging
@@ -75,6 +64,156 @@ _ENTITY_KQ_CHANNEL: dict[str, str] = {
 def kq_channel_for_entity(entity: str) -> str:
     """Return the KQ channel name for the entity, or the fallback approval channel."""
     return _ENTITY_KQ_CHANNEL.get(entity, APPROVAL_CHANNEL)
+
+
+# ── Confirmation detection ─────────────────────────────────────────────────────
+_CONFIRM_RE = re.compile(
+    r"^\s*(?:yes|yep|yup|yeah|correct|confirmed|confirm|that(?:'s|s) (?:right|correct)"
+    r"|looks? good|perfect|exactly|approved|approve|sounds? good|great|right|good|ok(?:ay)?|"
+    r"affirmative|spot on|100%|✅|👍)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_confirmation(text: str) -> bool:
+    """Return True if the text is a simple confirmation of Cora's paraphrase."""
+    return bool(_CONFIRM_RE.match(text.strip()))
+
+
+# ── Pending confirmation state (SQLite, survives restarts) ────────────────────
+
+def _ensure_confirm_table(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS pending_note_confirms (
+            channel_id    TEXT NOT NULL,
+            thread_ts     TEXT NOT NULL,
+            entity        TEXT NOT NULL,
+            channel_name  TEXT NOT NULL,
+            author        TEXT NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 'note',
+            raw_content   TEXT NOT NULL,
+            paraphrase    TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            PRIMARY KEY (channel_id, thread_ts)
+        );
+    """)
+    conn.commit()
+
+
+def _get_confirm_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_KB_DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_confirm_table(conn)
+    return conn
+
+
+def store_pending_confirm(
+    *,
+    channel_id: str,
+    thread_ts: str,
+    entity: str,
+    channel_name: str,
+    author: str,
+    kind: str,
+    raw_content: str,
+    paraphrase: str,
+) -> None:
+    """Save the awaiting-confirmation state for a thread."""
+    conn = _get_confirm_conn()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO pending_note_confirms
+               (channel_id, thread_ts, entity, channel_name, author, kind,
+                raw_content, paraphrase, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (channel_id, thread_ts, entity, channel_name, author, kind,
+             raw_content, paraphrase, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_confirm(channel_id: str, thread_ts: str) -> dict | None:
+    """Return the pending confirmation state for a thread, or None."""
+    conn = _get_confirm_conn()
+    try:
+        row = conn.execute(
+            """SELECT channel_id, thread_ts, entity, channel_name, author, kind,
+                      raw_content, paraphrase, created_at
+               FROM pending_note_confirms WHERE channel_id=? AND thread_ts=?""",
+            (channel_id, thread_ts),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    keys = ["channel_id", "thread_ts", "entity", "channel_name", "author", "kind",
+            "raw_content", "paraphrase", "created_at"]
+    return dict(zip(keys, row))
+
+
+def clear_pending_confirm(channel_id: str, thread_ts: str) -> None:
+    """Remove the confirmation state once resolved (confirmed or timed out)."""
+    conn = _get_confirm_conn()
+    try:
+        conn.execute(
+            "DELETE FROM pending_note_confirms WHERE channel_id=? AND thread_ts=?",
+            (channel_id, thread_ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Paraphrase generation ──────────────────────────────────────────────────────
+
+def paraphrase_note(raw_content: str, entity: str, correction: str | None = None) -> str:
+    """Use Claude Haiku to generate a clear recap of what the user wants Cora to remember.
+
+    If `correction` is provided, it's incorporated into an updated paraphrase.
+    Returns a formatted string ready to post to Slack.
+    """
+    try:
+        import anthropic as _anthropic
+        from .config import config as _config
+
+        client = _anthropic.Anthropic(api_key=_config.anthropic_api_key)
+
+        if correction:
+            user_text = (
+                f"Original note: {raw_content}\n"
+                f"User's correction: {correction}"
+            )
+            instruction = (
+                "The user submitted a note and then corrected it. "
+                "Incorporate the correction and write a fresh, specific recap."
+            )
+        else:
+            user_text = raw_content
+            instruction = "The user wants Cora to remember this."
+
+        prompt = (
+            f"{instruction}\n\n"
+            f"Entity context: {entity}\n"
+            f"Content: {user_text}\n\n"
+            "Write a clear, specific recap (2-4 sentences) of the key facts, names, dates, "
+            "and details. Start with \"Here's what I understood:\". End with "
+            "\"Is this correct, or would you like to adjust anything?\""
+        )
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as exc:
+        log.warning("paraphrase_note failed, using raw content: %s", exc)
+        return (
+            f"Here's what I understood: {raw_content[:500]}\n"
+            "Is this correct, or would you like to adjust anything?"
+        )
 
 # ── Correction signal patterns ─────────────────────────────────────────────────
 _CORRECTION_PATTERNS = [

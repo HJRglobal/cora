@@ -557,7 +557,55 @@ def _handle_note(
     original_ts: str,
     kind: str = "note",
 ) -> None:
-    """Store a pending write-back/correction/bookmark and post an approval card to the entity's KQ channel."""
+    """Paraphrase the note back to the author for confirmation before queuing.
+
+    Bookmarks (📚 reaction) skip the confirm loop — they go straight to the KQ
+    channel since the author is just flagging an existing message, not composing
+    new knowledge. Notes and corrections always go through the confirm loop.
+    """
+    if kind == "bookmark":
+        # Bookmarks: silent, straight to approval queue
+        _queue_contribution(
+            client=client, entity=entity, channel_id=channel_id,
+            channel_name=channel_name, user_id=user_id,
+            content=content, original_ts=original_ts, kind=kind,
+        )
+        return
+
+    # Generate paraphrase via Claude Haiku and ask the author to confirm
+    paraphrase = team_learning.paraphrase_note(content, entity)
+    team_learning.store_pending_confirm(
+        channel_id=channel_id,
+        thread_ts=original_ts,
+        entity=entity,
+        channel_name=channel_name,
+        author=user_id,
+        kind=kind,
+        raw_content=content,
+        paraphrase=paraphrase,
+    )
+    # Keep the thread active so the reply is routed back here
+    active_thread_store.register(channel_id, original_ts)
+
+    say(text=paraphrase, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
+    log.info(
+        "team_learning: awaiting confirm channel=#%s user=%s kind=%s",
+        channel_name, user_id, kind,
+    )
+
+
+def _queue_contribution(
+    *,
+    client,
+    entity: str,
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    content: str,
+    original_ts: str,
+    kind: str,
+) -> None:
+    """Store a confirmed contribution and post the approval card to the entity's KQ channel."""
     cid = team_learning.store_contribution(
         kind=kind,
         entity=entity,
@@ -568,17 +616,8 @@ def _handle_note(
         original_ts=original_ts,
     )
 
-    # Determine target approval channel: entity KQ channel, fallback to hjrg-leadership
     target_ch_name = team_learning.kq_channel_for_entity(entity)
 
-    # Acknowledge in the source channel (only for explicit commands, not bookmark reactions)
-    if kind != "bookmark":
-        ack = f"✅ Got it — pending approval in #{target_ch_name}."
-        if kind == "correction":
-            ack = f"🔄 Correction noted — pending approval in #{target_ch_name}."
-        say(text=ack, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
-
-    # Post approval card to the entity's KQ channel
     card_text = team_learning.build_approval_card(
         kind=kind,
         entity=entity,
@@ -604,8 +643,8 @@ def _handle_note(
         approval_ts = post_resp.get("ts", "")
         team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
         log.info(
-            "team_learning: posted approval card cid=%s kind=%s channel=#%s ts=%s",
-            cid[:8], kind, target_ch_name, approval_ts,
+            "team_learning: queued cid=%s kind=%s channel=#%s",
+            cid[:8], kind, target_ch_name,
         )
     except Exception as exc:
         log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
@@ -651,6 +690,67 @@ def handle_message_event(event: dict, client) -> None:
 
     text = event.get("text", "").strip()
     if not text:
+        return
+
+    # ── Path 0: Pending note confirmation loop ────────────────────────────────
+    # If this thread is waiting for the author to confirm Cora's paraphrase,
+    # handle the reply here before anything else.
+    pending = team_learning.get_pending_confirm(channel_id, thread_ts)
+    if pending and pending["author"] == user_id:
+        channel_name = _resolve_channel_name(client, channel_id)
+        say = lambda **kw: client.chat_postMessage(channel=channel_id, **kw)
+
+        if team_learning.is_confirmation(text):
+            # Author confirmed — queue the contribution and clear state
+            team_learning.clear_pending_confirm(channel_id, thread_ts)
+            target_ch = team_learning.kq_channel_for_entity(pending["entity"])
+            _queue_contribution(
+                client=client,
+                entity=pending["entity"],
+                channel_id=channel_id,
+                channel_name=pending["channel_name"],
+                user_id=user_id,
+                content=pending["raw_content"],
+                original_ts=thread_ts,
+                kind=pending["kind"],
+            )
+            say(
+                text=f"✅ Logged and queued for approval in #{target_ch}.",
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            log.info(
+                "team_learning: confirmed channel=#%s user=%s kind=%s",
+                channel_name, user_id, pending["kind"],
+            )
+        else:
+            # Author is correcting — re-paraphrase incorporating the correction
+            updated = team_learning.paraphrase_note(
+                pending["raw_content"], pending["entity"], correction=text
+            )
+            # Update stored paraphrase so next correction builds on this one
+            team_learning.store_pending_confirm(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                entity=pending["entity"],
+                channel_name=pending["channel_name"],
+                author=user_id,
+                kind=pending["kind"],
+                raw_content=pending["raw_content"],
+                paraphrase=updated,
+            )
+            active_thread_store.touch(channel_id, thread_ts)
+            say(
+                text=updated,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            log.info(
+                "team_learning: re-paraphrased channel=#%s user=%s",
+                channel_name, user_id,
+            )
         return
 
     # ── Path 1: Correction capture ────────────────────────────────────────────
