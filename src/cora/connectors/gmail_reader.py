@@ -192,6 +192,7 @@ def parse_message_metadata(msg: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "message_id": msg["id"],
+        "rfc_message_id": headers.get("message-id", ""),
         "thread_id": msg.get("threadId", ""),
         "from": headers.get("from", ""),
         "to": headers.get("to", ""),
