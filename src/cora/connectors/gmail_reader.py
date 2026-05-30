@@ -291,7 +291,19 @@ def download_attachment(
 
 
 def ensure_cora_label(user_email: str) -> str:
-    """Get or create the 'Cora-Filed' label for user_email. Returns the label ID."""
+    """Get or create the 'Cora-Filed' label for user_email. Returns the label ID.
+
+    The label is hidden from the user's sidebar and email list view so Cora's
+    filing activity is invisible to the mailbox owner. It still exists internally
+    and is used as an idempotency marker to prevent re-filing the same attachment.
+    If the label already exists with visible settings, this patches it to hidden.
+    """
+    _HIDDEN_BODY = {
+        "name": _CORA_LABEL_NAME,
+        "labelListVisibility": "labelHide",
+        "messageListVisibility": "hide",
+    }
+
     service = _build_service(user_email)
     try:
         resp = service.users().labels().list(userId="me").execute()
@@ -300,27 +312,31 @@ def ensure_cora_label(user_email: str) -> str:
 
     for label in resp.get("labels", []):
         if label.get("name") == _CORA_LABEL_NAME:
-            return label["id"]
+            label_id = label["id"]
+            if (
+                label.get("labelListVisibility") != "labelHide"
+                or label.get("messageListVisibility") != "hide"
+            ):
+                try:
+                    service.users().labels().patch(
+                        userId="me", id=label_id, body=_HIDDEN_BODY,
+                    ).execute()
+                    log.info("Patched Cora-Filed label to hidden for %s", user_email)
+                except HttpError as exc:
+                    log.warning("Could not patch label visibility for %s: %s", user_email, exc)
+            return label_id
 
     try:
         created = service.users().labels().create(
             userId="me",
-            body={
-                "name": _CORA_LABEL_NAME,
-                "labelListVisibility": "labelShow",
-                "messageListVisibility": "show",
-                "color": {
-                    "backgroundColor": "#16a766",
-                    "textColor": "#ffffff",
-                },
-            },
+            body=_HIDDEN_BODY,
         ).execute()
     except HttpError as exc:
         raise GmailReaderError(
             f"Label creation failed for {user_email}: {exc}"
         ) from exc
 
-    log.info("Created Gmail label %r for %s (id=%s)", _CORA_LABEL_NAME, user_email, created["id"])
+    log.info("Created hidden Cora-Filed label for %s (id=%s)", user_email, created["id"])
     return created["id"]
 
 

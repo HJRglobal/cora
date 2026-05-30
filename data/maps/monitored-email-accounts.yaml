@@ -94,6 +94,19 @@ accounts:
     asana_gid: "1211265856484421"
     slack_user_id: U0B3NGR1Y85
 
+  - email: matt@hjrglobal.com
+    name: Matt Petrovich
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: OSN
+    known_aliases:
+      - matt@f3energy.com
+    asana_gid: "1211215949326709"
+    slack_user_id: U0B3PS7RFJA
+
   # ── @f3energy.com -- DWD confirmed active 2026-05-27 ────────────────────
 
   - email: tommy@f3energy.com
@@ -147,6 +160,16 @@ accounts:
     thread_sweep: true
     attachment_filer: false
     drive_sweep: true
+    entity_default: F3E
+
+  # service@f3energy.com -- F3E shared service/operations inbox
+  - email: service@f3energy.com
+    name: F3E Service Inbox
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: false
+    attachment_filer: true
+    drive_sweep: false
     entity_default: F3E
 
   # ── @lexingtonservices.com -- DWD confirmed active 2026-05-27 ───────────
