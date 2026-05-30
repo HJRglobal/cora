@@ -179,9 +179,9 @@ _F3E_CLOSED_WON_ID  = ""  # TODO: fill after migration
 _F3E_CLOSED_LOST_ID = ""  # TODO: fill after migration
 
 # Owner short names for F3E Retail team (HubSpot owner_id str → display name)
-# TODO: update with new owner IDs after migration
 _F3E_OWNER_SHORT: dict[str, str] = {
-    # new IDs populated after Chrome Agent Prompt 3 + Cora config update
+    "162944825": "Tommy",
+    "160459333": "Harrison",
 }
 
 
