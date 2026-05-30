@@ -893,6 +893,7 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
                 reaction=reaction,
                 approval_channel_id=channel_id,
                 approval_msg_ts=message_ts,
+                reactor_id=reactor,
             )
             # Fall through to also log the reaction as normal feedback
 
@@ -946,8 +947,10 @@ def _process_contribution_reaction(
     reaction: str,
     approval_channel_id: str,
     approval_msg_ts: str,
+    reactor_id: str | None = None,
 ) -> None:
     """Process a ✅ or ❌ on a pending contribution approval card."""
+    import datetime as _dt
     cid = contribution["contribution_id"]
     if reaction == "white_check_mark":
         # Approve: ingest to KB
@@ -961,6 +964,33 @@ def _process_contribution_reaction(
                 "check logs. Contribution marked approved but not in KB."
             )
         log.info("team_learning: contribution %s approved ingest_ok=%s", cid[:8], success)
+
+        # Post audit record to Harrison's private KB log channel
+        kind = contribution.get("kind", "note")
+        kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
+        approver_mention = f"<@{reactor_id}>" if reactor_id else "_(unknown)_"
+        author_mention = f"<@{contribution['author']}>"
+        approved_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        content_preview = contribution.get("content", "")[:600]
+        audit_text = (
+            f"📋 *KB Approval* `[{cid[:8]}]`\n"
+            f"*Approved by:* {approver_mention}  |  "
+            f"*Entity:* {contribution['entity']}  |  "
+            f"*Kind:* {kind_label}\n"
+            f"*Submitted by:* {author_mention}  |  "
+            f"*Source:* #{contribution['channel_name']}  |  "
+            f"*At:* {approved_at}\n"
+            f"```\n{content_preview}\n```"
+        )
+        try:
+            client.chat_postMessage(
+                channel=team_learning.KB_AUDIT_CHANNEL,
+                text=audit_text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            log.warning("team_learning: failed to post KB audit record cid=%s: %s", cid[:8], exc)
     else:
         # Decline
         team_learning.resolve_contribution(cid, "declined")

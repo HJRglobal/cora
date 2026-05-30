@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 # ── Fallback approval channel (used only when no entity KQ channel exists) ────
 APPROVAL_CHANNEL = "hjrg-leadership"
 
+# ── Harrison-only audit log: every approved contribution is echoed here ───────
+KB_AUDIT_CHANNEL = "cora-kb-log"
+
 # ── Entity → KQ channel routing for approval cards ────────────────────────────
 # Each entity's contributions route to its private KQ channel so the designated
 # approver(s) for that entity see them — not just Harrison in hjrg-leadership.
