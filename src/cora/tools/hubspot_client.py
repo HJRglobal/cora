@@ -2,12 +2,12 @@
 
 Phase 2 #9 scope:
 - Endpoint: POST /crm/v3/objects/deals/search (owner-filtered, incomplete deals)
-- Two active pipelines on Starter: F3E Retail (2234421978), UFL Sponsorships (2242250445 — paused)
+- Four pipelines: F3E Retail, UFL Sponsorships, OSN, BDM (new account 246351746)
 - Token: HUBSPOT_PRIVATE_APP_TOKEN from .env (Bearer auth)
 - No write methods (read-only by design — user clicks deep link to edit in HubSpot)
 
 Deep-link pattern: https://app.hubspot.com/contacts/{PORTAL_ID}/deal/{deal_id}
-PORTAL_ID = 243870963 (HJR Global)
+PORTAL_ID = 246351746 (HJR Global — new account, migrated 2026-05-30)
 """
 
 import logging
@@ -19,13 +19,16 @@ import httpx
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.hubapi.com"
-_PORTAL_ID = "243870963"  # HJR Global account
+_PORTAL_ID = "246351746"  # HJR Global — new account (migrated 2026-05-30)
 _TIMEOUT = 12.0
 _DEFAULT_MAX_DEALS = 25
 
-# Pipeline GIDs from founder OS memory
-PIPELINE_F3E_RETAIL = "2234421978"
-PIPELINE_UFL_SPONSORSHIPS = "2242250445"  # paused per UFL pause; included for completeness
+# Pipeline GIDs — populated by setup_hubspot_pipelines.py; update after migration
+# Old account: F3E=2234421978, UFL=2242250445
+PIPELINE_F3E_RETAIL       = ""  # TODO: fill from new-pipeline-ids.json after setup
+PIPELINE_UFL_SPONSORSHIPS = ""  # TODO: fill from new-pipeline-ids.json after setup
+PIPELINE_OSN              = ""  # TODO: fill from new-pipeline-ids.json after setup
+PIPELINE_BDM              = ""  # TODO: fill from new-pipeline-ids.json after setup
 
 # Stage GID → human-readable name cache (refreshed on first call per process)
 _STAGE_NAME_CACHE: dict[str, str] = {}
@@ -155,29 +158,30 @@ def _deal_url(deal_id: str) -> str:
 # ── F3E Pipeline Summary ─────────────────────────────────────────────────────
 
 # Stage ordering for F3E Retail pipeline (ascending funnel progress).
-# Embedded from live HubSpot probe 2026-05-24 — overlay with _STAGE_NAME_CACHE on use.
+# Stage IDs are assigned by HubSpot at pipeline creation time — populated by
+# setup_hubspot_pipelines.py. _STAGE_NAME_CACHE (refreshed from live API) is the
+# authoritative source; _F3E_STAGE_ORDER is a display-order hint only.
+# TODO: re-probe after migration and replace these with new account stage IDs.
 _F3E_STAGE_ORDER: list[tuple[str, str]] = [
-    ("3601439469", "Identify"),
-    ("3601439470", "Outreach"),
-    ("3672898248", "Sample Sent"),
-    ("3672898250", "Qualified"),
-    ("3672898249", "Proposal"),
-    ("3604397771", "Negotiation"),
-    ("3601439474", "Closed Won"),
-    ("3601439475", "Closed Lost"),
+    ("", "Identify"),
+    ("", "Outreach"),
+    ("", "Sample Sent"),
+    ("", "Qualified"),
+    ("", "Proposal"),
+    ("", "Negotiation"),
+    ("", "Closed Won"),
+    ("", "Closed Lost"),
 ]
 
-# Stages where a deal is "hot" (action-required / approaching close)
-_F3E_HOT_STAGE_IDS: frozenset[str] = frozenset(
-    {"3672898250", "3672898249", "3604397771"}  # Qualified, Proposal, Negotiation
-)
-_F3E_CLOSED_WON_ID = "3601439474"
-_F3E_CLOSED_LOST_ID = "3601439475"
+# Populated after migration — update once setup_hubspot_pipelines.py runs
+_F3E_HOT_STAGE_IDS: frozenset[str] = frozenset()   # TODO: Qualified, Proposal, Negotiation IDs
+_F3E_CLOSED_WON_ID  = ""  # TODO: fill after migration
+_F3E_CLOSED_LOST_ID = ""  # TODO: fill after migration
 
 # Owner short names for F3E Retail team (HubSpot owner_id str → display name)
+# TODO: update with new owner IDs after migration
 _F3E_OWNER_SHORT: dict[str, str] = {
-    "162944825": "Tommy",
-    "160459333": "Harrison",
+    # new IDs populated after Chrome Agent Prompt 3 + Cora config update
 }
 
 
