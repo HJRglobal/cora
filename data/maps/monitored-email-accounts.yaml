@@ -123,6 +123,24 @@ accounts:
     asana_gid: "1211215949326709"
     slack_user_id: U0B3PS7RFJA
 
+  - email: payables@hjrglobal.com
+    name: HJR Payables Inbox
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: false
+    entity_default: FNDR
+
+  - email: receipts@hjrglobal.com
+    name: HJR Receipts Inbox
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: false
+    entity_default: FNDR
+
   # ── @f3energy.com -- DWD confirmed active 2026-05-27 ────────────────────
 
   - email: harrison@f3energy.com
@@ -205,6 +223,24 @@ accounts:
   # PHI guardrail active in sweep + reconciliation (subject-keyword filter).
   # Harrison is sole authority on all PHI access decisions (2026-05-21 doctrine).
 
+  - email: payables@lexingtonservices.com
+    name: Lex Payables Inbox
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: false
+    entity_default: LEX
+
+  - email: receipts@lexingtonservices.com
+    name: Lex Receipts Inbox
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: false
+    entity_default: LEX
+
   - email: harrison@lexingtonservices.com
     name: Harrison Rogers (Lex)
     enabled: true
@@ -263,6 +299,32 @@ accounts:
     slack_user_id: U0B3VGT8RE0
 
   # ── @unitedfightleague.com -- DWD confirmed active 2026-05-27 ───────────
+
+  - email: harrison@unitedfightleague.com
+    name: Harrison Rogers (UFL)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: UFL
+    known_aliases:
+      - harrison@hjrglobal.com
+    asana_gid: "1204525779609669"
+    slack_user_id: U0B2RM2JYJ1
+
+  - email: hannah@unitedfightleague.com
+    name: Hannah Grant (UFL)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: UFL
+    known_aliases:
+      - hannah@hjrglobal.com
+    asana_gid: "1209060959783860"
+    slack_user_id: U0B3AEQS0NB
 
   - email: alex@unitedfightleague.com
     name: Alex Cordova (UFL legacy)
