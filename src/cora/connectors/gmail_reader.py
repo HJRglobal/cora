@@ -492,3 +492,142 @@ def get_full_thread_text(
     # Oldest first (Gmail returns newest-first in thread)
     results.sort(key=lambda m: m["date_ts"])
     return results
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# User-facing inbox summary (metadata only — no body content)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_inbox_summary(
+    user_email: str,
+    query: str = "is:unread OR is:starred",
+    max_results: int = 10,
+) -> list[dict[str, Any]]:
+    """Return recent inbox messages for user_email (metadata only, no body).
+
+    Each returned dict:
+        {message_id, thread_id, from, to, subject, date_ts, snippet, labels}
+
+    query: any Gmail search string — "is:unread", "from:alex@hjrglobal.com",
+           "subject:invoice after:2026/05/01", etc.
+    max_results: capped at 20 to keep response latency under 3s.
+    """
+    max_results = min(max_results, 20)
+    service = _build_service(user_email)
+
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max_results,
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        if status == 403:
+            raise GmailReaderError(
+                f"Gmail 403 for {user_email} — service account lacks DWD scope or "
+                "user is not in the Google Workspace org."
+            ) from exc
+        raise GmailReaderError(f"Gmail list failed for {user_email} (HTTP {status}): {exc}") from exc
+
+    messages: list[dict[str, Any]] = []
+    for ref in resp.get("messages", []):
+        try:
+            msg = service.users().messages().get(
+                userId="me",
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "From", "To", "Date"],
+            ).execute()
+        except HttpError:
+            continue
+
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+        date_str = headers.get("date", "")
+        try:
+            date_ts = int(email.utils.parsedate_to_datetime(date_str).timestamp())
+        except Exception:
+            date_ts = int(msg.get("internalDate", "0")) // 1000
+
+        messages.append({
+            "message_id": msg["id"],
+            "thread_id": msg.get("threadId", ""),
+            "from":    headers.get("from", ""),
+            "to":      headers.get("to", ""),
+            "subject": headers.get("subject", "(no subject)"),
+            "date_ts": date_ts,
+            "snippet": msg.get("snippet", ""),
+            "labels":  msg.get("labelIds", []),
+        })
+
+    return messages
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Completion signal extraction from sent mail
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_sent_signals(
+    user_email: str,
+    since_ts: int,
+    max_results: int = 50,
+) -> list[dict[str, Any]]:
+    """Return sent emails since since_ts as lightweight signal dicts.
+
+    Used by completion_detector to cross-reference sent subjects/snippets
+    against open Asana tasks — if you sent something, the related task may
+    be done.  Returns metadata only (no body) for privacy.
+
+    Each returned dict:
+        {message_id, subject, snippet, date_ts}
+    """
+    service = _build_service(user_email)
+    query = f"in:sent after:{since_ts}"
+
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=min(max_results, 100),
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        log.warning("get_sent_signals: Gmail list failed for %s (HTTP %s): %s", user_email, status, exc)
+        return []
+
+    signals: list[dict[str, Any]] = []
+    for ref in resp.get("messages", []):
+        try:
+            msg = service.users().messages().get(
+                userId="me",
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "Date"],
+            ).execute()
+        except HttpError:
+            continue
+
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+        date_str = headers.get("date", "")
+        try:
+            date_ts = int(email.utils.parsedate_to_datetime(date_str).timestamp())
+        except Exception:
+            date_ts = int(msg.get("internalDate", "0")) // 1000
+
+        signals.append({
+            "message_id": msg["id"],
+            "subject":    headers.get("subject", ""),
+            "snippet":    msg.get("snippet", ""),
+            "date_ts":    date_ts,
+        })
+
+    log.info("get_sent_signals: %d sent emails since %d for %s", len(signals), since_ts, user_email)
+    return signals
