@@ -44,7 +44,7 @@ contributors:
       - OSNGF
       - OSNGW
 
-  U0B4L78SZHN:  # Micah Kessler — OSN store approver
+  U0B4L78SZHN:  # Micah Kessler — OSN + BDM approver
     name: Micah Kessler
     tier: approver
     entities:
@@ -53,6 +53,55 @@ contributors:
       - OSNVV
       - OSNGF
       - OSNGW
+      - BDM
+
+  U0B3VGWJTMJ:  # Alex Cordova — F3E approver
+    name: Alex Cordova
+    tier: approver
+    entities:
+      - F3E
+
+  U0B3AEQS0NB:  # Hannah Grant — HJRG, F3E, all Lexington approver
+    name: Hannah Grant
+    tier: approver
+    entities:
+      - HJRG
+      - F3E
+      - LEX
+      - LEX-LLC
+      - LEX-LTS
+      - LEX-LBHS
+      - LEX-LLA
+
+  U0B3PS82G30:  # Shaun Hawkins — LEX-LLC approver
+    name: Shaun Hawkins
+    tier: approver
+    entities:
+      - LEX-LLC
+
+  U0B3VGT8RE0:  # Jennifer Mortensen — LEX-LLC approver
+    name: Jennifer Mortensen
+    tier: approver
+    entities:
+      - LEX-LLC
+
+  U0B3KHBJJ91:  # Jeff Montgomery — LEX-LLC approver
+    name: Jeff Montgomery
+    tier: approver
+    entities:
+      - LEX-LLC
+
+  U0B3RU65TFU:  # Demi Bagby — BDM approver
+    name: Demi Bagby
+    tier: approver
+    entities:
+      - BDM
+
+  U0B3NGR1Y85:  # Larry Stone — BDM approver
+    name: Larry Stone
+    tier: approver
+    entities:
+      - BDM
 
 # Placeholder — add employees when you want to grant contributor access:
 #
