@@ -48,9 +48,33 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# ── Approval channel — where Harrison sees pending contributions ───────────────
-# This must be a channel Cora is in. #hjrg-leadership is the right home.
+# ── Fallback approval channel (used only when no entity KQ channel exists) ────
 APPROVAL_CHANNEL = "hjrg-leadership"
+
+# ── Entity → KQ channel routing for approval cards ────────────────────────────
+# Each entity's contributions route to its private KQ channel so the designated
+# approver(s) for that entity see them — not just Harrison in hjrg-leadership.
+_ENTITY_KQ_CHANNEL: dict[str, str] = {
+    "FNDR":    "cora-kq-fndr",
+    "HJRG":    "cora-kq-hjrg",
+    "F3E":     "cora-kq-f3e",
+    "LEX":     "cora-kq-lex",
+    "LEX-LLC": "cora-kq-lex-llc",
+    "LEX-LTS": "cora-kq-lex-lts",
+    "LEX-LBHS":"cora-kq-lex-lbhs",
+    "LEX-LLA": "cora-kq-lex-lla",
+    "OSN":     "cora-kq-osn",
+    "OSNGM":   "cora-kq-osngm",
+    "OSNVV":   "cora-kq-osnvv",
+    "OSNGF":   "cora-kq-osngf",
+    "OSNGW":   "cora-kq-osngw",
+    "BDM":     "cora-kq-bdm",
+}
+
+
+def kq_channel_for_entity(entity: str) -> str:
+    """Return the KQ channel name for the entity, or the fallback approval channel."""
+    return _ENTITY_KQ_CHANNEL.get(entity, APPROVAL_CHANNEL)
 
 # ── Correction signal patterns ─────────────────────────────────────────────────
 _CORRECTION_PATTERNS = [
@@ -67,8 +91,8 @@ _CORRECTION_PATTERNS = [
 _CORRECTION_RE = re.compile("|".join(_CORRECTION_PATTERNS), re.IGNORECASE)
 
 # ── Note trigger ───────────────────────────────────────────────────────────────
-# Matches "note:" anywhere after the bot mention
-_NOTE_RE = re.compile(r"\bnote\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+# Matches "note:" or "remember:" anywhere after the bot mention
+_NOTE_RE = re.compile(r"\b(?:note|remember)\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 # ── DB path — same file as KB ─────────────────────────────────────────────────
 _KB_DB_PATH = Path(__file__).parent.parent.parent / "data" / "cora_kb.db"
@@ -256,14 +280,14 @@ def build_approval_card(
     content: str,
     contribution_id: str,
 ) -> str:
-    """Build the Slack message text for an approval card posted to #hjrg-leadership."""
-    kind_label = "📝 Team Note" if kind == "note" else "🔄 Correction"
+    """Build the Slack message text for an approval card posted to the entity's KQ channel."""
+    kind_label = "📝 Team Note" if kind == "note" else ("📚 Bookmark" if kind == "bookmark" else "🔄 Correction")
     short_id = contribution_id[:8]
     return (
         f"{kind_label} pending approval `[{short_id}]`\n"
         f"*Entity:* {entity}  |  *Channel:* #{channel_name}  |  *From:* <@{author}>\n"
         f"```\n{content[:800]}\n```\n"
-        f"React ✅ to approve → KB ingest  |  ❌ to decline"
+        f"React ✅ to approve → enters Cora's KB  |  ❌ to decline"
     )
 
 
