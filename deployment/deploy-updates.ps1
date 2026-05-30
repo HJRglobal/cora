@@ -95,13 +95,28 @@ if ($coraPids) {
 # ------------------------------------------------------------------
 Write-Host "[3/6] Pulling latest code..." -ForegroundColor White
 
+# Git writes progress to stderr even on success. Temporarily relax
+# ErrorActionPreference so those lines don't abort the script, then
+# check $LASTEXITCODE to catch real failures.
 Push-Location $RepoRoot
 try {
     $branch = (& git rev-parse --abbrev-ref HEAD 2>&1)
     Write-Host "  Branch: $branch"
 
+    $savedEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
     & git fetch origin 2>&1 | ForEach-Object { Write-Host "  $_" }
+
     & git pull origin $branch 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $pullExit = $LASTEXITCODE
+
+    $ErrorActionPreference = $savedEAP
+
+    if ($pullExit -ne 0) {
+        Write-Error "git pull exited with code $pullExit — resolve any conflicts before proceeding."
+        exit $pullExit
+    }
 
     $commitHash = (& git rev-parse --short HEAD 2>&1)
     Write-Host "  OK  At commit: $commitHash"
