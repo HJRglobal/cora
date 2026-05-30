@@ -887,7 +887,7 @@ def pass5_drive_insights(
         try:
             resp = anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=512,
+                max_tokens=800,
                 system=_DRIVE_SYNTHESIS_PROMPT,
                 messages=[{"role": "user", "content": user_msg}],
             )
