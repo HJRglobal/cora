@@ -114,7 +114,7 @@ try {
     $ErrorActionPreference = $savedEAP
 
     if ($pullExit -ne 0) {
-        Write-Error "git pull exited with code $pullExit — resolve any conflicts before proceeding."
+        Write-Error "git pull exited with code $pullExit - resolve any conflicts before proceeding."
         exit $pullExit
     }
 
