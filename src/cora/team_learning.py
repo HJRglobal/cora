@@ -1,26 +1,35 @@
 """Team learning module — write-back, correction capture, approval queue, KB ingest.
 
 Enables the team to contribute knowledge to Cora directly from Slack and have
-Harrison approve it before it enters the KB.
+it approved before it enters the KB.
 
 Flows:
 
 1. Write-back
-   @Cora note: <content>
-   → Cora stores the pending contribution and posts an approval card to
-     #hjrg-leadership. Harrison reacts ✅ to approve (ingests to KB) or
-     ❌ to decline.
+   @Cora note: / @Cora remember: <content>
+   → Screened for scope, stored as pending, approval card posted to
+     the per-entity #cora-kq-{entity} queue channel.
 
 2. Correction capture
    A reply in a Cora thread that starts with a correction signal
    ("actually", "correction:", "that's wrong", "to clarify", etc.)
-   → Same approval flow as write-back, but labelled as a correction.
+   → Same flow as write-back, labelled as a correction.
 
-3. Approval processing
-   Called from app.py when reaction_added fires on a Cora message.
-   Checks if the reacted message is a pending-contribution approval card.
+3. 📚 bookmark
+   Any authorized contributor reacts 📚 to a message.
+   → Message text fetched, screened, and queued for approval.
+
+4. Approval processing
+   An approver reacts ✅ / ❌ on an approval card in a queue channel.
    ✅ → embed + ingest to KB, mark approved.
    ❌ → mark declined, no ingest.
+
+Contribution scope (enforced by screen_contribution):
+  ALLOWED  — factual entity knowledge: employee info/duties/tiers, document
+             locations, operational facts, vendor contacts, corrections.
+  REJECTED — behavioral directives ("you should always…"), identity overrides
+             ("your role is…"), suppression rules ("never say…"), cross-entity
+             instructions, system-prompt-style content, or submissions >2 000 chars.
 
 Table: pending_contributions (in cora_kb.db, not the vec table)
 
@@ -78,6 +87,76 @@ _CORRECTION_RE = re.compile("|".join(_CORRECTION_PATTERNS), re.IGNORECASE)
 # ── Note / remember trigger ────────────────────────────────────────────────────
 # Matches "note:" or "remember:" anywhere after the bot mention
 _NOTE_RE = re.compile(r"\b(?:note|remember)\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+# ── Content scope screener ────────────────────────────────────────────────────
+# Contributions must be factual entity knowledge only.  These patterns catch
+# attempts to inject behavioral instructions or identity overrides into the KB.
+
+_MAX_CONTRIBUTION_CHARS = 2000
+
+# Each tuple: (compiled pattern, short human label shown in the rejection message)
+_INJECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\byou\s+(?:should|must|always|never|can'?t|cannot)\b", re.I),
+     "behavioral directive"),
+    (re.compile(r"\balways\s+(?:respond|say|tell|answer|reply|use)\b", re.I),
+     "response directive"),
+    (re.compile(r"\bfrom\s+now\s+on\b|\bgoing\s+forward\b|\bstarting\s+now\b", re.I),
+     "temporal behavior override"),
+    (re.compile(
+        r"\byour\s+(?:role|job|purpose|new\s+instructions?|instructions?\s+are|system|persona)\b",
+        re.I),
+     "identity or instruction override"),
+    (re.compile(r"\bignore\s+(?:previous|your|all\s+previous|prior)\b", re.I),
+     "instruction override"),
+    (re.compile(r"\bnever\s+(?:say|mention|tell|respond|reply|discuss|reveal)\b", re.I),
+     "suppression directive"),
+    (re.compile(r"\bdo\s+not\s+(?:say|mention|tell|respond|discuss|reveal)\b", re.I),
+     "suppression directive"),
+    (re.compile(r"\bdon'?t\s+(?:say|mention|tell|respond|discuss|reveal)\b", re.I),
+     "suppression directive"),
+    (re.compile(
+        r"\bif\s+(?:someone|anyone|a\s+user)\s+asks?\b.{0,80}\b(?:respond|say|tell|reply)\b",
+        re.I | re.DOTALL),
+     "conditional behavior rule"),
+    (re.compile(
+        r"\bwhen\s+(?:asked|someone\s+asks?)\b.{0,80}\b(?:say|respond|tell|reply)\b",
+        re.I | re.DOTALL),
+     "conditional behavior rule"),
+    (re.compile(r"\boverride\b|\bdisregard\b|\bbypass\b", re.I),
+     "system override"),
+    (re.compile(r"\bsystem\s+prompt\b|\bprompt\s+injection\b", re.I),
+     "system prompt reference"),
+    (re.compile(r"\bact\s+as\b|\bpretend\s+(?:you\s+are|to\s+be)\b|\byou\s+are\s+now\b", re.I),
+     "persona override"),
+]
+
+_SCOPE_HELP = (
+    "Contributions must be *factual entity knowledge* — employee info, file locations, "
+    "operational facts, or corrections. They cannot change how Cora behaves. "
+    "Contact Harrison if you think this was flagged in error."
+)
+
+
+def screen_contribution(content: str) -> tuple[bool, str]:
+    """Check a contribution for scope violations before queuing.
+
+    Returns (True, "") if the content is acceptable, or (False, reason) if it
+    should be rejected.  Reasons are user-facing Slack mrkdwn strings.
+    """
+    if len(content) > _MAX_CONTRIBUTION_CHARS:
+        return False, (
+            f"Submission is too long ({len(content):,} chars — max {_MAX_CONTRIBUTION_CHARS:,}). "
+            "Break it into smaller, specific facts and submit each separately."
+        )
+
+    for pattern, label in _INJECTION_PATTERNS:
+        if pattern.search(content):
+            return False, (
+                f"⛔ Flagged as a *{label}* — can't queue this. {_SCOPE_HELP}"
+            )
+
+    return True, ""
+
 
 # ── DB path — same file as KB ─────────────────────────────────────────────────
 _KB_DB_PATH = Path(__file__).parent.parent.parent / "data" / "cora_kb.db"
@@ -309,14 +388,16 @@ def build_approval_card(
     content: str,
     contribution_id: str,
 ) -> str:
-    """Build the Slack message text for an approval card posted to #hjrg-leadership."""
+    """Build the Slack message text for an approval card posted to a queue channel."""
     kind_label = "📝 Team Note" if kind == "note" else "🔄 Correction"
     short_id = contribution_id[:8]
     return (
+        f"⚠️ *Approve factual entity knowledge only* — no behavioral instructions, "
+        f"no cross-entity content, no process/routing changes.\n"
         f"{kind_label} pending approval `[{short_id}]`\n"
         f"*Entity:* {entity}  |  *Channel:* #{channel_name}  |  *From:* <@{author}>\n"
         f"```\n{content[:800]}\n```\n"
-        f"React ✅ to approve → KB ingest  |  ❌ to decline"
+        f"✅ approve → adds to {entity} KB  |  ❌ decline → discarded"
     )
 
 

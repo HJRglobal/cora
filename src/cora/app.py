@@ -588,6 +588,12 @@ def _handle_note(
         log.info("team_learning: unauthorized note attempt user=%s entity=%s", user_id, entity)
         return
 
+    ok, reason = team_learning.screen_contribution(content)
+    if not ok:
+        say(text=reason, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
+        log.info("team_learning: scope rejection user=%s entity=%s", user_id, entity)
+        return
+
     cid = team_learning.store_contribution(
         kind=kind,
         entity=entity,
@@ -776,6 +782,15 @@ def _handle_bookmark_reaction(
 
     if not content:
         log.info("bookmark_reaction: empty content ts=%s channel=%s — skipping", message_ts, channel_id)
+        return
+
+    ok, reason = team_learning.screen_contribution(content)
+    if not ok:
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=reactor, text=reason)
+        except Exception as exc:
+            log.warning("bookmark_reaction: ephemeral scope-fail: %s", exc)
+        log.info("bookmark_reaction: scope rejection reactor=%s entity=%s", reactor, entity)
         return
 
     cid = team_learning.store_contribution(

@@ -70,17 +70,33 @@ def _build_message(name: str, entities: list[str], tier: str) -> str:
         "*Two ways to teach Cora something:*\n"
         "1️⃣  In any channel for your entity, type:\n"
         "    `@Cora remember: [what Cora should know]`\n"
-        "    _Example: `@Cora remember: our LLC lease renews June 30, 2027`_\n\n"
+        "    _Example: `@Cora remember: our LLC fleet registrations are in the LLC Drive → Fleet folder`_\n\n"
         "2️⃣  React 📚 to *any message* in one of your channels — Cora will bookmark it automatically.\n"
+    )
+
+    scope_section = (
+        "*What you can (and can't) submit:*\n"
+        "✅  *Allowed* — factual knowledge about your entity:\n"
+        "  • Employee details: job duties, titles, schedule tiers, contact info\n"
+        "  • Document locations: where SOPs, contracts, files, or Drive folders live\n"
+        "  • Operational facts: vendor contacts, deadlines, store hours, recurring processes\n"
+        "  • Corrections: \"Cora said X — the correct answer is Y\"\n\n"
+        "🚫  *Not allowed* — Cora will automatically reject these:\n"
+        "  • Instructions about how Cora should respond (\"always say…\", \"never mention…\")\n"
+        "  • Anything about other entities outside your authorized scope\n"
+        "  • Changes to Cora's processes, routing, or behavior\n"
+        "  • System prompt-style content of any kind\n"
+        "_Think of it as teaching Cora facts, not giving her new rules._\n"
     )
 
     if tier == "approver":
         review_section = (
             "*Reviewing submissions:*\n"
-            f"You'll see pending contributions from your team in your queue channel(s):\n"
+            f"Contributions for your entities appear in:\n"
             f"{queue_lines}\n\n"
-            "React ✅ on a queued card to approve it → it enters Cora's knowledge base immediately.\n"
-            "React ❌ to decline → nothing is added."
+            "React ✅ on a queued card to approve → enters Cora's KB immediately.\n"
+            "React ❌ to decline → discarded, nothing added.\n\n"
+            "_Before approving, apply the same scope check above — factual facts only._"
         )
     else:
         review_section = (
@@ -93,9 +109,9 @@ def _build_message(name: str, entities: list[str], tier: str) -> str:
         f"Hey {first}! 👋 You've been added as a Cora *knowledge {tier}*.\n\n"
         f"*Your authorized entities:*\n{entity_lines}\n\n"
         f"{contribute_section}\n"
+        f"{scope_section}\n"
         f"{review_section}\n\n"
-        "That's it — the more your team teaches Cora, the smarter she gets for your entity. "
-        "Questions? Ask Harrison or just `@Cora` anything."
+        "Questions? Ask Harrison."
     )
 
 
