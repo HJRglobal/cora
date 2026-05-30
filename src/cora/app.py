@@ -545,6 +545,23 @@ def _extract_and_log_gap(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _resolve_queue_channel_id(client, entity: str, fallback_channel_id: str) -> str:
+    """Find the Slack channel ID for the per-entity queue, falling back to #hjrg-leadership."""
+    target_names = [
+        team_learning.get_queue_channel(entity),  # e.g. cora-kq-osngm
+        team_learning.APPROVAL_CHANNEL,           # hjrg-leadership
+    ]
+    try:
+        resp = client.conversations_list(types="public_channel,private_channel", limit=200)
+        channels = {ch["name"]: ch["id"] for ch in resp.get("channels", [])}
+        for name in target_names:
+            if name in channels:
+                return channels[name]
+    except Exception as exc:
+        log.warning("_resolve_queue_channel_id: conversations_list failed: %s", exc)
+    return fallback_channel_id
+
+
 def _handle_note(
     *,
     client,
@@ -557,7 +574,20 @@ def _handle_note(
     original_ts: str,
     kind: str = "note",
 ) -> None:
-    """Store a pending write-back/correction and post an approval card to #hjrg-leadership."""
+    """Store a pending contribution and post an approval card to the per-entity queue channel."""
+    if not team_learning.is_authorized_contributor(user_id, entity):
+        say(
+            text=(
+                f"Sorry, you're not registered as a knowledge contributor for *{entity}*. "
+                "Contact Harrison to get access."
+            ),
+            thread_ts=original_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        log.info("team_learning: unauthorized note attempt user=%s entity=%s", user_id, entity)
+        return
+
     cid = team_learning.store_contribution(
         kind=kind,
         entity=entity,
@@ -568,11 +598,14 @@ def _handle_note(
         original_ts=original_ts,
     )
 
-    # Acknowledge in the source channel
-    ack = "✅ Got it — pending Harrison's approval." if kind == "note" else "🔄 Correction noted — pending Harrison's approval."
+    queue_name = team_learning.get_queue_channel(entity)
+    ack = (
+        f"✅ Got it — staged in `#{queue_name}` for approval."
+        if kind == "note"
+        else f"🔄 Correction noted — staged in `#{queue_name}` for approval."
+    )
     say(text=ack, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
 
-    # Post approval card to #hjrg-leadership
     card_text = team_learning.build_approval_card(
         kind=kind,
         entity=entity,
@@ -582,14 +615,7 @@ def _handle_note(
         contribution_id=cid,
     )
     try:
-        # Look up #hjrg-leadership channel ID dynamically
-        search_resp = client.conversations_list(types="public_channel,private_channel", limit=200)
-        approval_ch_id = channel_id  # fallback to source channel
-        for ch in search_resp.get("channels", []):
-            if ch.get("name") == team_learning.APPROVAL_CHANNEL:
-                approval_ch_id = ch["id"]
-                break
-
+        approval_ch_id = _resolve_queue_channel_id(client, entity, channel_id)
         post_resp = client.chat_postMessage(
             channel=approval_ch_id,
             text=card_text,
@@ -599,8 +625,8 @@ def _handle_note(
         approval_ts = post_resp.get("ts", "")
         team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
         log.info(
-            "team_learning: posted approval card cid=%s kind=%s ts=%s",
-            cid[:8], kind, approval_ts,
+            "team_learning: posted approval card cid=%s kind=%s queue=#%s ts=%s",
+            cid[:8], kind, queue_name, approval_ts,
         )
     except Exception as exc:
         log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
@@ -719,11 +745,107 @@ def handle_message_event(event: dict, client) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _handle_bookmark_reaction(
+    *, client, reactor: str, channel_id: str, channel_name: str, message_ts: str
+) -> None:
+    """Stage a 📚-bookmarked message as a knowledge contribution for the entity queue."""
+    entity = route(channel_name) if channel_name else "FNDR"
+
+    if not team_learning.is_authorized_contributor(reactor, entity):
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=reactor,
+                text=(
+                    f"📚 You're not authorized to contribute knowledge for *{entity}*. "
+                    "Contact Harrison to get access."
+                ),
+            )
+        except Exception as exc:
+            log.warning("bookmark_reaction: ephemeral auth-fail: %s", exc)
+        return
+
+    # Fetch the bookmarked message text via reactions.get (works for thread replies too)
+    content = ""
+    try:
+        resp = client.reactions_get(channel=channel_id, timestamp=message_ts)
+        msg_obj = resp.get("message") or {}
+        content = msg_obj.get("text", "").strip()
+    except Exception as exc:
+        log.warning("bookmark_reaction: failed to fetch message ts=%s: %s", message_ts, exc)
+
+    if not content:
+        log.info("bookmark_reaction: empty content ts=%s channel=%s — skipping", message_ts, channel_id)
+        return
+
+    cid = team_learning.store_contribution(
+        kind="note",
+        entity=entity,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        author=reactor,
+        content=content,
+        original_ts=message_ts,
+    )
+
+    queue_name = team_learning.get_queue_channel(entity)
+    card_text = team_learning.build_approval_card(
+        kind="note",
+        entity=entity,
+        channel_name=channel_name,
+        author=reactor,
+        content=content,
+        contribution_id=cid,
+    )
+    try:
+        approval_ch_id = _resolve_queue_channel_id(client, entity, channel_id)
+        post_resp = client.chat_postMessage(
+            channel=approval_ch_id,
+            text=card_text,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        approval_ts = post_resp.get("ts", "")
+        team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
+        log.info(
+            "bookmark_reaction: staged cid=%s entity=%s queue=#%s", cid[:8], entity, queue_name
+        )
+    except Exception as exc:
+        log.error("bookmark_reaction: failed to post approval card cid=%s: %s", cid[:8], exc)
+        return
+
+    try:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=reactor,
+            text=f"📚 Queued for *{entity}* review in `#{queue_name}`. Thanks!",
+        )
+    except Exception as exc:
+        log.warning("bookmark_reaction: ephemeral confirm failed: %s", exc)
+
+
 def _handle_reaction(event: dict, client, event_type: str) -> None:
     """Shared logic for reaction_added and reaction_removed events."""
     item = event.get("item") or {}
     if item.get("type") != "message":
         return  # ignore reactions on files, channel boundaries, etc.
+
+    channel_id = item.get("channel", "")
+    reactor = event.get("user", "")
+    reaction = event.get("reaction", "")
+    message_ts = item.get("ts", "")
+
+    # ── 📚 bookmark: runs on ANY message, not just Cora's ────────────────────
+    if event_type == "reaction_added" and reaction == "books" and channel_id and reactor:
+        channel_name = _resolve_channel_name(client, channel_id)
+        _handle_bookmark_reaction(
+            client=client,
+            reactor=reactor,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            message_ts=message_ts,
+        )
+        return
 
     item_user = event.get("item_user", "")
     bot_user_id = _resolve_bot_user_id(client)
@@ -731,11 +853,7 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         # Reaction on a non-Cora message - not our signal to capture
         return
 
-    channel_id = item.get("channel", "")
     channel_name = _resolve_channel_name(client, channel_id) if channel_id else ""
-    reactor = event.get("user", "")
-    reaction = event.get("reaction", "")
-    message_ts = item.get("ts", "")
 
     # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
     if event_type == "reaction_added" and reaction == "white_check_mark":

@@ -1,0 +1,63 @@
+# Knowledge Contributors Registry
+# Authorizes Slack users to submit knowledge contributions to Cora.
+#
+# tier:
+#   "approver"    — can submit AND approve/decline contributions for their entities
+#   "contributor" — can submit; contributions queue for an approver to review
+#
+# Each entity's queue routes to #cora-kq-{entity.lower()} in Slack.
+# Create those channels and invite Cora before enabling contributors.
+#
+# Required queue channels:
+#   #cora-kq-fndr   #cora-kq-hjrg   #cora-kq-f3e    #cora-kq-lex
+#   #cora-kq-osn    #cora-kq-osngm  #cora-kq-osnvv  #cora-kq-osngf  #cora-kq-osngw
+#   #cora-kq-bdm    #cora-kq-lex-llc  #cora-kq-lex-lts
+#   #cora-kq-lex-lbhs  #cora-kq-lex-lla
+
+contributors:
+  U0B2RM2JYJ1:  # Harrison Rogers — root approver, all entities
+    name: Harrison Rogers
+    tier: approver
+    entities:
+      - FNDR
+      - HJRG
+      - F3E
+      - LEX
+      - LEX-LLC
+      - LEX-LTS
+      - LEX-LBHS
+      - LEX-LLA
+      - OSN
+      - OSNGM
+      - OSNVV
+      - OSNGF
+      - OSNGW
+      - BDM
+
+  U0B3PS7RFJA:  # Matt Petrovich — OSN ops approver
+    name: Matt Petrovich
+    tier: approver
+    entities:
+      - OSN
+      - OSNGM
+      - OSNVV
+      - OSNGF
+      - OSNGW
+
+  U0B4L78SZHN:  # Micah Kessler — OSN store approver
+    name: Micah Kessler
+    tier: approver
+    entities:
+      - OSN
+      - OSNGM
+      - OSNVV
+      - OSNGF
+      - OSNGW
+
+# Placeholder — add employees when you want to grant contributor access:
+#
+#  SLACK_ID_HERE:
+#    name: Employee Name
+#    tier: contributor
+#    entities:
+#      - OSNGM     # list the store(s) or entity codes they should be able to contribute to

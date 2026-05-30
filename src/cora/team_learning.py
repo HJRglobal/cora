@@ -39,6 +39,7 @@ Table: pending_contributions (in cora_kb.db, not the vec table)
     resolved_at      INTEGER | NULL
 """
 
+import functools
 import logging
 import re
 import sqlite3
@@ -46,11 +47,19 @@ import time
 import uuid
 from pathlib import Path
 
+import yaml
+
 log = logging.getLogger(__name__)
 
-# ── Approval channel — where Harrison sees pending contributions ───────────────
-# This must be a channel Cora is in. #hjrg-leadership is the right home.
+# ── Fallback approval channel — used when a per-entity queue channel isn't found ─
+# Per-entity queues follow the pattern #cora-kq-{entity.lower()}.  If Cora isn't
+# in that channel yet (e.g. channel not created), contributions fall back here.
 APPROVAL_CHANNEL = "hjrg-leadership"
+
+# ── Contributors registry path ─────────────────────────────────────────────────
+_CONTRIBUTORS_PATH = (
+    Path(__file__).parent.parent.parent / "data" / "maps" / "knowledge-contributors.yaml"
+)
 
 # ── Correction signal patterns ─────────────────────────────────────────────────
 _CORRECTION_PATTERNS = [
@@ -66,12 +75,56 @@ _CORRECTION_PATTERNS = [
 ]
 _CORRECTION_RE = re.compile("|".join(_CORRECTION_PATTERNS), re.IGNORECASE)
 
-# ── Note trigger ───────────────────────────────────────────────────────────────
-# Matches "note:" anywhere after the bot mention
-_NOTE_RE = re.compile(r"\bnote\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+# ── Note / remember trigger ────────────────────────────────────────────────────
+# Matches "note:" or "remember:" anywhere after the bot mention
+_NOTE_RE = re.compile(r"\b(?:note|remember)\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 # ── DB path — same file as KB ─────────────────────────────────────────────────
 _KB_DB_PATH = Path(__file__).parent.parent.parent / "data" / "cora_kb.db"
+
+
+# ── Contributors registry ─────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=1)
+def _load_contributors_raw() -> dict:
+    """Load knowledge-contributors.yaml. Cached until process restart."""
+    try:
+        with open(_CONTRIBUTORS_PATH) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        log.warning("knowledge-contributors.yaml not found — no contributor access control")
+        return {}
+    except Exception as exc:
+        log.error("Failed to load knowledge-contributors.yaml: %s", exc)
+        return {}
+
+
+def load_contributors() -> dict[str, dict]:
+    """Return contributors keyed by Slack user ID."""
+    return _load_contributors_raw().get("contributors", {})
+
+
+def get_queue_channel(entity: str) -> str:
+    """Return the per-entity queue channel name (without #) for the given entity."""
+    return f"cora-kq-{entity.lower()}"
+
+
+def is_authorized_contributor(user_id: str, entity: str) -> bool:
+    """Return True if the user is authorized to contribute knowledge for entity."""
+    contributors = load_contributors()
+    entry = contributors.get(user_id)
+    if not entry:
+        return False
+    return entity in entry.get("entities", [])
+
+
+def is_approver(user_id: str, entity: str) -> bool:
+    """Return True if the user is an approver for the given entity."""
+    contributors = load_contributors()
+    entry = contributors.get(user_id)
+    if not entry:
+        return False
+    return entry.get("tier") == "approver" and entity in entry.get("entities", [])
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────

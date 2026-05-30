@@ -2,13 +2,18 @@
 
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from cora.team_learning import (
     APPROVAL_CHANNEL,
     build_approval_card,
+    get_queue_channel,
+    is_approver,
+    is_authorized_contributor,
     is_correction,
+    load_contributors,
     lookup_by_approval_ts,
     parse_note,
     pending_stats,
@@ -237,3 +242,97 @@ def test_build_approval_card_truncates_long_content():
 
 def test_approval_channel_is_hjrg_leadership():
     assert APPROVAL_CHANNEL == "hjrg-leadership"
+
+
+# ── parse_note: remember: alias ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("msg,expected", [
+    ("remember: BCB deposit is 50%",                       "BCB deposit is 50%"),
+    ("REMEMBER: Shaun is the LLC lead",                    "Shaun is the LLC lead"),
+    ("@Cora remember: Justin runs the LTS books",          "Justin runs the LTS books"),
+    ("Hey Cora, remember: lease expires June 30",          "lease expires June 30"),
+])
+def test_parse_note_remember_alias(msg, expected):
+    result = parse_note(msg)
+    assert result == expected
+
+
+# ── get_queue_channel() ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("entity,expected", [
+    ("OSNGM",    "cora-kq-osngm"),
+    ("OSN",      "cora-kq-osn"),
+    ("LEX-LLC",  "cora-kq-lex-llc"),
+    ("F3E",      "cora-kq-f3e"),
+    ("FNDR",     "cora-kq-fndr"),
+])
+def test_get_queue_channel(entity, expected):
+    assert get_queue_channel(entity) == expected
+
+
+# ── Contributor registry (mocked YAML) ───────────────────────────────────────
+
+_FAKE_CONTRIBUTORS = {
+    "contributors": {
+        "U_APPROVER": {
+            "name": "Alice Approver",
+            "tier": "approver",
+            "entities": ["OSNGM", "OSN"],
+        },
+        "U_CONTRIBUTOR": {
+            "name": "Bob Contributor",
+            "tier": "contributor",
+            "entities": ["OSNGM"],
+        },
+    }
+}
+
+
+@pytest.fixture
+def mock_contributors(monkeypatch):
+    import cora.team_learning as tl
+    monkeypatch.setattr(tl, "load_contributors", lambda: _FAKE_CONTRIBUTORS["contributors"])
+    yield
+
+
+def test_load_contributors_returns_dict():
+    result = load_contributors()
+    # Real YAML has at least Harrison, Matt, and Micah
+    assert len(result) >= 3
+    assert all(isinstance(v, dict) for v in result.values())
+
+
+def test_is_authorized_contributor_approver(mock_contributors):
+    assert is_authorized_contributor("U_APPROVER", "OSNGM") is True
+    assert is_authorized_contributor("U_APPROVER", "OSN") is True
+
+
+def test_is_authorized_contributor_contributor(mock_contributors):
+    assert is_authorized_contributor("U_CONTRIBUTOR", "OSNGM") is True
+
+
+def test_is_authorized_contributor_wrong_entity(mock_contributors):
+    assert is_authorized_contributor("U_CONTRIBUTOR", "OSN") is False
+    assert is_authorized_contributor("U_CONTRIBUTOR", "F3E") is False
+
+
+def test_is_authorized_contributor_unknown_user(mock_contributors):
+    assert is_authorized_contributor("U_UNKNOWN", "OSNGM") is False
+
+
+def test_is_approver_true(mock_contributors):
+    assert is_approver("U_APPROVER", "OSNGM") is True
+    assert is_approver("U_APPROVER", "OSN") is True
+
+
+def test_is_approver_contributor_tier(mock_contributors):
+    # contributor tier is NOT an approver
+    assert is_approver("U_CONTRIBUTOR", "OSNGM") is False
+
+
+def test_is_approver_wrong_entity(mock_contributors):
+    assert is_approver("U_APPROVER", "F3E") is False
+
+
+def test_is_approver_unknown_user(mock_contributors):
+    assert is_approver("U_UNKNOWN", "OSNGM") is False
