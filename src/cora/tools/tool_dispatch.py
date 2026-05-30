@@ -2187,12 +2187,14 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
         )
         return calendar_client.format_created_event_for_llm(event, user_email=requester_email)
 
-    # -- Phase 1: Find the next available slot --------------------------------
+    # -- Phase 1: Find up to 3 available slots --------------------------------
     try:
-        slot = calendar_client.find_meeting_slot(
+        slots = calendar_client.find_meeting_slots(
             requester_email=requester_email,
             calendar_emails=emails,
             duration_minutes=duration_minutes,
+            n=3,
+            search_days=14,
         )
     except calendar_client.CalendarClientError as exc:
         log.warning(
@@ -2206,26 +2208,11 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
             f"Delegation for the Cora service account (admin.google.com)."
         )
 
-    if slot is None:
-        log.info(
-            "calendar_schedule_meeting NO SLOT requester=%s participants=%s dur=%dmin",
-            slack_user_id, emails, duration_minutes,
-        )
-        return (
-            f"No common opening found in the next 7 working days for: "
-            f"{', '.join(names)}. "
-            f"Tell the user no slot was available and ask if they would like to look "
-            f"further out (2 weeks) or pick a specific time manually."
-        )
-
-    slot_start, slot_end = slot
     log.info(
-        "calendar_schedule_meeting SLOT FOUND requester=%s participants=%s start=%s dur=%dmin",
-        slack_user_id, emails, slot_start.isoformat(), duration_minutes,
+        "calendar_schedule_meeting SLOTS FOUND requester=%s participants=%s slots=%d dur=%dmin",
+        slack_user_id, emails, len(slots), duration_minutes,
     )
-    return calendar_client.format_slot_proposal_for_llm(
-        slot_start, slot_end, names, title=title
-    )
+    return calendar_client.format_slot_proposals_for_llm(slots, names, title=title)
 
 
 def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2709,21 +2696,25 @@ TOOL_DEFINITIONS = [
     {
         "name": "calendar_schedule_meeting",
         "description": (
-            "Find the next available time when ALL participants are free, propose it "
-            "for confirmation, then book the meeting in Google Calendar. "
+            "Find up to 3 available times when ALL participants are free, present them "
+            "as numbered options for the user to choose from, then book the chosen slot "
+            "in Google Calendar. A Google Meet link is ALWAYS included automatically. "
             "Use this when anyone says things like 'schedule a meeting for Larry and me', "
             "'find a time for Harrison and Hannah', 'when can Tommy and I meet', "
-            "'set up a call with Alex at the next opening', or similar. "
-            "TWO-PHASE FLOW: "
-            "Phase 1 (confirmed=false) -- call with participant names; the tool queries "
-            "everyone's Google Calendar freebusy and returns the next open slot as a "
-            "preview block. You MUST show the user this preview and ask for confirmation. "
-            "Phase 2 (confirmed=true) -- once the user says yes, call again with "
-            "confirmed=true plus the exact proposed_start and proposed_end strings from "
-            "Phase 1. The tool then creates the Google Calendar event and sends invites. "
-            "The requester is always auto-included -- pass only OTHER participants. "
+            "'set up a call with Alex', 'find a time that works for all of us', or similar. "
+            "\n"
+            "TWO-PHASE FLOW:\n"
+            "Phase 1 (confirmed=false) — call with participant names; the tool queries "
+            "everyone's Google Calendar freebusy over the next 14 days and returns up to "
+            "3 numbered options (1/2/3). Present these options clearly and ask the user "
+            "to reply with their choice. Do NOT book yet.\n"
+            "Phase 2 (confirmed=true) — once the user picks an option, call again with "
+            "confirmed=true plus the exact proposed_start and proposed_end ISO strings "
+            "from the chosen option. The tool creates the event, attaches a Google Meet "
+            "link, and sends calendar invitations to all participants. "
+            "The requester is always auto-included — pass only OTHER participants. "
             "Working hours: Mon-Fri 9 AM to 5 PM America/Phoenix. "
-            "Default duration: 30 minutes. Search window: next 7 days."
+            "Default duration: 30 minutes. Search window: next 14 days."
         ),
         "input_schema": {
             "type": "object",
