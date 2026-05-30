@@ -179,6 +179,109 @@ def _fetch_active_deals() -> list[dict]:
         return []
 
 
+def _build_name_to_sid_map() -> dict[str, str]:
+    """Build display_name (lower) → slack_user_id from slack-to-asana.yaml."""
+    maps_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+    try:
+        import yaml
+        data = yaml.safe_load(maps_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logging.getLogger("reconciliation").warning(
+            "Could not load slack-to-asana.yaml for stale-task DMs: %s", exc
+        )
+        return {}
+    result: dict[str, str] = {}
+    for entry in (data.get("users") or []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("display_name", "").strip()
+        sid  = entry.get("slack_user_id", "").strip()
+        if name and sid:
+            result[name.lower()] = sid
+    return result
+
+
+def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
+    """Send a gentle DM to each assignee whose tasks may already be done.
+
+    Groups multiple stale gaps per user into a single DM. Skips users whose
+    Slack ID cannot be resolved. Never DMs Harrison Rogers directly here —
+    he already sees all gaps in the knowledge_review queue.
+    """
+    import os
+    from slack_sdk import WebClient as SlackWebClient
+    from slack_sdk.errors import SlackApiError
+
+    log = logging.getLogger("reconciliation")
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.warning("SLACK_BOT_TOKEN not set — skipping stale task DMs")
+        return
+
+    name_to_sid = _build_name_to_sid_map()
+    if not name_to_sid:
+        log.warning("No name→Slack ID map available — skipping stale task DMs")
+        return
+
+    slack = SlackWebClient(token=token)
+
+    # Group gaps by assignee
+    by_assignee: dict[str, list[ReconciliationGap]] = {}
+    for gap in gaps:
+        assignee = (gap.payload.get("assignee_name") or "").strip()
+        if not assignee:
+            continue
+        by_assignee.setdefault(assignee, []).append(gap)
+
+    for assignee_name, user_gaps in by_assignee.items():
+        slack_id = name_to_sid.get(assignee_name.lower())
+        if not slack_id:
+            log.info(
+                "Could not resolve Slack ID for assignee %r — no DM sent", assignee_name
+            )
+            continue
+
+        try:
+            dm_resp    = slack.conversations_open(users=[slack_id])
+            dm_channel = dm_resp["channel"]["id"]
+        except SlackApiError as exc:
+            log.warning(
+                "Could not open DM for %s (%s): %s", assignee_name, slack_id, exc.response
+            )
+            continue
+
+        first_name = assignee_name.split()[0]
+        task_lines = []
+        for gap in user_gaps[:5]:  # cap at 5 tasks per DM
+            task_name = (gap.payload.get("task_name") or gap.title or "a task").strip()
+            task_url  = gap.payload.get("task_url", "")
+            if task_url:
+                task_lines.append(f"• <{task_url}|{task_name}>")
+            else:
+                task_lines.append(f"• {task_name}")
+
+        tasks_block = "\n".join(task_lines)
+        msg = (
+            f"Hey {first_name}! Cora noticed some recent Slack or email activity that "
+            f"suggests one or more of your open tasks may already be wrapped up:\n\n"
+            f"{tasks_block}\n\n"
+            f"Could you check and mark them complete in Asana if they're done? "
+            f"No pressure — just keeping the board tidy. Thanks! 🙌"
+        )
+
+        try:
+            slack.chat_postMessage(channel=dm_channel, text=msg)
+            log.info(
+                "Sent stale-task DM to %s (%s) — %d gap(s)",
+                assignee_name, slack_id, len(user_gaps),
+            )
+        except SlackApiError as exc:
+            log.warning(
+                "Failed to send stale-task DM to %s: %s", assignee_name, exc.response
+            )
+
+
 def _write_gaps_file(gaps: list[ReconciliationGap], date_str: str) -> Path:
     """Write gaps to data/reconciliation/YYYY-MM-DD-gaps.jsonl."""
     GAPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -331,6 +434,14 @@ def main() -> int:
         "Reconciliation sweep done — %d proposed, %d skipped (exit=%d)",
         proposed, skipped, exit_code,
     )
+
+    # ─── DM individual users for stale open task gaps ─────────────────────────
+    stale_gaps = [g for g in high_med if g.gap_type == "stale_open_task"]
+    if stale_gaps and not args.dry_run:
+        log.info("Sending stale-task DMs for %d gap(s)...", len(stale_gaps))
+        _dm_stale_task_assignees(stale_gaps)
+    elif stale_gaps and args.dry_run:
+        log.info("[DRY RUN] Would DM assignees for %d stale-task gap(s)", len(stale_gaps))
 
     if skipped > 0:
         exit_code = 2

@@ -21,8 +21,10 @@ import os
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
+import yaml
 
 from cora.knowledge_base.store import Document
 
@@ -112,6 +114,65 @@ def _tag_fireflies_sub_entity(transcript: dict) -> str | None:
     if any(s.lower() in participant_text for s in _SHAUN_IDENTIFIERS):
         return "LEX-LLC"
     return None
+
+
+# ── Participant → Slack ID resolution ─────────────────────────────────────────
+# data/maps/slack-to-asana.yaml is the authoritative source; email_aliases
+# covers cross-domain users (e.g. larry@bigd.media ↔ larry@hjrglobal.com).
+
+_ASANA_MAP_PATH = Path(__file__).resolve().parents[3] / "data" / "maps" / "slack-to-asana.yaml"
+_email_to_slack: dict[str, str] | None = None  # module-level cache
+
+
+def _load_email_to_slack() -> dict[str, str]:
+    """Build email→Slack ID map from slack-to-asana.yaml (loaded once per process)."""
+    global _email_to_slack
+    if _email_to_slack is not None:
+        return _email_to_slack
+
+    try:
+        data = yaml.safe_load(_ASANA_MAP_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("fireflies: could not load slack-to-asana.yaml: %s", exc)
+        _email_to_slack = {}
+        return _email_to_slack
+
+    result: dict[str, str] = {}
+    for entry in (data.get("users") or []):
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("slack_user_id", "").strip()
+        if not sid:
+            continue
+        primary = entry.get("asana_email", "").strip().lower()
+        if primary:
+            result[primary] = sid
+        for alias in (entry.get("email_aliases") or []):
+            if alias:
+                result[str(alias).strip().lower()] = sid
+
+    _email_to_slack = result
+    return _email_to_slack
+
+
+def _resolve_participant_slack_ids(attendees: list[dict]) -> list[str]:
+    """Map attendee email addresses to Slack user IDs.
+
+    Returns a deduplicated list of resolved Slack IDs. Attendees whose
+    emails don't appear in slack-to-asana.yaml are silently skipped.
+    """
+    email_map = _load_email_to_slack()
+    seen: set[str] = set()
+    slack_ids: list[str] = []
+    for a in attendees:
+        email = (a.get("email") or "").strip().lower()
+        if not email:
+            continue
+        sid = email_map.get(email)
+        if sid and sid not in seen:
+            seen.add(sid)
+            slack_ids.append(sid)
+    return slack_ids
 
 
 class FirefliesConnectorError(Exception):
@@ -365,6 +426,7 @@ def backfill(since: datetime) -> Iterator[Document]:
             permalink = t.get("transcript_url") or f"https://app.fireflies.ai/view/{transcript_id}"
             sub_entity = _tag_fireflies_sub_entity(t) if entity == "LEX" else None
 
+            meeting_attendees = t.get("meeting_attendees") or []
             yield Document(
                 source="fireflies",
                 source_id=transcript_id,
@@ -380,8 +442,9 @@ def backfill(since: datetime) -> Iterator[Document]:
                     "transcript_id": transcript_id,
                     "duration_sec": t.get("duration"),
                     "attendee_emails": [
-                        a.get("email", "") for a in (t.get("meeting_attendees") or [])
+                        a.get("email", "") for a in meeting_attendees
                     ],
+                    "participant_slack_ids": _resolve_participant_slack_ids(meeting_attendees),
                     "participants": t.get("participants") or [],
                 },
             )

@@ -12,6 +12,7 @@
 #   1. Verifies the repo and uv.exe are present
 #   2. Stops the running Cora service task (if running)
 #   3. Pulls the latest code from origin (current branch)
+#   3b. Re-baselines the security monitor (suppresses false-positive alerts after deploy)
 #   4. Runs uv sync to install any new/updated dependencies
 #   5. Restarts the Cora service task
 #   6. Tails the log to confirm a clean start
@@ -24,6 +25,10 @@
 #   - Completion-candidates timeout fix (was hanging on 13K-signal KB)
 #   - OSN shift scheduling system + 40-employee seed data
 #   - cora-kq-* channel routing (all 14 KQ channels now route correctly)
+#   - Security monitor re-baselining after each deploy (step 3b)
+#   - Per-user daily morning briefing DMs at 7:30am AZ (run_daily_briefing.py)
+#   - Fireflies transcripts now include participant Slack IDs in metadata
+#   - Stale open task DMs: reconciliation now DMs assignees directly
 
 $ErrorActionPreference = "Stop"
 
@@ -125,6 +130,27 @@ try {
 }
 
 # ------------------------------------------------------------------
+# [3b/6] Re-baseline security monitor
+# ------------------------------------------------------------------
+Write-Host "[3b/6] Re-baselining security monitor..." -ForegroundColor White
+
+Push-Location $RepoRoot
+try {
+    $savedEAP3b = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $uvExe run python scripts/security_monitor.py --init 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $baselineExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedEAP3b
+    if ($baselineExit -ne 0) {
+        Write-Host "  WARN  Security baseline returned exit $baselineExit (non-fatal, continuing)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  OK  Security baseline updated."
+    }
+} finally {
+    Pop-Location
+}
+
+# ------------------------------------------------------------------
 # [4/6] Sync dependencies
 # ------------------------------------------------------------------
 Write-Host "[4/6] Syncing dependencies (uv sync)..." -ForegroundColor White
@@ -209,6 +235,10 @@ Write-Host "Slack smoke test in #cora-build:" -ForegroundColor Cyan
 Write-Host "  Mention Cora and say: ping"
 Write-Host ""
 Write-Host "New features in this build:" -ForegroundColor Cyan
-Write-Host "  Gmail inbox tool    - ask Cora to read your inbox"
-Write-Host "  Calendar scheduling - ask Cora to schedule a meeting (3 slot options + Meet link)"
-Write-Host "  KQ channels         - cora-kq-osn/f3e/lex/bdm etc. now route to correct entity"
+Write-Host "  Gmail inbox tool      - ask Cora to read your inbox"
+Write-Host "  Calendar scheduling   - ask Cora to schedule a meeting (3 slot options + Meet link)"
+Write-Host "  KQ channels           - cora-kq-osn/f3e/lex/bdm etc. now route to correct entity"
+Write-Host "  Security baseline     - auto-reset after every deploy (no more false-positive alerts)"
+Write-Host "  Daily briefing DMs    - register task: .\deployment\setup-daily-briefing-task.ps1"
+Write-Host "  Fireflies Slack IDs   - participant_slack_ids in transcript metadata"
+Write-Host "  Stale-task DMs        - reconciliation now DMs assignees directly"
