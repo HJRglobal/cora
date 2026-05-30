@@ -12,12 +12,12 @@
 #   1. Verifies the repo and uv.exe are present
 #   2. Stops the running Cora service task (if running)
 #   3. Pulls the latest code from origin (current branch)
-#   4. Runs `uv sync` to install any new/updated dependencies
+#   4. Runs uv sync to install any new/updated dependencies
 #   5. Restarts the Cora service task
 #   6. Tails the log to confirm a clean start
 #
-# What's included in this deployment batch (2026-05-30):
-#   - Per-user Gmail inbox tool (@Cora read my inbox)
+# What is included in this deployment batch (2026-05-30):
+#   - Per-user Gmail inbox tool
 #   - Email completion signals wired into fndr_completion_candidates
 #   - Calendar multi-slot scheduling: up to 3 time options presented to user
 #   - Google Meet link auto-included in every booked calendar event
@@ -77,7 +77,7 @@ if ($task -and $task.State -eq "Running") {
 } elseif ($task) {
     Write-Host "  OK  Task was not running (state: $($task.State))."
 } else {
-    Write-Host "  --  Task '$TaskName' not found — skipping stop."
+    Write-Host "  --  Task '$TaskName' not found - skipping stop."
 }
 
 # Also kill any lingering python processes running cora (belt-and-suspenders)
@@ -147,9 +147,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 # ------------------------------------------------------------------
 Write-Host "[6/6] Checking startup log..." -ForegroundColor White
 
-$today    = Get-Date -Format "yyyy-MM-dd"
-$logPath  = "$RepoRoot\logs\cora-$today.log"
-$logGlob  = "$RepoRoot\logs\cora-*.log"
+$today   = Get-Date -Format "yyyy-MM-dd"
+$logPath = "$RepoRoot\logs\cora-$today.log"
+$logGlob = "$RepoRoot\logs\cora-*.log"
 
 Start-Sleep -Seconds 4
 
@@ -159,7 +159,6 @@ if (Test-Path $logPath) {
         Write-Host "  LOG  $line"
     }
 } else {
-    # Try any log file from today
     $recent = Get-ChildItem $logGlob -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending |
               Select-Object -First 1
@@ -171,7 +170,8 @@ if (Test-Path $logPath) {
         }
     } else {
         Write-Host "  --  No log file found yet at $logPath"
-        Write-Host "      Check again in a few seconds: Get-Content '$logPath' -Tail 20"
+        Write-Host "      Check again in a few seconds:"
+        Write-Host "      Get-Content '$logPath' -Tail 20"
     }
 }
 
@@ -179,14 +179,13 @@ Write-Host ""
 Write-Host "=== Deploy complete ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "Quick checks:" -ForegroundColor Cyan
-Write-Host "  Get-Process python*                                  # Cora should be running"
-Write-Host "  Get-Content '$logPath' -Tail 20   # Recent log"
+Write-Host "  Get-Process python*"
+Write-Host "  Get-Content '$logPath' -Tail 20"
 Write-Host ""
-Write-Host "Slack smoke test — in #cora-build:" -ForegroundColor Cyan
-Write-Host "  @Cora ping"
+Write-Host "Slack smoke test in #cora-build:" -ForegroundColor Cyan
+Write-Host "  Mention Cora and say: ping"
 Write-Host ""
 Write-Host "New features in this build:" -ForegroundColor Cyan
-Write-Host "  @Cora read my inbox                     (Gmail inbox — any KQ channel)"
-Write-Host "  @Cora what should I work on             (completion candidates + email signals)"
-Write-Host "  @Cora schedule a meeting with @Larry    (3 slot options + auto Meet link)"
-Write-Host "  #cora-kq-osn, #cora-kq-f3e, etc.       (KQ channels now route to correct entity)"
+Write-Host "  Gmail inbox tool    - ask Cora to read your inbox"
+Write-Host "  Calendar scheduling - ask Cora to schedule a meeting (3 slot options + Meet link)"
+Write-Host "  KQ channels         - cora-kq-osn/f3e/lex/bdm etc. now route to correct entity"
