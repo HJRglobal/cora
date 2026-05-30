@@ -131,7 +131,15 @@ Write-Host "[4/6] Syncing dependencies (uv sync)..." -ForegroundColor White
 
 Push-Location $RepoRoot
 try {
+    $savedEAP2 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $uvExe sync 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $syncExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedEAP2
+    if ($syncExit -ne 0) {
+        Write-Error "uv sync exited with code $syncExit"
+        exit $syncExit
+    }
     Write-Host "  OK  Dependencies synced."
 } finally {
     Pop-Location
