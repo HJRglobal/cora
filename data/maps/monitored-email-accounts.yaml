@@ -10,6 +10,7 @@
 #   - @f3energy.com -- DWD confirmed active 2026-05-27 (Harrison confirmed domain admin).
 #   - @lexingtonservices.com -- DWD confirmed active 2026-05-27 (Harrison confirmed domain admin).
 #   - @unitedfightleague.com -- DWD confirmed active 2026-05-27 (Harrison confirmed domain admin).
+#   - @bigd.media -- DWD confirmed active 2026-05-30 (Harrison confirmed domain admin).
 #   - Personal Gmail (@gmail.com) -- NOT eligible for DWD ever.
 #
 # PHI NOTE for @lexingtonservices.com accounts:
@@ -80,7 +81,7 @@ accounts:
     asana_gid: "1211363033856346"
     slack_user_id: U0B3TPD2MEV
 
-  # Larry Stone: primary @hjrglobal.com; also larry@bigd.media (not DWD eligible -- @bigd.media not in HJR workspace)
+  # Larry Stone: primary @hjrglobal.com; BDM work also runs through larry@bigd.media
   - email: larry@hjrglobal.com
     name: Larry Stone
     enabled: true
@@ -91,6 +92,21 @@ accounts:
     entity_default: BDM
     known_aliases:
       - larry@bigd.media
+    asana_gid: "1211265856484421"
+    slack_user_id: U0B3NGR1Y85
+
+  # ── @bigd.media -- DWD confirmed active 2026-05-30 ──────────────────────────
+
+  - email: larry@bigd.media
+    name: Larry Stone (BDM)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: BDM
+    known_aliases:
+      - larry@hjrglobal.com
     asana_gid: "1211265856484421"
     slack_user_id: U0B3NGR1Y85
 
