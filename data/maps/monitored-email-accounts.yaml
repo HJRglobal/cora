@@ -125,6 +125,19 @@ accounts:
 
   # ── @f3energy.com -- DWD confirmed active 2026-05-27 ────────────────────
 
+  - email: harrison@f3energy.com
+    name: Harrison Rogers (F3E)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: F3E
+    known_aliases:
+      - harrison@hjrglobal.com
+    asana_gid: "1204525779609669"
+    slack_user_id: U0B2RM2JYJ1
+
   - email: tommy@f3energy.com
     name: Tommy Anderson
     enabled: true
@@ -191,6 +204,19 @@ accounts:
   # ── @lexingtonservices.com -- DWD confirmed active 2026-05-27 ───────────
   # PHI guardrail active in sweep + reconciliation (subject-keyword filter).
   # Harrison is sole authority on all PHI access decisions (2026-05-21 doctrine).
+
+  - email: harrison@lexingtonservices.com
+    name: Harrison Rogers (Lex)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: true
+    drive_sweep: true
+    entity_default: LEX
+    known_aliases:
+      - harrison@hjrglobal.com
+    asana_gid: "1204525779609669"
+    slack_user_id: U0B2RM2JYJ1
 
   - email: justin@lexingtonservices.com
     name: Justin Moran (Lex)
