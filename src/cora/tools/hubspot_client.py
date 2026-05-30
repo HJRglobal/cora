@@ -503,6 +503,116 @@ def search_distributor_company(name: str) -> dict | None:
     return enrichment
 
 
+# ── Email engagement write methods ──────────────────────────────────────────────
+
+def search_contact_by_email(email: str) -> dict | None:
+    """Search HubSpot for a contact with matching email. Returns first result or None."""
+    try:
+        token = _token()
+    except HubSpotClientError:
+        return None
+
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email.lower()}]}],
+        "properties": ["firstname", "lastname", "email", "company"],
+        "limit": 1,
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/crm/v3/objects/contacts/search", headers=hdrs, json=body)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", []) or []
+        return results[0] if results else None
+    except Exception as exc:
+        log.warning("HubSpot contact search failed for %r: %s", email, exc)
+        return None
+
+
+def get_contact_deal_ids(contact_id: str) -> list[str]:
+    """Return deal IDs associated with a contact via v3 associations."""
+    try:
+        token = _token()
+    except HubSpotClientError:
+        return []
+
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/crm/v3/objects/contacts/{contact_id}/associations/deals",
+                headers=hdrs,
+            )
+        if r.status_code != 200:
+            return []
+        return [str(ref.get("id", "")) for ref in r.json().get("results", []) or [] if ref.get("id")]
+    except Exception as exc:
+        log.warning("HubSpot deal association fetch failed for contact %s: %s", contact_id, exc)
+        return []
+
+
+def log_email_engagement(
+    from_email: str,
+    to_emails: list[str],
+    subject: str,
+    body_text: str,
+    timestamp_ms: int,
+    direction: str,
+    owner_id: str,
+    contact_ids: list[str],
+    deal_ids: list[str],
+) -> str:
+    """Log an email engagement via v1 engagements API. Returns engagement ID or '' on failure.
+
+    direction: "INBOUND" (email received by rep) or "OUTBOUND" (email sent by rep).
+    Uses the v1 engagements API because it handles contact+deal associations atomically.
+    """
+    token = _token()
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    body: dict = {
+        "engagement": {
+            "active": True,
+            "type": "EMAIL",
+            "timestamp": timestamp_ms,
+        },
+        "associations": {
+            "contactIds": [int(c) for c in contact_ids if c],
+            "companyIds": [],
+            "dealIds": [int(d) for d in deal_ids if d],
+            "ownerIds": [int(owner_id)] if owner_id else [],
+        },
+        "metadata": {
+            "from": {"email": from_email},
+            "to": [{"email": e} for e in to_emails if e],
+            "subject": subject or "(no subject)",
+            "text": body_text[:8000] if body_text else "",
+            "html": "",
+            "direction": direction,
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/engagements/v1/engagements", headers=hdrs, json=body)
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(
+                f"HubSpot email engagement {r.status_code}: {r.text[:200]}"
+            )
+        result = r.json()
+        engagement_id = str((result.get("engagement") or {}).get("id", ""))
+        log.info(
+            "HubSpot email logged: id=%s  subject=%r  contacts=%s  deals=%s",
+            engagement_id, subject[:40], contact_ids, deal_ids,
+        )
+        return engagement_id
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"log_email_engagement failed: {exc}") from exc
+
+
 def format_deals_for_llm(
     deals: list[dict[str, Any]],
     entity_scope: str | None = None,

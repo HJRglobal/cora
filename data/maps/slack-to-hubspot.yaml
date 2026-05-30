@@ -29,3 +29,14 @@ users:
     hubspot_owner_id: 162944825
     hubspot_email: tommy@f3energy.com
     display_name: Tommy Anderson
+
+  # --- Old-account owner IDs; UPDATE after new account created ---
+  - slack_user_id: ""          # TODO: Alex's Slack user ID
+    hubspot_owner_id: 160262948
+    hubspot_email: alex@hjrglobal.com
+    display_name: Alex Cordova
+
+  - slack_user_id: ""          # TODO: Elena's Slack user ID
+    hubspot_owner_id: 160454475
+    hubspot_email: elena@f3energy.com
+    display_name: Elena Meirndorf

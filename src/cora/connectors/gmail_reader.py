@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 _GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 _CORA_LABEL_NAME = "Cora-Filed"
+_HUBSPOT_LABEL_NAME = "Cora-HubSpot"  # applied to threads logged to HubSpot (idempotency)
 
 # Skip attachments larger than this (25 MB) — avoids downloading huge files
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -339,6 +340,36 @@ def ensure_cora_label(user_email: str) -> str:
 
     log.info("Created hidden Cora-Filed label for %s (id=%s)", user_email, created["id"])
     return created["id"]
+
+
+def ensure_label(user_email: str, label_name: str) -> str:
+    """Get or create a hidden label by name for user_email. Returns the label ID."""
+    hidden_body = {
+        "name": label_name,
+        "labelListVisibility": "labelHide",
+        "messageListVisibility": "hide",
+    }
+    service = _build_service(user_email)
+    try:
+        resp = service.users().labels().list(userId="me").execute()
+    except HttpError as exc:
+        raise GmailReaderError(f"Label list failed for {user_email}: {exc}") from exc
+
+    for label in resp.get("labels", []):
+        if label.get("name") == label_name:
+            return label["id"]
+
+    try:
+        created = service.users().labels().create(userId="me", body=hidden_body).execute()
+    except HttpError as exc:
+        raise GmailReaderError(f"Label creation failed for {user_email}: {exc}") from exc
+    log.info("Created hidden label %r for %s (id=%s)", label_name, user_email, created["id"])
+    return created["id"]
+
+
+def ensure_hubspot_label(user_email: str) -> str:
+    """Get or create the Cora-HubSpot idempotency label. Returns label ID."""
+    return ensure_label(user_email, _HUBSPOT_LABEL_NAME)
 
 
 def apply_label(user_email: str, message_id: str, label_id: str) -> None:
