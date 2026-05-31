@@ -76,7 +76,7 @@ def _build_stage_map(export: dict) -> dict[str, str]:
             f"new-pipeline-ids.json not found at {new_ids_path}. "
             "Run setup_hubspot_pipelines.py first."
         )
-    new_ids = json.loads(new_ids_path.read_text(encoding="utf-8"))
+    new_ids = json.loads(new_ids_path.read_text(encoding="utf-8-sig"))
 
     # Build: new pipeline name → {stage_label: stage_id}
     new_by_name: dict[str, dict[str, str]] = {}
@@ -332,7 +332,7 @@ def main() -> int:  # noqa: C901 (intentionally long orchestrator)
             pipeline_name = old_pipeline_names.get(old_pipeline, "")
             # Find new pipeline ID by name
             new_ids_path = export_path.parent / "new-pipeline-ids.json"
-            new_ids_data = json.loads(new_ids_path.read_text(encoding="utf-8"))
+            new_ids_data = json.loads(new_ids_path.read_text(encoding="utf-8-sig"))
             new_pipeline_id = ""
             for p in new_ids_data.get("pipelines", []):
                 if p["pipeline_name"] == pipeline_name:
