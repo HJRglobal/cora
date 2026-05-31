@@ -417,8 +417,10 @@ def main() -> int:  # noqa: C901 (intentionally long orchestrator)
             ts_str = props.get("hs_timestamp") or props.get("createdate") or "0"
             try:
                 ts_ms = int(float(ts_str))
+                if ts_ms <= 0:
+                    ts_ms = int(time.time() * 1000)
             except (ValueError, TypeError):
-                ts_ms = 0
+                ts_ms = int(time.time() * 1000)
             old_owner = props.get("hubspot_owner_id", "")
             new_owner = old_to_new_owner.get(old_owner, "")
             if dry_run:
