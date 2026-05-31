@@ -78,19 +78,19 @@ def _build_stage_map(export: dict) -> dict[str, str]:
         )
     new_ids = json.loads(new_ids_path.read_text(encoding="utf-8-sig"))
 
-    # Build: new pipeline name → {stage_label: stage_id}
+    # Build: new pipeline name (and optional old_pipeline_name alias) → {stage_label: stage_id}
     new_by_name: dict[str, dict[str, str]] = {}
     for p in new_ids.get("pipelines", []):
-        new_by_name[p["pipeline_name"]] = p["stages"]
+        stages = p["stages"]
+        new_by_name[p["pipeline_name"]] = stages
+        # Support old_pipeline_name alias so renamed pipelines still match
+        # e.g. "UFL Sponsorships" (old) → "UFL / OSN / BDM" (new)
+        if p.get("old_pipeline_name"):
+            new_by_name[p["old_pipeline_name"]] = stages
 
     # Build: old_pipeline_id → old pipeline name (from export pipeline_map)
     old_pipeline_names = {pid: v["name"] for pid, v in export.get("pipeline_map", {}).items()}
 
-    # Build combined map: (old_pipeline_id, stage_id_or_label) → new_stage_id
-    # HubSpot stage IDs in old account are not labels — we need to resolve them.
-    # The export deals contain dealstage values which are stage IDs (not labels).
-    # We'll fetch the old pipeline stages at runtime only if needed.
-    # For now: return new_by_name keyed by old_pipeline_id for lookup at deal creation time.
     return {
         "old_pipeline_names": old_pipeline_names,
         "new_by_name": new_by_name,
