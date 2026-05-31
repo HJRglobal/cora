@@ -896,6 +896,11 @@ def pass5_drive_insights(
             log.error("pass5: Haiku call failed for entity %s: %s", entity, exc)
             continue
 
+        # Strip markdown fences that Haiku sometimes wraps around JSON
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0].strip()
+
         try:
             parsed = json.loads(raw)
         except (ValueError, TypeError):

@@ -102,6 +102,14 @@ for _entity, _siblings in _SIBLING_DEFS.items():
         for sib in _siblings
     ]
 
+# LBHS confidential-entity guard — terms that must never be discussed in any channel.
+# lbhs.md explicitly forbids surfacing COPA/BHRF/UnitedHealthcare data; this enforces
+# it pre-LLM so the model's helpfulness bias cannot override it.
+_LBHS_PRIVATE_RE = re.compile(
+    r"\b(COPA|BHRF|UnitedHealthcare|United\s+Health(?:care)?)\b",
+    re.IGNORECASE,
+)
+
 
 def check_redirect(entity: str, message: str) -> str | None:
     """Return a one-sentence redirect if message asks about a sibling entity.
@@ -114,6 +122,14 @@ def check_redirect(entity: str, message: str) -> str | None:
     (e.g. "villa" should not match LLA, "Lexington" alone should not redirect).
     First-match-wins (highest specificity keywords listed first in _SIBLING_DEFS).
     """
+    # LBHS confidential-entity guard: hard-block COPA/BHRF/UnitedHealthcare references
+    # before any LLM call, regardless of how the question is phrased.
+    if entity == "LEX-LBHS" and _LBHS_PRIVATE_RE.search(message):
+        return (
+            "That information is confidential to LBHS and cannot be discussed here. "
+            "Please contact LBHS leadership directly."
+        )
+
     compiled_siblings = _COMPILED.get(entity)
     if not compiled_siblings:
         return None

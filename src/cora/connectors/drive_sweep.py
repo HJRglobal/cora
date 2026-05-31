@@ -475,7 +475,7 @@ def sweep_user(
                 continue
 
             # PHI guard for Lex users — quarantine before classification
-            if is_lex_user and _PHI_PATTERNS.search(content[:500]):
+            if is_lex_user and _PHI_PATTERNS.search(content[:5000]):
                 log.debug("drive_sweep: PHI guard triggered for %s/%s", email, filename)
                 stats["phi_skipped"] += 1
                 continue

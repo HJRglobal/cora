@@ -109,7 +109,7 @@ def _fetch_open_tasks() -> list[dict]:
         all_tasks: dict[str, dict] = {}  # gid -> task (dedup)
 
         for user in users:
-            asana_gid = user.get("asana_gid", "")
+            asana_gid = user.get("asana_user_gid", "") or user.get("asana_gid", "")
             if not asana_gid:
                 continue
             try:

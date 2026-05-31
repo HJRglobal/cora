@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 app = App(token=config.slack_bot_token, signing_secret=config.slack_signing_secret)
 
 _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
+_FOUNDER_ID = "U0B2RM2JYJ1"  # Harrison — KB approvals and cross-entity access
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
 
 # Resolved at first event via auth.test() - the bot's own user ID. Used to
@@ -189,7 +190,6 @@ def _dispatch_qa(
 
     # Founder (Harrison) gets cross-entity access from any channel. His questions
     # about UFL, LEX, OSN etc. from an F3E channel should not be blocked by entity scope.
-    _FOUNDER_ID = "U0B2RM2JYJ1"
     is_founder = (user_id == _FOUNDER_ID)
     founder_note = (
         "\n**Cross-entity access ENABLED:** This user is the portfolio founder. "
@@ -402,6 +402,9 @@ def _dispatch_qa(
 
 @app.event("app_mention")
 def handle_mention(event: dict, say: callable, client) -> None:
+    if event.get("bot_id"):
+        return
+
     channel_id = event.get("channel", "")
     user_id = event.get("user")
     thread_ts = event.get("ts")          # ts of THIS message (used for reply threading)
@@ -790,6 +793,12 @@ def handle_message_event(event: dict, client) -> None:
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
 
+    # Apply sibling-entity guard pre-LLM (mirrors handle_mention Path 1).
+    sibling_redirect = sibling_guard.check_redirect(entity, text)
+    if sibling_redirect:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=sibling_redirect)
+        return
+
     active_thread_store.touch(channel_id, thread_ts)
     prior_messages = _fetch_thread_history(client, channel_id, thread_ts, msg_ts)
 
@@ -950,6 +959,10 @@ def _process_contribution_reaction(
     reactor_id: str | None = None,
 ) -> None:
     """Process a ✅ or ❌ on a pending contribution approval card."""
+    if reactor_id != _FOUNDER_ID:
+        log.warning("team_learning: KB reaction from non-founder %s — ignored", reactor_id)
+        return
+
     import datetime as _dt
     cid = contribution["contribution_id"]
     if reaction == "white_check_mark":
