@@ -34,9 +34,11 @@ _HIERARCHY_PATH = _REPO_ROOT / "data" / "maps" / "supervisor-hierarchy.yaml"
 # HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
 HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
     "F3E": hubspot_client.PIPELINE_F3E_RETAIL,
-    "UFL": hubspot_client.PIPELINE_UFL_SPONSORSHIPS,
-    # OSN / LEX / BDM / HJRG don't currently have HubSpot pipelines; return all-pipeline
-    # results in those channels (or empty if no deals match).
+    "UFL": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    # OSN and BDM share the UFL/OSN/BDM combined pipeline on Starter tier.
+    "OSN": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    "BDM": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    # LEX / HJRG don't have HubSpot pipelines; return all-pipeline results.
 }
 
 
