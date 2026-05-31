@@ -790,6 +790,15 @@ def handle_message_event(event: dict, client) -> None:
     if not active_thread_store.is_active(channel_id, thread_ts):
         return
 
+    allowed, cap_type = rate_limiter.check(user_id, channel_id)
+    if not allowed:
+        log.warning("rate_limited (path2) user=%s channel=%s cap=%s", user_id, channel_id, cap_type)
+        if cap_type == "user":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="You've hit the per-user mention cap (10/hour). I'll be back shortly.")
+        else:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="This channel has hit the mention cap (50/hour). Try again in a bit.")
+        return
+
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
 
