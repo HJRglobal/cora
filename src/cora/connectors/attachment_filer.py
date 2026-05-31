@@ -39,6 +39,8 @@ from typing import Any
 
 import anthropic
 import yaml
+from slack_sdk import WebClient as _SlackWebClient
+from slack_sdk.errors import SlackApiError as _SlackApiError
 
 from .drive_connector import (
     DriveConnectorError,
@@ -680,24 +682,18 @@ def post_slack_summary(summaries: list[dict[str, Any]]) -> bool:
     text = "\n".join(lines)
 
     try:
-        import requests
         token = os.environ.get("SLACK_BOT_TOKEN", "")
         if not token:
             log.warning("SLACK_BOT_TOKEN not set — Slack notification skipped")
             return False
 
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"channel": _NOTIFY_CHANNEL, "text": text},
-            timeout=10,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            log.warning("Slack post failed: %s", data.get("error"))
-            return False
+        client = _SlackWebClient(token=token)
+        client.chat_postMessage(channel=_NOTIFY_CHANNEL, text=text)
         log.info("Slack filing summary posted to #%s", _NOTIFY_CHANNEL)
         return True
+    except _SlackApiError as exc:
+        log.warning("Slack post failed: %s", exc.response.get("error", str(exc)))
+        return False
     except Exception as exc:
         log.warning("Slack notification failed: %s", exc)
         return False

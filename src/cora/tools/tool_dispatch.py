@@ -12,6 +12,7 @@ Cross-entity scope rules: when the asking channel maps to a specific entity
 that entity. FNDR channels (founder-level + catch-all) see everything.
 """
 
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -4053,7 +4054,13 @@ def dispatch(
     injected = dict(tool_input or {})
     injected["_channel_name"] = channel_name
     try:
-        return fn(slack_user_id, entity, injected)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, slack_user_id, entity, injected)
+            try:
+                return future.result(timeout=25)
+            except concurrent.futures.TimeoutError:
+                log.warning("Tool %s timed out after 25s for user=%s entity=%s", tool_name, slack_user_id, entity)
+                return "Tool timed out — please try again."
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
         return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."

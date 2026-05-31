@@ -50,6 +50,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from cora.phi_guard import _PHI_PATTERNS as _PHI_RE
+
 log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -69,14 +71,6 @@ MIN_FUZZY_RATIO = 0.35
 
 # Max gaps surfaced per pass (caps noise)
 MAX_GAPS_PER_PASS = 10
-
-# PHI-risk patterns: if any of these appear in a LEX chunk, skip entirely.
-_PHI_RE = re.compile(
-    r"\b(service\s+note|care\s+plan|incident\s+report|prior\s+auth|iep\b|arc\b"
-    r"|support\s+plan|clinical\s+note|assessment|discharge|intake\s+form"
-    r"|medication|diagnosis|ddd\s+client|hcbs\s+client)\b",
-    re.IGNORECASE,
-)
 
 # Action/commitment language patterns for Pass 1.
 _ACTION_RE = re.compile(
