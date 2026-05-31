@@ -185,7 +185,7 @@ def main() -> int:  # noqa: C901 (intentionally long orchestrator)
     log.info("=== HubSpot Import starting%s ===", " [DRY RUN]" if dry_run else "")
     log.info("Export: %s", export_path)
 
-    export = json.loads(export_path.read_text(encoding="utf-8"))
+    export = json.loads(export_path.read_text(encoding="utf-8-sig"))  # utf-8-sig strips BOM if PowerShell wrote it
     export["_source_path"] = str(export_path)
 
     # Validate owner_map
