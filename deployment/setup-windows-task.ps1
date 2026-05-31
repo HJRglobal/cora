@@ -67,11 +67,21 @@ Write-Host "  OK  $uvExe"
 # ------------------------------------------------------------------
 Write-Host "[4/5] Registering scheduled task '$TASK_NAME'..."
 
-# Remove existing task silently if present
+# Remove existing task silently if present, then kill any orphan python process
 $existing = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  Found existing task - removing before re-registration."
+    Write-Host "  Found existing task - stopping and removing before re-registration."
+    try { Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Seconds 2
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
+}
+# Kill any stale Cora python process (schtasks /End leaves the process alive)
+$orphans = Get-WmiObject Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*cora*" }
+if ($orphans) {
+    Write-Host "  Killing $($orphans.Count) orphan Cora python process(es)..."
+    $orphans | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
 }
 
 $action = New-ScheduledTaskAction `

@@ -58,9 +58,9 @@ $Trigger = New-ScheduledTaskTrigger `
     -Daily `
     -At "03:30"
 
-# Settings: allow up to 2 hours (initial full-corpus sweep can be large)
+# Settings: no execution time limit (full-corpus backfill can exceed 2h across 18 accounts)
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+    -ExecutionTimeLimit (New-TimeSpan -Days 0) `
     -StartWhenAvailable `
     -DontStopIfGoingOnBatteries:$false
 

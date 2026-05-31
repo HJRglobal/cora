@@ -86,11 +86,8 @@ _FACT_TYPE_TO_UPDATE_TYPE = {
     "amount":   None,  # amounts are skipped in the proposal loop
 }
 
-# Visibility CPA names (lowercase) — never in facts or proposals
-_VIS_CPA_NAMES_LOWER = frozenset({
-    "hayden greber", "andrew stubbs", "sarah bertoglio", "emily stubbs",
-    "michael dibenedetto", "andrew lee", "visibility cpa",
-})
+# Visibility CPA exclusion — centralized in phi_guard
+from cora.phi_guard import VISIBILITY_CPA_NAMES as _VIS_CPA_NAMES_LOWER, is_visibility_cpa_mention as _is_vis_cpa
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
@@ -209,9 +206,8 @@ def extract_facts_for_file(
     excerpt = content[:_MAX_CONTENT_CHARS]
 
     # Check for Visibility CPA names
-    excerpt_lower = excerpt.lower()
-    if any(name in excerpt_lower for name in _VIS_CPA_NAMES_LOWER):
-        log.debug("drive_extractor: skipping %s — Visibility CPA name detected", filename)
+    if _is_vis_cpa(excerpt):
+        log.debug("drive_extractor: skipping %s -- Visibility CPA name detected", filename)
         return []
 
     user_msg = f"FILENAME: {filename}\nENTITY: {entity}\n\n{excerpt}"
@@ -243,8 +239,7 @@ def extract_facts_for_file(
     # Filter out any Visibility CPA facts that slipped through
     clean: list[dict] = []
     for f in facts:
-        subject_lower = (f.get("subject") or "").lower()
-        if any(name in subject_lower for name in _VIS_CPA_NAMES_LOWER):
+        if _is_vis_cpa(f.get("subject") or ""):
             continue
         clean.append(f)
 

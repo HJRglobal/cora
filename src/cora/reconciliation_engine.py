@@ -90,11 +90,8 @@ _DECISION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Visibility CPA names — never included in gap output
-_VIS_CPA_NAMES = {
-    "hayden greber", "andrew stubbs", "sarah bertoglio", "emily stubbs",
-    "michael dibenedetto", "andrew lee", "visibility cpa",
-}
+# Visibility CPA exclusion -- centralized in phi_guard
+from cora.phi_guard import is_visibility_cpa_mention as _mentions_vis_cpa_fn
 
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -213,8 +210,7 @@ def _is_phi_content(text: str) -> bool:
 
 def _mentions_vis_cpa(text: str) -> bool:
     """True if text mentions Visibility CPA team members (by name)."""
-    lower = text.lower()
-    return any(name in lower for name in _VIS_CPA_NAMES)
+    return _mentions_vis_cpa_fn(text)
 
 
 # ── Utility ────────────────────────────────────────────────────────────────────
@@ -848,8 +844,7 @@ def pass5_drive_insights(
             if _PHI_RE.search(content[:500]):
                 continue
             # Skip if Visibility CPA names appear
-            content_lower = content.lower()
-            if any(name in content_lower for name in _VIS_CPA_NAMES):
+            if _mentions_vis_cpa(content):
                 continue
 
             try:
