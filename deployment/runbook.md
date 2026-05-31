@@ -1,5 +1,37 @@
 # Cora Operations Runbook
 
+## Scheduled Tasks Registry
+
+| Task name | Schedule | Script | Purpose |
+|---|---|---|---|
+| `cowork-cora-service` | AtLogon + auto-restart | `python -m cora.main` | Main Slack bot |
+| `cowork-cora-channel-sweep` | Daily 01:30 AZ (08:30 UTC) | `scripts/run_channel_sweep.py` | Nightly org-wide channel sweep |
+| `cowork-cora-knowledge-review` | Mon-Fri 07:00 AZ (14:00 UTC) | `scripts/run_knowledge_review.py` | Send Harrison pending knowledge-review DMs |
+| `cowork-cora-daily-briefing` | Daily (see PS1) | `scripts/run_daily_briefing.py` | Morning digest |
+| `cowork-cora-backup` | Daily 04:30 AZ | `scripts/backup_logs.py` | Backup KB + logs to Drive |
+
+**Re-register a task after editing its PS1:**
+```powershell
+.\deployment\setup-channel-sweep-task.ps1   # channel sweep
+.\deployment\setup-knowledge-review-task.ps1  # knowledge review
+```
+
+---
+
+## External Health Check
+
+Cora writes a UTC timestamp to `data/health/heartbeat.txt` every 60 seconds.
+If this file is older than 3 minutes, the process is stalled or dead.
+
+```powershell
+# Check last heartbeat
+Get-Content "data\health\heartbeat.txt"
+# Compare to now
+(Get-Date).ToUniversalTime() - [datetime]::Parse((Get-Content "data\health\heartbeat.txt").Trim())
+```
+
+---
+
 ## Operating Cora
 
 **Start:**
