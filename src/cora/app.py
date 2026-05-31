@@ -1030,3 +1030,18 @@ def handle_reaction_added(event: dict, client) -> None:
 @app.event("reaction_removed")
 def handle_reaction_removed(event: dict, client) -> None:
     _handle_reaction(event, client, "reaction_removed")
+
+
+@app.event("channel_created")
+def handle_channel_created(event: dict, client) -> None:
+    """Auto-join every new public channel so the nightly sweep has full coverage."""
+    ch = event.get("channel") or {}
+    ch_id = ch.get("id", "")
+    ch_name = ch.get("name", "")
+    if not ch_id:
+        return
+    try:
+        client.conversations_join(channel=ch_id)
+        log.info("auto-joined new channel #%s (%s)", ch_name, ch_id)
+    except Exception as exc:
+        log.warning("failed to auto-join #%s: %s", ch_name, exc)
