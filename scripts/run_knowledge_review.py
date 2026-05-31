@@ -35,11 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_review import (  # noqa: E402
     correlate_reactions_to_updates,
-    format_pending_dm,
     get_pending_updates,
     propose_update,
     resolve_update,
-    send_dm_to_harrison,
+    send_individual_dms,
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_GENERIC,
 )
@@ -67,6 +66,10 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="Print what would happen without sending DMs or writing state changes",
     )
+    parser.add_argument(
+        "--reset-dm-ts", action="store_true",
+        help="Clear dm_message_ts on all PENDING items so they get re-sent as individual DMs",
+    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -75,6 +78,11 @@ def main() -> int:
     log.info("Knowledge review run starting (dry_run=%s)", args.dry_run)
 
     exit_code = 0
+
+    # ─── Optional: reset dm_message_ts so items get re-sent individually ─────
+    if args.reset_dm_ts:
+        _reset_all_dm_ts()
+        log.info("Reset dm_message_ts on all PENDING items — they will be re-sent individually")
 
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()
@@ -116,40 +124,35 @@ def main() -> int:
 
     # ─── Step 2: Send DM batch for any still-PENDING updates ─────────────────
     pending = get_pending_updates()
-    log.info("Found %d PENDING updates to DM Harrison about", len(pending))
+    unsent = [u for u in pending if not u.get("dm_message_ts")]
+    log.info("Found %d PENDING updates to DM Harrison about (%d not yet sent)", len(pending), len(unsent))
 
-    if not pending:
-        log.info("No pending updates — nothing to DM")
-        return exit_code
-
-    dm_text = format_pending_dm(pending)
-    if not dm_text:
-        log.info("DM text was empty (no actionable pending updates)")
+    if not unsent:
+        log.info("All pending updates already have DM timestamps — nothing new to send")
         return exit_code
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not slack_token or args.dry_run:
         if args.dry_run:
-            log.info("[DRY RUN] Would send DM to Harrison:\n%s", dm_text)
+            for i, u in enumerate(unsent, 1):
+                log.info("[DRY RUN] Item %d/%d: %s", i, len(unsent), u.get("description", "?")[:120])
         else:
             log.warning("SLACK_BOT_TOKEN not set — cannot send DM, exit_code=2")
             exit_code = 2
         return exit_code
 
-    log.info("Sending DM to Harrison (user=%s) with %d pending items", HARRISON_SLACK_USER_ID, len(pending))
-    msg_ts = send_dm_to_harrison(dm_text, slack_token)
+    log.info("Sending %d individual DMs to Harrison (user=%s)...", len(unsent), HARRISON_SLACK_USER_ID)
+    sent_map = send_individual_dms(unsent, slack_token)  # {update_id: ts}
 
-    if msg_ts:
-        log.info("DM sent successfully ts=%s", msg_ts)
-        # Update all PENDING entries with the DM message_ts so reactions can correlate
-        for update in pending:
-            if not update.get("dm_message_ts"):
-                resolve_update(update["update_id"], "PENDING")  # no-op; just triggers rewrite
-                # We need to patch the dm_message_ts directly
-                _patch_dm_ts(update["update_id"], msg_ts)
-        log.info("Patched dm_message_ts on %d pending entries", len(pending))
+    if sent_map:
+        log.info("Sent %d/%d DMs successfully", len(sent_map), len(unsent))
+        for update in unsent:
+            ts = sent_map.get(update["update_id"])
+            if ts:
+                _patch_dm_ts(update["update_id"], ts)
+        log.info("Patched dm_message_ts on %d entries", len(sent_map))
     else:
-        log.warning("DM send failed — pending items remain undelivered")
+        log.warning("No DMs were sent — check SLACK_BOT_TOKEN and im:write scope")
         exit_code = 2
 
     log.info(
@@ -187,6 +190,41 @@ def _patch_dm_ts(update_id: str, dm_ts: str) -> None:
             for entry in entries:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         tmp.replace(_PROPOSED_UPDATES_PATH)
+
+
+def _reset_all_dm_ts() -> int:
+    """Clear dm_message_ts on all PENDING items so they get re-sent as individual DMs."""
+    import json
+    from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
+
+    if not _PROPOSED_UPDATES_PATH.exists():
+        return 0
+
+    count = 0
+    with _UPDATES_LOCK:
+        entries = []
+        with _PROPOSED_UPDATES_PATH.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("state") == "PENDING" and entry.get("dm_message_ts"):
+                    entry["dm_message_ts"] = ""
+                    entry["dm_channel_id"] = ""
+                    count += 1
+                entries.append(entry)
+
+        tmp = _PROPOSED_UPDATES_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        tmp.replace(_PROPOSED_UPDATES_PATH)
+
+    return count
 
 
 if __name__ == "__main__":
