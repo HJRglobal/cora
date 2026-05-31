@@ -1,7 +1,7 @@
 # setup-channel-sweep-task.ps1
 #
 # Registers the nightly org-wide channel sweep as a Windows Scheduled Task.
-# Runs at 1:30am AZ (08:30 UTC) — after Slack KB sync (2am) but before
+# Runs at 1:30am AZ (08:30 UTC) - after Slack KB sync (2am) but before
 # reconciliation (5:30am), so sweep data is available for pass 6.
 #
 # Usage (from repo root):
@@ -71,7 +71,7 @@ Register-ScheduledTask `
 Write-Host "  OK  Task registered: $TaskName" -ForegroundColor Green
 Write-Host "  Schedule: daily at $RunTime UTC (01:30 AZ)" -ForegroundColor White
 
-# ── Dry-run verification ────────────────────────────────────────────────────────
+# --- Dry-run verification ---
 Write-Host ""
 Write-Host "Running dry-run verification..." -ForegroundColor Cyan
 
@@ -85,7 +85,7 @@ try {
     if ($exitCode -eq 0) {
         Write-Host "  OK  Dry run succeeded." -ForegroundColor Green
     } else {
-        Write-Host "  WARN  Dry run exited $exitCode — check output above." -ForegroundColor Yellow
+        Write-Host "  WARN  Dry run exited $exitCode - check output above." -ForegroundColor Yellow
     }
 } finally {
     Pop-Location
