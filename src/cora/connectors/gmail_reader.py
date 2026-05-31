@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 _GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 _CORA_LABEL_NAME = "Cora-Filed"
+_HUBSPOT_LABEL_NAME = "Cora-HubSpot"  # applied to threads logged to HubSpot (idempotency)
 
 # Skip attachments larger than this (25 MB) — avoids downloading huge files
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -192,6 +193,7 @@ def parse_message_metadata(msg: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "message_id": msg["id"],
+        "rfc_message_id": headers.get("message-id", ""),
         "thread_id": msg.get("threadId", ""),
         "from": headers.get("from", ""),
         "to": headers.get("to", ""),
@@ -291,7 +293,19 @@ def download_attachment(
 
 
 def ensure_cora_label(user_email: str) -> str:
-    """Get or create the 'Cora-Filed' label for user_email. Returns the label ID."""
+    """Get or create the 'Cora-Filed' label for user_email. Returns the label ID.
+
+    The label is hidden from the user's sidebar and email list view so Cora's
+    filing activity is invisible to the mailbox owner. It still exists internally
+    and is used as an idempotency marker to prevent re-filing the same attachment.
+    If the label already exists with visible settings, this patches it to hidden.
+    """
+    _HIDDEN_BODY = {
+        "name": _CORA_LABEL_NAME,
+        "labelListVisibility": "labelHide",
+        "messageListVisibility": "hide",
+    }
+
     service = _build_service(user_email)
     try:
         resp = service.users().labels().list(userId="me").execute()
@@ -300,28 +314,62 @@ def ensure_cora_label(user_email: str) -> str:
 
     for label in resp.get("labels", []):
         if label.get("name") == _CORA_LABEL_NAME:
-            return label["id"]
+            label_id = label["id"]
+            if (
+                label.get("labelListVisibility") != "labelHide"
+                or label.get("messageListVisibility") != "hide"
+            ):
+                try:
+                    service.users().labels().patch(
+                        userId="me", id=label_id, body=_HIDDEN_BODY,
+                    ).execute()
+                    log.info("Patched Cora-Filed label to hidden for %s", user_email)
+                except HttpError as exc:
+                    log.warning("Could not patch label visibility for %s: %s", user_email, exc)
+            return label_id
 
     try:
         created = service.users().labels().create(
             userId="me",
-            body={
-                "name": _CORA_LABEL_NAME,
-                "labelListVisibility": "labelShow",
-                "messageListVisibility": "show",
-                "color": {
-                    "backgroundColor": "#16a766",
-                    "textColor": "#ffffff",
-                },
-            },
+            body=_HIDDEN_BODY,
         ).execute()
     except HttpError as exc:
         raise GmailReaderError(
             f"Label creation failed for {user_email}: {exc}"
         ) from exc
 
-    log.info("Created Gmail label %r for %s (id=%s)", _CORA_LABEL_NAME, user_email, created["id"])
+    log.info("Created hidden Cora-Filed label for %s (id=%s)", user_email, created["id"])
     return created["id"]
+
+
+def ensure_label(user_email: str, label_name: str) -> str:
+    """Get or create a hidden label by name for user_email. Returns the label ID."""
+    hidden_body = {
+        "name": label_name,
+        "labelListVisibility": "labelHide",
+        "messageListVisibility": "hide",
+    }
+    service = _build_service(user_email)
+    try:
+        resp = service.users().labels().list(userId="me").execute()
+    except HttpError as exc:
+        raise GmailReaderError(f"Label list failed for {user_email}: {exc}") from exc
+
+    for label in resp.get("labels", []):
+        if label.get("name") == label_name:
+            return label["id"]
+
+    try:
+        created = service.users().labels().create(userId="me", body=hidden_body).execute()
+    except HttpError as exc:
+        raise GmailReaderError(f"Label creation failed for {user_email}: {exc}") from exc
+    log.info("Created hidden label %r for %s (id=%s)", label_name, user_email, created["id"])
+    return created["id"]
+
+
+def ensure_hubspot_label(user_email: str) -> str:
+    """Get or create the Cora-HubSpot idempotency label. Returns label ID."""
+    return ensure_label(user_email, _HUBSPOT_LABEL_NAME)
 
 
 def apply_label(user_email: str, message_id: str, label_id: str) -> None:
@@ -492,3 +540,142 @@ def get_full_thread_text(
     # Oldest first (Gmail returns newest-first in thread)
     results.sort(key=lambda m: m["date_ts"])
     return results
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# User-facing inbox summary (metadata only — no body content)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_inbox_summary(
+    user_email: str,
+    query: str = "is:unread OR is:starred",
+    max_results: int = 10,
+) -> list[dict[str, Any]]:
+    """Return recent inbox messages for user_email (metadata only, no body).
+
+    Each returned dict:
+        {message_id, thread_id, from, to, subject, date_ts, snippet, labels}
+
+    query: any Gmail search string — "is:unread", "from:alex@hjrglobal.com",
+           "subject:invoice after:2026/05/01", etc.
+    max_results: capped at 20 to keep response latency under 3s.
+    """
+    max_results = min(max_results, 20)
+    service = _build_service(user_email)
+
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max_results,
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        if status == 403:
+            raise GmailReaderError(
+                f"Gmail 403 for {user_email} — service account lacks DWD scope or "
+                "user is not in the Google Workspace org."
+            ) from exc
+        raise GmailReaderError(f"Gmail list failed for {user_email} (HTTP {status}): {exc}") from exc
+
+    messages: list[dict[str, Any]] = []
+    for ref in resp.get("messages", []):
+        try:
+            msg = service.users().messages().get(
+                userId="me",
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "From", "To", "Date"],
+            ).execute()
+        except HttpError:
+            continue
+
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+        date_str = headers.get("date", "")
+        try:
+            date_ts = int(email.utils.parsedate_to_datetime(date_str).timestamp())
+        except Exception:
+            date_ts = int(msg.get("internalDate", "0")) // 1000
+
+        messages.append({
+            "message_id": msg["id"],
+            "thread_id": msg.get("threadId", ""),
+            "from":    headers.get("from", ""),
+            "to":      headers.get("to", ""),
+            "subject": headers.get("subject", "(no subject)"),
+            "date_ts": date_ts,
+            "snippet": msg.get("snippet", ""),
+            "labels":  msg.get("labelIds", []),
+        })
+
+    return messages
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Completion signal extraction from sent mail
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_sent_signals(
+    user_email: str,
+    since_ts: int,
+    max_results: int = 50,
+) -> list[dict[str, Any]]:
+    """Return sent emails since since_ts as lightweight signal dicts.
+
+    Used by completion_detector to cross-reference sent subjects/snippets
+    against open Asana tasks — if you sent something, the related task may
+    be done.  Returns metadata only (no body) for privacy.
+
+    Each returned dict:
+        {message_id, subject, snippet, date_ts}
+    """
+    service = _build_service(user_email)
+    query = f"in:sent after:{since_ts}"
+
+    try:
+        resp = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=min(max_results, 100),
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        log.warning("get_sent_signals: Gmail list failed for %s (HTTP %s): %s", user_email, status, exc)
+        return []
+
+    signals: list[dict[str, Any]] = []
+    for ref in resp.get("messages", []):
+        try:
+            msg = service.users().messages().get(
+                userId="me",
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "Date"],
+            ).execute()
+        except HttpError:
+            continue
+
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in msg.get("payload", {}).get("headers", [])
+        }
+        date_str = headers.get("date", "")
+        try:
+            date_ts = int(email.utils.parsedate_to_datetime(date_str).timestamp())
+        except Exception:
+            date_ts = int(msg.get("internalDate", "0")) // 1000
+
+        signals.append({
+            "message_id": msg["id"],
+            "subject":    headers.get("subject", ""),
+            "snippet":    msg.get("snippet", ""),
+            "date_ts":    date_ts,
+        })
+
+    log.info("get_sent_signals: %d sent emails since %d for %s", len(signals), since_ts, user_email)
+    return signals

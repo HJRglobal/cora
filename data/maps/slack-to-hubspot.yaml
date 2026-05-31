@@ -29,3 +29,14 @@ users:
     hubspot_owner_id: 162944825
     hubspot_email: tommy@f3energy.com
     display_name: Tommy Anderson
+
+  # --- Confirmed in new account (246351746) 2026-05-30 ---
+  - slack_user_id: ""          # TODO: get Alex's Slack user ID (Settings → Members → copy ID)
+    hubspot_owner_id: 160262948
+    hubspot_email: alex@hjrglobal.com
+    display_name: Alex Cordova
+
+  - slack_user_id: ""          # TODO: get Elena's Slack user ID
+    hubspot_owner_id: 160454475
+    hubspot_email: elena@f3energy.com
+    display_name: Elena Meirndorf

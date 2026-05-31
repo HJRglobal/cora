@@ -245,7 +245,9 @@ def _cache_set(file_id: str, tab_name: str, summary: CashflowSummary) -> None:
 def invalidate_cache(file_id: Optional[str] = None) -> None:
     """Force-expire cache for one file or all files. Useful for tests."""
     if file_id:
-        _CACHE.pop(file_id, None)
+        stale_keys = [k for k in _CACHE if k[0] == file_id]
+        for k in stale_keys:
+            del _CACHE[k]
     else:
         _CACHE.clear()
 
@@ -696,7 +698,8 @@ def get_cashflow(
         # direct SA creds sidestep that entirely.
         sa_creds = _build_direct_sa_creds()
         sheets_service = _build_sheets_service(sa_creds)
-        modified_date = "unknown"
+        drive_service = build("drive", "v3", credentials=sa_creds, cache_discovery=False)
+        modified_date = _get_modified_time(drive_service, fid)
         csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
         raise

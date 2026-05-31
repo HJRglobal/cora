@@ -31,6 +31,7 @@ Write doctrine (mirrors gmail_create_draft / asana_create_task):
 
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -272,6 +273,14 @@ def create_event(
         "summary": summary.strip(),
         "start": {"dateTime": start_rfc, "timeZone": time_zone},
         "end": {"dateTime": end_rfc, "timeZone": time_zone},
+        # Always attach a Google Meet link — unique requestId prevents duplicate
+        # conference objects if the event is updated later.
+        "conferenceData": {
+            "createRequest": {
+                "requestId": str(uuid.uuid4()),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
     }
     if description:
         body["description"] = description
@@ -296,7 +305,13 @@ def create_event(
         service = _build_service(user_email)
         event = (
             service.events()
-            .insert(calendarId="primary", body=body, sendUpdates="all")
+            .insert(
+                calendarId="primary",
+                body=body,
+                sendUpdates="all",
+                # Required for conferenceData to be processed by the API
+                conferenceDataVersion=1,
+            )
             .execute()
         )
     except HttpError as exc:
@@ -322,6 +337,15 @@ def create_event(
     return event
 
 
+def _extract_meet_link(event: dict[str, Any]) -> str:
+    """Pull the Google Meet join URL from the conferenceData response, or return ''."""
+    conf = event.get("conferenceData") or {}
+    for ep in conf.get("entryPoints") or []:
+        if ep.get("entryPointType") == "video":
+            return ep.get("uri", "")
+    return ""
+
+
 def format_created_event_for_llm(
     event: dict[str, Any],
     *,
@@ -332,35 +356,48 @@ def format_created_event_for_llm(
     html_link = event.get("htmlLink") or ""
     summary = event.get("summary") or "(no title)"
     start_raw = (event.get("start") or {}).get("dateTime") or ""
+    end_raw = (event.get("end") or {}).get("dateTime") or ""
     attendees_raw = event.get("attendees") or []
+    meet_link = _extract_meet_link(event)
 
-    # Format start for display
+    # Format start + end for display
+    phoenix_tz = timezone(timedelta(hours=-7))
     start_display = start_raw
+    end_display = ""
     if start_raw:
         try:
             dt = datetime.fromisoformat(start_raw)
-            phoenix_tz = timezone(timedelta(hours=-7))
-            start_display = dt.astimezone(phoenix_tz).strftime("%a %Y-%m-%d %H:%M AZ")
+            start_display = dt.astimezone(phoenix_tz).strftime("%a %Y-%m-%d %I:%M %p AZ").replace(" 0", " ")
         except Exception:
             pass
+    if end_raw:
+        try:
+            dt = datetime.fromisoformat(end_raw)
+            end_display = dt.astimezone(phoenix_tz).strftime("%I:%M %p AZ").replace(" 0", " ").lstrip("0").strip()
+        except Exception:
+            pass
+
+    time_str = f"{start_display}" + (f" – {end_display}" if end_display else "")
 
     attendee_list = [a.get("email", "") for a in attendees_raw if a.get("email")]
     attendees_str = (
         f"\n- Attendees: {', '.join(attendee_list)}" if attendee_list else ""
     )
 
-    link_str = f"<{html_link}|Open in Google Calendar>" if html_link else "(no link)"
+    cal_link_str = f"<{html_link}|Open in Google Calendar>" if html_link else "(no calendar link)"
+    meet_str = f"\n- Google Meet: <{meet_link}|Join meeting>" if meet_link else ""
 
     return (
         f"Calendar event CREATED in {user_email}'s primary calendar. Surface this to the user:\n"
         f"- Title: {summary}\n"
-        f"- Start: {start_display}{attendees_str}\n"
+        f"- Time: {time_str}{attendees_str}\n"
         f"- Event ID: {event_id}\n"
-        f"- {link_str}\n"
+        f"- {cal_link_str}{meet_str}\n"
         f"\n"
-        f"Tell the user the event is live on their calendar. Format the Open link as a "
-        f"Slack hyperlink (preserve the <url|name> syntax). If attendees were invited, "
-        f"mention that Google sent them invitations."
+        f"Tell the user the event is booked. Format the calendar link and Meet link as "
+        f"Slack hyperlinks (preserve the <url|name> syntax verbatim). "
+        f"{'Mention that Google sent calendar invitations to all attendees. ' if attendee_list else ''}"
+        f"{'Always show the Google Meet link prominently — everyone needs it to join.' if meet_link else ''}"
     )
 
 
@@ -609,13 +646,44 @@ def find_next_available_slot(
     return None
 
 
+def find_next_available_slots(
+    busy_by_email: dict[str, list[tuple[datetime, datetime]]],
+    n: int = 3,
+    duration_minutes: int = 30,
+    search_from: "datetime | None" = None,
+    search_days: int = 14,
+) -> "list[tuple[datetime, datetime]]":
+    """Return up to n available slots for all participants.
+
+    Each slot starts after the previous one ends — no overlapping proposals.
+    Searches up to search_days out to find n options.
+    """
+    slots: list[tuple[datetime, datetime]] = []
+    cursor = search_from or datetime.now(timezone.utc)
+
+    for _ in range(n):
+        slot = find_next_available_slot(
+            busy_by_email,
+            duration_minutes=duration_minutes,
+            search_from=cursor,
+            search_days=search_days,
+        )
+        if slot is None:
+            break
+        slots.append(slot)
+        # Next search starts 1 minute after this slot ends (avoid exact-boundary)
+        cursor = slot[1] + timedelta(minutes=1)
+
+    return slots
+
+
 def find_meeting_slot(
     requester_email: str,
     calendar_emails: list[str],
     duration_minutes: int = 30,
     search_days: int = 7,
 ) -> "tuple[datetime, datetime] | None":
-    """High-level convenience: freebusy query + slot scan in one call.
+    """High-level convenience: freebusy query + slot scan → single slot.
 
     Returns (slot_start_utc, slot_end_utc) or None.
     Raises CalendarClientError on API failure.
@@ -631,42 +699,65 @@ def find_meeting_slot(
     )
 
 
+def find_meeting_slots(
+    requester_email: str,
+    calendar_emails: list[str],
+    duration_minutes: int = 30,
+    n: int = 3,
+    search_days: int = 14,
+) -> "list[tuple[datetime, datetime]]":
+    """High-level convenience: freebusy query + slot scan → up to n options.
+
+    Fetches freebusy once over search_days, then finds n non-overlapping slots.
+    Raises CalendarClientError on API failure.
+    """
+    now      = datetime.now(timezone.utc)
+    time_max = now + timedelta(days=search_days)
+    busy     = get_free_busy(requester_email, calendar_emails, now, time_max)
+    return find_next_available_slots(
+        busy,
+        n=n,
+        duration_minutes=duration_minutes,
+        search_from=now,
+        search_days=search_days,
+    )
+
+
+def _fmt_slot(slot_start: datetime, slot_end: datetime) -> tuple[str, str, str, str]:
+    """Return (day_str, time_str, dur_str, start_iso, end_iso) for a slot in Phoenix TZ."""
+    start_az = slot_start.astimezone(_PHOENIX_TZ)
+    end_az   = slot_end.astimezone(_PHOENIX_TZ)
+    day_str  = start_az.strftime("%A, %B") + f" {start_az.day}"
+    s_str    = start_az.strftime("%I:%M %p").lstrip("0")
+    e_str    = end_az.strftime("%I:%M %p").lstrip("0")
+    dur_min  = int((slot_end - slot_start).total_seconds() / 60)
+    dur_str  = f"{dur_min} min"
+    start_iso = start_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+    end_iso   = end_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
+    return day_str, f"{s_str} – {e_str} AZ", dur_str, start_iso, end_iso
+
+
 def format_slot_proposal_for_llm(
     slot_start: datetime,
     slot_end: datetime,
     participant_names: list[str],
     title: str = "Meeting",
 ) -> str:
-    """Render the proposed slot as a Slack-friendly preview block.
-
-    Returns a string Claude should present to the user verbatim.
-    Embeds proposed_start / proposed_end as ISO strings so Claude can pass
-    them straight back in the Phase 2 confirmed=true call without re-parsing.
-    """
-    start_az = slot_start.astimezone(_PHOENIX_TZ)
-    end_az   = slot_end.astimezone(_PHOENIX_TZ)
-
-    # Windows-safe strftime (no %-d padding trick)
-    day_str   = start_az.strftime("%A, %B") + f" {start_az.day}, {start_az.year}"
-    start_str = start_az.strftime("%I:%M %p").lstrip("0") + " AZ"
-    end_str   = end_az.strftime("%I:%M %p").lstrip("0") + " AZ"
-    dur_min   = int((slot_end - slot_start).total_seconds() / 60)
+    """Render a single proposed slot as a Slack-friendly preview block (backward-compat)."""
+    day_str, time_str, dur_str, start_iso, end_iso = _fmt_slot(slot_start, slot_end)
 
     if len(participant_names) <= 2:
         names_str = " & ".join(participant_names)
     else:
         names_str = ", ".join(participant_names[:-1]) + f" & {participant_names[-1]}"
 
-    # Explicit -07:00 offset (Phoenix, no DST) for Phase 2 passback
-    start_iso = start_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
-    end_iso   = end_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
-
     return (
-        "SLOT FOUND -- present this as a clear preview block to the user:\n"
+        "SLOT FOUND — present this as a clear preview block to the user:\n"
         f"- *Title:* {title}\n"
         f"- *Day:* {day_str}\n"
-        f"- *Time:* {start_str} - {end_str} ({dur_min} min)\n"
+        f"- *Time:* {time_str} ({dur_str})\n"
         f"- *Participants:* {names_str}\n"
+        f"- *Google Meet link:* included automatically on booking\n"
         "\n"
         "Tell the user this is the next available opening that works for everyone, "
         "and ask for their explicit confirmation before booking.\n"
@@ -676,4 +767,57 @@ def format_slot_proposal_for_llm(
         f'  proposed_start: "{start_iso}"\n'
         f'  proposed_end: "{end_iso}"\n'
         "  (keep title and participants the same as this call)"
+    )
+
+
+def format_slot_proposals_for_llm(
+    slots: "list[tuple[datetime, datetime]]",
+    participant_names: list[str],
+    title: str = "Meeting",
+) -> str:
+    """Render up to 3 proposed slots as numbered options for the user to choose from.
+
+    Returns a string Claude should present verbatim. Embeds the ISO passback strings
+    so Claude can pass the user's chosen slot to Phase 2 without re-parsing.
+    """
+    if not slots:
+        return (
+            "NO_SLOT_FOUND — no common opening found in the next 14 working days. "
+            "Tell the user no time slot was available for all participants and suggest "
+            "they coordinate directly or try a shorter meeting duration."
+        )
+
+    if len(participant_names) <= 2:
+        names_str = " & ".join(participant_names)
+    else:
+        names_str = ", ".join(participant_names[:-1]) + f" & {participant_names[-1]}"
+
+    labels = ["1️⃣", "2️⃣", "3️⃣"]
+    option_lines: list[str] = []
+    passback_lines: list[str] = []
+
+    for i, (slot_start, slot_end) in enumerate(slots[:3]):
+        day_str, time_str, dur_str, start_iso, end_iso = _fmt_slot(slot_start, slot_end)
+        label = labels[i] if i < len(labels) else f"{i+1}."
+        option_lines.append(f"{label}  *{day_str}* — {time_str} ({dur_str})")
+        passback_lines.append(
+            f"  Option {i+1}: proposed_start=\"{start_iso}\" proposed_end=\"{end_iso}\""
+        )
+
+    options_block = "\n".join(option_lines)
+    passback_block = "\n".join(passback_lines)
+
+    return (
+        "SLOTS FOUND — present these as numbered options to the user:\n"
+        "\n"
+        f"*Scheduling options for {names_str} ({title}):*\n"
+        f"{options_block}\n"
+        "\n"
+        "A Google Meet link will be included automatically when the meeting is booked.\n"
+        "\n"
+        "Ask the user to reply with 1, 2, or 3 (or their preferred option). "
+        "Once they choose, call calendar_schedule_meeting again with confirmed=true "
+        "and the matching proposed_start / proposed_end:\n"
+        f"{passback_block}\n"
+        "(Keep title and participants unchanged from this call.)"
     )

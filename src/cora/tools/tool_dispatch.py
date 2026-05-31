@@ -12,6 +12,7 @@ Cross-entity scope rules: when the asking channel maps to a specific entity
 that entity. FNDR channels (founder-level + catch-all) see everything.
 """
 
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -19,7 +20,7 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
-from ..connectors import clover_client, photoroom_client, qbo_oauth, shopify_client
+from ..connectors import clover_client, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
 log = logging.getLogger(__name__)
@@ -34,9 +35,11 @@ _HIERARCHY_PATH = _REPO_ROOT / "data" / "maps" / "supervisor-hierarchy.yaml"
 # HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
 HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
     "F3E": hubspot_client.PIPELINE_F3E_RETAIL,
-    "UFL": hubspot_client.PIPELINE_UFL_SPONSORSHIPS,
-    # OSN / LEX / BDM / HJRG don't currently have HubSpot pipelines; return all-pipeline
-    # results in those channels (or empty if no deals match).
+    "UFL": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    # OSN and BDM share the UFL/OSN/BDM combined pipeline on Starter tier.
+    "OSN": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    "BDM": hubspot_client.PIPELINE_UFL_OSN_BDM,
+    # LEX / HJRG don't have HubSpot pipelines; return all-pipeline results.
 }
 
 
@@ -648,6 +651,85 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
         subject=subject,
         cc=cc_list,
     )
+
+
+def _tool_gmail_inbox(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return the asking user's recent Gmail inbox messages (unread + starred by default).
+
+    Resolves Slack user → asana_email (Google identity) → DWD Gmail access.
+    Returns up to 10 messages with sender, subject, date, and snippet.
+    Read-only — no confirmation gate needed.
+    """
+    mapping = _load_slack_asana_map()
+    user = mapping.get(slack_user_id)
+    if not user:
+        return (
+            f"Gmail lookup failed: Slack user {slack_user_id} is not mapped to a Google "
+            f"identity yet. Harrison can add a row to data/maps/slack-to-asana.yaml "
+            f"(the asana_email field doubles as the Google identity)."
+        )
+
+    user_email = (user.get("asana_email") or "").strip()
+    if not user_email:
+        return (
+            f"Gmail lookup failed: user {user.get('display_name', slack_user_id)} has "
+            f"no asana_email (Google identity) in the mapping."
+        )
+
+    inp = _input or {}
+    query = (inp.get("query") or "is:unread OR is:starred").strip()
+    max_results = max(1, min(int(inp.get("max_results") or 10), 20))
+
+    try:
+        messages = gmail_reader.get_inbox_summary(
+            user_email, query=query, max_results=max_results
+        )
+    except gmail_reader.GmailReaderError as exc:
+        log.warning(
+            "gmail_inbox tool error user=%s email=%s: %s", slack_user_id, user_email, exc
+        )
+        return (
+            f"Gmail error: {exc}. Tell the user there's a temporary issue reading their inbox. "
+            f"If the error mentions DWD or 403, Harrison may need to verify the Google Workspace "
+            f"Domain-wide Delegation settings."
+        )
+
+    log.info(
+        "gmail_inbox user=%s email=%s query=%r messages=%d",
+        slack_user_id, user_email, query, len(messages),
+    )
+
+    if not messages:
+        return f"No messages found matching '{query}' in your inbox right now."
+
+    import datetime
+    lines = [f"*Inbox for {user.get('display_name', user_email)}* — {len(messages)} message(s):"]
+    lines.append("")
+    for msg in messages:
+        date_str = ""
+        if msg.get("date_ts"):
+            dt = datetime.datetime.fromtimestamp(msg["date_ts"])
+            date_str = dt.strftime("%-m/%-d %-I:%M %p")
+        sender = msg.get("from", "Unknown")
+        # Strip angle-bracket email from "Name <email>" for cleaner display
+        import re as _re
+        name_only = _re.sub(r"\s*<[^>]+>", "", sender).strip() or sender
+        subject = msg.get("subject") or "(no subject)"
+        snippet = (msg.get("snippet") or "").strip()
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "…"
+        labels = msg.get("labels") or []
+        flags = ""
+        if "UNREAD" in labels:
+            flags += " 🔵"
+        if "STARRED" in labels:
+            flags += " ⭐"
+        line = f"• *{subject}*{flags}\n  From: {name_only}  ·  {date_str}"
+        if snippet:
+            line += f"\n  _{snippet}_"
+        lines.append(line)
+
+    return "\n".join(lines)
 
 
 def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -1754,21 +1836,33 @@ def _tool_fndr_completion_candidates(slack_user_id: str, entity: str, _input: di
     if entity and entity != "FNDR":
         entity_list = [entity, "FNDR"]
 
-    # 3. Run detection — use shorter interactive lookback (4h vs 25h sweep) so
+    # 3. Collect live email signals for the requesting user (fails silently)
+    email_signals: list = []
+    if user_entry:
+        user_email = (user_entry.get("asana_email") or "").strip()
+        if user_email:
+            email_signals = completion_detector.collect_email_signals(
+                user_email,
+                lookback_seconds=completion_detector.INTERACTIVE_LOOKBACK_SECONDS,
+                entity=entity or "FNDR",
+            )
+
+    # 4. Run detection — use shorter interactive lookback (4h vs 25h sweep) so
     # the fuzzy-match loop finishes in <5s even on a large KB.
     candidates = completion_detector.detect_candidates(
         open_tasks,
         lookback_seconds=completion_detector.INTERACTIVE_LOOKBACK_SECONDS,
         entities=entity_list,
         apply_dedup=True,
+        extra_signals=email_signals or None,
     )
 
-    # 4. Record dedup timestamps so the same candidates don't resurface immediately
+    # 5. Record dedup timestamps so the same candidates don't resurface immediately
     completion_detector.mark_candidates_sent(candidates)
 
     log.info(
-        "fndr_completion_candidates user=%s entity=%s tasks=%d candidates=%d",
-        slack_user_id, entity, len(open_tasks), len(candidates),
+        "fndr_completion_candidates user=%s entity=%s tasks=%d email_signals=%d candidates=%d",
+        slack_user_id, entity, len(open_tasks), len(email_signals), len(candidates),
     )
     return completion_detector.format_sweep_digest(candidates)
 
@@ -2096,12 +2190,14 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
         )
         return calendar_client.format_created_event_for_llm(event, user_email=requester_email)
 
-    # -- Phase 1: Find the next available slot --------------------------------
+    # -- Phase 1: Find up to 3 available slots --------------------------------
     try:
-        slot = calendar_client.find_meeting_slot(
+        slots = calendar_client.find_meeting_slots(
             requester_email=requester_email,
             calendar_emails=emails,
             duration_minutes=duration_minutes,
+            n=3,
+            search_days=14,
         )
     except calendar_client.CalendarClientError as exc:
         log.warning(
@@ -2115,26 +2211,11 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
             f"Delegation for the Cora service account (admin.google.com)."
         )
 
-    if slot is None:
-        log.info(
-            "calendar_schedule_meeting NO SLOT requester=%s participants=%s dur=%dmin",
-            slack_user_id, emails, duration_minutes,
-        )
-        return (
-            f"No common opening found in the next 7 working days for: "
-            f"{', '.join(names)}. "
-            f"Tell the user no slot was available and ask if they would like to look "
-            f"further out (2 weeks) or pick a specific time manually."
-        )
-
-    slot_start, slot_end = slot
     log.info(
-        "calendar_schedule_meeting SLOT FOUND requester=%s participants=%s start=%s dur=%dmin",
-        slack_user_id, emails, slot_start.isoformat(), duration_minutes,
+        "calendar_schedule_meeting SLOTS FOUND requester=%s participants=%s slots=%d dur=%dmin",
+        slack_user_id, emails, len(slots), duration_minutes,
     )
-    return calendar_client.format_slot_proposal_for_llm(
-        slot_start, slot_end, names, title=title
-    )
+    return calendar_client.format_slot_proposals_for_llm(slots, names, title=title)
 
 
 def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2482,6 +2563,40 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "gmail_inbox",
+        "description": (
+            "Fetch the asking user's recent Gmail inbox messages — unread and starred by default. "
+            "Use this when the user asks about their email, inbox, unread messages, or recent mail "
+            "— phrases like 'check my email', 'what's in my inbox', 'any unread emails', "
+            "'what emails do I have', 'show me my recent emails', 'any important emails'. "
+            "Returns up to 10 messages with sender name, subject, date, and a short snippet. "
+            "Uses the user's asana_email as their Google identity (same as Calendar). "
+            "Read-only — no confirmation needed. Do not call for another person's inbox, "
+            "only the asking user's. The optional `query` parameter accepts any Gmail search "
+            "string (e.g. 'from:harrison', 'subject:invoice', 'is:unread label:important'). "
+            "Default query: 'is:unread OR is:starred'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Gmail search string to filter messages. "
+                        "Default: 'is:unread OR is:starred'. "
+                        "Examples: 'is:unread', 'from:harrison@hjrglobal.com', "
+                        "'subject:invoice after:2026/05/01', 'is:unread label:important'."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max messages to return (1-20). Defaults to 10.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "calendar_get_my_events",
         "description": (
             "Fetch calendar events from the user's Google Calendar primary calendar. "
@@ -2584,21 +2699,25 @@ TOOL_DEFINITIONS = [
     {
         "name": "calendar_schedule_meeting",
         "description": (
-            "Find the next available time when ALL participants are free, propose it "
-            "for confirmation, then book the meeting in Google Calendar. "
+            "Find up to 3 available times when ALL participants are free, present them "
+            "as numbered options for the user to choose from, then book the chosen slot "
+            "in Google Calendar. A Google Meet link is ALWAYS included automatically. "
             "Use this when anyone says things like 'schedule a meeting for Larry and me', "
             "'find a time for Harrison and Hannah', 'when can Tommy and I meet', "
-            "'set up a call with Alex at the next opening', or similar. "
-            "TWO-PHASE FLOW: "
-            "Phase 1 (confirmed=false) -- call with participant names; the tool queries "
-            "everyone's Google Calendar freebusy and returns the next open slot as a "
-            "preview block. You MUST show the user this preview and ask for confirmation. "
-            "Phase 2 (confirmed=true) -- once the user says yes, call again with "
-            "confirmed=true plus the exact proposed_start and proposed_end strings from "
-            "Phase 1. The tool then creates the Google Calendar event and sends invites. "
-            "The requester is always auto-included -- pass only OTHER participants. "
+            "'set up a call with Alex', 'find a time that works for all of us', or similar. "
+            "\n"
+            "TWO-PHASE FLOW:\n"
+            "Phase 1 (confirmed=false) — call with participant names; the tool queries "
+            "everyone's Google Calendar freebusy over the next 14 days and returns up to "
+            "3 numbered options (1/2/3). Present these options clearly and ask the user "
+            "to reply with their choice. Do NOT book yet.\n"
+            "Phase 2 (confirmed=true) — once the user picks an option, call again with "
+            "confirmed=true plus the exact proposed_start and proposed_end ISO strings "
+            "from the chosen option. The tool creates the event, attaches a Google Meet "
+            "link, and sends calendar invitations to all participants. "
+            "The requester is always auto-included — pass only OTHER participants. "
             "Working hours: Mon-Fri 9 AM to 5 PM America/Phoenix. "
-            "Default duration: 30 minutes. Search window: next 7 days."
+            "Default duration: 30 minutes. Search window: next 14 days."
         ),
         "input_schema": {
             "type": "object",
@@ -3864,6 +3983,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_user_tasks": _tool_get_user_tasks,
     "asana_create_task": _tool_asana_create_task,
     "gmail_create_draft": _tool_gmail_create_draft,
+    "gmail_inbox": _tool_gmail_inbox,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
     "calendar_schedule_meeting": _tool_calendar_schedule_meeting,
@@ -3934,7 +4054,13 @@ def dispatch(
     injected = dict(tool_input or {})
     injected["_channel_name"] = channel_name
     try:
-        return fn(slack_user_id, entity, injected)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, slack_user_id, entity, injected)
+            try:
+                return future.result(timeout=25)
+            except concurrent.futures.TimeoutError:
+                log.warning("Tool %s timed out after 25s for user=%s entity=%s", tool_name, slack_user_id, entity)
+                return "Tool timed out — please try again."
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
         return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."

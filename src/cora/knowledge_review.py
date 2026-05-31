@@ -290,13 +290,41 @@ def correlate_reactions_to_updates() -> list[tuple[dict[str, Any], dict[str, Any
 
 # ── DM formatting ─────────────────────────────────────────────────────────────
 
+_TYPE_LABEL: dict[str, str] = {
+    UPDATE_TYPE_ASANA_TASK:   "Asana task",
+    UPDATE_TYPE_HUBSPOT_NOTE: "HubSpot note",
+    UPDATE_TYPE_DECISION:     "Decision capture",
+    UPDATE_TYPE_TASK_CLOSE:   "Close task",
+    UPDATE_TYPE_GENERIC:      "Action",
+}
+
+
+def format_single_item_dm(update: dict[str, Any]) -> str:
+    """Format one pending update as a standalone Slack DM message.
+
+    Each message gets its own 👍/👎 reaction so Harrison approves or dismisses
+    items individually rather than the whole batch at once.
+    """
+    conf = update.get("confidence", "?")
+    utype = update.get("update_type", "generic")
+    desc = update.get("description", "(no description)")
+    evidence = update.get("source_evidence", "")
+    conf_emoji = {"HIGH": "🔴", "MED": "🟡", "LOW": "⚪"}.get(conf, "⚪")
+    type_label = _TYPE_LABEL.get(utype, utype)
+
+    lines = [f"*[{type_label}]* {conf_emoji} `{conf}`\n{desc}"]
+    if evidence:
+        snippet = evidence[:300].replace("\n", " ")
+        lines.append(f"_Source: {snippet}_")
+    lines.append("\n👍 Approve · 👎 Dismiss")
+    return "\n".join(lines)
+
 
 def format_pending_dm(updates: list[dict[str, Any]]) -> str:
-    """Format a batch of pending updates into a Slack DM for Harrison.
+    """Format a batch of pending updates into a single Slack DM (legacy/fallback).
 
-    Each update gets a numbered line with description + confidence.
-    Harrison reacts 👍 to the individual DM message to approve all items in it,
-    or reacts 👎 to dismiss all. For mixed decisions, he can reply in thread.
+    Prefer send_individual_dms() which sends one message per item so each
+    can be approved or dismissed independently.
     """
     if not updates:
         return ""
@@ -308,13 +336,7 @@ def format_pending_dm(updates: list[dict[str, Any]]) -> str:
         desc = u.get("description", "(no description)")
         evidence = u.get("source_evidence", "")
         conf_emoji = {"HIGH": "🔴", "MED": "🟡", "LOW": "⚪"}.get(conf, "⚪")
-        type_label = {
-            UPDATE_TYPE_ASANA_TASK:   "Asana task",
-            UPDATE_TYPE_HUBSPOT_NOTE: "HubSpot note",
-            UPDATE_TYPE_DECISION:     "Decision capture",
-            UPDATE_TYPE_TASK_CLOSE:   "Close task",
-            UPDATE_TYPE_GENERIC:      "Action",
-        }.get(utype, utype)
+        type_label = _TYPE_LABEL.get(utype, utype)
 
         lines.append(f"*{i}. [{type_label}]* {conf_emoji} `{conf}` — {desc}")
         if evidence:
@@ -369,3 +391,51 @@ def send_dm_to_harrison(
     except Exception as exc:
         log.error("knowledge_review: DM send failed: %s", exc)
         return None
+
+
+def send_individual_dms(
+    updates: list[dict[str, Any]],
+    slack_bot_token: str,
+    _client_factory=None,
+) -> dict[str, str]:
+    """Send one DM per pending update. Returns {update_id: message_ts}.
+
+    Skips updates that already have dm_message_ts set (already delivered).
+    Adds a 0.5s delay between messages to stay within Slack rate limits.
+    """
+    import time as _time
+
+    unsent = [u for u in updates if not u.get("dm_message_ts")]
+    if not unsent:
+        return {}
+
+    if not slack_bot_token:
+        log.error("knowledge_review: SLACK_BOT_TOKEN not set")
+        return {}
+
+    try:
+        client = _client_factory() if _client_factory else _build_slack_client(slack_bot_token)
+        open_resp = client.conversations_open(users=[HARRISON_SLACK_USER_ID])
+        dm_channel = open_resp["channel"]["id"]
+    except Exception as exc:
+        log.error("knowledge_review: could not open DM channel: %s", exc)
+        return {}
+
+    results: dict[str, str] = {}
+    for update in unsent:
+        text = format_single_item_dm(update)
+        try:
+            resp = client.chat_postMessage(
+                channel=dm_channel,
+                text=text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            ts = resp.get("ts", "")
+            results[update["update_id"]] = ts
+            log.info("knowledge_review: DM sent for %s ts=%s", update["update_id"][:8], ts)
+        except Exception as exc:
+            log.warning("knowledge_review: DM failed for %s: %s", update["update_id"][:8], exc)
+        _time.sleep(0.5)
+
+    return results

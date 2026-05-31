@@ -5,12 +5,16 @@ import logging.handlers
 import os
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .app import app
 from .config import config
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_HEARTBEAT_FILE = _REPO_ROOT / "data" / "health" / "heartbeat.txt"
 
 # Seconds to wait before each successive restart attempt (capped at last value).
 _BACKOFF = (1, 2, 5, 10, 30)
@@ -46,7 +50,15 @@ def _setup_logging() -> None:
 def _heartbeat(stop: threading.Event, log: logging.Logger) -> None:
     start = time.monotonic()
     while not stop.wait(60):
-        log.info("heartbeat alive uptime_s=%d", int(time.monotonic() - start))
+        uptime = int(time.monotonic() - start)
+        log.info("heartbeat alive uptime_s=%d", uptime)
+        try:
+            _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _HEARTBEAT_FILE.write_text(
+                datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8"
+            )
+        except Exception as exc:
+            log.warning("heartbeat: failed to write sentinel file: %s", exc)
 
 
 def main() -> None:

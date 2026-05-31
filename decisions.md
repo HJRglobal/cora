@@ -119,3 +119,144 @@ bot confirmed its membership in `#f3e-sales` during first-run testing on
 **Rationale:** Monday morning delivery gives Tommy a fresh prospect queue at
 the start of each work week before the day's outreach begins. The 8 AM time
 was set during live testing and confirmed working (last result: 0, clean exit).
+
+---
+
+## D-008 · HubSpot migration: old portal 243870963 retired, new portal 246351746 (2026-05-30)
+
+**Context:** Old HubSpot portal (243870963, free tier) hit limits and had
+incorrect pipeline structure. Migrated to new Sales Hub Starter portal.
+
+**Decision:** New canonical HubSpot portal ID is **246351746**. All code,
+config, and URLs reference this ID. Old portal is being cancelled.
+
+**Pipeline structure in new portal:**
+- `PIPELINE_F3E_RETAIL` = `"2313722582"` — F3E retail deals
+- `PIPELINE_UFL_OSN_BDM` = `"default"` — combined UFL / OSN / BDM pipeline
+  (replaces the old separate "UFL Sponsorships" pipeline)
+
+**Custom deal properties created in new portal:**
+- `f3e_channel`, `f3e_geography`, `f3e_chain_type`, `f3e_distributor`
+
+**Migration outcome:** 27 deals + 9 notes imported. Old portal data archived
+in `data/hubspot-migration/`.
+
+---
+
+## D-009 · HubSpot combined UFL/OSN/BDM pipeline (2026-05-30)
+
+**Context:** Old portal had a separate "UFL Sponsorships" pipeline. New portal
+uses a single combined pipeline for UFL, OSN, and BDM deals.
+
+**Decision:** All three entity types route to `PIPELINE_UFL_OSN_BDM = "default"`.
+The `entity` custom property on each deal distinguishes UFL vs OSN vs BDM
+within the pipeline.
+
+**Alternatives considered:** Three separate pipelines — rejected because
+HubSpot Starter limits total pipeline count and the deal volumes don't justify
+the overhead.
+
+---
+
+## D-010 · Knowledge-review: one DM per proposed update, not a batch (2026-05-31)
+
+**Context:** Original implementation sent all PENDING updates as a single
+batched Slack DM. One 👍 on that message approved everything at once.
+
+**Decision:** Each proposed update gets its own DM with its own 👍/👎.
+Harrison approves or dismisses items individually. The `dm_message_ts` on each
+entry correlates its reaction back to the specific update.
+
+**Implementation:** `send_individual_dms()` in `knowledge_review.py`; 0.5s
+delay between messages to stay within Slack rate limits.
+
+---
+
+## D-011 · Harrison-sole-authority doctrine for all memory writes (LOCKED 2026-05-21)
+
+**Decision:** Cora **never** auto-writes to `decisions.md`, Asana, or HubSpot
+without an explicit Harrison 👍 reaction on a knowledge-review DM.
+
+**Locked:** This doctrine is non-negotiable and must not be relaxed without an
+explicit new decision entry superseding this one.
+
+**Enforcement points in code:**
+- `_process_contribution_reaction` in `app.py`: checks `reactor_id == _FOUNDER_ID`
+- `correlate_reactions_to_updates` in `knowledge_review.py`: only processes
+  reactions where `reactor_id == HARRISON_SLACK_USER_ID`
+- `run_knowledge_review.py`: prints `APPROVED:` lines to stdout for downstream
+  executors; nothing executes without that signal
+
+---
+
+## D-012 · PHI guard centralized to phi_guard.py (2026-05-31)
+
+**Context:** `drive_sweep.py` and `reconciliation_engine.py` both defined their
+own `_PHI_PATTERNS` / `_PHI_RE` regex with overlapping but non-identical patterns.
+
+**Decision:** Single source of truth at `src/cora/phi_guard.py`. Both modules
+import `_PHI_PATTERNS` from there. The union of all patterns (drive_sweep +
+reconciliation_engine + additions: patient, medicaid, ahcccs, npi, ssn) is the
+canonical set.
+
+---
+
+## D-013 · DOCUMENT_QUERY intent to prevent invoice/file queries from hitting financial tool (2026-05-31)
+
+**Context:** "Find the shipping invoice" was being classified as FINANCIAL and
+routed to the financial tool instead of KB search, returning wrong results.
+
+**Decision:** New `Intent.DOCUMENT_QUERY` in `intent_classifier.py` with k=15
+and 15-minute TTL. Checked before SIMPLE in the classification chain.
+COMPLEX k bumped from default-8 to 12.
+
+---
+
+## D-014 · Tool dispatch 25s hard timeout (2026-05-31)
+
+**Decision:** Every tool call in `tool_dispatch.dispatch()` is wrapped in a
+`ThreadPoolExecutor` with `future.result(timeout=25)`. Timed-out tools return
+`"Tool timed out — please try again."` instead of hanging indefinitely.
+
+**Rationale:** Slack's 3-second ack deadline means Cora's main loop must
+remain responsive. Long-running tool calls (slow HubSpot API, Drive timeouts)
+were silently blocking the event loop.
+
+---
+
+## D-015 · Rate limiter persisted to SQLite across restarts (2026-05-31)
+
+**Context:** Original rate limiter used in-memory deques with `time.monotonic()`.
+All rate limit windows reset on every process restart, allowing bypass.
+
+**Decision:** `rate_limiter.py` persists hits to `data/rate_limiter.db`
+(SQLite) using wall-clock `time.time()`. In-memory deque is the fast path;
+SQLite is written on every allowed request. Falls back to in-memory-only if
+the DB file cannot be opened.
+
+---
+
+## D-016 · PS1 files must use ASCII-only characters (2026-05-31)
+
+**Context:** `setup-channel-sweep-task.ps1` originally used em dashes (U+2014)
+in `Write-Host` strings. PowerShell 5.1 reads `.ps1` files as Windows-1252 by
+default; U+2014 (UTF-8: E2 80 94) is misread as byte 0x94, which is a closing
+double-quote in Windows-1252, causing string parse errors.
+
+**Decision:** All `.ps1` files in this repo use ASCII-only characters. No em
+dashes, curly quotes, box-drawing characters, or any codepoint > 127.
+
+---
+
+## D-017 · Org-wide channel sweep: Cora joins all public channels (2026-05-31)
+
+**Decision:** Cora is a member of all 51+ public Slack channels (bootstrapped
+via `scripts/bootstrap_channel_membership.py`). A nightly sweep
+(`scripts/run_channel_sweep.py`, 01:30 AZ via `cowork-cora-channel-sweep` task)
+scans recent messages for commitments, decisions, and cross-entity mentions.
+New public channels are auto-joined via the `channel_created` Slack event.
+
+**Excluded from sweep:** #general, #random, #announcements, #cora-build.
+
+**Output:** `data/channel-sweep/sweep-YYYY-MM-DD.json` — per-user synthesis
+written by Haiku; feeds Pass 6 of reconciliation.

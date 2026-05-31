@@ -2,30 +2,40 @@
 
 ## Scheduled Tasks Registry
 
-| Task Name | Schedule | Script | Channel | Setup Script |
-|---|---|---|---|---|
-| `cowork-cora-service` | On logon + RestartOnFailure | `cora.main` (bot process) | All Slack channels | `deployment/runbook.md` |
-| `cowork-cora-influencer-scan` | Every 2 hours | `scripts/run_influencer_scan.py` | `#f3-sales` | `deployment/setup-influencer-scan-task.ps1` |
-| `Cora - Email Attachment Filer` | Every 4 hours | `scripts/run_attachment_filer.py` | n/a (files to Drive) | `deployment/setup-attachment-filer-task.ps1` |
-| `Cora - LinkedIn Spy` | Every Monday at 8:00 AM | `scripts/run_linkedin_spy.py` | `#f3e-sales` | `deployment/setup-linkedin-spy-task.ps1` |
+| Task Name | Schedule | Script | Notes |
+|---|---|---|---|
+| `cowork-cora-service` | AtLogon + RestartOnFailure | `cora.main` (bot process) | Main Slack bot |
+| `cowork-cora-channel-sweep` | Daily 01:30 AZ (08:30 UTC) | `scripts/run_channel_sweep.py` | Nightly org-wide channel sweep |
+| `cowork-cora-knowledge-review` | Mon-Fri 07:00 AZ (14:00 UTC) | `scripts/run_knowledge_review.py` | Send Harrison pending knowledge-review DMs |
+| `cowork-cora-daily-briefing` | Daily (see PS1) | `scripts/run_daily_briefing.py` | Morning digest |
+| `cowork-cora-backup` | Daily 04:30 AZ | `scripts/backup_logs.py` | Backup KB + logs to Drive |
+| `cowork-cora-influencer-scan` | Every 2 hours | `scripts/run_influencer_scan.py` | Posts to #f3-sales |
+| `Cora - Email Attachment Filer` | Every 4 hours | `scripts/run_attachment_filer.py` | Files attachments to Drive |
+| `Cora - LinkedIn Spy` | Every Monday 08:00 | `scripts/run_linkedin_spy.py` | Posts to #f3e-sales |
 
 **LinkedIn Spy quick ops:**
 ```powershell
-# Run immediately (posts to #f3e-sales)
 Start-ScheduledTask -TaskName "Cora - LinkedIn Spy"
-
-# Check last run
 Get-ScheduledTaskInfo -TaskName "Cora - LinkedIn Spy" | Select LastRunTime, LastTaskResult
-
-# Expand prospect pool (edit then save — no restart needed)
 notepad data\maps\linkedin-spy-search-config.yaml
-
-# Remove task
 .\deployment\remove-linkedin-spy-task.ps1
 ```
 
-**Apollo trial expires June 10, 2026.** After that, scanner silently returns 0 results.
-Upgrade at https://app.apollo.io/#/settings/billing before June 7.
+> **Apollo trial expires June 10, 2026.** Scanner silently returns 0 results after expiry.
+> Upgrade at https://app.apollo.io/#/settings/billing before June 7.
+
+---
+
+## External Health Check
+
+Cora writes a UTC timestamp to `data/health/heartbeat.txt` every 60 seconds.
+If this file is older than 3 minutes, the process is stalled or dead.
+
+```powershell
+Get-Content "data\health\heartbeat.txt"
+(Get-Date).ToUniversalTime() - [datetime]::Parse((Get-Content "data\health\heartbeat.txt").Trim())
+```
+
 
 ---
 

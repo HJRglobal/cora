@@ -50,6 +50,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from cora.phi_guard import _PHI_PATTERNS as _PHI_RE
+
 log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -69,14 +71,6 @@ MIN_FUZZY_RATIO = 0.35
 
 # Max gaps surfaced per pass (caps noise)
 MAX_GAPS_PER_PASS = 10
-
-# PHI-risk patterns: if any of these appear in a LEX chunk, skip entirely.
-_PHI_RE = re.compile(
-    r"\b(service\s+note|care\s+plan|incident\s+report|prior\s+auth|iep\b|arc\b"
-    r"|support\s+plan|clinical\s+note|assessment|discharge|intake\s+form"
-    r"|medication|diagnosis|ddd\s+client|hcbs\s+client)\b",
-    re.IGNORECASE,
-)
 
 # Action/commitment language patterns for Pass 1.
 _ACTION_RE = re.compile(
@@ -887,7 +881,7 @@ def pass5_drive_insights(
         try:
             resp = anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=512,
+                max_tokens=800,
                 system=_DRIVE_SYNTHESIS_PROMPT,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -895,6 +889,11 @@ def pass5_drive_insights(
         except Exception as exc:
             log.error("pass5: Haiku call failed for entity %s: %s", entity, exc)
             continue
+
+        # Strip markdown fences that Haiku sometimes wraps around JSON
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0].strip()
 
         try:
             parsed = json.loads(raw)

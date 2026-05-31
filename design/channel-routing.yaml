@@ -11,6 +11,40 @@
 # causing @-mentions in the entity catch-all channel to fall through to FNDR scope.
 
 routes:
+  # ── cora-kq-* channels ──────────────────────────────────────────────────────
+  # Private "knowledge query" channels: one per entity, created 2026-05-30.
+  # Must appear BEFORE the entity-prefixed blocks (first match wins).
+  # Ordering within this block mirrors the entity blocks below so the
+  # sub-entity patterns land above their parent catch-alls.
+  - pattern: "cora-kq-fndr"
+    entity: FNDR
+  - pattern: "cora-kq-hjrg"
+    entity: FNDR
+  - pattern: "cora-kq-f3e"
+    entity: F3E
+  - pattern: "cora-kq-lex-llc"
+    entity: LEX-LLC
+  - pattern: "cora-kq-lex-lts"
+    entity: LEX-LTS
+  - pattern: "cora-kq-lex-lbhs"
+    entity: LEX-LBHS
+  - pattern: "cora-kq-lex-lla"
+    entity: LEX-LLA
+  - pattern: "cora-kq-lex"
+    entity: LEX
+  - pattern: "cora-kq-osngm"
+    entity: OSNGM
+  - pattern: "cora-kq-osnvv"
+    entity: OSNVV
+  - pattern: "cora-kq-osngf"
+    entity: OSNGF
+  - pattern: "cora-kq-osngw"
+    entity: OSNGW
+  - pattern: "cora-kq-osn"
+    entity: OSN
+  - pattern: "cora-kq-bdm"
+    entity: BDM
+
   # F3 Energy — covers bare #f3e, f3e-*, the f3-* exception (Pure launch etc.),
   # plus #polar-metrics (F3E ad spend dashboard, non-standard naming)
   - pattern: "f3e"

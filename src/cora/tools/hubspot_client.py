@@ -2,12 +2,12 @@
 
 Phase 2 #9 scope:
 - Endpoint: POST /crm/v3/objects/deals/search (owner-filtered, incomplete deals)
-- Two active pipelines on Starter: F3E Retail (2234421978), UFL Sponsorships (2242250445 — paused)
+- Four pipelines: F3E Retail, UFL Sponsorships, OSN, BDM (new account 246351746)
 - Token: HUBSPOT_PRIVATE_APP_TOKEN from .env (Bearer auth)
 - No write methods (read-only by design — user clicks deep link to edit in HubSpot)
 
 Deep-link pattern: https://app.hubspot.com/contacts/{PORTAL_ID}/deal/{deal_id}
-PORTAL_ID = 243870963 (HJR Global)
+PORTAL_ID = 246351746 (HJR Global — new account, migrated 2026-05-30)
 """
 
 import logging
@@ -19,13 +19,13 @@ import httpx
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.hubapi.com"
-_PORTAL_ID = "243870963"  # HJR Global account
+_PORTAL_ID = "246351746"  # HJR Global — new account (migrated 2026-05-30)
 _TIMEOUT = 12.0
 _DEFAULT_MAX_DEALS = 25
 
-# Pipeline GIDs from founder OS memory
-PIPELINE_F3E_RETAIL = "2234421978"
-PIPELINE_UFL_SPONSORSHIPS = "2242250445"  # paused per UFL pause; included for completeness
+# Pipeline IDs — new account (portal 246351746), created via HubSpot UI 2026-05-30
+PIPELINE_F3E_RETAIL   = "2313722582"
+PIPELINE_UFL_OSN_BDM  = "default"    # renamed from "Sales Pipeline"; covers UFL, OSN, BDM deals
 
 # Stage GID → human-readable name cache (refreshed on first call per process)
 _STAGE_NAME_CACHE: dict[str, str] = {}
@@ -154,27 +154,27 @@ def _deal_url(deal_id: str) -> str:
 
 # ── F3E Pipeline Summary ─────────────────────────────────────────────────────
 
-# Stage ordering for F3E Retail pipeline (ascending funnel progress).
-# Embedded from live HubSpot probe 2026-05-24 — overlay with _STAGE_NAME_CACHE on use.
+# Stage ordering for F3E Retail pipeline — new account stage IDs (probed 2026-05-30).
+# Identify/Outreach/Sample Sent IDs resolved at runtime via _refresh_pipeline_cache();
+# hot-stage IDs and terminal IDs are hardcoded for fast filtering.
 _F3E_STAGE_ORDER: list[tuple[str, str]] = [
-    ("3601439469", "Identify"),
-    ("3601439470", "Outreach"),
-    ("3672898248", "Sample Sent"),
-    ("3672898250", "Qualified"),
-    ("3672898249", "Proposal"),
-    ("3604397771", "Negotiation"),
-    ("3601439474", "Closed Won"),
-    ("3601439475", "Closed Lost"),
+    ("",           "Identify"),     # ID resolved from live cache
+    ("",           "Outreach"),     # ID resolved from live cache
+    ("",           "Sample Sent"),  # ID resolved from live cache
+    ("3760235204", "Qualified"),
+    ("3760204497", "Proposal"),
+    ("3760235205", "Negotiation"),
+    ("3760235206", "Closed Won"),
+    ("3760235207", "Closed Lost"),
 ]
 
-# Stages where a deal is "hot" (action-required / approaching close)
 _F3E_HOT_STAGE_IDS: frozenset[str] = frozenset(
-    {"3672898250", "3672898249", "3604397771"}  # Qualified, Proposal, Negotiation
+    {"3760235204", "3760204497", "3760235205"}  # Qualified, Proposal, Negotiation
 )
-_F3E_CLOSED_WON_ID = "3601439474"
-_F3E_CLOSED_LOST_ID = "3601439475"
+_F3E_CLOSED_WON_ID  = "3760235206"
+_F3E_CLOSED_LOST_ID = "3760235207"
 
-# Owner short names for F3E Retail team (HubSpot owner_id str → display name)
+# Owner short names for F3E Retail team (confirmed same IDs in new account)
 _F3E_OWNER_SHORT: dict[str, str] = {
     "162944825": "Tommy",
     "160459333": "Harrison",
@@ -501,6 +501,116 @@ def search_distributor_company(name: str) -> dict | None:
         enrichment["name"], enrichment["primary_contact_name"], len(enrichment["open_deals"]),
     )
     return enrichment
+
+
+# ── Email engagement write methods ──────────────────────────────────────────────
+
+def search_contact_by_email(email: str) -> dict | None:
+    """Search HubSpot for a contact with matching email. Returns first result or None."""
+    try:
+        token = _token()
+    except HubSpotClientError:
+        return None
+
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email.lower()}]}],
+        "properties": ["firstname", "lastname", "email", "company"],
+        "limit": 1,
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/crm/v3/objects/contacts/search", headers=hdrs, json=body)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", []) or []
+        return results[0] if results else None
+    except Exception as exc:
+        log.warning("HubSpot contact search failed for %r: %s", email, exc)
+        return None
+
+
+def get_contact_deal_ids(contact_id: str) -> list[str]:
+    """Return deal IDs associated with a contact via v3 associations."""
+    try:
+        token = _token()
+    except HubSpotClientError:
+        return []
+
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/crm/v3/objects/contacts/{contact_id}/associations/deals",
+                headers=hdrs,
+            )
+        if r.status_code != 200:
+            return []
+        return [str(ref.get("id", "")) for ref in r.json().get("results", []) or [] if ref.get("id")]
+    except Exception as exc:
+        log.warning("HubSpot deal association fetch failed for contact %s: %s", contact_id, exc)
+        return []
+
+
+def log_email_engagement(
+    from_email: str,
+    to_emails: list[str],
+    subject: str,
+    body_text: str,
+    timestamp_ms: int,
+    direction: str,
+    owner_id: str,
+    contact_ids: list[str],
+    deal_ids: list[str],
+) -> str:
+    """Log an email engagement via v1 engagements API. Returns engagement ID or '' on failure.
+
+    direction: "INBOUND" (email received by rep) or "OUTBOUND" (email sent by rep).
+    Uses the v1 engagements API because it handles contact+deal associations atomically.
+    """
+    token = _token()
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    body: dict = {
+        "engagement": {
+            "active": True,
+            "type": "EMAIL",
+            "timestamp": timestamp_ms,
+        },
+        "associations": {
+            "contactIds": [int(c) for c in contact_ids if c],
+            "companyIds": [],
+            "dealIds": [int(d) for d in deal_ids if d],
+            "ownerIds": [int(owner_id)] if owner_id else [],
+        },
+        "metadata": {
+            "from": {"email": from_email},
+            "to": [{"email": e} for e in to_emails if e],
+            "subject": subject or "(no subject)",
+            "text": body_text[:8000] if body_text else "",
+            "html": "",
+            "direction": direction,
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/engagements/v1/engagements", headers=hdrs, json=body)
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(
+                f"HubSpot email engagement {r.status_code}: {r.text[:200]}"
+            )
+        result = r.json()
+        engagement_id = str((result.get("engagement") or {}).get("id", ""))
+        log.info(
+            "HubSpot email logged: id=%s  subject=%r  contacts=%s  deals=%s",
+            engagement_id, subject[:40], contact_ids, deal_ids,
+        )
+        return engagement_id
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"log_email_engagement failed: {exc}") from exc
 
 
 def format_deals_for_llm(

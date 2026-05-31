@@ -1,6 +1,7 @@
 """Daily log backup — copies operational data to Google Drive for disaster recovery.
 
 Backs up:
+- data/cora_kb.db (CRITICAL — the entire knowledge base; uses SQLite online backup API)
 - logs/knowledge-gaps.jsonl (CRITICAL — captured gaps that haven't been reviewed yet)
 - Recent main log files (last 7 days)
 - .resolved-gaps.jsonl (tracks which gaps have been ingested)
@@ -27,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = REPO_ROOT / "logs"
 RESOLVED_FILE = REPO_ROOT / "design" / "known-answers" / ".resolved-gaps.jsonl"
 SNAPSHOTS_DIR = REPO_ROOT / "data" / "snapshots"
+KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 
 DEFAULT_BACKUP_ROOT = Path(
     "G:/My Drive/HJR-Founder-OS/_shared/projects/cora/backups"
@@ -101,6 +103,32 @@ def backup_snapshots(dest_dir: Path, dry_run: bool) -> int:
     count = sum(1 for _ in snap_dest.rglob("*") if _.is_file())
     print(f"  Snapshot files backed up: {count}")
     return count
+
+
+def backup_kb_database(dest_dir: Path, dry_run: bool) -> bool:
+    """Back up cora_kb.db using SQLite online backup API (safe while Cora is running)."""
+    print("[0/4] Backing up knowledge base (cora_kb.db)...")
+    if not KB_DB_PATH.exists():
+        print(f"  SKIP: {KB_DB_PATH} does not exist yet.")
+        return False
+    dst = dest_dir / "cora_kb.db"
+    size_mb = KB_DB_PATH.stat().st_size / (1024 * 1024)
+    if dry_run:
+        print(f"  [dry-run] would backup cora_kb.db ({size_mb:.1f} MB) -> {dst}")
+        return True
+    import sqlite3
+    src_conn = sqlite3.connect(str(KB_DB_PATH))
+    dst_conn = sqlite3.connect(str(dst))
+    try:
+        src_conn.backup(dst_conn)
+        print(f"  KB backup complete: {dst} ({size_mb:.1f} MB)")
+        return True
+    except Exception as exc:
+        print(f"  ERROR: KB backup failed: {exc}")
+        return False
+    finally:
+        src_conn.close()
+        dst_conn.close()
 
 
 def backup_critical_files(dest_dir: Path, dry_run: bool) -> int:
@@ -203,6 +231,7 @@ def main() -> int:
 
     ensure_dir(dest_dir, args.dry_run)
 
+    kb_ok = backup_kb_database(dest_dir, args.dry_run)
     critical_count = backup_critical_files(dest_dir, args.dry_run)
     main_log_count = backup_recent_main_logs(dest_dir, args.include_main_logs_days, args.dry_run)
     snapshot_count = backup_snapshots(dest_dir, args.dry_run)
@@ -212,6 +241,7 @@ def main() -> int:
     print("=" * 60)
     print("  Summary")
     print("=" * 60)
+    print(f"  KB database backed up:    {'YES' if kb_ok else 'NO (see above)'}")
     print(f"  Critical files backed up: {critical_count}")
     print(f"  Main log files backed up: {main_log_count}")
     print(f"  Snapshot files backed up: {snapshot_count}")

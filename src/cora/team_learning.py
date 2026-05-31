@@ -64,6 +64,7 @@ log = logging.getLogger(__name__)
 # Per-entity queues follow the pattern #cora-kq-{entity.lower()}.  If Cora isn't
 # in that channel yet (e.g. channel not created), contributions fall back here.
 APPROVAL_CHANNEL = "hjrg-leadership"
+KB_AUDIT_CHANNEL = "cora-kb-log"
 
 # ── Contributors registry path ─────────────────────────────────────────────────
 _CONTRIBUTORS_PATH = (

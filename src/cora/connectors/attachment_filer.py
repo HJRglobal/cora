@@ -39,6 +39,8 @@ from typing import Any
 
 import anthropic
 import yaml
+from slack_sdk import WebClient as _SlackWebClient
+from slack_sdk.errors import SlackApiError as _SlackApiError
 
 from .drive_connector import (
     DriveConnectorError,
@@ -66,6 +68,8 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ACCOUNTS_PATH = _REPO_ROOT / "data" / "maps" / "monitored-email-accounts.yaml"
 _WATERMARKS_PATH = _REPO_ROOT / "data" / "cache" / "email-filing-watermarks.json"
+_FILED_IDS_PATH = _REPO_ROOT / "data" / "cache" / "filed-message-ids.json"
+_DEDUP_TTL_DAYS = 30
 
 # Maps entity code → Drive folder name under HJR-Founder-OS
 _ENTITY_TO_DRIVE_FOLDER: dict[str, str] = {
@@ -130,21 +134,62 @@ def _save_watermarks(marks: dict[str, int]) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Cross-account deduplication (Fix 2)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _load_filed_ids() -> dict[str, int]:
+    """Load {rfc_message_id: filed_at_ts}, pruning entries older than _DEDUP_TTL_DAYS."""
+    if not _FILED_IDS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_FILED_IDS_PATH.read_text())
+    except Exception:
+        return {}
+    cutoff = int(time.time()) - _DEDUP_TTL_DAYS * 86400
+    return {k: v for k, v in data.items() if isinstance(v, int) and v > cutoff}
+
+
+def _save_filed_ids(filed_ids: dict[str, int]) -> None:
+    _FILED_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _FILED_IDS_PATH.write_text(json.dumps(filed_ids, indent=2))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# PHI guardrail (Fix 5)
+# ────────────────────────────────────────────────────────────────────────────
+
+_PHI_RE = re.compile(
+    r"(service note|care plan|incident report|prior auth|iep|arc|support plan"
+    r"|clinical note|assessment|discharge|intake form|medication|\bmom\b|\bdad\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_phi_risk(subject: str) -> bool:
+    """Return True if the email subject matches PHI-risk patterns for LEX inboxes."""
+    return bool(_PHI_RE.search(subject))
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Account list
 # ────────────────────────────────────────────────────────────────────────────
 
 
 def load_monitored_accounts() -> list[dict[str, Any]]:
-    """Load enabled accounts from monitored-email-accounts.yaml."""
+    """Load accounts from monitored-email-accounts.yaml that have attachment_filer enabled."""
     if not _ACCOUNTS_PATH.exists():
         raise AttachmentFilerError(
             f"Monitored accounts file not found: {_ACCOUNTS_PATH}"
         )
     data = yaml.safe_load(_ACCOUNTS_PATH.read_text()) or {}
     accounts = data.get("accounts", [])
-    enabled = [a for a in accounts if a.get("enabled", True)]
-    log.info("Loaded %d enabled monitored email accounts", len(enabled))
-    return enabled
+    eligible = [
+        a for a in accounts
+        if a.get("enabled", True) and a.get("attachment_filer", True)
+    ]
+    log.info("Loaded %d attachment_filer-eligible accounts", len(eligible))
+    return eligible
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -172,7 +217,7 @@ Response schema (array of decisions, one per attachment):
   ]
 }
 
-Entity codes: HJRG (HJR Global), F3E (F3 Energy), F3C (F3 Community), UFL (United Faculty League),
+Entity codes: HJRG (HJR Global), F3E (F3 Energy), F3C (F3 Community), UFL (United Fight League),
 HJRPROD (HJR Productions), HJRP (HJR Properties), BDM (Big-D Media), LEX (Lexington Services),
 OSN (One Stop Nutrition), FNDR (Founder/cross-portfolio).
 
@@ -201,6 +246,7 @@ SKIP attachments that are:
 def classify_attachments(
     email_meta: dict[str, Any],
     attachments: list[dict[str, Any]],
+    entity_hint: str | None = None,
 ) -> list[dict[str, Any]]:
     """Call Claude haiku to classify each attachment. Returns a list of decisions."""
     if not attachments:
@@ -221,7 +267,13 @@ def classify_attachments(
         "%Y-%m-%d"
     )
 
+    hint_line = (
+        f"Account entity context: {entity_hint} — default to this entity unless "
+        "the email content clearly indicates otherwise.\n\n"
+    ) if entity_hint else ""
+
     user_message = (
+        f"{hint_line}"
         f"Email received {date_str}:\n"
         f"From: {email_meta['from']}\n"
         f"To: {email_meta['to']}\n"
@@ -294,6 +346,8 @@ def process_email(
     label_id: str,
     dry_run: bool = False,
     kb=None,
+    entity_hint: str | None = None,
+    filed_ids: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Process one email: classify → download → upload → index → label.
 
@@ -307,10 +361,37 @@ def process_email(
         return []
 
     meta = parse_message_metadata(msg)
+    rfc_msg_id = meta.get("rfc_message_id", "")
 
-    # Already processed on a previous run
+    # Already processed on a previous run (same mailbox)
     if label_id in meta["labels"]:
         log.debug("Message %s already labeled Cora-Filed — skipping", message_id)
+        return []
+
+    # Cross-account deduplication: same RFC Message-ID filed from another inbox
+    if rfc_msg_id and filed_ids is not None and rfc_msg_id in filed_ids:
+        log.info(
+            "Message %r already filed from another account — stamping and skipping",
+            rfc_msg_id[:60],
+        )
+        if not dry_run:
+            try:
+                apply_label(user_email, message_id, label_id)
+            except GmailReaderError as exc:
+                log.warning("Label stamp failed for dedup skip %s: %s", message_id, exc)
+        return []
+
+    # PHI guardrail: skip LEX inbox emails that match client-care subject patterns
+    if entity_hint and entity_hint.startswith("LEX") and _is_phi_risk(meta["subject"]):
+        log.info(
+            "PHI risk detected in %s subject=%r — skipping (LEX PHI guardrail)",
+            user_email, meta["subject"][:80],
+        )
+        if not dry_run:
+            try:
+                apply_label(user_email, message_id, label_id)
+            except GmailReaderError as exc:
+                log.warning("Label stamp failed for PHI skip %s: %s", message_id, exc)
         return []
 
     raw_attachments = [a for a in meta["attachments"] if a["size"] > 5000]
@@ -324,7 +405,7 @@ def process_email(
     )
 
     try:
-        decisions = classify_attachments(meta, raw_attachments)
+        decisions = classify_attachments(meta, raw_attachments, entity_hint=entity_hint)
     except AttachmentFilerError as exc:
         log.warning("Classification failed for %s: %s", message_id, exc)
         return []
@@ -433,6 +514,10 @@ def process_email(
             "dry_run": False,
         })
 
+    # Register RFC Message-ID in cross-account dedup store after successful filing
+    if results and rfc_msg_id and filed_ids is not None and not dry_run:
+        filed_ids[rfc_msg_id] = int(time.time())
+
     # Label the message as processed regardless of how many were filed
     # (so we don't re-examine it if it runs again within the watermark window)
     if not dry_run:
@@ -455,6 +540,7 @@ def process_account(
     *,
     dry_run: bool = False,
     kb=None,
+    filed_ids: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Run the full filer pipeline for one monitored email account.
 
@@ -462,6 +548,7 @@ def process_account(
         {email, messages_scanned, filed, skipped, errors}
     """
     user_email = account["email"]
+    entity_hint: str | None = account.get("entity_default")
     since_ts = watermarks.get(user_email, int(time.time()) - _DEFAULT_LOOKBACK_HOURS * 3600)
 
     log.info(
@@ -498,7 +585,11 @@ def process_account(
 
     for msg_id in message_ids:
         try:
-            filed = process_email(user_email, msg_id, label_id, dry_run=dry_run, kb=kb)
+            filed = process_email(
+                user_email, msg_id, label_id,
+                dry_run=dry_run, kb=kb,
+                entity_hint=entity_hint, filed_ids=filed_ids,
+            )
         except Exception as exc:
             log.exception("Unexpected error processing %s/%s: %s", user_email, msg_id, exc)
             summary["errors"] += 1
@@ -536,11 +627,14 @@ def run_filer(
         return []
 
     watermarks = _load_watermarks()
+    filed_ids = _load_filed_ids()
     run_start = int(time.time())
     summaries: list[dict[str, Any]] = []
 
     for account in accounts:
-        summary = process_account(account, watermarks, dry_run=dry_run, kb=kb)
+        summary = process_account(
+            account, watermarks, dry_run=dry_run, kb=kb, filed_ids=filed_ids,
+        )
         summaries.append(summary)
 
         # Advance watermark for this account if no errors
@@ -552,6 +646,7 @@ def run_filer(
 
     if not dry_run:
         _save_watermarks(watermarks)
+        _save_filed_ids(filed_ids)
 
     return summaries
 
@@ -587,24 +682,18 @@ def post_slack_summary(summaries: list[dict[str, Any]]) -> bool:
     text = "\n".join(lines)
 
     try:
-        import requests
         token = os.environ.get("SLACK_BOT_TOKEN", "")
         if not token:
             log.warning("SLACK_BOT_TOKEN not set — Slack notification skipped")
             return False
 
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"channel": _NOTIFY_CHANNEL, "text": text},
-            timeout=10,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            log.warning("Slack post failed: %s", data.get("error"))
-            return False
+        client = _SlackWebClient(token=token)
+        client.chat_postMessage(channel=_NOTIFY_CHANNEL, text=text)
         log.info("Slack filing summary posted to #%s", _NOTIFY_CHANNEL)
         return True
+    except _SlackApiError as exc:
+        log.warning("Slack post failed: %s", exc.response.get("error", str(exc)))
+        return False
     except Exception as exc:
         log.warning("Slack notification failed: %s", exc)
         return False

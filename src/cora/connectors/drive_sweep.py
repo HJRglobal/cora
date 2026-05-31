@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from typing import Any
 import yaml
 
 from cora.knowledge_base.store import Document
+from cora.phi_guard import _PHI_PATTERNS
 
 log = logging.getLogger("cora.drive_sweep")
 
@@ -81,15 +83,6 @@ _TEXT_MIME_TYPES = {
 _PDF_MIME = "application/pdf"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-
-# ── PHI keyword guard (lexingtonservices.com owners) ─────────────────────────
-
-_PHI_PATTERNS = re.compile(
-    r"\b(dob|date of birth|diagnosis|icd-?10|medicaid|ahcccs|member ?id"
-    r"|provider ?id|npi|clinical note|treatment plan|progress note"
-    r"|patient|client name|ssn|social security)\b",
-    re.IGNORECASE,
-)
 
 # ── Haiku classification ──────────────────────────────────────────────────────
 
@@ -151,9 +144,9 @@ def _classify(anthropic_client: Any, filename: str, user_name: str,
 def _extract_google_doc(service: Any, file_id: str) -> str:
     """Export a Google Doc as plain text."""
     try:
-        data = service.files().export(
+        data = _retry_execute(service.files().export(
             fileId=file_id, mimeType="text/plain"
-        ).execute()
+        ))
         return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
     except Exception as exc:
         log.debug("drive_sweep: export failed for Doc %s: %s", file_id, exc)
@@ -167,10 +160,10 @@ def _extract_google_sheet(service: Any, file_id: str) -> str:
     except ImportError:
         return ""
     try:
-        data = service.files().export(
+        data = _retry_execute(service.files().export(
             fileId=file_id,
             mimeType=_XLSX_MIME,
-        ).execute()
+        ))
         wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
         parts: list[str] = []
         for sheet_name in wb.sheetnames:
@@ -233,7 +226,7 @@ def _download_and_extract(service: Any, file_meta: dict) -> str:
     mime = file_meta.get("mimeType", "")
     file_id = file_meta["id"]
     try:
-        data: bytes = service.files().get_media(fileId=file_id).execute()
+        data: bytes = _retry_execute(service.files().get_media(fileId=file_id))
     except Exception as exc:
         log.debug("drive_sweep: download failed for %s: %s", file_id, exc)
         return ""
@@ -365,6 +358,30 @@ _NOISE_FOLDER_PATTERNS = re.compile(
 )
 
 
+def _retry_execute(request: Any, max_retries: int = 3) -> Any:
+    """Execute a Google API request, retrying on 429 (rate limit) or 503 (unavailable).
+
+    Sleeps exponentially (2s, 4s, 8s) between retries. Raises the original
+    HttpError if all retries are exhausted.
+    """
+    from googleapiclient.errors import HttpError
+
+    for attempt in range(max_retries + 1):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = exc.resp.status if exc.resp else 0
+            if status in (429, 503) and attempt < max_retries:
+                sleep_seconds = 2 ** (attempt + 1)
+                log.warning(
+                    "drive_sweep: Google API returned %d — retrying in %ds (attempt %d/%d)",
+                    status, sleep_seconds, attempt + 1, max_retries,
+                )
+                time.sleep(sleep_seconds)
+                continue
+            raise
+
+
 def _build_drive_service(sa_json_path: str, user_email: str):
     """Build a Drive v3 service impersonating user_email via DWD."""
     from google.oauth2 import service_account
@@ -475,7 +492,7 @@ def sweep_user(
                 continue
 
             # PHI guard for Lex users — quarantine before classification
-            if is_lex_user and _PHI_PATTERNS.search(content[:500]):
+            if is_lex_user and _PHI_PATTERNS.search(content[:5000]):
                 log.debug("drive_sweep: PHI guard triggered for %s/%s", email, filename)
                 stats["phi_skipped"] += 1
                 continue

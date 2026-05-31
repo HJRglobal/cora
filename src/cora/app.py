@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 app = App(token=config.slack_bot_token, signing_secret=config.slack_signing_secret)
 
 _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
+_FOUNDER_ID = "U0B2RM2JYJ1"  # Harrison — KB approvals and cross-entity access
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
 
 # Resolved at first event via auth.test() - the bot's own user ID. Used to
@@ -189,7 +190,6 @@ def _dispatch_qa(
 
     # Founder (Harrison) gets cross-entity access from any channel. His questions
     # about UFL, LEX, OSN etc. from an F3E channel should not be blocked by entity scope.
-    _FOUNDER_ID = "U0B2RM2JYJ1"
     is_founder = (user_id == _FOUNDER_ID)
     founder_note = (
         "\n**Cross-entity access ENABLED:** This user is the portfolio founder. "
@@ -402,6 +402,9 @@ def _dispatch_qa(
 
 @app.event("app_mention")
 def handle_mention(event: dict, say: callable, client) -> None:
+    if event.get("bot_id"):
+        return
+
     channel_id = event.get("channel", "")
     user_id = event.get("user")
     thread_ts = event.get("ts")          # ts of THIS message (used for reply threading)
@@ -680,6 +683,67 @@ def handle_message_event(event: dict, client) -> None:
     if not text:
         return
 
+    # ── Path 0: Pending note confirmation loop ────────────────────────────────
+    # If this thread is waiting for the author to confirm Cora's paraphrase,
+    # handle the reply here before anything else.
+    pending = team_learning.get_pending_confirm(channel_id, thread_ts)
+    if pending and pending["author"] == user_id:
+        channel_name = _resolve_channel_name(client, channel_id)
+        say = lambda **kw: client.chat_postMessage(channel=channel_id, **kw)
+
+        if team_learning.is_confirmation(text):
+            # Author confirmed — queue the contribution and clear state
+            team_learning.clear_pending_confirm(channel_id, thread_ts)
+            target_ch = team_learning.kq_channel_for_entity(pending["entity"])
+            _queue_contribution(
+                client=client,
+                entity=pending["entity"],
+                channel_id=channel_id,
+                channel_name=pending["channel_name"],
+                user_id=user_id,
+                content=pending["raw_content"],
+                original_ts=thread_ts,
+                kind=pending["kind"],
+            )
+            say(
+                text=f"✅ Logged and queued for approval in #{target_ch}.",
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            log.info(
+                "team_learning: confirmed channel=#%s user=%s kind=%s",
+                channel_name, user_id, pending["kind"],
+            )
+        else:
+            # Author is correcting — re-paraphrase incorporating the correction
+            updated = team_learning.paraphrase_note(
+                pending["raw_content"], pending["entity"], correction=text
+            )
+            # Update stored paraphrase so next correction builds on this one
+            team_learning.store_pending_confirm(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                entity=pending["entity"],
+                channel_name=pending["channel_name"],
+                author=user_id,
+                kind=pending["kind"],
+                raw_content=pending["raw_content"],
+                paraphrase=updated,
+            )
+            active_thread_store.touch(channel_id, thread_ts)
+            say(
+                text=updated,
+                thread_ts=thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            log.info(
+                "team_learning: re-paraphrased channel=#%s user=%s",
+                channel_name, user_id,
+            )
+        return
+
     # ── Path 1: Correction capture ────────────────────────────────────────────
     if team_learning.is_correction(text):
         channel_name = _resolve_channel_name(client, channel_id)
@@ -714,8 +778,23 @@ def handle_message_event(event: dict, client) -> None:
     if not active_thread_store.is_active(channel_id, thread_ts):
         return
 
+    allowed, cap_type = rate_limiter.check(user_id, channel_id)
+    if not allowed:
+        log.warning("rate_limited (path2) user=%s channel=%s cap=%s", user_id, channel_id, cap_type)
+        if cap_type == "user":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="You've hit the per-user mention cap (10/hour). I'll be back shortly.")
+        else:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="This channel has hit the mention cap (50/hour). Try again in a bit.")
+        return
+
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
+
+    # Apply sibling-entity guard pre-LLM (mirrors handle_mention Path 1).
+    sibling_redirect = sibling_guard.check_redirect(entity, text)
+    if sibling_redirect:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=sibling_redirect)
+        return
 
     active_thread_store.touch(channel_id, thread_ts)
     prior_messages = _fetch_thread_history(client, channel_id, thread_ts, msg_ts)
@@ -878,6 +957,51 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         if sched_reply:
             client.chat_postMessage(channel=channel_id, text=sched_reply)
 
+    # ── 📚 bookmark: works on ANY message, not just Cora's ───────────────────
+    # When a team member reacts 📚 to any message, capture its text as a
+    # pending KB contribution and route it to the entity's KQ channel for approval.
+    if event_type == "reaction_added" and reaction == "books" and reactor and channel_id:
+        try:
+            hist = client.conversations_history(
+                channel=channel_id, latest=message_ts, limit=1, inclusive=True
+            )
+            msgs = (hist.get("messages") or [])
+            msg_text = msgs[0].get("text", "").strip() if msgs else ""
+            if msg_text:
+                entity = route(channel_name) if channel_name else "FNDR"
+                _handle_note(
+                    client=client,
+                    say=lambda **kw: None,  # no ack — reaction is silent
+                    entity=entity,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    user_id=reactor,
+                    content=msg_text,
+                    original_ts=message_ts,
+                    kind="bookmark",
+                )
+                log.info(
+                    "bookmark reaction cid=queued channel=#%s reactor=%s",
+                    channel_name, reactor,
+                )
+        except Exception as exc:
+            log.warning("bookmark reaction handler failed: %s", exc)
+        # bookmarks are on any message — don't gate the rest on bot_user_id
+
+    item_user = event.get("item_user", "")
+    bot_user_id = _resolve_bot_user_id(client)
+    if not bot_user_id or item_user != bot_user_id:
+        # Remaining handlers only apply to reactions on Cora's own messages
+        return
+
+    # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
+    if event_type == "reaction_added" and reaction == "white_check_mark":
+        sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
+            message_ts=message_ts, channel_id=channel_id, client=client
+        )
+        if sched_reply:
+            client.chat_postMessage(channel=channel_id, text=sched_reply)
+
     # ── Team learning: approval/decline of pending contributions ──────────────
     # Only process ✅ / ❌ on reaction_added (not removal). Look up by the ts
     # of the approval card Cora posted.
@@ -890,6 +1014,7 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
                 reaction=reaction,
                 approval_channel_id=channel_id,
                 approval_msg_ts=message_ts,
+                reactor_id=reactor,
             )
             # Fall through to also log the reaction as normal feedback
 
@@ -943,8 +1068,14 @@ def _process_contribution_reaction(
     reaction: str,
     approval_channel_id: str,
     approval_msg_ts: str,
+    reactor_id: str | None = None,
 ) -> None:
     """Process a ✅ or ❌ on a pending contribution approval card."""
+    if reactor_id != _FOUNDER_ID:
+        log.warning("team_learning: KB reaction from non-founder %s — ignored", reactor_id)
+        return
+
+    import datetime as _dt
     cid = contribution["contribution_id"]
     if reaction == "white_check_mark":
         # Approve: ingest to KB
@@ -958,6 +1089,33 @@ def _process_contribution_reaction(
                 "check logs. Contribution marked approved but not in KB."
             )
         log.info("team_learning: contribution %s approved ingest_ok=%s", cid[:8], success)
+
+        # Post audit record to Harrison's private KB log channel
+        kind = contribution.get("kind", "note")
+        kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
+        approver_mention = f"<@{reactor_id}>" if reactor_id else "_(unknown)_"
+        author_mention = f"<@{contribution['author']}>"
+        approved_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        content_preview = contribution.get("content", "")[:600]
+        audit_text = (
+            f"📋 *KB Approval* `[{cid[:8]}]`\n"
+            f"*Approved by:* {approver_mention}  |  "
+            f"*Entity:* {contribution['entity']}  |  "
+            f"*Kind:* {kind_label}\n"
+            f"*Submitted by:* {author_mention}  |  "
+            f"*Source:* #{contribution['channel_name']}  |  "
+            f"*At:* {approved_at}\n"
+            f"```\n{content_preview}\n```"
+        )
+        try:
+            client.chat_postMessage(
+                channel=team_learning.KB_AUDIT_CHANNEL,
+                text=audit_text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            log.warning("team_learning: failed to post KB audit record cid=%s: %s", cid[:8], exc)
     else:
         # Decline
         team_learning.resolve_contribution(cid, "declined")
@@ -984,3 +1142,18 @@ def handle_reaction_added(event: dict, client) -> None:
 @app.event("reaction_removed")
 def handle_reaction_removed(event: dict, client) -> None:
     _handle_reaction(event, client, "reaction_removed")
+
+
+@app.event("channel_created")
+def handle_channel_created(event: dict, client) -> None:
+    """Auto-join every new public channel so the nightly sweep has full coverage."""
+    ch = event.get("channel") or {}
+    ch_id = ch.get("id", "")
+    ch_name = ch.get("name", "")
+    if not ch_id:
+        return
+    try:
+        client.conversations_join(channel=ch_id)
+        log.info("auto-joined new channel #%s (%s)", ch_name, ch_id)
+    except Exception as exc:
+        log.warning("failed to auto-join #%s: %s", ch_name, exc)

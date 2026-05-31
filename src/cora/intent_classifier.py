@@ -1,15 +1,20 @@
 """Intent classifier for Cora — classifies questions before the pipeline runs.
 
-Classifies each user message into one of four intent categories to enable
+Classifies each user message into one of five intent categories to enable
 efficient pipeline routing:
 
-  FINANCIAL   → skip KB retrieval; go straight to financial tool call.
-                Never read or write the semantic cache (data changes constantly).
-  TASK_LOOKUP → use Asana tool; fetch fewer KB chunks (k=4).
-                Short cache TTL (5 min) because tasks change frequently.
-  SIMPLE      → KB-only retrieval; small k (k=3); long cache TTL (1 hour).
-                Covers quick factual questions: brand colors, taglines, who is X.
-  COMPLEX     → full pipeline; default k; standard cache TTL (30 min).
+  FINANCIAL      → skip KB retrieval; go straight to financial tool call.
+                   Never read or write the semantic cache (data changes constantly).
+  TASK_LOOKUP    → use Asana tool; fetch fewer KB chunks (k=4).
+                   Short cache TTL (5 min) because tasks change frequently.
+  DOCUMENT_QUERY → KB-focused document/file search; higher k=15 to surface the
+                   right file. Covers "where is X", "which file contains", "show
+                   me the contract for", "find the invoice" patterns.  Fixes the
+                   production bug where shipping/invoice questions triggered the
+                   financial tool instead of KB search.
+  SIMPLE         → KB-only retrieval; small k (k=3); long cache TTL (1 hour).
+                   Covers quick factual questions: brand colors, taglines, who is X.
+  COMPLEX        → full pipeline; k=12; standard cache TTL (30 min).
 
 Classification uses keyword/regex rules — no LLM call. ~microseconds per classify.
 
@@ -26,11 +31,12 @@ from dataclasses import dataclass
 # ── Intent enum ───────────────────────────────────────────────────────────────
 
 class Intent(str, Enum):
-    FINANCIAL   = "financial"     # cash, P&L, margins, financial pulse
-    TASK_LOOKUP = "task_lookup"   # tasks, Asana, what's on my plate
-    IDENTITY    = "identity"      # who am I, do you know me — never cache (user-specific)
-    SIMPLE      = "simple"        # quick factual: tagline, colors, who is X
-    COMPLEX     = "complex"       # default — full pipeline
+    FINANCIAL      = "financial"        # cash, P&L, margins, financial pulse
+    TASK_LOOKUP    = "task_lookup"      # tasks, Asana, what's on my plate
+    IDENTITY       = "identity"         # who am I, do you know me — never cache (user-specific)
+    DOCUMENT_QUERY = "document_query"   # find/locate a file, contract, invoice, etc.
+    SIMPLE         = "simple"           # quick factual: tagline, colors, who is X
+    COMPLEX        = "complex"          # default — full pipeline
 
 
 # ── Routing hints ─────────────────────────────────────────────────────────────
@@ -113,11 +119,27 @@ _SIMPLE_PATTERNS = [
     r"\bwhat\s+are\s+(the\s+)?hours?\b",
 ]
 
+# DOCUMENT_QUERY — user is asking to locate or retrieve a specific file/document.
+# Checked BEFORE SIMPLE so "find the contract" doesn't fall through to COMPLEX.
+_DOCUMENT_QUERY_PATTERNS = [
+    r"\bwhere\s+(is|are|can\s+I\s+find)\b",
+    r"\bwhich\s+file\b",
+    r"\bshow\s+me\s+(the\s+)?(document|file|contract|invoice|agreement|report|proposal)\b",
+    r"\bfind\s+(the\s+)?(contract|invoice|agreement|document|file|report|proposal|deck|pdf)\b",
+    r"\bget\s+(the\s+)?(contract|invoice|agreement|document|file|report)\b",
+    r"\bwhat\s+(file|document|contract|invoice|report)\s+(has|contains|is)\b",
+    r"\b(link|url)\s+(to|for)\s+(the\s+)?(contract|invoice|agreement|document|file|report)\b",
+    r"\b(shipping\s+invoice|vendor\s+invoice|purchase\s+order|PO\s+for)\b",
+    r"\bdo\s+(we|you)\s+have\s+(a\s+)?(contract|agreement|invoice|NDA|SOW|proposal)\b",
+    r"\bcan\s+you\s+(find|pull|get|show)\s+(me\s+)?(the\s+)?\w+\s*(contract|invoice|doc|file)\b",
+]
+
 # Compile once at import time
-_FINANCIAL_RE = re.compile("|".join(_FINANCIAL_PATTERNS), re.IGNORECASE)
-_TASK_RE      = re.compile("|".join(_TASK_PATTERNS),      re.IGNORECASE)
-_IDENTITY_RE  = re.compile("|".join(_IDENTITY_PATTERNS),  re.IGNORECASE)
-_SIMPLE_RE    = re.compile("|".join(_SIMPLE_PATTERNS),    re.IGNORECASE)
+_FINANCIAL_RE      = re.compile("|".join(_FINANCIAL_PATTERNS),      re.IGNORECASE)
+_TASK_RE           = re.compile("|".join(_TASK_PATTERNS),           re.IGNORECASE)
+_IDENTITY_RE       = re.compile("|".join(_IDENTITY_PATTERNS),       re.IGNORECASE)
+_SIMPLE_RE         = re.compile("|".join(_SIMPLE_PATTERNS),         re.IGNORECASE)
+_DOCUMENT_QUERY_RE = re.compile("|".join(_DOCUMENT_QUERY_PATTERNS), re.IGNORECASE)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -125,7 +147,8 @@ _SIMPLE_RE    = re.compile("|".join(_SIMPLE_PATTERNS),    re.IGNORECASE)
 def classify(user_message: str, entity: str = "") -> Intent:
     """Classify a user message into an Intent category.
 
-    Rules applied in priority order: FINANCIAL > TASK_LOOKUP > SIMPLE > COMPLEX.
+    Rules applied in priority order:
+    FINANCIAL > IDENTITY > TASK_LOOKUP > DOCUMENT_QUERY > SIMPLE > COMPLEX.
     COMPLEX is the safe default — it runs the full pipeline and never skips context.
 
     entity is accepted for future entity-specific rule variants (e.g., OSN questions
@@ -138,6 +161,8 @@ def classify(user_message: str, entity: str = "") -> Intent:
         return Intent.IDENTITY
     if _TASK_RE.search(text):
         return Intent.TASK_LOOKUP
+    if _DOCUMENT_QUERY_RE.search(text):
+        return Intent.DOCUMENT_QUERY
     if _SIMPLE_RE.search(text):
         return Intent.SIMPLE
     return Intent.COMPLEX
@@ -176,6 +201,14 @@ def routing_hints(intent: Intent) -> RoutingHints:
             bypass_cache=False,
             cache_ttl=300,      # tasks change fast — 5-minute TTL
         )
+    if intent == Intent.DOCUMENT_QUERY:
+        return RoutingHints(
+            intent=intent,
+            skip_kb=False,
+            kb_k_override=15,   # higher k surfaces the right file among many candidates
+            bypass_cache=False,
+            cache_ttl=900,      # documents stable for 15 minutes
+        )
     if intent == Intent.SIMPLE:
         return RoutingHints(
             intent=intent,
@@ -184,11 +217,11 @@ def routing_hints(intent: Intent) -> RoutingHints:
             bypass_cache=False,
             cache_ttl=3600,     # simple facts stable for 1 hour
         )
-    # COMPLEX — full pipeline, standard 30-minute cache
+    # COMPLEX — full pipeline, k=12, standard 30-minute cache
     return RoutingHints(
         intent=intent,
         skip_kb=False,
-        kb_k_override=None,
+        kb_k_override=12,
         bypass_cache=False,
         cache_ttl=1800,
     )

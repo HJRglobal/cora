@@ -149,7 +149,7 @@ class TestFormatCreatedEvent:
     def test_handles_missing_link_gracefully(self):
         event = _mock_created_event(html_link="")
         result = cal.format_created_event_for_llm(event, user_email="h@example.com")
-        assert "no link" in result
+        assert "no calendar link" in result
 
     def test_attendees_shown_when_present(self):
         event = _mock_created_event()

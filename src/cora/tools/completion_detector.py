@@ -504,6 +504,55 @@ def match_signals_to_tasks(
     return deduped[:MAX_CANDIDATES]
 
 
+def collect_email_signals(
+    user_email: str,
+    lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
+    entity: str = "FNDR",
+) -> list[CompletionSignal]:
+    """Fetch sent emails for user_email and extract completion signals from subjects/snippets.
+
+    Called by the interactive completion_candidates tool to supplement KB signals
+    with real-time sent-mail evidence.  Fails silently (logs warning, returns [])
+    so a Gmail outage never breaks the broader completion flow.
+    """
+    try:
+        from cora.connectors.gmail_reader import get_sent_signals
+    except ImportError:
+        log.warning("collect_email_signals: gmail_reader not available — skipping email signals")
+        return []
+
+    since_ts = int(time.time() - lookback_seconds)
+    try:
+        sent = get_sent_signals(user_email, since_ts=since_ts)
+    except Exception as exc:
+        log.warning("collect_email_signals: get_sent_signals failed for %s: %s", user_email, exc)
+        return []
+
+    signals: list[CompletionSignal] = []
+    for msg in sent:
+        subject = msg.get("subject", "").strip()
+        snippet = msg.get("snippet", "").strip()
+        # Combine subject + snippet for richer signal text
+        text = f"{subject}. {snippet}" if snippet else subject
+        if not text:
+            continue
+        new_signals = extract_signals_from_text(
+            text,
+            source="gmail",
+            source_id=msg.get("message_id", ""),
+            entity=entity,
+            deep_link="",
+            title=f"Sent: {subject[:80]}",
+        )
+        signals.extend(new_signals)
+
+    log.info(
+        "collect_email_signals: %d sent emails → %d signals for %s",
+        len(sent), len(signals), user_email,
+    )
+    return signals
+
+
 def detect_candidates(
     open_tasks: list[dict],
     *,
@@ -512,18 +561,27 @@ def detect_candidates(
     min_confidence: float = SWEEP_CONFIDENCE_THRESHOLD,
     apply_dedup: bool = True,
     db_path: Path | None = None,
+    extra_signals: list[CompletionSignal] | None = None,
 ) -> list[CompletionCandidate]:
     """Full pipeline: extract signals → match → filter → return candidates.
 
     open_tasks: pre-fetched list of incomplete Asana task dicts (caller
                 handles the API call so this module stays testable without
                 live Asana access).
+    extra_signals: additional signals (e.g. from live Gmail sent-mail) merged
+                   with KB signals before matching.
     """
     signals = extract_signals_from_db(
         lookback_seconds=lookback_seconds,
         entities=entities,
         db_path=db_path,
     )
+    if extra_signals:
+        signals = signals + extra_signals
+        log.info(
+            "detect_candidates: merged %d KB + %d extra signals",
+            len(signals) - len(extra_signals), len(extra_signals),
+        )
     return match_signals_to_tasks(
         signals,
         open_tasks,

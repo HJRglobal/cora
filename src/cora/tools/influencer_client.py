@@ -47,7 +47,7 @@ _DB_PATH = _REPO_ROOT / "data" / "influencer_tracker.db"
 _KNOWN_PLATFORMS = ("instagram", "tiktok", "youtube", "twitter", "x", "podcast", "facebook", "linkedin", "other")
 _KNOWN_TYPES = ("post", "story", "reel", "video", "tweet", "shoutout", "podcast_mention", "review", "other")
 
-HUBSPOT_DEAL_BASE_URL = "https://app.hubspot.com/contacts/243870963/deal/"
+HUBSPOT_DEAL_BASE_URL = "https://app.hubspot.com/contacts/246351746/deal/"
 
 
 class InfluencerClientError(Exception):
