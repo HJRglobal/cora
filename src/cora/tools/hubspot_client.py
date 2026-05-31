@@ -23,12 +23,9 @@ _PORTAL_ID = "246351746"  # HJR Global — new account (migrated 2026-05-30)
 _TIMEOUT = 12.0
 _DEFAULT_MAX_DEALS = 25
 
-# Pipeline GIDs — populated by setup_hubspot_pipelines.py; update after migration
-# Old account: F3E=2234421978, UFL=2242250445
-PIPELINE_F3E_RETAIL       = ""  # TODO: fill from new-pipeline-ids.json after setup
-PIPELINE_UFL_SPONSORSHIPS = ""  # TODO: fill from new-pipeline-ids.json after setup
-PIPELINE_OSN              = ""  # TODO: fill from new-pipeline-ids.json after setup
-PIPELINE_BDM              = ""  # TODO: fill from new-pipeline-ids.json after setup
+# Pipeline IDs — new account (portal 246351746), created via HubSpot UI 2026-05-30
+PIPELINE_F3E_RETAIL   = "2313722582"
+PIPELINE_UFL_OSN_BDM  = "default"    # renamed from "Sales Pipeline"; covers UFL, OSN, BDM deals
 
 # Stage GID → human-readable name cache (refreshed on first call per process)
 _STAGE_NAME_CACHE: dict[str, str] = {}
@@ -157,28 +154,27 @@ def _deal_url(deal_id: str) -> str:
 
 # ── F3E Pipeline Summary ─────────────────────────────────────────────────────
 
-# Stage ordering for F3E Retail pipeline (ascending funnel progress).
-# Stage IDs are assigned by HubSpot at pipeline creation time — populated by
-# setup_hubspot_pipelines.py. _STAGE_NAME_CACHE (refreshed from live API) is the
-# authoritative source; _F3E_STAGE_ORDER is a display-order hint only.
-# TODO: re-probe after migration and replace these with new account stage IDs.
+# Stage ordering for F3E Retail pipeline — new account stage IDs (probed 2026-05-30).
+# Identify/Outreach/Sample Sent IDs resolved at runtime via _refresh_pipeline_cache();
+# hot-stage IDs and terminal IDs are hardcoded for fast filtering.
 _F3E_STAGE_ORDER: list[tuple[str, str]] = [
-    ("", "Identify"),
-    ("", "Outreach"),
-    ("", "Sample Sent"),
-    ("", "Qualified"),
-    ("", "Proposal"),
-    ("", "Negotiation"),
-    ("", "Closed Won"),
-    ("", "Closed Lost"),
+    ("",           "Identify"),     # ID resolved from live cache
+    ("",           "Outreach"),     # ID resolved from live cache
+    ("",           "Sample Sent"),  # ID resolved from live cache
+    ("3760235204", "Qualified"),
+    ("3760204497", "Proposal"),
+    ("3760235205", "Negotiation"),
+    ("3760235206", "Closed Won"),
+    ("3760235207", "Closed Lost"),
 ]
 
-# Populated after migration — update once setup_hubspot_pipelines.py runs
-_F3E_HOT_STAGE_IDS: frozenset[str] = frozenset()   # TODO: Qualified, Proposal, Negotiation IDs
-_F3E_CLOSED_WON_ID  = ""  # TODO: fill after migration
-_F3E_CLOSED_LOST_ID = ""  # TODO: fill after migration
+_F3E_HOT_STAGE_IDS: frozenset[str] = frozenset(
+    {"3760235204", "3760204497", "3760235205"}  # Qualified, Proposal, Negotiation
+)
+_F3E_CLOSED_WON_ID  = "3760235206"
+_F3E_CLOSED_LOST_ID = "3760235207"
 
-# Owner short names for F3E Retail team (HubSpot owner_id str → display name)
+# Owner short names for F3E Retail team (confirmed same IDs in new account)
 _F3E_OWNER_SHORT: dict[str, str] = {
     "162944825": "Tommy",
     "160459333": "Harrison",
