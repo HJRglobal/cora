@@ -624,12 +624,18 @@ def main() -> int:
                         help="Print all results including OK checks")
     args = parser.parse_args()
 
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = _LOG_DIR / f"health-check-{today_str}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(
-            open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)
-        )],
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(
+                open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)
+            ),
+        ],
     )
 
     log.info("=" * 60)
