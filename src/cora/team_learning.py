@@ -165,12 +165,29 @@ _KB_DB_PATH = Path(__file__).parent.parent.parent / "data" / "cora_kb.db"
 
 # ── Contributors registry ─────────────────────────────────────────────────────
 
-@functools.lru_cache(maxsize=1)
+_contributors_cache: dict = {}
+_contributors_loaded_at: float = 0.0
+_CONTRIBUTORS_TTL = 60.0  # seconds
+
+
 def _load_contributors_raw() -> dict:
-    """Load knowledge-contributors.yaml. Cached until process restart."""
+    """Load knowledge-contributors.yaml with a 60s TTL cache.
+
+    Uses time-based cache instead of lru_cache to avoid permanently caching
+    an empty dict if the file isn't readable on the first call at startup.
+    """
+    import time as _time
+    global _contributors_cache, _contributors_loaded_at
+    now = _time.monotonic()
+    if _contributors_cache and (now - _contributors_loaded_at) < _CONTRIBUTORS_TTL:
+        return _contributors_cache
     try:
-        with open(_CONTRIBUTORS_PATH) as f:
-            return yaml.safe_load(f) or {}
+        with open(_CONTRIBUTORS_PATH, encoding="utf-8") as f:
+            result = yaml.safe_load(f) or {}
+        if result:
+            _contributors_cache = result
+            _contributors_loaded_at = now
+        return result
     except FileNotFoundError:
         log.warning("knowledge-contributors.yaml not found — no contributor access control")
         return {}
