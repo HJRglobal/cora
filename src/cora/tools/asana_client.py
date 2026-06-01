@@ -182,6 +182,42 @@ def create_task(
     return r.json().get("data") or {}
 
 
+def complete_task(task_gid: str) -> dict[str, Any]:
+    """Mark an Asana task as complete.
+
+    Returns the updated task dict. Raises AsanaClientError on failure.
+    """
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("complete_task requires a non-empty task_gid")
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.put(
+                f"{_BASE}/tasks/{task_gid}",
+                json={"data": {"completed": True}},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot complete task {task_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
 def format_created_task_for_llm(task: dict[str, Any]) -> str:
     """Render a freshly-created task as a Slack-mrkdwn confirmation line."""
     name = task.get("name", "(no name)")

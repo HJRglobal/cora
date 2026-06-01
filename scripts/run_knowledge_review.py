@@ -60,6 +60,106 @@ def _setup_logging() -> None:
     )
 
 
+def _post_to_slack(token: str, channel: str, text: str) -> None:
+    """Post a message to a Slack channel. Silently logs on failure."""
+    if not token:
+        return
+    try:
+        from slack_sdk import WebClient as _WC
+        _WC(token=token).chat_postMessage(
+            channel=channel, text=text, unfurl_links=False, unfurl_media=False
+        )
+    except Exception as exc:
+        logging.getLogger("knowledge-review").warning(
+            "gap-executor: Slack post to #%s failed: %s", channel, exc
+        )
+
+
+def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger) -> None:
+    """Execute one approved gap update. Dispatches by update_type.
+
+    asana_task     → create the task via Asana API
+    task_close     → mark the task complete via Asana API
+    decision       → post formatted entry to #hjrg-leadership for manual add
+    hubspot_note   → post formatted note to #hjrg-leadership with deal link
+    generic        → post description to #hjrg-leadership
+    """
+    import json
+    update_type = update.get("update_type", "generic")
+    payload = update.get("payload") or {}
+    desc = update.get("description", "")
+    uid_short = update.get("update_id", "?")[:8]
+    notify_ch = "hjrg-leadership"
+
+    try:
+        if update_type == "asana_task":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.tools.asana_client import create_task, AsanaClientError
+            task_name = (payload.get("suggested_task_name") or desc)[:150].strip()
+            notes = (
+                f"Auto-created from Cora reconciliation gap.\n\n"
+                f"Evidence: {update.get('source_evidence', '')[:400]}"
+            )
+            try:
+                task = create_task(name=task_name, notes=notes)
+                url = task.get("permalink_url", "")
+                msg = f":white_check_mark: *Gap executor* created Asana task: <{url}|{task_name}> `[{uid_short}]`"
+                log.info("gap-executor: created Asana task gid=%s name=%s", task.get("gid"), task_name)
+            except AsanaClientError as exc:
+                msg = f":warning: *Gap executor* could not create Asana task `[{uid_short}]`: {exc}\n> {task_name}"
+                log.warning("gap-executor: create_task failed: %s", exc)
+            _post_to_slack(slack_token, notify_ch, msg)
+
+        elif update_type == "task_close":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.tools.asana_client import complete_task, AsanaClientError
+            task_gid = payload.get("task_gid", "")
+            task_name = payload.get("task_name", task_gid)
+            task_url = payload.get("task_url", "")
+            if task_gid:
+                try:
+                    complete_task(task_gid)
+                    link = f"<{task_url}|{task_name}>" if task_url else task_name
+                    msg = f":white_check_mark: *Gap executor* marked complete: {link} `[{uid_short}]`"
+                    log.info("gap-executor: completed task gid=%s", task_gid)
+                except AsanaClientError as exc:
+                    msg = f":warning: *Gap executor* could not close task `[{uid_short}]`: {exc}\n> {task_name}"
+                    log.warning("gap-executor: complete_task failed: %s", exc)
+            else:
+                msg = f":warning: *Gap executor* `[{uid_short}]` task_close missing task_gid — skipped."
+                log.warning("gap-executor: task_close payload has no task_gid: %s", payload)
+            _post_to_slack(slack_token, notify_ch, msg)
+
+        elif update_type == "decision_capture":
+            formatted = payload.get("formatted_entry") or payload.get("decision_text") or desc
+            msg = (
+                f":pencil: *Gap executor* `[{uid_short}]` — add to `memory/decisions.md`:\n"
+                f"```{formatted[:600]}```"
+            )
+            log.info("gap-executor: decision_capture posted to #%s uid=%s", notify_ch, uid_short)
+            _post_to_slack(slack_token, notify_ch, msg)
+
+        elif update_type == "hubspot_note":
+            deal_name = payload.get("deal_name", "(unknown deal)")
+            deal_url = payload.get("deal_url", "")
+            note_text = payload.get("note") or desc
+            link = f"<{deal_url}|{deal_name}>" if deal_url else deal_name
+            msg = (
+                f":pencil: *Gap executor* `[{uid_short}]` — add HubSpot note to {link}:\n"
+                f"> {note_text[:400]}"
+            )
+            log.info("gap-executor: hubspot_note posted to #%s uid=%s", notify_ch, uid_short)
+            _post_to_slack(slack_token, notify_ch, msg)
+
+        else:
+            msg = f":information_source: *Gap executor* `[{uid_short}]` ({update_type}): {desc[:300]}"
+            log.info("gap-executor: generic action posted uid=%s", uid_short)
+            _post_to_slack(slack_token, notify_ch, msg)
+
+    except Exception as exc:
+        log.error("gap-executor: unexpected error for update %s: %s", uid_short, exc, exc_info=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -107,17 +207,11 @@ def main() -> int:
             dismissed_updates.append(update)
 
     if approved_updates:
-        log.info("APPROVED %d updates:", len(approved_updates))
+        log.info("APPROVED %d updates — executing now:", len(approved_updates))
+        slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
         for u in approved_updates:
             log.info("  [%s] %s — %s", u["update_type"], u["update_id"][:8], u["description"][:120])
-            # Print JSON line to stdout so downstream scripts/orchestrators can pick up
-            import json
-            print("APPROVED:" + json.dumps({
-                "update_id": u["update_id"],
-                "update_type": u["update_type"],
-                "payload": u["payload"],
-                "description": u["description"],
-            }))
+            _execute_approved_update(u, slack_token, log)
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
