@@ -113,15 +113,11 @@ users:
       - phi
       - cross_entity
 
-  U0B3RU65TFU:  # Demi Bagby — BDM partner
+  U0B3RU65TFU:  # Demi Bagby — BDM partner (full BDM access)
     name: Demi Bagby
     allowed_entities:
       - BDM
-    sensitive_topics_blocked:
-      - financials
-      - hr
-      - legal
-      - cap_table
+    sensitive_topics_blocked: []
       - cross_entity
 
   U0B3NGR1Y85:  # Larry Stone — BDM creative lead
