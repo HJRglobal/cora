@@ -229,13 +229,18 @@ confirmed against live systems._
 
 ---
 
-## Jake Lichtman — BDM
+## Jake Lichtman — BDM Client Rep / Videographer / Content Editor
 - **Slack:** `U0B3AER7NUF` | **Email:** Jake@bigd.media (Slack) / jake@hjrglobal.com (Asana)
 - **Asana GID:** `1211306578489633`
 - **Entity:** BDM
-- **Role:** BDM team member. Specific role within BDM to be confirmed by Harrison.
+- **Role:** Client-facing representative for BDM's clients, videographer, and content
+  editor. Handles client relationships on the BDM side, shoots video content, and
+  edits deliverables for BDM client projects.
+- **Owns:** BDM client rep relationships, video production shoots, content editing
+  and post-production for BDM deliverables.
 - **Reports to:** Larry Stone / Harrison
-- **Reconciliation relevance:** BDM Asana tasks, Fireflies BDM meetings.
+- **Reconciliation relevance:** BDM Asana tasks (client deliverables, shoot schedules,
+  edit timelines), Fireflies BDM client meetings, content production Gmail threads.
 
 ---
 
