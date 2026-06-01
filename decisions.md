@@ -260,3 +260,94 @@ New public channels are auto-joined via the `channel_created` Slack event.
 
 **Output:** `data/channel-sweep/sweep-YYYY-MM-DD.json` — per-user synthesis
 written by Haiku; feeds Pass 6 of reconciliation.
+
+
+---
+
+## D-018 · Pass 4 semantic matching upgrade (2026-05-31)
+
+**Context:** reconciliation_engine.py Pass 4 was using `SequenceMatcher.ratio()`
+(threshold 0.35) to match completion-language sentences against open Asana task
+names. Miss rate ~85% because natural language ("shipped samples to ADF") shares
+almost no characters with Asana task titles ("[F3E] Tommy -- ADF sampling kit").
+
+**Decisions:**
+1. Fireflies added as a source alongside Slack + Gmail (meetings are highest-signal).
+2. Semantic embedding (text-embedding-3-small, cosine_sim >= 0.72) replaces fuzzy
+   string matching. Falls back to fuzzy if OPENAI_API_KEY is absent.
+3. Task name prefixes ([ENTITY], "Name --") stripped via `_normalize_task_name()`
+   before matching to avoid dilution.
+4. New helpers: `_cosine_sim()`, `_embed_task_names()`, `_embed_sentence()`,
+   `_semantic_best_match()`, `_confidence_from_sim()`.
+5. `FIREFLIES_LOOKBACK_SECONDS = 48 * 3600` (separate from 25h default) so
+   yesterday's meetings are always included even when reconciliation runs same-day.
+
+---
+
+## D-019 · Reconciliation all-user coverage fixes (2026-05-31)
+
+**Context:** 5 bugs found that silently skipped users or blocked good matches.
+
+**Decisions (all implemented, committed 407fd03 + 4ada0d2):**
+1. `max_tasks` 50 → 200 per user (Harrison, Larry, Jake, Alex were hitting cap).
+2. `MAX_GAPS_PER_PASS` 10 → 30 (with 327 tasks across 16 users, later-processed
+   users were receiving 0 gaps per nightly run).
+3. `FIREFLIES_LOOKBACK_SECONDS` separate from DEFAULT (see D-018).
+4. Harrison Rogers included in stale-task DMs — all 16 users now receive.
+5. `seen_tasks` set replaced with `best_per_task` dict — best-score-wins per task
+   so a strong Fireflies signal can supersede a weak earlier Slack match.
+
+**Validation:** Manual run 2026-05-31 20:31: 15 gaps proposed, 6 users DM'd
+(Jake, Hannah, Larry, Harrison, Matt, Micah).
+
+---
+
+## D-020 · Reliability items — pending_confirm, KB checkpoint, Notion multi-DB, orphan-kill (2026-05-31)
+
+**Decisions (committed 32b06a1):**
+1. `team_learning.py`: `store/get/clear_pending_confirm()`, `kq_channel_for_entity()`,
+   `paraphrase_note()`, `is_confirmation()` — all were called from app.py but
+   undefined (live AttributeError on every paraphrase-confirm attempt). Now
+   SQLite-backed with 24h TTL. `pending_paraphrase_confirms` table in `cora_kb.db`.
+2. `checkpoint_state` table + `get/set/delete_checkpoint()` on `KnowledgeBase`.
+   Drive sweep saves per-user page token after each page; resumes mid-user on
+   restart rather than re-scanning from scratch.
+3. Notion connector: `NOTION_EXTRA_DB_IDS` env var (comma-separated DB IDs).
+   Extra DBs use generic page→text extraction. Only Contracts DB uses full schema.
+4. All 15 setup scripts: `Stop-ScheduledTask` added before `Unregister-ScheduledTask`
+   so any running instance is killed before re-registration.
+
+---
+
+## D-021 · Conftest env var doctrine (2026-05-31)
+
+**Context:** Cowork sandbox pre-sets required env vars to empty string `""`.
+`os.environ.setdefault()` does NOT overwrite empty strings (key already exists).
+This caused `cora.config._load()` to raise "ANTHROPIC_API_KEY: missing" during
+test collection, silently breaking ~30 tests per session.
+
+**Decision LOCKED:** In `tests/conftest.py`, always use:
+```python
+os.environ["KEY"] = os.environ.get("KEY") or "fallback-test-value"
+```
+Never `os.environ.setdefault("KEY", "fallback")` for required config vars in CI/sandbox.
+
+**Secondary doctrine:** Also pre-import `cora.config` at conftest module-load time
+(before `pytest_configure`) to prevent `test_f3e_inventory_location.py`'s fake
+`_Config` injection from corrupting the module cache for later tests.
+
+---
+
+## D-022 · Smart quote / encoding doctrine for PowerShell + Python source files (2026-05-31)
+
+**Context:** `Add-Content` in PowerShell 5.1 converts `"` to smart quotes
+(U+201C/U+201D) in appended content. Python source files with smart quote
+string delimiters fail to parse with `SyntaxError: unterminated string literal`.
+
+**Decision LOCKED:** Never use `Add-Content` to append Python source code.
+Use `Write` (Cowork tool) or `Edit` (targeted Edit tool). If a file gets smart
+quotes, fix with binary byte replacement:
+```python
+raw = raw.replace(b"\xe2\x80\x9c", b'"').replace(b"\xe2\x80\x9d", b'"')
+```
+Companion to D-016 (PS1 ASCII-only).
