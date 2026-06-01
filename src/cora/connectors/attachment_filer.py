@@ -3,11 +3,11 @@ Claude, and stores them in the canonically correct HJR-Founder-OS Drive folder.
 
 Flow (per monitored account):
   1. List unprocessed emails with attachments since last watermark.
-  2. Skip any already labeled "Cora-Filed" (idempotency within a watermark window).
+  2. Skip any already recorded in filed-message-ids.json (cross-account dedup, 30-day TTL).
   3. Call Claude (haiku) to classify each attachment: entity, subfolder, canonical
      filename, or skip if the attachment isn't worth archiving.
   4. For each "file" decision: download bytes → ensure Drive folder → upload → KB index.
-  5. Apply the "Cora-Filed" label to the message.
+  5. Record the RFC Message-ID in filed-message-ids.json (invisible — no Gmail labels).
   6. Advance the per-account watermark.
   7. Post a Slack summary to EMAIL_FILING_NOTIFY_CHANNEL if anything was filed.
 
@@ -51,9 +51,7 @@ from .drive_connector import (
 )
 from .gmail_reader import (
     GmailReaderError,
-    apply_label,
     download_attachment,
-    ensure_cora_label,
     get_message,
     list_messages_with_attachments,
     parse_message_metadata,
@@ -343,16 +341,16 @@ def _canonical_filename(
 def process_email(
     user_email: str,
     message_id: str,
-    label_id: str,
     dry_run: bool = False,
     kb=None,
     entity_hint: str | None = None,
     filed_ids: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Process one email: classify → download → upload → index → label.
+    """Process one email: classify → download → upload → index → record.
 
     Returns a list of filing results (one per filed attachment). Empty list
     means all attachments were skipped or the email was already processed.
+    No Gmail labels are applied — dedup is handled invisibly via filed-message-ids.json.
     """
     try:
         msg = get_message(user_email, message_id)
@@ -363,22 +361,9 @@ def process_email(
     meta = parse_message_metadata(msg)
     rfc_msg_id = meta.get("rfc_message_id", "")
 
-    # Already processed on a previous run (same mailbox)
-    if label_id in meta["labels"]:
-        log.debug("Message %s already labeled Cora-Filed — skipping", message_id)
-        return []
-
-    # Cross-account deduplication: same RFC Message-ID filed from another inbox
+    # Dedup: already filed from this or another inbox (invisible — no Gmail labels)
     if rfc_msg_id and filed_ids is not None and rfc_msg_id in filed_ids:
-        log.info(
-            "Message %r already filed from another account — stamping and skipping",
-            rfc_msg_id[:60],
-        )
-        if not dry_run:
-            try:
-                apply_label(user_email, message_id, label_id)
-            except GmailReaderError as exc:
-                log.warning("Label stamp failed for dedup skip %s: %s", message_id, exc)
+        log.debug("Message %r already filed — skipping", rfc_msg_id[:60])
         return []
 
     # PHI guardrail: skip LEX inbox emails that match client-care subject patterns
@@ -387,11 +372,6 @@ def process_email(
             "PHI risk detected in %s subject=%r — skipping (LEX PHI guardrail)",
             user_email, meta["subject"][:80],
         )
-        if not dry_run:
-            try:
-                apply_label(user_email, message_id, label_id)
-            except GmailReaderError as exc:
-                log.warning("Label stamp failed for PHI skip %s: %s", message_id, exc)
         return []
 
     raw_attachments = [a for a in meta["attachments"] if a["size"] > 5000]
@@ -514,17 +494,9 @@ def process_email(
             "dry_run": False,
         })
 
-    # Register RFC Message-ID in cross-account dedup store after successful filing
-    if results and rfc_msg_id and filed_ids is not None and not dry_run:
+    # Record RFC Message-ID so this email is never re-processed (invisible dedup)
+    if rfc_msg_id and filed_ids is not None and not dry_run:
         filed_ids[rfc_msg_id] = int(time.time())
-
-    # Label the message as processed regardless of how many were filed
-    # (so we don't re-examine it if it runs again within the watermark window)
-    if not dry_run:
-        try:
-            apply_label(user_email, message_id, label_id)
-        except GmailReaderError as exc:
-            log.warning("Failed to apply Cora-Filed label to %s: %s", message_id, exc)
 
     return results
 
@@ -567,13 +539,6 @@ def process_account(
     }
 
     try:
-        label_id = ensure_cora_label(user_email)
-    except GmailReaderError as exc:
-        log.error("Cannot get Cora-Filed label for %s: %s", user_email, exc)
-        summary["errors"] += 1
-        return summary
-
-    try:
         message_ids = list_messages_with_attachments(user_email, since_ts)
     except GmailReaderError as exc:
         log.error("Cannot list messages for %s: %s", user_email, exc)
@@ -586,7 +551,7 @@ def process_account(
     for msg_id in message_ids:
         try:
             filed = process_email(
-                user_email, msg_id, label_id,
+                user_email, msg_id,
                 dry_run=dry_run, kb=kb,
                 entity_hint=entity_hint, filed_ids=filed_ids,
             )
