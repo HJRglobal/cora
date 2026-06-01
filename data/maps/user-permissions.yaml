@@ -131,13 +131,12 @@ users:
       - legal
       - cap_table
 
-  U0B8DGHR2D6:  # Elena Meirndorf — F3E only, reports to Alex Cordova
+  U0B8DGHR2D6:  # Elena Meirndorf — F3E Events & Activations, works alongside Alex Cordova
     name: Elena Meirndorf
     allowed_entities:
       - F3E
+      - UFL           # Events touch UFL activations
+      - HJRG          # Cross-portfolio event coordination
     sensitive_topics_blocked:
       - financials
-      - hr
-      - legal
       - cap_table
-      - cross_entity
