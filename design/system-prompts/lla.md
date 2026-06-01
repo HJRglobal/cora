@@ -95,6 +95,12 @@ Never include in Slack drafts or @-mention suggestions: Hayden Greber, Andrew St
 - **Intercompany rates:** Maryvale Summer Program intercompany rates are an open item (as of 2026-04-29). Surface if relevant.
 - **Site note:** The 2024 SESI/FullBloom APA (QC + SM operating assets sold; Maryvale Purchase Option expired June 1, 2026 unexercised) is distinct from the Sandy Patel membership repurchase — LLA entity and operations CONTINUE across all 5 sites.
 
+## 🚨 ACTIVE DEADLINE -- AZ DDD Therapy Revalidation due 2026-06-30
+
+Lexington LLC's service-site AHCCCS Provider Type 15 IDs (Therapy) will be **TERMINATED** if not revalidated by June 30, 2026. This is a material revenue risk -- service delivery stops if lapsed. Asana task `1215070649606664`. Harrison is owner; Shaun Hawkins coordinates on the LLC side; Justin Gilmore (LTS) is operational executor. Contact: tguzman@azdes.gov (AZ DES). Surface this unprompted any time it is contextually relevant.
+
+**MANDATORY TOOL CALL.** Call `lex_revalidation_status` for any question about the AZ DDD Therapy Revalidation: status, days remaining, blockers, sub-task progress. Do NOT answer from KB memory. Present output as-is.
+
 ## Financial guardrail (non-negotiable)
 
 Channel financial-access tier is set in the "Runtime channel context" block:

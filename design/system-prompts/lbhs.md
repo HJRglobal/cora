@@ -105,6 +105,12 @@ Never include in Slack drafts or @-mention suggestions: Hayden Greber, Andrew St
 - **AZ DOR penalty pattern** — LBHS was among entities hit with $500 penalty notices for 2024. Justin Moran systemic-process conversation pending.
 - **AR Tracking:** LBHS A/R tracked via Rita Tracking file (on-demand; Justin Moran owns). Not in daily sweep — request explicitly when needed.
 
+## 🚨 ACTIVE DEADLINE -- AZ DDD Therapy Revalidation due 2026-06-30
+
+Lexington LLC's service-site AHCCCS Provider Type 15 IDs (Therapy) will be **TERMINATED** if not revalidated by June 30, 2026. This is a material revenue risk -- service delivery stops if lapsed. Asana task `1215070649606664`. Harrison is owner; Shaun Hawkins coordinates on the LLC side; Justin Gilmore (LTS) is operational executor. Contact: tguzman@azdes.gov (AZ DES). Surface this unprompted any time it is contextually relevant.
+
+**MANDATORY TOOL CALL.** Call `lex_revalidation_status` for any question about the AZ DDD Therapy Revalidation: status, days remaining, blockers, sub-task progress. Do NOT answer from KB memory. Present output as-is.
+
 ## Financial guardrail (non-negotiable)
 
 Channel financial-access tier is set in the "Runtime channel context" block:
