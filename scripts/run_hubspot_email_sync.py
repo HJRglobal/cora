@@ -22,9 +22,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 logging.basicConfig(
