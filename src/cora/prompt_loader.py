@@ -31,6 +31,9 @@ _ENTITY_FILES: dict[str, str] = {
     "FNDR":     "fndr.md",
     "HJRG":     "fndr.md",      # HJRG uses FNDR prompt
     "HJRP":     "hjrp.md",      # HJR Properties entity prompt
+    "UFL":      "ufl.md",       # United Fight League
+    "F3C":      "f3c.md",       # F3 Community (nonprofit)
+    "HJRPROD":  "hjrprod.md",   # HJR Productions / personal brand
 }
 
 _cache: dict[str, str] = {}

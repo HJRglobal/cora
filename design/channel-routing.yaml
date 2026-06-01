@@ -45,6 +45,50 @@ routes:
   - pattern: "cora-kq-bdm"
     entity: BDM
 
+  # ── Automated feed channels — Cora ignores @mentions silently ──────────────
+  # These are bot-posting channels only. No human conversation happens here.
+  - pattern: "asana-feed"
+    entity: FNDR
+    silent: true
+  - pattern: "fireflies-recaps"
+    entity: FNDR
+    silent: true
+  - pattern: "notion-changes"
+    entity: FNDR
+    silent: true
+  - pattern: "hubspot-feed"
+    entity: FNDR
+    silent: true
+  - pattern: "drive-shares"
+    entity: FNDR
+    silent: true
+
+  # ── UFL ─────────────────────────────────────────────────────────────────────
+  - pattern: "ufl"
+    entity: UFL
+  - pattern: "ufl-*"
+    entity: UFL
+
+  # ── F3 Community (nonprofit) ─────────────────────────────────────────────────
+  - pattern: "f3c"
+    entity: F3C
+  - pattern: "f3c-*"
+    entity: F3C
+
+  # ── HJR Productions / Personal brand ────────────────────────────────────────
+  - pattern: "hjrprod"
+    entity: HJRPROD
+  - pattern: "hjrprod-*"
+    entity: HJRPROD
+  - pattern: "harrisonjrogers-social"
+    entity: HJRPROD
+  - pattern: "hjr-podcast-social"
+    entity: HJRPROD
+
+  # ── Shaun's leadership channel — routes to LEX (he runs Lexington) ───────────
+  - pattern: "shaun-leadership"
+    entity: LEX
+
   # F3 Energy — covers bare #f3e, f3e-*, the f3-* exception (Pure launch etc.),
   # plus #polar-metrics (F3E ad spend dashboard, non-standard naming)
   - pattern: "f3e"

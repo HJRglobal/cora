@@ -14,6 +14,7 @@ from .claude_client import (
 )
 from . import active_thread_store
 from . import channel_classifier
+from . import user_access
 from .config import config
 from .context_loader import load_context
 from .entity_router import route
@@ -432,6 +433,13 @@ def handle_mention(event: dict, say: callable, client) -> None:
         return
 
     channel_name = _resolve_channel_name(client, channel_id)
+
+    # ── Silent channel check — automated feed channels, Cora does not respond ─
+    from .entity_router import is_silent_channel
+    if is_silent_channel(channel_name):
+        log.info("silent channel #%s — ignoring @mention from %s", channel_name, user_id)
+        return
+
     entity = route(channel_name)
     user_message = _MENTION_RE.sub("", raw_text).strip()
 
@@ -449,6 +457,18 @@ def handle_mention(event: dict, say: callable, client) -> None:
         "app_mention routed channel=#%s user=%s → entity=%s",
         channel_name, user_id, entity,
     )
+
+    # ── User access check — entity + sensitive topic authorization ────────────
+    if user_id:
+        access_block = user_access.check_access(user_id, entity, user_message)
+        if access_block:
+            log.info(
+                "user_access: blocked user=%s entity=%s reason=%s",
+                user_id, entity, access_block[:80],
+            )
+            say(text=access_block, thread_ts=thread_ts,
+                unfurl_links=False, unfurl_media=False)
+            return
 
     # Help-intent interception
     if help_responder.is_help_intent(user_message):

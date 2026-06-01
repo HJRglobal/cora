@@ -1,0 +1,136 @@
+# User-level Q&A permissions for Cora.
+#
+# Controls which entities a Slack user can ask Cora about — regardless of
+# which channel they're in. Both checks must pass before Cora answers:
+#   1. Channel entity scope (channel-routing.yaml)
+#   2. User entity scope (this file)
+#
+# If a user is not listed here, they get FNDR-level read access (cross-entity
+# overview, no sensitive sub-entity detail).
+#
+# sensitive_topics_blocked: topics Cora refuses for this user even in allowed entities.
+# Options: financials, hr, legal, phi, cap_table, cross_entity
+#
+# Harrison (U0B2RM2JYJ1) is the root authority — no restrictions apply.
+
+users:
+
+  U0B2RM2JYJ1:  # Harrison Rogers
+    name: Harrison Rogers
+    allowed_entities: all
+    sensitive_topics_blocked: []
+
+  U0B3AEQS0NB:  # Hannah Grant — Ops anchor, HJRG + F3E + LEX
+    name: Hannah Grant
+    allowed_entities:
+      - FNDR
+      - HJRG
+      - F3E
+      - LEX
+      - LEX-LLC
+      - LEX-LTS
+      - LEX-LBHS
+      - LEX-LLA
+      - BDM
+      - UFL
+    sensitive_topics_blocked:
+      - phi          # No client-level PHI even in LEX channels
+      - cap_table    # No ownership/equity details
+
+  U0B3VGWJTMJ:  # Alex Cordova — F3E sales + UFL sponsorships
+    name: Alex Cordova
+    allowed_entities:
+      - F3E
+      - UFL
+      - HJRG
+    sensitive_topics_blocked:
+      - financials   # P&L, cash flow — those go to Harrison/Justin
+      - hr
+      - legal
+      - cap_table
+
+  U0B3RU5Q55G:  # Tommy Anderson — F3E retail sales only
+    name: Tommy Anderson
+    allowed_entities:
+      - F3E
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table
+
+  U0B3PS7RFJA:  # Matt Petrovich — OSN ops across all 4 stores
+    name: Matt Petrovich
+    allowed_entities:
+      - OSN
+      - OSNGM
+      - OSNVV
+      - OSNGF
+      - OSNGW
+    sensitive_topics_blocked:
+      - hr
+      - legal
+      - cap_table
+
+  U0B4L78SZHN:  # Micah Kessler — OSN investor + BDM partner
+    name: Micah Kessler
+    allowed_entities:
+      - OSN
+      - OSNGM
+      - OSNVV
+      - OSNGF
+      - OSNGW
+      - BDM
+    sensitive_topics_blocked:
+      - hr
+      - legal
+
+  U0B3PS82G30:  # Shaun Hawkins — LEX-LLC ops lead
+    name: Shaun Hawkins
+    allowed_entities:
+      - LEX
+      - LEX-LLC
+    sensitive_topics_blocked:
+      - phi          # Clinical PHI stays in EHR
+      - cap_table    # No equity/ownership details
+      - cross_entity # No access to F3E, OSN, or other entities
+
+  U0B3VGT8RE0:  # Jennifer Mortensen — LEX-LLC
+    name: Jennifer Mortensen
+    allowed_entities:
+      - LEX-LLC
+    sensitive_topics_blocked:
+      - phi
+      - cap_table
+      - cross_entity
+      - financials
+
+  U0B3KHBJJ91:  # Jeff Montgomery — LEX-LLC minority owner
+    name: Jeff Montgomery
+    allowed_entities:
+      - LEX-LLC
+    sensitive_topics_blocked:
+      - phi
+      - cross_entity
+
+  U0B3RU65TFU:  # Demi Bagby — BDM partner
+    name: Demi Bagby
+    allowed_entities:
+      - BDM
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table
+      - cross_entity
+
+  U0B3NGR1Y85:  # Larry Stone — BDM creative lead
+    name: Larry Stone
+    allowed_entities:
+      - BDM
+      - F3E         # F3E is BDM's primary internal client
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table

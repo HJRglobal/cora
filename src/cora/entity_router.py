@@ -26,3 +26,15 @@ def route(channel_name: str) -> str:
         if fnmatch.fnmatch(channel_name, entry["pattern"]):
             return entry["entity"]
     return "FNDR"
+
+
+def is_silent_channel(channel_name: str) -> bool:
+    """Return True if this channel is marked silent (Cora should not respond).
+
+    Silent channels are automated feed channels where Cora is present for
+    monitoring but should not reply to @mentions.
+    """
+    for entry in _ROUTES:
+        if fnmatch.fnmatch(channel_name, entry["pattern"]):
+            return bool(entry.get("silent", False))
+    return False
