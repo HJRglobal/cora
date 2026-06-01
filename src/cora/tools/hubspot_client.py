@@ -247,13 +247,25 @@ def get_f3e_pipeline_summary_text() -> str:
     deals = _fetch_pipeline_deals(PIPELINE_F3E_RETAIL)
     today = _date.today().isoformat()
 
-    # Stage label map: embedded first, overlaid with live cache
-    stage_label: dict[str, str] = {sid: lbl for sid, lbl in _F3E_STAGE_ORDER}
+    # Build resolved stage order.  _F3E_STAGE_ORDER has empty-string IDs for
+    # stages whose IDs were not known at migration time (Identify, Outreach,
+    # Sample Sent).  After _fetch_pipeline_deals -> _refresh_pipeline_cache,
+    # _STAGE_NAME_CACHE is populated with {stage_id: label} from the live portal.
+    # Build a reverse (name -> id) map and fill in the empty slots.
+    _name_to_id: dict[str, str] = {v.lower(): k for k, v in _STAGE_NAME_CACHE.items()}
+    resolved_order: list[tuple[str, str]] = []
+    for sid, lbl in _F3E_STAGE_ORDER:
+        if not sid:
+            sid = _name_to_id.get(lbl.lower(), "")
+        resolved_order.append((sid, lbl))
+
+    # Stage label map: id -> display name
+    stage_label: dict[str, str] = {sid: lbl for sid, lbl in resolved_order if sid}
     stage_label.update(_STAGE_NAME_CACHE)
 
     # Bucket deals by stage_id
     stage_buckets: dict[str, list[dict[str, Any]]] = {
-        sid: [] for sid, _ in _F3E_STAGE_ORDER
+        sid: [] for sid, _ in resolved_order if sid
     }
     for deal in deals:
         sid = (deal.get("properties") or {}).get("dealstage", "")
@@ -285,7 +297,7 @@ def get_f3e_pipeline_summary_text() -> str:
 
     # Active stages (exclude terminal Closed Won/Lost)
     closed_ids = {_F3E_CLOSED_WON_ID, _F3E_CLOSED_LOST_ID}
-    active_stage_ids = [sid for sid, _ in _F3E_STAGE_ORDER if sid not in closed_ids]
+    active_stage_ids = [sid for sid, _ in resolved_order if sid and sid not in closed_ids]
     active_deals = [d for sid in active_stage_ids for d in stage_buckets.get(sid, [])]
     active_count = len(active_deals)
     active_value = sum(_amt(d) for d in active_deals)
@@ -301,8 +313,8 @@ def get_f3e_pipeline_summary_text() -> str:
         "BY STAGE:",
     ]
 
-    for sid, lbl in _F3E_STAGE_ORDER:
-        if sid in closed_ids:
+    for sid, lbl in resolved_order:
+        if not sid or sid in closed_ids:
             continue
         bucket = stage_buckets.get(sid, [])
         if not bucket:

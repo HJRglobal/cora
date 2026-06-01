@@ -152,7 +152,7 @@ def _audit(
 
 def _fmt_currency(val: Optional[float]) -> str:
     if val is None:
-        return "—"
+        return "-"
     sign = "-" if val < 0 else ""
     return f"{sign}${abs(val):,.0f}"
 

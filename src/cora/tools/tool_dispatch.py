@@ -709,7 +709,12 @@ def _tool_gmail_inbox(slack_user_id: str, entity: str, _input: dict) -> str:
         date_str = ""
         if msg.get("date_ts"):
             dt = datetime.datetime.fromtimestamp(msg["date_ts"])
-            date_str = dt.strftime("%-m/%-d %-I:%M %p")
+            # %-m / %-I removes leading zeros on Linux; %#m / %#I does the same on Windows
+            import sys as _sys
+            if _sys.platform == "win32":
+                date_str = dt.strftime("%#m/%#d %#I:%M %p")
+            else:
+                date_str = dt.strftime("%-m/%-d %-I:%M %p")
         sender = msg.get("from", "Unknown")
         # Strip angle-bracket email from "Name <email>" for cleaner display
         import re as _re

@@ -5,29 +5,29 @@ from cora.rate_limiter import RateLimiter
 
 
 def test_within_limits_allows():
-    rl = RateLimiter()
+    rl = RateLimiter(db_path=":memory:")
     for _ in range(9):
         assert rl.check("u1", "c1") == (True, None)
 
 
 def test_user_cap_hits_at_10():
-    rl = RateLimiter()
+    rl = RateLimiter(db_path=":memory:")
     for _ in range(10):
         assert rl.check("u1", "c1") == (True, None)
     assert rl.check("u1", "c1") == (False, "user")
 
 
 def test_channel_cap_hits_at_50():
-    rl = RateLimiter()
+    rl = RateLimiter(db_path=":memory:")
     for i in range(50):
         assert rl.check(f"user_{i}", "shared_channel") == (True, None)
     assert rl.check("user_50", "shared_channel") == (False, "channel")
 
 
 def test_window_expiry(monkeypatch):
-    rl = RateLimiter()
+    rl = RateLimiter(db_path=":memory:")
     current_time = [0.0]
-    monkeypatch.setattr(rl_module.time, "monotonic", lambda: current_time[0])
+    monkeypatch.setattr(rl_module.time, "time", lambda: current_time[0])
 
     for _ in range(10):
         rl.check("u1", "c1")
@@ -40,7 +40,7 @@ def test_window_expiry(monkeypatch):
 
 
 def test_user_cap_checked_before_channel_cap():
-    rl = RateLimiter()
+    rl = RateLimiter(db_path=":memory:")
 
     # Exhaust user cap for u_main across throwaway channels (don't pollute main_channel)
     for i in range(10):

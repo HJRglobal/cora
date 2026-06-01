@@ -28,21 +28,30 @@ CREATE INDEX IF NOT EXISTS rate_hits_ts       ON rate_hits(hit_ts);
 """
 
 
-def _open_db() -> sqlite3.Connection:
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+def _open_db(db_path: str | None = None) -> sqlite3.Connection:
+    path = db_path or str(_DB_PATH)
+    if path != ":memory:":
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
 
 
 class RateLimiter:
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
+        """Create a RateLimiter.
+
+        Args:
+            db_path: Path to the SQLite database file.  Pass ``":memory:"``
+                for an isolated in-memory store (useful in tests).  If
+                ``None``, uses the default ``data/rate_limiter.db``.
+        """
         self._user: dict[str, deque[float]] = {}
         self._channel: dict[str, deque[float]] = {}
         self._lock = Lock()
         try:
-            self._db: sqlite3.Connection | None = _open_db()
+            self._db: sqlite3.Connection | None = _open_db(db_path)
         except Exception:
             self._db = None  # fall back to in-memory only
 

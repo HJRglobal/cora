@@ -121,7 +121,7 @@ def test_hints_financial():
     assert hints.skip_kb is True
     assert hints.bypass_cache is True
     assert hints.cache_ttl == 0
-    assert hints.kb_k_override is None
+    assert hints.kb_k_override is None  # FINANCIAL skips KB entirely
 
 
 # ── routing_hints() — TASK_LOOKUP ─────────────────────────────────────────────
@@ -153,7 +153,7 @@ def test_hints_complex():
     assert hints.intent == Intent.COMPLEX
     assert hints.skip_kb is False
     assert hints.bypass_cache is False
-    assert hints.kb_k_override is None
+    assert hints.kb_k_override == 12  # COMPLEX uses k=12 for broader KB retrieval
     assert hints.cache_ttl == 1800  # 30 min
 
 

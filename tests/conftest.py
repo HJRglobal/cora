@@ -46,7 +46,32 @@ def _install_fake_tiktoken() -> None:
     sys.modules["tiktoken"] = fake  # type: ignore[assignment]
 
 
+# ── Set required env vars at MODULE LOAD TIME ─────────────────────────────────
+# Must happen before _patch_calendar_client_scheduler() (also module-level) and
+# before any src.cora.* imports, because config._load() runs at module import
+# time and raises if ANTHROPIC_API_KEY is missing.  pytest_configure() is too
+# late -- it fires after module-level conftest code has already run.
+#
+# Use unconditional assignment (NOT setdefault) for keys that config._load()
+# marks as required.  In the Cowork sandbox, these vars are already present but
+# set to empty string ""; setdefault won't overwrite them, causing _load() to
+# raise "ANTHROPIC_API_KEY: missing" even though the key technically exists.
+os.environ["SLACK_BOT_TOKEN"]      = os.environ.get("SLACK_BOT_TOKEN") or "xoxb-test-dummy-token-for-ci"
+os.environ["SLACK_APP_TOKEN"]      = os.environ.get("SLACK_APP_TOKEN") or "xapp-1-test-dummy-token-for-ci"
+os.environ["SLACK_SIGNING_SECRET"] = os.environ.get("SLACK_SIGNING_SECRET") or "test-signing-secret-for-ci"
+os.environ["ANTHROPIC_API_KEY"]    = os.environ.get("ANTHROPIC_API_KEY") or "sk-ant-test-dummy-key-for-ci"
+os.environ["ASANA_PAT"]            = os.environ.get("ASANA_PAT") or "0/dummy-asana-pat-for-ci"
+
 _install_fake_tiktoken()
+
+# Import cora.config NOW (env vars already set above) so that
+# test_f3e_inventory_location.py's "if 'cora.config' not in sys.modules" guard
+# sees it already loaded and skips injecting its fake _Config module, which
+# would pollute the real config object for subsequent tests.
+try:
+    import cora.config as _  # noqa: F401
+except Exception:
+    pass  # best-effort; tests that need config will re-import it
 
 
 def _mock_slack_auth_test() -> None:
@@ -87,11 +112,12 @@ def pytest_configure(config):
     proxy vars that interfere with the anthropic SDK in CI/sandbox envs.
     """
     # ── Required tokens (format must match config._PREFIX_RULES) ──────────────
-    os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-dummy-token-for-ci")
-    os.environ.setdefault("SLACK_APP_TOKEN", "xapp-1-test-dummy-token-for-ci")
-    os.environ.setdefault("SLACK_SIGNING_SECRET", "test-signing-secret-for-ci")
-    os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key-for-ci")
-    os.environ.setdefault("ASANA_PAT", "0/dummy-asana-pat-for-ci")
+    # Use "or" fallback so empty-string env vars (Cowork sandbox) get overwritten.
+    os.environ["SLACK_BOT_TOKEN"]      = os.environ.get("SLACK_BOT_TOKEN") or "xoxb-test-dummy-token-for-ci"
+    os.environ["SLACK_APP_TOKEN"]      = os.environ.get("SLACK_APP_TOKEN") or "xapp-1-test-dummy-token-for-ci"
+    os.environ["SLACK_SIGNING_SECRET"] = os.environ.get("SLACK_SIGNING_SECRET") or "test-signing-secret-for-ci"
+    os.environ["ANTHROPIC_API_KEY"]    = os.environ.get("ANTHROPIC_API_KEY") or "sk-ant-test-dummy-key-for-ci"
+    os.environ["ASANA_PAT"]            = os.environ.get("ASANA_PAT") or "0/dummy-asana-pat-for-ci"
 
     # ── Proxy vars that break anthropic/httpx in sandbox/CI environments ──────
     # The Cowork sandbox sets all_proxy=socks5h://localhost:1080 which causes

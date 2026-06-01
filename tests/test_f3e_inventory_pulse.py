@@ -531,12 +531,12 @@ class TestDispatchIntegration:
         from cora.tools.tool_dispatch import dispatch
         with patch("cora.tools.inventory_client.get_f3e_inventory_pulse_text",
                    return_value="*📦 F3 Inventory Pulse*"):
-            result = dispatch("f3e_inventory_pulse", "U123", "F3E", {})
+            result = dispatch("f3e_inventory_pulse", {}, "U123", "F3E")
         assert "Inventory Pulse" in result
 
     def test_dispatch_unknown_tool_still_works(self):
         from cora.tools.tool_dispatch import dispatch
-        result = dispatch("nonexistent_tool_xyz", "U123", "F3E", {})
+        result = dispatch("nonexistent_tool_xyz", {}, "U123", "F3E")
         assert "Unknown tool" in result
 
 

@@ -460,11 +460,9 @@ class TestToolCalendarScheduleMeeting:
         assert "could not find" in result.lower()
 
     def test_phase1_no_slot_found(self):
-        slot_start = az(2026, 6, 2, 9, 0).astimezone(UTC)
-        slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
-             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slot", return_value=None):
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[]):
             result = self._call("U_HARRISON", {"participants": ["Larry"]})
         assert "no common opening" in result.lower() or "no slot" in result.lower() or "not found" in result.lower()
 
@@ -473,9 +471,9 @@ class TestToolCalendarScheduleMeeting:
         slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
-             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slot", return_value=(slot_start, slot_end)):
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]):
             result = self._call("U_HARRISON", {"participants": ["Larry"]})
-        assert "SLOT FOUND" in result
+        assert "SLOTS FOUND" in result  # format_slot_proposals_for_llm header
         assert "2026-06-02" in result
         assert "confirmed" in result.lower()
 
@@ -530,9 +528,9 @@ class TestToolCalendarScheduleMeeting:
         slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
-             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slot", return_value=(slot_start, slot_end)) as mock_find:
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]) as mock_find:
             self._call("U_HARRISON", {"participants": ["Harrison", "Larry"]})
-        # emails passed to find_meeting_slot should not have harrison twice
+        # emails passed to find_meeting_slots should not have harrison twice
         call_kwargs = mock_find.call_args
         emails = call_kwargs[1].get("calendar_emails") or call_kwargs[0][1]
         assert emails.count("harrison@hjrglobal.com") == 1

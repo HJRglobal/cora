@@ -47,17 +47,33 @@ def _make_deal(
     }
 
 
-# Stage IDs from hubspot_client constants
-_IDENTIFY = "3601439469"
-_OUTREACH = "3601439470"
-_SAMPLE_SENT = "3672898248"
-_QUALIFIED = "3672898250"
-_PROPOSAL = "3672898249"
-_NEGOTIATION = "3604397771"
-_CLOSED_WON = "3601439474"
-_CLOSED_LOST = "3601439475"
+# Stage IDs -- new portal 246351746 (migrated 2026-05-30)
+# Qualified/Proposal/Negotiation/Closed have hardcoded IDs in hubspot_client.py.
+# Identify/Outreach/Sample Sent IDs are resolved from live cache; tests use
+# dedicated test IDs below and include them in _MOCK_STAGE_CACHE.
+_IDENTIFY    = "9900000001"   # test-only placeholder resolved from mock cache
+_OUTREACH    = "9900000002"   # test-only placeholder resolved from mock cache
+_SAMPLE_SENT = "9900000003"   # test-only placeholder resolved from mock cache
+_QUALIFIED   = "3760235204"
+_PROPOSAL    = "3760204497"
+_NEGOTIATION = "3760235205"
+_CLOSED_WON  = "3760235206"
+_CLOSED_LOST = "3760235207"
 
-_TOMMY_OWNER = "162944825"
+# Mock stage cache: maps test stage IDs -> display names so get_f3e_pipeline_summary_text()
+# can resolve the empty-string placeholders in _F3E_STAGE_ORDER via name lookup.
+_MOCK_STAGE_CACHE: dict[str, str] = {
+    _IDENTIFY:    "Identify",
+    _OUTREACH:    "Outreach",
+    _SAMPLE_SENT: "Sample Sent",
+    _QUALIFIED:   "Qualified",
+    _PROPOSAL:    "Proposal",
+    _NEGOTIATION: "Negotiation",
+    _CLOSED_WON:  "Closed Won",
+    _CLOSED_LOST: "Closed Lost",
+}
+
+_TOMMY_OWNER    = "162944825"
 _HARRISON_OWNER = "160459333"
 
 
@@ -71,7 +87,7 @@ class TestPipelineSummaryBasicStructure:
     def _get_summary(self, deals: list[dict[str, Any]]) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -112,7 +128,7 @@ class TestStageGrouping:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -171,7 +187,7 @@ class TestActivePipelineTotal:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -225,7 +241,7 @@ class TestHotList:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -299,7 +315,7 @@ class TestOwnerSplit:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -357,7 +373,7 @@ class TestClosedSection:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -402,7 +418,7 @@ class TestEmptyPipeline:
     def _run(self) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=[]):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -454,7 +470,7 @@ class TestPagination:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client.post.side_effect = _fake_post
 
-        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
@@ -487,7 +503,7 @@ class TestHubSpotClientErrors:
     def test_401_raises_client_error(self):
         from cora.tools.hubspot_client import HubSpotClientError, _fetch_pipeline_deals
         mock_client = self._make_mock_client(401)
-        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
@@ -497,7 +513,7 @@ class TestHubSpotClientErrors:
     def test_403_raises_client_error(self):
         from cora.tools.hubspot_client import HubSpotClientError, _fetch_pipeline_deals
         mock_client = self._make_mock_client(403)
-        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
@@ -507,7 +523,7 @@ class TestHubSpotClientErrors:
     def test_500_raises_client_error(self):
         from cora.tools.hubspot_client import HubSpotClientError, _fetch_pipeline_deals
         mock_client = self._make_mock_client(500)
-        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
@@ -521,7 +537,7 @@ class TestHubSpotClientErrors:
         mock_client.__enter__ = lambda s: mock_client
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client.post.side_effect = httpx.RequestError("connection refused")
-        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+        with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
@@ -671,7 +687,7 @@ class TestSourceOpacity:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -712,7 +728,7 @@ class TestDealLinkFormat:
     def _run(self, deals: list) -> str:
         with patch("cora.tools.hubspot_client._fetch_pipeline_deals", return_value=deals):
             with patch("cora.tools.hubspot_client._refresh_pipeline_cache"):
-                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", {}):
+                with patch("cora.tools.hubspot_client._STAGE_NAME_CACHE", _MOCK_STAGE_CACHE):
                     from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
                     return get_f3e_pipeline_summary_text()
 
@@ -725,4 +741,5 @@ class TestDealLinkFormat:
         deals = [_make_deal("123", "LinkTest", _PROPOSAL, "5000", _TOMMY_OWNER)]
         result = self._run(deals)
         assert "<" in result and "|LinkTest>" in result
+
 
