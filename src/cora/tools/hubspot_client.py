@@ -686,3 +686,175 @@ def format_deals_for_llm(
         )
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Write helpers — LinkedIn Spy → HubSpot pipeline
+# ---------------------------------------------------------------------------
+
+# F3E Retail pipeline first stage ("Identify") — confirmed 2026-05-31
+_F3E_STAGE_IDENTIFY = "3760235201"
+
+
+def find_contact_by_linkedin_url(linkedin_url: str) -> str | None:
+    """Search HubSpot contacts by LinkedIn URL. Returns contact ID or None."""
+    if not linkedin_url:
+        return None
+    hdrs = _headers()
+    body = {
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "hs_linkedin_url",
+                "operator": "EQ",
+                "value": linkedin_url,
+            }]
+        }],
+        "properties": ["hs_linkedin_url", "firstname", "lastname"],
+        "limit": 1,
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/crm/v3/objects/contacts/search", headers=hdrs, json=body)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", []) or []
+        return str(results[0]["id"]) if results else None
+    except Exception as exc:
+        log.warning("HubSpot linkedin search failed for %s: %s", linkedin_url, exc)
+        return None
+
+
+def create_contact(
+    *,
+    first_name: str,
+    last_name: str,
+    job_title: str,
+    company: str,
+    linkedin_url: str,
+) -> str:
+    """Create a HubSpot contact. Returns the new contact ID."""
+    hdrs = _headers()
+    props: dict[str, str] = {}
+    if first_name:
+        props["firstname"] = first_name
+    if last_name:
+        props["lastname"] = last_name
+    if job_title:
+        props["jobtitle"] = job_title
+    if company:
+        props["company"] = company
+    if linkedin_url:
+        props["hs_linkedin_url"] = linkedin_url
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/contacts",
+                headers=hdrs,
+                json={"properties": props},
+            )
+        if r.status_code in (200, 201):
+            return str(r.json().get("id", ""))
+        raise HubSpotClientError(f"create_contact {r.status_code}: {r.text[:200]}")
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"create_contact network error: {exc}") from exc
+
+
+def create_deal(
+    *,
+    deal_name: str,
+    pipeline_id: str = PIPELINE_F3E_RETAIL,
+    stage_id: str = _F3E_STAGE_IDENTIFY,
+    contact_id: str | None = None,
+    owner_id: str | None = None,
+) -> str:
+    """Create a HubSpot deal and optionally associate a contact. Returns deal ID."""
+    hdrs = _headers()
+    props: dict[str, str] = {
+        "dealname": deal_name,
+        "pipeline": pipeline_id,
+        "dealstage": stage_id,
+    }
+    if owner_id:
+        props["hubspot_owner_id"] = owner_id
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/deals",
+                headers=hdrs,
+                json={"properties": props},
+            )
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(f"create_deal {r.status_code}: {r.text[:200]}")
+
+        deal_id = str(r.json().get("id", ""))
+
+        if contact_id and deal_id:
+            try:
+                with httpx.Client(timeout=_TIMEOUT) as c2:
+                    c2.put(
+                        f"{_BASE}/crm/v4/objects/contacts/{contact_id}/associations/deals/{deal_id}",
+                        headers=hdrs,
+                        json=[{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 4}],
+                    )
+            except Exception as exc:
+                log.warning("HubSpot contact-deal association failed: %s", exc)
+
+        return deal_id
+
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"create_deal network error: {exc}") from exc
+
+
+def create_note(
+    *,
+    body: str,
+    deal_id: str | None = None,
+    contact_id: str | None = None,
+) -> str:
+    """Create a HubSpot note and associate with a deal and/or contact. Returns note ID."""
+    import time as _time
+
+    hdrs = _headers()
+    ts_ms = str(int(_time.time() * 1000))
+    props = {"hs_note_body": body[:65535], "hs_timestamp": ts_ms}
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/notes",
+                headers=hdrs,
+                json={"properties": props},
+            )
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(f"create_note {r.status_code}: {r.text[:200]}")
+
+        note_id = str(r.json().get("id", ""))
+
+        for obj_type, obj_id, assoc_type_id in [
+            ("deals", deal_id, 214),
+            ("contacts", contact_id, 202),
+        ]:
+            if obj_id and note_id:
+                try:
+                    with httpx.Client(timeout=_TIMEOUT) as c2:
+                        c2.put(
+                            f"{_BASE}/crm/v4/objects/notes/{note_id}/associations/{obj_type}/{obj_id}",
+                            headers=hdrs,
+                            json=[{"associationCategory": "HUBSPOT_DEFINED",
+                                   "associationTypeId": assoc_type_id}],
+                        )
+                except Exception as exc:
+                    log.warning("HubSpot note-%s association failed: %s", obj_type, exc)
+
+        return note_id
+
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"create_note network error: {exc}") from exc

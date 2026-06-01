@@ -168,6 +168,101 @@ def _generate_outreach(prospects: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# HubSpot sync
+# ---------------------------------------------------------------------------
+
+_TOMMY_OWNER_ID = "162944825"  # Tommy Anderson — F3E sales owner
+
+
+def _sync_prospects_to_hubspot(prospects: list[dict]) -> int:
+    """Create a HubSpot contact + deal + note for each new prospect.
+
+    Skips prospects that already have a contact by LinkedIn URL.
+    Returns count of new contacts created.
+    """
+    try:
+        from cora.tools.hubspot_client import (
+            HubSpotClientError,
+            PIPELINE_F3E_RETAIL,
+            _F3E_STAGE_IDENTIFY,
+            create_contact,
+            create_deal,
+            create_note,
+            find_contact_by_linkedin_url,
+        )
+    except ImportError as exc:
+        log.error("linkedin_spy: HubSpot client import failed — %s", exc)
+        return 0
+
+    created = 0
+    for p in prospects:
+        li_url = p.get("linkedin_url", "")
+        name = p.get("name") or ""
+        title = p.get("title", "")
+        company = p.get("company", "")
+        brand_fit = p.get("brand_fit", "")
+        message_draft = p.get("message_draft", "")
+
+        # Parse first / last name (best-effort split)
+        parts = name.strip().split(" ", 1)
+        first = parts[0] if parts else ""
+        last = parts[1] if len(parts) > 1 else ""
+
+        # Skip if already in HubSpot
+        if li_url:
+            existing = find_contact_by_linkedin_url(li_url)
+            if existing:
+                log.info("linkedin_spy: HubSpot contact already exists for %s — skipping", name or li_url)
+                continue
+
+        try:
+            contact_id = create_contact(
+                first_name=first,
+                last_name=last,
+                job_title=title,
+                company=company,
+                linkedin_url=li_url,
+            )
+
+            deal_name = f"{name} — {company}" if name else f"{title} @ {company}"
+            deal_id = create_deal(
+                deal_name=deal_name,
+                pipeline_id=PIPELINE_F3E_RETAIL,
+                stage_id=_F3E_STAGE_IDENTIFY,
+                contact_id=contact_id,
+                owner_id=_TOMMY_OWNER_ID,
+            )
+
+            note_lines = [
+                f"Source: LinkedIn Spy (Apollo.io) — auto-imported",
+                f"Title: {title}",
+                f"Company: {company}",
+                f"LinkedIn: {li_url}" if li_url else "",
+                f"",
+                f"Brand fit: {brand_fit}",
+                f"",
+                f"LinkedIn connection draft (≤280 chars — paste directly):",
+                f"{message_draft}",
+            ]
+            create_note(
+                body="\n".join(line for line in note_lines if line is not None),
+                deal_id=deal_id,
+                contact_id=contact_id,
+            )
+
+            created += 1
+            log.info(
+                "linkedin_spy: HubSpot — created contact=%s deal=%s for %s @ %s",
+                contact_id, deal_id, name or "(unnamed)", company,
+            )
+
+        except HubSpotClientError as exc:
+            log.warning("linkedin_spy: HubSpot sync failed for %s: %s", name or company, exc)
+
+    return created
+
+
+# ---------------------------------------------------------------------------
 # Slack posting
 # ---------------------------------------------------------------------------
 
@@ -200,12 +295,15 @@ def _post_to_slack(text: str) -> bool:
 # Report formatting
 # ---------------------------------------------------------------------------
 
-def _format_report(prospects: list[dict], new_found: int, total_seen: int) -> str:
+def _format_report(prospects: list[dict], new_found: int, total_seen: int,
+                   hs_created: int = 0) -> str:
     week_str = datetime.now(tz=timezone.utc).strftime("%#d %b %Y")
+    hs_note = f" *{hs_created} added to HubSpot* (Identify stage, assigned to Tommy)." \
+        if hs_created else ""
     lines = [
         f"📋 *F3 LinkedIn Prospect Report — {week_str}*",
         f"Found *{new_found} new* retail buyers & executives this week. "
-        f"Showing top {len(prospects)}. Total scanned to date: {total_seen}.",
+        f"Showing top {len(prospects)}. Total scanned to date: {total_seen}.{hs_note}",
         "",
     ]
 
@@ -343,8 +441,13 @@ def run_scan() -> None:
         log.warning("linkedin_spy: no pending report rows after write — skipping Slack post")
         return
 
-    # Step 5: post Slack report
-    report_text = _format_report(report_rows, new_found=total_new, total_seen=total_seen)
+    # Step 5: sync to HubSpot — create contact + deal + note for each new prospect
+    hs_created = _sync_prospects_to_hubspot(report_rows)
+    log.info("linkedin_spy: HubSpot sync — %d contact(s) created", hs_created)
+
+    # Step 6: post Slack report
+    report_text = _format_report(report_rows, new_found=total_new, total_seen=total_seen,
+                                 hs_created=hs_created)
     posted = _post_to_slack(report_text)
 
     if posted:
