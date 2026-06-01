@@ -60,6 +60,11 @@ log = logging.getLogger(__name__)
 # Lookback window for KB chunk queries — 25h to account for late-night syncs.
 DEFAULT_LOOKBACK_SECONDS = 25 * 3600
 
+# Extended lookback for Fireflies in Pass 4.  Fireflies syncs at 3:30am and
+# meetings happen irregularly — 25h often misses yesterday's transcripts.
+# 48h ensures 2 full days of meeting content are scanned for completion signals.
+FIREFLIES_LOOKBACK_SECONDS = 48 * 3600
+
 # HubSpot stale-deal threshold (seconds)
 HUBSPOT_STALE_DAYS = 7
 HUBSPOT_STALE_SECONDS = HUBSPOT_STALE_DAYS * 86400
@@ -70,8 +75,9 @@ CONFIDENCE_THRESHOLD = "MED"  # "HIGH" | "MED" — LOW is discarded
 # Min fuzzy ratio for task/deal name matching
 MIN_FUZZY_RATIO = 0.35
 
-# Max gaps surfaced per pass (caps noise)
-MAX_GAPS_PER_PASS = 10
+# Max gaps surfaced per pass.  Set to 30 so all 16 users can surface ~2 each.
+# Previously 10, which caused later users to be silently skipped.
+MAX_GAPS_PER_PASS = 30
 
 # Action/commitment language patterns for Pass 1.
 _ACTION_RE = re.compile(
@@ -736,11 +742,31 @@ def pass4_stale_open_tasks(
         )
         _have_completion_detector = False
 
-    # -- Fix 1: include Fireflies as a source ----------------------------------
-    chunks = _query_kb_chunks(
-        sources=["slack", "gmail", "fireflies"],
+    # -- Fix 1: include Fireflies, Bug 3: use extended lookback for Fireflies --
+    # Slack/Gmail use the standard 25h window.  Fireflies syncs at 3:30am and
+    # meetings happen irregularly — using 48h ensures yesterday's transcripts
+    # are always included even when the reconciliation run is same-day.
+    chunks_short = _query_kb_chunks(
+        sources=["slack", "gmail"],
         lookback_seconds=lookback_seconds,
         db_path=db_path,
+    )
+    chunks_ff = _query_kb_chunks(
+        sources=["fireflies"],
+        lookback_seconds=FIREFLIES_LOOKBACK_SECONDS,
+        db_path=db_path,
+    )
+    # Merge, dedup by source_id (Fireflies wins over shorter-window duplicates)
+    _seen_chunk_ids: set[str] = set()
+    chunks: list[dict] = []
+    for c in chunks_short + chunks_ff:
+        sid = c["source_id"]
+        if sid not in _seen_chunk_ids:
+            _seen_chunk_ids.add(sid)
+            chunks.append(c)
+    log.info(
+        "pass4 sources: %d slack/gmail chunks + %d fireflies chunks = %d total",
+        len(chunks_short), len(chunks_ff), len(chunks),
     )
 
     open_task_names = [
@@ -769,8 +795,11 @@ def pass4_stale_open_tasks(
     else:
         log.info("reconciliation pass4: falling back to fuzzy matching (semantic unavailable)")
 
-    gaps: list[ReconciliationGap] = []
-    seen_tasks: set[str] = set()
+    # Bug 5 fix: best-score-wins per task instead of first-match-wins.
+    # Tracks the best match found for each task GID so a stronger signal from
+    # Fireflies can supersede a weaker earlier match from Slack.
+    best_per_task: dict[str, tuple[float, bool, dict, dict]] = {}
+    # task_gid -> (score, used_semantic, chunk, best_task_entry)
 
     for chunk in chunks:
         for sentence in _extract_sentences(chunk["content"]):
@@ -784,7 +813,6 @@ def pass4_stale_open_tasks(
             used_semantic = False
 
             if use_semantic:
-                # Semantic path: embed sentence, cosine similarity against task embeddings
                 sent_emb = _embed_sentence(sentence)
                 if sent_emb:
                     best_sim, best_task = _semantic_best_match(
@@ -795,10 +823,8 @@ def pass4_stale_open_tasks(
                         used_semantic = True
 
             if not best_task:
-                # Fuzzy fallback (or when semantic embedding failed for this sentence)
                 best_ratio = MIN_FUZZY_RATIO
                 for task_entry in open_task_names:
-                    # Fix 3: match against normalised name to avoid prefix dilution
                     clean_name = _normalize_task_name(task_entry["name"])
                     ratio = _fuzzy_ratio(sentence, clean_name)
                     if ratio > best_ratio:
@@ -811,16 +837,14 @@ def pass4_stale_open_tasks(
                 continue
 
             task_gid = best_task.get("gid", "")
-            if task_gid in seen_tasks:
+            if not task_gid:
                 continue
 
             # Skip if already in completion_detector dedup cache
             if _have_completion_detector and _is_deduped(task_gid, chunk["source_id"]):
                 continue
 
-            seen_tasks.add(task_gid)
-
-            # Confidence: use semantic scoring function when semantic match was used
+            # Confidence: use semantic scoring when semantic match was used
             if used_semantic:
                 confidence = _confidence_from_sim(match_score, chunk["source"])
             else:
@@ -829,53 +853,67 @@ def pass4_stale_open_tasks(
             if confidence == "LOW":
                 continue
 
-            task_name = best_task.get("name", "")
-            task_url = best_task.get("permalink_url", "")
-            assignee = best_task.get("assignee") or {}
-            assignee_name = assignee.get("name", "")
+            # Best-score-wins: keep the highest-confidence match per task
+            prev = best_per_task.get(task_gid)
+            if prev is None or match_score > prev[0]:
+                best_per_task[task_gid] = (match_score, used_semantic, chunk, best_task)
 
-            match_method = "semantic" if used_semantic else "fuzzy"
-            match_label = f"sim={match_score:.3f}" if used_semantic else f"ratio={match_score:.3f}"
-
-            description = (
-                f"Possible task completion: \"{task_name}\" "
-                f"— {chunk['source']} says: \"{sentence[:120]}\""
-            )
-            if assignee_name:
-                description += f" (assigned to {assignee_name})"
-
-            gaps.append(ReconciliationGap(
-                gap_id=_gap_id("stale_open_task", chunk["source_id"], task_gid),
-                gap_type="stale_open_task",
-                description=description,
-                source_evidence=sentence[:400],
-                source=chunk["source"],
-                source_id=chunk["source_id"],
-                entity=chunk["entity"],
-                confidence=confidence,
-                proposed_action=(
-                    f"Close Asana task \"{task_name}\" "
-                    f"({task_url}) — completion language found in {chunk['source']} "
-                    f"[{match_method} {match_label}]"
-                ),
-                payload={
-                    "task_gid": task_gid,
-                    "task_name": task_name,
-                    "task_url": task_url,
-                    "assignee_name": assignee_name,
-                    "source": chunk["source"],
-                    "source_id": chunk["source_id"],
-                    "match_method": match_method,
-                    "match_score": round(match_score, 4),
-                },
-                deep_link=chunk["deep_link"],
-                title=chunk["title"],
-            ))
-
-            if len(gaps) >= MAX_GAPS_PER_PASS:
-                break
+    # Build gap list from best-per-task matches, sorted by score descending
+    gaps: list[ReconciliationGap] = []
+    for task_gid, (match_score, used_semantic, chunk, best_task) in sorted(
+        best_per_task.items(), key=lambda x: x[1][0], reverse=True
+    ):
         if len(gaps) >= MAX_GAPS_PER_PASS:
             break
+
+        task_name = best_task.get("name", "")
+        task_url = best_task.get("permalink_url", "")
+        assignee = best_task.get("assignee") or {}
+        assignee_name = assignee.get("name", "")
+
+        match_method = "semantic" if used_semantic else "fuzzy"
+        match_label = (
+            f"sim={match_score:.3f}" if used_semantic else f"ratio={match_score:.3f}"
+        )
+
+        description = (
+            f"Possible task completion: \"{task_name}\" "
+            f"-- {chunk['source']} says: \"{chunk['content'][:120]}\""
+        )
+        if assignee_name:
+            description += f" (assigned to {assignee_name})"
+
+        gaps.append(ReconciliationGap(
+            gap_id=_gap_id("stale_open_task", chunk["source_id"], task_gid),
+            gap_type="stale_open_task",
+            description=description,
+            source_evidence=chunk["content"][:400],
+            source=chunk["source"],
+            source_id=chunk["source_id"],
+            entity=chunk["entity"],
+            confidence=(
+                _confidence_from_sim(match_score, chunk["source"])
+                if used_semantic
+                else _confidence_from_ratio(match_score, chunk["source"])
+            ),
+            proposed_action=(
+                f"Close Asana task \"{task_name}\" "
+                f"({task_url}) -- completion language found in {chunk['source']} "
+                f"[{match_method} {match_label}]"
+            ),
+            payload={
+                "task_gid": task_gid,
+                "task_name": task_name,
+                "task_url": task_url,
+                "assignee_name": assignee_name,
+                "source": chunk["source"],
+                "source_id": chunk["source_id"],
+                "match_method": match_method,
+                "match_score": round(match_score, 4),
+            },
+            deep_link=chunk["deep_link"],
+            title=chunk["title"],
+        ))
 
     log.info(
         "reconciliation pass4: %d stale-task gaps found (%s matching, %d sources)",
