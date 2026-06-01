@@ -45,6 +45,8 @@ _INTERNAL_DOMAINS: frozenset[str] = frozenset({
     "f3energy.com",
     "bigd.media",
     "onestopmedia.com",
+    "lexingtonservices.com",
+    "unitedfightleague.com",
 })
 
 
