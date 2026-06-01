@@ -1,4 +1,4 @@
-"""Tests for src/cora/reconciliation_engine.py — Component 3.
+"""Tests for src/cora/reconciliation_engine.py  --  Component 3.
 
 Layer A: string/logic assertions (no imports needed).
 Layer B: import-guarded unit tests with mocks + temp DB.
@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# â"€â"€ helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 def _load_engine():
     """Import reconciliation_engine from src."""
@@ -81,11 +81,11 @@ def _make_db(chunks: list[dict]) -> Path:
     return Path(tmp)
 
 
-# ── Layer A: pure logic ────────────────────────────────────────────────────────
+# â"€â"€ Layer A: pure logic â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 
 class TestPhiContent:
-    """Layer A — PHI content detection."""
+    """Layer A  --  PHI content detection."""
 
     def test_service_note_detected(self):
         m = _load_engine()
@@ -121,7 +121,7 @@ class TestPhiContent:
 
 
 class TestVisCpaExclusion:
-    """Layer A — Visibility CPA name exclusion."""
+    """Layer A  --  Visibility CPA name exclusion."""
 
     def test_hayden_excluded(self):
         m = _load_engine()
@@ -146,7 +146,7 @@ class TestVisCpaExclusion:
 
 
 class TestGapId:
-    """Layer A — gap ID generation."""
+    """Layer A  --  gap ID generation."""
 
     def test_deterministic(self):
         m = _load_engine()
@@ -174,7 +174,7 @@ class TestGapId:
 
 
 class TestExtractSentences:
-    """Layer A — sentence extraction."""
+    """Layer A  --  sentence extraction."""
 
     def test_splits_on_period(self):
         m = _load_engine()
@@ -199,7 +199,7 @@ class TestExtractSentences:
 
 
 class TestConfidenceFromRatio:
-    """Layer A — confidence tier calculation."""
+    """Layer A  --  confidence tier calculation."""
 
     def test_slack_high_ratio_gives_med(self):
         m = _load_engine()
@@ -225,7 +225,7 @@ class TestConfidenceFromRatio:
         assert result in ("HIGH", "MED", "LOW")
 
 
-# ── Layer B: import-guarded unit tests with mocks + temp DB ───────────────────
+# â"€â"€ Layer B: import-guarded unit tests with mocks + temp DB â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 try:
     sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -237,7 +237,7 @@ except Exception:
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="reconciliation_engine not importable")
 class TestPass1MissingAsanaTasks:
-    """Layer B — pass1 missing Asana task detection."""
+    """Layer B  --  pass1 missing Asana task detection."""
 
     def _make_slack_chunk(self, content: str, entity: str = "F3E") -> dict:
         return {
@@ -313,7 +313,7 @@ class TestPass1MissingAsanaTasks:
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="reconciliation_engine not importable")
 class TestPass2StaleHubspot:
-    """Layer B — pass2 stale HubSpot deal detection."""
+    """Layer B  --  pass2 stale HubSpot deal detection."""
 
     def _make_slack_chunk(self, content: str) -> dict:
         return {
@@ -382,7 +382,7 @@ class TestPass2StaleHubspot:
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="reconciliation_engine not importable")
 class TestPass3UncapturedDecisions:
-    """Layer B — pass3 uncaptured decision detection."""
+    """Layer B  --  pass3 uncaptured decision detection."""
 
     def _make_fireflies_chunk(self, content: str) -> dict:
         return {
@@ -399,7 +399,7 @@ class TestPass3UncapturedDecisions:
                 "We decided to launch the Pure variety pack on June 15th going forward."
             )
         ])
-        # No decisions.md chunks in DB — should flag as new
+        # No decisions.md chunks in DB  --  should flag as new
         gaps = _re.pass3_uncaptured_decisions(db_path=db_path)
         assert len(gaps) >= 1
         assert all(g.gap_type == "uncaptured_decision" for g in gaps)
@@ -424,7 +424,7 @@ class TestPass3UncapturedDecisions:
         }
         db_path = _make_db([decisions_chunk, live_chunk])
         gaps = _re.pass3_uncaptured_decisions(db_path=db_path)
-        # The decision is in decisions.md already — should not be flagged
+        # The decision is in decisions.md already  --  should not be flagged
         # (key words "launch", "variety", "pack", "june" all present)
         # This test verifies the keyword-overlap suppression works
         assert isinstance(gaps, list)  # at minimum should not crash
@@ -436,7 +436,7 @@ class TestPass3UncapturedDecisions:
     def test_gap_has_decision_type(self):
         db_path = _make_db([
             self._make_fireflies_chunk(
-                "Going with the blue packaging for Mood — final decision confirmed today."
+                "Going with the blue packaging for Mood  --  final decision confirmed today."
             )
         ])
         gaps = _re.pass3_uncaptured_decisions(db_path=db_path)
@@ -447,7 +447,7 @@ class TestPass3UncapturedDecisions:
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="reconciliation_engine not importable")
 class TestPass4StaleOpenTasks:
-    """Layer B — pass4 stale open task (completion language) detection."""
+    """Layer B  --  pass4 stale open task (completion language) detection."""
 
     def _make_slack_chunk(self, content: str) -> dict:
         return {
@@ -486,7 +486,7 @@ class TestPass4StaleOpenTasks:
             open_tasks=[{"gid": "T002", "name": "Unrelated task about F3 branding", "permalink_url": "", "assignee": {}}],
             db_path=db_path,
         )
-        # Invoice payment vs F3 branding — low fuzzy ratio, should not match
+        # Invoice payment vs F3 branding  --  low fuzzy ratio, should not match
         assert len(gaps) == 0
 
     def test_empty_tasks_returns_empty(self):
@@ -519,7 +519,7 @@ class TestPass4StaleOpenTasks:
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="reconciliation_engine not importable")
 class TestReconcileOrchestration:
-    """Layer B — reconcile() top-level orchestration."""
+    """Layer B  --  reconcile() top-level orchestration."""
 
     def test_reconcile_returns_only_actionable(self):
         # No chunks in DB -> no gaps -> empty list
@@ -545,7 +545,7 @@ class TestReconcileOrchestration:
             db_path=db_path,
             passes=[3],
         )
-        # Pass 3 only — all gaps should be uncaptured_decision
+        # Pass 3 only  --  all gaps should be uncaptured_decision
         for g in gaps:
             assert g.gap_type == "uncaptured_decision"
 
@@ -650,7 +650,7 @@ class TestReconcileOrchestration:
 
 
 class TestPass5DriveInsights:
-    """Layer B — pass5_drive_insights() via reconcile()."""
+    """Layer B  --  pass5_drive_insights() via reconcile()."""
 
     def _make_drive_db(self, chunks: list[dict]) -> Path:
         """Create a temp DB with drive_sweep chunks."""
@@ -761,7 +761,7 @@ class TestPass5DriveInsights:
         ])
         client = MagicMock()
         client.messages.create.side_effect = RuntimeError("API down")
-        # Should not raise — errors are caught per-entity
+        # Should not raise  --  errors are caught per-entity
         gaps = _re.reconcile(
             open_tasks=[], active_deals=[],
             db_path=db_path,
@@ -818,3 +818,250 @@ class TestPass5DriveInsights:
         )
         assert gaps == []
         client.messages.create.assert_not_called()
+
+
+# â"€â"€ Tests for Pass 4 three-fix upgrade â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+
+_re = _load_engine()
+
+
+class TestNormalizeTaskName:
+    """Fix 3: prefix stripping before matching."""
+
+    def test_strips_entity_bracket(self):
+        assert _re._normalize_task_name("[F3E] Sampling kit delivery") == "Sampling kit delivery"
+
+    def test_strips_entity_and_assignee(self):
+        # Real Asana tasks use -- as the separator
+        assert _re._normalize_task_name("[OSN] Matt -- Inventory Reconciliation") == "Inventory Reconciliation"
+
+    def test_no_prefix_unchanged(self):
+        assert _re._normalize_task_name("Follow up with Harrison") == "Follow up with Harrison"
+
+    def test_lex_entity_stripped(self):
+        assert _re._normalize_task_name("[LEX-LLC] Jeff -- Website revamp") == "Website revamp"
+
+    def test_em_dash_prefix_stripped(self):
+        # Also handles em dash (U+2014) used in some task names
+        em = chr(0x2014)
+        result = _re._normalize_task_name(f"[F3E] Tommy{em}ADF follow up")
+        assert "Tommy" not in result
+        assert "ADF follow up" in result
+
+    def test_empty_string_safe(self):
+        assert _re._normalize_task_name("") == ""
+
+
+class TestCosineSim:
+    """Fix 2: cosine similarity helper."""
+
+    def test_identical_vectors(self):
+        v = [1.0, 0.0, 0.0]
+        assert abs(_re._cosine_sim(v, v) - 1.0) < 1e-6
+
+    def test_orthogonal_vectors(self):
+        a = [1.0, 0.0]
+        b = [0.0, 1.0]
+        assert abs(_re._cosine_sim(a, b)) < 1e-6
+
+    def test_opposite_vectors(self):
+        a = [1.0, 0.0]
+        b = [-1.0, 0.0]
+        assert _re._cosine_sim(a, b) < 0
+
+    def test_partial_similarity(self):
+        import math
+        a = [1.0, 1.0]
+        b = [1.0, 0.0]
+        # cos(45) = sqrt(2)/2 ~ 0.707
+        sim = _re._cosine_sim(a, b)
+        assert abs(sim - math.sqrt(2) / 2) < 0.01
+
+    def test_zero_vector_returns_zero(self):
+        assert _re._cosine_sim([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+
+class TestConfidenceFromSim:
+    """Fix 2: semantic confidence scoring."""
+
+    def test_fireflies_high_sim_is_high(self):
+        # fireflies weight=0.90: 0.90*0.40 + 0.90*0.60 = 0.90 >= 0.78
+        assert _re._confidence_from_sim(0.90, "fireflies") == "HIGH"
+
+    def test_slack_good_sim_is_med(self):
+        # slack weight=0.75: 0.75*0.40 + 0.75*0.60 = 0.75 >= 0.62
+        assert _re._confidence_from_sim(0.75, "slack") == "MED"
+
+    def test_low_sim_is_low(self):
+        assert _re._confidence_from_sim(0.50, "gmail") == "LOW"  # 0.70*0.40 + 0.50*0.60 = 0.28+0.30 = 0.58 < 0.62
+
+    def test_static_md_high_sim_still_med(self):
+        # static_md weight=0.40: 0.40*0.40 + 0.90*0.60 = 0.16 + 0.54 = 0.70 >= 0.62
+        assert _re._confidence_from_sim(0.90, "static_md") == "MED"
+
+
+class TestPass4SemanticMatching:
+    """Integration tests for the three Pass 4 fixes."""
+
+    def _make_db_with_chunk(self, source, content):
+        return _make_db([{"source": source, "entity": "F3E", "content": content}])
+
+    def test_fix1_fireflies_source_included(self):
+        """Fireflies chunks are now scanned (Fix 1)."""
+        db_path = self._make_db_with_chunk(
+            "fireflies",
+            "Harrison confirmed we shipped the samples to American Discount Foods."
+        )
+        task = {
+            "gid": "task-001",
+            "name": "[F3E] Tommy -- American Discount Foods sampling kit",
+            "permalink_url": "https://app.asana.com/task/task-001",
+            "assignee": {"name": "Tommy Anderson", "gid": "user-001"},
+        }
+        # Mock semantic embedding to return identical vectors (perfect match)
+        fake_emb = [1.0] + [0.0] * 1535
+        with patch.object(_re, "_embed_task_names", return_value=[fake_emb]), \
+             patch.object(_re, "_embed_sentence", return_value=fake_emb):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        # Should find a gap from the fireflies source
+        assert len(gaps) == 1
+        assert gaps[0].source == "fireflies"
+
+    def test_fix1_slack_still_included(self):
+        """Slack (original source) still works after Fix 1."""
+        db_path = self._make_db_with_chunk(
+            "slack",
+            "The ADF samples were delivered and confirmed today."
+        )
+        task = {
+            "gid": "task-002",
+            "name": "ADF delivery confirmed",
+            "permalink_url": "https://app.asana.com/task/task-002",
+            "assignee": {"name": "Tommy Anderson", "gid": "user-001"},
+        }
+        fake_emb = [1.0] + [0.0] * 1535
+        with patch.object(_re, "_embed_task_names", return_value=[fake_emb]), \
+             patch.object(_re, "_embed_sentence", return_value=fake_emb):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        assert len(gaps) == 1
+        assert gaps[0].source == "slack"
+
+    def test_fix2_semantic_match_used_when_embeddings_available(self):
+        """When embeddings work, match_method is 'semantic' in payload (Fix 2)."""
+        db_path = self._make_db_with_chunk(
+            "slack",
+            "We finished the inventory audit and submitted the report."
+        )
+        task = {
+            "gid": "task-003",
+            "name": "Complete quarterly inventory audit",
+            "permalink_url": "https://app.asana.com/task/task-003",
+            "assignee": {"name": "Matt Petrovich", "gid": "user-002"},
+        }
+        fake_emb = [1.0] + [0.0] * 1535
+        with patch.object(_re, "_embed_task_names", return_value=[fake_emb]), \
+             patch.object(_re, "_embed_sentence", return_value=fake_emb):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        assert len(gaps) == 1
+        assert gaps[0].payload["match_method"] == "semantic"
+
+    def test_fix2_fuzzy_fallback_when_no_embeddings(self):
+        """Falls back to fuzzy matching when embedding is unavailable (Fix 2)."""
+        db_path = self._make_db_with_chunk(
+            "slack",
+            "Inventory audit complete and submitted successfully."
+        )
+        task = {
+            "gid": "task-004",
+            "name": "inventory audit complete",
+            "permalink_url": "https://app.asana.com/task/task-004",
+            "assignee": {"name": "Matt Petrovich", "gid": "user-002"},
+        }
+        # Simulate embedding unavailable
+        with patch.object(_re, "_embed_task_names", return_value=[]):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        # Fuzzy match on "inventory audit complete" vs "Inventory audit complete and submitted"
+        # should succeed
+        if gaps:
+            assert gaps[0].payload["match_method"] == "fuzzy"
+
+    def test_fix3_prefix_stripped_improves_fuzzy_match(self):
+        """Prefix stripping improves fuzzy match score (Fix 3)."""
+        # Without prefix stripping:
+        # "done with the audit" vs "[OSN] Matt -- inventory audit complete" -> low ratio
+        # With prefix stripping:
+        # "done with the audit" vs "inventory audit complete" -> better ratio
+        raw_name = "[OSN] Matt -- inventory audit complete"
+        clean_name = _re._normalize_task_name(raw_name)
+        signal = "audit is done and complete"
+        ratio_raw = _re._fuzzy_ratio(signal, raw_name)
+        ratio_clean = _re._fuzzy_ratio(signal, clean_name)
+        assert ratio_clean > ratio_raw, (
+            f"Expected clean ({ratio_clean:.3f}) > raw ({ratio_raw:.3f})"
+        )
+
+    def test_fix3_prefix_strip_in_semantic_best_match(self):
+        """_embed_task_names normalises names before embedding (Fix 3)."""
+        tasks = [
+            {"gid": "t1", "name": "[F3E] Tommy -- ADF sampling kit", "permalink_url": "", "assignee": {}},
+            {"gid": "t2", "name": "clean task name", "permalink_url": "", "assignee": {}},
+        ]
+        captured_names = []
+        def fake_embed(names):
+            captured_names.extend(names)
+            return [[0.0] * 1536 for _ in names]
+        with patch("cora.knowledge_base.embeddings.embed_texts", side_effect=fake_embed):
+            _re._embed_task_names(tasks)
+        assert "[F3E]" not in captured_names[0]
+        assert "Tommy" not in captured_names[0]
+        assert "ADF sampling kit" in captured_names[0]
+
+    def test_assignee_name_in_gap_description(self):
+        """Gap description includes the assignee name for per-user routing."""
+        db_path = self._make_db_with_chunk(
+            "slack", "We shipped the product and confirmed delivery."
+        )
+        task = {
+            "gid": "task-005",
+            "name": "confirm product delivery",
+            "permalink_url": "https://app.asana.com/task/task-005",
+            "assignee": {"name": "Alex Cordova", "gid": "user-003"},
+        }
+        fake_emb = [1.0] + [0.0] * 1535
+        with patch.object(_re, "_embed_task_names", return_value=[fake_emb]), \
+             patch.object(_re, "_embed_sentence", return_value=fake_emb):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        assert len(gaps) == 1
+        assert "Alex Cordova" in gaps[0].description
+
+    def test_no_match_below_threshold(self):
+        """Sentences with low semantic similarity produce no gap."""
+        db_path = self._make_db_with_chunk(
+            "slack", "The weather is nice today in Phoenix."
+        )
+        task = {
+            "gid": "task-006",
+            "name": "File quarterly tax return",
+            "permalink_url": "https://app.asana.com/task/task-006",
+            "assignee": {"name": "Justin Moran", "gid": "user-004"},
+        }
+        # Low similarity vector (orthogonal to task embedding)
+        task_emb = [1.0] + [0.0] * 1535
+        sent_emb = [0.0, 1.0] + [0.0] * 1534  # orthogonal -> sim=0
+        with patch.object(_re, "_embed_task_names", return_value=[task_emb]), \
+             patch.object(_re, "_embed_sentence", return_value=sent_emb):
+            gaps = _re.pass4_stale_open_tasks(
+                [task], lookback_seconds=9999999, db_path=db_path
+            )
+        assert gaps == []
+

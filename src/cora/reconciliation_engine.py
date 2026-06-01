@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -242,6 +243,122 @@ def _confidence_from_ratio(fuzzy_ratio: float, source: str) -> str:
     if score >= 0.75:
         return "HIGH"
     if score >= 0.55:
+        return "MED"
+    return "LOW"
+
+
+# ── Fix 1+2+3 helpers: semantic task matching for Pass 4 ──────────────────────
+
+# Entity/assignee prefix pattern — strips "[F3E] Tommy — " style prefixes from
+# Asana task names before matching so the prefix doesn't dilute similarity scores.
+# Build dash character class without literal Unicode in source (avoids CIFS encoding issues).
+# Covers: em dash (U+2014), en dash (U+2013), regular hyphen (U+002D), double hyphen (--)
+_DASH_CHARS = chr(0x2014) + chr(0x2013) + "-"
+_TASK_PREFIX_RE = re.compile(
+    r"^\s*"
+    r"(?:\[[A-Z0-9_-]+\]\s*)?"             # optional [ENTITY] bracket, e.g. [F3E]
+    r"(?:[A-Za-z]+(?:\s+[A-Za-z]+)?"       # optional "Name" (1-2 words)
+    + r"\s*(?:--|[" + _DASH_CHARS + r"])\s*)?"  # followed by -- or any dash
+    + r"\s*",
+)
+
+# Minimum cosine similarity to consider a match (0–1 scale).
+# 0.72 ≈ "same topic / related concept"; avoids superficial keyword matches.
+_MIN_COSINE_SIM = 0.72
+
+
+def _normalize_task_name(name: str) -> str:
+    """Strip entity/assignee prefixes so semantic matching focuses on task content.
+
+    Examples:
+      "[F3E] Tommy — ADF sampling kit delivery"  → "ADF sampling kit delivery"
+      "[OSN] Matt — Reconciliation Pilot Phase 1" → "Reconciliation Pilot Phase 1"
+      "Follow up with Harrison"                   → "Follow up with Harrison"
+    """
+    return _TASK_PREFIX_RE.sub("", name).strip()
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two embedding vectors.
+
+    text-embedding-3-small outputs unit vectors, so this equals the dot product.
+    Computed explicitly to avoid numpy dependency.
+    """
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if not mag_a or not mag_b:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _embed_task_names(task_entries: list[dict]) -> list[list[float]]:
+    """Batch-embed normalised task names. Returns [] on any embedding failure.
+
+    Uses text-embedding-3-small via the existing cora.knowledge_base.embeddings
+    module.  Cost: ~10 tokens/task × 200 tasks = 2000 tokens ≈ $0.00004/run.
+    Falls back to empty list if OPENAI_API_KEY is missing or API call fails.
+    """
+    try:
+        from cora.knowledge_base.embeddings import embed_texts, EmbeddingError
+    except ImportError:
+        return []
+
+    names = [_normalize_task_name(t.get("name", "")) for t in task_entries]
+    if not names:
+        return []
+    try:
+        return embed_texts(names)
+    except EmbeddingError as exc:
+        log.warning("pass4 semantic: embed_task_names failed (%s) — falling back to fuzzy", exc)
+        return []
+
+
+def _embed_sentence(sentence: str) -> list[float] | None:
+    """Embed a single sentence. Returns None on failure."""
+    try:
+        from cora.knowledge_base.embeddings import embed_query, EmbeddingError
+        return embed_query(sentence)
+    except Exception as exc:
+        log.debug("pass4 semantic: embed_sentence failed: %s", exc)
+        return None
+
+
+def _semantic_best_match(
+    sentence: str,
+    sentence_emb: list[float],
+    task_entries: list[dict],
+    task_embs: list[list[float]],
+) -> tuple[float, dict]:
+    """Return (cosine_sim, best_task_entry) for the highest-similarity task.
+
+    Returns (0.0, {}) if no match exceeds _MIN_COSINE_SIM.
+    """
+    best_sim = _MIN_COSINE_SIM
+    best_task: dict = {}
+    for task_entry, task_emb in zip(task_entries, task_embs):
+        sim = _cosine_sim(sentence_emb, task_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_task = task_entry
+    return best_sim, best_task
+
+
+def _confidence_from_sim(cosine_sim: float, source: str) -> str:
+    """Map cosine similarity + source to HIGH/MED/LOW confidence.
+
+    Semantic similarity (0.72+) is weighted 60%; source credibility 40%.
+    Thresholds calibrated so a strong semantic match from Fireflies = HIGH,
+    a weak match from static_md = LOW.
+    """
+    source_weight = {
+        "fireflies": 0.90, "slack": 0.75, "gmail": 0.70,
+        "hubspot": 0.65, "asana": 0.60, "static_md": 0.40,
+    }.get(source, 0.55)
+    score = source_weight * 0.40 + cosine_sim * 0.60
+    if score >= 0.78:
+        return "HIGH"
+    if score >= 0.62:
         return "MED"
     return "LOW"
 
@@ -592,37 +709,36 @@ def pass4_stale_open_tasks(
     lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
     db_path: Path | None = None,
 ) -> list[ReconciliationGap]:
-    """Find completion language in Slack/Gmail KB chunks matched against open Asana tasks.
+    """Find completion language in Slack/Gmail/Fireflies KB chunks matched against open tasks.
 
-    Leverages completion_detector.py's _COMPLETION_RE pattern. This is the
-    reconciliation-routed twin of the daily completion sweep — same vocabulary,
-    different delivery path (👍/👎 DM vs #hjrg-leadership digest).
+    Three improvements over the original implementation:
+      1. Fireflies added as a source (meeting transcripts are the highest-signal source
+         for completion language — "we closed X", "Alex confirmed delivery").
+      2. Semantic matching replaces fuzzy string matching (SequenceMatcher).  Task names
+         and completion sentences are embedded with text-embedding-3-small; cosine
+         similarity >= 0.72 triggers a match.  Falls back to fuzzy if OPENAI_API_KEY
+         is absent.
+      3. Task name prefixes ([F3E], "Tommy — ") are stripped before matching so the
+         entity/assignee decorators don't dilute similarity scores.
 
-    Only surfaces gaps not already in the completion_detector dedup cache
-    (avoids double-pinging Harrison on the same task+source pair).
+    Delivery path: 👍/👎 DM to Harrison (not #hjrg-leadership digest).
     """
-    # Import completion detector vocabulary without full module overhead
+    # -- Completion vocabulary ------------------------------------------------
     try:
-        from cora.tools.completion_detector import (
-            _COMPLETION_RE,
-            _SOURCE_WEIGHTS,
-            extract_signals_from_db,
-            _is_deduped,
-        )
+        from cora.tools.completion_detector import _COMPLETION_RE, _is_deduped
         _have_completion_detector = True
     except ImportError:
         log.warning("reconciliation pass4: completion_detector not importable, using fallback")
-        _have_completion_detector = False
         _COMPLETION_RE = re.compile(
             r"\b(complet|finish|done|shipped|launched|signed|closed|resolved"
             r"|paid|confirmed|approved|submitted|delivered)\b",
             re.IGNORECASE,
         )
-        _SOURCE_WEIGHTS = {"fireflies": 0.90, "slack": 0.75, "gmail": 0.70}
         _have_completion_detector = False
 
+    # -- Fix 1: include Fireflies as a source ----------------------------------
     chunks = _query_kb_chunks(
-        sources=["slack", "gmail"],
+        sources=["slack", "gmail", "fireflies"],
         lookback_seconds=lookback_seconds,
         db_path=db_path,
     )
@@ -638,22 +754,58 @@ def pass4_stale_open_tasks(
         if t.get("name")
     ]
 
+    if not open_task_names:
+        log.info("reconciliation pass4: no open tasks to match against")
+        return []
+
+    # -- Fix 2+3: embed normalised task names once upfront ---------------------
+    task_embs = _embed_task_names(open_task_names)
+    use_semantic = bool(task_embs and len(task_embs) == len(open_task_names))
+    if use_semantic:
+        log.info(
+            "reconciliation pass4: semantic matching active — %d task embeddings ready",
+            len(task_embs),
+        )
+    else:
+        log.info("reconciliation pass4: falling back to fuzzy matching (semantic unavailable)")
+
     gaps: list[ReconciliationGap] = []
     seen_tasks: set[str] = set()
 
     for chunk in chunks:
         for sentence in _extract_sentences(chunk["content"]):
+            if len(sentence) < 15:
+                continue
             if not _COMPLETION_RE.search(sentence):
                 continue
 
-            # Fuzzy-match against open tasks
-            best_ratio = MIN_FUZZY_RATIO
             best_task: dict[str, Any] = {}
-            for task_entry in open_task_names:
-                ratio = _fuzzy_ratio(sentence, task_entry["name"])
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_task = task_entry
+            match_score: float = 0.0
+            used_semantic = False
+
+            if use_semantic:
+                # Semantic path: embed sentence, cosine similarity against task embeddings
+                sent_emb = _embed_sentence(sentence)
+                if sent_emb:
+                    best_sim, best_task = _semantic_best_match(
+                        sentence, sent_emb, open_task_names, task_embs
+                    )
+                    if best_task:
+                        match_score = best_sim
+                        used_semantic = True
+
+            if not best_task:
+                # Fuzzy fallback (or when semantic embedding failed for this sentence)
+                best_ratio = MIN_FUZZY_RATIO
+                for task_entry in open_task_names:
+                    # Fix 3: match against normalised name to avoid prefix dilution
+                    clean_name = _normalize_task_name(task_entry["name"])
+                    ratio = _fuzzy_ratio(sentence, clean_name)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_task = task_entry
+                if best_task:
+                    match_score = best_ratio
 
             if not best_task:
                 continue
@@ -667,7 +819,13 @@ def pass4_stale_open_tasks(
                 continue
 
             seen_tasks.add(task_gid)
-            confidence = _confidence_from_ratio(best_ratio, chunk["source"])
+
+            # Confidence: use semantic scoring function when semantic match was used
+            if used_semantic:
+                confidence = _confidence_from_sim(match_score, chunk["source"])
+            else:
+                confidence = _confidence_from_ratio(match_score, chunk["source"])
+
             if confidence == "LOW":
                 continue
 
@@ -675,6 +833,9 @@ def pass4_stale_open_tasks(
             task_url = best_task.get("permalink_url", "")
             assignee = best_task.get("assignee") or {}
             assignee_name = assignee.get("name", "")
+
+            match_method = "semantic" if used_semantic else "fuzzy"
+            match_label = f"sim={match_score:.3f}" if used_semantic else f"ratio={match_score:.3f}"
 
             description = (
                 f"Possible task completion: \"{task_name}\" "
@@ -694,7 +855,8 @@ def pass4_stale_open_tasks(
                 confidence=confidence,
                 proposed_action=(
                     f"Close Asana task \"{task_name}\" "
-                    f"({task_url}) — completion language found in {chunk['source']}"
+                    f"({task_url}) — completion language found in {chunk['source']} "
+                    f"[{match_method} {match_label}]"
                 ),
                 payload={
                     "task_gid": task_gid,
@@ -703,7 +865,8 @@ def pass4_stale_open_tasks(
                     "assignee_name": assignee_name,
                     "source": chunk["source"],
                     "source_id": chunk["source_id"],
-                    "fuzzy_ratio": round(best_ratio, 4),
+                    "match_method": match_method,
+                    "match_score": round(match_score, 4),
                 },
                 deep_link=chunk["deep_link"],
                 title=chunk["title"],
@@ -714,7 +877,12 @@ def pass4_stale_open_tasks(
         if len(gaps) >= MAX_GAPS_PER_PASS:
             break
 
-    log.info("reconciliation pass4: %d stale-task gaps found", len(gaps))
+    log.info(
+        "reconciliation pass4: %d stale-task gaps found (%s matching, %d sources)",
+        len(gaps),
+        "semantic" if use_semantic else "fuzzy",
+        len(chunks),
+    )
     return gaps
 
 
