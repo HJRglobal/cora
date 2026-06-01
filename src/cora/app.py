@@ -1107,8 +1107,14 @@ def _process_contribution_reaction(
     reactor_id: str | None = None,
 ) -> None:
     """Process a ✅ or ❌ on a pending contribution approval card."""
-    if reactor_id != _FOUNDER_ID:
-        log.warning("team_learning: KB reaction from non-founder %s — ignored", reactor_id)
+    entity = contribution.get("entity", "")
+    # Harrison (founder) can approve any entity. Registered entity approvers can
+    # approve only their authorized entities. Anyone else is ignored.
+    if reactor_id != _FOUNDER_ID and not team_learning.is_approver(reactor_id, entity):
+        log.warning(
+            "team_learning: KB reaction from unauthorized reactor %s for entity %s — ignored",
+            reactor_id, entity,
+        )
         return
 
     import datetime as _dt
