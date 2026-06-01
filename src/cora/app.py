@@ -1005,6 +1005,43 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
 
     channel_name = _resolve_channel_name(client, channel_id) if channel_id else ""
 
+    # ── HubSpot email sync: 👍/👎 on an ambiguous-match DM ──────────────────────
+    # When Cora DMs about an ambiguous email→HubSpot match, Harrison reacts
+    # 👍 to attach the thread or 👎 to skip. Runs before the bot_user_id gate
+    # because DM messages from Cora are item_user=bot but we want to catch this
+    # early for both DM channels (channel_type "im") and regular channels.
+    if event_type == "reaction_added" and reaction in ("+1", "thumbsup", "-1", "thumbsdown"):
+        try:
+            from cora.connectors.hubspot_email_sync import (
+                get_pending_reaction,
+                resolve_pending_reaction,
+            )
+            pending = get_pending_reaction(message_ts)
+            if pending:
+                approved = reaction in ("+1", "thumbsup")
+                resolve_pending_reaction(message_ts, approved=approved)
+                ack = (
+                    ":white_check_mark: Got it — email thread attached to HubSpot."
+                    if approved
+                    else ":x: Skipped — thread won't be attached."
+                )
+                try:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=ack,
+                        thread_ts=message_ts,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception:
+                    pass  # DM thread reply is best-effort
+                log.info(
+                    "email_sync: reaction %s on pending DM ts=%s approved=%s",
+                    reaction, message_ts, approved,
+                )
+        except Exception as exc:
+            log.warning("email_sync reaction handler failed: %s", exc)
+
     # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
     if event_type == "reaction_added" and reaction == "white_check_mark":
         sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
