@@ -689,6 +689,88 @@ def format_deals_for_llm(
 
 
 # ---------------------------------------------------------------------------
+# Company write helpers
+# ---------------------------------------------------------------------------
+
+def find_company_by_name(name: str) -> str | None:
+    """Search HubSpot for a company by exact name. Returns company ID or None."""
+    hdrs = _headers()
+    body = {
+        "filterGroups": [{
+            "filters": [{"propertyName": "name", "operator": "EQ", "value": name}]
+        }],
+        "properties": ["name", "address"],
+        "limit": 1,
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(f"{_BASE}/crm/v3/objects/companies/search", headers=hdrs, json=body)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", []) or []
+        return str(results[0]["id"]) if results else None
+    except Exception as exc:
+        log.warning("HubSpot company search failed for %r: %s", name, exc)
+        return None
+
+
+def create_company(
+    *,
+    name: str,
+    address: str = "",
+    city: str = "",
+    state: str = "",
+    zip_code: str = "",
+    phone: str = "",
+    industry: str = "",
+) -> str:
+    """Create a HubSpot company. Returns the new company ID."""
+    hdrs = _headers()
+    props: dict[str, str] = {"name": name}
+    if address:
+        props["address"] = address
+    if city:
+        props["city"] = city
+    if state:
+        props["state"] = state
+    if zip_code:
+        props["zip"] = zip_code
+    if phone:
+        props["phone"] = phone
+    if industry:
+        props["industry"] = industry
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/companies",
+                headers=hdrs,
+                json={"properties": props},
+            )
+        if r.status_code in (200, 201):
+            return str(r.json().get("id", ""))
+        raise HubSpotClientError(f"create_company {r.status_code}: {r.text[:200]}")
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"create_company network error: {exc}") from exc
+
+
+def associate_company_to_deal(company_id: str, deal_id: str) -> None:
+    """Associate a company with a deal via v4 associations API."""
+    hdrs = _headers()
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            c.put(
+                f"{_BASE}/crm/v4/objects/companies/{company_id}/associations/deals/{deal_id}",
+                headers=hdrs,
+                json=[{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 5}],
+            )
+    except Exception as exc:
+        log.warning("HubSpot company-deal association failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Write helpers — LinkedIn Spy → HubSpot pipeline
 # ---------------------------------------------------------------------------
 
