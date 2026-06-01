@@ -565,10 +565,9 @@ def _resolve_queue_channel_id(client, entity: str, fallback_channel_id: str) -> 
     return fallback_channel_id
 
 
-def _handle_note(
+def _queue_contribution(
     *,
     client,
-    say,
     entity: str,
     channel_id: str,
     channel_name: str,
@@ -577,26 +576,11 @@ def _handle_note(
     original_ts: str,
     kind: str = "note",
 ) -> None:
-    """Store a pending contribution and post an approval card to the per-entity queue channel."""
-    if not team_learning.is_authorized_contributor(user_id, entity):
-        say(
-            text=(
-                f"Sorry, you're not registered as a knowledge contributor for *{entity}*. "
-                "Contact Harrison to get access."
-            ),
-            thread_ts=original_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        log.info("team_learning: unauthorized note attempt user=%s entity=%s", user_id, entity)
-        return
+    """Store a confirmed contribution and post its approval card to the queue channel.
 
-    ok, reason = team_learning.screen_contribution(content)
-    if not ok:
-        say(text=reason, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
-        log.info("team_learning: scope rejection user=%s entity=%s", user_id, entity)
-        return
-
+    Called by the Path-0 confirmation loop once the author has said 'yes'.
+    Also used internally when bypassing the paraphrase step is appropriate.
+    """
     cid = team_learning.store_contribution(
         kind=kind,
         entity=entity,
@@ -608,13 +592,6 @@ def _handle_note(
     )
 
     queue_name = team_learning.get_queue_channel(entity)
-    ack = (
-        f"✅ Got it — staged in `#{queue_name}` for approval."
-        if kind == "note"
-        else f"🔄 Correction noted — staged in `#{queue_name}` for approval."
-    )
-    say(text=ack, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
-
     card_text = team_learning.build_approval_card(
         kind=kind,
         entity=entity,
@@ -639,6 +616,65 @@ def _handle_note(
         )
     except Exception as exc:
         log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
+
+
+def _handle_note(
+    *,
+    client,
+    say,
+    entity: str,
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    content: str,
+    original_ts: str,
+    kind: str = "note",
+) -> None:
+    """Paraphrase a contribution and ask the author to confirm before queuing for approval."""
+    if not team_learning.is_authorized_contributor(user_id, entity):
+        say(
+            text=(
+                f"Sorry, you're not registered as a knowledge contributor for *{entity}*. "
+                "Contact Harrison to get access."
+            ),
+            thread_ts=original_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        log.info("team_learning: unauthorized note attempt user=%s entity=%s", user_id, entity)
+        return
+
+    ok, reason = team_learning.screen_contribution(content)
+    if not ok:
+        say(text=reason, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
+        log.info("team_learning: scope rejection user=%s entity=%s", user_id, entity)
+        return
+
+    paraphrase = team_learning.paraphrase_note(content, entity)
+    team_learning.store_pending_confirm(
+        channel_id=channel_id,
+        thread_ts=original_ts,
+        entity=entity,
+        channel_name=channel_name,
+        author=user_id,
+        kind=kind,
+        raw_content=content,
+        paraphrase=paraphrase,
+    )
+    say(
+        text=(
+            f"{paraphrase}\n\n"
+            "Does that capture it? Reply *yes* to queue for approval, "
+            "or correct anything above."
+        ),
+        thread_ts=original_ts,
+        unfurl_links=False,
+        unfurl_media=False,
+    )
+    log.info(
+        "team_learning: paraphrase posted channel=#%s user=%s kind=%s",
+        channel_name, user_id, kind,
+    )
 
 
 # Message event handler — correction capture + active-thread follow-up routing.
