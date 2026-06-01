@@ -62,6 +62,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             last_sync_at          INTEGER NOT NULL,
             last_source_modified  INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS checkpoint_state (
+            key        TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         """
     )
 

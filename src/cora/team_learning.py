@@ -236,6 +236,19 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_contrib_status ON pending_contributions(status);
         CREATE INDEX IF NOT EXISTS idx_contrib_approval_ts ON pending_contributions(approval_msg_ts);
+
+        CREATE TABLE IF NOT EXISTS pending_paraphrase_confirms (
+            channel_id   TEXT NOT NULL,
+            thread_ts    TEXT NOT NULL,
+            entity       TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            author       TEXT NOT NULL,
+            kind         TEXT NOT NULL,
+            raw_content  TEXT NOT NULL,
+            paraphrase   TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (channel_id, thread_ts)
+        );
     """)
     conn.commit()
 
@@ -412,3 +425,156 @@ def pending_stats() -> dict:
     finally:
         conn.close()
     return {r[0]: r[1] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Paraphrase-confirm loop helpers
+# ---------------------------------------------------------------------------
+# When a team member submits a note, Cora paraphrases it and asks for
+# confirmation before storing.  These three functions persist the pending
+# state to SQLite so it survives a Cora restart (previously all in-memory).
+# ---------------------------------------------------------------------------
+
+_CONFIRM_TTL_SECONDS = 86_400  # 24 hours — stale confirms auto-expire
+
+
+def store_pending_confirm(
+    channel_id: str,
+    thread_ts: str,
+    entity: str,
+    channel_name: str,
+    author: str,
+    kind: str,
+    raw_content: str,
+    paraphrase: str,
+) -> None:
+    """Persist a pending paraphrase-confirmation record to SQLite.
+
+    Calling this again for the same (channel_id, thread_ts) pair updates the
+    record in place (REPLACE semantics), which is used when the author
+    iterates on the paraphrase with corrections.
+    """
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pending_paraphrase_confirms
+                (channel_id, thread_ts, entity, channel_name, author, kind,
+                 raw_content, paraphrase, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (channel_id, thread_ts, entity, channel_name, author, kind,
+             raw_content, paraphrase, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_confirm(channel_id: str, thread_ts: str) -> dict | None:
+    """Return the pending confirm record for this thread, or None if absent/expired."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT entity, channel_name, author, kind, raw_content, paraphrase, created_at
+            FROM pending_paraphrase_confirms
+            WHERE channel_id = ? AND thread_ts = ?
+            """,
+            (channel_id, thread_ts),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    entity, channel_name, author, kind, raw_content, paraphrase, created_at = row
+    # Expire records older than TTL
+    if time.time() - created_at > _CONFIRM_TTL_SECONDS:
+        clear_pending_confirm(channel_id, thread_ts)
+        return None
+    return {
+        "entity": entity,
+        "channel_name": channel_name,
+        "author": author,
+        "kind": kind,
+        "raw_content": raw_content,
+        "paraphrase": paraphrase,
+        "created_at": created_at,
+    }
+
+
+def clear_pending_confirm(channel_id: str, thread_ts: str) -> None:
+    """Delete a pending confirm record once the author confirms or abandons."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM pending_paraphrase_confirms WHERE channel_id = ? AND thread_ts = ?",
+            (channel_id, thread_ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def kq_channel_for_entity(entity: str) -> str:
+    """Return the per-entity knowledge queue channel name (alias for get_queue_channel)."""
+    return get_queue_channel(entity)
+
+
+def paraphrase_note(raw_content: str, entity: str, correction: str | None = None) -> str:
+    """Use Claude Haiku to produce a clean 1-2 sentence knowledge note.
+
+    If *correction* is provided, incorporate it into the paraphrase to reflect
+    the author's clarification.
+
+    Returns the paraphrased string.  On any API error, returns the raw_content
+    unchanged so the flow can continue.
+    """
+    import os as _os
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return raw_content
+
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return raw_content
+
+    correction_clause = (
+        f"\n\nThe author sent this correction: {correction!r}. "
+        "Incorporate it into your revised paraphrase."
+    ) if correction else ""
+
+    prompt = (
+        f"You are helping log a business knowledge note for entity {entity}.\n"
+        f"Raw note from team member:\n{raw_content}\n"
+        f"{correction_clause}\n\n"
+        "Write a clean, factual 1-2 sentence knowledge note in third-person past tense "
+        "that captures the key information. Be concise. Output only the note text."
+    )
+
+    try:
+        client = _anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (msg.content[0].text or raw_content).strip()
+    except Exception as exc:
+        log.warning("paraphrase_note: Haiku call failed (%s) -- using raw content", exc)
+        return raw_content
+
+
+def is_confirmation(text: str) -> bool:
+    """Return True if the text is a simple confirmation (yes, ok, looks good, etc.)."""
+    _CONFIRM_TOKENS = frozenset({
+        "yes", "yep", "yeah", "yup", "y",
+        "ok", "okay", "k",
+        "sure", "correct", "confirmed", "confirm",
+        "looks good", "lgtm", "approved", "approve",
+        "sounds good", "perfect", "great", "good",
+        "send it", "go ahead", "do it",
+    })
+    normalized = text.strip().lower().rstrip("!.")
+    return normalized in _CONFIRM_TOKENS

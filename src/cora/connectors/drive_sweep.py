@@ -417,6 +417,7 @@ def sweep_user(
 
     # Watermark for incremental sync
     watermark_key = f"drive_sweep_{email}"
+    checkpoint_key = f"drive_sweep_checkpoint_{email}"
     last_run_ts: int | None = None
     try:
         state = kb.get_sync_state(watermark_key)
@@ -425,10 +426,31 @@ def sweep_user(
     except Exception:
         pass
 
+    # Resume checkpoint: if a previous sweep was interrupted mid-user, pick up
+    # from the last saved nextPageToken rather than starting from scratch.
+    resume_page_token: str | None = None
+    files_processed_base: int = 0
+    if not dry_run:
+        try:
+            ckpt = kb.get_checkpoint(checkpoint_key)
+            if ckpt:
+                resume_page_token = ckpt.get("page_token")
+                files_processed_base = int(ckpt.get("files_processed", 0))
+                log.info(
+                    "drive_sweep: resuming %s from checkpoint "
+                    "(page_token=%s files_processed=%d)",
+                    email,
+                    resume_page_token or "(first page)",
+                    files_processed_base,
+                )
+        except Exception:
+            pass
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
-    if last_run_ts:
+    if last_run_ts and not resume_page_token:
+        # Only apply watermark cutoff on fresh (non-resume) runs so the query
+        # matches the same result set that was being paged when interrupted.
         watermark_dt = datetime.fromtimestamp(last_run_ts, tz=timezone.utc)
-        # Use the more recent of freshness cutoff vs watermark
         cutoff = max(cutoff, watermark_dt)
 
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
@@ -447,18 +469,21 @@ def sweep_user(
         f" and modifiedTime > '{cutoff_str}'"
     )
 
-    page_token = None
+    page_token: str | None = resume_page_token
+    files_processed_this_run: int = files_processed_base
     run_start = datetime.now(timezone.utc)
 
     while True:
         try:
-            resp = service.files().list(
+            list_kwargs: dict = dict(
                 q=q,
                 spaces="drive",
                 fields="nextPageToken, files(id, name, mimeType, modifiedTime, size, webViewLink, parents)",
                 pageSize=100,
-                pageToken=page_token,
-            ).execute()
+            )
+            if page_token:
+                list_kwargs["pageToken"] = page_token
+            resp = service.files().list(**list_kwargs).execute()
         except Exception as exc:
             log.error("drive_sweep: files.list failed for %s: %s", email, exc)
             break
@@ -498,6 +523,7 @@ def sweep_user(
                 continue
 
             stats["files_extracted"] += 1
+            files_processed_this_run += 1
 
             # Haiku classification
             preview = content[:2000]
@@ -523,6 +549,18 @@ def sweep_user(
             stats["chunks_ingested"] += n
 
         page_token = resp.get("nextPageToken")
+
+        # Persist checkpoint after each page so a killed/crashed sweep can resume
+        # from here next run instead of restarting from page 1.
+        if not dry_run:
+            try:
+                kb.set_checkpoint(checkpoint_key, {
+                    "page_token": page_token,           # None when this was the last page
+                    "files_processed": files_processed_this_run,
+                })
+            except Exception as exc:
+                log.warning("drive_sweep: could not save checkpoint for %s: %s", email, exc)
+
         if not page_token:
             break
 
@@ -532,6 +570,11 @@ def sweep_user(
             kb.set_sync_state(watermark_key, int(run_start.timestamp()))
         except Exception as exc:
             log.warning("drive_sweep: could not advance watermark for %s: %s", email, exc)
+        # Sweep completed — clear the checkpoint so the next run starts fresh
+        try:
+            kb.delete_checkpoint(checkpoint_key)
+        except Exception as exc:
+            log.warning("drive_sweep: could not clear checkpoint for %s: %s", email, exc)
 
     log.info(
         "drive_sweep: %s done -- enumerated=%d extracted=%d ingested=%d "

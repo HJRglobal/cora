@@ -37,6 +37,7 @@ if (-not (Test-Path $LogDir)) {
 
 # Remove existing task if present (clean reinstall)
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "Removed existing task: $TaskName"
 }

@@ -20,6 +20,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Write-Host "Registering task: $TaskName" -ForegroundColor Cyan
 
 # Remove existing task if present
+try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 # Build action -- absolute paths, no PATH dependency (Task Scheduler doctrine)

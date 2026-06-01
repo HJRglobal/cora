@@ -65,7 +65,8 @@ $HourMin     = "02:00"
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "Removing existing task: $TaskName" -ForegroundColor Yellow
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
 # Build the action. Log to dated file so each night's refresh has its own log.

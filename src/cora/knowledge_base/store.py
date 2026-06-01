@@ -332,3 +332,41 @@ class KnowledgeBase:
             (source, last_sync_at, last_source_modified),
         )
         self._conn.commit()
+
+    # ── Resumable-sweep checkpoint helpers ─────────────────────────────────────
+
+    def get_checkpoint(self, key: str) -> dict | None:
+        """Return the checkpoint dict stored under *key*, or None if absent."""
+        import json as _json
+        row = self._conn.execute(
+            "SELECT value_json FROM checkpoint_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return _json.loads(row[0])
+        except Exception:
+            return None
+
+    def set_checkpoint(self, key: str, data: dict) -> None:
+        """Persist a checkpoint dict under *key* (create or replace)."""
+        import json as _json
+        import time as _time
+        self._conn.execute(
+            """INSERT INTO checkpoint_state (key, value_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                 value_json = excluded.value_json,
+                 updated_at = excluded.updated_at""",
+            (key, _json.dumps(data), int(_time.time())),
+        )
+        self._conn.commit()
+
+    def delete_checkpoint(self, key: str) -> None:
+        """Remove a checkpoint record (idempotent — no error if key missing)."""
+        self._conn.execute(
+            "DELETE FROM checkpoint_state WHERE key = ?",
+            (key,),
+        )
+        self._conn.commit()

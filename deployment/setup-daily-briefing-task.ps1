@@ -33,6 +33,7 @@ if (-not (Test-Path $PythonPath)) {
 
 # Remove existing task if present
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "Removed existing task: $TaskName"
 }

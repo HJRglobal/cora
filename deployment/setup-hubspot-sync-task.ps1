@@ -40,6 +40,7 @@ Write-Host "  OK  Python: $PythonExe"
 # Remove existing task if present
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "  Removing existing task '$TaskName'..." -ForegroundColor Yellow
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 

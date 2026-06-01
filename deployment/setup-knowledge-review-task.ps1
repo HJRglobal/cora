@@ -37,6 +37,7 @@ Write-Host "Setting up scheduled task: $TaskName" -ForegroundColor Cyan
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  Removing existing task..." -ForegroundColor Yellow
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 

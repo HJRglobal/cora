@@ -31,11 +31,31 @@ from cora.knowledge_base.store import Document
 
 log = logging.getLogger(__name__)
 
-_DB_ID = "7820cd3689ae4596bd8f965f2bf96d5d"
+_CONTRACTS_DB_ID = "7820cd3689ae4596bd8f965f2bf96d5d"  # Contracts & Renewals Registry
 _API_BASE = "https://api.notion.com/v1"
 _NOTION_VERSION = "2022-06-28"
 _TIMEOUT = 20.0
 _RATE_SLEEP = 0.2  # Notion integration: 3 req/s average; 200ms is safe
+
+# ---------------------------------------------------------------------------
+# Multi-DB configuration
+# ---------------------------------------------------------------------------
+# Primary DB: Contracts & Renewals Registry (full field extraction).
+# Additional DBs: listed in NOTION_EXTRA_DB_IDS env var (comma-separated IDs).
+# Extra DBs use a generic page→Document extractor (title + all text properties).
+# ---------------------------------------------------------------------------
+
+def _extra_db_ids() -> list[str]:
+    """Return additional DB IDs from NOTION_EXTRA_DB_IDS env var (if set)."""
+    raw = os.environ.get("NOTION_EXTRA_DB_IDS", "").strip()
+    if not raw:
+        return []
+    return [db_id.strip() for db_id in raw.split(",") if db_id.strip()]
+
+
+def _all_db_ids() -> list[str]:
+    """Return all DB IDs to sync: contracts DB first, then any extras."""
+    return [_CONTRACTS_DB_ID] + _extra_db_ids()
 
 # Notion Entity select value → KB entity code.
 # LEX sub-entities get entity=LEX + sub_entity=<value>.
@@ -94,7 +114,7 @@ def _post(path: str, body: dict) -> dict:
     if r.status_code == 401:
         raise NotionConnectorError("Notion 401 — API key invalid or missing database access")
     if r.status_code == 404:
-        raise NotionConnectorError(f"Notion 404 — database not found: {_DB_ID}")
+        raise NotionConnectorError(f"Notion 404 — database not found (check DB IDs)")
     if r.status_code == 429:
         retry_after = float(r.headers.get("Retry-After", "2"))
         log.warning("Notion 429 rate-limited; sleeping %.1fs", retry_after)
@@ -108,21 +128,21 @@ def _post(path: str, body: dict) -> dict:
     return r.json()
 
 
-def _query_db(filter_body: dict | None = None, start_cursor: str | None = None) -> dict:
+def _query_db(db_id: str, filter_body: dict | None = None, start_cursor: str | None = None) -> dict:
     """Execute one page of a Notion database query."""
     body: dict = {"page_size": 100}
     if filter_body:
         body["filter"] = filter_body
     if start_cursor:
         body["start_cursor"] = start_cursor
-    return _post(f"/databases/{_DB_ID}/query", body)
+    return _post(f"/databases/{db_id}/query", body)
 
 
-def _paginate_db(filter_body: dict | None = None) -> Iterator[dict]:
-    """Yield all pages from the Contracts & Renewals Registry."""
+def _paginate_db(db_id: str, filter_body: dict | None = None) -> Iterator[dict]:
+    """Yield all pages from a Notion database."""
     cursor: str | None = None
     while True:
-        response = _query_db(filter_body=filter_body, start_cursor=cursor)
+        response = _query_db(db_id, filter_body=filter_body, start_cursor=cursor)
         for page in response.get("results", []):
             yield page
         has_more = response.get("has_more", False)
@@ -321,41 +341,128 @@ def _page_to_document(page: dict) -> "Document | None":
     )
 
 
-def sync_delta(last_sync_ts: int) -> Iterator[Document]:
-    """Yield Documents for Notion pages edited since last_sync_ts.
+# ---------------------------------------------------------------------------
+# Generic page extractor for extra DBs (unknown schema)
+# ---------------------------------------------------------------------------
 
-    Uses Notion's server-side last_edited_time filter for efficiency.
+def _extract_all_text(props: dict) -> str:
+    """Extract all text-bearing properties from an arbitrary Notion page."""
+    parts: list[str] = []
+    for name, prop in props.items():
+        ptype = prop.get("type", "")
+        if ptype == "title":
+            val = "".join(t.get("plain_text", "") for t in prop.get("title", []))
+        elif ptype == "rich_text":
+            val = "".join(t.get("plain_text", "") for t in prop.get("rich_text", []))
+        elif ptype == "select":
+            sel = prop.get("select") or {}
+            val = sel.get("name", "")
+        elif ptype == "multi_select":
+            val = ", ".join(o.get("name", "") for o in prop.get("multi_select", []))
+        elif ptype == "date":
+            d = prop.get("date") or {}
+            val = d.get("start", "")
+        elif ptype in ("number", "checkbox", "url", "email", "phone_number"):
+            val = str(prop.get(ptype, "") or "")
+        else:
+            val = ""
+        if val.strip():
+            parts.append(f"{name}: {val.strip()}")
+    return "\n".join(parts)
+
+
+def _generic_page_to_document(page: dict) -> "Document | None":
+    """Convert any Notion page to a Document using generic text extraction."""
+    page_id = page.get("id", "")
+    page_url = page.get("url", "")
+    last_edited = page.get("last_edited_time", "")
+    props = page.get("properties", {})
+
+    # Best-effort title from any title-type property
+    title = ""
+    for prop in props.values():
+        if prop.get("type") == "title":
+            title = "".join(t.get("plain_text", "") for t in prop.get("title", [])).strip()
+            if title:
+                break
+    if not title:
+        return None
+
+    content = f"[Notion Page] {title}\n\n{_extract_all_text(props)}"
+
+    date_mod: int | None = _ts(last_edited)
+    return Document(
+        source="notion",
+        source_id=page_id,
+        entity="FNDR",  # Default entity; overridden by schema-aware extractors
+        sub_entity=None,
+        title=title,
+        content=content,
+        deep_link=page_url,
+        date_modified=date_mod,
+        metadata={"db_type": "generic", "page_id": page_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public sync API
+# ---------------------------------------------------------------------------
+
+def sync_delta(last_sync_ts: int) -> Iterator[Document]:
+    """Yield Documents for Notion pages edited since last_sync_ts, across all DBs.
+
+    The Contracts & Renewals DB uses full field extraction.
+    Any extra DBs (NOTION_EXTRA_DB_IDS) use generic text extraction.
     """
     since_iso = datetime.fromtimestamp(last_sync_ts, tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.000Z"
     )
-    log.info("Notion sync_delta: querying pages edited after %s", since_iso)
 
     filter_body = {
         "timestamp": "last_edited_time",
         "last_edited_time": {"after": since_iso},
     }
 
-    count = 0
-    for page in _paginate_db(filter_body=filter_body):
-        doc = _page_to_document(page)
-        if doc:
-            yield doc
-            count += 1
+    all_ids = _all_db_ids()
+    log.info(
+        "Notion sync_delta: querying %d DB(s) for pages edited after %s",
+        len(all_ids), since_iso,
+    )
 
-    log.info("Notion sync_delta: yielded %d documents", count)
+    total = 0
+    for db_id in all_ids:
+        is_contracts = db_id == _CONTRACTS_DB_ID
+        converter = _page_to_document if is_contracts else _generic_page_to_document
+        log.info("Notion sync_delta: scanning DB %s (contracts=%s)", db_id, is_contracts)
+        try:
+            for page in _paginate_db(db_id, filter_body=filter_body):
+                doc = converter(page)
+                if doc:
+                    yield doc
+                    total += 1
+        except NotionConnectorError as exc:
+            log.warning("Notion sync_delta: DB %s skipped — %s", db_id, exc)
+
+    log.info("Notion sync_delta: yielded %d documents total", total)
 
 
 def backfill() -> Iterator[Document]:
-    """Yield Documents for ALL pages in the Contracts & Renewals Registry.
+    """Yield Documents for ALL pages across all configured Notion DBs."""
+    all_ids = _all_db_ids()
+    log.info("Notion backfill: walking %d DB(s)", len(all_ids))
 
-    Used for initial population or full re-index. No timestamp filter.
-    """
-    log.info("Notion backfill: walking all pages in DB %s", _DB_ID)
-    count = 0
-    for page in _paginate_db():
-        doc = _page_to_document(page)
-        if doc:
-            yield doc
-            count += 1
-    log.info("Notion backfill: yielded %d documents", count)
+    total = 0
+    for db_id in all_ids:
+        is_contracts = db_id == _CONTRACTS_DB_ID
+        converter = _page_to_document if is_contracts else _generic_page_to_document
+        log.info("Notion backfill: scanning DB %s (contracts=%s)", db_id, is_contracts)
+        try:
+            for page in _paginate_db(db_id):
+                doc = converter(page)
+                if doc:
+                    yield doc
+                    total += 1
+        except NotionConnectorError as exc:
+            log.warning("Notion backfill: DB %s skipped — %s", db_id, exc)
+
+    log.info("Notion backfill: yielded %d documents total", total)

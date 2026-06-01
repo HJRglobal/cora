@@ -99,6 +99,7 @@ foreach ($task in $Tasks) {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Host "  Removing existing task..." -ForegroundColor Yellow
+        try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
     }
 

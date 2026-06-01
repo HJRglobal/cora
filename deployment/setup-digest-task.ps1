@@ -71,6 +71,7 @@ Write-Host "[4/5] Registering scheduled task '$TASK_NAME'..."
 $existing = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  Found existing task - removing before re-registration."
+    try { Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue } catch {}
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
 }
 
