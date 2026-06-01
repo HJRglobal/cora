@@ -16,8 +16,8 @@ Harrison (root authority) bypasses all checks.
 
 from __future__ import annotations
 
-import functools
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +29,33 @@ _PERMISSIONS_PATH = (
     Path(__file__).parent.parent.parent / "data" / "maps" / "user-permissions.yaml"
 )
 
+# Simple TTL cache — reload the file at most once every 60 seconds.
+# Avoids lru_cache permanently caching a stale/empty result on startup.
+_permissions_cache: dict[str, Any] = {}
+_permissions_loaded_at: float = 0.0
+_PERMISSIONS_TTL = 60.0  # seconds
+
 _HARRISON_ID = "U0B2RM2JYJ1"
 
 
-@functools.lru_cache(maxsize=1)
 def _load_permissions() -> dict[str, Any]:
+    """Load user-permissions.yaml with a 60s TTL cache.
+
+    Uses a simple time-based cache instead of lru_cache to avoid the risk of
+    permanently caching an empty dict if the file isn't readable on first call.
+    """
+    global _permissions_cache, _permissions_loaded_at
+    now = time.monotonic()
+    if _permissions_cache and (now - _permissions_loaded_at) < _PERMISSIONS_TTL:
+        return _permissions_cache
     try:
         with open(_PERMISSIONS_PATH, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return data.get("users", {})
+        result = data.get("users", {})
+        if result:  # only cache non-empty results
+            _permissions_cache = result
+            _permissions_loaded_at = now
+        return result
     except FileNotFoundError:
         log.warning("user-permissions.yaml not found — all users get FNDR-level access")
         return {}
