@@ -171,7 +171,75 @@ def _generate_outreach(prospects: list[dict]) -> list[dict]:
 # HubSpot sync
 # ---------------------------------------------------------------------------
 
-_TOMMY_OWNER_ID = "162944825"  # Tommy Anderson — F3E sales owner
+_TOMMY_OWNER_ID   = "162944825"   # Tommy Anderson — HubSpot owner ID
+_TOMMY_SLACK_ID   = "U0B3RU5Q55G"  # Tommy Anderson — Slack user ID
+_PORTAL_ID        = "246351746"   # HJR HubSpot portal
+
+
+def _dm_tommy_new_lead(
+    *,
+    name: str,
+    title: str,
+    company: str,
+    deal_id: str,
+    brand_fit: str,
+    message_draft: str,
+    linkedin_url: str,
+) -> None:
+    """Send Tommy a Slack DM with a direct link to the new HubSpot deal."""
+    import requests
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.warning("linkedin_spy: SLACK_BOT_TOKEN not set — cannot DM Tommy")
+        return
+
+    deal_url = f"https://app.hubspot.com/contacts/{_PORTAL_ID}/deal/{deal_id}"
+    name_display = name or f"{title} @ {company}"
+    li_link = f"<{linkedin_url}|View LinkedIn>" if linkedin_url else ""
+
+    lines = [
+        f":wave: *New lead added to your pipeline!*",
+        f"",
+        f"*{name_display}*",
+        f"_{title} @ {company}_",
+        f"",
+        f"*Brand fit:* {brand_fit}",
+        f"",
+        f"*LinkedIn connection draft (≤280 chars — paste and send):*",
+        f"_{message_draft}_",
+        f"",
+        f"*Actions:* <{deal_url}|Open in HubSpot>  {li_link}",
+        f"",
+        f"_Move to Outreach once you've sent the connection request._",
+    ]
+    text = "\n".join(lines)
+
+    try:
+        # Open DM channel with Tommy
+        open_resp = requests.post(
+            "https://slack.com/api/conversations.open",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"users": _TOMMY_SLACK_ID},
+            timeout=10,
+        )
+        dm_channel = open_resp.json().get("channel", {}).get("id", "")
+        if not dm_channel:
+            log.warning("linkedin_spy: could not open DM channel with Tommy")
+            return
+
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"channel": dm_channel, "text": text, "mrkdwn": True},
+            timeout=10,
+        )
+        if resp.json().get("ok"):
+            log.info("linkedin_spy: DM sent to Tommy for lead %s", name_display)
+        else:
+            log.warning("linkedin_spy: DM to Tommy failed: %s", resp.json().get("error"))
+    except Exception as exc:
+        log.warning("linkedin_spy: DM to Tommy error: %s", exc)
 
 
 def _sync_prospects_to_hubspot(prospects: list[dict]) -> int:
@@ -248,6 +316,17 @@ def _sync_prospects_to_hubspot(prospects: list[dict]) -> int:
                 body="\n".join(line for line in note_lines if line is not None),
                 deal_id=deal_id,
                 contact_id=contact_id,
+            )
+
+            # DM Tommy with a direct link to the new deal
+            _dm_tommy_new_lead(
+                name=name,
+                title=title,
+                company=company,
+                deal_id=deal_id,
+                brand_fit=brand_fit,
+                message_draft=message_draft,
+                linkedin_url=li_url,
             )
 
             created += 1
