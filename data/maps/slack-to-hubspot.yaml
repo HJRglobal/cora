@@ -36,7 +36,7 @@ users:
     hubspot_email: alex@hjrglobal.com
     display_name: Alex Cordova
 
-  - slack_user_id: ""          # Elena not in Slack workspace — no DM path available
+  - slack_user_id: U0B8DGHR2D6
     hubspot_owner_id: 160454475
     hubspot_email: elena@f3energy.com
     display_name: Elena Meirndorf

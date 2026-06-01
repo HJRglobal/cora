@@ -115,3 +115,9 @@ users:
     asana_user_gid: 1212753858765058
     asana_email: jeff@hjrglobal.com
     display_name: Jeff Montgomery
+
+  # Elena: Slack elena@f3energy.com / Asana elena@f3energy.com — F3E only, reports to Alex
+  - slack_user_id: U0B8DGHR2D6
+    asana_user_gid: 1211824667367794
+    asana_email: elena@f3energy.com
+    display_name: Elena Meirndorf

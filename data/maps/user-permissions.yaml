@@ -130,3 +130,14 @@ users:
       - hr
       - legal
       - cap_table
+
+  U0B8DGHR2D6:  # Elena Meirndorf — F3E only, reports to Alex Cordova
+    name: Elena Meirndorf
+    allowed_entities:
+      - F3E
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table
+      - cross_entity
