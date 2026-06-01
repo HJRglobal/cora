@@ -192,18 +192,41 @@ def parse_period(period: str | None) -> tuple[str, str]:
     return (today - datetime.timedelta(days=30)).isoformat(), today.isoformat()
 
 
+# QBO Class codes for HJRP sub-properties (used to filter P&L by building)
+_HJRP_CLASS_MAP: dict[str, str] = {
+    "HJRP-1337": "7005-105",   # North Hampton — 1337 S Gilbert Rd
+    "HJRP-1555": "9400-703",   # South Hampton — 1555 S Gilbert Rd
+}
+
+
 def get_profit_loss(
     entity: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    class_ref: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch ProfitAndLoss report. Defaults to last 30 days if dates omitted."""
+    """Fetch ProfitAndLoss report. Defaults to last 30 days if dates omitted.
+
+    For HJRP sub-properties (HJRP-1337, HJRP-1555), pass the entity code and
+    the class_ref will be auto-resolved from _HJRP_CLASS_MAP. Alternatively
+    pass class_ref explicitly to filter by a specific QBO class code.
+    """
     if not start_date or not end_date:
         start_date, end_date = _default_date_range(30)
+    params: dict = {"start_date": start_date, "end_date": end_date, "minorversion": "65"}
+
+    # Auto-resolve class for HJRP sub-property entities
+    resolved_class = class_ref or _HJRP_CLASS_MAP.get(entity)
+    if resolved_class:
+        params["class"] = resolved_class
+
+    # HJRP sub-properties use the parent HJRP token
+    token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
+
     return _request(
-        entity,
+        token_entity,
         "/v3/company/{realm_id}/reports/ProfitAndLoss",
-        params={"start_date": start_date, "end_date": end_date, "minorversion": "65"},
+        params=params,
     )
 
 
@@ -211,8 +234,9 @@ def get_balance_sheet(entity: str, as_of_date: str | None = None) -> dict[str, A
     """Fetch BalanceSheet report. Defaults to today if as_of_date omitted."""
     if not as_of_date:
         as_of_date = datetime.date.today().isoformat()
+    token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
     return _request(
-        entity,
+        token_entity,
         "/v3/company/{realm_id}/reports/BalanceSheet",
         params={"as_of_date": as_of_date, "minorversion": "65"},
     )

@@ -1226,7 +1226,10 @@ def _tool_get_my_deals(slack_user_id: str, entity: str, _input: dict) -> str:
 # Entities that COULD have QBO data eventually. The tool checks list_provisioned_entities()
 # at call time, so this is just for the "please specify entity" disambiguation prompt
 # when the model calls a QBO tool from FNDR without naming an entity.
-_KNOWN_QBO_CAPABLE_ENTITIES = ("HJRG", "F3E", "F3C", "BDM", "LEX", "OSN", "HJRP", "HJRPROD", "UFL")
+_KNOWN_QBO_CAPABLE_ENTITIES = (
+    "HJRG", "F3E", "F3C", "BDM", "LEX", "OSN", "HJRP", "HJRPROD", "UFL",
+    "HJRP-1337", "HJRP-1555",  # HJRP sub-properties — use HJRP token + QBO class filter
+)
 
 
 def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str | None, str | None]:
@@ -1288,8 +1291,11 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
         return err
     period = (_input or {}).get("period")
     start_date, end_date = qbo_client.parse_period(period)
+    # For HJRP sub-properties, pass the sub-entity code so qbo_client
+    # auto-resolves the correct QBO class filter (1337 or 1555 building).
+    qbo_entity = target if target not in ("HJRP-1337", "HJRP-1555") else target
     try:
-        report = qbo_client.get_profit_loss(target, start_date, end_date)
+        report = qbo_client.get_profit_loss(qbo_entity, start_date, end_date)
     except qbo_client.QboClientError as exc:
         log.warning("QBO P&L tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)

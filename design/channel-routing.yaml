@@ -190,6 +190,13 @@ routes:
   - pattern: "media"
     entity: BDM
 
+  # HJR Properties — sub-property channels route to specific entity codes
+  # so QBO P&L tools auto-filter to the correct building class.
+  - pattern: "hjrp-1337"
+    entity: HJRP-1337
+  - pattern: "hjrp-1555"
+    entity: HJRP-1555
+
   # HJR Properties — covers bare #hjrp, hjrp-*, plus #rogers-ranch (HJRP-RR sub-entity catch-all)
   # and #rogers-ranch-* (operational booking + future sub-channels). Cora loads
   # 06-HJR-Properties/CLAUDE.md as HJRP context, plus rogers-ranch/CLAUDE.md when
