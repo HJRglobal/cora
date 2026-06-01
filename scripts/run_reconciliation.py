@@ -234,17 +234,7 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
             continue
         by_assignee.setdefault(assignee, []).append(gap)
 
-    # Harrison Rogers sees all gaps via knowledge_review DMs already.
-    # DM-ing him about his own tasks here would be duplicate noise.
-    _SKIP_DM_NAMES = {“harrison rogers”, “harrison”}
-
     for assignee_name, user_gaps in by_assignee.items():
-        if assignee_name.lower() in _SKIP_DM_NAMES:
-            log.info(
-                “Skipping DM to %r -- routed to knowledge_review queue instead”,
-                assignee_name,
-            )
-            continue
         slack_id = name_to_sid.get(assignee_name.lower())
         if not slack_id:
             log.info(
