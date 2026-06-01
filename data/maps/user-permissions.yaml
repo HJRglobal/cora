@@ -9,7 +9,7 @@
 # overview, no sensitive sub-entity detail).
 #
 # sensitive_topics_blocked: topics Cora refuses for this user even in allowed entities.
-# Options: financials, hr, legal, phi, cap_table, cross_entity
+# Options: financials, hr, legal, phi, cap_table, cross_entity, marketing, events
 #
 # Harrison (U0B2RM2JYJ1) is the root authority — no restrictions apply.
 
@@ -113,12 +113,11 @@ users:
       - phi
       - cross_entity
 
-  U0B3RU65TFU:  # Demi Bagby — BDM partner (full BDM access)
+  U0B3RU65TFU:  # Demi Bagby — BDM partner, full BDM access + general social
     name: Demi Bagby
     allowed_entities:
       - BDM
-    sensitive_topics_blocked: []
-      - cross_entity
+    sensitive_topics_blocked: []  # No topic restrictions within BDM
 
   U0B3NGR1Y85:  # Larry Stone — BDM creative lead
     name: Larry Stone
@@ -140,3 +139,56 @@ users:
     sensitive_topics_blocked:
       - financials
       - cap_table
+
+  U0B3AEJCYGP:  # Justin Moran — Finance & Ops across all entities (Visibility CPA)
+    name: Justin Moran
+    allowed_entities: all
+    sensitive_topics_blocked:
+      - phi           # No clinical client data
+      - marketing     # Not his lane
+      - events        # Not his lane
+
+  U0B3PS63F1C:  # Daniel Sion — BDM only + general social channels/topics
+    name: Daniel Sion
+    allowed_entities:
+      - BDM
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table
+      - phi
+
+  U0B3PRZMBCN:  # Eric Canku — Finance topics all entities + F3E logistics
+    name: Eric Canku
+    allowed_entities: all
+    sensitive_topics_blocked:
+      - hr
+      - legal
+      - cap_table
+      - phi
+      - marketing
+      - events
+    notes: F3E logistics topics (transportation, truckload, invoicing) permitted in addition to finance
+
+  U0B3TPD2MEV:  # Alina Thomas — HR for all entities + general social channels/topics
+    name: Alina Thomas
+    allowed_entities: all
+    sensitive_topics_blocked:
+      - financials
+      - legal
+      - cap_table
+      - phi
+      - marketing
+      - events
+
+  U0B3AER7NUF:  # Jake Lichtman — BDM only + general social channels/topics
+    name: Jake Lichtman
+    allowed_entities:
+      - BDM
+    sensitive_topics_blocked:
+      - financials
+      - hr
+      - legal
+      - cap_table
+      - phi
