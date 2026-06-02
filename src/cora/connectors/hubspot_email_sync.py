@@ -260,8 +260,6 @@ def sync_user(
     """Sync Gmail → HubSpot for one user. Returns stats dict."""
     from cora.connectors.gmail_reader import (
         GmailReaderError,
-        apply_label,
-        ensure_hubspot_label,
         get_full_thread_text,
         list_threads_since,
     )
@@ -287,16 +285,8 @@ def sync_user(
 
     stats = {"threads": 0, "logged": 0, "skipped": 0, "dm_sent": 0}
 
-    # Get Gmail label ID for idempotency
+    # List new threads (watermark-based dedup — no visible Gmail labels)
     try:
-        label_id = ensure_hubspot_label(owner_email)
-    except GmailReaderError as exc:
-        log.warning("[%s] Cannot ensure HubSpot label: %s", display_name, exc)
-        return stats
-
-    # List new threads
-    try:
-        # Exclude already-synced threads via Gmail label filter
         thread_ids = list_threads_since(
             owner_email,
             since_ts=since_ts,
@@ -321,11 +311,7 @@ def sync_user(
         if not messages:
             continue
 
-        # Skip if already labeled
-        latest_labels = messages[-1].get("label_ids", [])
-        if any("Cora-HubSpot" in str(lbl) for lbl in latest_labels):
-            stats["skipped"] += 1
-            continue
+        # Dedup is handled by the watermark (last_synced_ts) — no Gmail label needed
 
         # Find external participants
         external = _external_participants(messages, owner_email)
@@ -449,12 +435,7 @@ def sync_user(
 
         if logged_count > 0:
             stats["logged"] += 1
-            # Apply idempotency label to the first (oldest) message in thread
-            if not dry_run:
-                try:
-                    apply_label(owner_email, messages[0]["message_id"], label_id)
-                except GmailReaderError as exc:
-                    log.debug("[%s] apply_label failed: %s", display_name, exc)
+            # No Gmail label applied — dedup handled invisibly via watermark
 
         time.sleep(0.1)
 
