@@ -137,9 +137,12 @@ def check_access(user_id: str, entity: str, user_message: str) -> str | None:
 
     topic_patterns = {
         "financials": [
-            "p&l", "profit", "loss", "revenue", "cash flow", "balance sheet",
-            "financial", "budget", "spend", "cost", "expense", "income",
-            "ebitda", "margin", "qbo", "quickbooks", "invoice", "payroll",
+            "p&l", "p and l", "profit", "loss", "revenue", "cash flow",
+            "cash position", "cash balance", "net income", "gross margin",
+            "balance sheet", "financial", "budget", "spend", "cost",
+            "expense", "income", "ebitda", "margin", "qbo", "quickbooks",
+            "invoice", "payroll", "accounts receivable", "accounts payable",
+            "noi", "cap rate", "debt service", "refinanc",
         ],
         "hr": [
             "salary", "compensation", "pay rate", "hire", "fire", "terminate",
