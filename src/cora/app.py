@@ -460,6 +460,80 @@ def _dispatch_qa(
     active_thread_store.register(channel_id, register_ts)
 
 
+@app.command("/cora-ask")
+def handle_cora_ask(ack, body, client) -> None:
+    """Handle /cora-ask slash command -- answer a question in-channel without @-mention.
+
+    Usage: /cora-ask [your question]
+
+    Note: Register /cora-ask in the Slack app manifest under Slash Commands.
+    For Socket Mode apps, no URL is needed -- just enable the command in the app config.
+    """
+    ack()  # Must ack within 3 seconds per Slack requirements
+
+    channel_id = body.get("channel_id", "")
+    user_id    = body.get("user_id", "")
+    text       = (body.get("text") or "").strip()
+
+    if not text:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text=":information_source: Usage: `/cora-ask [your question]`",
+        )
+        return
+
+    # Hard block: never respond in permanently blocked channels
+    if _is_blocked_channel(channel_id):
+        log.warning("handle_cora_ask: blocked channel %s -- ignoring", channel_id)
+        return
+
+    # Rate limiting (reuse same limiter as @-mentions)
+    allowed, cap_type = rate_limiter.check(user_id, channel_id)
+    if not allowed:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text="You've hit the rate limit. Try again in a moment.",
+        )
+        return
+
+    channel_name = _resolve_channel_name(client, channel_id)
+
+    # Lazy-resolve bot user ID (needed for thread history role assignment)
+    _resolve_bot_user_id(client)
+
+    from .entity_router import is_silent_channel
+    if is_silent_channel(channel_name):
+        log.info("silent channel #%s -- ignoring /cora-ask from %s", channel_name, user_id)
+        return
+
+    entity = route(channel_name)
+
+    log.info(
+        "cora_ask slash channel=#%s user=%s entity=%s question=%.80s",
+        channel_name, user_id, entity, text,
+    )
+
+    # Build a say-equivalent that posts to the channel (not in a thread)
+    def _say(**kwargs) -> dict:
+        kwargs.pop("thread_ts", None)
+        return client.chat_postMessage(channel=channel_id, **kwargs)
+
+    _dispatch_qa(
+        channel_id=channel_id,
+        channel_name=channel_name,
+        user_id=user_id,
+        user_message=text,
+        reply_thread_ts=None,
+        entity=entity,
+        client=client,
+        say=_say,
+        prior_messages=[],
+        root_thread_ts=None,
+    )
+
+
 @app.event("app_mention")
 def handle_mention(event: dict, say: callable, client) -> None:
     if event.get("bot_id"):
@@ -1420,4 +1494,86 @@ def _process_contribution_reaction(
             if "already_reacted" not in str(_react_exc):
                 log.warning("react_to_approve: reactions.add failed: %s", _react_exc)
 
-        # Po
+        # Post audit record to Harrison's private KB log channel
+        kind = contribution.get("kind", "note")
+        kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
+        approver_mention = f"<@{reactor_id}>" if reactor_id else "_(unknown)_"
+        author_mention = f"<@{contribution['author']}>"
+        approved_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        content_preview = contribution.get("content", "")[:600]
+        audit_text = (
+            f"📋 *KB Approval* `[{cid[:8]}]`\n"
+            f"*Approved by:* {approver_mention}  |  "
+            f"*Entity:* {contribution['entity']}  |  "
+            f"*Kind:* {kind_label}\n"
+            f"*Submitted by:* {author_mention}  |  "
+            f"*Source:* #{contribution['channel_name']}  |  "
+            f"*At:* {approved_at}\n"
+            f"```\n{content_preview}\n```"
+        )
+        try:
+            client.chat_postMessage(
+                channel=team_learning.KB_AUDIT_CHANNEL,
+                text=audit_text,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except Exception as exc:
+            log.warning("team_learning: failed to post KB audit record cid=%s: %s", cid[:8], exc)
+    else:
+        # Decline
+        team_learning.resolve_contribution(cid, "declined")
+        reply = f"❌ Contribution `[{cid[:8]}]` declined. Nothing added to KB."
+        log.info("team_learning: contribution %s declined", cid[:8])
+
+    try:
+        client.chat_postMessage(
+            channel=approval_channel_id,
+            thread_ts=approval_msg_ts,
+            text=reply,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except Exception as exc:
+        log.warning("team_learning: failed to post resolution reply: %s", exc)
+
+    # Feature 3: Pin approved decisions to the entity's leadership channel
+    if reaction == "white_check_mark" and _is_decision_content(contribution.get("content", "")):
+        leadership_ch = _entity_leadership_channel(contribution.get("entity", ""))
+        original_ts = contribution.get("original_ts")
+        if leadership_ch and original_ts:
+            try:
+                client.pins_add(channel=leadership_ch, timestamp=original_ts)
+                log.info(
+                    "pin_decision: pinned cid=%s to #%s ts=%s",
+                    contribution.get("contribution_id", "?")[:8], leadership_ch, original_ts,
+                )
+            except Exception as exc:
+                err_str = str(exc)
+                if "already_pinned" not in err_str and "no_pin" not in err_str:
+                    log.warning("pin_decision: pins.add failed: %s", exc)
+
+
+@app.event("reaction_added")
+def handle_reaction_added(event: dict, client) -> None:
+    _handle_reaction(event, client, "reaction_added")
+
+
+@app.event("reaction_removed")
+def handle_reaction_removed(event: dict, client) -> None:
+    _handle_reaction(event, client, "reaction_removed")
+
+
+@app.event("channel_created")
+def handle_channel_created(event: dict, client) -> None:
+    """Auto-join every new public channel so the nightly sweep has full coverage."""
+    ch = event.get("channel") or {}
+    ch_id = ch.get("id", "")
+    ch_name = ch.get("name", "")
+    if not ch_id:
+        return
+    try:
+        client.conversations_join(channel=ch_id)
+        log.info("auto-joined new channel #%s (%s)", ch_name, ch_id)
+    except Exception as exc:
+        log.warning("failed to auto-join #%s: %s", ch_name, exc)
