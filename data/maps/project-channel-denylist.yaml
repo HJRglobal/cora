@@ -1,0 +1,37 @@
+# Project channel denylist for run_project_channel_sync.py.
+# Projects whose names match ANY of these patterns (case-insensitive substring)
+# will be skipped -- no Slack channel will be created for them.
+#
+# Add patterns to prevent template projects, tracking projects, and
+# high-churn projects from flooding the workspace with channels.
+
+patterns:
+  # Internal tracking / management projects (not operational)
+  - "Q1 Goals"
+  - "Q2 Goals"
+  - "Q3 Goals"
+  - "Q4 Goals"
+  - "HAT"                    # Holds Action Tracker naming pattern
+  - "Asana Deep Dive"
+  - "Sales Pipeline"         # Pipeline boards, not campaigns
+  - "Hygiene"
+
+  # Already have Slack channels by other means
+  - "July 10th"              # Event-specific (cancelled)
+  - "Amateur Event"
+
+  # Administrative / template projects
+  - "Template"
+  - "Archive"
+  - "Test"
+  - "Sandbox"
+  - "onboarding"
+
+  # OSN sub-store level projects (stores have channels already)
+  - "G&W"
+  - "G&M"
+  - "G&F"
+  - "VVP"
+
+  # Projects that are entity-wide catch-alls (not campaign-specific)
+  - "Operations"             # Too broad — entity ops channels already exist

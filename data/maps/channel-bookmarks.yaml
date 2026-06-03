@@ -1,0 +1,93 @@
+# Channel bookmarks configuration for Cora.
+# Defines the bookmarks to maintain in each entity leadership channel.
+# Run scripts/setup_channel_bookmarks.py to apply / re-apply.
+# Safe to re-run — idempotent (adds new, updates changed, leaves extras alone).
+#
+# type must be "link" (only Slack-supported type via API).
+# emoji is optional — Slack displays it next to the bookmark title.
+#
+# Channel IDs verified 2026-06-02 via Slack API.
+
+channels:
+
+  - channel_id: C0B3K67J10T   # hjrg-leadership
+    channel_name: hjrg-leadership
+    bookmarks:
+      - title: "Asana — HJRG Projects"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "Notion — Entity Registry"
+        link: "https://www.notion.so/fb4046be41994574ba492f8ee6db9736"
+        emoji: ":notion:"
+      - title: "Notion — Contracts & Renewals"
+        link: "https://www.notion.so/7820cd3689ae4596bd8f965f2bf96d5d"
+        emoji: ":memo:"
+      - title: "Cash Flow — Standing ACTUALS"
+        link: "https://docs.google.com/spreadsheets/d/1bkMFetsIW-cLtYwLorgio01gLm7EOdJ7UgGHj_lTqPI/edit"
+        emoji: ":bar_chart:"
+
+  - channel_id: C0B3V5SDNAG   # hjrg-finance
+    channel_name: hjrg-finance
+    bookmarks:
+      - title: "Cash Flow — Standing ACTUALS"
+        link: "https://docs.google.com/spreadsheets/d/1bkMFetsIW-cLtYwLorgio01gLm7EOdJ7UgGHj_lTqPI/edit"
+        emoji: ":bar_chart:"
+      - title: "Asana — HJRG Projects"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "Notion — Pending Decisions"
+        link: "https://www.notion.so/3581148721ff81ed85afee6fbccf6c10"
+        emoji: ":hourglass:"
+
+  - channel_id: C0B4KRQT3LY   # f3e-leadership
+    channel_name: f3e-leadership
+    bookmarks:
+      - title: "Asana — F3 Energy"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "HubSpot — F3E Retail Pipeline"
+        link: "https://app.hubspot.com/contacts/246351746/deals/list/view/all"
+        emoji: ":hubspot:"
+      - title: "Shopify — F3 Energy Store"
+        link: "https://f3energy.myshopify.com/admin"
+        emoji: ":shopify:"
+      - title: "Polar Analytics — F3E Ads"
+        link: "https://app.polaranalytics.com"
+        emoji: ":chart_with_upwards_trend:"
+
+  - channel_id: C0B3TCEF4KT   # osn-leadership
+    channel_name: osn-leadership
+    bookmarks:
+      - title: "Asana — One Stop Nutrition"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "Notion — OSN Operations"
+        link: "https://www.notion.so/fb4046be41994574ba492f8ee6db9736"
+        emoji: ":notion:"
+
+  - channel_id: C0B3A3U7WS3   # lex-leadership
+    channel_name: lex-leadership
+    bookmarks:
+      - title: "Asana — Lexington Services"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "AZ DDD Revalidation — Due 2026-06-30"
+        link: "https://app.asana.com/0/682743441507584/task/1215070649606664"
+        emoji: ":rotating_light:"
+
+  - channel_id: C0B3PF5QK9C   # bdm-leadership
+    channel_name: bdm-leadership
+    bookmarks:
+      - title: "Asana — Big D Media"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+
+  - channel_id: C0B3A3W2A3H   # hjrp-leadership
+    channel_name: hjrp-leadership
+    bookmarks:
+      - title: "Asana — HJR Properties"
+        link: "https://app.asana.com/0/682743441507584/list"
+        emoji: ":asana:"
+      - title: "Rogers Ranch — Airbnb"
+        link: "https://www.airbnb.com/manage-your-space"
+        emoji: ":house:"

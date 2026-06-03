@@ -1,0 +1,57 @@
+# Entity → Slack channel ID mapping for Cora features.
+# Used by: pin_decisions (Feature 3), channel_bookmarks (Feature 4), and any
+# future feature that needs to post to entity-specific channels.
+#
+# Leadership channels: where decisions get pinned, questions get asked.
+# Finance channels: where financial data goes. Source-opacity rules enforced.
+#
+# IDs verified 2026-06-02 via Slack API.
+
+entities:
+  FNDR:
+    leadership: C0B3K67J10T   # hjrg-leadership
+    finance:    C0B3V5SDNAG   # hjrg-finance
+
+  HJRG:
+    leadership: C0B3K67J10T   # hjrg-leadership
+    finance:    C0B3V5SDNAG   # hjrg-finance
+
+  F3E:
+    leadership: C0B4KRQT3LY   # f3e-leadership
+    finance:    C0B3V5X6CFN   # f3e-finance
+
+  OSN:
+    leadership: C0B3TCEF4KT   # osn-leadership
+    finance:    C0B3K6C5HC3   # osn-finance
+
+  LEX:
+    leadership: C0B3A3U7WS3   # lex-leadership
+    finance:    C0B3A3TTN5D   # lex-finance
+
+  LEX-LLC:
+    leadership: C0B3A3U7WS3   # lex-leadership (GM-level; no LLC-specific leadership channel)
+    finance:    C0B3A3TTN5D   # lex-finance
+
+  LEX-LTS:
+    leadership: C0B3A3U7WS3   # lex-leadership
+    finance:    C0B3A3TTN5D   # lex-finance
+
+  LEX-LBHS:
+    leadership: C0B3A3U7WS3   # lex-leadership
+    finance:    C0B3A3TTN5D   # lex-finance
+
+  LEX-LLA:
+    leadership: C0B3A3U7WS3   # lex-leadership
+    finance:    C0B3A3TTN5D   # lex-finance
+
+  BDM:
+    leadership: C0B3PF5QK9C   # bdm-leadership
+    finance:    C0B3V5V3DQC   # bdm-finance
+
+  HJRP:
+    leadership: C0B3A3W2A3H   # hjrp-leadership
+    finance:    C0B3V5SDNAG   # hjrg-finance (HJRP rolls up to HJRG finance)
+
+  UFL:
+    leadership: C0B3N5YG1SR   # ufl-leadership (monitor-only; UFL paused)
+    finance:    C0B3V5SDNAG   # hjrg-finance

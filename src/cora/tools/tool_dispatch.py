@@ -1463,6 +1463,29 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
         entity_filter,
         len(result),
     )
+    # Feature 6: upload long reports as Slack files
+    channel_id = inp.get("_channel_id", "")
+    if (
+        len(result) > financial_client.FILE_UPLOAD_THRESHOLD
+        and result != financial_client.UNKNOWN_RESPONSE
+        and channel_id
+    ):
+        import os as _os
+        from slack_sdk import WebClient as _SlackWebClient
+        _bot_token = _os.environ.get("SLACK_BOT_TOKEN", "")
+        if _bot_token:
+            _sc = _SlackWebClient(token=_bot_token)
+            title = f"Cash Flow Report — {entity_filter}"
+            thread_ts = inp.get("_thread_ts")
+            uploaded = financial_client.upload_report_as_file(
+                slack_client=_sc,
+                channel_id=channel_id,
+                title=title,
+                content=result,
+                thread_ts=thread_ts,
+            )
+            if uploaded:
+                return "📎 Full cash flow report uploaded above."
     return result
 
 
@@ -4049,6 +4072,8 @@ def dispatch(
     slack_user_id: str,
     entity: str = "FNDR",
     channel_name: str = "",
+    channel_id: str = "",
+    thread_ts: str | None = None,
 ) -> str:
     """Run a tool by name. Always returns a string for tool_result content.
 
@@ -4057,6 +4082,9 @@ def dispatch(
 
     channel_name is injected into tool_input as '_channel_name' so financial
     tools can enforce the finance-channel access rule without changing signatures.
+
+    channel_id and thread_ts are injected for Feature 6 file uploads and any
+    future tools that need to post directly to Slack channels.
     """
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if not fn:
@@ -4064,6 +4092,10 @@ def dispatch(
         return f"Unknown tool: {tool_name}. Available tools: {list(_TOOL_FUNCTIONS)}"
     injected = dict(tool_input or {})
     injected["_channel_name"] = channel_name
+    if channel_id:
+        injected["_channel_id"] = channel_id
+    if thread_ts:
+        injected["_thread_ts"] = thread_ts
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, slack_user_id, entity, injected)

@@ -43,6 +43,52 @@ _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
 _FOUNDER_ID = "U0B2RM2JYJ1"  # Harrison — KB approvals and cross-entity access
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
 
+# Feature 3: Decision-language patterns for pin-on-approval logic
+_DECISION_RE = re.compile(
+    r"\b(decided|locked|going with|approved|we will|we won'?t|not going to|"
+    r"confirmed|final decision|agreed to|moving forward with|shutting down|"
+    r"launching|cancell?ing|pausing)\b",
+    re.IGNORECASE,
+)
+
+# Feature 3 + 4: Entity → leadership channel ID, loaded lazily from entity-channels.yaml
+_ENTITY_CHANNELS_CACHE: dict | None = None
+
+
+def _is_decision_content(text: str) -> bool:
+    """Return True if the text contains decision-language worthy of pinning."""
+    return bool(_DECISION_RE.search(text))
+
+
+def _load_entity_channels() -> dict:
+    """Load entity-channels.yaml, cached in process memory."""
+    global _ENTITY_CHANNELS_CACHE
+    if _ENTITY_CHANNELS_CACHE is not None:
+        return _ENTITY_CHANNELS_CACHE
+    try:
+        import yaml as _yaml
+        path = Path(__file__).resolve().parents[2] / "data" / "maps" / "entity-channels.yaml"
+        data = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        _ENTITY_CHANNELS_CACHE = data.get("entities", {})
+    except Exception as exc:
+        log.warning("_load_entity_channels: failed to load entity-channels.yaml: %s", exc)
+        _ENTITY_CHANNELS_CACHE = {}
+    return _ENTITY_CHANNELS_CACHE
+
+
+def _entity_leadership_channel(entity: str) -> str | None:
+    """Return the Slack channel ID for the entity's leadership channel, or None."""
+    channels = _load_entity_channels()
+    entry = channels.get(entity, {})
+    return entry.get("leadership") or None
+
+
+def _entity_finance_channel(entity: str) -> str | None:
+    """Return the Slack channel ID for the entity's finance channel, or None."""
+    channels = _load_entity_channels()
+    entry = channels.get(entity, {})
+    return entry.get("finance") or None
+
 # Resolved at first event via auth.test() - the bot's own user ID. Used to
 # filter reaction_added events down to "user reacted to a Cora message" only.
 _CORA_BOT_USER_ID: str | None = None
@@ -671,17 +717,7 @@ def _handle_note(
         return
 
     paraphrase = team_learning.paraphrase_note(content, entity)
-    team_learning.store_pending_confirm(
-        channel_id=channel_id,
-        thread_ts=original_ts,
-        entity=entity,
-        channel_name=channel_name,
-        author=user_id,
-        kind=kind,
-        raw_content=content,
-        paraphrase=paraphrase,
-    )
-    say(
+    preview_resp = say(
         text=(
             f"{paraphrase}\n\n"
             "Does that capture it? Reply *yes* to queue for approval, "
@@ -691,9 +727,23 @@ def _handle_note(
         unfurl_links=False,
         unfurl_media=False,
     )
+    preview_msg_ts = None
+    if isinstance(preview_resp, dict):
+        preview_msg_ts = preview_resp.get("ts")
+    team_learning.store_pending_confirm(
+        channel_id=channel_id,
+        thread_ts=original_ts,
+        entity=entity,
+        channel_name=channel_name,
+        author=user_id,
+        kind=kind,
+        raw_content=content,
+        paraphrase=paraphrase,
+        preview_msg_ts=preview_msg_ts,
+    )
     log.info(
-        "team_learning: paraphrase posted channel=#%s user=%s kind=%s",
-        channel_name, user_id, kind,
+        "team_learning: paraphrase posted channel=#%s user=%s kind=%s preview_ts=%s",
+        channel_name, user_id, kind, preview_msg_ts,
     )
 
 
@@ -761,12 +811,48 @@ def handle_message_event(event: dict, client) -> None:
                 original_ts=thread_ts,
                 kind=pending["kind"],
             )
-            say(
-                text=f"✅ Logged and queued for approval in #{target_ch}.",
-                thread_ts=thread_ts,
-                unfurl_links=False,
-                unfurl_media=False,
+            confirmed_text = (
+                f"{pending['paraphrase']}\n\n"
+                f"✅ Confirmed — queued for approval in #{target_ch}."
             )
+            # Feature 7: Update preview message in-place instead of posting a new reply
+            preview_ts = pending.get("preview_msg_ts")
+            if preview_ts:
+                try:
+                    client.chat_update(
+                        channel=channel_id,
+                        ts=preview_ts,
+                        text=confirmed_text,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as exc:
+                    log.warning("staged_write_update: chat.update failed ts=%s: %s", preview_ts, exc)
+                    # Fallback: post as new reply
+                    say(
+                        text=f"✅ Logged and queued for approval in #{target_ch}.",
+                        thread_ts=thread_ts,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+            else:
+                say(
+                    text=f"✅ Logged and queued for approval in #{target_ch}.",
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+            # Feature 2: React ✅ to the user's confirming message
+            try:
+                client.reactions_add(
+                    channel=channel_id,
+                    name="white_check_mark",
+                    timestamp=event["ts"],
+                )
+            except Exception as exc:
+                err_str = str(exc)
+                if "already_reacted" not in err_str:
+                    log.warning("react_to_confirm: reactions.add failed: %s", exc)
             log.info(
                 "team_learning: confirmed channel=#%s user=%s kind=%s",
                 channel_name, user_id, pending["kind"],
@@ -776,7 +862,32 @@ def handle_message_event(event: dict, client) -> None:
             updated = team_learning.paraphrase_note(
                 pending["raw_content"], pending["entity"], correction=text
             )
-            # Update stored paraphrase so next correction builds on this one
+            # Feature 7: update the existing preview message in-place
+            preview_ts = pending.get("preview_msg_ts")
+            if preview_ts:
+                try:
+                    client.chat_update(
+                        channel=channel_id,
+                        ts=preview_ts,
+                        text=(
+                            f"{updated}\n\n"
+                            "Does that capture it? Reply *yes* to queue for approval, "
+                            "or correct anything above."
+                        ),
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as exc:
+                    log.warning("staged_write_update: chat.update (correction) failed: %s", exc)
+                    preview_ts = None  # Fall through to say() below
+            if not preview_ts:
+                say(
+                    text=updated,
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+            # Update stored paraphrase so next correction builds on this one; preserve preview_ts
             team_learning.store_pending_confirm(
                 channel_id=channel_id,
                 thread_ts=thread_ts,
@@ -786,14 +897,9 @@ def handle_message_event(event: dict, client) -> None:
                 kind=pending["kind"],
                 raw_content=pending["raw_content"],
                 paraphrase=updated,
+                preview_msg_ts=pending.get("preview_msg_ts"),
             )
             active_thread_store.touch(channel_id, thread_ts)
-            say(
-                text=updated,
-                thread_ts=thread_ts,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
             log.info(
                 "team_learning: re-paraphrased channel=#%s user=%s",
                 channel_name, user_id,
@@ -1189,6 +1295,17 @@ def _process_contribution_reaction(
             )
         log.info("team_learning: contribution %s approved ingest_ok=%s", cid[:8], success)
 
+        # Feature 2: React ✅ to the approval card to signal it was processed
+        try:
+            client.reactions_add(
+                channel=approval_channel_id,
+                name="white_check_mark",
+                timestamp=approval_msg_ts,
+            )
+        except Exception as _react_exc:
+            if "already_reacted" not in str(_react_exc):
+                log.warning("react_to_approve: reactions.add failed: %s", _react_exc)
+
         # Post audit record to Harrison's private KB log channel
         kind = contribution.get("kind", "note")
         kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
@@ -1231,6 +1348,22 @@ def _process_contribution_reaction(
         )
     except Exception as exc:
         log.warning("team_learning: failed to post resolution reply: %s", exc)
+
+    # Feature 3: Pin approved decisions to the entity's leadership channel
+    if reaction == "white_check_mark" and _is_decision_content(contribution.get("content", "")):
+        leadership_ch = _entity_leadership_channel(contribution.get("entity", ""))
+        original_ts = contribution.get("original_ts")
+        if leadership_ch and original_ts:
+            try:
+                client.pins_add(channel=leadership_ch, timestamp=original_ts)
+                log.info(
+                    "pin_decision: pinned cid=%s to #%s ts=%s",
+                    contribution.get("contribution_id", "?")[:8], leadership_ch, original_ts,
+                )
+            except Exception as exc:
+                err_str = str(exc)
+                if "already_pinned" not in err_str and "no_pin" not in err_str:
+                    log.warning("pin_decision: pins.add failed: %s", exc)
 
 
 @app.event("reaction_added")

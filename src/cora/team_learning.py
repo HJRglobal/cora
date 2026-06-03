@@ -255,19 +255,26 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_contrib_approval_ts ON pending_contributions(approval_msg_ts);
 
         CREATE TABLE IF NOT EXISTS pending_paraphrase_confirms (
-            channel_id   TEXT NOT NULL,
-            thread_ts    TEXT NOT NULL,
-            entity       TEXT NOT NULL,
-            channel_name TEXT NOT NULL,
-            author       TEXT NOT NULL,
-            kind         TEXT NOT NULL,
-            raw_content  TEXT NOT NULL,
-            paraphrase   TEXT NOT NULL,
-            created_at   INTEGER NOT NULL,
+            channel_id      TEXT NOT NULL,
+            thread_ts       TEXT NOT NULL,
+            entity          TEXT NOT NULL,
+            channel_name    TEXT NOT NULL,
+            author          TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            raw_content     TEXT NOT NULL,
+            paraphrase      TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            preview_msg_ts  TEXT,
             PRIMARY KEY (channel_id, thread_ts)
         );
     """)
     conn.commit()
+    # Idempotent migration: add preview_msg_ts to existing tables that predate this column.
+    try:
+        conn.execute("ALTER TABLE pending_paraphrase_confirms ADD COLUMN preview_msg_ts TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists — safe to ignore
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -464,12 +471,16 @@ def store_pending_confirm(
     kind: str,
     raw_content: str,
     paraphrase: str,
+    preview_msg_ts: str | None = None,
 ) -> None:
     """Persist a pending paraphrase-confirmation record to SQLite.
 
     Calling this again for the same (channel_id, thread_ts) pair updates the
     record in place (REPLACE semantics), which is used when the author
     iterates on the paraphrase with corrections.
+
+    preview_msg_ts: the ts of Cora's paraphrase message — used to update that
+    message in-place via chat.update once the author confirms.
     """
     conn = _get_conn()
     try:
@@ -477,11 +488,11 @@ def store_pending_confirm(
             """
             INSERT OR REPLACE INTO pending_paraphrase_confirms
                 (channel_id, thread_ts, entity, channel_name, author, kind,
-                 raw_content, paraphrase, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 raw_content, paraphrase, created_at, preview_msg_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (channel_id, thread_ts, entity, channel_name, author, kind,
-             raw_content, paraphrase, int(time.time())),
+             raw_content, paraphrase, int(time.time()), preview_msg_ts),
         )
         conn.commit()
     finally:
@@ -494,7 +505,8 @@ def get_pending_confirm(channel_id: str, thread_ts: str) -> dict | None:
     try:
         row = conn.execute(
             """
-            SELECT entity, channel_name, author, kind, raw_content, paraphrase, created_at
+            SELECT entity, channel_name, author, kind, raw_content, paraphrase,
+                   created_at, preview_msg_ts
             FROM pending_paraphrase_confirms
             WHERE channel_id = ? AND thread_ts = ?
             """,
@@ -504,7 +516,7 @@ def get_pending_confirm(channel_id: str, thread_ts: str) -> dict | None:
         conn.close()
     if not row:
         return None
-    entity, channel_name, author, kind, raw_content, paraphrase, created_at = row
+    entity, channel_name, author, kind, raw_content, paraphrase, created_at, preview_msg_ts = row
     # Expire records older than TTL
     if time.time() - created_at > _CONFIRM_TTL_SECONDS:
         clear_pending_confirm(channel_id, thread_ts)
@@ -517,6 +529,7 @@ def get_pending_confirm(channel_id: str, thread_ts: str) -> dict | None:
         "raw_content": raw_content,
         "paraphrase": paraphrase,
         "created_at": created_at,
+        "preview_msg_ts": preview_msg_ts,
     }
 
 

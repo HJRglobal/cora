@@ -414,6 +414,96 @@ def get_osn_pulse_text(
         return UNKNOWN_RESPONSE
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Feature 6: File upload for long financial reports
+# ────────────────────────────────────────────────────────────────────────────
+
+# Reports longer than this threshold are uploaded as a Slack file instead of
+# posted inline.  Keeps #hjrg-finance readable.
+FILE_UPLOAD_THRESHOLD = 2000  # characters
+
+
+def upload_report_as_file(
+    slack_client: SlackWebClient,
+    channel_id: str,
+    title: str,
+    content: str,
+    thread_ts: str | None = None,
+) -> bool:
+    """Upload a long financial report as a Slack file using the v2 upload API.
+
+    Returns True on success, False on any failure (caller falls back to inline).
+    The file is posted directly to channel_id; thread_ts is optional.
+    """
+    try:
+        import httpx
+    except ImportError:
+        log.warning("upload_report_as_file: httpx not installed — falling back to inline")
+        return False
+
+    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not bot_token:
+        log.warning("upload_report_as_file: SLACK_BOT_TOKEN not set")
+        return False
+
+    content_bytes = content.encode("utf-8")
+    filename = f"financial-report-{int(time.time())}.txt"
+
+    try:
+        # Step 1: get upload URL
+        url_resp = slack_client.files_getUploadURLExternal(
+            filename=filename,
+            length=len(content_bytes),
+        )
+        if not url_resp.get("ok"):
+            log.warning("upload_report_as_file: getUploadURL failed: %s", url_resp.get("error"))
+            return False
+        upload_url = url_resp["upload_url"]
+        file_id = url_resp["file_id"]
+
+        # Step 2: PUT the bytes to the upload URL
+        put_resp = httpx.put(
+            upload_url,
+            content=content_bytes,
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            timeout=30.0,
+        )
+        if put_resp.status_code not in (200, 201):
+            log.warning("upload_report_as_file: PUT failed status=%s", put_resp.status_code)
+            return False
+
+        # Step 3: complete the upload and share to channel
+        files_payload = [{"id": file_id, "title": title}]
+        complete_kwargs = {
+            "files": files_payload,
+            "channel_id": channel_id,
+        }
+        if thread_ts:
+            complete_kwargs["thread_ts"] = thread_ts
+
+        complete_resp = slack_client.files_completeUploadExternal(**complete_kwargs)
+        if not complete_resp.get("ok"):
+            log.warning(
+                "upload_report_as_file: completeUpload failed: %s",
+                complete_resp.get("error"),
+            )
+            return False
+
+        log.info("upload_report_as_file: uploaded file_id=%s to channel=%s", file_id, channel_id)
+        return True
+
+    except SlackApiError as exc:
+        err = exc.response.get("error", "") if exc.response else str(exc)
+        if "missing_scope" in err or "not_allowed_token_type" in err:
+            log.warning("upload_report_as_file: missing files:write scope — falling back to inline")
+        else:
+            log.warning("upload_report_as_file: SlackApiError: %s", exc)
+        return False
+    except Exception as exc:
+        log.warning("upload_report_as_file: unexpected error: %s", exc)
+        return False
+
+
 def notify_gap(
     topic: str,
     channel: str = "",
