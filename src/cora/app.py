@@ -1103,6 +1103,85 @@ def _handle_bookmark_reaction(
         log.warning("bookmark_reaction: ephemeral confirm failed: %s", exc)
 
 
+def _handle_react_to_task(
+    *,
+    client,
+    reactor: str,
+    channel_id: str,
+    channel_name: str,
+    message_ts: str,
+) -> None:
+    """Create an Asana task from a clipboard-reacted message and DM the reactor."""
+    import yaml as _yaml
+    from pathlib import Path as _Path
+    from cora.tools.asana_client import create_task, AsanaClientError
+
+    try:
+        hist = client.conversations_history(
+            channel=channel_id, latest=message_ts, limit=1, inclusive=True
+        )
+        msgs = hist.get("messages") or []
+        if not msgs:
+            log.info("react_to_task: no messages found ts=%s channel=%s", message_ts, channel_id)
+            return
+        msg_text = msgs[0].get("text", "").strip()
+        if not msg_text:
+            log.info("react_to_task: empty message ts=%s channel=%s -- skipping", message_ts, channel_id)
+            return
+
+        # Truncate task name to 250 chars (Asana limit)
+        task_name = msg_text[:250]
+
+        # Resolve reactor's Asana GID from slack-to-asana.yaml
+        _repo_root = _Path(__file__).resolve().parents[2]
+        asana_map_path = _repo_root / "data" / "maps" / "slack-to-asana.yaml"
+        asana_map: dict = {}
+        try:
+            raw = _yaml.safe_load(asana_map_path.read_text(encoding="utf-8")) or {}
+            for u in raw.get("users") or []:
+                sid = u.get("slack_user_id")
+                if sid:
+                    asana_map[sid] = u
+        except Exception as exc:
+            log.warning("react_to_task: failed to load asana map: %s", exc)
+
+        assignee_gid: str | None = None
+        reactor_name = "you"
+        if reactor in asana_map:
+            gid_val = asana_map[reactor].get("asana_user_gid")
+            assignee_gid = str(gid_val) if gid_val else None
+            dn = (asana_map[reactor].get("display_name") or "").strip()
+            reactor_name = dn.split()[0] if dn else "you"
+
+        task = create_task(
+            name=task_name,
+            assignee_gid=assignee_gid or None,
+            notes=f"Created from Slack message in #{channel_name} via clipboard reaction.",
+        )
+        task_url = task.get("permalink_url", "")
+        task_gid = task.get("gid", "")
+
+        # DM the reactor
+        try:
+            dm = client.conversations_open(users=[reactor])
+            dm_channel = dm["channel"]["id"]
+            reply = f":clipboard: Task created for {reactor_name}!"
+            if task_url:
+                reply += f"\n{task_url}"
+            client.chat_postMessage(channel=dm_channel, text=reply)
+        except Exception as exc:
+            log.warning("react_to_task: DM failed for reactor=%s: %s", reactor, exc)
+
+        log.info(
+            "react_to_task: task=%s created for reactor=%s channel=#%s",
+            task_gid, reactor, channel_name,
+        )
+    except AsanaClientError as exc:
+        log.warning("react_to_task: Asana error: %s", exc)
+    except Exception as exc:
+        log.warning("react_to_task handler failed: %s", exc)
+
+
 def _handle_reaction(event: dict, client, event_type: str) -> None:
     """Shared logic for reaction_added and reaction_removed events."""
     item = event.get("item") or {}
@@ -1113,6 +1192,18 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     reactor = event.get("user", "")
     reaction = event.get("reaction", "")
     message_ts = item.get("ts", "")
+
+    # ── 📋 react-to-task: ANY message -> Asana task + DM reactor ───────────────
+    if event_type == "reaction_added" and reaction == "clipboard" and reactor and channel_id:
+        channel_name = _resolve_channel_name(client, channel_id)
+        _handle_react_to_task(
+            client=client,
+            reactor=reactor,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            message_ts=message_ts,
+        )
+        return
 
     # ── 📚 bookmark: runs on ANY message, not just Cora's ────────────────────
     if event_type == "reaction_added" and reaction == "books" and channel_id and reactor:
@@ -1329,86 +1420,4 @@ def _process_contribution_reaction(
             if "already_reacted" not in str(_react_exc):
                 log.warning("react_to_approve: reactions.add failed: %s", _react_exc)
 
-        # Post audit record to Harrison's private KB log channel
-        kind = contribution.get("kind", "note")
-        kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
-        approver_mention = f"<@{reactor_id}>" if reactor_id else "_(unknown)_"
-        author_mention = f"<@{contribution['author']}>"
-        approved_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-        content_preview = contribution.get("content", "")[:600]
-        audit_text = (
-            f"📋 *KB Approval* `[{cid[:8]}]`\n"
-            f"*Approved by:* {approver_mention}  |  "
-            f"*Entity:* {contribution['entity']}  |  "
-            f"*Kind:* {kind_label}\n"
-            f"*Submitted by:* {author_mention}  |  "
-            f"*Source:* #{contribution['channel_name']}  |  "
-            f"*At:* {approved_at}\n"
-            f"```\n{content_preview}\n```"
-        )
-        try:
-            client.chat_postMessage(
-                channel=team_learning.KB_AUDIT_CHANNEL,
-                text=audit_text,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
-        except Exception as exc:
-            log.warning("team_learning: failed to post KB audit record cid=%s: %s", cid[:8], exc)
-    else:
-        # Decline
-        team_learning.resolve_contribution(cid, "declined")
-        reply = f"❌ Contribution `[{cid[:8]}]` declined. Nothing added to KB."
-        log.info("team_learning: contribution %s declined", cid[:8])
-
-    try:
-        client.chat_postMessage(
-            channel=approval_channel_id,
-            thread_ts=approval_msg_ts,
-            text=reply,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-    except Exception as exc:
-        log.warning("team_learning: failed to post resolution reply: %s", exc)
-
-    # Feature 3: Pin approved decisions to the entity's leadership channel
-    if reaction == "white_check_mark" and _is_decision_content(contribution.get("content", "")):
-        leadership_ch = _entity_leadership_channel(contribution.get("entity", ""))
-        original_ts = contribution.get("original_ts")
-        if leadership_ch and original_ts:
-            try:
-                client.pins_add(channel=leadership_ch, timestamp=original_ts)
-                log.info(
-                    "pin_decision: pinned cid=%s to #%s ts=%s",
-                    contribution.get("contribution_id", "?")[:8], leadership_ch, original_ts,
-                )
-            except Exception as exc:
-                err_str = str(exc)
-                if "already_pinned" not in err_str and "no_pin" not in err_str:
-                    log.warning("pin_decision: pins.add failed: %s", exc)
-
-
-@app.event("reaction_added")
-def handle_reaction_added(event: dict, client) -> None:
-    _handle_reaction(event, client, "reaction_added")
-
-
-@app.event("reaction_removed")
-def handle_reaction_removed(event: dict, client) -> None:
-    _handle_reaction(event, client, "reaction_removed")
-
-
-@app.event("channel_created")
-def handle_channel_created(event: dict, client) -> None:
-    """Auto-join every new public channel so the nightly sweep has full coverage."""
-    ch = event.get("channel") or {}
-    ch_id = ch.get("id", "")
-    ch_name = ch.get("name", "")
-    if not ch_id:
-        return
-    try:
-        client.conversations_join(channel=ch_id)
-        log.info("auto-joined new channel #%s (%s)", ch_name, ch_id)
-    except Exception as exc:
-        log.warning("failed to auto-join #%s: %s", ch_name, exc)
+        # Po
