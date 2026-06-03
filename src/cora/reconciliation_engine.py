@@ -69,15 +69,17 @@ FIREFLIES_LOOKBACK_SECONDS = 48 * 3600
 HUBSPOT_STALE_DAYS = 7
 HUBSPOT_STALE_SECONDS = HUBSPOT_STALE_DAYS * 86400
 
-# Confidence thresholds — only HIGH and MED are queued for Harrison review.
-CONFIDENCE_THRESHOLD = "MED"  # "HIGH" | "MED" — LOW is discarded
+# Confidence thresholds — only HIGH gaps are queued for Harrison review.
+# MED was generating too many low-signal proposals that piled up unreviewed.
+# Tuned 2026-06-03: raised from MED to HIGH to keep daily DM batch to 3-7 items.
+CONFIDENCE_THRESHOLD = "HIGH"  # "HIGH" | "MED" — LOW always discarded
 
 # Min fuzzy ratio for task/deal name matching
 MIN_FUZZY_RATIO = 0.35
 
-# Max gaps surfaced per pass.  Set to 30 so all 16 users can surface ~2 each.
-# Previously 10, which caused later users to be silently skipped.
-MAX_GAPS_PER_PASS = 30
+# Max gaps surfaced per pass. Reduced from 30 to 8 — keeps daily review batch
+# small enough that Harrison can action everything within the 7am DM window.
+MAX_GAPS_PER_PASS = 8
 
 # Action/commitment language patterns for Pass 1.
 _ACTION_RE = re.compile(

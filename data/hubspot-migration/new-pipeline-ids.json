@@ -1,0 +1,33 @@
+﻿{
+    "pipelines":  [
+                      {
+                          "stages":  {
+                                         "Proposal":  "3760204497",
+                                         "Sample Sent":  "",
+                                         "Qualified":  "3760235204",
+                                         "Closed Lost":  "3760235207",
+                                         "Negotiation":  "3760235205",
+                                         "Identify":  "",
+                                         "Closed Won":  "3760235206",
+                                         "Outreach":  ""
+                                     },
+                          "pipeline_name":  "F3E Retail",
+                          "pipeline_id":  "2313722582"
+                      },
+                      {
+                          "stages":  {
+                                         "Outreach":  "3760204502",
+                                         "Negotiation":  "3760204504",
+                                         "Closed Lost":  "closedlost",
+                                         "Proposal":  "3760204501",
+                                         "Closed Won":  "closedwon",
+                                         "Identify":  "3760204503"
+                                     },
+                          "pipeline_name":  "UFL / OSN / BDM",
+                          "pipeline_id":  "default"
+                      }
+                  ],
+    "owners":  {
+
+               }
+}

@@ -184,6 +184,37 @@ def main() -> int:
         _reset_all_dm_ts()
         log.info("Reset dm_message_ts on all PENDING items — they will be re-sent individually")
 
+    # ─── Step 0: Auto-dismiss PENDING entries older than 48h ─────────────────
+    # Stale entries pile up unreviewed and clutter the DM queue. Any gap
+    # that Harrison hasn't acted on within 48h is auto-dismissed — the next
+    # reconciliation run will re-surface anything still genuinely actionable.
+    if not args.dry_run:
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
+        cutoff = _dt.now(_tz.utc) - _td(hours=48)
+        auto_dismissed = 0
+        if _PROPOSED_UPDATES_PATH.exists():
+            with _UPDATES_LOCK:
+                raw = _PROPOSED_UPDATES_PATH.read_text(encoding="utf-8")
+                entries = [_json.loads(l) for l in raw.splitlines() if l.strip()]
+                for e in entries:
+                    if e.get("state") == "PENDING":
+                        try:
+                            proposed = _dt.fromisoformat(e["proposed_at"])
+                            if proposed < cutoff:
+                                e["state"] = "DISMISSED"
+                                e["resolved_at"] = _dt.now(_tz.utc).isoformat()
+                                auto_dismissed += 1
+                        except Exception:
+                            pass
+                _PROPOSED_UPDATES_PATH.write_text(
+                    "\n".join(_json.dumps(e) for e in entries) + "\n",
+                    encoding="utf-8",
+                )
+        if auto_dismissed:
+            log.info("Auto-dismissed %d stale PENDING entries (>48h old)", auto_dismissed)
+
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()
     log.info("Found %d reaction-to-update correlations to process", len(pairs))
@@ -217,8 +248,15 @@ def main() -> int:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
 
     # ─── Step 2: Send DM batch for any still-PENDING updates ─────────────────
+    # Cap at 5 DMs per run — keeps Harrison's review queue manageable.
+    _MAX_DMS_PER_RUN = 5
     pending = get_pending_updates()
     unsent = [u for u in pending if not u.get("dm_message_ts")]
+    if len(unsent) > _MAX_DMS_PER_RUN:
+        log.info("Capping DM batch: %d unsent -> sending top %d (HIGH confidence first)",
+                 len(unsent), _MAX_DMS_PER_RUN)
+        unsent = sorted(unsent, key=lambda u: 0 if u.get("confidence") == "HIGH" else 1)
+        unsent = unsent[:_MAX_DMS_PER_RUN]
     log.info("Found %d PENDING updates to DM Harrison about (%d not yet sent)", len(pending), len(unsent))
 
     if not unsent:

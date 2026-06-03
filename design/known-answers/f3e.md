@@ -154,3 +154,115 @@ Uses a subset of the core F3 palette. No unique colors introduced.
 - AutoCAD Color entries in AI dieline files are structural dieline layers, not print inks. Disregard for color spec purposes.
 - "crazy white" and "Die Color" designations in Ball dieline files are structural references, not branded color names.
 - **BDM (Larry Stone / Big D Media) executes to spec on color — they do not own or decide color assignments.** All PMS decisions originate from Harrison Rogers and the internal marketing team.
+
+## F3 Brand Assets, Production Files & Shopify Reference
+
+_Source: `02-F3-Energy/brand/f3-brand-assets-cora-reference.md` — compiled 2026-06-02 from 4 Drive folders. Covers brand guidelines, production dielines, can asset folders, and Shopify v1 asset drop system._
+
+### Role Architecture (non-negotiable)
+
+**Harrison Rogers** owns ALL creative decisions: palette choices, typography, photography direction, voice, positioning, brand strategy.
+
+**Larry Stone / Big D Media (BDM)** produces to the locked spec: logo asset files, photography/video, social/email/Shopify templates, paid ad creative, packaging production files.
+
+Production constraints flow BACK to Harrison. Creative decisions NEVER flow from BDM to the brand.
+
+### Brand Guidelines Source Files (Drive)
+
+| File | Drive ID | Description |
+|---|---|---|
+| F3-Brand-Guidelines-BDM-Updated.pptx | `1LbJQQWfK8Sl9v-2TzgrP0rw3XkLPJhCt` | Full BDM production handoff deck, May 26 2026. All 3 brands. |
+| F3-Brand-One-Pagers-BDM_Updated.pdf | `1to5OTXMX7RCT5Dt5uHyeeiiYRaFa6MLi` | One-page quick-reference cards for Pure, Mood, Energy. |
+
+Brand assets folder: `1pIarJR33QgQQLf-mL1XfY2G-YbzfzzH5`
+
+### Production Dieline Files Registry
+
+Folder 3 — F3 Production Dielines: `1khxquXopQcfiABtLGKdZzqDRYD14SewL`
+
+**F3 Energy Trays** (`1b0-WSp_zRcq-mD1g3UGbGrzqiT1ZbK8d`):
+- F3 Original Tray → `1VkTIY1TAly1dztQJOs1906qCv1pE17dT`
+- F3 Citrus Clarity Tray → `1KlxzJjJo-SiwQVYy8XZQrkoc4l6HMCcI`
+- F3 Strawberry Lemonade Tray → `1Xf7bnE7kZ8kRL7qsnmC0UEG2hHydvENK`
+- F3 Tropical Theory Tray → `16n1pnG19VOLO-6pv-K8d`
+- HP00186 SOJO Energy 12pk → `1wLllPKvcWM7TBn3Zy46UewArAWRChxSb`
+
+**F3 Pure Line Trays** (`1oc6G5F_2nDDTJYy4Vkwqo9Op63y4ENnE`):
+- Pure Original → `1Spgyy-UROWLo_QLXOfv1gJ-3yfUYtja4`
+- Pure Citrus Clarity → `1tKP7DJTCjOc-AsQzKHWI7wg8V2GohVLp`
+- Pure Strawberry Lemonade → `1_f28LFKPh2ySh0TX1x8LXm19r93xdB6g`
+- Pure Tropical Theory → `1OiePaU5e-9sjNYiH7nqxgT-ELlS5s45x`
+- **BCB Pure Variety Carton Proof** → `1drETPFGHh7QZwAadDVuHjzzmWTvm-dyc` (BCB press proof Form #AF07885B, dated 5/22/2026, CMYK only)
+
+**F3 Mood Trays** (`1VbWC8rMl4CZcJX5qIV-XXD3ZsDAl_COn`):
+- Mood Orange → `1JKD_Bj4NZuPZfSMHkKSt5NIRAIK58ZRs`
+- Mood Peach → `10zXFTkjwqpQsLcmUhMfKCev4RCADtppC`
+- Mood Piña Colada → `18BQ0olsX8lo3kF9WtQfeWFk92Uu8fwL5`
+- Mood Strawberries & Cream → `1iDy5Bq56QSIz6FspqAq6mU-IqgaEe8IY`
+- Mood can label (12-pack sleek) → `17Na8-V5EK0DPrlA2mn4hChzffwRiDhSS`
+
+**PNG Renders (tray artwork):**
+- F3 Orangesicle → `13xEC_h52aD9CEVgtinIUjyWBfXFBM53T`
+- F3 Peach Paradise → `1gmc4kWHDc5AJ2WhAZMHOSWSt_YCubWSK`
+- F3 Piña Colada → `1yExhhAmjxsPXi-sJICQNInzWXwYNpa4C`
+- F3 Strawberries & Cream → `1ZDbiLN_mMxbqp3zNIjmXVHFVK6bABe0k`
+
+### Can Asset Folders (Folder 2 — staging area for BDM)
+
+Folder: `1sbMb57XdQO_uWgfSdTtczV3crRVe9or0`
+
+| Brand | Folder ID |
+|---|---|
+| Pure | `1wEJ22MY6zqbyYjjXzGpZPwzatiCGKDff` |
+| Energy | `1pxDPavIRFTYMJXOg5Spo7up4A4abKyA-` |
+| Mood | `1NWqBRlLKtxuk3jX6OPOmmB4Ao38sbIIa` |
+
+### Shopify v1 Asset Drop System (Folder 4)
+
+Folder: `1e0cWt3w9OYVSNjwJcmtdFV1BhaYtmoFL`
+
+How it works: Harrison generates asset → names it EXACTLY per spec → drops in matching Drive subfolder → tells Cowork → Cowork uploads to Shopify Files and wires into Customizer.
+
+**Key subfolders:**
+- hero-banners/: `1C301pjYPRHYk8wrwpoSZChf2juE2T9pF`
+- brand-lifestyle/: `1hcihzBvF47dmA89cVpp8KHw_OPUaTHrM`
+- avatar-photography/: `10J-b_AY_6JQUma0H1C7iYKthkbColIi9`
+- ingredient-photography/: `17ZGXi3rw5cJ6AmZKKKcL66xDg4-PzQpm`
+- static-pages/: `1ZH_RXNBhBhJ0JDNiqKy16aUymxyLIHAn`
+
+**Critical P1 asset filenames (6/15 launch):**
+
+Theme system (upload directly to Shopify Files):
+- Favicons: `f3-favicon-pure.png`, `f3-favicon-mood.png`, `f3-favicon-energy.png` — 512×512 PNG
+- Logos: `f3-logo-pure.png`, `f3-logo-mood.png`, `f3-logo-energy.png` — 1200×400 PNG transparent
+- Social share: `f3-social-pure.png`, `f3-social-mood.png`, `f3-social-energy.png` — 1200×630 PNG/JPG
+
+Homepage heroes (drop in hero-banners/):
+- `f3-homepage-hero-pure.jpg`, `f3-homepage-hero-mood.jpg`, `f3-homepage-hero-energy.jpg`, `f3-homepage-hero-family.jpg` — 2880×1620
+
+Pure product photography (CRITICAL — no legacy exists, P1):
+- `f3-pure-original-hero-01.png`, `f3-pure-citrus-clarity-hero-01.png`, `f3-pure-tropical-theory-hero-01.png`, `f3-pure-strawberry-lemonade-hero-01.png`, `f3-pure-variety-pack-hero-01.png`
+- Hero spec: 2048×2048 PNG transparent OR `#FAFAF7` background
+
+Mood product photography (AUDIT first — Mood cans redesigned to black):
+- `f3-mood-pina-colada-hero-01.png`, `f3-mood-peach-paradise-hero-01.png`, `f3-mood-orangesicle-hero-01.png`, `f3-mood-strawberries-cream-hero-01.png`, `f3-mood-variety-pack-hero-01.png`
+- Hero spec: 2048×2048 PNG transparent OR Mood Black `#1A1A1A` background
+
+Family lineup (P1, most reusable):
+- `f3-family-lineup-01.jpg` — 2880×1080 wide, all 3 brand cans side-by-side
+
+Master manifest: Drive ID `1oq2QPeP6FvMU_98uGZajO7wiISjpqi7J` (MASTER-ASSET-MANIFEST-v1.md)
+
+### Confirmed F3 Shipping, Returns & Contact Policy
+
+_Source: Drive ID `1GlajW_w3HXSssJMUcuW8moUIKY7kIXrR` — confirmed by Harrison, locked 2026-05-24._
+
+- Free shipping on orders over **$60**. Under $60: flat **$6.99**.
+- Processing: **2 business days**. Delivery: **3-5 business days** after shipment.
+- Carriers: UPS and FedEx. Ships to all 50 US states only.
+- Damaged orders: replacement within 7 days, email info@f3energy.com with order # + photo.
+- General contact: info@f3energy.com
+- Pure questions: info@f3pure.com | Mood questions: info@f3mood.com
+- Retail/wholesale/media: info@f3energy.com — subject "Partnership Inquiry"
+- **Mailing address: F3 Energy, 1337 S Gilbert Rd, Suite 113, Mesa, AZ 85204**
+- Instagram: @f3energy / @drinkf3mood / @f3pure

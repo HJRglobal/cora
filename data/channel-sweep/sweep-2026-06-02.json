@@ -1,0 +1,74 @@
+{
+  "swept_at": "2026-06-02T15:30:03.026974+00:00",
+  "channels_swept": 50,
+  "users_active": 5,
+  "dry_run": false,
+  "users": {
+    "U0B2RM2JYJ1": {
+      "display_name": "Harrison Rogers",
+      "message_count": 3,
+      "commitments": [
+        "Get Julian back into the conversation about MMA Lab sponsorship immediately"
+      ],
+      "decisions": [
+        "MMA Lab gym-wide sponsorship model is being wound down effective immediately",
+        "New MMA Lab payment structure: pay per fighter at end of month only for verified post deliverables"
+      ],
+      "open_questions": [
+        "Need to finish conversation with Julian regarding MMA Lab underperformance (last post May 2nd, below agreement terms)"
+      ],
+      "cross_entity_mentions": [
+        "MMA Lab",
+        "Julian",
+        "Destiny",
+        "Crouch"
+      ]
+    },
+    "U0B3VGWJTMJ": {
+      "display_name": "Alex Cordova",
+      "message_count": 4,
+      "commitments": [
+        "Circle back on sponsorships with The Lab and Redhawk for June"
+      ],
+      "decisions": [],
+      "open_questions": [
+        "What events are coming up?",
+        "What do current sponsorships with The Lab and Redhawk look like for June?",
+        "Are we continuing to sponsor both gyms or focusing on one over the other?"
+      ],
+      "cross_entity_mentions": [
+        "The Lab (gym sponsorship)",
+        "Redhawk (gym sponsorship)"
+      ]
+    },
+    "U0B8DGHR2D6": {
+      "display_name": "Elena Meirndorf",
+      "message_count": 1,
+      "commitments": [],
+      "decisions": [],
+      "open_questions": [
+        "Asked @U0B44MDGC5R if they know who Elena is"
+      ],
+      "cross_entity_mentions": []
+    },
+    "U0B4L78SZHN": {
+      "display_name": "Micah Kessler",
+      "message_count": 2,
+      "commitments": [],
+      "decisions": [],
+      "open_questions": [],
+      "cross_entity_mentions": []
+    },
+    "U0B3AEQS0NB": {
+      "display_name": "Hannah Grant",
+      "message_count": 1,
+      "commitments": [],
+      "decisions": [],
+      "open_questions": [
+        "What's the most recent update for Van 15-11?"
+      ],
+      "cross_entity_mentions": []
+    }
+  },
+  "errors": []
+}

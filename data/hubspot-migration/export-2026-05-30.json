@@ -1,0 +1,889 @@
+﻿{
+    "exported_at":  "2026-05-30",
+    "portal_id":  "243870963",
+    "summary":  {
+                    "deals":  27,
+                    "contacts":  0,
+                    "companies":  0,
+                    "notes":  9
+                },
+    "owner_map":  {
+                      "160459333":  {
+                                        "name":  "Harrison Rogers",
+                                        "email":  "harrison@hjrglobal.com",
+                                        "new_owner_id":  "160459333"
+                                    },
+                      "162944825":  {
+                                        "name":  "Tommy Anderson",
+                                        "email":  "tommy@f3energy.com",
+                                        "new_owner_id":  "162944825"
+                                    },
+                      "160262948":  {
+                                        "name":  "Alex Cordova",
+                                        "email":  "alex@hjrglobal.com",
+                                        "new_owner_id":  "160262948"
+                                    },
+                      "83346026":  {
+                                       "name":  "Matt Petrovich",
+                                       "email":  "matt@hjrglobal.com",
+                                       "new_owner_id":  "83346026"
+                                   },
+                      "160454475":  {
+                                        "name":  "Elena Meirndorf",
+                                        "email":  "elena@f3energy.com",
+                                        "new_owner_id":  "160454475"
+                                    }
+                  },
+    "pipeline_map":  {
+                         "2234421978":  {
+                                            "name":  "F3E Retail",
+                                            "new_pipeline_id":  ""
+                                        },
+                         "2242250445":  {
+                                            "name":  "UFL Sponsorships",
+                                            "new_pipeline_id":  ""
+                                        }
+                     },
+    "deals":  [
+                  {
+                      "id":  "323974845153",
+                      "properties":  {
+                                         "amount":  "375000",
+                                         "closedate":  "2026-05-08T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:27:39.779Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Arizona Diamondbacks - Home Run Porch Naming Rights (F3 Energy)",
+                                         "dealstage":  "3601439475",
+                                         "dealtype":  null,
+                                         "description":  "[2026-05-08 CLOSED LOST] 5/8/26: Lucas de Jong (D-Backs) confirmed via email that Diamondbacks selected a second energy drink partner, closing the category. Verbal $300K/$400K/$425K (2026-2028) terms agreed 5/5 will not happen. Lucas confirmed relationship preserved; door open for future re-engagement when current partner contracts come up for renewal. Recommend 6-month calendar reminder. Prior context: Multi-tier sponsorship â€” naming rights to Home Run Porch + hospitality 33 games + reduced media spots. Contact: Lucas de Jong (ldejong@dbacks.com). Source: Fireflies meetings 2026-03-27 and 2026-05-05; Gmail thread 19d68daec6109fab; Asana 1214552623835787.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:39.055Z",
+                                         "hs_object_id":  "323974845153",
+                                         "hubspot_owner_id":  "160459333",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:27:39.779Z",
+                      "updatedAt":  "2026-05-16T03:20:39.055Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323974845153"
+                  },
+                  {
+                      "id":  "324001644278",
+                      "properties":  {
+                                         "amount":  "50000",
+                                         "closedate":  "2026-06-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:27:40.586Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Wham Distributor - F3 Energy 185 Pallet Allocation",
+                                         "dealstage":  "3604397771",
+                                         "dealtype":  null,
+                                         "description":  "Plan to increase pallet allocation to 185 pallets, projected mid-five-figure revenue. East-coast wholesaler \u0027Igor\u0027 parallel target. Source: Fireflies 2026-04-30 F3 Weekly.\n\n[Hygiene 2026-05-08] Tessa reply on Wham still pending (Top of Mind). Tessa F3 Weekly 5/7 referenced 185-pallet allocation; no new objections.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-30T14:03:13.101Z",
+                                         "hs_object_id":  "324001644278",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:27:40.586Z",
+                      "updatedAt":  "2026-05-30T14:03:13.101Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/324001644278"
+                  },
+                  {
+                      "id":  "323986671295",
+                      "properties":  {
+                                         "amount":  "20000",
+                                         "closedate":  "2026-06-30T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:27:40.722Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Northgate Markets - F3 Energy LA/OC Reactivation",
+                                         "dealstage":  "3672898250",
+                                         "dealtype":  null,
+                                         "description":  "Limited LA store availability blocking OC marketing. Northgate buyer Alex Cabrera to be reapproached via Jhosimar Rivera. Source: Fireflies 2026-03-12 F3 x OCSC x Northgate.\n\n[Hygiene 2026-05-08] PAUSED. Reapproach via Jhosimar Rivera pending. Tied to OCSC pause; revisit when LA capacity changes.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:38.671Z",
+                                         "hs_object_id":  "323986671295",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:27:40.722Z",
+                      "updatedAt":  "2026-05-16T03:20:38.671Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323986671295"
+                  },
+                  {
+                      "id":  "323990700769",
+                      "properties":  {
+                                         "amount":  "5000",
+                                         "closedate":  "2026-05-16T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:07.903Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "MVP MMA May 16 Event Sponsorship (F3 Energy)",
+                                         "dealstage":  "3601439470",
+                                         "dealtype":  null,
+                                         "description":  "Sponsorship of MVP MMA event headlined by Rousey-Carano, Diaz-Perry, Ngannou-Lins. Ecosystem includes broadcast, talent, hospitality. Ownership/exclusivity available. Contact: Keith Wan, KSE Agency (kwan@kseagency.com). Source: Fireflies 2026-05-04.\n\n[Hygiene 2026-05-08] Owner set to Harrison (was unassigned). Cross-ref Asana 1214552574608762 (review deck + define budget range). Deck inbound from Keith Wan post-5/4 meeting. PRIORITY: D-Backs $1.125M reallocation candidate; event 5/16.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-30T14:03:12.340Z",
+                                         "hs_object_id":  "323990700769",
+                                         "hubspot_owner_id":  "160459333",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:07.903Z",
+                      "updatedAt":  "2026-05-30T14:03:12.340Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323990700769"
+                  },
+                  {
+                      "id":  "323971208912",
+                      "properties":  {
+                                         "amount":  "100000",
+                                         "closedate":  "2026-08-15T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.065Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Phoenix Suns - F3 Energy Beverage Category + Suite",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Beverage category exclusivity check + suite leasing tied to autism-awareness Lexington Services and F3 Mood. April 8 prospect visit confirmed. Contact: Mark True (mtrue@suns.com). Source: Fireflies 2026-03-26.\n\n[Hygiene 2026-05-08] Owner set to Harrison (was unassigned). Candidate for D-Backs $1.125M reallocation. No 5/8 traffic from Mark True; needs nudge from Harrison.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:38.942Z",
+                                         "hs_object_id":  "323971208912",
+                                         "hubspot_owner_id":  "160459333",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.065Z",
+                      "updatedAt":  "2026-05-16T03:20:38.942Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323971208912"
+                  },
+                  {
+                      "id":  "323994713840",
+                      "properties":  {
+                                         "amount":  "50000",
+                                         "closedate":  "2026-09-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.198Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Unbeaten Sports - Non-Exclusive Streaming Distribution (UFL)",
+                                         "dealstage":  "3604372174",
+                                         "dealtype":  null,
+                                         "description":  "Non-exclusive streaming partnership. Reaches 150M devices / 100M homes. 50/50 ad revenue split with Amazon/Samsung. 70/30 commercial sales split after fees. Events submitted 6 weeks ahead. Kickoff July 10. Contacts: Brian Bernstein (metroanthemsports@gmail.com), Matt Bellotti (matt.bellotti@inverleigh.com). Source: Fireflies 2026-04-22 and 2026-04-27.\n\n[Hygiene 2026-05-08] Inverleigh sent Unbeaten agreement 5/1; Alex forwarded; awaiting Harrison review (Wave1 Gmail Pass2). UFL legal entity name + 2026 schedule drafted; mailing address still needed before send (Top of Mind).",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-30T14:03:13.126Z",
+                                         "hs_object_id":  "323994713840",
+                                         "hubspot_owner_id":  "160262948",
+                                         "pipeline":  "2242250445"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.198Z",
+                      "updatedAt":  "2026-05-30T14:03:13.126Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323994713840"
+                  },
+                  {
+                      "id":  "323994760912",
+                      "properties":  {
+                                         "amount":  "30000",
+                                         "closedate":  "2026-10-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.356Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "TrillerTV - UFL Streaming Follow-up",
+                                         "dealstage":  "3604372173",
+                                         "dealtype":  null,
+                                         "description":  "Streaming partnership negotiation; minimum content requirements and delayed payments are open concerns. Contact: Adam Bigwood (adam.bigwood@trillertv.com). Source: Fireflies 2026-04-29 and 2026-05-01.\n\n[Hygiene 2026-05-08] Fireflies UFL x TrillerTV Follow-up meeting 5/4 was silent / skipped (transcription concern). Re-engage Adam Bigwood; concerns on min content + delayed payments unresolved.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:21:07.857Z",
+                                         "hs_object_id":  "323994760912",
+                                         "hubspot_owner_id":  "160262948",
+                                         "pipeline":  "2242250445"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.356Z",
+                      "updatedAt":  "2026-05-16T03:21:07.857Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323994760912"
+                  },
+                  {
+                      "id":  "323958545085",
+                      "properties":  {
+                                         "amount":  "25000",
+                                         "closedate":  "2026-09-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.510Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Lifted Trucks - UFL Event Sponsorship",
+                                         "dealstage":  "3604372174",
+                                         "dealtype":  null,
+                                         "description":  "Ticket allocations and promotional gatherings confirmed for fight night events. Source: Fireflies 2026-03-27 UFL Weekly.\n\n[Hygiene 2026-05-08] No 5/8 traffic; needs Alex Cordova nudge. Lifted Trucks remains a confirmed UFL sponsor; expand to FFN5 ask?",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:21:07.772Z",
+                                         "hs_object_id":  "323958545085",
+                                         "hubspot_owner_id":  "160262948",
+                                         "pipeline":  "2242250445"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.510Z",
+                      "updatedAt":  "2026-05-16T03:21:07.772Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323958545085"
+                  },
+                  {
+                      "id":  "323826518767",
+                      "properties":  {
+                                         "amount":  "20000",
+                                         "closedate":  "2026-10-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.627Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Napa Auto Parts - UFL Event Sponsor",
+                                         "dealstage":  "3604372173",
+                                         "dealtype":  null,
+                                         "description":  "Existing UFL sponsor under expansion discussion. Parallel F3 Energy AZ trial distribution program with Napa warehouse. Source: Fireflies 2026-04-24 and 2026-03-12.\n\n[Hygiene 2026-05-08] Cross-deal F3E AZ trial distribution thread; cross-link to F3E pipeline if it scales. Needs Alex Cordova nudge for expansion timing.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:21:07.945Z",
+                                         "hs_object_id":  "323826518767",
+                                         "hubspot_owner_id":  "160262948",
+                                         "pipeline":  "2242250445"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.627Z",
+                      "updatedAt":  "2026-05-16T03:21:07.945Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323826518767"
+                  },
+                  {
+                      "id":  "323971208913",
+                      "properties":  {
+                                         "amount":  "30000",
+                                         "closedate":  "2026-08-01T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.770Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "AFW / Hensley - F3 Energy Distributor Outreach",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Tommy leading phased distributor approach: AFW, Hensley, future relationships. Source: Fireflies 2026-03-12 F3 Weekly.\n\n[Hygiene 2026-05-08] Tommy-owned. Fireflies 5/7 F3 Weekly reaffirmed phased approach. No specific AFW/Hensley action items in Wave1 Fireflies.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:39.285Z",
+                                         "hs_object_id":  "323971208913",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.770Z",
+                      "updatedAt":  "2026-05-16T03:20:39.285Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323971208913"
+                  },
+                  {
+                      "id":  "323826518768",
+                      "properties":  {
+                                         "amount":  "12000",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.839Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Muscle Foods + Elite Distributors - F3 Energy",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Tessa initiating distributor outreach. Source: Fireflies 2026-04-30 F3 Weekly.\n\n[Hygiene 2026-05-08] Cross-ref Tommy F3 Weekly 5/7 (Asana). Tommy leading phased approach across distributors.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:39.174Z",
+                                         "hs_object_id":  "323826518768",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.839Z",
+                      "updatedAt":  "2026-05-16T03:20:39.174Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323826518768"
+                  },
+                  {
+                      "id":  "323990640338",
+                      "properties":  {
+                                         "amount":  "15000",
+                                         "closedate":  "2026-06-30T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:08.897Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "OCSC (Orange County SC) - F3 Energy Sponsorship",
+                                         "dealstage":  "3672898250",
+                                         "dealtype":  null,
+                                         "description":  "Sponsorship contract issues; concession discrepancies under review with Micah. Source: Fireflies 2026-03-06 and 2026-03-12.\n\n[Hygiene 2026-05-08] Last activity 5/6; no recent traffic. PAUSED status appropriate. Re-evaluate 30-day cadence.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:38.527Z",
+                                         "hs_object_id":  "323990640338",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:08.897Z",
+                      "updatedAt":  "2026-05-16T03:20:38.527Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323990640338"
+                  },
+                  {
+                      "id":  "323971208914",
+                      "properties":  {
+                                         "amount":  "10000",
+                                         "closedate":  "2026-09-15T00:00:00Z",
+                                         "createdate":  "2026-05-05T17:28:09.020Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Bear Divine - F3 Energy + UFL Sponsorship",
+                                         "dealstage":  "3604372173",
+                                         "dealtype":  null,
+                                         "description":  "Vendor/sponsor relationship under negotiation across F3 + UFL. Emily following up on contract finalization. Source: Fireflies 2026-03-25 and 2026-04-20.\n\n[Hygiene 2026-05-08] Likely typo: should read \u0027Berry Divine\u0027 per memory/projects.md (Larry / Harrison client-side). Cross-ref Asana Big D Media projects. Emily follow-up status unverified \u003e 14d.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:21:08.017Z",
+                                         "hs_object_id":  "323971208914",
+                                         "hubspot_owner_id":  "160262948",
+                                         "pipeline":  "2242250445"
+                                     },
+                      "createdAt":  "2026-05-05T17:28:09.020Z",
+                      "updatedAt":  "2026-05-16T03:21:08.017Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/323971208914"
+                  },
+                  {
+                      "id":  "325242237645",
+                      "properties":  {
+                                         "amount":  "5616.00",
+                                         "closedate":  "2026-05-14T00:00:00Z",
+                                         "createdate":  "2026-05-15T04:16:20.265Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "American Discount Foods â€” Initial Order",
+                                         "dealstage":  "3601439474",
+                                         "dealtype":  null,
+                                         "description":  "Tommy\u0027s first F3E retail close (referenced in F3 Weekly 2026-05-14). Channel: sub-broker / discount retail. Use as Session 1 walkthrough template for Tommy\u0027s training. Next step: confirm shipment + reorder cadence by 2026-05-28.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  null,
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-15T04:16:37.173Z",
+                                         "hs_object_id":  "325242237645",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T04:16:20.265Z",
+                      "updatedAt":  "2026-05-15T04:16:37.173Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325242237645"
+                  },
+                  {
+                      "id":  "325236506304",
+                      "properties":  {
+                                         "amount":  "10000",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:40.292Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "SJ Food Brokers â€” F3E Broker",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Broker contact identified during F3 Weekly meeting 2026-05-14. Tommy to engage and qualify. Backfilled to HubSpot 2026-05-14 during Tommy F3E sales tooling rollout.",
+                                         "f3e_channel":  "Sub-broker",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:21:07.600Z",
+                                         "hs_object_id":  "325236506304",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:40.292Z",
+                      "updatedAt":  "2026-05-16T03:21:07.600Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236506304"
+                  },
+                  {
+                      "id":  "325236733665",
+                      "properties":  {
+                                         "amount":  "6000",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:40.505Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Jeremy Campos â€” F3E Sub-broker",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Individual sub-broker contact identified during F3 Weekly 2026-05-14. Tommy to engage. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Sub-broker",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.372Z",
+                                         "hs_object_id":  "325236733665",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:40.505Z",
+                      "updatedAt":  "2026-05-16T03:20:51.372Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236733665"
+                  },
+                  {
+                      "id":  "325236615891",
+                      "properties":  {
+                                         "amount":  "8000",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:40.677Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Cruse Marketing â€” F3E Broker",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Marketing/broker firm identified during F3 Weekly 2026-05-14. Tommy to engage. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Sub-broker",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.217Z",
+                                         "hs_object_id":  "325236615891",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:40.677Z",
+                      "updatedAt":  "2026-05-16T03:20:51.217Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236615891"
+                  },
+                  {
+                      "id":  "325266718415",
+                      "properties":  {
+                                         "amount":  "3500",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:40.832Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Ike â€” F3E Account",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Single-name contact from F3 Weekly 2026-05-14. Channel classification + buyer details TBD by Tommy in Session 1. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.704Z",
+                                         "hs_object_id":  "325266718415",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:40.832Z",
+                      "updatedAt":  "2026-05-16T03:20:51.704Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325266718415"
+                  },
+                  {
+                      "id":  "325262511810",
+                      "properties":  {
+                                         "amount":  "4000",
+                                         "closedate":  "2026-07-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:40.997Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Berry Divine â€” F3E Account",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Account identified during F3 Weekly 2026-05-14. Channel classification + buyer details TBD by Tommy in Session 1. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.296Z",
+                                         "hs_object_id":  "325262511810",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:40.997Z",
+                      "updatedAt":  "2026-05-16T03:20:51.296Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325262511810"
+                  },
+                  {
+                      "id":  "325236615892",
+                      "properties":  {
+                                         "amount":  "12000",
+                                         "closedate":  "2026-08-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:41.126Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Sunset Distributing â€” F3E Distributor",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Distribution opportunity identified during F3 Weekly 2026-05-14. Tommy to engage. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Distributor",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.490Z",
+                                         "hs_object_id":  "325236615892",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:41.126Z",
+                      "updatedAt":  "2026-05-16T03:20:51.490Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236615892"
+                  },
+                  {
+                      "id":  "325264934649",
+                      "properties":  {
+                                         "amount":  "15000",
+                                         "closedate":  "2026-08-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:41.204Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Reliant â€” F3E Distributor",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Distribution opportunity from F3 Weekly 2026-05-14. Channel + geography assumptions Tommy to confirm. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Distributor",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.785Z",
+                                         "hs_object_id":  "325264934649",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:41.204Z",
+                      "updatedAt":  "2026-05-16T03:20:51.785Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325264934649"
+                  },
+                  {
+                      "id":  "325266718416",
+                      "properties":  {
+                                         "amount":  "10000",
+                                         "closedate":  "2026-08-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:41.349Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "UFC Gyms â€” F3E Gym Chain",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "UFC Gyms multi-location chain placement opportunity from F3 Weekly 2026-05-14. National scope. Tommy to identify decision-maker. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Gym/Fitness",
+                                         "f3e_geography":  "National",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.029Z",
+                                         "hs_object_id":  "325266718416",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:41.349Z",
+                      "updatedAt":  "2026-05-16T03:20:51.029Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325266718416"
+                  },
+                  {
+                      "id":  "325236615893",
+                      "properties":  {
+                                         "amount":  "4000",
+                                         "closedate":  "2026-07-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:41.420Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Red Hawk â€” F3E Account",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Account identified during F3 Weekly 2026-05-14. Channel + counterparty details TBD by Tommy in Session 1. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  null,
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.597Z",
+                                         "hs_object_id":  "325236615893",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:41.420Z",
+                      "updatedAt":  "2026-05-16T03:20:51.597Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236615893"
+                  },
+                  {
+                      "id":  "325236615894",
+                      "properties":  {
+                                         "amount":  "5000",
+                                         "closedate":  "2026-07-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:41.506Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "MMA Lab â€” F3E Retail (gym shop)",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "MMA Lab retail/gym-shop placement opportunity from F3 Weekly 2026-05-14. NOTE: separate from active F3E G1 Conditional Accommodation sponsorship reached 2026-05-11 (Gmail thread 19e18158bd39b25c). This deal is for product placement, not sponsorship. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Gym/Fitness",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:51.136Z",
+                                         "hs_object_id":  "325236615894",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:41.506Z",
+                      "updatedAt":  "2026-05-16T03:20:51.136Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325236615894"
+                  },
+                  {
+                      "id":  "325223672528",
+                      "properties":  {
+                                         "amount":  "25000",
+                                         "closedate":  "2026-08-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:56.810Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Sprouts â€” F3E Retail Chain",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Target chain placement. Downstream of F3 Pure 6/1 vs 6/15 launch decision (CLAUDE.md TOM #5) + Tommy field sampling 5/22. UPC/GTIN locked 2026-05-12. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Retail (chain)",
+                                         "f3e_geography":  "National",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  "F3 Pure",
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:39.407Z",
+                                         "hs_object_id":  "325223672528",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:56.810Z",
+                      "updatedAt":  "2026-05-16T03:20:39.407Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325223672528"
+                  },
+                  {
+                      "id":  "325079673576",
+                      "properties":  {
+                                         "amount":  "25000",
+                                         "closedate":  "2026-09-01T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:56.946Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Whole Foods â€” F3E Retail Chain",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Target chain placement. Downstream of F3 Pure 6/1 vs 6/15 launch decision (CLAUDE.md TOM #5) + Tommy field sampling 5/22. UPC/GTIN locked 2026-05-12. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Retail (chain)",
+                                         "f3e_geography":  "National",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  "F3 Pure",
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:39.486Z",
+                                         "hs_object_id":  "325079673576",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:56.946Z",
+                      "updatedAt":  "2026-05-16T03:20:39.486Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325079673576"
+                  },
+                  {
+                      "id":  "325059927747",
+                      "properties":  {
+                                         "amount":  "8000",
+                                         "closedate":  "2026-07-15T00:00:00Z",
+                                         "createdate":  "2026-05-15T06:34:57.078Z",
+                                         "deal_currency_code":  "USD",
+                                         "dealname":  "Big Savings Outlet â€” F3E Retail",
+                                         "dealstage":  "3601439469",
+                                         "dealtype":  null,
+                                         "description":  "Discount retail account from F3 Weekly 2026-05-14. Tommy to engage. Backfilled to HubSpot 2026-05-14.",
+                                         "f3e_channel":  "Retail (independent)",
+                                         "f3e_geography":  "AZ",
+                                         "f3e_monthly_volume_cases":  null,
+                                         "f3e_product_lines":  null,
+                                         "hs_lastmodifieddate":  "2026-05-16T03:20:50.918Z",
+                                         "hs_object_id":  "325059927747",
+                                         "hubspot_owner_id":  "162944825",
+                                         "pipeline":  "2234421978"
+                                     },
+                      "createdAt":  "2026-05-15T06:34:57.078Z",
+                      "updatedAt":  "2026-05-16T03:20:50.918Z",
+                      "archived":  false,
+                      "url":  "https://app-na2.hubspot.com/contacts/243870963/record/0-3/325059927747"
+                  }
+              ],
+    "contacts":  [
+
+                 ],
+    "companies":  [
+
+                  ],
+    "deal_to_contact_ids":  {
+
+                            },
+    "deal_to_company_ids":  {
+
+                            },
+    "deal_notes":  {
+                       "323994760912":  [
+                                            {
+                                                "id":  "368802195142",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-09T19:04:45.945Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-09T19:04:46.278Z",
+                                                                   "hs_note_body":  "5/8/26: Ownership reassigned Tommy â†’ Alex Cordova per UFL Sponsorships pipeline structure. Alex is the UFL sponsor relationship owner; Harrison secondary. Tracked in [HJRG] HubSpot Sales Operating Model Notion page.",
+                                                                   "hs_object_id":  "368802195142",
+                                                                   "hs_timestamp":  "2026-05-08T12:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-09T19:04:45.945Z",
+                                                "updatedAt":  "2026-05-09T19:04:46.278Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368802195142%22%7D%5D"
+                                            }
+                                        ],
+                       "323958545085":  [
+                                            {
+                                                "id":  "368805915343",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-09T19:04:45.755Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-09T19:04:46.348Z",
+                                                                   "hs_note_body":  "5/8/26: Ownership reassigned Tommy â†’ Alex Cordova per UFL Sponsorships pipeline structure. Alex is the UFL sponsor relationship owner; Harrison secondary. Tracked in [HJRG] HubSpot Sales Operating Model Notion page.",
+                                                                   "hs_object_id":  "368805915343",
+                                                                   "hs_timestamp":  "2026-05-08T12:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-09T19:04:45.755Z",
+                                                "updatedAt":  "2026-05-09T19:04:46.348Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368805915343%22%7D%5D"
+                                            }
+                                        ],
+                       "323971208914":  [
+                                            {
+                                                "id":  "368782843590",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-09T19:04:45.295Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-09T19:04:45.805Z",
+                                                                   "hs_note_body":  "5/8/26: Ownership reassigned Tommy â†’ Alex Cordova per UFL Sponsorships pipeline structure. Alex is the UFL sponsor relationship owner; Harrison secondary. Tracked in [HJRG] HubSpot Sales Operating Model Notion page.",
+                                                                   "hs_object_id":  "368782843590",
+                                                                   "hs_timestamp":  "2026-05-08T12:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-09T19:04:45.295Z",
+                                                "updatedAt":  "2026-05-09T19:04:45.805Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368782843590%22%7D%5D"
+                                            }
+                                        ],
+                       "323826518768":  [
+                                            {
+                                                "id":  "368483821272",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-07T19:35:21.122Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-07T19:35:21.122Z",
+                                                                   "hs_note_body":  "\u003cdiv style=\"\" dir=\"auto\" data-top-level=\"true\"\u003e\u003cp style=\"margin:0;\"\u003eTA TT Ryan Gilmour 5/7/26 via EM. They still have product from their last buy. He says he will follow up with UFC but velocities have plummeted. \u0026nbsp;\u003c/p\u003e\u003c/div\u003e",
+                                                                   "hs_object_id":  "368483821272",
+                                                                   "hs_timestamp":  "2026-05-07T19:35:21.172Z",
+                                                                   "hubspot_owner_id":  "162944825"
+                                                               },
+                                                "createdAt":  "2026-05-07T19:35:21.122Z",
+                                                "updatedAt":  "2026-05-07T19:35:21.122Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368483821272%22%7D%5D"
+                                            }
+                                        ],
+                       "323994713840":  [
+                                            {
+                                                "id":  "368806186733",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-09T19:04:46.117Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-09T19:04:46.573Z",
+                                                                   "hs_note_body":  "5/8/26: Ownership reassigned Tommy â†’ Alex Cordova per UFL Sponsorships pipeline structure. Alex is the UFL sponsor relationship owner; Harrison secondary. Tracked in [HJRG] HubSpot Sales Operating Model Notion page.",
+                                                                   "hs_object_id":  "368806186733",
+                                                                   "hs_timestamp":  "2026-05-08T12:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-09T19:04:46.117Z",
+                                                "updatedAt":  "2026-05-09T19:04:46.573Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368806186733%22%7D%5D"
+                                            },
+                                            {
+                                                "id":  "372613093068",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-30T14:03:11.129Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-30T14:03:11.483Z",
+                                                                   "hs_note_body":  "[Hygiene Flag â€” 2026-05-30] Per portfolio records, Harrison sent Brian Bernstein (Unbeaten) an honest decline on 2026-05-17 citing UFL pause. Quote: \u0027I have decided to pause all UFL initiatives... I don\u0027t have anything I can commit to or offer Unbeaten.\u0027 Deal is still in Negotiating stage at $50K. Likely needs Closed Lost. Surface to Harrison for decision before closing.",
+                                                                   "hs_object_id":  "372613093068",
+                                                                   "hs_timestamp":  "2026-05-30T00:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-30T14:03:11.129Z",
+                                                "updatedAt":  "2026-05-30T14:03:11.483Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22372613093068%22%7D%5D"
+                                            }
+                                        ],
+                       "323990700769":  [
+                                            {
+                                                "id":  "372606890735",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-30T14:03:10.527Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-30T14:03:11.031Z",
+                                                                   "hs_note_body":  "[Hygiene Flag â€” 2026-05-30] MVP MMA May 16 Event close date has passed (event occurred 2026-05-16). Deal is still in Outreach stage. Needs Harrison review: mark Closed Won if F3E sponsorship executed, or Closed Lost if not. No contacts linked.",
+                                                                   "hs_object_id":  "372606890735",
+                                                                   "hs_timestamp":  "2026-05-30T00:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-30T14:03:10.527Z",
+                                                "updatedAt":  "2026-05-30T14:03:11.031Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22372606890735%22%7D%5D"
+                                            }
+                                        ],
+                       "323826518767":  [
+                                            {
+                                                "id":  "368766904012",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-09T19:04:45.545Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-09T19:04:46.020Z",
+                                                                   "hs_note_body":  "5/8/26: Ownership reassigned Tommy â†’ Alex Cordova per UFL Sponsorships pipeline structure. Alex is the UFL sponsor relationship owner; Harrison secondary. Tracked in [HJRG] HubSpot Sales Operating Model Notion page.",
+                                                                   "hs_object_id":  "368766904012",
+                                                                   "hs_timestamp":  "2026-05-08T12:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-09T19:04:45.545Z",
+                                                "updatedAt":  "2026-05-09T19:04:46.020Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22368766904012%22%7D%5D"
+                                            }
+                                        ],
+                       "324001644278":  [
+                                            {
+                                                "id":  "372606662350",
+                                                "properties":  {
+                                                                   "hs_createdate":  "2026-05-30T14:03:10.869Z",
+                                                                   "hs_lastmodifieddate":  "2026-05-30T14:03:11.136Z",
+                                                                   "hs_note_body":  "[Hygiene Flag â€” 2026-05-30] Close date is 2026-06-01 (1 day away). Deal is in Negotiation at $50K. No contacts linked. Recommend Tommy confirm Wham deal status immediately â€” 185 pallet allocation per CLAUDE.md context. Wham closeout inventory reply was pending as of last known status.",
+                                                                   "hs_object_id":  "372606662350",
+                                                                   "hs_timestamp":  "2026-05-30T00:00:00Z",
+                                                                   "hubspot_owner_id":  null
+                                                               },
+                                                "createdAt":  "2026-05-30T14:03:10.869Z",
+                                                "updatedAt":  "2026-05-30T14:03:11.136Z",
+                                                "archived":  false,
+                                                "url":  "https://app-na2.hubspot.com/contacts/243870963/objects/0-46/views/all/list?filters=%5B%7B%22property%22%3A%22hs_object_id%22%2C%22operator%22%3A%22EQ%22%2C%22value%22%3A%22372606662350%22%7D%5D"
+                                            }
+                                        ]
+                   }
+}

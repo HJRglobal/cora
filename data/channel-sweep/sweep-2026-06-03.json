@@ -1,0 +1,59 @@
+{
+  "swept_at": "2026-06-03T15:30:03.267656+00:00",
+  "channels_swept": 49,
+  "users_active": 3,
+  "dry_run": false,
+  "users": {
+    "U0B2RM2JYJ1": {
+      "display_name": "Harrison Rogers",
+      "message_count": 5,
+      "commitments": [
+        "Book sponsorship/influencer tracking history to the tracker being built",
+        "Create UI for the influencer/sponsorship tracker"
+      ],
+      "decisions": [
+        "Adding team members to #hjr-fleet channel to avoid duplicate communication channels"
+      ],
+      "open_questions": [
+        "What are the PMS colors for the F3 Energy Trays?",
+        "Can Bentley tires be purchased from Discount Tire or must they come from a specific supplier?"
+      ],
+      "cross_entity_mentions": [
+        "F3 Energy Trays",
+        "Discount Tire"
+      ]
+    },
+    "U0B3VGWJTMJ": {
+      "display_name": "Alex Cordova",
+      "message_count": 6,
+      "commitments": [
+        "Review Destiny's monthly tracking sheet of athlete sponsorship obligations completion",
+        "Adjust sponsorship payments based on athlete compliance with contract requirements"
+      ],
+      "decisions": [
+        "Shift to using Google Sheet for athlete sponsorship tracking instead of previous method"
+      ],
+      "open_questions": [
+        "Should Destiny manually track fighters' completion of sponsorship obligations?",
+        "Were the posting deliverables (2 Story posts and 1 main feed post) part of the fighter agreement?",
+        "How should F3 move forward on the sponsorship with the MMA lab given low fighter compliance rates?"
+      ],
+      "cross_entity_mentions": [
+        "F3 X MMA LAB",
+        "Destiny (team member handling athlete tracking)",
+        "Harrison (referenced regarding fighter agreement details)"
+      ]
+    },
+    "U0B4L78SZHN": {
+      "display_name": "Micah Kessler",
+      "message_count": 2,
+      "commitments": [],
+      "decisions": [],
+      "open_questions": [
+        "Can we calculate how many sponsorships per month were actually completed?"
+      ],
+      "cross_entity_mentions": []
+    }
+  },
+  "errors": []
+}
