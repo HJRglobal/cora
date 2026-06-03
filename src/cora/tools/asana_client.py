@@ -218,6 +218,44 @@ def complete_task(task_gid: str) -> dict[str, Any]:
     return r.json().get("data") or {}
 
 
+def create_task_comment(task_gid: str, text: str) -> dict[str, Any]:
+    """Post a comment (story) on an Asana task.
+
+    Returns the story dict. Raises AsanaClientError on failure.
+    """
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("create_task_comment requires a non-empty task_gid")
+    if not text or not text.strip():
+        raise AsanaClientError("create_task_comment requires non-empty text")
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/tasks/{task_gid}/stories",
+                json={"data": {"text": text}},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot comment on task {task_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
 def format_created_task_for_llm(task: dict[str, Any]) -> str:
     """Render a freshly-created task as a Slack-mrkdwn confirmation line."""
     name = task.get("name", "(no name)")
@@ -289,35 +327,4 @@ def format_tasks_for_llm(
         # Resolve project / section from memberships (richer than top-level projects)
         memberships = t.get("memberships") or []
         proj_section = []
-        for m in memberships:
-            proj = (m.get("project") or {}).get("name") or ""
-            section = (m.get("section") or {}).get("name") or ""
-            if proj:
-                proj_section.append(f"{proj}" + (f" / {section}" if section else ""))
-        if not proj_section:
-            # fallback to flat projects list
-            proj_section = [p.get("name", "") for p in (t.get("projects") or [])]
-        project_str = " | ".join(p for p in proj_section if p) or "no project"
-
-        # Truncate notes to a preview
-        notes = (t.get("notes") or "").replace("\n", " ").strip()
-        notes_preview = f" — {notes[:120]}..." if len(notes) > 120 else (f" — {notes}" if notes else "")
-
-        # Wrap task name in Slack mrkdwn hyperlink (renders as clickable in Slack)
-        if permalink:
-            name_with_link = f"<{permalink}|{name}>"
-        else:
-            name_with_link = name
-
-        lines.append(f"- [{due}] {name_with_link} ({project_str}){notes_preview}")
-
-    # Footer for scoped results — helps the LLM mention the scope to the user
-    if entity_scope and total_before_filter and total_before_filter > len(tasks):
-        lines.append("")
-        lines.append(
-            f"[Scope: showing {entity_scope}-tagged tasks only. "
-            f"{total_before_filter - len(tasks)} other tasks exist across other entities — "
-            f"user can ask in a #fndr-* channel to see them all.]"
-        )
-
-    return "\n".join(lines)
+    
