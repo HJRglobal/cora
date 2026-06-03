@@ -1,22 +1,22 @@
-﻿"""Google Calendar v3 client â€” read + write, Service Account + Domain-wide Delegation.
+"""Google Calendar v3 client -- read + write, Service Account + Domain-wide Delegation.
 
 Phase 2 #9 part 2 scope:
 - Read endpoint: events.list (per-user, via DWD impersonation)
-- Write endpoint: events.insert (staged-write pattern â€” confirmed=True gate)
+- Write endpoint: events.insert (staged-write pattern -- confirmed=True gate)
 
 Write tool added 2026-05-23:
 - create_event() mirrors gmail_client.create_draft() staged-write pattern.
 - DWD impersonation: event lands in the asker's own primary calendar.
 - Required DWD scope: https://www.googleapis.com/auth/calendar.events
-  (supersedes calendar.readonly â€” Harrison must add this scope in
-  admin.google.com â†’ Security â†’ API controls â†’ Domain-wide Delegation,
+  (supersedes calendar.readonly -- Harrison must add this scope in
+  admin.google.com â†' Security â†' API controls â†' Domain-wide Delegation,
   same DWD entry as gmail.compose).
 
 Architecture:
 - Service Account `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com`
 - Unique ID 117814221557902200858 (registered in Workspace admin DWD)
 - Authorized scopes: https://www.googleapis.com/auth/calendar.events
-  (calendar.events is a superset of calendar.readonly â€” one scope covers both)
+  (calendar.events is a superset of calendar.readonly -- one scope covers both)
 - Service account impersonates the asking Slack user's Google identity.
 
 Deep-link pattern: Google's `htmlLink` field returned per event. Looks like:
@@ -26,7 +26,7 @@ Write doctrine (mirrors gmail_create_draft / asana_create_task):
 - Cora shows a preview block first and requires confirmed=True before calling.
 - Audit log: asker / event_id / summary / attendee_count / start_datetime.
   Event body / description is NOT logged.
-- Default time zone: America/Phoenix (AZ â€” no DST).
+- Default time zone: America/Phoenix (AZ -- no DST).
 """
 
 import logging
@@ -41,10 +41,14 @@ from googleapiclient.errors import HttpError
 
 log = logging.getLogger(__name__)
 
-# calendar.events is a superset of calendar.readonly â€” covers both read + write.
-_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+# calendar.freebusy is the authorized DWD scope for read operations (freebusy + event listing).
+# calendar.events is used for write operations (create event) -- requires it to be in DWD.
+# Confirmed 2026-06-03: only calendar.freebusy is authorized; calendar.events returns 403.
+_SCOPES_READ  = ["https://www.googleapis.com/auth/calendar.freebusy"]
+_SCOPES_WRITE = ["https://www.googleapis.com/auth/calendar.events"]
+_SCOPES = _SCOPES_READ  # default; create_event overrides to _SCOPES_WRITE
 _DEFAULT_MAX_EVENTS = 25
-# Default to America/Phoenix â€” Harrison + HJR portfolio is AZ-based
+# Default to America/Phoenix -- Harrison + HJR portfolio is AZ-based
 _DEFAULT_TZ = "America/Phoenix"
 
 
@@ -56,7 +60,7 @@ def _service_account_path() -> str:
     val = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     if not val:
         raise CalendarClientError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON not set in environment â€” Calendar tool-use disabled"
+            "GOOGLE_SERVICE_ACCOUNT_JSON not set in environment -- Calendar tool-use disabled"
         )
     if not os.path.exists(val):
         raise CalendarClientError(
@@ -65,12 +69,17 @@ def _service_account_path() -> str:
     return val
 
 
-def _build_service(user_email: str):
-    """Build a Calendar service that impersonates user_email via Domain-wide Delegation."""
+def _build_service(user_email: str, write: bool = False):
+    """Build a Calendar service that impersonates user_email via Domain-wide Delegation.
+
+    write=False (default): uses calendar.freebusy scope (read-only, confirmed working).
+    write=True: uses calendar.events scope (required to create events).
+    """
+    scopes = _SCOPES_WRITE if write else _SCOPES_READ
     try:
         creds = service_account.Credentials.from_service_account_file(
             _service_account_path(),
-            scopes=_SCOPES,
+            scopes=scopes,
         )
     except Exception as exc:
         raise CalendarClientError(
@@ -85,11 +94,11 @@ def _parse_when(when: str) -> tuple[datetime, datetime, str]:
     """Resolve a 'when' parameter into (time_min, time_max, label).
 
     Accepts:
-      - "today"      â†’ today 00:00 â†’ today 23:59:59 AZ
-      - "tomorrow"   â†’ tomorrow 00:00 â†’ tomorrow 23:59:59 AZ
-      - "this_week"  â†’ now â†’ 7 days from now
-      - "next_week"  â†’ today + 7 days â†’ today + 14 days
-      - "YYYY-MM-DD" â†’ that day, 00:00 â†’ 23:59:59 AZ
+      - "today"      â†' today 00:00 â†' today 23:59:59 AZ
+      - "tomorrow"   â†' tomorrow 00:00 â†' tomorrow 23:59:59 AZ
+      - "this_week"  â†' now â†' 7 days from now
+      - "next_week"  â†' today + 7 days â†' today + 14 days
+      - "YYYY-MM-DD" â†' that day, 00:00 â†' 23:59:59 AZ
 
     All returned datetimes are timezone-aware (UTC, suitable for Calendar API timeMin/timeMax).
     Label is a human-readable description of the window for the tool result.
@@ -167,13 +176,13 @@ def get_user_events(
         status = exc.resp.status if exc.resp else "?"
         if status == 403:
             raise CalendarClientError(
-                f"Calendar 403 for {user_email} â€” service account lacks delegation for this "
+                f"Calendar 403 for {user_email} -- service account lacks delegation for this "
                 f"user's domain, or user not in Workspace. Harrison may need to add the "
                 f"domain to Domain-wide Delegation in admin.google.com."
             ) from exc
         if status == 404:
             raise CalendarClientError(
-                f"Calendar 404 for {user_email} â€” user has no primary calendar or doesn't exist."
+                f"Calendar 404 for {user_email} -- user has no primary calendar or doesn't exist."
             ) from exc
         raise CalendarClientError(f"Calendar API HTTP {status}: {exc}") from exc
     except Exception as exc:
@@ -183,16 +192,16 @@ def get_user_events(
 
 
 # ---------------------------------------------------------------------------
-# Write â€” create_event (staged-write, confirmed=True gate)
+# Write -- create_event (staged-write, confirmed=True gate)
 # ---------------------------------------------------------------------------
 
 def _parse_datetime_input(value: str, tz_name: str = _DEFAULT_TZ) -> str:
     """Accept a datetime string in several common formats and return RFC 3339.
 
     Accepted inputs:
-      - "2026-05-25T14:00" or "2026-05-25T14:00:00"  (naive â€” treated as tz_name)
-      - "2026-05-25T14:00:00-07:00"                   (already offset-aware â€” returned as-is)
-      - "2026-05-25 14:00"                             (space separator â€” normalised)
+      - "2026-05-25T14:00" or "2026-05-25T14:00:00"  (naive -- treated as tz_name)
+      - "2026-05-25T14:00:00-07:00"                   (already offset-aware -- returned as-is)
+      - "2026-05-25 14:00"                             (space separator -- normalised)
 
     Always returns a string like "2026-05-25T14:00:00-07:00".
     Raises CalendarClientError on unrecognisable input.
@@ -204,7 +213,7 @@ def _parse_datetime_input(value: str, tz_name: str = _DEFAULT_TZ) -> str:
         dt = datetime.fromisoformat(value)
         if dt.tzinfo is not None:
             return dt.isoformat()
-        # Naive â€” apply the requested timezone
+        # Naive -- apply the requested timezone
     except ValueError:
         raise CalendarClientError(
             f"Cannot parse datetime {value!r}. Use ISO format, e.g. '2026-05-25T14:00' "
@@ -234,14 +243,14 @@ def create_event(
     ----------
     user_email   : Google Workspace email to impersonate (DWD).
     summary      : Event title.
-    start        : Start datetime â€” ISO 8601, e.g. "2026-05-25T14:00" or
+    start        : Start datetime -- ISO 8601, e.g. "2026-05-25T14:00" or
                    "2026-05-25T14:00:00-07:00". Naive datetimes treated as time_zone.
-    end          : End datetime â€” same format as start.
+    end          : End datetime -- same format as start.
     attendees    : Optional list of email addresses. Invites are sent by Google
                    if notification settings allow.
     description  : Optional free-text event body.
     location     : Optional location string.
-    time_zone    : IANA tz name â€” default "America/Phoenix".
+    time_zone    : IANA tz name -- default "America/Phoenix".
 
     Returns the created event resource dict (includes `id` and `htmlLink`).
     Raises CalendarClientError on validation or API failure.
@@ -273,7 +282,7 @@ def create_event(
         "summary": summary.strip(),
         "start": {"dateTime": start_rfc, "timeZone": time_zone},
         "end": {"dateTime": end_rfc, "timeZone": time_zone},
-        # Always attach a Google Meet link â€” unique requestId prevents duplicate
+        # Always attach a Google Meet link -- unique requestId prevents duplicate
         # conference objects if the event is updated later.
         "conferenceData": {
             "createRequest": {
@@ -302,7 +311,7 @@ def create_event(
             body["attendees"] = [{"email": a} for a in clean]
 
     try:
-        service = _build_service(user_email)
+        service = _build_service(user_email, write=True)
         event = (
             service.events()
             .insert(
@@ -318,7 +327,7 @@ def create_event(
         status = exc.resp.status if exc.resp else "?"
         if status == 403:
             raise CalendarClientError(
-                f"Calendar 403 for {user_email} â€” service account lacks "
+                f"Calendar 403 for {user_email} -- service account lacks "
                 f"calendar.events DWD scope. Harrison needs to update Domain-wide "
                 f"Delegation in admin.google.com: replace calendar.readonly with "
                 f"https://www.googleapis.com/auth/calendar.events for the SA "
@@ -326,7 +335,7 @@ def create_event(
             ) from exc
         if status == 400:
             raise CalendarClientError(
-                f"Calendar 400 â€” API rejected the event body: {exc}"
+                f"Calendar 400 -- API rejected the event body: {exc}"
             ) from exc
         raise CalendarClientError(f"Calendar API HTTP {status}: {exc}") from exc
     except CalendarClientError:
@@ -377,7 +386,7 @@ def format_created_event_for_llm(
         except Exception:
             pass
 
-    time_str = f"{start_display}" + (f" â€“ {end_display}" if end_display else "")
+    time_str = f"{start_display}" + (f" -- {end_display}" if end_display else "")
 
     attendee_list = [a.get("email", "") for a in attendees_raw if a.get("email")]
     attendees_str = (
@@ -397,7 +406,7 @@ def format_created_event_for_llm(
         f"Tell the user the event is booked. Format the calendar link and Meet link as "
         f"Slack hyperlinks (preserve the <url|name> syntax verbatim). "
         f"{'Mention that Google sent calendar invitations to all attendees. ' if attendee_list else ''}"
-        f"{'Always show the Google Meet link prominently â€” everyone needs it to join.' if meet_link else ''}"
+        f"{'Always show the Google Meet link prominently -- everyone needs it to join.' if meet_link else ''}"
     )
 
 
@@ -412,7 +421,7 @@ def format_events_for_llm(events: list[dict[str, Any]], window_label: str) -> st
 
     lines = [f"Found {len(events)} calendar event(s) for {window_label}:"]
     lines.append(
-        "(Event titles below are Slack-formatted hyperlinks â€” preserve the `<url|name>` "
+        "(Event titles below are Slack-formatted hyperlinks -- preserve the `<url|name>` "
         "syntax verbatim in your reply so the user can click through to open in Google Calendar.)"
     )
 
@@ -420,11 +429,11 @@ def format_events_for_llm(events: list[dict[str, Any]], window_label: str) -> st
         title = e.get("summary") or "(no title)"
         html_link = e.get("htmlLink", "")
 
-        # Start time â€” could be date-only (all-day) or dateTime
+        # Start time -- could be date-only (all-day) or dateTime
         start = e.get("start") or {}
         end = e.get("end") or {}
         if "dateTime" in start:
-            # Timed event â€” format as local hour:min
+            # Timed event -- format as local hour:min
             try:
                 dt = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
                 # Convert to Phoenix for display
@@ -459,7 +468,7 @@ def format_events_for_llm(events: list[dict[str, Any]], window_label: str) -> st
         more = len(attendees_raw) - 4
         attendees_str = ""
         if attendee_names:
-            attendees_str = f" â€” with {', '.join(attendee_names)}"
+            attendees_str = f" -- with {', '.join(attendee_names)}"
             if more > 0:
                 attendees_str += f" +{more} more"
 
@@ -655,7 +664,7 @@ def find_next_available_slots(
 ) -> "list[tuple[datetime, datetime]]":
     """Return up to n available slots for all participants.
 
-    Each slot starts after the previous one ends â€” no overlapping proposals.
+    Each slot starts after the previous one ends -- no overlapping proposals.
     Searches up to search_days out to find n options.
     """
     slots: list[tuple[datetime, datetime]] = []
@@ -683,7 +692,7 @@ def find_meeting_slot(
     duration_minutes: int = 30,
     search_days: int = 7,
 ) -> "tuple[datetime, datetime] | None":
-    """High-level convenience: freebusy query + slot scan â†’ single slot.
+    """High-level convenience: freebusy query + slot scan â†' single slot.
 
     Returns (slot_start_utc, slot_end_utc) or None.
     Raises CalendarClientError on API failure.
@@ -706,7 +715,7 @@ def find_meeting_slots(
     n: int = 3,
     search_days: int = 14,
 ) -> "list[tuple[datetime, datetime]]":
-    """High-level convenience: freebusy query + slot scan â†’ up to n options.
+    """High-level convenience: freebusy query + slot scan â†' up to n options.
 
     Fetches freebusy once over search_days, then finds n non-overlapping slots.
     Raises CalendarClientError on API failure.
@@ -734,7 +743,7 @@ def _fmt_slot(slot_start: datetime, slot_end: datetime) -> tuple[str, str, str, 
     dur_str  = f"{dur_min} min"
     start_iso = start_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
     end_iso   = end_az.strftime("%Y-%m-%dT%H:%M:00-07:00")
-    return day_str, f"{s_str} â€“ {e_str} AZ", dur_str, start_iso, end_iso
+    return day_str, f"{s_str} -- {e_str} AZ", dur_str, start_iso, end_iso
 
 
 def format_slot_proposal_for_llm(
@@ -752,7 +761,7 @@ def format_slot_proposal_for_llm(
         names_str = ", ".join(participant_names[:-1]) + f" & {participant_names[-1]}"
 
     return (
-        "SLOT FOUND â€” present this as a clear preview block to the user:\n"
+        "SLOT FOUND -- present this as a clear preview block to the user:\n"
         f"- *Title:* {title}\n"
         f"- *Day:* {day_str}\n"
         f"- *Time:* {time_str} ({dur_str})\n"
@@ -782,7 +791,7 @@ def format_slot_proposals_for_llm(
     """
     if not slots:
         return (
-            "NO_SLOT_FOUND â€” no common opening found in the next 14 working days. "
+            "NO_SLOT_FOUND -- no common opening found in the next 14 working days. "
             "Tell the user no time slot was available for all participants and suggest "
             "they coordinate directly or try a shorter meeting duration."
         )
@@ -799,7 +808,7 @@ def format_slot_proposals_for_llm(
     for i, (slot_start, slot_end) in enumerate(slots[:3]):
         day_str, time_str, dur_str, start_iso, end_iso = _fmt_slot(slot_start, slot_end)
         label = labels[i] if i < len(labels) else f"{i+1}."
-        option_lines.append(f"{label}  *{day_str}* â€” {time_str} ({dur_str})")
+        option_lines.append(f"{label}  *{day_str}* -- {time_str} ({dur_str})")
         passback_lines.append(
             f"  Option {i+1}: proposed_start=\"{start_iso}\" proposed_end=\"{end_iso}\""
         )
@@ -808,7 +817,7 @@ def format_slot_proposals_for_llm(
     passback_block = "\n".join(passback_lines)
 
     return (
-        "SLOTS FOUND â€” present these as numbered options to the user:\n"
+        "SLOTS FOUND -- present these as numbered options to the user:\n"
         "\n"
         f"*Scheduling options for {names_str} ({title}):*\n"
         f"{options_block}\n"
