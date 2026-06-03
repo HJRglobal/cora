@@ -45,6 +45,19 @@ routes:
   - pattern: "cora-kq-bdm"
     entity: BDM
 
+  # ── BLOCKED: workspace default general channel — Cora must NEVER post here ──
+  # Channel ID C0B2NMLK7CK. Originally #all-hjr-global, renamed 2026-06-02.
+  # Slack prevents archiving this channel (it is the workspace general channel).
+  # Code-level block in app.py (_BLOCKED_CHANNEL_IDS) enforces this as a hard stop.
+  - pattern: "general-do-not-use"
+    entity: FNDR
+    silent: true
+    blocked: true
+  - pattern: "all-hjr-global"
+    entity: FNDR
+    silent: true
+    blocked: true
+
   # ── Automated feed channels — Cora ignores @mentions silently ──────────────
   # These are bot-posting channels only. No human conversation happens here.
   - pattern: "asana-feed"

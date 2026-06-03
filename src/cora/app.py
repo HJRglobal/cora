@@ -40,6 +40,19 @@ log = logging.getLogger(__name__)
 app = App(token=config.slack_bot_token, signing_secret=config.slack_signing_secret)
 
 _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
+# ── Permanently blocked channel IDs ────────────────────────────────────────────
+# Cora must NEVER post to these channels under any circumstance.
+# C0B2NMLK7CK = #general-do-not-use (was #all-hjr-global) — workspace default
+# general channel; Slack prevents archiving it, so we block it in code instead.
+# Used by _is_blocked_channel() which gates every outbound chat_postMessage.
+_BLOCKED_CHANNEL_IDS: frozenset[str] = frozenset({"C0B2NMLK7CK"})
+
+
+def _is_blocked_channel(channel_id: str) -> bool:
+    """Return True if this channel is permanently blocked from Cora posts."""
+    return channel_id in _BLOCKED_CHANNEL_IDS
+
+
 _FOUNDER_ID = "U0B2RM2JYJ1"  # Harrison — KB approvals and cross-entity access
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
 
@@ -453,6 +466,12 @@ def handle_mention(event: dict, say: callable, client) -> None:
         return
 
     channel_id = event.get("channel", "")
+
+    # Hard block: never respond in permanently blocked channels
+    if _is_blocked_channel(channel_id):
+        log.warning("handle_mention: blocked channel %s — ignoring", channel_id)
+        return
+
     user_id = event.get("user")
     thread_ts = event.get("ts")          # ts of THIS message (used for reply threading)
     event_thread_ts = event.get("thread_ts")  # root ts if this is inside a thread
@@ -768,6 +787,10 @@ def handle_message_event(event: dict, client) -> None:
         if user_id and text and not event.get("bot_id"):
             log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
             osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+        return
+
+    # Hard block: never respond in permanently blocked channels
+    if _is_blocked_channel(event.get("channel", "")):
         return
 
     # Only interested in thread replies (has thread_ts != ts)
