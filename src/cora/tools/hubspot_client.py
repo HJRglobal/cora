@@ -893,6 +893,103 @@ def create_deal(
         raise HubSpotClientError(f"create_deal network error: {exc}") from exc
 
 
+def get_deal(deal_id: str) -> dict[str, Any]:
+    """Fetch a single deal by ID. Returns properties dict.
+
+    Raises HubSpotClientError on any API failure.
+    """
+    if not _STAGE_NAME_CACHE:
+        _refresh_pipeline_cache()
+    hdrs = _headers()
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/crm/v3/objects/deals/{deal_id}",
+                headers=hdrs,
+                params={"properties": "dealname,dealstage,pipeline,amount,hubspot_owner_id"},
+            )
+        if r.status_code == 404:
+            raise HubSpotClientError(f"Deal {deal_id} not found (404)")
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(f"get_deal {r.status_code}: {r.text[:200]}")
+        return r.json().get("properties") or {}
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"get_deal network error: {exc}") from exc
+
+
+def update_deal_stage(deal_id: str, stage_id: str) -> dict[str, Any]:
+    """Update a deal's pipeline stage. Returns updated deal properties.
+
+    Raises HubSpotClientError on any API failure.
+    """
+    hdrs = _headers()
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.patch(
+                f"{_BASE}/crm/v3/objects/deals/{deal_id}",
+                headers=hdrs,
+                json={"properties": {"dealstage": stage_id}},
+            )
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(f"update_deal_stage {r.status_code}: {r.text[:200]}")
+        return r.json().get("properties") or {}
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"update_deal_stage network error: {exc}") from exc
+
+
+def create_note(
+    *,
+    body: str,
+    deal_id: str | None = None,
+    contact_id: str | None = None,
+) -> str:
+    """Create a HubSpot note and associate with a deal and/or contact. Returns note ID."""
+    import time as _time
+
+    hdrs = _headers()
+    ts_ms = str(int(_time.time() * 1000))
+    props = {"hs_note_body": body[:65535], "hs_timestamp": ts_ms}
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/notes",
+                headers=hdrs,
+                json={"properties": props},
+            )
+        if r.status_code not in (200, 201):
+            raise HubSpotClientError(f"create_note {r.status_code}: {r.text[:200]}")
+
+        note_id = str(r.json().get("id", ""))
+
+        for obj_type, obj_id, assoc_type_id in [
+            ("deals", deal_id, 214),
+            ("contacts", contact_id, 202),
+        ]:
+            if obj_id and note_id:
+                try:
+                    with httpx.Client(timeout=_TIMEOUT) as c2:
+                        c2.put(
+                            f"{_BASE}/crm/v4/objects/notes/{note_id}/associations/{obj_type}/{obj_id}",
+                            headers=hdrs,
+                            json=[{"associationCategory": "HUBSPOT_DEFINED",
+                                   "associationTypeId": assoc_type_id}],
+                        )
+                except Exception as exc:
+                    log.warning("HubSpot note-%s association failed: %s", obj_type, exc)
+
+        return note_id
+
+    except HubSpotClientError:
+        raise
+    except Exception as exc:
+        raise HubSpotClientError(f"create_note network error: {exc}") from exc
+
+
 def create_note(
     *,
     body: str,

@@ -2331,6 +2331,159 @@ def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     return result
 
 
+def _tool_hubspot_update_deal_stage(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Update a HubSpot deal's pipeline stage. Staged-write tool.
+
+    First call (confirmed=False or missing): fetches deal name + current stage,
+    returns a human-readable preview string asking for explicit confirmation.
+    Second call (confirmed=True): executes the stage update via PATCH and returns
+    a WRITE_CONFIRMED response.
+
+    Scope: FNDR, F3E, OSN, BDM only. Blocked from LEX channels.
+    """
+    import os
+    from slack_sdk import WebClient as _SlackWebClient
+    from slack_sdk.errors import SlackApiError as _SlackApiError
+
+    input_data = _input or {}
+
+    # Scope guard
+    if entity and entity.upper().startswith("LEX"):
+        return (
+            "hubspot_update_deal_stage blocked: HubSpot write tools are not available "
+            "from Lex channels. Use a non-Lex channel or contact Harrison."
+        )
+
+    deal_id = (input_data.get("deal_id") or "").strip()
+    stage_id = (input_data.get("stage_id") or "").strip()
+    confirmed = input_data.get("confirmed", False)
+
+    if not deal_id:
+        return "hubspot_update_deal_stage: missing `deal_id`. Ask the user for the HubSpot deal ID."
+    if not stage_id:
+        return "hubspot_update_deal_stage: missing `stage_id`. Ask the user for the target stage ID."
+
+    # Fetch current deal info for preview (needed for both confirmed and unconfirmed)
+    try:
+        deal_props = hubspot_client.get_deal(deal_id)
+    except hubspot_client.HubSpotClientError as exc:
+        return f"hubspot_update_deal_stage: could not fetch deal {deal_id}: {exc}"
+
+    deal_name = deal_props.get("dealname") or "(unnamed)"
+    current_stage_id = deal_props.get("dealstage") or ""
+    # Ensure stage cache is warm
+    if not hubspot_client._STAGE_NAME_CACHE:
+        try:
+            hubspot_client._refresh_pipeline_cache()
+        except hubspot_client.HubSpotClientError:
+            pass
+    current_stage_name = hubspot_client._STAGE_NAME_CACHE.get(current_stage_id, current_stage_id)
+    new_stage_name = hubspot_client._STAGE_NAME_CACHE.get(stage_id, stage_id)
+
+    if confirmed is not True:
+        return (
+            f"WRITE_PREVIEW Update deal '{deal_name}' stage from "
+            f"'{current_stage_name}' to '{new_stage_name}'? "
+            f"Respond with confirmed=True to proceed."
+        )
+
+    # Execute the update
+    try:
+        hubspot_client.update_deal_stage(deal_id, stage_id)
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning(
+            "hubspot_update_deal_stage FAILED asker=%s deal_id=%s stage_id=%s exc=%s",
+            slack_user_id, deal_id, stage_id, exc,
+        )
+        return (
+            f"HubSpot update failed: {exc}. Tell the user the stage was not changed "
+            "and suggest they update it directly in HubSpot."
+        )
+
+    deal_url = hubspot_client._deal_url(deal_id)
+    log.info(
+        "hubspot_update_deal_stage UPDATED asker=%s deal_id=%s deal_name=%r "
+        "old_stage=%r new_stage=%r",
+        slack_user_id, deal_id, deal_name, current_stage_name, new_stage_name,
+    )
+
+    return (
+        f"WRITE_CONFIRMED -- post the following lines as your entire response "
+        f"(no preamble, no meta-commentary, just these lines):\n\n"
+        f"Updated <{deal_url}|{deal_name}> stage: {current_stage_name} -> *{new_stage_name}*."
+    )
+
+
+def _tool_hubspot_add_note(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Add a note to a HubSpot deal. Staged-write tool.
+
+    First call (confirmed=False or missing): returns a preview showing the deal
+    name and note body, asking for confirmation.
+    Second call (confirmed=True): calls hubspot_client.create_note() and returns
+    a WRITE_CONFIRMED response.
+
+    Scope: FNDR, F3E, OSN, BDM, HJRG channels. Blocked from LEX channels.
+    """
+    input_data = _input or {}
+
+    # Scope guard
+    if entity and entity.upper().startswith("LEX"):
+        return (
+            "hubspot_add_note blocked: HubSpot write tools are not available "
+            "from Lex channels. Use a non-Lex channel or contact Harrison."
+        )
+
+    deal_id = (input_data.get("deal_id") or "").strip()
+    note_body = (input_data.get("note_body") or "").strip()
+    confirmed = input_data.get("confirmed", False)
+
+    if not deal_id:
+        return "hubspot_add_note: missing `deal_id`. Ask the user which deal to note."
+    if not note_body:
+        return "hubspot_add_note: missing `note_body`. Ask the user what the note should say."
+
+    # Fetch deal name for preview
+    try:
+        deal_props = hubspot_client.get_deal(deal_id)
+    except hubspot_client.HubSpotClientError as exc:
+        return f"hubspot_add_note: could not fetch deal {deal_id}: {exc}"
+
+    deal_name = deal_props.get("dealname") or "(unnamed)"
+
+    if confirmed is not True:
+        preview_body = note_body[:300] + ("..." if len(note_body) > 300 else "")
+        return (
+            f"WRITE_PREVIEW Add note to '{deal_name}':\n\n"
+            f"{preview_body}\n\n"
+            f"Respond with confirmed=True to add this note."
+        )
+
+    # Execute note creation
+    try:
+        note_id = hubspot_client.create_note(body=note_body, deal_id=deal_id)
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning(
+            "hubspot_add_note FAILED asker=%s deal_id=%s exc=%s",
+            slack_user_id, deal_id, exc,
+        )
+        return (
+            f"HubSpot note creation failed: {exc}. Tell the user the note was not saved "
+            "and suggest they add it directly in HubSpot."
+        )
+
+    deal_url = hubspot_client._deal_url(deal_id)
+    log.info(
+        "hubspot_add_note CREATED asker=%s deal_id=%s deal_name=%r note_id=%s chars=%d",
+        slack_user_id, deal_id, deal_name, note_id, len(note_body),
+    )
+
+    return (
+        f"WRITE_CONFIRMED -- post the following lines as your entire response "
+        f"(no preamble, no meta-commentary, just these lines):\n\n"
+        f"Note added to <{deal_url}|{deal_name}>."
+    )
+
+
 def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
     """Send a Slack DM to a named teammate on behalf of Cora.
 
@@ -3971,6 +4124,62 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # --- HubSpot two-way write tools ---
+    {
+        "name": "hubspot_update_deal_stage",
+        "description": (
+            "Update a HubSpot deal's pipeline stage. STAGED-WRITE TOOL -- show a preview "
+            "and receive explicit approval (confirmed=true) before mutating.\n\n"
+            "Trigger phrases: 'move deal to', 'update deal stage', 'advance deal', "
+            "'change stage for', 'mark deal as'.\n\n"
+            "Scope: FNDR, F3E, OSN, BDM channels only. Not available in LEX channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {
+                    "type": "string",
+                    "description": "HubSpot deal ID (numeric string).",
+                },
+                "stage_id": {
+                    "type": "string",
+                    "description": "Target stage ID (from pipeline stage list).",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true after user approves the preview.",
+                },
+            },
+            "required": ["deal_id", "stage_id", "confirmed"],
+        },
+    },
+    {
+        "name": "hubspot_add_note",
+        "description": (
+            "Add a note to a HubSpot deal. STAGED-WRITE TOOL -- show a preview and receive "
+            "explicit approval (confirmed=true) before writing.\n\n"
+            "Trigger phrases: 'add note to deal', 'log note', 'note on deal', 'update deal notes'.\n\n"
+            "Scope: FNDR, F3E, OSN, BDM, HJRG channels. Not available in LEX channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {
+                    "type": "string",
+                    "description": "HubSpot deal ID (numeric string).",
+                },
+                "note_body": {
+                    "type": "string",
+                    "description": "Full text of the note to add.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true after user approves the preview.",
+                },
+            },
+            "required": ["deal_id", "note_body", "confirmed"],
+        },
+    },
     # --- Cross-entity write tools ---
     {
         "name": "slack_send_dm",
@@ -4061,6 +4270,9 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
     "lex_staff_pulse": _tool_lex_staff_pulse,
+    # HubSpot two-way write tools
+    "hubspot_update_deal_stage": _tool_hubspot_update_deal_stage,
+    "hubspot_add_note": _tool_hubspot_add_note,
     # Cross-entity write tools
     "slack_send_dm": _tool_slack_send_dm,
 }
