@@ -1,0 +1,27 @@
+# Inventory alert thresholds for Cora proactive reorder alerts.
+# alert_below: post alert when units_available falls below this number.
+# 7-day throttle per SKU/item to avoid spam.
+
+f3e:
+  # F3E SKU thresholds (cases). Matched against inventory pulse text flags (emoji).
+  # These map to the emoji flags in get_f3e_inventory_pulse_text():
+  #   🚨 = <= 50 cases   (critical)
+  #   ⚠️  = <= 200 cases  (warning)
+  - sku: "F3 Energy"
+    alert_below: 200
+  - sku: "F3 Pure"
+    alert_below: 100
+  - sku: "F3 Mood"
+    alert_below: 100
+  - sku: "Variety Pack"
+    alert_below: 50
+
+osn:
+  # OSN thresholds are store-level (Clover inventory by item name).
+  # alert_below is total units across all stores.
+  - item: "Protein"
+    alert_below: 20
+  - item: "Pre-Workout"
+    alert_below: 15
+  - item: "Fat Burner"
+    alert_below: 10
