@@ -31,6 +31,7 @@ brands:
       monitored_hashtags:
         - "F3Energy"
         - "DrinkF3Energy"
+        - "DrinkF3"
     tiktok:
       handle: "f3energy"
       # Monitoring pending TikTok Research API approval — see tiktok_monitor.py
