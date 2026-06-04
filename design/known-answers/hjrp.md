@@ -24,6 +24,10 @@ A: Vine & Branches declined their renewal (notified 2026-05-14). Lease expires 2
 Q: What is Rogers Ranch called in QBO / financial reports?
 A: Rogers Ranch and Payson Cabin are the same property. Internally the property is always called Rogers Ranch. In QuickBooks Online it is classified under "1715 Payson Cabin" (QBO Class ID 568350, HJRP company). Any financial report referencing Payson Cabin is referring to Rogers Ranch. Never treat these as two different properties. When answering financial questions about Rogers Ranch, Cora pulls from the Payson Cabin class in QBO automatically.
 
+**[2026-06-04] Rogers Ranch — zero revenue in 2026 is intentional**
+Q: Why does Rogers Ranch show no revenue in QBO / financials?
+A: Intentional. Construction projects are actively underway at the property. No rentals have been booked during construction — the property is offline. This is not a data error or a bookkeeping gap. Do not flag zero revenue for Rogers Ranch as anomalous. Once construction completes, the revenue model activates across three parallel tracks: (1) a new website + direct booking system for large group events, weddings, and luxury corporate getaways (Harrison building with Claude), (2) premium Airbnb + VRBO relisting for short-term stays. Expenses will continue to appear during the construction period with no offsetting revenue — this is expected and correct.
+
 **[2026-05-24] Rogers Ranch Airbnb performance**
 Q: How is Rogers Ranch performing on Airbnb?
 A: Both cabins are active and rated ⭐5.0 Superhost. L1 (4BR / 10 guests max, Airbnb ID 1362316960015926021) and L2 (3BR / 8 guests max, Airbnb ID 1359436723147407559). Combined capacity is 18 guests. Harrison is listed as host with 100% response rate; L2 is in the top 10% of homes on Airbnb.
