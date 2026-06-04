@@ -123,6 +123,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_inf_due_date  ON influencer_deliverables(due_date);
         CREATE INDEX IF NOT EXISTS idx_inf_entity    ON influencer_deliverables(entity);
     """)
+    # Migrations: add columns if they don't exist (safe to run every time)
+    for col, definition in [
+        ("campaign_month", "TEXT"),
+        ("requirements",   "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE influencer_deliverables ADD COLUMN {col} {definition}")
+        except Exception:
+            pass  # column already exists
     conn.commit()
 
 
