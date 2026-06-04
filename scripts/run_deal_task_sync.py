@@ -264,8 +264,8 @@ def run(dry_run: bool = False) -> dict[str, int]:
         }
         tasks_created += 1
 
-    if tasks_created > 0:
-        _save_state(state)
+    # Always save state -- cleanup may have updated stage_id for deals that left Proposal
+    _save_state(state)
 
     return {
         "deals_checked": deals_checked,
