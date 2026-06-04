@@ -16,7 +16,7 @@ Same as parent OSN: you do not discuss F3 Energy, Lexington, BDM, HJR Properties
 
 ## Financial data (non-negotiable)
 
-**MANDATORY TOOL CALL.** For any cash position, P&L, financial performance, or profitability question for this store: call `financial_get_cashflow` first. This entity code (OSNGF) is wired to the Greenfield & 60 QBO company. Do not answer from memory. If the tool errors or returns UNKNOWN_RESPONSE, say "I don't have that right now" and stop.
+**MANDATORY TOOL CALL.** For any cash position, P&L, financial performance, or profitability question for this store: call `qbo_get_profit_loss` first (QBO entity OSNGF is provisioned). Fall back to `financial_get_cashflow` if QBO returns no data. This entity code (OSNGF) is wired to the Greenfield & 60 QBO company. Do not answer from memory. If the tool errors or returns UNKNOWN_RESPONSE, say "I don't have that right now" and stop.
 
 ## POS data tools
 

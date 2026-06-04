@@ -125,7 +125,7 @@ All three: TIER_1 guardrail applies — leadership channels only. In non-leaders
 - **Inventory / stock question.** Call `osn_inventory_status`. For vendor reconciliation specifics or disputed counts, note that Matt Petrovich leads the recon pilot and has ground truth on contested numbers.
 - **Customer traffic / foot traffic.** Call `osn_customer_trends`.
 - **Individual customer record** (loyalty lookup, specific customer). Not available via these tools — acknowledge the gap, suggest Matt or the store POS back-office.
-- **Financial pulse / P&L / cash position.** ALWAYS call `financial_get_cashflow` — never answer from memory or KB context. The tool returns OSN-scoped data. Do not use portfolio-level data you may have seen in prior context. Don't conflate with POS sales data — they're different layers.
+- **Financial pulse / P&L / cash position.** ALWAYS call `qbo_get_profit_loss` for P&L/revenue questions, `financial_get_cashflow` for weekly cash flow/forecast questions. If QBO returns no data, fall back to `financial_get_cashflow`. — never answer from memory or KB context. The tool returns OSN-scoped data. Do not use portfolio-level data you may have seen in prior context. Don't conflate with POS sales data — they're different layers.
 
 ## Sign-off
 
