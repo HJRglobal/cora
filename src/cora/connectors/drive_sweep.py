@@ -292,9 +292,11 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
     """Store classified content in the KB as a single Document. Returns chunk count ingested."""
     entity = classification.get("entity") or user.get("entity_default", "FNDR")
     sub_entity: str | None = None
-    if "-" in entity and entity.startswith("LEX"):
-        sub_entity = entity
-        entity = "LEX"
+    if "-" in entity:
+        prefix = entity.split("-")[0]
+        if prefix in ("LEX", "HJRP", "HJRPROD"):
+            sub_entity = entity
+            entity = prefix
 
     summary = classification.get("summary", file_meta["name"])
     file_id = file_meta["id"]
@@ -639,6 +641,397 @@ def run_sweep(
         "drive_sweep: COMPLETE -- accounts=%d enumerated=%d extracted=%d "
         "ingested=%d phi_skipped=%d noise=%d dedup=%d",
         aggregate["accounts_swept"], aggregate["files_enumerated"],
+        aggregate["files_extracted"], aggregate["chunks_ingested"],
+        aggregate["phi_skipped"], aggregate["noise_filtered"],
+        aggregate["dedup_skipped"],
+    )
+    return aggregate
+
+
+# ── HJR-Founder-OS shared folder sweep ────────────────────────────────────────
+
+FOUNDERS_OS_ROOT_ID = "1TfxuKxzXz0-NipAFYqbK5AxowAy-LIPG"
+
+_FOUNDERS_OS_ENTITY_MAP: dict[str, str] = {
+    "00-founder":            "FNDR",
+    "01-hjr-global":         "HJRG",
+    "02-f3-energy":          "F3E",
+    "03-f3-community":       "F3C",
+    "04-ufl":                "UFL",
+    "05-hjr-productions":    "HJRPROD",
+    "06-hjr-properties":     "HJRP",
+    "07-big-d-media":        "BDM",
+    "08-lexington-services": "LEX",
+    "09-one-stop-nutrition":  "OSN",
+    "_shared":               "FNDR",
+}
+
+_HJRP_SUB_ENTITY: dict[str, str] = {
+    "cinema-lanes": "HJRP-CL",
+    "lci-realty":   "HJRP-LCI",
+    "rogers-ranch": "HJRP-RR",
+}
+
+_LEX_SUB_ENTITY: dict[str, str] = {
+    "llc":               "LEX-LLC",
+    "lexington-llc":     "LEX-LLC",
+    "lts":               "LEX-LTS",
+    "lexington-therapy": "LEX-LTS",
+    "lbhs":              "LEX-LBHS",
+    "behavioral-health": "LEX-LBHS",
+    "lla":               "LEX-LLA",
+    "lex-life-academy":  "LEX-LLA",
+    "lex-life":          "LEX-LLA",
+}
+
+_ENTITY_SUB_MAP: dict[str, dict[str, str]] = {
+    "LEX":  _LEX_SUB_ENTITY,
+    "HJRP": _HJRP_SUB_ENTITY,
+}
+
+_FOUNDERS_OS_SKIP_FOLDERS = frozenset({
+    "_archive", "archive", "old", "backup", "temp", ".cache",
+    ".tmp", "node_modules", ".git",
+})
+
+_LEX_SCORE_THRESHOLD = 6
+_DEFAULT_SCORE_THRESHOLD = 4
+
+
+def _build_sa_drive_service_direct(sa_json_path: str) -> Any:
+    """Build a Drive v3 service using direct SA credentials (no DWD impersonation).
+
+    Used for the HJR-Founder-OS shared folder. The SA must have the folder
+    shared with it as Viewer in Google Drive (one-time Harrison action).
+    SA email: cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com
+    """
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_file(
+        sa_json_path, scopes=[_DRIVE_SCOPE]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _list_subfolders(service: Any, parent_id: str) -> list[dict]:
+    """List immediate subfolder children of a Drive folder."""
+    results: list[dict] = []
+    page_token: str | None = None
+    while True:
+        kwargs: dict = dict(
+            q=(
+                f"'{parent_id}' in parents"
+                f" and mimeType='{_GOOGLE_FOLDER_MIME}'"
+                f" and trashed=false"
+            ),
+            fields="nextPageToken, files(id, name)",
+            pageSize=100,
+        )
+        if page_token:
+            kwargs["pageToken"] = page_token
+        try:
+            resp = _retry_execute(service.files().list(**kwargs))
+        except Exception as exc:
+            log.warning("founders_os: subfolder list failed for %s: %s", parent_id, exc)
+            break
+        results.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def _sweep_folder_tree(
+    *,
+    service: Any,
+    folder_id: str,
+    entity: str,
+    sub_entity: str | None,
+    kb: Any,
+    anthropic_client: Any,
+    cutoff_str: str,
+    dry_run: bool,
+    is_lex: bool,
+    score_threshold: int,
+    seen_file_ids: set,
+    stats: dict,
+    checkpoint_key: str,
+) -> None:
+    """Query all files in a folder subtree modified since cutoff, classify, ingest.
+
+    Uses Drive 'ancestors' query — one paginated request covers the full depth.
+    Entity is pre-determined from folder context; Haiku only scores relevance.
+    PHI guard fires for all LEX content before classification.
+    """
+    effective_entity = sub_entity or entity
+    label = f"{entity}/{sub_entity}" if sub_entity else entity
+    q = (
+        f"'{folder_id}' in ancestors"
+        f" and ({_SUPPORTED_MIME_QUERY})"
+        f" and trashed = false"
+        f" and modifiedTime > '{cutoff_str}'"
+    )
+
+    page_token: str | None = None
+    if not dry_run:
+        try:
+            ckpt = kb.get_checkpoint(checkpoint_key)
+            if ckpt and ckpt.get("folder_id") == folder_id:
+                page_token = ckpt.get("page_token")
+                if page_token:
+                    log.info("founders_os: resuming %s from checkpoint", label)
+        except Exception:
+            pass
+
+    while True:
+        list_kwargs: dict = dict(
+            q=q,
+            spaces="drive",
+            fields=(
+                "nextPageToken,"
+                "files(id,name,mimeType,modifiedTime,size,webViewLink,parents)"
+            ),
+            pageSize=100,
+        )
+        if page_token:
+            list_kwargs["pageToken"] = page_token
+
+        try:
+            resp = _retry_execute(service.files().list(**list_kwargs))
+        except Exception as exc:
+            log.error("founders_os: files.list failed for %s: %s", label, exc)
+            break
+
+        files = resp.get("files", [])
+        stats["files_enumerated"] += len(files)
+
+        for file_meta in files:
+            file_id  = file_meta["id"]
+            filename = file_meta.get("name", "")
+
+            if file_id in seen_file_ids:
+                stats["dedup_skipped"] += 1
+                continue
+            seen_file_ids.add(file_id)
+
+            try:
+                if int(file_meta.get("size", "0")) < 200:
+                    stats["noise_filtered"] += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+            content = _extract_content(service, file_meta)
+            if not content or len(content.strip()) < 150:
+                stats["noise_filtered"] += 1
+                continue
+
+            if is_lex and _PHI_PATTERNS.search(content[:5000]):
+                log.debug("founders_os: PHI guard triggered for %s / %s", label, filename)
+                stats["phi_skipped"] += 1
+                continue
+
+            stats["files_extracted"] += 1
+
+            classification = _classify(
+                anthropic_client,
+                filename,
+                "HJR-Founder-OS",
+                "founders_os@hjrglobal.com",
+                effective_entity,
+                content[:2000],
+            )
+            score = classification.get("score", 0)
+            classification["entity"] = effective_entity  # folder path wins over Haiku
+
+            if score < score_threshold:
+                log.debug("founders_os: discarded %s (score=%s)", filename, score)
+                stats["noise_filtered"] += 1
+                continue
+
+            log.info("founders_os: ingesting %s / %s (score=%s)", label, filename, score)
+
+            if dry_run:
+                stats["chunks_ingested"] += 1
+                log.info("[DRY RUN] Would ingest: %s -> entity=%s", filename, effective_entity)
+                continue
+
+            user_dict = {
+                "email": "founders_os@hjrglobal.com",
+                "name":  "HJR-Founder-OS",
+                "entity_default": effective_entity,
+            }
+            n = _ingest_file(kb, file_meta, content, classification, user_dict)
+            stats["chunks_ingested"] += n
+
+        page_token = resp.get("nextPageToken")
+
+        if not dry_run:
+            try:
+                kb.set_checkpoint(checkpoint_key, {
+                    "folder_id": folder_id,
+                    "page_token": page_token,
+                })
+            except Exception:
+                pass
+
+        if not page_token:
+            break
+
+    if not dry_run:
+        try:
+            kb.delete_checkpoint(checkpoint_key)
+        except Exception:
+            pass
+
+
+def sweep_founders_os(
+    sa_json_path: str,
+    kb: Any,
+    anthropic_client: Any,
+    root_folder_id: str = FOUNDERS_OS_ROOT_ID,
+    entity_filter: str | None = None,
+    freshness_days: int = 730,
+    dry_run: bool = False,
+) -> dict:
+    """Sweep the HJR-Founder-OS shared Drive folder into Cora's KB.
+
+    Entity is determined from folder path (deterministic), not Haiku.
+    Haiku only scores relevance (0-10); files below threshold are discarded.
+    PHI guard enforced on all LEX content. LEX threshold = 6, others = 4.
+
+    One-time Harrison action required: share HJR-Founder-OS folder with
+    cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com as Viewer.
+    """
+    log.info(
+        "founders_os: starting sweep root=%s filter=%s freshness=%dd dry_run=%s",
+        root_folder_id, entity_filter or "ALL", freshness_days, dry_run,
+    )
+
+    try:
+        service = _build_sa_drive_service_direct(sa_json_path)
+    except Exception as exc:
+        log.error("founders_os: could not build Drive service: %s", exc)
+        return {"error": str(exc)}
+
+    allowed_entities: set[str] | None = None
+    if entity_filter:
+        allowed_entities = {e.strip().upper() for e in entity_filter.split(",")}
+
+    top_folders = _list_subfolders(service, root_folder_id)
+    log.info("founders_os: found %d top-level folders", len(top_folders))
+
+    aggregate: dict = {
+        "entities_swept": 0, "files_enumerated": 0, "files_extracted": 0,
+        "chunks_ingested": 0, "phi_skipped": 0, "noise_filtered": 0,
+        "dedup_skipped": 0,
+    }
+    seen_file_ids: set[str] = set()
+    run_start = datetime.now(timezone.utc)
+
+    for folder in top_folders:
+        folder_id   = folder["id"]
+        folder_name = folder["name"]
+        folder_key  = folder_name.lower()
+
+        if folder_key in _FOUNDERS_OS_SKIP_FOLDERS:
+            continue
+
+        entity = _FOUNDERS_OS_ENTITY_MAP.get(folder_key)
+        if entity is None:
+            for key, ent in _FOUNDERS_OS_ENTITY_MAP.items():
+                if folder_key.startswith(key):
+                    entity = ent
+                    break
+        if entity is None:
+            log.info("founders_os: no mapping for %r — skipping", folder_name)
+            continue
+
+        if allowed_entities and entity not in allowed_entities:
+            continue
+
+        log.info("founders_os: sweeping %s -> entity=%s", folder_name, entity)
+
+        watermark_key = f"founders_os_{entity}_{folder_id}"
+        cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
+        if not dry_run:
+            try:
+                state = kb.get_sync_state(watermark_key)
+                if state and isinstance(state[0], int):
+                    wm_dt = datetime.fromtimestamp(state[0], tz=timezone.utc)
+                    cutoff = max(cutoff, wm_dt)
+            except Exception:
+                pass
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+        is_lex         = entity == "LEX"
+        score_threshold = _LEX_SCORE_THRESHOLD if is_lex else _DEFAULT_SCORE_THRESHOLD
+        stats: dict = {
+            "files_enumerated": 0, "files_extracted": 0, "chunks_ingested": 0,
+            "phi_skipped": 0, "noise_filtered": 0, "dedup_skipped": 0,
+        }
+
+        sub_entity_map = _ENTITY_SUB_MAP.get(entity)
+        if sub_entity_map:
+            subfolders = _list_subfolders(service, folder_id)
+            for subfolder in subfolders:
+                sub_entity = sub_entity_map.get(subfolder["name"].lower())
+                if not sub_entity:
+                    continue
+                log.info("founders_os: sweeping sub-entity %s", sub_entity)
+                _sweep_folder_tree(
+                    service=service, folder_id=subfolder["id"],
+                    entity=entity, sub_entity=sub_entity,
+                    kb=kb, anthropic_client=anthropic_client,
+                    cutoff_str=cutoff_str, dry_run=dry_run,
+                    is_lex=is_lex, score_threshold=score_threshold,
+                    seen_file_ids=seen_file_ids, stats=stats,
+                    checkpoint_key=f"founders_os_ckpt_{subfolder['id']}",
+                )
+            _sweep_folder_tree(
+                service=service, folder_id=folder_id,
+                entity=entity, sub_entity=None,
+                kb=kb, anthropic_client=anthropic_client,
+                cutoff_str=cutoff_str, dry_run=dry_run,
+                is_lex=is_lex, score_threshold=score_threshold,
+                seen_file_ids=seen_file_ids, stats=stats,
+                checkpoint_key=f"founders_os_ckpt_{folder_id}_root",
+            )
+        else:
+            _sweep_folder_tree(
+                service=service, folder_id=folder_id,
+                entity=entity, sub_entity=None,
+                kb=kb, anthropic_client=anthropic_client,
+                cutoff_str=cutoff_str, dry_run=dry_run,
+                is_lex=is_lex, score_threshold=score_threshold,
+                seen_file_ids=seen_file_ids, stats=stats,
+                checkpoint_key=f"founders_os_ckpt_{folder_id}",
+            )
+
+        if not dry_run:
+            try:
+                kb.set_sync_state(watermark_key, int(run_start.timestamp()))
+            except Exception as exc:
+                log.warning("founders_os: watermark advance failed for %s: %s", entity, exc)
+
+        log.info(
+            "founders_os: %s done -- enumerated=%d extracted=%d ingested=%d "
+            "phi=%d noise=%d dedup=%d",
+            entity, stats["files_enumerated"], stats["files_extracted"],
+            stats["chunks_ingested"], stats["phi_skipped"],
+            stats["noise_filtered"], stats["dedup_skipped"],
+        )
+
+        aggregate["entities_swept"] += 1
+        for k in ("files_enumerated", "files_extracted", "chunks_ingested",
+                  "phi_skipped", "noise_filtered", "dedup_skipped"):
+            aggregate[k] += stats.get(k, 0)
+
+    log.info(
+        "founders_os: COMPLETE -- entities=%d enumerated=%d extracted=%d "
+        "ingested=%d phi=%d noise=%d dedup=%d",
+        aggregate["entities_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
         aggregate["dedup_skipped"],
