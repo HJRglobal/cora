@@ -742,12 +742,12 @@ def _list_subfolders(service: Any, parent_id: str) -> list[dict]:
     return results
 
 
-def _sweep_folder_tree(
+def _process_single_folder_files(
     *,
     service: Any,
     folder_id: str,
-    entity: str,
-    sub_entity: str | None,
+    label: str,
+    effective_entity: str,
     kb: Any,
     anthropic_client: Any,
     cutoff_str: str,
@@ -756,34 +756,15 @@ def _sweep_folder_tree(
     score_threshold: int,
     seen_file_ids: set,
     stats: dict,
-    checkpoint_key: str,
 ) -> None:
-    """Query all files in a folder subtree modified since cutoff, classify, ingest.
-
-    Uses Drive 'ancestors' query — one paginated request covers the full depth.
-    Entity is pre-determined from folder context; Haiku only scores relevance.
-    PHI guard fires for all LEX content before classification.
-    """
-    effective_entity = sub_entity or entity
-    label = f"{entity}/{sub_entity}" if sub_entity else entity
+    """Process files directly inside one folder (non-recursive, 'in parents' only)."""
     q = (
-        f"'{folder_id}' in ancestors"
+        f"'{folder_id}' in parents"
         f" and ({_SUPPORTED_MIME_QUERY})"
         f" and trashed = false"
         f" and modifiedTime > '{cutoff_str}'"
     )
-
     page_token: str | None = None
-    if not dry_run:
-        try:
-            ckpt = kb.get_checkpoint(checkpoint_key)
-            if ckpt and ckpt.get("folder_id") == folder_id:
-                page_token = ckpt.get("page_token")
-                if page_token:
-                    log.info("founders_os: resuming %s from checkpoint", label)
-        except Exception:
-            pass
-
     while True:
         list_kwargs: dict = dict(
             q=q,
@@ -800,7 +781,7 @@ def _sweep_folder_tree(
         try:
             resp = _retry_execute(service.files().list(**list_kwargs))
         except Exception as exc:
-            log.error("founders_os: files.list failed for %s: %s", label, exc)
+            log.error("founders_os: files.list failed for %s/%s: %s", label, folder_id, exc)
             break
 
         files = resp.get("files", [])
@@ -835,12 +816,9 @@ def _sweep_folder_tree(
             stats["files_extracted"] += 1
 
             classification = _classify(
-                anthropic_client,
-                filename,
-                "HJR-Founder-OS",
-                "founders_os@hjrglobal.com",
-                effective_entity,
-                content[:2000],
+                anthropic_client, filename,
+                "HJR-Founder-OS", "founders_os@hjrglobal.com",
+                effective_entity, content[:2000],
             )
             score = classification.get("score", 0)
             classification["entity"] = effective_entity  # folder path wins over Haiku
@@ -866,24 +844,71 @@ def _sweep_folder_tree(
             stats["chunks_ingested"] += n
 
         page_token = resp.get("nextPageToken")
-
-        if not dry_run:
-            try:
-                kb.set_checkpoint(checkpoint_key, {
-                    "folder_id": folder_id,
-                    "page_token": page_token,
-                })
-            except Exception:
-                pass
-
         if not page_token:
             break
 
-    if not dry_run:
-        try:
-            kb.delete_checkpoint(checkpoint_key)
-        except Exception:
-            pass
+
+def _sweep_folder_tree(
+    *,
+    service: Any,
+    folder_id: str,
+    entity: str,
+    sub_entity: str | None,
+    kb: Any,
+    anthropic_client: Any,
+    cutoff_str: str,
+    dry_run: bool,
+    is_lex: bool,
+    score_threshold: int,
+    seen_file_ids: set,
+    stats: dict,
+    checkpoint_key: str,
+) -> None:
+    """BFS walk of a folder subtree using 'in parents' queries at each depth.
+
+    The Drive API 'in ancestors' operator only works for Shared Drives, not
+    personal My Drive folders. This BFS approach works for all Drive types:
+    enumerate files in each folder with 'in parents', then recurse into subfolders.
+
+    Entity is pre-determined from folder context; Haiku only scores relevance.
+    PHI guard fires for all LEX content before classification.
+    Dedup via seen_file_ids prevents double-ingesting files in overlapping sweeps.
+    """
+    effective_entity = sub_entity or entity
+    label = f"{entity}/{sub_entity}" if sub_entity else entity
+
+    # BFS queue: process one folder at a time, recurse into subfolders
+    queue: list[str] = [folder_id]
+    visited: set[str] = set()
+
+    while queue:
+        current_id = queue.pop(0)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+
+        # Process files directly inside this folder
+        _process_single_folder_files(
+            service=service,
+            folder_id=current_id,
+            label=label,
+            effective_entity=effective_entity,
+            kb=kb,
+            anthropic_client=anthropic_client,
+            cutoff_str=cutoff_str,
+            dry_run=dry_run,
+            is_lex=is_lex,
+            score_threshold=score_threshold,
+            seen_file_ids=seen_file_ids,
+            stats=stats,
+        )
+
+        # Discover subfolders and add to BFS queue
+        subfolders = _list_subfolders(service, current_id)
+        for subfolder in subfolders:
+            sub_name = subfolder["name"].lower()
+            if sub_name not in _FOUNDERS_OS_SKIP_FOLDERS and subfolder["id"] not in visited:
+                queue.append(subfolder["id"])
 
 
 def sweep_founders_os(
