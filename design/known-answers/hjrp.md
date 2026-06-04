@@ -20,6 +20,10 @@ A: Resolved. Vitalant signed the lease amendment 2026-03-25 — new lease starts
 Q: What's happening with Vine & Branches / suite 121?
 A: Vine & Branches declined their renewal (notified 2026-05-14). Lease expires 2026-06-30. Suite 121 will be vacant. Sharon Carstens is relisting to market. Track the vacancy income gap.
 
+**[2026-06-04] Rogers Ranch = Payson Cabin (LOCKED)**
+Q: What is Rogers Ranch called in QBO / financial reports?
+A: Rogers Ranch and Payson Cabin are the same property. Internally the property is always called Rogers Ranch. In QuickBooks Online it is classified under "1715 Payson Cabin" (QBO Class ID 568350, HJRP company). Any financial report referencing Payson Cabin is referring to Rogers Ranch. Never treat these as two different properties. When answering financial questions about Rogers Ranch, Cora pulls from the Payson Cabin class in QBO automatically.
+
 **[2026-05-24] Rogers Ranch Airbnb performance**
 Q: How is Rogers Ranch performing on Airbnb?
 A: Both cabins are active and rated ⭐5.0 Superhost. L1 (4BR / 10 guests max, Airbnb ID 1362316960015926021) and L2 (3BR / 8 guests max, Airbnb ID 1359436723147407559). Combined capacity is 18 guests. Harrison is listed as host with 100% response rate; L2 is in the top 10% of homes on Airbnb.

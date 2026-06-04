@@ -199,7 +199,9 @@ def parse_period(period: str | None) -> tuple[str, str]:
 _HJRP_CLASS_MAP: dict[str, str] = {
     "HJRP-1337": "3600000000001380786",   # North Hampton -- 1337 S Gilbert Rd (7005-105 1337 Bldg)
     "HJRP-1555": "3600000000001148584",   # South Hampton -- 1555 S Gilbert Rd (9400-703 LexBuilding Three)
-    # HJRP-RR (Rogers Ranch): no QBO class exists yet -- add when Visibility creates it in QBO
+    "HJRP-RR":   "568350",               # Rogers Ranch -- Payson property (1715 Payson Cabin in QBO)
+    # NOTE: Rogers Ranch and Payson Cabin are the same property. Internal name = Rogers Ranch.
+    # QBO class name = "1715 Payson Cabin". Always treat these as identical when answering questions.
 }
 
 
