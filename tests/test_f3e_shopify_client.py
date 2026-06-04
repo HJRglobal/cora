@@ -12,21 +12,28 @@ from cora.connectors.shopify_client import (
     LOW_STOCK_THRESHOLD,
     VALID_PERIODS,
     InventoryVariant,
+    LocationSKU,
     SalesSummary,
     ShopifyConfigError,
     ShopifyConnectorError,
     TopProduct,
+    _az_now,
     _base_url,
     _cache_clear,
     _cache_get,
     _cache_set,
+    _get_locations,
     _headers,
+    _infer_brand_from_title,
     _period_to_iso,
     _store_config,
     format_inventory_for_llm,
+    format_location_inventory_for_llm,
     format_sales_for_llm,
+    get_inventory_by_location,
     get_inventory_status,
     get_sales_pulse,
+    graphql,
 )
 
 
@@ -548,3 +555,310 @@ def test_format_inventory_no_shopify_mention():
     variants = [_make_variant_obj()]
     assert "Shopify" not in format_inventory_for_llm(variants)
     assert "Shopify" not in format_inventory_for_llm(variants, low_stock_only=False)
+
+
+# ── HTTP response helper (for requests-backed functions) ────────────────────────
+
+def _make_resp(status: int = 200, json_body=None, text: str = ""):
+    """Build a fake requests.Response-like object."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.ok = 200 <= status < 300
+    resp.json.return_value = {} if json_body is None else json_body
+    resp.text = text
+    return resp
+
+
+# ── _az_now ─────────────────────────────────────────────────────────────────────
+
+def test_az_now_is_utc_minus_7():
+    """Phoenix has no DST -- offset is always exactly UTC-7."""
+    from datetime import timedelta
+
+    now = _az_now()
+    assert now.tzinfo is not None
+    assert now.utcoffset() == timedelta(hours=-7)
+
+
+# ── _infer_brand_from_title ─────────────────────────────────────────────────────
+
+def test_infer_brand_pure():
+    assert _infer_brand_from_title("F3 Pure Variety Pack") == "Pure"
+
+
+def test_infer_brand_mood():
+    assert _infer_brand_from_title("F3 Mood 12-Pack") == "Mood"
+
+
+def test_infer_brand_energy_default():
+    assert _infer_brand_from_title("F3 Energy 24-Pack") == "Energy"
+    # Anything that isn't Pure/Mood falls back to Energy
+    assert _infer_brand_from_title("Mystery Beverage") == "Energy"
+
+
+def test_infer_brand_case_insensitive():
+    assert _infer_brand_from_title("f3 PURE single") == "Pure"
+    assert _infer_brand_from_title("F3 mOOd") == "Mood"
+
+
+# ── _get_locations ──────────────────────────────────────────────────────────────
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_locations_filters_and_lowercases(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {
+        "locations": [
+            {"id": 1, "name": "Nimbl 3PL", "active": True},
+            {"id": 2, "name": "Warehouse", "active": True},
+            {"id": 3, "name": "Closed Spot", "active": False},   # inactive -> dropped
+            {"id": 4, "name": "", "active": True},                # no name -> dropped
+            {"name": "No ID", "active": True},                    # no id -> dropped
+        ]
+    })
+    result = _get_locations()
+    assert result == {"nimbl 3pl": 1, "warehouse": 2}
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_locations_cached(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {"locations": [
+        {"id": 1, "name": "Nimbl", "active": True},
+    ]})
+    _get_locations()
+    _get_locations()
+    assert mock_get.call_count == 1  # second call served from cache
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_locations_auth_error(mock_get, env_vars):
+    mock_get.return_value = _make_resp(401, text="unauthorized")
+    with pytest.raises(ShopifyConnectorError, match="401"):
+        _get_locations()
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_locations_http_error(mock_get, env_vars):
+    mock_get.return_value = _make_resp(500, text="boom")
+    with pytest.raises(ShopifyConnectorError, match="500"):
+        _get_locations()
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_locations_network_error(mock_get, env_vars):
+    import requests
+    mock_get.side_effect = requests.exceptions.RequestException("conn reset")
+    with pytest.raises(ShopifyConnectorError, match="Network error"):
+        _get_locations()
+
+
+def test_get_locations_config_error(monkeypatch):
+    monkeypatch.delenv("SHOPIFY_F3E_STORE", raising=False)
+    monkeypatch.delenv("SHOPIFY_F3E_ACCESS_TOKEN", raising=False)
+    with pytest.raises(ShopifyConfigError):
+        _get_locations()
+
+
+# ── get_inventory_by_location ───────────────────────────────────────────────────
+
+_INV_LEVELS = [
+    {"inventory_item_id": 111, "available": 5},
+    {"inventory_item_id": 222, "available": 80},
+    {"inventory_item_id": 333, "available": 0},
+]
+
+_PRODUCTS = [
+    {"id": 1, "title": "F3 Energy 12-Pack", "variants": [
+        {"inventory_item_id": 111, "sku": "EN12", "title": "Default Title"},
+    ]},
+    {"id": 2, "title": "F3 Pure", "variants": [
+        {"inventory_item_id": 222, "sku": "PU24", "title": "24-Pack"},
+    ]},
+    {"id": 3, "title": "F3 Mood", "variants": [
+        {"inventory_item_id": 333, "sku": "MO12", "title": "Default Title"},
+    ]},
+]
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_exact_match(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 999}
+    mock_paginate.side_effect = [_INV_LEVELS, _PRODUCTS]
+    skus = get_inventory_by_location("nimbl")
+    # sorted by product_title
+    titles = [s.product_title for s in skus]
+    assert titles == ["F3 Energy 12-Pack", "F3 Mood", "F3 Pure - 24-Pack"]
+    by_sku = {s.sku: s.available for s in skus}
+    assert by_sku == {"EN12": 5, "PU24": 80, "MO12": 0}
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_partial_match(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl 3pl warehouse": 999}
+    mock_paginate.side_effect = [_INV_LEVELS, _PRODUCTS]
+    skus = get_inventory_by_location("nimbl")  # partial substring match
+    assert len(skus) == 3
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_brand_filter(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 999}
+    mock_paginate.side_effect = [_INV_LEVELS, _PRODUCTS]
+    skus = get_inventory_by_location("nimbl", brand="Pure")
+    assert len(skus) == 1
+    assert skus[0].sku == "PU24"
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_not_found(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 1, "warehouse": 2}
+    with pytest.raises(ShopifyConnectorError, match="not found"):
+        get_inventory_by_location("atlantis")
+    mock_paginate.assert_not_called()
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_ambiguous(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"east warehouse": 1, "west warehouse": 2}
+    with pytest.raises(ShopifyConnectorError, match="ambiguous"):
+        get_inventory_by_location("warehouse")
+    mock_paginate.assert_not_called()
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_empty_levels(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 999}
+    mock_paginate.side_effect = [[], _PRODUCTS]  # no inventory levels
+    skus = get_inventory_by_location("nimbl")
+    assert skus == []
+    # products are never fetched when there are no levels
+    assert mock_paginate.call_count == 1
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_skips_unmapped_item(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 999}
+    # level for item 444 has no matching product variant -> skipped
+    mock_paginate.side_effect = [
+        [{"inventory_item_id": 444, "available": 9}, {"inventory_item_id": 111, "available": 5}],
+        _PRODUCTS,
+    ]
+    skus = get_inventory_by_location("nimbl")
+    assert [s.sku for s in skus] == ["EN12"]
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+@patch("cora.connectors.shopify_client._get_locations")
+def test_get_inventory_by_location_cached(mock_locs, mock_paginate, env_vars):
+    mock_locs.return_value = {"nimbl": 999}
+    mock_paginate.side_effect = [_INV_LEVELS, _PRODUCTS]
+    get_inventory_by_location("nimbl")
+    get_inventory_by_location("nimbl")
+    # two paginated calls total (levels + products), not four
+    assert mock_paginate.call_count == 2
+
+
+def test_get_inventory_by_location_config_error(monkeypatch):
+    monkeypatch.delenv("SHOPIFY_F3E_STORE", raising=False)
+    monkeypatch.delenv("SHOPIFY_F3E_ACCESS_TOKEN", raising=False)
+    with pytest.raises(ShopifyConfigError):
+        get_inventory_by_location("nimbl")
+
+
+# ── format_location_inventory_for_llm ───────────────────────────────────────────
+
+def test_format_location_inventory_empty():
+    text = format_location_inventory_for_llm([], "nimbl")
+    assert "No stock on hand" in text
+    assert "Nimbl" in text
+
+
+def test_format_location_inventory_single_brand_label():
+    skus = [LocationSKU(product_title="F3 Pure", sku="PU24", available=80)]
+    text = format_location_inventory_for_llm(skus, "nimbl", brand="pure")
+    assert "F3 Pure inventory at Nimbl" in text
+    # single-brand view does not print a per-brand header
+    assert "*F3 Pure*\n" not in text
+
+
+def test_format_location_inventory_multi_brand_grouping():
+    skus = [
+        LocationSKU(product_title="F3 Energy 12-Pack", sku="EN12", available=100),
+        LocationSKU(product_title="F3 Pure", sku="PU24", available=80),
+    ]
+    text = format_location_inventory_for_llm(skus, "nimbl")
+    assert "F3E inventory at Nimbl" in text
+    assert "*F3 Energy*" in text
+    assert "*F3 Pure*" in text
+    # Energy is rendered before Pure
+    assert text.index("*F3 Energy*") < text.index("*F3 Pure*")
+
+
+def test_format_location_inventory_flag_thresholds():
+    skus = [
+        LocationSKU(product_title="F3 Energy Critical", sku="A", available=5),    # <=10 -> alarm
+        LocationSKU(product_title="F3 Energy Warn", sku="B", available=40),       # <=50 -> warn
+        LocationSKU(product_title="F3 Energy Healthy", sku="C", available=200),   # >50 -> ok
+    ]
+    text = format_location_inventory_for_llm(skus, "nimbl", brand="energy")
+    assert "\U0001f6a8" in text   # 🚨
+    assert "⚠️" in text  # ⚠️
+    assert "✅" in text        # ✅
+
+
+def test_format_location_inventory_quantity_comma_formatted():
+    skus = [LocationSKU(product_title="F3 Energy", sku="A", available=12345)]
+    text = format_location_inventory_for_llm(skus, "nimbl", brand="energy")
+    assert "12,345" in text
+
+
+# ── graphql ─────────────────────────────────────────────────────────────────────
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_graphql_success(mock_post, env_vars):
+    mock_post.return_value = _make_resp(200, {"data": {"shop": {"name": "F3"}}})
+    body = graphql("query { shop { name } }", {})
+    assert body["data"]["shop"]["name"] == "F3"
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_graphql_body_errors_raise(mock_post, env_vars):
+    mock_post.return_value = _make_resp(200, {
+        "errors": [{"message": "Field 'bogus' doesn't exist"}]
+    })
+    with pytest.raises(ShopifyConnectorError, match="bogus"):
+        graphql("query { bogus }", {})
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_graphql_auth_error(mock_post, env_vars):
+    mock_post.return_value = _make_resp(401, text="unauthorized")
+    with pytest.raises(ShopifyConnectorError, match="401"):
+        graphql("query { shop { name } }", {})
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_graphql_http_error(mock_post, env_vars):
+    mock_post.return_value = _make_resp(500, text="server error")
+    with pytest.raises(ShopifyConnectorError, match="500"):
+        graphql("query { shop { name } }", {})
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_graphql_network_error(mock_post, env_vars):
+    import requests
+    mock_post.side_effect = requests.exceptions.RequestException("timeout")
+    with pytest.raises(ShopifyConnectorError, match="network error"):
+        graphql("query { shop { name } }", {})
+
+
+def test_graphql_config_error(monkeypatch):
+    monkeypatch.delenv("SHOPIFY_F3E_STORE", raising=False)
+    monkeypatch.delenv("SHOPIFY_F3E_ACCESS_TOKEN", raising=False)
+    with pytest.raises(ShopifyConfigError):
+        graphql("query { shop { name } }", {})
