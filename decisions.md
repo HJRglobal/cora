@@ -351,3 +351,42 @@ quotes, fix with binary byte replacement:
 raw = raw.replace(b"\xe2\x80\x9c", b'"').replace(b"\xe2\x80\x9d", b'"')
 ```
 Companion to D-016 (PS1 ASCII-only).
+
+---
+
+## D-023 · influencer_complete_deliverable: no staged-write gate (2026-06-03)
+
+**Context:** All other Cora write tools require a preview block + confirmed=True
+before executing. The new influencer_complete_deliverable tool marks a deliverable
+done when Alex types "@Cora complete deliverable [ID]".
+
+**Decision:** No confirm gate on this tool. Alex's explicit typed command (or a
+thumbs-up reaction on a detection proposal) is unambiguous intent -- the extra
+round-trip adds friction with no safety benefit for a one-shot close-out action.
+
+**Contrast with other writes:** asana_create_task / gmail_create_draft / etc. have
+ambiguous parameters (title, assignee, dates) where a preview catches mistakes.
+"Complete #5" has no parameters to misread.
+
+---
+
+## D-024 · Influencer monthly deliverables: auto-generated 1st of month (2026-06-03)
+
+**Context:** 57 F3 sponsored fighters each owe 3 deliverables/month (2 IG stories +
+1 IG post, tagging @f3energy + #DrinkF3, due last day of month).
+
+**Decision:** cowork-cora-monthly-deliverables Task Scheduler task fires at 9 AM
+AZ on the 1st of every month, running scripts/generate_monthly_deliverables.py.
+Creates 3 rows per active fighter in influencer_deliverables (campaign_month +
+requirements columns added in schema migration). Posts confirmation to #f3-athletes.
+
+**Source of truth:** SQLite (influencer_tracker.db) only. No HubSpot involvement.
+Fighter roster seeded 2026-06-03 from Google Sheet
+1oFmiSVbPMLOMdpjsUBOG_SGp00a9xzTrUCVNuyb0_kA via scripts/seed_fighters.py
+(idempotent -- safe to re-run).
+
+**Fighters excluded from roster (not seeded):**
+- Malik Besseck -- no IG on file
+- Jovan Ravago -- TikTok only (not yet monitored)
+- Louie Lopez / Taquel Young -- dates in handle column, not handles
+- Gym accounts (Betweenrounds, MMAelite, MMALAB) -- not individual fighters
