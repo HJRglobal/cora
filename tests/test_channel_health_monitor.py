@@ -127,7 +127,7 @@ def test_run_dry_run_no_post(monkeypatch):
 
     with patch.object(chm, "list_joined_channels", return_value=channels), \
          patch.object(chm, "_check_channel_activity", return_value=True), \
-         patch("run_channel_health_monitor.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = MagicMock()
         mock_wc.return_value = client
         result = chm.run(dry_run=True)
@@ -142,7 +142,7 @@ def test_run_posts_to_hjrg_leadership(monkeypatch):
 
     with patch.object(chm, "list_joined_channels", return_value=channels), \
          patch.object(chm, "_check_channel_activity", return_value=True), \
-         patch("run_channel_health_monitor.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = MagicMock()
         mock_wc.return_value = client
         chm.run(dry_run=False)
@@ -158,7 +158,7 @@ def test_run_detects_dead_channel(monkeypatch):
 
     with patch.object(chm, "list_joined_channels", return_value=channels), \
          patch.object(chm, "_check_channel_activity", return_value=False), \
-         patch("run_channel_health_monitor.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = MagicMock()
         result = chm.run(dry_run=True)
 
@@ -171,7 +171,7 @@ def test_run_detects_unmapped_channel(monkeypatch):
 
     with patch.object(chm, "list_joined_channels", return_value=channels), \
          patch.object(chm, "_check_channel_activity", return_value=True), \
-         patch("run_channel_health_monitor.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = MagicMock()
         result = chm.run(dry_run=True)
 
@@ -188,7 +188,7 @@ def test_run_skips_dm_channels(monkeypatch):
 
     with patch.object(chm, "list_joined_channels", return_value=channels), \
          patch.object(chm, "_check_channel_activity", return_value=True), \
-         patch("run_channel_health_monitor.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = MagicMock()
         result = chm.run(dry_run=True)
 
@@ -201,7 +201,7 @@ def test_run_handles_list_channels_error(monkeypatch):
     from cora.connectors.slack_connector import SlackConnectorError
 
     with patch.object(chm, "list_joined_channels", side_effect=SlackConnectorError("fail")), \
-         patch("run_channel_health_monitor.WebClient"):
+         patch("slack_sdk.WebClient"):
         result = chm.run(dry_run=True)
 
     assert result == {"channels_checked": 0, "dead": 0, "missing": 0}

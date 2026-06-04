@@ -209,7 +209,7 @@ def _mock_slack_client():
 def test_run_dry_run_no_dm_sent():
     mock_summary = _make_mock_summary()
     with patch.object(pulse, "get_cashflow", return_value=mock_summary), \
-         patch("run_cashflow_pulse.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = _mock_slack_client()
         result = pulse.run(dry_run=True)
     # dry_run=True -- conversations_open should NOT be called
@@ -220,7 +220,7 @@ def test_run_dry_run_no_dm_sent():
 def test_run_sends_dm_when_not_dry_run():
     mock_summary = _make_mock_summary()
     with patch.object(pulse, "get_cashflow", return_value=mock_summary), \
-         patch("run_cashflow_pulse.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack_client()
         mock_wc.return_value = client
         result = pulse.run(dry_run=False)
@@ -231,7 +231,7 @@ def test_run_sends_dm_when_not_dry_run():
 def test_run_all_fail_skips_dm():
     from cora.connectors.gsheets_financials import GsheetsConnectorError
     with patch.object(pulse, "get_cashflow", side_effect=GsheetsConnectorError("x")), \
-         patch("run_cashflow_pulse.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack_client()
         mock_wc.return_value = client
         result = pulse.run(dry_run=False)
@@ -248,7 +248,7 @@ def test_run_no_token_returns_early(monkeypatch):
 def test_run_returns_correct_counts():
     mock_summary = _make_mock_summary(closing_balance=1_000_000.0)
     with patch.object(pulse, "get_cashflow", return_value=mock_summary), \
-         patch("run_cashflow_pulse.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = _mock_slack_client()
         result = pulse.run(dry_run=True)
     assert result["entities_fetched"] == len(pulse.PULSE_ENTITIES)
@@ -266,7 +266,7 @@ def test_run_flagged_count():
         portfolio_forecast=-40_000.0,
     )
     with patch.object(pulse, "get_cashflow", return_value=low_balance_summary), \
-         patch("run_cashflow_pulse.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = _mock_slack_client()
         result = pulse.run(dry_run=True)
     assert result["flagged"] == len(pulse.PULSE_ENTITIES)

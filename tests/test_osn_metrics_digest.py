@@ -190,7 +190,7 @@ def test_run_dry_run_no_dm_sent(monkeypatch):
     stores = _make_four_stores()
 
     with patch.object(osn, "get_all_stores_sales_pulse", return_value=stores), \
-         patch("run_osn_metrics_digest.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
         osn.run(dry_run=True)
@@ -203,7 +203,7 @@ def test_run_sends_dm_to_matt(monkeypatch):
     stores = _make_four_stores()
 
     with patch.object(osn, "get_all_stores_sales_pulse", return_value=stores), \
-         patch("run_osn_metrics_digest.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
         result = osn.run(dry_run=False)
@@ -216,7 +216,7 @@ def test_run_no_stores_skips_dm(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
 
     with patch.object(osn, "get_all_stores_sales_pulse", return_value=[]), \
-         patch("run_osn_metrics_digest.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
         result = osn.run(dry_run=False)
@@ -229,7 +229,7 @@ def test_run_clover_error(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
 
     with patch.object(osn, "get_all_stores_sales_pulse", side_effect=osn.CloverConnectorError("fail")), \
-         patch("run_osn_metrics_digest.WebClient") as mock_wc:
+         patch("slack_sdk.WebClient") as mock_wc:
         mock_wc.return_value = _mock_slack()
         result = osn.run(dry_run=False)
 

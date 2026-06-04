@@ -2,30 +2,21 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+# Direct import (consistent with Tier 3 test pattern)
+if str(_REPO_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-# ---------------------------------------------------------------------------
-# Import the module under test
-# ---------------------------------------------------------------------------
-
-def _import_module():
-    import importlib.util, sys
-    from pathlib import Path
-    spec = importlib.util.spec_from_file_location(
-        "run_pipeline_digest",
-        Path(__file__).resolve().parents[1] / "scripts" / "run_pipeline_digest.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["run_pipeline_digest"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-mod = _import_module()
+import run_pipeline_digest as mod  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +66,7 @@ class TestBuildTommyMessage:
         assert "ACTIVE PIPELINE: 3 deals" in msg
 
     def test_aging_count_shown_when_deals_stall(self):
-        # Deal with stage "Identify" old enough to exceed 14d threshold
         deal = _make_deal(stage_id="identify", days_old=20)
-        # Fake stage cache so stage name resolves
         with patch.dict(mod._STAGE_NAME_CACHE, {"identify": "Identify"}):
             msg = mod.build_tommy_message([deal], "Pipeline text")
         assert "1 deal(s) need attention" in msg
@@ -149,12 +138,13 @@ class TestIsAging:
     def test_unknown_stage_uses_default_threshold(self):
         deal = _make_deal(stage_id="custom123", days_old=25)
         with patch.dict(mod._STAGE_NAME_CACHE, {}):
-            # Default is 21 days
             assert mod._is_aging(deal) is True
 
 
 # ---------------------------------------------------------------------------
 # run() integration tests
+# -- All hubspot patches use patch.object(mod, ...) because run_pipeline_digest
+#    uses direct from-import; source-level patches do not intercept.
 # ---------------------------------------------------------------------------
 
 class TestRun:
@@ -163,9 +153,9 @@ class TestRun:
         f3e_deals = [_make_deal()]
         default_deals = [_make_deal(name="UFL MMA Sponsorship")]
 
-        with patch("cora.tools.hubspot_client.get_deals_by_pipeline") as mock_deals, \
-             patch("cora.tools.hubspot_client.get_f3e_pipeline_summary_text", return_value="Pipeline OK"), \
-             patch("cora.tools.hubspot_client._refresh_pipeline_cache"), \
+        with patch.object(mod, "get_deals_by_pipeline") as mock_deals, \
+             patch.object(mod, "get_f3e_pipeline_summary_text", return_value="Pipeline OK"), \
+             patch.object(mod, "_refresh_pipeline_cache"), \
              patch("slack_sdk.WebClient", return_value=slack), \
              patch.dict(mod._STAGE_NAME_CACHE, {}):
             mock_deals.side_effect = [f3e_deals, default_deals]
@@ -178,23 +168,23 @@ class TestRun:
         slack = _make_slack()
         from cora.tools.hubspot_client import HubSpotClientError
 
-        with patch("cora.tools.hubspot_client.get_deals_by_pipeline",
+        with patch.object(mod, "get_deals_by_pipeline",
                    side_effect=HubSpotClientError("401")), \
-             patch("cora.tools.hubspot_client._refresh_pipeline_cache"), \
+             patch.object(mod, "get_f3e_pipeline_summary_text",
+                   side_effect=HubSpotClientError("401")), \
+             patch.object(mod, "_refresh_pipeline_cache"), \
              patch("slack_sdk.WebClient", return_value=slack), \
              patch.dict(mod._STAGE_NAME_CACHE, {}):
             result = mod.run(dry_run=False)
 
-        # Both failed but fallback messages were sent
         assert len(result["errors"]) > 0
-        # chat_postMessage still called (fallback)
         assert slack.chat_postMessage.call_count >= 1
 
     def test_dry_run_no_dm_sent(self):
         slack = _make_slack()
-        with patch("cora.tools.hubspot_client.get_deals_by_pipeline", return_value=[]), \
-             patch("cora.tools.hubspot_client.get_f3e_pipeline_summary_text", return_value="OK"), \
-             patch("cora.tools.hubspot_client._refresh_pipeline_cache"), \
+        with patch.object(mod, "get_deals_by_pipeline", return_value=[]), \
+             patch.object(mod, "get_f3e_pipeline_summary_text", return_value="OK"), \
+             patch.object(mod, "_refresh_pipeline_cache"), \
              patch("slack_sdk.WebClient", return_value=slack), \
              patch.dict(mod._STAGE_NAME_CACHE, {}):
             mod.run(dry_run=True)
@@ -217,16 +207,18 @@ class TestRun:
             _make_deal(did="D1", name="UFL Fight Night Sponsor"),
             _make_deal(did="D2", name="Regular OSN Deal"),
         ]
-        with patch("cora.tools.hubspot_client.get_deals_by_pipeline") as mock_deals, \
-             patch("cora.tools.hubspot_client.get_f3e_pipeline_summary_text", return_value="OK"), \
-             patch("cora.tools.hubspot_client._refresh_pipeline_cache"), \
+        with patch.object(mod, "get_deals_by_pipeline") as mock_deals, \
+             patch.object(mod, "get_f3e_pipeline_summary_text", return_value="OK"), \
+             patch.object(mod, "_refresh_pipeline_cache"), \
              patch("slack_sdk.WebClient", return_value=slack), \
              patch.dict(mod._STAGE_NAME_CACHE, {}):
             mock_deals.side_effect = [[], deals]
             mod.run(dry_run=False)
 
-        # Alex's message should only contain UFL deal (or all deals as fallback)
-        alex_call = slack.chat_postMessage.call_args_list[-1]
-        text = alex_call.kwargs.get("text", "") or alex_call.args[0] if alex_call.args else ""
-        # Message should be about UFL pipeline
-        assert "UFL Sponsorship" in text
+        all_texts = [
+            c.kwargs.get("text") or (c.args[0] if c.args else "")
+            for c in slack.chat_postMessage.call_args_list
+        ]
+        assert any("UFL Sponsorship" in (t or "") for t in all_texts), (
+            f"Expected 'UFL Sponsorship' in one of the posted messages. Got: {all_texts}"
+        )

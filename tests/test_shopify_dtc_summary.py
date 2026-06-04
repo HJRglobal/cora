@@ -50,7 +50,7 @@ def _make_sales_summary(
         refunds_usd=5.0,
         net_revenue_usd=net_revenue,
         avg_order_value_usd=aov,
-        top_products=[TopProduct(title=top_product_title, quantity_sold=top_product_qty, sku="SKU1")]
+        top_products=[TopProduct(title=top_product_title, quantity_sold=top_product_qty, revenue_usd=50.0)]
         if top_product_title else [],
     )
 

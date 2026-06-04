@@ -3,31 +3,21 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 import pytest
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+# Add scripts/ and src/ to sys.path for direct import (consistent with Tier 3 test pattern)
+if str(_REPO_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-# ---------------------------------------------------------------------------
-# Import helpers
-# ---------------------------------------------------------------------------
-
-def _import_module():
-    import importlib.util, sys
-    from pathlib import Path
-    spec = importlib.util.spec_from_file_location(
-        "run_due_date_escalation",
-        Path(__file__).resolve().parents[1] / "scripts" / "run_due_date_escalation.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["run_due_date_escalation"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-mod = _import_module()
+import run_due_date_escalation as mod  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +106,7 @@ class TestThrottle:
 
 # ---------------------------------------------------------------------------
 # run_pass1_due_tasks tests
+# -- patch.object(mod, "get_user_tasks") because mod uses direct from-import
 # ---------------------------------------------------------------------------
 
 class TestPass1:
@@ -128,7 +119,7 @@ class TestPass1:
         users = [_make_user(slack_id="U001", asana_gid="G001")]
         t = throttle or {}
 
-        with patch("cora.tools.asana_client.get_user_tasks", return_value=user_tasks):
+        with patch.object(mod, "get_user_tasks", return_value=user_tasks):
             stats = mod.run_pass1_due_tasks(slack, users, t, now, dry_run)
         return slack, stats, t
 
@@ -162,14 +153,14 @@ class TestPass1:
         from cora.tools.asana_client import AsanaClientError
         slack = _make_slack()
         users = [_make_user()]
-        with patch("cora.tools.asana_client.get_user_tasks", side_effect=AsanaClientError("401")):
+        with patch.object(mod, "get_user_tasks", side_effect=AsanaClientError("401")):
             stats = mod.run_pass1_due_tasks(slack, users, {}, _az_now(), False)
         assert stats["errors"] == 1
 
     def test_user_without_gid_skipped(self):
         slack = _make_slack()
         users = [{"slack_user_id": "U001", "display_name": "No GID"}]
-        with patch("cora.tools.asana_client.get_user_tasks") as mock_get:
+        with patch.object(mod, "get_user_tasks") as mock_get:
             mod.run_pass1_due_tasks(slack, users, {}, _az_now(), False)
         mock_get.assert_not_called()
 
@@ -184,7 +175,7 @@ class TestPass1:
         now = _az_now()
         today = now.strftime("%Y-%m-%d")
         users = [_make_user()]
-        with patch("cora.tools.asana_client.get_user_tasks", return_value=[_make_task(due_on=today)]):
+        with patch.object(mod, "get_user_tasks", return_value=[_make_task(due_on=today)]):
             # Should not raise
             stats = mod.run_pass1_due_tasks(slack, users, {}, now, False)
         assert stats["alerted"] == 0
@@ -195,7 +186,7 @@ class TestPass1:
         today = now.strftime("%Y-%m-%d")
         users = [_make_user()]
         task = _make_task(name="Review OSN P&L", due_on=today)
-        with patch("cora.tools.asana_client.get_user_tasks", return_value=[task]):
+        with patch.object(mod, "get_user_tasks", return_value=[task]):
             mod.run_pass1_due_tasks(slack, users, {}, now, False)
         text = slack.chat_postMessage.call_args.kwargs["text"]
         assert "Review OSN P&L" in text
@@ -205,7 +196,7 @@ class TestPass1:
         now = _az_now()
         today = now.strftime("%Y-%m-%d")
         users = [_make_user()]
-        with patch("cora.tools.asana_client.get_user_tasks", return_value=[_make_task(due_on=today)]):
+        with patch.object(mod, "get_user_tasks", return_value=[_make_task(due_on=today)]):
             mod.run_pass1_due_tasks(slack, users, {}, now, False)
         text = slack.chat_postMessage.call_args.kwargs["text"]
         assert today in text
