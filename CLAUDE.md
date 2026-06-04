@@ -32,7 +32,7 @@ Scheduled tasks (all registered, all smoke-tested):
 
 | Task | Schedule | Script |
 |---|---|---|
-| cowork-cora-influencer-scan | Every 2h | scripts/run_influencer_scan.py |
+| cowork-cora-influencer-scan | 7 AM + 7 PM daily | scripts/run_influencer_scan.py |
 | cowork-cora-monthly-deliverables | 1st of month, 9 AM AZ | scripts/generate_monthly_deliverables.py |
 | cowork-cora-influencer-overdue-alerts | Daily 9 AM | scripts/run_influencer_overdue_alerts.py |
 | cowork-cora-influencer-digest | Monday 8 AM | scripts/run_influencer_digest.py |
@@ -188,7 +188,7 @@ deployment/
 | cowork-cora-knowledge-review | Mon-Fri 07:00 AZ | run_knowledge_review.py |
 | cowork-cora-daily-briefing | Daily (see PS1) | run_daily_briefing.py |
 | cowork-cora-backup | Daily 04:30 AZ | backup_logs.py |
-| cowork-cora-influencer-scan | Every 2h | run_influencer_scan.py |
+| cowork-cora-influencer-scan | 7 AM + 7 PM daily | run_influencer_scan.py |
 | cowork-cora-influencer-digest | Monday 08:00 AZ | run_influencer_digest.py |
 | cowork-cora-influencer-overdue-alerts | Daily 09:00 AZ | run_influencer_overdue_alerts.py |
 | cowork-cora-monthly-deliverables | 1st of month 09:00 AZ | generate_monthly_deliverables.py |
