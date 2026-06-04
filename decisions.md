@@ -419,3 +419,45 @@ removes ambiguity about who posted.
 stays active as a monitoring signal -- useful for brand awareness tracking and
 catching posts Cora can flag for Alex to manually review -- but it does not
 auto-complete deliverables.
+
+
+---
+
+## D-023 · QBO is the primary financial data source for all accounting questions (2026-06-04)
+
+**Context:** Cora was returning UNKNOWN_RESPONSE to "Q1 LLC revenue" in #lex-finance.
+Root cause: all entity system prompts had a single MANDATORY directive routing ALL financial
+questions to `financial_get_cashflow` (Google Sheets weekly cash flow). That tool reads the
+13-week rolling forecast spreadsheet -- it cannot answer P&L or revenue questions. QBO tokens
+were fully valid (all 11 entities, 100 days remaining) but the prompts never directed Claude
+to use QBO tools.
+
+Secondary cause: `financial_get_close_pack` tool description included "balance sheet for Q1"
+as a trigger example, causing Claude to match "Q1 LLC revenue" to the wrong tool. And
+`qbo_get_profit_loss` had no quarterly examples and no signal that it handles date ranges.
+
+**Decisions LOCKED:**
+
+1. **QBO is the primary source for all accounting questions** -- P&L, revenue, income,
+   expenses, quarterly results, balance sheet, AR aging, AP aging, recent transactions.
+   `qbo_get_profit_loss` is called FIRST. QBO tokens refresh daily (task: cowork-cora-qbo-token-refresh, 2am AZ).
+
+2. **Google Sheets is supplemental** -- for weekly cash flow forecast (13-week rolling),
+   monthly close pack files Hayden/Justin file in Drive. Never the first call for P&L.
+
+3. **Tool description hierarchy** -- `qbo_get_profit_loss` description now explicitly says
+   "THIS IS THE PRIMARY TOOL FOR ALL REVENUE, P&L, AND INCOME QUESTIONS" and includes
+   explicit Q1/quarterly examples with pre-resolved date ranges
+   (Q1 = '2026-01-01 to 2026-03-31', etc.).
+
+4. **`financial_get_close_pack` scoped to archived Drive files only** -- description now
+   says "USE THIS ONLY AS A FALLBACK when qbo_get_profit_loss returns no data" and
+   explicitly excludes Q1/quarterly queries.
+
+5. **Financial routing table applied across all 14 entity prompts** (commit 7f4e243):
+   lex.md, llc.md, lts.md, lbhs.md, lla.md, f3e.md, fndr.md, bdm.md,
+   osn.md, osngf.md, osngm.md, osngw.md, osnvv.md, hjrp.md.
+
+**Provisioned QBO entities (as of 2026-06-04):**
+BDM, F3E, HJRG, HJRP, HRLLC, LEX, OSN, OSNGF, OSNGM, OSNGW, OSNVV
+(11 entities, all refreshed today, 100 days remaining on tokens)
