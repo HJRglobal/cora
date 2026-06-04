@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
 from ..connectors import clover_client, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
@@ -2331,6 +2331,23 @@ def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     return result
 
 
+def _tool_hjrp_lease_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return the HJRP lease register: renewal countdowns, clusters, vacancies, brokers.
+
+    Lease economics (monthly rent, rent-at-risk) are financial -> gated to HJRP
+    (or founder) entities AND TIER_1 channels (#hjrp-finance / #hjrp-leadership).
+    Mirrors the financial-tool gating pattern; the system prompt also restricts it.
+    """
+    entity_upper = (entity or "").upper()
+    if not (entity_upper.startswith("HJRP") or entity_upper in ("FNDR", "HJRG")):
+        return "Lease details are scoped to HJR Properties channels."
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _FINANCE_CHANNEL_REQUIRED
+    log.info("hjrp_lease_status user=%s entity=%s", slack_user_id, entity)
+    return hjrp_client.get_lease_status()
+
+
 def _tool_hubspot_update_deal_stage(slack_user_id: str, entity: str, _input: dict) -> str:
     """Update a HubSpot deal's pipeline stage. Staged-write tool.
 
@@ -3164,15 +3181,20 @@ TOOL_DEFINITIONS = [
         "name": "qbo_get_profit_loss",
         "description": (
             "Fetch a QuickBooks Online Profit & Loss summary for a portfolio entity over "
-            "a date range. Use this when a user in a TIER_1 channel (any #*-finance, "
-            "#*-leadership, #hjrg-*, or #fndr-* channel) asks about revenue, expenses, "
-            "profitability, margin, or P&L performance — phrases like 'what's our P&L', "
-            "'how much did we make last month', 'what's revenue YTD', 'profit this month'. "
+            "a date range. THIS IS THE PRIMARY TOOL FOR ALL REVENUE, P&L, AND INCOME QUESTIONS. "
+            "Use this when a user asks about revenue, income, expenses, profitability, margin, "
+            "or P&L performance for any time period -- phrases like: "
+            "'Q1 revenue', 'Q1 LLC revenue', 'what was revenue in Q1', 'Q1 P&L', "
+            "'how much did we make last month', 'what is revenue YTD', 'profit this month', "
+            "'show me the P&L', 'how did we do in January', 'quarterly results'. "
+            "For quarterly questions: Q1 = '2026-01-01 to 2026-03-31', Q2 = '2026-04-01 to 2026-06-30', "
+            "Q3 = '2026-07-01 to 2026-09-30', Q4 = '2026-10-01 to 2026-12-31'. "
             "Returns top-line section totals (Income, COGS, Net Income) plus a clickable "
             "QBO deep link to the full report. The tool defaults to the channel's entity, "
             "but the `entity` parameter can override (use it in FNDR/HJRG channels where "
             "the user names a specific entity). The `period` parameter controls the date "
-            "range — defaults to last_30_days. Refuse and don't call this tool in TIER_3 "
+            "range -- defaults to last_30_days. CALL THIS BEFORE financial_get_close_pack "
+            "for any revenue or P&L question. Refuse and don't call this tool in TIER_3 "
             "channels per the financial guardrail."
         ),
         "input_schema": {
@@ -3649,18 +3671,19 @@ TOOL_DEFINITIONS = [
     {
         "name": "financial_get_close_pack",
         "description": (
-            "Read a monthly close pack report (P&L, Balance Sheet, Cash Flow, AR aging, "
+            "Read a monthly close pack REPORT FILE (P&L, Balance Sheet, Cash Flow, AR aging, "
             "or AP aging) for an entity from the Drive monthly-reports folder. "
-            "Use this when a user in a *-finance channel asks about a specific month's "
-            "financials -- phrases like 'show me the April P&L', 'what was net income in "
-            "March', 'balance sheet for Q1', 'AR aging for February', 'what's on the "
-            "balance sheet', 'how was cash flow last month', 'what do we owe (AP)'. "
+            "USE THIS ONLY AS A FALLBACK when qbo_get_profit_loss returns no data -- "
+            "this tool reads archived Excel report files that Hayden/Justin file in Drive "
+            "each month. It does NOT query live QuickBooks data. "
+            "Use for: 'show me the filed April close pack', 'get the March report from Drive', "
+            "'what did Hayden file for February', 'the monthly report for March', "
+            "'AR aging report for February', 'what do we owe (AP) per the close pack'. "
+            "DO NOT use for: 'Q1 revenue', quarterly results, or any live accounting question "
+            "-- use qbo_get_profit_loss instead. "
             "Reports cover all portfolio entities. Files are named {YYYY-MM}_{entity}_{type}.xlsx. "
-            "FINANCE CHANNEL ONLY: returns an access-denied message in any non-finance channel. "
-            "If the report is not found, returns the standard UNKNOWN_RESPONSE and Cora notifies "
-            "the finance channel. "
-            "When the user says 'last month', resolve to the prior calendar month (e.g. if today "
-            "is May, last month = April = '2026-04'). Default doctype is 'pl' if not specified."
+            "FINANCE CHANNEL ONLY. If the report file is not found in Drive, returns UNKNOWN_RESPONSE. "
+            "When the user says 'last month', resolve to the prior calendar month. Default doctype pl."
         ),
         "input_schema": {
             "type": "object",
@@ -4124,6 +4147,33 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "hjrp_lease_status",
+        "description": (
+            "Return the HJR Properties lease register for both buildings — North "
+            "Hampton (1337 S Gilbert) and South Hampton (1555 S Gilbert). For each "
+            "tenant it returns the lease-end date, days-to-expiry, status, plus the "
+            "upcoming renewal cluster(s) with monthly rent at risk, upcoming "
+            "vacancies, and broker contacts. ALWAYS call this tool when a user asks "
+            "about HJRP leases, lease renewals, when a tenant's lease expires, which "
+            "leases are coming up, the October 2026 cluster, rent at risk, upcoming "
+            "vacancies, or relist status. Do NOT answer from KB memory — present the "
+            "tool output as-is without truncating or summarizing.\n"
+            "\n"
+            "Trigger phrases: 'lease status', 'lease renewals', 'which leases expire', "
+            "'when does <tenant>'s lease end', 'October 2026 cluster', 'rent at risk', "
+            "'upcoming vacancies', 'what's expiring', 'lease register', 'renewal timeline'.\n"
+            "\n"
+            "Scope: HJRP / HJRP-* channels and FNDR/HJRG. Lease economics are financial "
+            "— TIER_1 channels only (#hjrp-finance, #hjrp-leadership). In TIER_3 HJRP "
+            "channels, do NOT call this tool; the financial guardrail applies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     # --- HubSpot two-way write tools ---
     {
         "name": "hubspot_update_deal_stage",
@@ -4270,6 +4320,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
     "lex_staff_pulse": _tool_lex_staff_pulse,
+    # HJRP tools
+    "hjrp_lease_status": _tool_hjrp_lease_status,
     # HubSpot two-way write tools
     "hubspot_update_deal_stage": _tool_hubspot_update_deal_stage,
     "hubspot_add_note": _tool_hubspot_add_note,
