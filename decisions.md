@@ -1,4 +1,4 @@
-# Cora — Architecture Decision Log
+﻿# Cora — Architecture Decision Log
 
 Decisions recorded here are permanent unless explicitly superseded. Each entry
 captures the choice made, the alternative considered, and the reason. Append
@@ -423,7 +423,7 @@ auto-complete deliverables.
 
 ---
 
-## D-023 · QBO is the primary financial data source for all accounting questions (2026-06-04)
+## D-026 · QBO is the primary financial data source for all accounting questions (2026-06-04)
 
 **Context:** Cora was returning UNKNOWN_RESPONSE to "Q1 LLC revenue" in #lex-finance.
 Root cause: all entity system prompts had a single MANDATORY directive routing ALL financial
