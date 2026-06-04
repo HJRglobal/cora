@@ -1,0 +1,171 @@
+# HJR Properties — lease register (static).
+# Source of truth: design/system-prompts/hjrp.md tenant tables (Jan 2026 CAM
+# analysis sheet 1OISz5r6VP5Q-A2JdZA-S8DZbtI7E-jJq). Update both together.
+#
+# Consumed by src/cora/tools/hjrp_client.py -> hjrp_lease_status tool.
+# Lease economics (monthly_rent) are financial — this tool is TIER_1-gated
+# (#hjrp-finance / #hjrp-leadership) per the financial guardrail.
+#
+# lease_end: ISO date (YYYY-MM-DD), or "MTM" (month-to-month), or null (no
+#   dates on file). status one of: active | renewing | not_renewing | internal.
+
+properties:
+  - code: HJRP-1337
+    name: North Hampton
+    address: 1337 S Gilbert Rd, Mesa AZ
+    sqft: 38790
+    leases:
+      - suite: "101-103"
+        tenant: Vitalant
+        monthly_rent: 7370
+        lease_end: "2026-05-31"
+        status: renewing
+        note: "New lease starts June 2026 (resolved 2026-03-25). CAM agreement from 1992 needs update at renewal."
+        broker: "Sharon Carstens <brokerandtrainer@gmail.com>"
+        contact: "Robin Owens <cmatz@vitalant.org>"
+      - suite: "104"
+        tenant: F3 Storage (internal)
+        monthly_rent: 0
+        lease_end: "MTM"
+        status: internal
+        contact: "Justin Moran <justin@hjrglobal.com>"
+      - suite: "105-105A"
+        tenant: LTS (Lexington Therapies)
+        monthly_rent: 5847
+        lease_end: "2027-10-31"
+        status: active
+        contact: "Justin Gilmore <justin@lexingtonlifeacademy.com>"
+      - suite: "106-110"
+        tenant: US Renal Care (DSI Renal)
+        monthly_rent: 14689
+        lease_end: "2027-06-30"
+        status: active
+        note: "Largest tenant."
+        contact: "Timothy.Fraley@usrenalcare.com"
+      - suite: "111-113"
+        tenant: HJR Global
+        monthly_rent: 5351
+        lease_end: "2026-10-31"
+        status: active
+        contact: "Justin Moran <justin@hjrglobal.com>"
+      - suite: "114-116"
+        tenant: Big D Media
+        monthly_rent: 5844
+        lease_end: null
+        status: active
+        contact: "Justin Moran <justin@hjrglobal.com>"
+      - suite: "117"
+        tenant: UFL
+        monthly_rent: 1564
+        lease_end: null
+        status: active
+        note: "UFL paused operationally."
+        contact: "Justin Moran <justin@hjrglobal.com>"
+      - suite: "118-120"
+        tenant: Brick Road Coffee / Empower Coffee Roasters
+        monthly_rent: 2910
+        lease_end: "2034-12-31"
+        status: active
+        note: "Long-term lease."
+        contact: "Gabe Hagen <deniseandzach@empowercoffeeroasters.com>"
+      - suite: "121"
+        tenant: Vine and Branches
+        monthly_rent: 1144
+        lease_end: "2026-06-30"
+        status: not_renewing
+        note: "NOT renewing (declined 2026-05-14). Suite goes vacant 2026-07-01."
+        broker: "Sharon Carstens <brokerandtrainer@gmail.com>"
+        contact: "Margaret <felizhairstyle@gmail.com>"
+      - suite: "122"
+        tenant: Sweet Eclairs and Desserts
+        monthly_rent: 812
+        lease_end: "2028-02-29"
+        status: active
+        contact: "Craig Peterson <Bostonkgp@gmail.com>"
+      - suite: "123-124"
+        tenant: Ronin Games
+        monthly_rent: 2791
+        lease_end: "2028-12-31"
+        status: active
+        contact: "Preston Statzer"
+      - suite: "CC&Rs"
+        tenant: India Oven (HZ Ops Holding)
+        monthly_rent: 2676
+        lease_end: null
+        status: active
+        note: "CAM agreement terms unclear, copy not available."
+        contact: "azindiaoven@gmail.com"
+
+  - code: HJRP-1555
+    name: South Hampton
+    address: 1555 S Gilbert Rd, Mesa AZ
+    sqft: 24006
+    leases:
+      - suite: "101"
+        tenant: LBHS (Lexington Behavioral Health)
+        monthly_rent: 2049
+        lease_end: "MTM"
+        status: active
+        contact: "Jared Harker <harkerj@lexingtonbhs.com>"
+      - suite: "102"
+        tenant: De La Fe Chiropractic
+        monthly_rent: 1545
+        lease_end: "2027-11-30"
+        status: active
+        contact: "Scott De La Fe <drd@backfxr.com>"
+      - suite: "103-104"
+        tenant: Dynamic Living
+        monthly_rent: 3456
+        lease_end: "2030-04-30"
+        status: active
+        note: "Approximate end date."
+        contact: "Mark Thiele <mthiele@dynamicliving.net>"
+      - suite: "106"
+        tenant: Barba's Barber Shop (Clippers)
+        monthly_rent: 1639
+        lease_end: "2027-10-31"
+        status: active
+        contact: "Carolina and Alex <caroleonc6@gmail.com>"
+      - suite: "107"
+        tenant: The Uplift Center
+        monthly_rent: 2586
+        lease_end: "2028-10-31"
+        status: active
+        contact: "Krystelle Richardson <Krystellerichardson@gmail.com>"
+      - suite: "108"
+        tenant: LLC Admin (Lexington)
+        monthly_rent: 2049
+        lease_end: "2026-10-31"
+        status: active
+        contact: "Shaun Hawkins <shaun@lexingtonservices.com>"
+      - suite: "109"
+        tenant: LLC Admin (LBHS)
+        monthly_rent: 2049
+        lease_end: "MTM"
+        status: active
+        contact: "Jared Harker <harkerj@lexingtonbhs.com>"
+      - suite: "110-112"
+        tenant: LLC - DTA (Lexington)
+        monthly_rent: 9895
+        lease_end: "2026-10-31"
+        status: active
+        note: "Largest Lexington lease."
+        contact: "Shaun Hawkins <shaun@lexingtonservices.com>"
+      - suite: "112"
+        tenant: LLC - DTT (Lexington)
+        monthly_rent: 6540
+        lease_end: "2026-10-31"
+        status: active
+        contact: "Shaun Hawkins <shaun@lexingtonservices.com>"
+      - suite: "113"
+        tenant: LBHS (Lexington)
+        monthly_rent: 2461
+        lease_end: "MTM"
+        status: active
+        contact: "Jared Harker <harkerj@lexingtonbhs.com>"
+      - suite: "CC&Rs"
+        tenant: Native (Hampton Inn area)
+        monthly_rent: 1112
+        lease_end: null
+        status: active
+        contact: "Lee Harding <toothtwister@hotmail.com>"
