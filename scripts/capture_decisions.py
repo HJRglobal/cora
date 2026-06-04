@@ -34,9 +34,15 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Claude Haiku verification gate — keeps the regex heuristic as a cheap
+# pre-filter and lets Haiku decide what is actually a business decision.
+_HAIKU_MODEL = "claude-haiku-4-5"
+_MAX_VERIFY = 50  # cap candidates sent to Haiku per run (bounds cost/tokens)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -51,23 +57,35 @@ MAX_DECISIONS_PER_POST = 10  # cap to avoid overwhelming the channel
 # ── Decision-language patterns ────────────────────────────────────────────────
 # Ordered by confidence. Weights map to how confident we are it's a real decision.
 _DECISION_PATTERNS: list[tuple[re.Pattern, int]] = [
+    # Strong — explicit decision language (weight 3, qualifies alone)
     (re.compile(r"\bwe\s+(?:have\s+)?decided\s+to\b", re.I), 3),
     (re.compile(r"\b(?:decision|final\s+call|final\s+decision)[:\s]", re.I), 3),
+    # Medium — directional / commitment language (weight 2, qualifies alone)
     (re.compile(r"\bgoing\s+forward\s*[,:]", re.I), 2),
     (re.compile(r"\bwe\s+(?:are\s+)?going\s+(?:with|to\s+use)\b", re.I), 2),
-    (re.compile(r"\blocked\s+(?:in|down)\b", re.I), 2),
-    (re.compile(r"\bwe\s+(?:will|won'?t|are\s+not\s+going\s+to)\b", re.I), 2),
-    (re.compile(r"\b(?:confirmed|approved|signed\s+off)\b", re.I), 2),
+    (re.compile(r"\blocked?\s+(?:in|down|as)\b", re.I), 2),
     (re.compile(r"\bno\s+longer\s+(?:going|doing|pursuing|using)\b", re.I), 2),
-    (re.compile(r"\barchive[d]?\b", re.I), 1),
-    (re.compile(r"\bcancell?ed?\b", re.I), 1),
     (re.compile(r"\b(?:effective|starting)\s+(?:immediately|today|now)\b", re.I), 2),
     (re.compile(r"\bpivot(?:ing|ed)?\s+(?:to|from|away)\b", re.I), 2),
     (re.compile(r"\bshipping\s+(?:today|this\s+week|now)\b", re.I), 2),
-    (re.compile(r"\blocke[d]?\s+(?:in|down|as)\b", re.I), 2),
+    # Weak — common conversational words; need a second signal to qualify (weight 1)
+    (re.compile(r"\bwe\s+(?:will|won'?t|are\s+not\s+going\s+to)\b", re.I), 1),
+    (re.compile(r"\b(?:confirmed|approved|signed\s+off)\b", re.I), 1),
+    (re.compile(r"\barchive[d]?\b", re.I), 1),
+    (re.compile(r"\bcancell?ed?\b", re.I), 1),
 ]
 
-_MIN_SCORE = 2  # minimum total score for a sentence to be considered a decision
+_MIN_SCORE = 2  # minimum total score; a single weak (weight-1) signal can no longer pass
+_MIN_WORDS = 5  # backchannel floor — kills "Verify confirmed.", "And so we will."
+
+# Strip a leading "[Speaker Name] " transcript tag so it doesn't inflate length
+# or pollute the dedup fingerprint.
+_SPEAKER_PREFIX = re.compile(r"^\s*\[[^\]]{1,60}\]\s*")
+
+
+def _strip_speaker(text: str) -> str:
+    """Remove a leading "[Speaker]" transcript prefix, if present."""
+    return _SPEAKER_PREFIX.sub("", text or "").strip()
 
 
 def score_sentence(text: str) -> int:
@@ -81,8 +99,10 @@ def extract_decision_sentences(text: str) -> list[str]:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     results: list[str] = []
     for sent in sentences:
-        sent = sent.strip()
+        sent = _strip_speaker(sent.strip())
         if len(sent) < 20 or len(sent) > 500:
+            continue
+        if len(sent.split()) < _MIN_WORDS:
             continue
         if score_sentence(sent) >= _MIN_SCORE:
             results.append(sent)
@@ -90,8 +110,16 @@ def extract_decision_sentences(text: str) -> list[str]:
 
 
 def _fingerprint(text: str) -> str:
-    """Stable 12-char fingerprint for deduplication."""
-    return hashlib.sha256(text.lower().strip().encode()).hexdigest()[:12]
+    """Stable 12-char fingerprint for deduplication.
+
+    Normalizes first (strip speaker tag, lowercase, drop punctuation, collapse
+    whitespace) so near-duplicates that differ only by a comma or speaker label
+    collapse to the same fingerprint.
+    """
+    norm = _strip_speaker(text).lower()
+    norm = re.sub(r"[^a-z0-9\s]", "", norm)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return hashlib.sha256(norm.encode()).hexdigest()[:12]
 
 
 def load_surfaced(path: Path) -> set[str]:
@@ -178,6 +206,96 @@ def deduplicate(candidates: list[dict], surfaced: set[str]) -> list[dict]:
     return out
 
 
+_VERIFY_PROMPT = """You are filtering candidate sentences pulled from meeting \
+transcripts. Keep ONLY sentences that record an actual business DECISION, \
+commitment, or resolved direction (e.g. "we decided to cancel X", "going \
+forward we will use Y", "the launch is locked for June 15").
+
+REJECT: backchannel and filler ("verify confirmed", "yep, sounds good"), \
+questions, hypotheticals, vague musings, status chatter, and anything where \
+no concrete choice was actually made.
+
+For each item, return whether it is a real decision and, if so, a concise \
+one-sentence restatement of the decision (no speaker names, no filler).
+
+Return ONLY a JSON array, one object per input item, in the same order:
+[{{"index": 0, "is_decision": true, "summary": "..."}}, ...]
+
+Candidate sentences:
+{items}"""
+
+
+def verify_decisions_with_haiku(candidates: list[dict]) -> list[dict]:
+    """Precision gate: keep only candidates Haiku confirms are real decisions.
+
+    Returns a subset of ``candidates`` (each with ``sentence`` replaced by
+    Haiku's cleaned summary and the original kept under ``raw_sentence``), plus
+    sets ``_haiku_evaluated=True`` on every input it actually scored.
+
+    Fail-open: on missing key / API error / parse failure, returns the input
+    unchanged (degraded = the tightened heuristic list, never silent total loss).
+    """
+    if not candidates:
+        return []
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        log.warning("ANTHROPIC_API_KEY not set — skipping Haiku verification (fail-open)")
+        return candidates
+
+    batch = candidates[:_MAX_VERIFY]
+    items_text = "\n".join(f"{i}. {c['sentence']}" for i, c in enumerate(batch))
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=_HAIKU_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": _VERIFY_PROMPT.format(items=items_text)}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(
+                line for line in raw.split("\n") if not line.startswith("```")
+            ).strip()
+        # Haiku sometimes wraps the array in prose ("Here are the results: [...]
+        # Let me know..."). Extract just the JSON array to avoid "Extra data".
+        start, end = raw.find("["), raw.rfind("]")
+        if start != -1 and end > start:
+            raw = raw[start:end + 1]
+        verdicts = json.loads(raw)
+        if not isinstance(verdicts, list):
+            log.warning("Haiku returned non-list verdicts — fail-open")
+            return candidates
+    except json.JSONDecodeError as exc:
+        log.warning("Haiku verdict JSON parse failed (%s) — fail-open", exc)
+        return candidates
+    except Exception as exc:  # noqa: BLE001 — any API error -> degrade gracefully
+        log.error("Haiku verification error (%s) — fail-open", exc)
+        return candidates
+
+    kept: list[dict] = []
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        idx = v.get("index")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(batch):
+            continue
+        batch[idx]["_haiku_evaluated"] = True
+        if not v.get("is_decision"):
+            continue
+        cand = batch[idx]
+        summary = str(v.get("summary") or "").strip()
+        if summary:
+            cand["raw_sentence"] = cand["sentence"]
+            cand["sentence"] = summary
+        kept.append(cand)
+
+    log.info("Haiku verification: %d/%d candidates confirmed as decisions",
+             len(kept), len(batch))
+    return kept
+
+
 def group_by_entity(candidates: list[dict]) -> dict[str, list[dict]]:
     from collections import defaultdict
     grouped: dict[str, list[dict]] = defaultdict(list)
@@ -252,6 +370,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    # The Slack message contains emoji (✅ etc.); the default Windows console is
+    # cp1252 and would crash on print(). Make stdout UTF-8 tolerant for --dry-run.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
     log.info("Scanning Fireflies KB chunks from last %d days...", args.days)
     candidates = scan_kb_fireflies(args.days)
     log.info("  Found %d candidate decision sentences", len(candidates))
@@ -262,14 +387,27 @@ def main() -> int:
     new_candidates = deduplicate(candidates, surfaced)
     log.info("  %d new candidates after deduplication", len(new_candidates))
 
-    msg = build_slack_message(new_candidates, args.days)
+    verified = verify_decisions_with_haiku(new_candidates)
+    log.info("  %d candidate(s) confirmed by Haiku verification", len(verified))
+
+    # Fingerprints Haiku evaluated but rejected — record so they never re-incur cost.
+    verified_ids = {id(c) for c in verified}
+    rejected_fps = [
+        c["fingerprint"] for c in new_candidates
+        if c.get("_haiku_evaluated") and id(c) not in verified_ids
+    ]
+
+    msg = build_slack_message(verified, args.days)
 
     if args.dry_run:
         print(msg)
         return 0
 
-    if not new_candidates:
+    if not verified:
         log.info("Nothing new to surface. Exiting.")
+        if rejected_fps:
+            save_surfaced(SURFACED_PATH, rejected_fps)
+            log.info("Recorded %d Haiku-rejected fingerprint(s)", len(rejected_fps))
         return 0
 
     token = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -291,12 +429,14 @@ def main() -> int:
         unfurl_links=False,
         unfurl_media=False,
     )
-    log.info("Posted %d decisions to #%s ts=%s", len(new_candidates), TARGET_CHANNEL, resp.get("ts"))
+    log.info("Posted %d decisions to #%s ts=%s", len(verified), TARGET_CHANNEL, resp.get("ts"))
 
-    # Record fingerprints so we don't surface the same decisions tomorrow
-    new_fps = [c["fingerprint"] for c in new_candidates[:MAX_DECISIONS_PER_POST]]
-    save_surfaced(SURFACED_PATH, new_fps)
-    log.info("Saved %d fingerprints to %s", len(new_fps), SURFACED_PATH)
+    # Record fingerprints so we don't resurface: shown (verified) + Haiku-rejected.
+    shown_fps = [c["fingerprint"] for c in verified[:MAX_DECISIONS_PER_POST]]
+    all_fps = shown_fps + rejected_fps
+    save_surfaced(SURFACED_PATH, all_fps)
+    log.info("Saved %d fingerprints (%d shown + %d rejected) to %s",
+             len(all_fps), len(shown_fps), len(rejected_fps), SURFACED_PATH)
     return 0
 
 

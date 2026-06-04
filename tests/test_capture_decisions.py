@@ -3,19 +3,23 @@
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+import capture_decisions as cd  # type: ignore  # noqa: E402
 from capture_decisions import (  # type: ignore  # noqa: E402
     _fingerprint,
+    _strip_speaker,
     build_slack_message,
     deduplicate,
     extract_decision_sentences,
     load_surfaced,
     save_surfaced,
     score_sentence,
+    verify_decisions_with_haiku,
 )
 
 
@@ -25,8 +29,6 @@ from capture_decisions import (  # type: ignore  # noqa: E402
     ("We have decided to cancel the July 10th event.", 3),
     ("Going forward, Tessa is part-time remote.",     2),
     ("We locked down the F3 Pure launch date.",       2),
-    ("The deal is confirmed and approved.",           2),
-    ("We will not be pursuing UFL this quarter.",     2),
     ("This is pivoting to a new approach.",           2),
     ("F3E shipping today, let's go.",                 2),
 ])
@@ -39,9 +41,21 @@ def test_score_sentence_high(text, min_score):
     "Please review the attached document.",
     "Let me know if you have questions.",
     "Thanks!",
+    # Single weak signal no longer qualifies (down-weighted to 1) — these were
+    # the exact garbage that flooded the 7am digest.
+    "And so we will.",
+    "Verify confirmed.",
+    "Yep, verify confirmed.",
+    "We won't touch it unless we use it or we won't pay unless we touch it.",
 ])
 def test_score_sentence_low_or_zero(text):
     assert score_sentence(text) < 2
+
+
+def test_two_weak_signals_qualify():
+    """Two independent weak signals together clear the bar (sum >= 2)."""
+    # "confirmed" (1) + "cancelled" (1) = 2
+    assert score_sentence("The order was confirmed and then cancelled.") >= 2
 
 
 # ── extract_decision_sentences() ─────────────────────────────────────────────
@@ -180,7 +194,6 @@ def test_build_slack_message_with_candidates():
 
 def test_build_slack_message_caps_at_max(monkeypatch):
     """More than MAX candidates should still produce a valid message."""
-    import capture_decisions as cd
     monkeypatch.setattr(cd, "MAX_DECISIONS_PER_POST", 3)
     candidates = [
         {"entity": "F3E", "title": f"Meeting {i}", "sentence": f"We decided to do thing {i}.",
@@ -189,3 +202,143 @@ def test_build_slack_message_caps_at_max(monkeypatch):
     ]
     msg = build_slack_message(candidates, 3)
     assert "more" in msg.lower()  # overflow indicator
+
+
+# ── _strip_speaker() + speaker-aware extraction ──────────────────────────────
+
+def test_strip_speaker_removes_prefix():
+    assert _strip_speaker("[Harrison Rogers] We decided to ship.") == "We decided to ship."
+    assert _strip_speaker("[Justin Moran] Verify confirmed.") == "Verify confirmed."
+
+
+def test_strip_speaker_noop_without_prefix():
+    assert _strip_speaker("We decided to ship.") == "We decided to ship."
+
+
+def test_extract_strips_speaker_prefix():
+    text = "[Harrison Rogers] We have decided to lock down the launch for June 15th."
+    decisions = extract_decision_sentences(text)
+    assert decisions, "should still extract the decision"
+    assert not decisions[0].startswith("["), "speaker prefix must be stripped"
+
+
+def test_extract_filters_short_backchannel():
+    """The exact garbage from the 7am digest must not survive extraction."""
+    garbage = (
+        "[Justin Moran] Verify confirmed. [Justin Moran] Yep, verify confirmed. "
+        "[Harrison Rogers] And so we will."
+    )
+    assert extract_decision_sentences(garbage) == []
+
+
+def test_extract_min_word_count():
+    # Scores >=3 (decision:) and >=20 chars, but only 4 words -> filtered.
+    assert extract_decision_sentences("Decision: cancel it now.") == []
+
+
+# ── normalized fingerprint / near-duplicate dedup ────────────────────────────
+
+def test_fingerprint_strips_speaker():
+    assert _fingerprint("[Harrison Rogers] We decided to ship.") == _fingerprint("We decided to ship.")
+
+
+def test_fingerprint_collapses_punctuation_near_dupes():
+    a = "We won't touch it unless we use it or we won't pay unless we touch it."
+    b = "We won't touch it unless we use it, or we won't pay unless we touch it."
+    assert _fingerprint(a) == _fingerprint(b)
+
+
+def test_deduplicate_collapses_near_duplicates():
+    a = "We won't touch it unless we use it or we won't pay unless we touch it."
+    b = "We won't touch it unless we use it, or we won't pay unless we touch it."
+    candidates = [
+        {"fingerprint": _fingerprint(a), "sentence": a},
+        {"fingerprint": _fingerprint(b), "sentence": b},
+    ]
+    assert len(deduplicate(candidates, set())) == 1
+
+
+# ── verify_decisions_with_haiku() ────────────────────────────────────────────
+
+def _haiku_response(text: str):
+    resp = MagicMock()
+    resp.content = [MagicMock(text=text)]
+    return resp
+
+
+def _candidates():
+    return [
+        {"entity": "FNDR", "sentence": "We decided to cancel the July 10 event.", "fingerprint": "a"},
+        {"entity": "FNDR", "sentence": "Verify confirmed.", "fingerprint": "b"},
+    ]
+
+
+def test_verify_keeps_only_decisions(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    cands = _candidates()
+    verdict_json = json.dumps([
+        {"index": 0, "is_decision": True, "summary": "Cancel the July 10 event."},
+        {"index": 1, "is_decision": False},
+    ])
+    with patch.object(cd, "anthropic") as mock_anthropic:
+        mock_anthropic.Anthropic.return_value.messages.create.return_value = _haiku_response(verdict_json)
+        kept = verify_decisions_with_haiku(cands)
+    assert len(kept) == 1
+    assert kept[0]["sentence"] == "Cancel the July 10 event."   # summary substituted
+    assert kept[0]["raw_sentence"] == "We decided to cancel the July 10 event."
+    # both were evaluated (so the rejected one can be recorded + suppressed)
+    assert all(c.get("_haiku_evaluated") for c in cands)
+
+
+def test_verify_strips_code_fences(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    fenced = "```json\n" + json.dumps([{"index": 0, "is_decision": True, "summary": "Ship it."}]) + "\n```"
+    cands = [{"entity": "FNDR", "sentence": "We decided to ship.", "fingerprint": "a"}]
+    with patch.object(cd, "anthropic") as mock_anthropic:
+        mock_anthropic.Anthropic.return_value.messages.create.return_value = _haiku_response(fenced)
+        kept = verify_decisions_with_haiku(cands)
+    assert len(kept) == 1
+
+
+def test_verify_extracts_array_from_prose(monkeypatch):
+    """Haiku sometimes wraps the JSON array in explanation — extract it anyway."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    prose = (
+        "Here are the results:\n"
+        + json.dumps([{"index": 0, "is_decision": True, "summary": "Ship it."},
+                      {"index": 1, "is_decision": False}])
+        + "\nLet me know if you need anything else."
+    )
+    cands = _candidates()
+    with patch.object(cd, "anthropic") as mock_anthropic:
+        mock_anthropic.Anthropic.return_value.messages.create.return_value = _haiku_response(prose)
+        kept = verify_decisions_with_haiku(cands)
+    assert len(kept) == 1
+    assert kept[0]["sentence"] == "Ship it."
+
+
+def test_verify_fail_open_without_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    cands = _candidates()
+    assert verify_decisions_with_haiku(cands) == cands  # unchanged
+
+
+def test_verify_fail_open_on_api_error(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    cands = _candidates()
+    with patch.object(cd, "anthropic") as mock_anthropic:
+        mock_anthropic.Anthropic.return_value.messages.create.side_effect = RuntimeError("503")
+        kept = verify_decisions_with_haiku(cands)
+    assert kept == cands  # fail-open: never silently lose decisions
+
+
+def test_verify_fail_open_on_bad_json(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    cands = _candidates()
+    with patch.object(cd, "anthropic") as mock_anthropic:
+        mock_anthropic.Anthropic.return_value.messages.create.return_value = _haiku_response("not json at all")
+        assert verify_decisions_with_haiku(cands) == cands
+
+
+def test_verify_empty_input():
+    assert verify_decisions_with_haiku([]) == []
