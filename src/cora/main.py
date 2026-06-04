@@ -12,6 +12,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .app import app
 from .config import config
+from .context_loader import _load_static_context
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEARTBEAT_FILE = _REPO_ROOT / "data" / "health" / "heartbeat.txt"
@@ -61,10 +62,42 @@ def _heartbeat(stop: threading.Event, log: logging.Logger) -> None:
             log.warning("heartbeat: failed to write sentinel file: %s", exc)
 
 
+_ALL_ENTITIES = [
+    "FNDR", "HJRG", "F3E", "F3C", "OSN", "LEX",
+    "LEX-LLC", "LEX-LTS", "LEX-LBHS", "LEX-LLA",
+    "UFL", "BDM", "HJRP", "HJRPROD",
+]
+
+
+def _prewarm_contexts(log: logging.Logger) -> None:
+    """Load all entity CLAUDE.md files into the TTL cache at startup.
+
+    Runs in a background daemon thread so it doesn't delay Socket Mode connection.
+    Eliminates the first-request cold-cache penalty (up to 2s per entity per 5-min window).
+    """
+    loaded = 0
+    for entity in _ALL_ENTITIES:
+        try:
+            _load_static_context(entity)
+            loaded += 1
+        except Exception as exc:
+            log.warning("prewarm: failed for entity=%s: %s", entity, exc)
+    log.info("prewarm: loaded %d/%d entity contexts into cache", loaded, len(_ALL_ENTITIES))
+
+
 def main() -> None:
     _setup_logging()
     log = logging.getLogger(__name__)
     log.info("Cora starting up…")
+
+    # Pre-warm all entity contexts in background so first requests don't pay the
+    # cold-cache penalty (Google Drive read per entity, up to 2s each).
+    threading.Thread(
+        target=_prewarm_contexts,
+        args=(log,),
+        name="ContextPrewarm",
+        daemon=True,
+    ).start()
 
     attempt = 0
     last_error = ""

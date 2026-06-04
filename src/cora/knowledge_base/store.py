@@ -218,6 +218,7 @@ class KnowledgeBase:
         max_age_days: int | None = 365,
         include_fndr: bool = True,
         sub_entity: str | None = None,
+        query_vec: list[float] | None = None,
     ) -> list[SearchResult]:
         """Vector search top-K chunks. Filters by entity (incl. FNDR) and recency.
 
@@ -227,11 +228,15 @@ class KnowledgeBase:
         max_age_days: drop chunks with date_modified older than this. None disables.
         sub_entity: when set (e.g. "LEX-LLC"), apply intra-entity visibility scoping
         so only chunks tagged for that sub-entity (or untagged) are returned.
+        query_vec: pre-computed embedding vector. When provided, skips the OpenAI
+        embed_query() call entirely -- caller is responsible for ensuring it was
+        produced by the same model (text-embedding-3-small, 1536 dims).
         """
-        try:
-            query_vec = embeddings.embed_query(query)
-        except embeddings.EmbeddingError as exc:
-            raise KnowledgeBaseError(f"Query embedding failed: {exc}") from exc
+        if query_vec is None:
+            try:
+                query_vec = embeddings.embed_query(query)
+            except embeddings.EmbeddingError as exc:
+                raise KnowledgeBaseError(f"Query embedding failed: {exc}") from exc
 
         # Build entity filter
         if entity == "FNDR" or not include_fndr:

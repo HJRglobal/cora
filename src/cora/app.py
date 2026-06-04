@@ -122,12 +122,30 @@ def _resolve_bot_user_id(client) -> str | None:
     return _CORA_BOT_USER_ID
 
 
+# Channel name cache: avoids a Slack API call on every mention.
+# Keyed by channel_id → (name, cached_at). TTL = 30 minutes.
+# Channel names rarely change; stale cache for a renamed channel is acceptable.
+_CHANNEL_NAME_CACHE: dict[str, tuple[str, float]] = {}
+_CHANNEL_NAME_TTL = 1800  # 30 minutes
+
+
 def _resolve_channel_name(client, channel_id: str) -> str:
+    now = time.monotonic()
+    cached = _CHANNEL_NAME_CACHE.get(channel_id)
+    if cached is not None:
+        name, cached_at = cached
+        if now - cached_at < _CHANNEL_NAME_TTL:
+            return name
+
     try:
         info = client.conversations_info(channel=channel_id)
-        return info["channel"]["name"]
+        name = info["channel"]["name"]
+        _CHANNEL_NAME_CACHE[channel_id] = (name, now)
+        return name
     except Exception as exc:
         log.warning("Could not resolve channel name for %s: %s", channel_id, exc)
+        # Cache the fallback too so we don't hammer Slack on a dead channel
+        _CHANNEL_NAME_CACHE[channel_id] = (channel_id, now)
         return channel_id
 
 
@@ -306,11 +324,16 @@ def _dispatch_qa(
             log.warning("semantic_cache lookup error for entity=%s: %s", entity, exc)
 
     # ── Context + prompt loading ───────────────────────────────────────────
+    # Pass question_embedding (already computed for semantic cache) so
+    # context_loader → store.search() can skip its own embed_query() call.
+    # If bypass_cache=True the embedding was never computed; passing None
+    # is safe -- store.search() falls back to computing it internally.
     context = load_context(
         entity,
         query=user_message,
         skip_kb=hints.skip_kb,
         kb_k=hints.kb_k_override,
+        query_vec=question_embedding,
     )
     prompt = load_prompt(entity)
     chosen_model = model_router.choose_model(user_message)
