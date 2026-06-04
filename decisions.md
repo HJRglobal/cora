@@ -390,3 +390,32 @@ Fighter roster seeded 2026-06-03 from Google Sheet
 - Jovan Ravago -- TikTok only (not yet monitored)
 - Louie Lopez / Taquel Young -- dates in handle column, not handles
 - Gym accounts (Betweenrounds, MMAelite, MMALAB) -- not individual fighters
+
+---
+
+## D-025 · Deliverable credit requires @f3energy tag, not hashtag alone (2026-06-03)
+
+**Decision:** A fighter's Instagram post only counts as a completed deliverable
+if they directly tag @f3energy in the photo or video (a media tag). Hashtag-only
+posts (#DrinkF3, #F3Energy, etc.) do NOT qualify for credit.
+
+**Rationale:** Media tags are verifiable by the Graph API -- the /{ig-user-id}/tags
+endpoint returns only posts where the brand was tagged in the media object, and
+it returns the poster's username so Cora can auto-identify the fighter. Hashtag
+search does not return the poster's username (Meta privacy restriction), so credit
+cannot be attributed automatically. Requiring a tag keeps the system auditable and
+removes ambiguity about who posted.
+
+**Operational impact:**
+- Scanner auto-match proposals are only generated for tagged-media detections,
+  not hashtag-only detections. Hashtag hits are logged to detection_log for
+  reference but do not trigger a match proposal to Alex.
+- Fighter contracts and onboarding language should reflect this: "must tag
+  @f3energy in the photo or video to receive credit toward monthly deliverables."
+- Cora's system prompt for #f3-athletes should communicate this rule to Alex
+  when she surfaces deliverable status or detections.
+
+**What still uses hashtags:** The hashtag scan (#DrinkF3, #F3Energy, #DrinkF3Energy)
+stays active as a monitoring signal -- useful for brand awareness tracking and
+catching posts Cora can flag for Alex to manually review -- but it does not
+auto-complete deliverables.

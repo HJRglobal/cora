@@ -1,14 +1,15 @@
 # setup-influencer-scan-task.ps1
 # Registers the Cora influencer scan as a Windows scheduled task.
-# Runs every 2 hours. Detects new tagged posts on F3 brand Instagram accounts
-# and posts Slack alerts to the influencer ops channel for Alex to confirm.
+# Runs twice daily: 7:00 AM and 7:00 PM.
+# Detects new tagged posts on F3 brand Instagram accounts and posts
+# Slack alerts to the influencer ops channel for Alex to confirm.
 #
-# Run once from PowerShell (as Administrator or normal user — no admin needed):
+# Run once from PowerShell (as Administrator or normal user -- no admin needed):
 #   cd C:\Users\Harri\code\cora
 #   .\deployment\setup-influencer-scan-task.ps1
 #
 # Prerequisites:
-#   1. Complete META_SETUP_GUIDE.md — add IG tokens to .env
+#   1. Complete META_SETUP_GUIDE.md -- add IG tokens to .env
 #   2. Confirm brand handles in data/maps/brand-social-accounts.yaml
 #   3. Set INFLUENCER_SCAN_NOTIFY_CHANNEL in .env (default: f3-sales)
 
@@ -47,11 +48,9 @@ $Action  = New-ScheduledTaskAction `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot
 
-# Every 2 hours, starting at the next even hour
-$Trigger = New-ScheduledTaskTrigger `
-    -RepetitionInterval (New-TimeSpan -Hours 2) `
-    -Once `
-    -At (Get-Date).Date.AddHours(([Math]::Ceiling((Get-Date).Hour / 2) * 2))
+# Two daily triggers: 7:00 AM and 7:00 PM
+$Trigger7AM = New-ScheduledTaskTrigger -Daily -At "07:00AM"
+$Trigger7PM = New-ScheduledTaskTrigger -Daily -At "07:00PM"
 
 $Settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
@@ -62,14 +61,14 @@ $Settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask `
     -TaskName   $TaskName `
     -Action     $Action `
-    -Trigger    $Trigger `
+    -Trigger    @($Trigger7AM, $Trigger7PM) `
     -Settings   $Settings `
-    -Description "Cora influencer scan - polls F3 brand IG accounts every 2h for athlete post detections" `
+    -Description "Cora influencer scan - polls F3 brand IG accounts at 7am and 7pm for athlete post detections" `
     | Out-Null
 
 Write-Host ""
 Write-Host "Task registered: $TaskName"
-Write-Host "  Schedule : Every 2 hours"
+Write-Host "  Schedule : Daily at 7:00 AM and 7:00 PM"
 Write-Host "  Python   : $PythonPath"
 Write-Host "  Script   : $ScriptPath"
 Write-Host "  Logs     : $LogDir\influencer-scan-YYYY-MM-DD.log"
@@ -80,5 +79,5 @@ Write-Host ""
 Write-Host "To check last run status:"
 Write-Host "  Get-ScheduledTaskInfo -TaskName '$TaskName' | Select LastRunTime, LastTaskResult"
 Write-Host ""
-Write-Host "NOTE: Scanning will silently skip any brand accounts whose .env tokens aren't"
+Write-Host "NOTE: Scanning will silently skip any brand accounts whose .env tokens are not"
 Write-Host "      populated yet. Complete META_SETUP_GUIDE.md first to activate each account."

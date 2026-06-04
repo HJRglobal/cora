@@ -48,11 +48,18 @@ Phase 2 tools (built this Cowork session):
 
 No HubSpot involved -- tracking lives entirely in SQLite + Slack.
 
+Deliverable credit rule (D-025):
+- A post counts ONLY if the fighter tags @f3energy in the photo/video (media tag)
+- Hashtag-only posts (#DrinkF3 etc.) do NOT qualify -- cannot auto-attribute poster
+- Tagged-media scan auto-proposes matches; hashtag scan logs for awareness only
+- Fighter contracts + Alex's onboarding language should reflect this requirement
+
 Deferred:
 - Recurring deliverable templates (auto-generate next month)
 - TikTok monitoring (scaffold in tiktok_monitor.py, pending API approval)
 - Bulk HubSpot->influencer import
 - Update #f3-sales detection message to also use 👍/👎 pattern
+- Update scanner: suppress auto-match proposals for hashtag-only detections (D-025)
 
 ---
 
@@ -206,3 +213,4 @@ deployment/
 | D-022 | Never Add-Content for Python source (LOCKED) |
 | D-023 | influencer_complete_deliverable: no staged-write gate |
 | D-024 | Monthly deliverables auto-generated 1st of month, 57 fighters, 3 each |
+| D-025 | Credit requires @f3energy media tag -- hashtag-only posts do not qualify |

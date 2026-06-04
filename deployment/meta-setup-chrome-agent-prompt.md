@@ -1,137 +1,152 @@
-# Chrome Agent Prompt — Meta / Instagram Token Setup
-
-Paste this entire prompt into a Chrome Agent session. It will walk through the
-Meta Developer portal and generate the tokens needed for the Cora influencer scanner.
-
----
-
-**CHROME AGENT PROMPT:**
-
-You are setting up Instagram Graph API credentials for three F3 brand Instagram accounts so the Cora influencer scanner can monitor tagged posts. You need to complete Steps 1–6 from `C:\Users\Harri\code\cora\deployment\META_SETUP_GUIDE.md`. Follow each task in sequence and do not move to the next until the current one is confirmed.
+# Chrome Agent Prompt -- Meta / Instagram Token Setup
+# For Cora F3 Fighter Influencer Tracking
+#
+# Paste everything between the dashed lines into a Claude in Chrome session.
+# Harrison must already be logged into his Facebook/Meta account in that browser.
 
 ---
 
-**TASK 1: Verify the Meta Developer App exists**
+You are setting up Instagram Graph API credentials so Cora can monitor when
+F3 Energy's 57 sponsored fighters post to Instagram. You need one Long-Lived
+Access Token and one numeric IG User ID -- both for the @f3energy account.
+
+The user (Harrison) is already logged into his Facebook/Meta account in this
+browser. Work through each task in order. Do not skip ahead. Report clearly
+after each task before moving to the next.
+
+---
+
+TASK 1 -- Find or create the Meta Developer App
 
 1. Navigate to: https://developers.facebook.com/apps
-2. Log in if needed (use Harrison's Facebook account)
-3. Look for an existing app named `Cora-HJR` or similar HJR app
-4. If it exists: click into it and confirm Instagram Graph API is listed under "Added products" in the left sidebar. Screenshot the app dashboard.
-5. If it does NOT exist:
-   - Click "Create App"
-   - Select "Business" as the use case
-   - App name: `Cora-HJR`
-   - Contact email: harrison@hjrglobal.com
-   - Click through to create
-6. Note the **App ID** shown at the top of the dashboard (format: 15-digit number)
-7. Go to Settings → Basic → copy the **App Secret** (click "Show")
-8. Report: App ID and whether it already had Instagram Graph API added
+2. Look for an existing app named "Cora-HJR" or any HJR app you recognize.
+3. If found: click into it. Note the App ID shown at the top (15-digit number).
+   Go to Settings > Basic > click "Show" next to App Secret and copy it.
+4. If NOT found: click "Create App", select "Business" as use case,
+   name it "Cora-HJR", email harrison@hjrglobal.com, click through to create.
+   Then go to Settings > Basic and copy both App ID and App Secret.
+5. Still in the app: look at the left sidebar for "Instagram Graph API".
+   If it is not listed, click "Add Product", find "Instagram Graph API",
+   and click Set Up.
+
+REPORT: App ID, whether it was existing or new, whether Instagram Graph API
+was already added or just added.
 
 ---
 
-**TASK 2: Confirm Instagram Graph API product is added**
-
-1. In the left sidebar of the app, look for "Instagram Graph API"
-2. If not present: click "Add Product" → find "Instagram Graph API" → "Set up"
-3. Screenshot the sidebar showing Instagram Graph API is listed
-4. Report: confirmed added or just added now
-
----
-
-**TASK 3: Generate short-lived tokens for all three F3 brand accounts**
-
-Do this three times — once per brand. For each:
+TASK 2 -- Generate a short-lived User Access Token
 
 1. Navigate to: https://developers.facebook.com/tools/explorer/
-2. In the top-right "Meta App" dropdown, select the `Cora-HJR` app
-3. Click "Generate Access Token"
-4. In the permissions dialog, check ALL four:
+2. In the top-right "Meta App" dropdown, select your Cora-HJR app.
+3. Click "Generate Access Token".
+4. A permissions dialog appears. Select ALL of these (expand sections as needed):
    - instagram_basic
    - instagram_manage_insights
    - pages_show_list
    - pages_read_engagement
-5. Click "Generate Token" and authorize in the pop-up
-6. Copy the token from the "Access Token" field
+5. Click "Generate Token". A pop-up will ask you to authorize -- approve it.
+   If it asks which Facebook Page to connect, select the F3 Energy page.
+6. The Access Token field now shows a long string starting with "EAA...".
+   Copy the entire token.
 
-Run for: F3 Energy (the primary F3 brand account), F3 Mood, F3 Pure.
-Note: you may need to select which Facebook Page to authorize for each — pick the matching F3 brand page.
-
-Report all three short-lived tokens (they expire in ~1 hour so move quickly to Task 4).
-
----
-
-**TASK 4: Exchange each short-lived token for a Long-Lived Token**
-
-For each of the three tokens from Task 3:
-
-1. Open a new browser tab
-2. Paste this URL, substituting your values:
-   ```
-   https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_TOKEN
-   ```
-   Replace APP_ID, APP_SECRET (from Task 1), and SHORT_TOKEN (from Task 3).
-3. The page returns JSON. Copy the `access_token` value — this is your Long-Lived Token (~60 days).
-
-Do this for all three accounts.
-Report all three Long-Lived Tokens.
+REPORT: The short-lived token (it expires in about 1 hour, so move fast).
+Also report which Facebook Page was selected during authorization.
 
 ---
 
-**TASK 5: Get the numeric IG Business Account User ID for each brand**
+TASK 3 -- Exchange for a Long-Lived Token (valid 60 days)
 
-For each Long-Lived Token:
+You will construct a URL and navigate to it. Replace the three placeholders
+with the real values from Tasks 1 and 2:
 
-1. Open a new browser tab
-2. Paste this URL:
-   ```
+URL pattern:
+https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_TOKEN
+
+1. Build that URL with your App ID, App Secret, and the short-lived token.
+2. Navigate to it in a new tab. You will see raw JSON on the page.
+3. Copy the value of "access_token" from the JSON. This is the Long-Lived Token.
+   It will be a much longer string, also starting with "EAA...".
+4. Also note the "expires_in" value (should be around 5184000, which is 60 days).
+
+REPORT: The Long-Lived Token and the expires_in value.
+
+---
+
+TASK 4 -- Get the numeric IG Business Account ID for @f3energy
+
+Note: We may already have this (17841448560031091) but verify it is correct.
+
+1. Build this URL using your Long-Lived Token:
    https://graph.facebook.com/v19.0/me/accounts?fields=name,instagram_business_account&access_token=LONG_LIVED_TOKEN
-   ```
-   Replace LONG_LIVED_TOKEN with the token for that brand.
-3. The response lists Facebook Pages. Find the matching F3 brand page.
-4. Copy the value of `instagram_business_account.id` — this is the numeric IG User ID.
+2. Navigate to it. You will see a JSON list of Facebook Pages you admin.
+3. Find the entry where "name" contains "F3 Energy".
+4. Copy the value of instagram_business_account.id for that entry.
+   It will be a 17-digit number.
 
-Do this for F3 Energy, F3 Mood, and F3 Pure.
-Report all three numeric IDs.
+REPORT: The numeric IG Business Account ID for F3 Energy, and whether it
+matches 17841448560031091.
 
 ---
 
-**TASK 6: Add credentials to the .env file**
+TASK 5 -- Add credentials to the .env file
 
-1. Open Notepad or VS Code to: `C:\Users\Harri\code\cora\.env`
-2. Append these lines at the bottom (fill in the values from Tasks 4 and 5):
-   ```
-   # Instagram Graph API — F3 Energy (@f3energy)
-   INSTAGRAM_F3E_USER_ID=<numeric ID>
-   INSTAGRAM_F3E_ACCESS_TOKEN=<long-lived token>
+1. Open this file in Notepad or VS Code:
+   C:\Users\Harri\code\cora\.env
+2. Find any existing lines that start with INSTAGRAM_F3E_ and update them,
+   or add these lines if they do not exist:
 
-   # Instagram Graph API — F3 Mood (@drinkf3mood)
-   INSTAGRAM_F3MOOD_USER_ID=<numeric ID>
-   INSTAGRAM_F3MOOD_ACCESS_TOKEN=<long-lived token>
+   INSTAGRAM_F3E_USER_ID=<17-digit number from Task 4>
+   INSTAGRAM_F3E_ACCESS_TOKEN=<long-lived token from Task 3>
 
-   # Instagram Graph API — F3 Pure (@f3pure)
-   INSTAGRAM_F3PURE_USER_ID=<numeric ID>
-   INSTAGRAM_F3PURE_ACCESS_TOKEN=<long-lived token>
-
-   # Slack channel for influencer detection alerts (without #)
-   INFLUENCER_SCAN_NOTIFY_CHANNEL=f3-sales
-   ```
 3. Save the file.
-4. Screenshot the saved .env showing the new lines (mask the middle of each token for security).
+
+REPORT: Confirm the lines are saved. Show the first 10 characters and last
+5 characters of the token so we can verify without exposing the full value.
 
 ---
 
-**TASK 7: Run a test scan**
+TASK 6 -- Run a test scan and confirm it works
 
-1. Open PowerShell
-2. Run:
-   ```powershell
+1. Open PowerShell.
+2. Run these commands:
+
    cd C:\Users\Harri\code\cora
-   uv run python scripts/run_influencer_scan.py
-   ```
-3. Wait for it to complete (30–60 seconds)
-4. Report the last 20 lines of output
+   .venv\Scripts\python.exe scripts\run_influencer_scan.py
 
-**Done when:** All 6 .env values are set, test scan completes without errors.
+3. Wait for it to finish (30 to 60 seconds).
+4. Read the last 30 lines of the log file:
+
+   Get-Content logs\influencer-scan-*.log | Select-Object -Last 30
+
+REPORT: Paste the last 30 lines of log output. A successful run will show
+lines containing "scan complete" for each brand account. Zero detections
+is fine and expected -- it means the connection worked but no new posts
+were found since the last scan time (watermark).
+
+If you see "OAuthException" or "Invalid OAuth access token", stop and
+report the exact error -- do not retry.
 
 ---
-**Note for the Chrome Agent:** If any step hits a permissions error or Meta App Review wall, stop and report the exact error message. Do not attempt to submit an App Review or agree to any Meta business verification — those require Harrison's manual review.
+
+TASK 7 -- Re-register the scan task with the new twice-daily schedule
+
+The scan previously ran every 2 hours. We are changing it to 7 AM and 7 PM.
+
+1. In PowerShell (still in C:\Users\Harri\code\cora), run:
+
+   .\deployment\setup-influencer-scan-task.ps1
+
+2. Confirm the output shows:
+   Schedule : Daily at 7:00 AM and 7:00 PM
+
+REPORT: Paste the output of the setup script.
+
+---
+
+DONE when: Task 6 log shows "scan complete" without auth errors, and
+Task 7 shows the new 7 AM / 7 PM schedule confirmed.
+
+If Meta requires App Review or business verification at any point during
+Tasks 1-3, STOP immediately and report the exact message shown. Do not
+submit any App Review or agree to any business verification -- those require
+Harrison to review manually before proceeding.
