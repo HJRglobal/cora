@@ -6,13 +6,13 @@ from cora.rate_limiter import RateLimiter
 
 def test_within_limits_allows():
     rl = RateLimiter(db_path=":memory:")
-    for _ in range(9):
+    for _ in range(29):
         assert rl.check("u1", "c1") == (True, None)
 
 
-def test_user_cap_hits_at_10():
+def test_user_cap_hits_at_30():
     rl = RateLimiter(db_path=":memory:")
-    for _ in range(10):
+    for _ in range(30):
         assert rl.check("u1", "c1") == (True, None)
     assert rl.check("u1", "c1") == (False, "user")
 
@@ -29,7 +29,7 @@ def test_window_expiry(monkeypatch):
     current_time = [0.0]
     monkeypatch.setattr(rl_module.time, "time", lambda: current_time[0])
 
-    for _ in range(10):
+    for _ in range(30):
         rl.check("u1", "c1")
 
     assert rl.check("u1", "c1") == (False, "user")
@@ -43,7 +43,7 @@ def test_user_cap_checked_before_channel_cap():
     rl = RateLimiter(db_path=":memory:")
 
     # Exhaust user cap for u_main across throwaway channels (don't pollute main_channel)
-    for i in range(10):
+    for i in range(30):
         rl.check("u_main", f"other_{i}")
 
     # Exhaust channel cap on main_channel using distinct users

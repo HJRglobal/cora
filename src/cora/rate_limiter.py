@@ -11,7 +11,7 @@ from collections import deque
 from pathlib import Path
 from threading import Lock
 
-_USER_LIMIT = 10
+_USER_LIMIT = 30
 _CHANNEL_LIMIT = 50
 _WINDOW = 3600  # seconds
 
