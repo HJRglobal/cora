@@ -192,10 +192,14 @@ def parse_period(period: str | None) -> tuple[str, str]:
     return (today - datetime.timedelta(days=30)).isoformat(), today.isoformat()
 
 
-# QBO Class codes for HJRP sub-properties (used to filter P&L by building)
+# QBO Class IDs for HJRP sub-properties (used to filter P&L by building).
+# Values are QBO integer Class IDs (from SELECT * FROM Class), NOT class names.
+# Class names are human-readable labels; the API requires the numeric Id field.
+# Confirmed live against HJRP realm 123145677834422 on 2026-06-04.
 _HJRP_CLASS_MAP: dict[str, str] = {
-    "HJRP-1337": "7005-105",   # North Hampton — 1337 S Gilbert Rd
-    "HJRP-1555": "9400-703",   # South Hampton — 1555 S Gilbert Rd
+    "HJRP-1337": "3600000000001380786",   # North Hampton -- 1337 S Gilbert Rd (7005-105 1337 Bldg)
+    "HJRP-1555": "3600000000001148584",   # South Hampton -- 1555 S Gilbert Rd (9400-703 LexBuilding Three)
+    # HJRP-RR (Rogers Ranch): no QBO class exists yet -- add when Visibility creates it in QBO
 }
 
 
@@ -330,7 +334,7 @@ def format_pnl_for_llm(
 
     header = (report.get("Header") or {})
     report_name = header.get("ReportName", "Profit and Loss")
-    period = f"{start_date} → {end_date}"
+    period = f"{start_date} to {end_date}"
 
     totals = _extract_top_level_sections(report)
     if not totals:
