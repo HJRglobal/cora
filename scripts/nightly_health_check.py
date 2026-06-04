@@ -70,7 +70,16 @@ class CheckResult:
 
 # ── Tasks expected to be in each state ────────────────────────────────────────
 
-_EXPECTED_DISABLED = {"cowork-cora-qbo-token-refresh"}
+# Tasks intentionally Disabled (Harrison-directed). Keep in sync with
+# project_scheduled_tasks_registry.md "Disabled tasks" section.
+#   - asana-email-sync / hubspot-email-sync: Gmail-match precision too low (paused)
+#   - proactive-gaps: wrong-entity content bug (fix queued)
+# NOTE: qbo-token-refresh was RE-ENABLED 2026-06-04 -- it is now expected Ready.
+_EXPECTED_DISABLED = {
+    "cowork-cora-asana-email-sync",
+    "cowork-cora-hubspot-email-sync",
+    "cowork-cora-proactive-gaps",
+}
 _EXPECTED_RUNNING  = {"cowork-cora-service"}
 
 # Friendly labels for the report
@@ -96,7 +105,7 @@ _TASK_LABELS: dict[str, str] = {
     "cowork-cora-kb-sync-static":    "KB sync: Static MD",
     "cowork-cora-knowledge-review":  "Knowledge review",
     "cowork-cora-proactive-gaps":    "Proactive gaps",
-    "cowork-cora-qbo-token-refresh": "QBO token refresh (disabled)",
+    "cowork-cora-qbo-token-refresh": "QBO token refresh",
     "cowork-cora-reconciliation":    "Reconciliation",
     "cowork-cora-security-monitor":  "Security monitor",
     "cowork-cora-service":           "Cora service",
