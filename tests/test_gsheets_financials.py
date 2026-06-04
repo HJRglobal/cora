@@ -603,3 +603,44 @@ class TestCashflowCache:
             get_cashflow()  # stale → should re-fetch
 
         assert call_count["n"] == 2
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Regression: real Standing ACTUALS balance-row labels (cash pulse came up empty)
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestRealSheetBalanceLabels:
+    """The live tabs label balances 'BEGINNING Cash/CC - Book Balance' and
+    'Ending Cash/CC Book Balance' (not 'opening/closing balance'). They must
+    parse, and the closing match must NOT grab the decoy 'Total Liquidity -
+    ENDING Cash/CC - Book Balance' row (value 0). Caused the 2026-06-04 pulse
+    showing '--' for all 9 entities."""
+
+    def _csv(self) -> str:
+        import csv as _csv
+        import io as _io
+        rows = [
+            ["", "5/29/2026", "", ""],
+            ["Entity", "FORECAST", "ACTUAL", "DIFF"],
+            ["F3", "16228", "16228", "-"],
+            ["BEGINNING Cash/CC - Book Balance", "1406", "1406", ""],
+            ["Ending Cash/CC Book Balance", "2748", "2748", "0"],
+            ["Total Liquidity - ENDING Cash/CC - Book Balance-S/B ZERO", "", "0.00", ""],
+        ]
+        buf = _io.StringIO()
+        _csv.writer(buf).writerows(rows)
+        return buf.getvalue()
+
+    def test_closing_balance_from_real_label(self):
+        summary = _parse_cashflow_csv(self._csv(), "2026-06-04")
+        assert summary.closing_balance == 2748.0
+
+    def test_opening_balance_from_real_label(self):
+        summary = _parse_cashflow_csv(self._csv(), "2026-06-04")
+        assert summary.opening_balance == 1406.0
+
+    def test_decoy_total_liquidity_not_picked_as_closing(self):
+        # If the decoy row won, closing_balance would be 0.0 — the original bug's
+        # near-miss. Assert we got the real ending cash, not the liquidity check row.
+        summary = _parse_cashflow_csv(self._csv(), "2026-06-04")
+        assert summary.closing_balance != 0.0

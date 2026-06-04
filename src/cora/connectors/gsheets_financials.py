@@ -69,8 +69,18 @@ _PORTFOLIO_TOTAL_LABELS = frozenset({
     "portfolio total", "total portfolio", "grand total",
     "net total", "total net", "portfolio net",
 })
-_OPENING_BALANCE_LABELS = frozenset({"opening balance", "beginning balance"})
-_CLOSING_BALANCE_LABELS = frozenset({"closing balance", "ending balance"})
+# Substring (case-insensitive) matches. The Standing ACTUALS tabs label these
+# rows "BEGINNING Cash/CC - Book Balance" and "Ending Cash/CC Book Balance" — the
+# generic "opening/closing balance" terms never matched, so balances came back
+# None for every entity (cash pulse showed all '--'). The closing match must be
+# "ending cash/cc book balance" (no dash) so it does NOT also hit the decoy row
+# "Total Liquidity - ENDING Cash/CC - Book Balance-S/B ZERO" (value 0).
+_OPENING_BALANCE_LABELS = frozenset({
+    "opening balance", "beginning balance", "beginning cash/cc",
+})
+_CLOSING_BALANCE_LABELS = frozenset({
+    "closing balance", "ending balance", "ending cash/cc book balance",
+})
 
 # Known entity display names → canonical entity code mapping
 # These match the row labels in the sheet (fuzzy/substring match).
