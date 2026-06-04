@@ -817,6 +817,20 @@ def test_format_location_inventory_quantity_comma_formatted():
     assert "12,345" in text
 
 
+def test_format_location_inventory_no_shopify_mention():
+    """Source-opaque check -- must not name the platform (matches sibling formatter)."""
+    skus = [
+        LocationSKU(product_title="F3 Energy 12-Pack", sku="EN12", available=100),
+        LocationSKU(product_title="F3 Pure", sku="PU24", available=80),
+    ]
+    # multi-brand view
+    assert "Shopify" not in format_location_inventory_for_llm(skus, "nimbl")
+    # single-brand view
+    assert "Shopify" not in format_location_inventory_for_llm(skus, "nimbl", brand="energy")
+    # empty view
+    assert "Shopify" not in format_location_inventory_for_llm([], "nimbl")
+
+
 # ── graphql ─────────────────────────────────────────────────────────────────────
 
 @patch("cora.connectors.shopify_client.requests.post")

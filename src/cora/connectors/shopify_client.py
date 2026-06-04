@@ -603,7 +603,7 @@ def format_location_inventory_for_llm(
         if not brand:
             lines.append("")
 
-    lines.append("_Live Shopify data. Units = individual cans._")
+    lines.append("_Live data. Units = individual cans._")
     return "\n".join(lines)
 
 
