@@ -431,19 +431,17 @@ class TestFormatLocationInventoryForLlm:
         result = self.fn(skus, "nimbl")
         assert "✅" in result  # ✅
 
-    def test_footer_includes_live_shopify_note(self):
+    def test_footer_includes_live_note(self):
         skus = _energy_skus()
         result = self.fn(skus, "nimbl")
-        assert "Live Shopify data" in result
+        # Footer signals freshness without naming the platform (source-opacity).
+        assert "Live data" in result
 
-    def test_source_opacity_no_shopify_word_in_brand_name(self):
-        """'Shopify' only appears in the footer note, not as a platform identifier."""
+    def test_source_opacity_no_shopify_mention(self):
+        """Source-opaque: the platform name must never appear in the reply."""
         skus = _energy_skus()
         result = self.fn(skus, "nimbl")
-        # Footer note says "Live Shopify data" which is acceptable
-        # but there should be no "shopify.com" or "admin.shopify" leaks
-        assert "shopify.com" not in result.lower()
-        assert "admin.shopify" not in result.lower()
+        assert "shopify" not in result.lower()
 
     def test_units_formatted_with_commas_large_numbers(self):
         skus = [_make_location_sku("F3 Energy Original", "F3-Original", 12345)]
