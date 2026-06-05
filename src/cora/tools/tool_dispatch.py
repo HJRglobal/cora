@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import yaml
 
-from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
+from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
 from ..connectors import clover_client, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
@@ -1146,6 +1146,30 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
             f"Influencer tracker error: {exc}. Tell the user the action wasn't completed "
             f"and suggest they check the deliverable ID or input values."
         )
+
+
+def _tool_fighter_compliance(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read the F3 Fighter Influencer Tracker Google Sheet and return compliance status."""
+    input_data = _input or {}
+    platform       = (input_data.get("platform") or "Instagram").strip().title()
+    campaign_month = (input_data.get("campaign_month") or "").strip() or None
+    show_complete  = bool(input_data.get("show_complete", False))
+
+    if platform not in ("Instagram", "Facebook", "Tiktok", "TikTok"):
+        platform = "Instagram"
+
+    log.info(
+        "fighter_compliance actor=%s platform=%s month=%s",
+        slack_user_id, platform, campaign_month or "current",
+    )
+    try:
+        return fighter_tracker_client.format_compliance_for_slack(
+            platform=platform,
+            campaign_month=campaign_month,
+            show_complete=show_complete,
+        )
+    except fighter_tracker_client.FighterTrackerError as exc:
+        return f"Could not read fighter tracker: {exc}"
 
 
 def _tool_influencer_list_handles(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3002,6 +3026,35 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "fighter_compliance",
+        "description": (
+            "Read the F3 Fighter Influencer Deliverable Tracker Google Sheet and show "
+            "compliance status. Use when Alex asks: 'show fighter compliance', 'who hasn't "
+            "posted yet', 'what's the fighter status for June', 'which fighters still owe us "
+            "posts', 'show me the Instagram tracker', 'who's missing their stories'. "
+            "Make.com writes dates into the sheet automatically when fighters post -- "
+            "this tool reads that live data. Read-only, no confirmation needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {
+                    "type": "string",
+                    "description": "Platform tab to read. One of: Instagram, Facebook, TikTok. Default: Instagram.",
+                },
+                "campaign_month": {
+                    "type": "string",
+                    "description": "Optional YYYY-MM filter (e.g. '2026-06'). If omitted, returns all rows.",
+                },
+                "show_complete": {
+                    "type": "boolean",
+                    "description": "If true, also lists fighters who have completed all 3 deliverables. Default false (only shows incomplete).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "influencer_list_handles",
         "description": (
             "List all sponsored athletes registered in Cora's influencer tracker — their "
@@ -4321,6 +4374,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
     "calendar_schedule_meeting": _tool_calendar_schedule_meeting,
+    "fighter_compliance": _tool_fighter_compliance,
     "influencer_list_handles": _tool_influencer_list_handles,
     "influencer_add_handle": _tool_influencer_add_handle,
     "influencer_get_status": _tool_influencer_get_status,
