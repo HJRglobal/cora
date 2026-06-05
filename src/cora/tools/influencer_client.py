@@ -476,6 +476,41 @@ def mark_waived(
     return dict(updated)
 
 
+def resolve_pending_deliverable(
+    athlete_name: str,
+    deliverable_type: str | None = None,
+    campaign_month: str | None = None,
+) -> dict | None:
+    """Find the best matching PENDING deliverable by athlete name + optional type.
+
+    Used when Alex types "@Cora complete deliverable Mario Bautista story" so he
+    doesn't need to know the numeric ID. Matches on partial case-insensitive name.
+
+    If multiple pending deliverables match (e.g. two stories), returns the one
+    with the earliest due_date (oldest first, to close them in order).
+
+    Returns a row dict, or None if no match found.
+    """
+    conn = _get_conn()
+    try:
+        params: list = [f"%{athlete_name.lower()}%"]
+        query = (
+            "SELECT * FROM influencer_deliverables "
+            "WHERE lower(athlete_name) LIKE ? AND status = 'pending'"
+        )
+        if deliverable_type:
+            query += " AND lower(deliverable_type) = ?"
+            params.append(deliverable_type.lower())
+        if campaign_month:
+            query += " AND campaign_month = ?"
+            params.append(campaign_month)
+        query += " ORDER BY due_date ASC, id ASC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def get_deliverables(
     *,
     entity: str | None = None,

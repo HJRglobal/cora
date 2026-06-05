@@ -1068,17 +1068,43 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
 
         else:  # complete or waive
             deliverable_id_raw = input_data.get("deliverable_id")
-            if not deliverable_id_raw:
-                return (
-                    f"influencer_log_deliverable: `deliverable_id` is required for action={action}. "
-                    f"Ask the user for the deliverable ID (shown in status reports as #N)."
+            athlete_name_raw = (input_data.get("athlete_name") or "").strip()
+
+            if not deliverable_id_raw and athlete_name_raw:
+                # Name-based lookup: Alex typed "complete deliverable Mario Bautista story"
+                dtype = (input_data.get("deliverable_type") or "").strip() or None
+                month = (input_data.get("campaign_month") or "").strip() or None
+                resolved = influencer_client.resolve_pending_deliverable(
+                    athlete_name=athlete_name_raw,
+                    deliverable_type=dtype,
+                    campaign_month=month,
                 )
-            try:
-                deliverable_id = int(deliverable_id_raw)
-            except (TypeError, ValueError):
+                if not resolved:
+                    desc = athlete_name_raw
+                    if dtype:
+                        desc += f" ({dtype})"
+                    return (
+                        f"No pending deliverable found for {desc}. "
+                        f"Either it's already complete, the name doesn't match, "
+                        f"or try specifying the type (story/post/reel)."
+                    )
+                deliverable_id = resolved["id"]
+                log.info(
+                    "influencer_log_deliverable: resolved %r %r -> id=%d",
+                    athlete_name_raw, dtype, deliverable_id,
+                )
+            elif deliverable_id_raw:
+                try:
+                    deliverable_id = int(deliverable_id_raw)
+                except (TypeError, ValueError):
+                    return (
+                        f"influencer_log_deliverable: `deliverable_id` must be a number. "
+                        f"Got {deliverable_id_raw!r}."
+                    )
+            else:
                 return (
-                    f"influencer_log_deliverable: `deliverable_id` must be a number. "
-                    f"Got {deliverable_id_raw!r}."
+                    f"influencer_log_deliverable: provide either `deliverable_id` (numeric) "
+                    f"or `athlete_name` (e.g. 'Mario Bautista') to identify the deliverable."
                 )
 
             if action == "complete":
@@ -3101,9 +3127,10 @@ TOOL_DEFINITIONS = [
             "- action=waive: 'waive [athlete]'s post this month', 'cancel the deliverable for [name]', "
             "  'mark #7 as excused — they had an injury'.\n"
             "\n"
-            "For action=complete or action=waive, you need the deliverable_id (shown as #N in "
-            "status reports). If the user doesn't know the ID, call influencer_get_status first "
-            "to find it, then confirm the right one with the user before completing/waiving."
+            "For action=complete or action=waive: use EITHER deliverable_id (#N from status reports) "
+            "OR athlete_name + deliverable_type (e.g. athlete_name='Mario Bautista', deliverable_type='story'). "
+            "Name-based lookup finds the oldest pending deliverable matching that fighter and type — "
+            "ideal when Alex replies to a Make.com Instagram notification like 'complete Mario Bautista story'."
         ),
         "input_schema": {
             "type": "object",
@@ -3114,7 +3141,13 @@ TOOL_DEFINITIONS = [
                 },
                 "athlete_name": {
                     "type": "string",
-                    "description": "Full name of the sponsored athlete / influencer. Required for action=add.",
+                    "description": (
+                        "Name of the sponsored athlete / influencer. "
+                        "Required for action=add. "
+                        "For action=complete or action=waive: provide this INSTEAD OF deliverable_id "
+                        "when Alex types naturally (e.g. 'complete Mario Bautista story'). "
+                        "Partial match is supported — 'Mario' finds 'Mario Bautista'."
+                    ),
                 },
                 "platform": {
                     "type": "string",
@@ -3130,7 +3163,15 @@ TOOL_DEFINITIONS = [
                 },
                 "deliverable_id": {
                     "type": "integer",
-                    "description": "ID of an existing deliverable. Required for action=complete and action=waive. Shown as #N in status reports.",
+                    "description": (
+                        "ID of an existing deliverable (shown as #N in status reports). "
+                        "For action=complete and action=waive: use this OR athlete_name — not both required. "
+                        "If athlete_name is provided, deliverable_id can be omitted and Cora will resolve automatically."
+                    ),
+                },
+                "campaign_month": {
+                    "type": "string",
+                    "description": "Optional. YYYY-MM format (e.g. 2026-06). Narrows name-based lookup to a specific month when a fighter has deliverables across multiple months.",
                 },
                 "completion_link": {
                     "type": "string",
