@@ -16,7 +16,6 @@ import pytest
 from src.cora.tools import lex_client
 from src.cora.tools.tool_dispatch import (
     _tool_lex_revalidation_status,
-    _tool_lex_staff_pulse,
 )
 
 
@@ -321,25 +320,11 @@ class TestDispatchLayer:
             result = _tool_lex_revalidation_status("U_TEST", "LEX", {})
         assert "AZ DDD Therapy Revalidation" in result
 
-    def test_lex_staff_pulse_dispatches(self):
-        result = _tool_lex_staff_pulse("U_TEST", "LEX", {})
-        assert isinstance(result, str)
-        assert len(result) > 10
-
     def test_revalidation_in_tool_definitions(self):
         from src.cora.tools.tool_dispatch import TOOL_DEFINITIONS
         names = [t["name"] for t in TOOL_DEFINITIONS]
         assert "lex_revalidation_status" in names
 
-    def test_staff_pulse_in_tool_definitions(self):
-        from src.cora.tools.tool_dispatch import TOOL_DEFINITIONS
-        names = [t["name"] for t in TOOL_DEFINITIONS]
-        assert "lex_staff_pulse" in names
-
     def test_revalidation_in_tool_functions(self):
         from src.cora.tools.tool_dispatch import _TOOL_FUNCTIONS
         assert "lex_revalidation_status" in _TOOL_FUNCTIONS
-
-    def test_staff_pulse_in_tool_functions(self):
-        from src.cora.tools.tool_dispatch import _TOOL_FUNCTIONS
-        assert "lex_staff_pulse" in _TOOL_FUNCTIONS

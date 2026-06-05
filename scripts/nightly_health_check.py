@@ -76,9 +76,24 @@ class CheckResult:
 #   - proactive-gaps: wrong-entity content bug (fix queued)
 # NOTE: qbo-token-refresh was RE-ENABLED 2026-06-04 -- it is now expected Ready.
 _EXPECTED_DISABLED = {
+    # Gmail sync -- precision too low (paused)
     "cowork-cora-asana-email-sync",
     "cowork-cora-hubspot-email-sync",
+    # Wrong-entity content bug (fix queued)
     "cowork-cora-proactive-gaps",
+    # Moved to Make.com 2026-06-05
+    "Cora - Deal Task Sync",
+    "Cora - Asana Hygiene Nudges",
+    "Cora - Channel Health Monitor",
+    "Cora - HubSpot Deal Monitor",
+    "Cora - OSN Metrics Digest",
+    "Cora - Shopify DTC Summary",
+    # Clover retired 2026-06-05
+    "Cora - Clover Daily Summary",
+    # LinkedIn Spy moved to Make.com 2026-06-05
+    "Cora - LinkedIn Spy",
+    # Meeting Action Capture -- intentionally disabled (currently paused)
+    "Cora - Meeting Action Capture",
 }
 _EXPECTED_RUNNING  = {"cowork-cora-service"}
 

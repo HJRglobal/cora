@@ -1539,17 +1539,6 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
     return result
 
 
-def _tool_financial_notify_gap(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Post a finance data gap alert to #hjrg-finance and return the fixed response."""
-    topic = (_input or {}).get("topic") or "unspecified financial question"
-    channel_name = (_input or {}).get("_channel_name", "")
-    return financial_client.notify_gap(
-        topic=topic,
-        channel=channel_name or entity,
-        user=slack_user_id,
-    )
-
-
 def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch OSN store-by-store financial snapshot from the OSN Consolidated cashflow tab."""
     channel_name = (_input or {}).get("_channel_name", "")
@@ -2281,18 +2270,6 @@ def _tool_lex_revalidation_status(slack_user_id: str, entity: str, _input: dict)
     """
     log.info("lex_revalidation_status user=%s entity=%s", slack_user_id, entity)
     return lex_client.get_revalidation_status()
-
-
-def _tool_lex_staff_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return Lex staffing pulse from the Sean/Jen Drive upload folder."""
-    entity_upper = (entity or "").upper()
-    # Aggregate staffing counts are not PHI — allow any LEX context or founder
-    if not (entity_upper.startswith("LEX") or entity_upper in ("FNDR", "HJRG")):
-        return _HR_CHANNEL_REQUIRED
-    log.info("lex_staff_pulse user=%s entity=%s", slack_user_id, entity)
-    result = lex_client.get_staff_pulse()
-    log.info("lex_staff_pulse result_len=%d preview=%r", len(result), result[:120])
-    return result
 
 
 def _tool_hjrp_lease_status(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3348,34 +3325,6 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
-    {
-        "name": "financial_notify_gap",
-        "description": (
-            "Post a finance data gap alert to the #hjrg-finance channel and return the "
-            "standard unknown-answer response string. Call this tool when: "
-            "(1) financial_get_cashflow returned the UNKNOWN_RESPONSE string, OR "
-            "(2) the user asked a financial question that financial_get_cashflow cannot "
-            "answer (e.g. a specific month's P&L, QBO balance sheet, or a question about "
-            "data that isn't in the Standing ACTUALS sheet). "
-            "The notification is throttled to one per topic per 24 hours — call it freely, "
-            "the tool handles deduplication. Always return the tool's output verbatim to "
-            "the user — do not rephrase or soften it."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "description": (
-                        "Short description of what the user asked for that could not be "
-                        "answered. Example: 'OSN April P&L', 'QBO balance sheet for F3E', "
-                        "'weekly cash flow (connector error)'. Used in the Slack alert."
-                    ),
-                },
-            },
-            "required": ["topic"],
-        },
-    },
     # ── FNDR-specific tools (founder / HJRG channels only) ──
     {
         "name": "fndr_completion_candidates",
@@ -4037,28 +3986,6 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "lex_staff_pulse",
-        "description": (
-            "Return Lexington staffing pulse data from the Sean/Jen Drive upload folder — "
-            "open positions, recent terminations, and training compliance counts. "
-            "ALWAYS call this tool when a user asks about Lex staffing levels, open roles, "
-            "recent staff departures, driver safety, or training compliance status. "
-            "Do NOT answer from KB memory — this tool fetches the most-recently uploaded "
-            "staffing and driver safety reports and returns a live summary.\n"
-            "\n"
-            "Trigger phrases: 'staffing', 'open positions', 'staff turnover', 'training "
-            "compliance', 'how many staff', 'driver safety compliance', 'who left', "
-            "'recent terminations', 'staffing report'.\n"
-            "\n"
-            "Scope: LEX / LEX-* channels and FNDR/HJRG. HR channel required or founder entity."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    {
         "name": "hjrp_lease_status",
         "description": (
             "Return the HJR Properties lease register for both buildings — North "
@@ -4203,7 +4130,6 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_ap_aging": _tool_qbo_get_ap_aging,
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
     "financial_get_cashflow": _tool_financial_get_cashflow,
-    "financial_notify_gap": _tool_financial_notify_gap,
     "financial_get_pulse": _tool_financial_get_pulse,
     "financial_get_close_pack": _tool_financial_get_close_pack,
     "fndr_completion_candidates": _tool_fndr_completion_candidates,
@@ -4228,7 +4154,6 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3_create_sales_deck": _tool_f3_create_sales_deck,
     # LEX tools
     "lex_revalidation_status": _tool_lex_revalidation_status,
-    "lex_staff_pulse": _tool_lex_staff_pulse,
     # HJRP tools
     "hjrp_lease_status": _tool_hjrp_lease_status,
     # HubSpot two-way write tools
@@ -4237,6 +4162,52 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     # Cross-entity write tools
     "slack_send_dm": _tool_slack_send_dm,
 }
+
+
+# Per-tool timeout overrides (seconds). Default = 15s.
+# Fast tools (local DB / simple API): 8s
+# Heavy tools (multi-step, slow external APIs): 25s
+_TOOL_TIMEOUTS: dict[str, int] = {
+    # Fast — local DB or single quick API call
+    "asana_get_my_tasks": 8,
+    "asana_get_user_tasks": 8,
+    "fndr_open_decisions": 8,
+    "fndr_completion_candidates": 8,
+    "hjrp_lease_status": 8,
+    "osn_financial_pulse": 8,
+    "hubspot_get_my_deals": 8,
+    "calendar_get_my_events": 8,
+    "influencer_list_handles": 8,
+    "influencer_get_status": 8,
+    # Normal — single external API call
+    "asana_create_task": 12,
+    "f3e_hubspot_pipeline_summary": 12,
+    "fndr_contracts_dashboard": 12,
+    "lex_revalidation_status": 12,
+    "f3e_shopify_sales_pulse": 12,
+    "f3e_shopify_inventory": 12,
+    "f3e_inventory_pulse": 12,
+    "f3e_inventory_by_location": 12,
+    "financial_get_cashflow": 15,
+    "financial_get_pulse": 15,
+    "financial_get_close_pack": 15,
+    "qbo_get_profit_loss": 15,
+    "qbo_get_balance_sheet": 15,
+    "qbo_get_ar_aging": 15,
+    "qbo_get_ap_aging": 15,
+    "qbo_get_recent_transactions": 15,
+    # Heavy — multi-step, slow uploads, or long-running APIs
+    "gmail_create_draft": 20,
+    "calendar_create_event": 20,
+    "calendar_schedule_meeting": 25,
+    "f3_create_image": 25,
+    "f3_create_sales_deck": 25,
+    "influencer_log_deliverable": 20,
+    "hubspot_update_deal_stage": 20,
+    "hubspot_add_note": 20,
+    "slack_send_dm": 12,
+}
+_DEFAULT_TOOL_TIMEOUT = 15
 
 
 def dispatch(
@@ -4270,12 +4241,13 @@ def dispatch(
     if thread_ts:
         injected["_thread_ts"] = thread_ts
     try:
+        timeout = _TOOL_TIMEOUTS.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, slack_user_id, entity, injected)
             try:
-                return future.result(timeout=25)
+                return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                log.warning("Tool %s timed out after 25s for user=%s entity=%s", tool_name, slack_user_id, entity)
+                log.warning("Tool %s timed out after %ds for user=%s entity=%s", tool_name, timeout, slack_user_id, entity)
                 return "Tool timed out — please try again."
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
