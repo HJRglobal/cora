@@ -1,24 +1,32 @@
-"""Fighter Influencer Tracker — Google Sheets reader for F3 sponsored athletes.
+"""MMA Lab x F3 Fighter Tracker -- Google Sheets reader.
 
-Reads the F3 Fighter Influencer Deliverable Tracker spreadsheet via the
-Google Sheets API using the same service account as the cashflow connector.
+Reads the "MMA Lab x F3 Fighters Tracker" spreadsheet via the Google Sheets API.
+This tracks the MMA Lab sponsorship: 57 fighters must each post monthly on Instagram
+(2 stories + 1 hard post tagging @f3energy + #DrinkF3). F3 pays MMA Lab $125 per
+fighter who completes all 3 deliverables that month (max $6,250/month if all 57 post).
 
-Sheet ID stored in FIGHTER_TRACKER_SHEET_ID env var.
+Sheet ID: FIGHTER_TRACKER_SHEET_ID env var
 Sheet URL: https://docs.google.com/spreadsheets/d/1tPpsdUrvXaYq7Cz77L5yYwEC6plptO_xcGY3JncPK28
 
-Tab structure (one per platform):
-  Instagram | Facebook | TikTok
+Tab structure -- one tab per MONTH (not platform):
+  June 2026 | July 2026 | August 2026 | ... | December 2026
 
 Columns per tab:
   A: Fighter Name
-  B: Handle
-  C: Campaign Month (YYYY-MM, e.g. 2026-06)
-  D: Hard Post (Date completed, or blank)
-  E: Story 1 (Date completed, or blank)
-  F: Story 2 (Date completed, or blank)
+  B: Instagram Handle (without @)
+  C: Hard Post (Date completed, or blank)
+  D: Story 1 (Date completed, or blank)
+  E: Story 2 (Date completed, or blank)
+  F: All 3 Complete? (formula -- "YES" when C+D+E all filled)
 
-Make.com writes the date cells when a fighter posts.
-Cora reads this sheet on demand to answer Alex's status questions.
+Value tracker rows at bottom of each tab (auto-calculated):
+  - Fighters completed all 3 deliverables
+  - Amount owed to MMA Lab ($125 x count)
+  - Maximum possible this month
+  - Completion rate
+
+Make.com writes dates into C/D/E when fighters post.
+Cora reads on demand to answer Alex's status questions.
 """
 
 from __future__ import annotations
@@ -33,15 +41,21 @@ log = logging.getLogger(__name__)
 
 _SHEET_ID_ENV = "FIGHTER_TRACKER_SHEET_ID"
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-_PLATFORMS = ["Instagram", "Facebook", "TikTok"]
+# Tab names follow "Month YYYY" pattern
+_MONTH_TABS = [
+    "June 2026","July 2026","August 2026","September 2026",
+    "October 2026","November 2026","December 2026",
+]
 
-# Column indices (0-based after reading values)
-_COL_NAME     = 0
-_COL_HANDLE   = 1
-_COL_MONTH    = 2
-_COL_POST     = 3
-_COL_STORY1   = 4
-_COL_STORY2   = 5
+# Column indices (0-based) -- no Campaign Month column any more
+_COL_NAME    = 0
+_COL_HANDLE  = 1
+_COL_POST    = 2   # C: Hard Post
+_COL_STORY1  = 3   # D: Story 1
+_COL_STORY2  = 4   # E: Story 2
+_COL_DONE    = 5   # F: All 3 Complete? (formula, "YES" or "")
+
+_PAY_PER_FIGHTER = 125
 
 
 class FighterTrackerError(Exception):
@@ -73,14 +87,17 @@ def _get_service():
         raise FighterTrackerError(f"Could not build Sheets service: {exc}") from exc
 
 
-def read_tab(platform: str, campaign_month: str | None = None) -> list[dict]:
-    """Read one platform tab and return a list of fighter dicts.
+def _current_month_tab() -> str:
+    """Return the current month's tab name, e.g. 'June 2026'."""
+    return date.today().strftime("%B %Y")
 
-    Each dict has keys: name, handle, month, post, story1, story2,
-    post_done, story1_done, story2_done, all_done, deliverables_done (int 0-3).
 
-    If campaign_month is provided (YYYY-MM), filters to rows matching that month
-    OR rows where the month column is blank (treat as current month).
+def read_month_tab(month_tab: str) -> list[dict]:
+    """Read one monthly tab and return a list of fighter dicts.
+
+    month_tab: e.g. "June 2026", "July 2026"
+    Each dict: name, handle, post, story1, story2,
+               post_done, story1_done, story2_done, all_done, deliverables_done
     """
     service = _get_service()
     sid = _sheet_id()
@@ -89,107 +106,100 @@ def read_tab(platform: str, campaign_month: str | None = None) -> list[dict]:
         result = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=sid, range=f"{platform}!A2:F200")
+            .get(spreadsheetId=sid, range=f"'{month_tab}'!A2:F80")
             .execute()
         )
     except Exception as exc:
-        raise FighterTrackerError(f"Sheets API error reading {platform}: {exc}") from exc
+        raise FighterTrackerError(f"Sheets API error reading tab '{month_tab}': {exc}") from exc
 
     rows = result.get("values", [])
     fighters = []
     for row in rows:
-        # Pad row to 6 columns
         while len(row) < 6:
             row.append("")
 
-        name      = row[_COL_NAME].strip()
+        name = row[_COL_NAME].strip()
+        if not name or name.lower().startswith("mma lab"):
+            continue  # skip tracker rows at bottom
+
         handle    = row[_COL_HANDLE].strip()
-        month     = row[_COL_MONTH].strip()
         post_date = row[_COL_POST].strip()
         s1_date   = row[_COL_STORY1].strip()
         s2_date   = row[_COL_STORY2].strip()
-
-        if not name:
-            continue
-
-        # Month filter
-        if campaign_month and month and month != campaign_month:
-            continue
+        done_flag = row[_COL_DONE].strip().upper()
 
         done_count = sum(1 for d in (post_date, s1_date, s2_date) if d)
+        all_done   = done_count == 3 or done_flag == "YES"
+
         fighters.append({
-            "name":       name,
-            "handle":     handle,
-            "month":      month or campaign_month or "",
-            "post":       post_date,
-            "story1":     s1_date,
-            "story2":     s2_date,
-            "post_done":  bool(post_date),
-            "story1_done": bool(s1_date),
-            "story2_done": bool(s2_date),
-            "all_done":   done_count == 3,
+            "name":            name,
+            "handle":          handle,
+            "post":            post_date,
+            "story1":          s1_date,
+            "story2":          s2_date,
+            "post_done":       bool(post_date),
+            "story1_done":     bool(s1_date),
+            "story2_done":     bool(s2_date),
+            "all_done":        all_done,
             "deliverables_done": done_count,
         })
     return fighters
 
 
 def format_compliance_for_slack(
-    platform: str = "Instagram",
-    campaign_month: str | None = None,
+    month_tab: str | None = None,
     show_complete: bool = False,
 ) -> str:
-    """Return a Slack-formatted compliance summary for one platform tab.
+    """Return a Slack-formatted MMA Lab compliance summary.
 
-    By default only shows fighters who are NOT fully complete (actionable view).
-    Pass show_complete=True to include everyone.
+    month_tab: e.g. "June 2026". Defaults to current month.
+    show_complete: if True, also lists fighters who finished all 3.
     """
+    tab = month_tab or _current_month_tab()
+
     try:
-        fighters = read_tab(platform, campaign_month)
+        fighters = read_month_tab(tab)
     except FighterTrackerError as exc:
-        return f"Could not read fighter tracker sheet: {exc}"
+        return f"Could not read fighter tracker for {tab}: {exc}"
 
     if not fighters:
-        return f"No data found in the {platform} tab{' for ' + campaign_month if campaign_month else ''}."
+        return f"No fighter data found for {tab}. Check the sheet tab name."
 
-    month_label = campaign_month or date.today().strftime("%Y-%m")
-    total = len(fighters)
+    total    = len(fighters)
     complete = sum(1 for f in fighters if f["all_done"])
     pending  = total - complete
+    owed     = complete * _PAY_PER_FIGHTER
+    max_pay  = total * _PAY_PER_FIGHTER
 
     lines = [
-        f"*F3 Fighter Compliance -- {platform} -- {month_label}*",
-        f"{complete}/{total} fighters complete | {pending} outstanding",
-        "",
+        f"*MMA Lab x F3 -- Fighter Compliance -- {tab}*",
+        f"",
+        f"*{complete}/{total}* fighters completed all 3 deliverables",
+        f"*Amount owed to MMA Lab: ${owed:,}* (of ${max_pay:,} max)",
+        f"",
     ]
 
     incomplete = [f for f in fighters if not f["all_done"]]
     if incomplete:
-        lines.append("*Still outstanding:*")
-        for f in sorted(incomplete, key=lambda x: x["deliverables_done"]):
+        lines.append(f"*Still outstanding ({len(incomplete)} fighters):*")
+        for f in sorted(incomplete, key=lambda x: x["deliverables_done"], reverse=True):
+            done   = f["deliverables_done"]
             name   = f["name"]
             handle = f"@{f['handle']}" if f["handle"] else ""
-            post   = "✅" if f["post_done"]   else "❌ post"
-            s1     = "✅" if f["story1_done"] else "❌ story1"
-            s2     = "✅" if f["story2_done"] else "❌ story2"
-            done   = f["deliverables_done"]
-            missing_parts = [p for p in [
-                ("post" if not f["post_done"] else None),
-                ("story1" if not f["story1_done"] else None),
-                ("story2" if not f["story2_done"] else None),
-            ] if p]
-            missing_str = ", ".join(missing_parts)
-            lines.append(f"  {done}/3 -- *{name}* {handle} -- missing: {missing_str}")
+            missing = []
+            if not f["post_done"]:   missing.append("hard post")
+            if not f["story1_done"]: missing.append("story 1")
+            if not f["story2_done"]: missing.append("story 2")
+            lines.append(f"  {done}/3 -- *{name}* {handle} -- needs: {', '.join(missing)}")
 
-    if show_complete:
-        done_fighters = [f for f in fighters if f["all_done"]]
-        if done_fighters:
-            lines.append("")
-            lines.append("*Complete:*")
-            for f in done_fighters:
-                lines.append(f"  ✅ {f['name']} (@{f['handle']})")
+    if show_complete and complete > 0:
+        lines.append("")
+        lines.append(f"*Completed ({complete} fighters -- ${owed:,} earned):*")
+        for f in [f for f in fighters if f["all_done"]]:
+            lines.append(f"  ✅ {f['name']} (@{f['handle']})")
 
     sheet_url = f"https://docs.google.com/spreadsheets/d/{_sheet_id()}"
     lines.append("")
-    lines.append(f"_<{sheet_url}|View full tracker> -- Make.com updates automatically when fighters post._")
+    lines.append(f"_<{sheet_url}|Open tracker> -- Make.com logs dates automatically when fighters post._")
 
     return "\n".join(lines)

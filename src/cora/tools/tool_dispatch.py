@@ -1150,22 +1150,17 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
 
 def _tool_fighter_compliance(slack_user_id: str, entity: str, _input: dict) -> str:
     """Read the F3 Fighter Influencer Tracker Google Sheet and return compliance status."""
-    input_data = _input or {}
-    platform       = (input_data.get("platform") or "Instagram").strip().title()
-    campaign_month = (input_data.get("campaign_month") or "").strip() or None
-    show_complete  = bool(input_data.get("show_complete", False))
-
-    if platform not in ("Instagram", "Facebook", "Tiktok", "TikTok"):
-        platform = "Instagram"
+    input_data    = _input or {}
+    month_tab     = (input_data.get("month_tab") or "").strip() or None
+    show_complete = bool(input_data.get("show_complete", False))
 
     log.info(
-        "fighter_compliance actor=%s platform=%s month=%s",
-        slack_user_id, platform, campaign_month or "current",
+        "fighter_compliance actor=%s month=%s show_complete=%s",
+        slack_user_id, month_tab or "current", show_complete,
     )
     try:
         return fighter_tracker_client.format_compliance_for_slack(
-            platform=platform,
-            campaign_month=campaign_month,
+            month_tab=month_tab,
             show_complete=show_complete,
         )
     except fighter_tracker_client.FighterTrackerError as exc:
@@ -2919,27 +2914,26 @@ TOOL_DEFINITIONS = [
     {
         "name": "fighter_compliance",
         "description": (
-            "Read the F3 Fighter Influencer Deliverable Tracker Google Sheet and show "
-            "compliance status. Use when Alex asks: 'show fighter compliance', 'who hasn't "
-            "posted yet', 'what's the fighter status for June', 'which fighters still owe us "
-            "posts', 'show me the Instagram tracker', 'who's missing their stories'. "
-            "Make.com writes dates into the sheet automatically when fighters post -- "
-            "this tool reads that live data. Read-only, no confirmation needed."
+            "Read the MMA Lab x F3 Fighters Tracker Google Sheet and show MMA Lab "
+            "sponsorship compliance. Use when Alex or Harrison asks: 'show fighter compliance', "
+            "'who hasn't posted yet', 'what's the MMA Lab status for June', 'which fighters "
+            "still owe us posts', 'how much do we owe MMA Lab', 'show fighter tracker', "
+            "'who's missing their stories this month'. "
+            "Tabs are per month (June 2026, July 2026, etc.). Make.com writes dates when "
+            "fighters post. Shows who's done, who's missing deliverables, and amount owed "
+            "to MMA Lab ($125 per fighter who completes all 3, max $6,250+/month). "
+            "Read-only, no confirmation needed."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "platform": {
+                "month_tab": {
                     "type": "string",
-                    "description": "Platform tab to read. One of: Instagram, Facebook, TikTok. Default: Instagram.",
-                },
-                "campaign_month": {
-                    "type": "string",
-                    "description": "Optional YYYY-MM filter (e.g. '2026-06'). If omitted, returns all rows.",
+                    "description": "Month tab to read, e.g. 'June 2026', 'July 2026'. Defaults to current month if omitted.",
                 },
                 "show_complete": {
                     "type": "boolean",
-                    "description": "If true, also lists fighters who have completed all 3 deliverables. Default false (only shows incomplete).",
+                    "description": "If true, also lists fighters who completed all 3 deliverables. Default false (shows only incomplete).",
                 },
             },
             "required": [],
