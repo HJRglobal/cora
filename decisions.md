@@ -461,3 +461,76 @@ as a trigger example, causing Claude to match "Q1 LLC revenue" to the wrong tool
 **Provisioned QBO entities (as of 2026-06-04):**
 BDM, F3E, HJRG, HJRP, HRLLC, LEX, OSN, OSNGF, OSNGM, OSNGW, OSNVV
 (11 entities, all refreshed today, 100 days remaining on tokens)
+
+
+---
+
+## D-027 · Make.com Apollo LinkedIn Spy scenario built (2026-06-05)
+
+**What shipped:**
+Make.com scenario ID `4769263` -- "[F3E] Apollo LinkedIn Spy -- HubSpot Leads + Tommy DM"
+Runs weekly (every 7 days). Apollo key: `Dgjo_xURHLTiIonedhGPjw` (renewed June 2026, key stable).
+
+**Pipeline:**
+1. HTTP -> Apollo People Search API (25 retail buyers/run, US-based, 13 buyer titles)
+2. BasicFeeder iterator -- one prospect at a time
+3. Data Store dedup check (store ID 86999, structure ID 281670, "F3E Apollo Spy Dedup")
+4. Filter: skip if already processed (exist = false passes through)
+5. OpenAI GPT-3.5 -- brand fit score (Pure/Mood/Energy/All, 1-10) + 280-char LinkedIn note
+6. JSON Parse AI response
+7. HubSpot: Create or Update Contact (connection 4784191, portal 246351746)
+8. HubSpot: Create Deal (F3E Retail pipeline 2313722582, Identify stage 3760235201, Tommy owner 162944825)
+9. Data Store: Add Record -- marks LinkedIn URL as processed with contact + deal IDs
+10. Array Aggregator -- collects all new leads this run
+11. Slack DM to Tommy (U0B3RU5Q55G, connection 4791951, HJR Global workspace)
+
+**Relationship to Python script:** Both the Python LinkedIn Spy (scripts/run_linkedin_spy.py,
+cowork-cora-linkedin-spy Task Scheduler) and this Make scenario run the same Apollo query and
+write to HubSpot. They use SEPARATE dedup stores (Python: SQLite data/linkedin_spy.db,
+Make: data store 86999). Running both creates duplicate HubSpot contacts/deals. Disable one.
+Harrison to decide -- can retire the Python task if Make ownership is preferred.
+
+---
+
+## D-028 · F3 Shopify Impulse theme build state locked (2026-06-04, via Cowork cascade)
+
+**Theme:** Impulse ID 185801638208 -- UNPUBLISHED DRAFT on f3energy.myshopify.com
+**Active live theme:** Reformation (ID 180110164288) -- DO NOT touch
+
+**8 theme files written 2026-06-04:**
+brand-routing-vars.liquid (Pure button #2D3436, font weight CSS vars),
+font-face.liquid (Josefin Sans 100/300/600 added),
+product.pure/mood/energy.json ($75 shipping),
+header-group.json ($75 announcement bar),
+footer-group.json (Shop/Company/Resources labels),
+page.contact.json (F3 branded copy).
+
+**4 decisions LOCKED:**
+1. Pure H2 = Josefin Sans Light 300 (weight 200 does not exist in font)
+2. Energy H2 = Josefin Sans Regular 400 (weight 500 does not exist in font)
+3. Free shipping threshold = $75 everywhere (canonical)
+4. Klaviyo popup SUBSCRIBE button = #2D3436 charcoal (not teal)
+Josefin Sans ships 100/300/400/600/700 ONLY. No 200, no 500. Any prior spec referencing
+those weights is superseded.
+
+**BLOCKING PUBLISH -- Harrison uploads needed:**
+- Favicon (32x32 + 180x180 + 192x192) via Shopify Admin > Themes > Impulse > Customize
+- f3-logo-pure.png (1200x400 transparent PNG) via Shopify Admin > Content > Files
+- f3-logo-mood.png (same spec)
+- 8 hero photography slots (all 2880x1620px 16:9): homepage mood-hero, family-hero
+  pure/mood/energy/family images, Pure + Mood + Energy collection heroes
+
+**One manual Shopify step:** Rename nav menu "footer--company" -> "Company" in Admin.
+**Klaviyo:** Update SUBSCRIBE button to #2D3436 in form builder (not a theme change).
+
+**Verification gate before publish:**
+Preview: https://f3energy.myshopify.com/?preview_theme_id=185801638208&brand=energy
+DevTools: H1 = font-weight 100, H2 = font-weight 300, @font-face for 100/300/600 present.
+If weights show as 400 despite CSS vars, font_modify returned nil -- escalate before publishing.
+
+**11 draft pages to review** before publishing (ingredients-pure/mood/energy, 4 LPs,
+about/faq/shipping-returns/contact-v2 -- each replaces an existing page).
+
+**Canonical files:**
+- Inventory: 02-F3-Energy/_shared/f3-website-brand-config-inventory-CANONICAL-2026-06-04.md
+- Punch list v3: 02-F3-Energy/_shared/impulse-correction-punch-list-v3-2026-06-04.md
