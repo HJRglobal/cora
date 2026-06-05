@@ -20,7 +20,7 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
-from ..connectors import clover_client, gmail_reader, photoroom_client, qbo_oauth, shopify_client
+from ..connectors import gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
 log = logging.getLogger(__name__)
@@ -1598,93 +1598,7 @@ def _tool_financial_get_close_pack(slack_user_id: str, entity: str, _input: dict
     )
 
 
-# --- OSN Clover tools ---
-
-
-def _tool_osn_sales_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return OSN sales summary from Clover POS for one or all stores."""
-    store = (_input.get("store") or "all").upper()
-    period = _input.get("period") or "today"
-    if period not in clover_client.VALID_PERIODS:
-        period = "today"
-    try:
-        if store == "ALL":
-            summaries = clover_client.get_all_stores_sales_pulse(period)
-        elif store in clover_client.VALID_STORES:
-            summaries = [clover_client.get_sales_pulse(store, period)]
-        else:
-            return (
-                f"Unknown store code {store!r}. "
-                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
-            )
-    except clover_client.CloverConfigError as exc:
-        log.warning("osn_sales_pulse config error: %s", exc)
-        return "I don't have that right now."
-    except clover_client.CloverConnectorError as exc:
-        log.warning("osn_sales_pulse connector error user=%s: %s", slack_user_id, exc)
-        return "I don't have that right now."
-    if not summaries:
-        return "No sales data returned for that period."
-    log.info("osn_sales_pulse user=%s entity=%s store=%s period=%s stores=%d",
-             slack_user_id, entity, store, period, len(summaries))
-    return clover_client.format_sales_for_llm(summaries, period)
-
-
-def _tool_osn_inventory_status(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return OSN inventory levels from Clover POS with low-stock flags."""
-    store = (_input.get("store") or "all").upper()
-    low_stock_only = _input.get("low_stock_only", True)
-    threshold = int(_input.get("threshold") or clover_client.DEFAULT_LOW_STOCK_THRESHOLD)
-    try:
-        if store == "ALL":
-            summaries = clover_client.get_all_stores_inventory(threshold)
-        elif store in clover_client.VALID_STORES:
-            summaries = [clover_client.get_inventory(store, threshold)]
-        else:
-            return (
-                f"Unknown store code {store!r}. "
-                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
-            )
-    except clover_client.CloverConfigError as exc:
-        log.warning("osn_inventory_status config error: %s", exc)
-        return "I don't have that right now."
-    except clover_client.CloverConnectorError as exc:
-        log.warning("osn_inventory_status connector error user=%s: %s", slack_user_id, exc)
-        return "I don't have that right now."
-    if not summaries:
-        return "No inventory data returned."
-    log.info("osn_inventory_status user=%s entity=%s store=%s low_stock_only=%s",
-             slack_user_id, entity, store, low_stock_only)
-    return clover_client.format_inventory_for_llm(summaries, bool(low_stock_only))
-
-
-def _tool_osn_customer_trends(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Return OSN customer trend data from Clover POS with MoM delta."""
-    store = (_input.get("store") or "all").upper()
-    period = _input.get("period") or "30d"
-    if period not in clover_client.VALID_PERIODS:
-        period = "30d"
-    try:
-        if store == "ALL":
-            summaries = clover_client.get_all_stores_customer_trends(period)
-        elif store in clover_client.VALID_STORES:
-            summaries = [clover_client.get_customer_trends(store, period)]
-        else:
-            return (
-                f"Unknown store code {store!r}. "
-                f"Valid options: {', '.join(clover_client.VALID_STORES)} or 'all'."
-            )
-    except clover_client.CloverConfigError as exc:
-        log.warning("osn_customer_trends config error: %s", exc)
-        return "I don't have that right now."
-    except clover_client.CloverConnectorError as exc:
-        log.warning("osn_customer_trends connector error user=%s: %s", slack_user_id, exc)
-        return "I don't have that right now."
-    if not summaries:
-        return "No customer data returned for that period."
-    log.info("osn_customer_trends user=%s entity=%s store=%s period=%s",
-             slack_user_id, entity, store, period)
-    return clover_client.format_customer_trends_for_llm(summaries)
+# --- OSN tools (Clover removed -- OSN now uses QBO as financial source) ---
 
 
 # --- FNDR-specific tools ---
@@ -3802,103 +3716,6 @@ TOOL_DEFINITIONS = [
             "required": ["period"],
         },
     },
-    # ── OSN Clover POS tools (OSN channels only) ──
-    {
-        "name": "osn_sales_pulse",
-        "description": (
-            "Fetch real-time sales data for one or all OSN store locations. "
-            "Use when a user asks about sales, revenue, transactions, average ticket, "
-            "or refunds — phrases like 'how are sales today', 'what did we do yesterday', "
-            "'show me this week's numbers', 'how much did GW bring in', 'total revenue', "
-            "'transactions today', 'average sale'. "
-            "Data is sourced from the point-of-sale system (clover-daily refresh cadence, "
-            "cached 5 minutes). Output is source-opaque — never mention the POS platform "
-            "or merchant IDs. "
-            "Only call in OSN or FNDR channels. "
-            "Requires TIER_1 (leadership-channel) enforcement — refuse in non-leadership "
-            "channels and redirect to #osn-leadership."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "store": {
-                    "type": "string",
-                    "enum": ["all", "GW", "GM", "GF", "VVP"],
-                    "description": (
-                        "Store code: GW = Gilbert & Warner, GM = Gilbert & McKellips, "
-                        "GF = Greenfield & 60, VVP = Val Vista & Pecos. "
-                        "Defaults to 'all' (portfolio summary)."
-                    ),
-                },
-                "period": {
-                    "type": "string",
-                    "enum": ["today", "yesterday", "7d", "30d"],
-                    "description": "Time window. Defaults to 'today'.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "osn_inventory_status",
-        "description": (
-            "Fetch current inventory levels for one or all OSN store locations. "
-            "Use when a user asks about stock, inventory, what's running low, out-of-stock "
-            "items — phrases like 'what's low on stock', 'inventory status', 'what do we "
-            "need to reorder', 'stock levels at GW', 'what's out', 'inventory check'. "
-            "Can filter to low-stock items only (at or below threshold). "
-            "Output is source-opaque. Only call in OSN or FNDR channels. "
-            "Apply TIER_1 guardrail — leadership channels only."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "store": {
-                    "type": "string",
-                    "enum": ["all", "GW", "GM", "GF", "VVP"],
-                    "description": "Store code. Defaults to 'all'.",
-                },
-                "low_stock_only": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, return only items at or below the low-stock threshold. "
-                        "Defaults to true (low stock only)."
-                    ),
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "osn_customer_trends",
-        "description": (
-            "Fetch customer count trends for one or all OSN store locations, comparing "
-            "the current period to the equivalent prior period. "
-            "Use when a user asks about customer traffic, foot traffic, new vs returning "
-            "customers, customer growth — phrases like 'how many customers today', "
-            "'customer count this week', 'are we getting more customers', 'foot traffic', "
-            "'new customers this month', 'customer trends at VVP'. "
-            "Returns current period count, prior period count, and delta. "
-            "Output is source-opaque. Only call in OSN or FNDR channels. "
-            "Apply TIER_1 guardrail — leadership channels only."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "store": {
-                    "type": "string",
-                    "enum": ["all", "GW", "GM", "GF", "VVP"],
-                    "description": "Store code. Defaults to 'all'.",
-                },
-                "period": {
-                    "type": "string",
-                    "enum": ["today", "yesterday", "7d", "30d"],
-                    "description": "Time window for trend comparison. Defaults to 'today'.",
-                },
-            },
-            "required": [],
-        },
-    },
     # ── Ad performance tools (F3E only — scoped by entity check in f3e.md prompt) ──
     {
         "name": "ads_get_performance_summary",
@@ -4399,9 +4216,6 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
     "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
     "osn_financial_pulse": _tool_osn_financial_pulse,
-    "osn_sales_pulse": _tool_osn_sales_pulse,
-    "osn_inventory_status": _tool_osn_inventory_status,
-    "osn_customer_trends": _tool_osn_customer_trends,
     "ads_get_performance_summary": _tool_ads_get_performance_summary,
     "ads_get_channel_breakdown": _tool_ads_get_channel_breakdown,
     "ads_get_subbrand_performance": _tool_ads_get_subbrand_performance,
