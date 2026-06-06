@@ -45,11 +45,81 @@ def _token() -> str:
     return val
 
 
-def _headers() -> dict[str, str]:
+def _raw_headers() -> dict[str, str]:
+    """Auth headers WITHOUT the portal guard — used by the guard's own probe."""
     return {
         "Authorization": f"Bearer {_token()}",
         "Content-Type": "application/json",
     }
+
+
+# ── Portal guard (D-030) ──────────────────────────────────────────────────────
+# After the 2026-05-31 migration (old portal 243870963 → new 246351746), Cora must
+# NEVER silently operate on the wrong HubSpot portal. The guard confirms the live
+# token resolves to the canonical portal before any request, once per process.
+_EXPECTED_PORTAL_ID = _PORTAL_ID     # canonical — the ONLY portal Cora may touch
+_portal_verified = False             # set True once the live token is confirmed on-portal
+
+
+def _expected_portal_id() -> str:
+    """The portal Cora is allowed to operate on.
+
+    HUBSPOT_PORTAL_ID may be set in the environment, but if it is it MUST equal the
+    canonical portal — a non-canonical override is a configuration error, refused
+    deterministically (no network call needed).
+    """
+    env = (os.environ.get("HUBSPOT_PORTAL_ID") or "").strip()
+    if env and env != _EXPECTED_PORTAL_ID:
+        raise HubSpotClientError(
+            f"HUBSPOT_PORTAL_ID={env!r} != canonical portal {_EXPECTED_PORTAL_ID!r} — "
+            "refusing to operate on a non-canonical HubSpot portal (D-030 guard)."
+        )
+    return _EXPECTED_PORTAL_ID
+
+
+def _verify_portal_live() -> str:
+    """Return the portalId the current token resolves to (account-info/v3/details)."""
+    with httpx.Client(timeout=_TIMEOUT) as c:
+        r = c.get(f"{_BASE}/account-info/v3/details", headers=_raw_headers())
+    if r.status_code != 200:
+        raise HubSpotClientError(f"account-info {r.status_code}: {r.text[:200]}")
+    return str((r.json() or {}).get("portalId", ""))
+
+
+def _assert_portal() -> None:
+    """Runtime portal guard (D-030): never operate on the wrong HubSpot portal.
+
+    - Confirmed mismatch  -> hard raise (callers translate to graceful refusal).
+    - Inconclusive probe (network / non-200) -> do NOT cache; allow the real call
+      to surface its own auth error, and re-check on the next call.
+    - Verified once per process, then cached.
+    """
+    global _portal_verified
+    if _portal_verified or os.environ.get("CORA_DISABLE_HUBSPOT_PORTAL_GUARD") == "1":
+        return
+    expected = _expected_portal_id()  # also validates any env override
+    try:
+        live = _verify_portal_live()
+    except HubSpotClientError as exc:
+        log.warning("HubSpot portal guard inconclusive (probe failed): %s", exc)
+        return
+    if live != expected:
+        log.error(
+            "HUBSPOT PORTAL MISMATCH — token resolves to portal %s but Cora requires %s. "
+            "Refusing all HubSpot operations (D-030 portal guard).",
+            live, expected,
+        )
+        raise HubSpotClientError(
+            f"HubSpot portal mismatch: token portal {live!r} != required {expected!r} (D-030)"
+        )
+    _portal_verified = True
+    log.info("HubSpot portal guard OK — operating on portal %s.", live)
+
+
+def _headers() -> dict[str, str]:
+    """Auth headers, gated by the D-030 portal guard. All write/read paths use this."""
+    _assert_portal()
+    return _raw_headers()
 
 
 def _refresh_pipeline_cache() -> None:
@@ -580,8 +650,7 @@ def log_email_engagement(
     direction: "INBOUND" (email received by rep) or "OUTBOUND" (email sent by rep).
     Uses the v1 engagements API because it handles contact+deal associations atomically.
     """
-    token = _token()
-    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    hdrs = _headers()  # D-030 portal guard runs here (this is a write path)
 
     body: dict = {
         "engagement": {

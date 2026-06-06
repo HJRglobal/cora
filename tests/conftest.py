@@ -64,6 +64,13 @@ os.environ["SLACK_SIGNING_SECRET"] = os.environ.get("SLACK_SIGNING_SECRET") or "
 os.environ["ANTHROPIC_API_KEY"]    = os.environ.get("ANTHROPIC_API_KEY") or "sk-ant-test-dummy-key-for-ci"
 os.environ["ASANA_PAT"]            = os.environ.get("ASANA_PAT") or "0/dummy-asana-pat-for-ci"
 
+# Disable the HubSpot D-030 portal guard in unit tests. The guard probes
+# account-info/v3/details on first request; HubSpot test modules mock httpx.Client
+# with deal-search payloads (no portalId), which would otherwise trip a false
+# mismatch. The guard's own logic is exercised explicitly in test_hubspot_portal_guard.py
+# (which clears this flag).
+os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
+
 _install_fake_tiktoken()
 
 # Import cora.config NOW (env vars already set above) so that
@@ -120,6 +127,7 @@ def pytest_configure(config):
     os.environ["SLACK_SIGNING_SECRET"] = os.environ.get("SLACK_SIGNING_SECRET") or "test-signing-secret-for-ci"
     os.environ["ANTHROPIC_API_KEY"]    = os.environ.get("ANTHROPIC_API_KEY") or "sk-ant-test-dummy-key-for-ci"
     os.environ["ASANA_PAT"]            = os.environ.get("ASANA_PAT") or "0/dummy-asana-pat-for-ci"
+    os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
 
     # ── Proxy vars that break anthropic/httpx in sandbox/CI environments ──────
     # The Cowork sandbox sets all_proxy=socks5h://localhost:1080 which causes

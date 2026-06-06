@@ -475,7 +475,7 @@ class TestPagination:
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
                         from cora.tools.hubspot_client import _fetch_pipeline_deals
-                        deals = _fetch_pipeline_deals("2234421978")
+                        deals = _fetch_pipeline_deals("2313722582")
 
         assert len(deals) == 2
         names = {d["properties"]["dealname"] for d in deals}
@@ -508,7 +508,7 @@ class TestHubSpotClientErrors:
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
                         with pytest.raises(HubSpotClientError, match="401"):
-                            _fetch_pipeline_deals("2234421978")
+                            _fetch_pipeline_deals("2313722582")
 
     def test_403_raises_client_error(self):
         from cora.tools.hubspot_client import HubSpotClientError, _fetch_pipeline_deals
@@ -518,7 +518,7 @@ class TestHubSpotClientErrors:
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
                         with pytest.raises(HubSpotClientError):
-                            _fetch_pipeline_deals("2234421978")
+                            _fetch_pipeline_deals("2313722582")
 
     def test_500_raises_client_error(self):
         from cora.tools.hubspot_client import HubSpotClientError, _fetch_pipeline_deals
@@ -528,7 +528,7 @@ class TestHubSpotClientErrors:
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
                         with pytest.raises(HubSpotClientError):
-                            _fetch_pipeline_deals("2234421978")
+                            _fetch_pipeline_deals("2313722582")
 
     def test_network_error_raises_client_error(self):
         import httpx
@@ -542,7 +542,7 @@ class TestHubSpotClientErrors:
                 with patch("cora.tools.hubspot_client._token", return_value="fake-token"):
                     with patch("httpx.Client", return_value=mock_client):
                         with pytest.raises(HubSpotClientError, match="network error"):
-                            _fetch_pipeline_deals("2234421978")
+                            _fetch_pipeline_deals("2313722582")
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +708,7 @@ class TestSourceOpacity:
     def test_pipeline_id_not_exposed(self):
         deals = [_make_deal("1", "Deal", _IDENTIFY, "5000", _TOMMY_OWNER)]
         result = self._run(deals)
-        assert "2234421978" not in result
+        assert "2313722582" not in result
 
     def test_note_instructs_source_opacity(self):
         result = self._run([])
