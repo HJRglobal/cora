@@ -90,47 +90,64 @@ _MOCK_PARSED_TASKS = [
 
 class TestWatermark:
     def test_read_watermark_missing_file(self, tmp_path):
-        """Missing watermark file returns default 24h-ago timestamp."""
+        """Missing watermark file returns default 24h-ago timestamp and empty id set."""
         with patch.object(fae, "_WATERMARK_PATH", tmp_path / "missing.json"):
-            ts = fae._read_watermark()
+            ts, ids = fae._read_watermark()
         assert ts > 0
         assert ts < int(time.time())
         assert ts >= int(time.time()) - (25 * 3600)  # within 25h of now
+        assert ids == set()
 
     def test_read_watermark_valid_file(self, tmp_path):
-        """Valid watermark file returns stored timestamp."""
+        """Valid watermark file returns stored timestamp and IDs."""
         wpath = tmp_path / "watermark.json"
         expected_ts = 1700000000
-        wpath.write_text(json.dumps({"last_processed_ts": expected_ts}), encoding="utf-8")
+        wpath.write_text(json.dumps({
+            "last_processed_ts": expected_ts,
+            "processed_ids": ["id1", "id2"],
+        }), encoding="utf-8")
         with patch.object(fae, "_WATERMARK_PATH", wpath):
-            ts = fae._read_watermark()
+            ts, ids = fae._read_watermark()
         assert ts == expected_ts
+        assert ids == {"id1", "id2"}
 
     def test_read_watermark_corrupt_file(self, tmp_path):
         """Corrupt watermark file falls back to default."""
         wpath = tmp_path / "watermark.json"
         wpath.write_text("not valid json", encoding="utf-8")
         with patch.object(fae, "_WATERMARK_PATH", wpath):
-            ts = fae._read_watermark()
+            ts, ids = fae._read_watermark()
         assert ts > 0
+        assert ids == set()
 
     def test_write_watermark_creates_dirs(self, tmp_path):
         """Write watermark creates parent directories."""
         wpath = tmp_path / "subdir" / "nested" / "watermark.json"
         with patch.object(fae, "_WATERMARK_PATH", wpath):
-            fae._write_watermark(1700000000)
+            fae._write_watermark(1700000000, {"abc", "def"})
         assert wpath.exists()
         data = json.loads(wpath.read_text())
         assert data["last_processed_ts"] == 1700000000
+        assert set(data["processed_ids"]) == {"abc", "def"}
 
     def test_write_watermark_updates_existing(self, tmp_path):
         """Write watermark overwrites existing file."""
         wpath = tmp_path / "watermark.json"
         wpath.write_text(json.dumps({"last_processed_ts": 1000}), encoding="utf-8")
         with patch.object(fae, "_WATERMARK_PATH", wpath):
-            fae._write_watermark(2000)
+            fae._write_watermark(2000, {"x"})
         data = json.loads(wpath.read_text())
         assert data["last_processed_ts"] == 2000
+        assert data["processed_ids"] == ["x"]
+
+    def test_write_watermark_caps_ids_at_200(self, tmp_path):
+        """Write watermark keeps only last 200 IDs."""
+        wpath = tmp_path / "watermark.json"
+        big_set = {f"id{i}" for i in range(250)}
+        with patch.object(fae, "_WATERMARK_PATH", wpath):
+            fae._write_watermark(1000, big_set)
+        data = json.loads(wpath.read_text())
+        assert len(data["processed_ids"]) == 200
 
 
 # ---------------------------------------------------------------------------

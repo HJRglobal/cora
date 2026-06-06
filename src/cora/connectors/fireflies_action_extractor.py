@@ -95,29 +95,39 @@ Action items text:
 # Watermark management
 # ---------------------------------------------------------------------------
 
-def _read_watermark() -> int:
-    """Read last-processed Unix timestamp from watermark file.
+def _read_watermark() -> tuple[int, set[str]]:
+    """Read last-processed timestamp + set of processed transcript IDs.
 
-    Returns default (24 hours ago) if file is missing or corrupt.
+    Returns (timestamp, processed_ids_set).
+    Timestamp defaults to 24 hours ago if file is missing or corrupt.
+    processed_ids prevents reprocessing the same transcript regardless of
+    timestamp -- fixes the bug where meeting_ts == since_ts and the watermark
+    never advances, causing the same transcript to post to Slack every hour.
     """
     try:
         if _WATERMARK_PATH.exists():
             data = json.loads(_WATERMARK_PATH.read_text(encoding="utf-8"))
             ts = data.get("last_processed_ts")
+            ids = set(data.get("processed_ids") or [])
             if isinstance(ts, (int, float)) and ts > 0:
-                return int(ts)
+                return int(ts), ids
     except Exception as exc:
         log.warning("Could not read action watermark: %s", exc)
-    # Default: 24 hours ago
-    return int(time.time()) - (_DEFAULT_LOOKBACK_HOURS * 3600)
+    # Default: 24 hours ago, no processed IDs
+    return int(time.time()) - (_DEFAULT_LOOKBACK_HOURS * 3600), set()
 
 
-def _write_watermark(ts: int) -> None:
-    """Write last-processed Unix timestamp to watermark file."""
+def _write_watermark(ts: int, processed_ids: set[str]) -> None:
+    """Write last-processed timestamp + processed transcript IDs to watermark file.
+
+    Keeps only the last 200 transcript IDs to bound file size.
+    """
     try:
         _WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Cap to 200 most-recent IDs (arbitrary order -- just prevents unbounded growth)
+        ids_list = list(processed_ids)[-200:]
         _WATERMARK_PATH.write_text(
-            json.dumps({"last_processed_ts": ts}, indent=2),
+            json.dumps({"last_processed_ts": ts, "processed_ids": ids_list}, indent=2),
             encoding="utf-8",
         )
     except Exception as exc:
@@ -332,9 +342,10 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         "errors": [],
     }
 
-    since_ts = _read_watermark()
+    since_ts, processed_ids = _read_watermark()
     since_dt = datetime.fromtimestamp(since_ts, tz=timezone.utc)
-    log.info("Action capture: fetching transcripts since %s", since_dt.isoformat())
+    log.info("Action capture: fetching transcripts since %s (known_ids=%d)",
+             since_dt.isoformat(), len(processed_ids))
 
     # Fetch transcripts since watermark
     from_date = since_dt.isoformat()
@@ -380,6 +391,14 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         if not title:
             continue
 
+        # ID-based dedup: skip any transcript already processed in a prior run.
+        # This is the primary guard against the re-processing bug where
+        # meeting_ts == since_ts so the watermark never advances.
+        transcript_id = transcript.get("id") or ""
+        if transcript_id and transcript_id in processed_ids:
+            log.info("Skipping already-processed transcript id=%s title=%r", transcript_id, title)
+            continue
+
         entity = _classify_entity(title)
 
         # PHI guardrail: skip ALL LEX meetings (not just clinical ones)
@@ -400,6 +419,10 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         meeting_ts = _parse_date(transcript.get("date"))
         if meeting_ts and meeting_ts > latest_ts:
             latest_ts = meeting_ts
+
+        # Mark this transcript as processed so it won't be reprocessed next hour
+        if transcript_id:
+            processed_ids.add(transcript_id)
 
         meeting_date_str = (
             datetime.fromtimestamp(meeting_ts, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -486,11 +509,16 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
             continue
         _post_slack_summary(channel, meeting_title, tasks, dry_run=dry_run)
 
-    # Update watermark to latest transcript we saw
-    if latest_ts > since_ts:
-        _write_watermark(latest_ts)
-        log.info("Watermark advanced to %d (%s)", latest_ts,
-                 datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat())
+    # Always write watermark: update timestamp if advanced, always persist processed IDs.
+    # Writing processed_ids even when timestamp didn't advance is critical -- it ensures
+    # that transcripts with meeting_ts == since_ts are never reprocessed.
+    new_ts = max(latest_ts, since_ts)
+    _write_watermark(new_ts, processed_ids)
+    if new_ts > since_ts:
+        log.info("Watermark advanced to %d (%s)", new_ts,
+                 datetime.fromtimestamp(new_ts, tz=timezone.utc).isoformat())
+    else:
+        log.info("Watermark unchanged at %d; %d transcript IDs now tracked", new_ts, len(processed_ids))
 
     log.info(
         "Action capture complete: meetings=%d tasks=%d errors=%d",

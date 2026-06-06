@@ -1,3 +1,6 @@
-{
-  "last_processed_ts": 1780522800
+﻿{
+    "processed_ids":  [
+                          "OSN_DEDUPED_SENTINEL"
+                      ],
+    "last_processed_ts":  1780686300
 }
