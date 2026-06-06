@@ -34,6 +34,13 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 load_dotenv(_REPO_ROOT / ".env")
 
 from cora.tools.asana_client import AsanaClientError, create_task  # noqa: E402
+from cora.tools.project_resolver import resolve_project  # noqa: E402
+
+# Pipeline ID -> entity code (for project resolver)
+_PIPELINE_ENTITY: dict[str, str] = {
+    "2313722582": "F3E",   # F3E Retail pipeline
+    "default":    "FNDR",  # All other pipelines (UFL/OSN/BDM)
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -202,9 +209,11 @@ def run(dry_run: bool = False) -> dict[str, int]:
     skipped = 0
 
     for deal in proposal_deals:
-        deal_id   = deal["deal_id"]
-        deal_name = deal.get("deal_name") or f"Deal {deal_id}"
-        owner_id  = str(deal.get("owner_id") or "")
+        deal_id    = deal["deal_id"]
+        deal_name  = deal.get("deal_name") or f"Deal {deal_id}"
+        owner_id   = str(deal.get("owner_id") or "")
+        pipeline_id = str(deal.get("pipeline_id") or "")
+        deal_entity = _PIPELINE_ENTITY.get(pipeline_id, "FNDR")
         amount_raw = deal.get("amount") or "0"
         try:
             amount = float(amount_raw)
@@ -237,11 +246,23 @@ def run(dry_run: bool = False) -> dict[str, int]:
             deal_id, deal_name, owner_id, asana_gid or "(unmapped)",
         )
 
+        # Smart project routing: route deal task to correct project
+        deal_project_gid = resolve_project(
+            entity=deal_entity,
+            task_text=task_name,
+            assignee_gid=asana_gid if asana_gid else None,
+        )
+        log.info(
+            "deal_task_sync: project_resolver -> entity=%s project_gid=%s",
+            deal_entity, deal_project_gid,
+        )
+
         if not dry_run:
             try:
                 task = create_task(
                     name=task_name,
                     assignee_gid=asana_gid if asana_gid else None,
+                    project_gid=deal_project_gid,
                     notes=task_notes,
                     due_on=due_on,
                 )

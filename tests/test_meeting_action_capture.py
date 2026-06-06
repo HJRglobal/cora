@@ -747,6 +747,8 @@ class TestProjectRouting:
             patch("cora.connectors.fireflies_action_extractor.set_task_custom_fields") as mock_cf,
             patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
             patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+            # Stub project_resolver so this test validates custom-field tagging in isolation
+            patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ1"),
         ):
             fae._email_to_asana_gid = {}
             mock_anth.return_value.messages.create.return_value = haiku

@@ -524,6 +524,32 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     notes = input_data.get("notes") or None
     due_on = (input_data.get("due_on") or "").strip() or None
 
+    # Smart project routing: if no explicit project_gid was given, resolve one
+    # from the entity + task context so tasks never land as orphans.
+    if not project_gid:
+        try:
+            from cora.tools.project_resolver import resolve_project, is_blocked_project
+            resolved = resolve_project(
+                entity=entity,
+                task_text=title + (" " + (notes or "")),
+                assignee_gid=assignee_gid,
+            )
+            if resolved:
+                if is_blocked_project(resolved):
+                    log.warning(
+                        "asana_create_task: resolver returned blocked project %s for entity=%s "
+                        "-- routing to None (task will land in My Tasks)",
+                        resolved, entity,
+                    )
+                else:
+                    project_gid = resolved
+                    log.info(
+                        "asana_create_task: smart resolver -> project_gid=%s for entity=%s title=%r",
+                        project_gid, entity, title,
+                    )
+        except Exception as exc:
+            log.warning("asana_create_task: project_resolver failed (%s) -- proceeding without project", exc)
+
     try:
         created = asana_client.create_task(
             name=title,

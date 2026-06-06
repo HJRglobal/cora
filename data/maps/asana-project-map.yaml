@@ -1,0 +1,362 @@
+# Asana Project Resolution Map
+# Used by Cora to route task creation to the correct project
+# Last updated: 2026-06-06
+#
+# Routing priority order (highest to lowest):
+#   1. blocked_projects  — Cora NEVER creates tasks here (Harrison Private)
+#   2. assignee_rules    — if assignee matches a person, override to their home project
+#   3. meeting_title_patterns — if Fireflies meeting title matches, route here
+#   4. brand_rules       — F3E only: if Pure/Mood/Energy keyword found, brand-specific routing
+#   5. keyword_rules     — if any keyword matches task title or description
+#   6. catch_all_gid     — fallback when nothing else matches
+#
+# GIDs never change when projects are renamed — this map stays stable through renames.
+# When adding a new project, add its GID and keywords here before using it.
+
+workspace_gid: "682743441507584"
+
+# ─────────────────────────────────────────────
+# HARD BLOCK — Harrison Private Team
+# Cora NEVER creates tasks in these projects under any circumstances.
+# ─────────────────────────────────────────────
+blocked_projects:
+  - "1209086911828222"  # Kids' Schedules and Tasks
+  - "1209086911828247"  # Expense & Budget Planning
+  - "1209086911828255"  # Family Travel Plans
+  - "1209086911828263"  # Cabin Management
+  - "1209086911828270"  # Home Management
+  - "1209086911828283"  # Personal Tasks
+
+# ─────────────────────────────────────────────
+# ENTITIES
+# ─────────────────────────────────────────────
+entities:
+
+  # ── F3 ENERGY ──────────────────────────────
+  F3E:
+    catch_all_gid: "1215470928454227"  # [F3E] Operations — General
+
+    # Assignee overrides: if task is assigned to this person, route here first
+    assignee_rules:
+      - asana_gid: "1213638047870465"   # Tommy Anderson
+        project_gid: "1214824237490027" # [F3E] Sales Pipeline — Tommy
+      - asana_gid: "1211824667367794"   # Elena Meirndorf
+        project_gid: "1215470944043920" # [F3E] Events — Energy (events specialist)
+
+    # Brand detection: if brand keyword found in task context, use brand-specific project
+    brand_rules:
+      - brand: pure
+        detect_keywords: [pure, f3 pure, f3pure]
+        event_project_gid: "1215470928060524"   # [F3E] Events — Pure
+        social_project_gid: "1214974454966852"  # [F3E] Social Pure
+      - brand: mood
+        detect_keywords: [mood, f3 mood, f3mood]
+        event_project_gid: "1215470944103963"   # [F3E] Events — Mood
+        social_project_gid: "1214974636796074"  # [F3E] Social Mood
+      - brand: energy
+        detect_keywords: [energy, f3 energy, f3energy]
+        event_project_gid: "1215470944043920"   # [F3E] Events — Energy
+        social_project_gid: "1214974734213847"  # [F3E] Social Energy
+
+    keyword_rules:
+      - project_gid: "1212712983866927"  # [F3E] Wholesale & Distribution
+        keywords: [wholesale, distributor, distribution, GNC, five below, erewhon, costco,
+                   broker, placement, door, doors, retail account, case stack, retailer,
+                   regional, national account, chain, jason dorfman, dorfman, bevintel]
+
+      - project_gid: "1214824237490027"  # [F3E] Sales Pipeline — Tommy
+        keywords: [sales pipeline, deal, outreach, sample sent, proposal, negotiation,
+                   closed won, closed lost, prospect, lead, cold outreach, tommy]
+
+      - project_gid: "1215470944043920"  # [F3E] Events — Energy (default event fallback)
+        keywords: [event, activation, sponsor, sponsorship, appearance, booth, pop-up,
+                   pop up, community event, mma event, fight, athlete appearance, gym]
+        brand_detect: true  # attempt brand detection first; fall to Energy if no brand found
+
+      - project_gid: "1214974734213847"  # [F3E] Social Energy (default social fallback)
+        keywords: [social media, instagram, tiktok, content, post, reel, story, caption,
+                   creative, content calendar, social post, influencer post, ugc]
+        brand_detect: true  # attempt brand detection first; fall to Energy if no brand found
+
+      - project_gid: "1211807465567672"  # [F3E] NSF Certification
+        keywords: [nsf, certification, certified, banned substance, label compliance,
+                   sport certification, nsf sport]
+
+      - project_gid: "1214878916621796"  # [F3E] Pure Launch — Variety 4-Flavor
+        keywords: [variety pack, variety 4, 4-flavor, bcb, blue chip, production run,
+                   co-pack, copacker, launch date, 6/15, june 15, pure launch]
+
+      - project_gid: "1214880646765110"  # [F3E] Paid Ads Optimization
+        keywords: [ads, meta ads, facebook ads, ad spend, roas, campaign, creative testing,
+                   paid media, cpa, cpm, ctr, ad account, ad set, ad copy]
+
+      - project_gid: "1215467195476181"  # [F3E] Reddit Presence — 90-Day Build
+        keywords: [reddit, subreddit, karma, ama, r/energydrinks, reddit post, reddit strategy]
+
+      - project_gid: "1212733689313577"  # [F3E] Account Management
+        keywords: [account management, account check-in, relationship, follow-up, reorder,
+                   existing account, account visit, invoice follow]
+
+      - project_gid: "1212721319418289"  # [F3E] Weekly Ops Meeting
+        keywords: [f3 weekly, weekly meeting, weekly agenda, weekly recap, weekly ops]
+
+      - project_gid: "1213456479462250"  # [F3E] Annual Planning 2026
+        keywords: [annual plan, 2026 planning, roadmap, quarterly review, strategy session,
+                   q3 planning, q4 planning]
+
+    # Meeting title patterns: if Fireflies meeting title contains these strings, route here
+    meeting_title_rules:
+      - project_gid: "1214824237490027"  # [F3E] Sales Pipeline — Tommy
+        title_patterns: [sales, wholesale, retailer, distribution, tommy]
+      - project_gid: "1215470944043920"  # [F3E] Events — Energy
+        title_patterns: [event, activation, mma, fight, athlete]
+      - project_gid: "1212721319418289"  # [F3E] Weekly Ops Meeting
+        title_patterns: [f3 weekly, f3 energy weekly, weekly ops]
+      - project_gid: "1213456479462250"  # [F3E] Annual Planning 2026
+        title_patterns: [planning, strategy, roadmap, quarterly]
+
+  # ── HJR GLOBAL / FOUNDER ───────────────────
+  HJRG:
+    catch_all_gid: "1215470834914137"  # [HJRG] Operations — General
+
+    keyword_rules:
+      - project_gid: "1211723492575905"  # [HJRG] Job Description Updates
+        keywords: [job description, hiring, hire, job post, candidate, interview,
+                   onboarding, hr, payroll, compensation review, offer letter]
+
+      - project_gid: "1211924464567559"  # [HJRG] Lexington Monthly Check-In
+        keywords: [lexington check-in, monthly check-in, lex monthly, lex check-in]
+
+      - project_gid: "1211926023912226"  # [HJRG] Fleet Safety Improvements
+        keywords: [fleet, vehicle, accident, driver, dot compliance, insurance,
+                   fleet inspection, truck, van, driver safety]
+
+      - project_gid: "1212698712924565"  # [HJRG] Asana Implementation
+        keywords: [asana, project management setup, workflow setup, team onboarding asana]
+
+      - project_gid: "1212816399207681"  # [HJRG] Goals & OKRs 2026
+        keywords: [goal, okr, q1, q2, q3, q4, objectives, kpi, milestone, annual goal,
+                   quarterly target, hat review]
+
+    meeting_title_rules:
+      - project_gid: "1212816399207681"  # [HJRG] Goals & OKRs 2026
+        title_patterns: [goals, okr, quarterly review, wcf, 13-week, hat]
+      - project_gid: "1211924464567559"  # [HJRG] Lexington Monthly Check-In
+        title_patterns: [lex monthly, lexington check]
+
+  FNDR:
+    catch_all_gid: "1215470834914137"  # [HJRG] Operations — General (shared catch-all)
+
+    keyword_rules:
+      - project_gid: "1214978721696677"  # [FNDR] Retail — Portfolio
+        keywords: [retail portfolio, retail strategy, national retail, retail expansion,
+                   retail partner, gnc regional, five below national]
+
+      - project_gid: "1214978770972293"  # [FNDR] Influencer — Portfolio
+        keywords: [influencer portfolio, athlete ambassador, ugc portfolio, creator strategy,
+                   influencer program, ambassador program]
+
+      - project_gid: "1214978850068747"  # [FNDR] Ecom — Portfolio
+        keywords: [ecom portfolio, shopify strategy, dtc portfolio, amazon portfolio,
+                   tiktok shop, online sales strategy]
+
+      - project_gid: "1214978983999666"  # [FNDR] Paid Ads — Portfolio
+        keywords: [paid ads portfolio, media buy, ad strategy, advertising budget,
+                   paid media plan, meta strategy, google ads strategy]
+
+      - project_gid: "1214978984873060"  # [FNDR] Brand System — Portfolio
+        keywords: [brand system, brand guidelines, identity system, logo system,
+                   typography, brand standards, brand portfolio]
+
+  # ── LEXINGTON ──────────────────────────────
+  LEX:
+    catch_all_gid: "1215470944114390"  # [LEX-LLC] Operations — General
+
+    keyword_rules:
+      - project_gid: "1209152923740496"  # [LEX-LLC] Hampton Location
+        keywords: [hampton, north hampton, 1337, gilbert road]
+
+      - project_gid: "1212621507108628"  # [LEX-LLC] Ellsworth Location
+        keywords: [ellsworth, mesa, ellsworth location]
+
+      - project_gid: "1212621507108636"  # [LEX-LLC] Phoenix Location
+        keywords: [phoenix, 35th, central phoenix, phoenix dta]
+
+      - project_gid: "1212754052205590"  # [LEX-LLC] Tucson DTA Opening
+        keywords: [tucson, tucson dta, tucson opening, new location tucson]
+
+      - project_gid: "1212621507108624"  # [LEX-LLC] HCBS
+        keywords: [hcbs, home and community, day support, community support, dta]
+
+      - project_gid: "1212752629798314"  # [LEX-LLC] DDD Contract Expansion
+        keywords: [ddd, contract expansion, revalidation, ahcccs, provider type,
+                   ddd contract, new contract, ddd member]
+
+      - project_gid: "1212754052205580"  # [LEX-LLC] Grow to 750 Members
+        keywords: [membership, enrollment, intake, 750, grow members, member count,
+                   new member, referral, member goal]
+
+      - project_gid: "1212754052205604"  # [LEX-LLC] Staff Wage Increase
+        keywords: [wage, salary, pay increase, compensation, staff pay, hourly rate, raise]
+
+      - project_gid: "1212754428779086"  # [LEX-LLC] Marketing
+        keywords: [lex marketing, lexington marketing, outreach, referral source,
+                   community marketing, lex ads, lex social]
+
+      - project_gid: "1212711410691157"  # [LEX-LLC] Fleet Safety & Compliance
+        keywords: [vehicle, at-fault, accident report, driver safety, fleet safety,
+                   dot, license, insurance claim]
+
+    meeting_title_rules:
+      - project_gid: "1215470944114390"  # catch-all for any lex meeting
+        title_patterns: [lexington, lex, llc, dta, hcbs]
+
+  LEX-LLC:
+    catch_all_gid: "1215470944114390"  # [LEX-LLC] Operations — General
+
+  LEX-LLA:
+    catch_all_gid: "1215470928477598"  # [LEX-LLA] Operations — General
+
+    keyword_rules:
+      - project_gid: "1209152923740504"  # [LEX-LLA] Maryvale Program Operations
+        keywords: [maryvale, show low, lla, lex life academy, academy, school program,
+                   sandy patel, sbp, lla location, lla student]
+
+  LEX-LBHS:
+    catch_all_gid: "1209152923740511"  # [LEX-LBHS] Operations (this IS the catch-all)
+    note: "LBHS is COPA-sensitive. Cora creates tasks here only for operational items. Never surface COPA/BHRF details in tasks."
+
+  # ── ONE STOP NUTRITION ─────────────────────
+  OSN:
+    catch_all_gid: "1215470834881074"  # [OSN] Operations — General
+
+    keyword_rules:
+      - project_gid: "1212621507108649"  # [OSN] Location - Gilbert & Warner
+        keywords: [gilbert warner, g&w, gw store, warner location, store 1, osn gw]
+
+      - project_gid: "1212621507108662"  # [OSN] Location - Gilbert & McKellips
+        keywords: [gilbert mckellips, g&m, gm store, mckellips location, store 2, osn gm]
+
+      - project_gid: "1212621507108673"  # [OSN] Location - Greenfield & 60
+        keywords: [greenfield, gf store, greenfield location, store 3, osn gf, 60 freeway]
+
+      - project_gid: "1212621507108680"  # [OSN] Location - Val Vista & Pecos
+        keywords: [val vista, vv store, pecos location, store 4, osn vv, vvp]
+
+      - project_gid: "1212621507108692"  # [OSN] Paylocity Transition
+        keywords: [paylocity, payroll system, hr system, timekeeping, punch in, schedule system]
+
+      - project_gid: "1212621507108725"  # [OSN] Customer Tips Rollout
+        keywords: [tips, customer tips, tip rollout, tip feature, tip screen]
+
+      - project_gid: "1212865814792670"  # [OSN] Homebase Integration
+        keywords: [homebase, shift scheduling, employee schedule, schedule app, shift swap]
+
+      - project_gid: "1214516618188085"  # [OSN] Inventory Reconciliation Pilot
+        keywords: [inventory recon, stock count, variance, inventory count, reconciliation, recon]
+
+      - project_gid: "1211296847942170"  # [OSN] POS System Transition
+        keywords: [pos, point of sale, register, clover replacement, wu, cbs northstar,
+                   new pos, pos system, cbsns]
+
+    meeting_title_rules:
+      - project_gid: "1215470834881074"  # catch-all for any osn meeting
+        title_patterns: [osn, one stop, nutrition, matt, store]
+
+  # ── HJR PROPERTIES ─────────────────────────
+  HJRP:
+    catch_all_gid: "1212895000591057"  # [HJRP] Property Management
+
+    keyword_rules:
+      - project_gid: "1211881823396571"  # [HJRP] Leasing & Tenant Relations
+        keywords: [lease, tenant, rent, renewal, vacancy, relist, sharon, suite, landlord,
+                   lease renewal, tenant notice, cam, hampton tenant, 1555 tenant, 1337 tenant]
+
+      - project_gid: "1213080069216682"  # [HJRP] Property Inspections
+        keywords: [inspection, property inspection, annual inspection, unit inspection,
+                   walk through, walkthrough, maintenance inspection]
+
+      - project_gid: "1215070431026838"  # [HJRP-RR] Rogers Ranch — Operations
+        keywords: [rogers ranch, payson, cabin, airbnb, vrbo, booking, guest, wedding,
+                   corporate retreat, ranch operations, mikenna, ranch guest]
+
+      - project_gid: "1215070431336670"  # [HJRP-RR] Launch — Brand + Website + Booking Infra
+        keywords: [rogers ranch launch, ranch website, booking system, ranch brand,
+                   ranch marketing, ranch social, wedding venue launch]
+
+    meeting_title_rules:
+      - project_gid: "1212895000591057"  # general property management
+        title_patterns: [property, hampton, 1337, 1555, hjrp, leasing]
+      - project_gid: "1215070431026838"  # rogers ranch
+        title_patterns: [rogers ranch, payson, cabin, ranch]
+
+  HJRP-RR:
+    catch_all_gid: "1215070431026838"  # [HJRP-RR] Rogers Ranch — Operations
+
+  # ── HJR PRODUCTIONS / PODCAST ──────────────
+  POD:
+    catch_all_gid: "1215470944131060"  # [POD] Operations — General
+
+    keyword_rules:
+      - project_gid: "1214487014638100"  # [POD] Guest Pipeline
+        keywords: [guest, podcast guest, booking, episode guest, interview request,
+                   potential guest, guest outreach, guest confirmation, schedule guest]
+
+      - project_gid: "1214487014690541"  # [POD] Episode Pipeline
+        keywords: [episode, recording, publish, release, editing, edit, clip, production,
+                   episode prep, show notes, thumbnail, episode title, upload]
+
+      - project_gid: "1214487948687395"  # [POD] Distribution & Performance
+        keywords: [distribution, analytics, views, downloads, youtube, spotify, apple podcast,
+                   streaming, metrics, growth, subscriber, subscribers]
+
+      - project_gid: "1214487948813691"  # [POD] Sponsors
+        keywords: [sponsor, sponsorship, ad read, promo, brand deal, podcast sponsor,
+                   sponsor outreach, sponsor renewal, ad slot]
+
+      - project_gid: "1214974633130677"  # [HJR-PB] Social HarrisonJRogers
+        keywords: [harrison social, harrisonjrogers, personal brand, harrison instagram,
+                   harrison tiktok, founder content, hjr social, personal post]
+
+      - project_gid: "1214974734384465"  # [POD] Social Podcast
+        keywords: [podcast social, podcast instagram, podcast tiktok, podcast clip,
+                   podcast content, hjr podcast social]
+
+      - project_gid: "1215467165406936"  # [POD] Reddit Presence — 90-Day Build
+        keywords: [reddit, subreddit, r/podcasts, karma, ama, podcast reddit]
+
+    meeting_title_rules:
+      - project_gid: "1214487014638100"  # guest pipeline
+        title_patterns: [guest, interview prep, podcast booking]
+      - project_gid: "1214487014690541"  # episode pipeline
+        title_patterns: [episode, recording, production]
+
+  HJRPROD:
+    catch_all_gid: "1215470944131060"  # [POD] Operations — General (shared)
+
+  # ── F3 COMMUNITY ───────────────────────────
+  F3C:
+    catch_all_gid: "1214489612964340"  # [F3C] Programs
+
+    keyword_rules:
+      - project_gid: "1214485863902222"  # [F3C] Grant Pipeline
+        keywords: [grant, funding, application, foundation, nonprofit grant,
+                   grant application, grant deadline, grant reporting]
+
+      - project_gid: "1214487948569784"  # [F3C] Events
+        keywords: [f3c event, community event, nonprofit event, fundraiser, charity event,
+                   awareness event, volunteer, f3 community event]
+
+      - project_gid: "1214489612891917"  # [F3C] Donor Stewardship
+        keywords: [donor, donation, stewardship, thank you, major donor, donor outreach,
+                   recurring donor, annual fund]
+
+  # ── UFL (PAUSED) ───────────────────────────
+  UFL:
+    catch_all_gid: "1211401911685190"  # [UFL] UFL Strategic Planning (monitor-only)
+    paused: true
+    note: >
+      UFL is paused until F3 Energy and Lexington reach profitability.
+      All task creation routes to Strategic Planning as monitor-only.
+      No active work execution. Sponsors pipeline closed in HubSpot.
+      Do not create tasks in Venue & Production, AZ Sponsorships, or Sponsor Pipeline.

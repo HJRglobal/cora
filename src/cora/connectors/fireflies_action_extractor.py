@@ -42,6 +42,7 @@ from cora.tools.asana_client import (
     find_recent_duplicate_task,
     set_task_custom_fields,
 )
+from cora.tools.project_resolver import resolve_project as _resolve_project_smart
 
 log = logging.getLogger(__name__)
 
@@ -499,14 +500,18 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         log.info("Processing %d action items from %r", len(parsed_tasks), title)
         result["meetings_processed"] += 1
 
-        # Route captured tasks into the entity's project so they aren't orphans.
-        capture_project_gid = _resolve_capture_project(entity)
+        # Route captured tasks into the most-specific project via smart resolver.
+        # The resolver applies keyword + assignee + brand + meeting-title rules
+        # from data/maps/asana-project-map.yaml, falling back to catch-all per entity.
+        # Legacy meeting-capture-projects.yaml is kept for custom_fields config only.
         capture_fields = _capture_custom_fields(entity)
-        if not capture_project_gid:
+        # Note: per-task routing happens inside the task loop (assignee varies per task).
+        # We do an entity-level pre-check here just for logging.
+        entity_catch_all = _resolve_project_smart(entity=entity, task_text="", meeting_title=title)
+        if not entity_catch_all:
             log.warning(
-                "No meeting-capture project configured for entity %s -- tasks "
-                "will land in assignee My Tasks (orphan). Populate "
-                "data/maps/meeting-capture-projects.yaml to fix.", entity,
+                "No project configured for entity %s (not even catch-all). "
+                "Tasks will be orphaned. Add entity to asana-project-map.yaml.", entity,
             )
 
         created_tasks: list[dict[str, Any]] = []
@@ -518,6 +523,19 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
 
             # Resolve assignee GID
             assignee_gid = _resolve_assignee_gid(assignee_name, attendees)
+
+            # Smart project routing: use task text + assignee + meeting title
+            # for the most-specific project match.
+            capture_project_gid = _resolve_project_smart(
+                entity=entity,
+                task_text=task_name,
+                assignee_gid=assignee_gid,
+                meeting_title=title,
+            )
+            log.debug(
+                "project_resolver: task=%r entity=%s -> project_gid=%s",
+                task_name, entity, capture_project_gid,
+            )
 
             # Build task notes
             notes = _TASK_NOTES_TEMPLATE.format(

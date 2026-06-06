@@ -55,7 +55,10 @@ def test_create_task_with_confirmation_calls_asana_client():
         "due_on": None,
         "projects": [],
     }
-    with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock:
+    # Patch project_resolver at its source module so the lazy import inside the handler
+    # picks up the stub (preserving the original expectation: project_gid=None when not given).
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task", return_value=fake_created) as mock:
         result = td._tool_asana_create_task(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
@@ -70,9 +73,9 @@ def test_create_task_with_confirmation_calls_asana_client():
     call_kwargs = mock.call_args.kwargs
     assert call_kwargs["name"] == "Test task"
     assert call_kwargs["notes"] == "test context"
-    # Defaulted to Harrison (the asker) — his Asana GID is in the real YAML
+    # Defaulted to Harrison (the asker) -- his Asana GID is in the real YAML
     assert call_kwargs["assignee_gid"] == "1204525779609669"
-    # Project + due_on weren't specified, should be None
+    # Resolver returned None -> project_gid stays None
     assert call_kwargs["project_gid"] is None
     assert call_kwargs["due_on"] is None
     # The formatted response surfaces the task to the LLM
