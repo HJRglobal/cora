@@ -52,6 +52,7 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "meeting_action_watermark.json"
 _ASANA_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+_PROJECT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "meeting-capture-projects.yaml"
 _DEFAULT_LOOKBACK_HOURS = 24
 
 # Entity -> leadership Slack channel mapping (LEX is intentionally absent -- PHI)
@@ -175,6 +176,63 @@ def _load_email_to_asana_gid() -> dict[str, str]:
 
     _email_to_asana_gid = result
     return _email_to_asana_gid
+
+
+# ---------------------------------------------------------------------------
+# Meeting-capture project routing (Fix 3 -- stop orphaning captured tasks)
+# ---------------------------------------------------------------------------
+
+_capture_project_cfg: dict[str, Any] | None = None  # module-level cache
+
+
+def _load_capture_project_cfg() -> dict[str, Any]:
+    """Load meeting-capture-projects.yaml (entity->project + custom-field GIDs)."""
+    global _capture_project_cfg
+    if _capture_project_cfg is not None:
+        return _capture_project_cfg
+    try:
+        _capture_project_cfg = yaml.safe_load(
+            _PROJECT_MAP_PATH.read_text(encoding="utf-8")
+        ) or {}
+    except Exception as exc:
+        log.warning("Could not load meeting-capture-projects.yaml: %s", exc)
+        _capture_project_cfg = {}
+    return _capture_project_cfg
+
+
+def _resolve_capture_project(entity: str) -> str | None:
+    """Return the Asana project GID captured tasks for `entity` should land in.
+
+    None means no project is configured -> fall back to workspace-only
+    (assignee My Tasks) with a logged orphan warning.
+    """
+    cfg = _load_capture_project_cfg()
+    gid = ((cfg.get("projects") or {}).get(entity) or "").strip()
+    return gid or None
+
+
+def _capture_custom_fields(entity: str) -> dict[str, str]:
+    """Build the custom_fields dict to stamp on a captured task.
+
+    Always sets Status=Not Started + Priority=Medium when those field GIDs are
+    configured; sets Entity only if an option GID is mapped for `entity`.
+    Returns {} if no field GIDs configured. Applied best-effort downstream.
+    """
+    cf = _load_capture_project_cfg().get("custom_fields") or {}
+    fields: dict[str, str] = {}
+    status_field = (cf.get("status_field_gid") or "").strip()
+    status_opt = (cf.get("status_not_started_option") or "").strip()
+    if status_field and status_opt:
+        fields[status_field] = status_opt
+    prio_field = (cf.get("priority_field_gid") or "").strip()
+    prio_opt = (cf.get("priority_medium_option") or "").strip()
+    if prio_field and prio_opt:
+        fields[prio_field] = prio_opt
+    entity_field = (cf.get("entity_field_gid") or "").strip()
+    entity_opt = ((cf.get("entity_options") or {}).get(entity) or "").strip()
+    if entity_field and entity_opt:
+        fields[entity_field] = entity_opt
+    return fields
 
 
 def _resolve_assignee_gid(
@@ -441,6 +499,16 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         log.info("Processing %d action items from %r", len(parsed_tasks), title)
         result["meetings_processed"] += 1
 
+        # Route captured tasks into the entity's project so they aren't orphans.
+        capture_project_gid = _resolve_capture_project(entity)
+        capture_fields = _capture_custom_fields(entity)
+        if not capture_project_gid:
+            log.warning(
+                "No meeting-capture project configured for entity %s -- tasks "
+                "will land in assignee My Tasks (orphan). Populate "
+                "data/maps/meeting-capture-projects.yaml to fix.", entity,
+            )
+
         created_tasks: list[dict[str, Any]] = []
 
         for item in parsed_tasks:
@@ -491,13 +559,18 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
                     created = create_task(
                         name=task_name,
                         assignee_gid=assignee_gid,
+                        project_gid=capture_project_gid,
                         notes=notes,
                     )
                     permalink = created.get("permalink_url", "")
                     log.info(
-                        "Created Asana task: gid=%s  name=%r  assignee=%s",
-                        created.get("gid"), task_name, assignee_gid,
+                        "Created Asana task: gid=%s  name=%r  assignee=%s  project=%s",
+                        created.get("gid"), task_name, assignee_gid, capture_project_gid,
                     )
+                    # Best-effort custom-field tagging (Entity/Status/Priority).
+                    # Project-scoped: a field not on the project is skipped, not fatal.
+                    if capture_project_gid and capture_fields:
+                        set_task_custom_fields(created.get("gid", ""), capture_fields)
                     created_tasks.append({
                         "task_name": task_name,
                         "assignee_name": assignee_name,

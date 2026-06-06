@@ -692,3 +692,66 @@ class TestDedupHardening:
 
         data = json.loads(watermark_path.read_text())
         assert "abc123" in data["processed_ids"]
+
+
+# ---------------------------------------------------------------------------
+# Project routing tests (Fix 3, 2026-06-06)
+# ---------------------------------------------------------------------------
+
+class TestProjectRouting:
+    def setup_method(self):
+        fae._email_to_asana_gid = None
+        fae._capture_project_cfg = None
+
+    def teardown_method(self):
+        fae._capture_project_cfg = None
+
+    def test_resolve_capture_project(self):
+        fae._capture_project_cfg = {"projects": {"F3E": "12345", "OSN": ""}}
+        assert fae._resolve_capture_project("F3E") == "12345"
+        assert fae._resolve_capture_project("OSN") is None   # blank -> None
+        assert fae._resolve_capture_project("HJRG") is None  # unmapped -> None
+
+    def test_capture_custom_fields_status_priority_entity(self):
+        fae._capture_project_cfg = {"custom_fields": {
+            "status_field_gid": "S", "status_not_started_option": "S0",
+            "priority_field_gid": "P", "priority_medium_option": "P0",
+            "entity_field_gid": "E", "entity_options": {"F3E": "EF3"},
+        }}
+        assert fae._capture_custom_fields("F3E") == {"S": "S0", "P": "P0", "E": "EF3"}
+        # Entity option missing -> entity field omitted, status/priority still set
+        assert fae._capture_custom_fields("OSN") == {"S": "S0", "P": "P0"}
+
+    def test_capture_custom_fields_empty_when_unconfigured(self):
+        fae._capture_project_cfg = {}
+        assert fae._capture_custom_fields("F3E") == {}
+
+    def test_run_routes_task_into_project_and_tags(self, tmp_path):
+        transcript = _make_transcript()  # F3 Weekly Review -> F3E
+        mock_ff = {"transcripts": [transcript]}
+        wpath = tmp_path / "wm.json"
+        # _make_transcript() title "F3 Weekly Review" classifies to FNDR.
+        fae._capture_project_cfg = {
+            "projects": {"FNDR": "PROJ1"},
+            "custom_fields": {"status_field_gid": "S", "status_not_started_option": "S0"},
+        }
+        haiku = MagicMock()
+        haiku.content = [MagicMock(text=json.dumps([{"task": "X", "assignee_name": None, "due_mention": None}]))]
+
+        with (
+            patch.object(fae, "_WATERMARK_PATH", wpath),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor.set_task_custom_fields") as mock_cf,
+            patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
+            patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+        ):
+            fae._email_to_asana_gid = {}
+            mock_anth.return_value.messages.create.return_value = haiku
+            mock_create.return_value = {"gid": "777", "permalink_url": ""}
+            fae.run_action_capture(dry_run=False)
+
+        assert mock_create.call_args.kwargs["project_gid"] == "PROJ1"
+        mock_cf.assert_called_once_with("777", {"S": "S0"})

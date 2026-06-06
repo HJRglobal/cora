@@ -1,0 +1,47 @@
+# Meeting Action Capture -> Asana project routing
+# ------------------------------------------------------------------------------
+# Every Fireflies-captured action item is created INTO the mapped project so it
+# is no longer an untaggable orphan in the assignee's My Tasks, and so the
+# Entity / Status / Priority custom fields below can be set (Asana custom fields
+# are project-scoped -- a task can only carry a field its project has attached).
+#
+# HOW TO POPULATE (one-time, by Harrison):
+#   For each entity below, set project_gid to an Asana project that ALREADY has
+#   the Entity / Status / Priority custom fields attached. Two good options:
+#     (a) the entity's existing ops/goals project, or
+#     (b) a dedicated "[ENTITY] Meeting Action Items" project you create.
+#   Find a project's GID in its Asana URL: .../project/<PROJECT_GID>/...
+#
+# Until a project_gid is filled in, captured tasks for that entity fall back to
+# the previous behavior (workspace-only -> lands in assignee My Tasks) and a
+# warning is logged. No tasks are lost.
+#
+# custom_fields are set best-effort AFTER creation; a field not attached to the
+# chosen project is logged and skipped -- it never aborts task creation.
+# Field/option GIDs below are the canonical FNDR portfolio fields.
+
+custom_fields:
+  entity_field_gid: "1214487026542596"
+  status_field_gid: "1214566926973275"
+  status_not_started_option: "1214566926973276"
+  priority_field_gid: "1204547177535963"
+  priority_medium_option: "1204547177535965"
+  # Entity is an enum field: each entity code maps to a DIFFERENT option GID.
+  # Fill these in to enable Entity tagging on captured tasks (look up the option
+  # GIDs from the Entity custom field). Leave empty to skip Entity tagging.
+  entity_options: {}
+    # F3E: ""
+    # OSN: ""
+    # HJRG: ""
+
+# entity code -> Asana project GID to drop captured tasks into
+projects:
+  F3E:     ""
+  OSN:     ""
+  HJRG:    ""
+  UFL:     ""
+  HJRP:    ""
+  BDM:     ""
+  HJRPROD: ""
+  FNDR:    ""
+  F3C:     ""
