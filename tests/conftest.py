@@ -16,6 +16,8 @@ import sys
 import types
 from unittest.mock import patch
 
+import pytest
+
 
 def _install_fake_tiktoken() -> None:
     """Register a network-free tiktoken stub in sys.modules before any source
@@ -307,3 +309,20 @@ def _patch_calendar_client_scheduler():
 
 
 _patch_calendar_client_scheduler()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_nudge_ledger(tmp_path, monkeypatch):
+    """Point the shared nudge ledger at an isolated temp file for every test.
+
+    Without this, run_asana_hygiene_nudges tests that post comments would
+    append to (and read from) the REAL closure-nudges JSONL on the Drive,
+    polluting production state and cross-contaminating tests. Each test gets a
+    fresh empty path -- recently_nudged() sees no file (returns False) and
+    record_nudge() writes only to tmp. Tests that exercise the ledger directly
+    can monkeypatch.setenv to their own path, overriding this default.
+    """
+    monkeypatch.setenv(
+        "CLOSURE_NUDGE_LOG_PATH", str(tmp_path / "closure-nudges-throttle.jsonl")
+    )
+    yield

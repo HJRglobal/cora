@@ -189,6 +189,55 @@ def test_run_posts_comment_when_not_dry_run(tmp_path, monkeypatch):
     assert result["nudges_sent"] == 1
 
 
+def test_run_skips_task_nudged_by_other_system(tmp_path, monkeypatch):
+    """Cross-system lockout: a task already nudged in the shared closure JSONL
+    (e.g. by the weekly Cowork sweep) within 14d is skipped by the daily job."""
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+
+    ledger = tmp_path / "closure-nudges-throttle.jsonl"
+    recent = _dt.now(_tz.utc).isoformat()
+    ledger.write_text(
+        _json.dumps({"_schema": "x"}) + "\n"
+        + _json.dumps({"task_gid": "333", "last_nudged_at": recent, "nudge_count": 1}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLOSURE_NUDGE_LOG_PATH", str(ledger))
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("333", "Already nudged elsewhere", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_comment.assert_not_called()
+    assert result["nudges_sent"] == 0
+
+
+def test_run_records_nudge_to_shared_ledger(tmp_path, monkeypatch):
+    """A fired nudge is appended to the shared ledger so the weekly sweep sees it."""
+    import json as _json
+
+    ledger = tmp_path / "closure-nudges-throttle.jsonl"
+    monkeypatch.setenv("CLOSURE_NUDGE_LOG_PATH", str(ledger))
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("444", "Fresh stale task", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_comment.assert_called_once()
+    assert result["nudges_sent"] == 1
+    assert ledger.exists()
+    rows = [_json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+    assert any(r.get("task_gid") == "444" for r in rows)
+
+
 def test_run_skips_visibility_tasks(tmp_path, monkeypatch):
     monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
     monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")

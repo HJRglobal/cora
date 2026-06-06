@@ -34,6 +34,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 load_dotenv(_REPO_ROOT / ".env")
 
+from cora import nudge_ledger  # noqa: E402
 from cora.tools.asana_client import (  # noqa: E402
     AsanaClientError,
     create_task_comment,
@@ -54,7 +55,8 @@ THROTTLE_FILE = _REPO_ROOT / "data" / "state" / "hygiene_nudge_throttle.json"
 USER_MAP_FILE = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 KB_DB_FILE    = _REPO_ROOT / "data" / "cora_kb.db"
 
-THROTTLE_DAYS       = 7      # days between nudges on the same task
+THROTTLE_DAYS       = 7      # days between nudges on the same task (this system)
+CROSS_SYSTEM_DAYS   = 14     # skip if EITHER nudge system touched the task within this window
 OVERDUE_THRESHOLD   = 14     # days past due_on to qualify
 MAX_PER_USER        = 5      # nudges per user per run
 MAX_TOTAL           = 25     # nudges total per run
@@ -147,6 +149,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
     throttle = _load_throttle()
     users = _load_users()
     now_ts = int(time.time())
+    run_id = f"hygiene-nudge-daily-{date.today().isoformat()}"
 
     tasks_checked = 0
     nudges_sent = 0
@@ -192,7 +195,17 @@ def run(dry_run: bool = False) -> dict[str, int]:
                 log.debug("Skipping Visibility CPA task: %s", task_name)
                 continue
 
-            # Throttle check
+            # Cross-system lockout: skip if EITHER nudge system (this daily job
+            # OR the weekly Cowork closure sweep) touched this task recently.
+            # Reads the shared closure-nudges JSONL; enforces 1 comment/task/7d
+            # via a stricter 14-day window. Fails open on read error.
+            if nudge_ledger.recently_nudged(task_gid, within_days=CROSS_SYSTEM_DAYS):
+                log.debug("Skipping task nudged by another system <%dd ago: %s",
+                          CROSS_SYSTEM_DAYS, task_name)
+                skipped_throttle += 1
+                continue
+
+            # Local throttle check (secondary guard)
             last_nudged = throttle.get(task_gid, 0)
             if now_ts - last_nudged < THROTTLE_DAYS * 86400:
                 skipped_throttle += 1
@@ -212,6 +225,17 @@ def run(dry_run: bool = False) -> dict[str, int]:
                     log.info(
                         "Nudge sent: task_gid=%s user=%s overdue=%dd",
                         task_gid, display_name, overdue_days,
+                    )
+                    # Record in the shared ledger so the weekly closure sweep
+                    # respects this fire (and vice versa).
+                    nudge_ledger.record_nudge(
+                        task_gid,
+                        task_name=task_name,
+                        assignee_user=display_name,
+                        assignee_gid=str(asana_gid),
+                        signal_source="task_staleness_daily",
+                        signal_summary=f"{overdue_days}d overdue; no recent KB signal.",
+                        run_id=run_id,
                     )
                 except AsanaClientError as exc:
                     log.warning("Failed to comment on task %s: %s", task_gid, exc)
