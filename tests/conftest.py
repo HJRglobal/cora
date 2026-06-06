@@ -320,17 +320,27 @@ _patch_calendar_client_scheduler()
 
 
 @pytest.fixture(autouse=True)
-def _isolate_nudge_ledger(tmp_path, monkeypatch):
-    """Point the shared nudge ledger at an isolated temp file for every test.
+def _isolate_cross_test_global_state(tmp_path, monkeypatch):
+    """Isolate module-global state that otherwise leaks between tests.
 
-    Without this, run_asana_hygiene_nudges tests that post comments would
-    append to (and read from) the REAL closure-nudges JSONL on the Drive,
-    polluting production state and cross-contaminating tests. Each test gets a
-    fresh empty path -- recently_nudged() sees no file (returns False) and
-    record_nudge() writes only to tmp. Tests that exercise the ledger directly
-    can monkeypatch.setenv to their own path, overriding this default.
+    1. Nudge ledger: point CLOSURE_NUDGE_LOG_PATH at an isolated temp file so
+       run_asana_hygiene_nudges tests never read/write the REAL closure-nudges
+       JSONL on the Drive. Tests exercising the ledger directly override it.
+
+    2. HubSpot portal guard: test_hubspot_portal_guard.py enables the live guard
+       (deletes CORA_DISABLE_HUBSPOT_PORTAL_GUARD and flips _portal_verified),
+       and one test sets _portal_verified raw. Under some collection orders that
+       leaked into test_hubspot_two_way, which then made a live /account-info
+       call. Force the guard back to disabled + reset the flag after every test
+       so portal state can never leak across tests.
     """
     monkeypatch.setenv(
         "CLOSURE_NUDGE_LOG_PATH", str(tmp_path / "closure-nudges-throttle.jsonl")
     )
     yield
+    os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
+    try:
+        import cora.tools.hubspot_client as _hc
+        _hc._portal_verified = False
+    except Exception:
+        pass
