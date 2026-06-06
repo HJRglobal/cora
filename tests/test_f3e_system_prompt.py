@@ -61,8 +61,10 @@ class TestBrandGuidelinesV1:
     def test_mood_black_hex(self):
         assert "#1A1A1A" in PROMPT, "Mood Black hex must be in prompt"
 
-    def test_mood_gold_hex(self):
-        assert "#C9A84C" in PROMPT, "Mood Gold hex must be in prompt"
+    def test_mood_orange_hex(self):
+        # Mood Orange (#FF6B00, PMS 1505C) superseded the original Mood Gold
+        # (#C9A84C) in the brand cascade commit e57e079 ("Mood Orange replaces Gold").
+        assert "#FF6B00" in PROMPT, "Mood Orange hex must be in prompt"
 
     def test_energy_red_hex(self):
         assert "#B02225" in PROMPT, "Energy Red hex must be in prompt"
