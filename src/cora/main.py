@@ -85,6 +85,35 @@ def _prewarm_contexts(log: logging.Logger) -> None:
     log.info("prewarm: loaded %d/%d entity contexts into cache", loaded, len(_ALL_ENTITIES))
 
 
+def _prewarm_kb(log: logging.Logger) -> None:
+    """Warm the KB vector index at startup so the first complex query is fast.
+
+    The first vector search after a restart pays a one-time disk cost loading the
+    sqlite-vec (vec0) index over the ~200K-chunk KB into the OS page cache — observed
+    ~25s on 2026-06-06. This issues one throwaway nearest-neighbour scan with a dummy
+    zero vector (no OpenAI embed call, supplied via query_vec=) to absorb that cost
+    before any user request. Runs in a background daemon thread.
+    """
+    try:
+        from .context_loader import _KB_DB_PATH
+        from .knowledge_base import KnowledgeBase
+
+        if not _KB_DB_PATH.exists():
+            log.info("kb-prewarm: no KB db at %s — skipping", _KB_DB_PATH)
+            return
+        start = time.monotonic()
+        kb = KnowledgeBase(_KB_DB_PATH)
+        try:
+            # 1536 dims = text-embedding-3-small. Zero vector is a valid MATCH target;
+            # we only care about loading the index pages, not the results.
+            kb.search("", entity="FNDR", k=1, max_age_days=None, query_vec=[0.0] * 1536)
+        finally:
+            kb.close()
+        log.info("kb-prewarm: vector index warmed in %.1fs", time.monotonic() - start)
+    except Exception as exc:
+        log.warning("kb-prewarm: failed (non-fatal): %s", exc)
+
+
 def main() -> None:
     _setup_logging()
     log = logging.getLogger(__name__)
@@ -96,6 +125,15 @@ def main() -> None:
         target=_prewarm_contexts,
         args=(log,),
         name="ContextPrewarm",
+        daemon=True,
+    ).start()
+
+    # Warm the KB vector index too (separate thread — it's the slow one, ~25s, and
+    # must not delay the context prewarm or Socket Mode connection).
+    threading.Thread(
+        target=_prewarm_kb,
+        args=(log,),
+        name="KBPrewarm",
         daemon=True,
     ).start()
 
