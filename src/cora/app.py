@@ -1359,14 +1359,6 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         except Exception as exc:
             log.warning("email_sync reaction handler failed: %s", exc)
 
-    # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
-    if event_type == "reaction_added" and reaction == "white_check_mark":
-        sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
-            message_ts=message_ts, channel_id=channel_id, client=client
-        )
-        if sched_reply:
-            client.chat_postMessage(channel=channel_id, text=sched_reply)
-
     # ── 📚 bookmark: works on ANY message, not just Cora's ───────────────────
     # When a team member reacts 📚 to any message, capture its text as a
     # pending KB contribution and route it to the entity's KQ channel for approval.
@@ -1407,7 +1399,7 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
     if event_type == "reaction_added" and reaction == "white_check_mark":
         sched_reply = osn_shift_handler.handle_schedule_approval_reaction(
-            message_ts=message_ts, channel_id=channel_id, client=client
+            reaction=reaction, message_ts=message_ts, reactor_user_id=reactor, client=client
         )
         if sched_reply:
             client.chat_postMessage(channel=channel_id, text=sched_reply)
