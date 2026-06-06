@@ -534,3 +534,41 @@ about/faq/shipping-returns/contact-v2 -- each replaces an existing page).
 **Canonical files:**
 - Inventory: 02-F3-Energy/_shared/f3-website-brand-config-inventory-CANONICAL-2026-06-04.md
 - Punch list v3: 02-F3-Energy/_shared/impulse-correction-punch-list-v3-2026-06-04.md
+
+## D-029 · HubSpot runtime portal guard -- never operate on the wrong portal (2026-06-06)
+
+**Context:** The 2026-05-31 portal migration (old 243870963 -> canonical 246351746,
+see D-008) repointed Cora's code but NOT the Cowork HubSpot MCP connector. The drift
+went unnoticed for ~6 days -- the 2026-06-06 hygiene-hubspot run silently audited the
+dead portal. Founder doctrine D-030 (memory/decisions.md): any system-of-record
+migration must sweep + repoint every consumer in the same session, and any agent
+touching HubSpot must verify the portal before writing.
+
+**Decision:** `hubspot_client._assert_portal()` is a hard runtime guard.
+- On the first request per process it calls `GET /account-info/v3/details` and asserts
+  the live token's portalId == `HUBSPOT_PORTAL_ID` env (if set) == canonical 246351746.
+- Confirmed mismatch -> raise `HubSpotClientError` (callers degrade to Cora's standard
+  graceful refusal). It must NEVER silently operate on the wrong portal.
+- Inconclusive probe (network error / non-200) -> fail open, do not cache, retry next
+  call; the real API call surfaces its own auth error.
+- A non-canonical `HUBSPOT_PORTAL_ID` env value is refused deterministically (no
+  network) -- catches a misconfigured repoint instantly.
+- Wired through `_headers()` so every read/write path is covered; `log_email_engagement`
+  (a `_token`-direct write) now uses `_headers()`.
+- Verified once per process then cached (`_portal_verified`).
+
+**Test harness:** conftest sets `CORA_DISABLE_HUBSPOT_PORTAL_GUARD=1` so the broad
+suite (which mocks httpx with deal-search payloads, no portalId) does not trip a false
+mismatch. `tests/test_hubspot_portal_guard.py` clears the flag and exercises the real
+logic (match / mismatch / inconclusive / env-override / caching / `_headers`).
+
+**Confirmed live (2026-06-06):** portal 246351746; F3E Retail pipeline 2313722582;
+UFL Sponsorships = `default` pipeline ("UFL / OSN / BDM") -- no separate UFL pipeline
+(Sales Hub Starter 2-pipeline cap).
+
+**Deliberate non-actions:** state stores (`data/state/deal_task_sync_state.json`,
+`data/hubspot_deal_snapshots.db`) already key on new-portal deal IDs and were NOT
+flushed -- flushing would re-create ~22 duplicate Asana tasks (D-031). The existing
+private-app token already authenticates on 246351746; rotation optional.
+
+**Companion to D-008** (portal migration). Commit `2500668`.
