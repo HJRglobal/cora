@@ -572,3 +572,48 @@ flushed -- flushing would re-create ~22 duplicate Asana tasks (D-031). The exist
 private-app token already authenticates on 246351746; rotation optional.
 
 **Companion to D-008** (portal migration). Commit `2500668`.
+
+## D-030 · Hygiene root fixes -- meeting-capture dedup, nudge unification, project routing (2026-06-06)
+
+The 2026-06-06 hygiene-asana sweep surfaced three recurring hygiene failures. Symptoms
+were cleaned in Asana; these are the code-level anti-recurrence fixes.
+
+**Fix 1 -- Meeting Action Capture duplicate creation (commit `6429aa3`).** Builds on
+`1d17912` (transcript-ID dedup) with three layers:
+- Per-meeting *atomic* watermark persistence: `processed_ids` are marked AND written
+  after each meeting, so a crash later in a run can't lose dedup state for finished
+  meetings (the 6/4 double-fire root cause -- run died before the single end-of-run
+  watermark write).
+- Process lockfile (`data/state/meeting_action_capture.lock`, stale >2h) in the run
+  script -- a concurrent instance exits immediately; skipped in `--dry-run`.
+- Creation-time dedup guard `asana_client.find_recent_duplicate_task()` (typeahead +
+  per-gid confirm, fail-open) -- skips creating an action item if an identical OPEN
+  task was created in the last 7d. Catches the partial-crash case.
+
+**Fix 2 -- two nudge systems unified on one ledger (commit `1122214`).** New
+`src/cora/nudge_ledger.py` reads AND appends the EXISTING closure-nudges JSONL (the same
+append-only file the weekly Cowork hygiene-asana sweep already uses for its 7d lockout).
+Sharing that file gives a bidirectional guarantee with zero SKILL change. The daily
+hygiene-nudge now skips any task nudged by EITHER system within 14d and records its own
+fires. Path: `CLOSURE_NUDGE_LOG_PATH` (default = Drive closure JSONL). Doctrine: **max 1
+automated comment of any kind per task per 7 days.**
+
+**Fix 3 -- captured tasks routed into projects (commit `8991289`).** Fireflies-captured
+action items were created with NO project -> untaggable orphans (Asana custom fields are
+project-scoped). New `data/maps/meeting-capture-projects.yaml` maps entity -> project +
+Entity/Status/Priority field GIDs. `run_action_capture` now creates tasks INTO the
+entity's project and best-effort stamps the fields (`set_task_custom_fields`, never
+fatal). Config-map design (vs auto-creating projects) keeps it repointable.
+**ONE manual step remains to make this live:** fill `project_gid` (and optionally
+`entity_options`) in the YAML; until then behavior is unchanged + an orphan warning is
+logged.
+
+**Test isolation (commit `d2c6929`).** Adding two new test files shifted collection order
+and exposed a latent leak (test_hubspot_portal_guard's `_portal_verified` global / guard
+env bleeding into test_hubspot_two_way). conftest autouse fixture now force-resets the
+portal guard + isolates the nudge-ledger path after every test. Full suite order-
+independent: **3232 passed, 41 skipped.**
+
+**Discovered (out of scope, not fixed):** `run_asana_hygiene_nudges._has_kb_signal`
+queries table `chunks` but the KB table is `knowledge_chunks` -> the KB-signal skip
+silently never fires (fails soft). Worth a follow-up.
