@@ -36,7 +36,12 @@ from cora.connectors.fireflies_connector import (
     _parse_date,
     FirefliesConnectorError,
 )
-from cora.tools.asana_client import AsanaClientError, create_task
+from cora.tools.asana_client import (
+    AsanaClientError,
+    create_task,
+    find_recent_duplicate_task,
+    set_task_custom_fields,
+)
 
 log = logging.getLogger(__name__)
 
@@ -420,10 +425,6 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         if meeting_ts and meeting_ts > latest_ts:
             latest_ts = meeting_ts
 
-        # Mark this transcript as processed so it won't be reprocessed next hour
-        if transcript_id:
-            processed_ids.add(transcript_id)
-
         meeting_date_str = (
             datetime.fromtimestamp(meeting_ts, tz=timezone.utc).strftime("%Y-%m-%d")
             if meeting_ts else "unknown date"
@@ -458,6 +459,19 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
             )
             if due_mention:
                 notes += f"\nDue mention: {due_mention}"
+
+            # Creation-time dedup guard: skip if an identical OPEN task was
+            # created in the last 7 days. Catches the partial-crash case where a
+            # prior run created some tasks for this meeting but died before
+            # persisting the watermark, so the meeting is reprocessed.
+            if not dry_run:
+                dup_gid = find_recent_duplicate_task(task_name, within_days=7)
+                if dup_gid:
+                    log.info(
+                        "Skipping duplicate action item %r (existing open task gid=%s)",
+                        task_name, dup_gid,
+                    )
+                    continue
 
             # Create Asana task
             if dry_run:
@@ -495,6 +509,16 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
                     msg = f"Asana create_task failed for {task_name!r}: {exc}"
                     log.error(msg)
                     result["errors"].append(msg)
+
+        # Mark processed AFTER task creation -- a crash mid-creation reprocesses
+        # the meeting next run, where the creation-time dedup guard prevents
+        # re-creating tasks that already landed.
+        if transcript_id:
+            processed_ids.add(transcript_id)
+
+        # Atomic per-meeting persistence: write the watermark now so a crash
+        # later in the run doesn't lose dedup state for meetings already done.
+        _write_watermark(max(latest_ts, since_ts), processed_ids)
 
         # Store results keyed by (entity, meeting_title) for Slack posting
         key = f"{entity}||{title}"

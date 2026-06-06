@@ -256,6 +256,137 @@ def create_task_comment(task_gid: str, text: str) -> dict[str, Any]:
     return r.json().get("data") or {}
 
 
+def find_recent_duplicate_task(name: str, within_days: int = 7) -> str | None:
+    """Return the GID of an existing OPEN task with the same name created recently.
+
+    Creation-time dedup guard used by Meeting Action Capture: before creating an
+    auto-captured action item, check whether the bot already created an identical
+    open task in the last `within_days` days. Prevents duplicate creation when a
+    prior run crashed mid-way (after creating tasks, before persisting the
+    watermark) and the same meeting is reprocessed.
+
+    Matching is case-insensitive on the full (stripped) task name. Only OPEN
+    (incomplete) tasks count -- a closed dup shouldn't block a fresh re-raise.
+
+    Fail-open: on any API/network error, returns None (allows creation). We'd
+    rather risk a rare duplicate than silently suppress a legitimate task.
+    """
+    if not name or not name.strip():
+        return None
+
+    target = name.strip().lower()
+    headers = {"Authorization": f"Bearer {_pat()}"}
+
+    # Phase 1: typeahead to find candidate tasks by name (cheap, name-only).
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/workspaces/{_WORKSPACE_GID}/typeahead",
+                params={
+                    "resource_type": "task",
+                    "query": name.strip()[:100],
+                    "count": 20,
+                    "opt_fields": "name",
+                },
+                headers=headers,
+            )
+        if r.status_code != 200:
+            log.warning("dedup typeahead %s: %s", r.status_code, r.text[:120])
+            return None
+        candidates = r.json().get("data", []) or []
+    except httpx.RequestError as exc:
+        log.warning("dedup typeahead network error: %s", exc)
+        return None
+
+    # Keep only exact (case-insensitive) name matches.
+    matches = [
+        c.get("gid")
+        for c in candidates
+        if (c.get("name") or "").strip().lower() == target and c.get("gid")
+    ][:5]
+    if not matches:
+        return None
+
+    # Phase 2: confirm each match is open AND created within the window.
+    cutoff = _utcnow() - within_days * 86400
+    for gid in matches:
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as c:
+                r = c.get(
+                    f"{_BASE}/tasks/{gid}",
+                    params={"opt_fields": "completed,created_at,name"},
+                    headers=headers,
+                )
+            if r.status_code != 200:
+                continue
+            t = r.json().get("data") or {}
+            if t.get("completed"):
+                continue
+            created_ts = _parse_iso8601(t.get("created_at"))
+            if created_ts is not None and created_ts >= cutoff:
+                log.info("dedup hit: existing open task gid=%s name=%r", gid, name)
+                return gid
+        except httpx.RequestError as exc:
+            log.warning("dedup task fetch network error for %s: %s", gid, exc)
+            continue
+
+    return None
+
+
+def set_task_custom_fields(task_gid: str, custom_fields: dict[str, str]) -> bool:
+    """Best-effort set of enum/text custom fields on a task.
+
+    `custom_fields` maps custom_field_gid -> value (an enum option GID for enum
+    fields, or a plain string for text fields).
+
+    Returns True on success, False on any failure. NEVER raises -- custom-field
+    failures (e.g. the field isn't attached to the task's project) must not
+    abort the surrounding flow. The task itself is already created; tagging is
+    a best-effort enrichment.
+    """
+    if not task_gid or not custom_fields:
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.put(
+                f"{_BASE}/tasks/{task_gid}",
+                json={"data": {"custom_fields": custom_fields}},
+                headers=headers,
+            )
+        if r.status_code in (200, 201):
+            return True
+        log.warning(
+            "set_task_custom_fields %s for task %s: %s",
+            r.status_code, task_gid, r.text[:200],
+        )
+        return False
+    except httpx.RequestError as exc:
+        log.warning("set_task_custom_fields network error for %s: %s", task_gid, exc)
+        return False
+
+
+def _utcnow() -> int:
+    """Current UTC epoch seconds (wrapper for test patchability)."""
+    import time as _time
+    return int(_time.time())
+
+
+def _parse_iso8601(value: str | None) -> int | None:
+    """Parse an ISO8601 timestamp (Asana created_at) to UTC epoch seconds."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
 def format_created_task_for_llm(task: dict[str, Any]) -> str:
     """Render a freshly-created task as a Slack-mrkdwn confirmation line."""
     name = task.get("name", "(no name)")

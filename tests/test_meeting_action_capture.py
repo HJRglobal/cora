@@ -598,3 +598,97 @@ class TestRunActionCapture:
         assert watermark_path.exists()
         data = json.loads(watermark_path.read_text())
         assert data["last_processed_ts"] == future_ts
+
+
+# ---------------------------------------------------------------------------
+# Dedup hardening tests (Fix 1, 2026-06-06)
+# ---------------------------------------------------------------------------
+
+class TestDedupHardening:
+    def setup_method(self):
+        fae._email_to_asana_gid = None
+
+    def _haiku(self, tasks=None):
+        mock = MagicMock()
+        mock.content = [MagicMock(text=json.dumps(tasks or _MOCK_PARSED_TASKS))]
+        return mock
+
+    def test_double_run_creates_zero_duplicates(self, tmp_path):
+        """Running twice over the same transcript creates tasks once, never twice.
+
+        Run 1 creates tasks and persists the transcript id to the watermark.
+        Run 2 sees the same transcript already in processed_ids and skips it
+        entirely -- create_task must NOT fire again.
+        """
+        transcript = _make_transcript()  # id="abc123"
+        mock_ff_data = {"transcripts": [transcript]}
+        watermark_path = tmp_path / "watermark.json"
+
+        def _run():
+            with (
+                patch.object(fae, "_WATERMARK_PATH", watermark_path),
+                patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+                patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+                patch("anthropic.Anthropic") as mock_anth,
+                patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+                patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
+                patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+            ):
+                fae._email_to_asana_gid = {}
+                mock_anth.return_value.messages.create.return_value = self._haiku()
+                mock_create.return_value = {"gid": "9999", "permalink_url": "https://app.asana.com/t/9999"}
+                res = fae.run_action_capture(dry_run=False)
+                return res, mock_create.call_count
+
+        res1, calls1 = _run()
+        res2, calls2 = _run()
+
+        assert calls1 == 2          # 2 parsed action items created on first run
+        assert calls2 == 0          # nothing re-created on second run
+        assert res2["meetings_processed"] == 0
+        assert res2["tasks_created"] == 0
+
+    def test_creation_time_guard_skips_existing_open_task(self, tmp_path):
+        """If an identical open task already exists, create_task is not called."""
+        transcript = _make_transcript()
+        mock_ff_data = {"transcripts": [transcript]}
+        watermark_path = tmp_path / "watermark.json"
+
+        with (
+            patch.object(fae, "_WATERMARK_PATH", watermark_path),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value="111"),
+            patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+        ):
+            fae._email_to_asana_gid = {}
+            mock_anth.return_value.messages.create.return_value = self._haiku()
+            result = fae.run_action_capture(dry_run=False)
+
+        mock_create.assert_not_called()
+        assert result["tasks_created"] == 0
+
+    def test_watermark_persisted_per_meeting(self, tmp_path):
+        """Transcript id is persisted to the watermark after the meeting is processed."""
+        transcript = _make_transcript()  # id="abc123"
+        mock_ff_data = {"transcripts": [transcript]}
+        watermark_path = tmp_path / "watermark.json"
+
+        with (
+            patch.object(fae, "_WATERMARK_PATH", watermark_path),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
+            patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+        ):
+            fae._email_to_asana_gid = {}
+            mock_anth.return_value.messages.create.return_value = self._haiku()
+            mock_create.return_value = {"gid": "9999", "permalink_url": ""}
+            fae.run_action_capture(dry_run=False)
+
+        data = json.loads(watermark_path.read_text())
+        assert "abc123" in data["processed_ids"]
