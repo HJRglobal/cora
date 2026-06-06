@@ -107,14 +107,25 @@ def _is_lex_task(task: dict[str, Any]) -> bool:
 
 
 def _has_kb_signal(task_name: str) -> bool:
-    """Check KB for recent mentions of this task name (last 30 days)."""
+    """Check the KB for recent activity mentioning this task name (last 30 days).
+
+    Table is `knowledge_chunks` (the prior `chunks` name was wrong, so this guard
+    silently never fired -- every run logged "no such table: chunks").
+
+    Recency uses `date_modified` -- when the underlying source (Slack message,
+    Asana task, Drive doc, Fireflies transcript) was last touched -- NOT
+    `ingested_at`. After a full KB re-ingest every row's `ingested_at` is recent,
+    which would make the window a no-op and degrade this to "name appears
+    anywhere in the KB". `date_modified` reflects genuine recent activity.
+    """
     if not KB_DB_FILE.exists():
         return False
     try:
         cutoff_ts = int(time.time()) - KB_LOOKBACK_DAYS * 86400
         with sqlite3.connect(str(KB_DB_FILE)) as conn:
             row = conn.execute(
-                "SELECT 1 FROM chunks WHERE content LIKE ? AND ingested_at > ? LIMIT 1",
+                "SELECT 1 FROM knowledge_chunks "
+                "WHERE content LIKE ? AND date_modified > ? LIMIT 1",
                 (f"%{task_name[:60]}%", cutoff_ts),
             ).fetchone()
         return row is not None

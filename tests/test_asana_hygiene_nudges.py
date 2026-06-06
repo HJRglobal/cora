@@ -127,6 +127,73 @@ def test_save_and_load_throttle(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _has_kb_signal -- against a temp DB matching the real knowledge_chunks schema
+# ---------------------------------------------------------------------------
+
+def _make_kb_db(path, rows):
+    """rows: list of (content, date_modified_epoch)."""
+    import sqlite3
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE knowledge_chunks ("
+        "chunk_id TEXT, source TEXT, content TEXT, "
+        "date_modified INTEGER, ingested_at INTEGER)"
+    )
+    for i, (content, dm) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO knowledge_chunks (chunk_id, content, date_modified, ingested_at) "
+            "VALUES (?, ?, ?, ?)",
+            (str(i), content, dm, int(time.time())),  # ingested_at always 'now'
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_kb_signal_missing_db_returns_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "nope.db")
+    assert nudges._has_kb_signal("Follow up Allen Flavors") is False
+
+
+def test_kb_signal_recent_match_returns_true(tmp_path, monkeypatch):
+    db = tmp_path / "kb.db"
+    recent = int(time.time()) - 3 * 86400  # 3 days ago (within 30d window)
+    _make_kb_db(db, [("Notes about Follow up Allen Flavors deadline", recent)])
+    monkeypatch.setattr(nudges, "KB_DB_FILE", db)
+    assert nudges._has_kb_signal("Follow up Allen Flavors") is True
+
+
+def test_kb_signal_old_match_returns_false(tmp_path, monkeypatch):
+    """A matching chunk whose source was modified long ago is NOT recent signal."""
+    db = tmp_path / "kb.db"
+    old = int(time.time()) - 90 * 86400  # 90 days ago (outside 30d window)
+    _make_kb_db(db, [("Follow up Allen Flavors", old)])
+    monkeypatch.setattr(nudges, "KB_DB_FILE", db)
+    assert nudges._has_kb_signal("Follow up Allen Flavors") is False
+
+
+def test_kb_signal_no_content_match_returns_false(tmp_path, monkeypatch):
+    db = tmp_path / "kb.db"
+    recent = int(time.time()) - 1 * 86400
+    _make_kb_db(db, [("Completely unrelated content", recent)])
+    monkeypatch.setattr(nudges, "KB_DB_FILE", db)
+    assert nudges._has_kb_signal("Follow up Allen Flavors") is False
+
+
+def test_kb_signal_uses_date_modified_not_ingested_at(tmp_path, monkeypatch):
+    """Regression: recency must key on date_modified, not ingested_at.
+
+    A chunk freshly ingested (ingested_at=now) but with an OLD date_modified must
+    NOT count as recent activity -- otherwise a full KB re-ingest would make every
+    task look 'recently active' and suppress all nudges.
+    """
+    db = tmp_path / "kb.db"
+    old = int(time.time()) - 200 * 86400  # source last touched 200d ago
+    _make_kb_db(db, [("Follow up Allen Flavors", old)])  # ingested_at = now inside helper
+    monkeypatch.setattr(nudges, "KB_DB_FILE", db)
+    assert nudges._has_kb_signal("Follow up Allen Flavors") is False
+
+
+# ---------------------------------------------------------------------------
 # run() -- with mocked dependencies
 # ---------------------------------------------------------------------------
 
