@@ -617,3 +617,27 @@ independent: **3232 passed, 41 skipped.**
 **Discovered (out of scope, not fixed):** `run_asana_hygiene_nudges._has_kb_signal`
 queries table `chunks` but the KB table is `knowledge_chunks` -> the KB-signal skip
 silently never fires (fails soft). Worth a follow-up.
+
+### Update (2026-06-06, later same day) -- follow-on commits
+
+- **KB-signal bug fixed (commit `8381b6f`).** The "discovered" item above is now done:
+  table `chunks` -> `knowledge_chunks`, and recency column `ingested_at` -> `date_modified`
+  (after a full re-ingest every row's `ingested_at` is recent, which made the 30-day
+  window a no-op). Validated via `--dry-run`: `skipped_signal` 0 -> 65; "no such table"
+  warnings gone. +5 tests.
+
+- **Fix 3 is now LIVE (commit `2020f91`).** `meeting-capture-projects.yaml` `project_gid`s
+  populated for all entities except BDM (excluded), using per-entity catch-all
+  "Operations -- General" GIDs from `asana-project-map.yaml` (produced by the concurrent
+  Asana structure rebuild; every GID cross-checked == that entity's `catch_all_gid`).
+  Captured tasks now route to projects + get Status=Not Started / Priority=Medium stamped.
+  `entity_options` still blank -> Entity field tagging stays off until those option GIDs
+  are supplied. LEX* entries populated but inert (PHI guardrail skips all LEX meetings
+  before routing).
+
+- **Clover stripped from `inventory-thresholds.yaml` (commit `2020f91`, D-027 follow-through).**
+  Removed the `osn:` item-level block ("Clover inventory by item name"); only `f3e:`
+  thresholds remain. grep `clover`/`osn` -> 0.
+
+Suite at this point: 3269 passed, 41 skipped. Cora restarted, post-restart heartbeat
+confirmed. Live end-to-end routing verification pending the next real capture (watch armed).
