@@ -79,3 +79,25 @@ def test_ufl_question_in_bdm_channel_redirects():
     assert r is not None
     assert "#ufl-leadership" in r
     assert "scoped to Big D Media here" in r
+
+
+def test_f3e_channel_f3c_question_allows():
+    # F3 Energy and F3 Community are intentionally paired — no block.
+    assert check_cross_entity("how is the F3 Community nonprofit arm doing?", "F3E") is None
+    assert check_cross_entity("what's happening with F3C?", "F3E") is None
+
+
+def test_f3c_channel_f3e_question_allows():
+    # Symmetric pairing exception.
+    assert check_cross_entity("how is F3 Energy revenue trending?", "F3C") is None
+
+
+def test_osn_channel_energy_drink_question_allows():
+    # "energy drink" is a normal OSN topic (nutrition retailer) — no longer a keyword.
+    assert check_cross_entity("which energy drink sells best in our stores?", "OSN") is None
+
+
+def test_f3e_keywords_dropped_shopify_dtc():
+    # "shopify"/"dtc" removed — must not trigger a redirect from an OSN channel.
+    assert check_cross_entity("is our shopify store up?", "OSN") is None
+    assert check_cross_entity("how are dtc orders?", "OSN") is None

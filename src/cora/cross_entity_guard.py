@@ -51,7 +51,7 @@ _ENTITY_DEFS: dict[str, _EntityDef] = {
     "F3E": _EntityDef(
         "F3 Energy", "#f3e-leadership or #f3e-finance",
         _compile("f3 energy", "f3energy", "f3e", "f3 pure", "f3pure", "f3 mood",
-                 "f3mood", "energy drink", "shopify", "dtc", "cotton 3pl"),
+                 "f3mood", "cotton 3pl"),
     ),
     "LEX": _EntityDef(
         "Lexington Services", "#lex-leadership or #llc-leadership",
@@ -95,6 +95,14 @@ _ENTITY_DEFS: dict[str, _EntityDef] = {
 # Channels that may ask portfolio-wide — no cross-entity block.
 _PASS_THROUGH: frozenset[str] = frozenset({"FNDR", "HJRG"})
 
+# Intentionally-paired entities: a channel in one may freely discuss the other.
+# F3 Energy (brand) and F3 Community (nonprofit) are the same brand family and
+# are allowed to cross-reference each other by doctrine.
+PAIRED_ENTITIES: dict[str, set[str]] = {
+    "F3E": {"F3C"},
+    "F3C": {"F3E"},
+}
+
 
 def _channel_family(channel_entity: str) -> str:
     """Collapse a channel entity code to its blockable family.
@@ -136,9 +144,13 @@ def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
         # Unrecognized / non-firewalled channel family — do not interfere.
         return None
 
+    paired = PAIRED_ENTITIES.get(family, set())
+
     for code, ent in _ENTITY_DEFS.items():
         if code == family:
             continue  # never block an entity's own questions
+        if code in paired:
+            continue  # intentionally-paired entity — allowed cross-reference
         for pat in ent.patterns:
             if pat.search(message_text):
                 return (
