@@ -15,13 +15,3 @@ f3e:
     alert_below: 100
   - sku: "Variety Pack"
     alert_below: 50
-
-osn:
-  # OSN thresholds are store-level (Clover inventory by item name).
-  # alert_below is total units across all stores.
-  - item: "Protein"
-    alert_below: 20
-  - item: "Pre-Workout"
-    alert_below: 15
-  - item: "Fat Burner"
-    alert_below: 10

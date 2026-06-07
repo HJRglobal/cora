@@ -34,14 +34,25 @@ custom_fields:
     # OSN: ""
     # HJRG: ""
 
-# entity code -> Asana project GID to drop captured tasks into
+# entity code -> Asana project GID to drop captured tasks into.
+# Populated 2026-06-06 with per-entity catch-all "Operations — General" project
+# GIDs from asana-project-map.yaml (post Asana structure rebuild). Cross-checked:
+# every GID equals that entity's catch_all_gid in asana-project-map.yaml.
+# BDM is intentionally left empty -- excluded from the meeting-capture initiative.
+# NOTE: LEX* entries are populated for completeness, but the capture extractor
+# skips ALL LEX meetings (PHI guardrail) before project routing, so they're inert
+# unless that guardrail is ever relaxed.
 projects:
-  F3E:     ""
-  OSN:     ""
-  HJRG:    ""
-  UFL:     ""
-  HJRP:    ""
-  BDM:     ""
-  HJRPROD: ""
-  FNDR:    ""
-  F3C:     ""
+  F3E:      "1215470928454227"
+  OSN:      "1215470834881074"
+  HJRG:     "1215470834914137"
+  UFL:      "1211401911685190"
+  HJRP:     "1212895000591057"
+  BDM:      ""
+  HJRPROD:  "1215470944131060"
+  FNDR:     "1215470834914137"
+  F3C:      "1214489612964340"
+  LEX:      "1215470944114390"
+  LEX-LLC:  "1215470944114390"
+  LEX-LLA:  "1215470928477598"
+  LEX-LBHS: "1209152923740511"
