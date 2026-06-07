@@ -25,6 +25,7 @@ from . import intent_classifier as ic
 from . import knowledge_gaps
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
+from . import cross_entity_guard
 from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
@@ -648,6 +649,14 @@ def handle_mention(event: dict, say: callable, client) -> None:
         say(text=sibling_redirect, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
         return
 
+    # Cross-entity redirect interception (deterministic, pre-LLM). Fires before
+    # any tool/Claude call so cross-entity data can never be surfaced.
+    cross_redirect = cross_entity_guard.check_cross_entity(user_message, entity)
+    if cross_redirect:
+        log.info("cross-entity redirect fired channel=#%s entity=%s", channel_name, entity)
+        say(text=cross_redirect, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+        return
+
     # Root thread ts: if @mention is inside an existing thread use that root,
     # otherwise this message IS the root.
     root_thread_ts = event_thread_ts or thread_ts
@@ -1076,6 +1085,12 @@ def handle_message_event(event: dict, client) -> None:
     sibling_redirect = sibling_guard.check_redirect(entity, text)
     if sibling_redirect:
         client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=sibling_redirect)
+        return
+
+    # Cross-entity guard pre-LLM (mirrors handle_mention Path 1).
+    cross_redirect = cross_entity_guard.check_cross_entity(text, entity)
+    if cross_redirect:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=cross_redirect)
         return
 
     active_thread_store.touch(channel_id, thread_ts)
