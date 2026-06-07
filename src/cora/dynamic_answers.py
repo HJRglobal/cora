@@ -25,6 +25,19 @@ def _load_snapshot(path: Path) -> dict:
     return yaml.safe_load(text) or {}
 
 
+def available_dynamic_entities() -> list[str]:
+    """Return the entity folder names that have a dynamic-snapshot directory.
+
+    Each subfolder of design/known-answers/dynamic/ holds the snapshots that
+    belong to exactly one entity. Used by the context loader's entity-scope
+    firewall to decide which snapshots the founder-level (FNDR) aggregator may
+    surface. Returns an empty list if the dynamic directory doesn't exist.
+    """
+    if not _DYNAMIC_DIR.exists():
+        return []
+    return sorted(p.name for p in _DYNAMIC_DIR.iterdir() if p.is_dir())
+
+
 def snapshot_fingerprint(entity: str) -> float:
     """Sum of mtimes for all YAML answer files + referenced snapshot files.
 

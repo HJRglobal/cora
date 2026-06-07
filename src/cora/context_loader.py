@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from cora.dynamic_answers import load_dynamic_answers
+from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,40 @@ _NO_FOUNDER_CONTEXT: frozenset[str] = frozenset({
 })
 
 _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
+
+# Founder-level entity — the ONLY cross-entity aggregator. FNDR channels may
+# surface every entity's dynamic snapshots; every other entity sees ONLY its own.
+_FNDR_ENTITY = "FNDR"
+
+
+def _allowed_snapshot_entities(entity: str) -> list[str]:
+    """Return the dynamic-snapshot folders whose answers may load for `entity`.
+
+    Entity-scope firewall for dynamic snapshots. Each snapshot folder
+    (design/known-answers/dynamic/{E}) belongs to exactly one entity. A
+    snapshot must NEVER surface in a sibling entity's context — e.g. F3E cash
+    position or sales pipeline must not appear in an OSN, LEX, BDM, HJRP, or UFL
+    channel, even when the startup prewarm has already loaded it for F3E.
+
+    - FNDR: the founder-level aggregator — may see every entity's snapshots.
+    - Any other entity (incl. LEX sub-entities): sees ONLY its own snapshots.
+      A LEX sub-entity with no dynamic folder of its own simply gets none; it
+      never inherits sibling or parent snapshots.
+    """
+    if entity == _FNDR_ENTITY:
+        return available_dynamic_entities()
+    return [entity]
+
+
+def _load_scoped_dynamic_answers(entity: str) -> str:
+    """Load only the dynamic answers this entity is permitted to see.
+
+    Concatenates the rendered dynamic answers for each allowed snapshot folder
+    (see _allowed_snapshot_entities). Returns "" when no allowed snapshot
+    produces content.
+    """
+    parts = [load_dynamic_answers(snap) for snap in _allowed_snapshot_entities(entity)]
+    return "\n\n".join(p for p in parts if p)
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _KNOWN_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers"
@@ -171,8 +205,10 @@ def _load_static_context(entity: str) -> str:
     else:
         log.info("no known-answers file for entity %s", entity)
 
-    # Append dynamic answers interpolated from snapshots
-    dynamic = load_dynamic_answers(entity)
+    # Append dynamic answers interpolated from snapshots — entity-scoped so a
+    # sibling entity's snapshot (e.g. F3E cash position) can never leak into
+    # this context. FNDR is the only entity that aggregates across all.
+    dynamic = _load_scoped_dynamic_answers(entity)
     if dynamic:
         parts.append("# Dynamic Known Answers (refreshed from snapshots)\n\n" + dynamic)
 
