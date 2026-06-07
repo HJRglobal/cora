@@ -115,7 +115,7 @@ def test_osn_prompt_has_cross_entity_refusal(osn_prompt):
     """osn.md must carry the cross-entity firewall refusal language."""
     assert "Cross-entity firewall" in osn_prompt
     assert "I'm scoped to OSN here" in osn_prompt
-    assert "even if you have it in your context window" in osn_prompt
+    assert "even if you have data in your context window" in osn_prompt
 
 
 def test_f3e_prompt_has_lex_redirect(f3e_prompt):
@@ -123,3 +123,28 @@ def test_f3e_prompt_has_lex_redirect(f3e_prompt):
     assert "That's a Lexington question" in f3e_prompt
     assert "#lex-leadership" in f3e_prompt
     assert "I'm scoped to F3 Energy here" in f3e_prompt
+
+
+# ---------------------------------------------------------------------------
+# 3. Pre-tool refusal language (must refuse BEFORE attempting a tool call)
+# ---------------------------------------------------------------------------
+
+
+def test_osn_prompt_has_pre_tool_refusal(osn_prompt):
+    """osn.md must instruct refusal BEFORE any tool call for non-OSN entities."""
+    assert "Before calling ANY tool" in osn_prompt
+    assert "STOP IMMEDIATELY" in osn_prompt
+    assert "Do not call any tool" in osn_prompt
+
+
+def test_f3e_prompt_has_pre_tool_refusal(f3e_prompt):
+    """f3e.md must instruct refusal BEFORE any tool call for non-F3E entities."""
+    assert "Before calling ANY tool" in f3e_prompt
+    assert "STOP IMMEDIATELY" in f3e_prompt
+    assert "Do not call any tool" in f3e_prompt
+
+
+def test_osn_redirect_names_specific_entity_channels(osn_prompt):
+    """OSN redirect must name concrete entity channels, not generic placeholders."""
+    assert "#f3e-leadership" in osn_prompt
+    assert "#lex-leadership" in osn_prompt
