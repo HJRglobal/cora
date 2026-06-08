@@ -32,9 +32,20 @@ git push origin main
 if ($LASTEXITCODE -ne 0) { Write-Host "git push failed (non-fatal for migration; retry later)." -ForegroundColor Yellow }
 
 Write-Host "=== Step 1: stop Cora (service + orphan python) ==="
+# Disable the task so it can't auto-restart, then hard-kill via WMI command-line
+# match (Get-Process .Path is unreliable -- repo doctrine uses CommandLine).
 Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*cora*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 4
+Disable-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue | Out-Null
+$coraDown = $false
+for ($i = 0; $i -lt 15; $i++) {
+    $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+             Where-Object { $_.CommandLine -like "*cora*" }
+    if (-not $procs) { $coraDown = $true; break }
+    foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+}
+if ($coraDown) { Write-Host "Cora stopped (no cora python process running)." }
+else { Write-Host "WARNING: a cora python process is still alive after 30s." -ForegroundColor Yellow }
 
 Write-Host "=== Step 2: backup cora_kb.db (Cora is stopped) ==="
 New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
@@ -50,12 +61,26 @@ Write-Host "=== Step 3: dry-run migration (counts only) ==="
 if ($LASTEXITCODE -ne 0) { Write-Host "Dry-run failed -- aborting." -ForegroundColor Red; exit 1 }
 
 $answer = Read-Host "Proceed with the real migration? (y/n)"
-if ($answer -ne "y") { Write-Host "Aborted by user. Restarting Cora unchanged."; Start-ScheduledTask -TaskName "cowork-cora-service"; exit 0 }
+if ($answer -ne "y") {
+    Write-Host "Aborted by user. Re-enabling + restarting Cora unchanged."
+    Enable-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue | Out-Null
+    Start-ScheduledTask -TaskName "cowork-cora-service"
+    exit 0
+}
+
+if (-not $coraDown) {
+    Write-Host "ABORT: Cora is not confirmed down -- refusing to migrate under a live service (write contention). Re-enabling + restarting Cora; investigate the stray process." -ForegroundColor Red
+    Enable-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue | Out-Null
+    Start-ScheduledTask -TaskName "cowork-cora-service"
+    exit 1
+}
 
 Write-Host "=== Step 4: migrate (backfill bin + f32, arm fast path) ==="
-& $py scripts\migrate_kb_binary_index.py
+# --force is safe: Step 1 verified no cora python process is running.
+& $py scripts\migrate_kb_binary_index.py --force
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "MIGRATION DID NOT COMPLETE (fast path not armed). Cora will use the float fallback (still correct). Re-run this script to finish. Restarting Cora..." -ForegroundColor Yellow
+    Write-Host "MIGRATION DID NOT COMPLETE (fast path not armed). Cora will use the float fallback (still correct). Re-run this script to finish. Re-enabling + restarting Cora..." -ForegroundColor Yellow
+    Enable-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue | Out-Null
     Start-ScheduledTask -TaskName "cowork-cora-service"
     exit 1
 }
@@ -64,7 +89,8 @@ Write-Host "=== Step 5: benchmark (latency + recall guard) ==="
 & $py scripts\bench_kb_search.py
 if ($LASTEXITCODE -ne 0) { Write-Host "RECALL GUARD FAILED. Investigate before relying on the fast path (it is armed but recall is below target)." -ForegroundColor Yellow }
 
-Write-Host "=== Step 6: start Cora -> verify heartbeat ==="
+Write-Host "=== Step 6: re-enable + start Cora -> verify heartbeat ==="
+Enable-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue | Out-Null
 Start-ScheduledTask -TaskName "cowork-cora-service"
 Start-Sleep -Seconds 70
 Get-Content "$repo\data\health\heartbeat.txt" | Select-Object -First 3
