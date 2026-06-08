@@ -8,10 +8,18 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [INFRA] KB vector-search fast path (binary quantization) -- 2026-06-07 (commit 8d3c3d0)
+### [INFRA] KB vector-search fast path (binary quantization) -- 2026-06-07 (commit 8d3c3d0, ship 846faf3)
 
-Repo HEAD: `8d3c3d0` (code, local; push via the ship PS1) | **3,398 passed / 41 skipped** | code is
-live-safe immediately but the fast path stays OFF until the host migration arms it.
+Repo HEAD: `846faf3` on `origin/main` | **3,398 passed / 41 skipped** | **MIGRATION RAN -- fast path
+ARMED** (262,441 vectors backfilled; Cora restarted via `ship-kb-binary-index-2026-06-07.ps1`).
+
+**MEASURED on live data (bench, LEX, 12 queries, on-disk):** float p50 **7,749ms** / p95 7,928ms ->
+fast p50 **1,082ms** / p95 1,137ms = **~7.2x faster, recall@10 100%**. Original cold case was ~31s.
+
+**DB note (benign):** `knowledge_vec`=262,441 but `knowledge_chunks`=223,799 -> ~38,642 orphan
+vectors (chunk row deleted, vector left behind) pre-existed. Harmless: re-rank JOINs
+knowledge_chunks so orphans drop on BOTH paths (recall 100%). ~230 MB dead weight -- cleanup later
+alongside the `knowledge_vec` drop.
 
 **Problem:** KB vector search was ~31s cold (75% of total mention latency). Root cause: brute-force
 float KNN (`embedding MATCH`) scanning the entire ~1.4 GB vec0 float index over 223,799 chunks
@@ -40,19 +48,21 @@ float KNN (`embedding MATCH`) scanning the entire ~1.4 GB vec0 float index over 
 gives ~98% recall@10; real clustered embeddings recall higher. Re-rank of 1000 candidates adds
 ~2-3ms (probe-measured), negligible vs the multi-second budget.
 
-**Expected latency:** scan drops 1.4 GB -> 43 MB. Target: warm KB search < 3s, cold (first
-post-restart) < 5s. Final production p50/p95 are captured by `bench_kb_search.py` during the host
-migration (the sandbox can only measure in-memory, where the cold-disk win does not show).
+**Latency:** scan dropped 1.4 GB -> ~50 MB. Measured fast p50 ~1.1s (target was warm < 3s) at 262K
+vectors; bench `scripts/bench_kb_search.py` reproduces float-vs-fast + recall@10 any time.
 
-**Harrison -- run host PS1 (elevated):** `.\ship-kb-binary-index-2026-06-07.ps1` does
-push -> stop Cora -> **backup cora_kb.db** -> dry-run -> migrate -> bench -> restart -> verify.
-~8 GB free needed (3.3 GB backup + ~1.4 GB f32). **Restart required: YES.** Post-restart verify:
-first `#llc` mention logs `latency_ms < 10000` with NO schema-init line; warm mentions < 5000;
-prewarm line shows < 1s. Follow-up (separate session, after ~1 week stable): drop `knowledge_vec`
-to reclaim ~1.4 GB (it is now only the fallback).
+**Ship sequence (DONE 2026-06-07):** `ship-kb-binary-index-2026-06-07.ps1` ran -- push -> stop Cora
+(WMI command-line kill after the `Get-Process .Path` match failed twice; doctrine confirmed) ->
+backup -> migrate (262,441 rows, ~9 min @ ~450/s) -> bench -> restart. **Post-restart verify still
+worth eyeballing:** first `#llc` mention logs `latency_ms` low (~1s) with NO "schema initialized"
+line; `kb-prewarm: vector index warmed in <1s`.
 
-_Note: this commit is selective -- the uncommitted `gap_autofill` working-tree files (`app.py`,
-`run_knowledge_review.py`) are left untouched for their own cascade._
+**Follow-ups:** (1) after ~1 week stable, drop `knowledge_vec` (fallback only now) -> reclaims
+~1.4 GB and also clears the 38K orphan vectors. (2) `ship-kb...ps1` Step 1 hardened mid-run to the
+CIM/CommandLine kill -- reuse that pattern, not `Get-Process .Path`, for future stop-Cora scripts.
+
+_Note: this was a selective commit -- the `gap_autofill` work (`app.py`, `run_knowledge_review.py`)
+was committed separately by its own cascade (54b1ef2); never touched here._
 
 ### [FNDR] Knowledge-gap autofill from Slack conversations -- 2026-06-07 (commit 54b1ef2)
 
