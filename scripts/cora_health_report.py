@@ -26,14 +26,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env", override=True)
+except Exception:  # noqa: BLE001 -- .env load is best-effort; offline mode still works
+    pass
 
 KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 LOGS_DIR = REPO_ROOT / "logs"
@@ -269,6 +277,18 @@ def _hour_of(next_run: str) -> int | None:
     return hour
 
 
+def _clock_str(next_run: str) -> str | None:
+    """Extract the clock time-of-day (e.g. '4:00 AM') ignoring the date.
+
+    Used to detect same-clock-time collisions across tasks whose next-run dates
+    differ (a daily 4am task vs a weekly 4am task collide on the clock).
+    """
+    m = _TIME_RE.search(next_run)
+    if not m:
+        return None
+    return f"{int(m.group(1))}:{m.group(2)} {m.group(3).upper()}"
+
+
 def scheduled_tasks() -> dict:
     try:
         proc = subprocess.run(
@@ -308,6 +328,13 @@ def scheduled_tasks() -> dict:
         if hour is not None and 3 <= hour < 9:
             early_window.append({"name": t["name"], "next_run": t.get("next_run", "")})
 
+    # Same-clock-time collisions in the early window (true simultaneity).
+    peaks = Counter(
+        _clock_str(t["next_run"]) for t in early_window if _clock_str(t["next_run"])
+    )
+    max_concurrent = max(peaks.values()) if peaks else 0
+    peak_times = sorted(ct for ct, c in peaks.items() if c >= 2)
+
     return {
         "available": True,
         "cora_task_count": len(cora),
@@ -318,6 +345,8 @@ def scheduled_tasks() -> dict:
         ],
         "early_window_0300_0900": early_window,
         "early_window_overlap": len(early_window) > 1,
+        "max_concurrent_in_window": max_concurrent,
+        "concurrent_peak_times": peak_times,
     }
 
 
@@ -333,11 +362,132 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f}GB"
 
 
+def threshold_alarms(report: dict) -> list[str]:
+    """Return human-readable alarms for any section-5 threshold crossed.
+
+    Empty list = all clear. These are the lines the weekly Slack post leads with
+    so the metrics watch themselves instead of waiting for an incident.
+    """
+    alarms: list[str] = []
+    kb = report.get("kb_corpus", {})
+    if kb.get("available"):
+        if kb.get("fndr_share_pct", 0) > 60:
+            alarms.append(
+                f"FNDR co-scan share {kb['fndr_share_pct']}% > 60% -- add an "
+                f"FNDR retention/archive tier (every query co-scans FNDR)."
+            )
+        if kb.get("total_chunks", 0) > 750_000:
+            alarms.append(
+                f"KB {kb['total_chunks']:,} chunks > 750K -- evaluate graduating "
+                f"off sqlite-vec (LanceDB/Qdrant)."
+            )
+    st = report.get("state", {})
+    ledger_bytes = sum(st.get("jsonl_ledgers", {}).values()) + st.get("logs_dir_bytes", 0)
+    if ledger_bytes > 300 * 1024 * 1024:
+        alarms.append(
+            f"logs/ + JSONL ledgers {_fmt_bytes(ledger_bytes)} > 300MB -- run the "
+            f"compaction/rotation job."
+        )
+    sch = report.get("scheduled_tasks", {})
+    if sch.get("available") and sch.get("max_concurrent_in_window", 0) > 2:
+        times = ", ".join(sch.get("concurrent_peak_times", [])) or "?"
+        alarms.append(
+            f"up to {sch['max_concurrent_in_window']} tasks share a clock time in "
+            f"the 03:00-09:00 window; collisions at {times} -- stagger them."
+        )
+    return alarms
+
+
+def _fmt_tok(info: dict) -> str:
+    return f"~{info['tokens']:,}" if "tokens" in info else "ERR"
+
+
+def format_slack(report: dict) -> str:
+    """Compact Slack mrkdwn digest of the weekly health metrics."""
+    kb = report.get("kb_corpus", {})
+    st = report.get("state", {})
+    b = report.get("billing", {})
+    sch = report.get("scheduled_tasks", {})
+    alarms = report.get("alarms", [])
+
+    lines = ["*Cora weekly health* (Phase-0 scaling metrics)"]
+    if alarms:
+        lines.append(":rotating_light: *Alarms:*")
+        lines.extend(f"  - {a}" for a in alarms)
+    else:
+        lines.append(":white_check_mark: all section-5 thresholds clear")
+
+    if kb.get("available"):
+        top = max(kb["by_entity"].items(), key=lambda kv: kv[1]) if kb.get("by_entity") else ("?", 0)
+        lines.append(
+            f"*KB:* {kb['total_chunks']:,} chunks | FNDR co-scan "
+            f"{kb['fndr_share_pct']}% | largest {top[0]} ({top[1]:,})"
+        )
+    sc = report.get("static_context", {})
+    big = {e: sc[e] for e in ("F3E", "OSN", "LEX", "FNDR") if e in sc and "tokens" in sc[e]}
+    if big:
+        lines.append(
+            "*Static ctx/entity:* "
+            + " | ".join(f"{e} {_fmt_tok(sc[e])} tok" for e in big)
+            + f" | tools {report.get('tool_block', {}).get('tool_count', '?')}/"
+            + f"~{report.get('tool_block', {}).get('approx_tokens', 0):,}"
+        )
+    lines.append(
+        f"*Billing* ({b.get('usage_lines', 0)} lines): median input "
+        f"{b.get('median_input', 0):,.0f} | cache_read/input {b.get('cache_read_over_input', 0)}"
+    )
+    lines.append(
+        f"*Disk:* cora_kb.db {_fmt_bytes(st.get('cora_kb_db_bytes', 0))} | "
+        f"logs/ {_fmt_bytes(st.get('logs_dir_bytes', 0))}"
+    )
+    if sch.get("available"):
+        lines.append(
+            f"*Tasks:* {sch['cora_task_count']} cora | "
+            f"{len(sch.get('early_window_0300_0900', []))} in 03:00-09:00 | "
+            f"peak {sch.get('max_concurrent_in_window', 0)} at one clock time"
+        )
+    lines.append(f"_token method: {report.get('token_method')}_")
+    return "\n".join(lines)
+
+
+def post_slack(message: str, channel: str) -> bool:
+    """Post the digest to Slack via chat.postMessage. Returns success."""
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        print("SLACK_BOT_TOKEN not set -- not posting.", file=sys.stderr)
+        return False
+    try:
+        import httpx  # noqa: PLC0415
+        resp = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json={"channel": channel, "text": message,
+                  "unfurl_links": False, "unfurl_media": False},
+            timeout=15,
+        )
+        ok = bool(resp.json().get("ok"))
+        if not ok:
+            print(f"Slack post failed: {resp.text}", file=sys.stderr)
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        print(f"Slack post error: {exc}", file=sys.stderr)
+        return False
+
+
 def render(report: dict) -> None:
     print("=" * 72)
     print("CORA HEALTH REPORT (Phase 0 baseline)")
     print(f"token method: {report['token_method']}")
     print("=" * 72)
+
+    alarms = report.get("alarms", [])
+    print("\n[0] THRESHOLD ALARMS")
+    if alarms:
+        for a in alarms:
+            print(f"  !! {a}")
+    else:
+        print("  all section-5 thresholds clear")
 
     # 1. KB corpus
     kb = report["kb_corpus"]
@@ -414,7 +564,7 @@ def render(report: dict) -> None:
 
 def build_report(log_days: int, use_api: bool) -> dict:
     counter, method = _make_token_counter(use_api)
-    return {
+    report = {
         "token_method": method,
         "kb_corpus": kb_corpus(),
         "static_context": static_context_tokens(counter),
@@ -423,6 +573,8 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "state": state_sizes(),
         "scheduled_tasks": scheduled_tasks(),
     }
+    report["alarms"] = threshold_alarms(report)
+    return report
 
 
 def main() -> int:
@@ -432,9 +584,21 @@ def main() -> int:
                     help="Use Anthropic count_tokens (accurate; needs API key).")
     ap.add_argument("--log-days", type=int, default=3,
                     help="How many recent cora-*.log files to parse for billing.")
+    ap.add_argument("--slack", action="store_true",
+                    help="Post the compact digest to Slack (weekly task uses this).")
+    ap.add_argument("--channel", default="",
+                    help="Slack channel (default HEALTH_REPORT_CHANNEL env or hjrg-leadership).")
     args = ap.parse_args()
 
     report = build_report(args.log_days, args.count_tokens)
+
+    if args.slack:
+        channel = args.channel or os.environ.get("HEALTH_REPORT_CHANNEL", "hjrg-leadership")
+        msg = format_slack(report)
+        ok = post_slack(msg, channel)
+        print(msg)
+        print(f"\n[slack] posted to #{channel}: {ok}")
+        return 0 if ok else 1
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
