@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -465,3 +465,91 @@ def sync_delta(last_sync_ts: int) -> Iterator[Document]:
     """Pull transcripts modified since the last sync timestamp."""
     since_dt = datetime.fromtimestamp(last_sync_ts, tz=timezone.utc)
     yield from backfill(since=since_dt)
+
+
+# ── DWD coverage monitoring (team membership + per-host recency probe) ─────────
+# Used by fireflies_coverage.py / run_fireflies_coverage.py to verify every DWD
+# user's meetings are actually being captured (not just Harrison's). Reads only
+# membership / transcript counts / recency — never titles or content — so the
+# PHI guardrail is not engaged here.
+
+# Admin-only query (verified live 2026-06-08; Harrison is workspace admin).
+# Field set confirmed against the live schema: see CP-1 in the relay.
+_USERS_QUERY = """
+query Users {
+  users {
+    user_id
+    email
+    name
+    num_transcripts
+    minutes_consumed
+    recent_transcript
+    recent_meeting
+    is_admin
+    integrations
+  }
+}
+"""
+
+
+def list_team_members() -> list[dict]:
+    """Enumerate Fireflies workspace members (admin `users` query).
+
+    Returns a normalized list of dicts:
+        {email, name, num_transcripts, minutes_consumed, integrations, is_admin}
+
+    `email` is lowercased for downstream case-insensitive matching. `num_transcripts`
+    is normalized to an int (the API returns null for members who have never recorded).
+    Raises FirefliesConnectorError if the query fails or `users` is not permitted —
+    callers (coverage monitor) treat that as "could not enumerate" and degrade gracefully.
+    """
+    data = _graphql_query(_USERS_QUERY)
+    raw = data.get("users") or []
+    members: list[dict] = []
+    for u in raw:
+        if not isinstance(u, dict):
+            continue
+        members.append(
+            {
+                "email": (u.get("email") or "").strip().lower(),
+                "name": (u.get("name") or "").strip(),
+                "num_transcripts": int(u.get("num_transcripts") or 0),
+                "minutes_consumed": u.get("minutes_consumed"),
+                "integrations": u.get("integrations") or [],
+                "is_admin": bool(u.get("is_admin")),
+            }
+        )
+    return members
+
+
+# Per-host recency probe. NOTE: organizer_email is a single String (the build plan's
+# `organizers: [String]` was wrong — rejected by the live schema; corrected at CP-1).
+_RECENT_HOST_QUERY = """
+query RecentHost($org: String, $fromDate: DateTime, $toDate: DateTime) {
+  transcripts(organizer_email: $org, fromDate: $fromDate, toDate: $toDate, limit: 1) {
+    id
+    title
+    date
+    organizer_email
+  }
+}
+"""
+
+
+def has_recent_host_meeting(email: str, days: int = 30) -> bool:
+    """Return True if `email` HOSTED (organized) a meeting in the last `days`.
+
+    CORRECTNESS NOTE: this reflects "a meeting this email organized was recorded",
+    which only happens if someone with a connected calendar was in the room — it is
+    NOT proof that this person's own calendar is connected. The coverage classifier
+    uses it ONLY to refine people who are already Fireflies members; it must never
+    promote a non-member to COVERED. Raises FirefliesConnectorError on API failure.
+    """
+    now = datetime.now(timezone.utc)
+    from_iso = (now - timedelta(days=days)).isoformat()
+    to_iso = now.isoformat()
+    data = _graphql_query(
+        _RECENT_HOST_QUERY,
+        {"org": (email or "").strip().lower(), "fromDate": from_iso, "toDate": to_iso},
+    )
+    return bool(data.get("transcripts") or [])
