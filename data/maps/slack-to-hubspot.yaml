@@ -40,3 +40,12 @@ users:
     hubspot_owner_id: 160454475
     hubspot_email: elena@f3energy.com
     display_name: Elena Meirndorf
+
+  # --- Confirmed in new account (246351746) 2026-06-08 ---
+  # Hannah has a HubSpot seat (created 2026-06-04) but owns no deals; she's
+  # ops/chief-of-staff, not a sales owner. Mapped so Cora can resolve her for
+  # read views; do not auto-route deal-aging DMs to her (she owns nothing).
+  - slack_user_id: U0B3AEQS0NB
+    hubspot_owner_id: 165179973
+    hubspot_email: hannah@hjrglobal.com
+    display_name: Hannah Grant

@@ -1059,50 +1059,164 @@ def create_note(
         raise HubSpotClientError(f"create_note network error: {exc}") from exc
 
 
-def create_note(
+# ---------------------------------------------------------------------------
+# Governance taxonomy + hygiene helpers (2026-06-08)
+# See 00-Founder/hubspot-governance-standard-2026-06-08.md
+# ---------------------------------------------------------------------------
+
+# Custom deal property internal names — the multi-entity taxonomy layer used on
+# the Starter plan (2 pipeline max). New entity types are added as property
+# OPTIONS, never as new pipelines.
+PROP_ENTITY    = "f3_entity"          # F3E / UFL / OSN / BDM / HJRG / HJRP / LEX
+PROP_DIRECTION = "f3_deal_direction"  # revenue_in / spend_out
+PROP_DEAL_TYPE = "hjr_deal_type"      # retail_account / distribution / broker / ...
+_GOVERNANCE_PROPS: tuple[str, str, str] = (PROP_ENTITY, PROP_DIRECTION, PROP_DEAL_TYPE)
+
+# Mojibake repair: during the 2026-05-31 portal migration, UTF-8 punctuation bytes
+# were mis-decoded as cp1252 (e.g. the em-dash "—" became the 3-char "â€”").
+# We REBUILD that corruption map at import time by replaying the exact transform on the
+# intended characters -- so this source stays clean and we never hand-type mojibake
+# (which transport layers silently normalize). The em-dash is the case that actually hit
+# the data (14 deals, 2026-06-08); the rest are defensive. Characters whose 3rd byte is
+# undefined in cp1252 (e.g. the right double-quote) raise on decode and are skipped.
+_MOJIBAKE_INTENDED: tuple[str, ...] = ("—", "–", "’", "‘", "“", "…")
+
+
+def _build_mojibake_map() -> dict[str, str]:
+    """Replay UTF-8 bytes -> cp1252 mis-decode to derive {corrupted: intended}."""
+    fixes: dict[str, str] = {}
+    for ch in _MOJIBAKE_INTENDED:
+        try:
+            bad = ch.encode("utf-8").decode("cp1252")
+        except UnicodeDecodeError:
+            continue
+        if bad and bad != ch:
+            fixes[bad] = ch
+    return fixes
+
+
+_MOJIBAKE_FIXES: dict[str, str] = _build_mojibake_map()
+
+
+def fix_deal_name(name: str) -> str:
+    """Repair migration mojibake in a deal name; return the corrected string.
+
+    Idempotent -- a clean name is returned unchanged. The dominant case is the
+    em-dash sequence "â€”" -> "—" (house style). Used by the 2026-06-08
+    cleanup and kept available as a guard against future mojibake.
+    """
+    if not name:
+        return name
+    fixed = name
+    for bad, good in _MOJIBAKE_FIXES.items():
+        if bad in fixed:
+            fixed = fixed.replace(bad, good)
+    return fixed
+
+
+def _paged_deal_search(
+    filter_groups: list[dict[str, Any]],
+    properties: list[str],
+    max_deals: int = 200,
+) -> list[dict[str, Any]]:
+    """POST /deals/search with the given filterGroups, following pagination.
+
+    Shared by get_deals_by_filter / get_untagged_deals. Raises HubSpotClientError
+    on any non-2xx response or network failure.
+    """
+    body: dict[str, Any] = {
+        "filterGroups": filter_groups,
+        "properties": properties,
+        "sorts": [{"propertyName": "hs_lastmodifieddate", "direction": "DESCENDING"}],
+        "limit": 100,
+    }
+    out: list[dict[str, Any]] = []
+    after: str | None = None
+    while len(out) < max_deals:
+        if after:
+            body["after"] = after
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as c:
+                r = c.post(
+                    f"{_BASE}/crm/v3/objects/deals/search", headers=_headers(), json=body
+                )
+        except httpx.RequestError as exc:
+            raise HubSpotClientError(f"HubSpot network error: {exc}") from exc
+        if r.status_code == 401:
+            raise HubSpotClientError("HubSpot 401 — token invalid or revoked")
+        if r.status_code >= 400:
+            raise HubSpotClientError(f"HubSpot {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        out.extend(data.get("results", []) or [])
+        next_after = ((data.get("paging") or {}).get("next") or {}).get("after")
+        if not next_after:
+            break
+        after = next_after
+    return out[:max_deals]
+
+
+def get_deals_by_filter(
     *,
-    body: str,
-    deal_id: str | None = None,
-    contact_id: str | None = None,
-) -> str:
-    """Create a HubSpot note and associate with a deal and/or contact. Returns note ID."""
-    import time as _time
+    entity: str | None = None,
+    direction: str | None = None,
+    owner_id: str | None = None,
+    stage_id: str | None = None,
+    pipeline_id: str | None = None,
+    include_closed: bool = False,
+    max_deals: int = 200,
+) -> list[dict[str, Any]]:
+    """Fetch deals matching any combination of entity / direction / owner / stage.
 
-    hdrs = _headers()
-    ts_ms = str(int(_time.time() * 1000))
-    props = {"hs_note_body": body[:65535], "hs_timestamp": ts_ms}
+    All supplied filters are ANDed into a single filter group. Returns raw deal
+    objects (id + properties). By default Closed Won/Lost stages are dropped
+    (matching get_owner_deals); pass include_closed=True to keep them.
 
-    try:
-        with httpx.Client(timeout=_TIMEOUT) as c:
-            r = c.post(
-                f"{_BASE}/crm/v3/objects/notes",
-                headers=hdrs,
-                json={"properties": props},
-            )
-        if r.status_code not in (200, 201):
-            raise HubSpotClientError(f"create_note {r.status_code}: {r.text[:200]}")
+    Powers the per-role saved-view tools (Tommy / Alex / Harrison / Matt / Elena).
+    """
+    if not _STAGE_NAME_CACHE:
+        _refresh_pipeline_cache()
 
-        note_id = str(r.json().get("id", ""))
+    filters: list[dict[str, Any]] = []
+    if entity:
+        filters.append({"propertyName": PROP_ENTITY, "operator": "EQ", "value": entity})
+    if direction:
+        filters.append({"propertyName": PROP_DIRECTION, "operator": "EQ", "value": direction})
+    if owner_id:
+        filters.append({"propertyName": "hubspot_owner_id", "operator": "EQ", "value": str(owner_id)})
+    if stage_id:
+        filters.append({"propertyName": "dealstage", "operator": "EQ", "value": str(stage_id)})
+    if pipeline_id:
+        filters.append({"propertyName": "pipeline", "operator": "EQ", "value": str(pipeline_id)})
 
-        for obj_type, obj_id, assoc_type_id in [
-            ("deals", deal_id, 214),
-            ("contacts", contact_id, 202),
-        ]:
-            if obj_id and note_id:
-                try:
-                    with httpx.Client(timeout=_TIMEOUT) as c2:
-                        c2.put(
-                            f"{_BASE}/crm/v4/objects/notes/{note_id}/associations/{obj_type}/{obj_id}",
-                            headers=hdrs,
-                            json=[{"associationCategory": "HUBSPOT_DEFINED",
-                                   "associationTypeId": assoc_type_id}],
-                        )
-                except Exception as exc:
-                    log.warning("HubSpot note-%s association failed: %s", obj_type, exc)
+    props = [
+        "dealname", "amount", "dealstage", "pipeline", "closedate",
+        "hubspot_owner_id", "hs_lastmodifieddate", "deal_currency_code",
+        PROP_ENTITY, PROP_DIRECTION, PROP_DEAL_TYPE,
+    ]
+    deals = _paged_deal_search([{"filters": filters}], props, max_deals=max_deals)
 
-        return note_id
+    if include_closed:
+        return deals
+    open_deals: list[dict[str, Any]] = []
+    for d in deals:
+        sid = (d.get("properties") or {}).get("dealstage", "")
+        label = _STAGE_NAME_CACHE.get(sid, sid).lower()
+        if "closed" in label and ("won" in label or "lost" in label):
+            continue
+        open_deals.append(d)
+    return open_deals
 
-    except HubSpotClientError:
-        raise
-    except Exception as exc:
-        raise HubSpotClientError(f"create_note network error: {exc}") from exc
+
+def get_untagged_deals(max_deals: int = 200) -> list[dict[str, Any]]:
+    """Return deals missing ANY of the three governance custom properties.
+
+    Used by Cora's weekly HubSpot hygiene to flag deals that slipped through
+    without an entity / direction / deal-type tag. Each NOT_HAS_PROPERTY filter
+    is in its own filter group, so HubSpot ORs them together.
+    """
+    filter_groups = [
+        {"filters": [{"propertyName": p, "operator": "NOT_HAS_PROPERTY"}]}
+        for p in _GOVERNANCE_PROPS
+    ]
+    props = ["dealname", "pipeline", "dealstage", "hubspot_owner_id", *_GOVERNANCE_PROPS]
+    return _paged_deal_search(filter_groups, props, max_deals=max_deals)
