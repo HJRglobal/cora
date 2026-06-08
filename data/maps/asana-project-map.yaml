@@ -201,6 +201,10 @@ entities:
                    typography, brand standards, brand portfolio]
 
   # ── LEXINGTON ──────────────────────────────
+  # Asana team GIDs (reference only — routing below is by project_gid, never team_gid):
+  #   Lexington Services (GM-level, cross-sub-entity)  1215480830642799  (created 2026-06-08)
+  #   LTS Team (LEX-LTS sub-entity)                    1215480830642802  (created 2026-06-08)
+  #   LLC Team 1209152915815732 | LLA Team 1209152923740446 | LBHS Team 1209152923740451
   LEX:
     catch_all_gid: "1215470944114390"  # [LEX-LLC] Operations — General
 
