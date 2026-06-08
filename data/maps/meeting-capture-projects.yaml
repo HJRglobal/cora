@@ -56,3 +56,32 @@ projects:
   LEX-LLC:  "1215470944114390"
   LEX-LLA:  "1215470928477598"
   LEX-LBHS: "1209152923740511"
+
+# ------------------------------------------------------------------------------
+# 2026-06-08 Asana governance restructure — new Harrison-owned projects.
+# ------------------------------------------------------------------------------
+# 11 new Harrison-owned projects replace old Hannah-owned F3E projects and
+# untagged HJRP/OSN projects. They are FUNCTION-SPECIFIC (sales, leasing, tech,
+# etc.), NOT per-entity catch-alls, so the meeting-capture `projects:` map above
+# intentionally still points each entity at its "Operations — General" catch-all
+# (the single drop target for un-routable captured action items). Functional
+# routing for these new projects lives in asana-project-map.yaml
+# (keyword_rules + meeting_title_rules). This block registers the new GIDs so
+# the capture config reflects the new structure; old project GIDs are retained
+# in asana-project-map.yaml until task migration is confirmed complete.
+new_projects_2026_06_08:
+  F3E:
+    - gid: "1215477882565190"  # [F3E] Sales — Wholesale & Retail Pipeline
+    - gid: "1215477795747654"  # [F3E] Sales — Account Management
+    - gid: "1215477504148494"  # [F3E] Planning — 2026 Annual
+    - gid: "1215477907120289"  # [F3E] Activations — Events & Sampling
+    - gid: "1215477907334373"  # [F3E] Weekly — Team Meeting
+    - gid: "1215477503091206"  # [F3E] Sales — Distributor Relations
+  HJRP:
+    - gid: "1215477882706087"  # [HJRP] Leasing — Active Leases & Renewals
+    - gid: "1215477640975218"  # [HJRP] Maintenance — Inspections & Repairs
+  OSN:
+    - gid: "1215498953914619"  # [OSN] Tech — POS & Systems
+    - gid: "1215477549068105"  # [OSN] Vendor — Good Pudding
+  LEX:
+    - gid: "1215477796340344"  # [LEX] Strategic — 2026 Planning

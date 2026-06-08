@@ -59,6 +59,30 @@ entities:
         social_project_gid: "1214974734213847"  # [F3E] Social Energy
 
     keyword_rules:
+      # ── 2026-06-08 governance restructure: Harrison-owned replacements ──
+      # New projects take routing priority (listed first = first-match wins).
+      # Old GIDs are RETAINED below until task migration is confirmed complete.
+      - project_gid: "1215477882565190"  # [F3E] Sales — Wholesale & Retail Pipeline (replaces Wholesale & Distribution + Sales Pipeline — Tommy)
+        keywords: [wholesale, distributor, distribution, GNC, five below, erewhon, costco,
+                   broker, placement, door, doors, retail account, case stack, retailer,
+                   regional, national account, chain, jason dorfman, dorfman, bevintel,
+                   sales pipeline, deal, outreach, sample sent, proposal, negotiation,
+                   closed won, closed lost, prospect, lead, cold outreach]
+      - project_gid: "1215477503091206"  # [F3E] Sales — Distributor Relations
+        keywords: [distributor relations, distributor partner, distributor agreement,
+                   distributor onboarding, distributor terms, distributor margin]
+      - project_gid: "1215477795747654"  # [F3E] Sales — Account Management (replaces Account Management)
+        keywords: [account management, account check-in, relationship, follow-up, reorder,
+                   existing account, account visit, invoice follow]
+      - project_gid: "1215477907120289"  # [F3E] Activations — Events & Sampling
+        keywords: [activation, sampling, sample event, in-store sampling, in store sampling,
+                   product demo, demo day, sampling event, field sampling]
+      - project_gid: "1215477504148494"  # [F3E] Planning — 2026 Annual (replaces Annual Planning 2026)
+        keywords: [annual plan, 2026 planning, roadmap, quarterly review, strategy session,
+                   q3 planning, q4 planning]
+      - project_gid: "1215477907334373"  # [F3E] Weekly — Team Meeting (replaces Weekly Ops Meeting)
+        keywords: [f3 weekly, weekly meeting, weekly agenda, weekly recap, weekly ops, team meeting]
+      # ── old projects (retained during migration) ──
       - project_gid: "1212712983866927"  # [F3E] Wholesale & Distribution
         keywords: [wholesale, distributor, distribution, GNC, five below, erewhon, costco,
                    broker, placement, door, doors, retail account, case stack, retailer,
@@ -106,6 +130,16 @@ entities:
 
     # Meeting title patterns: if Fireflies meeting title contains these strings, route here
     meeting_title_rules:
+      # ── 2026-06-08 governance restructure (new projects first) ──
+      - project_gid: "1215477882565190"  # [F3E] Sales — Wholesale & Retail Pipeline
+        title_patterns: [sales, wholesale, retailer, distribution, tommy]
+      - project_gid: "1215477907334373"  # [F3E] Weekly — Team Meeting
+        title_patterns: [f3 weekly, f3 energy weekly, weekly ops, team meeting]
+      - project_gid: "1215477504148494"  # [F3E] Planning — 2026 Annual
+        title_patterns: [planning, strategy, roadmap, quarterly]
+      - project_gid: "1215477907120289"  # [F3E] Activations — Events & Sampling
+        title_patterns: [activation, sampling]
+      # ── old projects (retained during migration) ──
       - project_gid: "1214824237490027"  # [F3E] Sales Pipeline — Tommy
         title_patterns: [sales, wholesale, retailer, distribution, tommy]
       - project_gid: "1215470944043920"  # [F3E] Events — Energy
@@ -173,6 +207,11 @@ entities:
     catch_all_gid: "1215470944114390"  # [LEX-LLC] Operations — General
 
     keyword_rules:
+      # ── 2026-06-08 governance restructure: new Harrison-owned project ──
+      - project_gid: "1215477796340344"  # [LEX] Strategic — 2026 Planning
+        keywords: [lex strategic, lexington strategic, 2026 planning, lex annual plan,
+                   strategic planning, lex roadmap, lex goals]
+      # ── existing ──
       - project_gid: "1209152923740496"  # [LEX-LLC] Hampton Location
         keywords: [hampton, north hampton, 1337, gilbert road]
 
@@ -208,6 +247,9 @@ entities:
                    dot, license, insurance claim]
 
     meeting_title_rules:
+      # ── 2026-06-08 governance restructure (new project first) ──
+      - project_gid: "1215477796340344"  # [LEX] Strategic — 2026 Planning
+        title_patterns: [lex strategic, lex planning, lexington planning, lex 2026]
       - project_gid: "1215470944114390"  # catch-all for any lex meeting
         title_patterns: [lexington, lex, llc, dta, hcbs]
 
@@ -231,6 +273,15 @@ entities:
     catch_all_gid: "1215470834881074"  # [OSN] Operations — General
 
     keyword_rules:
+      # ── 2026-06-08 governance restructure: Harrison-owned replacements ──
+      # New projects take routing priority; old (untagged) GIDs retained below.
+      - project_gid: "1215498953914619"  # [OSN] Tech — POS & Systems (replaces POS System Transition)
+        keywords: [pos, point of sale, register, clover replacement, wu, cbs northstar,
+                   new pos, pos system, cbsns, systems, tech stack, software,
+                   integration, paylocity, homebase]
+      - project_gid: "1215477549068105"  # [OSN] Vendor — Good Pudding
+        keywords: [good pudding, pudding, good pudding vendor]
+      # ── old / existing projects ──
       - project_gid: "1212621507108649"  # [OSN] Location - Gilbert & Warner
         keywords: [gilbert warner, g&w, gw store, warner location, store 1, osn gw]
 
@@ -268,6 +319,16 @@ entities:
     catch_all_gid: "1212895000591057"  # [HJRP] Property Management
 
     keyword_rules:
+      # ── 2026-06-08 governance restructure: Harrison-owned replacements ──
+      # New projects take routing priority; old (untagged) GIDs retained below.
+      - project_gid: "1215477882706087"  # [HJRP] Leasing — Active Leases & Renewals (replaces Leasing & Tenant Relations)
+        keywords: [lease, tenant, rent, renewal, vacancy, relist, sharon, suite, landlord,
+                   lease renewal, tenant notice, cam, hampton tenant, 1555 tenant, 1337 tenant]
+      - project_gid: "1215477640975218"  # [HJRP] Maintenance — Inspections & Repairs (replaces Property Inspections)
+        keywords: [inspection, property inspection, annual inspection, unit inspection,
+                   walk through, walkthrough, maintenance inspection, repair, maintenance,
+                   handyman, hvac, plumbing, work order]
+      # ── old projects (retained during migration) ──
       - project_gid: "1211881823396571"  # [HJRP] Leasing & Tenant Relations
         keywords: [lease, tenant, rent, renewal, vacancy, relist, sharon, suite, landlord,
                    lease renewal, tenant notice, cam, hampton tenant, 1555 tenant, 1337 tenant]
@@ -285,6 +346,12 @@ entities:
                    ranch marketing, ranch social, wedding venue launch]
 
     meeting_title_rules:
+      # ── 2026-06-08 governance restructure (new projects first) ──
+      - project_gid: "1215477882706087"  # [HJRP] Leasing — Active Leases & Renewals
+        title_patterns: [lease, leasing, renewal, tenant]
+      - project_gid: "1215477640975218"  # [HJRP] Maintenance — Inspections & Repairs
+        title_patterns: [inspection, maintenance, repair]
+      # ── existing ──
       - project_gid: "1212895000591057"  # general property management
         title_patterns: [property, hampton, 1337, 1555, hjrp, leasing]
       - project_gid: "1215070431026838"  # rogers ranch
