@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 from . import embeddings, schema
 from .chunker import chunk_text
+from .lex_sub_entity import detect_sub_entity
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +123,18 @@ class KnowledgeBase:
         docs_list = list(docs)
         if not docs_list:
             return 0
+
+        # Step 0: ingest-time LEX sub-entity tagging (Part 2 of the 5/23 siloing fix).
+        # Connectors that don't know the sub-entity write LEX docs with sub_entity=None;
+        # without this, nightly syncs accumulate untagged chunks that sub-entity channels
+        # can never retrieve (strict filter excludes NULL). Tag here at the choke point
+        # so every source is covered. Conservative exactly-one-match rule -- ambiguous or
+        # general-LEX content stays NULL (GM-level) by design.
+        for doc in docs_list:
+            if doc.entity == "LEX" and doc.sub_entity is None:
+                detected = detect_sub_entity(doc.title, doc.content)
+                if detected:
+                    doc.sub_entity = detected
 
         # Step 1: chunk each doc, build flat list of (doc, chunk_text, chunk_id)
         chunk_tuples: list[tuple[Document, str, str]] = []

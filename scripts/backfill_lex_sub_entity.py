@@ -6,6 +6,11 @@ and should stay NULL -- they correctly appear in all LEX channels including the 
 #lex-* view. This script only tags chunks that have UNAMBIGUOUS sub-entity signals (unique
 keywords that belong to exactly one sub-entity).
 
+Detection logic lives in src/cora/knowledge_base/lex_sub_entity.py (shared with
+ingest-time tagging in store.upsert_documents). New chunks are tagged at ingest;
+this script is the catch-up sweep for chunks written before that shipped, or after
+any future pattern additions.
+
 Usage:
     .venv\\Scripts\\python.exe scripts\\backfill_lex_sub_entity.py
     .venv\\Scripts\\python.exe scripts\\backfill_lex_sub_entity.py --dry-run
@@ -16,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -24,79 +28,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from cora.knowledge_base.lex_sub_entity import (  # noqa: E402
+    COMPILED_PATTERNS,
+    SUB_ENTITY_PATTERNS,
+    detect_sub_entity,
+)
+
+# Backward-compatible aliases (tests + run() reference the old private names)
+_SUB_ENTITY_PATTERNS = SUB_ENTITY_PATTERNS
+_COMPILED = COMPILED_PATTERNS
+_detect_sub_entity = detect_sub_entity
+
 log = logging.getLogger("backfill_lex")
-
-# ---------------------------------------------------------------------------
-# Keyword patterns per sub-entity.
-# Each entry is (sub_entity, [list of regex patterns]).
-# A chunk is tagged only if it matches patterns for EXACTLY ONE sub-entity.
-# If it matches patterns for 2+ sub-entities it stays NULL (ambiguous).
-# ---------------------------------------------------------------------------
-_SUB_ENTITY_PATTERNS: list[tuple[str, list[str]]] = [
-    (
-        "LEX-LLC",
-        [
-            r"\[LEX-LLC\]",
-            r"\bLexington LLC\b",
-            r"\bDay Program\b",
-            r"\bSupported Living\b",
-            r"\bHCBS\b",
-            r"\bJeff Montgomery\b",
-            r"\bAaron Ferrucci\b",
-            r"\[LEX-LLC\]",
-            r"Lexington.*LLC",
-        ],
-    ),
-    (
-        "LEX-LTS",
-        [
-            r"\[LEX-LTS\]",
-            r"\bLexington Therapeutic\b",
-            r"\bProvider Type 15\b",
-            r"\bDDD Therapy Revalidation\b",
-            r"\bJustin Gilmore\b",
-        ],
-    ),
-    (
-        "LEX-LBHS",
-        [
-            r"\bLBHS\b",
-            r"\[LEX-LBHS\]",
-            r"\bBehavioral Health Services\b",
-            r"\bCOPA\b",
-            r"\bBHRF\b",
-            r"\bJared Harker\b",
-        ],
-    ),
-    (
-        "LEX-LLA",
-        [
-            r"\[LEX-LLA\]",
-            r"\bLex Life Academy\b",
-            r"\bSandy Patel\b",
-        ],
-    ),
-]
-
-# Compile all patterns once
-_COMPILED: list[tuple[str, list[re.Pattern]]] = [
-    (se, [re.compile(p, re.IGNORECASE) for p in pats])
-    for se, pats in _SUB_ENTITY_PATTERNS
-]
-
-
-def _detect_sub_entity(title: str, content: str) -> str | None:
-    """Return the sub_entity if UNAMBIGUOUS, else None."""
-    text = (title or "") + " " + (content or "")
-    matched: set[str] = set()
-    for sub_entity, patterns in _COMPILED:
-        for pat in patterns:
-            if pat.search(text):
-                matched.add(sub_entity)
-                break  # one match per sub-entity is enough
-    if len(matched) == 1:
-        return matched.pop()
-    return None  # 0 = general LEX; 2+ = ambiguous; both stay NULL
 
 
 def run(dry_run: bool = False, verbose: bool = False) -> None:
