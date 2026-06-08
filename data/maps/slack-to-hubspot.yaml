@@ -20,10 +20,9 @@ users:
     hubspot_email: harrison@hjrglobal.com
     display_name: Harrison Rogers
 
-  - slack_user_id: U0B3PS7RFJA
-    hubspot_owner_id: 83346026
-    hubspot_email: matt@hjrglobal.com
-    display_name: Matt Petrovich
+  # Matt Petrovich (owner 83346026) intentionally NOT mapped — his HubSpot seat is
+  # deactivated (inactive owner, owns 0 deals; OSN runs on QBO, not HubSpot).
+  # Removed 2026-06-08 per Harrison. Do not re-add unless he is reactivated.
 
   - slack_user_id: U0B3RU5Q55G
     hubspot_owner_id: 162944825
