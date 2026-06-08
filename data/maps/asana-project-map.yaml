@@ -62,12 +62,10 @@ entities:
       # ── 2026-06-08 governance restructure: Harrison-owned replacements ──
       # New projects take routing priority (listed first = first-match wins).
       # Old GIDs are RETAINED below until task migration is confirmed complete.
-      - project_gid: "1215477882565190"  # [F3E] Sales — Wholesale & Retail Pipeline (replaces Wholesale & Distribution + Sales Pipeline — Tommy)
+      - project_gid: "1215477882565190"  # [F3E] Sales — Wholesale & Retail Pipeline (replaces [F3E] 2026 - Wholesale Tracker (Hannah-owned))
         keywords: [wholesale, distributor, distribution, GNC, five below, erewhon, costco,
                    broker, placement, door, doors, retail account, case stack, retailer,
-                   regional, national account, chain, jason dorfman, dorfman, bevintel,
-                   sales pipeline, deal, outreach, sample sent, proposal, negotiation,
-                   closed won, closed lost, prospect, lead, cold outreach]
+                   regional, national account, chain, jason dorfman, dorfman, bevintel]
       - project_gid: "1215477503091206"  # [F3E] Sales — Distributor Relations
         keywords: [distributor relations, distributor partner, distributor agreement,
                    distributor onboarding, distributor terms, distributor margin]
