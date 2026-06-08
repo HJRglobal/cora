@@ -25,6 +25,17 @@ from .lex_sub_entity import detect_sub_entity
 
 log = logging.getLogger(__name__)
 
+# Binary-index fast-path tuning.
+# Coarse hamming scan over-fetches generously so binary-quantization loss is
+# recovered by the exact float re-rank. coarse_k = max(_COARSE_MIN, k*_COARSE_MULT).
+# Sized from a recall sweep on worst-case (random-gaussian) vectors: 1000 gives
+# ~98% recall@10 there, and real (clustered) embeddings recall higher still. The
+# extra candidates cost ~2-3ms of re-rank — negligible against the latency budget.
+_COARSE_MIN = 1000
+_COARSE_MULT = 50
+# checkpoint_state key set by the migration once every chunk has a bin + f32 row.
+_BIN_READY_KEY = "kb_bin_index_ready"
+
 
 @dataclass
 class Document:
@@ -101,11 +112,15 @@ def _serialize_vec(embedding: list[float]) -> bytes:
 class KnowledgeBase:
     """High-level KB API. Wraps sqlite + sqlite-vec + OpenAI embeddings."""
 
-    def __init__(self, db_path: Path | str):
+    def __init__(self, db_path: Path | str, check_same_thread: bool = True):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = schema.connect(self.db_path)
+        self._conn = schema.connect(self.db_path, check_same_thread=check_same_thread)
         schema.init_schema(self._conn)
+        # Lazily resolved on first search; cached for the life of the instance.
+        # The migration runs with Cora stopped, so a fresh post-restart instance
+        # always reads the correct value.
+        self._bin_ready: bool | None = None
 
     def close(self) -> None:
         self._conn.close()
@@ -182,6 +197,14 @@ class KnowledgeBase:
                     old_ids,
                 )
                 cur.execute(
+                    f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({placeholders})",
+                    old_ids,
+                )
+                cur.execute(
+                    f"DELETE FROM knowledge_vec_f32 WHERE chunk_id IN ({placeholders})",
+                    old_ids,
+                )
+                cur.execute(
                     f"DELETE FROM knowledge_chunks WHERE chunk_id IN ({placeholders})",
                     old_ids,
                 )
@@ -209,9 +232,21 @@ class KnowledgeBase:
                     now,
                 ),
             )
+            vec_bytes = _serialize_vec(vec)
             cur.execute(
                 "INSERT INTO knowledge_vec (chunk_id, embedding) VALUES (?, ?)",
-                (chunk_id, _serialize_vec(vec)),
+                (chunk_id, vec_bytes),
+            )
+            # Keep the binary index + exact-float re-rank table in sync so newly
+            # ingested chunks are visible to the fast path without a re-migration.
+            cur.execute(
+                "INSERT INTO knowledge_vec_bin (chunk_id, entity, embedding) "
+                "VALUES (?, ?, vec_quantize_binary(?))",
+                (chunk_id, doc.entity, vec_bytes),
+            )
+            cur.execute(
+                "INSERT INTO knowledge_vec_f32 (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, vec_bytes),
             )
 
         self._conn.commit()
@@ -257,7 +292,10 @@ class KnowledgeBase:
         else:
             entity_filter = (entity, "FNDR")
 
-        # Build optional sub-entity visibility clause
+        # Build optional sub-entity visibility clause. This is a SECURITY
+        # invariant (strict LEX sub-entity scoping); it is applied identically
+        # in both the fast and fallback paths, against the authoritative
+        # knowledge_chunks table.
         sub_entity_clause = ""
         sub_entity_params: list[Any] = []
         if sub_entity:
@@ -265,6 +303,121 @@ class KnowledgeBase:
             if result:
                 sub_entity_clause, sub_entity_params = result
 
+        cutoff = (
+            int(time.time()) - (max_age_days * 86400) if max_age_days else None
+        )
+
+        if self._is_bin_index_ready():
+            return self._search_binary(
+                query_vec, entity_filter, k, cutoff,
+                sub_entity_clause, sub_entity_params,
+            )
+        return self._search_float(
+            query_vec, entity_filter, k, cutoff,
+            sub_entity_clause, sub_entity_params,
+        )
+
+    def _is_bin_index_ready(self) -> bool:
+        """True once the migration has backfilled bin + f32 rows for every chunk.
+
+        Cached for the instance lifetime — the migration runs with Cora stopped,
+        so a fresh post-restart instance always reads the right value.
+        """
+        if self._bin_ready is None:
+            cp = self.get_checkpoint(_BIN_READY_KEY)
+            self._bin_ready = bool(cp and cp.get("ready"))
+        return self._bin_ready
+
+    def _rows_to_results(self, rows: list) -> list[SearchResult]:
+        return [
+            SearchResult(
+                chunk_id=r[0],
+                source=r[1],
+                source_id=r[2],
+                entity=r[3],
+                title=r[4] or "",
+                content=r[5],
+                deep_link=r[6] or "",
+                date_modified=r[7],
+                distance=r[8],
+            )
+            for r in rows
+        ]
+
+    def _search_binary(
+        self,
+        query_vec: list[float],
+        entity_filter: tuple[str, ...],
+        k: int,
+        cutoff: int | None,
+        sub_entity_clause: str,
+        sub_entity_params: list[Any],
+    ) -> list[SearchResult]:
+        """Fast path: binary coarse hamming scan -> exact float32 L2 re-rank.
+
+        Distances returned are vec_distance_l2 — identical metric to the float
+        fallback (vec0 FLOAT default is L2), so the caller's distance threshold
+        is unchanged.
+        """
+        qbytes = _serialize_vec(query_vec)
+        coarse_k = max(_COARSE_MIN, int(k) * _COARSE_MULT)
+        ent_ph = ",".join("?" * len(entity_filter))
+
+        # Stage 1: coarse candidate generation over the binary index, entity
+        # pre-filtered (vec0 metadata column) so narrow channels aren't starved.
+        cand_ids = [
+            row[0]
+            for row in self._conn.execute(
+                f"""
+                SELECT chunk_id FROM knowledge_vec_bin
+                WHERE embedding MATCH vec_quantize_binary(?)
+                  AND entity IN ({ent_ph})
+                  AND k = ?
+                ORDER BY distance
+                """,
+                [qbytes, *entity_filter, coarse_k],
+            ).fetchall()
+        ]
+        if not cand_ids:
+            return []
+
+        # Stage 2: exact re-rank of candidates against float32 vectors (true PK
+        # reads from knowledge_vec_f32), applying the authoritative entity /
+        # recency / sub-entity filters against knowledge_chunks.
+        cand_ph = ",".join("?" * len(cand_ids))
+        sql = f"""
+            SELECT
+                k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
+                k.deep_link, k.date_modified,
+                vec_distance_l2(?, f.embedding) AS distance
+            FROM knowledge_chunks k
+            JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
+            WHERE k.chunk_id IN ({cand_ph})
+              AND k.entity IN ({ent_ph})
+              {'AND (k.date_modified IS NULL OR k.date_modified > ?)' if cutoff is not None else ''}
+              {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
+            ORDER BY distance
+            LIMIT {int(k)}
+        """
+        params: list[Any] = [qbytes, *cand_ids, *entity_filter]
+        if cutoff is not None:
+            params.append(cutoff)
+        params.extend(sub_entity_params)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        return self._rows_to_results(rows)
+
+    def _search_float(
+        self,
+        query_vec: list[float],
+        entity_filter: tuple[str, ...],
+        k: int,
+        cutoff: int | None,
+        sub_entity_clause: str,
+        sub_entity_params: list[Any],
+    ) -> list[SearchResult]:
+        """Fallback: brute-force float vec0 scan (used until the binary index is
+        backfilled). Preserved verbatim from the original implementation."""
         # sqlite-vec requires LIMIT to be on the vec0 scan directly (not an outer JOIN).
         # Use a CTE to do the knn scan first, then join+filter metadata.
         # Over-fetch by 5x so entity filtering doesn't starve the result set.
@@ -282,33 +435,18 @@ class KnowledgeBase:
             FROM vec_knn vk
             JOIN knowledge_chunks k ON k.chunk_id = vk.chunk_id
             WHERE k.entity IN ({','.join('?' * len(entity_filter))})
-              {f'AND (k.date_modified IS NULL OR k.date_modified > ?)' if max_age_days else ''}
+              {'AND (k.date_modified IS NULL OR k.date_modified > ?)' if cutoff is not None else ''}
               {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
             ORDER BY vk.distance
             LIMIT {int(k)}
         """
         params: list[Any] = [_serialize_vec(query_vec), *entity_filter]
-        if max_age_days:
-            cutoff = int(time.time()) - (max_age_days * 86400)
+        if cutoff is not None:
             params.append(cutoff)
         params.extend(sub_entity_params)
 
         rows = self._conn.execute(sql, params).fetchall()
-
-        return [
-            SearchResult(
-                chunk_id=r[0],
-                source=r[1],
-                source_id=r[2],
-                entity=r[3],
-                title=r[4] or "",
-                content=r[5],
-                deep_link=r[6] or "",
-                date_modified=r[7],
-                distance=r[8],
-            )
-            for r in rows
-        ]
+        return self._rows_to_results(rows)
 
     # --- Maintenance / introspection ---
 

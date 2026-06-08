@@ -8,6 +8,7 @@ KB retrieval is query-dependent.
 
 import datetime
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -100,6 +101,40 @@ _KB_MAX_AGE_DAYS = 365
 # matches without flooding context with noise. >1.30 is genuinely unrelated.
 # Revisit after Phase 3C eval suite collects measured precision/recall data.
 _KB_MAX_DISTANCE = 1.30
+
+# ── Shared KB instance ──────────────────────────────────────────────────────
+# One long-lived KnowledgeBase (and its sqlite connection) is shared across all
+# request threads and the startup prewarm thread, instead of opening + closing a
+# fresh connection per request. This (a) lets the prewarm actually warm the
+# connection the request path uses, and (b) stops the per-request schema-init
+# work + log line. The connection is created check_same_thread=False; all access
+# is serialized through _SHARED_KB_LOCK (KB searches are ~ms, so serializing is
+# cheap and far simpler than a per-thread pool).
+_shared_kb = None  # type: ignore[var-annotated]
+_SHARED_KB_LOCK = threading.Lock()
+
+
+def get_shared_kb():
+    """Return the process-wide shared KnowledgeBase, creating it on first use.
+
+    Returns None if the KB db doesn't exist yet (migration hasn't run) or if
+    construction fails — callers must treat KB retrieval as a non-fatal upgrade.
+    """
+    global _shared_kb
+    if _shared_kb is not None:
+        return _shared_kb
+    with _SHARED_KB_LOCK:
+        if _shared_kb is not None:
+            return _shared_kb
+        if not _KB_DB_PATH.exists():
+            return None
+        try:
+            from cora.knowledge_base import KnowledgeBase
+            _shared_kb = KnowledgeBase(_KB_DB_PATH, check_same_thread=False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shared KB init failed (non-fatal): %s", exc)
+            return None
+    return _shared_kb
 
 _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
     "F3E":  _KNOWN_ANSWERS_DIR / "f3e.md",
@@ -235,8 +270,11 @@ def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K, query_vec: lis
         log.debug("KB not initialized (no db at %s) — skipping retrieval", _KB_DB_PATH)
         return None
 
+    kb = get_shared_kb()
+    if kb is None:
+        return None
+
     try:
-        from cora.knowledge_base import KnowledgeBase
         # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX".
         kb_entity = _LEX_PARENT.get(entity, entity)
         sub_entity_scope = entity if entity in _LEX_PARENT else None
@@ -244,8 +282,8 @@ def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K, query_vec: lis
         # The founder CLAUDE.md is indexed under entity=FNDR and contains
         # cross-entity financial data for all portfolio entities.
         include_fndr = entity not in _NO_FOUNDER_CONTEXT
-        kb = KnowledgeBase(_KB_DB_PATH)
-        try:
+        # Shared connection — serialize access (KB searches are ms-scale).
+        with _SHARED_KB_LOCK:
             results = kb.search(
                 query,
                 entity=kb_entity,
@@ -255,8 +293,6 @@ def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K, query_vec: lis
                 sub_entity=sub_entity_scope,
                 query_vec=query_vec,
             )
-        finally:
-            kb.close()
     except Exception as exc:
         log.warning("KB retrieval failed for entity=%s query=%r: %s", entity, query[:60], exc)
         return None

@@ -95,20 +95,23 @@ def _prewarm_kb(log: logging.Logger) -> None:
     before any user request. Runs in a background daemon thread.
     """
     try:
-        from .context_loader import _KB_DB_PATH
-        from .knowledge_base import KnowledgeBase
+        from . import context_loader
 
-        if not _KB_DB_PATH.exists():
-            log.info("kb-prewarm: no KB db at %s — skipping", _KB_DB_PATH)
+        if not context_loader._KB_DB_PATH.exists():
+            log.info("kb-prewarm: no KB db at %s — skipping", context_loader._KB_DB_PATH)
             return
         start = time.monotonic()
-        kb = KnowledgeBase(_KB_DB_PATH)
-        try:
-            # 1536 dims = text-embedding-3-small. Zero vector is a valid MATCH target;
-            # we only care about loading the index pages, not the results.
+        # Create + warm the SAME shared instance the request path reuses, so the
+        # warmed connection (and its page cache) is the one serving live queries.
+        kb = context_loader.get_shared_kb()
+        if kb is None:
+            log.warning("kb-prewarm: shared KB unavailable — skipping")
+            return
+        # 1536 dims = text-embedding-3-small. Zero vector is a valid MATCH target;
+        # we only care about loading the index pages, not the results. Hold the
+        # shared lock so a concurrent first request doesn't race the warm scan.
+        with context_loader._SHARED_KB_LOCK:
             kb.search("", entity="FNDR", k=1, max_age_days=None, query_vec=[0.0] * 1536)
-        finally:
-            kb.close()
         log.info("kb-prewarm: vector index warmed in %.1fs", time.monotonic() - start)
     except Exception as exc:
         log.warning("kb-prewarm: failed (non-fatal): %s", exc)
