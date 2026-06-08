@@ -8,7 +8,11 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [FNDR] Knowledge-gap autofill from Slack conversations -- 2026-06-07 (commit pending cascade-push)
+### [FNDR] Knowledge-gap autofill from Slack conversations -- 2026-06-07 (commit 54b1ef2)
+
+Repo HEAD: `54b1ef2` on `origin/main` | **3,360 passed / 41 skipped** | task `cowork-cora-gap-autofill`
+registered (daily 6:00am AZ) | Cora restarted 03:17 UTC, heartbeat confirmed | 8 files, +1,563 lines.
+Note: `cascade-push-gap-autofill-2026-06-07.ps1` is gitignored (one-shot, not committed).
 
 **Problem:** 41 gaps in `logs/knowledge-gaps.jsonl`, only 1 ever resolved via the manual digest flow.
 
@@ -28,11 +32,13 @@ TOM entries are newest-first. Do not edit past TOM entries.
   7am knowledge-review): `scripts/run_gap_autofill.py` (--dry-run / --max-gaps / --no-escalate).
   Register: `deployment\setup-gap-autofill-task.ps1` (elevated PS).
 - **Tests:** `tests/test_gap_autofill.py` -- 54 tests (loading, evidence filtering, fail-closed drafting,
-  escalation eligibility, ask lifecycle, executor, wiring assertions). Full sandbox-runnable suite green;
-  host full-suite + import smoke gated in `cascade-push-gap-autofill-2026-06-07.ps1` (run BEFORE commit).
+  escalation eligibility, ask lifecycle, executor, wiring assertions). Host suite 3,360 passed / 41
+  skipped + import smoke clean at commit time.
 - **State files:** `data/state/gap_autofill_state.json` (per-gap) + `data/state/gap_ask_pending.json` (asks).
 
-**⚠️ RESTART REQUIRED** -- app.py changed (DM reply capture). Restart after cascade-push.
+**✅ Restart DONE 2026-06-08 03:17 UTC** (app.py DM reply capture live). First scheduled fire: 6:00am AZ.
+**Smoke test queued:** `.venv\Scripts\python.exe scripts\run_gap_autofill.py --dry-run` then check the
+7am knowledge-review DM the next weekday morning for any `known_answer` proposals.
 **Doctrine note:** mid-session `git stash/pop` on the Cowork mount caused stale-size truncated reads of
 app.py/CLAUDE.md (sandbox saw old st_size with new pages -- looked like file corruption). Recovery:
 restore from `git show HEAD:file`, re-apply edits with sandbox-side writes. Avoid stash on the mount.

@@ -641,3 +641,39 @@ silently never fires (fails soft). Worth a follow-up.
 
 Suite at this point: 3269 passed, 41 skipped. Cora restarted, post-restart heartbeat
 confirmed. Live end-to-end routing verification pending the next real capture (watch armed).
+
+---
+
+## D-031 (cora log) · Knowledge-gap autofill doctrines (2026-06-07, commit 54b1ef2)
+
+_Note: numbering is this repo's own sequence -- distinct from the founder memory/decisions.md
+D-031 (Asana hygiene remediation). Cross-log collisions are pre-existing (D-027+ differ too)._
+
+**Context:** 41 gaps in logs/knowledge-gaps.jsonl, 1 ever resolved via the manual digest
+flow. New two-stage autofill ships in src/cora/gap_autofill.py + scripts/run_gap_autofill.py
+(task cowork-cora-gap-autofill, daily 6am AZ).
+
+**Decisions LOCKED:**
+
+1. **Both stages Harrison-gated** -- mined drafts AND teammate DM answers enter the existing
+   knowledge-review queue as update_type="known_answer". Nothing writes to known-answers
+   files without Harrison thumbs-up (extends D-011, no exceptions).
+
+2. **Fail-closed drafting** -- a Haiku API error, JSON parse failure, or PHI-flagged answer
+   proposes NOTHING (contrast with capture_decisions fail-open, which degrades to heuristics).
+   Rationale: a wrong "known fact" poisons every future answer for that entity.
+
+3. **Evidence source = swept Slack conversations only** (source="slack", distance <= 1.30,
+   min 2 chunks). Override via GAP_AUTOFILL_SOURCES env if other sources earn trust later.
+
+4. **Escalation rules** -- one DM ask per gap EVER; max 3 asks/run; 72h age gate; LEX* and
+   PHI-flagged gaps NEVER escalate; owner map at data/maps/gap-domain-owners.yaml; decline
+   phrases leave the gap open for the digest flow.
+
+5. **Shared resolution ledger** -- autofill writes the same design/known-answers/{entity}.md
+   "## Known facts" format and the same .resolved-gaps.jsonl as the manual digest flow, so
+   the two flows can never double-resolve or fight.
+
+6. **DM routing precedence** -- gap-ask reply capture runs BEFORE osn_shift_handler in
+   app.py's DM path. Threaded replies to the ask message always win; top-level DMs are
+   captured only when the user has exactly one live ask and the text is not a shift command.
