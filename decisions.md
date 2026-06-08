@@ -677,3 +677,38 @@ flow. New two-stage autofill ships in src/cora/gap_autofill.py + scripts/run_gap
 6. **DM routing precedence** -- gap-ask reply capture runs BEFORE osn_shift_handler in
    app.py's DM path. Threaded replies to the ask message always win; top-level DMs are
    captured only when the user has exactly one live ask and the text is not a shift command.
+
+---
+
+## D-032 · Conversational replies pass through a deterministic formatter; tool outputs bypass (2026-06-08)
+
+**Context:** A 2026-06-08 comms review of ~40 recent Cora messages found systematic
+violations of the voice/style contract in `design/system-prompts/fndr.md` (em-dashes,
+emojis, markdown bold/tables/headers/rules, filler prefaces) and source-opacity breaches
+(bare `docs.google.com` / `app.asana.com` URLs and raw Asana GIDs pasted to users).
+Prompt-only enforcement of the contract drifts.
+
+**Decision:** Every CONVERSATIONAL reply is passed through
+`src/cora/reply_formatter.py` `format_reply(text, *, is_tool_output=False)` immediately
+before posting -- the same point in `app.py` where `WRITE_CONFIRMED` and the
+`[CORA_KNOWLEDGE_GAP: ...]` marker are stripped. It flattens banned markdown, replaces
+em/en-dashes with hyphens, strips emoji + `:shortcodes:`, redacts bare
+docs.google/drive/asana/notion URLs and naked `gid`/16+-digit IDs (while PRESERVING
+sanctioned `<url|label>` links and `<@mentions>`), and measures + logs the 280-char cap
+WITHOUT truncating (truncation is worse than length; the cap is enforced primarily via
+the prompt). TOOL OUTPUTS bypass the formatter entirely via `is_tool_output=True` --
+financial pulses, decision queues, dashboard/pipeline summaries are presented exactly as
+the tool returned them (per fndr.md "tool outputs are presented as-is").
+
+**Alternative considered:** Tighten the system prompt only. Rejected -- same failure mode
+as the cross-entity guard and sibling guard: prompt-only enforcement of a hard requirement
+drifts; deterministic code-level interception at the latest point before posting is
+required.
+
+**Reason:** Mechanical, testable (`tests/test_reply_formatter.py`), and immune to model
+drift. The formatter never changes financial / PHI / cross-entity guard behavior -- it
+only shapes already-approved conversational text.
+
+**Note:** the formatter MODULE shipped in commit `544bbe2`; the `app.py` wiring + Cora
+restart were HELD pending a clean working tree (a concurrent session held `app.py`
+uncommitted). Wiring + restart land in the next clean-window commit.
