@@ -105,10 +105,9 @@ confirmed against live systems._
   HubSpot — prospecting, outreach, sampling, proposals, negotiation, and close.
   Focused purely on new account acquisition.
 - **Owns:** F3E Retail pipeline (HubSpot portal `246351746`, pipeline `2313722582`),
-  Asana project `[F3E] Sales — Wholesale & Retail Pipeline` (GID `1215477882565190`,
-  the 2026-06-08 Harrison-owned project replacing the old `[F3E] Sales Pipeline — Tommy`),
-  distributor and broker outreach, weekly sales cadence. LinkedIn Spy leads are DMed
-  to Tommy automatically every Monday 8am.
+  Asana project `[F3E] Sales Pipeline — Tommy`, distributor and broker outreach,
+  weekly sales cadence. LinkedIn Spy leads are DMed to Tommy automatically every
+  Monday 8am.
 - **Reports to:** Harrison (and coordinates with Alex post-close)
 - **Reconciliation relevance:** HubSpot deal stage movement, stale deals with no
   activity, Asana sales tasks, Gmail threads with retail buyers and distributors.
