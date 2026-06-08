@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import anthropic
 
 from .config import config
-from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch
+from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch, tools_for_entity
 
 log = logging.getLogger(__name__)
 
@@ -234,19 +234,26 @@ def _build_cached_system(
     ]
 
 
-def _build_cached_tools() -> list[dict]:
-    """Return TOOL_DEFINITIONS with cache_control on the last tool.
+def _build_cached_tools(entity: str = "FNDR", cross_entity: bool = False) -> list[dict]:
+    """Return the entity-scoped tool definitions with cache_control on the last.
 
-    Caches the full tool-definitions block for the ephemeral cache window.
-    Tool definitions are large (~3-5k tokens) and static across all requests,
-    so this is a free win.
+    Tools are scoped to the channel's entity (tools_for_entity): only the tools
+    that entity actually uses are offered, which shrinks the cached tools block
+    and narrows the model's tool-selection space. Aggregators (FNDR/HJRG) and the
+    founder-from-any-channel (cross_entity=True) get the full set. The default
+    (entity="FNDR") returns all tools, so any caller that omits the args is
+    unchanged.
+
+    The per-entity subset preserves TOOL_DEFINITIONS order, so each entity's
+    tools block has a stable cache key and caches independently for the window.
 
     Anthropic rule: cache_control on the last tool caches the entire tools
     array as a single cacheable unit.
     """
-    if not TOOL_DEFINITIONS:
+    tools = tools_for_entity(entity, cross_entity)
+    if not tools:
         return []
-    tools = list(TOOL_DEFINITIONS)
+    tools = list(tools)
     tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
 
@@ -339,6 +346,7 @@ def generate_response(
     prior_messages: list[dict] | None = None,
     channel_name: str = "",
     cached_context: str | None = None,
+    cross_entity_tools: bool = False,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
@@ -366,7 +374,7 @@ def generate_response(
     Raises ClaudeClientError on hard failure after retries.
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
-    cached_tools = _build_cached_tools()
+    cached_tools = _build_cached_tools(entity, cross_entity_tools)
     effective_model = model or _MODEL
 
     # Conversation accumulator — prepend thread history if provided, then append
@@ -460,6 +468,7 @@ def generate_response_streaming(
     prior_messages: list[dict] | None = None,
     channel_name: str = "",
     cached_context: str | None = None,
+    cross_entity_tools: bool = False,
 ) -> str:
     """Streaming variant of generate_response.
 
@@ -488,7 +497,7 @@ def generate_response_streaming(
     Raises ClaudeClientError on hard failure after retries.
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
-    cached_tools = _build_cached_tools()
+    cached_tools = _build_cached_tools(entity, cross_entity_tools)
     effective_model = model or _MODEL
 
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]

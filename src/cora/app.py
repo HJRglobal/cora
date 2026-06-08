@@ -378,6 +378,7 @@ def _dispatch_qa(
                 prior_messages=prior_messages,
                 channel_name=channel_name,
                 cached_context=static_text,
+                cross_entity_tools=is_founder,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -435,6 +436,7 @@ def _dispatch_qa(
             prior_messages=prior_messages,
             channel_name=channel_name,
             cached_context=static_text,
+            cross_entity_tools=is_founder,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)

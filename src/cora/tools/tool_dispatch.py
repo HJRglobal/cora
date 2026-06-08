@@ -4170,6 +4170,127 @@ TOOL_DEFINITIONS = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-entity tool exposure
+# ─────────────────────────────────────────────────────────────────────────────
+# Which TOOL_DEFINITIONS are offered to Claude for a given channel entity. This
+# is a PERFORMANCE + tool-selection optimization, NOT a security boundary: the
+# cross-entity guard (cross_entity_guard.py, pre-LLM) and each tool's own runtime
+# guardrails (financial tier gate, LEX PHI/HubSpot block, staged-write confirm)
+# remain the security layer. So this map errs INCLUSIVE — a tool missing here only
+# means the model isn't offered it; an over-broad entry is harmless (just tokens).
+#
+# Sending only the channel-entity's tools (a) shrinks the per-call tool-schema
+# block (~14.5K tok for all 48) — the biggest savings land on the lean entities
+# (F3C/HJRPROD ship ~11 core tools, not 48), and (b) narrows the model's
+# tool-selection space so it mis-picks less and burns fewer wasted iterations.
+#
+# Aggregators (FNDR, HJRG) and the founder from ANY channel get the full set —
+# they ask cross-entity questions by design.
+
+# Tools every channel gets: task/calendar/comms/cashflow + the portfolio
+# decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
+_GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
+    "asana_get_my_tasks",
+    "asana_get_user_tasks",
+    "asana_create_task",
+    "gmail_create_draft",
+    "gmail_inbox",
+    "calendar_get_my_events",
+    "calendar_create_event",
+    "calendar_schedule_meeting",
+    "slack_send_dm",
+    "financial_get_cashflow",
+    "fndr_open_decisions",
+})
+
+# QBO + Drive close-pack financial depth — only entities that have QBO
+# provisioned (BDM/F3E/HJRG/HJRP/LEX/OSN). UFL/F3C/HJRPROD are not provisioned;
+# they keep financial_get_cashflow (in core) for the weekly forecast.
+_FINANCIAL_TOOLS: frozenset[str] = frozenset({
+    "qbo_get_profit_loss",
+    "qbo_get_balance_sheet",
+    "qbo_get_ar_aging",
+    "qbo_get_ap_aging",
+    "qbo_get_recent_transactions",
+    "financial_get_pulse",
+    "financial_get_close_pack",
+})
+
+# HubSpot deal tools — sales entities only. LEX is intentionally excluded
+# (HubSpot blocked for LEX per the Tier-1 doctrine).
+_HUBSPOT_TOOLS: frozenset[str] = frozenset({
+    "hubspot_get_my_deals",
+    "hubspot_update_deal_stage",
+    "hubspot_add_note",
+})
+
+# F3 brand image / deck generation — F3E + BDM (the in-house media agency).
+_F3_IMAGE_TOOLS: frozenset[str] = frozenset({
+    "f3_generate_image",
+    "f3_batch_image_run",
+    "f3_create_image",
+    "f3_create_sales_deck",
+})
+
+# Extra tools per entity, BEYOND _GLOBAL_CORE_TOOLS.
+_ENTITY_TOOLS: dict[str, frozenset[str]] = {
+    "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
+        "f3e_shopify_sales_pulse",
+        "f3e_shopify_inventory",
+        "f3e_inventory_pulse",
+        "f3e_inventory_by_location",
+        "f3e_brand_voice_check",
+        "f3e_hubspot_pipeline_summary",
+        "ads_get_performance_summary",
+        "ads_get_channel_breakdown",
+        "ads_get_subbrand_performance",
+        "ads_get_pixel_attribution",
+        "ads_get_cm_waterfall",
+        "fighter_compliance",
+        "influencer_list_handles",
+        "influencer_add_handle",
+        "influencer_get_status",
+        "influencer_log_deliverable",
+    }),
+    "OSN": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | frozenset({"osn_financial_pulse"}),
+    "LEX": _FINANCIAL_TOOLS | frozenset({"lex_revalidation_status"}),
+    "HJRP": _FINANCIAL_TOOLS | frozenset({"hjrp_lease_status"}),
+    "BDM": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS,
+    "UFL": _HUBSPOT_TOOLS,  # sponsor pipeline; no QBO provisioned
+    "F3C": frozenset(),       # nonprofit — core only
+    "HJRPROD": frozenset(),   # personal-brand umbrella — core only
+}
+
+# Sub-entity channels resolve to their parent's tool set.
+_SUBENTITY_PARENT: dict[str, str] = {
+    "OSNGF": "OSN", "OSNGM": "OSN", "OSNGW": "OSN", "OSNVV": "OSN",
+    "LEX-LLC": "LEX", "LEX-LTS": "LEX", "LEX-LBHS": "LEX", "LEX-LLA": "LEX",
+    "HJRP-1337": "HJRP", "HJRP-1555": "HJRP", "HJRP-RR": "HJRP",
+    "HJRP-CL": "HJRP", "HJRP-LCI": "HJRP",
+}
+
+# Aggregators see every tool — they ask cross-entity questions by design.
+_FULL_ACCESS_ENTITIES: frozenset[str] = frozenset({"FNDR", "HJRG"})
+
+
+def tools_for_entity(entity: str, cross_entity: bool = False) -> list[dict]:
+    """Return the TOOL_DEFINITIONS subset to offer Claude for this channel.
+
+    Order is preserved from TOOL_DEFINITIONS so the cached tools block has a
+    stable per-entity cache key.
+
+    cross_entity=True (the founder asking from any channel) or an aggregator
+    entity (FNDR/HJRG) gets the full set. An unknown entity falls back to the
+    global core only — safe, never a crash.
+    """
+    if cross_entity or entity in _FULL_ACCESS_ENTITIES:
+        return list(TOOL_DEFINITIONS)
+    canon = _SUBENTITY_PARENT.get(entity, entity)
+    allowed = _GLOBAL_CORE_TOOLS | _ENTITY_TOOLS.get(canon, frozenset())
+    return [t for t in TOOL_DEFINITIONS if t["name"] in allowed]
+
+
 # Name -> callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.
 _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
