@@ -500,5 +500,9 @@ class TestRealMapsSmoke:
     def test_hubspot_harrison_owner_id(self):
         assert hubspot_owner_id("U0B2RM2JYJ1") == "160459333"
 
-    def test_hubspot_matt_owner_id(self):
-        assert hubspot_owner_id("U0B3PS7RFJA") == "83346026"
+    def test_hubspot_matt_not_mapped(self):
+        # Matt Petrovich (owner 83346026) was intentionally removed from
+        # slack-to-hubspot.yaml on 2026-06-08 — his HubSpot seat is deactivated
+        # (inactive owner, owns 0 deals; OSN runs on QBO). Cora must NOT resolve
+        # him to a dead owner. Re-add only if the seat is reactivated.
+        assert hubspot_owner_id("U0B3PS7RFJA") is None
