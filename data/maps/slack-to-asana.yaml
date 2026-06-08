@@ -121,3 +121,10 @@ users:
     asana_user_gid: 1211824667367794
     asana_email: elena@f3energy.com
     display_name: Elena Meirndorf
+
+  # Jason Dorfman: external/guest Slack user. Transitioned employee -> outside
+  # consultant; still active on F3E retail expansion.
+  # external consultant - F3E; no Asana account
+  - slack_user_id: U0B6LQNSR25
+    asana_email: jasrdorfman@gmail.com
+    display_name: Jason Dorfman

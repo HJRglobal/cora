@@ -202,6 +202,28 @@ class TestAsanaMapLoading:
         assert len(users) == 1
         assert users[0].slack_user_id == "U002"
 
+    def test_gidless_entry_resolves_but_absent_from_reverse_index(self, map_dir):
+        """An external consultant with NO asana_user_gid (e.g. Jason Dorfman) must
+        load without crashing, resolve for identity (Slack ID, email, name alias),
+        carry asana_gid=None, and never pollute the Asana reverse index."""
+        _write_asana_map(
+            map_dir / "slack-to-asana.yaml",
+            [
+                {"slack_user_id": "U001", "asana_user_gid": "111", "display_name": "Alice"},
+                {"slack_user_id": "UEXT", "asana_email": "ext@gmail.com", "display_name": "Ext Consultant"},
+            ],
+        )
+        _write_alias_map(map_dir / "user-aliases.yaml", {"Ext Consultant": ["Ext"]})
+        invalidate_cache()
+        rec = get_user("UEXT")
+        assert rec is not None
+        assert rec.asana_gid is None
+        assert rec.asana_email == "ext@gmail.com"
+        assert asana_gid("UEXT") is None
+        assert slack_id_from_name("Ext") == "UEXT"
+        # reverse index contains only the gid'd user — gid-less entry excluded
+        assert all_asana_gids() == ["111"]
+
 
 # ── Cache loading — HubSpot map ────────────────────────────────────────────────
 
@@ -506,3 +528,16 @@ class TestRealMapsSmoke:
         # (inactive owner, owns 0 deals; OSN runs on QBO). Cora must NOT resolve
         # him to a dead owner. Re-add only if the seat is reactivated.
         assert hubspot_owner_id("U0B3PS7RFJA") is None
+
+    def test_jason_dorfman_gidless_external_consultant(self):
+        """Jason Dorfman (added 2026-06-08) is an external F3E consultant with NO
+        Asana account. He must resolve for identity by Slack ID + name alias, carry
+        asana_gid=None, and never appear in the Asana reverse index."""
+        rec = get_user("U0B6LQNSR25")
+        assert rec is not None
+        assert rec.display_name == "Jason Dorfman"
+        assert rec.asana_gid is None
+        assert rec.asana_email == "jasrdorfman@gmail.com"
+        assert asana_gid("U0B6LQNSR25") is None
+        assert slack_id_from_name("Dorfman") == "U0B6LQNSR25"
+        assert slack_id_from_name("Jason") == "U0B6LQNSR25"
