@@ -1,10 +1,12 @@
 # setup-fireflies-coverage-task.ps1
 # Registers the Cora Fireflies DWD coverage monitor as a Windows scheduled task.
 # Runs weekly Monday 8:00 AM -- DMs Harrison a digest of who is COVERED /
-# MEMBER_NO_RECORDINGS / NOT_A_MEMBER in Fireflies.
+# MEMBER_NO_RECORDINGS / NOT_A_MEMBER in Fireflies, AND nudges each uncovered
+# teammate (7-day throttle per user).
 #
-# FIRST SHIP IS DIGEST-ONLY (no teammate nudges). After Harrison reviews the
-# first digest, change the argument to "--nudge" and re-run this script.
+# ARMED FOR NUDGE 2026-06-08 (after Harrison reviewed the first digest). The
+# next scheduled run will DM ~14 teammates. To revert to digest-only, change
+# the argument back to "--digest-only" and re-run this script.
 #
 # Run once from elevated PowerShell:
 #   cd C:\Users\Harri\code\cora
@@ -36,10 +38,10 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Removed existing task: $TaskName"
 }
 
-# DIGEST-ONLY on first ship. Change to "--nudge" after Harrison reviews the first digest.
+# NUDGE armed 2026-06-08 (Harrison reviewed the first digest). Revert to "--digest-only" to disarm.
 $Action = New-ScheduledTaskAction `
     -Execute $PythonPath `
-    -Argument "`"$ScriptPath`" --digest-only" `
+    -Argument "`"$ScriptPath`" --nudge" `
     -WorkingDirectory $RepoRoot
 
 # Weekly, Monday 8:00 AM
@@ -59,13 +61,13 @@ Register-ScheduledTask `
     -Action     $Action `
     -Trigger    $Trigger `
     -Settings   $Settings `
-    -Description "Cora Fireflies DWD coverage monitor - weekly digest to Harrison (digest-only; flip to --nudge after first review)" `
+    -Description "Cora Fireflies DWD coverage monitor - weekly digest to Harrison + nudge uncovered teammates (7d throttle)" `
     | Out-Null
 
 Write-Host ""
 Write-Host "Task registered: $TaskName"
 Write-Host "  Schedule : Weekly, Monday 8:00 AM"
-Write-Host "  Argument : --digest-only  (change to --nudge after first digest review)"
+Write-Host "  Argument : --nudge  (digest to Harrison + DMs each uncovered teammate, 7d throttle)"
 Write-Host "  Python   : $PythonPath"
 Write-Host "  Script   : $ScriptPath"
 Write-Host "  Logs     : $LogDir\fireflies-coverage-YYYY-MM-DD.log"
