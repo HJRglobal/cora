@@ -8,6 +8,52 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [INFRA] KB vector-search fast path (binary quantization) -- 2026-06-07 (commit 8d3c3d0)
+
+Repo HEAD: `8d3c3d0` (code, local; push via the ship PS1) | **3,398 passed / 41 skipped** | code is
+live-safe immediately but the fast path stays OFF until the host migration arms it.
+
+**Problem:** KB vector search was ~31s cold (75% of total mention latency). Root cause: brute-force
+float KNN (`embedding MATCH`) scanning the entire ~1.4 GB vec0 float index over 223,799 chunks
+(24x growth since Phase 3 shipped at 9,380). Aggravator: `context_loader` opened a fresh
+`KnowledgeBase` per request, so the startup prewarm warmed a connection nothing used and
+"Knowledge Base schema initialized" logged on every request (read as a cold start).
+
+**Shipped (sandbox session 2026-06-07):**
+- **Binary-quantized fast path** (`store.py` + `schema.py`): new `knowledge_vec_bin` (vec0
+  `bit[1536]`, 1/32 the bytes ~= 43 MB, with an `entity` metadata column for in-scan pre-filtering)
+  + `knowledge_vec_f32` (plain btree blob table for true O(log n) PK re-rank reads). `search()`
+  does a coarse hamming scan (entity pre-filtered, `coarse_k=1000`) then exact float32 re-rank via
+  `vec_distance_l2` -- same metric as the old float path, so the `_KB_MAX_DISTANCE=1.30` threshold
+  is unchanged. Float path kept verbatim as the fallback; gated by the `kb_bin_index_ready`
+  checkpoint so deploy is decoupled from the data migration. `upsert` keeps bin+f32 in sync.
+  **sub_entity strict filter is unchanged** (security invariant, applied at re-rank vs knowledge_chunks).
+- **Shared KB instance** (`context_loader.py` + `main.py`): one lock-serialized `KnowledgeBase`
+  reused by all request threads AND the prewarm. Acceptance met: no schema-init log per request.
+- **Migration** `scripts/migrate_kb_binary_index.py`: idempotent, resumable backfill from existing
+  float vectors (NO re-embedding); heartbeat guard; arms the fast path only when bin==f32==knowledge_vec.
+- **Bench** `scripts/bench_kb_search.py`: float vs fast p50/p95 + recall@10 guard (>=0.80).
+- **+11 tests** (`tests/test_kb_binary_search.py`): fast==float equivalence, entity isolation,
+  sub_entity strict invariant, recency, bin/f32 sync.
+
+**Recall sized empirically:** sweep on worst-case (random-gaussian) vectors -> `coarse_k=1000`
+gives ~98% recall@10; real clustered embeddings recall higher. Re-rank of 1000 candidates adds
+~2-3ms (probe-measured), negligible vs the multi-second budget.
+
+**Expected latency:** scan drops 1.4 GB -> 43 MB. Target: warm KB search < 3s, cold (first
+post-restart) < 5s. Final production p50/p95 are captured by `bench_kb_search.py` during the host
+migration (the sandbox can only measure in-memory, where the cold-disk win does not show).
+
+**Harrison -- run host PS1 (elevated):** `.\ship-kb-binary-index-2026-06-07.ps1` does
+push -> stop Cora -> **backup cora_kb.db** -> dry-run -> migrate -> bench -> restart -> verify.
+~8 GB free needed (3.3 GB backup + ~1.4 GB f32). **Restart required: YES.** Post-restart verify:
+first `#llc` mention logs `latency_ms < 10000` with NO schema-init line; warm mentions < 5000;
+prewarm line shows < 1s. Follow-up (separate session, after ~1 week stable): drop `knowledge_vec`
+to reclaim ~1.4 GB (it is now only the fallback).
+
+_Note: this commit is selective -- the uncommitted `gap_autofill` working-tree files (`app.py`,
+`run_knowledge_review.py`) are left untouched for their own cascade._
+
 ### [FNDR] Knowledge-gap autofill from Slack conversations -- 2026-06-07 (commit 54b1ef2)
 
 Repo HEAD: `54b1ef2` on `origin/main` | **3,360 passed / 41 skipped** | task `cowork-cora-gap-autofill`
