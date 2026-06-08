@@ -8,6 +8,134 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [LEX + KB] Ingest-time LEX sub-entity tagging (Part 2) -- 2026-06-07 (commit 2e0c2a4)
+
+Repo HEAD: `2e0c2a4` on local main (NOT yet pushed -- see pending host run below).
+Prior 3 commits (`eaf25da`/`9f7fa66`/`bcb997e`, Asana YAML governance fixes from a
+concurrent session) were already at HEAD when this session started.
+
+**Problem:** The 5/31 sub-entity backfill was a one-shot script. Nightly syncs kept
+writing LEX chunks with sub_entity=NULL -- by 6/07 the KB (223,799 chunks) held 52,916
+NULL LEX chunks, 5,906 of them with UNAMBIGUOUS sub-entity signals (drive_sweep 41.7K +
+gmail 7.4K NULLs dominated). Strict filter kept them OUT of sub-entity channels, so this
+was a retrieval-coverage gap, NOT a leak -- sub-entity channels were blind to ~5,900
+chunks they should see.
+
+**Fix (commit `2e0c2a4`, 4 files):**
+- New `src/cora/knowledge_base/lex_sub_entity.py` -- shared detection module (locked
+  exactly-one-match keyword rule from the 5/31 ship, patterns unchanged).
+- `store.upsert_documents` Step 0: LEX docs arriving with sub_entity=None get detected +
+  tagged at the choke point -- covers ALL connectors permanently. Explicit connector tags
+  never overridden; ambiguous / general-LEX stays NULL (GM-level) by design.
+- `scripts/backfill_lex_sub_entity.py` refactored to import the shared module (now the
+  catch-up sweep only; backward-compatible aliases keep old tests green).
+- 14 new tests: `tests/test_lex_sub_entity_ingest.py`.
+
+**Test state:** Session ran in Cowork Linux sandbox (host .venv not executable here).
+Full-suite sandbox parity run: 3,292 passed / 41 skipped / 14 failed -- ALL 14 failures
+reproduced identically on pristine HEAD (11 sqlite-vec vec0 KNN env errors + 3 gsheets
+cache env errors). Zero regressions from this change. Import smoke clean through all
+cora modules (stops only at app.py's live Slack call, which needs host network).
+
+**⏳ PENDING -- Harrison host run (elevated PS):** `verify-lex-tagging-2026-06-07.ps1`
+-- runs doctrine-exact host pytest + import smoke, git fsck ground-truth check (sandbox
+FUSE view showed a pack checksum warning that is likely cache staleness -- verify on real
+disk before push), push to origin/main, Cora stop, one-time catch-up backfill (5,906
+chunks: 4,515 LLC / 762 LTS / 434 LBHS / 195 LLA), Cora restart + heartbeat.
+
+**Cora restart required:** YES (store.py is loaded by the live service) -- the PS1 does it.
+
+**Side findings:** (1) Working tree has a concurrent session's uncommitted gap_autofill
+work (`src/cora/gap_autofill.py` + script + tests, modified app.py + run_knowledge_review.py)
+-- deliberately NOT committed here. (2) 5 KB chunks carry sub_entity='LEX-LCI' which is not
+a LEX sub-entity (LCI is HJRP's) -- worth a look in a future hygiene pass. (3) Sandbox
+doctrine: virtiofs caches go stale when host file tools edit a file the sandbox already
+read -- converge by rewriting from the sandbox side; never git-commit a file edited
+host-side this session without verifying the sandbox view parses + tail is intact.
+
+---
+
+### [SECURITY + INFRA] Cross-entity firewall closed + team training manual — 2026-06-06 (9076b42→3748203)
+
+**`cross_entity_guard.py` — deterministic pre-LLM cross-entity keyword interceptor**
+- 8 entity keyword dicts: F3E / LEX / OSN / UFL / BDM / HJRP / HJRPROD / F3C
+- FNDR + HJRG = pass-through aggregators (not blockable — they are the portfolio layer)
+- PAIRED_ENTITIES = {F3E↔F3C} — brand + nonprofit pairing is intentional per doctrine
+- Keywords removed from F3E to prevent OSN false positives: "energy drink", "shopify", "dtc"
+- Wired at 2 sites in `app.py` BEFORE any Claude API call fires
+- 16 tests: `tests/test_cross_entity_guard.py` + `tests/test_cross_entity_firewall.py`
+
+**`hjrprod.md` typo fix (commit 9076b42):** "F3C (F3 Cannabis)" → "F3C (F3 Community — the nonprofit arm)"
+
+**Team training manual written + saved to Drive:**
+`G:\My Drive\HJR-Founder-OS\_shared\projects\cora\2026-06-06_fndr_cora-team-training-manual.md`
+10 sections: capabilities, channel scoping, guardrails, automated messages schedule, meeting
+action capture, knowledge approval map, troubleshooting, quick reference card.
+
+**Verified live:**
+- 3,290 tests passing (main @ `3748203`)
+- 50 active tasks (confirmed 2026-06-06 -- Tier 3 registrations complete)
+- Smoke test: `@Cora pipeline summary` in `#f3e-leadership` (confirm after next restart)
+
+**Pre-distribution checks (do before distributing manual to team):**
+1. Verify calendar DWD propagation: test `@Cora schedule a 15-min call`
+2. Check Fireflies invite acceptance: app.fireflies.ai/settings/team/members-and-groups
+3. Post reminder in #all-hjr-global
+
+**Asana hygiene blocked:** 9 project renames + 3 archives require Tessa Miller to grant Harrison
+project-admin access first. Chrome Agent prompt at:
+`C:\Users\Harri\code\cora\_notes\2026-06-06_chrome-agent-asana-renames-archives.md`
+
+**DOCTRINE LOCKED (D-034):** Prompt-only enforcement insufficient for hard security requirements.
+Code-level interception required at the earliest possible intercept point in app.py before LLM is
+called. Pattern: guard module + wire before any Claude API call. Same doctrine as sibling_guard.py
+(2026-05-24), now generalized to portfolio-wide cross-entity firewall.
+
+---
+
+### [INFRA] Hygiene root fixes — D-031 Code delivery -- 2026-06-06 (commits 6429aa3, 1122214, 8991289, 2020f91, 8381b6f, d2c6929)
+
+Repo HEAD: `2020f91` on `origin/main` | **3,269 passed / 41 skipped** | 45 active tools | Cora restarted, heartbeat confirmed (uptime_s 60→120).
+
+Three code-level anti-recurrence fixes for the issues the 2026-06-06 hygiene-asana sweep surfaced (D-031). All on origin/main; test suite is now order-independent.
+
+**Fix 1 — Meeting Action Capture: atomic watermark + lockfile + creation-time dedup (commit `6429aa3`)**
+- Root cause of 6/4 "13 WCF Review" double-fire: even after 1d17912, the watermark (incl. transcript-ID ledger) was flushed only once at end-of-run. A crash after task creation → next run reprocessed the same meeting.
+- Three new layers added:
+  1. **Per-meeting atomic persistence**: watermark flushed immediately after each transcript is processed (no wait-until-end-of-run).
+  2. **Process lockfile** at `data/state/meeting_action_capture.lock` — stale if >2h, auto-clears. Concurrent instance exits immediately.
+  3. **Creation-time dedup guard** `find_recent_duplicate_task` — skips creating an action item if an identical OPEN task already exists from the last 7 days.
+
+**Fix 2 — Nudge ledger unified (commit `1122214`)**
+- Problem: daily Tier-3 Asana Hygiene Nudge + weekly hygiene-asana closure sweep were both commenting on the same stale tasks.
+- New `src/cora/nudge_ledger.py` reads AND appends the EXISTING `closure-nudges-throttle.jsonl` (the same file the weekly sweep uses for its 7-day lockout) — bidirectional, zero SKILL change required.
+- Daily nudge now skips any task nudged by EITHER system within 14 days.
+- **Doctrine locked**: max 1 automated comment of any kind per task per 7 days.
+
+**Fix 3 — Captured tasks routed into projects (commits `8991289` mechanism + `2020f91` live)**
+- Problem: Fireflies-captured action items created with NO project → untaggable orphans cluttering My Tasks.
+- New `data/maps/meeting-capture-projects.yaml` maps each entity → its catch-all Asana project. All GIDs sourced from asana-project-map.yaml and cross-checked (catch_all_gid per entity). BDM intentionally excluded (empty). LEX* entries populated but inert — PHI guardrail skips all LEX meetings before routing ever runs.
+- Captured tasks now: routed into project + `Status=Not Started` + `Priority=Medium` stamped at creation.
+- **⬜ Open**: Entity custom-field option GIDs not yet supplied → entity tagging still OFF. Field GIDs when ready:
+  - Entity field: `1214487026542596`
+  - Status: `1214566926973275` / Not Started: `1214566926973276`
+  - Priority: `1204547177535963` / Medium: `1204547177535965`
+
+**Additional fixes same session:**
+- `8381b6f` — **KB-signal guard repaired**: `_has_kb_signal` queried table `"chunks"` but the live KB table is `"knowledge_chunks"` → guard had NEVER fired since it shipped. Also switched recency column `ingested_at` → `date_modified` (full KB re-ingest resets `ingested_at` to today, making the window a no-op). Validated via dry-run: `skipped_signal` 0 → 65.
+- `d2c6929` — **Test isolation**: autouse conftest fixture now resets HubSpot portal-guard global state + nudge-ledger path per test. Full suite is order-independent.
+- `2020f91` — **Clover stripped from `inventory-thresholds.yaml`**: OSN/Clover item-level block removed; only f3e thresholds remain. **Closes open TOM follow-up "confirm OSN/Clover leg stripped from inventory-thresholds.yaml" ✅**
+- `2500668` (concurrent session) — D-029 HubSpot runtime portal guard (see HubSpot entry above).
+- `b2eada1` (concurrent session) — startup KB-vector prewarm perf.
+
+**⏳ Verification pending**: next real Fireflies capture will confirm Fix 3 routing end-to-end (background watch armed).
+
+**Pre-existing, fail-soft, not yet addressed:**
+- `_has_kb_signal` does unindexed LIKE scan over ~222K KB chunks (FTS index would speed it up).
+- Confirm `inventory-alerts` loader reads `inventory-thresholds.yaml` as UTF-8 (⚠️ emoji in file can crash a default cp1252 read on Windows).
+
+---
+
 ### [F3E] Make.com Fighter Scenario Deployment + IG Account Issue -- 2026-06-05 (Cowork session)
 
 **Google Sheet restructured: "MMA Lab x F3 Fighters Tracker"**
@@ -64,6 +192,36 @@ Once switched, re-activate their scenarios.
 
 ---
 
+### [INCIDENT] Meeting Action Capture infinite loop -- 2026-06-05 evening (commit 1d17912)
+
+**Incident:** `Cora - Meeting Action Capture` (hourly task) stuck in infinite loop on an OSN
+meeting transcript, 6pm–11pm AZ. Same transcript reprocessed every hour → 54 duplicate
+Asana tasks (all assigned Matt Petrovich) + #osn-leadership flooded with identical posts.
+All 54 duplicates bulk-deleted via Chrome Agent.
+
+**Root cause:** `fireflies_action_extractor.py` watermark only advanced when
+`latest_ts > since_ts`. This OSN transcript's `meeting_ts` exactly equaled the watermark
+value, so `latest_ts` never exceeded `since_ts`, the watermark never updated, and the
+transcript was reprocessed every hour forever.
+
+**Fix (commit `1d17912`):**
+- `_read_watermark()` now returns `(timestamp, processed_ids: set[str])` instead of just a timestamp.
+- After processing any transcript, its Fireflies ID is added to `processed_ids`.
+- `_write_watermark()` always persists both timestamp AND the ID set (no longer conditional).
+- Processing loop skips any transcript whose Fireflies ID is already in `processed_ids`.
+- Dedup is now ID-based, not timestamp-based.
+
+**New watermark format** (`data/state/meeting_action_watermark.json`):
+`{"last_processed_ts": 1780686300, "processed_ids": ["id1", "id2", ...]}`
+
+**D-030 locked** (see ACTIVE DECISIONS below): ID-based dedup is required for all Fireflies
+watermarks. Timestamp-only is insufficient because meeting_ts reflects the meeting DATE,
+not ingestion date.
+
+**Status:** Task re-enabled, running clean. Fix committed + pushed. Cora restarted ✅
+
+---
+
 ### [INFRA] Clover retired + Phase 3 tool audit -- 2026-06-05 (commits 4231ae7, d6e2133)
 
 Repo HEAD: `d6e2133` on `origin/main` | 3,132 tests | 45 active tools | 37 Ready tasks | 10 Disabled
@@ -112,7 +270,7 @@ Repo HEAD: `d6e2133` on `origin/main` | 3,132 tests | 45 active tools | 37 Ready
 ### [MAKE.COM] Phase 2 migration — 8 mechanical tasks moved out of Cora -- 2026-06-04/05
 
 8 Make.com scenarios built covering all mechanical automation that doesn't require Cora's
-intelligence. 7 Cora scheduled tasks disabled; task count: 47 → 40 active.
+intelligence. 7 Cora scheduled tasks disabled; task count: 47 → 40 active (**50 active tasks confirmed 2026-06-06** -- Tier 3 registrations complete + cross-entity firewall added).
 
 | Make.com ID | Scenario | Cora task → status |
 |---|---|---|
@@ -567,3 +725,4 @@ deployment/
 | D-027 | Clover retired permanently from OSN stack (2026-06-05). OSN uses QBO as sole financial source. Do NOT rebuild Clover integration. |
 | D-028 | Per-tool timeout tiers: 8s fast (local DB), 15s default (single API), 25s heavy (multi-step/image/meeting). |
 | D-029 | Cora = intelligence + conversation. Make.com = mechanical automation. Rule-based, threshold-based, or straight data-push tasks belong in Make.com. Cora only where natural language or context is needed. |
+| D-030 | Meeting Action Capture watermark must track transcript IDs, not just timestamps. Timestamp-only watermarks fail when meeting_ts equals the watermark value. ID-set dedup is required. Watermark format: `{"last_processed_ts": N, "processed_ids": [...]}`. |
