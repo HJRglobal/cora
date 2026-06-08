@@ -167,6 +167,41 @@ def _known_answers_mtime(entity: str) -> float | None:
     return path.stat().st_mtime
 
 
+def load_context_parts(
+    entity: str,
+    query: str | None = None,
+    skip_kb: bool = False,
+    kb_k: int | None = None,
+    query_vec: list[float] | None = None,
+) -> tuple[str, str]:
+    """Return (static_text, kb_text) for the entity, kept as separate strings.
+
+    static_text: the deterministic per-entity portfolio context — entity
+      CLAUDE.md + founder CLAUDE.md + known-answers + dynamic snapshots. This is
+      mtime-stable and TTL-cached (see _load_static_context). It is the block the
+      caching split in claude_client caches as block 2 of the system array.
+    kb_text: the query-specific top-K KB chunks, or "" when there is no query,
+      KB is skipped, or retrieval finds nothing past the distance threshold.
+      This is the volatile, never-cached portion.
+
+    Splitting the two lets callers cache the large static mass (the founder
+    CLAUDE.md alone is ~30K tokens) while keeping the per-query KB chunks in an
+    uncached block. load_context() composes them back for the legacy contract.
+
+    query_vec: pre-computed embedding for `query`. When provided, forwarded to
+    _try_kb_retrieve so store.search() can skip its own embed_query() call.
+    Saves one OpenAI API round-trip per request.
+    """
+    static_text = _load_static_context(entity)
+
+    if not query or skip_kb:
+        return static_text, ""
+
+    effective_k = kb_k if kb_k is not None else _KB_TOP_K
+    kb_section = _try_kb_retrieve(entity, query, k=effective_k, query_vec=query_vec) or ""
+    return static_text, kb_section
+
+
 def load_context(
     entity: str,
     query: str | None = None,
@@ -183,21 +218,17 @@ def load_context(
     The static portion is cached with a 5-minute TTL (mtime-invalidated). The
     KB portion is recomputed per query and NOT cached.
 
-    query_vec: pre-computed embedding for `query`. When provided, forwarded to
-    _try_kb_retrieve so store.search() can skip its own embed_query() call.
-    Saves one OpenAI API round-trip per request.
+    Thin wrapper over load_context_parts() that joins the static + KB portions
+    into the single-string contract this function has always returned. When
+    there is no KB portion it returns the cached static object verbatim (so the
+    TTL cache-identity invariant holds).
     """
-    static_text = _load_static_context(entity)
-
-    if not query or skip_kb:
+    static_text, kb_text = load_context_parts(
+        entity, query=query, skip_kb=skip_kb, kb_k=kb_k, query_vec=query_vec
+    )
+    if not kb_text:
         return static_text
-
-    effective_k = kb_k if kb_k is not None else _KB_TOP_K
-    kb_section = _try_kb_retrieve(entity, query, k=effective_k, query_vec=query_vec)
-    if not kb_section:
-        return static_text
-
-    return static_text + "\n\n---\n\n" + kb_section
+    return static_text + "\n\n---\n\n" + kb_text
 
 
 def _load_static_context(entity: str) -> str:

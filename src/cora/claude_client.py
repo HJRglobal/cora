@@ -172,22 +172,50 @@ def _extract_text(response: anthropic.types.Message) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
-def _build_cached_system(system_prompt: str, context: str) -> list[dict]:
-    """Build the system field as a 2-block array for prompt caching.
+def _build_cached_system(
+    system_prompt: str,
+    volatile_context: str,
+    static_context: str | None = None,
+) -> list[dict]:
+    """Build the system field as a cached-block array for prompt caching.
 
-    Block 1: the entity system prompt + voice — deterministic per entity, cached.
-    Block 2: the KB / runtime context — query-specific, NOT cached.
+    Two shapes:
 
-    Anthropic's prompt cache will hit on block 1 for any subsequent request
-    in the same entity within the ~5-minute ephemeral cache window. The cache
-    miss rate is dominated by block 2 (different KB chunks per question), but
-    that's the smaller block; block 1 carries most of the prompt mass.
+    2-block (static_context falsy — legacy/back-compat):
+      Block 1: entity system prompt + voice — cached.
+      Block 2: the context arg — query-specific, NOT cached.
+
+    3-block (static_context provided — the caching split):
+      Block 1: entity system prompt + voice — cached.
+      Block 2: static portfolio context (founder CLAUDE.md + entity CLAUDE.md +
+               known-answers + dynamic snapshots) — deterministic per entity,
+               mtime-stable, CACHED. This is the large static mass (~30K tokens
+               for the founder brief alone) that previously rode in the uncached
+               block and was re-billed on every mention.
+      Block 3: per-query KB chunks + runtime context — query-specific, NOT cached.
 
     Cache-control rules (Anthropic):
       - cache_control on a block caches that block AND everything before it.
-      - Putting cache_control only on block 1 makes block 1 cacheable while
-        block 2 stays per-request. That's what we want.
+      - Two breakpoints (block 1 + block 2): the block-1 hit survives even when a
+        CLAUDE.md edit changes block 2, and the block-2 hit covers the whole
+        static prefix when block 2 is unchanged.
+      - Min cacheable size is ~1024 tokens (Sonnet): block 2 (CLAUDE.md) is far
+        over it; block 1 may be under it, in which case its breakpoint is a
+        harmless no-op. Max 4 breakpoints/request — we use <=3 (2 here + tools).
     """
+    if not static_context:
+        return [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": "\n\n---\n\n# Context\n\n" + volatile_context,
+            },
+        ]
+
     return [
         {
             "type": "text",
@@ -196,7 +224,12 @@ def _build_cached_system(system_prompt: str, context: str) -> list[dict]:
         },
         {
             "type": "text",
-            "text": "\n\n---\n\n# Context\n\n" + context,
+            "text": "\n\n---\n\n# Portfolio context\n\n" + static_context,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": "\n\n---\n\n# Context\n\n" + volatile_context,
         },
     ]
 
@@ -305,6 +338,7 @@ def generate_response(
     model: str | None = None,
     prior_messages: list[dict] | None = None,
     channel_name: str = "",
+    cached_context: str | None = None,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
 
@@ -324,9 +358,14 @@ def generate_response(
     across requests within the same entity. Expect ~5-10x faster input processing
     on cache hits.
 
+    cached_context: optional static portfolio context (founder + entity
+    CLAUDE.md + known-answers + dynamic snapshots). When provided it becomes a
+    second CACHED system block, so the large static mass is no longer re-billed
+    on every mention — only the query-varying `context` arg stays uncached.
+
     Raises ClaudeClientError on hard failure after retries.
     """
-    system_blocks = _build_cached_system(system_prompt, context)
+    system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
     cached_tools = _build_cached_tools()
     effective_model = model or _MODEL
 
@@ -420,6 +459,7 @@ def generate_response_streaming(
     model: str | None = None,
     prior_messages: list[dict] | None = None,
     channel_name: str = "",
+    cached_context: str | None = None,
 ) -> str:
     """Streaming variant of generate_response.
 
@@ -442,9 +482,12 @@ def generate_response_streaming(
     update_callback may be None (e.g., during tests) — in that case no
     progressive updates fire, but the function still returns the final text.
 
+    cached_context: optional static portfolio context — see generate_response.
+    When provided it becomes a second CACHED system block.
+
     Raises ClaudeClientError on hard failure after retries.
     """
-    system_blocks = _build_cached_system(system_prompt, context)
+    system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
     cached_tools = _build_cached_tools()
     effective_model = model or _MODEL
 

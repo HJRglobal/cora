@@ -16,7 +16,7 @@ from . import active_thread_store
 from . import channel_classifier
 from . import user_access
 from .config import config
-from .context_loader import load_context
+from .context_loader import load_context_parts
 from .entity_router import route
 from . import feedback_log
 from . import help_responder
@@ -330,7 +330,10 @@ def _dispatch_qa(
     # context_loader → store.search() can skip its own embed_query() call.
     # If bypass_cache=True the embedding was never computed; passing None
     # is safe -- store.search() falls back to computing it internally.
-    context = load_context(
+    # Split static portfolio context (cacheable) from per-query KB chunks
+    # (volatile). static_text becomes a cached system block; kb_text rides in the
+    # uncached block alongside runtime_context. See claude_client._build_cached_system.
+    static_text, kb_text = load_context_parts(
         entity,
         query=user_message,
         skip_kb=hints.skip_kb,
@@ -367,13 +370,14 @@ def _dispatch_qa(
         try:
             response_text = generate_response(
                 prompt,
-                runtime_context + context,
+                runtime_context + kb_text,
                 user_message,
                 slack_user_id=user_id or "",
                 entity=entity,
                 model=chosen_model,
                 prior_messages=prior_messages,
                 channel_name=channel_name,
+                cached_context=static_text,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -422,7 +426,7 @@ def _dispatch_qa(
     try:
         response_text = generate_response_streaming(
             prompt,
-            runtime_context + context,
+            runtime_context + kb_text,
             user_message,
             update_callback=update_callback,
             slack_user_id=user_id or "",
@@ -430,6 +434,7 @@ def _dispatch_qa(
             model=chosen_model,
             prior_messages=prior_messages,
             channel_name=channel_name,
+            cached_context=static_text,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
