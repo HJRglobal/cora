@@ -115,18 +115,16 @@ def check_access(user_id: str, entity: str, user_message: str) -> str | None:
 
     Returns None (pass) or a one-sentence redirect (block).
     """
-    # Entity check
+    # Entity check.
+    # Refusal copy is channel/topic-relative and MUST NOT emit an internal entity
+    # code (FNDR/HJRG/F3E/...). Leaking the code both confuses operators and exposes
+    # internal taxonomy (the 2026-06-01 #f3-events incident: Alex was refused 3x with
+    # "I can only assist with FNDR topics", leaking the code on the access-gate default).
     if not is_authorized(user_id, entity):
-        users = _load_permissions()
-        entry = users.get(user_id, {})
-        name = entry.get("name", "you")
-        allowed = entry.get("allowed_entities", ["FNDR", "HJRG"])
-        if isinstance(allowed, list) and allowed:
-            entity_hint = allowed[0]
-            return (
-                f"I can only assist with {entity_hint} topics in your authorized channels."
-            )
-        return "That entity is outside your access scope."
+        return (
+            "That's outside what I can help with in this channel. Ask me in the "
+            "channel for the team that owns it and I'll answer there."
+        )
 
     # Sensitive topic check
     blocked = blocked_topics(user_id)
