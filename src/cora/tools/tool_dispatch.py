@@ -2250,6 +2250,28 @@ def _tool_fndr_contracts_dashboard(slack_user_id: str, entity: str, _input: dict
         )
 
 
+def _tool_fndr_press_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Fetch the FNDR/HJRG press-acquisition pipeline summary from Notion.
+
+    Scope: founder-level only. Refuses in entity channels (press strategy is a
+    portfolio concern, mirroring the cross-entity firewall doctrine).
+    """
+    entity_upper = (entity or "FNDR").upper().strip()
+    if entity_upper not in ("FNDR", "HJRG"):
+        return (
+            "The press pipeline is a founder-level view -- ask me about it in a "
+            "founder or HJR Global channel."
+        )
+    try:
+        return notion_client.get_press_pipeline_summary_text()
+    except notion_client.NotionClientError as exc:
+        log.warning("fndr_press_pipeline_summary error user=%s: %s", slack_user_id, exc)
+        return (
+            f"fndr_press_pipeline_summary: I don't have that right now -- {exc}. "
+            "Apologize to the user and suggest they check back shortly."
+        )
+
+
 # ---------------------------------------------------------------------------
 # PhotoRoom image generation tool handlers
 # ---------------------------------------------------------------------------
@@ -3580,6 +3602,26 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "fndr_press_pipeline_summary",
+        "description": (
+            "Fetch the FNDR/HJRG press-acquisition pipeline (Media Contacts) summary. "
+            "Use this when a user asks about press / media outreach status, the press "
+            "pipeline, journalist outreach, published features, or Wikipedia-AfC press "
+            "progress -- phrases like 'press pipeline summary', 'press pipeline', "
+            "'how's the press strategy going', 'media contacts', 'what have we pitched', "
+            "'who's published us', 'press coverage status'. "
+            "Returns total contacts + status breakdown, per-entity Published-feature "
+            "progress vs the Wikipedia AfC threshold (F3 Energy 3, Lexington 2), the "
+            "active pitched/responded reporters, and the to-pitch list with deep links. "
+            "Call in any FNDR or HJRG channel only. No inputs required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "f3e_hubspot_pipeline_summary",
         "description": (
             "Fetch a source-opaque sales summary of the F3E HubSpot pipeline. "
@@ -4161,6 +4203,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
     "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
+    "fndr_press_pipeline_summary": _tool_fndr_press_pipeline_summary,
     "osn_financial_pulse": _tool_osn_financial_pulse,
     "ads_get_performance_summary": _tool_ads_get_performance_summary,
     "ads_get_channel_breakdown": _tool_ads_get_channel_breakdown,
@@ -4203,6 +4246,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "asana_create_task": 12,
     "f3e_hubspot_pipeline_summary": 12,
     "fndr_contracts_dashboard": 12,
+    "fndr_press_pipeline_summary": 12,
     "lex_revalidation_status": 12,
     "f3e_shopify_sales_pulse": 12,
     "f3e_shopify_inventory": 12,
