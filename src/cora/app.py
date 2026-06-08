@@ -23,6 +23,7 @@ from . import help_responder
 from . import knowledge_review
 from . import intent_classifier as ic
 from . import knowledge_gaps
+from . import gap_autofill
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
@@ -885,12 +886,45 @@ def handle_message_event(event: dict, client) -> None:
          responded (within TTL_SECONDS), treat it as a follow-up question and
          run the full Q&A pipeline without requiring a fresh @mention.
     """
-    # ── DM path — route to OSN shift scheduler ───────────────────────────────
+    # ── DM path — gap-ask reply capture, then OSN shift scheduler ───────────
     channel_type = event.get("channel_type", "")
     if channel_type == "im":
         user_id = event.get("user", "")
         text = event.get("text", "").strip()
         if user_id and text and not event.get("bot_id"):
+            # Gap autofill Stage 2: if this user has a pending knowledge-gap
+            # ask, treat the reply as the answer. Threaded replies to the ask
+            # message always match; top-level DMs match only when the text is
+            # not an OSN shift-scheduler command (those keep their old route).
+            try:
+                ask = gap_autofill.match_pending_ask(
+                    user_id,
+                    event.get("thread_ts"),
+                    allow_toplevel=not gap_autofill.is_shift_keyword(text),
+                )
+            except Exception as exc:  # noqa: BLE001 — capture must never break DMs
+                log.warning("gap_autofill: match_pending_ask failed: %s", exc)
+                ask = None
+            if ask:
+                log.info("gap_autofill: DM reply captured user=%s ask=%s",
+                         user_id, ask.get("ask_id", "?"))
+                try:
+                    ack = gap_autofill.record_ask_answer(ask, text)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("gap_autofill: record_ask_answer failed: %s", exc)
+                    ack = ("Sorry — something went wrong recording that. "
+                           "I'll re-ask if it's still needed.")
+                try:
+                    client.chat_postMessage(
+                        channel=event.get("channel", user_id),
+                        text=ack,
+                        thread_ts=event.get("thread_ts"),
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("gap_autofill: ack post failed: %s", exc)
+                return
             log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
             osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
         return

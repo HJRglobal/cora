@@ -1,0 +1,30 @@
+# Gap autofill -- entity domain owners for Stage-2 escalation DMs.
+#
+# When a knowledge gap can't be answered from swept Slack conversations after
+# ESCALATE_AFTER_HOURS, Cora DMs the entity's domain owner ONCE asking the
+# question. Their reply is routed through the Harrison knowledge-review gate.
+#
+# Rules:
+# - Slack user IDs only (resolve via data/maps/slack-to-asana.yaml).
+# - LEX* entities are listed for completeness but NEVER receive escalation
+#   DMs (PHI guardrail blocks escalation in code before this map is read).
+# - Visibility CPA team members must never appear here (not in Slack anyway).
+# - default = Harrison (founder-level gaps go straight to the source).
+
+owners:
+  F3E: U0B3RU5Q55G        # Tommy Anderson -- F3E retail sales
+  UFL: U0B3VGWJTMJ        # Alex Cordova -- UFL residual + athlete affairs
+  OSN: U0B3PS7RFJA        # Matt Petrovich -- OSN ops
+  BDM: U0B3NGR1Y85        # Larry Stone -- BDM media
+  HJRP: U0B3AEQS0NB       # Hannah Grant -- HJRP recurring ops
+  HJRG: U0B2RM2JYJ1       # Harrison Rogers
+  FNDR: U0B2RM2JYJ1       # Harrison Rogers
+  F3C: U0B2RM2JYJ1        # Harrison Rogers
+  HJRPROD: U0B2RM2JYJ1    # Harrison Rogers
+  # LEX entries intentionally inert -- code skips escalation for LEX* gaps.
+  LEX: U0B3PS82G30        # Shaun Hawkins (inert)
+  LEX-LLC: U0B3PS82G30    # (inert)
+  LEX-LLA: U0B3PS82G30    # (inert)
+  LEX-LBHS: U0B3PS82G30   # (inert)
+
+default: U0B2RM2JYJ1      # Harrison Rogers

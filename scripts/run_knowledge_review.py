@@ -139,6 +139,22 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             log.info("gap-executor: decision_capture posted to #%s uid=%s", notify_ch, uid_short)
             _post_to_slack(slack_token, notify_ch, msg)
 
+        elif update_type == "known_answer":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.gap_autofill import apply_known_answer
+            ok, summary = apply_known_answer(payload)
+            q_short = (payload.get("question") or desc)[:160]
+            if ok:
+                msg = (
+                    f":white_check_mark: *Gap executor* `[{uid_short}]` learned a new answer "
+                    f"({summary}):\n> Q: {q_short}\n> A: {(payload.get('answer') or '')[:300]}"
+                )
+                log.info("gap-executor: known_answer applied uid=%s", uid_short)
+            else:
+                msg = f":warning: *Gap executor* `[{uid_short}]` known_answer failed: {summary}"
+                log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
+            _post_to_slack(slack_token, notify_ch, msg)
+
         elif update_type == "hubspot_note":
             deal_name = payload.get("deal_name", "(unknown deal)")
             deal_url = payload.get("deal_url", "")

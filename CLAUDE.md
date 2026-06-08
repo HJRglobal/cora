@@ -8,6 +8,37 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [FNDR] Knowledge-gap autofill from Slack conversations -- 2026-06-07 (commit pending cascade-push)
+
+**Problem:** 41 gaps in `logs/knowledge-gaps.jsonl`, only 1 ever resolved via the manual digest flow.
+
+**Shipped (Cowork session 2026-06-07) -- two-stage autofill, both stages Harrison-gated (D-011 intact):**
+- **Stage 1 MINE** -- `src/cora/gap_autofill.py`: per open gap, entity-scoped KB search restricted to
+  swept Slack conversation chunks (`source="slack"`, distance <= 1.30, PHI-filtered), Haiku drafts an
+  answer (FAIL-CLOSED: API/parse error proposes nothing), proposal lands in the existing 7am
+  knowledge-review DM queue as new `update_type="known_answer"`.
+- **Stage 2 ASK** -- gaps with no evidence after 72h get ONE escalation DM to the entity domain owner
+  (`data/maps/gap-domain-owners.yaml`; LEX* + PHI gaps NEVER escalate; max 3 asks/run). Reply captured
+  in app.py DM path (threaded replies always; top-level only when not an OSN shift command), routed
+  through the same Harrison gate. Decline phrases ("no idea", "not my area") leave the gap open.
+- **Executor** -- on Harrison thumbs-up, `run_knowledge_review.py` calls `gap_autofill.apply_known_answer`:
+  appends to `design/known-answers/{entity}.md` "## Known facts" (same format as the digest flow,
+  loaded into Cora's per-entity context) + records `.resolved-gaps.jsonl` + posts to #hjrg-leadership.
+- **New scheduled task** -- `cowork-cora-gap-autofill` daily 6:00am AZ (after 2am Slack sync, before
+  7am knowledge-review): `scripts/run_gap_autofill.py` (--dry-run / --max-gaps / --no-escalate).
+  Register: `deployment\setup-gap-autofill-task.ps1` (elevated PS).
+- **Tests:** `tests/test_gap_autofill.py` -- 54 tests (loading, evidence filtering, fail-closed drafting,
+  escalation eligibility, ask lifecycle, executor, wiring assertions). Full sandbox-runnable suite green;
+  host full-suite + import smoke gated in `cascade-push-gap-autofill-2026-06-07.ps1` (run BEFORE commit).
+- **State files:** `data/state/gap_autofill_state.json` (per-gap) + `data/state/gap_ask_pending.json` (asks).
+
+**⚠️ RESTART REQUIRED** -- app.py changed (DM reply capture). Restart after cascade-push.
+**Doctrine note:** mid-session `git stash/pop` on the Cowork mount caused stale-size truncated reads of
+app.py/CLAUDE.md (sandbox saw old st_size with new pages -- looked like file corruption). Recovery:
+restore from `git show HEAD:file`, re-apply edits with sandbox-side writes. Avoid stash on the mount.
+
+---
+
 ### [LEX + KB] Ingest-time LEX sub-entity tagging (Part 2) -- 2026-06-07 (commit 2e0c2a4)
 
 Repo HEAD: `2e0c2a4` on local main (NOT yet pushed -- see pending host run below).
@@ -37,13 +68,20 @@ reproduced identically on pristine HEAD (11 sqlite-vec vec0 KNN env errors + 3 g
 cache env errors). Zero regressions from this change. Import smoke clean through all
 cora modules (stops only at app.py's live Slack call, which needs host network).
 
-**⏳ PENDING -- Harrison host run (elevated PS):** `verify-lex-tagging-2026-06-07.ps1`
--- runs doctrine-exact host pytest + import smoke, git fsck ground-truth check (sandbox
-FUSE view showed a pack checksum warning that is likely cache staleness -- verify on real
-disk before push), push to origin/main, Cora stop, one-time catch-up backfill (5,906
-chunks: 4,515 LLC / 762 LTS / 434 LBHS / 195 LLA), Cora restart + heartbeat.
+**✅ HOST RUN COMPLETE 2026-06-08 03:06 UTC** (via `rescue-git-and-ship-lex-tagging-2026-06-07.ps1`):
+host suite **3,360 passed / 41 skipped**, import smoke OK, pushed `bcb997e..297ea43`,
+catch-up backfill APPLIED (5,906 tagged: 4,515 LLC / 762 LTS / 434 LBHS / 195 LLA),
+Cora restarted, heartbeat fresh. ⏳ Remaining: Slack smoke test `@Cora what's the
+revalidation status?` in an #lts-* or #llc-* channel.
 
-**Cora restart required:** YES (store.py is loaded by the live service) -- the PS1 does it.
+**🚨 GIT PACK CORRUPTION INCIDENT (same session, RESOLVED):** git auto-maintenance ran
+during the Cowork sandbox session and rewrote packs over the virtiofs mount -- pack
+`c44d7e5a` came out corrupt (object de2e7c04 hash mismatch). Recovery: fresh bare clone
+from origin, pack transplant, corrupt pack quarantined to `.git-corrupt-backup`, dead
+`refs/stash` dropped (only casualty -- local stash, contents unknowable, nothing pushed
+or committed lost). fsck clean. **DOCTRINE LOCKED: `gc.auto=0` + `maintenance.auto=false`
+set in this repo's local config -- sandbox sessions must NEVER auto-repack over virtiofs.
+Do not unset these.** Cleanup when satisfied: remove `.git-corrupt-backup` + `C:\Users\Harri\code\cora-rescue.git`.
 
 **Side findings:** (1) Working tree has a concurrent session's uncommitted gap_autofill
 work (`src/cora/gap_autofill.py` + script + tests, modified app.py + run_knowledge_review.py)
