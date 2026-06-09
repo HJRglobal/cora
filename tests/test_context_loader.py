@@ -147,3 +147,90 @@ def test_cache_returns_same_instance_within_ttl(monkeypatch, tmp_path):
 
     assert result1 is result2  # same object from cache
     assert "original content" in result1
+
+
+# ── Founder CLAUDE.md slimming (section 10.3) ───────────────────────────────
+
+_FOUNDER_DOC = (
+    "# HJR Founder OS\n\nStatic brief: portfolio principles.\n\n"
+    "---\n\n# Current State of the World\n\nTOM: secret dynamic stuff.\n"
+)
+
+
+def test_non_aggregator_entity_gets_slim_founder(monkeypatch, tmp_path):
+    _clear_cache()
+    f3e = tmp_path / "F3E.md"
+    f3e.write_text("F3E entity content", encoding="utf-8")
+    founder = tmp_path / "FNDR.md"
+    founder.write_text(_FOUNDER_DOC, encoding="utf-8")
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder)
+
+    result = cl.load_context("F3E")
+
+    assert "Static brief: portfolio principles." in result   # static head kept
+    assert "TOM: secret dynamic stuff." not in result         # dynamic section dropped
+    assert "knowledge base" in result                         # retrieval note present
+
+
+def test_fndr_keeps_full_founder(monkeypatch, tmp_path):
+    _clear_cache()
+    founder = tmp_path / "FNDR.md"
+    founder.write_text(_FOUNDER_DOC, encoding="utf-8")
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder)
+    monkeypatch.setattr(cl, "_ENTITY_PATHS", {})
+
+    result = cl.load_context("FNDR")
+
+    assert "Static brief: portfolio principles." in result
+    assert "TOM: secret dynamic stuff." in result             # aggregator keeps full
+
+
+def test_hjrg_keeps_full_founder(monkeypatch, tmp_path):
+    _clear_cache()
+    founder = tmp_path / "FNDR.md"
+    founder.write_text(_FOUNDER_DOC, encoding="utf-8")
+    monkeypatch.setitem(cl._ENTITY_PATHS, "HJRG", tmp_path / "missing-hjrg.md")
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder)
+
+    result = cl.load_context("HJRG")
+
+    assert "TOM: secret dynamic stuff." in result             # HJRG is an aggregator
+
+
+def test_slim_falls_back_to_full_when_marker_absent(monkeypatch, tmp_path):
+    _clear_cache()
+    f3e = tmp_path / "F3E.md"
+    f3e.write_text("F3E entity content", encoding="utf-8")
+    founder = tmp_path / "FNDR.md"
+    founder.write_text("# Founder\n\nNo marker here, all static.\n", encoding="utf-8")
+    monkeypatch.setitem(cl._ENTITY_PATHS, "F3E", f3e)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder)
+
+    result = cl.load_context("F3E")
+
+    assert "No marker here, all static." in result            # full inject fallback
+
+
+def test_lex_sub_entity_still_gets_no_founder(monkeypatch, tmp_path):
+    _clear_cache()
+    llc = tmp_path / "llc.md"
+    llc.write_text("LLC stub content", encoding="utf-8")
+    founder = tmp_path / "FNDR.md"
+    founder.write_text(_FOUNDER_DOC, encoding="utf-8")
+    monkeypatch.setitem(cl._ENTITY_PATHS, "LEX-LLC", llc)
+    monkeypatch.setattr(cl, "_FOUNDER_PATH", founder)
+
+    result = cl.load_context("LEX-LLC")
+
+    assert "LLC stub content" in result
+    assert "Static brief: portfolio principles." not in result  # firewall: no founder at all
+    assert "TOM: secret dynamic stuff." not in result
+
+
+def test_slim_founder_unit():
+    out = cl._slim_founder(_FOUNDER_DOC)
+    assert "Static brief: portfolio principles." in out
+    assert "TOM: secret dynamic stuff." not in out
+    # no marker -> returned unchanged
+    assert cl._slim_founder("no marker text") == "no marker text"

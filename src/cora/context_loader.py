@@ -50,6 +50,43 @@ _NO_FOUNDER_CONTEXT: frozenset[str] = frozenset({
 
 _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 
+# ── Founder CLAUDE.md slimming ───────────────────────────────────────────────
+# The founder CLAUDE.md is ~32K tokens, but ~93% of it (~30K) is the dynamic
+# "Current State of the World" section (Top of Mind, active workstreams, recent
+# decisions, delegates) that changes daily. Only the ~2.2K-token static brief
+# above that marker is the stable portfolio "constitution".
+#
+# That dynamic section is ALSO chunked into the KB (source=static_md) and is
+# already co-scanned on every non-LEX query (include_fndr=True), so injecting it
+# wholesale into every entity's context is pure redundancy — retrieval surfaces
+# the relevant current-state per question. So: aggregators (FNDR/HJRG) that ask
+# portfolio-wide questions keep the FULL founder brief inlined; every other
+# entity gets only the static brief, and leans on retrieval for the long tail.
+# This also stops daily TOM edits from invalidating those entities' cached
+# context block (the caching-split synergy).
+_FOUNDER_DYNAMIC_MARKER = "# Current State of the World"
+_FOUNDER_FULL_ENTITIES: frozenset[str] = frozenset({"FNDR", "HJRG"})
+
+
+def _slim_founder(text: str) -> str:
+    """Return the founder brief trimmed to its static head (everything before the
+    dynamic 'Current State of the World' section), with a note that the dynamic
+    portion is retrieval-served. Falls back to the full text if the marker is
+    absent, so a founder-doc restructure never silently drops context.
+    """
+    idx = text.find(_FOUNDER_DYNAMIC_MARKER)
+    if idx == -1:
+        return text
+    head = text[:idx].rstrip()
+    return (
+        head
+        + "\n\n---\n\n_Portfolio Current State / Top of Mind / recent decisions are "
+        "not inlined here — they live in Cora's knowledge base and are pulled in on "
+        "demand. If the question needs current portfolio state, use the retrieved "
+        "knowledge below; if it isn't there, say so rather than guessing._"
+    )
+
+
 # Founder-level entity — the ONLY cross-entity aggregator. FNDR channels may
 # surface every entity's dynamic snapshots; every other entity sees ONLY its own.
 _FNDR_ENTITY = "FNDR"
@@ -260,7 +297,12 @@ def _load_static_context(entity: str) -> str:
     # Sub-entity channels must not receive that data — their own stub CLAUDE.md
     # is the only entity context they get.
     if entity not in _NO_FOUNDER_CONTEXT:
-        parts.append(_FOUNDER_PATH.read_text(encoding="utf-8"))
+        founder_text = _FOUNDER_PATH.read_text(encoding="utf-8")
+        # Aggregators (FNDR/HJRG) keep the full brief; every other entity gets the
+        # static head only and relies on KB retrieval for the dynamic current-state.
+        if entity not in _FOUNDER_FULL_ENTITIES:
+            founder_text = _slim_founder(founder_text)
+        parts.append(founder_text)
 
     # Append static known-answers if available
     ka_path = _KNOWN_ANSWERS_PATHS.get(entity)
