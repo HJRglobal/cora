@@ -96,14 +96,8 @@ def main() -> int:
             "WHERE k.entity = ? LIMIT ?",
             (entity, args.queries),
         ).fetchall()
-        if not rows:
-            # f32 not populated for this entity (pre-migration) -> sample via knowledge_vec
-            rows = conn.execute(
-                "SELECT v.embedding FROM knowledge_vec v "
-                "JOIN knowledge_chunks k ON k.chunk_id = v.chunk_id "
-                "WHERE k.entity = ? LIMIT ?",
-                (entity, args.queries),
-            ).fetchall()
+        # (The legacy knowledge_vec sampling fallback was removed when that table
+        # was dropped 2026-06-08; knowledge_vec_f32 is always the float source now.)
         qvecs = [_f32_bytes_to_list(r[0]) for r in rows]
         if not qvecs:
             continue

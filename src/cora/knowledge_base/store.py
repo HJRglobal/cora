@@ -193,10 +193,6 @@ class KnowledgeBase:
             if old_ids:
                 placeholders = ",".join("?" * len(old_ids))
                 cur.execute(
-                    f"DELETE FROM knowledge_vec WHERE chunk_id IN ({placeholders})",
-                    old_ids,
-                )
-                cur.execute(
                     f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({placeholders})",
                     old_ids,
                 )
@@ -233,12 +229,9 @@ class KnowledgeBase:
                 ),
             )
             vec_bytes = _serialize_vec(vec)
-            cur.execute(
-                "INSERT INTO knowledge_vec (chunk_id, embedding) VALUES (?, ?)",
-                (chunk_id, vec_bytes),
-            )
-            # Keep the binary index + exact-float re-rank table in sync so newly
-            # ingested chunks are visible to the fast path without a re-migration.
+            # The legacy float vec0 table (knowledge_vec) was dropped 2026-06-08;
+            # the binary index (coarse scan) + the float32 blob table (exact
+            # re-rank AND the fallback path) are the only vector stores now.
             cur.execute(
                 "INSERT INTO knowledge_vec_bin (chunk_id, entity, embedding) "
                 "VALUES (?, ?, vec_quantize_binary(?))",
@@ -416,31 +409,31 @@ class KnowledgeBase:
         sub_entity_clause: str,
         sub_entity_params: list[Any],
     ) -> list[SearchResult]:
-        """Fallback: brute-force float vec0 scan (used until the binary index is
-        backfilled). Preserved verbatim from the original implementation."""
-        # sqlite-vec requires LIMIT to be on the vec0 scan directly (not an outer JOIN).
-        # Use a CTE to do the knn scan first, then join+filter metadata.
-        # Over-fetch by 5x so entity filtering doesn't starve the result set.
-        knn_limit = int(k) * 5
+        """Fallback: exact brute-force float32 L2 scan over knowledge_vec_f32.
+
+        Used only when the binary index is not ready (fresh DB pre-migration, or
+        the checkpoint cleared). Computes vec_distance_l2 against every float
+        vector for the entity -- correct but O(n), so it is the slow safety net,
+        not the hot path. The legacy float vec0 table (knowledge_vec) this used
+        to scan was dropped 2026-06-08; knowledge_vec_f32 holds the same vectors,
+        so the fallback survives the drop with no re-migration needed.
+        """
+        qbytes = _serialize_vec(query_vec)
+        ent_ph = ",".join("?" * len(entity_filter))
         sql = f"""
-            WITH vec_knn AS (
-                SELECT chunk_id, distance
-                FROM knowledge_vec
-                WHERE embedding MATCH ?
-                LIMIT {knn_limit}
-            )
             SELECT
                 k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
-                k.deep_link, k.date_modified, vk.distance
-            FROM vec_knn vk
-            JOIN knowledge_chunks k ON k.chunk_id = vk.chunk_id
-            WHERE k.entity IN ({','.join('?' * len(entity_filter))})
+                k.deep_link, k.date_modified,
+                vec_distance_l2(?, f.embedding) AS distance
+            FROM knowledge_chunks k
+            JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
+            WHERE k.entity IN ({ent_ph})
               {'AND (k.date_modified IS NULL OR k.date_modified > ?)' if cutoff is not None else ''}
               {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
-            ORDER BY vk.distance
+            ORDER BY distance
             LIMIT {int(k)}
         """
-        params: list[Any] = [_serialize_vec(query_vec), *entity_filter]
+        params: list[Any] = [qbytes, *entity_filter]
         if cutoff is not None:
             params.append(cutoff)
         params.extend(sub_entity_params)

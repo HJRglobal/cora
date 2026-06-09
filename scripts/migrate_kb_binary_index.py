@@ -92,6 +92,19 @@ def main() -> int:
     conn = schema.connect(args.db)        # loads sqlite-vec (vec_quantize_binary)
     schema.init_schema(conn)              # ensure bin + f32 tables exist
 
+    # The legacy float vec0 table this migration reads from was dropped 2026-06-08
+    # once the binary fast path was proven. This one-time migration is therefore
+    # complete and cannot re-run from knowledge_vec. To rebuild the binary index
+    # in the future, source the float vectors from knowledge_vec_f32 instead.
+    has_legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='knowledge_vec'"
+    ).fetchone()
+    if not has_legacy:
+        print("knowledge_vec no longer exists (dropped 2026-06-08) -- migration "
+              "already complete. Rebuild bin/f32 from knowledge_vec_f32 if ever needed.",
+              file=sys.stderr)
+        return 0
+
     total_vec = conn.execute("SELECT COUNT(*) FROM knowledge_vec").fetchone()[0]
     bin_have = conn.execute("SELECT COUNT(*) FROM knowledge_vec_bin").fetchone()[0]
     f32_have = conn.execute("SELECT COUNT(*) FROM knowledge_vec_f32").fetchone()[0]

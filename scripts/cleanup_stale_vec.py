@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Remove orphaned rows from knowledge_vec that have no matching knowledge_chunks entry.
+"""OBSOLETE as of 2026-06-08: knowledge_vec was dropped (the binary fast path
+replaced the float vec0 index). This script targeted knowledge_vec orphans; that
+table no longer exists. Orphans now live in knowledge_vec_bin / knowledge_vec_f32
+and are prevented going forward by the upsert DELETE that keeps both in sync.
+Kept for reference; repoint to knowledge_vec_bin/_f32 if an orphan sweep is ever
+needed again.
+
+Remove orphaned rows from knowledge_vec that have no matching knowledge_chunks entry.
 
 sqlite-vec's vec0 virtual table does not enforce referential integrity, so a
 crash or early exit during upsert_documents() can leave embedding rows in

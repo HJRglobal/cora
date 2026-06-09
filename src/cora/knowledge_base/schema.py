@@ -2,7 +2,9 @@
 
 Tables:
 - knowledge_chunks: one row per chunk with source/entity/date/content/deep_link/metadata
-- knowledge_vec: sqlite-vec virtual table holding the 1536-dim float embeddings
+- knowledge_vec_bin: binary-quantized vec0 table (fast coarse hamming scan)
+- knowledge_vec_f32: float32 blob table (exact re-rank + brute-force fallback)
+  (the legacy float vec0 table `knowledge_vec` was dropped 2026-06-08)
 - sync_state: per-source watermark tracking for incremental ingest
 
 The embedding dimension (1536) is fixed by OpenAI text-embedding-3-small. If we ever
@@ -34,6 +36,11 @@ def connect(db_path: Path | str, check_same_thread: bool = True) -> sqlite3.Conn
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Wait up to 30s for a held write lock instead of failing instantly with
+    # "database is locked". WAL permits concurrent readers + one writer, but two
+    # writers (e.g. the live bot ingestion + a manual Gmail backfill) still
+    # contend; without a busy timeout the loser raises OperationalError mid-run.
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -91,17 +98,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-    # Virtual vec0 table — must be created separately (DDL has its own syntax).
-    # FLOAT vec0: default distance metric is L2 (euclidean). Kept as the
-    # fallback brute-force scan when the binary index isn't ready yet.
-    conn.execute(
-        f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_vec USING vec0(
-            chunk_id TEXT PRIMARY KEY,
-            embedding FLOAT[{EMBEDDING_DIM}]
-        )
-        """
-    )
+    # NOTE: the legacy float vec0 table `knowledge_vec` (~1.4 GB) was dropped
+    # 2026-06-08 and is no longer created. The binary index (coarse scan) + the
+    # float32 blob table (exact re-rank AND the brute-force fallback in
+    # _search_float) are the only vector stores. Do not re-add knowledge_vec.
 
     # Binary-quantized vec0 table for the fast coarse scan (~1/32 the bytes of
     # the float index). `entity` is a vec0 metadata column so the hamming knn
