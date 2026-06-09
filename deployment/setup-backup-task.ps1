@@ -1,8 +1,8 @@
 # setup-backup-task.ps1
 #
 # Registers cowork-cora-backup as a Windows Task Scheduler task.
-# The task runs the log backup script once daily at 4:30 AM (local time),
-# 30 minutes before the digest builder fires at 5:00 AM.
+# The task runs the log backup script once daily at 1:00 PM (local time) -- moved
+# off 4:30 AM so its online backup reads the KB while no KB-sync is writing it.
 # This is a one-shot daily task, not a persistent service.
 #
 # Usage (run from any directory, as the current user -- no elevation needed):
@@ -125,7 +125,7 @@ Write-Host "  OK  NextRunTime  : $($info.NextRunTime)"
 Write-Host ""
 Write-Host "=== Setup complete ==="
 Write-Host ""
-Write-Host "The backup will run automatically every day at 4:30 AM."
+Write-Host "The backup will run automatically every day at 1:00 PM."
 Write-Host "To run it manually right now:"
 Write-Host "  Start-ScheduledTask -TaskName '$TASK_NAME'"
 Write-Host "Or run the script directly with --dry-run first to preview:"

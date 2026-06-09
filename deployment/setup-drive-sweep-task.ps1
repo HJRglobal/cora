@@ -1,6 +1,6 @@
 # setup-drive-sweep-task.ps1
 # Registers a Windows Task Scheduler task that runs the Drive sweep every night
-# at 3:30 AM Arizona time (MST = UTC-7, no DST).
+# at 6:00 AM Arizona time (MST = UTC-7, no DST).
 #
 # Run once from an elevated PowerShell prompt:
 #   Set-ExecutionPolicy RemoteSigned -Scope Process
@@ -84,7 +84,7 @@ Register-ScheduledTask `
 
 Write-Host ""
 Write-Host "Task registered: '$TaskName'" -ForegroundColor Green
-Write-Host "  Schedule:     Daily at 3:30 AM"
+Write-Host "  Schedule:     Daily at 6:00 AM"
 Write-Host "  Python:       $PythonPath"
 Write-Host "  Script:       $ScriptPath"
 Write-Host "  Working dir:  $RepoRoot"
