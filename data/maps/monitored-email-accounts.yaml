@@ -123,6 +123,73 @@ accounts:
     asana_gid: "1211215949326709"
     slack_user_id: U0B3PS7RFJA
 
+  # ── Slack users on DWD-eligible domains added 2026-06-08 (read+unread coverage) ──
+  # Added so Cora ingests every Slack teammate's mailbox, not just the original 12.
+  # thread_sweep only (KB ingestion); attachment_filer + drive_sweep left off to keep
+  # scope to "reading gmail." If any of these is an alias-only address with no real
+  # mailbox, the sweep logs "Skipping <email>" (HTTP 403/404) and moves on -- safe.
+
+  - email: eric@hjrglobal.com
+    name: Eric Canku
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: F3E
+    asana_gid: "1213834391232263"
+    slack_user_id: U0B3PRZMBCN
+
+  - email: daniel@hjrglobal.com
+    name: Daniel Sion
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: BDM
+    asana_gid: "1213560435702029"
+    slack_user_id: U0B3PS63F1C
+
+  - email: jake@hjrglobal.com
+    name: Jake Lichtman
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: BDM
+    known_aliases:
+      - jake@bigd.media
+    asana_gid: "1211306578489633"
+    slack_user_id: U0B3AER7NUF
+
+  - email: micah@hjrglobal.com
+    name: Micah Kessler
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: FNDR
+    known_aliases:
+      - micah@bigd.media
+    asana_gid: "1209079709678901"
+    slack_user_id: U0B4L78SZHN
+
+  - email: tommy@hjrglobal.com
+    name: Tommy Anderson (HJRG)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: F3E
+    known_aliases:
+      - tommy@f3energy.com
+    asana_gid: "1213638047870465"
+    slack_user_id: U0B3RU5Q55G
+
   - email: payables@hjrglobal.com
     name: HJR Payables Inbox
     enabled: true
@@ -181,7 +248,7 @@ accounts:
   # Jason@f3energy.com -- identity TBD (flagged as open question in TOM 2026-05-14)
   - email: jason@f3energy.com
     name: Jason (F3E)
-    enabled: true
+    enabled: false  # departed 2026-06-08
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: false
@@ -191,7 +258,7 @@ accounts:
   # Gaelan -- dual-domain (F3E + UFL); sweep both accounts
   - email: gaelan@f3energy.com
     name: Gaelan
-    enabled: true
+    enabled: false  # departed 2026-06-08
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: false
@@ -202,12 +269,24 @@ accounts:
 
   - email: brett@f3energy.com
     name: Brett (F3E)
-    enabled: true
+    enabled: false  # departed 2026-06-08
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: false
     drive_sweep: true
     entity_default: F3E
+
+  # Elena Meirndorf -- F3E, reports to Alex (added 2026-06-08, DWD-eligible Slack user)
+  - email: elena@f3energy.com
+    name: Elena Meirndorf
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: true
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: F3E
+    asana_gid: "1211824667367794"
+    slack_user_id: U0B8DGHR2D6
 
   # service@f3energy.com -- F3E shared service/operations inbox
   - email: service@f3energy.com
@@ -339,7 +418,7 @@ accounts:
   # Sophia -- UFL, aliases unknown (add here when confirmed)
   - email: sophia@unitedfightleague.com
     name: Sophia (UFL)
-    enabled: true
+    enabled: false  # departed 2026-06-08
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: false
@@ -349,7 +428,7 @@ accounts:
   # Gaelan UFL alias -- same person as gaelan@f3energy.com above
   - email: gaelan@unitedfightleague.com
     name: Gaelan (UFL)
-    enabled: true
+    enabled: false  # departed 2026-06-08
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: false

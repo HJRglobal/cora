@@ -142,6 +142,56 @@ class TestChunkText:
             assert len(chunk) <= 2400 + 600  # generous slack
 
 
+class TestOrderAccounts:
+    """Layer A -- stale-first account ordering (resumability)."""
+
+    def test_never_swept_accounts_first(self):
+        m = _load_sweep()
+        accts = [{"email": "a@x.com"}, {"email": "b@x.com"}, {"email": "c@x.com"}]
+        wm = {"a@x.com": 2000, "c@x.com": 1000}  # b has no watermark
+        order = [a["email"] for a in m._order_accounts(accts, wm, fallback_ts=500)]
+        assert order == ["b@x.com", "c@x.com", "a@x.com"]
+
+    def test_never_swept_sorts_before_any_persisted(self):
+        m = _load_sweep()
+        accts = [{"email": "swept@x.com"}, {"email": "fresh@x.com"}]
+        wm = {"swept@x.com": 999_999_999}
+        order = [a["email"] for a in m._order_accounts(accts, wm, fallback_ts=100)]
+        assert order == ["fresh@x.com", "swept@x.com"]
+
+    def test_stable_for_equal_watermarks(self):
+        m = _load_sweep()
+        accts = [{"email": "a@x.com"}, {"email": "b@x.com"}]
+        order = [a["email"] for a in m._order_accounts(accts, {}, fallback_ts=100)]
+        assert order == ["a@x.com", "b@x.com"]
+
+
+class TestNextWatermark:
+    """Layer A -- cap-aware watermark advancement (no silent backlog drop)."""
+
+    def test_under_cap_advances_to_sync_start(self):
+        m = _load_sweep()
+        assert m._next_watermark(50, 500, 1234, 9999) == 9999
+
+    def test_at_cap_holds_at_newest_processed(self):
+        m = _load_sweep()
+        # cap hit -> older backlog remains -> do NOT jump to sync_start
+        assert m._next_watermark(500, 500, 1234, 9999) == 1234
+
+    def test_over_cap_holds_at_newest_processed(self):
+        m = _load_sweep()
+        assert m._next_watermark(600, 500, 1234, 9999) == 1234
+
+    def test_capped_but_nothing_parsed_returns_zero(self):
+        m = _load_sweep()
+        # 0 signals caller to leave the watermark unchanged
+        assert m._next_watermark(500, 500, 0, 9999) == 0
+
+    def test_just_under_cap_boundary(self):
+        m = _load_sweep()
+        assert m._next_watermark(499, 500, 1, 9999) == 9999
+
+
 # ── Layer B: import-guarded unit tests with mocks ─────────────────────────────
 
 try:

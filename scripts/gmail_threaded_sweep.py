@@ -167,6 +167,73 @@ def _chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks
 
 
+def _order_accounts(
+    accounts: list[dict[str, Any]],
+    watermarks: dict[str, int],
+    fallback_ts: int,
+) -> list[dict[str, Any]]:
+    """Return accounts sorted stale-first (oldest current watermark first).
+
+    Accounts that have never been swept (no watermark) use fallback_ts, which is
+    older than any persisted watermark from a prior run, so never-swept accounts
+    naturally sort to the front. This guarantees that even if a run is cut short
+    (Task Scheduler time limit), the most-neglected mailboxes are processed first
+    and every account is reached over successive runs.
+    """
+    return sorted(
+        accounts,
+        key=lambda a: watermarks.get(a.get("email", ""), fallback_ts),
+    )
+
+
+def _next_watermark(
+    thread_count: int,
+    max_threads: int,
+    newest_processed_ts: int,
+    sync_start: int,
+) -> int:
+    """Decide the watermark to persist for an account after a sweep pass.
+
+    - If the account returned FEWER threads than the cap, we drained everything
+      since its old watermark, so advance to sync_start (fully caught up).
+    - If the cap was hit, there is almost certainly older backlog we did NOT
+      reach this pass. Advancing to sync_start would silently skip it forever.
+      Instead advance only to the newest message we actually processed, so the
+      next run re-queries and continues draining the backlog (idempotent upsert
+      absorbs the small overlap). If somehow nothing parsed, leave the watermark
+      untouched by returning 0 (caller treats 0 as "no change").
+    """
+    if thread_count < max_threads:
+        return sync_start
+    if newest_processed_ts > 0:
+        return newest_processed_ts
+    return 0
+
+
+def _upsert_with_retry(kb, docs, log, attempts: int = 5, base_delay: float = 2.0) -> int:
+    """Upsert a batch, retrying on transient 'database is locked' errors.
+
+    The KB connection now sets busy_timeout=30s, but a long backfill running while
+    the live Cora service is writing can still occasionally exceed it. Rather than
+    crash the whole run (and lose the in-progress account), back off and retry.
+    Re-raises any non-lock error, and the lock error after the final attempt.
+    """
+    import sqlite3
+    for attempt in range(1, attempts + 1):
+        try:
+            return kb.upsert_documents(docs)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == attempts:
+                raise
+            delay = base_delay * attempt
+            log.warning(
+                "KB locked on upsert (attempt %d/%d) -- retrying in %.0fs",
+                attempt, attempts, delay,
+            )
+            time.sleep(delay)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -174,6 +241,16 @@ def main() -> int:
         help="Days to look back if no watermark exists for an account (default 2)",
     )
     parser.add_argument("--batch-size", type=int, default=50)
+    parser.add_argument(
+        "--max-threads", type=int, default=MAX_THREADS_PER_ACCOUNT,
+        help=f"Max threads per account per run (default {MAX_THREADS_PER_ACCOUNT}). "
+             "Raise for a one-time deep historical backfill.",
+    )
+    parser.add_argument(
+        "--accounts", type=str, default="",
+        help="Comma-separated list of account emails to sweep (default: all enabled). "
+             "Use for targeted backfill of specific mailboxes.",
+    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -191,14 +268,27 @@ def main() -> int:
 
     sync_start = int(time.time())
     fallback_ts = sync_start - (args.fallback_days * 86400)
+    max_threads = max(1, args.max_threads)
+
+    # Optional --accounts filter for targeted backfill
+    account_filter = {e.strip().lower() for e in args.accounts.split(",") if e.strip()}
+    if account_filter:
+        accounts = [a for a in accounts if a.get("email", "").lower() in account_filter]
+        log.info("Account filter active: %d of requested %d accounts matched",
+                 len(accounts), len(account_filter))
+
+    # Stale-first: process the most-neglected mailboxes first so that even if this
+    # run is cut short by the Task Scheduler time limit, every account is reached
+    # over successive runs (no account is permanently starved behind the wall).
+    accounts = _order_accounts(accounts, watermarks, fallback_ts)
 
     total_accounts = 0
     total_threads = 0
     total_docs = 0
     total_chunks = 0
     skipped_accounts = 0
+    capped_accounts = 0
     exit_code = 0
-    new_watermarks: dict[str, int] = {}
 
     for account in accounts:
         user_email = account.get("email", "")
@@ -217,7 +307,7 @@ def main() -> int:
 
         try:
             thread_ids = list_threads_since(
-                user_email, since_ts=watermark_ts, max_results=MAX_THREADS_PER_ACCOUNT
+                user_email, since_ts=watermark_ts, max_results=max_threads
             )
         except GmailReaderError as exc:
             log.warning("Skipping %s: %s", user_email, exc)
@@ -227,6 +317,7 @@ def main() -> int:
 
         log.info("Found %d threads since watermark for %s", len(thread_ids), user_email)
         docs_batch: list[Document] = []
+        newest_processed_ts = 0  # newest message ts we actually examined this account
 
         for thread_id in thread_ids:
             try:
@@ -237,6 +328,12 @@ def main() -> int:
 
             if not messages:
                 continue
+
+            # Track coverage boundary across ALL examined threads (incl. PHI-skipped),
+            # so the cap-aware watermark reflects everything we actually looked at.
+            thread_newest = max((m.get("date_ts", 0) for m in messages), default=0)
+            if thread_newest > newest_processed_ts:
+                newest_processed_ts = thread_newest
 
             # PHI check on first message subject
             first_subject = messages[0].get("subject", "")
@@ -300,7 +397,7 @@ def main() -> int:
             total_threads += 1
 
             if len(docs_batch) >= args.batch_size:
-                chunk_count = kb.upsert_documents(docs_batch)
+                chunk_count = _upsert_with_retry(kb, docs_batch, log)
                 total_chunks += chunk_count
                 total_docs += len(docs_batch)
                 log.info(
@@ -310,7 +407,7 @@ def main() -> int:
                 docs_batch = []
 
         if docs_batch:
-            chunk_count = kb.upsert_documents(docs_batch)
+            chunk_count = _upsert_with_retry(kb, docs_batch, log)
             total_chunks += chunk_count
             total_docs += len(docs_batch)
             log.info(
@@ -318,14 +415,33 @@ def main() -> int:
                 user_email, len(docs_batch), chunk_count,
             )
 
-        new_watermarks[user_email] = sync_start
+        # Cap-aware, incremental watermark persistence. We persist AFTER EACH
+        # account so a mid-run kill (Task Scheduler time limit) still advances
+        # every completed account -- the next run resumes with the remainder.
+        next_wm = _next_watermark(
+            thread_count=len(thread_ids),
+            max_threads=max_threads,
+            newest_processed_ts=newest_processed_ts,
+            sync_start=sync_start,
+        )
+        if next_wm > 0:
+            watermarks[user_email] = next_wm
+            if len(thread_ids) >= max_threads:
+                capped_accounts += 1
+                log.warning(
+                    "%s hit the %d-thread cap -- watermark advanced only to %d "
+                    "(newest processed); older backlog remains. Run a deeper "
+                    "backfill with --max-threads / --fallback-days to fully drain.",
+                    user_email, max_threads, next_wm,
+                )
+        _save_watermarks(watermarks)
         total_accounts += 1
 
-    merged = {**watermarks, **new_watermarks}
-    _save_watermarks(merged)
     log.info(
-        "Gmail sweep complete — %d accounts, %d threads, %d docs -> %d chunks (exit=%d)",
-        total_accounts, total_threads, total_docs, total_chunks, exit_code,
+        "Gmail sweep complete -- %d accounts, %d threads, %d docs -> %d chunks "
+        "(%d skipped, %d capped, exit=%d)",
+        total_accounts, total_threads, total_docs, total_chunks,
+        skipped_accounts, capped_accounts, exit_code,
     )
 
     kb.close()
