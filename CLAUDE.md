@@ -8,6 +8,383 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [HYGIENE] Monthly log + ledger compaction job -- section 10.5 -- 2026-06-09 (commit 3fe3a38)
+
+Repo HEAD: `3fe3a38` on `origin/main` | task `Cora - Log Compaction` registered (monthly, day 1 @ 14:00 AZ, Ready, Next Run 7/1) | no Cora restart needed (standalone task).
+
+Dated log files are the unbounded grower (~23 task families x 1 file/day forever; 45MB / 23 days).
+`scripts/compact_logs.py` gzips dated logs older than 30d into `logs/archive/` + deletes originals,
+purges archives >365d. Ledger trim is **size-gated** (only touches a `*.jsonl` once it exceeds 5MB;
+keeps last 90d by `ts` + any undatable line -- fail-safe, never breaks a ~14d throttle lookback;
+no-op today since all ledgers are <1MB). **No SQLite VACUUM** in the routine job (bot holds state
+DBs open; cora_kb.db too heavy -- big reclaims are manual via `reclaim_kb_space.py`).
+
+Registered non-elevated (user-level file hygiene needs no admin; uses `schtasks /Create /SC MONTHLY`
+since `New-ScheduledTaskTrigger` has no monthly trigger). Validated: dry-run clean at 30d; a real
+21d run archived 6 old logs to valid `.gz`. The weekly health metric (10.4) already alarms if
+logs+ledgers exceed 300MB, so this job is the actuator behind that alarm.
+
+---
+
+### [INFRA/PERF] Slimmed the wholesale founder CLAUDE.md inject -- section 10.3 -- 2026-06-09 (commit b2254fe)
+
+Repo HEAD: `b2254fe` on `origin/main` | full suite **3,580 passed / 41 skipped** | Cora restarted 2026-06-09 11:45 AZ, healthy (heartbeat fresh, KB warmed 4.1s). **LIVE.**
+
+The founder CLAUDE.md is ~32.5K tok but ~93% (~30.3K) is the dynamic "Current State of the World"
+section (TOM, workstreams, recent decisions) that changes daily AND is already chunked into the KB
+(source=static_md) + co-scanned on every non-LEX query (include_fndr=True). Inlining it wholesale
+into every entity's context was pure redundancy.
+
+**Now (`context_loader._load_static_context` + `_slim_founder`):** aggregators **FNDR/HJRG** (which
+ask portfolio-wide questions) keep the FULL founder brief inlined; **every other entity** gets only
+the ~2.2K static head (everything before `# Current State of the World`) + a note that current-state
+is retrieval-served. LEX sub-entities still get no founder context (firewall unchanged). **Marker
+absent -> full inject** (a founder-doc restructure can never silently drop context -- the split keys
+on the literal heading `# Current State of the World`, so keep that heading in the founder doc).
+
+**Measured static-context drop (the win):** F3E 41.5K->11.2K, OSN 39.6K->9.3K, LEX 39.1K->8.9K,
+BDM 30K->3.4K tok (~73% off the high-traffic entity channels); FNDR/HJRG unchanged at ~33K.
+**Synergy with the caching split (10.1):** the volatile TOM no longer rides in those entities'
+cached system block, so Harrison's daily TOM edits stop invalidating their cache -- it now stays
+warm across days, not just the 5-min window. +8 tests.
+
+**Quality note / what to watch:** non-FNDR channels now rely on KB retrieval for portfolio
+current-state. The FNDR co-scan already surfaced those chunks, so this should be transparent, but if
+an entity-channel answer ever misses cross-portfolio context it used to have, that's the signal --
+the fix is to ensure the fact is in the entity's `known-answers/{entity}.md` (always-injected) or to
+add HJRG/FNDR to `_FOUNDER_FULL_ENTITIES`.
+
+---
+
+### [INFRA] Dropped legacy float vec0 table (knowledge_vec) -- section 10.6 -- 2026-06-08 (commits fccf028, 40a0403, 65c38a1)
+
+Repo HEAD: `65c38a1` on `origin/main` | full suite **3,574 passed / 41 skipped** | Cora restarted, healthy.
+
+**DONE (the goal): `knowledge_vec` is dropped.** The store no longer reads/writes it (commit
+`fccf028`): `upsert_documents` writes only `knowledge_vec_bin` + `knowledge_vec_f32`;
+`_search_float` repointed from the knowledge_vec vec0 KNN to an exact brute-force
+`vec_distance_l2` scan over `knowledge_vec_f32` (the fallback survives the drop -- f32 holds the
+same float vectors, no rebuild path needed); schema stops creating knowledge_vec on fresh DBs.
+The DROP ran via `scripts/drop_legacy_float_vec.py` (`40a0403`); verified gone, no orphan float
+shadow tables, Cora healthy on the new code (binary fast path 100% recall unchanged).
+
+**✅ DISK RECLAIM DONE 2026-06-08: 2.91 GB freed (6.11 -> 2.98 GB).** Harrison ran
+`scripts\reclaim_kb_space.py` from elevated PS after killing the stuck procs; Cora restarted clean
+(stable heartbeats). The stuck 02:51 AM elevated pair is gone -- watch for it reappearing (it points
+to a recurring early-morning KB-sync/gmail-sweep hang worth fixing separately). Rollback backup
+`data\cora_kb.db.bak-2026-06-08` (pre-drop, 5.69GB) can be deleted after a few stable days.
+
+_How it played out (historical):_
+- The in-place DROP+VACUUM did **not** shrink the file: a WAL-mode VACUUM writes compacted pages
+  to the WAL, not the main file. `cora_kb.db` is still 5.69GB (+ a large WAL). `VACUUM INTO`
+  proved the true compacted size is **3.20GB (reclaims 2.9GB)** and round-trips the vec0 binary
+  search cleanly (VERIFY_OK).
+- **Blocker: a stuck 02:51 AM elevated python pair (PIDs 21040 parent / 1776 child) has held
+  cora_kb.db all day** -- 14h+, not serving (it is NOT the live Cora; the live Cora is a separate
+  healthy pair). A non-elevated session CANNOT kill them ("Access is denied") -- they run elevated.
+  This is why every in-place truncating VACUUM hit "database is locked". **Worth investigating what
+  that stuck process is** (likely a hung kb-sync / gmail-sweep from the 02:30-03:00 window).
+- **To finish the reclaim (elevated PS, when convenient -- 293GB free, zero disk pressure):**
+  ```
+  cd C:\Users\Harri\code\cora
+  schtasks /End /TN cowork-cora-service
+  Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.ExecutablePath -like '*cora*' } | Stop-Process -Force
+  .venv\Scripts\python.exe scripts\reclaim_kb_space.py        # truncating VACUUM (commit 65c38a1)
+  schtasks /Run /TN cowork-cora-service
+  ```
+  This also clears the stuck procs. Rollback if ever needed: `data\cora_kb.db.bak-2026-06-08`
+  (pre-drop, 5.69GB) -- safe to delete after a few days of stable running.
+
+**DOCTRINE LOCKED:** (1) in-place VACUUM in WAL mode does NOT truncate the main db file -- use
+`VACUUM INTO` (+ swap) or `journal_mode=DELETE` around VACUUM (needs exclusive access).
+(2) Elevated processes (the service runs `-RunLevel Highest`) are invisible to a non-elevated
+`Get-Process .Path`/CommandLine match AND unkillable from a non-elevated session -- destructive KB
+ops that need exclusive access must run from elevated PS. (3) The PowerShell sandbox analyzer
+false-positives when `Remove-Item` and `schtasks /Change` share one command -- keep file ops and
+scheduler ops in separate commands.
+
+---
+
+### [INFRA/PERF] Per-entity tool exposure + weekly self-watching health metrics -- 2026-06-08 (commits 691c6c1, f184267)
+
+Repo HEAD: `f184267` on `origin/main` | full suite **3,574 passed / 41 skipped** | import smoke clean.
+Game-plan payoff-items 2 + 4. **Committed + pushed + LIVE** (Cora restarted 2026-06-08 17:30 AZ,
+heartbeat fresh; weekly task registered by Harrison, smoke post to #cora-health = True).
+
+**Per-entity tool exposure (commit `691c6c1`):** all 48 tool schemas (~14.5K tok) shipped on every
+Claude call regardless of channel. Now `tool_dispatch.tools_for_entity(entity, cross_entity)` offers
+only the channel-entity's tools + a global core (asana/gmail/calendar/cashflow/decisions/slack_dm).
+`claude_client._build_cached_tools(entity, cross_entity)` filters in TOOL_DEFINITIONS order (stable
+per-entity cache key); app.py passes `cross_entity_tools=is_founder`. Aggregators (FNDR/HJRG) and the
+founder-from-any-channel get the full set, so Harrison's cross-entity questions + the FNDR-only
+dashboards stay reachable. Sub-entities resolve to parent (OSNGF->OSN, LEX-LLC->LEX, HJRP-1337->HJRP).
+Lean entities (F3C/HJRPROD) now ship ~11 core tools, not 48; LEX excludes HubSpot (Tier-1 doctrine).
+**NOT a security boundary** -- cross_entity_guard + per-tool runtime guardrails remain that layer;
+the map errs inclusive. Mapping validated vs the entity system prompts. +18 tests
+(`tests/test_tool_exposure.py`).
+
+**Weekly self-watching health metrics (commit `f184267`, game-plan section 10.4):** `cora_health_report.py`
+gained `--slack`: builds the Phase-0 metrics, runs the section-5 threshold checks (FNDR co-scan >60%,
+KB >750K chunks, logs+ledgers >300MB, >2 tasks colliding on one clock time in 03:00-09:00), and posts a
+compact mrkdwn digest (alarms first) to Slack. `deployment/setup-weekly-health-metrics-task.ps1` registers
+`Cora - Weekly Health Metrics`, Monday 09:30 AZ, `--slack --channel cora-health --log-days 7` (offline
+char/4, no API key). **Smoke-tested live: posted to #cora-health = True** (and one earlier test landed in
+#hjrg-leadership before the channel was pinned). First live alarm already firing: up to 3 cora tasks share
+a clock time in the 03:00-09:00 window (4:00 AM cluster) -- a future staggering cleanup.
+
+**✅ Both activation steps DONE 2026-06-08:**
+1. ✅ Weekly task registered (Harrison, elevated PS): `Cora - Weekly Health Metrics`, next run 6/15 09:30,
+   smoke post to #cora-health = True. First alarm already firing: up to 4 tasks share a clock time in the
+   03:00-09:00 window -> **acted on**: 3 heavy jobs staggered out (Drive Sweep 03:30->06:00,
+   founders-os-sweep 04:15->06:30, backup 04:30->13:00; commit `1a88f10`) -- pending re-register of those
+   3 tasks (elevated PS). (FYI: weekly task Logon Mode = "Interactive only" -- fires only while the host is
+   logged in; fine for the always-on desktop, but won't run unattended if logged out.)
+2. ✅ Cora restarted 17:30 AZ -- per-entity tool exposure live. Confirmed tool counts in loaded code:
+   FNDR 47 (full) / F3E 41 / OSN 22 / LEX 19 / HJRP 19 / UFL 14 / F3C 11 / HJRPROD 11; founder-from-OSN
+   channel = 47 (cross-entity preserved). The 15h-old WIP (schema busy_timeout PRAGMA + embeddings token-batch
+   cap; drive_sweep not bot-loaded) was assessed safe and went live with this restart.
+
+_Note: cache_read/input median still 0.0 in the billing parse is EXPECTED, not a bug -- the caching split
+works (probe: 0 -> 68,706 on a warm repeat) but at current low volume real traffic rarely has 2 mentions in
+one entity within the 5-min window before a CLAUDE.md edit/restart invalidates block 2. The win lands on bursts._
+
+---
+
+### [INFRA/PERF] Phase 0 baseline + caching split (static CLAUDE.md under the cache) -- 2026-06-08 (commits e7f8cd7, 37f2780)
+
+Repo HEAD: `37f2780` on `origin/main` | **3,556 passed / 41 skipped** | import smoke clean |
+Cora restarted 2026-06-08 22:29 UTC, `heartbeat alive uptime_s=120`, KB prewarm 5.2s, no errors.
+Implements Phase 0 + payoff-item 1 of
+`_shared/projects/cora/design/2026-06-08_fndr_cora-scaling-memory-game-plan.md`.
+
+**Deliverable A -- `scripts/cora_health_report.py` (commit `e7f8cd7`):** repeatable Phase 0 /
+weekly health metric. Six sections (KB corpus by entity+source, static-context tokens/entity,
+tool-block size, billing parsed from logs/cora-*.log usage lines, state sizes, scheduled-task
+03:00-09:00 overlaps). Offline char/4 by default; `--count-tokens` for the Anthropic endpoint;
+`--json` for the ritual. No restart needed (new script + read-only).
+
+**MEASURED BASELINE (2026-06-08 -- reconciles game-plan section 5):**
+- KB **224,771 chunks. FNDR co-scan share 18.8%** (42,320) -- NOT the ~56% the mirror estimated.
+  **LEX is the largest partition (81,882 = 36%)**, so LEX is the co-scan ceiling to watch, not
+  FNDR. Both well under the 60% act-threshold.
+- Static context/entity: F3E ~38.2K tok, OSN ~36.3K, LEX ~35.8K, BDM/HJRG/FNDR ~30K. LEX
+  sub-entities ~1K (founder-firewalled). This is the uncached mass the split moves.
+- Tools: 46 / ~14.5K tok. cora_kb.db 5.3GB (float table not yet dropped); logs/ 34MB; JSONL
+  ledgers all small (no compaction needed yet).
+- Billing (5 logs, low volume): median input 37,589, **cache_read/input = 0.0** (BEFORE baseline).
+- Bench fast path (fresh): LEX p50 2.32s / FNDR 0.92s / F3E 1.47s / OSN 1.00s, recall@10 100%;
+  float fallback ~8-9.8s. LEX p50 highest (largest partition) -- under the 3s warm threshold.
+- **24 cora tasks land in the 03:00-09:00 AZ window** (e.g. 3:30 drive-sweep + kb-sync-fireflies
+  overlap; 4:00 four tasks). Staggering is a future cleanup, not in scope.
+
+**Deliverable B -- caching split (commit `37f2780`):** the entity prompt + tools were cached, but
+the founder CLAUDE.md (~40K tok) + entity CLAUDE.md + known-answers + dynamic snapshots rode in
+the UNCACHED context arg, re-billed every mention (twice on tool turns). Now a 3-block system
+array: block 1 (prompt) + block 2 (static portfolio context) both `cache_control: ephemeral`;
+block 3 (runtime + per-query KB chunks) uncached. `context_loader.load_context_parts()` returns
+(static, kb) separately; `load_context()` is a byte-identical wrapper (no-query path still returns
+the cached static object). `claude_client._build_cached_system()` gained optional `static_context`
+(2-block back-compat when falsy); `generate_response[_streaming]` gained `cached_context=`; app.py
+passes static_text there and runtime+kb_text as the uncached block. Retrieval path / distance
+threshold / LEX sub-entity firewall untouched. +13 tests (`tests/test_caching_split.py`).
+
+**AFTER -- empirically validated live (probe: same entity, 2 identical calls):** block shape = 3,
+cache_control on blocks 1+2 only. Cold: input=342, cache_create=68,706, cache_read=0. Warm repeat:
+input=**3**, **cache_read=68,706** (full prefix served from cache). The ~40K static mass + tools
+now cache-read on a warm repeat instead of re-billing.
+
+**Honest tradeoff:** block 2 invalidates whenever CLAUDE.md is edited (TOM ~daily) or on restart;
+the win lands on the common case -- 2+ mentions in one entity within the ~5-min ephemeral window
+(aligns with context_loader's 300s static TTL). The 2-breakpoint design keeps block-1 (prompt)
+caching even when block-2 changes.
+
+**Smoke test for Harrison:** two identical `@Cora` mentions in one entity channel within 5 min;
+the 2nd's `claude usage` log line should show cache_read ~= entity_prompt + CLAUDE.md tokens and
+input drop to the query remainder. Re-run the baseline any time:
+`.venv\Scripts\python.exe scripts\cora_health_report.py`.
+
+**Next sessions (game-plan section 10):** 2) per-entity tool exposure; 3) slim the wholesale
+CLAUDE.md inject; 4) FNDR/Slack archive tier + schedule cora_health_report.py weekly; 6) drop the
+float32 KB table.
+
+_Note: code (commits e7f8cd7 + 37f2780) is committed + pushed + LIVE. This TOM entry is NOT yet
+committed -- CLAUDE.md already carried concurrent uncommitted TOM entries from other sessions
+(Fireflies DWD coverage, gmail/drive sweep); leaving it uncommitted avoids entangling the sessions.
+All these TOM entries ride in the working tree until the next host cascade/ship commits CLAUDE.md._
+
+---
+
+### [FNDR] Fireflies DWD coverage monitor -- 2026-06-08 (commit 172d064; task NOT yet registered)
+
+Repo HEAD: `172d064` on local main | **3,469 passed / 41 skipped** (+28 mine) | import smoke clean.
+TOM entry written but CLAUDE.md NOT committed this session (it carried concurrent gmail/drive
+sweep edits; commit was 4 Fireflies paths only -- this TOM lands via the next cascade/gmail ship).
+
+**Problem:** Fireflies was only capturing Harrison's meetings. The org-wide invite wave (founder TOM
+0i, 16 invites 2026-06-03) was stalling silently -- no automated signal when a teammate never
+accepts or never connects their calendar. DWD does NOT help (Fireflies is third-party SaaS; DWD
+grants Cora's service account access, not Fireflies). Needs durable assurance, so: a weekly monitor.
+
+**Shipped (4 files, +1,224 lines):**
+- `connectors/fireflies_connector.py`: `list_team_members()` (admin `users` GraphQL query --
+  confirmed live, full field set) + `has_recent_host_meeting(email, days=30)` recency probe.
+  **Schema correction:** the plan doc's `organizers: [String]` arg was REJECTED by the live schema;
+  correct arg is a single `organizer_email: String`. `num_transcripts` returns null (not 0) for
+  never-recorded members -> normalized to 0.
+- `connectors/fireflies_coverage.py` (NEW, pure/no-network classifier): `load_dwd_humans()` reads
+  `monitored-email-accounts.yaml`, drops shared inboxes (payables/receipts/service), collapses
+  cross-domain aliases via union-find over {slack_user_id, shared-email, normalized-name} (the
+  normalized-name edge is what collapses Alex's slack-less/alias-less UFL-legacy entry). `classify()`
+  -> **3 statuses: COVERED / MEMBER_NO_RECORDINGS / NOT_A_MEMBER.** `MEMBER_NO_CALENDAR` was DROPPED
+  -- `integrations` provably does NOT carry calendar state (Harrison has 566 transcripts, no calendar
+  in his integrations list), so it would be dead/undetectable.
+- **CORRECTNESS LOCK:** membership is authoritative. The organizer probe reflects "someone with a
+  connected calendar attended", NOT "this person's calendar is connected" (Larry's 5/5 meeting was
+  captured only because Harrison was in the room, yet Larry is not a member). The probe ONLY refines
+  people who are ALREADY members; it never promotes a NOT_A_MEMBER to COVERED.
+- `scripts/run_fireflies_coverage.py` (NEW): `--dry-run` / `--digest-only` / `--nudge` / `--days N`.
+  Digest = DM to Harrison `U0B2RM2JYJ1`. Nudges (only with `--nudge`, status-branched copy) throttled
+  7d/user via new `data/fireflies_coverage.db` (`coverage_nudge_log`). Fail-closed: if `users` errors,
+  digest still sends with a "could not enumerate" note (no crash, no nudges).
+- `tests/test_fireflies_coverage.py`: 28 tests (roster collapse incl. Alex-by-name, all 3 statuses,
+  alias/case-insensitive match, recency refinement, correctness lock, 7d throttle on/off, fail-closed).
+
+**Rollout (LOCKED by Harrison):** digest-FIRST. Task ships as `--digest-only`; flip to `--nudge` only
+after Harrison eyeballs the first weekly digest. Task `cowork-cora-fireflies-coverage`, **Weekly Mon
+08:00 AZ** -- **NOT yet registered** (CP-3 gate pending in the relay before
+`deployment\setup-fireflies-coverage-task.ps1` runs from elevated PS).
+
+**Live gap as of 2026-06-08 (dry-run, of 20 DWD humans):** 2 COVERED (Harrison 566; Shaun 1 -- Shaun
+flipped from member-no-recordings to COVERED between CP-1 and the dry-run, i.e. the monitor caught a
+real live state change), 6 MEMBER_NO_RECORDINGS (Elena, Eric, Hannah, Jeff, Jen, Micah), 12
+NOT_A_MEMBER (Alex, Alina, Brett, Daniel, Gaelan, Jake, Jason, Justin, Larry, Matt, Sophia, Tommy).
+
+**Jason kept** (`jason@f3energy.com` -- identity-TBD F3E mailbox, genuinely not covered, no slack_user_id
+so never auto-nudged). **Future option (not built):** to exclude any mailbox from coverage, add a
+roster-level `coverage_monitor: false` flag in `monitored-email-accounts.yaml` that the loader respects
+-- keep the monitor 100% roster-driven, no hardcoded names.
+
+Plan: `_notes/2026-06-08_fndr_fireflies-coverage-monitor-build-plan.md`. Relay:
+`_notes/2026-06-08_fireflies-coverage-RELAY.md`.
+
+**Update (CP-5, 2026-06-08, commit `e39b7a2`):** Harrison reviewed the first digest, offboarded 4 departed
+users (Brett, Gaelan [both f3e+ufl entries], Jason, Sophia) -> `enabled: false` in
+`monitored-email-accounts.yaml` (runtime-effective immediately; YAML not committed -- mixed with the
+gmail/drive-sweep sessions' edits, rides their ship). Roster 20 -> 16; NOT_A_MEMBER 12 -> 8. Task arg flipped
+`--digest-only` -> `--nudge` + re-registered; **next auto-run Mon 2026-06-15 08:00 AZ** will DM Harrison the
+digest AND nudge 14 uncovered teammates (8 "accept invite" + 6 "connect calendar", 7d throttle). **NOT fired
+manually** -- the first live nudge batch is irreversible comms and awaits Harrison's explicit "fire now" (or
+the 6/15 auto-run carries it).
+
+### [DRIVE/KB] Drive+Sheets sweep recall fixes -- 2026-06-08 (STAGED, host ship pending)
+
+Repo HEAD at session start: `be4d4d6` on `main`. **STAGED in Cowork sandbox; NOT
+committed** -- host ship via `deployment\ship-drive-sweep-recall-2026-06-08.ps1`
+(elevated PS). Commits THIS session's files ONLY -- does NOT touch the separately
+staged Gmail sweep work below.
+
+**Context:** the multi-user Drive+Sheets sweep (`Cora - Drive Sweep`, 3:30am AZ,
+`run_drive_sweep.py`) has run nightly since 5/28 and works (Hannah 2,650 / Justin
+5,691 chunks). But its own logs (`drive-sweep-*.log`) showed three recall gaps,
+all on Sheets/large files, plus an entity-tagging gap:
+1. **Large Google Sheets 403 on Drive export** (`exportSizeLimitExceeded`, 17 hits
+   5/28-6/07) -> the biggest, most data-rich sheets dropped entirely.
+2. **Large files 400 at embed time** (OpenAI 300K-token request limit, 10 hits,
+   e.g. Rita Tracking.xlsx) -> whole file lost.
+3. **Sheet extraction truncated to first 200 rows/tab** -> later rows unrecallable.
+4. **Haiku entity misclassification** (OSN P&L -> LEX; HJRP invoice -> LEX-LLC) ->
+   pollutes entity-scoped recall + cross-entity-surfacing risk.
+
+**Fix (staged, 3 src + 3 tests + 1 ship script):**
+- `src/cora/knowledge_base/embeddings.py`: `embed_texts` now batches by BOTH count
+  (100) AND a 250K-token budget (`MAX_BATCH_TOKENS`); a single oversized input
+  becomes its own batch (never dropped). Fixes gap 2 globally (all connectors).
+- `src/cora/connectors/drive_sweep.py`: on export failure, fall back to the Sheets
+  API values reader per tab (`_extract_sheet_via_api`, no export ceiling) via new
+  `_build_sheets_service` (DWD) + `_build_sa_sheets_service_direct`; row cap 200 ->
+  `_MAX_SHEET_ROWS=5000`; `sheets_service` threaded through `sweep_user` +
+  `sweep_founders_os`. Gaps 1+3.
+- `src/cora/connectors/drive_entity_detect.py` (NEW): deterministic HJR
+  naming-convention entity override applied after Haiku in `sweep_user` ONLY
+  (`sweep_founders_os` is already folder-path-deterministic). Conservative: only
+  fires on an exact code token in the first 2 naming positions. Gap 4.
+- Tests: `test_embeddings_batching.py`, `test_drive_entity_detect.py`,
+  `test_drive_sweep_sheets.py`.
+
+**PREREQ for the oversized-sheet fallback:** add scope
+`https://www.googleapis.com/auth/spreadsheets.readonly` to the Cora SA DWD grant
+(admin.google.com -> Security -> API Controls -> Domain-wide Delegation). Code
+degrades gracefully without it (oversized sheets stay dropped, same as today) --
+safe to ship either way, but the re-backfill only recovers them once granted.
+
+**Ship steps (in the PS1):** import smoke -> full pytest -> commit/push (this
+session's files only) -> optional Cora restart -> optional one-time all-time
+re-backfill `run_drive_sweep.py --backfill --freshness-days 36500` (recovers
+previously-dropped sheets/large files, full rows, corrected entity tags;
+resumable + idempotent). **COST:** `--backfill` re-embeds the corpus -> real
+OpenAI spend; narrow `--freshness-days` to limit it.
+**Restart:** NOT required for the fix to take effect in the nightly sweeps (each
+sweep is a fresh process and picks up new code automatically). Recommended for the
+live bot via the PS1's doctrine-#5 sequence so runtime KB upserts use it too.
+**Verify:** `drive-sweep-<date>.log` shows `COMPLETE` + any "recovered oversized
+sheet" lines (if oversized sheets exist + scope granted).
+
+**Sandbox note:** full pytest + import smoke NOT runnable in this Cowork sandbox
+(no `openai`/`googleapiclient`); validated via py_compile + standalone batching
+algorithm check + `drive_entity_detect` unit run. Host PS1 runs the authoritative
+pytest before commit. Stale-virtiofs truncated-read artifact reappeared on
+host-edited files (`embeddings.py`, `monitored-email-accounts.yaml` looked
+corrupt/truncated in sandbox `python3` but are intact on host) -- trust the Read
+tool / `git show HEAD:` for those files, not sandbox bash.
+
+### [GMAIL/KB] Gmail sweep was broken since 5/28 -- coverage + resumability fix -- 2026-06-08 (STAGED, host ship pending)
+
+Repo HEAD at session start: `be4d4d6` on `main` (846faf3 KB fast-path + 2 doc commits on top).
+**STAGED in Cowork sandbox; NOT yet committed** -- host ship via
+`deployment\ship-gmail-sweep-coverage-2026-06-08.ps1` (elevated PS). No cowork-cora-service
+restart required (the sweep is an independent scheduled task, not the bot process).
+
+**Problem (audit finding):** the nightly Gmail KB sweep (`scripts/gmail_threaded_sweep.py`,
+task `cowork-cora-kb-sync-gmail` 2:30am AZ) has been **silently failing since 2026-05-28**.
+Read-vs-unread was never the issue -- the query is `after:{ts}` (covers read AND unread, all
+mail minus spam/trash). The real bugs:
+1. **Task `-ExecutionTimeLimit 1h`** (setup-kb-sync-tasks.ps1) kills the run every night ~3:30am,
+   **14 of 28 accounts in -- always mid `jason@f3energy.com`.** "sweep complete" never logged.
+2. **Watermark persisted only once at end-of-run** -> since the run never finishes,
+   `data/cache/gmail-thread-watermarks.json` hasn't been written since **5/28 09:43**. The first
+   ~7 accounts re-scan a growing backlog from 5/28 every night (harrison 284->427 threads; hannah +
+   justin pinned at the 500 cap), re-embedding the same mail nightly (wasted OpenAI spend).
+3. **14 mailboxes never reached at all**: the entire Lexington set (payables/receipts/harrison/
+   justin/jeff/shaun/jen) + entire UFL set (harrison/hannah/alex/sophia/gaelan) + gaelan/brett@f3e.
+4. **`uv run` in the task action** -> D-005 violation + venv-lock deadlock risk vs the live service.
+5. **Roster gap**: 5 DWD-eligible Slack users had NO mailbox entry -- Eric Canku, Daniel Sion,
+   Jake Lichtman, Micah Kessler, Elena Meirndorf.
+
+**Fix (staged, 4 files + 1 ship script):**
+- `scripts/gmail_threaded_sweep.py`: (a) **incremental atomic watermark** -- persisted after EACH
+  account, so a mid-run kill still advances completed accounts and the next run resumes;
+  (b) **stale-first ordering** (`_order_accounts`) -- oldest/never-swept mailboxes processed first,
+  so no account is starved behind the time wall; (c) **cap-aware watermark** (`_next_watermark`) --
+  on cap-hit, advance only to newest-processed (not sync_start) so older backlog is not silently
+  dropped; (d) CLI `--max-threads` + `--accounts` for targeted/deep backfill.
+- `data/maps/monitored-email-accounts.yaml`: +6 DWD-eligible mailboxes (Eric, Daniel, Jake,
+  Micah, Elena, + tommy@hjrglobal.com per Harrison 2026-06-08), thread_sweep only
+  (attachment_filer/drive_sweep off). Now 34 thread_sweep accounts. Demi Bagby's personal
+  mailbox deliberately EXCLUDED per Harrison 2026-06-08 (do not add).
+- `deployment/setup-kb-sync-tasks.ps1`: `uv run` -> `.venv\Scripts\python.exe` (D-005); Gmail
+  task limit 1h -> **3h**; ASCII-only rewrite (D-016, file had em-dashes).
+- `tests/test_gmail_threaded_sweep.py`: +8 tests (`_order_accounts`, `_next_watermark`).
+
+**Host ship steps (in the PS1):** import smoke -> full pytest -> git add/commit/push ->
+re-register kb-sync tasks (`setup-kb-sync-tasks.ps1`) -> optional one-time deep backfill
+`.venv\Scripts\python.exe scripts\gmail_threaded_sweep.py --fallback-days 400 --max-threads 2000`
+(drains the 5/28 backlog + the 14 dark accounts; resumable, safe to re-run). Even without the
+manual backfill, the next 2:30am run self-heals stale-first.
+**Verify after ship:** `logs/kb-sync-gmail-<date>.log` shows a "sweep complete" line and
+`gmail-thread-watermarks.json` mtime is fresh with ~33 advancing entries.
+**Resolved 2026-06-08 (Harrison):** Demi Bagby's personal mailbox stays EXCLUDED;
+`tommy@hjrglobal.com` ADDED to the sweep. No open roster questions remain.
+
 ### [INFRA] KB vector-search fast path (binary quantization) -- 2026-06-07 (commit 8d3c3d0, ship 846faf3)
 
 Repo HEAD: `846faf3` on `origin/main` | **3,398 passed / 41 skipped** | **MIGRATION RAN -- fast path
