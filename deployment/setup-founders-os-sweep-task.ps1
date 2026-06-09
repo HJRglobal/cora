@@ -26,8 +26,9 @@ $Action = New-ScheduledTaskAction `
     -Argument $Script `
     -WorkingDirectory $RepoRoot
 
-# Trigger: daily at 4:15 AM local time
-$Trigger = New-ScheduledTaskTrigger -Daily -At "04:15AM"
+# Trigger: daily at 6:30 AM local (AZ). Moved off 4:15 so this heavy Drive BFS
+# does not bunch with the 4:00/4:30 KB-sync band; 30 min after the Drive Sweep.
+$Trigger = New-ScheduledTaskTrigger -Daily -At "06:30AM"
 
 # Settings: run whether logged on or not, 2-hour execution limit
 $Settings = New-ScheduledTaskSettingsSet `
@@ -44,7 +45,7 @@ Register-ScheduledTask `
     -RunLevel Highest `
     -Force | Out-Null
 
-Write-Host "Registered: $TaskName (nightly 4:15 AM)"
+Write-Host "Registered: $TaskName (nightly 6:30 AM AZ)"
 Write-Host ""
 Write-Host "To run immediately (incremental):"
 Write-Host "  schtasks /Run /TN $TaskName"

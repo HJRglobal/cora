@@ -54,10 +54,12 @@ $Action = New-ScheduledTaskAction `
     -Argument "`"$ScriptPath`" --with-slack" `
     -WorkingDirectory $RepoRoot
 
-# Trigger: daily at 3:30 AM (Arizona MST = UTC-7; adjust if DST ever applies)
+# Trigger: daily at 6:00 AM AZ. Moved off 3:30 to clear the kb-sync-fireflies
+# collision (both are heavy KB writers); 6:00 is after the KB-sync band, still
+# low-traffic pre-dawn. (Arizona MST = UTC-7; adjust if DST ever applies)
 $Trigger = New-ScheduledTaskTrigger `
     -Daily `
-    -At "03:30"
+    -At "06:00"
 
 # Settings: no execution time limit (full-corpus backfill can exceed 2h across 18 accounts)
 $Settings = New-ScheduledTaskSettingsSet `

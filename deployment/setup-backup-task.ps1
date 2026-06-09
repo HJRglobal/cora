@@ -16,7 +16,9 @@ $ErrorActionPreference = "Stop"
 $TASK_NAME    = "cowork-cora-backup"
 $REPO_DIR     = "C:\Users\Harri\code\cora"
 $SCRIPT_PATH  = "$REPO_DIR\scripts\backup_logs.py"
-$TRIGGER_TIME = "4:30AM"
+# 1:00PM AZ -- moved off 4:30AM so the online backup reads the 5.7GB cora_kb.db
+# while it is quiescent (no KB-sync writer active), not during kb-sync-drive.
+$TRIGGER_TIME = "1:00PM"
 
 Write-Host ""
 Write-Host "=== Cora Log Backup Task Setup ==="
