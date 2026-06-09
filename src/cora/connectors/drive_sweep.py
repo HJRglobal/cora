@@ -42,6 +42,7 @@ from typing import Any
 
 import yaml
 
+from cora.connectors.drive_entity_detect import detect_entity_from_filename
 from cora.knowledge_base.store import Document
 from cora.phi_guard import _PHI_PATTERNS
 
@@ -83,6 +84,12 @@ _TEXT_MIME_TYPES = {
 _PDF_MIME = "application/pdf"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Rows-per-tab ingested from any spreadsheet (Google Sheet export, XLSX binary,
+# or Sheets-API fallback). Was 200, which silently truncated large data tables
+# so later rows could never be recalled. Raised for data recall; the embedding
+# layer now batches by token budget so large sheets no longer fail to embed.
+_MAX_SHEET_ROWS = 5000
 
 # ── Haiku classification ──────────────────────────────────────────────────────
 
@@ -153,32 +160,108 @@ def _extract_google_doc(service: Any, file_id: str) -> str:
         return ""
 
 
-def _extract_google_sheet(service: Any, file_id: str) -> str:
-    """Export a Google Sheet as XLSX, parse all tabs with openpyxl."""
+def _extract_google_sheet(service: Any, file_id: str,
+                          sheets_service: Any | None = None) -> str:
+    """Extract a Google Sheet's values as text.
+
+    Primary path: Drive export as XLSX, parsed with openpyxl. Large sheets blow
+    past Drive's export ceiling and raise HttpError 'exportSizeLimitExceeded',
+    which previously dropped the file entirely. When that happens (or the export
+    is empty) and a Sheets API service is available, fall back to the Sheets API
+    `values` reader, which has no such size limit.
+    """
     try:
         import openpyxl
     except ImportError:
-        return ""
+        openpyxl = None  # type: ignore
+
+    export_error: Exception | None = None
+    if openpyxl is not None:
+        try:
+            data = _retry_execute(service.files().export(
+                fileId=file_id,
+                mimeType=_XLSX_MIME,
+            ))
+            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+            parts: list[str] = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                rows_text: list[str] = []
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None and str(c).strip()]
+                    if cells:
+                        rows_text.append("\t".join(cells))
+                    if len(rows_text) >= _MAX_SHEET_ROWS:
+                        break
+                if rows_text:
+                    parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows_text))
+            text = "\n\n".join(parts)
+            if text.strip():
+                return text
+        except Exception as exc:
+            export_error = exc
+            log.debug("drive_sweep: sheet export failed for %s: %s", file_id, exc)
+
+    # Fallback: Sheets API values reader (no export size ceiling).
+    if sheets_service is not None:
+        text = _extract_sheet_via_api(sheets_service, file_id)
+        if text.strip():
+            if export_error is not None:
+                log.info("drive_sweep: recovered oversized sheet %s via Sheets API", file_id)
+            return text
+
+    return ""
+
+
+def _extract_sheet_via_api(sheets_service: Any, file_id: str) -> str:
+    """Read a spreadsheet's values via the Sheets API (no export size limit).
+
+    Lists each tab, then reads up to _MAX_SHEET_ROWS rows per tab. Cells are
+    rendered as UNFORMATTED_VALUE so numbers/dates come through as data, not
+    display strings. Returns the same `[Sheet: name]\\n<tab-joined rows>` text
+    shape as the openpyxl path so downstream chunking is identical.
+    """
     try:
-        data = _retry_execute(service.files().export(
-            fileId=file_id,
-            mimeType=_XLSX_MIME,
+        meta = _retry_execute(sheets_service.spreadsheets().get(
+            spreadsheetId=file_id,
+            fields="sheets.properties.title",
         ))
-        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-        parts: list[str] = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows_text: list[str] = []
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c is not None and str(c).strip()]
-                if cells:
-                    rows_text.append("\t".join(cells))
-            if rows_text:
-                parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows_text[:200]))
-        return "\n\n".join(parts)
     except Exception as exc:
-        log.debug("drive_sweep: sheet export failed for %s: %s", file_id, exc)
+        log.debug("drive_sweep: Sheets API metadata failed for %s: %s", file_id, exc)
         return ""
+
+    titles = [
+        s.get("properties", {}).get("title", "")
+        for s in meta.get("sheets", [])
+        if s.get("properties", {}).get("title")
+    ]
+    if not titles:
+        return ""
+
+    parts: list[str] = []
+    for title in titles:
+        # Quote the tab title for the A1 range; escape embedded single quotes.
+        safe_title = title.replace("'", "''")
+        rng = f"'{safe_title}'!A1:ZZ{_MAX_SHEET_ROWS}"
+        try:
+            resp = _retry_execute(sheets_service.spreadsheets().values().get(
+                spreadsheetId=file_id,
+                range=rng,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ))
+        except Exception as exc:
+            log.debug("drive_sweep: Sheets API values failed for %s/%s: %s",
+                      file_id, title, exc)
+            continue
+        rows = resp.get("values", [])
+        rows_text: list[str] = []
+        for row in rows:
+            cells = [str(c) for c in row if c is not None and str(c).strip()]
+            if cells:
+                rows_text.append("\t".join(cells))
+        if rows_text:
+            parts.append(f"[Sheet: {title}]\n" + "\n".join(rows_text))
+    return "\n\n".join(parts)
 
 
 def _extract_pdf_bytes(data: bytes) -> str:
@@ -213,8 +296,10 @@ def _extract_xlsx_bytes(data: bytes) -> str:
                 cells = [str(c) for c in row if c is not None and str(c).strip()]
                 if cells:
                     rows_text.append("\t".join(cells))
+                if len(rows_text) >= _MAX_SHEET_ROWS:
+                    break
             if rows_text:
-                parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows_text[:200]))
+                parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows_text))
         return "\n\n".join(parts)
     except Exception as exc:
         log.debug("drive_sweep: XLSX parse failed: %s", exc)
@@ -248,7 +333,8 @@ def _download_and_extract(service: Any, file_meta: dict) -> str:
     return ""
 
 
-def _extract_content(service: Any, file_meta: dict) -> str:
+def _extract_content(service: Any, file_meta: dict,
+                     sheets_service: Any | None = None) -> str:
     """Route to the right extractor for a Drive file."""
     mime = file_meta.get("mimeType", "")
     file_id = file_meta["id"]
@@ -261,7 +347,7 @@ def _extract_content(service: Any, file_meta: dict) -> str:
     if mime == _GOOGLE_DOC_MIME:
         return _extract_google_doc(service, file_id)
     if mime == _GOOGLE_SHEET_MIME:
-        return _extract_google_sheet(service, file_id)
+        return _extract_google_sheet(service, file_id, sheets_service=sheets_service)
     if mime in (_GOOGLE_SLIDE_MIME,):
         return _extract_google_doc(service, file_id)  # same export path
     # Binary files
@@ -340,6 +426,7 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
 # ── Per-user sweep ────────────────────────────────────────────────────────────
 
 _DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
 _SUPPORTED_MIME_QUERY = " or ".join([
     f"mimeType='{_GOOGLE_DOC_MIME}'",
@@ -393,6 +480,28 @@ def _build_drive_service(sa_json_path: str, user_email: str):
         sa_json_path, scopes=[_DRIVE_SCOPE]
     ).with_subject(user_email)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _build_sheets_service(sa_json_path: str, user_email: str):
+    """Build a Sheets v4 service impersonating user_email via DWD.
+
+    Requires the Cora SA DWD grant to include the scope
+    'https://www.googleapis.com/auth/spreadsheets.readonly' (one-time Harrison
+    action in admin.google.com). Returns None if the service cannot be built so
+    the caller degrades gracefully to the Drive-export path.
+    """
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        creds = service_account.Credentials.from_service_account_file(
+            sa_json_path, scopes=[_SHEETS_SCOPE]
+        ).with_subject(user_email)
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        log.warning("drive_sweep: could not build Sheets service for %s: %s",
+                    user_email, exc)
+        return None
 
 
 def sweep_user(
@@ -464,6 +573,10 @@ def sweep_user(
         log.error("drive_sweep: could not build Drive service for %s: %s", email, exc)
         return stats
 
+    # Sheets API service for the oversized-export fallback (None if scope/grant
+    # missing -> we degrade to the Drive-export path without crashing).
+    sheets_service = _build_sheets_service(sa_json_path, email)
+
     # Build Drive files.list query
     q = (
         f"({_SUPPORTED_MIME_QUERY})"
@@ -513,7 +626,7 @@ def sweep_user(
                 pass
 
             # Extract content
-            content = _extract_content(service, file_meta)
+            content = _extract_content(service, file_meta, sheets_service=sheets_service)
             if not content or len(content.strip()) < 150:
                 stats["noise_filtered"] += 1
                 continue
@@ -533,6 +646,13 @@ def sweep_user(
                 anthropic_client, filename, name, email, entity_default, preview
             )
             score = classification.get("score", 0)
+
+            # Deterministic filename entity override -- HJR naming convention is
+            # more reliable than Haiku for entity attribution (Haiku has tagged
+            # OSN P&Ls and HJRP invoices as LEX). Score still comes from Haiku.
+            detected_entity = detect_entity_from_filename(filename)
+            if detected_entity:
+                classification["entity"] = detected_entity
 
             if score < 4:
                 log.debug("drive_sweep: discarded %s (score=%s: %s)",
@@ -714,6 +834,25 @@ def _build_sa_drive_service_direct(sa_json_path: str) -> Any:
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def _build_sa_sheets_service_direct(sa_json_path: str) -> Any:
+    """Build a Sheets v4 service using direct SA credentials (no impersonation).
+
+    Used for the HJR-Founder-OS shared folder oversized-sheet fallback. Returns
+    None on any failure so the caller degrades to the Drive-export path.
+    """
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        creds = service_account.Credentials.from_service_account_file(
+            sa_json_path, scopes=[_SHEETS_SCOPE]
+        )
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        log.warning("founders_os: could not build Sheets service: %s", exc)
+        return None
+
+
 def _list_subfolders(service: Any, parent_id: str) -> list[dict]:
     """List immediate subfolder children of a Drive folder."""
     results: list[dict] = []
@@ -756,6 +895,7 @@ def _process_single_folder_files(
     score_threshold: int,
     seen_file_ids: set,
     stats: dict,
+    sheets_service: Any | None = None,
 ) -> None:
     """Process files directly inside one folder (non-recursive, 'in parents' only)."""
     q = (
@@ -803,7 +943,7 @@ def _process_single_folder_files(
             except (ValueError, TypeError):
                 pass
 
-            content = _extract_content(service, file_meta)
+            content = _extract_content(service, file_meta, sheets_service=sheets_service)
             if not content or len(content.strip()) < 150:
                 stats["noise_filtered"] += 1
                 continue
@@ -863,6 +1003,7 @@ def _sweep_folder_tree(
     seen_file_ids: set,
     stats: dict,
     checkpoint_key: str,
+    sheets_service: Any | None = None,
 ) -> None:
     """BFS walk of a folder subtree using 'in parents' queries at each depth.
 
@@ -901,6 +1042,7 @@ def _sweep_folder_tree(
             score_threshold=score_threshold,
             seen_file_ids=seen_file_ids,
             stats=stats,
+            sheets_service=sheets_service,
         )
 
         # Discover subfolders and add to BFS queue
@@ -939,6 +1081,9 @@ def sweep_founders_os(
     except Exception as exc:
         log.error("founders_os: could not build Drive service: %s", exc)
         return {"error": str(exc)}
+
+    # Sheets API service for oversized-export fallback (None -> degrade gracefully).
+    sheets_service = _build_sa_sheets_service_direct(sa_json_path)
 
     allowed_entities: set[str] | None = None
     if entity_filter:
@@ -1013,6 +1158,7 @@ def sweep_founders_os(
                     is_lex=is_lex, score_threshold=score_threshold,
                     seen_file_ids=seen_file_ids, stats=stats,
                     checkpoint_key=f"founders_os_ckpt_{subfolder['id']}",
+                    sheets_service=sheets_service,
                 )
             _sweep_folder_tree(
                 service=service, folder_id=folder_id,
@@ -1022,6 +1168,7 @@ def sweep_founders_os(
                 is_lex=is_lex, score_threshold=score_threshold,
                 seen_file_ids=seen_file_ids, stats=stats,
                 checkpoint_key=f"founders_os_ckpt_{folder_id}_root",
+                sheets_service=sheets_service,
             )
         else:
             _sweep_folder_tree(
@@ -1032,6 +1179,7 @@ def sweep_founders_os(
                 is_lex=is_lex, score_threshold=score_threshold,
                 seen_file_ids=seen_file_ids, stats=stats,
                 checkpoint_key=f"founders_os_ckpt_{folder_id}",
+                sheets_service=sheets_service,
             )
 
         if not dry_run:

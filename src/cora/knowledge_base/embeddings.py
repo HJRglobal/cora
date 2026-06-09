@@ -16,6 +16,13 @@ log = logging.getLogger(__name__)
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
 BATCH_SIZE = 100
+# OpenAI's embeddings endpoint rejects any single request whose inputs sum to
+# more than 300,000 tokens. BATCH_SIZE alone (count-based) is not enough: 100
+# dense chunks (each up to the chunker's 8,000-token hard max) can blow past
+# 300K and the whole batch 400s, which previously dropped large spreadsheets
+# (e.g. Rita Tracking.xlsx) from the KB entirely. We cap each batch by BOTH the
+# count AND a token budget kept safely under the hard limit.
+MAX_BATCH_TOKENS = 250_000
 _TIMEOUT = 30.0
 _RETRY_DELAYS = (1, 2, 5)
 
@@ -25,6 +32,54 @@ class EmbeddingError(Exception):
 
 
 _client: OpenAI | None = None
+_encoder = None
+
+
+def _count_tokens(text: str) -> int:
+    """Best-effort token count for batch budgeting.
+
+    Uses the same cl100k encoding the chunker uses. Falls back to a
+    conservative chars/4 estimate if tiktoken is unavailable for any reason
+    (budgeting only -- correctness does not depend on exactness).
+    """
+    global _encoder
+    if _encoder is None:
+        try:
+            import tiktoken
+            _encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - tiktoken is a hard dep in practice
+            _encoder = False
+    if _encoder:
+        try:
+            return len(_encoder.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return (len(text) // 4) + 1
+
+
+def _iter_token_batches(texts: list[str]):
+    """Yield batches bounded by BOTH BATCH_SIZE (count) and MAX_BATCH_TOKENS.
+
+    A single oversized input (> MAX_BATCH_TOKENS) is emitted as its own batch
+    so it is never silently dropped; the chunker already caps individual chunks
+    well under the per-input limit, so this is a safety net rather than a
+    routine path.
+    """
+    batch: list[str] = []
+    batch_tokens = 0
+    for text in texts:
+        t_tokens = _count_tokens(text)
+        if batch and (
+            len(batch) >= BATCH_SIZE
+            or batch_tokens + t_tokens > MAX_BATCH_TOKENS
+        ):
+            yield batch
+            batch = []
+            batch_tokens = 0
+        batch.append(text)
+        batch_tokens += t_tokens
+    if batch:
+        yield batch
 
 
 def _get_client() -> OpenAI:
@@ -51,11 +106,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     client = _get_client()
     out: list[list[float]] = []
 
-    for batch_start in range(0, len(texts), BATCH_SIZE):
-        batch = texts[batch_start : batch_start + BATCH_SIZE]
+    for batch in _iter_token_batches(texts):
         embeddings = _embed_batch_with_retry(client, batch)
         out.extend(embeddings)
-        log.debug("Embedded batch %d-%d", batch_start, batch_start + len(batch))
+        log.debug("Embedded batch of %d texts", len(batch))
 
     return out
 
