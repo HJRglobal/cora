@@ -347,8 +347,14 @@ def generate_response(
     channel_name: str = "",
     cached_context: str | None = None,
     cross_entity_tools: bool = False,
+    meta: dict | None = None,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
+
+    meta: optional caller-owned dict for out-of-band response metadata. When
+    provided, this function sets meta["used_tools"] (bool) so callers can tell
+    whether the reply incorporates tool output (D-032: tool outputs bypass the
+    reply formatter). Per-call object, so concurrent requests never race.
 
     slack_user_id is bound into the tool dispatcher so tools like asana_get_my_tasks
     resolve to the right Asana account. Pass empty string if there's no asking user
@@ -381,6 +387,9 @@ def generate_response(
     # the current user message. Grows with each tool_use / tool_result exchange.
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
 
+    if meta is not None:
+        meta["used_tools"] = False
+
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         response = _create_with_retry(
             model=effective_model,
@@ -395,6 +404,9 @@ def generate_response(
         if response.stop_reason != "tool_use":
             # Model is done — return whatever text it produced
             return _extract_text(response) or "(Cora returned no text)"
+
+        if meta is not None:
+            meta["used_tools"] = True
 
         if iteration >= _MAX_TOOL_ITERATIONS:
             log.warning(
@@ -469,8 +481,12 @@ def generate_response_streaming(
     channel_name: str = "",
     cached_context: str | None = None,
     cross_entity_tools: bool = False,
+    meta: dict | None = None,
 ) -> str:
     """Streaming variant of generate_response.
+
+    meta: optional caller-owned dict for out-of-band response metadata — sets
+    meta["used_tools"] (bool) exactly like generate_response (D-032 bypass signal).
 
     Calls Claude with `messages.stream()` and invokes `update_callback(text)` on
     every text-delta event with the CUMULATIVE response text so far (not just the
@@ -503,6 +519,9 @@ def generate_response_streaming(
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
     accumulated_text = ""
     _last_tool_result_text: str = ""  # safety net: fallback if Claude emits no text after a write
+
+    if meta is not None:
+        meta["used_tools"] = False
 
     def _maybe_push(text: str) -> None:
         if update_callback is not None:
@@ -568,6 +587,9 @@ def generate_response_streaming(
                     len(accumulated_text),
                 )
             return accumulated_text or "(Cora returned no text)"
+
+        if meta is not None:
+            meta["used_tools"] = True
 
         if iteration >= _MAX_TOOL_ITERATIONS:
             log.warning(

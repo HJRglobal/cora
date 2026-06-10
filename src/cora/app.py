@@ -31,6 +31,7 @@ from . import cross_entity_guard
 from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
+from .reply_formatter import format_reply
 from . import semantic_cache as sc
 from . import slack_update_throttle
 from . import team_learning
@@ -366,6 +367,10 @@ def _dispatch_qa(
             channel_id, user_id, exc,
         )
 
+    # D-032 reply-formatter signal: generate_response* sets gen_meta["used_tools"]
+    # so tool-bearing replies bypass format_reply (tool outputs present as-is).
+    gen_meta: dict = {}
+
     if placeholder_ts is None:
         # ── Fallback: non-streaming path ──
         try:
@@ -380,6 +385,7 @@ def _dispatch_qa(
                 channel_name=channel_name,
                 cached_context=static_text,
                 cross_entity_tools=is_founder,
+                meta=gen_meta,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -389,6 +395,12 @@ def _dispatch_qa(
         latency_ms = int((time.monotonic() - t0) * 1000)
         response_text = _extract_and_log_gap(
             response_text, entity, channel_name, user_id, user_message, latency_ms,
+        )
+        # D-032: conversational replies pass through the deterministic voice
+        # formatter; tool outputs bypass. Applied before the cache store so
+        # cached replays are already-formatted.
+        response_text = format_reply(
+            response_text, is_tool_output=bool(gen_meta.get("used_tools")),
         )
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
@@ -438,6 +450,7 @@ def _dispatch_qa(
             channel_name=channel_name,
             cached_context=static_text,
             cross_entity_tools=is_founder,
+            meta=gen_meta,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
@@ -460,6 +473,12 @@ def _dispatch_qa(
     latency_ms = int((time.monotonic() - t0) * 1000)
     response_text = _extract_and_log_gap(
         response_text, entity, channel_name, user_id, user_message, latency_ms,
+    )
+    # D-032: conversational replies pass through the deterministic voice
+    # formatter; tool outputs bypass. Applied before the cache store so
+    # cached replays are already-formatted.
+    response_text = format_reply(
+        response_text, is_tool_output=bool(gen_meta.get("used_tools")),
     )
     _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
