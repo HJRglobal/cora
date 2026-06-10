@@ -757,3 +757,60 @@ absolute paths.
 
 **Reason:** Cost two blocked swap attempts during the section-10.6 reclaim before the cause
 was clear.
+
+## D-038 -- Gmail/KB sweeps must be resumable, stale-first, and cap-aware (2026-06-09)
+
+**Decision:** Long multi-account sweeps (gmail_threaded_sweep.py and similar) must: (1) persist
+their watermark AFTER EACH account, not once at end-of-run; (2) process accounts STALE-FIRST
+(oldest/never-swept watermark first) so no account is starved behind a time limit; (3) be
+CAP-AWARE -- when an account hits the per-run thread cap, advance its watermark only to the
+newest message actually processed, never jump to "now" (that silently drops backlog); (4) ship
+with an ExecutionTimeLimit that fits the workload (gmail = 3h). A bulk one-time backfill is a
+separate `--max-threads`/`--fallback-days`/`--accounts` invocation.
+
+**Reason:** The gmail sweep silently stalled 5-28 -> 6-08: a 1h task limit killed it ~14/28
+accounts in every night, and the end-of-run-only watermark flush meant nothing ever persisted,
+so early accounts re-scanned a growing backlog nightly while the entire Lexington + UFL mailbox
+sets were never reached. Read-vs-unread was never the issue (`after:{ts}` covers both).
+
+## D-039 -- KB SQLite needs PRAGMA busy_timeout (WAL alone is insufficient) (2026-06-09)
+
+**Decision:** `schema.connect` sets `PRAGMA busy_timeout=30000`. WAL allows concurrent readers +
+ONE writer, but two writers (e.g. the live bot ingesting while a manual backfill runs) still
+contend; without a busy timeout the loser raises `OperationalError: database is locked` and
+crashes mid-run. A heavy daytime backfill should run with the bot also on busy_timeout (i.e.
+after a restart that picks up this change) so both wait politely.
+
+**Reason:** The first gmail deep-backfill crashed on "database is locked" colliding with the
+live service; busy_timeout fixed it.
+
+## D-040 -- DR backup must include encrypted secrets + verify offsite (2026-06-09)
+
+**Decision:** The daily backup (`backup_logs.py`) must (1) bundle `.env` + the Google SA JSON
+into ONE Fernet-encrypted blob (key from `CORA_BACKUP_PASSPHRASE` via PBKDF2; SKIP rather than
+ever write plaintext if the passphrase is unset; decrypt via `restore_secrets.py`); (2) online-
+backup the small feature DBs; (3) VERIFY the KB actually landed at the offsite destination and
+exit non-zero if not. Scheduled backup tasks use `.venv` python (D-005) and a time limit that
+fits a multi-GB online backup (60m). The passphrase lives in Harrison's password manager + a
+persistent User env var, NEVER in `.env` (the thing being backed up).
+
+**Reason:** Code is on GitHub and the KB was already backed up, but `.env` + SA JSON (gitignored)
+were backed up nowhere -- a machine loss would leave a rebuilt Cora unable to authenticate to
+anything. The old backup also had a silent-failure mode (reported success with no offsite file).
+
+## D-041 -- Shared working tree + sandbox reliability doctrines (2026-06-09)
+
+**Decision:** When multiple Cowork/Code sessions share the one repo working tree: (1) commit
+with EXPLICIT paths (`git add <files>`), NEVER `git add -A` -- it sweeps other sessions' in-flight
+work into your commit (observed live: a busy_timeout edit landed in an unrelated session's
+commit). (2) A stale `.git/index.lock` (0-byte, from a crashed/concurrent git) silently fails
+every commit -- clear it (after confirming no git process runs) as the first step of any ship
+script, and VERIFY HEAD actually advanced after committing (checking `git push` exit code is
+not enough -- "Everything up-to-date" returns 0). (3) Do NOT bulk re-register scheduled tasks
+with `-StartWhenAvailable` while past-due -- Windows fires the whole missed batch at once (a
+thundering herd that collided three sweeps + the bot). (4) The Cowork Linux sandbox's virtiofs
+view of host-edited files goes STALE/truncated -- for host files trust the Read tool and
+`git show HEAD:<path>` (object store, stale-proof), NOT sandbox `cat`/`git diff`/`py_compile`.
+
+**Reason:** All four cost real time during the 2026-06-09 multi-session commit storm; codifying
+them prevents the next pile-up.

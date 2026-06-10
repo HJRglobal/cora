@@ -8,6 +8,48 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [GMAIL/KB + BACKUP/DR] Gmail sweep coverage fix + DR backup hardening -- 2026-06-09 (commits 02813dd, d2ac2a7, ec5af47, 5b3967f)
+
+Repo HEAD: `5b3967f` on `origin/main` | full suite **3,628 passed / 41 skipped** | Cora restarted, heartbeat fresh | gmail catch-up CONFIRMED working in prod.
+
+**Problem found (audit):** the nightly Gmail KB sweep (`scripts/gmail_threaded_sweep.py`,
+task `cowork-cora-kb-sync-gmail`) had silently stalled since **2026-05-28**. Read-vs-unread
+was never the issue (`after:{ts}` covers both). Root causes: (1) the task's 1h
+ExecutionTimeLimit killed the run ~14/28 accounts in every night (always mid jason@f3energy);
+(2) the watermark was flushed only once at end-of-run, so since the run never finished it
+NEVER persisted -> early accounts re-scanned a growing backlog nightly and the entire
+Lexington + UFL mailbox sets were never reached; (3) `uv run` in the task (D-005 violation);
+(4) 5-6 DWD-eligible Slack users had no mailbox entry at all.
+
+**Shipped (02813dd):** per-account ATOMIC watermark (resumable across kills), STALE-FIRST
+ordering (oldest/never-swept mailboxes first), CAP-AWARE watermark (`_next_watermark` -- on
+cap-hit advance only to newest-processed, never silently skip backlog), `_upsert_with_retry`
+(backs off on transient KB locks), `--max-threads`/`--accounts` CLI; +6 DWD mailboxes (Eric,
+Daniel, Jake, Micah, Elena, tommy@hjrglobal); `setup-kb-sync-tasks.ps1` -> .venv python + gmail
+3h limit. **VERIFIED working:** `gmail-thread-watermarks.json` went 12 stuck@5-28 -> 27 accounts
+@ 6/08-6/09, incl. the previously-dark Lexington inboxes. **Demi Bagby personal mail deliberately
+EXCLUDED** (Harrison). `busy_timeout=30000` added to `schema.connect` (was the DB-lock-crash fix;
+landed via a concurrent session's commit).
+
+**DR backup hardened (ec5af47 + 5b3967f):** `backup_logs.py` now also bundles `.env` + the SA
+JSON into ONE Fernet-encrypted blob (`secrets-YYYY-MM-DD.enc`, key from CORA_BACKUP_PASSPHRASE
+via PBKDF2; SKIPS rather than ever writing plaintext if unset), online-backs-up the small
+feature DBs, and VERIFIES the KB landed offsite (exit non-zero if not). `restore_secrets.py`
+is the decrypt companion. `setup-backup-task.ps1` -> .venv python + 60m limit (10m was killing
+the multi-GB KB online backup), 1:00pm trigger preserved.
+
+**Drive-recall fixes (d2ac2a7):** oversized-sheet Sheets-API fallback, 250k-token embed
+batching, deterministic entity override (another session's work; committed here when its ship
+hit the lock).
+
+**OPEN (Harrison action -- DR not yet ACTIVE):** (1) set `CORA_BACKUP_PASSPHRASE` (password
+manager + persistent User env var); (2) re-run `deployment\setup-backup-task.ps1`; (3) one
+`backup_logs.py` run showing `Offsite verify: PASS`. Until then the encrypted-secrets backup is
+built+tested but dormant -- secrets remain the one thing a machine loss would cost.
+
+**Doctrines locked this session: D-038 (gmail sweep resumability), D-039 (KB busy_timeout),
+D-040 (DR backup completeness), D-041 (shared-tree git ops + virtiofs/sandbox reliability).**
+
 ### [HYGIENE] Monthly log + ledger compaction job -- section 10.5 -- 2026-06-09 (commit 3fe3a38)
 
 Repo HEAD: `3fe3a38` on `origin/main` | task `Cora - Log Compaction` registered (monthly, day 1 @ 14:00 AZ, Ready, Next Run 7/1) | no Cora restart needed (standalone task).
