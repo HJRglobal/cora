@@ -106,12 +106,24 @@ def blocked_topics(user_id: str) -> list[str]:
     return entry.get("sensitive_topics_blocked", [])
 
 
-def check_access(user_id: str, entity: str, user_message: str) -> str | None:
+def check_access(
+    user_id: str,
+    entity: str,
+    user_message: str,
+    phi_custodian: bool = False,
+) -> str | None:
     """Full access check. Returns a redirect message string if blocked, None if allowed.
 
     Checks:
       1. Entity authorization — is the user allowed to ask about this entity?
       2. Sensitive topic detection — is the question about a blocked topic?
+
+    `phi_custodian` (default False): when True, the `phi` topic block is skipped
+    for THIS request only. The caller sets it via lex_phi_access.phi_allowed(),
+    which is fail-closed and already verified the user is an authorized LEX
+    custodian asking inside LEX scope. All other topic blocks (financials, hr,
+    legal, cap_table) and the entity-authorization check are unaffected — this
+    flag never opens cross-entity flow.
 
     Returns None (pass) or a one-sentence redirect (block).
     """
@@ -164,6 +176,9 @@ def check_access(user_id: str, entity: str, user_message: str) -> str | None:
     }
 
     for topic in blocked:
+        # Authorized LEX PHI custodian (in LEX scope) — skip the phi block only.
+        if topic == "phi" and phi_custodian:
+            continue
         patterns = topic_patterns.get(topic, [])
         if any(p in msg_lower for p in patterns):
             redirects = {

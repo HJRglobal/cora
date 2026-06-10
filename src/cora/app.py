@@ -15,6 +15,7 @@ from .claude_client import (
 from . import active_thread_store
 from . import channel_classifier
 from . import user_access
+from . import lex_phi_access
 from .config import config
 from .context_loader import load_context_parts
 from .entity_router import route
@@ -631,7 +632,16 @@ def handle_mention(event: dict, say: callable, client) -> None:
 
     # ── User access check — entity + sensitive topic authorization ────────────
     if user_id:
-        access_block = user_access.check_access(user_id, entity, user_message)
+        # LEX PHI custodian gate (fail-closed). Grants the `phi` topic ONLY to an
+        # allowlisted custodian asking inside LEX scope (LEX/LEX-* channel, or DM).
+        # Channel IDs starting with "D" are DMs. Never relaxes anything else; the
+        # sibling + cross-entity guards below still run.
+        phi_custodian = lex_phi_access.phi_allowed(
+            user_id, entity, is_dm=str(channel_id).startswith("D")
+        )
+        access_block = user_access.check_access(
+            user_id, entity, user_message, phi_custodian=phi_custodian
+        )
         if access_block:
             log.info(
                 "user_access: blocked user=%s entity=%s reason=%s",

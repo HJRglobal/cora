@@ -1,0 +1,33 @@
+# LEX PHI Custodian Allowlist
+# ---------------------------------------------------------------------------
+# Authorized custodians who may receive Lexington (LEX) PHI through Cora.
+#
+# These four people already hold all hard-copy client / employee / parent PHI
+# and may need to furnish it to DDD / AHCCCS. To them ONLY, and ONLY inside a
+# designated LEX channel or a direct message with them, Cora surfaces LEX PHI.
+#
+# For everyone else the existing PHI refusal stands. LEX PHI NEVER surfaces in
+# a non-LEX channel for ANY user (incl. these four). The sibling_guard and
+# cross_entity_guard remain fully enforced — this allowlist only relaxes the
+# `phi` topic block within LEX scope; it never opens cross-entity flow.
+#
+# Gate is FAIL-CLOSED: a Slack user ID not listed here gets the refusal, and an
+# unresolved / empty file means nobody is a custodian (refuse all).
+#
+# Locked by Harrison's directive (Universal Session Capture spec, 2026-06-09).
+# To change the roster, edit this file — no restart needed (60s TTL reload).
+# ---------------------------------------------------------------------------
+
+custodians:
+  - name: Harrison Rogers
+    slack_id: U0B2RM2JYJ1
+    email: harrison@hjrglobal.com
+  - name: Shaun Hawkins
+    slack_id: U0B3PS82G30
+    email: shaun@lexingtonservices.com
+  - name: Jennifer Mortensen
+    slack_id: U0B3VGT8RE0
+    email: jen@lexingtonservices.com
+  - name: Jeff Montgomery
+    slack_id: U0B3KHBJJ91
+    email: Jeff@LexingtonServices.com
