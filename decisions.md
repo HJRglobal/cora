@@ -814,3 +814,24 @@ view of host-edited files goes STALE/truncated -- for host files trust the Read 
 
 **Reason:** All four cost real time during the 2026-06-09 multi-session commit storm; codifying
 them prevents the next pile-up.
+
+## D-042 -- Session capture: no Python transcript API + Path("") is truthy (2026-06-09)
+
+**Decision:** (1) Cora's Python service has NO session-transcript API. The Universal Session
+Capture spec named `session_info.list_sessions` / `read_transcript`, but those are MCP tools
+available only to the Cowork/Code harness, not to the standalone service. The harvester
+(`session_capture.py`) reads the on-disk Claude Code transcripts at `~/.claude/projects/**/*.jsonl`
+directly (skip `*/subagents/*`; dedup by session id via `logs/session-captures.jsonl`; 30-min
+settle window so live sessions aren't grabbed). Claude Desktop Cowork chats live in a SEPARATE,
+undocumented `AppData\Roaming\Claude` store and are NOT reachable by the harvester -- they rely on
+the session-end self-capture doctrine instead. (2) `Path("")` is TRUTHY (it equals `Path(".")`),
+so `Path(os.environ.get("VAR", "")) or fallback` never reaches the fallback when the var is unset --
+it silently resolves to the current directory. Guard on the string (`Path(s) if s else default`),
+not on the Path object. PHI routing: if `phi_guard.is_phi_risk` fires on a transcript, the note is
+forced into the LEX-scoped store regardless of the distilled entity, so client PHI is always gated
+by `lex_phi_access` + the existing sibling / cross-entity guards.
+
+**Reason:** Both were live traps in the 2026-06-09 build. The transcript-API assumption would have
+made the feature unbuildable as specced; reading JSONL directly is the only workable path on this
+machine. The `Path("")` truthiness bug made the first dry-run find zero transcripts (it pointed at
+cwd) -- caught only because the dry-run reported "0 examined".
