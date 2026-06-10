@@ -68,6 +68,14 @@ _VISIBILITY_SKIP_TERMS = frozenset([
     "hayden greber", "emily stubbs",
 ])
 
+# Asana auto-generated system reminders that are NOT real work -- skip these.
+# "It's time to update your goal(s)" is created automatically by Asana Goals; it
+# is not an actionable task and was being nudged daily (surfaced by hygiene-asana
+# 2026-06-10 -- 6 of these were open + getting nudged). Substring, case-folded.
+_SYSTEM_NOISE_SKIP_TERMS = frozenset([
+    "it's time to update your goal",
+])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +104,12 @@ def _load_users() -> list[dict[str, Any]]:
 def _is_visibility_task(task_name: str) -> bool:
     lower = task_name.lower()
     return any(term in lower for term in _VISIBILITY_SKIP_TERMS)
+
+
+def _is_system_noise_task(task_name: str) -> bool:
+    """True for Asana auto-generated, non-actionable system reminders."""
+    lower = task_name.lower()
+    return any(term in lower for term in _SYSTEM_NOISE_SKIP_TERMS)
 
 
 def _is_lex_task(task: dict[str, Any]) -> bool:
@@ -204,6 +218,12 @@ def run(dry_run: bool = False) -> dict[str, int]:
             # Visibility CPA skip
             if _is_visibility_task(task_name):
                 log.debug("Skipping Visibility CPA task: %s", task_name)
+                continue
+
+            # Asana system-reminder skip (non-actionable auto-generated tasks,
+            # e.g. "It's time to update your goal(s)")
+            if _is_system_noise_task(task_name):
+                log.debug("Skipping Asana system-reminder task: %s", task_name)
                 continue
 
             # Cross-system lockout: skip if EITHER nudge system (this daily job
