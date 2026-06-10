@@ -94,3 +94,28 @@ def test_mixed_valid_and_invalid():
     text = "Real: <#C0B4KRQT3LY|f3e-leadership>, fake: <#C0DEADBEEF|ghost>."
     out = app_mod._validate_channel_links(text, client)
     assert out == "Real: <#C0B4KRQT3LY|f3e-leadership>, fake: #ghost."
+
+
+# ---------------------------------------------------------------------------
+# _fix_lex_channel_names — nonexistent #lex-<subentity> plain-text rewrite
+# ---------------------------------------------------------------------------
+
+def test_lex_alias_rewrites_all_four_subentities():
+    text = "Ask in #lex-llc, #lex-lts, #lex-lbhs, or #lex-lla."
+    out = app_mod._fix_lex_channel_names(text)
+    assert out == "Ask in #llc, #lts, #lbhs, or #lla."
+
+
+def test_lex_alias_rewrites_suffixed_variants():
+    out = app_mod._fix_lex_channel_names("Try #lex-llc-leadership for that.")
+    assert out == "Try #llc-leadership for that."
+
+
+def test_lex_alias_leaves_real_lex_channels_alone():
+    text = "Financial questions go to #lex-finance or #lex-leadership."
+    assert app_mod._fix_lex_channel_names(text) == text
+
+
+def test_lex_alias_no_lex_mentions_short_circuits():
+    text = "Nothing about those channels here."
+    assert app_mod._fix_lex_channel_names(text) is text

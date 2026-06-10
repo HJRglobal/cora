@@ -70,6 +70,23 @@ _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | r
 _CHANNEL_LINK_RE = re.compile(r"<#(C[A-Z0-9]+)(?:\|([^>]*))?>")
 _channel_link_cache: dict[str, bool] = {}  # channel_id -> exists
 
+# Known-bad plain-text channel names the LLM produces by blending the #lex-
+# prefix with sub-entity codes (taught by a since-fixed fndr.md line; stale
+# copies persist in swept Slack history and KB chunks). The real families are
+# #llc*, #lts*, #lbhs*, #lla*. Rewrite deterministically — "#lex-llc-leadership"
+# also corrects to "#llc-leadership".
+_LEX_CHANNEL_ALIAS_RE = re.compile(r"#lex-(llc|lts|lbhs|lla)\b")
+
+
+def _fix_lex_channel_names(text: str) -> str:
+    """Rewrite nonexistent #lex-<subentity> channel names to the real family."""
+    if "#lex-" not in text:
+        return text
+    fixed, n = _LEX_CHANNEL_ALIAS_RE.subn(r"#\1", text)
+    if n:
+        log.warning("lex_channel_alias rewritten: %d occurrence(s)", n)
+    return fixed
+
 
 def _validate_channel_links(text: str, client) -> str:
     """Replace channel links whose IDs don't resolve with plain '#name' text."""
@@ -441,6 +458,7 @@ def _dispatch_qa(
         response_text = format_reply(
             response_text, is_tool_output=bool(gen_meta.get("used_tools")),
         )
+        response_text = _fix_lex_channel_names(response_text)
         response_text = _validate_channel_links(response_text, client)
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
@@ -520,6 +538,7 @@ def _dispatch_qa(
     response_text = format_reply(
         response_text, is_tool_output=bool(gen_meta.get("used_tools")),
     )
+    response_text = _fix_lex_channel_names(response_text)
     response_text = _validate_channel_links(response_text, client)
     _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
