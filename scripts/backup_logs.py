@@ -1,4 +1,4 @@
-"""Daily backup — copies operational data to Google Drive for disaster recovery.
+r"""Daily backup — copies operational data to Google Drive for disaster recovery.
 
 Backs up:
 - data/cora_kb.db (CRITICAL — the entire knowledge base; uses SQLite online backup API)
