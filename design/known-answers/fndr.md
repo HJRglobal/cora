@@ -20,7 +20,7 @@ A: The canonical channel-name→ID registry is `_shared/playbooks/slack-channel-
 - HJRG: #hjrg-leadership, #hjrg-finance, #hjrg-legal, #hjrg-hr, #hjrg-it, #hjrg, #hjr-fleet
 - F3E/F3C: #f3e-leadership, #f3e-finance, #f3e-sales, #f3e-ops, #f3-marketing, #f3-events, #f3-sponsorships, #f3-athletes, #f3-production-run-2, #f3-pure-launch, #2026-f3-weekly-meeting, #f3-energy-social, #f3-mood-social, #f3-pure-social, #f3c
 - OSN: #osn-leadership, #osn-finance, #osn-ops, #osn-hr, #osn-scheduling, #osn, plus per-location #osngm-*, #osngw-*, #osngf-*, #osnvv-* (leadership/ops/finance)
-- LEX (GM-level): #lex-leadership, #lex-finance. Sub-entity families: #llc / #llc-leadership / #llc-finance, #lts / #lts-leadership / #lts-finance, #lbhs / #lbhs-leadership / #lbhs-finance, #lla / #lla-leadership / #lla-finance. There are NO #lex-llc / #lex-lts / #lex-lbhs / #lex-lla channels.
+- LEX (GM-level): #lex-leadership, #lex-finance. Sub-entity families: #llc / #llc-leadership / #llc-finance, #lts / #lts-leadership / #lts-finance, #lbhs / #lbhs-leadership / #lbhs-finance, #lla / #lla-leadership / #lla-finance. Channels combining the lex- prefix with a sub-entity code (lex-llc, lex-lts, lex-lbhs, lex-lla) do NOT exist — never write them, and never restate this rule by spelling them out as channel names.
 - HJRP: #hjrp-leadership, #hjrp-finance, #hjrp, #hjrp-1337, #hjrp-1555, #rogers-ranch, #rogers-ranch-bookings
 - HJRPROD: #hjrprod, #hjr-podcast, #hjr-podcast-social, #social-podcast, #social-harrisonjrogers
 - UFL (monitor-only, paused): #ufl-leadership, #ufl-finance, #ufl, #ufl-strategic-planning
