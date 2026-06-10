@@ -881,3 +881,14 @@ relaunched 10:59:45, heartbeats steady from 11:00:48.
   bypass so the formatter's GID redaction did not apply. Watch for recurrence.
 - Untracked leftovers in the tree (not committed, unknown origin): .git-corrupt-backup/,
   backups/, deployment/recover-backlog-2026-06-08.ps1, scripts/run_retroactive_hashtag_scan.py.
+
+**Addendum (same day, later session):** Both flags RESOLVED, Harrison-directed.
+(1) Post-BAA authorized-custodian language shipped to all 5 LEX prompts (`0dad7c4`);
+verified live in #lex-leadership -- Cora now correctly offers client-level PHI to the
+four custodians in LEX scope at minimum-necessary, LBHS keeps the 42 CFR Part 2
+heightened posture. (2) Hallucinated channel-link validator shipped (`4a03a1c`) --
+_validate_channel_links verifies every <#Cxxx|name> token via conversations_info on
+ALL replies including tool-bypass output. Also: working tree fully cleaned (`ff5e877`)
+-- runtime churn files untracked + ignored, ending the perpetually-dirty-tree
+condition. Second clean restart 12:07:55 AZ, heartbeat fresh. HEAD `4a03a1c`,
+3,643 passed / 41 skipped.
