@@ -210,6 +210,20 @@ def _next_watermark(
     return 0
 
 
+def _effective_since(watermark_ts: int, force_since_days: int | None, sync_start: int) -> int:
+    """Reach back at least `force_since_days` for THIS run, regardless of watermark.
+
+    For a deliberate windowed backfill (e.g. --force-since-days 550 = ~18 months):
+    returns the EARLIER of the account's existing watermark and (now - N days), so a
+    recent watermark does not stop the run from re-reaching older mail. After processing,
+    _next_watermark still advances to "now", so this does not regress forward progress.
+    None/0 => no override (normal incremental behavior).
+    """
+    if not force_since_days:
+        return watermark_ts
+    return min(watermark_ts, sync_start - force_since_days * 86400)
+
+
 def _upsert_with_retry(kb, docs, log, attempts: int = 5, base_delay: float = 2.0) -> int:
     """Upsert a batch, retrying on transient 'database is locked' errors.
 
@@ -250,6 +264,13 @@ def main() -> int:
         "--accounts", type=str, default="",
         help="Comma-separated list of account emails to sweep (default: all enabled). "
              "Use for targeted backfill of specific mailboxes.",
+    )
+    parser.add_argument(
+        "--force-since-days", type=int, default=None,
+        help="Force a re-reach back N days for EVERY account this run, ignoring its "
+             "watermark (e.g. 550 ~= 18 months). Pair with a high --max-threads so a "
+             "busy account's full window is fetched in one pass. Watermarks still advance "
+             "to now afterward, so this does not regress forward progress.",
     )
     args = parser.parse_args()
 
@@ -300,6 +321,7 @@ def main() -> int:
             continue
 
         watermark_ts = watermarks.get(user_email, fallback_ts)
+        watermark_ts = _effective_since(watermark_ts, args.force_since_days, sync_start)
         log.info(
             "Sweeping %s (%s, entity_default=%s, since=%d)",
             user_email, display_name, entity_default, watermark_ts,

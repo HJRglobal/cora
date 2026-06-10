@@ -192,6 +192,28 @@ class TestNextWatermark:
         assert m._next_watermark(499, 500, 1, 9999) == 9999
 
 
+class TestEffectiveSince:
+    """Layer A -- windowed-backfill override (--force-since-days)."""
+
+    def test_no_override_returns_watermark(self):
+        m = _load_sweep()
+        assert m._effective_since(2000, None, 9999) == 2000
+        assert m._effective_since(2000, 0, 9999) == 2000
+
+    def test_override_reaches_back_past_recent_watermark(self):
+        m = _load_sweep()
+        sync = 1_000_000
+        # 5-day force = sync - 432000; a recent watermark (sync-100) must be pulled back
+        out = m._effective_since(sync - 100, 5, sync)
+        assert out == sync - 5 * 86400
+
+    def test_override_does_not_move_an_even_older_watermark_forward(self):
+        m = _load_sweep()
+        sync = 1_000_000
+        very_old = sync - 999 * 86400  # older than the 5-day window
+        assert m._effective_since(very_old, 5, sync) == very_old  # keeps the earlier ts
+
+
 # ── Layer B: import-guarded unit tests with mocks ─────────────────────────────
 
 try:
