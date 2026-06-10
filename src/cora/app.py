@@ -60,6 +60,45 @@ def _is_blocked_channel(channel_id: str) -> bool:
 _FOUNDER_ID = "U0B2RM2JYJ1"  # Harrison — KB approvals and cross-entity access
 _GAP_RE = re.compile(r"\n*\s*\[CORA_KNOWLEDGE_GAP:\s*(.+?)\]\s*$", re.DOTALL | re.IGNORECASE)
 
+# ── Channel-link validation ────────────────────────────────────────────────────
+# The LLM occasionally invents Slack channel tokens (<#Cxxxx|name>) with
+# fabricated IDs; Slack renders those as broken links (observed 2026-06-10 in a
+# PHI-redirect reply). Verify each ID via conversations_info and degrade invalid
+# ones to plain "#name" text. Applies to ALL replies including tool outputs —
+# genuine tool-emitted channel IDs validate fine, so this is safe alongside the
+# D-032 tool-output bypass.
+_CHANNEL_LINK_RE = re.compile(r"<#(C[A-Z0-9]+)(?:\|([^>]*))?>")
+_channel_link_cache: dict[str, bool] = {}  # channel_id -> exists
+
+
+def _validate_channel_links(text: str, client) -> str:
+    """Replace channel links whose IDs don't resolve with plain '#name' text."""
+    if "<#" not in text:
+        return text
+
+    def _sub(m: re.Match) -> str:
+        cid, label = m.group(1), m.group(2) or ""
+        ok = _channel_link_cache.get(cid)
+        if ok is None:
+            try:
+                resp = client.conversations_info(channel=cid)
+                ok = bool(resp.get("ok"))
+                _channel_link_cache[cid] = ok
+            except Exception as exc:  # noqa: BLE001
+                if "channel_not_found" in str(exc):
+                    ok = False
+                    _channel_link_cache[cid] = ok
+                else:
+                    # Transient API error — keep the token, don't cache a verdict.
+                    log.warning("channel-link check failed for %s: %s", cid, exc)
+                    return m.group(0)
+        if ok:
+            return m.group(0)
+        log.warning("invalid_channel_link stripped: id=%s label=%s", cid, label)
+        return f"#{label}" if label else "the relevant channel"
+
+    return _CHANNEL_LINK_RE.sub(_sub, text)
+
 # Feature 3: Decision-language patterns for pin-on-approval logic
 _DECISION_RE = re.compile(
     r"\b(decided|locked|going with|approved|we will|we won'?t|not going to|"
@@ -402,6 +441,7 @@ def _dispatch_qa(
         response_text = format_reply(
             response_text, is_tool_output=bool(gen_meta.get("used_tools")),
         )
+        response_text = _validate_channel_links(response_text, client)
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
@@ -480,6 +520,7 @@ def _dispatch_qa(
     response_text = format_reply(
         response_text, is_tool_output=bool(gen_meta.get("used_tools")),
     )
+    response_text = _validate_channel_links(response_text, client)
     _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
