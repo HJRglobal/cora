@@ -835,3 +835,49 @@ by `lex_phi_access` + the existing sibling / cross-entity guards.
 made the feature unbuildable as specced; reading JSONL directly is the only workable path on this
 machine. The `Path("")` truthiness bug made the first dry-run find zero transcripts (it pointed at
 cwd) -- caught only because the dry-run reported "0 examined".
+
+
+## Closeout -- 2026-06-10 weekly closeout: D-032 wiring live + single clean restart
+
+**What activated (one restart, 10:59:45 AZ 2026-06-10):**
+- `3dc0f2b` feat(comms): D-032 reply-formatter wiring -- generate_response /
+  generate_response_streaming now report tool usage via a caller-owned `meta` dict;
+  app._dispatch_qa (shared by @-mentions, thread follow-ups, /cora-ask) passes every
+  conversational reply through reply_formatter.format_reply after gap extraction and
+  before the semantic-cache store; tool-bearing replies bypass via is_tool_output=True.
+- `06417e7` fix(nudges): _SYSTEM_NOISE_SKIP_TERMS skip for Asana "It's time to update
+  your goal(s)" auto-reminders in the daily hygiene nudge (Cowork edit 2026-06-10,
+  committed for durability; picked up by the next 06:30 run, no restart needed).
+- `e8b2fac` docs(tom): committed the 2026-06-09 session's leftover [NEXT UP] per-user
+  email/Drive access-spec TOM pointer so the tree was clean for the restart.
+- Already-pushed dormant commits now confirmed live: fndr_press_pipeline_summary
+  (b418bb4), f3e.md production-KB prompt + T3 escalation (8acbdf4), reply-formatter
+  module + refusal-copy fix (544bbe2), Universal Session Capture + LEX PHI custodian
+  gate (4a9c8c9 -- was already live since the 2026-06-09 restart).
+
+**State:** HEAD `e8b2fac` on origin/main. Full suite 3,636 passed / 41 skipped.
+Restart: orphan-kill via WMI CommandLine match (2 procs killed), single instance
+relaunched 10:59:45, heartbeats steady from 11:00:48.
+
+**Smoke results (live Slack, 11:07):**
+1. Press pipeline (#hjrg-leadership): PASS -- totals + status breakdown + per-entity
+   Published-vs-AfC; tool bypass kept rich output intact.
+2. F3 production KB (#f3e-leadership): PASS -- "Pure R-ALA, not RS-ALA" + Run 1 context.
+3. Reply formatter conversational (#hjrg-leadership): PASS -- no em-dashes / markdown
+   bold / emoji in a no-tool reply; log confirms tool-using replies took the bypass.
+4. PHI custodian gate: PASS at the code level -- custodian (Harrison) in #lex-leadership
+   reached the LLM (no hard refusal); PHI ask in non-LEX channel did not surface client
+   detail. Non-custodian refusal covered by tests/test_lex_phi_access.py (cannot be
+   live-tested from Harrison's account).
+
+**Flags for follow-up (no code change this session):**
+- lex*.md system prompts still say "HIPAA compliance for Slack-with-Lex is UNVERIFIED
+  as of 2026-05-24" -- stale vs the 2026-06-09 BAA confirmation, so Cora describes the
+  custodian gate as inactive and behaviorally refuses PHI to custodians in LEX channels.
+  Fail-closed (safe direction), but the prompt layer now lags the sanctioned model.
+  Harrison to decide the prompt-language update.
+- In the non-LEX PHI redirect, Cora emitted channel links with IDs not present in the
+  channel registry (likely hallucinated <#id|name> tokens) -- the reply took the tool
+  bypass so the formatter's GID redaction did not apply. Watch for recurrence.
+- Untracked leftovers in the tree (not committed, unknown origin): .git-corrupt-backup/,
+  backups/, deployment/recover-backlog-2026-06-08.ps1, scripts/run_retroactive_hashtag_scan.py.
