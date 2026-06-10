@@ -45,26 +45,15 @@ if (-not (Test-Path $SCRIPT_PATH -PathType Leaf)) {
 Write-Host "  OK  $SCRIPT_PATH"
 
 # ------------------------------------------------------------------
-# [3/5] Locate uv.exe
+# [3/5] Locate the repo venv python (D-005: never uv in scheduled tasks)
 # ------------------------------------------------------------------
-Write-Host "[3/5] Locating uv.exe..."
-$uvExe = $null
-$candidates = @(
-    "C:\Users\Harri\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\uv\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe"
-)
-foreach ($c in $candidates) {
-    if (Test-Path $c -PathType Leaf) { $uvExe = $c; break }
-}
-if (-not $uvExe) {
-    try { $uvExe = (Get-Command uv -ErrorAction Stop).Source } catch {}
-}
-if (-not $uvExe) {
-    Write-Host "  ERROR: uv.exe not found. Install uv first: https://docs.astral.sh/uv/" -ForegroundColor Red
+Write-Host "[3/5] Locating venv python..."
+$PythonExe = "$REPO_DIR\.venv\Scripts\python.exe"
+if (-not (Test-Path $PythonExe -PathType Leaf)) {
+    Write-Host "  ERROR: venv python not found at $PythonExe. Create the venv first (uv venv / uv sync)." -ForegroundColor Red
     exit 1
 }
-Write-Host "  OK  $uvExe"
+Write-Host "  OK  $PythonExe"
 
 # ------------------------------------------------------------------
 # [4/5] Build and register the task (idempotent -- remove then re-add)
@@ -79,14 +68,16 @@ if ($existing) {
 }
 
 $action = New-ScheduledTaskAction `
-    -Execute $uvExe `
-    -Argument "run python scripts/backup_logs.py" `
+    -Execute $PythonExe `
+    -Argument "scripts\backup_logs.py" `
     -WorkingDirectory $REPO_DIR
 
 $trigger = New-ScheduledTaskTrigger -Daily -At $TRIGGER_TIME
 
+# 60-min limit: the online backup of the multi-GB cora_kb.db can exceed the old
+# 10-min cap and get killed mid-copy, leaving a truncated/missing backup.
 $settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 60) `
     -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -129,7 +120,10 @@ Write-Host "The backup will run automatically every day at 1:00 PM."
 Write-Host "To run it manually right now:"
 Write-Host "  Start-ScheduledTask -TaskName '$TASK_NAME'"
 Write-Host "Or run the script directly with --dry-run first to preview:"
-Write-Host "  uv run python scripts/backup_logs.py --dry-run"
+Write-Host "  .venv\Scripts\python.exe scripts\backup_logs.py --dry-run"
+Write-Host ""
+Write-Host "Encrypted secrets backup requires CORA_BACKUP_PASSPHRASE in the environment"
+Write-Host "(store it in your password manager). Without it, the secrets step is skipped."
 Write-Host ""
 Write-Host "Backups land in: G:\My Drive\HJR-Founder-OS\_shared\projects\cora\backups\YYYY-MM-DD\"
 Write-Host ""
