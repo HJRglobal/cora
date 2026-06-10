@@ -8,6 +8,9 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [NEXT UP] Per-user email/Drive access control -- spec ready, build after the 18mo gmail backfill
+Spec: `G:\My Drive\HJR-Founder-OS\_shared\projects\cora\design\2026-06-09_fndr_per-user-email-drive-access-spec.md` (also KB-ingested via static_md). Two-tier rule: (1) institutional knowledge stays usable as context for everyone via header-stripped chunks; (2) specific email/Drive retrieval is DM-only + owner's-own-mailbox-only, Harrison-override (allowlist), fail-closed. Code-level guard + new DM retrieval path + tests (D-034 pattern). Gate: build after `--force-since-days 550` gmail backfill lands + Drive owner-tagging confirmed.
+
 ### [GMAIL/KB + BACKUP/DR] Gmail sweep coverage fix + DR backup hardening -- 2026-06-09 (commits 02813dd, d2ac2a7, ec5af47, 5b3967f)
 
 Repo HEAD: `5b3967f` on `origin/main` | full suite **3,628 passed / 41 skipped** | Cora restarted, heartbeat fresh | gmail catch-up CONFIRMED working in prod.
