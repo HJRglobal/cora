@@ -2613,6 +2613,11 @@ def _safe_plate_section(label: str, builder: Callable[..., Any], *args: Any) -> 
 
 def _plate_asana_section(target_id: str, entity: str) -> str:
     """Open Asana tasks for the target, entity-scoped. Fail-soft string."""
+    # Sub-entities canonicalize to their parent for the task filter --
+    # ENTITY_PROJECT_PREFIXES has no LEX-LLC/OSNGF/... keys, so a raw
+    # sub-entity fell through _filter_tasks_by_entity UNFILTERED. A
+    # sub-entity scope must never be wider than its parent's.
+    entity = _SUBENTITY_PARENT.get(entity, entity)
     mapping = _load_slack_asana_map()
     user = mapping.get(target_id)
     asana_gid = str((user or {}).get("asana_user_gid", "") or "")

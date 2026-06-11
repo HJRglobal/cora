@@ -1,522 +1,430 @@
-"""Tests for Feature #2 -- Per-Role Entity Briefings.
+"""Tests for the org-roles-driven daily briefing (Org Synthesis Phase 2, deliverable 2).
 
 Coverage:
-  - _load_role_config(): happy path, missing file, malformed entry
-  - _load_users(): merge with role config, skip_briefing flag, fallback defaults
-  - _fetch_tasks(): entity filtering (F3E, LEX, OSN, FNDR pass-through)
-  - _fetch_extra_data(): each extra_data key, unknown key handled gracefully
-  - _fetch_hubspot_f3e_summary(): success + error fallback
-  - _fetch_hubspot_all_summary(): success + error fallback
-  - _fetch_financial_snapshot(): success + error fallback
-  - _fetch_deal_aging_summary(): no DB, empty table, aging logic, no aging
-  - _build_briefing(): prompt includes role + entity + extra_data sections
-  - _load_asana_users(): happy path, missing file
-  - main(): full run, missing env vars, no users
+  - roster: registry-driven parity (every active registry user with a Slack ID
+    gets a briefing built), externals + registry-only excluded, fail-closed
+  - section composition: reuses the plate builders from tool_dispatch; LEX
+    users never get a pipeline section; stalled decisions are Harrison-only;
+    sections fail soft to stub lines
+  - digest mode (DEFAULT): ONE DM to Harrison containing every user's
+    would-be briefing; no per-user DMs (rollout doctrine 2026-06-11)
+  - send mode: per-user DMs only with the explicit --send-users flag
+  - retirement of role-briefing-config.yaml (old config path is gone)
+  - digest chunking
+  - sub-entity canonicalization in the SHARED plate task builder (LEX-LLC
+    scopes to LEX, never unfiltered)
+
+Doctrine: direct `sys.path + import mod` (NOT spec_from_file_location) so
+patch.object(rdb, ...) intercepts module-global lookups.
 """
 
 from __future__ import annotations
 
-import json
 import sys
-import time
-import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+
+from cora import org_roles  # noqa: E402
+from cora.tools import tool_dispatch as td  # noqa: E402
+
+import run_daily_briefing as rdb  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Import the module under test
+# Registry fixture
 # ---------------------------------------------------------------------------
 
-import importlib
-import importlib.util
+_HARRISON = "U0B2RM2JYJ1"  # must match tool_dispatch._HARRISON_SLACK_ID
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location(
-        "run_daily_briefing",
-        _REPO_ROOT / "scripts" / "run_daily_briefing.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-# We need to mock asana_client before loading
-_ASANA_MOCK = MagicMock()
-_ASANA_MOCK.get_user_tasks = MagicMock(return_value=[])
-_ASANA_MOCK.AsanaClientError = Exception
-
-with patch.dict("sys.modules", {
-    "cora.tools.asana_client": _ASANA_MOCK,
-    "dotenv": MagicMock(load_dotenv=lambda: None),
-}):
-    rdb = _load_module()
-
-# ---------------------------------------------------------------------------
-# Fixtures and helpers
-# ---------------------------------------------------------------------------
-
-_SAMPLE_ASANA_YAML = """
+_SAMPLE_REGISTRY = """
 users:
-  - slack_user_id: U001
-    asana_user_gid: "111"
-    asana_email: alice@hjrglobal.com
-    display_name: Alice Smith
-  - slack_user_id: U002
-    asana_user_gid: "222"
-    asana_email: bob@hjrglobal.com
-    display_name: Bob Jones
-  - slack_user_id: U003
-    asana_user_gid: "333"
-    asana_email: carol@hjrglobal.com
-    display_name: Carol White
-"""
-
-_SAMPLE_ROLE_YAML = """
-users:
-  - slack_user_id: U001
-    role: "F3E Sales Lead"
-    entity: F3E
-    extra_data:
-      - hubspot_f3e
-      - deal_aging
-    briefing_channel: ""
-  - slack_user_id: U002
-    role: "Controller"
-    entity: HJRG
-    extra_data:
-      - financial
-    briefing_channel: "#hjrg-finance"
-  - slack_user_id: U003
-    skip_briefing: true
-    role: "External Contractor"
+  - slack_id: U0B2RM2JYJ1
+    name: Harrison Rogers
+    role: Founder / CEO
     entity: FNDR
-    extra_data: []
-    briefing_channel: ""
+    responsibilities:
+      - Portfolio strategy
+  - slack_id: U101
+    name: Tara Sales
+    role: F3E Sales Lead
+    entity: F3E
+    responsibilities:
+      - Retail pipeline
+  - slack_id: U102
+    name: Lana Lex
+    role: LLC Office Manager
+    entity: LEX-LLC
+  - slack_id: UEXT
+    name: Gene Guest
+    role: Outside Consultant
+    entity: F3E
+    external: true
+  - name: Reggie RegistryOnly
+    role: Part-time EA
+    entity: HJRG
 """
 
 
-def _make_task(name: str, project: str, due: str = "", url: str = "") -> dict:
-    return {
-        "name": name,
-        "due_on": due,
-        "permalink_url": url,
-        "memberships": [{"project": {"name": project}}],
-        "projects": [],
-    }
+@pytest.fixture
+def registry(tmp_path):
+    p = tmp_path / "org-roles.yaml"
+    p.write_text(_SAMPLE_REGISTRY, encoding="utf-8")
+    with patch.object(org_roles, "_ROLES_PATH", p):
+        org_roles.invalidate_cache()
+        yield p
+    org_roles.invalidate_cache()
+
+
+@pytest.fixture
+def empty_registry(tmp_path):
+    p = tmp_path / "org-roles.yaml"
+    p.write_text("users: []\n", encoding="utf-8")
+    with patch.object(org_roles, "_ROLES_PATH", p):
+        org_roles.invalidate_cache()
+        yield p
+    org_roles.invalidate_cache()
+
+
+def _mock_slack():
+    client = MagicMock()
+    client.conversations_open.return_value = {"channel": {"id": "DM-CHAN"}}
+    client.chat_postMessage.return_value = {"ok": True}
+    return client
+
+
+_ENV = {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": "key"}
 
 
 # ---------------------------------------------------------------------------
-# _load_asana_users
+# Roster (registry-driven config parity)
 # ---------------------------------------------------------------------------
 
-class TestLoadAsanaUsers:
-    def test_happy_path(self, tmp_path):
-        p = tmp_path / "slack-to-asana.yaml"
-        p.write_text(_SAMPLE_ASANA_YAML, encoding="utf-8")
-        with patch.object(rdb, "_ASANA_MAP", p):
-            users = rdb._load_asana_users()
-        assert len(users) == 3
-        assert "U001" in users
-        assert users["U001"]["first_name"] == "Alice"
+class TestRoster:
+    def test_every_active_registry_user_with_slack_id_included(self, registry):
+        roster, _ = rdb._load_briefing_roster()
+        names = {r.name for r in roster}
+        assert names == {"Harrison Rogers", "Tara Sales", "Lana Lex"}
 
-    def test_missing_file(self, tmp_path, caplog):
-        with patch.object(rdb, "_ASANA_MAP", tmp_path / "nonexistent.yaml"):
-            users = rdb._load_asana_users()
-        assert users == {}
+    def test_external_excluded_from_delivery(self, registry):
+        roster, excluded = rdb._load_briefing_roster()
+        assert all(r.name != "Gene Guest" for r in roster)
+        assert any("Gene Guest" in n and "external" in n for n in excluded)
 
-    def test_skips_incomplete_entries(self, tmp_path):
-        yaml_text = "users:\n  - slack_user_id: U999\n  - slack_user_id: U001\n    asana_user_gid: '1'\n    display_name: Valid User\n"
-        p = tmp_path / "asana.yaml"
-        p.write_text(yaml_text, encoding="utf-8")
-        with patch.object(rdb, "_ASANA_MAP", p):
-            users = rdb._load_asana_users()
-        assert "U001" in users
-        assert "U999" not in users
+    def test_registry_only_excluded_from_delivery(self, registry):
+        roster, excluded = rdb._load_briefing_roster()
+        assert all(r.name != "Reggie RegistryOnly" for r in roster)
+        assert any("Reggie RegistryOnly" in n and "registry-only" in n for n in excluded)
 
+    def test_empty_registry_yields_no_recipients(self, empty_registry):
+        roster, excluded = rdb._load_briefing_roster()
+        assert roster == []
+        assert excluded == []
 
-# ---------------------------------------------------------------------------
-# _load_role_config
-# ---------------------------------------------------------------------------
-
-class TestLoadRoleConfig:
-    def test_happy_path(self, tmp_path):
-        p = tmp_path / "role-briefing-config.yaml"
-        p.write_text(_SAMPLE_ROLE_YAML, encoding="utf-8")
-        with patch.object(rdb, "_ROLE_CONFIG", p):
-            config = rdb._load_role_config()
-        assert "U001" in config
-        assert config["U001"]["role"] == "F3E Sales Lead"
-        assert config["U001"]["entity"] == "F3E"
-        assert "hubspot_f3e" in config["U001"]["extra_data"]
-
-    def test_missing_file_returns_empty(self, tmp_path):
-        with patch.object(rdb, "_ROLE_CONFIG", tmp_path / "nonexistent.yaml"):
-            config = rdb._load_role_config()
-        assert config == {}
-
-    def test_malformed_yaml_returns_empty(self, tmp_path):
-        p = tmp_path / "role.yaml"
-        p.write_text("not: valid: yaml: [[[", encoding="utf-8")
-        with patch.object(rdb, "_ROLE_CONFIG", p):
-            config = rdb._load_role_config()
-        assert config == {}
+    def test_unknown_users_skipped_by_construction(self, registry):
+        # The registry IS the roster -- there is no merge with any other map,
+        # so a user absent from org-roles.yaml can never receive a briefing.
+        roster, _ = rdb._load_briefing_roster()
+        assert all(r.slack_id for r in roster)
+        assert {r.slack_id for r in roster} <= {_HARRISON, "U101", "U102"}
 
 
 # ---------------------------------------------------------------------------
-# _load_users (merged)
+# Section composition (shared plate builders)
 # ---------------------------------------------------------------------------
 
-class TestLoadUsers:
-    def test_merge_applies_role(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        rp = tmp_path / "role.yaml"
-        ap.write_text(_SAMPLE_ASANA_YAML, encoding="utf-8")
-        rp.write_text(_SAMPLE_ROLE_YAML, encoding="utf-8")
-        with patch.object(rdb, "_ASANA_MAP", ap), patch.object(rdb, "_ROLE_CONFIG", rp):
-            users = rdb._load_users()
-        # Carol (U003) should be skipped
-        names = [u["display_name"] for u in users]
-        assert "Carol White" not in names
-        assert len(users) == 2
-        alice = next(u for u in users if u["slack_user_id"] == "U001")
-        assert alice["role"] == "F3E Sales Lead"
-        assert alice["entity"] == "F3E"
-        assert "hubspot_f3e" in alice["extra_data"]
+class TestComposeSections:
+    def test_role_header_and_lanes(self, registry):
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value=None):
+            out = rdb._compose_sections(rec)
+        assert "ROLE" in out
+        assert "Tara Sales -- F3E Sales Lead (F3E)" in out
+        assert "Lanes: Retail pipeline" in out
+        assert "OPEN TASKS\nT" in out
+        assert "CALENDAR\nC" in out
 
-    def test_no_role_config_uses_defaults(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        ap.write_text(_SAMPLE_ASANA_YAML, encoding="utf-8")
-        with patch.object(rdb, "_ASANA_MAP", ap), patch.object(rdb, "_ROLE_CONFIG", tmp_path / "nope.yaml"):
-            users = rdb._load_users()
-        assert len(users) == 3
-        assert all(u["role"] == "Team Member" for u in users)
-        assert all(u["entity"] == "FNDR" for u in users)
+    def test_harrison_gets_stalled_decisions(self, registry):
+        rec = org_roles.get_role(_HARRISON)
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value=None), \
+             patch.object(rdb, "_tool_fndr_open_decisions", return_value="DEC") as dec:
+            out = rdb._compose_sections(rec)
+        assert "STALLED DECISIONS\nDEC" in out
+        dec.assert_called_once()
 
-    def test_briefing_channel_from_config(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        rp = tmp_path / "role.yaml"
-        ap.write_text(_SAMPLE_ASANA_YAML, encoding="utf-8")
-        rp.write_text(_SAMPLE_ROLE_YAML, encoding="utf-8")
-        with patch.object(rdb, "_ASANA_MAP", ap), patch.object(rdb, "_ROLE_CONFIG", rp):
-            users = rdb._load_users()
-        bob = next(u for u in users if u["slack_user_id"] == "U002")
-        assert bob["briefing_channel"] == "#hjrg-finance"
+    def test_non_harrison_never_gets_stalled_decisions(self, registry):
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value=None), \
+             patch.object(rdb, "_tool_fndr_open_decisions") as dec:
+            out = rdb._compose_sections(rec)
+        assert "STALLED DECISIONS" not in out
+        dec.assert_not_called()
+
+    def test_lex_user_never_gets_pipeline_section(self, registry):
+        # Uses the REAL shared _plate_hubspot_section: LEX scope (incl.
+        # sub-entities) returns None before any map/network access.
+        rec = org_roles.get_role("U102")
+        assert rec.entity == "LEX-LLC"
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"):
+            out = rdb._compose_sections(rec)
+        assert "DEAL PIPELINE" not in out
+
+    def test_pipeline_section_present_for_owner(self, registry):
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value="DEALS"):
+            out = rdb._compose_sections(rec)
+        assert "DEAL PIPELINE\nDEALS" in out
+
+    def test_section_crash_degrades_to_stub(self, registry):
+        # Real _safe_plate_section wraps the patched (crashing) builder.
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", side_effect=RuntimeError("boom")), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value=None):
+            out = rdb._compose_sections(rec)
+        assert "(Open tasks section unavailable right now.)" in out
+
+    def test_pipeline_crash_degrades_to_stub(self, registry):
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", return_value="T"), \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", side_effect=RuntimeError("boom")):
+            out = rdb._compose_sections(rec)
+        assert "DEAL PIPELINE\n(Deal pipeline section unavailable right now.)" in out
 
 
 # ---------------------------------------------------------------------------
-# _fetch_tasks (entity filtering)
+# Digest mode (DEFAULT -- rollout doctrine)
 # ---------------------------------------------------------------------------
 
-class TestFetchTasks:
+class TestDigestMode:
+    def _run(self, argv, registry_users=3):
+        client = _mock_slack()
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
+             patch.object(rdb, "_write_audit", return_value=None):
+            rc = rdb.main(argv)
+        return rc, client
+
+    def test_default_mode_is_digest_to_harrison_only(self, registry):
+        rc, client = self._run([])
+        assert rc == 0
+        # ONE DM conversation opened -- Harrison's
+        client.conversations_open.assert_called_once_with(users=[_HARRISON])
+        sent = "\n".join(
+            call.kwargs["text"] for call in client.chat_postMessage.call_args_list
+        )
+        assert "DAILY BRIEFING DIGEST" in sent
+        for name in ("Harrison Rogers", "Tara Sales", "Lana Lex"):
+            assert f"BRIEF::{name}" in sent
+
+    def test_digest_only_flag_equivalent_to_default(self, registry):
+        rc, client = self._run(["--digest-only"])
+        assert rc == 0
+        client.conversations_open.assert_called_once_with(users=[_HARRISON])
+
+    def test_digest_header_carries_rollout_note_and_exclusions(self, registry):
+        _, client = self._run([])
+        first_msg = client.chat_postMessage.call_args_list[0].kwargs["text"]
+        assert "per-user delivery is OFF" in first_msg
+        assert "--send-users" in first_msg
+        assert "Gene Guest" in first_msg          # external, named as excluded
+        assert "Reggie RegistryOnly" in first_msg  # registry-only, named as excluded
+
+    def test_no_briefing_dm_ever_reaches_external_or_other_users(self, registry):
+        _, client = self._run([])
+        opened = [c.kwargs["users"] for c in client.conversations_open.call_args_list]
+        assert opened == [[_HARRISON]]
+
+    def test_build_failure_lands_in_digest_and_returns_2(self, registry):
+        client = _mock_slack()
+
+        def _build(rec, **k):
+            if rec.name == "Lana Lex":
+                raise RuntimeError("asana down")
+            return f"BRIEF::{rec.name}"
+
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing", side_effect=_build), \
+             patch.object(rdb, "_write_audit", return_value=None):
+            rc = rdb.main([])
+        assert rc == 2
+        sent = "\n".join(
+            call.kwargs["text"] for call in client.chat_postMessage.call_args_list
+        )
+        assert "(briefing could not be built" in sent
+        assert "BRIEF::Tara Sales" in sent  # other users still present
+
+    def test_empty_registry_returns_0_sends_nothing(self, empty_registry):
+        rc, client = self._run([])
+        assert rc == 0
+        client.chat_postMessage.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Send mode (per-user delivery -- explicit flag only)
+# ---------------------------------------------------------------------------
+
+class TestSendMode:
+    def test_send_users_dms_each_active_registry_user(self, registry):
+        client = _mock_slack()
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
+             patch.object(rdb, "_write_audit", return_value=None), \
+             patch.object(rdb.time, "sleep", return_value=None):
+            rc = rdb.main(["--send-users"])
+        assert rc == 0
+        opened = sorted(c.kwargs["users"][0] for c in client.conversations_open.call_args_list)
+        assert opened == sorted([_HARRISON, "U101", "U102"])
+        assert client.chat_postMessage.call_count == 3
+
+    def test_user_filter_limits_delivery(self, registry):
+        client = _mock_slack()
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
+             patch.object(rdb, "_write_audit", return_value=None), \
+             patch.object(rdb.time, "sleep", return_value=None):
+            rc = rdb.main(["--send-users", "--user", "tara"])
+        assert rc == 0
+        client.conversations_open.assert_called_once_with(users=["U101"])
+
+    def test_flags_mutually_exclusive(self, registry):
+        with pytest.raises(SystemExit):
+            rdb.main(["--digest-only", "--send-users"])
+
+
+# ---------------------------------------------------------------------------
+# Dry run + env guards
+# ---------------------------------------------------------------------------
+
+class TestDryRunAndEnv:
+    def test_dry_run_sends_nothing(self, registry, capsys):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}), \
+             patch.object(rdb, "SlackWebClient") as slack_cls, \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"):
+            rc = rdb.main(["--dry-run"])
+        assert rc == 0
+        slack_cls.assert_not_called()
+        out = capsys.readouterr().out
+        assert "BRIEF::Tara Sales" in out
+
+    def test_missing_anthropic_key_returns_1(self, registry):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": ""}):
+            assert rdb.main([]) == 1
+
+    def test_missing_slack_token_returns_1_when_sending(self, registry):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}):
+            assert rdb.main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retirement of role-briefing-config.yaml (D-044 item 5 consolidation point)
+# ---------------------------------------------------------------------------
+
+class TestOldConfigRetired:
+    def test_module_has_no_role_config_path(self):
+        assert not hasattr(rdb, "_ROLE_CONFIG")
+        assert not hasattr(rdb, "_load_role_config")
+
+    def test_source_never_references_old_config(self):
+        src = Path(rdb.__file__).read_text(encoding="utf-8")
+        assert "role-briefing-config" not in src
+
+    def test_old_config_file_deleted_from_repo(self):
+        assert not (_REPO_ROOT / "data" / "maps" / "role-briefing-config.yaml").exists()
+
+    def test_roster_reads_org_roles_registry(self, registry):
+        # The roster is served by org_roles (60s TTL live-reload) -- edit the
+        # registry, invalidate, and the roster follows with no other config.
+        roster, _ = rdb._load_briefing_roster()
+        assert {r.slack_id for r in roster} == {_HARRISON, "U101", "U102"}
+
+
+# ---------------------------------------------------------------------------
+# Digest chunking
+# ---------------------------------------------------------------------------
+
+class TestDigestChunking:
+    def test_single_message_when_small(self):
+        msgs = rdb._chunk_digest("HEAD", ["a", "b"])
+        assert len(msgs) == 1
+        assert msgs[0].startswith("HEAD")
+        assert "a" in msgs[0] and "b" in msgs[0]
+
+    def test_splits_on_size_and_preserves_all_blocks(self):
+        big = "x" * 3000
+        blocks = [f"=== U{i} ===\n{big}" for i in range(4)]
+        msgs = rdb._chunk_digest("HEAD", blocks)
+        assert len(msgs) > 1
+        joined = "\n".join(msgs)
+        for i in range(4):
+            assert f"=== U{i} ===" in joined
+        # No message except a single-oversized-block one exceeds the cap by a block
+        for m in msgs:
+            assert len(m) <= rdb._DIGEST_CHUNK_CHARS + len(blocks[0])
+
+    def test_order_preserved(self):
+        big = "y" * 3400
+        blocks = [f"B{i}|{big}" for i in range(3)]
+        msgs = rdb._chunk_digest("HEAD", blocks)
+        joined = "".join(msgs)
+        assert joined.index("B0|") < joined.index("B1|") < joined.index("B2|")
+
+
+# ---------------------------------------------------------------------------
+# Sub-entity canonicalization in the SHARED plate task builder
+# ---------------------------------------------------------------------------
+
+class TestSharedBuilderSubEntityScope:
     def _tasks(self):
         return [
-            _make_task("F3E task 1", "[F3E] Sales Pipeline"),
-            _make_task("OSN task 1", "[OSN] Operations"),
-            _make_task("FNDR task 1", "[HJRG] Q1 Goals"),
-            _make_task("F3E task 2", "[F3 Pure] Launch"),
+            {
+                "name": "LEX task A",
+                "permalink_url": "https://app.asana.com/1",
+                "memberships": [{"project": {"name": "[LEX] Operations"}}],
+                "projects": [],
+            },
+            {
+                "name": "OSN task B",
+                "permalink_url": "https://app.asana.com/2",
+                "memberships": [{"project": {"name": "[OSN] Store Ops"}}],
+                "projects": [],
+            },
         ]
 
-    def test_fndr_returns_all(self):
-        with patch.object(rdb, "get_user_tasks", return_value=self._tasks()):
-            result = rdb._fetch_tasks("111", "FNDR")
-        assert len(result) == 4
+    def test_lex_llc_scopes_to_lex_not_unfiltered(self):
+        with patch.object(td, "_load_slack_asana_map",
+                          return_value={"U_X": {"asana_user_gid": "111"}}), \
+             patch.object(td.asana_client, "get_user_tasks", return_value=self._tasks()):
+            out = td._plate_asana_section("U_X", "LEX-LLC")
+        assert "LEX task A" in out
+        assert "OSN task B" not in out
 
-    def test_f3e_filters_correctly(self):
-        with patch.object(rdb, "get_user_tasks", return_value=self._tasks()):
-            result = rdb._fetch_tasks("111", "F3E")
-        names = [t["name"] for t in result]
-        assert "F3E task 1" in names
-        assert "F3E task 2" in names
-        assert "OSN task 1" not in names
-
-    def test_osn_filters_correctly(self):
-        with patch.object(rdb, "get_user_tasks", return_value=self._tasks()):
-            result = rdb._fetch_tasks("111", "OSN")
-        names = [t["name"] for t in result]
-        assert "OSN task 1" in names
-        assert "F3E task 1" not in names
-
-    def test_asana_error_returns_empty(self):
-        with patch.object(rdb, "get_user_tasks", side_effect=rdb.AsanaClientError("fail")):
-            result = rdb._fetch_tasks("111", "F3E")
-        assert result == []
-
-    def test_unknown_entity_passes_through(self):
-        with patch.object(rdb, "get_user_tasks", return_value=self._tasks()):
-            result = rdb._fetch_tasks("111", "UNKNOWN_ENTITY")
-        assert len(result) == 4  # no filter applied for unknown entity
-
-
-# ---------------------------------------------------------------------------
-# _fetch_extra_data
-# ---------------------------------------------------------------------------
-
-class TestFetchExtraData:
-    def test_hubspot_f3e_called(self):
-        # Patch the fetcher in the module's dict (already bound at load time)
-        original = rdb._EXTRA_DATA_FETCHERS["hubspot_f3e"]
-        rdb._EXTRA_DATA_FETCHERS["hubspot_f3e"] = lambda: "f3e summary"
-        try:
-            result = rdb._fetch_extra_data(["hubspot_f3e"])
-        finally:
-            rdb._EXTRA_DATA_FETCHERS["hubspot_f3e"] = original
-        assert "F3E Sales Pipeline (HubSpot)" in result
-        assert result["F3E Sales Pipeline (HubSpot)"] == "f3e summary"
-
-    def test_hubspot_all_called(self):
-        with patch.object(rdb, "_fetch_hubspot_all_summary", return_value="all summary"):
-            result = rdb._fetch_extra_data(["hubspot_all"])
-        assert "Sales Pipelines Overview (HubSpot)" in result
-
-    def test_financial_called(self):
-        with patch.object(rdb, "_fetch_financial_snapshot", return_value="cash: $500K"):
-            result = rdb._fetch_extra_data(["financial"])
-        assert "Cash Flow Snapshot" in result
-
-    def test_deal_aging_called(self):
-        with patch.object(rdb, "_fetch_deal_aging_summary", return_value="aging: 2 deals"):
-            result = rdb._fetch_extra_data(["deal_aging"])
-        assert "Deal Aging Alerts" in result
-
-    def test_unknown_key_skipped_gracefully(self):
-        result = rdb._fetch_extra_data(["hubspot_f3e", "totally_unknown_key"])
-        # only 1 result (unknown key skipped, hubspot_f3e returned error string since not mocked)
-        assert "totally_unknown_key" not in str(result)
-
-    def test_empty_list_returns_empty(self):
-        result = rdb._fetch_extra_data([])
-        assert result == {}
-
-
-# ---------------------------------------------------------------------------
-# Individual extra data fetchers
-# ---------------------------------------------------------------------------
-
-class TestExtraFetchers:
-    def test_hubspot_f3e_error_returns_fallback(self):
-        with patch("cora.tools.hubspot_client.get_f3e_pipeline_summary_text", side_effect=Exception("fail")):
-            result = rdb._fetch_hubspot_f3e_summary()
-        assert "unavailable" in result
-
-    def test_hubspot_all_error_returns_fallback(self):
-        with patch("cora.tools.hubspot_client.get_f3e_pipeline_summary_text", side_effect=Exception("fail")):
-            result = rdb._fetch_hubspot_all_summary()
-        assert "unavailable" in result
-
-    def test_financial_error_returns_fallback(self):
-        # Patch the fetcher at the module level since it uses a local import
-        with patch.object(rdb, "_fetch_financial_snapshot", return_value="(financial data unavailable)"):
-            result = rdb._fetch_extra_data(["financial"])
-        assert "unavailable" in result["Cash Flow Snapshot"]
-
-    def test_deal_aging_no_db(self, tmp_path):
-        with patch.object(rdb, "_REPO_ROOT", tmp_path):
-            result = rdb._fetch_deal_aging_summary()
-        assert "no deal snapshot data" in result
-
-    def test_deal_aging_empty_table(self, tmp_path):
-        import sqlite3
-        db = tmp_path / "data" / "hubspot_deal_snapshots.db"
-        db.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(db))
-        conn.execute("CREATE TABLE deal_last_stage (deal_name TEXT, stage_name TEXT, last_seen_ts INTEGER)")
-        conn.commit()
-        conn.close()
-        with patch.object(rdb, "_REPO_ROOT", tmp_path):
-            result = rdb._fetch_deal_aging_summary()
-        assert "no active deals" in result
-
-    def test_deal_aging_detects_aged_deal(self, tmp_path):
-        import sqlite3
-        db = tmp_path / "data" / "hubspot_deal_snapshots.db"
-        db.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(db))
-        conn.execute("CREATE TABLE deal_last_stage (deal_name TEXT, stage_name TEXT, last_seen_ts INTEGER)")
-        # Insert a deal that's been in "Identify" stage for 20 days (threshold: 14)
-        old_ts = int(time.time()) - 20 * 86400
-        conn.execute("INSERT INTO deal_last_stage VALUES (?, ?, ?)", ("Stale Deal", "Identify", old_ts))
-        conn.commit()
-        conn.close()
-        with patch.object(rdb, "_REPO_ROOT", tmp_path):
-            result = rdb._fetch_deal_aging_summary()
-        assert "Stale Deal" in result
-        assert "Identify" in result
-
-    def test_deal_aging_fresh_deal_not_flagged(self, tmp_path):
-        import sqlite3
-        db = tmp_path / "data" / "hubspot_deal_snapshots.db"
-        db.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(db))
-        conn.execute("CREATE TABLE deal_last_stage (deal_name TEXT, stage_name TEXT, last_seen_ts INTEGER)")
-        # A deal entered today -- should NOT appear in aging list
-        fresh_ts = int(time.time()) - 2 * 86400
-        conn.execute("INSERT INTO deal_last_stage VALUES (?, ?, ?)", ("Fresh Deal", "Identify", fresh_ts))
-        conn.commit()
-        conn.close()
-        with patch.object(rdb, "_REPO_ROOT", tmp_path):
-            result = rdb._fetch_deal_aging_summary()
-        assert "Fresh Deal" not in result
-
-
-# ---------------------------------------------------------------------------
-# _build_briefing (prompt content)
-# ---------------------------------------------------------------------------
-
-class TestBuildBriefing:
-    def _run(self, role="Sales Lead", entity="F3E", extra_data=None, tasks=None, chunks=None):
-        captured_prompts = []
-
-        def fake_create(**kwargs):
-            msg_content = kwargs.get("messages", [{}])[0].get("content", "")
-            captured_prompts.append(msg_content)
-            resp = MagicMock()
-            resp.content = [MagicMock(text="Good morning, Alice! Here is your briefing.")]
-            return resp
-
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = fake_create
-
-        import anthropic as _ant
-        with patch.object(_ant, "Anthropic", return_value=mock_client):
-            result = rdb._build_briefing(
-                api_key="test-key",
-                display_name="Alice Smith",
-                first_name="Alice",
-                role=role,
-                entity=entity,
-                tasks=tasks or [],
-                chunks=chunks or [],
-                extra_data=extra_data or {},
-                today_str="Monday, June 3, 2026",
-            )
-        return result, captured_prompts[0] if captured_prompts else ""
-
-    def test_role_in_prompt(self):
-        _, prompt = self._run(role="F3E Sales Lead")
-        assert "F3E Sales Lead" in prompt
-
-    def test_entity_note_in_prompt_for_non_fndr(self):
-        _, prompt = self._run(entity="F3E")
-        assert "F3E" in prompt
-
-    def test_extra_data_section_in_prompt(self):
-        _, prompt = self._run(extra_data={"F3E Sales Pipeline (HubSpot)": "3 open deals"})
-        assert "3 open deals" in prompt
-        assert "F3E Sales Pipeline" in prompt
-
-    def test_tasks_in_prompt(self):
-        tasks = [_make_task("Send samples to Sprouts", "[F3E] Sales")]
-        _, prompt = self._run(tasks=tasks)
-        assert "Send samples to Sprouts" in prompt
-
-    def test_returns_haiku_output(self):
-        result, _ = self._run()
-        assert "Good morning, Alice!" in result
-
-    def test_no_tasks_text(self):
-        _, prompt = self._run(tasks=[])
-        assert "no open tasks" in prompt
-
-
-# ---------------------------------------------------------------------------
-# main() integration
-# ---------------------------------------------------------------------------
-
-class TestMain:
-    def test_missing_slack_token_returns_1(self):
-        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}):
-            assert rdb.main() == 1
-
-    def test_missing_anthropic_key_returns_1(self):
-        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": ""}):
-            assert rdb.main() == 1
-
-    def test_no_users_returns_0(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        ap.write_text("users: []\n", encoding="utf-8")
-        with (
-            patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": "key"}),
-            patch.object(rdb, "_ASANA_MAP", ap),
-            patch.object(rdb, "_ROLE_CONFIG", tmp_path / "nope.yaml"),
-        ):
-            assert rdb.main() == 0
-
-    def test_full_run_success(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        rp = tmp_path / "role.yaml"
-        ap.write_text("""users:
-  - slack_user_id: U001
-    asana_user_gid: "111"
-    asana_email: alice@hjrglobal.com
-    display_name: Alice Smith
-""", encoding="utf-8")
-        rp.write_text("""users:
-  - slack_user_id: U001
-    role: "F3E Sales Lead"
-    entity: F3E
-    extra_data: []
-    briefing_channel: ""
-""", encoding="utf-8")
-
-        mock_slack = MagicMock()
-        mock_slack.conversations_open.return_value = {"channel": {"id": "DM001"}}
-        mock_slack.chat_postMessage.return_value = {"ok": True}
-
-        mock_haiku_resp = MagicMock()
-        mock_haiku_resp.content = [MagicMock(text="Good morning, Alice!")]
-        mock_ant_client = MagicMock()
-        mock_ant_client.messages.create.return_value = mock_haiku_resp
-
-        import anthropic as _ant
-        with (
-            patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": "key"}),
-            patch.object(rdb, "_ASANA_MAP", ap),
-            patch.object(rdb, "_ROLE_CONFIG", rp),
-            patch.object(rdb, "_KB_DB_PATH", tmp_path / "nope.db"),
-            patch.object(rdb, "get_user_tasks", return_value=[]),
-            patch.object(_ant, "Anthropic", return_value=mock_ant_client),
-            # Patch the already-imported SlackWebClient in the module's namespace
-            patch.object(rdb, "SlackWebClient", return_value=mock_slack),
-            patch.object(rdb, "_write_audit", return_value=None),
-        ):
-            result = rdb.main()
-        assert result == 0
-
-    def test_haiku_failure_returns_2(self, tmp_path):
-        ap = tmp_path / "asana.yaml"
-        rp = tmp_path / "role.yaml"
-        ap.write_text("""users:
-  - slack_user_id: U001
-    asana_user_gid: "111"
-    asana_email: alice@hjrglobal.com
-    display_name: Alice Smith
-""", encoding="utf-8")
-        rp.write_text("""users:
-  - slack_user_id: U001
-    role: "Sales"
-    entity: F3E
-    extra_data: []
-    briefing_channel: ""
-""", encoding="utf-8")
-
-        mock_slack = MagicMock()
-        mock_ant_client = MagicMock()
-        mock_ant_client.messages.create.side_effect = Exception("API error")
-
-        import anthropic as _ant
-        with (
-            patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": "key"}),
-            patch.object(rdb, "_ASANA_MAP", ap),
-            patch.object(rdb, "_ROLE_CONFIG", rp),
-            patch.object(rdb, "_KB_DB_PATH", tmp_path / "nope.db"),
-            patch.object(rdb, "get_user_tasks", return_value=[]),
-            patch.object(_ant, "Anthropic", return_value=mock_ant_client),
-            patch("slack_sdk.WebClient", return_value=mock_slack),
-            patch.object(rdb, "_write_audit", return_value=None),
-        ):
-            result = rdb.main()
-        assert result == 2  # partial failure
+    def test_osn_substore_scopes_to_osn(self):
+        with patch.object(td, "_load_slack_asana_map",
+                          return_value={"U_X": {"asana_user_gid": "111"}}), \
+             patch.object(td.asana_client, "get_user_tasks", return_value=self._tasks()):
+            out = td._plate_asana_section("U_X", "OSNGW")
+        assert "OSN task B" in out
+        assert "LEX task A" not in out

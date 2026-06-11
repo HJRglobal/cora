@@ -981,3 +981,43 @@ preserves the D-034 doctrine that hard security boundaries live in code-level gu
 context or prompts. Shipped: `8d153b6` (registry + loader + injection, 3,762 tests) +
 `721970e` (roster review: Jerry Reick = Staff Accountant under Justin; Tessa Miller added as
 first registry-only entry; 3,766 tests).
+
+---
+
+## 2026-06-11 -- D-044 item 5 EXECUTED: briefing rework onto org-roles.yaml; role-briefing-config.yaml retired (Org Synthesis Phase 2 d2)
+
+**What happened:** `run_daily_briefing.py` rewritten to read `data/maps/org-roles.yaml` via
+`org_roles.py`. `data/maps/role-briefing-config.yaml` is DELETED -- this was the locked
+consolidation point (D-044 item 5: existing per-user maps stay separate "until their feature
+is reworked onto the registry"). Do NOT recreate the old config; the registry IS the briefing
+roster. A regression test (`tests/test_per_role_briefing.py::TestOldConfigRetired`) fails the
+suite if the file or any source reference to it reappears.
+
+**Content contract:** per-user briefing content mirrors the `whats_on_my_plate` composite and
+REUSES its section builders from `tool_dispatch` (`_plate_asana_section`,
+`_plate_calendar_section`, `_plate_hubspot_section`, `_safe_plate_section`,
+`_tool_fndr_open_decisions`) -- the logic is shared, not forked, so plate scoping/fail-soft
+fixes apply to the briefing automatically. Sections: role + lanes, entity-scoped open tasks
+(capped 10), today/tomorrow calendar, deal pipeline for owners (LEX scope never, Tier-1
+doctrine), stalled decisions Harrison-only, plus the 25h recent-activity KB scan the briefing
+has always carried. The old `extra_data` system (hubspot_f3e / hubspot_all / financial /
+deal_aging) retired with the config -- the plate carries NO financial figures by doctrine
+(Harrison's daily Cash Flow Pulse covers cash separately).
+
+**Exclusions (fail-closed):** external consultants (`external: true`, e.g. Jason Dorfman) and
+registry-only people (no slack_id, e.g. Tessa Miller) never receive delivery; anyone absent
+from the registry is skipped by construction.
+
+**ROLLOUT DOCTRINE (Harrison-locked 2026-06-11): digest-to-Harrison-first.** The script
+DEFAULTS to digest mode -- ONE DM to Harrison containing every user's would-be briefing for
+review. Per-user delivery requires the explicit `--send-users` flag and flips on only after
+Harrison's explicit go (`setup-daily-briefing-task.ps1 -SendUsers`). Same pattern as the
+Fireflies coverage rollout. No unsolicited DMs before review.
+
+**Shared-builder fix (applies to the plate tool too):** `_plate_asana_section` now
+canonicalizes sub-entities to their parent (`_SUBENTITY_PARENT`) before the task filter.
+Previously a raw sub-entity (LEX-LLC, OSNGW, ...) fell through `ENTITY_PROJECT_PREFIXES`
+UNFILTERED -- with the 6/11 registry move of Shaun/Jen/Jeff/Aaron to `entity: LEX-LLC`, their
+plates and briefings would have shown unscoped task lists. A sub-entity scope must never be
+wider than its parent's. Bot-loaded: the plate-tool side activates at the next restart; the
+briefing side is live at the task's next fire (fresh process).

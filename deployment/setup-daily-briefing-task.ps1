@@ -1,21 +1,32 @@
 # setup-daily-briefing-task.ps1
-# Registers a Windows Task Scheduler task that DMs each team member a
-# personalized morning briefing at 7:30am AZ (14:30 UTC) every weekday.
+# Registers the Windows Task Scheduler task for the org-roles-driven daily
+# briefing (Org Synthesis Phase 2, deliverable 2) at 7:30am AZ, weekdays.
+#
+# ROLLOUT DOCTRINE (locked 2026-06-11): digest-to-Harrison-first.
+#   Default registration runs the script with NO flags -> digest mode:
+#   Harrison gets ONE DM containing every user's would-be briefing; no
+#   per-user DMs are sent. After Harrison's explicit go, re-register with
+#   -SendUsers to flip on per-user delivery.
 #
 # Run once from an elevated PowerShell prompt:
 #   Set-ExecutionPolicy RemoteSigned -Scope Process
-#   .\deployment\setup-daily-briefing-task.ps1
+#   .\deployment\setup-daily-briefing-task.ps1            # digest mode (default)
+#   .\deployment\setup-daily-briefing-task.ps1 -SendUsers # per-user delivery
 #
 # Prerequisites:
 #   1. ASANA_PAT, ANTHROPIC_API_KEY, and SLACK_BOT_TOKEN are set in .env.
-#   2. data/maps/slack-to-asana.yaml is populated with team Slack + Asana IDs.
-#   3. cora_kb.db exists and has been seeded with at least one sync cycle.
+#   2. data/maps/org-roles.yaml is the briefing roster (D-044). The old
+#      role-briefing-config.yaml is RETIRED -- do not recreate it.
 #
 # To run immediately (for testing):
 #   Start-ScheduledTask -TaskName "Cora - Daily Briefing"
 #
-# Smoke test (check last 10 lines of today's log):
+# Smoke test (check last 10 lines of the audit log):
 #   Get-Content "C:\Users\Harri\code\cora\logs\cora-daily-briefing.jsonl" -Tail 10
+
+param(
+    [switch]$SendUsers
+)
 
 $TaskName   = "Cora - Daily Briefing"
 $RepoRoot   = Split-Path -Parent $PSScriptRoot
@@ -38,14 +49,20 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Removed existing task: $TaskName"
 }
 
-# Action: run via venv python (Task Scheduler has no user PATH)
+# Action: run via venv python (Task Scheduler has no user PATH; D-005)
+$ScriptArgs = "`"$ScriptPath`""
+$Mode = "digest-only (review DM to Harrison)"
+if ($SendUsers) {
+    $ScriptArgs = "`"$ScriptPath`" --send-users"
+    $Mode = "per-user delivery (--send-users)"
+}
+
 $Action = New-ScheduledTaskAction `
     -Execute $PythonPath `
-    -Argument "`"$ScriptPath`"" `
+    -Argument $ScriptArgs `
     -WorkingDirectory $RepoRoot
 
-# Trigger: 7:30am AZ = 14:30 UTC, weekdays only
-# Note: AZ is UTC-7 year-round (no DST). Adjust if running from a non-AZ machine.
+# Trigger: 7:30am AZ, weekdays only (AZ is UTC-7 year-round, no DST)
 $Trigger = New-ScheduledTaskTrigger `
     -Weekly `
     -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday `
@@ -74,6 +91,7 @@ Register-ScheduledTask `
 
 Write-Host ""
 Write-Host "Task registered: '$TaskName'" -ForegroundColor Green
+Write-Host "  Mode:        $Mode"
 Write-Host "  Schedule:    Weekdays at 7:30am AZ"
 Write-Host "  Python:      $PythonPath"
 Write-Host "  Script:      $ScriptPath"

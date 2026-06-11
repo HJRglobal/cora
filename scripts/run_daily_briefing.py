@@ -1,22 +1,45 @@
 #!/usr/bin/env python3
-"""Daily per-user morning briefing -- DMs each team member a personalized synthesis.
+"""Daily per-user morning briefing -- org-roles-driven (Org Synthesis Phase 2, deliverable 2).
 
-Pipeline per user:
-  1. Load role config from data/maps/role-briefing-config.yaml
-  2. Fetch their open Asana tasks (entity-filtered for non-FNDR roles)
-  3. Query last 25h of KB (slack, gmail, fireflies, notion) for content mentioning them
-  4. Pull optional role-specific data (HubSpot deals, financial snapshot, deal aging)
-  5. Call Claude Haiku to synthesize a concise, role-aware briefing
-  6. DM the user via Slack (or post to briefing_channel if configured)
+The briefing roster and role data come from data/maps/org-roles.yaml via
+cora.org_roles (D-044: the canonical org role registry). The old per-user
+briefing config YAML (data/maps) RETIRED in this deliverable -- this was the
+locked consolidation point (D-044 item 5).
 
-Registered as Windows Task Scheduler task `cowork-cora-daily-briefing`
-at 7:30am AZ (14:30 UTC).
+Per-user briefing content mirrors the whats_on_my_plate composite and REUSES
+its section builders from tool_dispatch (no forked logic):
+  - role + lanes (org-roles registry)
+  - open Asana tasks, entity-scoped to the user's primary entity, capped at 10
+  - today + tomorrow calendar
+  - HubSpot deal pipeline for users who own a pipeline (LEX scope NEVER gets
+    a pipeline section -- Tier-1 doctrine, enforced inside the shared builder)
+  - stalled P0/P1 decisions -- Harrison only
+plus the recent-activity KB scan (last 25h of Slack/Gmail/Fireflies/Notion
+chunks mentioning the user) that the briefing has always carried.
+
+Exclusion rules (fail-closed):
+  - external consultants (external: true, e.g. Jason Dorfman) -- never receive
+    internal proactive comms
+  - registry-only people (no slack_id, e.g. Tessa Miller) -- no Slack identity
+  - anyone NOT in the registry is skipped by construction (the registry IS the
+    roster; no fallback path exists)
+
+ROLLOUT DOCTRINE (locked 2026-06-11): digest-to-Harrison-first.
+  - DEFAULT mode is --digest-only: Harrison gets ONE DM containing every
+    user's would-be briefing for review. No per-user DMs are sent.
+  - Per-user delivery requires the explicit --send-users flag, which flips on
+    only after Harrison's explicit go (re-register the task with the flag, or
+    setup-daily-briefing-task.ps1 -SendUsers).
+
+Registered as Windows Task Scheduler task "Cora - Daily Briefing"
+at 7:30am AZ, weekdays.
 
 Exit codes: 0 = success, 1 = fatal error, 2 = partial (some users failed)
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -26,7 +49,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import yaml
 from dotenv import load_dotenv
 from slack_sdk import WebClient as SlackWebClient
 from slack_sdk.errors import SlackApiError
@@ -36,31 +58,29 @@ load_dotenv()
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from cora.tools.asana_client import get_user_tasks, AsanaClientError  # noqa: E402
+from cora import org_roles  # noqa: E402
+from cora.org_roles import RoleRecord  # noqa: E402
+
+# Plate section builders -- SHARED with the whats_on_my_plate tool
+# (tool_dispatch). Reused, not forked: any fix to plate scoping/fail-soft
+# behavior applies to the briefing automatically.
+from cora.tools.tool_dispatch import (  # noqa: E402
+    _HARRISON_SLACK_ID,
+    _plate_asana_section,
+    _plate_calendar_section,
+    _plate_hubspot_section,
+    _safe_plate_section,
+    _tool_fndr_open_decisions,
+)
 
 # ---- Configuration -----------------------------------------------------------
 
 _KB_DB_PATH        = _REPO_ROOT / "data" / "cora_kb.db"
-_ASANA_MAP         = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
-_ROLE_CONFIG       = _REPO_ROOT / "data" / "maps" / "role-briefing-config.yaml"
 _LOOKBACK_SECONDS  = 25 * 3600
-_MAX_TASKS         = 30
 _MAX_CHUNKS        = 20    # per-user cap before sending to Haiku
 _MAX_CHUNK_CHARS   = 500   # truncate long chunks
-_ENTITY_TASK_LIMIT = 15    # max tasks shown for non-FNDR entity roles
-
-# Asana project prefix filter per entity (mirrors tool_dispatch.ENTITY_PROJECT_PREFIXES)
-_ENTITY_PREFIXES: dict[str, list[str]] = {
-    "F3E":     ["[F3E]", "[F3 ", "[F3-", "[F3C]"],
-    "LEX":     ["[LEX]", "[LEX-"],
-    "OSN":     ["[OSN]"],
-    "BDM":     ["[BDM]"],
-    "UFL":     ["[UFL]"],
-    "HJRP":    ["[HJRP]", "[HJRP-"],
-    "HJRPROD": ["[HJRPROD]", "[POD]", "[FF]", "[HJR-PB]", "[CHK]", "[CHB]"],
-    "HJRG":    ["[HJRG]"],
-    "FNDR":    [],  # no filter -- see all tasks
-}
+_DIGEST_CHUNK_CHARS = 3500  # split the Harrison digest into messages this size
+_HAIKU_MODEL       = "claude-haiku-4-5-20251001"
 
 # ---- Logging -----------------------------------------------------------------
 
@@ -72,117 +92,71 @@ logging.basicConfig(
 log = logging.getLogger("run_daily_briefing")
 
 
-# ---- User + role loading -----------------------------------------------------
+# ---- Roster (org role registry, D-044) ----------------------------------------
 
-def _load_asana_users() -> dict[str, dict]:
-    """Return a dict keyed by slack_user_id from slack-to-asana.yaml."""
-    try:
-        data = yaml.safe_load(_ASANA_MAP.read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        log.error("slack-to-asana.yaml not found at %s", _ASANA_MAP)
-        return {}
-    users = {}
-    for entry in (data.get("users") or []):
-        if not isinstance(entry, dict):
-            continue
-        sid  = entry.get("slack_user_id", "").strip()
-        gid  = str(entry.get("asana_user_gid") or "").strip()
-        name = entry.get("display_name", "").strip()
-        if sid and gid and name:
-            users[sid] = {
-                "slack_user_id": sid,
-                "asana_user_gid": gid,
-                "display_name": name,
-                "first_name": name.split()[0],
-            }
-    return users
+def _load_briefing_roster() -> tuple[list[RoleRecord], list[str]]:
+    """Active briefing recipients from the org role registry.
 
-
-def _load_role_config() -> dict[str, dict]:
-    """Return a dict keyed by slack_user_id from role-briefing-config.yaml.
-
-    Falls back to empty dict if file is missing -- all users will receive
-    the generic briefing with entity=FNDR and no extra data sources.
+    Returns (roster, excluded_notes). Included: every registry entry with a
+    slack_id and external != true. Excluded (logged + reported): external
+    consultants and registry-only people. Unknown/unmapped users are skipped
+    fail-closed by construction -- the registry IS the roster.
     """
-    if not _ROLE_CONFIG.exists():
-        log.warning(
-            "role-briefing-config.yaml not found at %s -- using generic briefings", _ROLE_CONFIG
+    roster: list[RoleRecord] = []
+    excluded: list[str] = []
+    for rec in org_roles.all_roles():
+        if not rec.slack_id:
+            excluded.append(f"{rec.name} (registry-only, no Slack identity)")
+            continue
+        if rec.external:
+            excluded.append(f"{rec.name} (external consultant -- no internal proactive comms)")
+            continue
+        roster.append(rec)
+    return roster, excluded
+
+
+# ---- Plate sections (shared builders) -----------------------------------------
+
+def _compose_sections(rec: RoleRecord) -> str:
+    """Compose the role-scoped plate sections for one user.
+
+    Mirrors _tool_whats_on_my_plate's composition exactly (minus the tool's
+    reply-format trailer): role header, open tasks, calendar, deal pipeline
+    for owners (omitted for LEX scope inside the shared builder), stalled
+    decisions for Harrison only. Every section is fail-soft.
+    """
+    sid = rec.slack_id
+    entity = rec.entity
+
+    header = [f"ROLE\n{rec.name} -- {rec.role} ({rec.entity})"]
+    if rec.responsibilities:
+        header.append("Lanes: " + "; ".join(rec.responsibilities))
+
+    sections: list[str] = ["\n".join(header)]
+    sections.append(
+        "OPEN TASKS\n" + _safe_plate_section("Open tasks", _plate_asana_section, sid, entity)
+    )
+    sections.append(
+        "CALENDAR\n" + _safe_plate_section("Calendar", _plate_calendar_section, sid)
+    )
+    try:
+        deals = _plate_hubspot_section(sid, entity)
+    except Exception:
+        log.exception("briefing: deal pipeline section crashed for %s", rec.name)
+        deals = "(Deal pipeline section unavailable right now.)"
+    if deals is not None:
+        sections.append("DEAL PIPELINE\n" + str(deals))
+    if sid == _HARRISON_SLACK_ID:
+        sections.append(
+            "STALLED DECISIONS\n"
+            + _safe_plate_section(
+                "Stalled decisions", _tool_fndr_open_decisions, sid, entity, {}
+            )
         )
-        return {}
-    try:
-        data = yaml.safe_load(_ROLE_CONFIG.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        log.warning("Could not load role-briefing-config.yaml: %s -- using generic briefings", exc)
-        return {}
-    config: dict[str, dict] = {}
-    for entry in (data.get("users") or []):
-        if not isinstance(entry, dict):
-            continue
-        sid = entry.get("slack_user_id", "").strip()
-        if sid:
-            config[sid] = entry
-    return config
+    return "\n\n".join(sections)
 
 
-def _load_users() -> list[dict]:
-    """Merge Asana user records with role config. Returns list of merged user dicts."""
-    asana_users = _load_asana_users()
-    role_config = _load_role_config()
-
-    merged = []
-    for sid, asana_data in asana_users.items():
-        role_entry = role_config.get(sid, {})
-        if role_entry.get("skip_briefing"):
-            log.info("Skipping %s (skip_briefing=true)", asana_data["display_name"])
-            continue
-        merged.append({
-            **asana_data,
-            "role":             role_entry.get("role", "Team Member"),
-            "entity":           role_entry.get("entity", "FNDR"),
-            "extra_data":       role_entry.get("extra_data") or [],
-            "briefing_channel": (role_entry.get("briefing_channel") or "").strip(),
-        })
-    return merged
-
-
-# ---- Asana tasks (entity-filtered) ------------------------------------------
-
-def _fetch_tasks(asana_gid: str, entity: str) -> list[dict]:
-    """Fetch Asana tasks for a user, filtered by entity if not FNDR."""
-    try:
-        tasks = get_user_tasks(asana_gid, max_tasks=_MAX_TASKS)
-    except AsanaClientError as exc:
-        log.warning("Asana fetch failed for gid=%s: %s", asana_gid, exc)
-        return []
-
-    if entity == "FNDR" or entity not in _ENTITY_PREFIXES:
-        return tasks
-
-    prefixes = _ENTITY_PREFIXES[entity]
-    if not prefixes:
-        return tasks
-
-    filtered = []
-    for t in tasks:
-        memberships = t.get("memberships") or []
-        proj_names = [(m.get("project") or {}).get("name", "") for m in memberships]
-        proj_names += [p.get("name", "") for p in (t.get("projects") or [])]
-        if any(pn.startswith(pfx) for pn in proj_names for pfx in prefixes):
-            filtered.append(t)
-    return filtered[:_ENTITY_TASK_LIMIT]
-
-
-def _format_task_line(task: dict) -> str:
-    name  = (task.get("name") or "Untitled task").strip()
-    due   = task.get("due_on") or task.get("due_at", "")
-    url   = task.get("permalink_url", "")
-    label = f"{name} (due {due})" if due else name
-    if url:
-        return f"- {label}  ({url})"
-    return f"- {label}"
-
-
-# ---- KB chunk query ----------------------------------------------------------
+# ---- KB chunk query (recent activity mentioning the user) ---------------------
 
 def _query_user_chunks(display_name: str, first_name: str) -> list[dict]:
     """Fetch recent KB chunks that mention the user by full name or first name."""
@@ -218,129 +192,18 @@ def _query_user_chunks(display_name: str, first_name: str) -> list[dict]:
     ]
 
 
-# ---- Role-specific data pulls ------------------------------------------------
+# ---- Claude Haiku synthesis ----------------------------------------------------
 
-def _fetch_hubspot_f3e_summary() -> str:
-    try:
-        from cora.tools.hubspot_client import get_f3e_pipeline_summary_text
-        return get_f3e_pipeline_summary_text()
-    except Exception as exc:
-        log.warning("HubSpot F3E pull failed: %s", exc)
-        return "(HubSpot F3E data unavailable)"
-
-
-def _fetch_hubspot_all_summary() -> str:
-    try:
-        from cora.tools.hubspot_client import (
-            get_f3e_pipeline_summary_text,
-            get_deals_by_pipeline,
-            PIPELINE_UFL_OSN_BDM,
-        )
-        f3e_text = get_f3e_pipeline_summary_text()
-        other_deals = get_deals_by_pipeline(PIPELINE_UFL_OSN_BDM)
-        other_count = len(other_deals)
-        return f"{f3e_text}\n\nDefault pipeline: {other_count} active deal(s)."
-    except Exception as exc:
-        log.warning("HubSpot all-pipeline pull failed: %s", exc)
-        return "(HubSpot data unavailable)"
-
-
-def _fetch_financial_snapshot() -> str:
-    try:
-        from cora.connectors.gsheets_financials import get_cashflow_for_entity
-        result = get_cashflow_for_entity("FNDR")
-        if isinstance(result, str):
-            return result[:600]
-        return "(financial snapshot unavailable)"
-    except Exception as exc:
-        log.warning("Financial snapshot pull failed: %s", exc)
-        return "(financial data unavailable)"
-
-
-def _fetch_deal_aging_summary() -> str:
-    """Summarize deals currently exceeding age thresholds."""
-    try:
-        db_path = _REPO_ROOT / "data" / "hubspot_deal_snapshots.db"
-        if not db_path.exists():
-            return "(no deal snapshot data yet)"
-        conn = sqlite3.connect(str(db_path))
-        try:
-            rows = conn.execute(
-                "SELECT deal_name, stage_name, last_seen_ts "
-                "FROM deal_last_stage ORDER BY last_seen_ts ASC LIMIT 20"
-            ).fetchall()
-        finally:
-            conn.close()
-        if not rows:
-            return "(no active deals in snapshot)"
-        now = time.time()
-        thresholds = {
-            "Identify": 14, "Outreach": 10, "Sample Sent": 7,
-            "Qualified": 21, "Proposal": 14, "Negotiation": 7,
-        }
-        aging_lines = []
-        for deal_name, stage_name, last_seen_ts in rows:
-            age_days = int((now - (last_seen_ts or now)) / 86400)
-            threshold = thresholds.get(stage_name, 21)
-            if age_days >= threshold:
-                aging_lines.append(
-                    f"- {deal_name} ({stage_name}, {age_days}d -- threshold {threshold}d)"
-                )
-        if not aging_lines:
-            return "(no deals currently exceeding age thresholds)"
-        return "Aging deals:\n" + "\n".join(aging_lines)
-    except Exception as exc:
-        log.warning("Deal aging summary failed: %s", exc)
-        return "(deal aging data unavailable)"
-
-
-_EXTRA_DATA_FETCHERS: dict[str, object] = {
-    "hubspot_f3e": _fetch_hubspot_f3e_summary,
-    "hubspot_all": _fetch_hubspot_all_summary,
-    "financial":   _fetch_financial_snapshot,
-    "deal_aging":  _fetch_deal_aging_summary,
-}
-
-_EXTRA_DATA_LABELS: dict[str, str] = {
-    "hubspot_f3e": "F3E Sales Pipeline (HubSpot)",
-    "hubspot_all": "Sales Pipelines Overview (HubSpot)",
-    "financial":   "Cash Flow Snapshot",
-    "deal_aging":  "Deal Aging Alerts",
-}
-
-
-def _fetch_extra_data(extra_data: list[str]) -> dict[str, str]:
-    """Fetch all requested extra data sources. Returns label -> content dict."""
-    result: dict[str, str] = {}
-    for key in extra_data:
-        fetcher = _EXTRA_DATA_FETCHERS.get(key)
-        if callable(fetcher):
-            label = _EXTRA_DATA_LABELS.get(key, key)
-            result[label] = fetcher()
-        else:
-            log.warning("Unknown extra_data key: %s", key)
-    return result
-
-
-# ---- Claude Haiku synthesis --------------------------------------------------
-
-def _build_briefing(
+def _synthesize(
     *,
     api_key: str,
-    display_name: str,
-    first_name: str,
-    role: str,
-    entity: str,
-    tasks: list[dict],
+    rec: RoleRecord,
+    sections_text: str,
     chunks: list[dict],
-    extra_data: dict[str, str],
     today_str: str,
 ) -> str:
-    """Call Claude Haiku to generate a personalized, role-aware morning briefing."""
-    tasks_text = (
-        "\n".join(_format_task_line(t) for t in tasks)
-        if tasks else "(no open tasks)"
-    )
+    """Call Claude Haiku to turn the plate sections + recent activity into a DM."""
+    first_name = rec.name.split()[0]
 
     chunk_lines = []
     for c in chunks:
@@ -351,43 +214,84 @@ def _build_briefing(
         chunk_lines.append(f"[{src}/{ent}] {title}: {snippet}")
     context_text = "\n".join(chunk_lines) if chunk_lines else "(no recent activity found)"
 
-    extra_sections = ""
-    for label, content in extra_data.items():
-        extra_sections += f"\n== {label} ==\n{content}\n"
-
-    entity_note = f" (filtered to {entity} projects)" if entity != "FNDR" else ""
-
     prompt = (
         f"You are Cora, an AI chief-of-staff assistant for HJR Global.\n"
-        f"Write a concise morning briefing DM for {display_name}, whose role is: {role}.\n\n"
+        f"Write a concise morning briefing DM for {rec.name}, whose role is: {rec.role}.\n\n"
         f"Today: {today_str}\n\n"
-        f"== Open Tasks{entity_note} ==\n{tasks_text}\n\n"
+        f"== Their plate (role-scoped; sections below are authoritative) ==\n"
+        f"{sections_text}\n\n"
         f"== Recent Activity Mentioning {first_name} (last 25h: Slack, Gmail, Meetings) ==\n"
-        f"{context_text}{extra_sections}\n"
+        f"{context_text}\n\n"
         f"Instructions:\n"
         f"- Begin with: Good morning, {first_name}!\n"
-        f"- Briefly acknowledge their role context where relevant\n"
-        f"- List 2-4 open tasks needing attention today (prioritize overdue or due today)\n"
-        f"- Summarize 1-3 notable activity items from context that directly involve {first_name}\n"
-        f"- If extra data sections present (HubSpot, cash flow, deal aging), include a 1-2 line "
-        f"  role-relevant summary\n"
+        f"- Open with a one-line acknowledgment of their role and lanes where relevant\n"
+        f"- List 2-4 open tasks needing attention today (prioritize overdue or due today); "
+        f"preserve any <url|name> Slack links verbatim\n"
+        f"- Mention today's calendar in one line if events exist\n"
+        f"- If a DEAL PIPELINE section is present, give a 1-2 line role-relevant summary\n"
+        f"- If a STALLED DECISIONS section is present, surface the 1-2 most urgent items\n"
+        f"- Summarize 1-3 notable activity items that directly involve {first_name}\n"
         f"- End with a single-sentence offer to help\n"
         f"- Keep total under 320 words, plain text, no markdown headers or bullet symbols\n"
         f"- If no tasks AND no relevant activity, say it is a quiet start and offer to help\n"
+        f"- Do NOT add financial figures not present above\n"
         f"- Do NOT fabricate tasks or events not shown above"
     )
 
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=_HAIKU_MODEL,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
     return resp.content[0].text.strip()
 
 
-# ---- Slack helpers -----------------------------------------------------------
+def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str:
+    """Build the full briefing text for one registry user."""
+    sections_text = _compose_sections(rec)
+    chunks = _query_user_chunks(rec.name, rec.name.split()[0])
+    return _synthesize(
+        api_key=api_key,
+        rec=rec,
+        sections_text=sections_text,
+        chunks=chunks,
+        today_str=today_str,
+    )
+
+
+# ---- Digest composition --------------------------------------------------------
+
+def _compose_digest_header(today_str: str, excluded: list[str]) -> str:
+    lines = [
+        f"DAILY BRIEFING DIGEST -- {today_str}",
+        "Review mode: per-user delivery is OFF. Below is the briefing each user "
+        "WOULD receive. To flip on per-user delivery after review, re-register "
+        "the task with --send-users (setup-daily-briefing-task.ps1 -SendUsers).",
+    ]
+    if excluded:
+        lines.append("Excluded from delivery: " + "; ".join(excluded) + ".")
+    return "\n".join(lines)
+
+
+def _chunk_digest(header: str, blocks: list[str]) -> list[str]:
+    """Split the digest into Slack-friendly messages of ~_DIGEST_CHUNK_CHARS."""
+    messages: list[str] = []
+    cur = header
+    for b in blocks:
+        candidate = (cur + "\n\n" + b) if cur else b
+        if cur and len(candidate) > _DIGEST_CHUNK_CHARS:
+            messages.append(cur)
+            cur = b
+        else:
+            cur = candidate
+    if cur:
+        messages.append(cur)
+    return messages
+
+
+# ---- Slack helpers -------------------------------------------------------------
 
 def _open_dm(client: SlackWebClient, slack_user_id: str) -> str | None:
     try:
@@ -407,7 +311,7 @@ def _send_message(client: SlackWebClient, channel: str, text: str) -> bool:
         return False
 
 
-# ---- Audit log ---------------------------------------------------------------
+# ---- Audit log -----------------------------------------------------------------
 
 def _write_audit(entries: list[dict]) -> None:
     log_path = _REPO_ROOT / "logs" / "cora-daily-briefing.jsonl"
@@ -420,107 +324,143 @@ def _write_audit(entries: list[dict]) -> None:
         log.warning("Could not write briefing audit log: %s", exc)
 
 
-# ---- Main --------------------------------------------------------------------
+# ---- CLI / main ----------------------------------------------------------------
 
-def main() -> int:
-    log.info("=== Daily briefing starting ===")
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Org-roles-driven daily briefing")
+    p.add_argument(
+        "--digest-only",
+        action="store_true",
+        help="(DEFAULT) build every user's briefing and DM Harrison ONE review "
+             "digest; no per-user DMs are sent",
+    )
+    p.add_argument(
+        "--send-users",
+        action="store_true",
+        help="DM each user their own briefing -- only after Harrison's explicit "
+             "go on the digest output",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build briefings and print to stdout; send nothing to Slack",
+    )
+    p.add_argument(
+        "--user",
+        default="",
+        help="limit to one user (slack_id or case-insensitive name substring)",
+    )
+    args = p.parse_args(argv)
+    if args.digest_only and args.send_users:
+        p.error("--digest-only and --send-users are mutually exclusive")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    mode = "send" if args.send_users else "digest"
+    log.info("=== Daily briefing starting (mode=%s, dry_run=%s) ===", mode, args.dry_run)
 
     slack_token   = os.environ.get("SLACK_BOT_TOKEN", "")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    if not slack_token:
-        log.error("SLACK_BOT_TOKEN not set -- cannot send briefings")
-        return 1
     if not anthropic_key:
         log.error("ANTHROPIC_API_KEY not set -- cannot generate briefings")
         return 1
+    if not slack_token and not args.dry_run:
+        log.error("SLACK_BOT_TOKEN not set -- cannot send briefings")
+        return 1
 
-    users = _load_users()
-    if not users:
-        log.warning("No users found -- nothing to brief")
+    roster, excluded = _load_briefing_roster()
+    for note in excluded:
+        log.info("Excluded from briefing delivery: %s", note)
+    if args.user:
+        needle = args.user.strip().lower()
+        roster = [
+            r for r in roster
+            if r.slack_id.lower() == needle or needle in r.name.lower()
+        ]
+    if not roster:
+        log.warning("No briefing recipients in the org role registry -- nothing to do")
         return 0
 
-    log.info("Preparing role-aware briefings for %d users", len(users))
-    slack_client = SlackWebClient(token=slack_token)
+    log.info("Building role-scoped briefings for %d registry users", len(roster))
     today_str = datetime.now().strftime("%A, %B %d, %Y")
 
     audit_entries: list[dict] = []
     errors = 0
+    built: list[tuple[RoleRecord, str]] = []
 
-    for user in users:
-        name   = user["display_name"]
-        sid    = user["slack_user_id"]
-        gid    = user["asana_user_gid"]
-        first  = user["first_name"]
-        role   = user["role"]
-        entity = user["entity"]
-        extra  = user["extra_data"]
-        b_chan = user["briefing_channel"]
-
-        log.info("Briefing %s (role=%s, entity=%s)...", name, role, entity)
-
-        tasks      = _fetch_tasks(gid, entity)
-        chunks     = _query_user_chunks(name, first)
-        extra_data = _fetch_extra_data(extra)
-        log.info(
-            "  %d tasks (entity=%s), %d chunks, %d extra sources",
-            len(tasks), entity, len(chunks), len(extra_data),
-        )
-
+    for rec in roster:
+        log.info("Briefing %s (role=%s, entity=%s)...", rec.name, rec.role, rec.entity)
         try:
-            briefing = _build_briefing(
-                api_key=anthropic_key,
-                display_name=name,
-                first_name=first,
-                role=role,
-                entity=entity,
-                tasks=tasks,
-                chunks=chunks,
-                extra_data=extra_data,
-                today_str=today_str,
-            )
+            text = build_user_briefing(rec, api_key=anthropic_key, today_str=today_str)
+            built.append((rec, text))
         except Exception as exc:
-            log.warning("Haiku synthesis failed for %s: %s", name, exc)
+            log.warning("Briefing build failed for %s: %s", rec.name, exc)
             errors += 1
+            built.append((rec, f"(briefing could not be built: {exc})"))
             audit_entries.append({
-                "ts": time.time(), "user": name, "sid": sid, "role": role,
-                "entity": entity, "tasks": len(tasks), "chunks": len(chunks),
+                "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
+                "role": rec.role, "entity": rec.entity, "mode": mode,
                 "sent": False, "error": str(exc),
             })
-            continue
 
-        # Resolve delivery channel
-        if b_chan:
-            dest = b_chan
-        else:
-            dest = _open_dm(slack_client, sid)
+    if args.dry_run:
+        for rec, text in built:
+            print(f"\n=== {rec.name} ({rec.role}, {rec.entity}) ===\n{text}")
+        log.info("=== Dry run done -- %d briefings built, %d errors ===", len(built), errors)
+        return 0 if errors == 0 else 2
+
+    slack_client = SlackWebClient(token=slack_token)
+
+    if mode == "digest":
+        header = _compose_digest_header(today_str, excluded)
+        blocks = [
+            f"=== {rec.name} ({rec.role}, {rec.entity}) ===\n{text}"
+            for rec, text in built
+        ]
+        dest = _open_dm(slack_client, _HARRISON_SLACK_ID)
+        if not dest:
+            log.error("Could not open the Harrison digest DM -- nothing sent")
+            return 1
+        sent_all = True
+        for msg in _chunk_digest(header, blocks):
+            if not _send_message(slack_client, dest, msg):
+                sent_all = False
+                errors += 1
+        audit_entries.append({
+            "ts": time.time(), "user": "digest->Harrison", "sid": _HARRISON_SLACK_ID,
+            "mode": mode, "users_included": len(built),
+            "sent": sent_all, "error": None if sent_all else "partial_digest_send",
+        })
+        log.info("Digest sent to Harrison (%d user briefings, sent_ok=%s)", len(built), sent_all)
+    else:
+        for rec, text in built:
+            dest = _open_dm(slack_client, rec.slack_id)
             if not dest:
                 errors += 1
                 audit_entries.append({
-                    "ts": time.time(), "user": name, "sid": sid, "role": role,
-                    "entity": entity, "tasks": len(tasks), "chunks": len(chunks),
+                    "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
+                    "role": rec.role, "entity": rec.entity, "mode": mode,
                     "sent": False, "error": "dm_open_failed",
                 })
                 continue
-
-        sent = _send_message(slack_client, dest, briefing)
-        if not sent:
-            errors += 1
-
-        audit_entries.append({
-            "ts": time.time(), "user": name, "sid": sid, "role": role,
-            "entity": entity, "tasks": len(tasks), "chunks": len(chunks),
-            "extra_data_keys": list(extra_data.keys()),
-            "sent": sent, "error": None,
-        })
-        log.info("  %s -> %s sent: %s", name, dest, sent)
-
-        time.sleep(1)  # gentle Slack rate-limit buffer
+            sent = _send_message(slack_client, dest, text)
+            if not sent:
+                errors += 1
+            audit_entries.append({
+                "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
+                "role": rec.role, "entity": rec.entity, "mode": mode,
+                "sent": sent, "error": None,
+            })
+            log.info("  %s -> %s sent: %s", rec.name, dest, sent)
+            time.sleep(1)  # gentle Slack rate-limit buffer
 
     _write_audit(audit_entries)
 
-    succeeded = len(users) - errors
-    log.info("=== Daily briefing done -- %d/%d succeeded ===", succeeded, len(users))
+    succeeded = len(roster) - errors
+    log.info("=== Daily briefing done -- %d/%d succeeded ===", succeeded, len(roster))
     return 0 if errors == 0 else 2
 
 
