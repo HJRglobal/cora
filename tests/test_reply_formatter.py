@@ -233,3 +233,33 @@ class TestEdgeCases:
         for bad in ("##", "**", "—", "🚨", ":tada:", "docs.google.com", "1215472268404903"):
             assert bad not in out
         assert "Status is open" in out
+
+
+# --- redaction shells (2026-06-11 live artifact) ---------------------------
+
+
+class TestRedactionShells:
+    def test_url_in_parens_leaves_no_empty_shell(self):
+        out = format_reply("The doc (https://docs.google.com/spreadsheets/d/abc) covers it.")
+        assert "()" not in out
+        assert "docs.google.com" not in out
+        assert "The doc covers it." in out
+
+    def test_markdown_link_keeps_label(self):
+        out = format_reply("See [Q3 forecast](https://docs.google.com/spreadsheets/d/abc) for detail.")
+        assert "docs.google.com" not in out
+        assert "[" not in out and "()" not in out
+        assert "Q3 forecast" in out
+
+    def test_asana_url_in_parens(self):
+        out = format_reply("Task created (https://app.asana.com/0/123/456).")
+        assert "()" not in out
+        assert "app.asana.com" not in out
+
+    def test_legit_parenthetical_preserved(self):
+        out = format_reply("Revenue grew (per the weekly review) by a lot.")
+        assert "(per the weekly review)" in out
+
+    def test_sanctioned_slack_link_untouched(self):
+        out = format_reply("Open <https://app.asana.com/0/1/2|the task> when ready.")
+        assert "<https://app.asana.com/0/1/2|the task>" in out

@@ -2590,6 +2590,11 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
 
 _HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 
+# Cap per plate section: long composites (25 tasks + 23 deals seen live
+# 2026-06-11) push the narration into max-token truncation, ending the Slack
+# reply in a malformed half-link. The standalone tools remain the full view.
+_PLATE_MAX_ITEMS = 10
+
 
 def _safe_plate_section(label: str, builder: Callable[..., Any], *args: Any) -> str:
     """Fail-soft wrapper for plate sections: a section may degrade to a stub
@@ -2619,8 +2624,9 @@ def _plate_asana_section(target_id: str, entity: str) -> str:
         log.warning("whats_on_my_plate asana error user=%s: %s", target_id, exc)
         return "(Temporary issue reaching Asana -- task list unavailable right now.)"
     filtered = _filter_tasks_by_entity(all_tasks, entity)
+    shown = filtered[:_PLATE_MAX_ITEMS]
     text = asana_client.format_tasks_for_llm(
-        filtered,
+        shown,
         entity_scope=entity if entity != "FNDR" else None,
         total_before_filter=len(all_tasks),
     )
@@ -2629,6 +2635,11 @@ def _plate_asana_section(target_id: str, entity: str) -> str:
     if not isinstance(text, str) or not text.strip():
         log.warning("whats_on_my_plate: task formatter returned %r for user=%s", type(text).__name__, target_id)
         return f"({len(filtered)} open task(s) found, but the task list could not be rendered.)"
+    if len(filtered) > _PLATE_MAX_ITEMS:
+        text += (
+            f"\n(Plate view shows the first {_PLATE_MAX_ITEMS} of {len(filtered)} open tasks -- "
+            f"say 'show me my tasks' for the full list.)"
+        )
     return text
 
 
@@ -2668,11 +2679,18 @@ def _plate_hubspot_section(target_id: str, entity: str) -> str | None:
     except hubspot_client.HubSpotClientError as exc:
         log.warning("whats_on_my_plate hubspot error user=%s: %s", target_id, exc)
         return "(Temporary issue reaching the deal pipeline.)"
-    return hubspot_client.format_deals_for_llm(
-        deals,
+    shown = deals[:_PLATE_MAX_ITEMS]
+    text = hubspot_client.format_deals_for_llm(
+        shown,
         entity_scope=entity if entity != "FNDR" else None,
         pipeline_filter_applied=pipeline_id is not None,
     )
+    if isinstance(text, str) and len(deals) > _PLATE_MAX_ITEMS:
+        text += (
+            f"\n(Plate view shows the first {_PLATE_MAX_ITEMS} of {len(deals)} deals -- "
+            f"say 'show me my deals' for the full list.)"
+        )
+    return text
 
 
 def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2720,7 +2738,10 @@ def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> st
         slack_user_id, target_id, entity, rec.external,
     )
 
-    header = [f"PLATE FOR {rec.name} -- {rec.role} ({rec.entity})"]
+    # Labeled like the other sections + reinforced in the closing instruction:
+    # live smoke 2026-06-11 showed models presenting the role line for Harrison
+    # but dropping it 2/2 for other askers when it was an unlabeled preamble.
+    header = [f"YOUR ROLE\n{rec.name} -- {rec.role} ({rec.entity})"]
     if rec.responsibilities:
         header.append("Lanes: " + "; ".join(rec.responsibilities))
 
@@ -2749,9 +2770,12 @@ def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> st
         )
 
     sections.append(
-        "(Present the sections above in order, preserving any <url|name> links verbatim. "
-        "This is the user's own role-scoped picture; entity scoping for this channel has "
-        "already been applied. Do not add financial figures from other sources.)"
+        "(REPLY FORMAT -- follow exactly: START your reply by stating the user's role and "
+        "lanes from the YOUR ROLE section. EVERY asker gets their role line, not only "
+        "Harrison. Then present each remaining section in order, preserving any <url|name> "
+        "links verbatim. This is the user's own role-scoped picture; entity scoping for "
+        "this channel has already been applied. Do not add financial figures from other "
+        "sources.)"
     )
     return "\n\n".join(sections)
 

@@ -72,11 +72,21 @@ _EMOJI_RE = re.compile(
 _BARE_DOC_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?"
     r"(?:docs\.google\.com|drive\.google\.com|app\.asana\.com|notion\.so)"
-    r"/?[^\s<>|]*",
+    # ')' excluded so a URL inside "(...)" or a markdown link "[label](...)"
+    # leaves a balanced empty shell for the 8b cleanup (these URLs never
+    # legitimately contain a close-paren).
+    r"/?[^\s<>|)]*",
     re.IGNORECASE,
 )
 _GID_RE = re.compile(r"\bgid[:=]?\s*\d{4,}\b", re.IGNORECASE)
 _NAKED_ID_RE = re.compile(r"\b\d{16,}\b")
+
+# Redaction shells: when a redacted URL sat inside parens or a markdown link,
+# the surrounding "()" / "[label]()" survives as a visible artifact (live
+# 2026-06-11 follow-up replies). Clean them after the redaction pass.
+_EMPTY_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(\s*\)")  # [label]() -> label
+_EMPTY_PARENS_RE = re.compile(r"\(\s*\)")
+_EMPTY_BRACKETS_RE = re.compile(r"\[\s*\]")
 
 # --- whitespace cleanup --------------------------------------------------
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
@@ -148,6 +158,12 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _BARE_DOC_URL_RE.sub("", work)
     work = _GID_RE.sub("", work)
     work = _NAKED_ID_RE.sub("", work)
+
+    # 8b. Clean redaction shells the lint leaves behind: "[label]()" -> label,
+    # then any empty "()" / "[]" pairs.
+    work = _EMPTY_MD_LINK_RE.sub(r"\1", work)
+    work = _EMPTY_PARENS_RE.sub("", work)
+    work = _EMPTY_BRACKETS_RE.sub("", work)
 
     # 9. Whitespace cleanup.
     work = _MULTISPACE_RE.sub(" ", work)

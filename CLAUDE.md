@@ -8,6 +8,24 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Plate round 3: role-header determinism + section caps + reply-formatter shells -- 2026-06-11 (RESTART PENDING)
+
+Exit-gate round-2 findings (Cowork): Harrison PASS, Tommy PASS incl. negative test, Shaun
+PARTIAL, Matt not yet run. Fixes (full suite **3,858 passed / 41 skipped**, +31): **restart via
+`deployment\ship-plate-round3-2026-06-11.ps1 -Restart` (elevated PS), then finish the smoke.**
+
+1. **Role header dropped for non-Harrison askers (2/2 live):** the tool DID emit it, but as an
+   unlabeled preamble the model treated it as metadata and skipped it in narration. Now a labeled
+   `YOUR ROLE` section + an explicit REPLY FORMAT instruction ("START your reply... EVERY asker
+   gets their role line") in the tool output AND all 17 entity prompts. Tests pin the labeled
+   section first for a non-Harrison asker.
+2. **Long-plate truncation (25 tasks / 23 deals -> reply ended in a malformed half-link, i.e.
+   max-token cutoff):** plate sections now cap at `_PLATE_MAX_ITEMS=10` with a "first 10 of N --
+   say 'show me my tasks/deals' for the full list" note. Standalone tools remain the full view.
+3. **reply_formatter "()" shells:** the bare-URL redaction left "( )" / "[label]()" artifacts
+   when a redacted URL sat inside parens or a markdown link. URL regex now excludes ')' + new 8b
+   cleanup pass (empty md-links keep their label; empty paren/bracket pairs dropped). 5 tests.
+
 ### [ORG SYNTHESIS + HOTFIX] Plate-tool live-crash fixes: truncated asana_client restored + plate hardening + calendar scope + router + kill filter -- 2026-06-11 (SHIPPED + LIVE, commit a5f4d4f)
 
 Fixes for the 00:51 AZ live smoke crash (Cowork bug report). Full suite **3,827 passed / 41

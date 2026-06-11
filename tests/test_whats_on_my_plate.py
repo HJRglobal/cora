@@ -457,3 +457,74 @@ def test_model_router_plate_queries_force_sonnet(msg):
 def test_model_router_simple_lookup_still_haiku():
     from cora import model_router
     assert model_router.choose_model("list my tasks") == model_router.MODEL_HAIKU
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-11 exit-gate round 2 (role header omission + long-plate truncation)
+# --------------------------------------------------------------------------- #
+
+def test_role_section_labeled_and_first_for_non_harrison():
+    # REGRESSION: live smoke showed models presenting the role line for Harrison
+    # but dropping it 2/2 for other askers when it was an unlabeled preamble.
+    # The role block must be a labeled section at the very top.
+    with patch.object(td.org_roles, "get_role", return_value=_role()), \
+         patch.object(td, "_plate_asana_section", return_value="T"), \
+         patch.object(td, "_plate_calendar_section", return_value="C"), \
+         patch.object(td, "_plate_hubspot_section", return_value=None):
+        out = td._tool_whats_on_my_plate("U_TEST", "F3E", {})
+    assert out.startswith("YOUR ROLE\nTest User -- Test Role (F3E)")
+    assert "Lanes: Lane one; Lane two" in out
+
+
+def test_reply_format_instruction_demands_role_first():
+    with patch.object(td.org_roles, "get_role", return_value=_role()), \
+         patch.object(td, "_plate_asana_section", return_value="T"), \
+         patch.object(td, "_plate_calendar_section", return_value="C"), \
+         patch.object(td, "_plate_hubspot_section", return_value=None):
+        out = td._tool_whats_on_my_plate("U_TEST", "F3E", {})
+    assert "START your reply" in out
+    assert "EVERY asker gets their role line" in out
+
+
+def test_all_entity_prompts_demand_role_first():
+    prompts_dir = REPO_ROOT / "design" / "system-prompts"
+    missing = [
+        f.name
+        for f in sorted(prompts_dir.glob("*.md"))
+        if "START your reply with the user's role and lanes" not in f.read_text(encoding="utf-8")
+    ]
+    assert not missing, f"prompts missing the role-first directive: {missing}"
+
+
+def test_asana_section_caps_at_ten_items():
+    # REGRESSION: 25-task plates pushed the narration into max-token truncation
+    # (malformed trailing link in the live reply). Sections cap at 10 + a note.
+    mapping = {"U_X": {"asana_user_gid": "123"}}
+    tasks = [{"name": f"t{i}", "projects": [{"name": "[F3E] Sales"}]} for i in range(15)]
+    with patch.object(td, "_load_slack_asana_map", return_value=mapping), \
+         patch.object(td.asana_client, "get_user_tasks", return_value=tasks), \
+         patch.object(td.asana_client, "format_tasks_for_llm", return_value="OK") as fmt:
+        out = td._plate_asana_section("U_X", "F3E")
+    assert len(fmt.call_args[0][0]) == 10
+    assert "first 10 of 15 open tasks" in out
+
+
+def test_asana_section_no_cap_note_when_under_limit():
+    mapping = {"U_X": {"asana_user_gid": "123"}}
+    tasks = [{"name": f"t{i}", "projects": [{"name": "[F3E] Sales"}]} for i in range(3)]
+    with patch.object(td, "_load_slack_asana_map", return_value=mapping), \
+         patch.object(td.asana_client, "get_user_tasks", return_value=tasks), \
+         patch.object(td.asana_client, "format_tasks_for_llm", return_value="OK"):
+        out = td._plate_asana_section("U_X", "F3E")
+    assert "Plate view shows" not in out
+
+
+def test_hubspot_section_caps_at_ten_items():
+    mapping = {"U_X": {"hubspot_owner_id": "999"}}
+    deals = [{"id": str(i)} for i in range(12)]
+    with patch.object(td, "_load_slack_hubspot_map", return_value=mapping), \
+         patch.object(td.hubspot_client, "get_owner_deals", return_value=deals), \
+         patch.object(td.hubspot_client, "format_deals_for_llm", return_value="DEALS") as fmt:
+        out = td._plate_hubspot_section("U_X", "F3E")
+    assert len(fmt.call_args[0][0]) == 10
+    assert "first 10 of 12 deals" in out
