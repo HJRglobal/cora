@@ -33,6 +33,15 @@ Full entry: decisions.md 2026-06-11 (D-044 item 5 executed).
    the task filter (LEX-LLC/OSNGW fell through ENTITY_PROJECT_PREFIXES UNFILTERED -- matters
    since the 6/11 registry move of Shaun/Jen/Jeff/Aaron to LEX-LLC). Plate-tool side needs
    the next restart; briefing side live at next task fire.
+5. **d1 exit-gate nits FIXED (follow-up commit, folded into d2 per the spec tracker):**
+   (a) `format_tasks_for_llm` no longer tells non-founders to "ask in a #fndr-* channel"
+   (empty-case + scope footer now just state the out-of-scope count); (b) tasks render
+   due-date-first (stable sort, `sort_tasks_due_first`) and the plate's 10-item cap selects
+   due-dated work first -- Shaun's long no-due-date list had crowded out dated tasks and cut
+   mid-link; long lists (>10) also carry a terse-render instruction. NOTE: asana_client.py
+   was staged in ISOLATION (hash-object/update-index) because a concurrent session holds
+   uncommitted nudge-guard WIP in the same file -- their working-tree changes were never
+   committed here. +7 tests.
 
 **⏰ Open:** (1) Harrison eyeballs the first digest DM, then flips `-SendUsers` (or says
 hold); (2) next clean restart activates the sub-entity plate fix + the pending LLC posting

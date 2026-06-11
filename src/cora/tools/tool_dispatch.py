@@ -2629,7 +2629,9 @@ def _plate_asana_section(target_id: str, entity: str) -> str:
         log.warning("whats_on_my_plate asana error user=%s: %s", target_id, exc)
         return "(Temporary issue reaching Asana -- task list unavailable right now.)"
     filtered = _filter_tasks_by_entity(all_tasks, entity)
-    shown = filtered[:_PLATE_MAX_ITEMS]
+    # Due-dated tasks first so the 10-item cap keeps the most urgent work
+    # (2026-06-11 exit-gate nit: a long no-due-date list crowded out dated tasks).
+    shown = asana_client.sort_tasks_due_first(filtered)[:_PLATE_MAX_ITEMS]
     text = asana_client.format_tasks_for_llm(
         shown,
         entity_scope=entity if entity != "FNDR" else None,

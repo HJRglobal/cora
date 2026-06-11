@@ -528,3 +528,81 @@ def test_hubspot_section_caps_at_ten_items():
         out = td._plate_hubspot_section("U_X", "F3E")
     assert len(fmt.call_args[0][0]) == 10
     assert "first 10 of 12 deals" in out
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-11 exit-gate nits (folded into Org Synthesis Phase 2 d2)
+# --------------------------------------------------------------------------- #
+
+def test_scoped_empty_hint_never_references_founder_channels():
+    # NIT 1 (Matt's smoke): the overflow hint told a non-founder to ask in a
+    # #fndr-* channel they cannot access. State the fact, skip the advice.
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm([], entity_scope="OSN", total_before_filter=4)
+    assert "#fndr" not in out
+    assert "outside this channel's scope" in out
+
+
+def test_scoped_footer_never_references_founder_channels():
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm(
+        [{"name": "Task A", "projects": [{"name": "[OSN] Ops"}]}],
+        entity_scope="OSN",
+        total_before_filter=5,
+    )
+    assert "#fndr" not in out
+    assert "[Scope: showing OSN-tagged tasks only." in out
+
+
+def test_sort_tasks_due_first_orders_dated_then_undated():
+    from cora.tools import asana_client
+    tasks = [
+        {"name": "undated1"},
+        {"name": "late", "due_on": "2026-07-01"},
+        {"name": "soon", "due_on": "2026-06-12"},
+        {"name": "undated2"},
+    ]
+    out = [t["name"] for t in asana_client.sort_tasks_due_first(tasks)]
+    assert out == ["soon", "late", "undated1", "undated2"]
+
+
+def test_formatter_renders_due_dated_before_undated():
+    # NIT 2 (Shaun's smoke): a long no-due-date list rendered ahead of dated
+    # work, so a narration cutoff cost the urgent tail. Dated tasks lead.
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm([
+        {"name": "NoDueTask", "projects": []},
+        {"name": "DatedTask", "due_on": "2026-06-12", "projects": []},
+    ])
+    assert out.index("DatedTask") < out.index("NoDueTask")
+
+
+def test_plate_cap_keeps_due_dated_tasks():
+    # The 10-item plate cap must keep dated work, not the first 10 in API order.
+    mapping = {"U_X": {"asana_user_gid": "123"}}
+    tasks = [
+        {"name": f"nodue{i}", "projects": [{"name": "[F3E] S"}]} for i in range(12)
+    ]
+    tasks.append(
+        {"name": "dated", "due_on": "2026-06-12", "projects": [{"name": "[F3E] S"}]}
+    )
+    with patch.object(td, "_load_slack_asana_map", return_value=mapping), \
+         patch.object(td.asana_client, "get_user_tasks", return_value=tasks), \
+         patch.object(td.asana_client, "format_tasks_for_llm", return_value="OK") as fmt:
+        td._plate_asana_section("U_X", "F3E")
+    shown = fmt.call_args[0][0]
+    assert len(shown) == 10
+    assert shown[0]["name"] == "dated"
+
+
+def test_long_list_carries_terse_render_note():
+    from cora.tools import asana_client
+    tasks = [{"name": f"t{i}", "projects": []} for i in range(11)]
+    out = asana_client.format_tasks_for_llm(tasks)
+    assert "Long list" in out
+
+
+def test_short_list_has_no_terse_render_note():
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm([{"name": "t", "projects": []}])
+    assert "Long list" not in out

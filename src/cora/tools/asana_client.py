@@ -430,6 +430,20 @@ def format_created_task_for_llm(task: dict[str, Any]) -> str:
     )
 
 
+def sort_tasks_due_first(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Due-dated tasks first (ascending), then no-due-date tasks in input order.
+
+    2026-06-11 exit-gate nit (Shaun's plate): a long no-due-date list rendered
+    ahead of dated work, so any narration cutoff cost the urgent tail. Stable
+    sort: ties keep the API's order.
+    """
+    def _key(t: dict[str, Any]) -> tuple[int, str]:
+        due = t.get("due_on") or t.get("due_at") or ""
+        return (0, str(due)) if due else (1, "")
+
+    return sorted(tasks, key=_key)
+
+
 def format_tasks_for_llm(
     tasks: list[dict[str, Any]],
     entity_scope: str | None = None,
@@ -447,12 +461,16 @@ def format_tasks_for_llm(
     # Empty-list case
     if not tasks:
         if entity_scope and total_before_filter and total_before_filter > 0:
+            # 2026-06-11 exit-gate nit: never point a non-founder at #fndr-*
+            # channels they cannot access -- state the fact, skip the advice.
             return (
                 f"No incomplete {entity_scope}-tagged tasks assigned. "
-                f"User has {total_before_filter} task(s) across other entities — "
-                f"they can ask in a #fndr-* channel to see the full list."
+                f"User has {total_before_filter} task(s) across other entities, "
+                f"outside this channel's scope."
             )
         return "No incomplete tasks assigned in Asana."
+
+    tasks = sort_tasks_due_first(tasks)
 
     # Header — vary by whether scope filter is active
     if entity_scope and total_before_filter and total_before_filter > len(tasks):
@@ -470,6 +488,11 @@ def format_tasks_for_llm(
         "(Task names below are Slack-formatted hyperlinks — preserve the `<url|name>` "
         "syntax verbatim in your reply so the user can click through to edit in Asana.)"
     )
+    if len(tasks) > 10:
+        lines.append(
+            "(Long list: reproduce each task line verbatim and add no extra "
+            "commentary, so the full list fits in the reply.)"
+        )
     for t in tasks:
         name = t.get("name", "(no name)")
         due = t.get("due_on") or t.get("due_at") or "no due date"
@@ -505,8 +528,8 @@ def format_tasks_for_llm(
         lines.append("")
         lines.append(
             f"[Scope: showing {entity_scope}-tagged tasks only. "
-            f"{total_before_filter - len(tasks)} other tasks exist across other entities — "
-            f"user can ask in a #fndr-* channel to see them all.]"
+            f"{total_before_filter - len(tasks)} other task(s) exist outside "
+            f"this channel's scope.]"
         )
 
     return "\n".join(lines)
