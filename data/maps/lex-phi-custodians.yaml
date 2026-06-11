@@ -2,9 +2,11 @@
 # ---------------------------------------------------------------------------
 # Authorized custodians who may receive Lexington (LEX) PHI through Cora.
 #
-# These four people already hold all hard-copy client / employee / parent PHI
+# These custodians already hold all hard-copy client / employee / parent PHI
 # and may need to furnish it to DDD / AHCCCS. To them ONLY, and ONLY inside a
 # designated LEX channel or a direct message with them, Cora surfaces LEX PHI.
+# (Roster grew 4 -> 5 on 2026-06-11: Aaron Ferrucci added per Harrison's
+# explicit directive -- "can be added to all PHI access".)
 #
 # For everyone else the existing PHI refusal stands. LEX PHI NEVER surfaces in
 # a non-LEX channel for ANY user (incl. these four). The sibling_guard and
@@ -31,3 +33,6 @@ custodians:
   - name: Jeff Montgomery
     slack_id: U0B3KHBJJ91
     email: Jeff@LexingtonServices.com
+  - name: Aaron Ferrucci
+    slack_id: U0B3PS32A22
+    email: programdirector@lexingtonservices.com

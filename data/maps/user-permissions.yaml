@@ -113,8 +113,10 @@ users:
       - phi
       - cross_entity
 
-  U0B3PS32A22:  # Aaron Ferrucci — LEX-LLC Program Director (added 2026-06-11, Harrison)
-    name: Aaron Ferrucci
+  U0B3PS32A22:  # Aaron Ferrucci — LEX-LLC Programs Director (added 2026-06-11, Harrison)
+    name: Aaron Ferrucci  # PHI custodian (lex-phi-custodians.yaml) — the phi block below
+                          # is relaxed contextually by the custodian gate in LEX scope,
+                          # same pattern as Shaun/Jen/Jeff.
     allowed_entities:
       - LEX-LLC
     sensitive_topics_blocked:
@@ -122,6 +124,18 @@ users:
       - cap_table
       - cross_entity
       - financials
+
+  U0B9JS3JW07:  # Sara Fonseca — LLC marketing freelancer (added 2026-06-11, Harrison)
+    name: Sara Fonseca
+    allowed_entities:
+      - LEX-LLC
+    sensitive_topics_blocked:
+      - phi          # freelancer — never client-level info; NOT a custodian
+      - cap_table
+      - cross_entity
+      - financials
+      - hr
+      - legal
 
   U0B3RU65TFU:  # Demi Bagby — BDM partner, full BDM access + general social
     name: Demi Bagby

@@ -179,16 +179,32 @@ users:
 
   - slack_id: U0B3PS32A22
     name: Aaron Ferrucci
-    role: Program Director (LLC)
+    role: Programs Director (LLC)
     entity: LEX-LLC
     entities: [LEX]
     responsibilities:
       - LLC program direction and day-program operations
     manager: U0B3PS82G30
     notes: >-
-      Added 2026-06-11 (Harrison: LLC-specific roster). NOT a PHI custodian.
+      Added 2026-06-11 (Harrison: LLC-specific roster). PHI custodian (LEX
+      scope only) per Harrison 2026-06-11 -- "can be added to all PHI access".
       No Asana account yet -- slack-to-asana mapping pending his Asana invite.
       LLC-specific topics belong in #llc-leadership, not #lex-leadership.
+
+  - slack_id: U0B9JS3JW07
+    name: Sara Fonseca
+    role: Marketing Freelancer (LLC) -- videography + social media
+    entity: LEX-LLC
+    responsibilities:
+      - LLC videography and social media content
+      - LLC marketing asset production
+    manager: U0B3PS82G30
+    notes: >-
+      Freelance contractor (not FTE), added 2026-06-11 per Harrison. Reports
+      to Shaun AND Jen Mortensen. Needs access to LLC marketing assets
+      (Drive ACLs handled outside Cora). NOT a PHI custodian -- never
+      surface client-level information to her. No Asana/Google mapping yet.
+      LLC marketing topics live in #llc-marketing.
 
   - slack_id: U0B3NGR1Y85
     name: Larry Stone
