@@ -104,10 +104,15 @@ if ($Restart) {
     Write-Host "Heartbeat:"
     Get-Content "data\health\heartbeat.txt"
     Write-Host "Verify the timestamp above is fresh (within ~60s)."
-    $instances = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    # Healthy single instance = cora.exe launcher -> venv python REDIRECTOR ->
+    # base python = 1 cora.exe + 2 python.exe matches (verified 2026-06-11).
+    $pys = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
         Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" })
-    Write-Host ("Bot python instances running: " + $instances.Count + " (must be exactly 1)")
-    if ($instances.Count -ne 1) { Write-Warning "INSTANCE COUNT WRONG - investigate before walking away." }
+    $launchers = @(Get-CimInstance Win32_Process -Filter "Name='cora.exe'")
+    Write-Host ("Bot processes: " + $launchers.Count + " cora.exe launcher(s) + " + $pys.Count + " python (healthy single instance = 1 + 2)")
+    if ($pys.Count -ne 2 -or $launchers.Count -ne 1) {
+        Write-Warning "PROCESS SHAPE UNEXPECTED (stacked or partial instance?) - check the log for a single 'Cora starting up' + one monotonic heartbeat sequence."
+    }
 } else {
     Write-Host "=== Step 5 SKIPPED: no -Restart switch ==="
     Write-Host "The tool stays dormant until the next clean restart. From elevated PS:"

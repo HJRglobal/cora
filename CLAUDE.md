@@ -8,12 +8,14 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [ORG SYNTHESIS + HOTFIX] Plate-tool live-crash fixes: truncated asana_client restored + plate hardening + calendar scope + router + kill filter -- 2026-06-11 (RESTART PENDING)
+### [ORG SYNTHESIS + HOTFIX] Plate-tool live-crash fixes: truncated asana_client restored + plate hardening + calendar scope + router + kill filter -- 2026-06-11 (SHIPPED + LIVE, commit a5f4d4f)
 
 Fixes for the 00:51 AZ live smoke crash (Cowork bug report). Full suite **3,827 passed / 41
-skipped** (+14). **Restart REQUIRED** via `deployment\ship-plate-fixes-2026-06-11.ps1 -Restart`
-from elevated PS -- it carries the CORRECTED kill filter (see doctrine #5) and collapses any
-stacked instances.
+skipped** (+14). **Restarted 2026-06-11 01:17 AZ via `ship-plate-fixes-2026-06-11.ps1 -Restart`
+(corrected kill filter) -- old instance killed cleanly (its heartbeat counter died at 2341s),
+single new instance confirmed** (one "Cora starting up", one monotonic heartbeat sequence; the
+script's "2 instances" warning was a FALSE POSITIVE from a wrong threshold -- one healthy bot is
+a 3-process chain, see doctrine #5; verification corrected in both ship PS1s).
 
 1. **ROOT CAUSE -- `asana_client.py` was TRUNCATED ON MAIN since `d5f2e6f` (2026-06-03):** the
    Feature-14 commit cut the file mid-loop inside `format_tasks_for_llm`; the function fell off
@@ -1361,8 +1363,14 @@ deployment/
      Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
    ```
-   After Start-ScheduledTask + sleep, verify single instance: the same query must
-   return exactly 2 rows (cora.exe launcher + its python child) or 1 (python only).
+   After Start-ScheduledTask + sleep, verify single instance. **Healthy shape
+   (verified live 2026-06-11, all 3 created the same second):** `cora.exe`
+   launcher -> `.venv\Scripts\python.exe` (venv REDIRECTOR, not the bot) -> base
+   `Python312\python.exe` (the actual bot). So the query returns 3 rows for ONE
+   instance: 1 cora.exe + 2 python.exe. More than that = stacked; confirm via the
+   log (a single "Cora starting up" + one monotonic heartbeat sequence). FYI the
+   service task action is `uv.exe run cora` (pre-D-005 legacy; flagged 2026-06-11,
+   unchanged -- migrating it to .venv\Scripts\python.exe -m needs a Harrison call).
 
 6. **Import smoke test** -- Before every commit:
    `.venv\Scripts\python.exe -c "from src.cora.app import app"`
