@@ -8,7 +8,10 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [ORG SYNTHESIS] Phase 1: org role registry + role-aware context -- 2026-06-10 (STAGED, host ship pending)
+### [ORG SYNTHESIS] Phase 1: org role registry + role-aware context -- 2026-06-10 (SHIPPED + LIVE, commit 8d153b6)
+
+Repo HEAD: `8d153b6` on `origin/main` | full suite **3,762 passed / 41 skipped** | Cora restarted
+2026-06-10 ~23:27 AZ, heartbeat confirmed advancing | role injection LIVE.
 
 New program (Harrison-directed 2026-06-10): full organizational synthesis -- Cora as the
 role-scoped individual resource for EVERY user (as she is for Harrison), plus a founder-level
@@ -34,9 +37,11 @@ strategy/oversight layer for Harrison. Spec of record:
 - 28 tests `tests/test_org_roles.py` (28/28 in sandbox; full host suite runs in the ship PS1),
   incl. roster-drift guards: every slack-to-asana user + PHI custodian + finance-allowlisted
   user MUST have a registry entry.
-- **Proposed D-044** (in spec, awaiting Harrison 👍 before decisions.md): org-roles.yaml is the
-  canonical role registry; advisory-only; fail-closed; roster changes through Harrison; new
-  per-user features read it instead of growing new per-user maps.
+- **D-044 LOCKED** (Harrison-approved 2026-06-10 after full roster review; full entry in
+  decisions.md): org-roles.yaml is the canonical role registry; advisory-only; fail-closed;
+  roster changes through Harrison; new per-user features read it instead of growing new
+  per-user maps. Roster review shipped as `721970e` (Jerry = Staff Accountant under Justin;
+  Tessa added as first registry-only entry; suite 3,766 passed / 41 skipped).
 
 **Ship steps:** run the PS1 (import smoke -> full pytest -> commit/push -> optional restart).
 **Restart REQUIRED** for the injection to go live (app.py is in the bot process). The PS1's

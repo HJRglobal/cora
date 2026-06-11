@@ -945,3 +945,39 @@ the finance team gets receipts/invoices -- a content-type carve-out -- without e
 private mail around them. Prompt-only enforcement is insufficient for hard privacy rules (D-034);
 shipping the guard BEFORE the 18-month backfill lands means the historical mass arrives into an
 already-guarded, tag-at-ingest pipeline.
+
+
+## D-044 -- org-roles.yaml is the canonical org role registry: advisory-only, fail-closed (2026-06-10)
+
+**Decision (Harrison-approved 2026-06-10 after full roster review):**
+
+1. `data/maps/org-roles.yaml` is the CANONICAL registry of who each person is in the
+   organization: role, primary entity, additional entities, responsibilities (lanes), manager,
+   routing notes, external flag. Loaded by `src/cora/org_roles.py` (60s TTL live-reload -- edit
+   the YAML, no restart).
+2. **Advisory-only:** the registry NEVER expands access. It tailors tone, relevance, and
+   proactive suggestions. Access control remains exclusively with the deterministic guards
+   (user_access, sibling_guard, cross_entity_guard, phi_guard, historical_access D-043). Every
+   injected role block carries an explicit no-expansion rule so prompt-layer behavior cannot
+   silently drift from this contract.
+3. **Fail-closed:** an unknown Slack user gets no role block -- exactly the pre-registry
+   behavior. Parse errors keep the last good registry; a registry typo must never take Cora
+   down or change access posture.
+4. **Roster changes go through Harrison** (D-011 pattern). Registry-only entries (no slack_id,
+   e.g. Tessa Miller) ride `all_roles()`/`roles_for_entity()` for roster-level features but can
+   never trigger role-block injection.
+5. **New per-user features read this registry** instead of growing new per-user YAML maps.
+   Existing maps that drive live systems (slack-to-asana, role-briefing-config,
+   lex-phi-custodians, finance-receipt-allowlist, gap-domain-owners) stay separate until their
+   feature is reworked onto the registry (role-briefing-config consolidates in Org Synthesis
+   Phase 2).
+
+**Reason:** Org Synthesis program (spec
+`_shared/projects/cora/design/2026-06-10_fndr_org-synthesis-spec.md`): Cora becomes the
+role-scoped individual resource for every user and a portfolio-oversight layer for Harrison.
+That requires one authoritative answer to "who is this person and what do they own" -- before
+Phase 1 it was scattered across six maps and the founder brief. Keeping it advisory-only
+preserves the D-034 doctrine that hard security boundaries live in code-level guards, never in
+context or prompts. Shipped: `8d153b6` (registry + loader + injection, 3,762 tests) +
+`721970e` (roster review: Jerry Reick = Staff Accountant under Justin; Tessa Miller added as
+first registry-only entry; 3,766 tests).
