@@ -29,8 +29,9 @@ entities:
     finance:    C0B3A3TTN5D   # lex-finance
 
   LEX-LLC:
-    leadership: C0B3A3U7WS3   # lex-leadership (GM-level; no LLC-specific leadership channel)
-    finance:    C0B3A3TTN5D   # lex-finance
+    leadership: C0B5SJDHB9C   # llc-leadership (Harrison 2026-06-11: LLC-specific posts go
+                              # here, NOT #lex-leadership which stays GM-level)
+    finance:    C0B6NUYD3EU   # llc-finance
 
   LEX-LTS:
     leadership: C0B3A3U7WS3   # lex-leadership

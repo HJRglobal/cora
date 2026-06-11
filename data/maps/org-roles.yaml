@@ -142,32 +142,53 @@ users:
   - slack_id: U0B3PS82G30
     name: Shaun Hawkins
     role: Lexington Services Operations Director
-    entity: LEX
+    entity: LEX-LLC
+    entities: [LEX]
     responsibilities:
       - LLC operations (DDD/HCBS/DTA), residential + community services
       - Staff training and operational systems
     manager: U0B2RM2JYJ1
     notes: >-
       PHI custodian (LEX scope only). Operator within his lane, NOT an
-      approval gate -- escalate decisions to Harrison.
+      approval gate -- escalate decisions to Harrison. LLC-specific topics
+      belong in #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
 
   - slack_id: U0B3VGT8RE0
     name: Jennifer Mortensen
     role: Lexington Services Office Manager
-    entity: LEX
+    entity: LEX-LLC
+    entities: [LEX]
     responsibilities:
-      - LEX office administration and client records
+      - LLC office administration and client records
     manager: U0B3PS82G30
-    notes: PHI custodian (LEX scope only).
+    notes: >-
+      PHI custodian (LEX scope only). LLC-specific topics belong in
+      #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
 
   - slack_id: U0B3KHBJJ91
     name: Jeff Montgomery
     role: Lexington Services Minority Owner
-    entity: LEX
+    entity: LEX-LLC
+    entities: [LEX]
     responsibilities:
       - LEX 20% minority owner (confirmed 2026-05-13); strategic oversight
     manager: U0B2RM2JYJ1
-    notes: PHI custodian (LEX scope only).
+    notes: >-
+      PHI custodian (LEX scope only). LLC-specific topics belong in
+      #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
+
+  - slack_id: U0B3PS32A22
+    name: Aaron Ferrucci
+    role: Program Director (LLC)
+    entity: LEX-LLC
+    entities: [LEX]
+    responsibilities:
+      - LLC program direction and day-program operations
+    manager: U0B3PS82G30
+    notes: >-
+      Added 2026-06-11 (Harrison: LLC-specific roster). NOT a PHI custodian.
+      No Asana account yet -- slack-to-asana mapping pending his Asana invite.
+      LLC-specific topics belong in #llc-leadership, not #lex-leadership.
 
   - slack_id: U0B3NGR1Y85
     name: Larry Stone

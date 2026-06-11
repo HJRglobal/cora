@@ -113,6 +113,16 @@ users:
       - phi
       - cross_entity
 
+  U0B3PS32A22:  # Aaron Ferrucci — LEX-LLC Program Director (added 2026-06-11, Harrison)
+    name: Aaron Ferrucci
+    allowed_entities:
+      - LEX-LLC
+    sensitive_topics_blocked:
+      - phi
+      - cap_table
+      - cross_entity
+      - financials
+
   U0B3RU65TFU:  # Demi Bagby — BDM partner, full BDM access + general social
     name: Demi Bagby
     allowed_entities:
