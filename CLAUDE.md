@@ -8,6 +8,44 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Phase 2 deliverable 1: whats_on_my_plate tool -- 2026-06-11 (SHIPPED, commit f9cf11b; RESTART PENDING)
+
+Repo HEAD: `f9cf11b` on `origin/main` | full suite **3,813 passed / 41 skipped** (+47) |
+**Cora NOT yet restarted** -- the tool is dormant until the next clean restart
+(`deployment\ship-whats-on-my-plate-2026-06-11.ps1 -Restart` from elevated PS; kill filter
+matches `cora.main` ONLY, safe alongside any running backfill).
+
+First Phase 2 deliverable per the org-synthesis spec (decided with Harrison 2026-06-10:
+pull-not-push ships before the briefing rework). On-demand composite plate view, all in
+`tool_dispatch.py`:
+- **`whats_on_my_plate`** -- any teammate asks "what's on my plate" in any channel/DM and
+  gets THEIR role-scoped picture: role + lanes from org-roles.yaml (D-044), open Asana
+  tasks (channel entity-scope reused from asana_get_my_tasks), today + tomorrow calendar,
+  HubSpot deals when they own a pipeline (data-driven: presence in slack-to-hubspot.yaml),
+  and stalled P0/P1 decisions for Harrison only. Each section fail-soft.
+- **Scope rules:** own plate ONLY -- optional `person` param is Harrison-only (everyone
+  else politely refused; asana_get_user_tasks stays the peer-visible path). Unknown user
+  (no org-roles entry) = graceful fail-closed no-data response. External consultants
+  (Jason Dorfman) = role scope only, zero internal task/CRM/calendar pulls. LEX scope
+  (incl. sub-entities) never gets a HubSpot section (Tier-1 doctrine). NO financial
+  figures pulled anywhere (channel-tier guardrail respected by construction).
+- **ADVISORY data only** -- org_roles never expands access (D-044); user_access / sibling /
+  cross_entity / phi / historical_access guards all run unchanged, pre-LLM.
+- **Wiring:** TOOL_DEFINITIONS + _TOOL_FUNCTIONS + _GLOBAL_CORE_TOOLS (exposed to every
+  entity channel + DMs) + heavy 25s timeout tier. All 17 entity prompts gained a mandatory
+  "## What's on my plate" tool-call section. `asana_get_my_tasks` description re-pointed
+  (it previously claimed the literal phrase "what's on my plate" as its trigger).
+- 47 tests `tests/test_whats_on_my_plate.py` (wiring/exposure, registry scoping,
+  unknown-user refusal, Harrison override, external limits, LEX HubSpot exclusion,
+  fail-soft sections, prompt coverage).
+
+**Exit gate (Phase 2 deliverable 1):** after restart, live smoke for 3-4 roles --
+Harrison (FNDR/DM, expect STALLED DECISIONS section), Matt (#osn-leadership), Tommy
+(#f3e-sales, expect DEAL PIPELINE), one LEX user in #llc/#lex-leadership (expect NO
+pipeline section). **Next Phase 2 deliverable:** briefing rework -- `run_daily_briefing.py`
+reads org-roles.yaml; that is the consolidation point where role-briefing-config.yaml
+retires (do NOT touch it before then).
+
 ### [ORG SYNTHESIS] Phase 1: org role registry + role-aware context -- 2026-06-10 (SHIPPED + LIVE, commit 8d153b6)
 
 Repo HEAD: `8d153b6` on `origin/main` | full suite **3,762 passed / 41 skipped** | Cora restarted
