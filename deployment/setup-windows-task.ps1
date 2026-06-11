@@ -1,7 +1,9 @@
 # setup-windows-task.ps1
 #
 # Registers cowork-cora-service as a Windows Task Scheduler task.
-# The task launches "uv run cora" at logon and auto-restarts on failure.
+# The task launches .venv\Scripts\cora.exe at logon and auto-restarts on failure.
+# (D-005: never "uv run" in task actions -- uv contends for the venv lock against
+# concurrent test runs and deadlocks. Patched 2026-06-11.)
 #
 # Usage (run from any directory, as the current user - no elevation needed):
 #   powershell -ExecutionPolicy Bypass -File "C:\Users\Harri\code\cora\deployment\setup-windows-task.ps1"
@@ -41,26 +43,16 @@ if (-not (Test-Path $ENV_FILE -PathType Leaf)) {
 Write-Host "  OK  $ENV_FILE"
 
 # ------------------------------------------------------------------
-# [3/5] Locate uv.exe
+# [3/5] Locate the venv cora.exe entry point (absolute path -- Task
+# Scheduler has no user PATH, and "uv run" risks the venv-lock deadlock)
 # ------------------------------------------------------------------
-Write-Host "[3/5] Locating uv.exe..."
-$uvExe = $null
-$candidates = @(
-    "C:\Users\Harri\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\uv\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe"
-)
-foreach ($c in $candidates) {
-    if (Test-Path $c -PathType Leaf) { $uvExe = $c; break }
-}
-if (-not $uvExe) {
-    try { $uvExe = (Get-Command uv -ErrorAction Stop).Source } catch {}
-}
-if (-not $uvExe) {
-    Write-Host "  ERROR: uv.exe not found. Install uv first: https://docs.astral.sh/uv/" -ForegroundColor Red
+Write-Host "[3/5] Locating .venv\Scripts\cora.exe..."
+$CoraExe = Join-Path $REPO_DIR ".venv\Scripts\cora.exe"
+if (-not (Test-Path $CoraExe -PathType Leaf)) {
+    Write-Host "  ERROR: $CoraExe not found. Run 'uv sync' in $REPO_DIR first." -ForegroundColor Red
     exit 1
 }
-Write-Host "  OK  $uvExe"
+Write-Host "  OK  $CoraExe"
 
 # ------------------------------------------------------------------
 # [4/5] Build and register the task (idempotent - remove then re-add)
@@ -85,8 +77,7 @@ if ($orphans) {
 }
 
 $action = New-ScheduledTaskAction `
-    -Execute $uvExe `
-    -Argument "run cora" `
+    -Execute $CoraExe `
     -WorkingDirectory $REPO_DIR
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME

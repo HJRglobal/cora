@@ -61,18 +61,37 @@ sys.path.insert(0, str(_REPO_ROOT))
 from dotenv import load_dotenv
 load_dotenv(_REPO_ROOT / ".env", override=True)
 
-import anthropic
-
-from src.cora.connectors.drive_sweep import sweep_founders_os, FOUNDERS_OS_ROOT_ID
-from src.cora.knowledge_base.store import KnowledgeBase
-
 # ── Logging ────────────────────────────────────────────────────────────────────
+# File handler added 2026-06-11: the scheduled task (cowork-cora-founders-os-sweep)
+# had no stdout redirection and no file logging, so exit-code failures
+# (SCHED_S_TASK_TERMINATED) were undiagnosable. Configured BEFORE the heavy
+# imports below so an import failure still leaves a log line behind.
+_LOG_DIR = _REPO_ROOT / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(
+            _LOG_DIR / f"founders-os-sweep-{time.strftime('%Y-%m-%d')}.log",
+            encoding="utf-8",
+        ),
+        logging.StreamHandler(
+            open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)
+        ),
+    ],
 )
 log = logging.getLogger("ingest-founders-os")
+
+try:
+    import anthropic
+
+    from src.cora.connectors.drive_sweep import sweep_founders_os, FOUNDERS_OS_ROOT_ID
+    from src.cora.knowledge_base.store import KnowledgeBase
+except Exception:
+    log.exception("Fatal: import failure before main()")
+    sys.exit(1)
 
 # ── Phase definitions ──────────────────────────────────────────────────────────
 PHASES: dict[str, dict] = {

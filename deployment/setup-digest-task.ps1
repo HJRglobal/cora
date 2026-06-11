@@ -42,26 +42,20 @@ if (-not (Test-Path $SCRIPT_PATH -PathType Leaf)) {
 Write-Host "  OK  $SCRIPT_PATH"
 
 # ------------------------------------------------------------------
-# [3/5] Locate uv.exe
+# [3/5] Locate venv python + script (D-005: no "uv run" in task actions)
 # ------------------------------------------------------------------
-Write-Host "[3/5] Locating uv.exe..."
-$uvExe = $null
-$candidates = @(
-    "C:\Users\Harri\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\uv\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe"
-)
-foreach ($c in $candidates) {
-    if (Test-Path $c -PathType Leaf) { $uvExe = $c; break }
-}
-if (-not $uvExe) {
-    try { $uvExe = (Get-Command uv -ErrorAction Stop).Source } catch {}
-}
-if (-not $uvExe) {
-    Write-Host "  ERROR: uv.exe not found. Install uv first: https://docs.astral.sh/uv/" -ForegroundColor Red
+Write-Host "[3/5] Locating .venv python and script..."
+$PythonPath = Join-Path $REPO_DIR ".venv\Scripts\python.exe"
+$ScriptPath = Join-Path $REPO_DIR "scripts\generate_knowledge_gaps_digest.py"
+if (-not (Test-Path $PythonPath -PathType Leaf)) {
+    Write-Host "  ERROR: $PythonPath not found. Run 'uv sync' in $REPO_DIR first." -ForegroundColor Red
     exit 1
 }
-Write-Host "  OK  $uvExe"
+if (-not (Test-Path $ScriptPath -PathType Leaf)) {
+    Write-Host "  ERROR: $ScriptPath not found." -ForegroundColor Red
+    exit 1
+}
+Write-Host "  OK  $PythonPath"
 
 # ------------------------------------------------------------------
 # [4/5] Build and register the task (idempotent - remove then re-add)
@@ -76,8 +70,8 @@ if ($existing) {
 }
 
 $action = New-ScheduledTaskAction `
-    -Execute $uvExe `
-    -Argument "run python scripts/generate_knowledge_gaps_digest.py" `
+    -Execute $PythonPath `
+    -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $REPO_DIR
 
 $trigger = New-ScheduledTaskTrigger -Daily -At "05:00"

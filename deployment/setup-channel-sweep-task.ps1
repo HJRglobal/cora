@@ -20,26 +20,18 @@ $TaskName  = "cowork-cora-channel-sweep"
 $LogDir    = "$RepoRoot\logs"
 $RunTime   = "08:30"   # UTC = 01:30 AZ (Phoenix, UTC-7, no DST)
 
-# Locate uv
-$uvExe = $null
-$uvCandidates = @(
-    "C:\Users\Harri\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\uv\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe"
-)
-foreach ($c in $uvCandidates) {
-    if (Test-Path $c -PathType Leaf) { $uvExe = $c; break }
-}
-if (-not $uvExe) {
-    try { $uvExe = (Get-Command uv -ErrorAction Stop).Source } catch {}
-}
-if (-not $uvExe) { Write-Error "uv.exe not found."; exit 1 }
+# Absolute venv python + absolute script path (D-005: no "uv run" in task
+# actions -- venv-lock deadlock risk; Task Scheduler has no user PATH).
+$PythonPath = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$ScriptPath = Join-Path $RepoRoot "scripts\run_channel_sweep.py"
+if (-not (Test-Path $PythonPath -PathType Leaf)) { Write-Error "python.exe not found at $PythonPath. Run 'uv sync' first."; exit 1 }
+if (-not (Test-Path $ScriptPath -PathType Leaf)) { Write-Error "Script not found at $ScriptPath."; exit 1 }
 
 Write-Host "Registering task: $TaskName" -ForegroundColor Cyan
 
 $Action  = New-ScheduledTaskAction `
-    -Execute $uvExe `
-    -Argument "run python scripts/run_channel_sweep.py" `
+    -Execute $PythonPath `
+    -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot
 
 $Trigger = New-ScheduledTaskTrigger -Daily -At $RunTime

@@ -43,33 +43,7 @@ load_dotenv()
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from cora.reconciliation_engine import (  # noqa: E402
-    reconcile,
-    ReconciliationGap,
-    DEFAULT_LOOKBACK_SECONDS,
-)
-from cora.knowledge_review import (  # noqa: E402
-    propose_update,
-    UPDATE_TYPE_ASANA_TASK,
-    UPDATE_TYPE_HUBSPOT_NOTE,
-    UPDATE_TYPE_DECISION,
-    UPDATE_TYPE_TASK_CLOSE,
-)
-
-LOG_DIR          = _REPO_ROOT / "logs"
-GAPS_DIR         = _REPO_ROOT / "data" / "reconciliation"
-KB_DB_PATH       = _REPO_ROOT / "data" / "cora_kb.db"
-
-# Map gap_type -> knowledge_review update_type constant
-_GAP_TYPE_TO_UPDATE_TYPE = {
-    "missing_asana_task":   UPDATE_TYPE_ASANA_TASK,
-    "stale_hubspot_deal":   UPDATE_TYPE_HUBSPOT_NOTE,
-    "uncaptured_decision":  UPDATE_TYPE_DECISION,
-    "stale_open_task":      UPDATE_TYPE_TASK_CLOSE,
-}
-
-# Only queue HIGH + MED for Harrison review
-_REVIEW_CONFIDENCES = {"HIGH", "MED"}
+LOG_DIR = _REPO_ROOT / "logs"
 
 
 def _setup_logging() -> None:
@@ -84,6 +58,43 @@ def _setup_logging() -> None:
             logging.StreamHandler(open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)),
         ],
     )
+
+
+# File logging must exist BEFORE the cora package imports: an import failure here
+# used to exit 1 with no log file at all (last reconciliation-*.log was 2026-05-31),
+# leaving the scheduled task's exit-1 undiagnosable.
+_setup_logging()
+
+try:
+    from cora.reconciliation_engine import (  # noqa: E402
+        reconcile,
+        ReconciliationGap,
+        DEFAULT_LOOKBACK_SECONDS,
+    )
+    from cora.knowledge_review import (  # noqa: E402
+        propose_update,
+        UPDATE_TYPE_ASANA_TASK,
+        UPDATE_TYPE_HUBSPOT_NOTE,
+        UPDATE_TYPE_DECISION,
+        UPDATE_TYPE_TASK_CLOSE,
+    )
+except Exception:
+    logging.getLogger("reconciliation").exception("Fatal: import failure before main()")
+    sys.exit(1)
+
+GAPS_DIR         = _REPO_ROOT / "data" / "reconciliation"
+KB_DB_PATH       = _REPO_ROOT / "data" / "cora_kb.db"
+
+# Map gap_type -> knowledge_review update_type constant
+_GAP_TYPE_TO_UPDATE_TYPE = {
+    "missing_asana_task":   UPDATE_TYPE_ASANA_TASK,
+    "stale_hubspot_deal":   UPDATE_TYPE_HUBSPOT_NOTE,
+    "uncaptured_decision":  UPDATE_TYPE_DECISION,
+    "stale_open_task":      UPDATE_TYPE_TASK_CLOSE,
+}
+
+# Only queue HIGH + MED for Harrison review
+_REVIEW_CONFIDENCES = {"HIGH", "MED"}
 
 
 def _fetch_open_tasks() -> list[dict]:
@@ -238,7 +249,7 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
         slack_id = name_to_sid.get(assignee_name.lower())
         if not slack_id:
             log.info(
-                “Could not resolve Slack ID for assignee %r -- no DM sent”, assignee_name
+                "Could not resolve Slack ID for assignee %r -- no DM sent", assignee_name
             )
             continue
 
@@ -323,7 +334,6 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    _setup_logging()
     log = logging.getLogger("reconciliation")
     log.info("=" * 60)
     log.info("Reconciliation sweep starting (dry_run=%s)", args.dry_run)

@@ -14,21 +14,16 @@
 $ErrorActionPreference = "Stop"
 
 $RepoRoot  = "C:\Users\Harri\code\cora"
-$UvExe     = "C:\Users\Harri\AppData\Local\Programs\Python\Python312\Scripts\uv.exe"
 $TaskName  = "cowork-cora-knowledge-review"
 $Script    = "scripts\run_knowledge_review.py"
 $HourMin   = "07:00"
 
-# Fallback: try resolving uv from PATH
-if (-not (Test-Path $UvExe)) {
-    $uvFromPath = (Get-Command uv -ErrorAction SilentlyContinue).Source
-    if ($uvFromPath) {
-        $UvExe = $uvFromPath
-        Write-Host "Resolved uv from PATH: $UvExe"
-    } else {
-        Write-Error "uv.exe not found at $UvExe or in PATH. Install uv or adjust the script."
-        exit 1
-    }
+# Absolute venv python (D-005: no "uv run" in task actions -- venv-lock
+# deadlock risk against the live cowork-cora-service; patched 2026-06-11).
+$PythonPath = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $PythonPath -PathType Leaf)) {
+    Write-Error "python.exe not found at $PythonPath. Run 'uv sync' in $RepoRoot first."
+    exit 1
 }
 
 Write-Host "Setting up scheduled task: $TaskName" -ForegroundColor Cyan
@@ -42,8 +37,11 @@ if ($existing) {
 }
 
 $scriptPath = Join-Path $RepoRoot $Script
-$cmdArgs    = "/c cd /d `"$RepoRoot`" `& `"$UvExe`" run python `"$scriptPath`""
-$action     = New-ScheduledTaskAction -Execute "cmd.exe" -WorkingDirectory $RepoRoot -Argument $cmdArgs
+if (-not (Test-Path $scriptPath -PathType Leaf)) {
+    Write-Error "Script not found at $scriptPath."
+    exit 1
+}
+$action = New-ScheduledTaskAction -Execute $PythonPath -WorkingDirectory $RepoRoot -Argument "`"$scriptPath`""
 
 # Mon-Fri only at 7:00 AM local time (machine is set to AZ timezone)
 $trigger = New-ScheduledTaskTrigger -Weekly `

@@ -72,9 +72,12 @@ class CheckResult:
 
 # Tasks intentionally Disabled (Harrison-directed). Keep in sync with
 # project_scheduled_tasks_registry.md "Disabled tasks" section.
-#   - asana-email-sync / hubspot-email-sync: Gmail-match precision too low (paused)
-#   - proactive-gaps: wrong-entity content bug (fix queued)
-# NOTE: qbo-token-refresh was RE-ENABLED 2026-06-04 -- it is now expected Ready.
+# Reconciled against live `schtasks /Query` 2026-06-11 (14-day infra review):
+# Deal Task Sync / Asana Hygiene Nudges / Channel Health Monitor / OSN Metrics
+# Digest were re-enabled with the 2026-06-06 Tier 3 registrations -- removed.
+# Deal Aging Alerts / Weekly Pipeline Digest are live-Disabled (Make.com
+# migration 2026-06-05) -- added.
+# NOTE: qbo-token-refresh was RE-ENABLED 2026-06-04 -- it is expected Ready.
 _EXPECTED_DISABLED = {
     # Gmail sync -- precision too low (paused)
     "cowork-cora-asana-email-sync",
@@ -82,12 +85,10 @@ _EXPECTED_DISABLED = {
     # Wrong-entity content bug (fix queued)
     "cowork-cora-proactive-gaps",
     # Moved to Make.com 2026-06-05
-    "Cora - Deal Task Sync",
-    "Cora - Asana Hygiene Nudges",
-    "Cora - Channel Health Monitor",
     "Cora - HubSpot Deal Monitor",
-    "Cora - OSN Metrics Digest",
     "Cora - Shopify DTC Summary",
+    "Cora - Deal Aging Alerts",
+    "Cora - Weekly Pipeline Digest",
     # Clover retired 2026-06-05
     "Cora - Clover Daily Summary",
     # LinkedIn Spy moved to Make.com 2026-06-05
@@ -290,7 +291,7 @@ def check_scheduled_tasks() -> list[CheckResult]:
         results.append(CheckResult(
             "Scheduled tasks", "critical",
             f"{len(problems)} task(s) in unexpected state:\n" +
-            "\n".join(f"  • {p}" for p in problems)
+            "\n".join(f"  - {p}" for p in problems)
         ))
     else:
         results.append(CheckResult(

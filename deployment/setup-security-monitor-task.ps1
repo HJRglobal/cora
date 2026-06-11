@@ -47,24 +47,17 @@ Write-Host "  OK  security_monitor.py present"
 # ------------------------------------------------------------------
 # [3/5] Locate uv.exe
 # ------------------------------------------------------------------
-Write-Host "[3/5] Locating uv.exe..."
-$uvExe = $null
-$candidates = @(
-    "C:\Users\Harri\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\uv\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe"
-)
-foreach ($c in $candidates) {
-    if (Test-Path $c -PathType Leaf) { $uvExe = $c; break }
-}
-if (-not $uvExe) {
-    try { $uvExe = (Get-Command uv -ErrorAction Stop).Source } catch {}
-}
-if (-not $uvExe) {
-    Write-Host "  ERROR: uv.exe not found. Install uv first: https://docs.astral.sh/uv/" -ForegroundColor Red
+Write-Host "[3/5] Locating .venv python (D-005: no 'uv run' in task actions)..."
+$PythonPath = Join-Path $REPO_DIR ".venv\Scripts\python.exe"
+if (-not (Test-Path $PythonPath -PathType Leaf)) {
+    Write-Host "  ERROR: $PythonPath not found. Run 'uv sync' in $REPO_DIR first." -ForegroundColor Red
     exit 1
 }
-Write-Host "  OK  $uvExe"
+if (-not (Test-Path $SCRIPT -PathType Leaf)) {
+    Write-Host "  ERROR: script not found at $SCRIPT" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  OK  $PythonPath"
 
 # ------------------------------------------------------------------
 # [4/5] Register task (idempotent - remove then re-add)
@@ -79,8 +72,8 @@ if ($existing) {
 }
 
 $action = New-ScheduledTaskAction `
-    -Execute $uvExe `
-    -Argument "run python `"$SCRIPT`"" `
+    -Execute $PythonPath `
+    -Argument "`"$SCRIPT`"" `
     -WorkingDirectory $REPO_DIR
 
 # Repeat every 15 minutes; StartWhenAvailable covers missed firings (logon, wake from sleep)
