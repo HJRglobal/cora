@@ -39,6 +39,9 @@ _BASE = "https://app.asana.com/api/1.0"
 _WORKSPACE_GID = "682743441507584"  # HJR Global workspace
 _TIMEOUT = 10.0
 _DEFAULT_MAX_TASKS = 25
+# Asana rejects limit > 100 with a 400. max_tasks above this is served by
+# paginating with the next_page offset token.
+_API_MAX_LIMIT = 100
 
 
 class AsanaClientError(Exception):
@@ -55,45 +58,62 @@ def _pat() -> str:
 def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[dict[str, Any]]:
     """Fetch incomplete tasks assigned to a user.
 
+    Paginates when max_tasks > 100 (Asana 400s on limit > 100 — the 5/31
+    reconciliation "scale increase" to max_tasks=200 silently broke every
+    fetch until 2026-06-11).
+
     Returns a list of task dicts. Empty list if no incomplete tasks.
     Raises AsanaClientError on auth / network / 5xx failure.
     """
-    params = {
-        "assignee": user_gid,
-        "workspace": _WORKSPACE_GID,
-        "completed_since": "now",  # incomplete-only filter
-        "limit": max_tasks,
-        "opt_fields": ",".join([
-            "name",
-            "due_on",
-            "due_at",
-            "completed",
-            "assignee.gid",   # needed for user_identity reverse lookup (@mention in digests)
-            "assignee.name",  # human-readable fallback when reverse lookup misses
-            "projects.name",
-            "memberships.section.name",
-            "memberships.project.name",
-            "notes",
-            "permalink_url",  # Slack deep link — user clicks to edit in Asana
-        ]),
-    }
     headers = {"Authorization": f"Bearer {_pat()}"}
-    try:
-        with httpx.Client(timeout=_TIMEOUT) as c:
-            r = c.get(f"{_BASE}/tasks", params=params, headers=headers)
-    except httpx.RequestError as exc:
-        raise AsanaClientError(f"Asana network error: {exc}") from exc
+    tasks: list[dict[str, Any]] = []
+    offset: str | None = None
 
-    if r.status_code == 401:
-        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
-    if r.status_code == 403:
-        raise AsanaClientError(f"Asana 403 — PAT lacks permission for user {user_gid}")
-    if r.status_code >= 500:
-        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
-    if r.status_code != 200:
-        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+    while len(tasks) < max_tasks:
+        params = {
+            "assignee": user_gid,
+            "workspace": _WORKSPACE_GID,
+            "completed_since": "now",  # incomplete-only filter
+            "limit": min(_API_MAX_LIMIT, max_tasks - len(tasks)),
+            "opt_fields": ",".join([
+                "name",
+                "due_on",
+                "due_at",
+                "completed",
+                "assignee.gid",   # needed for user_identity reverse lookup (@mention in digests)
+                "assignee.name",  # human-readable fallback when reverse lookup misses
+                "projects.name",
+                "memberships.section.name",
+                "memberships.project.name",
+                "notes",
+                "permalink_url",  # Slack deep link — user clicks to edit in Asana
+            ]),
+        }
+        if offset:
+            params["offset"] = offset
 
-    return r.json().get("data", []) or []
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as c:
+                r = c.get(f"{_BASE}/tasks", params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+        if r.status_code == 401:
+            raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+        if r.status_code == 403:
+            raise AsanaClientError(f"Asana 403 — PAT lacks permission for user {user_gid}")
+        if r.status_code >= 500:
+            raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+        if r.status_code != 200:
+            raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+        body = r.json()
+        tasks.extend(body.get("data", []) or [])
+        offset = (body.get("next_page") or {}).get("offset")
+        if not offset:
+            break
+
+    return tasks[:max_tasks]
 
 
 def create_task(

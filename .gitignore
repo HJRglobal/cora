@@ -87,3 +87,4 @@ data/health/heartbeat.txt
 data/*.db.bak*
 /.git-corrupt-backup/
 /backups/
+data/health-kb-baseline.json

@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python3
-"""5:30am AZ daily â€” cross-source reconciliation sweep.
+"""5:30am AZ daily -- cross-source reconciliation sweep.
 
 Runs after all four KB sync tasks (Slack 2am, Gmail 2:30am, Asana 3am,
 Fireflies 3:30am, static_md 4am, Drive 4:30am) have completed so the KB
@@ -8,7 +8,7 @@ contains fresh content for all sources.
 Pipeline:
   1. Fetch open Asana tasks (all assigned users in workspace).
   2. Fetch active HubSpot deals from F3E Retail pipeline.
-  3. Call reconciliation_engine.reconcile() â€” runs four passes:
+  3. Call reconciliation_engine.reconcile() -- runs four passes:
        Pass 1: Missing Asana tasks (action commitments without tasks)
        Pass 2: Stale HubSpot deals (deal mentions, no HubSpot activity in 7d)
        Pass 3: Uncaptured decisions (decision language not in decisions.md)
@@ -25,7 +25,7 @@ Asana, or HubSpot. It only queues proposals.
 Exit codes:
     0 = success
     1 = fatal error
-    2 = partial â€” some passes failed or KB is empty
+    2 = partial -- some passes failed or KB is empty
 """
 
 import argparse
@@ -110,7 +110,7 @@ def _fetch_open_tasks() -> list[dict]:
         maps_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
         if not maps_path.exists():
             log = logging.getLogger("reconciliation")
-            log.warning("slack-to-asana.yaml not found â€” using empty task list")
+            log.warning("slack-to-asana.yaml not found -- using empty task list")
             return []
 
         with maps_path.open(encoding="utf-8") as fh:
@@ -191,7 +191,7 @@ def _fetch_active_deals() -> list[dict]:
 
 
 def _build_name_to_sid_map() -> dict[str, str]:
-    """Build display_name (lower) â†’ slack_user_id from slack-to-asana.yaml."""
+    """Build display_name (lower) â†' slack_user_id from slack-to-asana.yaml."""
     maps_path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
     try:
         import yaml
@@ -216,7 +216,7 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
     """Send a gentle DM to each assignee whose tasks may already be done.
 
     Groups multiple stale gaps per user into a single DM. Skips users whose
-    Slack ID cannot be resolved. Never DMs Harrison Rogers directly here â€”
+    Slack ID cannot be resolved. Never DMs Harrison Rogers directly here --
     he already sees all gaps in the knowledge_review queue.
     """
     import os
@@ -227,12 +227,12 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
 
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
-        log.warning("SLACK_BOT_TOKEN not set â€” skipping stale task DMs")
+        log.warning("SLACK_BOT_TOKEN not set -- skipping stale task DMs")
         return
 
     name_to_sid = _build_name_to_sid_map()
     if not name_to_sid:
-        log.warning("No nameâ†’Slack ID map available â€” skipping stale task DMs")
+        log.warning("No nameâ†'Slack ID map available -- skipping stale task DMs")
         return
 
     slack = SlackWebClient(token=token)
@@ -278,13 +278,13 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
             f"suggests one or more of your open tasks may already be wrapped up:\n\n"
             f"{tasks_block}\n\n"
             f"Could you check and mark them complete in Asana if they're done? "
-            f"No pressure â€” just keeping the board tidy. Thanks! ðŸ™Œ"
+            f"No pressure -- just keeping the board tidy. Thanks! ðŸ™Œ"
         )
 
         try:
             slack.chat_postMessage(channel=dm_channel, text=msg)
             log.info(
-                "Sent stale-task DM to %s (%s) â€” %d gap(s)",
+                "Sent stale-task DM to %s (%s) -- %d gap(s)",
                 assignee_name, slack_id, len(user_gaps),
             )
         except SlackApiError as exc:
@@ -348,7 +348,7 @@ def main() -> int:
     date_str = datetime.now().strftime("%Y-%m-%d")
     exit_code = 0
 
-    # â”€â”€â”€ Fetch open tasks and active deals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ Fetch open tasks and active deals â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     log.info("Fetching open Asana tasks...")
     open_tasks = _fetch_open_tasks()
     log.info("Fetched %d open Asana tasks", len(open_tasks))
@@ -357,7 +357,7 @@ def main() -> int:
     active_deals = _fetch_active_deals()
     log.info("Fetched %d active HubSpot deals", len(active_deals))
 
-    # â”€â”€â”€ Build Anthropic client for pass 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ Build Anthropic client for pass 5 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     anthropic_client = None
     if 5 in passes:
         import os
@@ -370,9 +370,9 @@ def main() -> int:
             except Exception as exc:
                 log.warning("Could not build Anthropic client for pass 5: %s", exc)
         else:
-            log.warning("ANTHROPIC_API_KEY not set â€” pass 5 will be skipped")
+            log.warning("ANTHROPIC_API_KEY not set -- pass 5 will be skipped")
 
-    # â”€â”€â”€ Run reconciliation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ Run reconciliation â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     log.info("Running reconciliation passes %s over last %.0fh of KB...", passes, args.lookback_hours)
     try:
         gaps = reconcile(
@@ -395,16 +395,16 @@ def main() -> int:
     )
 
     if not gaps:
-        log.info("No actionable gaps â€” nothing to propose")
+        log.info("No actionable gaps -- nothing to propose")
         # Write empty gaps file so scheduled-task scheduler knows it ran
         _write_gaps_file([], date_str)
         return 0
 
-    # â”€â”€â”€ Write gaps file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ Write gaps file â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     gaps_path = _write_gaps_file(gaps, date_str)
     log.info("Wrote %d gaps to %s", len(gaps), gaps_path)
 
-    # â”€â”€â”€ Propose updates to Harrison via knowledge_review â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ Propose updates to Harrison via knowledge_review â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     high_med = [g for g in gaps if g.confidence in _REVIEW_CONFIDENCES]
     log.info("Queuing %d HIGH/MED gaps for Harrison review (+1/-1)", len(high_med))
 
@@ -441,11 +441,11 @@ def main() -> int:
             skipped += 1
 
     log.info(
-        "Reconciliation sweep done â€” %d proposed, %d skipped (exit=%d)",
+        "Reconciliation sweep done -- %d proposed, %d skipped (exit=%d)",
         proposed, skipped, exit_code,
     )
 
-    # â”€â”€â”€ DM individual users for stale open task gaps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€â"€ DM individual users for stale open task gaps â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     stale_gaps = [g for g in high_med if g.gap_type == "stale_open_task"]
     if stale_gaps and not args.dry_run:
         log.info("Sending stale-task DMs for %d gap(s)...", len(stale_gaps))
