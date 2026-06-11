@@ -22,6 +22,7 @@ from typing import Any, Iterable
 from . import embeddings, schema
 from .chunker import chunk_text
 from .lex_sub_entity import detect_sub_entity
+from ..finance_doc_classifier import is_financial_document
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +66,11 @@ class SearchResult:
     deep_link: str
     date_modified: int | None
     distance: float            # cosine distance (0 = identical, 2 = opposite)
+    # Added 2026-06-10 for per-user email/Drive access control: the owner
+    # check needs metadata.user_email and the Tier-1 strip needs author.
+    # Defaulted so existing positional constructions stay valid.
+    author: str = ""
+    metadata: dict[str, Any] | None = None
 
 
 # LEX sub-entity visibility: which sub_entity values a given sub-entity channel can see.
@@ -150,6 +156,19 @@ class KnowledgeBase:
                 detected = detect_sub_entity(doc.title, doc.content)
                 if detected:
                     doc.sub_entity = detected
+
+        # Step 0b: ingest-time financial-document tagging (Tier 2-Finance).
+        # Personal-source docs (gmail/drive_sweep) that look like receipts/
+        # invoices/statements get metadata.financial_document=True at the
+        # choke point, so every connector — including bulk gmail backfills —
+        # is covered. Deterministic + precision-biased (see
+        # finance_doc_classifier); absence of the key means "not financial".
+        for doc in docs_list:
+            if doc.source in ("gmail", "drive_sweep") and not (
+                doc.metadata or {}
+            ).get("financial_document"):
+                if is_financial_document(doc.title, doc.content, doc.author):
+                    doc.metadata = {**(doc.metadata or {}), "financial_document": True}
 
         # Step 1: chunk each doc, build flat list of (doc, chunk_text, chunk_id)
         chunk_tuples: list[tuple[Document, str, str]] = []
@@ -322,20 +341,30 @@ class KnowledgeBase:
         return self._bin_ready
 
     def _rows_to_results(self, rows: list) -> list[SearchResult]:
-        return [
-            SearchResult(
-                chunk_id=r[0],
-                source=r[1],
-                source_id=r[2],
-                entity=r[3],
-                title=r[4] or "",
-                content=r[5],
-                deep_link=r[6] or "",
-                date_modified=r[7],
-                distance=r[8],
+        results: list[SearchResult] = []
+        for r in rows:
+            metadata = None
+            if len(r) > 10 and r[10]:
+                try:
+                    metadata = json.loads(r[10])
+                except (ValueError, TypeError):
+                    metadata = None
+            results.append(
+                SearchResult(
+                    chunk_id=r[0],
+                    source=r[1],
+                    source_id=r[2],
+                    entity=r[3],
+                    title=r[4] or "",
+                    content=r[5],
+                    deep_link=r[6] or "",
+                    date_modified=r[7],
+                    distance=r[8],
+                    author=(r[9] or "") if len(r) > 9 else "",
+                    metadata=metadata,
+                )
             )
-            for r in rows
-        ]
+        return results
 
     def _search_binary(
         self,
@@ -382,7 +411,8 @@ class KnowledgeBase:
             SELECT
                 k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
                 k.deep_link, k.date_modified,
-                vec_distance_l2(?, f.embedding) AS distance
+                vec_distance_l2(?, f.embedding) AS distance,
+                k.author, k.metadata
             FROM knowledge_chunks k
             JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
             WHERE k.chunk_id IN ({cand_ph})
@@ -424,7 +454,8 @@ class KnowledgeBase:
             SELECT
                 k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
                 k.deep_link, k.date_modified,
-                vec_distance_l2(?, f.embedding) AS distance
+                vec_distance_l2(?, f.embedding) AS distance,
+                k.author, k.metadata
             FROM knowledge_chunks k
             JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
             WHERE k.entity IN ({ent_ph})
@@ -438,6 +469,81 @@ class KnowledgeBase:
             params.append(cutoff)
         params.extend(sub_entity_params)
 
+        rows = self._conn.execute(sql, params).fetchall()
+        return self._rows_to_results(rows)
+
+    # --- Owner-scoped retrieval (Tier 2 / Tier 2-Finance) ---
+
+    def search_owned(
+        self,
+        query: str,
+        owner_emails: frozenset[str] | set[str] | None,
+        sources: tuple[str, ...] = ("gmail", "drive_sweep"),
+        k: int = 12,
+        financial_only: bool = False,
+        query_vec: list[float] | None = None,
+    ) -> list[SearchResult]:
+        """Exact vector search restricted to specific mailbox owners.
+
+        Used by the Tier-2 explicit-retrieval paths (historical_access /
+        finance_receipts), NEVER by general Q&A retrieval. Differences from
+        search():
+          - owner filter: metadata.user_email IN owner_emails. None means ANY
+            mailbox — only the Tier 2-Finance path may pass None, and only
+            with financial_only=True.
+          - source filter: personal sources only (gmail/drive_sweep).
+          - financial_only: metadata.financial_document must be true.
+          - NO entity filter and NO recency cutoff — this is deliberately a
+            historical search over the asker's own (or finance-authorized)
+            corpus. Entity scoping is a channel concept; a mailbox owner may
+            always see their own mail.
+
+        Implementation: brute-force exact vec_distance_l2 over the FILTERED
+        subset via the knowledge_vec_f32 join. A single mailbox is a small
+        fraction of the corpus, so the O(n-subset) scan is the simple, exact,
+        recall-perfect choice over coarse-then-filter (which can starve small
+        mailboxes out of the candidate set).
+        """
+        if owner_emails is None and not financial_only:
+            raise KnowledgeBaseError(
+                "search_owned: owner_emails=None (any mailbox) requires financial_only=True"
+            )
+        if query_vec is None:
+            try:
+                query_vec = embeddings.embed_query(query)
+            except embeddings.EmbeddingError as exc:
+                raise KnowledgeBaseError(f"Query embedding failed: {exc}") from exc
+
+        qbytes = _serialize_vec(query_vec)
+        src_ph = ",".join("?" * len(sources))
+        where = [f"k.source IN ({src_ph})"]
+        params: list[Any] = [qbytes, *sources]
+
+        if owner_emails is not None:
+            owners = sorted({e.strip().lower() for e in owner_emails if e})
+            if not owners:
+                return []
+            own_ph = ",".join("?" * len(owners))
+            where.append(
+                f"LOWER(json_extract(k.metadata, '$.user_email')) IN ({own_ph})"
+            )
+            params.extend(owners)
+
+        if financial_only:
+            where.append("json_extract(k.metadata, '$.financial_document') = 1")
+
+        sql = f"""
+            SELECT
+                k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
+                k.deep_link, k.date_modified,
+                vec_distance_l2(?, f.embedding) AS distance,
+                k.author, k.metadata
+            FROM knowledge_chunks k
+            JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
+            WHERE {" AND ".join(where)}
+            ORDER BY distance
+            LIMIT {int(k)}
+        """
         rows = self._conn.execute(sql, params).fetchall()
         return self._rows_to_results(rows)
 

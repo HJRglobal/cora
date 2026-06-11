@@ -8,7 +8,52 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [NEXT UP] Per-user email/Drive access control -- spec ready, build after the 18mo gmail backfill
+### [SECURITY + FINANCE] Per-user email/Drive access control + finance receipt tier SHIPPED -- 2026-06-10 (D-043)
+
+Built ahead of the 18-month gmail backfill (Harrison re-decided the gate order 2026-06-10:
+enforcement ships FIRST so the historical mass lands into a guarded, tag-at-ingest pipeline).
+Spec of record: `_shared/projects/cora/design/2026-06-09_fndr_per-user-email-drive-access-spec.md`.
+Supersedes the [NEXT UP] entry below. Full doctrine: decisions.md D-043.
+
+**Shipped (all deterministic, pre-LLM, D-034 pattern):**
+- **Tier 1** -- `historical_access.apply_tier1` wired in `context_loader._try_kb_retrieve`:
+  gmail/drive_sweep chunks owned by someone other than the asker are header-stripped
+  (From/To/Subject/Date/author/message_id/deep_link/thread_id) before entering LLM context; the
+  factual body survives as institutional knowledge. `founders_os@hjrglobal.com` chunks =
+  org-shared, exempt. Unknown owner or unknown asker = stripped (fail-closed). Synthesis rule
+  injected into every runtime context.
+- **Tier 2** -- DM-only explicit retrieval ("pull up / show me / find the email"), own-mailbox-only
+  (aliases incl.), Harrison override via `data/maps/historical-access-allowlist.yaml`,
+  teammate-mailbox requests refused without existence leak, unmapped identity fail-closed. New
+  `store.search_owned` (exact owner-scoped scan, no entity/recency filter) + a plain-DM branch in
+  `app.handle_message_event` + the gate at the TOP of `_dispatch_qa` covering all 4 entry points
+  (mention / thread follow-up / /cora-ask / DM).
+- **Tier 2-Finance** -- Justin `U0B3AEJCYGP` / Eric `U0B3PRZMBCN` / Jerry `U0B4L7886PJ`
+  (`data/maps/finance-receipt-allowlist.yaml`) may pull financial_document-tagged chunks from ANY
+  mailbox, ONLY in #hjr-finance `C0BAK65N4TA`; non-financial retrieval refused; every pull audited
+  to `logs/finance-access-audit.jsonl`. Ingest tagging at `store.upsert_documents` Step 0b
+  (`finance_doc_classifier`, precision-biased, >=2 independent signals). Auto-file to the
+  "Receipts & Invoices Inbox" Drive folder `1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj` (SA write verified
+  live; Cora bot + all 3 allowlisted users confirmed in the channel). Weekly digest
+  `scripts/run_finance_receipt_digest.py`, task `cowork-cora-finance-receipt-digest` (Mon 10:30
+  AZ; register via `deployment\setup-finance-receipt-digest-task.ps1` from elevated PS).
+- **Cache-leak closure:** responses built on UNSTRIPPED personal chunks (grants, owner's own mail,
+  unrestricted asker) never enter the shared semantic cache; the grant path also skips cache
+  lookup and withholds the static portfolio context (`static_text=""` -- a DM asker may not be
+  entity-authorized for the founder brief).
+
+**Sequencing (plan of record):**
+1. Build + tests + restart -- THIS session.
+2. **Tonight: relaunch the 18-month gmail backfill** from elevated PS (manual -- the scheduled
+   task's 3h limit would kill it): `.venv\Scripts\python.exe scripts\gmail_threaded_sweep.py
+   --force-since-days 550`. The 6/10 00:14 attempt died at 03:29 in the machine outage mid-FIRST
+   account; ~60-65 percent of the work remains (harrison@hjrglobal Dec'24-Jun'25 gap + all 28
+   other accounts). Expect ~8-12h, resumable, lands pre-tagged + pre-guarded.
+3. **After the backfill completes:** run `scripts\backfill_financial_document_tags.py` (idempotent
+   catch-up tagger; safe to also run once before), then the 5 live smoke tests (build prompt /
+   D-043).
+
+### [SUPERSEDED 2026-06-10 -- see entry above] Per-user email/Drive access control -- spec ready, build after the 18mo gmail backfill
 Spec: `G:\My Drive\HJR-Founder-OS\_shared\projects\cora\design\2026-06-09_fndr_per-user-email-drive-access-spec.md` (also KB-ingested via static_md). Two-tier rule: (1) institutional knowledge stays usable as context for everyone via header-stripped chunks; (2) specific email/Drive retrieval is DM-only + owner's-own-mailbox-only, Harrison-override (allowlist), fail-closed. Code-level guard + new DM retrieval path + tests (D-034 pattern). Gate: build after `--force-since-days 550` gmail backfill lands + Drive owner-tagging confirmed.
 
 ### [GMAIL/KB + BACKUP/DR] Gmail sweep coverage fix + DR backup hardening -- 2026-06-09 (commits 02813dd, d2ac2a7, ec5af47, 5b3967f)

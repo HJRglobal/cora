@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from cora import historical_access
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 
 log = logging.getLogger(__name__)
@@ -210,6 +211,9 @@ def load_context_parts(
     skip_kb: bool = False,
     kb_k: int | None = None,
     query_vec: list[float] | None = None,
+    asker_emails: frozenset[str] | None = None,
+    asker_unrestricted: bool = False,
+    kb_meta: dict | None = None,
 ) -> tuple[str, str]:
     """Return (static_text, kb_text) for the entity, kept as separate strings.
 
@@ -228,6 +232,15 @@ def load_context_parts(
     query_vec: pre-computed embedding for `query`. When provided, forwarded to
     _try_kb_retrieve so store.search() can skip its own embed_query() call.
     Saves one OpenAI API round-trip per request.
+
+    Tier-1 per-user access control (historical_access): gmail/drive_sweep
+    chunks owned by someone other than the asker are header-stripped before
+    they enter kb_text. asker_emails is the asker's owned-mailbox set
+    (None/empty = unknown asker = FAIL-CLOSED, strip everything personal);
+    asker_unrestricted=True (Harrison override) skips stripping. When kb_meta
+    is provided, kb_meta["unstripped_personal"]=True signals that personal
+    chunks rode through UNSTRIPPED — callers must not put the response in the
+    shared semantic cache.
     """
     static_text = _load_static_context(entity)
 
@@ -235,7 +248,11 @@ def load_context_parts(
         return static_text, ""
 
     effective_k = kb_k if kb_k is not None else _KB_TOP_K
-    kb_section = _try_kb_retrieve(entity, query, k=effective_k, query_vec=query_vec) or ""
+    kb_section = _try_kb_retrieve(
+        entity, query, k=effective_k, query_vec=query_vec,
+        asker_emails=asker_emails, asker_unrestricted=asker_unrestricted,
+        kb_meta=kb_meta,
+    ) or ""
     return static_text, kb_section
 
 
@@ -326,7 +343,41 @@ def _load_static_context(entity: str) -> str:
     return text
 
 
-def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K, query_vec: list[float] | None = None) -> str | None:
+def owned_kb_search(
+    query: str,
+    owner_emails: frozenset[str] | None,
+    financial_only: bool = False,
+    k: int = 12,
+    query_vec: list[float] | None = None,
+) -> list:
+    """Tier-2 owner-scoped KB search through the shared instance + lock.
+
+    Thin wrapper over KnowledgeBase.search_owned so callers (app.py grant
+    path) keep the shared-connection lock discipline. Returns [] when the KB
+    is unavailable. PHI filtering is the caller's job (historical_access.drop_phi).
+    """
+    kb = get_shared_kb()
+    if kb is None:
+        return []
+    with _SHARED_KB_LOCK:
+        return kb.search_owned(
+            query,
+            owner_emails=owner_emails,
+            financial_only=financial_only,
+            k=k,
+            query_vec=query_vec,
+        )
+
+
+def _try_kb_retrieve(
+    entity: str,
+    query: str,
+    k: int = _KB_TOP_K,
+    query_vec: list[float] | None = None,
+    asker_emails: frozenset[str] | None = None,
+    asker_unrestricted: bool = False,
+    kb_meta: dict | None = None,
+) -> str | None:
     """Search the KB and return a formatted context block. Returns None on any failure.
 
     Failure modes that should return None (not raise):
@@ -376,6 +427,17 @@ def _try_kb_retrieve(entity: str, query: str, k: int = _KB_TOP_K, query_vec: lis
         log.info("KB returned %d chunks but none passed distance threshold %.2f",
                  len(results), _KB_MAX_DISTANCE)
         return None
+
+    # Tier-1 per-user access control: header-strip personal (gmail/drive_sweep)
+    # chunks the asker doesn't own. Fail-closed — an unknown asker
+    # (asker_emails None/empty) gets everything personal stripped. The
+    # unstripped_personal flag tells the caller the response must not enter
+    # the shared semantic cache.
+    relevant, unstripped_personal = historical_access.apply_tier1(
+        relevant, asker_emails or frozenset(), asker_unrestricted,
+    )
+    if kb_meta is not None and unstripped_personal:
+        kb_meta["unstripped_personal"] = True
 
     log.info(
         "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",

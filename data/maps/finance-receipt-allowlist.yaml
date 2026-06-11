@@ -1,0 +1,24 @@
+# Tier 2-Finance — receipt/invoice retrieval allowlist (spec 2026-06-09).
+#
+# The users below may retrieve FINANCIAL DOCUMENTS (receipts, invoices,
+# statements, order confirmations, payments) from ANY monitored mailbox —
+# but ONLY inside the #hjr-finance channel, and ONLY financial documents.
+# Outside that channel they are normal Tier-2 users (own mailbox only).
+# The safety model is a CONTENT-TYPE permission, not a mailbox permission.
+#
+# Every cross-mailbox pull is written to logs/finance-access-audit.jsonl.
+#
+# FAIL-CLOSED: missing/unreadable file -> nobody has the finance power.
+
+users:
+  - U0B3AEJCYGP   # Justin Moran
+  - U0B3PRZMBCN   # Eric Canku
+  - U0B4L7886PJ   # Jerry Reick
+
+# The ONE channel where the finance retrieval path exists.
+# Confirmed live 2026-06-10: #hjr-finance (NOT #hjrg-finance).
+channel_id: C0BAK65N4TA
+channel_name: hjr-finance
+
+# Auto-file destination: "Receipts & Invoices Inbox" Drive folder.
+drive_folder_id: "1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj"

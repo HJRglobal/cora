@@ -1,0 +1,13 @@
+# Historical email/Drive access — UNRESTRICTED retrieval allowlist.
+#
+# Slack user IDs listed here may use Tier-2 explicit retrieval ("pull up /
+# show me the email...") against ANY monitored mailbox or Drive history, not
+# just their own. Everyone else is locked to their own accounts.
+#
+# Default: Harrison only (spec 2026-06-09). Add a Slack ID here to extend —
+# no code change needed; the file is re-read on a 60s TTL.
+#
+# FAIL-CLOSED: if this file is missing or unreadable, NOBODY is unrestricted.
+
+unrestricted:
+  - U0B2RM2JYJ1   # Harrison Rogers

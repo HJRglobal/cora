@@ -28,6 +28,8 @@ from . import gap_autofill
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
+from . import historical_access
+from . import finance_receipts
 from . import model_router
 from .prompt_loader import load_prompt
 from . import rate_limiter
@@ -277,6 +279,60 @@ def _fetch_thread_history(
     return merged
 
 
+def _build_grant_context(
+    grant: "historical_access.AccessDecision",
+    query: str,
+    user_id: str,
+    channel_name: str,
+    query_vec: "list[float] | None",
+) -> str:
+    """Fetch + format owner-authorized chunks for a Tier-2 / finance grant.
+
+    Personal mode: owner-scoped search over the asker's (or, for an
+    unrestricted asker, the named teammate's) mailboxes — full headers/links.
+    Finance mode: financial_document-tagged chunks from any/scoped mailboxes,
+    best-effort auto-filed into the Receipts & Invoices Inbox, every pull
+    audit-logged. Both modes pass a defensive PHI filter.
+    """
+    from .context_loader import owned_kb_search
+
+    try:
+        results = owned_kb_search(
+            query,
+            grant.owner_emails,
+            financial_only=(grant.mode == "finance"),
+            k=12,
+            query_vec=query_vec,
+        )
+    except Exception as exc:  # noqa: BLE001 — retrieval failure = empty, not crash
+        log.error("historical_access: owned_kb_search failed user=%s: %s", user_id, exc)
+        results = []
+
+    results = historical_access.drop_phi(results)
+
+    if grant.mode == "finance":
+        filed_links: dict[str, str] = {}
+        try:
+            filed_links = finance_receipts.auto_file_results(results)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_receipts: on-demand auto-file failed: %s", exc)
+        finance_receipts.audit(
+            requester=user_id, query=query, owner_emails=grant.owner_emails,
+            items=results, channel=channel_name,
+        )
+        return finance_receipts.format_finance_chunks(
+            results, grant.target_label, filed_links,
+        )
+
+    historical_access.audit(
+        requester=user_id, query=query, mode="personal",
+        owner_emails=grant.owner_emails,
+        items=[r.source_id for r in results], channel=channel_name,
+    )
+    label = "your" if grant.target_label == "your" else f"{grant.target_label}'s"
+    return historical_access.format_owned_chunks(results, label)
+
+
 def _dispatch_qa(
     *,
     channel_id: str,
@@ -315,6 +371,32 @@ def _dispatch_qa(
         prior_messages = []
     register_ts = root_thread_ts or reply_thread_ts
 
+    # ── Per-user historical email/Drive access gate (pre-LLM, D-034) ────────
+    # Deterministic, runs before the semantic cache and before any Claude
+    # call. Finance gate first (it only acts inside #hjr-finance), then the
+    # personal Tier-2 gate. "respond" decisions are COMPLETE replies (DM
+    # redirect / refusal); "grant" switches the pipeline to owner-authorized
+    # retrieval below. See historical_access.py / finance_receipts.py.
+    is_dm = str(channel_id).startswith("D")
+    access_decision = finance_receipts.check_request(
+        user_id or "", channel_id, user_message,
+    )
+    if access_decision.action == "pass":
+        access_decision = historical_access.check_tier2(
+            user_id or "", is_dm, user_message,
+        )
+    if access_decision.action == "respond":
+        log.info(
+            "historical_access: deterministic response channel=#%s user=%s",
+            channel_name, user_id,
+        )
+        say(text=access_decision.message, thread_ts=reply_thread_ts,
+            unfurl_links=False, unfurl_media=False)
+        return
+    retrieval_grant = access_decision if access_decision.action == "grant" else None
+    asker_emails = historical_access.owned_emails(user_id or "")
+    asker_unrestricted = historical_access.is_unrestricted(user_id or "")
+
     function = channel_classifier.classify_function(channel_name)
     tier = channel_classifier.tier_label(entity, function)
 
@@ -347,6 +429,7 @@ def _dispatch_qa(
         f"Harrison Rogers unless their Slack ID is U0B2RM2JYJ1.\n"
         f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
+        f"{historical_access.TIER1_SYNTHESIS_RULE}\n\n"
         f"---\n\n"
     )
 
@@ -362,7 +445,10 @@ def _dispatch_qa(
     )
 
     question_embedding: list[float] | None = None
-    if not hints.bypass_cache:
+    # Grant-path responses contain owner-private mail/file content — they must
+    # never be served from (or stored into) the shared semantic cache, where a
+    # different user's similar question would replay them.
+    if not hints.bypass_cache and retrieval_grant is None:
         try:
             question_embedding = kb_embeddings.embed_query(user_message)
             cached_response = sc.get_cache().lookup(entity, question_embedding)
@@ -391,13 +477,31 @@ def _dispatch_qa(
     # Split static portfolio context (cacheable) from per-query KB chunks
     # (volatile). static_text becomes a cached system block; kb_text rides in the
     # uncached block alongside runtime_context. See claude_client._build_cached_system.
-    static_text, kb_text = load_context_parts(
-        entity,
-        query=user_message,
-        skip_kb=hints.skip_kb,
-        kb_k=hints.kb_k_override,
-        query_vec=question_embedding,
-    )
+    kb_meta: dict = {}
+    if retrieval_grant is not None:
+        # Tier-2 grant: owner-authorized retrieval REPLACES normal KB
+        # retrieval, and the static portfolio context is withheld — explicit
+        # mailbox retrieval doesn't need it, and a DM asker may not be
+        # entity-authorized for the founder brief it contains.
+        static_text = ""
+        kb_text = _build_grant_context(
+            retrieval_grant, user_message, user_id or "", channel_name,
+            question_embedding,
+        )
+    else:
+        static_text, kb_text = load_context_parts(
+            entity,
+            query=user_message,
+            skip_kb=hints.skip_kb,
+            kb_k=hints.kb_k_override,
+            query_vec=question_embedding,
+            asker_emails=asker_emails,
+            asker_unrestricted=asker_unrestricted,
+            kb_meta=kb_meta,
+        )
+    # A response built on UNSTRIPPED personal chunks (owner's own mail, or an
+    # unrestricted asker) must not enter the shared semantic cache.
+    cache_storable = retrieval_grant is None and not kb_meta.get("unstripped_personal")
     prompt = load_prompt(entity)
     chosen_model = model_router.choose_model(user_message)
     log.info(
@@ -460,7 +564,8 @@ def _dispatch_qa(
         )
         response_text = _fix_lex_channel_names(response_text)
         response_text = _validate_channel_links(response_text, client)
-        _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+        if cache_storable:
+            _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
@@ -540,7 +645,8 @@ def _dispatch_qa(
     )
     response_text = _fix_lex_channel_names(response_text)
     response_text = _validate_channel_links(response_text, client)
-    _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+    if cache_storable:
+        _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
     log.info(
@@ -1020,6 +1126,38 @@ def handle_message_event(event: dict, client) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("gap_autofill: ack post failed: %s", exc)
+                return
+            # ── Tier-2 historical retrieval (DM-only by design) ─────────────
+            # Explicit "pull up / show me my emails" requests in a plain DM
+            # route into the Q&A pipeline; the historical-access gate at the
+            # top of _dispatch_qa issues the owner-scoped grant (or refuses,
+            # fail-closed). The grant path withholds the static portfolio
+            # context, so this adds no entity exposure for non-FNDR users.
+            if historical_access.detect_retrieval_intent(text):
+                dm_channel = event.get("channel", user_id)
+                allowed, _cap = rate_limiter.check(user_id, dm_channel)
+                if not allowed:
+                    client.chat_postMessage(
+                        channel=dm_channel,
+                        text="You've hit the rate limit. Try again in a bit.",
+                    )
+                    return
+                log.info(
+                    "historical_access: DM retrieval intent user=%s text=%.80s",
+                    user_id, text,
+                )
+                _dispatch_qa(
+                    channel_id=dm_channel,
+                    channel_name="dm",
+                    user_id=user_id,
+                    user_message=text,
+                    reply_thread_ts=event.get("thread_ts") or event.get("ts"),
+                    entity="FNDR",
+                    client=client,
+                    say=lambda **kw: client.chat_postMessage(channel=dm_channel, **kw),
+                    prior_messages=[],
+                    root_thread_ts=None,
+                )
                 return
             log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
             osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)

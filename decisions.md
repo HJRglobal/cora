@@ -892,3 +892,56 @@ ALL replies including tool-bypass output. Also: working tree fully cleaned (`ff5
 -- runtime churn files untracked + ignored, ending the perpetually-dirty-tree
 condition. Second clean restart 12:07:55 AZ, heartbeat fresh. HEAD `4a03a1c`,
 3,643 passed / 41 skipped.
+
+
+## D-043 -- Per-user email/Drive access: two-tier code-level guard + finance content-type exception (2026-06-10)
+
+**Decision:** Access to personal-source KB content (source gmail / drive_sweep) is governed by a
+deterministic pre-LLM guard (D-034 pattern), NOT prompts:
+
+1. **Tier 1 (institutional knowledge, everyone):** gmail/drive_sweep chunks still inform any
+   answer, but a chunk owned by someone other than the asker is HEADER-STRIPPED before it enters
+   LLM context (`historical_access.apply_tier1`, wired in `context_loader._try_kb_retrieve`):
+   title/Subject, author/From, To/Cc/Date/Attachments header lines, deep_link, date, metadata
+   (message_id/thread_id) all removed; the factual body survives. Owner identity =
+   `metadata.user_email` (100% coverage verified on both sources 2026-06-10); unknown owner =
+   stripped (fail-closed); `founders_os@hjrglobal.com` chunks are org-shared and exempt.
+2. **Tier 2 (explicit retrieval):** "pull up / show me / find the email(s)" is DM-ONLY (channel ask
+   gets a redirect), owner's-own-mailbox-only (aliases included), Harrison-override via
+   `data/maps/historical-access-allowlist.yaml` (default Harrison; file-driven, 60s TTL,
+   fail-closed), explicit refusal for an internal teammate's mailbox with no existence leak,
+   FAIL-CLOSED for unmapped Slack identities. Implemented as `historical_access.check_tier2` +
+   `store.search_owned` (exact scan over the owner-filtered subset -- recall-perfect, no
+   coarse-index starvation) + a new plain-DM branch in app.handle_message_event.
+3. **Tier 2-Finance (content-type permission, not a mailbox permission):**
+   `data/maps/finance-receipt-allowlist.yaml` (Justin/Eric/Jerry by Slack ID) may retrieve
+   `metadata.financial_document=true` chunks from ANY mailbox, ONLY inside #hjr-finance
+   (`C0BAK65N4TA`); non-financial retrieval on that path is refused; every pull is audit-logged to
+   `logs/finance-access-audit.jsonl`. Tagging is deterministic + precision-biased
+   (`finance_doc_classifier`, >=2 independent signals) at the `store.upsert_documents` choke point
+   (Step 0b) so the 18-month gmail backfill arrives pre-tagged;
+   `scripts/backfill_financial_document_tags.py` is the idempotent catch-up for older chunks.
+   Auto-file copies retrieved + weekly-digest-detected receipts into the "Receipts & Invoices
+   Inbox" Drive folder (`1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj`; SA write verified); weekly task
+   `cowork-cora-finance-receipt-digest` (Mon 10:30 AZ) posts the proactive digest with per-account
+   atomic watermarks (D-038) + a dedup ledger.
+
+**Companion invariants:**
+- **Semantic-cache leak closed:** any response built on UNSTRIPPED personal chunks (a Tier-2 grant,
+  an owner's own chunk, or an unrestricted asker) is NEVER stored in the shared semantic cache --
+  a similar question from another user must not replay private mail. Grant-path requests also skip
+  cache LOOKUP entirely.
+- **Grant path withholds static portfolio context** (`static_text=""`): a DM asker may not be
+  entity-authorized for the founder brief, and explicit mailbox retrieval doesn't need it.
+- **PHI:** ingest guards already exclude LEX client PHI; grants additionally run
+  `historical_access.drop_phi` (defensive phi_guard pattern filter). Sibling + cross-entity guards
+  are untouched and still run.
+- A Tier-2 grant deliberately does NOT consult user_access topic blocks -- the scope is the asker's
+  OWN mailbox, which they may always see (spec directive).
+
+**Reason:** Harrison's requirement (spec 2026-06-09): Cora absorbs organizational email/Drive
+knowledge collectively, but specific individual emails go only to their owner (or Harrison), and
+the finance team gets receipts/invoices -- a content-type carve-out -- without ever seeing the
+private mail around them. Prompt-only enforcement is insufficient for hard privacy rules (D-034);
+shipping the guard BEFORE the 18-month backfill lands means the historical mass arrives into an
+already-guarded, tag-at-ingest pipeline.
