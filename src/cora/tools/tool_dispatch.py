@@ -20,6 +20,7 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
+from .. import org_roles
 from ..connectors import gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
@@ -2577,14 +2578,166 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
 # --- Catalog: tool definitions exposed to Claude ---
 
 
+# --- What's on my plate (Org Synthesis Phase 2, deliverable 1) ---
+#
+# Role-scoped composite "my plate" view: role + lanes (org-roles registry),
+# open Asana tasks, today/tomorrow calendar, and HubSpot deals for users who
+# own a pipeline. Pull-not-push: only fires when the user asks. ADVISORY data
+# only -- org_roles never expands access (D-044); all deterministic guards
+# (user_access, sibling, cross_entity, phi, historical_access) already ran
+# before the tool loop, and each section reuses the same per-user mapping +
+# entity-scope filters as the standalone tools.
+
+_HARRISON_SLACK_ID = "U0B2RM2JYJ1"
+
+
+def _plate_asana_section(target_id: str, entity: str) -> str:
+    """Open Asana tasks for the target, entity-scoped. Fail-soft string."""
+    mapping = _load_slack_asana_map()
+    user = mapping.get(target_id)
+    asana_gid = str((user or {}).get("asana_user_gid", "") or "")
+    if not user or not asana_gid or "REPLACE" in asana_gid:
+        return "(No Asana mapping for this user -- task list unavailable.)"
+    try:
+        all_tasks = asana_client.get_user_tasks(asana_gid)
+    except asana_client.AsanaClientError as exc:
+        log.warning("whats_on_my_plate asana error user=%s: %s", target_id, exc)
+        return "(Temporary issue reaching Asana -- task list unavailable right now.)"
+    filtered = _filter_tasks_by_entity(all_tasks, entity)
+    return asana_client.format_tasks_for_llm(
+        filtered,
+        entity_scope=entity if entity != "FNDR" else None,
+        total_before_filter=len(all_tasks),
+    )
+
+
+def _plate_calendar_section(target_id: str) -> str:
+    """Today + tomorrow calendar for the target. Fail-soft string."""
+    mapping = _load_slack_asana_map()
+    user_email = ((mapping.get(target_id) or {}).get("asana_email") or "").strip()
+    if not user_email:
+        return "(No Google identity mapped -- calendar unavailable.)"
+    parts: list[str] = []
+    for when in ("today", "tomorrow"):
+        try:
+            events, window_label = calendar_client.get_user_events(user_email, when=when)
+        except calendar_client.CalendarClientError as exc:
+            log.warning("whats_on_my_plate calendar error user=%s when=%s: %s", target_id, when, exc)
+            parts.append(f"(Temporary issue reaching the calendar for {when}.)")
+            continue
+        parts.append(calendar_client.format_events_for_llm(events, window_label))
+    return "\n".join(parts)
+
+
+def _plate_hubspot_section(target_id: str, entity: str) -> str | None:
+    """Open deals for users who own a HubSpot pipeline. None = omit section.
+
+    LEX scope (incl. sub-entities) never gets a HubSpot section -- HubSpot is
+    blocked for LEX per the Tier-1 doctrine, matching tools_for_entity.
+    """
+    if _SUBENTITY_PARENT.get(entity, entity) == "LEX":
+        return None
+    user = _load_slack_hubspot_map().get(target_id)
+    owner_id = str((user or {}).get("hubspot_owner_id", "") or "")
+    if not user or not owner_id or "REPLACE" in owner_id:
+        return None  # not a deal owner -- silently omit, not an error
+    pipeline_id = HUBSPOT_PIPELINE_BY_ENTITY.get(entity)
+    try:
+        deals = hubspot_client.get_owner_deals(owner_id, pipeline_id=pipeline_id)
+    except hubspot_client.HubSpotClientError as exc:
+        log.warning("whats_on_my_plate hubspot error user=%s: %s", target_id, exc)
+        return "(Temporary issue reaching the deal pipeline.)"
+    return hubspot_client.format_deals_for_llm(
+        deals,
+        entity_scope=entity if entity != "FNDR" else None,
+        pipeline_filter_applied=pipeline_id is not None,
+    )
+
+
+def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Role-scoped composite plate view for the asking user.
+
+    Optional `person` parameter is HARRISON-ONLY: everyone else gets their own
+    plate exclusively (asana_get_user_tasks remains the peer-visible path for
+    a teammate's raw task list). Unknown users (no org-roles entry) get a
+    graceful no-data response (fail-closed, D-044). External consultants get
+    role scope only -- no internal task/CRM/calendar pulls.
+    """
+    person = str((_input or {}).get("person") or "").strip()
+    target_id = slack_user_id
+    if person:
+        if slack_user_id != _HARRISON_SLACK_ID:
+            return (
+                "Refused: whats_on_my_plate only shows the asking user their OWN plate; "
+                "viewing another teammate's plate is Harrison-only. Politely explain this, "
+                "and offer asana_get_user_tasks if they just need that teammate's open "
+                "Asana tasks (peer-visible by doctrine)."
+            )
+        resolved, info = resolve_name_to_slack_user_id(person, channel_entity=entity)
+        if not resolved:
+            return info or (
+                f"No teammate found matching '{person}'. Tell Harrison the name didn't "
+                f"match anyone in the user map."
+            )
+        target_id = resolved
+
+    rec = org_roles.get_role(target_id)
+    if rec is None:
+        if target_id == slack_user_id:
+            return (
+                "I don't have a role mapping for this user yet -- Harrison can add them to "
+                "the org role registry (data/maps/org-roles.yaml). No plate data is shown "
+                "without a registry entry. Relay this politely and suggest they ping Harrison."
+            )
+        return (
+            "That person has no entry in the org role registry yet, so there is no plate "
+            "view for them. Harrison can add them to data/maps/org-roles.yaml."
+        )
+
+    log.info(
+        "whats_on_my_plate asker=%s target=%s entity=%s external=%s",
+        slack_user_id, target_id, entity, rec.external,
+    )
+
+    header = [f"PLATE FOR {rec.name} -- {rec.role} ({rec.entity})"]
+    if rec.responsibilities:
+        header.append("Lanes: " + "; ".join(rec.responsibilities))
+
+    if rec.external:
+        return "\n".join(header) + (
+            "\n\nThis user is an EXTERNAL consultant/guest: internal task, CRM, and "
+            "calendar systems are not part of their plate view. Their plate is their "
+            "engagement scope above. Do not surface internal-only context (financials, "
+            "cap tables, internal personnel matters) beyond that scope."
+        )
+
+    sections: list[str] = ["\n".join(header)]
+    sections.append("OPEN TASKS\n" + _plate_asana_section(target_id, entity))
+    sections.append("CALENDAR\n" + _plate_calendar_section(target_id))
+    deals = _plate_hubspot_section(target_id, entity)
+    if deals is not None:
+        sections.append("DEAL PIPELINE\n" + deals)
+    if target_id == _HARRISON_SLACK_ID:
+        sections.append("STALLED DECISIONS\n" + _tool_fndr_open_decisions(target_id, entity, {}))
+
+    sections.append(
+        "(Present the sections above in order, preserving any <url|name> links verbatim. "
+        "This is the user's own role-scoped picture; entity scoping for this channel has "
+        "already been applied. Do not add financial figures from other sources.)"
+    )
+    return "\n\n".join(sections)
+
+
 TOOL_DEFINITIONS = [
     {
         "name": "asana_get_my_tasks",
         "description": (
             "Fetch the incomplete Asana tasks assigned to the user who @-mentioned Cora. "
-            "Use this when the user asks about their workload, priorities, or what they "
-            "should work on — phrases like 'what's on my plate', 'what should I work on', "
-            "'show me my tasks', 'what's due this week'. Returns up to 25 tasks with name, "
+            "Use this when the user asks specifically about their Asana tasks — phrases "
+            "like 'show me my tasks', 'what's due this week', 'my open Asana items'. For "
+            "the broader whole-plate picture ('what's on my plate', 'what do I have going "
+            "on', overall workload/day), use whats_on_my_plate instead — it includes tasks "
+            "plus role, calendar, and pipeline. Returns up to 25 tasks with name, "
             "due date, project, and notes preview. Each task name is wrapped in a Slack "
             "hyperlink (`<url|task name>`) — preserve these verbatim in your reply so the "
             "user can click through to edit in Asana. Do not call for questions about another "
@@ -4167,6 +4320,38 @@ TOOL_DEFINITIONS = [
             "required": ["recipient_name", "message", "confirmed"],
         },
     },
+    {
+        "name": "whats_on_my_plate",
+        "description": (
+            "Role-scoped composite picture of the asking user's current work. Use this "
+            "whenever the user asks for their overall plate, workload, day, or focus — "
+            "phrases like 'what's on my plate', 'what do I have going on', 'what should I "
+            "be focused on today', 'catch me up on my work', 'how does my day look'. "
+            "Returns, in one call: their role and lanes (from the org role registry), "
+            "their open Asana tasks (entity-scoped to this channel), today + tomorrow "
+            "calendar, and their open deals if they own a sales pipeline. Present the "
+            "returned sections in order and preserve any `<url|name>` Slack links "
+            "verbatim. This tool shows the asker their OWN plate only — for another "
+            "teammate's plate it refuses unless the asker is Harrison (the optional "
+            "`person` parameter is Harrison-only; for just a teammate's open Asana tasks, "
+            "anyone can use asana_get_user_tasks instead). Users without an org-role "
+            "registry entry get a graceful no-data response."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {
+                    "type": "string",
+                    "description": (
+                        "HARRISON-ONLY. Name of a teammate whose plate Harrison wants to "
+                        "see (first name, full name, or alias). Omit for the asking "
+                        "user's own plate — which is the only valid use for everyone else."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -4191,6 +4376,7 @@ TOOL_DEFINITIONS = [
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
+    "whats_on_my_plate",
     "asana_get_my_tasks",
     "asana_get_user_tasks",
     "asana_create_task",
@@ -4345,6 +4531,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "hubspot_add_note": _tool_hubspot_add_note,
     # Cross-entity write tools
     "slack_send_dm": _tool_slack_send_dm,
+    # Org Synthesis Phase 2: role-scoped composite plate view
+    "whats_on_my_plate": _tool_whats_on_my_plate,
 }
 
 
@@ -4391,6 +4579,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "hubspot_update_deal_stage": 20,
     "hubspot_add_note": 20,
     "slack_send_dm": 12,
+    "whats_on_my_plate": 25,  # multi-source composite (Asana + Calendar x2 + HubSpot)
 }
 _DEFAULT_TOOL_TIMEOUT = 15
 
