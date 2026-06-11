@@ -16,7 +16,8 @@ from cora.model_router import (
 
 
 @pytest.mark.parametrize("msg", [
-    "what's on my plate?",
+    # "what's on my plate?" removed 2026-06-11: plate queries are Sonnet-forced
+    # (multi-source composite tool; Haiku misnarrated a degraded result live).
     "show me my tasks",
     "what's Tommy's open work?",
     "list my deals",

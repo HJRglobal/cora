@@ -74,12 +74,23 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\bhow'?s? (gilbert|warner|mckellips|greenfield|val vista|pecos|GW|GM|GF|VVP)\b",
     r"\bwhat did (we|GW|GM|GF|VVP|gilbert|warner|mckellips|greenfield|val\s*vista|pecos)\b",
     r"\bwhat (sales|revenue|numbers?|did).{0,20}(GW|GM|GF|VVP|gilbert|warner|mckellips|greenfield|val\s*vista|pecos)\b",
+    # whats_on_my_plate composite queries -- a multi-source tool whose reply must
+    # faithfully narrate several sections. Haiku misnarrated a degraded tool
+    # result as "no open tasks" on 2026-06-11; plate queries force Sonnet.
+    r"\b(on|off) (my|the|\w+'?s?) plate\b",
+    r"\bmy plate\b",
+    r"\bcatch me up\b",
+    r"\bwhat (do|did|does) (i|\w+) have going on\b",
+    r"\bmy (day|workload) (look|looking)\b",
+    r"\bhow'?s? my day\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 
 # Haiku-friendly query patterns -- direct factual lookups, single-tool dispatches.
+# NOTE: this list is advisory/dead (choose_model never consults it); "plate" was
+# removed 2026-06-11 because plate queries are Sonnet-forced above.
 _HAIKU_HINT_PATTERNS = [
-    r"\bwhat'?s? (on my|my) (plate|calendar|tasks?|schedule|deals?|pipeline)\b",
+    r"\bwhat'?s? (on my|my) (calendar|tasks?|schedule|deals?|pipeline)\b",
     r"\bshow me\b",
     r"\blist\b",
     r"\bfind\b",

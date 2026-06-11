@@ -8,6 +8,41 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS + HOTFIX] Plate-tool live-crash fixes: truncated asana_client restored + plate hardening + calendar scope + router + kill filter -- 2026-06-11 (RESTART PENDING)
+
+Fixes for the 00:51 AZ live smoke crash (Cowork bug report). Full suite **3,827 passed / 41
+skipped** (+14). **Restart REQUIRED** via `deployment\ship-plate-fixes-2026-06-11.ps1 -Restart`
+from elevated PS -- it carries the CORRECTED kill filter (see doctrine #5) and collapses any
+stacked instances.
+
+1. **ROOT CAUSE -- `asana_client.py` was TRUNCATED ON MAIN since `d5f2e6f` (2026-06-03):** the
+   Feature-14 commit cut the file mid-loop inside `format_tasks_for_llm`; the function fell off
+   the end and returned **None for every NON-EMPTY task list**. `asana_get_my_tasks` has been
+   silently returning None for a week (models narrated "no tasks"); the plate tool surfaced it
+   as a TypeError. Tail restored byte-identical from `f0e5de3` (last complete blob); regression
+   tests added (no test had ever covered the non-empty formatting path).
+2. **Plate composition hardened:** `_safe_plate_section` wrapper -- any section that raises or
+   returns None degrades to a stub line; helpers also coerce formatter regressions. The
+   "every section fail-soft" promise now holds at BOTH layers.
+3. **Calendar reads fixed (no admin action needed):** probed the live DWD grant -- `events.list`
+   works ONLY under `calendar.events` (already granted); `calendar.freebusy` 403s it and
+   `calendar.readonly` is NOT actually granted (contradicts the 6/06 audit note). freebusy.query
+   conversely works ONLY under `calendar.freebusy`. `get_user_events` now builds with the events
+   scope; freebusy path unchanged. Verified live: harrison@ returned 7 events. This also
+   un-breaks the standalone `calendar_get_my_events` tool (silently 403ing since the 6/03 scope
+   change).
+4. **Model router:** plate queries now FORCE SONNET (multi-source composite; Haiku misnarrated a
+   degraded result as "no open tasks"). "what's on my plate" had literally been a Haiku hint.
+5. **RESTART KILL FILTER CORRECTED (doctrine #5 rewritten):** live service command lines contain
+   `\Scripts\cora.exe`, NOT `cora.main` -- the old filter matched NOTHING, which is why restarts
+   stacked instances (6/10 23:26 + 6/11 00:37). Both ship PS1s now kill on either pattern +
+   verify exactly one instance after start.
+6. Semantic-cache flush: checked -- tonight's bad replies were never cached (tool-bearing replies
+   skip the cache store); `scripts/flush_plate_cache.py` kept as a targeted-flush utility.
+
+**After restart, re-run the deliverable-1 exit gate** (Harrison / Matt / Tommy / LEX user smoke;
+Cowork re-fires the Harrison leg on signal).
+
 ### [ORG SYNTHESIS] Phase 2 deliverable 1: whats_on_my_plate tool -- 2026-06-11 (SHIPPED + LIVE, commit f9cf11b)
 
 Repo HEAD: `ab8db8b` on `origin/main` | full suite **3,813 passed / 41 skipped** (+47) |
@@ -1314,8 +1349,20 @@ deployment/
 4. **PS1 files** -- ASCII-only. No em-dashes, curly quotes, or any char > 127.
    PowerShell 5.1 reads UTF-8 as Windows-1252 by default (D-016).
 
-5. **Restart sequence** -- Stop-ScheduledTask -> WMI/Get-Process kill ->
-   Start-Sleep 3 -> Start-ScheduledTask. Stop alone does NOT kill python.exe.
+5. **Restart sequence** -- Stop-ScheduledTask -> CIM kill -> Start-Sleep 3 ->
+   Start-ScheduledTask -> VERIFY exactly one instance. Stop alone does NOT kill
+   python.exe. **KILL FILTER (corrected 2026-06-11): the service launches via the
+   console-script wrapper, so live command lines contain `\Scripts\cora.exe` --
+   NOT `cora.main`. A `*cora.main*` filter matches NOTHING and stacks a second
+   instance (happened 6/10 23:26 + 6/11 00:37).** Canonical kill, from ELEVATED
+   PS (service runs -RunLevel Highest; non-elevated sees no cmdline, kills nothing):
+   ```powershell
+   Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
+     Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
+     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+   ```
+   After Start-ScheduledTask + sleep, verify single instance: the same query must
+   return exactly 2 rows (cora.exe launcher + its python child) or 1 (python only).
 
 6. **Import smoke test** -- Before every commit:
    `.venv\Scripts\python.exe -c "from src.cora.app import app"`

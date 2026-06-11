@@ -91,16 +91,23 @@ if ($Restart) {
         Write-Error "Restart requires elevated PS (service runs -RunLevel Highest; D-036). Re-run with -Restart from an elevated prompt."
         exit 1
     }
+    # CORRECTED KILL FILTER (2026-06-11): the service launches via the console
+    # script wrapper, so live command lines contain \Scripts\cora.exe -- NOT
+    # cora.main. The old *cora.main* filter matched nothing and stacked instances.
     Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*cora.main*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
+        Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep 3
     Start-ScheduledTask -TaskName "cowork-cora-service"
     Start-Sleep 90
     Write-Host "Heartbeat:"
     Get-Content "data\health\heartbeat.txt"
     Write-Host "Verify the timestamp above is fresh (within ~60s)."
+    $instances = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" })
+    Write-Host ("Bot python instances running: " + $instances.Count + " (must be exactly 1)")
+    if ($instances.Count -ne 1) { Write-Warning "INSTANCE COUNT WRONG - investigate before walking away." }
 } else {
     Write-Host "=== Step 5 SKIPPED: no -Restart switch ==="
     Write-Host "The tool stays dormant until the next clean restart. From elevated PS:"

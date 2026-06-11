@@ -458,4 +458,36 @@ def format_tasks_for_llm(
         # Resolve project / section from memberships (richer than top-level projects)
         memberships = t.get("memberships") or []
         proj_section = []
+        for m in memberships:
+            proj = (m.get("project") or {}).get("name") or ""
+            section = (m.get("section") or {}).get("name") or ""
+            if proj:
+                proj_section.append(f"{proj}" + (f" / {section}" if section else ""))
+        if not proj_section:
+            # fallback to flat projects list
+            proj_section = [p.get("name", "") for p in (t.get("projects") or [])]
+        project_str = " | ".join(p for p in proj_section if p) or "no project"
+
+        # Truncate notes to a preview
+        notes = (t.get("notes") or "").replace("\n", " ").strip()
+        notes_preview = f" — {notes[:120]}..." if len(notes) > 120 else (f" — {notes}" if notes else "")
+
+        # Wrap task name in Slack mrkdwn hyperlink (renders as clickable in Slack)
+        if permalink:
+            name_with_link = f"<{permalink}|{name}>"
+        else:
+            name_with_link = name
+
+        lines.append(f"- [{due}] {name_with_link} ({project_str}){notes_preview}")
+
+    # Footer for scoped results — helps the LLM mention the scope to the user
+    if entity_scope and total_before_filter and total_before_filter > len(tasks):
+        lines.append("")
+        lines.append(
+            f"[Scope: showing {entity_scope}-tagged tasks only. "
+            f"{total_before_filter - len(tasks)} other tasks exist across other entities — "
+            f"user can ask in a #fndr-* channel to see them all.]"
+        )
+
+    return "\n".join(lines)
     

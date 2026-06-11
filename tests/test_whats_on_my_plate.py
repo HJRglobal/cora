@@ -342,3 +342,118 @@ def test_all_entity_prompts_carry_plate_section():
         if "## What's on my plate" not in f.read_text(encoding="utf-8")
     ]
     assert not missing, f"prompts missing the plate section: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-11 live-crash regressions (Cowork bug report)
+# --------------------------------------------------------------------------- #
+
+def test_format_tasks_for_llm_nonempty_returns_string():
+    # REGRESSION: commit d5f2e6f (2026-06-03) truncated asana_client.py mid-loop;
+    # format_tasks_for_llm fell off the end and returned None for every NON-EMPTY
+    # task list, crashing whats_on_my_plate live (TypeError on str concat) and
+    # silently nulling asana_get_my_tasks for a week. Pin the non-empty path.
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm(
+        [
+            {
+                "name": "Task A",
+                "due_on": "2026-06-15",
+                "permalink_url": "https://app.asana.com/t/1",
+                "projects": [{"name": "[F3E] Sales"}],
+                "notes": "context",
+            },
+            {"name": "Task B", "projects": []},
+        ]
+    )
+    assert isinstance(out, str)
+    assert "<https://app.asana.com/t/1|Task A>" in out
+    assert "Task B" in out
+
+
+def test_format_tasks_for_llm_scoped_footer_returns_string():
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm(
+        [{"name": "Task A", "projects": [{"name": "[OSN] Ops"}]}],
+        entity_scope="OSN",
+        total_before_filter=5,
+    )
+    assert isinstance(out, str)
+    assert "[Scope: showing OSN-tagged tasks only." in out
+
+
+def test_safe_plate_section_catches_exception():
+    def boom(*_args):
+        raise RuntimeError("section exploded")
+    out = td._safe_plate_section("Open tasks", boom, "U_X", "F3E")
+    assert out == "(Open tasks section unavailable right now.)"
+
+
+def test_safe_plate_section_coerces_none():
+    out = td._safe_plate_section("Calendar", lambda *_: None, "U_X")
+    assert out == "(Calendar section returned no data.)"
+
+
+def test_composite_survives_section_crash():
+    # The composition site must degrade a crashing section, never raise.
+    with patch.object(td.org_roles, "get_role", return_value=_role()), \
+         patch.object(td, "_plate_asana_section", side_effect=RuntimeError("boom")), \
+         patch.object(td, "_plate_calendar_section", return_value="CAL"), \
+         patch.object(td, "_plate_hubspot_section", return_value=None):
+        out = td._tool_whats_on_my_plate("U_TEST", "F3E", {})
+    assert "OPEN TASKS\n(Open tasks section unavailable right now.)" in out
+    assert "CALENDAR\nCAL" in out
+
+
+def test_composite_survives_section_returning_none():
+    with patch.object(td.org_roles, "get_role", return_value=_role()), \
+         patch.object(td, "_plate_asana_section", return_value=None), \
+         patch.object(td, "_plate_calendar_section", return_value="CAL"), \
+         patch.object(td, "_plate_hubspot_section", return_value=None):
+        out = td._tool_whats_on_my_plate("U_TEST", "F3E", {})
+    assert "OPEN TASKS\n(Open tasks section returned no data.)" in out
+
+
+def test_composite_survives_hubspot_crash():
+    with patch.object(td.org_roles, "get_role", return_value=_role()), \
+         patch.object(td, "_plate_asana_section", return_value="T"), \
+         patch.object(td, "_plate_calendar_section", return_value="C"), \
+         patch.object(td, "_plate_hubspot_section", side_effect=RuntimeError("boom")):
+        out = td._tool_whats_on_my_plate("U_TEST", "F3E", {})
+    assert "DEAL PIPELINE\n(Deal pipeline section unavailable right now.)" in out
+
+
+def test_asana_helper_coerces_formatter_none():
+    # Belt-and-braces inside the helper itself: a formatter regression returning
+    # None must degrade to a counted-but-unrendered message, not None.
+    mapping = {"U_X": {"asana_user_gid": "123"}}
+    tasks = [{"name": "a", "projects": [{"name": "[F3E] Sales"}]}]
+    with patch.object(td, "_load_slack_asana_map", return_value=mapping), \
+         patch.object(td.asana_client, "get_user_tasks", return_value=tasks), \
+         patch.object(td.asana_client, "format_tasks_for_llm", return_value=None):
+        out = td._plate_asana_section("U_X", "F3E")
+    assert isinstance(out, str)
+    assert "1 open task(s) found" in out
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "what's on my plate",
+        "What is on my plate today?",
+        "whats on my plate",
+        "catch me up on my work",
+        "what do I have going on today",
+        "how's my day looking",
+    ],
+)
+def test_model_router_plate_queries_force_sonnet(msg):
+    # REGRESSION: Haiku narrated a degraded plate tool result as "no open tasks"
+    # (2026-06-11). Plate queries are multi-source composites -> Sonnet.
+    from cora import model_router
+    assert model_router.choose_model(msg) == model_router.MODEL_SONNET
+
+
+def test_model_router_simple_lookup_still_haiku():
+    from cora import model_router
+    assert model_router.choose_model("list my tasks") == model_router.MODEL_HAIKU

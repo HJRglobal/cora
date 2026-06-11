@@ -41,12 +41,17 @@ from googleapiclient.errors import HttpError
 
 log = logging.getLogger(__name__)
 
-# calendar.freebusy is the authorized DWD scope for read operations (freebusy + event listing).
-# calendar.events is used for write operations (create event) -- requires it to be in DWD.
-# Confirmed 2026-06-03: only calendar.freebusy is authorized; calendar.events returns 403.
+# Scope routing -- probed live 2026-06-11 against the actual DWD grant:
+#   events.list  -> ONLY calendar.events works (calendar.freebusy = 403
+#                   insufficientPermissions; calendar.readonly = unauthorized_client,
+#                   i.e. NOT in the DWD grant despite the 6/06 audit note).
+#   freebusy.query -> ONLY calendar.freebusy works (calendar.events = 403).
+# So: events read AND write ride calendar.events; freebusy rides calendar.freebusy.
+# (Supersedes the 2026-06-03 "freebusy for reads" note, which was only ever true
+# for freebusy queries -- events.list had been 403ing under it.)
 _SCOPES_READ  = ["https://www.googleapis.com/auth/calendar.freebusy"]
 _SCOPES_WRITE = ["https://www.googleapis.com/auth/calendar.events"]
-_SCOPES = _SCOPES_READ  # default; create_event overrides to _SCOPES_WRITE
+_SCOPES = _SCOPES_READ  # default; events.list + create_event override to _SCOPES_WRITE
 _DEFAULT_MAX_EVENTS = 25
 # Default to America/Phoenix -- Harrison + HJR portfolio is AZ-based
 _DEFAULT_TZ = "America/Phoenix"
@@ -159,7 +164,9 @@ def get_user_events(
     time_min, time_max, label = _parse_when(when)
 
     try:
-        service = _build_service(user_email)
+        # write=True is deliberate: events.list requires the calendar.events
+        # scope under this DWD grant (probed 2026-06-11; freebusy scope 403s).
+        service = _build_service(user_email, write=True)
         result = (
             service.events()
             .list(

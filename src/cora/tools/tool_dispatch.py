@@ -2591,6 +2591,21 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
 _HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 
 
+def _safe_plate_section(label: str, builder: Callable[..., Any], *args: Any) -> str:
+    """Fail-soft wrapper for plate sections: a section may degrade to a stub
+    line, but it must NEVER raise or return None into the composite (the
+    2026-06-11 live crash was a helper returning None into a str concat)."""
+    try:
+        out = builder(*args)
+    except Exception:
+        log.exception("whats_on_my_plate: %s section crashed", label)
+        return f"({label} section unavailable right now.)"
+    if out is None or not str(out).strip():
+        log.warning("whats_on_my_plate: %s section returned empty/None", label)
+        return f"({label} section returned no data.)"
+    return str(out)
+
+
 def _plate_asana_section(target_id: str, entity: str) -> str:
     """Open Asana tasks for the target, entity-scoped. Fail-soft string."""
     mapping = _load_slack_asana_map()
@@ -2604,11 +2619,17 @@ def _plate_asana_section(target_id: str, entity: str) -> str:
         log.warning("whats_on_my_plate asana error user=%s: %s", target_id, exc)
         return "(Temporary issue reaching Asana -- task list unavailable right now.)"
     filtered = _filter_tasks_by_entity(all_tasks, entity)
-    return asana_client.format_tasks_for_llm(
+    text = asana_client.format_tasks_for_llm(
         filtered,
         entity_scope=entity if entity != "FNDR" else None,
         total_before_filter=len(all_tasks),
     )
+    # Belt-and-braces: never let a formatter regression (e.g. the truncated
+    # format_tasks_for_llm shipped 6/03-6/11) propagate None into the plate.
+    if not isinstance(text, str) or not text.strip():
+        log.warning("whats_on_my_plate: task formatter returned %r for user=%s", type(text).__name__, target_id)
+        return f"({len(filtered)} open task(s) found, but the task list could not be rendered.)"
+    return text
 
 
 def _plate_calendar_section(target_id: str) -> str:
@@ -2712,13 +2733,20 @@ def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> st
         )
 
     sections: list[str] = ["\n".join(header)]
-    sections.append("OPEN TASKS\n" + _plate_asana_section(target_id, entity))
-    sections.append("CALENDAR\n" + _plate_calendar_section(target_id))
-    deals = _plate_hubspot_section(target_id, entity)
+    sections.append("OPEN TASKS\n" + _safe_plate_section("Open tasks", _plate_asana_section, target_id, entity))
+    sections.append("CALENDAR\n" + _safe_plate_section("Calendar", _plate_calendar_section, target_id))
+    try:
+        deals = _plate_hubspot_section(target_id, entity)
+    except Exception:
+        log.exception("whats_on_my_plate: deal pipeline section crashed")
+        deals = "(Deal pipeline section unavailable right now.)"
     if deals is not None:
-        sections.append("DEAL PIPELINE\n" + deals)
+        sections.append("DEAL PIPELINE\n" + str(deals))
     if target_id == _HARRISON_SLACK_ID:
-        sections.append("STALLED DECISIONS\n" + _tool_fndr_open_decisions(target_id, entity, {}))
+        sections.append(
+            "STALLED DECISIONS\n"
+            + _safe_plate_section("Stalled decisions", _tool_fndr_open_decisions, target_id, entity, {})
+        )
 
     sections.append(
         "(Present the sections above in order, preserving any <url|name> links verbatim. "
