@@ -1,0 +1,248 @@
+# Org Role Registry -- canonical per-person role + responsibility map.
+# ---------------------------------------------------------------------------
+# Phase 1 of the Org Synthesis program (spec:
+# _shared/projects/cora/design/2026-06-10_fndr_org-synthesis-spec.md).
+#
+# This is the single source of truth for WHO each person is in the
+# organization: their role, primary entity, responsibilities ("lanes"),
+# manager, and routing notes. org_roles.py loads it with a 60s TTL --
+# edit this file and Cora picks it up without a restart.
+#
+# What this file is FOR:
+#   - Role-aware context injection: when a user @-mentions or DMs Cora,
+#     their role block is added to the runtime context so answers are
+#     tailored to their position, entity, and role.
+#   - Phases 2-4 (per-user proactive assistant, efficiency mining, founder
+#     strategy layer) all read this registry.
+#
+# What this file is NOT:
+#   - NOT an access-control list. Access is governed by the deterministic
+#     guards (user_access, sibling_guard, cross_entity_guard, phi_guard,
+#     historical_access D-043). A role entry NEVER expands what a user may
+#     see. Unknown users simply get no role block (fail-closed to neutral).
+#
+# Relationship to other maps (deliberately NOT merged -- they drive live
+# systems; this registry consolidates the ROLE knowledge layer only):
+#   - slack-to-asana.yaml        identity resolution (user_identity.py)
+#   - role-briefing-config.yaml  morning-briefing task config (Tier 1)
+#   - lex-phi-custodians.yaml    PHI custodian gate (lex_phi_access.py)
+#   - finance-receipt-allowlist.yaml  Tier 2-Finance gate
+#   - gap-domain-owners.yaml     gap-escalation routing
+#
+# Field reference:
+#   slack_id          required; primary key
+#   name              display name
+#   role              human-readable title
+#   entity            primary entity code (FNDR/HJRG/F3E/OSN/LEX/BDM/HJRP/UFL/...)
+#   entities          optional; additional entities they actively work in
+#   responsibilities  list of lanes they own (kept short, factual)
+#   manager           slack_id of the person they report to ("" = Harrison)
+#   notes             routing cautions for Cora (anti-patterns, do-not-route)
+#   external: true    guest / outside consultant (never receives internal
+#                     proactive comms; role block still injected)
+#
+# Sources consolidated 2026-06-10: founder CLAUDE.md "Key delegates",
+# role-briefing-config.yaml, slack-to-asana.yaml, monitored-email-accounts.yaml,
+# entity system prompts. Roster changes go through Harrison.
+# ---------------------------------------------------------------------------
+
+users:
+
+  - slack_id: U0B2RM2JYJ1
+    name: Harrison Rogers
+    role: Founder / CEO
+    entity: FNDR
+    entities: [HJRG, F3E, F3C, OSN, LEX, BDM, HJRP, HJRPROD, UFL]
+    responsibilities:
+      - Portfolio strategy, capital allocation, and all final decisions
+      - Sole authority on memory writes, PHI access decisions, and counterparty comms
+    manager: ""
+    notes: >-
+      Cross-entity access enabled from any channel. Brief quickly, give a clear
+      recommendation, portfolio-level lens.
+
+  - slack_id: U0B3AEQS0NB
+    name: Hannah Grant
+    role: Operations Manager
+    entity: FNDR
+    entities: [HJRG, BDM, HJRP, F3E]
+    responsibilities:
+      - BDM weekly content review (owns the cadence since 5/15)
+      - Sponsor triage, MVP MMA, Pure UGC, Funbox, 12 News, Mach 10 wind-down
+      - HJRP recurring ops items (post-Tessa transition)
+    manager: U0B2RM2JYJ1
+    notes: >-
+      NOT ad ops anymore -- Harrison took ad ops in-house pending hire. Payroll
+      is 100% HJR Global.
+
+  - slack_id: U0B3AEJCYGP
+    name: Justin Moran
+    role: Controller / Finance Lead
+    entity: HJRG
+    entities: [LEX, OSN, FNDR]
+    responsibilities:
+      - Books, intercompany, IRS amendments, fleet (works through Visibility CPA)
+      - Financial data SOP owner; QBO close coordination
+    manager: U0B2RM2JYJ1
+    notes: >-
+      Defer accounting interpretation to Justin in finance channels. Finance
+      receipt retrieval allowlisted (#hjr-finance only).
+
+  - slack_id: U0B3RU5Q55G
+    name: Tommy Anderson
+    role: F3E Sales Lead
+    entity: F3E
+    responsibilities:
+      - F3 Energy retail sales pipeline (HubSpot F3E Retail)
+    manager: U0B2RM2JYJ1
+
+  - slack_id: U0B3VGWJTMJ
+    name: Alex Cordova
+    role: Director of Client and Athlete Affairs
+    entity: F3E
+    entities: [UFL]
+    responsibilities:
+      - F3E post-sale logistics and account management
+      - Athlete / influencer relations (fighter roster, deliverables)
+      - UFL sponsor pipeline residual (paused), Visit Mesa
+    manager: U0B2RM2JYJ1
+    notes: Title locked 2026-06-03. UFL work is monitor-only while UFL is paused.
+
+  - slack_id: U0B8DGHR2D6
+    name: Elena Meirndorf
+    role: F3E Team Member
+    entity: F3E
+    responsibilities:
+      - F3E support, reports to Alex Cordova
+    manager: U0B3VGWJTMJ
+
+  - slack_id: U0B3PRZMBCN
+    name: Eric Canku
+    role: F3E Logistics
+    entity: F3E
+    responsibilities:
+      - F3E logistics and fulfillment coordination
+    manager: U0B2RM2JYJ1
+    notes: Finance receipt retrieval allowlisted (#hjr-finance only).
+
+  - slack_id: U0B3PS7RFJA
+    name: Matt Petrovich
+    role: OSN Operations Manager
+    entity: OSN
+    responsibilities:
+      - OSN inventory reconciliation pilot (Wed weekly cadence)
+      - DNA Sports AR, vendor management
+    manager: U0B2RM2JYJ1
+    notes: >-
+      Do not confuse with Matt Dennis (osnmatt@yahoo.com, franchise
+      counterparty). Default Matt = Petrovich.
+
+  - slack_id: U0B3PS82G30
+    name: Shaun Hawkins
+    role: Lexington Services Operations Director
+    entity: LEX
+    responsibilities:
+      - LLC operations (DDD/HCBS/DTA), residential + community services
+      - Staff training and operational systems
+    manager: U0B2RM2JYJ1
+    notes: >-
+      PHI custodian (LEX scope only). Operator within his lane, NOT an
+      approval gate -- escalate decisions to Harrison.
+
+  - slack_id: U0B3VGT8RE0
+    name: Jennifer Mortensen
+    role: Lexington Services Office Manager
+    entity: LEX
+    responsibilities:
+      - LEX office administration and client records
+    manager: U0B3PS82G30
+    notes: PHI custodian (LEX scope only).
+
+  - slack_id: U0B3KHBJJ91
+    name: Jeff Montgomery
+    role: Lexington Services Minority Owner
+    entity: LEX
+    responsibilities:
+      - LEX 20% minority owner (confirmed 2026-05-13); strategic oversight
+    manager: U0B2RM2JYJ1
+    notes: PHI custodian (LEX scope only).
+
+  - slack_id: U0B3NGR1Y85
+    name: Larry Stone
+    role: Big D Media Creative Director
+    entity: BDM
+    responsibilities:
+      - All BDM media production (F3E, UFL, Lex, OSN, podcast media)
+    manager: U0B2RM2JYJ1
+    notes: >-
+      BDM is production-only -- creative direction (palette/type/voice/
+      positioning) is Harrison's lane. Never propose BDM iterating on
+      creative direction.
+
+  - slack_id: U0B4L78SZHN
+    name: Micah Kessler
+    role: BDM Co-owner / OSN Co-owner
+    entity: BDM
+    entities: [OSN]
+    responsibilities:
+      - BDM co-ownership (33.33% with Demi); OSN equity holder
+    manager: U0B2RM2JYJ1
+
+  - slack_id: U0B3RU65TFU
+    name: Demi Bagby
+    role: BDM Co-owner / Talent
+    entity: BDM
+    responsibilities:
+      - BDM team management and on-camera talent
+    manager: U0B2RM2JYJ1
+    notes: Personal mailbox deliberately excluded from KB sweeps (Harrison 2026-06-08).
+
+  - slack_id: U0B3AER7NUF
+    name: Jake Lichtman
+    role: BDM Creative
+    entity: BDM
+    responsibilities:
+      - BDM content production
+    manager: U0B3NGR1Y85
+
+  - slack_id: U0B3TPD2MEV
+    name: Alina Thomas
+    role: Content Creator
+    entity: BDM
+    responsibilities:
+      - Content creation across portfolio brands
+    manager: U0B3NGR1Y85
+
+  - slack_id: U0B3PS63F1C
+    name: Daniel Sion
+    role: Creative / Design
+    entity: BDM
+    responsibilities:
+      - BDM design support
+    manager: U0B3NGR1Y85
+    notes: >-
+      Executor-removed entity-wide per 2026-05-22 lock -- never propose Daniel
+      as owner/executor for any workstream.
+
+  - slack_id: U0B4L7886PJ
+    name: Jerry Reick
+    role: HJRG Finance / Compliance
+    entity: HJRG
+    responsibilities:
+      - Compliance filings (e.g. F3C 990-N); finance support
+    manager: U0B3AEJCYGP
+    notes: >-
+      Finance receipt retrieval allowlisted (#hjr-finance only). Role title
+      pending Harrison confirmation -- sourced from finance allowlist + filings.
+
+  - slack_id: U0B6LQNSR25
+    name: Jason Dorfman
+    role: Outside Consultant -- F3E Retail Expansion
+    entity: F3E
+    external: true
+    responsibilities:
+      - F3E retail expansion consulting (transitioned employee -> consultant 2026-06-08)
+    manager: U0B2RM2JYJ1
+    notes: >-
+      Guest Slack user, no Asana account. External: exclude from internal
+      proactive comms and internal-only context.

@@ -8,6 +8,44 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Phase 1: org role registry + role-aware context -- 2026-06-10 (STAGED, host ship pending)
+
+New program (Harrison-directed 2026-06-10): full organizational synthesis -- Cora as the
+role-scoped individual resource for EVERY user (as she is for Harrison), plus a founder-level
+strategy/oversight layer for Harrison. Spec of record:
+`_shared/projects/cora/design/2026-06-10_fndr_org-synthesis-spec.md` (4 phases + tracker).
+
+**Phase 1 BUILT this session (Cowork sandbox; commit via
+`deployment\ship-org-roles-2026-06-10.ps1` from elevated PS):**
+- `data/maps/org-roles.yaml` -- canonical org role registry, 19 people: role, primary entity,
+  additional entities, lanes, manager, routing notes, external flag. Consolidated from founder
+  CLAUDE.md delegates + role-briefing-config + slack-to-asana + monitored-email-accounts.
+  `role-briefing-config.yaml` deliberately untouched (drives the live Tier-1 briefing task;
+  consolidation point is Phase 2).
+- `src/cora/org_roles.py` -- loader, 60s TTL live-reload (edit YAML, no restart -- the
+  lex-phi-custodians pattern). FAIL-CLOSED: unknown asker = no role block = exact pre-Phase-1
+  behavior. Parse errors keep the last good registry.
+- `app.py` -- `_dispatch_qa` runtime context now carries a terse role block for every known
+  asker (role, lanes, cautions: Daniel executor-removed, Jason external-consultant, Matt
+  disambiguation, etc.). Covers mentions / thread follow-ups / /cora-ask / DMs.
+- **ADVISORY-ONLY invariant (load-bearing):** the registry never grants access; every injected
+  block carries an explicit "does NOT expand entity access" rule; user_access / sibling /
+  cross_entity / phi / historical_access (D-043) all run unchanged.
+- 28 tests `tests/test_org_roles.py` (28/28 in sandbox; full host suite runs in the ship PS1),
+  incl. roster-drift guards: every slack-to-asana user + PHI custodian + finance-allowlisted
+  user MUST have a registry entry.
+- **Proposed D-044** (in spec, awaiting Harrison 👍 before decisions.md): org-roles.yaml is the
+  canonical role registry; advisory-only; fail-closed; roster changes through Harrison; new
+  per-user features read it instead of growing new per-user maps.
+
+**Ship steps:** run the PS1 (import smoke -> full pytest -> commit/push -> optional restart).
+**Restart REQUIRED** for the injection to go live (app.py is in the bot process). The PS1's
+kill filter matches `cora.main` ONLY, so a restart will NOT touch the 18mo gmail backfill if
+it is still running. Smoke test: a non-Harrison teammate asks @Cora anything -- reply should
+reflect their role; guest/unknown users unchanged.
+**Open for Harrison:** confirm Jerry Reick's title; Tessa registry entry y/n; Phase 2 first
+deliverable (briefing rework vs on-demand "what's on my plate" tool).
+
 ### [SECURITY + FINANCE] Per-user email/Drive access control + finance receipt tier SHIPPED -- 2026-06-10 (D-043)
 
 Built ahead of the 18-month gmail backfill (Harrison re-decided the gate order 2026-06-10:

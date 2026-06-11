@@ -31,6 +31,7 @@ from . import cross_entity_guard
 from . import historical_access
 from . import finance_receipts
 from . import model_router
+from . import org_roles
 from .prompt_loader import load_prompt
 from . import rate_limiter
 from .reply_formatter import format_reply
@@ -408,6 +409,14 @@ def _dispatch_qa(
     if caller_record and caller_record.asana_email:
         caller_role_hint = f" ({caller_record.asana_email})"
 
+    # Role-aware context (org_roles, Phase 1 of Org Synthesis): a terse block
+    # describing the asker's role/entity/lanes so answers are tailored to their
+    # position. ADVISORY ONLY -- unknown users get "" (fail-closed to neutral)
+    # and the block itself states it never expands entity access. All hard
+    # guards (user_access / sibling / cross_entity / phi / historical_access)
+    # run regardless.
+    caller_role_block = org_roles.format_role_context(user_id or "")
+
     # Founder (Harrison) gets cross-entity access from any channel. His questions
     # about UFL, LEX, OSN etc. from an F3E channel should not be blocked by entity scope.
     is_founder = (user_id == _FOUNDER_ID)
@@ -427,7 +436,8 @@ def _dispatch_qa(
         f"(Slack ID: {user_id or 'unknown'}).\n"
         f"Address them by their first name if relevant. Do NOT assume the asker is "
         f"Harrison Rogers unless their Slack ID is U0B2RM2JYJ1.\n"
-        f"{founder_note}\n"
+        + (f"\n{caller_role_block}\n" if caller_role_block else "")
+        + f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
         f"{historical_access.TIER1_SYNTHESIS_RULE}\n\n"
         f"---\n\n"
