@@ -8,12 +8,12 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [ORG SYNTHESIS] Phase 2 deliverable 1: whats_on_my_plate tool -- 2026-06-11 (SHIPPED, commit f9cf11b; RESTART PENDING)
+### [ORG SYNTHESIS] Phase 2 deliverable 1: whats_on_my_plate tool -- 2026-06-11 (SHIPPED + LIVE, commit f9cf11b)
 
-Repo HEAD: `f9cf11b` on `origin/main` | full suite **3,813 passed / 41 skipped** (+47) |
-**Cora NOT yet restarted** -- the tool is dormant until the next clean restart
-(`deployment\ship-whats-on-my-plate-2026-06-11.ps1 -Restart` from elevated PS; kill filter
-matches `cora.main` ONLY, safe alongside any running backfill).
+Repo HEAD: `ab8db8b` on `origin/main` | full suite **3,813 passed / 41 skipped** (+47) |
+**Cora restarted 2026-06-11 07:37 UTC (00:37 AZ)** via the ship PS1 `-Restart` from elevated
+PS -- clean startup (Socket Mode attempt #1, prewarm 14/14, KB warmed 7.4s), heartbeat
+advancing, tool exposure verified in loaded code (all entities incl. sub-entities, 25s tier).
 
 First Phase 2 deliverable per the org-synthesis spec (decided with Harrison 2026-06-10:
 pull-not-push ships before the briefing rework). On-demand composite plate view, all in
@@ -39,7 +39,7 @@ pull-not-push ships before the briefing rework). On-demand composite plate view,
   unknown-user refusal, Harrison override, external limits, LEX HubSpot exclusion,
   fail-soft sections, prompt coverage).
 
-**Exit gate (Phase 2 deliverable 1):** after restart, live smoke for 3-4 roles --
+**Exit gate (Phase 2 deliverable 1) -- the one open item:** live smoke for 3-4 roles --
 Harrison (FNDR/DM, expect STALLED DECISIONS section), Matt (#osn-leadership), Tommy
 (#f3e-sales, expect DEAL PIPELINE), one LEX user in #llc/#lex-leadership (expect NO
 pipeline section). **Next Phase 2 deliverable:** briefing rework -- `run_daily_briefing.py`
