@@ -71,17 +71,24 @@ class RoleRecord:
 _lock = threading.Lock()
 _loaded_at: float = 0.0
 _by_slack: dict[str, RoleRecord] = {}
+_registry_only: list[RoleRecord] = []
 
 
-def _parse(raw: object) -> dict[str, RoleRecord]:
-    """Parse the YAML payload into a slack_id -> RoleRecord index.
+def _parse(raw: object) -> tuple[dict[str, RoleRecord], list[RoleRecord]]:
+    """Parse the YAML payload.
+
+    Returns (by_slack_index, registry_only) where registry_only holds valid
+    entries WITHOUT a slack_id (e.g. part-time staff with no Slack access).
+    Those appear in all_roles()/roles_for_entity() for roster-level features
+    but can never trigger role-block injection (no Slack identity to match).
 
     Malformed entries are skipped with a warning rather than crashing the
     bot -- a registry typo must never take Cora down.
     """
     index: dict[str, RoleRecord] = {}
+    registry_only: list[RoleRecord] = []
     if not isinstance(raw, dict):
-        return index
+        return index, registry_only
     for entry in (raw.get("users") or []):
         if not isinstance(entry, dict):
             continue
@@ -89,10 +96,10 @@ def _parse(raw: object) -> dict[str, RoleRecord]:
         name = str(entry.get("name") or "").strip()
         role = str(entry.get("role") or "").strip()
         entity = str(entry.get("entity") or "").strip()
-        if not sid or not role or not entity:
+        if not role or not entity or (not sid and not name):
             log.warning("org_roles: skipping malformed entry %r", entry.get("name") or entry)
             continue
-        index[sid] = RoleRecord(
+        rec = RoleRecord(
             slack_id=sid,
             name=name or sid,
             role=role,
@@ -105,11 +112,15 @@ def _parse(raw: object) -> dict[str, RoleRecord]:
             notes=str(entry.get("notes") or "").strip(),
             external=bool(entry.get("external", False)),
         )
-    return index
+        if sid:
+            index[sid] = rec
+        else:
+            registry_only.append(rec)
+    return index, registry_only
 
 
 def _refresh_if_stale() -> None:
-    global _loaded_at, _by_slack
+    global _loaded_at, _by_slack, _registry_only
     now = time.monotonic()
     if _by_slack and (now - _loaded_at) < _TTL_SECONDS:
         return
@@ -119,19 +130,22 @@ def _refresh_if_stale() -> None:
             return
         try:
             raw = yaml.safe_load(_ROLES_PATH.read_text(encoding="utf-8"))
-            parsed = _parse(raw)
-            if parsed:
+            parsed, extras = _parse(raw)
+            if parsed or extras:
                 _by_slack = parsed
+                _registry_only = extras
             else:
                 # Empty/unparseable file: keep serving the previous registry if
                 # we have one (transient editor save states), else stay empty.
                 log.warning("org_roles: registry parsed empty at %s", _ROLES_PATH)
                 if not _by_slack:
                     _by_slack = {}
+                    _registry_only = []
             _loaded_at = now
         except FileNotFoundError:
             log.warning("org_roles: %s not found -- no role context will be injected", _ROLES_PATH)
             _by_slack = {}
+            _registry_only = []
             _loaded_at = now
         except Exception as exc:
             # Keep the last good registry on read/parse errors.
@@ -141,10 +155,11 @@ def _refresh_if_stale() -> None:
 
 def invalidate_cache() -> None:
     """Force reload on next call (tests + manual edits)."""
-    global _loaded_at, _by_slack
+    global _loaded_at, _by_slack, _registry_only
     with _lock:
         _loaded_at = 0.0
         _by_slack = {}
+        _registry_only = []
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -158,15 +173,20 @@ def get_role(slack_id: str) -> Optional[RoleRecord]:
 
 
 def all_roles() -> list[RoleRecord]:
+    """Every registry entry, including registry-only people without a Slack ID."""
     _refresh_if_stale()
-    return list(_by_slack.values())
+    return list(_by_slack.values()) + list(_registry_only)
 
 
 def roles_for_entity(entity: str) -> list[RoleRecord]:
     """All people whose primary or secondary entities include `entity`."""
     _refresh_if_stale()
     ent = (entity or "").strip().upper()
-    return [r for r in _by_slack.values() if ent in (e.upper() for e in r.all_entities)]
+    return [
+        r
+        for r in list(_by_slack.values()) + list(_registry_only)
+        if ent in (e.upper() for e in r.all_entities)
+    ]
 
 
 # The disclaimer ships INSIDE the injected block so prompt-layer behavior can

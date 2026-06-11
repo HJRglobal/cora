@@ -30,7 +30,9 @@
 #   - gap-domain-owners.yaml     gap-escalation routing
 #
 # Field reference:
-#   slack_id          required; primary key
+#   slack_id          primary key when present; registry-only entries (no
+#                     Slack access, e.g. part-time staff) may omit it -- they
+#                     ride the roster but never trigger role injection
 #   name              display name
 #   role              human-readable title
 #   entity            primary entity code (FNDR/HJRG/F3E/OSN/LEX/BDM/HJRP/UFL/...)
@@ -226,14 +228,33 @@ users:
 
   - slack_id: U0B4L7886PJ
     name: Jerry Reick
-    role: HJRG Finance / Compliance
+    role: Staff Accountant
     entity: HJRG
     responsibilities:
-      - Compliance filings (e.g. F3C 990-N); finance support
+      - Runs ARs across entities
+      - Allocates entity expenses to correct categories
+      - Compliance filings support (e.g. F3C 990-N)
     manager: U0B3AEJCYGP
     notes: >-
-      Finance receipt retrieval allowlisted (#hjr-finance only). Role title
-      pending Harrison confirmation -- sourced from finance allowlist + filings.
+      Finance receipt retrieval allowlisted (#hjr-finance only). Title
+      confirmed by Harrison 2026-06-10.
+
+  # Registry-only entry (no slack_id): Tessa has no active Slack/Asana access
+  # (revoked 2026-05-22) but retains a real part-time role. She appears in
+  # all_roles()/roles_for_entity() for Phases 2-4; no role block can be
+  # injected without a Slack identity. Added per Harrison 2026-06-10.
+  - name: Tessa Miller
+    role: Executive Assistant (part-time remote, ~10 hrs/wk)
+    entity: HJRG
+    entities: [OSN, HJRP]
+    responsibilities:
+      - Metrics + meeting structure (since 5/26)
+      - Lease-renewal coordination; OSN scheduling weekly
+      - Harrison email/calendar/receipts/scheduling; travel booking; cabin admin
+    manager: U0B2RM2JYJ1
+    notes: >-
+      Part-time remote effective 2026-05-23; 8/8 review milestone for summer
+      scope check. No Slack/Asana access -- registry-only entry.
 
   - slack_id: U0B6LQNSR25
     name: Jason Dorfman

@@ -55,19 +55,22 @@ class TestRegistryFile:
     def test_every_entry_has_required_fields(self):
         data = yaml.safe_load(_REGISTRY.read_text(encoding="utf-8"))
         for entry in data["users"]:
-            assert entry.get("slack_id", "").startswith("U"), entry
+            # slack_id optional (registry-only people, e.g. Tessa) but when
+            # present it must be a real Slack ID.
+            sid = entry.get("slack_id", "")
+            assert sid == "" or sid.startswith("U"), entry
             assert entry.get("name"), entry
             assert entry.get("role"), entry
             assert entry.get("entity"), entry
 
     def test_slack_ids_unique(self):
         data = yaml.safe_load(_REGISTRY.read_text(encoding="utf-8"))
-        ids = [e["slack_id"] for e in data["users"]]
+        ids = [e["slack_id"] for e in data["users"] if e.get("slack_id")]
         assert len(ids) == len(set(ids))
 
     def test_managers_reference_known_ids_or_blank(self):
         data = yaml.safe_load(_REGISTRY.read_text(encoding="utf-8"))
-        ids = {e["slack_id"] for e in data["users"]}
+        ids = {e["slack_id"] for e in data["users"] if e.get("slack_id")}
         for entry in data["users"]:
             mgr = entry.get("manager", "")
             assert mgr == "" or mgr in ids, f"{entry['name']} manager {mgr} unknown"
@@ -133,6 +136,40 @@ class TestGetRole:
         assert org_roles.roles_for_entity("lex") == org_roles.roles_for_entity("LEX")
 
 
+class TestRegistryOnlyPeople:
+    """People without Slack IDs (e.g. Tessa) ride the roster, never injection."""
+
+    def test_tessa_in_all_roles(self):
+        names = {r.name for r in org_roles.all_roles()}
+        assert "Tessa Miller" in names
+
+    def test_tessa_in_entity_rosters(self):
+        for ent in ("HJRG", "OSN", "HJRP"):
+            names = {r.name for r in org_roles.roles_for_entity(ent)}
+            assert "Tessa Miller" in names, ent
+
+    def test_registry_only_never_injects(self, tmp_path):
+        _write_registry(
+            tmp_path,
+            """
+            users:
+              - name: No Slack Person
+                role: Registry Only
+                entity: HJRG
+            """,
+        )
+        assert len(org_roles.all_roles()) == 1
+        # No slack identity -> no get_role hit, no block.
+        assert org_roles.get_role("") is None
+        assert org_roles.format_role_context("") == ""
+
+    def test_jerry_title_confirmed(self):
+        rec = org_roles.get_role("U0B4L7886PJ")
+        assert rec is not None
+        assert rec.role == "Staff Accountant"
+        assert rec.manager == "U0B3AEJCYGP"  # Justin
+
+
 # ── Role block formatting ──────────────────────────────────────────────────
 
 
@@ -165,6 +202,8 @@ class TestFormatRoleContext:
     def test_block_is_terse(self):
         # Uncached per-request token cost: keep every block under ~1K chars.
         for rec in org_roles.all_roles():
+            if not rec.slack_id:
+                continue
             block = org_roles.format_role_context(rec.slack_id)
             assert len(block) < 1000, f"{rec.name} block too long ({len(block)})"
 
@@ -183,7 +222,7 @@ class TestLoaderRobustness:
                 role: Tester
                 entity: F3E
               - slack_id: ""
-                name: No Id
+                name: ""
                 role: Ghost
                 entity: F3E
               - just a string
