@@ -13,6 +13,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from .app import app
 from .config import config
 from .context_loader import _load_static_context
+from .health_endpoint import start_health_server, start_ping_thread
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEARTBEAT_FILE = _REPO_ROOT / "data" / "health" / "heartbeat.txt"
@@ -139,6 +140,12 @@ def main() -> None:
         name="KBPrewarm",
         daemon=True,
     ).start()
+
+    # Stage 2 uptime monitoring: local /health endpoint + outbound dead-man's-switch
+    # ping. Both fail-soft; started once for process lifetime (they key off the
+    # heartbeat sentinel file, so they track liveness across reconnect cycles).
+    start_health_server()
+    start_ping_thread()
 
     attempt = 0
     last_error = ""
