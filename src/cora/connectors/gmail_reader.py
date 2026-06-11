@@ -26,6 +26,7 @@ import logging
 import os
 from typing import Any
 
+from google.auth.exceptions import GoogleAuthError
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -123,6 +124,11 @@ def list_messages_with_attachments(
             raise GmailReaderError(
                 f"Gmail list failed for {user_email} (HTTP {status}): {exc}"
             ) from exc
+        except GoogleAuthError as exc:
+            raise GmailReaderError(
+                f"Gmail auth failed for {user_email} (alias-only address or "
+                f"no impersonatable mailbox?): {exc}"
+            ) from exc
 
         for msg in resp.get("messages", []):
             ids.append(msg["id"])
@@ -153,6 +159,10 @@ def get_message(user_email: str, message_id: str) -> dict[str, Any]:
     except HttpError as exc:
         raise GmailReaderError(
             f"Gmail get message {message_id} failed: {exc}"
+        ) from exc
+    except GoogleAuthError as exc:
+        raise GmailReaderError(
+            f"Gmail auth failed for {user_email}: {exc}"
         ) from exc
 
 
@@ -430,6 +440,16 @@ def list_threads_since(
             raise GmailReaderError(
                 f"Gmail threads.list failed for {user_email} (HTTP {status}): {exc}"
             ) from exc
+        except GoogleAuthError as exc:
+            # invalid_grant ("Invalid email or User ID") = the address is
+            # alias-only / not an impersonatable mailbox. Surface as a
+            # GmailReaderError so per-account loops SKIP instead of dying —
+            # an uncaught RefreshError here killed the 2026-06-10 backfill
+            # (and the nightly sweep) on harrison@unitedfightleague.com.
+            raise GmailReaderError(
+                f"Gmail auth failed for {user_email} (alias-only address or "
+                f"no impersonatable mailbox?): {exc}"
+            ) from exc
 
         for t in resp.get("threads", []):
             thread_ids.append(t["id"])
@@ -501,6 +521,10 @@ def get_full_thread_text(
     except HttpError as exc:
         raise GmailReaderError(
             f"Gmail threads.get failed for {thread_id}: {exc}"
+        ) from exc
+    except GoogleAuthError as exc:
+        raise GmailReaderError(
+            f"Gmail auth failed for {user_email}: {exc}"
         ) from exc
 
     messages = resp.get("messages", [])
