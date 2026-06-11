@@ -379,10 +379,18 @@ accounts:
 
   # ── @unitedfightleague.com -- DWD confirmed active 2026-05-27 ───────────
 
+# PERMANENT ALIAS, no mailbox of its own (confirmed Harrison 2026-06-10).
+  # Mail to this address is delivered into harrison@hjrglobal.com and is
+  # swept nightly there (verified: 2,748 KB chunks in the primary sweep
+  # mention unitedfightleague.com, incl. To:-alias mail; recipient-based
+  # entity tagging routes UFL mail to entity=UFL). Impersonating the alias
+  # fails DWD with invalid_grant -- disabled to stop the nightly skip noise.
+  # Entry kept (not deleted) so identity/ownership mapping still links the
+  # alias address to Harrison.
   - email: harrison@unitedfightleague.com
     name: Harrison Rogers (UFL)
-    enabled: true
-    dwd_eligible: true
+    enabled: false  # permanent alias of harrison@hjrglobal.com -- covered by the primary sweep
+    dwd_eligible: false
     thread_sweep: true
     attachment_filer: true
     drive_sweep: true
@@ -392,10 +400,12 @@ accounts:
     asana_gid: "1204525779609669"
     slack_user_id: U0B2RM2JYJ1
 
+  # PERMANENT ALIAS of hannah@hjrglobal.com -- same situation as above
+  # (112 alias-addressed chunks verified in her primary sweep).
   - email: hannah@unitedfightleague.com
     name: Hannah Grant (UFL)
-    enabled: true
-    dwd_eligible: true
+    enabled: false  # permanent alias of hannah@hjrglobal.com -- covered by the primary sweep
+    dwd_eligible: false
     thread_sweep: true
     attachment_filer: true
     drive_sweep: true
