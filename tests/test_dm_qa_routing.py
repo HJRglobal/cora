@@ -108,9 +108,11 @@ def qa_mocks():
          patch.object(app_module.help_responder, "is_help_intent", return_value=False), \
          patch.object(app_module.sibling_guard, "check_redirect", return_value=None), \
          patch.object(app_module.cross_entity_guard, "check_cross_entity", return_value=None), \
-         patch.object(app_module, "_fetch_dm_history", return_value=[]), \
+         patch.object(app_module, "_fetch_dm_history", return_value=[]) as dm_hist, \
+         patch.object(app_module, "_fetch_thread_history", return_value=[]) as thread_hist, \
          patch.object(app_module, "_dispatch_qa") as dispatch:
-        yield SimpleNamespace(rate=rate, get_role=get_role, access=access, dispatch=dispatch)
+        yield SimpleNamespace(rate=rate, get_role=get_role, access=access,
+                              dispatch=dispatch, dm_hist=dm_hist, thread_hist=thread_hist)
 
 
 class TestHandleDmQa:
@@ -149,6 +151,34 @@ class TestHandleDmQa:
     def test_user_access_always_consulted(self, qa_mocks):
         app_module._handle_dm_qa(_event(), MagicMock(), TOMMY, "remember X")
         assert qa_mocks.access.call_count == 1
+
+    def test_threaded_dm_replies_into_the_thread(self, qa_mocks):
+        # Slack's AI-assistant "Chat" pane (Agents & AI Apps mode) runs every
+        # conversation as a thread on the im channel — replies must follow it.
+        event = _event()
+        event["thread_ts"] = "99.5"
+        client = MagicMock()
+        app_module._handle_dm_qa(event, client, TOMMY, "remember X")
+        kwargs = qa_mocks.dispatch.call_args.kwargs
+        assert kwargs["reply_thread_ts"] == "99.5"
+        assert kwargs["root_thread_ts"] == "99.5"
+        # Context comes from the thread, not the channel history.
+        qa_mocks.thread_hist.assert_called_once()
+        qa_mocks.dm_hist.assert_not_called()
+        # The say wrapper enforces the thread on every post.
+        kwargs["say"](text="hi")
+        assert client.chat_postMessage.call_args.kwargs["thread_ts"] == "99.5"
+
+    def test_toplevel_dm_replies_unthreaded(self, qa_mocks):
+        client = MagicMock()
+        app_module._handle_dm_qa(_event(), client, TOMMY, "remember X")
+        kwargs = qa_mocks.dispatch.call_args.kwargs
+        assert kwargs["reply_thread_ts"] is None
+        qa_mocks.dm_hist.assert_called_once()
+        qa_mocks.thread_hist.assert_not_called()
+        # The say wrapper strips any thread_ts a caller passes.
+        kwargs["say"](text="hi", thread_ts="should-be-dropped")
+        assert "thread_ts" not in client.chat_postMessage.call_args.kwargs
 
 
 # ── handle_message_event DM branch routing ────────────────────────────────────

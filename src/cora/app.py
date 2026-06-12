@@ -1173,6 +1173,12 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
     """
     dm_channel = event.get("channel", user_id)
     current_ts = event.get("ts", "")
+    # If the user is typing inside a thread — including Slack's AI-assistant
+    # "Chat" pane (Agents & AI Apps mode), where every conversation is an
+    # assistant thread on the im channel — replies MUST land in that thread.
+    # A top-level reply renders only in the classic conversation view (the
+    # "History" tab) and the pane the user is typing in looks unanswered.
+    dm_thread_ts = event.get("thread_ts") or None
 
     allowed, _cap = rate_limiter.check(user_id, dm_channel)
     if not allowed:
@@ -1193,7 +1199,12 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
         entity = "FNDR"
 
     def _say(**kwargs) -> dict:
-        kwargs.pop("thread_ts", None)  # DM replies go to the main conversation
+        # Follow the user's surface: threaded ask -> threaded reply (the
+        # AI-assistant Chat pane case); top-level ask -> main conversation.
+        if dm_thread_ts:
+            kwargs["thread_ts"] = dm_thread_ts
+        else:
+            kwargs.pop("thread_ts", None)
         return client.chat_postMessage(channel=dm_channel, **kwargs)
 
     # PHI custodian relaxation: DMs count as LEX scope for allowlisted
@@ -1224,19 +1235,29 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
         _say(text=cross_redirect, unfurl_links=False, unfurl_media=False)
         return
 
-    log.info("dm_qa routed user=%s entity=%s text=%.80s", user_id, entity, text)
+    log.info(
+        "dm_qa routed user=%s entity=%s thread=%s text=%.80s",
+        user_id, entity, bool(dm_thread_ts), text,
+    )
+
+    # Conversation context: thread replies (assistant pane) read the thread;
+    # top-level DMs read the recent channel history.
+    if dm_thread_ts:
+        prior_messages = _fetch_thread_history(client, dm_channel, dm_thread_ts, current_ts)
+    else:
+        prior_messages = _fetch_dm_history(client, dm_channel, current_ts)
 
     _dispatch_qa(
         channel_id=dm_channel,
         channel_name="dm",
         user_id=user_id,
         user_message=text,
-        reply_thread_ts=None,  # _say drops thread_ts — replies stay top-level
+        reply_thread_ts=dm_thread_ts,  # _say enforces the same surface either way
         entity=entity,
         client=client,
         say=_say,
-        prior_messages=_fetch_dm_history(client, dm_channel, current_ts),
-        root_thread_ts=current_ts,
+        prior_messages=prior_messages,
+        root_thread_ts=dm_thread_ts or current_ts,
     )
 
 

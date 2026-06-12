@@ -37,6 +37,17 @@ the scheduler greeting (those words are common in normal questions); OSN employe
 nudged with the exact phrase "submit availability", which still routes correctly, and
 mid-flow turns are never hijacked.
 
+**Follow-up same night — replies now follow the user's surface:** Cora's live Slack app
+is enrolled in **Agents & AI Apps mode** (evidence: App Home shows "Chat Tab", not
+"Messages Tab") — DMing her opens the AI-assistant pane whose Chat tab runs every
+conversation as a THREAD on the im channel. The first cut of this fix replied top-level
+only, so assistant-pane asks looked unanswered (replies rendered under the pane's
+"History" tab — Harrison's live report). Now: threaded ask -> threaded reply +
+thread-history context; top-level ask -> main-conversation reply + channel-history
+context (`dm_thread_ts` in `_handle_dm_qa`; the say wrapper enforces the surface on
+every post). Works in BOTH app modes; the Agents-mode toggle can stay on or off as a
+pure UX preference. +2 tests.
+
 ### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED + LIVE, D-049; commit `01a12ed`, restarted ~21:59 AZ)
 
 Any teammate can now teach Cora a personal note -- "Cora, remember X" / "note that X" --
