@@ -48,6 +48,15 @@ context (`dm_thread_ts` in `_handle_dm_qa`; the say wrapper enforces the surface
 every post). Works in BOTH app modes; the Agents-mode toggle can stay on or off as a
 pure UX preference. +2 tests.
 
+**RESOLVED 2026-06-11 ~23:15 AZ:** Harrison turned the Agents & AI Apps toggle OFF
+(Chrome agent; "Mark this app as an agent app" now off, nothing else touched — note the
+app's "Slack MCP Server" toggle is ON and was left alone). Cora DMs are classic
+conversations again; no restart needed (Slack-side presentation only). The
+surface-following reply code stays — it is correct in either mode and protects against
+the toggle ever being re-enabled. If the AI-assistant pane is ever wanted back, turn the
+toggle on AND build proper assistant polish (assistant_thread_started handling, status
+indicators, suggested prompts) in a Code session.
+
 ### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED + LIVE, D-049; commit `01a12ed`, restarted ~21:59 AZ)
 
 Any teammate can now teach Cora a personal note -- "Cora, remember X" / "note that X" --
