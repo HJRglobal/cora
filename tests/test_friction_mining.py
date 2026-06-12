@@ -237,6 +237,16 @@ class TestRepeatedQuestions:
         assert len(findings) == 1
         assert findings[0].count == 3
 
+    def test_quoted_reply_lines_not_counted(self, paths):
+        # One genuine ask + two quoted copies of it (email reply chains)
+        # must NOT count as 3 occurrences.
+        chunks = [
+            _chunk("What is our wholesale pricing for retailers?"),
+            _chunk("> What is our wholesale pricing for retailers?"),
+            _chunk(">> What is our wholesale pricing for retailers?"),
+        ]
+        assert fm.detect_repeated_questions(chunks, [], [], embed_fn=_kw_embed) == []
+
     def test_embed_failure_yields_nothing(self, paths):
         def boom(texts):
             raise RuntimeError("no api")

@@ -150,6 +150,15 @@ _VENDOR_RE = re.compile(
 _QUESTION_MIN_LEN = 20
 _QUESTION_MAX_LEN = 240
 
+# Email quoted-reply marker. A ">"-prefixed line is a COPY of an earlier
+# message, not a fresh occurrence -- counting them inflates frequency
+# (observed live 2026-06-11: a single email line counted 134x via re-quotes).
+_QUOTE_LINE_RE = re.compile(r"^\s*>")
+
+
+def _is_quoted(sentence: str) -> bool:
+    return bool(_QUOTE_LINE_RE.match(sentence))
+
 
 # ---------------------------------------------------------------------------
 # Paths (env-overridable for tests)
@@ -398,6 +407,8 @@ def _extract_question_sentences(chunks: list[dict[str, Any]]) -> list[dict[str, 
     out: list[dict[str, Any]] = []
     for chunk in chunks:
         for sentence in _extract_sentences(chunk["content"]):
+            if _is_quoted(sentence):
+                continue
             if "?" not in sentence:
                 continue
             if not (_QUESTION_MIN_LEN <= len(sentence) <= _QUESTION_MAX_LEN):
@@ -478,7 +489,7 @@ def detect_manual_steps(
     candidates: list[dict[str, Any]] = []
     for chunk in chunks:
         for sentence in _extract_sentences(chunk["content"]):
-            if len(sentence) < 25 or len(sentence) > 400:
+            if _is_quoted(sentence) or len(sentence) < 25 or len(sentence) > 400:
                 continue
             if _RECURRENCE_RE.search(sentence) and _MANUAL_RE.search(sentence):
                 candidates.append({"text": sentence, "entity": chunk["entity"], "chunk": chunk})
@@ -536,7 +547,7 @@ def detect_stale_handoffs(
     for chunk in chunks:
         is_old = chunk["ingested_at"] < stale_cutoff
         for sentence in _extract_sentences(chunk["content"]):
-            if len(sentence) < 25 or len(sentence) > 400:
+            if _is_quoted(sentence) or len(sentence) < 25 or len(sentence) > 400:
                 continue
             if is_old:
                 if _HANDOFF_RE.search(sentence) and len(old_candidates) < _MAX_HANDOFF_CANDIDATES:
@@ -585,7 +596,7 @@ def detect_cross_entity_duplication(
         if entity in ("FNDR", "HJRG"):
             continue   # aggregators discuss everything -- not a duplication signal
         for sentence in _extract_sentences(chunk["content"]):
-            if len(sentence) < 25 or len(sentence) > 400:
+            if _is_quoted(sentence) or len(sentence) < 25 or len(sentence) > 400:
                 continue
             if _VENDOR_RE.search(sentence):
                 candidates.append({"text": sentence, "entity": entity, "chunk": chunk})
