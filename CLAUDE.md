@@ -26,12 +26,11 @@ follower). Three-layer fix:
 3. **Weekly hygiene-asana SKILL.md patched** (OneDrive): permanent already_closed rows never
    re-commented + live completion re-check before any comment.
 
-**WARNING -- OWNERSHIP DRIFT FOR HARRISON**: the scheduled task "Cora - Asana Hygiene Nudges"
-is ENABLED and firing daily (6:30am, ledger rows 6/08-6/11) DESPITE the 6/05 memory saying it
-was disabled in favor of the Make scenario -- both have been nudging. Pick one owner: the
-Cora job is the smarter one (all users, ledger, KB-signal check, throttles); the Make
-scenario covers only Harrison's tasks with none of that. Recommend deactivating Make 4768887.
-Hannah replied-to in #info-for-cora. Full record: D-045.
+**OWNERSHIP RESOLVED same evening (D-045a, Harrison directive)**: Make scenario 4768887
+DEACTIVATED -- the Cora daily job ("Cora - Asana Hygiene Nudges", 6:30am AZ, Enabled/Ready)
+is now the sole overdue-task nudge owner (alongside the weekly closure sweep, both on the
+shared ledger + closed-task guard). Doctrine: do NOT re-activate Make 4768887 or create
+parallel nudge automations. Hannah replied-to in #info-for-cora. Full record: D-045 + D-045a.
 
 ### [LEX + KB] DDD manuals + EVV docs LIVE via recurring dump-folder sync -- 2026-06-11 (SHIPPED, D-046; closes Asana 1215643646634974)
 

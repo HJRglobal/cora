@@ -1168,3 +1168,21 @@ AND all GM #lex-* channels (GM scope sees every LEX chunk). NOT visible in
 **Note:** the `lex_gm_level` store Step 0 opt-out (D-046 item 3) stays in the codebase --
 it is a generic, tested mechanism for any future deliberately-GM-level LEX ingest; this
 script simply no longer uses it.
+
+---
+
+## D-045a -- AMENDMENT: Cora is the sole owner of Asana hygiene nudges; Make 4768887 DEACTIVATED (2026-06-11 PM, Harrison)
+
+**Resolves the D-045 ownership-drift item.** Harrison directive: deactivate Make scenario
+4768887 and make the Cora daily job the default and only owner of overdue-task nudging.
+
+**Executed:** scenario 4768887 deactivated via Make API (isActive=false, nextExec null;
+blueprint retained with the corrected AND filter in case it is ever revived). The scheduled
+task "Cora - Asana Hygiene Nudges" (daily 6:30am AZ) is confirmed Enabled/Ready and is now
+the single nudge source alongside the weekly hygiene-asana closure sweep -- both share the
+closure-nudges ledger and the D-045 closed-task guard.
+
+**Doctrine:** overdue-task nudging lives in Cora (run_asana_hygiene_nudges.py). Do NOT
+re-activate Make 4768887 or create parallel nudge automations -- the 6/05-6/11 period proved
+that two unsynchronized sources double-comment and bypass the ledger. Any future nudge
+behavior change goes into the Cora job.
