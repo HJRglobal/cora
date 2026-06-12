@@ -6,11 +6,12 @@ Coverage:
   - section composition: reuses the plate builders from tool_dispatch; LEX
     users never get a pipeline section; stalled decisions are Harrison-only;
     sections fail soft to stub lines
-  - digest mode (DEFAULT): ONE DM to Harrison containing every user's
-    would-be briefing; no per-user DMs (rollout doctrine 2026-06-11)
-  - send mode: per-user DMs only with the explicit --send-users flag
+  - review-driven rollout (DEFAULT, Harrison 2026-06-11): one review DM PER
+    USER to Harrison; his :+1: on a message enables that user's delivery at
+    the next run; :-1: drops the user from review; nobody else's reactions
+    count; no unsolicited DMs before a thumbs-up
+  - send mode: --send-users force-delivers to all active registry users
   - retirement of role-briefing-config.yaml (old config path is gone)
-  - digest chunking
   - sub-entity canonicalization in the SHARED plate task builder (LEX-LLC
     scopes to LEX, never unfiltered)
 
@@ -20,6 +21,7 @@ patch.object(rdb, ...) intercepts module-global lookups.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -36,7 +38,7 @@ from cora.tools import tool_dispatch as td  # noqa: E402
 import run_daily_briefing as rdb  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Registry fixture
+# Registry + state fixtures
 # ---------------------------------------------------------------------------
 
 _HARRISON = "U0B2RM2JYJ1"  # must match tool_dispatch._HARRISON_SLACK_ID
@@ -90,14 +92,48 @@ def empty_registry(tmp_path):
     org_roles.invalidate_cache()
 
 
-def _mock_slack():
+@pytest.fixture
+def state_path(tmp_path):
+    p = tmp_path / "briefing-delivery.json"
+    with patch.object(rdb, "_DELIVERY_STATE_PATH", p):
+        yield p
+
+
+def _read_state(p: Path) -> dict:
+    if not p.exists():
+        return {"enabled": {}, "declined": {}, "pending_reviews": []}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _seed_state(p: Path, **kw) -> None:
+    state = {"enabled": {}, "declined": {}, "pending_reviews": []}
+    state.update(kw)
+    p.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _mock_slack(reactions=None):
     client = MagicMock()
     client.conversations_open.return_value = {"channel": {"id": "DM-CHAN"}}
-    client.chat_postMessage.return_value = {"ok": True}
+    client.chat_postMessage.return_value = {"ok": True, "ts": "1700000000.000100"}
+    client.reactions_get.return_value = {"message": {"reactions": reactions or []}}
     return client
 
 
 _ENV = {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": "key"}
+
+
+def _run_main(argv, client):
+    with patch.dict("os.environ", _ENV), \
+         patch.object(rdb, "SlackWebClient", return_value=client), \
+         patch.object(rdb, "build_user_briefing",
+                      side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
+         patch.object(rdb, "_write_audit", return_value=None), \
+         patch.object(rdb.time, "sleep", return_value=None):
+        return rdb.main(argv)
+
+
+def _posts(client) -> list[str]:
+    return [c.kwargs["text"] for c in client.chat_postMessage.call_args_list]
 
 
 # ---------------------------------------------------------------------------
@@ -207,51 +243,65 @@ class TestComposeSections:
 
 
 # ---------------------------------------------------------------------------
-# Digest mode (DEFAULT -- rollout doctrine)
+# Review mode (DEFAULT -- one DM per user to Harrison)
 # ---------------------------------------------------------------------------
 
-class TestDigestMode:
-    def _run(self, argv, registry_users=3):
+class TestReviewMode:
+    def test_default_sends_one_message_per_user_to_harrison_only(self, registry, state_path):
         client = _mock_slack()
-        with patch.dict("os.environ", _ENV), \
-             patch.object(rdb, "SlackWebClient", return_value=client), \
-             patch.object(rdb, "build_user_briefing",
-                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
-             patch.object(rdb, "_write_audit", return_value=None):
-            rc = rdb.main(argv)
-        return rc, client
-
-    def test_default_mode_is_digest_to_harrison_only(self, registry):
-        rc, client = self._run([])
+        rc = _run_main([], client)
         assert rc == 0
-        # ONE DM conversation opened -- Harrison's
+        # ONE DM conversation opened -- Harrison's (no user deliveries yet)
         client.conversations_open.assert_called_once_with(users=[_HARRISON])
-        sent = "\n".join(
-            call.kwargs["text"] for call in client.chat_postMessage.call_args_list
-        )
-        assert "DAILY BRIEFING DIGEST" in sent
+        posts = _posts(client)
+        # header + one message per active registry user
+        assert len(posts) == 1 + 3
+        assert "DAILY BRIEFING REVIEW" in posts[0]
+        per_user = "\n".join(posts[1:])
         for name in ("Harrison Rogers", "Tara Sales", "Lana Lex"):
-            assert f"BRIEF::{name}" in sent
+            assert f"WOULD-BE BRIEFING -- {name}" in per_user
+            assert f"BRIEF::{name}" in per_user
 
-    def test_digest_only_flag_equivalent_to_default(self, registry):
-        rc, client = self._run(["--digest-only"])
+    def test_review_messages_carry_reaction_instructions(self, registry, state_path):
+        client = _mock_slack()
+        _run_main([], client)
+        for msg in _posts(client)[1:]:
+            assert ":+1:" in msg
+            assert ":-1:" in msg
+
+    def test_header_carries_rollout_state(self, registry, state_path):
+        client = _mock_slack()
+        _run_main([], client)
+        header = _posts(client)[0]
+        assert "nobody yet" in header
+        assert "Gene Guest" in header          # external, named as excluded
+        assert "Reggie RegistryOnly" in header  # registry-only, named as excluded
+
+    def test_each_review_message_tracked_for_reactions(self, registry, state_path):
+        client = _mock_slack()
+        _run_main([], client)
+        state = _read_state(state_path)
+        sids = {p["sid"] for p in state["pending_reviews"]}
+        assert sids == {_HARRISON, "U101", "U102"}
+        assert all(p["ts"] for p in state["pending_reviews"])
+
+    def test_rerun_replaces_pending_not_accumulates(self, registry, state_path):
+        client = _mock_slack()
+        _run_main([], client)
+        _run_main([], client)
+        state = _read_state(state_path)
+        assert len(state["pending_reviews"]) == 3  # one per user, latest only
+
+    def test_digest_only_flag_forces_review_for_everyone(self, registry, state_path):
+        _seed_state(state_path, enabled={"U101": {"name": "Tara Sales"}})
+        client = _mock_slack()
+        rc = _run_main(["--digest-only"], client)
         assert rc == 0
+        # Even the enabled user goes to review; no user DMs opened
         client.conversations_open.assert_called_once_with(users=[_HARRISON])
+        assert len(_posts(client)) == 1 + 3
 
-    def test_digest_header_carries_rollout_note_and_exclusions(self, registry):
-        _, client = self._run([])
-        first_msg = client.chat_postMessage.call_args_list[0].kwargs["text"]
-        assert "per-user delivery is OFF" in first_msg
-        assert "--send-users" in first_msg
-        assert "Gene Guest" in first_msg          # external, named as excluded
-        assert "Reggie RegistryOnly" in first_msg  # registry-only, named as excluded
-
-    def test_no_briefing_dm_ever_reaches_external_or_other_users(self, registry):
-        _, client = self._run([])
-        opened = [c.kwargs["users"] for c in client.conversations_open.call_args_list]
-        assert opened == [[_HARRISON]]
-
-    def test_build_failure_lands_in_digest_and_returns_2(self, registry):
+    def test_build_failure_lands_in_review_and_returns_2(self, registry, state_path):
         client = _mock_slack()
 
         def _build(rec, **k):
@@ -262,53 +312,122 @@ class TestDigestMode:
         with patch.dict("os.environ", _ENV), \
              patch.object(rdb, "SlackWebClient", return_value=client), \
              patch.object(rdb, "build_user_briefing", side_effect=_build), \
-             patch.object(rdb, "_write_audit", return_value=None):
+             patch.object(rdb, "_write_audit", return_value=None), \
+             patch.object(rdb.time, "sleep", return_value=None):
             rc = rdb.main([])
         assert rc == 2
-        sent = "\n".join(
-            call.kwargs["text"] for call in client.chat_postMessage.call_args_list
-        )
-        assert "(briefing could not be built" in sent
-        assert "BRIEF::Tara Sales" in sent  # other users still present
+        joined = "\n".join(_posts(client))
+        assert "(briefing could not be built" in joined
+        assert "BRIEF::Tara Sales" in joined  # other users still present
 
-    def test_empty_registry_returns_0_sends_nothing(self, empty_registry):
-        rc, client = self._run([])
+    def test_empty_registry_returns_0_sends_nothing(self, empty_registry, state_path):
+        client = _mock_slack()
+        rc = _run_main([], client)
         assert rc == 0
         client.chat_postMessage.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Send mode (per-user delivery -- explicit flag only)
+# Reaction-driven enablement (Harrison's :+1: / :-1:)
+# ---------------------------------------------------------------------------
+
+class TestReactionEnablement:
+    def _pending(self, sid, name):
+        return [{"sid": sid, "name": name, "channel": "DM-CHAN",
+                 "ts": "1.1", "sent_at": 1_700_000_000.0}]
+
+    def test_thumbs_up_enables_and_delivers_on_this_run(self, registry, state_path):
+        _seed_state(state_path, pending_reviews=self._pending("U101", "Tara Sales"))
+        client = _mock_slack(reactions=[{"name": "+1", "users": [_HARRISON]}])
+        rc = _run_main([], client)
+        assert rc == 0
+        state = _read_state(state_path)
+        assert "U101" in state["enabled"]
+        # Tara got her OWN DM; the other two went to Harrison for review
+        opened = [c.kwargs["users"][0] for c in client.conversations_open.call_args_list]
+        assert "U101" in opened and _HARRISON in opened
+        joined = "\n".join(_posts(client))
+        assert "WOULD-BE BRIEFING -- Tara Sales" not in joined  # not in review anymore
+        assert "BRIEF::Tara Sales" in joined                    # delivered directly
+        assert "Delivered live this run: Tara Sales" in _posts(client)[1]  # header after her DM
+
+    def test_thumbs_down_declines_and_excludes(self, registry, state_path):
+        _seed_state(state_path, pending_reviews=self._pending("U102", "Lana Lex"))
+        client = _mock_slack(reactions=[{"name": "-1", "users": [_HARRISON]}])
+        builds = []
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: builds.append(rec.name) or f"B::{rec.name}"), \
+             patch.object(rdb, "_write_audit", return_value=None), \
+             patch.object(rdb.time, "sleep", return_value=None):
+            rc = rdb.main([])
+        assert rc == 0
+        state = _read_state(state_path)
+        assert "U102" in state["declined"]
+        assert "Lana Lex" not in builds  # declined users are not even built
+        header = next(p for p in _posts(client) if "DAILY BRIEFING REVIEW" in p)
+        assert "Declined" in header and "Lana Lex" in header
+
+    def test_other_users_reactions_are_ignored(self, registry, state_path):
+        _seed_state(state_path, pending_reviews=self._pending("U101", "Tara Sales"))
+        client = _mock_slack(reactions=[{"name": "+1", "users": ["U_SOMEONE_ELSE"]}])
+        _run_main([], client)
+        state = _read_state(state_path)
+        assert state["enabled"] == {}
+        # Still pending (re-tracked from this run's fresh review message)
+        assert any(p["sid"] == "U101" for p in state["pending_reviews"])
+
+    def test_thumbs_up_wins_over_thumbs_down(self, registry, state_path):
+        client = _mock_slack(reactions=[
+            {"name": "-1", "users": [_HARRISON]},
+            {"name": "+1", "users": [_HARRISON]},
+        ])
+        assert rdb._harrison_verdict(client, "DM-CHAN", "1.1") == "up"
+
+    def test_verdict_none_when_no_reactions(self):
+        client = _mock_slack(reactions=[])
+        assert rdb._harrison_verdict(client, "DM-CHAN", "1.1") is None
+
+    def test_verdict_fail_soft_on_api_error(self):
+        from slack_sdk.errors import SlackApiError
+        client = MagicMock()
+        client.reactions_get.side_effect = SlackApiError("boom", {"error": "x"})
+        assert rdb._harrison_verdict(client, "DM-CHAN", "1.1") is None
+
+    def test_enabled_user_skips_review_on_subsequent_runs(self, registry, state_path):
+        _seed_state(state_path, enabled={"U101": {"name": "Tara Sales"}})
+        client = _mock_slack()
+        _run_main([], client)
+        posts = _posts(client)
+        review = "\n".join(p for p in posts if "WOULD-BE BRIEFING" in p)
+        assert "Tara Sales" not in review
+        opened = [c.kwargs["users"][0] for c in client.conversations_open.call_args_list]
+        assert "U101" in opened
+
+
+# ---------------------------------------------------------------------------
+# Send mode (force-deliver to all)
 # ---------------------------------------------------------------------------
 
 class TestSendMode:
-    def test_send_users_dms_each_active_registry_user(self, registry):
+    def test_send_users_dms_each_active_registry_user(self, registry, state_path):
         client = _mock_slack()
-        with patch.dict("os.environ", _ENV), \
-             patch.object(rdb, "SlackWebClient", return_value=client), \
-             patch.object(rdb, "build_user_briefing",
-                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
-             patch.object(rdb, "_write_audit", return_value=None), \
-             patch.object(rdb.time, "sleep", return_value=None):
-            rc = rdb.main(["--send-users"])
+        rc = _run_main(["--send-users"], client)
         assert rc == 0
         opened = sorted(c.kwargs["users"][0] for c in client.conversations_open.call_args_list)
         assert opened == sorted([_HARRISON, "U101", "U102"])
-        assert client.chat_postMessage.call_count == 3
+        # 3 user DMs, no review header
+        assert len(_posts(client)) == 3
+        assert all("DAILY BRIEFING REVIEW" not in p for p in _posts(client))
 
-    def test_user_filter_limits_delivery(self, registry):
+    def test_user_filter_limits_processing(self, registry, state_path):
         client = _mock_slack()
-        with patch.dict("os.environ", _ENV), \
-             patch.object(rdb, "SlackWebClient", return_value=client), \
-             patch.object(rdb, "build_user_briefing",
-                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}"), \
-             patch.object(rdb, "_write_audit", return_value=None), \
-             patch.object(rdb.time, "sleep", return_value=None):
-            rc = rdb.main(["--send-users", "--user", "tara"])
+        rc = _run_main(["--send-users", "--user", "tara"], client)
         assert rc == 0
         client.conversations_open.assert_called_once_with(users=["U101"])
 
-    def test_flags_mutually_exclusive(self, registry):
+    def test_flags_mutually_exclusive(self, registry, state_path):
         with pytest.raises(SystemExit):
             rdb.main(["--digest-only", "--send-users"])
 
@@ -318,7 +437,7 @@ class TestSendMode:
 # ---------------------------------------------------------------------------
 
 class TestDryRunAndEnv:
-    def test_dry_run_sends_nothing(self, registry, capsys):
+    def test_dry_run_sends_nothing_and_keeps_state(self, registry, state_path, capsys):
         with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}), \
              patch.object(rdb, "SlackWebClient") as slack_cls, \
              patch.object(rdb, "build_user_briefing",
@@ -326,14 +445,15 @@ class TestDryRunAndEnv:
             rc = rdb.main(["--dry-run"])
         assert rc == 0
         slack_cls.assert_not_called()
+        assert not state_path.exists()  # no state mutation on dry runs
         out = capsys.readouterr().out
         assert "BRIEF::Tara Sales" in out
 
-    def test_missing_anthropic_key_returns_1(self, registry):
+    def test_missing_anthropic_key_returns_1(self, registry, state_path):
         with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "ANTHROPIC_API_KEY": ""}):
             assert rdb.main([]) == 1
 
-    def test_missing_slack_token_returns_1_when_sending(self, registry):
+    def test_missing_slack_token_returns_1_when_sending(self, registry, state_path):
         with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}):
             assert rdb.main([]) == 1
 
@@ -359,37 +479,6 @@ class TestOldConfigRetired:
         # registry, invalidate, and the roster follows with no other config.
         roster, _ = rdb._load_briefing_roster()
         assert {r.slack_id for r in roster} == {_HARRISON, "U101", "U102"}
-
-
-# ---------------------------------------------------------------------------
-# Digest chunking
-# ---------------------------------------------------------------------------
-
-class TestDigestChunking:
-    def test_single_message_when_small(self):
-        msgs = rdb._chunk_digest("HEAD", ["a", "b"])
-        assert len(msgs) == 1
-        assert msgs[0].startswith("HEAD")
-        assert "a" in msgs[0] and "b" in msgs[0]
-
-    def test_splits_on_size_and_preserves_all_blocks(self):
-        big = "x" * 3000
-        blocks = [f"=== U{i} ===\n{big}" for i in range(4)]
-        msgs = rdb._chunk_digest("HEAD", blocks)
-        assert len(msgs) > 1
-        joined = "\n".join(msgs)
-        for i in range(4):
-            assert f"=== U{i} ===" in joined
-        # No message except a single-oversized-block one exceeds the cap by a block
-        for m in msgs:
-            assert len(m) <= rdb._DIGEST_CHUNK_CHARS + len(blocks[0])
-
-    def test_order_preserved(self):
-        big = "y" * 3400
-        blocks = [f"B{i}|{big}" for i in range(3)]
-        msgs = rdb._chunk_digest("HEAD", blocks)
-        joined = "".join(msgs)
-        assert joined.index("B0|") < joined.index("B1|") < joined.index("B2|")
 
 
 # ---------------------------------------------------------------------------

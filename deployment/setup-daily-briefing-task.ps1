@@ -2,16 +2,20 @@
 # Registers the Windows Task Scheduler task for the org-roles-driven daily
 # briefing (Org Synthesis Phase 2, deliverable 2) at 7:30am AZ, weekdays.
 #
-# ROLLOUT DOCTRINE (locked 2026-06-11): digest-to-Harrison-first.
-#   Default registration runs the script with NO flags -> digest mode:
-#   Harrison gets ONE DM containing every user's would-be briefing; no
-#   per-user DMs are sent. After Harrison's explicit go, re-register with
-#   -SendUsers to flip on per-user delivery.
+# ROLLOUT DOCTRINE (locked 2026-06-11, refined same day): review-driven
+# per-user enablement.
+#   Default registration runs the script with NO flags -> review mode:
+#   Harrison gets ONE DM PER USER containing that user's would-be briefing.
+#   He reacts :+1: on a user's message to enable real delivery for THAT user
+#   (picked up automatically at the next run) or :-1: to drop the user from
+#   review. Enablement state: data/state/briefing-delivery.json.
+#   -SendUsers force-delivers to ALL users regardless of enablement state --
+#   normally unnecessary; prefer the per-user :+1: flow.
 #
 # Run once from an elevated PowerShell prompt:
 #   Set-ExecutionPolicy RemoteSigned -Scope Process
-#   .\deployment\setup-daily-briefing-task.ps1            # digest mode (default)
-#   .\deployment\setup-daily-briefing-task.ps1 -SendUsers # per-user delivery
+#   .\deployment\setup-daily-briefing-task.ps1            # review-driven (default)
+#   .\deployment\setup-daily-briefing-task.ps1 -SendUsers # force-deliver to all
 #
 # Prerequisites:
 #   1. ASANA_PAT, ANTHROPIC_API_KEY, and SLACK_BOT_TOKEN are set in .env.
@@ -51,10 +55,10 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 
 # Action: run via venv python (Task Scheduler has no user PATH; D-005)
 $ScriptArgs = "`"$ScriptPath`""
-$Mode = "digest-only (review DM to Harrison)"
+$Mode = "review-driven (per-user review DMs to Harrison; :+1: enables delivery)"
 if ($SendUsers) {
     $ScriptArgs = "`"$ScriptPath`" --send-users"
-    $Mode = "per-user delivery (--send-users)"
+    $Mode = "force-deliver to ALL users (--send-users)"
 }
 
 $Action = New-ScheduledTaskAction `

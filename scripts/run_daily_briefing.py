@@ -24,12 +24,20 @@ Exclusion rules (fail-closed):
   - anyone NOT in the registry is skipped by construction (the registry IS the
     roster; no fallback path exists)
 
-ROLLOUT DOCTRINE (locked 2026-06-11): digest-to-Harrison-first.
-  - DEFAULT mode is --digest-only: Harrison gets ONE DM containing every
-    user's would-be briefing for review. No per-user DMs are sent.
-  - Per-user delivery requires the explicit --send-users flag, which flips on
-    only after Harrison's explicit go (re-register the task with the flag, or
-    setup-daily-briefing-task.ps1 -SendUsers).
+ROLLOUT DOCTRINE (locked 2026-06-11, refined per Harrison same day):
+review-driven per-user enablement.
+  - DEFAULT mode sends Harrison ONE DM PER USER containing that user's
+    would-be briefing. Harrison reacts :+1: on a user's message to enable
+    real delivery for THAT user (picked up automatically at the next run),
+    or :-1: to drop the user from review. Reactions are read back via the
+    Slack reactions API at the start of each run -- only Harrison's count.
+  - Users Harrison has enabled get their own DM each run; everyone else
+    (not declined) keeps appearing as a review message to Harrison.
+  - Enablement state lives in data/state/briefing-delivery.json.
+  - --send-users force-delivers to ALL active registry users regardless of
+    the per-user enablement state (the old full flip; normally unnecessary).
+  - --digest-only forces review mode for everyone (no per-user delivery).
+  - No unsolicited DMs before a Harrison thumbs-up, ever.
 
 Registered as Windows Task Scheduler task "Cora - Daily Briefing"
 at 7:30am AZ, weekdays.
@@ -79,8 +87,14 @@ _KB_DB_PATH        = _REPO_ROOT / "data" / "cora_kb.db"
 _LOOKBACK_SECONDS  = 25 * 3600
 _MAX_CHUNKS        = 20    # per-user cap before sending to Haiku
 _MAX_CHUNK_CHARS   = 500   # truncate long chunks
-_DIGEST_CHUNK_CHARS = 3500  # split the Harrison digest into messages this size
 _HAIKU_MODEL       = "claude-haiku-4-5-20251001"
+
+# Review-driven enablement state (who Harrison has thumbed up/down, plus the
+# review messages still awaiting his reaction).
+_DELIVERY_STATE_PATH  = _REPO_ROOT / "data" / "state" / "briefing-delivery.json"
+_THUMBS_UP            = {"+1", "thumbsup"}
+_THUMBS_DOWN          = {"-1", "thumbsdown"}
+_PENDING_MAX_AGE_DAYS = 30
 
 # ---- Logging -----------------------------------------------------------------
 
@@ -113,6 +127,94 @@ def _load_briefing_roster() -> tuple[list[RoleRecord], list[str]]:
             continue
         roster.append(rec)
     return roster, excluded
+
+
+# ---- Delivery enablement state (Harrison's review verdicts) --------------------
+
+def _load_delivery_state() -> dict:
+    try:
+        raw = json.loads(_DELIVERY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": dict(raw.get("enabled") or {}),
+        "declined": dict(raw.get("declined") or {}),
+        "pending_reviews": list(raw.get("pending_reviews") or []),
+    }
+
+
+def _save_delivery_state(state: dict) -> None:
+    try:
+        _DELIVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DELIVERY_STATE_PATH.write_text(
+            json.dumps(state, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        log.warning("Could not persist briefing delivery state: %s", exc)
+
+
+def _harrison_verdict(client: SlackWebClient, channel: str, ts: str) -> str | None:
+    """Return "up" / "down" / None for Harrison's reaction on a review message.
+
+    Only Harrison's reactions count (D-011 pattern). :+1: wins if both are
+    present. Any API error keeps the message pending (fail-soft).
+    """
+    if not channel or not ts:
+        return None
+    try:
+        resp = client.reactions_get(channel=channel, timestamp=ts)
+    except SlackApiError as exc:
+        log.warning("reactions_get failed for %s/%s: %s", channel, ts, exc)
+        return None
+    reactions = ((resp.get("message") or {}).get("reactions")) or []
+    up = down = False
+    for r in reactions:
+        if _HARRISON_SLACK_ID not in (r.get("users") or []):
+            continue
+        name = r.get("name") or ""
+        if name in _THUMBS_UP:
+            up = True
+        elif name in _THUMBS_DOWN:
+            down = True
+    if up:
+        return "up"
+    if down:
+        return "down"
+    return None
+
+
+def _process_pending_reviews(client: SlackWebClient, state: dict) -> None:
+    """Apply Harrison's reactions on outstanding review messages.
+
+    :+1: -> delivery ENABLED for that user (their briefing DMs them from the
+    next run on). :-1: -> DECLINED (dropped from review and delivery). No
+    reaction -> stays pending; expires silently after 30 days (the user simply
+    reappears in the next review batch).
+    """
+    still_pending: list[dict] = []
+    now = time.time()
+    for p in state.get("pending_reviews", []):
+        sid = str(p.get("sid") or "")
+        verdict = _harrison_verdict(client, str(p.get("channel") or ""), str(p.get("ts") or ""))
+        if verdict == "up" and sid:
+            state["enabled"][sid] = {
+                "name": p.get("name", ""), "enabled_at": now, "via": "digest_reaction",
+            }
+            state["declined"].pop(sid, None)
+            log.info("Briefing delivery ENABLED for %s (review thumbs-up)", p.get("name"))
+        elif verdict == "down" and sid:
+            state["declined"][sid] = {
+                "name": p.get("name", ""), "declined_at": now, "via": "digest_reaction",
+            }
+            state["enabled"].pop(sid, None)
+            log.info("Briefing delivery DECLINED for %s (review thumbs-down)", p.get("name"))
+        elif now - float(p.get("sent_at") or now) > _PENDING_MAX_AGE_DAYS * 86400:
+            log.info("Review message for %s expired unanswered", p.get("name"))
+        else:
+            still_pending.append(p)
+    state["pending_reviews"] = still_pending
 
 
 # ---- Plate sections (shared builders) -----------------------------------------
@@ -261,34 +363,74 @@ def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str
     )
 
 
-# ---- Digest composition --------------------------------------------------------
+# ---- Review messages to Harrison (one DM per user) -----------------------------
 
-def _compose_digest_header(today_str: str, excluded: list[str]) -> str:
+def _compose_review_header(
+    today_str: str,
+    *,
+    review_count: int,
+    delivered: list[str],
+    declined: list[str],
+    excluded: list[str],
+) -> str:
     lines = [
-        f"DAILY BRIEFING DIGEST -- {today_str}",
-        "Review mode: per-user delivery is OFF. Below is the briefing each user "
-        "WOULD receive. To flip on per-user delivery after review, re-register "
-        "the task with --send-users (setup-daily-briefing-task.ps1 -SendUsers).",
+        f"DAILY BRIEFING REVIEW -- {today_str}",
+        f"{review_count} would-be briefing(s) follow, ONE MESSAGE PER USER. "
+        "React :+1: on a user's message to start delivering their briefing to "
+        "them each weekday (picked up automatically at the next run). React "
+        ":-1: to drop a user from review.",
     ]
+    if delivered:
+        lines.append("Delivered live this run: " + ", ".join(delivered) + ".")
+    else:
+        lines.append("Delivered live this run: nobody yet -- no user is enabled.")
+    if declined:
+        lines.append(
+            "Declined (not reviewed, not delivered): " + ", ".join(declined)
+            + ". To re-review someone, remove them from data/state/briefing-delivery.json."
+        )
     if excluded:
         lines.append("Excluded from delivery: " + "; ".join(excluded) + ".")
     return "\n".join(lines)
 
 
-def _chunk_digest(header: str, blocks: list[str]) -> list[str]:
-    """Split the digest into Slack-friendly messages of ~_DIGEST_CHUNK_CHARS."""
-    messages: list[str] = []
-    cur = header
-    for b in blocks:
-        candidate = (cur + "\n\n" + b) if cur else b
-        if cur and len(candidate) > _DIGEST_CHUNK_CHARS:
-            messages.append(cur)
-            cur = b
+def _compose_review_message(rec: RoleRecord, text: str) -> str:
+    first = rec.name.split()[0]
+    return (
+        f"WOULD-BE BRIEFING -- {rec.name} ({rec.role}, {rec.entity})\n"
+        f"React :+1: on THIS message to start delivering this briefing to {first} "
+        f"each weekday. React :-1: to drop {first} from review.\n\n{text}"
+    )
+
+
+def _send_review_messages(
+    client: SlackWebClient,
+    dest: str,
+    items: list[tuple[RoleRecord, str]],
+    state: dict,
+) -> int:
+    """Send one review message per user; track each for reaction pickup.
+
+    Returns the number of send failures. A newer review message replaces any
+    older pending entry for the same user (only the latest message counts).
+    """
+    errors = 0
+    for rec, text in items:
+        ts = _post_returning_ts(client, dest, _compose_review_message(rec, text))
+        if ts:
+            state["pending_reviews"] = [
+                p for p in state["pending_reviews"] if p.get("sid") != rec.slack_id
+            ]
+            state["pending_reviews"].append({
+                "sid": rec.slack_id,
+                "name": rec.name,
+                "channel": dest,
+                "ts": ts,
+                "sent_at": time.time(),
+            })
         else:
-            cur = candidate
-    if cur:
-        messages.append(cur)
-    return messages
+            errors += 1
+    return errors
 
 
 # ---- Slack helpers -------------------------------------------------------------
@@ -311,6 +453,15 @@ def _send_message(client: SlackWebClient, channel: str, text: str) -> bool:
         return False
 
 
+def _post_returning_ts(client: SlackWebClient, channel: str, text: str) -> str | None:
+    try:
+        resp = client.chat_postMessage(channel=channel, text=text)
+        return str(resp.get("ts") or "") or None
+    except SlackApiError as exc:
+        log.warning("Failed to send message to %s: %s", channel, exc.response)
+        return None
+
+
 # ---- Audit log -----------------------------------------------------------------
 
 def _write_audit(entries: list[dict]) -> None:
@@ -331,19 +482,21 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--digest-only",
         action="store_true",
-        help="(DEFAULT) build every user's briefing and DM Harrison ONE review "
-             "digest; no per-user DMs are sent",
+        help="force review mode for EVERYONE: no per-user delivery, Harrison "
+             "gets one review DM per user (default behaves like this until he "
+             "enables users via :+1:)",
     )
     p.add_argument(
         "--send-users",
         action="store_true",
-        help="DM each user their own briefing -- only after Harrison's explicit "
-             "go on the digest output",
+        help="force-deliver to ALL active registry users regardless of the "
+             "per-user enablement state (normally unnecessary -- prefer the "
+             "per-user :+1: review flow)",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="build briefings and print to stdout; send nothing to Slack",
+        help="build briefings and print to stdout; send nothing, change no state",
     )
     p.add_argument(
         "--user",
@@ -358,7 +511,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    mode = "send" if args.send_users else "digest"
+    if args.send_users:
+        mode = "send_all"
+    elif args.digest_only:
+        mode = "review_only"
+    else:
+        mode = "review_driven"  # deliver to enabled users, review the rest
     log.info("=== Daily briefing starting (mode=%s, dry_run=%s) ===", mode, args.dry_run)
 
     slack_token   = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -371,17 +529,31 @@ def main(argv: list[str] | None = None) -> int:
         log.error("SLACK_BOT_TOKEN not set -- cannot send briefings")
         return 1
 
+    state = _load_delivery_state()
+    slack_client: SlackWebClient | None = None
+    if not args.dry_run:
+        slack_client = SlackWebClient(token=slack_token)
+        # Pick up Harrison's reactions on earlier review messages FIRST, so a
+        # fresh thumbs-up/down takes effect on this very run.
+        _process_pending_reviews(slack_client, state)
+
     roster, excluded = _load_briefing_roster()
-    for note in excluded:
-        log.info("Excluded from briefing delivery: %s", note)
+    declined_names = sorted(
+        (v.get("name") or sid) for sid, v in state["declined"].items()
+    )
+    roster = [r for r in roster if r.slack_id not in state["declined"]]
     if args.user:
         needle = args.user.strip().lower()
         roster = [
             r for r in roster
             if r.slack_id.lower() == needle or needle in r.name.lower()
         ]
+    for note in excluded:
+        log.info("Excluded from briefing delivery: %s", note)
     if not roster:
-        log.warning("No briefing recipients in the org role registry -- nothing to do")
+        log.warning("No briefing recipients to process -- nothing to do")
+        if not args.dry_run:
+            _save_delivery_state(state)
         return 0
 
     log.info("Building role-scoped briefings for %d registry users", len(roster))
@@ -412,51 +584,67 @@ def main(argv: list[str] | None = None) -> int:
         log.info("=== Dry run done -- %d briefings built, %d errors ===", len(built), errors)
         return 0 if errors == 0 else 2
 
-    slack_client = SlackWebClient(token=slack_token)
+    assert slack_client is not None  # narrowed by the dry_run gate above
 
-    if mode == "digest":
-        header = _compose_digest_header(today_str, excluded)
-        blocks = [
-            f"=== {rec.name} ({rec.role}, {rec.entity}) ===\n{text}"
-            for rec, text in built
-        ]
-        dest = _open_dm(slack_client, _HARRISON_SLACK_ID)
-        if not dest:
-            log.error("Could not open the Harrison digest DM -- nothing sent")
-            return 1
-        sent_all = True
-        for msg in _chunk_digest(header, blocks):
-            if not _send_message(slack_client, dest, msg):
-                sent_all = False
-                errors += 1
-        audit_entries.append({
-            "ts": time.time(), "user": "digest->Harrison", "sid": _HARRISON_SLACK_ID,
-            "mode": mode, "users_included": len(built),
-            "sent": sent_all, "error": None if sent_all else "partial_digest_send",
-        })
-        log.info("Digest sent to Harrison (%d user briefings, sent_ok=%s)", len(built), sent_all)
+    # Split: who gets a real DM vs. who goes to Harrison for review.
+    if mode == "send_all":
+        to_deliver, to_review = built, []
+    elif mode == "review_only":
+        to_deliver, to_review = [], built
     else:
-        for rec, text in built:
-            dest = _open_dm(slack_client, rec.slack_id)
-            if not dest:
-                errors += 1
-                audit_entries.append({
-                    "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
-                    "role": rec.role, "entity": rec.entity, "mode": mode,
-                    "sent": False, "error": "dm_open_failed",
-                })
-                continue
-            sent = _send_message(slack_client, dest, text)
-            if not sent:
-                errors += 1
+        to_deliver = [(r, t) for r, t in built if r.slack_id in state["enabled"]]
+        to_review  = [(r, t) for r, t in built if r.slack_id not in state["enabled"]]
+
+    # Real deliveries first.
+    for rec, text in to_deliver:
+        dest = _open_dm(slack_client, rec.slack_id)
+        if not dest:
+            errors += 1
             audit_entries.append({
                 "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
                 "role": rec.role, "entity": rec.entity, "mode": mode,
-                "sent": sent, "error": None,
+                "delivery": "user_dm", "sent": False, "error": "dm_open_failed",
             })
-            log.info("  %s -> %s sent: %s", rec.name, dest, sent)
-            time.sleep(1)  # gentle Slack rate-limit buffer
+            continue
+        sent = _send_message(slack_client, dest, text)
+        if not sent:
+            errors += 1
+        audit_entries.append({
+            "ts": time.time(), "user": rec.name, "sid": rec.slack_id,
+            "role": rec.role, "entity": rec.entity, "mode": mode,
+            "delivery": "user_dm", "sent": sent, "error": None,
+        })
+        log.info("  %s -> %s sent: %s", rec.name, dest, sent)
+        time.sleep(1)  # gentle Slack rate-limit buffer
 
+    # Review messages to Harrison: header + one message per user.
+    if to_review:
+        dest = _open_dm(slack_client, _HARRISON_SLACK_ID)
+        if not dest:
+            log.error("Could not open the Harrison review DM -- review batch not sent")
+            errors += len(to_review)
+        else:
+            header = _compose_review_header(
+                today_str,
+                review_count=len(to_review),
+                delivered=[r.name for r, _ in to_deliver],
+                declined=declined_names,
+                excluded=excluded,
+            )
+            if not _send_message(slack_client, dest, header):
+                errors += 1
+            errors += _send_review_messages(slack_client, dest, to_review, state)
+            audit_entries.append({
+                "ts": time.time(), "user": "review->Harrison", "sid": _HARRISON_SLACK_ID,
+                "mode": mode, "users_in_review": len(to_review),
+                "delivered_count": len(to_deliver), "sent": True, "error": None,
+            })
+            log.info(
+                "Review batch sent to Harrison (%d users; %d delivered live)",
+                len(to_review), len(to_deliver),
+            )
+
+    _save_delivery_state(state)
     _write_audit(audit_entries)
 
     succeeded = len(roster) - errors

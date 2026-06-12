@@ -188,7 +188,9 @@ users:
     notes: >-
       Added 2026-06-11 (Harrison: LLC-specific roster). PHI custodian (LEX
       scope only) per Harrison 2026-06-11 -- "can be added to all PHI access".
-      No Asana account yet -- slack-to-asana mapping pending his Asana invite.
+      Asana invite issued (Harrison 2026-06-11) but not yet visible via the
+      API (likely pending acceptance) -- add his slack-to-asana row the
+      moment his GID appears in workspace users.
       LLC-specific topics belong in #llc-leadership, not #lex-leadership.
 
   - slack_id: U0B9JS3JW07
