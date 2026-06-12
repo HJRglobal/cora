@@ -132,8 +132,9 @@ if ($Restart) {
 }
 
 Write-Host "=== Done ==="
-Write-Host "DIGEST REVIEW STEP: tomorrow's 7:30am run (or Start-ScheduledTask"
-Write-Host "-TaskName 'Cora - Daily Briefing' now) DMs Harrison ONE digest with"
-Write-Host "every user's would-be briefing. Per-user delivery stays OFF until"
-Write-Host "Harrison reviews it and re-registers with:"
-Write-Host "  .\deployment\setup-daily-briefing-task.ps1 -SendUsers"
+Write-Host "REVIEW STEP (review-driven enablement, ed6c212): tomorrow's 7:30am run"
+Write-Host "(or Start-ScheduledTask -TaskName 'Cora - Daily Briefing' now) DMs"
+Write-Host "Harrison ONE MESSAGE PER USER with that user's would-be briefing."
+Write-Host "React :+1: on a user's message to enable their delivery (picked up"
+Write-Host "automatically at the NEXT run); :-1: drops them from review. No"
+Write-Host "re-registration needed; -SendUsers exists only as a force-all override."
