@@ -2579,6 +2579,181 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
     )
 
 
+# --- Personal notes (Org Synthesis Phase 5, deliverable 1) ---
+#
+# Any teammate can teach Cora a personal note ("Cora, remember X"). Notes are
+# blast-radius-1: stored in the KB under source="user_note" + owner metadata,
+# retrievable ONLY by their owner (SQL-layer exclusion in store.search /
+# store.search_user_notes — D-034 pattern, never prompts). D-011 untouched:
+# a personal note is the user's own data, not canonical memory; org-wide
+# promotion (share_requested) ships in deliverable 2 behind Harrison's gate.
+
+
+def _notes_kb():
+    """Shared KnowledgeBase instance + lock from context_loader (lazy import)."""
+    from cora import context_loader
+    return context_loader.get_shared_kb(), context_loader._SHARED_KB_LOCK
+
+
+def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Save a personal note for the asking user (staged-write, confirmed gate).
+
+    PHI save matrix (deterministic, user_notes.resolve_save_scope): PHI-flagged
+    text saves only for a LEX PHI custodian in LEX scope or DM (forced into
+    LEX scope); everyone else gets the standard PHI refusal. Save-time conflict
+    check probes the canonical KB and appends a heads-up — never blocks.
+    """
+    from cora import user_notes
+
+    input_data = _input or {}
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "cora_remember refused: `confirmed` must be set to true ONLY after "
+            "you have shown the user a preview of the note — format it as "
+            "\"Saving to YOUR notes (only you can retrieve this): <note text>\" — "
+            "and received explicit approval. Show the preview, wait for their "
+            "yes, then call again with confirmed=true."
+        )
+
+    note_text = str(input_data.get("note_text", "") or "").strip()
+    if not note_text:
+        return "cora_remember: note_text is required and cannot be empty."
+    share_requested = bool(input_data.get("share_requested", False))
+    is_dm = str(input_data.get("_channel_id", "") or "").startswith("D")
+
+    decision = user_notes.resolve_save_scope(note_text, entity, slack_user_id, is_dm)
+    if not decision.allowed:
+        log.info(
+            "cora_remember PHI-REFUSED owner=%s entity=%s is_dm=%s",
+            slack_user_id, entity, is_dm,
+        )
+        return decision.reason
+
+    kb, kb_lock = _notes_kb()
+    if kb is None:
+        return (
+            "Notes storage is unavailable right now — tell the user the note "
+            "was NOT saved and to try again shortly."
+        )
+
+    owner_email = str(
+        (_load_slack_asana_map().get(slack_user_id) or {}).get("asana_email", "") or ""
+    ).strip()
+
+    with kb_lock:
+        conflict = user_notes.conflict_excerpt(kb, note_text, decision.entity)
+        note_id = user_notes.save_note(
+            kb,
+            note_text=note_text,
+            owner_slack=slack_user_id,
+            owner_email=owner_email,
+            entity=decision.entity,
+            sub_entity=decision.sub_entity,
+            share_requested=share_requested,
+            channel_name=str(input_data.get("_channel_name", "") or ""),
+        )
+
+    lines = [
+        "WRITE_CONFIRMED -- post the following as your entire response "
+        "(no preamble, no meta-commentary):",
+        "",
+        "Saved to your notes. Only you can retrieve it -- ask me about it any time.",
+    ]
+    if share_requested:
+        lines.append(
+            "You asked to share it org-wide: org-wide sharing goes through "
+            "Harrison's review, which isn't wired up yet -- for now the note "
+            "is saved privately and flagged for that review."
+        )
+    if conflict:
+        lines.append(
+            f"Heads up -- this may conflict with existing org knowledge: {conflict}"
+        )
+    log.info(
+        "cora_remember SAVED owner=%s id=%s entity=%s conflict=%s",
+        slack_user_id, note_id, decision.entity, bool(conflict),
+    )
+    return "\n".join(lines)
+
+
+def _tool_cora_my_notes(slack_user_id: str, entity: str, _input: dict) -> str:
+    """List the asking user's own personal notes (owner-only, read-only)."""
+    kb, kb_lock = _notes_kb()
+    if kb is None:
+        return "Notes storage is unavailable right now -- please try again shortly."
+    with kb_lock:
+        notes = kb.list_user_notes(slack_user_id)
+    if not notes:
+        return (
+            "You have no saved personal notes. Tell the user they can save one "
+            "any time with 'Cora, remember ...'."
+        )
+    lines = [f"Your saved personal notes ({len(notes)}):", ""]
+    for i, n in enumerate(notes, 1):
+        date_str = ""
+        if n.get("date_created"):
+            try:
+                import datetime as _dt
+                date_str = _dt.date.fromtimestamp(n["date_created"]).isoformat()
+            except (OSError, ValueError, OverflowError):
+                pass
+        text = (n.get("content") or "").strip().replace("\n", " ")
+        if len(text) > 160:
+            text = text[:160] + "..."
+        short_id = str(n.get("note_id", "")).rsplit(":", 1)[-1]
+        lines.append(f"{i}. [{short_id}] {date_str} -- {text}")
+    lines.append("")
+    lines.append(
+        "(These are the asker's OWN private notes -- present them only to the "
+        "asker. To delete one, they can say 'forget that note' and you confirm "
+        "which, then call cora_forget_note with its id.)"
+    )
+    return "\n".join(lines)
+
+
+def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delete one of the asking user's own notes (staged-write, owner-only)."""
+    input_data = _input or {}
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "cora_forget_note refused: `confirmed` must be set to true ONLY "
+            "after you have shown the user WHICH note will be deleted (use "
+            "cora_my_notes to find it) and received explicit approval."
+        )
+    note_id = str(input_data.get("note_id", "") or "").strip()
+    if not note_id:
+        return "cora_forget_note: note_id is required (find it via cora_my_notes)."
+
+    kb, kb_lock = _notes_kb()
+    if kb is None:
+        return "Notes storage is unavailable right now -- the note was NOT deleted."
+
+    # Accept either the full id ("note:U123:abcdef1234") or the short token
+    # shown by cora_my_notes — resolved against the ASKER'S OWN notes only.
+    if not note_id.startswith("note:"):
+        with kb_lock:
+            notes = kb.list_user_notes(slack_user_id)
+        matches = [n["note_id"] for n in notes if n["note_id"].rsplit(":", 1)[-1] == note_id]
+        if not matches:
+            return "No note of yours matches that id -- nothing was deleted."
+        note_id = matches[0]
+
+    with kb_lock:
+        deleted = kb.delete_user_note(note_id, owner_slack=slack_user_id)
+    if deleted == 0:
+        # Missing and not-yours are deliberately indistinguishable (no
+        # existence leak) — the SQL owner check handled both.
+        return "No note of yours matches that id -- nothing was deleted."
+    log.info("cora_forget_note DELETED owner=%s id=%s chunks=%d", slack_user_id, note_id, deleted)
+    return (
+        "WRITE_CONFIRMED -- post the following as your entire response "
+        "(no preamble, no meta-commentary):\n\n"
+        "Note deleted."
+    )
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -4415,6 +4590,92 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # --- Personal notes (Org Synthesis Phase 5) ---
+    {
+        "name": "cora_remember",
+        "description": (
+            "Save a PERSONAL NOTE for the asking user. Use this whenever the user "
+            "teaches Cora something or asks her to remember a fact — phrases like "
+            "'Cora, remember ...', 'note that ...', 'keep track of ...', 'this is the "
+            "<X> we use for ...', 'save this for later'. Notes are PRIVATE: only the "
+            "person who saved a note can ever retrieve it, and Cora automatically "
+            "surfaces a user's own notes when they ask a related question later.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write — never skip):\n"
+            "1. On the first ask, show a preview: \"Saving to YOUR notes (only you can "
+            "   retrieve this): <note text>\" and ask them to confirm. DO NOT call the "
+            "   tool yet.\n"
+            "2. On their explicit yes, call with confirmed=true.\n"
+            "3. If they want changes, re-show the preview. If they cancel, don't call.\n"
+            "\n"
+            "If the user signals they want it shared org-wide ('make sure everyone can "
+            "find it', 'the team should know this'), still save it — set "
+            "share_requested=true — and tell them org-wide sharing goes through "
+            "Harrison's review. NEVER refuse to accept knowledge: the right response is "
+            "\"I'll save that to your notes; org-wide sharing needs Harrison's review.\"\n"
+            "\n"
+            "The result may include a heads-up that the note conflicts with existing "
+            "org knowledge — relay it to the user verbatim; the note is still saved."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note_text": {
+                    "type": "string",
+                    "description": "The note to save, as a self-contained statement (it will be retrieved out of this conversation's context later).",
+                },
+                "share_requested": {
+                    "type": "boolean",
+                    "description": "Set true ONLY when the user explicitly asked for the note to be shared org-wide / findable by everyone.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true. Only set after showing the user the save preview and receiving explicit approval.",
+                },
+            },
+            "required": ["note_text", "confirmed"],
+        },
+    },
+    {
+        "name": "cora_my_notes",
+        "description": (
+            "List the asking user's own saved personal notes with dates and ids. Use "
+            "when the user asks 'show my notes', 'what notes do I have', 'what have I "
+            "asked you to remember', or before deleting a note (to find its id). "
+            "Owner-only: this never shows anyone else's notes, and another user's "
+            "notes can never appear here."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "cora_forget_note",
+        "description": (
+            "Delete ONE of the asking user's own personal notes. Use when the user "
+            "says 'forget that note', 'delete my note about X', 'remove that'. "
+            "REQUIRED PATTERN (staged-write): first call cora_my_notes to find the "
+            "note, show the user WHICH note will be deleted, and only after their "
+            "explicit yes call this with confirmed=true and the note's id. Owner-only: "
+            "a user can only delete their own notes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "string",
+                    "description": "The note id from cora_my_notes (the short token in [brackets], or the full note:... id).",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true. Only set after showing the user which note will be deleted and receiving explicit approval.",
+                },
+            },
+            "required": ["note_id", "confirmed"],
+        },
+    },
 ]
 
 
@@ -4440,6 +4701,9 @@ TOOL_DEFINITIONS = [
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "whats_on_my_plate",
+    "cora_remember",
+    "cora_my_notes",
+    "cora_forget_note",
     "asana_get_my_tasks",
     "asana_get_user_tasks",
     "asana_create_task",
@@ -4596,6 +4860,10 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "slack_send_dm": _tool_slack_send_dm,
     # Org Synthesis Phase 2: role-scoped composite plate view
     "whats_on_my_plate": _tool_whats_on_my_plate,
+    # Org Synthesis Phase 5: personal notes (owner-only, blast-radius-1)
+    "cora_remember": _tool_cora_remember,
+    "cora_my_notes": _tool_cora_my_notes,
+    "cora_forget_note": _tool_cora_forget_note,
 }
 
 
@@ -4643,6 +4911,11 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "hubspot_add_note": 20,
     "slack_send_dm": 12,
     "whats_on_my_plate": 25,  # multi-source composite (Asana + Calendar x2 + HubSpot)
+    # Personal notes: remember = embed + conflict probe + upsert (default 15s
+    # tier is right); list/delete are local SQL.
+    "cora_remember": 15,
+    "cora_my_notes": 8,
+    "cora_forget_note": 8,
 }
 _DEFAULT_TOOL_TIMEOUT = 15
 

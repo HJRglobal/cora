@@ -1265,3 +1265,49 @@ Locked rules:
 layer on top of Phases 1-3. Consumes Phase 3's approved efficiency-backlog entries in the
 recommendations section, closing the loop from detection to strategy. Rollout gate:
 Harrison reviews a --dry-run memo before the first scheduled fire.
+
+
+## D-049 -- Org Synthesis Phase 5 d1: personal notes are owner-only at the SQL layer; notes are not canonical memory (2026-06-11)
+
+**Decision:** Any teammate can teach Cora a personal note ("Cora, remember X") stored in
+the main KB under `source="user_note"` + `metadata.owner_slack`. Locked rules:
+
+1. **Blast-radius-1 is enforced in SQL, never prompts (D-034 pattern):** the general
+   `store.search()` excludes `source='user_note'` in BOTH vector paths, so every consumer
+   (Q&A retrieval, sweeps, digests, reconciliation, friction/strategy mining) excludes
+   notes by construction with no per-caller opt-out. The ONLY retrieval path is
+   `store.search_user_notes()`, which filters `metadata.owner_slack == asker` in the
+   WHERE clause. `unrestricted=True` (the D-043 historical-access allowlist, i.e.
+   Harrison) is the single exception, and callers must verify it via
+   `historical_access.is_unrestricted`. `search_owned` refuses the user_note source.
+2. **Notes are the user's own data, NOT canonical memory -- D-011 untouched.** Saving a
+   note is not a canonical write; org-wide promotion is deliverable 2 and goes through
+   Harrison's knowledge-review gate. Share intent today = private save +
+   `share_requested=true` metadata + telling the user review is coming.
+3. **PHI save matrix (deterministic, `user_notes.resolve_save_scope`):** PHI-flagged note
+   text saves ONLY when `lex_phi_access.phi_allowed` passes (LEX custodian in LEX scope
+   or DM); custodian DM saves are FORCED into the LEX store (session-capture rule);
+   everyone else gets the standard PHI refusal and nothing is written.
+4. **Channel containment on read:** channel asks retrieve only notes saved in that
+   channel's entity scope (+FNDR, except LEX sub-entities which stay firewalled); a
+   LEX-scoped note can never surface in a non-LEX channel reply. DMs see all owned notes.
+5. **Labeling + cache-skip:** notes enter LLM context only under an explicit
+   "ASKER'S PERSONAL NOTE from <date> -- present as their own note, not org-canon"
+   header with a synthesis rule, and any response built on one sets
+   `kb_meta["unstripped_personal"]=True` so it never enters the shared semantic cache
+   (the D-043 invariant, reused and test-pinned).
+6. **Save-time conflict check is advisory:** the canonical KB is probed at save
+   (distance <= 1.05); a hit appends a heads-up to the confirmation but NEVER blocks the
+   save -- the user may be righter than canon; the conflict rides the d2 drift sweep.
+7. **Staged-write doctrine applies:** `cora_remember` and `cora_forget_note` refuse
+   without confirmed=true; delete is owner-only and a non-owner delete is a no-op
+   indistinguishable from a missing note (no existence leak).
+
+**Why:** Phase 5 of the org-synthesis spec (Harrison-directed, design locked 2026-06-11):
+the contribution flywheel -- each user can teach Cora directly with blast-radius-1 safety,
+so Cora ACCEPTS knowledge instead of refusing it, without touching the Harrison-gated
+canonical layer. NOT a sharding of the KB by user: question scope does not correlate with
+user scope; notes are a thin additive overlay next to the entity partition + FNDR co-scan.
+Shipped with 52 tests including the adversarial identical-query exclusion and the
+"remember Harrison approved my raise" pin (saves fine, never surfaces to anyone else,
+never presented as org-fact).

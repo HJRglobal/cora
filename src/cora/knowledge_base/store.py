@@ -37,6 +37,14 @@ _COARSE_MULT = 50
 # checkpoint_state key set by the migration once every chunk has a bin + f32 row.
 _BIN_READY_KEY = "kb_bin_index_ready"
 
+# Personal user notes (Org Synthesis Phase 5). HARD INVARIANT (D-034 pattern):
+# user_note chunks are EXCLUDED from the general search() paths at the SQL
+# layer — they are retrievable ONLY via search_user_notes(), which filters on
+# metadata.owner_slack. This is what makes a personal note blast-radius-1:
+# every existing caller (Q&A retrieval, sweeps, digests, reconciliation,
+# friction mining) excludes notes by construction, with no per-caller opt-out.
+USER_NOTE_SOURCE = "user_note"
+
 
 @dataclass
 class Document:
@@ -425,6 +433,7 @@ class KnowledgeBase:
             JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
             WHERE k.chunk_id IN ({cand_ph})
               AND k.entity IN ({ent_ph})
+              AND k.source != '{USER_NOTE_SOURCE}'
               {'AND (k.date_modified IS NULL OR k.date_modified > ?)' if cutoff is not None else ''}
               {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
             ORDER BY distance
@@ -467,6 +476,7 @@ class KnowledgeBase:
             FROM knowledge_chunks k
             JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
             WHERE k.entity IN ({ent_ph})
+              AND k.source != '{USER_NOTE_SOURCE}'
               {'AND (k.date_modified IS NULL OR k.date_modified > ?)' if cutoff is not None else ''}
               {f'AND {sub_entity_clause}' if sub_entity_clause else ''}
             ORDER BY distance
@@ -516,6 +526,11 @@ class KnowledgeBase:
             raise KnowledgeBaseError(
                 "search_owned: owner_emails=None (any mailbox) requires financial_only=True"
             )
+        if USER_NOTE_SOURCE in sources:
+            raise KnowledgeBaseError(
+                "search_owned: user_note retrieval must go through search_user_notes "
+                "(owner_slack-filtered) — never the mailbox path"
+            )
         if query_vec is None:
             try:
                 query_vec = embeddings.embed_query(query)
@@ -554,6 +569,135 @@ class KnowledgeBase:
         """
         rows = self._conn.execute(sql, params).fetchall()
         return self._rows_to_results(rows)
+
+    # --- Personal user notes (Org Synthesis Phase 5, deliverable 1) ---
+
+    def search_user_notes(
+        self,
+        query: str,
+        owner_slack: str,
+        k: int = 5,
+        entity_scope: tuple[str, ...] | None = None,
+        unrestricted: bool = False,
+        query_vec: list[float] | None = None,
+    ) -> list[SearchResult]:
+        """Vector search over personal user notes — the ONLY retrieval path
+        for source='user_note' chunks (general search() excludes them in SQL).
+
+        HARD INVARIANT (enforced here, never in prompts — D-034): a note is
+        returned ONLY when metadata.owner_slack equals owner_slack. The single
+        exception is unrestricted=True (the D-043 historical-access allowlist,
+        i.e. Harrison) — the CALLER must verify that via
+        historical_access.is_unrestricted before passing it.
+
+        entity_scope: acceptable note entity values for the current channel
+        (e.g. ("F3E", "FNDR")). None means no entity filter — DM retrieval,
+        where the asker's whole note set is theirs to search. This is how a
+        LEX-scoped (potentially PHI-bearing, custodian-only by save-time
+        enforcement) note never surfaces in a non-LEX channel reply.
+
+        Exact brute-force scan over the filtered subset (search_owned pattern):
+        the notes partition is tiny, and coarse-then-filter could starve it
+        out of the binary candidate set entirely.
+        """
+        if not owner_slack and not unrestricted:
+            return []
+        if query_vec is None:
+            try:
+                query_vec = embeddings.embed_query(query)
+            except embeddings.EmbeddingError as exc:
+                raise KnowledgeBaseError(f"Query embedding failed: {exc}") from exc
+
+        qbytes = _serialize_vec(query_vec)
+        where = ["k.source = ?"]
+        params: list[Any] = [qbytes, USER_NOTE_SOURCE]
+        if not unrestricted:
+            where.append("json_extract(k.metadata, '$.owner_slack') = ?")
+            params.append(owner_slack)
+        if entity_scope is not None:
+            ents = [e for e in entity_scope if e]
+            if not ents:
+                return []
+            ent_ph = ",".join("?" * len(ents))
+            where.append(f"k.entity IN ({ent_ph})")
+            params.extend(ents)
+
+        sql = f"""
+            SELECT
+                k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
+                k.deep_link, k.date_modified,
+                vec_distance_l2(?, f.embedding) AS distance,
+                k.author, k.metadata
+            FROM knowledge_chunks k
+            JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
+            WHERE {" AND ".join(where)}
+            ORDER BY distance
+            LIMIT {int(k)}
+        """
+        rows = self._conn.execute(sql, params).fetchall()
+        return self._rows_to_results(rows)
+
+    def list_user_notes(self, owner_slack: str, limit: int = 50) -> list[dict[str, Any]]:
+        """All notes owned by owner_slack, newest first — one dict per note
+        (source_id), not per chunk. Owner filter is SQL-layer; there is no
+        unrestricted variant here by design (note management is owner-only
+        in deliverable 1)."""
+        if not owner_slack:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT source_id, title, content, date_created, entity, metadata
+            FROM knowledge_chunks
+            WHERE source = ?
+              AND json_extract(metadata, '$.owner_slack') = ?
+            ORDER BY date_created DESC, source_id
+            """,
+            (USER_NOTE_SOURCE, owner_slack),
+        ).fetchall()
+        notes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for source_id, title, content, date_created, entity, metadata in rows:
+            if source_id in seen:
+                continue  # multi-chunk note — first (full-text) chunk wins
+            seen.add(source_id)
+            notes.append({
+                "note_id": source_id,
+                "title": title or "",
+                "content": content or "",
+                "date_created": date_created,
+                "entity": entity,
+                "metadata": json.loads(metadata) if metadata else {},
+            })
+            if len(notes) >= limit:
+                break
+        return notes
+
+    def delete_user_note(self, note_id: str, owner_slack: str) -> int:
+        """Delete a personal note (all its chunks + vector rows). Returns the
+        number of chunks removed (0 = no such note, or not the caller's note).
+
+        Owner check is part of the SQL WHERE — a non-owner delete is a no-op,
+        indistinguishable from a missing note (no existence leak)."""
+        if not note_id or not owner_slack:
+            return 0
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT chunk_id FROM knowledge_chunks
+            WHERE source = ? AND source_id = ?
+              AND json_extract(metadata, '$.owner_slack') = ?
+            """,
+            (USER_NOTE_SOURCE, note_id, owner_slack),
+        )
+        chunk_ids = [row[0] for row in cur.fetchall()]
+        if not chunk_ids:
+            return 0
+        ph = ",".join("?" * len(chunk_ids))
+        cur.execute(f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({ph})", chunk_ids)
+        cur.execute(f"DELETE FROM knowledge_vec_f32 WHERE chunk_id IN ({ph})", chunk_ids)
+        cur.execute(f"DELETE FROM knowledge_chunks WHERE chunk_id IN ({ph})", chunk_ids)
+        self._conn.commit()
+        return len(chunk_ids)
 
     # --- Maintenance / introspection ---
 

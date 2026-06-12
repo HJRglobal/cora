@@ -8,6 +8,48 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED, D-049; RESTART REQUIRED to activate)
+
+Any teammate can now teach Cora a personal note -- "Cora, remember X" / "note that X" --
+retrievable BY THE OWNER ONLY. Spec: org-synthesis spec Phase 5 (design locked 2026-06-11);
+deliverable 2 (promotion + drift sweep) is a LATER session -- share intent today saves
+privately + flags `share_requested` metadata and tells the user org-wide review is coming.
+Full suite **4,053 passed / 41 skipped** (+52).
+
+- **Blast-radius-1 is SQL-layer (D-034), never prompts:** `store.search()` excludes
+  `source='user_note'` in BOTH vector paths -- every existing consumer (Q&A retrieval,
+  sweeps, digests, reconciliation, friction/strategy mining) excludes notes by
+  construction. The ONLY retrieval path is new `store.search_user_notes()`, owner-filtered
+  in SQL on `metadata.owner_slack` (unrestricted = the D-043 allowlist, i.e. Harrison).
+  `search_owned` refuses the user_note source outright.
+- **Write path:** staged-write tools `cora_remember` / `cora_my_notes` / `cora_forget_note`
+  in tool_dispatch, all `_GLOBAL_CORE_TOOLS` (every entity + DMs). Preview wording:
+  "Saving to YOUR notes (only you can retrieve this): ...". PHI save matrix
+  (`user_notes.resolve_save_scope`): PHI-flagged text saves ONLY for a LEX PHI custodian
+  in LEX scope or DM (DM saves FORCED into the LEX store, session-capture rule); everyone
+  else gets the standard PHI refusal. Save-time conflict check probes the CANONICAL KB
+  (notes excluded by construction) and appends "Heads up -- this may conflict with ..."
+  WITHOUT blocking. Delete is owner-only; non-owner delete is a no-op indistinguishable
+  from a missing note (no existence leak).
+- **Read overlay:** `context_loader._try_kb_retrieve` co-retrieves the asker's own notes
+  alongside the entity + FNDR scan -- fires even when the canonical scan returns nothing.
+  Channel asks see only notes saved in that channel's entity scope (a LEX-scoped note can
+  NEVER surface in a non-LEX channel reply); DMs see all owned notes. Notes enter context
+  under "ASKER'S PERSONAL NOTE from <date> -- present as their own note, not org-canon" +
+  a synthesis rule; any response using one sets `kb_meta["unstripped_personal"]=True` so
+  it never enters the shared semantic cache (D-043 invariant reused, test-pinned).
+- **D-011 untouched:** personal notes are the user's own data, NOT canonical memory.
+  All 17 entity prompts gained "## Personal notes" incl. the accept-not-refuse line
+  ("I'll save that to your notes; org-wide sharing needs Harrison's review").
+- 52 tests `tests/test_user_notes.py` (adversarial owner-exclusion incl. identical-query
+  and the "Harrison approved my raise" pin, Harrison override, staged gates, PHI matrix,
+  LEX containment, cache-skip, list/delete owner-only, wiring + 17-prompt coverage).
+- Ship: `deployment\ship-personal-notes-2026-06-11.ps1` (`-Restart` from elevated PS --
+  **restart REQUIRED**: store/context_loader/app/tool_dispatch/prompts are bot-loaded).
+- **Live smoke after restart:** (1) Harrison DM save -> retrieve -> teammate's identical
+  question sees nothing; (2) one teammate save+retrieve in their entity channel; (3) LEX
+  channel non-custodian PHI note -> refusal.
+
 ### [ORG SYNTHESIS] Phase 4: founder strategy layer -- 2026-06-11 (SHIPPED, D-048; COMPLETES THE PROGRAM; dry-run review = rollout gate)
 
 New module `src/cora/strategy_memo.py` + `scripts/run_strategy_memo.py` + task

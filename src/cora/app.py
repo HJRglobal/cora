@@ -508,6 +508,11 @@ def _dispatch_qa(
             asker_emails=asker_emails,
             asker_unrestricted=asker_unrestricted,
             kb_meta=kb_meta,
+            # Personal-note overlay (Phase 5): owner-filtered at the SQL layer;
+            # any response using a note sets kb_meta["unstripped_personal"] so
+            # the cache_storable check below keeps it out of the shared cache.
+            asker_slack_id=user_id or "",
+            asker_is_dm=is_dm,
         )
     # A response built on UNSTRIPPED personal chunks (owner's own mail, or an
     # unrestricted asker) must not enter the shared semantic cache.

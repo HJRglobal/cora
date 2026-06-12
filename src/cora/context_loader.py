@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from cora import historical_access
+from cora import historical_access, user_notes
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 
 log = logging.getLogger(__name__)
@@ -214,6 +214,8 @@ def load_context_parts(
     asker_emails: frozenset[str] | None = None,
     asker_unrestricted: bool = False,
     kb_meta: dict | None = None,
+    asker_slack_id: str | None = None,
+    asker_is_dm: bool = False,
 ) -> tuple[str, str]:
     """Return (static_text, kb_text) for the entity, kept as separate strings.
 
@@ -241,6 +243,15 @@ def load_context_parts(
     is provided, kb_meta["unstripped_personal"]=True signals that personal
     chunks rode through UNSTRIPPED — callers must not put the response in the
     shared semantic cache.
+
+    Personal-note overlay (Org Synthesis Phase 5): when asker_slack_id is
+    provided, the asker's own user_note chunks matching the query are
+    co-retrieved (owner-filtered at the SQL layer in store.search_user_notes)
+    and appended as a labeled block. Any response using them also sets
+    kb_meta["unstripped_personal"]=True — same cache-skip invariant.
+    asker_is_dm widens the note scope to ALL the asker's notes; channel asks
+    only see notes saved in the channel's entity scope (a LEX-scoped note can
+    never surface in a non-LEX channel reply).
     """
     static_text = _load_static_context(entity)
 
@@ -251,7 +262,7 @@ def load_context_parts(
     kb_section = _try_kb_retrieve(
         entity, query, k=effective_k, query_vec=query_vec,
         asker_emails=asker_emails, asker_unrestricted=asker_unrestricted,
-        kb_meta=kb_meta,
+        kb_meta=kb_meta, asker_slack_id=asker_slack_id, asker_is_dm=asker_is_dm,
     ) or ""
     return static_text, kb_section
 
@@ -369,6 +380,65 @@ def owned_kb_search(
         )
 
 
+def _note_entity_scope(entity: str) -> tuple[str, ...]:
+    """Acceptable note-entity values for a CHANNEL ask (DMs pass scope=None).
+
+    Notes store the channel entity they were saved in verbatim. Channel
+    retrieval sees notes saved in that same scope plus FNDR (DM/default
+    notes) — except LEX sub-entity channels, which stay firewalled from
+    FNDR-scoped content just like the rest of their context.
+    """
+    if entity in _NO_FOUNDER_CONTEXT or entity == "FNDR":
+        return (entity,)
+    return (entity, "FNDR")
+
+
+def _try_user_notes_overlay(
+    kb,
+    entity: str,
+    query: str,
+    query_vec: list[float] | None,
+    asker_slack_id: str | None,
+    asker_is_dm: bool,
+    asker_unrestricted: bool,
+    kb_meta: dict | None,
+) -> str:
+    """Retrieve the asker's own personal notes matching the query (Phase 5).
+
+    Owner exclusion is enforced inside store.search_user_notes at the SQL
+    layer — this helper only decides scope and formats the labeled block.
+    Failures return "" (notes are an upgrade, never a gate)."""
+    if not asker_slack_id:
+        return ""
+    try:
+        scope = None if asker_is_dm else _note_entity_scope(entity)
+        with _SHARED_KB_LOCK:
+            note_results = kb.search_user_notes(
+                query,
+                owner_slack=asker_slack_id,
+                k=user_notes.NOTE_OVERLAY_K,
+                entity_scope=scope,
+                unrestricted=asker_unrestricted,
+                query_vec=query_vec,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("user-note overlay failed for asker=%s: %s", asker_slack_id, exc)
+        return ""
+    note_results = [r for r in note_results if r.distance <= _KB_MAX_DISTANCE]
+    if not note_results:
+        return ""
+    # Personal-note content must never enter the shared semantic cache —
+    # another user's similar question would replay a private note (the
+    # existing D-043 unstripped_personal invariant, reused).
+    if kb_meta is not None:
+        kb_meta["unstripped_personal"] = True
+    log.info(
+        "user-note overlay: %d note(s) for asker=%s entity=%s best=%.3f",
+        len(note_results), asker_slack_id, entity, note_results[0].distance,
+    )
+    return user_notes.format_notes_overlay(note_results, asker_slack_id)
+
+
 def _try_kb_retrieve(
     entity: str,
     query: str,
@@ -377,6 +447,8 @@ def _try_kb_retrieve(
     asker_emails: frozenset[str] | None = None,
     asker_unrestricted: bool = False,
     kb_meta: dict | None = None,
+    asker_slack_id: str | None = None,
+    asker_is_dm: bool = False,
 ) -> str | None:
     """Search the KB and return a formatted context block. Returns None on any failure.
 
@@ -421,31 +493,44 @@ def _try_kb_retrieve(
         log.warning("KB retrieval failed for entity=%s query=%r: %s", entity, query[:60], exc)
         return None
 
+    # Personal-note overlay (Phase 5): the asker's own notes matching the
+    # query, owner-filtered at the SQL layer. Computed independently of the
+    # canonical results — a note can answer a question the org corpus can't.
+    notes_block = _try_user_notes_overlay(
+        kb, entity, query, query_vec, asker_slack_id, asker_is_dm,
+        asker_unrestricted, kb_meta,
+    )
+
     # Filter by relevance threshold
     relevant = [r for r in results if r.distance <= _KB_MAX_DISTANCE]
-    if not relevant:
+    if not relevant and not notes_block:
         log.info("KB returned %d chunks but none passed distance threshold %.2f",
                  len(results), _KB_MAX_DISTANCE)
         return None
 
-    # Tier-1 per-user access control: header-strip personal (gmail/drive_sweep)
-    # chunks the asker doesn't own. Fail-closed — an unknown asker
-    # (asker_emails None/empty) gets everything personal stripped. The
-    # unstripped_personal flag tells the caller the response must not enter
-    # the shared semantic cache.
-    relevant, unstripped_personal = historical_access.apply_tier1(
-        relevant, asker_emails or frozenset(), asker_unrestricted,
-    )
-    if kb_meta is not None and unstripped_personal:
-        kb_meta["unstripped_personal"] = True
+    main_block = ""
+    if relevant:
+        # Tier-1 per-user access control: header-strip personal (gmail/drive_sweep)
+        # chunks the asker doesn't own. Fail-closed — an unknown asker
+        # (asker_emails None/empty) gets everything personal stripped. The
+        # unstripped_personal flag tells the caller the response must not enter
+        # the shared semantic cache.
+        relevant, unstripped_personal = historical_access.apply_tier1(
+            relevant, asker_emails or frozenset(), asker_unrestricted,
+        )
+        if kb_meta is not None and unstripped_personal:
+            kb_meta["unstripped_personal"] = True
 
-    log.info(
-        "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
-        len(relevant), len(results), entity,
-        relevant[0].distance if relevant else 0,
-    )
+        log.info(
+            "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
+            len(relevant), len(results), entity,
+            relevant[0].distance if relevant else 0,
+        )
+        main_block = _format_kb_chunks(relevant)
 
-    return _format_kb_chunks(relevant)
+    if notes_block:
+        return f"{main_block}\n\n{notes_block}" if main_block else notes_block
+    return main_block
 
 
 def _format_kb_chunks(chunks: list) -> str:
