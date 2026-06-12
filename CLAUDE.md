@@ -52,11 +52,14 @@ PDF cap had truncated even the one manual it did ingest.
   (policy manuals trip program keywords by construction -- see D-046 posture).
 - **Gmail related check PASSED**: Lex mailboxes enabled in monitored-email-accounts.yaml;
   KB already holds `gmail | LEX | "EVV Paper Timesheet Attestation"` (mentions DDD-2101A).
-- **WARNING -- visibility tension for Harrison (D-046 item 5)**: GM-level chunks are strictly
-  excluded from #llc-*/#lts-* channels, and Shaun/Jen/Jeff/Aaron LEFT #lex-leadership 6/11
-  per the LLC routing directive -- the manuals are invisible where that team now lives
-  (partial mitigation: the dump-root Provider Manual copy is LEX-LLC-tagged, so LLC channels
-  have that one). Decide: published-policy carve-out in the strict filter vs re-tag the tree.
+- **RESOLVED same evening (D-046a, Harrison directive)**: DDD tree re-tagged GM-level ->
+  **LEX-LLC**. Sync script now tags everything in the dump folder LEX-LLC (policy-tree
+  detection kept as metadata provenance only; client-record filename rule removed as dead
+  code); **2,840 existing chunks re-tagged in place** (SQL on knowledge_chunks, no
+  re-embedding); smoke test re-run in #llc-leadership PASSED + manuals-indexed note relayed
+  there for Shaun's team. Manuals visible in #llc-* AND GM #lex-* channels; not in
+  LTS/LBHS/LLA (accepted). The `lex_gm_level` store opt-out stays as a generic mechanism,
+  unused by this script.
 
 ### [ORG SYNTHESIS] Phase 2 deliverable 2: briefing rework -- role-briefing-config.yaml RETIRED -- 2026-06-11 (SHIPPED; DIGEST REVIEW PENDING)
 

@@ -1,12 +1,15 @@
 """Tests for the recurring LEX Dump Folder sync (2026-06-11).
 
 Covers:
-  - resolve_sub_entity tagging rules (GM-level policy tree vs dump-folder root,
-    client-record filename fail-closed exception)
-  - walk_folder recursion: subfolders, folder shortcuts, gm_level propagation
-    from the curated "DDD Policies" / "EVV Documents" folder names
+  - resolve_sub_entity tagging: uniform LEX-LLC for ALL dump-folder content,
+    including the DDD Policies tree (Harrison directive 2026-06-11 PM,
+    superseding the GM-level tagging shipped earlier the same day -- the LLC
+    team lives in #llc-* channels where the strict filter excludes NULL)
+  - walk_folder recursion: subfolders, folder shortcuts, policy_tree
+    provenance propagation from the "DDD Policies" / "EVV Documents" names
   - store Step 0 opt-out: metadata.lex_gm_level=True keeps a LEX doc at
     sub_entity NULL even when its content carries sub-entity keywords
+    (generic store mechanism -- no longer used by this script, but locked)
 """
 
 from __future__ import annotations
@@ -46,25 +49,28 @@ def patch_embeddings(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestResolveSubEntity:
-    def test_gm_level_policy_doc_untagged(self):
-        f = {"name": "DDD Complete Operations Manual.pdf", "gm_level": True}
-        assert sync.resolve_sub_entity(f) == (None, True)
+    def test_policy_manual_tagged_llc(self):
+        f = {"name": "DDD Complete Operations Manual.pdf", "policy_tree": True}
+        assert sync.resolve_sub_entity(f) == ("LEX-LLC", True)
 
-    def test_root_file_stays_llc(self):
-        f = {"name": "Employee Payrates.xlsx", "gm_level": False}
+    def test_root_file_tagged_llc(self):
+        f = {"name": "Employee Payrates.xlsx", "policy_tree": False}
         assert sync.resolve_sub_entity(f) == ("LEX-LLC", False)
 
-    def test_client_record_name_in_policy_tree_forced_llc(self):
-        f = {"name": "progressReport - Jane Doe March 2026.pdf", "gm_level": True}
-        assert sync.resolve_sub_entity(f) == ("LEX-LLC", False)
+    def test_evv_faq_tagged_llc_with_policy_provenance(self):
+        f = {"name": "EVV_Live-InCaregiverFAQ.pdf", "policy_tree": True}
+        assert sync.resolve_sub_entity(f) == ("LEX-LLC", True)
 
-    def test_assessment_name_in_policy_tree_forced_llc(self):
-        f = {"name": "Intake Assessment - new client.pdf", "gm_level": True}
-        assert sync.resolve_sub_entity(f) == ("LEX-LLC", False)
-
-    def test_evv_faq_stays_gm(self):
-        f = {"name": "EVV_Live-InCaregiverFAQ.pdf", "gm_level": True}
-        assert sync.resolve_sub_entity(f) == (None, True)
+    def test_never_returns_null_sub_entity(self):
+        """Regression for the 6/11 directive: NULL (GM-level) chunks are
+        invisible in #llc-* channels, where the DDD policy consumers live."""
+        for f in (
+            {"name": "anything.pdf", "policy_tree": True},
+            {"name": "anything.pdf", "policy_tree": False},
+            {"name": "anything.pdf"},
+        ):
+            sub_entity, _ = sync.resolve_sub_entity(f)
+            assert sub_entity == "LEX-LLC"
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +112,7 @@ class TestWalkFolder:
         ]})
         files = sync.walk_folder(svc, "root")
         assert len(files) == 1
-        assert files[0]["gm_level"] is False
+        assert files[0]["policy_tree"] is False
 
     def test_subfolder_recursion(self):
         svc = _fake_service({
@@ -115,9 +121,9 @@ class TestWalkFolder:
         })
         files = sync.walk_folder(svc, "root")
         assert [f["id"] for f in files] == ["f2"]
-        assert files[0]["gm_level"] is False
+        assert files[0]["policy_tree"] is False
 
-    def test_ddd_policies_folder_marks_gm_level(self):
+    def test_ddd_policies_folder_marks_policy_tree(self):
         svc = _fake_service({
             "root": [{"id": "ddd", "name": "DDD Policies", "mimeType": _FOLDER}],
             "ddd": [
@@ -128,10 +134,10 @@ class TestWalkFolder:
         })
         files = sync.walk_folder(svc, "root")
         by_id = {f["id"]: f for f in files}
-        assert by_id["m1"]["gm_level"] is True
-        assert by_id["m2"]["gm_level"] is True
+        assert by_id["m1"]["policy_tree"] is True
+        assert by_id["m2"]["policy_tree"] is True
 
-    def test_folder_shortcut_followed_with_gm_level(self):
+    def test_folder_shortcut_followed_with_policy_tree(self):
         """The real dump folder holds 'DDD Policies' as a SHORTCUT to a folder."""
         svc = _fake_service({
             "root": [{
@@ -142,7 +148,7 @@ class TestWalkFolder:
         })
         files = sync.walk_folder(svc, "root")
         assert [f["id"] for f in files] == ["m3"]
-        assert files[0]["gm_level"] is True
+        assert files[0]["policy_tree"] is True
 
     def test_file_shortcut_resolved(self):
         svc = _fake_service(

@@ -13,24 +13,23 @@ Behavior:
 - Watermark-based incremental: only files with Drive modifiedTime newer than
   the last sync are re-ingested (sync_state source "lex_dump_folder").
   --backfill forces everything.
-- Entity tagging: entity=LEX always.
-    * Files inside the DDD Policies tree (incl. EVV Documents) are published
-      AHCCCS/DES policy documents -> sub_entity=None (GM-level) with
-      metadata.lex_gm_level=True so store Step 0 auto-detection does not
-      scatter manual chunks into single sub-entity scopes. EXCEPTION:
-      a file whose NAME looks like a client record (progress report,
-      assessment, intake, etc.) is forced to LEX-LLC -- fail-closed against
-      client records drifting into the policy tree.
-    * Files anywhere else in the dump folder keep the original LEX-LLC
-      tagging (tightest scope; several ARE client-level PHI, sanctioned
-      in-KB per the 2026-06-01 Harrison directive + custodian gate).
+- Entity tagging: entity=LEX, sub_entity=LEX-LLC for EVERYTHING in the dump
+  folder, including the DDD Policies tree (Harrison directive 2026-06-11 PM,
+  superseding the GM-level tagging shipped earlier the same day -- see D-046
+  amendment). Rationale: the DDD policy consumers (Shaun/Jen/Jeff/Aaron) live
+  in #llc-* channels per the 6/11 LLC routing directive, and the strict
+  sub-entity filter excludes GM-level NULL chunks from those channels. The
+  explicit LEX-LLC tag makes the manuals visible in #llc-* AND in GM #lex-*
+  channels (GM scope sees all LEX chunks); only LTS/LBHS/LLA channels do not
+  see them. The explicit tag also means store Step 0 auto-detection never
+  fires (explicit sub_entity is never overridden).
 - PHI guard: phi_guard.is_phi_risk runs per chunk and the per-file trip count
   is logged + stored in metadata.phi_risk_chunks. Published policy manuals
   trip the program-keyword patterns (ahcccs/medicaid/assessment) on nearly
   every chunk BY CONSTRUCTION -- they are manuals ABOUT those topics -- so
-  for the curated DDD Policies tree the guard is an audit signal, not a
-  scope-downgrade. Outside the tree everything is already LEX-LLC (tightest).
-  Surfacing remains governed by the prompt guardrails + PHI custodian gate.
+  the guard is an audit signal, not a scope-downgrade; everything is already
+  LEX-LLC (the tightest custodian-gated scope). Surfacing remains governed by
+  the prompt guardrails + PHI custodian gate.
 - Large files: > MAX_FILE_MB skipped with a logged note. PDFs are parsed
   fully (no 80-page cap -- the old cap silently truncated the 460+ page
   Provider Manual past page 80).
@@ -50,7 +49,6 @@ import argparse
 import io
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -81,21 +79,11 @@ MAX_FILE_MB = 60
 MAX_PDF_PAGES = 2000
 MAX_DEPTH = 4
 
-# Folder names whose subtree is treated as published GM-level policy docs.
-# The DDD Policies folder is curated by Shaun/Harrison to hold AHCCCS/DES
-# published manuals, FAQs, and compliance notices -- cross-sub-entity by nature.
-_GM_LEVEL_FOLDER_NAMES = frozenset({"ddd policies", "evv documents"})
-
-# Filename patterns that look like an individual client record. Inside the
-# GM-level policy tree these force the file down to LEX-LLC (fail-closed).
-_CLIENT_RECORD_NAME_PATTERNS = re.compile(
-    # "intake" alone is too broad -- AHCCCS publishes "Data-Intake-Specifications"
-    # tech specs; only intake form/packet/assessment names are client records.
-    r"progress\s*report|assessment|intake\s*(form|packet|paperwork)"
-    r"|service\s*note|incident\s*report"
-    r"|treatment\s*plan|care\s*plan|client\s*file",
-    re.IGNORECASE,
-)
+# Folder names marking the published-policy subtree (DDD Policies + EVV
+# Documents -- AHCCCS/DES published manuals, FAQs, compliance notices).
+# Tracked as metadata provenance (policy_tree) only; tagging is uniform
+# LEX-LLC per the 2026-06-11 PM directive.
+_POLICY_TREE_FOLDER_NAMES = frozenset({"ddd policies", "evv documents"})
 
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 _GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
@@ -132,13 +120,14 @@ def _build_drive_service(impersonate_email: str):
 
 # -- Enumeration ----------------------------------------------------------------
 
-def walk_folder(service, folder_id: str, *, gm_level: bool = False,
+def walk_folder(service, folder_id: str, *, policy_tree: bool = False,
                 depth: int = 0, path: str = "") -> list[dict]:
     """Recursively list files under folder_id, following folder shortcuts.
 
     Returns flat list of file dicts with added keys: "path" (folder path within
-    the dump tree) and "gm_level" (True when the file sits inside a curated
-    published-policy subtree -- see _GM_LEVEL_FOLDER_NAMES).
+    the dump tree) and "policy_tree" (True when the file sits inside the
+    curated published-policy subtree -- see _POLICY_TREE_FOLDER_NAMES;
+    provenance metadata only, tagging is uniform LEX-LLC).
     """
     if depth > MAX_DEPTH:
         log.warning("Max depth %d exceeded at %s -- not descending", MAX_DEPTH, path)
@@ -160,11 +149,11 @@ def walk_folder(service, folder_id: str, *, gm_level: bool = False,
         for f in resp.get("files", []):
             name = f.get("name", "")
             mime = f.get("mimeType", "")
-            child_gm = gm_level or name.strip().lower() in _GM_LEVEL_FOLDER_NAMES
+            child_pt = policy_tree or name.strip().lower() in _POLICY_TREE_FOLDER_NAMES
 
             if mime == _GOOGLE_FOLDER_MIME:
                 files.extend(walk_folder(
-                    service, f["id"], gm_level=child_gm,
+                    service, f["id"], policy_tree=child_pt,
                     depth=depth + 1, path=f"{path}/{name}",
                 ))
             elif mime == _GOOGLE_SHORTCUT_MIME:
@@ -173,7 +162,7 @@ def walk_folder(service, folder_id: str, *, gm_level: bool = False,
                 target_mime = details.get("targetMimeType", "")
                 if target_id and target_mime == _GOOGLE_FOLDER_MIME:
                     files.extend(walk_folder(
-                        service, target_id, gm_level=child_gm,
+                        service, target_id, policy_tree=child_pt,
                         depth=depth + 1, path=f"{path}/{name}",
                     ))
                 elif target_id:
@@ -184,13 +173,13 @@ def walk_folder(service, folder_id: str, *, gm_level: bool = False,
                             supportsAllDrives=True,
                         ).execute()
                         target["path"] = path
-                        target["gm_level"] = child_gm
+                        target["policy_tree"] = child_pt
                         files.append(target)
                     except Exception as exc:
                         log.warning("shortcut target fetch failed for %s: %s", name, exc)
             else:
                 f["path"] = path
-                f["gm_level"] = gm_level
+                f["policy_tree"] = policy_tree
                 files.append(f)
 
         page_token = resp.get("nextPageToken")
@@ -259,22 +248,16 @@ def _parse_pdf(data: bytes) -> str:
 
 # -- Tagging ---------------------------------------------------------------------
 
-def resolve_sub_entity(file_meta: dict) -> tuple[str | None, bool]:
-    """Return (sub_entity, gm_level_flag) for a dump-folder file.
+def resolve_sub_entity(file_meta: dict) -> tuple[str, bool]:
+    """Return (sub_entity, policy_tree_flag) for a dump-folder file.
 
-    GM-level policy tree -> (None, True) unless the filename looks like a
-    client record, which forces LEX-LLC. Everything else -> ("LEX-LLC", False).
+    UNIFORM LEX-LLC (Harrison directive 2026-06-11 PM, supersedes the GM-level
+    tagging shipped earlier the same day): the DDD policy consumers live in
+    #llc-* channels, where the strict sub-entity filter excludes NULL chunks.
+    LEX-LLC chunks remain visible in GM #lex-* channels too. The policy_tree
+    flag rides along as metadata provenance only.
     """
-    name = file_meta.get("name", "")
-    if file_meta.get("gm_level"):
-        if _CLIENT_RECORD_NAME_PATTERNS.search(name):
-            log.warning(
-                "client-record-looking file inside policy tree -> forcing LEX-LLC: %s",
-                name,
-            )
-            return "LEX-LLC", False
-        return None, True
-    return "LEX-LLC", False
+    return "LEX-LLC", bool(file_meta.get("policy_tree"))
 
 
 def _parse_drive_time(value: str | None) -> int | None:
@@ -304,8 +287,8 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
 
     log.info("Enumerating dump folder %s recursively...", FOLDER_ID)
     all_files = walk_folder(service, FOLDER_ID)
-    log.info("Found %d files (%d GM-level policy docs)",
-             len(all_files), sum(1 for f in all_files if f.get("gm_level")))
+    log.info("Found %d files (%d in the DDD policy tree)",
+             len(all_files), sum(1 for f in all_files if f.get("policy_tree")))
 
     ingested = skipped_unchanged = skipped_large = skipped_empty = 0
     total_chunks = 0
@@ -331,9 +314,9 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
             skipped_large += 1
             continue
 
-        sub_entity, gm_level = resolve_sub_entity(f)
+        sub_entity, policy_tree = resolve_sub_entity(f)
         log.info("Processing: %s%s (%.1fMB) -> sub_entity=%s",
-                 f.get("path", ""), "/" + name, size_mb, sub_entity or "GM-level")
+                 f.get("path", ""), "/" + name, size_mb, sub_entity)
 
         content = _extract_content(service, f)
         if not content or not content.strip():
@@ -349,7 +332,7 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
         if phi_chunks:
             log.info("  -> PHI-risk patterns in %d/%d chunks%s",
                      phi_chunks, len(chunks),
-                     " (expected for published policy text)" if gm_level else "")
+                     " (expected for published policy text)" if policy_tree else "")
 
         if dry_run:
             log.info("  [DRY RUN] would ingest %d chunks", len(chunks))
@@ -387,7 +370,7 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
                 "folder_id": FOLDER_ID,
                 "folder_path": f.get("path", ""),
                 "mime_type": mime,
-                "lex_gm_level": gm_level,
+                "policy_tree": policy_tree,
                 "phi_risk_chunks": phi_chunks,
                 "ingested_by": "run_lex_dump_folder_sync.py",
             },

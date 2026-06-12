@@ -1140,3 +1140,31 @@ API shows NO matching workspace user or Lexington-team member (likely invite pen
 acceptance). Fail-closed: no slack-to-asana row until his GID is visible; org-roles note
 updated to say exactly that. His briefing/plate task section shows a fail-soft stub until
 then.
+
+---
+
+## D-046a -- AMENDMENT: DDD Policies tree re-tagged GM-level -> LEX-LLC (2026-06-11 PM, Harrison)
+
+**Supersedes D-046 item 2 (tagging) and resolves D-046 item 5 (visibility tension).**
+
+Harrison directive same evening: re-tag the DDD Policies tree to LEX-LLC so the manuals are
+visible in #llc-* channels, where the DDD policy consumers (Shaun/Jen/Jeff/Aaron) now live
+per the 6/11 LLC routing directive. GM-level NULL tagging made the manuals invisible there
+(strict sub-entity filter excludes NULL).
+
+**Executed:**
+1. `run_lex_dump_folder_sync.py` now tags EVERYTHING in the dump folder LEX-LLC, including
+   the DDD Policies tree. The policy-tree detection survives as metadata provenance only
+   (`metadata.policy_tree`); the client-record filename rule was removed (dead code once
+   every path is LEX-LLC). Explicit sub_entity means store Step 0 auto-detection never fires.
+2. **2,840 existing chunks re-tagged in place** (63 files, SQL UPDATE on knowledge_chunks --
+   sub_entity lives only there, no re-embedding needed). Zero NULL dump-folder chunks remain.
+3. Smoke test re-run in #llc-leadership (strict LEX-LLC scope) -- see TOM.
+
+**Visibility after the change:** manuals visible in #llc-* (strict filter matches LEX-LLC)
+AND all GM #lex-* channels (GM scope sees every LEX chunk). NOT visible in
+#lts-*/#lbhs-*/#lla-* -- accepted; LTS is the only other DDD provider and can re-raise.
+
+**Note:** the `lex_gm_level` store Step 0 opt-out (D-046 item 3) stays in the codebase --
+it is a generic, tested mechanism for any future deliberately-GM-level LEX ingest; this
+script simply no longer uses it.
