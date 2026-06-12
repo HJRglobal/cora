@@ -101,7 +101,8 @@ def _tag_fireflies_sub_entity(transcript: dict) -> str | None:
     """
     attendees = transcript.get("meeting_attendees") or []
     participant_text = " ".join(
-        a.get("displayName", "") + " " + a.get("email", "") for a in attendees
+        (a.get("displayName") or "") + " " + (a.get("email") or "")
+        for a in attendees if isinstance(a, dict)
     ).lower()
     matched = []
     for identifiers, code in _FIREFLIES_PARTICIPANT_SUB_ENTITY:
@@ -165,6 +166,8 @@ def _resolve_participant_slack_ids(attendees: list[dict]) -> list[str]:
     seen: set[str] = set()
     slack_ids: list[str] = []
     for a in attendees:
+        if not isinstance(a, dict):
+            continue
         email = (a.get("email") or "").strip().lower()
         if not email:
             continue
@@ -442,7 +445,8 @@ def backfill(since: datetime) -> Iterator[Document]:
                     "transcript_id": transcript_id,
                     "duration_sec": t.get("duration"),
                     "attendee_emails": [
-                        a.get("email", "") for a in meeting_attendees
+                        (a.get("email") or "")
+                        for a in meeting_attendees if isinstance(a, dict)
                     ],
                     "participant_slack_ids": _resolve_participant_slack_ids(meeting_attendees),
                     "participants": t.get("participants") or [],
