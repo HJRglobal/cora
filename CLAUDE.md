@@ -8,13 +8,25 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
-### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED, D-049; RESTART REQUIRED to activate)
+### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED + LIVE, D-049; commit `01a12ed`, restarted ~21:59 AZ)
 
 Any teammate can now teach Cora a personal note -- "Cora, remember X" / "note that X" --
 retrievable BY THE OWNER ONLY. Spec: org-synthesis spec Phase 5 (design locked 2026-06-11);
 deliverable 2 (promotion + drift sweep) is a LATER session -- share intent today saves
 privately + flags `share_requested` metadata and tells the user org-wide review is coming.
-Full suite **4,053 passed / 41 skipped** (+52).
+Full suite **4,053 passed / 41 skipped** (+52). **Restarted clean 2026-06-11 ~21:59 AZ via
+the ship PS1 -Restart (Harrison, elevated): single 3-process chain, monotonic heartbeats,
+KB prewarm 8.1s. Remaining exit gate: the 3-leg live smoke below.**
+
+**🚨 Side find during restart verification -- dead-man ping was DARK since 20:23 AZ:**
+`.env` carried TWO `HEALTH_PING_URL` lines (the real hc-ping UUID + a
+`PASTE-UUID-HERE` placeholder appended below it ~20:22); dotenv takes the LAST duplicate,
+so every 5-min ping 400'd from the second 20:22 startup onward (healthchecks.io will have
+alerted DOWN). Placeholder line REMOVED from .env (byte-safe edit, exactly one line);
+**the next restart re-arms the ping loop** -- after it, verify no new
+"health-ping: ping failed" lines and the healthchecks.io check flips UP.
+DOCTRINE: never append env templates to a live .env; check for duplicate keys before a
+restart (`Select-String .env -Pattern "^KEY="` should return exactly one line).
 
 - **Blast-radius-1 is SQL-layer (D-034), never prompts:** `store.search()` excludes
   `source='user_note'` in BOTH vector paths -- every existing consumer (Q&A retrieval,
