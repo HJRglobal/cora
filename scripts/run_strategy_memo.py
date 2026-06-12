@@ -40,6 +40,10 @@ LOG_DIR = _REPO_ROOT / "logs"
 
 
 def _setup_logging() -> None:
+    # Windows consoles default to cp1252 -- live task/decision text carries
+    # non-ASCII chars, so force UTF-8 (never crash the dry-run print).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     logging.basicConfig(

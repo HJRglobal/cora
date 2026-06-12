@@ -270,7 +270,11 @@ def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
         if not block.startswith("### "):
             continue
         topic = block.split("\n", 1)[0][4:].strip()
-        sev = re.search(r"\*\*Severity\*\*:\s*(P\d)", block)
+        if topic == "[Topic]":
+            continue   # the "How to use" template skeleton, not a real entry
+        # The template's "P0 / P1 / P2 / P3" alternatives line must not match;
+        # annotated real values ("P0 (decision Monday)") must.
+        sev = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
         if not sev or sev.group(1) not in ("P0", "P1"):
             continue
         entity_m = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)

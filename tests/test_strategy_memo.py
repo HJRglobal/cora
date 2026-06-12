@@ -233,6 +233,25 @@ class TestDecisions:
         out = sm.gather_stalled_decisions(today=TODAY)
         assert out["ok"] is False
 
+    def test_template_skeleton_never_parsed_but_annotated_severity_is(self, paths):
+        """The 'How to use' template block (topic '[Topic]', severity line
+        'P0 / P1 / P2 / P3') must be skipped; a real entry with an annotated
+        severity ('P0 (decision Monday)') must be kept. Live-dry-run finding
+        2026-06-11: the skeleton leaked into the memo as a bogus P0."""
+        (paths / "pending.md").write_text(
+            "# Pending\n\n## How to use\n\n"
+            "### [Topic]\n- **Entity**: FNDR / HJRG / F3E / OSN\n"
+            "- **Severity**: P0 / P1 / P2 / P3\n"
+            "- **Owner of next nudge**: who is supposed to move this forward\n\n"
+            "## Active\n\n"
+            "### Real call\n- **Entity**: F3E\n"
+            "- **Severity**: P0 (decision moment is the Monday call)\n"
+            "- **Last touched**: 2026-06-06\n"
+            "- **Owner of next nudge**: Harrison\n",
+            encoding="utf-8")
+        out = sm.gather_stalled_decisions(today=TODAY)
+        assert [d["topic"] for d in out["decisions"]] == ["Real call"]
+
 
 # ---------------------------------------------------------------------------
 # Deadline radar (incl. LEX aggregate-only + PHI guard)
@@ -621,6 +640,8 @@ class TestSourceWiring:
             encoding="utf-8")
         assert "--dry-run" in src
         assert "run_memo" in src
+        # cp1252 console guard: live text is non-ASCII; print must not crash.
+        assert 'reconfigure(encoding="utf-8"' in src
 
     def test_setup_ps1_doctrine_compliance(self):
         ps1 = _REPO_ROOT / "deployment" / "setup-strategy-memo-task.ps1"
