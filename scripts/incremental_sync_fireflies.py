@@ -44,6 +44,19 @@ def _setup_logging() -> None:
     )
 
 
+def _resolve_last_sync(state, since_days, fallback_days, now_ts: int) -> int:
+    """Decide the 'since' timestamp for this run.
+
+    --since-days overrides everything (forced deep backfill, ignores the watermark);
+    else resume from the persisted watermark; else fall back N days.
+    """
+    if since_days:
+        return now_ts - since_days * 86400
+    if state is not None:
+        return state[0]
+    return now_ts - fallback_days * 86400
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -51,6 +64,12 @@ def main() -> int:
         help="Days to look back if no watermark exists (default 2)",
     )
     parser.add_argument("--batch-size", type=int, default=20)
+    parser.add_argument(
+        "--since-days", type=int, default=None,
+        help="Force a deep backfill reaching back N days, ignoring the watermark "
+             "(e.g. 2000 ~= all history the API key can access). Watermark still "
+             "advances to now afterward, so nightly incremental resumes normally.",
+    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -60,15 +79,21 @@ def main() -> int:
 
     kb = KnowledgeBase(KB_DB_PATH)
     state = kb.get_sync_state("fireflies")
+    now_ts = int(time.time())
+    last_sync_ts = _resolve_last_sync(state, args.since_days, args.fallback_days, now_ts)
 
-    if state is None:
-        last_sync_ts = int(time.time()) - (args.fallback_days * 86400)
+    if args.since_days:
+        log.warning(
+            "FORCED deep backfill: reaching back %d days (ignoring watermark), since=%s",
+            args.since_days,
+            datetime.fromtimestamp(last_sync_ts, tz=timezone.utc).isoformat(),
+        )
+    elif state is None:
         log.warning(
             "No watermark in sync_state.fireflies — falling back to last %d days",
             args.fallback_days,
         )
     else:
-        last_sync_ts = state[0]
         log.info(
             "Resuming from watermark: last_sync_at=%s",
             datetime.fromtimestamp(last_sync_ts, tz=timezone.utc).isoformat(),
