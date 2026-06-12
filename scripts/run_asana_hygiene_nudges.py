@@ -35,6 +35,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 load_dotenv(_REPO_ROOT / ".env")
 
 from cora import nudge_ledger  # noqa: E402
+from cora.nudge_ledger import closed_task_guard  # noqa: E402
 from cora.tools.asana_client import (  # noqa: E402
     AsanaClientError,
     create_task_comment,
@@ -180,6 +181,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
     nudges_sent = 0
     skipped_throttle = 0
     skipped_signal = 0
+    skipped_closed = 0
     total_nudges = 0
 
     for user in users:
@@ -248,6 +250,18 @@ def run(dry_run: bool = False) -> dict[str, int]:
                 skipped_signal += 1
                 continue
 
+            # Fire-time completion guard (2026-06-11 Hannah report): the
+            # candidate list filters on completion, but the task can close
+            # between listing and firing -- and the shared ledger must record
+            # already-closed tasks so NO source (this job, the weekly sweep)
+            # ever nudges them again. Skipped in dry-run (read-only preview;
+            # the guard writes ledger rows). Fails open inside the guard.
+            if not dry_run and closed_task_guard(
+                task_gid, task_name=task_name, run_id=run_id
+            ):
+                skipped_closed += 1
+                continue
+
             comment = _build_comment(first_name, overdue_days, task_gid)
 
             if not dry_run:
@@ -290,6 +304,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
         "nudges_sent": nudges_sent,
         "skipped_throttle": skipped_throttle,
         "skipped_signal": skipped_signal,
+        "skipped_closed": skipped_closed,
     }
 
 

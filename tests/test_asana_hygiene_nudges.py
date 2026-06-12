@@ -249,6 +249,7 @@ def test_run_posts_comment_when_not_dry_run(tmp_path, monkeypatch):
 
     with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
          patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
          patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
         result = nudges.run(dry_run=False)
 
@@ -295,6 +296,7 @@ def test_run_records_nudge_to_shared_ledger(tmp_path, monkeypatch):
 
     with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
          patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
          patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
         result = nudges.run(dry_run=False)
 
@@ -358,6 +360,7 @@ def test_run_respects_max_per_user(tmp_path, monkeypatch):
 
     with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
          patch("run_asana_hygiene_nudges.get_user_tasks", return_value=tasks), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
          patch("run_asana_hygiene_nudges.create_task_comment"):
         result = nudges.run(dry_run=False)
 
@@ -379,7 +382,113 @@ def test_run_respects_max_total(tmp_path, monkeypatch):
 
     with patch.object(nudges, "_load_users", return_value=many_users), \
          patch("run_asana_hygiene_nudges.get_user_tasks", side_effect=mock_get_tasks), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
          patch("run_asana_hygiene_nudges.create_task_comment"):
         result = nudges.run(dry_run=False)
 
     assert result["nudges_sent"] <= nudges.MAX_TOTAL
+
+
+# ---------------------------------------------------------------------------
+# Fire-time closed-task guard (2026-06-11 -- Hannah report: nudges were firing
+# on tasks already closed; no source re-checked completion at fire time)
+# ---------------------------------------------------------------------------
+
+def test_run_skips_task_closed_at_fire_time(tmp_path, monkeypatch):
+    """Closed task -> no comment posted, counted as skipped_closed."""
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("666", "Closed while queued", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=True) as mock_guard, \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_guard.assert_called_once()
+    mock_comment.assert_not_called()
+    assert result["nudges_sent"] == 0
+    assert result["skipped_closed"] == 1
+
+
+def test_run_closed_task_skip_recorded_in_ledger(tmp_path, monkeypatch):
+    """End-to-end through the REAL guard: a task whose live Asana state is
+    completed gets no comment and a reason=already_closed ledger row."""
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    import cora.tools.asana_client as _ac
+
+    ledger = tmp_path / "closure-nudges-throttle.jsonl"
+    monkeypatch.setenv("CLOSURE_NUDGE_LOG_PATH", str(ledger))
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("777", "Closed long ago", _overdue_date(60))
+    closed_at = (_dt.now(_tz.utc) - _td(days=9)).isoformat()
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch.object(_ac, "get_task_completion",
+                      return_value={"completed": True, "completed_at": closed_at}), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_comment.assert_not_called()
+    assert result["skipped_closed"] == 1
+    rows = [_json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+    closed_rows = [r for r in rows if r.get("reason") == "already_closed"]
+    assert len(closed_rows) == 1
+    assert closed_rows[0]["task_gid"] == "777"
+    assert closed_rows[0]["permanent"] is True
+
+
+def test_run_open_task_unaffected_by_guard(tmp_path, monkeypatch):
+    """Open task -> the real guard passes it through and the nudge fires."""
+    import cora.tools.asana_client as _ac
+
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("888", "Still open and stale", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch.object(_ac, "get_task_completion",
+                      return_value={"completed": False, "completed_at": None}), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_comment.assert_called_once()
+    assert result["nudges_sent"] == 1
+    assert result["skipped_closed"] == 0
+
+
+def test_run_permanent_exclusion_skips_without_api_call(tmp_path, monkeypatch):
+    """A previously recorded permanent already_closed row skips the task with
+    no Asana fetch at all."""
+    import json as _json
+
+    import cora.tools.asana_client as _ac
+
+    ledger = tmp_path / "closure-nudges-throttle.jsonl"
+    ledger.write_text(
+        _json.dumps({
+            "task_gid": "999", "reason": "already_closed", "permanent": True,
+            "last_nudged_at": "2026-01-01T00:00:00+00:00",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLOSURE_NUDGE_LOG_PATH", str(ledger))
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    task = _make_task("999", "Permanently excluded", _overdue_date(120))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch.object(_ac, "get_task_completion",
+                      side_effect=AssertionError("must not be called")), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    mock_comment.assert_not_called()
+    assert result["skipped_closed"] == 1

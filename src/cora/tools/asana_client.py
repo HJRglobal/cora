@@ -276,6 +276,43 @@ def create_task_comment(task_gid: str, text: str) -> dict[str, Any]:
     return r.json().get("data") or {}
 
 
+def get_task_completion(task_gid: str) -> dict[str, Any]:
+    """Fetch a task's live completion state: {"completed": bool, "completed_at": str|None}.
+
+    Used by the closed-task nudge guard (nudge_ledger.closed_task_guard) to
+    re-check completion at fire time -- the candidate list can be stale by the
+    time a nudge actually posts, and other comment sources don't filter on
+    completion at all (2026-06-11 Hannah report: daily nudges on a task closed
+    a year prior).
+
+    Raises AsanaClientError on any failure -- the caller decides fail direction.
+    """
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("get_task_completion requires a non-empty task_gid")
+
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/tasks/{task_gid}",
+                params={"opt_fields": "completed,completed_at"},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code != 200:
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    data = r.json().get("data") or {}
+    return {
+        "completed": bool(data.get("completed")),
+        "completed_at": data.get("completed_at"),
+    }
+
+
 def find_recent_duplicate_task(name: str, within_days: int = 7) -> str | None:
     """Return the GID of an existing OPEN task with the same name created recently.
 
