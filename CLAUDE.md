@@ -8,6 +8,42 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [BUG FIX] 2026-06-12 morning failures -- backfill flooded the recon window; briefing task killed (SHIPPED, script-side, NO restart needed)
+
+Cowork's morning report, one root cause / three symptoms: reconciliation windowed "last
+25h" by INGESTION date, so the 6/11 18-month gmail backfill (~50K chunks, old message
+dates, fresh ingested_at) made pass 4 scan 111,878 chunks for ~6h (5:30->11:14+, an
+OpenAI embed round-trip per completion-flagged sentence). The 7:00 knowledge review saw
+an empty queue (20 gaps found by 6:41 but proposals only landed at end-of-run) and the
+7:30 "Cora - Daily Briefing" task was TERMINATED at its **PT10M** ExecutionTimeLimit
+(Last Result 267014) with zero users finished and no audit trace.
+
+**Fixes (all script-side -- reconciliation_engine + run_reconciliation +
+run_daily_briefing are not bot-loaded; live at the next scheduled fires, 6/13 morning):**
+1. **Content-date windowing** at the `_query_kb_chunks` chokepoint (all passes) + pass
+   5's own query: `COALESCE(date_modified, date_created, ingested_at) >= cutoff` --
+   backfills can never read as "recent activity" again. Plus a hard
+   `MAX_CHUNKS_PER_QUERY=4000` cap (newest content first, warning when hit).
+2. **Budgets:** `run_reconciliation --time-budget-min` (default 50 -- finishes by ~6:20
+   from a 5:30 start, inside the task's PT1H limit); pass 4 honors the deadline
+   mid-scan AND caps sentence embeds at `PASS4_MAX_SENTENCE_EMBEDS=2000` (fuzzy
+   fallback after). NOTE from the incident: the task's ExecutionTimeLimit kills the
+   `cmd /c` wrapper but NOT the python child -- script-side self-bounding is the real
+   control; the task limit is only a backstop.
+3. **Per-pass incremental proposing:** each pass's HIGH/MED gaps are proposed the
+   moment the pass returns -- the 7:00 review can never again see an empty queue while
+   earlier passes already found gaps.
+4. **Briefing visibility + budget:** "Cora - Daily Briefing" ExecutionTimeLimit raised
+   PT10M -> **PT2H** (Set-ScheduledTask, done); `run_daily_briefing` now writes
+   run_start/run_end lines to cora-daily-briefing.jsonl (a termination = run_start with
+   no run_end) and has a `--time-budget-min` build budget (default 90) that skips
+   remaining users gracefully with audit lines instead of dying mid-run.
+
++15 tests (content-date window incl. the backfill-exclusion pin, cap, pass-4/reconcile
+deadlines, briefing budget + run-audit). **One optional elevated action:** raise
+`cowork-cora-reconciliation`'s limit PT1H -> PT2H as a backstop (non-elevated Set
+denied; script self-bounds at 50min so not urgent).
+
 ### [BUG FIX] Plain-DM Q&A was UNREACHABLE -- OSN shift scheduler swallowed every DM -- 2026-06-11 (SHIPPED; restart required)
 
 Found by the Phase 5 exit-gate smoke: Harrison DM'd "Cora, remember the Tucson stove

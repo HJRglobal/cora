@@ -332,6 +332,16 @@ def main() -> int:
         "--lookback-hours", type=float, default=25.0,
         help="Hours of KB history to scan (default: 25)",
     )
+    parser.add_argument(
+        "--time-budget-min", type=float, default=50.0,
+        help="Wall-clock budget in minutes for the whole sweep (default: 50 -- "
+             "inside the scheduled task's 1h ExecutionTimeLimit, and a 5:30 "
+             "start finishes by ~6:20, well before the 7:00 knowledge review). "
+             "Passes that haven't started when the budget runs out are skipped; "
+             "pass 4 also stops scanning mid-pass. Proposals land per-pass, so "
+             "earlier passes' findings reach the 7am review even when the "
+             "budget cuts a later pass short.",
+    )
     args = parser.parse_args()
 
     log = logging.getLogger("reconciliation")
@@ -372,77 +382,109 @@ def main() -> int:
         else:
             log.warning("ANTHROPIC_API_KEY not set -- pass 5 will be skipped")
 
-    # â"€â"€â"€ Run reconciliation â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-    log.info("Running reconciliation passes %s over last %.0fh of KB...", passes, args.lookback_hours)
-    try:
-        gaps = reconcile(
-            open_tasks,
-            active_deals,
-            lookback_seconds=lookback_seconds,
-            db_path=KB_DB_PATH if KB_DB_PATH.exists() else None,
-            passes=passes,
-            anthropic_client=anthropic_client,
+    # â"€â"€â"€ Run reconciliation PER PASS, proposing incrementally â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    # 2026-06-12 sequencing fix: proposals used to land only at end-of-run, so a
+    # long pass 4 (the 18-month-backfill incident: ~6h) starved the 7:00
+    # knowledge review even though passes 1-3 had finished by 6:41 with 20 gaps.
+    # Now each pass's HIGH/MED gaps are proposed the moment that pass returns,
+    # and a wall-clock budget bounds the whole sweep (pass 4 also honors the
+    # deadline mid-pass via deadline_monotonic).
+    deadline_monotonic = time.monotonic() + args.time_budget_min * 60.0
+    log.info(
+        "Running reconciliation passes %s over last %.0fh of KB (budget %.0f min, per-pass proposing)...",
+        passes, args.lookback_hours, args.time_budget_min,
+    )
+
+    def _propose_batch(batch: list[ReconciliationGap]) -> tuple[int, int]:
+        """Queue one pass's HIGH/MED gaps for Harrison review. Returns (proposed, skipped)."""
+        n_prop = 0
+        n_skip = 0
+        for gap in batch:
+            if gap.confidence not in _REVIEW_CONFIDENCES:
+                continue
+            update_type = _GAP_TYPE_TO_UPDATE_TYPE.get(gap.gap_type, "generic")
+            if args.dry_run:
+                log.info(
+                    "[DRY RUN] Would propose: [%s] %s confidence=%s",
+                    gap.gap_type, gap.description[:80], gap.confidence,
+                )
+                n_prop += 1
+                continue
+            try:
+                propose_update(
+                    update_id=gap.gap_id,
+                    update_type=update_type,
+                    description=gap.description,
+                    payload=gap.payload,
+                    source_evidence=gap.source_evidence,
+                    confidence=gap.confidence,
+                )
+                n_prop += 1
+                log.info(
+                    "Proposed update gap_id=%s type=%s confidence=%s",
+                    gap.gap_id[:20], gap.gap_type, gap.confidence,
+                )
+            except Exception as exc:
+                log.warning("Failed to propose update for gap %s: %s", gap.gap_id[:20], exc)
+                n_skip += 1
+        return n_prop, n_skip
+
+    gaps: list[ReconciliationGap] = []
+    proposed = 0
+    skipped = 0
+    passes_run: list[int] = []
+
+    for p in passes:
+        if time.monotonic() > deadline_monotonic:
+            log.warning(
+                "Time budget exhausted before pass %d -- skipping remaining passes %s",
+                p, [q for q in passes if q >= p],
+            )
+            exit_code = 2
+            break
+        try:
+            pass_gaps = reconcile(
+                open_tasks,
+                active_deals,
+                lookback_seconds=lookback_seconds,
+                db_path=KB_DB_PATH if KB_DB_PATH.exists() else None,
+                passes=[p],
+                anthropic_client=anthropic_client,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception as exc:
+            log.error("reconciliation pass %d failed: %s", p, exc, exc_info=True)
+            exit_code = 2
+            continue
+        passes_run.append(p)
+        gaps.extend(pass_gaps)
+        n_prop, n_skip = _propose_batch(pass_gaps)
+        proposed += n_prop
+        skipped += n_skip
+        log.info(
+            "Pass %d complete: %d actionable gaps, %d proposed now (cumulative %d)",
+            p, len(pass_gaps), n_prop, proposed,
         )
-    except Exception as exc:
-        log.error("reconciliation_engine.reconcile() failed: %s", exc, exc_info=True)
-        return 1
 
     log.info(
-        "Reconciliation complete: %d actionable gaps found (high=%d, med=%d)",
-        len(gaps),
+        "Reconciliation complete: %d actionable gaps across passes %s (high=%d, med=%d)",
+        len(gaps), passes_run,
         sum(1 for g in gaps if g.confidence == "HIGH"),
         sum(1 for g in gaps if g.confidence == "MED"),
     )
 
-    if not gaps:
-        log.info("No actionable gaps -- nothing to propose")
-        # Write empty gaps file so scheduled-task scheduler knows it ran
-        _write_gaps_file([], date_str)
-        return 0
-
-    # â"€â"€â"€ Write gaps file â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    # â"€â"€â"€ Write gaps file (audit -- proposals already landed per-pass) â"€â"€â"€â"€â"€â"€â"€â"€â"€
     gaps_path = _write_gaps_file(gaps, date_str)
     log.info("Wrote %d gaps to %s", len(gaps), gaps_path)
 
-    # â"€â"€â"€ Propose updates to Harrison via knowledge_review â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    if not gaps:
+        log.info("No actionable gaps -- nothing proposed")
+        return exit_code
+
     high_med = [g for g in gaps if g.confidence in _REVIEW_CONFIDENCES]
-    log.info("Queuing %d HIGH/MED gaps for Harrison review (+1/-1)", len(high_med))
-
-    proposed = 0
-    skipped = 0
-
-    for gap in high_med:
-        update_type = _GAP_TYPE_TO_UPDATE_TYPE.get(gap.gap_type, "generic")
-
-        if args.dry_run:
-            log.info(
-                "[DRY RUN] Would propose: [%s] %s confidence=%s",
-                gap.gap_type, gap.description[:80], gap.confidence,
-            )
-            proposed += 1
-            continue
-
-        try:
-            propose_update(
-                update_id=gap.gap_id,
-                update_type=update_type,
-                description=gap.description,
-                payload=gap.payload,
-                source_evidence=gap.source_evidence,
-                confidence=gap.confidence,
-            )
-            proposed += 1
-            log.info(
-                "Proposed update gap_id=%s type=%s confidence=%s",
-                gap.gap_id[:20], gap.gap_type, gap.confidence,
-            )
-        except Exception as exc:
-            log.warning("Failed to propose update for gap %s: %s", gap.gap_id[:20], exc)
-            skipped += 1
-
     log.info(
-        "Reconciliation sweep done -- %d proposed, %d skipped (exit=%d)",
-        proposed, skipped, exit_code,
+        "Reconciliation sweep done -- %d proposed, %d skipped of %d HIGH/MED (exit=%d)",
+        proposed, skipped, len(high_med), exit_code,
     )
 
     # â"€â"€â"€ DM individual users for stale open task gaps â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€

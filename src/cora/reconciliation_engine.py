@@ -60,6 +60,20 @@ log = logging.getLogger(__name__)
 # Lookback window for KB chunk queries — 25h to account for late-night syncs.
 DEFAULT_LOOKBACK_SECONDS = 25 * 3600
 
+# Hard cap on chunks per KB query (2026-06-12). The window is keyed on CONTENT
+# date, but a mis-dated source or any future surprise must never reproduce the
+# 6/12 incident: the 18-month gmail backfill (ingested 6/11) made the
+# ingestion-dated window scan 111,878 chunks for ~6 hours, starving the 7:00
+# knowledge review and getting the 7:30 briefing task killed at its time limit.
+# Normal nightly volume is low thousands; the cap only bites on floods.
+MAX_CHUNKS_PER_QUERY = 4000
+
+# Pass-4 budget knobs (2026-06-12): each completion-flagged sentence costs an
+# OpenAI embed round-trip, so sentence volume — not chunk count — is the real
+# wall-clock driver. After the embed budget is spent, matching falls back to
+# fuzzy (cheap, lower recall) instead of stopping.
+PASS4_MAX_SENTENCE_EMBEDS = 2000
+
 # Extended lookback for Fireflies in Pass 4.  Fireflies syncs at 3:30am and
 # meetings happen irregularly — 25h often misses yesterday's transcripts.
 # 48h ensures 2 full days of meeting content are scanned for completion signals.
@@ -141,8 +155,16 @@ def _query_kb_chunks(
     lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
     db_path: Path | None = None,
     exclude_phi_lex: bool = True,
+    max_chunks: int = MAX_CHUNKS_PER_QUERY,
 ) -> list[dict[str, Any]]:
-    """Fetch KB chunks ingested within lookback window.
+    """Fetch KB chunks whose CONTENT date falls within the lookback window.
+
+    Windowing is keyed on COALESCE(date_modified, date_created, ingested_at) —
+    the message/content date with an ingestion-date fallback for undated rows.
+    Keying on ingested_at alone made every historical backfill look like "the
+    last 25 hours" (the 2026-06-12 incident: a 6h pass-4 run over the 18-month
+    gmail backfill). max_chunks is a hard backstop on top of that — newest
+    content first, excess dropped with a warning.
 
     Returns list of dicts with keys:
       source, source_id, entity, sub_entity, content, deep_link, title, ingested_at
@@ -153,10 +175,11 @@ def _query_kb_chunks(
         return []
 
     cutoff_ts = int(time.time() - lookback_seconds)
+    content_date = "COALESCE(date_modified, date_created, ingested_at)"
     conn = sqlite3.connect(str(db_path))
     try:
         params: list[Any] = [cutoff_ts]
-        clauses: list[str] = ["ingested_at >= ?"]
+        clauses: list[str] = [f"{content_date} >= ?"]
 
         if sources:
             placeholders = ",".join("?" * len(sources))
@@ -169,18 +192,28 @@ def _query_kb_chunks(
             params.extend(entities)
 
         where = " AND ".join(clauses)
+        params.append(int(max_chunks))
         rows = conn.execute(
             f"""
             SELECT source, source_id, entity, sub_entity, content,
                    deep_link, title, ingested_at
             FROM knowledge_chunks
             WHERE {where}
-            ORDER BY ingested_at DESC
+            ORDER BY {content_date} DESC
+            LIMIT ?
             """,
             params,
         ).fetchall()
     finally:
         conn.close()
+
+    if len(rows) >= max_chunks:
+        log.warning(
+            "reconciliation: chunk query hit the %d-chunk cap (sources=%s) -- "
+            "oldest in-window content dropped; if this repeats outside a "
+            "backfill day, raise MAX_CHUNKS_PER_QUERY",
+            max_chunks, sources,
+        )
 
     chunks = []
     for row in rows:
@@ -716,6 +749,7 @@ def pass4_stale_open_tasks(
     *,
     lookback_seconds: float = DEFAULT_LOOKBACK_SECONDS,
     db_path: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[ReconciliationGap]:
     """Find completion language in Slack/Gmail/Fireflies KB chunks matched against open tasks.
 
@@ -803,7 +837,22 @@ def pass4_stale_open_tasks(
     best_per_task: dict[str, tuple[float, bool, dict, dict]] = {}
     # task_gid -> (score, used_semantic, chunk, best_task_entry)
 
-    for chunk in chunks:
+    # Wall-clock + embed budgets (2026-06-12): sentence embeds are an OpenAI
+    # round-trip each, so a chunk flood turns this loop into hours. Past the
+    # embed budget we fall back to fuzzy matching; past the deadline we stop
+    # scanning and keep what we found.
+    embeds_used = 0
+    deadline_hit = False
+
+    for chunk_idx, chunk in enumerate(chunks):
+        if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+            deadline_hit = True
+            log.warning(
+                "reconciliation pass4: wall-clock deadline hit at chunk %d/%d -- "
+                "keeping %d matches found so far",
+                chunk_idx, len(chunks), len(best_per_task),
+            )
+            break
         for sentence in _extract_sentences(chunk["content"]):
             if len(sentence) < 15:
                 continue
@@ -814,7 +863,14 @@ def pass4_stale_open_tasks(
             match_score: float = 0.0
             used_semantic = False
 
-            if use_semantic:
+            if use_semantic and embeds_used < PASS4_MAX_SENTENCE_EMBEDS:
+                embeds_used += 1
+                if embeds_used == PASS4_MAX_SENTENCE_EMBEDS:
+                    log.warning(
+                        "reconciliation pass4: sentence-embed budget (%d) spent -- "
+                        "remaining sentences match via fuzzy fallback",
+                        PASS4_MAX_SENTENCE_EMBEDS,
+                    )
                 sent_emb = _embed_sentence(sentence)
                 if sent_emb:
                     best_sim, best_task = _semantic_best_match(
@@ -918,10 +974,13 @@ def pass4_stale_open_tasks(
         ))
 
     log.info(
-        "reconciliation pass4: %d stale-task gaps found (%s matching, %d sources)",
+        "reconciliation pass4: %d stale-task gaps found (%s matching, %d sources, "
+        "%d sentence embeds%s)",
         len(gaps),
         "semantic" if use_semantic else "fuzzy",
         len(chunks),
+        embeds_used,
+        ", DEADLINE HIT" if deadline_hit else "",
     )
     return gaps
 
@@ -983,13 +1042,15 @@ def pass5_drive_insights(
     try:
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
+        # Content-date window (same rule as _query_kb_chunks): a backfill's
+        # ingestion burst must not read as "recent Drive activity".
         rows = conn.execute(
             """
             SELECT source_id, entity, sub_entity, content, metadata
             FROM knowledge_chunks
             WHERE source = 'drive_sweep'
-              AND ingested_at >= ?
-            ORDER BY ingested_at DESC
+              AND COALESCE(date_modified, date_created, ingested_at) >= ?
+            ORDER BY COALESCE(date_modified, date_created, ingested_at) DESC
             LIMIT 200
             """,
             (cutoff_ts,),
@@ -1182,6 +1243,7 @@ def reconcile(
     db_path: Path | None = None,
     passes: list[int] | None = None,
     anthropic_client: Any | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[ReconciliationGap]:
     """Run all reconciliation passes and return actionable gaps.
 
@@ -1214,39 +1276,51 @@ def reconcile(
 
     kwargs = {"lookback_seconds": lookback_seconds, "db_path": db_path}
 
-    if 1 in passes:
+    def _past_deadline(pass_no: int) -> bool:
+        if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+            log.warning(
+                "reconciliation: wall-clock deadline reached -- skipping pass %d "
+                "and any remaining passes", pass_no,
+            )
+            return True
+        return False
+
+    if 1 in passes and not _past_deadline(1):
         try:
             all_gaps.extend(pass1_missing_asana_tasks(open_tasks, **kwargs))
         except Exception as exc:
             log.error("reconciliation pass1 failed: %s", exc, exc_info=True)
 
-    if 2 in passes:
+    if 2 in passes and not _past_deadline(2):
         try:
             all_gaps.extend(pass2_stale_hubspot_deals(active_deals, **kwargs))
         except Exception as exc:
             log.error("reconciliation pass2 failed: %s", exc, exc_info=True)
 
-    if 3 in passes:
+    if 3 in passes and not _past_deadline(3):
         try:
             all_gaps.extend(pass3_uncaptured_decisions(**kwargs))
         except Exception as exc:
             log.error("reconciliation pass3 failed: %s", exc, exc_info=True)
 
-    if 4 in passes:
+    if 4 in passes and not _past_deadline(4):
         try:
-            all_gaps.extend(pass4_stale_open_tasks(open_tasks, **kwargs))
+            all_gaps.extend(pass4_stale_open_tasks(
+                open_tasks, deadline_monotonic=deadline_monotonic, **kwargs
+            ))
         except Exception as exc:
             log.error("reconciliation pass4 failed: %s", exc, exc_info=True)
 
     if 5 in passes and anthropic_client is not None:
-        try:
-            all_gaps.extend(
-                pass5_drive_insights(
-                    open_tasks, active_deals, anthropic_client, **kwargs
+        if not _past_deadline(5):
+            try:
+                all_gaps.extend(
+                    pass5_drive_insights(
+                        open_tasks, active_deals, anthropic_client, **kwargs
+                    )
                 )
-            )
-        except Exception as exc:
-            log.error("reconciliation pass5 failed: %s", exc, exc_info=True)
+            except Exception as exc:
+                log.error("reconciliation pass5 failed: %s", exc, exc_info=True)
     elif 5 in passes and anthropic_client is None:
         log.info("reconciliation pass5 skipped: no anthropic_client provided")
 

@@ -503,6 +503,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default="",
         help="limit to one user (slack_id or case-insensitive name substring)",
     )
+    p.add_argument(
+        "--time-budget-min",
+        type=float,
+        default=90.0,
+        help="wall-clock budget in minutes for the build loop (default: 90). "
+             "Users not yet built when it runs out are skipped with an audit "
+             "line -- a degraded run beats a Task-Scheduler termination "
+             "(2026-06-12: the task was killed at its time limit mid-run with "
+             "zero users finished and nothing in the audit log).",
+    )
     args = p.parse_args(argv)
     if args.digest_only and args.send_users:
         p.error("--digest-only and --send-users are mutually exclusive")
@@ -518,6 +528,15 @@ def main(argv: list[str] | None = None) -> int:
     else:
         mode = "review_driven"  # deliver to enabled users, review the rest
     log.info("=== Daily briefing starting (mode=%s, dry_run=%s) ===", mode, args.dry_run)
+    run_started = time.time()
+    build_deadline = time.monotonic() + args.time_budget_min * 60.0
+    # Start-of-run audit line (2026-06-12): the 6/12 termination at the task's
+    # ExecutionTimeLimit left NO trace in this file -- a run that starts but
+    # never finishes must be visible as a run_start with no matching run_end.
+    _write_audit([{
+        "ts": run_started, "event": "run_start", "mode": mode,
+        "dry_run": args.dry_run, "time_budget_min": args.time_budget_min,
+    }])
 
     slack_token   = os.environ.get("SLACK_BOT_TOKEN", "")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -554,6 +573,11 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("No briefing recipients to process -- nothing to do")
         if not args.dry_run:
             _save_delivery_state(state)
+        _write_audit([{
+            "ts": time.time(), "event": "run_end", "mode": mode,
+            "dry_run": args.dry_run, "succeeded": 0, "errors": 0, "roster": 0,
+            "elapsed_s": round(time.time() - run_started, 1),
+        }])
         return 0
 
     log.info("Building role-scoped briefings for %d registry users", len(roster))
@@ -563,7 +587,21 @@ def main(argv: list[str] | None = None) -> int:
     errors = 0
     built: list[tuple[RoleRecord, str]] = []
 
-    for rec in roster:
+    for i, rec in enumerate(roster):
+        if time.monotonic() > build_deadline:
+            remaining = [r.name for r in roster[i:]]
+            log.warning(
+                "Briefing build budget (%.0f min) exhausted -- skipping %d remaining "
+                "user(s): %s", args.time_budget_min, len(remaining), ", ".join(remaining),
+            )
+            errors += len(remaining)
+            for r in roster[i:]:
+                audit_entries.append({
+                    "ts": time.time(), "user": r.name, "sid": r.slack_id,
+                    "role": r.role, "entity": r.entity, "mode": mode,
+                    "sent": False, "error": "skipped: build time budget exhausted",
+                })
+            break
         log.info("Briefing %s (role=%s, entity=%s)...", rec.name, rec.role, rec.entity)
         try:
             text = build_user_briefing(rec, api_key=anthropic_key, today_str=today_str)
@@ -582,6 +620,11 @@ def main(argv: list[str] | None = None) -> int:
         for rec, text in built:
             print(f"\n=== {rec.name} ({rec.role}, {rec.entity}) ===\n{text}")
         log.info("=== Dry run done -- %d briefings built, %d errors ===", len(built), errors)
+        _write_audit([{
+            "ts": time.time(), "event": "run_end", "mode": mode, "dry_run": True,
+            "built": len(built), "errors": errors,
+            "elapsed_s": round(time.time() - run_started, 1),
+        }])
         return 0 if errors == 0 else 2
 
     assert slack_client is not None  # narrowed by the dry_run gate above
@@ -645,9 +688,14 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     _save_delivery_state(state)
+    succeeded = len(roster) - errors
+    audit_entries.append({
+        "ts": time.time(), "event": "run_end", "mode": mode, "dry_run": False,
+        "succeeded": succeeded, "errors": errors, "roster": len(roster),
+        "elapsed_s": round(time.time() - run_started, 1),
+    })
     _write_audit(audit_entries)
 
-    succeeded = len(roster) - errors
     log.info("=== Daily briefing done -- %d/%d succeeded ===", succeeded, len(roster))
     return 0 if errors == 0 else 2
 

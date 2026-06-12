@@ -1,4 +1,4 @@
-"""Tests for the org-roles-driven daily briefing (Org Synthesis Phase 2, deliverable 2).
+﻿"""Tests for the org-roles-driven daily briefing (Org Synthesis Phase 2, deliverable 2).
 
 Coverage:
   - roster: registry-driven parity (every active registry user with a Slack ID
@@ -517,3 +517,61 @@ class TestSharedBuilderSubEntityScope:
             out = td._plate_asana_section("U_X", "OSNGW")
         assert "OSN task B" in out
         assert "LEX task A" not in out
+
+
+# ---------------------------------------------------------------------------
+# Time budget + run-audit visibility (2026-06-12 morning-failure fixes)
+# ---------------------------------------------------------------------------
+
+class TestTimeBudgetAndRunAudit:
+    """The 6/12 incident: the task was killed at its ExecutionTimeLimit
+    mid-run (recon KB contention) with zero users finished and NO trace in the
+    audit log. Now: a start-of-run line makes terminations visible (run_start
+    with no run_end), and a build-loop budget degrades gracefully instead of
+    being killed."""
+
+    def _run_with_audit(self, argv, client):
+        audit_entries: list[dict] = []
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "build_user_briefing",
+                          side_effect=lambda rec, **k: f"BRIEF::{rec.name}") as build, \
+             patch.object(rdb, "_write_audit",
+                          side_effect=lambda entries: audit_entries.extend(entries)), \
+             patch.object(rdb.time, "sleep", return_value=None):
+            rc = rdb.main(argv)
+        return rc, build, audit_entries
+
+    def test_zero_budget_skips_all_users_gracefully(self, registry):
+        client = _mock_slack()
+        rc, build, audit = self._run_with_audit(["--time-budget-min=-1"], client)
+        assert rc == 2
+        build.assert_not_called()
+        skips = [e for e in audit
+                 if e.get("error") == "skipped: build time budget exhausted"]
+        assert len(skips) == 3  # the whole roster, each visible in the audit log
+
+    def test_run_start_line_written_before_any_build(self, registry):
+        client = _mock_slack()
+        _, _, audit = self._run_with_audit(["--time-budget-min=-1"], client)
+        events = [e.get("event") for e in audit if e.get("event")]
+        assert events[0] == "run_start"
+        assert events[-1] == "run_end"
+
+    def test_normal_run_has_start_and_end_with_elapsed(self, registry):
+        client = _mock_slack()
+        rc, build, audit = self._run_with_audit([], client)
+        assert rc == 0
+        assert build.call_count == 3
+        start = [e for e in audit if e.get("event") == "run_start"]
+        end = [e for e in audit if e.get("event") == "run_end"]
+        assert len(start) == 1 and len(end) == 1
+        assert "elapsed_s" in end[0]
+        assert end[0]["roster"] == 3
+
+    def test_dry_run_also_writes_run_end(self, registry):
+        client = _mock_slack()
+        rc, _, audit = self._run_with_audit(["--dry-run"], client)
+        assert rc == 0
+        end = [e for e in audit if e.get("event") == "run_end"]
+        assert len(end) == 1 and end[0]["dry_run"] is True

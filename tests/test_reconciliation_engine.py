@@ -42,7 +42,13 @@ def _load_engine():
 
 
 def _make_db(chunks: list[dict]) -> Path:
-    """Create a temp sqlite KB DB populated with the given chunks."""
+    """Create a temp sqlite KB DB populated with the given chunks.
+
+    Mirrors the production columns the engine queries — including
+    date_created/date_modified, which the content-date window (2026-06-12)
+    COALESCEs with ingested_at. Omitted dates default to NULL so the window
+    falls back to ingested_at, preserving older tests' semantics.
+    """
     tmp = tempfile.mktemp(suffix=".db")
     conn = sqlite3.connect(tmp)
     conn.execute(
@@ -56,14 +62,16 @@ def _make_db(chunks: list[dict]) -> Path:
             content    TEXT,
             deep_link  TEXT,
             title      TEXT,
-            ingested_at INTEGER
+            ingested_at INTEGER,
+            date_created INTEGER,
+            date_modified INTEGER
         )
         """
     )
     now = int(time.time())
     for i, c in enumerate(chunks):
         conn.execute(
-            "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 c.get("chunk_id", f"chunk_{i}"),
                 c.get("source", "slack"),
@@ -74,6 +82,8 @@ def _make_db(chunks: list[dict]) -> Path:
                 c.get("deep_link", ""),
                 c.get("title", ""),
                 c.get("ingested_at", now),
+                c.get("date_created"),
+                c.get("date_modified"),
             ),
         )
     conn.commit()
@@ -668,14 +678,16 @@ class TestPass5DriveInsights:
                 deep_link  TEXT,
                 title      TEXT,
                 metadata   TEXT DEFAULT '{}',
-                ingested_at INTEGER
+                ingested_at INTEGER,
+                date_created INTEGER,
+                date_modified INTEGER
             )
             """
         )
         now = int(time.time())
         for i, c in enumerate(chunks):
             conn.execute(
-                "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     c.get("chunk_id", f"chunk_{i}"),
                     c.get("source", "drive_sweep"),
@@ -687,6 +699,8 @@ class TestPass5DriveInsights:
                     c.get("title", ""),
                     c.get("metadata", "{}"),
                     c.get("ingested_at", now),
+                    c.get("date_created"),
+                    c.get("date_modified"),
                 ),
             )
         conn.commit()
@@ -1065,3 +1079,93 @@ class TestPass4SemanticMatching:
             )
         assert gaps == []
 
+
+
+class TestContentDateWindowAndBudgets:
+    """2026-06-12 morning-failure fixes: content-date windowing, chunk cap,
+    wall-clock deadline. The incident: an 18-month gmail backfill (old message
+    dates, fresh ingested_at) made the ingestion-dated 25h window scan 111,878
+    chunks for ~6 hours."""
+
+    def test_backfilled_old_content_excluded_from_window(self):
+        m = _load_engine()
+        now = int(time.time())
+        db = _make_db([
+            {  # backfilled: ingested now, message from 90 days ago
+                "content": "old backfilled email body",
+                "ingested_at": now,
+                "date_modified": now - 90 * 86400,
+            },
+        ])
+        chunks = m._query_kb_chunks(db_path=db)
+        assert chunks == []
+
+    def test_recent_content_included_despite_old_ingestion(self):
+        m = _load_engine()
+        now = int(time.time())
+        db = _make_db([
+            {
+                "content": "fresh message ingested a while ago",
+                "ingested_at": now - 30 * 86400,
+                "date_modified": now - 3600,
+            },
+        ])
+        chunks = m._query_kb_chunks(db_path=db)
+        assert len(chunks) == 1
+
+    def test_null_dates_fall_back_to_ingested_at(self):
+        m = _load_engine()
+        now = int(time.time())
+        db = _make_db([
+            {"content": "undated row, fresh ingestion", "ingested_at": now},
+        ])
+        chunks = m._query_kb_chunks(db_path=db)
+        assert len(chunks) == 1
+
+    def test_hard_chunk_cap_enforced_newest_first(self):
+        m = _load_engine()
+        now = int(time.time())
+        rows = [
+            {
+                "content": f"msg {i}",
+                "source_id": f"s{i}",
+                "ingested_at": now,
+                "date_modified": now - i * 60,
+            }
+            for i in range(50)
+        ]
+        db = _make_db(rows)
+        chunks = m._query_kb_chunks(db_path=db, max_chunks=10)
+        assert len(chunks) == 10
+        # Newest content first: msg 0 has the most recent date_modified.
+        assert chunks[0]["content"] == "msg 0"
+
+    def test_pass4_deadline_already_past_scans_nothing(self):
+        m = _load_engine()
+        now = int(time.time())
+        db = _make_db([
+            {
+                "content": "We completed the sponsor deck task yesterday.",
+                "date_modified": now - 600,
+            },
+        ])
+        open_tasks = [{
+            "gid": "T1", "name": "Sponsor deck", "permalink_url": "http://x",
+            "assignee": {},
+        }]
+        gaps = m.pass4_stale_open_tasks(
+            open_tasks, db_path=db, deadline_monotonic=time.monotonic() - 1,
+        )
+        assert gaps == []
+
+    def test_reconcile_deadline_past_skips_all_passes(self):
+        m = _load_engine()
+        now = int(time.time())
+        db = _make_db([
+            {"content": "I will send the contract tomorrow.", "date_modified": now - 600},
+        ])
+        gaps = m.reconcile(
+            [], [], db_path=db, passes=[1, 2, 3, 4],
+            deadline_monotonic=time.monotonic() - 1,
+        )
+        assert gaps == []
