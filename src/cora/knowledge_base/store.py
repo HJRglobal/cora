@@ -151,8 +151,16 @@ class KnowledgeBase:
         # can never retrieve (strict filter excludes NULL). Tag here at the choke point
         # so every source is covered. Conservative exactly-one-match rule -- ambiguous or
         # general-LEX content stays NULL (GM-level) by design.
+        # metadata.lex_gm_level=True opts a doc OUT of detection (2026-06-11): published
+        # DDD policy manuals are deliberately GM-level, but their text mentions
+        # sub-entity keywords (HCBS, Day Program) constantly -- auto-detection would
+        # scatter chunks of a cross-sub-entity manual into single sub-entity scopes.
         for doc in docs_list:
-            if doc.entity == "LEX" and doc.sub_entity is None:
+            if (
+                doc.entity == "LEX"
+                and doc.sub_entity is None
+                and not (doc.metadata or {}).get("lex_gm_level")
+            ):
                 detected = detect_sub_entity(doc.title, doc.content)
                 if detected:
                     doc.sub_entity = detected
