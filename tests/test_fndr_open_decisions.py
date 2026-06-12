@@ -92,13 +92,17 @@ def _parse_decisions(content: str, entity: str = "FNDR", today: date | None = No
             continue
 
         topic = block.split("\n", 1)[0][4:].strip()
+        if topic == "[Topic]":
+            continue  # the "How to use" template skeleton, not a real entry
 
         entity_match = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
         entry_entity_raw = entity_match.group(1).strip() if entity_match else "FNDR"
         if not _entity_matches(entry_entity_raw):
             continue
 
-        sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)", block)
+        # The template's "P0 / P1 / P2 / P3" alternatives line must not match;
+        # annotated real values ("P0 (decision Monday)") must.
+        sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
         if not sev_match:
             continue
         severity = sev_match.group(1)
@@ -508,6 +512,64 @@ class TestGmailDeepDiveSections:
         result = _parse_decisions(content)
         assert "Live P0" in result
         assert "Already resolved item" not in result
+
+
+class TestTemplateSkeleton:
+    """The 'How to use' template skeleton in decisions-pending.md must never
+    parse as a real entry. Live finding 2026-06-11 (strategy-memo dry run):
+    the skeleton's '- **Severity**: P0 / P1 / P2 / P3' alternatives line
+    matched the naive (P\\d) regex and leaked a bogus P0
+    ('[P0] [FNDR / HJRG / ...] [Topic]') into output. Same fix as
+    strategy_memo.gather_stalled_decisions (commit 9c6d3a0)."""
+
+    _SKELETON = (
+        "## How to use\n\n"
+        "Each entry follows this skeleton:\n\n"
+        "### [Topic]\n"
+        "- **Entity**: FNDR / HJRG / F3E / OSN / LEX / LEX-LLC\n"
+        "- **Question**: what specifically needs to be decided\n"
+        "- **Severity**: P0 / P1 / P2 / P3\n"
+        "- **Last touched**: YYYY-MM-DD\n"
+        "- **Owner of next nudge**: who is supposed to move this forward\n\n"
+    )
+
+    def test_skeleton_never_parsed(self):
+        content = (
+            "# Pending Decisions Queue\n\n"
+            + self._SKELETON
+            + "## Active\n\n"
+            "### Real P0\n"
+            "- **Entity**: F3E\n"
+            "- **Severity**: P0\n"
+            f"- **Last touched**: {_ago(5)}\n"
+            "- **Owner of next nudge**: Harrison\n"
+        )
+        result = _parse_decisions(content)
+        assert "Real P0" in result
+        assert "[Topic]" not in result
+        assert "who is supposed to move this forward" not in result
+
+    def test_annotated_severity_still_parsed(self):
+        content = (
+            "# Pending Decisions Queue\n\n"
+            + self._SKELETON
+            + "## Active\n\n"
+            "### Annotated call\n"
+            "- **Entity**: F3E\n"
+            "- **Severity**: P0 (decision moment is the Monday call)\n"
+            f"- **Last touched**: {_ago(3)}\n"
+            "- **Owner of next nudge**: Harrison\n"
+        )
+        result = _parse_decisions(content)
+        assert "Annotated call" in result
+
+    def test_handler_source_carries_both_guards(self):
+        """Drift guard: the REAL handler in tool_dispatch.py must carry the
+        same two guards as this file's mirror parser."""
+        src = (Path(__file__).resolve().parents[1] / "src" / "cora" / "tools"
+               / "tool_dispatch.py").read_text(encoding="utf-8")
+        assert 'if topic == "[Topic]":' in src
+        assert r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)" in src
 
 
 class TestOutputFormat:

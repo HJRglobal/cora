@@ -1678,6 +1678,8 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
             continue
 
         topic = block.split("\n", 1)[0][4:].strip()  # strip "### " prefix
+        if topic == "[Topic]":
+            continue  # the "How to use" template skeleton, not a real entry
 
         # Entity tag (required for filtering; absent = treat as FNDR/visible everywhere)
         entity_match = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
@@ -1685,7 +1687,9 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
         if not _entity_matches(entry_entity_raw):
             continue
 
-        sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)", block)
+        # The template's "P0 / P1 / P2 / P3" alternatives line must not match;
+        # annotated real values ("P0 (decision Monday)") must.
+        sev_match = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
         if not sev_match:
             continue
         severity = sev_match.group(1)
