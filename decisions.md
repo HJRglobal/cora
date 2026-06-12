@@ -1225,3 +1225,43 @@ one review surface and one approval doctrine.
 
 Commits `a473a2d` (feature) + `5c84df5` (quote-skip), 3,951 tests. Rollout gate: Harrison
 reviewed the 2026-06-11 live dry-run findings before the first scheduled fire (6/14).
+
+## D-048 -- Org Synthesis Phase 4: weekly founder strategy memo is Harrison-only, fail-closed, advisory (2026-06-11)
+
+**Decision:** The founder strategy layer (`src/cora/strategy_memo.py`, task
+"Cora - Strategy Memo", weekly Sunday 18:30 AZ -- one hour after friction mining so the
+memo sees that run's pending findings) produces a weekly portfolio synthesis memo.
+Locked rules:
+
+1. **Harrison-only distribution:** the memo is DM'd to `HARRISON_SLACK_ID` (hard-coded --
+   no recipient parameter exists) and filed to
+   `00-Founder/_strategy-memos/YYYY-MM/YYYY-MM-DD_fndr_weekly-strategy-memo.md` (nightly
+   static_md sync ingests it, so Cora can be held to her own past recommendations).
+   NEVER posted to any channel or any other user's DM -- source-level regression test
+   pins exactly one Slack post site.
+2. **Gather is deterministic and fail-soft PER SECTION:** cash (Standing ACTUALS via
+   gsheets, the Cash Flow Pulse source), pipeline posture (HubSpot F3E Retail + default),
+   stalled P0/P1 decisions (memory/decisions-pending.md), 14d Asana deadline radar,
+   efficiency backlog + pending friction findings, 7d KB momentum counts, heartbeat
+   one-liner. A dead source degrades to a stub line; it never kills the memo.
+3. **Snapshots before synthesis:** every gather is written to
+   `data/state/strategy-memo-snapshots/YYYY-MM-DD.json` (26 kept); deltas and multi-week
+   streaks ("cash down N weeks straight", "decision unmoved N memos running") are computed
+   from real snapshots. The first run says "first run -- no deltas yet" honestly.
+4. **Synthesis is Sonnet (claude-sonnet-4-6), FAIL-CLOSED:** the one place quality beats
+   cost. Any API error or PHI-flagged output falls back to a deterministic factual rollup
+   with a "SYNTHESIS UNAVAILABLE" note -- never a hallucinated memo.
+5. **LEX stays aggregate:** LEX cash/task counts may appear; LEX tasks are never itemized
+   (counted in an aggregate-only bucket); is_phi_risk drops flagged content everywhere;
+   Visibility CPA excluded; the synthesis prompt forbids client-level health information.
+6. **Advisory only (D-011):** recommendations carry reasoning + trade-off and route per the
+   holdco lens ("should this live at HJR Global?"); nothing auto-executes, no Asana or
+   decisions.md writes.
+7. **Standalone script-side stack (D-047 invariant):** strategy_memo never imports
+   bot-process modules (app/tool_dispatch/claude_client) -- subprocess regression test.
+   Shipping changes here NEVER requires a Cora restart.
+
+**Why:** Phase 4 (final phase) of the org-synthesis spec -- the founder-level oversight
+layer on top of Phases 1-3. Consumes Phase 3's approved efficiency-backlog entries in the
+recommendations section, closing the loop from detection to strategy. Rollout gate:
+Harrison reviews a --dry-run memo before the first scheduled fire.

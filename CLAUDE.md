@@ -8,6 +8,44 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Phase 4: founder strategy layer -- 2026-06-11 (SHIPPED, D-048; COMPLETES THE PROGRAM; dry-run review = rollout gate)
+
+New module `src/cora/strategy_memo.py` + `scripts/run_strategy_memo.py` + task
+**"Cora - Strategy Memo" (weekly Sunday 18:30 AZ)** -- slot checked free against the live
+registry (Friction Mining Sun 17:30 w/ 1h limit; nothing else Sunday PM; outside the
+03:00-09:00 stagger window; the 1h offset means the memo sees friction mining's
+just-proposed pending findings). **NO restart needed** -- standalone script, zero
+bot-process imports (subprocess-tested, D-047 invariant).
+
+- **GATHER (deterministic, fail-soft per section -- dead source = stub line, never a dead
+  memo):** per-entity cash + WoW delta (Standing ACTUALS via gsheets, the Cash Flow Pulse
+  source); pipeline posture (HubSpot F3E Retail `2313722582` + default: open totals, stage
+  mix, stage movement, deals idle 14d+); stalled P0/P1 decisions w/ ages
+  (decisions-pending.md); 14d Asana deadline radar across the slack-to-asana roster
+  (overdue counts per owner); the week's approved efficiency-backlog entries + pending
+  friction findings (Phase 3 output); 7d KB swept-content momentum per entity; heartbeat
+  one-liner.
+- **SNAPSHOT** every gather to `data/state/strategy-memo-snapshots/YYYY-MM-DD.json` (26
+  kept) -> real WoW deltas + multi-week streaks ("OSN cash down 2 weeks straight",
+  "decision unmoved 3 memos running"). First run says "first run -- no deltas yet".
+- **SYNTHESIZE with Sonnet (`claude-sonnet-4-6`) FAIL-CLOSED:** API error or PHI-flagged
+  output -> deterministic factual rollup w/ "SYNTHESIS UNAVAILABLE" note, never a
+  hallucinated memo. Memo shape: PORTFOLIO PULSE / WHAT CHANGED / RISKS & DEADLINES /
+  RECOMMENDATIONS (3-5, each w/ reasoning AND trade-off, [entity]-tagged, holdco lens,
+  consumes approved backlog entries) / WATCH LIST. ~600-900 words.
+- **DELIVER Harrison-ONLY:** DM to `U0B2RM2JYJ1` (hard-coded, no recipient param; a
+  source-level test pins exactly one Slack post site) + memo file
+  `00-Founder/_strategy-memos/YYYY-MM/YYYY-MM-DD_fndr_weekly-strategy-memo.md` (static_md
+  ingests it -> Cora can answer "what did last week's memo say about OSN").
+- **Hard rules (D-048):** LEX aggregate-only (LEX tasks counted, never itemized; is_phi_risk
+  everywhere; prompt forbids client-level health info); Visibility CPA excluded;
+  recommendations ADVISORY -- nothing auto-executes, no Asana/decisions.md writes (D-011).
+- 38 tests `tests/test_strategy_memo.py` incl. the subprocess no-bot-process-import guard +
+  Harrison-only delivery assertions. Ship: `deployment\ship-strategy-memo-2026-06-11.ps1`
+  (optional `-RegisterTask`); task registration: `deployment\setup-strategy-memo-task.ps1`.
+- **Rollout gate:** Harrison reviews `run_strategy_memo.py --dry-run` output before the
+  first scheduled fire. **Org Synthesis: ALL 4 PHASES COMPLETE.**
+
 ### [ORG SYNTHESIS] Phase 3: weekly efficiency mining pass -- 2026-06-11 (SHIPPED + REGISTERED, D-047; dry-run reviewed)
 
 Repo HEAD: `5c84df5` on `origin/main` (commits `a473a2d` + `5c84df5`) | full suite
