@@ -1114,3 +1114,29 @@ PDF parsing at 80 pages, silently truncating the Provider Manual.
 Shaun/Jen keep adding to (per the 2026-05-22 Cora x Lex direction). Backfill ingested the
 full tree same-day (83 files; see TOM for chunk counts) so the live compliance question
 (DES notices on live-in caregiver EVV date to Dec 2025) is answerable immediately.
+
+---
+
+## 2026-06-11 (addendum) -- Briefing rollout refined: review-driven per-user enablement via Harrison's reactions
+
+**Harrison directive (2026-06-11, same day as the d2 ship):** a single combined digest DM
+cannot be reviewed per user -- he wants ONE DM PER USER so he can thumbs the ones he wants
+running. Shipped as `ed6c212` (suite 3,903 passed / 41 skipped); supersedes the
+"single digest DM + -SendUsers full flip" mechanism in the entry above.
+
+**Mechanism (self-contained in the scheduled task, no bot restart):** default mode sends
+Harrison one review DM per user ("WOULD-BE BRIEFING -- name"). Each run STARTS by reading
+reactions on outstanding review messages via the Slack reactions API -- ONLY Harrison's
+reactions count (D-011 pattern). `:+1:` enables that user's real delivery from that run
+on; `:-1:` declines (user dropped from review AND delivery; re-review by removing them
+from the state file). State: `data/state/briefing-delivery.json` (enabled / declined /
+pending_reviews; a newer review message replaces the older pending entry for the same user;
+unanswered pendings expire after 30 days and the user simply reappears in review).
+`--send-users` remains as a force-deliver-all override; `--digest-only` forces review
+mode for everyone. No unsolicited DMs before a thumbs-up, ever.
+
+**Aaron Ferrucci note:** Harrison reports an Asana account was assigned 2026-06-11, but the
+API shows NO matching workspace user or Lexington-team member (likely invite pending his
+acceptance). Fail-closed: no slack-to-asana row until his GID is visible; org-roles note
+updated to say exactly that. His briefing/plate task section shows a fail-soft stub until
+then.

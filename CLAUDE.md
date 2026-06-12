@@ -74,11 +74,14 @@ Full entry: decisions.md 2026-06-11 (D-044 item 5 executed).
    owners (LEX never), stalled decisions Harrison-only, + the 25h recent-activity KB scan.
    Old `extra_data` fetchers (hubspot_f3e/hubspot_all/financial/deal_aging) retired with the
    config; no financial figures by plate doctrine (Cash Flow Pulse covers cash).
-3. **ROLLOUT (Harrison-locked): digest-to-Harrison-first.** Script DEFAULTS to digest mode --
-   the registered task `Cora - Daily Briefing` (7:30am AZ weekdays, action unchanged) will
-   send Harrison ONE review DM with every user's would-be briefing at its next fire. NO
-   per-user DMs until Harrison reviews and re-registers with
-   `setup-daily-briefing-task.ps1 -SendUsers`. Also: `--dry-run`, `--user <filter>`.
+3. **ROLLOUT (Harrison-locked, refined same day -> `ed6c212`): review-driven per-user
+   enablement.** Default mode sends Harrison ONE DM PER USER ("WOULD-BE BRIEFING -- name");
+   his reactions are FUNCTIONAL: each run reads reactions on outstanding review messages
+   (Harrison's only, D-011 pattern) -- :+1: enables that user's real delivery from that run
+   on, :-1: drops them from review. State: `data/state/briefing-delivery.json`. The
+   registered task (7:30am AZ weekdays, action unchanged) starts in pure review mode until
+   the first thumbs-up. `--send-users` = force-deliver all (rarely needed);
+   `--digest-only` = force review for everyone; `--dry-run`, `--user <filter>`.
 4. **Shared-builder fix:** `_plate_asana_section` canonicalizes sub-entity -> parent before
    the task filter (LEX-LLC/OSNGW fell through ENTITY_PROJECT_PREFIXES UNFILTERED -- matters
    since the 6/11 registry move of Shaun/Jen/Jeff/Aaron to LEX-LLC). Plate-tool side needs
@@ -93,10 +96,13 @@ Full entry: decisions.md 2026-06-11 (D-044 item 5 executed).
    uncommitted nudge-guard WIP in the same file -- their working-tree changes were never
    committed here. +7 tests.
 
-**⏰ Open:** (1) Harrison eyeballs the first digest DM, then flips `-SendUsers` (or says
-hold); (2) next clean restart activates the sub-entity plate fix + the pending LLC posting
-targets + five-custodian prompt language (558e768/c7bce7a); (3) plate exit-gate smoke
-re-runs (Shaun re-run, Matt leg) still outstanding from round 3.
+**⏰ Open:** (1) Harrison reviews the per-user briefing DMs at the next 7:30am fire and
+:+1:'s the ones to enable -- enablement is automatic at the following run, no other action
+needed; (2) next clean restart activates the sub-entity plate fix + the pending LLC posting
+targets + five-custodian prompt language (558e768/c7bce7a); (3) **Aaron Ferrucci's Asana
+account is NOT yet visible via the API** (no workspace-user or Lexington-team entry --
+invite likely pending his acceptance); add his slack-to-asana row the moment his GID
+appears (live-reload, no restart).
 
 ### [ORG SYNTHESIS] Plate round 3: role-header determinism + section caps + reply-formatter shells -- 2026-06-11 (RESTART PENDING)
 
