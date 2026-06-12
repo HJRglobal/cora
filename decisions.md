@@ -1021,3 +1021,96 @@ UNFILTERED -- with the 6/11 registry move of Shaun/Jen/Jeff/Aaron to `entity: LE
 plates and briefings would have shown unscoped task lists. A sub-entity scope must never be
 wider than its parent's. Bot-loaded: the plate-tool side activates at the next restart; the
 briefing side is live at the task's next fire (fresh process).
+
+---
+
+## D-045 -- Closed-task nudge guard: fire-time completion re-check + permanent ledger exclusion (2026-06-11)
+
+**Context (Hannah report, #info-for-cora 2026-06-11):** Hannah received DAILY nudge comments
+on an Asana task completed a year prior ("Jimmy Bar - Potential Activation", closed
+2025-06-03, nudged every day 6/05-6/11). Root-cause investigation found THREE nudge sources,
+none of which re-checked completion at fire time:
+
+1. **Make.com scenario 4768887** ("[HJR] Asana Hygiene Nudges -- Overdue Task Comments",
+   created 6/04) -- THE OFFENDER. Its filter had two condition GROUPS, which Make ORs:
+   `(due_on < now-14d) OR (completed == false)` -- so any task overdue 14+ days passed even
+   when completed. It listed tasks without a completed_since filter, ran DAILY with no
+   throttle/ledger (violating the D-031 max 1 comment/task/7d doctrine), and posted via
+   Harrison's Asana connection (which is why ledger forensics showed nothing). Hannah was hit
+   as a follower on Harrison's tasks.
+2. The daily Cora job (run_asana_hygiene_nudges.py) -- candidates are incomplete-only
+   (completed_since=now) but nothing re-checked completion between listing and firing.
+   ALSO: the scheduled task "Cora - Asana Hygiene Nudges" is ENABLED and firing daily,
+   despite the 6/05 memory claiming it was disabled in favor of the Make scenario --
+   Cora + Make were BOTH nudging (Harrison to pick one owner; see TOM).
+3. The weekly hygiene-asana Cowork sweep -- throttle-ledger-aware but no fire-time
+   completion re-check.
+
+**Decision (Harrison-approved fix directive 2026-06-11):**
+
+1. **Shared chokepoint guard in `nudge_ledger.py`:** `closed_task_guard(task_gid)` runs at
+   fire time -- checks the ledger for a permanent exclusion first (no API call), then fetches
+   live `completed`/`completed_at` via the new `asana_client.get_task_completion`. Completed ->
+   skip + append a `reason="already_closed"` row. The exclusion is PERMANENT when completed_at
+   is older than 48h (`CLOSED_PERMANENT_AFTER_HOURS`) or missing; a just-closed task gets a
+   throttled row that re-evaluates later. Skip rows carry `last_nudged_at` deliberately so the
+   weekly sweep's existing lockout window honors them with zero SKILL changes. Fetch errors
+   fail OPEN (the nudge proceeds; a dead Asana API fails loudly at comment-post).
+2. **Make scenario 4768887 fixed in place:** filter conditions moved into ONE AND group
+   (`overdue 14d+ AND incomplete`) and cadence dropped daily -> weekly (604800s) to respect
+   the 1 comment/task/7d doctrine. Next exec 2026-06-18.
+3. **Weekly sweep SKILL.md patched** (OneDrive Scheduled/hygiene-asana): already_closed
+   permanent rows are never re-commented; live completion re-checked before any comment.
+
+**Doctrine locked:** Any automation that comments on Asana tasks MUST re-check the task's
+live completed status immediately before posting, and MUST consult/append the shared
+closure-nudges ledger. A task completed >48h ago is permanently excluded from all nudging.
+Make filter conditions that must ALL hold belong in ONE condition group -- separate groups
+are OR'd, and a wrong grouping turns a guard into a bypass.
+
+---
+
+## D-046 -- LEX Dump Folder: recurring recursive KB sync replaces the one-shot ingest (2026-06-11)
+
+**Context (Shaun, #lex-leadership 2026-06-11; Asana 1215643646634974):** Cora could not
+answer what DDD policy says about live-in caregivers' EVV responsibilities. The 2026-06-01
+ingest of the Shaun x Jen Lexington Dump Folder was a ONE-SHOT script with a hardcoded
+20-file list; the "DDD Policies" SHORTCUT added 6/04 (-> folder with the DDD Complete
+Provider/Operations/Medical/Behavior Supports/Eligibility manuals + a 57-file EVV Documents
+folder incl. EVV_Live-InCaregiverFAQ.pdf) was never picked up. The old script also capped
+PDF parsing at 80 pages, silently truncating the Provider Manual.
+
+**Decision (Harrison-approved 2026-06-11):**
+
+1. **`scripts/run_lex_dump_folder_sync.py`** replaces `ingest_dump_folder.py`: recursive
+   enumeration (follows folder shortcuts, depth-capped), watermark-incremental
+   (sync_state source `lex_dump_folder`, --backfill to force), no PDF page cap (2000-page
+   sanity bound), >60MB files skipped with a logged note. Scheduled task
+   **"Cora - LEX Dump Folder Sync"** daily 4:45am AZ (registered, non-elevated OK).
+2. **Tagging:** entity=LEX everywhere. Files inside the curated DDD Policies tree
+   (published AHCCCS/DES policy docs) -> sub_entity=NULL (GM-level) with
+   `metadata.lex_gm_level=True`; everything else keeps LEX-LLC (tightest). A filename that
+   looks like a client record (progress report / assessment / intake form...) is forced to
+   LEX-LLC even inside the policy tree -- fail-closed against drift.
+3. **store.py Step 0 opt-out:** `metadata.lex_gm_level=True` blocks LEX sub-entity
+   auto-detection. Published manuals mention HCBS/Day Program constantly; auto-detection
+   would scatter a cross-sub-entity manual's chunks into single sub-entity scopes.
+4. **PHI guard posture:** `phi_guard.is_phi_risk` runs per chunk; the count is logged and
+   stored in `metadata.phi_risk_chunks`. For the curated policy tree it is an AUDIT signal,
+   not a scope downgrade -- published manuals trip the program-keyword patterns
+   (ahcccs/medicaid/assessment) on most chunks BY CONSTRUCTION because they are manuals
+   ABOUT those topics. Keyword PHI detection cannot distinguish policy-about-PHI from
+   actual PHI; the compensating controls are the LEX-LLC default outside the tree, the
+   client-record filename rule inside it, and the unchanged response-layer guards
+   (prompts + custodian gate + sibling/cross-entity guards).
+5. **Known visibility tension (flagged, not resolved here):** GM-level (NULL) chunks are
+   excluded from #llc-*/#lts-*/#lbhs-*/#lla-* by the locked strict filter -- and the LLC
+   team (Shaun/Jen/Jeff/Aaron) left #lex-leadership on 6/11 per the LLC routing directive.
+   The DDD manuals are therefore invisible in the channels that team now lives in.
+   Harrison decides: published-policy carve-out in the strict filter, or re-tag the DDD
+   tree to LEX-LLC.
+
+**Reason:** Recurring coverage beats one-shot lists -- the folder is a living dump that
+Shaun/Jen keep adding to (per the 2026-05-22 Cora x Lex direction). Backfill ingested the
+full tree same-day (83 files; see TOM for chunk counts) so the live compliance question
+(DES notices on live-in caregiver EVV date to Dec 2025) is answerable immediately.

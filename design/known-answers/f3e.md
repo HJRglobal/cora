@@ -4,7 +4,7 @@ _Compiled from Cora knowledge-gap reviews. Read alongside CLAUDE.md and founder 
 
 ## Routing rules
 
-(empty - rules added as Harrison flags ROUTE: entries in digests)
+**KB contributors (Harrison-approved):** Alex Cordova (`U0B3VGWJTMJ`, alex@f3energy.com) is an approved KB contributor for F3E content — sponsorships, athlete contracts, account/athlete affairs (Harrison directive in #f3-sponsorships, 2026-06-10). Facts he supplies in F3E channels may be treated as authoritative F3E operational knowledge; money/contract DECISIONS still escalate to Harrison.
 
 ## Known facts
 
@@ -16,6 +16,34 @@ _Compiled from Cora knowledge-gap reviews. Read alongside CLAUDE.md and founder 
 - Reports to Alex Cordova
 - F3E-scoped; no access to financials or cap table details
 - When someone asks "who handles F3 events?" or "who is doing activations?" — the answer is Elena (with Alex)
+
+### MMA Lab x F3 Energy Partnership Agreement (locked, approved by Harrison 2026-06-03; committed to KB 2026-06-11 per Harrison's 2026-06-10 in-thread approval)
+
+_Source: Alex Cordova summary in #f3-sponsorships 2026-06-10; Harrison approved in-thread. Counterparties: John and Destiny at MMA Lab._
+
+- **Sponsorship:** up to 50 MMA Lab Elite athletes at $125/athlete/month for gym memberships.
+- **Per-athlete deliverables:** 1 dedicated F3 feed post + 2 F3-related Instagram Stories per month.
+- **MMA Lab additional exposure:** monthly "F3 Technique of the Month" videos (UFC/high-profile athletes in F3 gear); content amplification via The MMA Lab, MMA Lab Elite, and Between Rounds Podcast channels (reposts, stories, collabs); F3 product placement + branding during Between Rounds Podcast episodes.
+- **F3 assets in the gym:** cage tarp in exchange for logo placement; $10,000 goodwill investment funding a dedicated F3 retail area + branded refrigerator inside MMA Lab (permanent retail presence).
+- **Tracking:** F3 Fighter IG Tracking Spreadsheet (`1tPpsdUrvXaYq7Cz77L5yYwEC6plptO_xcGY3JncPK28`). Monthly reporting: athlete compliance, content performance, additional MMA Lab exposure, optimization opportunities. John + Destiny send monthly sales reports + fighter deliverable analytics to Alex; Alex reviews monthly and presents ROI to Harrison (recurring Asana task `1215559426437365`, due 1st of month).
+- **Open flags (as of 2026-06-10):** roster is 61 fighters — 11 above the "up to 50" cap ($7,625/mo max at 61 vs the cap) — Harrison to confirm coverage or revisit cap; May compliance was 1/61 (Rodrick Agyeman only); tracker does not yet capture the additional MMA Lab exposure deliverables (Technique of the Month, podcast, reposts).
+- Deliverable credit rule still applies: a post counts ONLY with an @f3energy media tag (D-025); hashtag-only posts do not qualify.
+
+### Micky Scala — Athlete Endorsement Agreement (committed 2026-06-11; full text supplied by Alex Cordova in #f3-athletes 2026-06-10)
+
+- **Parties/term:** F3 Enterprises Inc. x Micky Scala, effective 08/01/2025, 1-year term (option to extend by mutual agreement) → expires ~08/01/2026. "At Will" framing with 30-day written-notice termination either way (notice to service@f3energy.com); auto-termination on retirement or doping determination.
+- **Payment:** $4,800 total — 12 monthly payments of $400 ($400 on execution, then 1st of month from 09/01/2025), ACH. Commission: if 10% of gross sales via his code exceeds the $400 monthly rate, he receives the excess; paid within 30 days of month close via UpPromote tracking.
+- **Discount code:** "MickyF3" — 10% (never below 10%; athletes notified before promo upticks). Affiliate profile in UpPromote.
+- **Monthly deliverables:** 2 in-feed posts (static/reel, reposted to IG stories and/or TikTok); 1 story series per week (4/mo) with F3 link + code; post F3 Energy once a week in stories; F3 link + code in bio at all times.
+- **One-time/ongoing:** 3 local public appearances (UFL or F3); ≥1 HJR Podcast guest appearance; 1 designated F3 photo shoot; carry/wear F3 during warmup/walkout when able; mention F3 when asked about sponsors; follow/like/comment @f3energy; repost giveaways; use brand hashtags (#F3Energy #FuelFocusFinish #EnergyDrink #F3Mood); product feedback; NIL license to F3 for website/social during contract year.
+- **Non-compete:** no competing energy/mood-relaxation/hydration/pre-workout/alkaline-water/protein-cookie brands; no competitor energy brand during performances. NDA survives 1 year past termination. Non-disparagement with $1/impression penalty clause.
+- Agreement PDF: Slack upload F0B6LQDF881 (f3_energy_official_athlete_micky_scala.pdf). Hannah flagged 5/27 that the agreement ends in 2-3 months — renewal/extension decision is Harrison's, managed by Alex.
+
+### Tierra Brandt — deliverables summary (committed 2026-06-11; per Alex Cordova #f3-athletes 2026-05-28)
+
+- **Monthly:** 2 in-feed posts (IG/TikTok); 4 story series (1/week) with F3 link + discount code; weekly F3 story mention; F3 link + code in bio at all times; follow/like/comment on F3 posts.
+- **Ongoing/one-time:** 3 public appearance events; 1 HJR Podcast appearance; 1 designated photo shoot; wear/carry F3 during warmups/walkouts; mention F3 when asked about sponsors; repost giveaways, brand hashtags, product feedback.
+- Contract management: Alex Cordova took over Tierra Brandt + Micky Scala contract management from Larry/BDM as of 2026-05-28. Agreements uploaded by Hannah in #f3-athletes 2026-05-27.
 
 ## F3 PMS Spot Color Reference
 

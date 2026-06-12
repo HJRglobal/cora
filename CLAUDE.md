@@ -8,6 +8,56 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [BUG FIX] Closed-task nudge guard -- Hannah's daily nudges on a year-closed task -- 2026-06-11 (SHIPPED, D-045)
+
+Hannah (#info-for-cora 6/11): daily nudges on "Jimmy Bar - Potential Activation", completed
+2025-06-03. **Offender = Make.com scenario 4768887**, NOT a Cora-side job: its Make filter had
+the completed check in a separate OR group -- `(overdue 14d+) OR (incomplete)` -- so completed
+overdue tasks passed; daily cadence, no throttle/ledger, posted as Harrison (Hannah hit as
+follower). Three-layer fix:
+
+1. **Make 4768887 fixed in place**: single AND group + cadence daily -> WEEKLY (next exec
+   6/18) per the 1 comment/task/7d doctrine.
+2. **Cora chokepoint**: `nudge_ledger.closed_task_guard()` -- fire-time live completion
+   re-check via new `asana_client.get_task_completion`; completed -> skip + ledger row
+   `reason="already_closed"` (PERMANENT when completed_at >48h old); wired into
+   run_asana_hygiene_nudges before every post; skip rows carry last_nudged_at so the weekly
+   sweep's lockout inherits them for free. Fetch errors fail open.
+3. **Weekly hygiene-asana SKILL.md patched** (OneDrive): permanent already_closed rows never
+   re-commented + live completion re-check before any comment.
+
+**WARNING -- OWNERSHIP DRIFT FOR HARRISON**: the scheduled task "Cora - Asana Hygiene Nudges"
+is ENABLED and firing daily (6:30am, ledger rows 6/08-6/11) DESPITE the 6/05 memory saying it
+was disabled in favor of the Make scenario -- both have been nudging. Pick one owner: the
+Cora job is the smarter one (all users, ledger, KB-signal check, throttles); the Make
+scenario covers only Harrison's tasks with none of that. Recommend deactivating Make 4768887.
+Hannah replied-to in #info-for-cora. Full record: D-045.
+
+### [LEX + KB] DDD manuals + EVV docs LIVE via recurring dump-folder sync -- 2026-06-11 (SHIPPED, D-046; closes Asana 1215643646634974)
+
+Shaun's live-in caregiver EVV question now answerable: **83 files / 3,978 chunks** ingested
+(was 20 files one-shot). The 6/04 "DDD Policies" SHORTCUT (never indexed) held the DDD
+Complete Provider (410 chunks) / Operations (531) / Medical (1,087) / Behavior Supports /
+Eligibility manuals + 57 EVV docs incl. EVV_Live-InCaregiverFAQ.pdf. Old script's 80-page
+PDF cap had truncated even the one manual it did ingest.
+
+- **`scripts/run_lex_dump_folder_sync.py`** (replaces ingest_dump_folder.py): recursive +
+  shortcut-following, watermark-incremental, full PDF parse, >60MB skip-with-note. Task
+  **"Cora - LEX Dump Folder Sync"** daily 4:45am AZ REGISTERED (non-elevated OK).
+- **Tagging**: DDD Policies tree -> GM-level (sub_entity NULL + `metadata.lex_gm_level=True`
+  -- new store Step 0 opt-out so auto-detection can't scatter manual chunks); dump root
+  stays LEX-LLC; client-record-looking filenames forced LEX-LLC even in the tree. Legacy
+  one-shot `{fid}:chunkN` rows cleaned (0 remain).
+- **PHI guard**: per-chunk is_phi_risk audit logged + stored in metadata.phi_risk_chunks
+  (policy manuals trip program keywords by construction -- see D-046 posture).
+- **Gmail related check PASSED**: Lex mailboxes enabled in monitored-email-accounts.yaml;
+  KB already holds `gmail | LEX | "EVV Paper Timesheet Attestation"` (mentions DDD-2101A).
+- **WARNING -- visibility tension for Harrison (D-046 item 5)**: GM-level chunks are strictly
+  excluded from #llc-*/#lts-* channels, and Shaun/Jen/Jeff/Aaron LEFT #lex-leadership 6/11
+  per the LLC routing directive -- the manuals are invisible where that team now lives
+  (partial mitigation: the dump-root Provider Manual copy is LEX-LLC-tagged, so LLC channels
+  have that one). Decide: published-policy carve-out in the strict filter vs re-tag the tree.
+
 ### [ORG SYNTHESIS] Phase 2 deliverable 2: briefing rework -- role-briefing-config.yaml RETIRED -- 2026-06-11 (SHIPPED; DIGEST REVIEW PENDING)
 
 Full suite **3,875 passed / 41 skipped** (+11). Ship:
