@@ -155,6 +155,23 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
 
+        elif update_type == "efficiency":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.friction_mining import apply_efficiency
+            ok, summary = apply_efficiency(payload)
+            title = (payload.get("title") or desc)[:160]
+            if ok:
+                msg = (
+                    f":bulb: *Gap executor* `[{uid_short}]` efficiency finding approved "
+                    f"({summary}):\n> {title}\n"
+                    f"> Route: {payload.get('route', '?')} | {payload.get('frequency', '')}"
+                )
+                log.info("gap-executor: efficiency applied uid=%s", uid_short)
+            else:
+                msg = f":warning: *Gap executor* `[{uid_short}]` efficiency apply failed: {summary}"
+                log.warning("gap-executor: efficiency failed uid=%s: %s", uid_short, summary)
+            _post_to_slack(slack_token, notify_ch, msg)
+
         elif update_type == "hubspot_note":
             deal_name = payload.get("deal_name", "(unknown deal)")
             deal_url = payload.get("deal_url", "")
