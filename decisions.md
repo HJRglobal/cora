@@ -1186,3 +1186,42 @@ closure-nudges ledger and the D-045 closed-task guard.
 re-activate Make 4768887 or create parallel nudge automations -- the 6/05-6/11 period proved
 that two unsynchronized sources double-comment and bypass the ledger. Any future nudge
 behavior change goes into the Cora job.
+
+## D-047 -- Org Synthesis Phase 3: weekly friction mining is proposal-only, ledger-deduped, LEX-excluded (2026-06-11)
+
+**Decision:** Efficiency mining (`src/cora/friction_mining.py`, task "Cora - Friction Mining",
+weekly Sunday 17:30 AZ) surfaces process-friction findings -- repeated questions, repeated
+manual steps, stale handoffs, cross-entity duplication -- as proposals into the existing 7am
+knowledge-review DM queue (`update_type="efficiency"`). Locked rules:
+
+1. **Proposal-only (D-011):** nothing auto-executes. Harrison's thumbs-up routes the finding
+   (via the run_knowledge_review.py executor) into `design/efficiency-backlog.md`
+   (append-only); thumbs-down just resolves it.
+2. **Fingerprints recorded at PROPOSAL time (D-030 pattern):** ledger
+   `data/state/friction-fingerprints.jsonl` -- a finding never re-proposes regardless of
+   outcome, including paraphrases (same-signal fuzzy >= 0.85). No dismissal hook needed.
+3. **LEX is excluded ENTIRELY at the SQL layer** (entity/sub_entity NOT LIKE 'LEX%') --
+   stronger than reconciliation passes 1-4. PHI-flagged content (is_phi_risk) is dropped for
+   ALL entities; Visibility CPA mentions excluded.
+4. **Haiku drafting FAIL-CLOSED** (gap_autofill pattern): any API/parse error, PHI in the
+   draft, or a not-worth-proposing verdict proposes nothing.
+5. **Caps:** max 5 proposals/run (highest confidence first), max 12 Haiku candidates/run,
+   bounded embedding pools.
+6. **org-roles is advisory routing context only** in the draft prompt (D-044) -- never an
+   access expansion. Recommendation routing follows D-029: rule-based mechanical -> Make.com
+   idea; language/context -> Cora tool idea; repeated questions -> known-answer/doc.
+7. **Quoted-reply lines are never counted** ('>'-prefixed sentences are copies, not
+   occurrences -- the first live dry-run counted one email line 134x via re-quotes before
+   this rule).
+8. **Standalone script-side stack:** friction_mining must never import bot-process modules
+   (app/tool_dispatch/claude_client) -- regression-tested via a subprocess import check.
+   Shipping changes here NEVER requires a Cora restart (the knowledge-review executor is
+   also script-side).
+
+**Why:** Phase 3 of the org-synthesis spec -- continuous learning at the entity level. The
+reconciliation engine catches tracking gaps; this pass catches PROCESS gaps (the "should
+this live at the holdco?" lens included). Routing through the existing Harrison gate keeps
+one review surface and one approval doctrine.
+
+Commits `a473a2d` (feature) + `5c84df5` (quote-skip), 3,951 tests. Rollout gate: Harrison
+reviewed the 2026-06-11 live dry-run findings before the first scheduled fire (6/14).

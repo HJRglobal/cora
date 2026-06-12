@@ -8,6 +8,44 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [ORG SYNTHESIS] Phase 3: weekly efficiency mining pass -- 2026-06-11 (SHIPPED + REGISTERED, D-047; dry-run reviewed)
+
+Repo HEAD: `5c84df5` on `origin/main` (commits `a473a2d` + `5c84df5`) | full suite
+**3,951 passed / 41 skipped** (+48) | **NO restart needed** -- friction_mining is a
+standalone scheduled script and the knowledge-review executor change is script-side too
+(zero bot-process files touched).
+
+New module `src/cora/friction_mining.py` + `scripts/run_friction_mining.py` + task
+**"Cora - Friction Mining" (weekly Sunday 17:30 AZ, REGISTERED, Ready, next fire 6/14)** --
+slot checked free (Channel Health Monitor is Sun 4am; outside the 03:00-09:00 window;
+Sunday-evening proposals ride Monday's 7am knowledge-review DM).
+
+- **Four detectors over the swept corpus** (slack/gmail/fireflies chunks, 14d) + Cora's own
+  question logs (knowledge-gaps.jsonl + semantic_cache): repeated_question (3+ similar asks,
+  embedding-clustered), repeated_manual_steps (recurrence + manual-action cues), stale_handoff
+  (request aged 7d+ with no similar follow-up; reuses reconciliation cosine helpers),
+  cross_entity_duplication (same vendor/spend in 2+ entities -- the holdco lens).
+- **Everything Harrison-gated (D-011):** each finding -> ONE proposal via
+  `knowledge_review.propose_update(update_type="efficiency")`, max 5/run highest-confidence
+  first. Thumbs-up -> executor appends to `design/efficiency-backlog.md`; fingerprint ledger
+  (`data/state/friction-fingerprints.jsonl`, written at proposal time, D-030) means a finding
+  never re-proposes regardless of outcome (exact + same-signal fuzzy >= 0.85).
+- **Hard exclusions:** LEX/LEX-* excluded at the SQL layer entirely; PHI-flagged content
+  dropped for ALL entities; Visibility CPA excluded; Haiku drafting FAIL-CLOSED; org-roles
+  advisory-only in the draft prompt (D-044); D-029 routing (mechanical -> Make.com idea,
+  language -> Cora tool idea).
+- **Live dry-run quality fix (commit `5c84df5`):** email quoted-reply lines ('>'-prefixed)
+  are copies, not re-asks -- the first dry-run counted one line 134x via re-quotes; now
+  skipped in all four detectors.
+- **Dry-run reviewed 2026-06-11 (the rollout gate):** 134,760 chunks -> 111 raw findings ->
+  5 proposals, all HIGH: Cox bill email flood (166 emails/14d -> Make.com filter), check
+  reconciliation SOP, F3E Anaheim address known-answer, Asana digest notification config,
+  BDM weekly sheets automation. If these look wrong, disable before Sunday:
+  `schtasks /Change /TN "Cora - Friction Mining" /Disable`.
+- 49 tests `tests/test_friction_mining.py` incl. a subprocess no-bot-process-import guard.
+  Doctrine: D-047. **Next Org Synthesis build: Phase 4 -- founder strategy layer** (weekly
+  portfolio synthesis memo; can consume approved efficiency-backlog entries).
+
 ### [BUG FIX] Closed-task nudge guard -- Hannah's daily nudges on a year-closed task -- 2026-06-11 (SHIPPED, D-045)
 
 Hannah (#info-for-cora 6/11): daily nudges on "Jimmy Bar - Potential Activation", completed
