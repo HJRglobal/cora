@@ -8,6 +8,35 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [BUG FIX] Plain-DM Q&A was UNREACHABLE -- OSN shift scheduler swallowed every DM -- 2026-06-11 (SHIPPED; restart required)
+
+Found by the Phase 5 exit-gate smoke: Harrison DM'd "Cora, remember the Tucson stove
+vendor is Apex Appliance" 4x and got the shift-scheduler greeting ("Hi! I can help you
+submit your availability...") instead. ROOT CAUSE: **Slack does not deliver app_mention
+events for IMs**, so the message-event DM branch is the ONLY DM entry point -- and its
+routing sent every DM that wasn't a gap-ask reply or an explicit "pull up my emails"
+straight to `osn_shift_handler.handle_dm`. Plain DM Q&A (and with it the notes write
+path, the plate tool in DMs, everything) has NEVER had a route; older TOM claims that
+"DMs flow through _dispatch_qa" were true only for the Tier-2 retrieval branch.
+
+**Fix (app.py):** `_dm_is_shift_message` -- the scheduler keeps users mid availability
+flow (DM state step != idle) and explicit scheduler phrases ("submit availability",
+"my schedule", "my shifts", "when do i work"); EVERYTHING ELSE runs the new
+`_handle_dm_qa`: full handle_mention guard sequence (rate limit, user_access incl. PHI
+custodian relaxation w/ is_dm=True, help intent, sibling + cross-entity guards), then
+`_dispatch_qa` with `channel_name="dm"`. Entity = the asker's org-roles primary entity
+(ADVISORY pick of which context to load -- user_access still enforces; unknown users
+fall back to FNDR = exactly the catch-all-channel posture; Harrison = FNDR). DM replies
+post to the main conversation (no threading -- people type in the composer), and
+conversation context (e.g. the "yes" confirming a staged write) comes from
+`_fetch_dm_history` over conversations_history (merged alternating turns, same rules
+as _fetch_thread_history). +17 tests `tests/test_dm_qa_routing.py`.
+
+**Behavior change to know:** a bare "schedule"/"hours"/"submit" DM no longer triggers
+the scheduler greeting (those words are common in normal questions); OSN employees are
+nudged with the exact phrase "submit availability", which still routes correctly, and
+mid-flow turns are never hijacked.
+
 ### [ORG SYNTHESIS] Phase 5 d1: personal notes (write + read) -- 2026-06-11 (SHIPPED + LIVE, D-049; commit `01a12ed`, restarted ~21:59 AZ)
 
 Any teammate can now teach Cora a personal note -- "Cora, remember X" / "note that X" --

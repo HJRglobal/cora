@@ -1090,6 +1090,156 @@ def _handle_note(
     )
 
 
+# ── Plain-DM Q&A (fixed 2026-06-11) ──────────────────────────────────────────
+# Scheduler phrases that keep a DM on the OSN shift handler when the user is
+# NOT mid-flow. Employees are nudged with the exact phrase "submit
+# availability"; everything else in an idle DM is a question for Cora.
+_SHIFT_DM_TRIGGERS = (
+    "submit availability", "my availability", "availability",
+    "my schedule", "my shifts", "when do i work",
+)
+
+
+def _dm_is_shift_message(user_id: str, text: str) -> bool:
+    """True when a plain DM belongs to the OSN shift scheduler.
+
+    Mid-flow users (DM state step != idle) stay with the scheduler
+    unconditionally so multi-step availability submission is never hijacked by
+    the Q&A pipeline. Idle users route there only on an explicit scheduler
+    phrase.
+    """
+    try:
+        if osn_shift_handler.get_dm_state(user_id).get("step", "idle") != "idle":
+            return True
+    except Exception:  # noqa: BLE001 — scheduler state must never break DMs
+        log.warning("dm_routing: shift-state lookup failed for user=%s", user_id)
+    t = (text or "").lower()
+    return any(kw in t for kw in _SHIFT_DM_TRIGGERS)
+
+
+def _fetch_dm_history(client, channel_id: str, current_msg_ts: str, limit: int = 10) -> list[dict]:
+    """Prior messages of a DM conversation in Claude format (oldest first).
+
+    DMs have no reliable thread structure — people type in the main composer —
+    so conversation context (e.g. the 'yes' confirming a staged write) comes
+    from the channel history itself. Best-effort: errors return [].
+    """
+    try:
+        resp = client.conversations_history(channel=channel_id, limit=limit)
+        raw_messages = resp.get("messages", [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("dm_history: conversations_history failed channel=%s: %s", channel_id, exc)
+        return []
+
+    bot_id = _CORA_BOT_USER_ID
+    history: list[dict] = []
+    for msg in reversed(raw_messages):  # API returns newest first
+        if msg.get("ts") == current_msg_ts:
+            continue  # the current message is appended as the final user turn
+        if msg.get("subtype"):
+            continue
+        text = _MENTION_RE.sub("", msg.get("text", "")).strip()
+        if not text:
+            continue
+        is_bot = bool(msg.get("bot_id")) or (bot_id and msg.get("user") == bot_id)
+        history.append({"role": "assistant" if is_bot else "user", "content": text})
+
+    # Anthropic requires alternating turns starting with user — same merge
+    # rules as _fetch_thread_history.
+    merged: list[dict] = []
+    for turn in history:
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["content"] += "\n" + turn["content"]
+        else:
+            merged.append({"role": turn["role"], "content": turn["content"]})
+    while merged and merged[0]["role"] == "assistant":
+        merged.pop(0)
+    return merged
+
+
+def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
+    """Run the full Q&A pipeline for a plain DM.
+
+    Mirrors handle_mention's guard sequence (rate limit, user_access incl. the
+    PHI custodian relaxation, help intent, sibling + cross-entity guards) —
+    none of them are skipped just because the surface is a DM.
+
+    Entity scope: the asker's primary entity from org-roles. The registry is
+    ADVISORY (D-044) and is used here only to pick WHICH entity context to
+    load — user_access.check_access still enforces authorization against that
+    entity. Unknown users fall back to FNDR, which is exactly the catch-all
+    channel posture (is_authorized allows unknown users FNDR/HJRG only, and
+    every topic block still applies). Harrison is FNDR as everywhere else.
+    """
+    dm_channel = event.get("channel", user_id)
+    current_ts = event.get("ts", "")
+
+    allowed, _cap = rate_limiter.check(user_id, dm_channel)
+    if not allowed:
+        try:
+            client.chat_postMessage(
+                channel=dm_channel,
+                text="You've hit the rate limit. Try again in a bit.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    _resolve_bot_user_id(client)
+
+    role = org_roles.get_role(user_id)
+    entity = (getattr(role, "primary_entity", "") or "").strip() or "FNDR"
+    if user_id == _FOUNDER_ID:
+        entity = "FNDR"
+
+    def _say(**kwargs) -> dict:
+        kwargs.pop("thread_ts", None)  # DM replies go to the main conversation
+        return client.chat_postMessage(channel=dm_channel, **kwargs)
+
+    # PHI custodian relaxation: DMs count as LEX scope for allowlisted
+    # custodians (lex_phi_access doctrine); everyone else unchanged.
+    phi_custodian = lex_phi_access.phi_allowed(user_id, entity, is_dm=True)
+    access_block = user_access.check_access(
+        user_id, entity, text, phi_custodian=phi_custodian
+    )
+    if access_block:
+        log.info("dm_qa: user_access blocked user=%s entity=%s", user_id, entity)
+        _say(text=access_block, unfurl_links=False, unfurl_media=False)
+        return
+
+    if help_responder.is_help_intent(text):
+        function = channel_classifier.classify_function("dm")
+        tier = channel_classifier.tier_label(entity, function)
+        _say(text=help_responder.build_message(entity, function, tier),
+             unfurl_links=False, unfurl_media=False)
+        return
+
+    sibling_redirect = sibling_guard.check_redirect(entity, text)
+    if sibling_redirect:
+        _say(text=sibling_redirect, unfurl_links=False, unfurl_media=False)
+        return
+
+    cross_redirect = cross_entity_guard.check_cross_entity(text, entity)
+    if cross_redirect:
+        _say(text=cross_redirect, unfurl_links=False, unfurl_media=False)
+        return
+
+    log.info("dm_qa routed user=%s entity=%s text=%.80s", user_id, entity, text)
+
+    _dispatch_qa(
+        channel_id=dm_channel,
+        channel_name="dm",
+        user_id=user_id,
+        user_message=text,
+        reply_thread_ts=None,  # _say drops thread_ts — replies stay top-level
+        entity=entity,
+        client=client,
+        say=_say,
+        prior_messages=_fetch_dm_history(client, dm_channel, current_ts),
+        root_thread_ts=current_ts,
+    )
+
+
 # Message event handler — correction capture + active-thread follow-up routing.
 # Bolt requires an explicit event listener for "message" events.
 @app.event("message")
@@ -1174,8 +1324,18 @@ def handle_message_event(event: dict, client) -> None:
                     root_thread_ts=None,
                 )
                 return
-            log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
-            osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+            # ── Plain-DM routing: shift scheduler vs Q&A (fixed 2026-06-11) ──
+            # Slack does NOT deliver app_mention events for IMs, so this branch
+            # is the ONLY DM entry point. Before this fix every non-retrieval
+            # DM fell through to the OSN shift scheduler greeting and DM Q&A
+            # (incl. the Phase 5 personal-notes write path) was unreachable.
+            # The scheduler keeps (a) users mid availability flow and (b)
+            # explicit scheduler phrases; everything else is a Q&A question.
+            if _dm_is_shift_message(user_id, text):
+                log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
+                osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+                return
+            _handle_dm_qa(event, client, user_id, text)
         return
 
     # Hard block: never respond in permanently blocked channels
