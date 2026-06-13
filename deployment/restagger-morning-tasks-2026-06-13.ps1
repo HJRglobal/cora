@@ -29,7 +29,13 @@ $moves = @(
   @{ Name = 'cowork-cora-decision-capture';   Old = '07:00'; New = '07:15' },
   @{ Name = 'cowork-cora-fireflies-coverage'; Old = '08:00'; New = '08:10' },
   @{ Name = 'cowork-cora-influencer-digest';  Old = '08:00'; New = '08:20' },
-  @{ Name = 'cowork-cora-channel-sweep';      Old = '08:30'; New = '08:40' }
+  @{ Name = 'cowork-cora-channel-sweep';      Old = '08:30'; New = '08:40' },
+  # Added 2026-06-13 (second pass): the first run cleared 7 of 9 but left two.
+  # drive-extractor was not in the initial enumeration (surfaced once Channel
+  # Health Monitor moved off 04:00); influencer-overdue was omitted from the
+  # first move list. Re-running is safe -- already-moved tasks no-op (WARN).
+  @{ Name = 'cowork-cora-drive-extractor';            Old = '04:00'; New = '04:05' },
+  @{ Name = 'cowork-cora-influencer-overdue-alerts';  Old = '09:00'; New = '09:10' }
 )
 
 if ($WhatIfList) {
