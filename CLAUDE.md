@@ -8,6 +8,37 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [SHIPPED] 2026-06-13 6/13-sweep fixes -- B1 stagger (done), B3 grounding + B4 reply-formatter + D1 info-for-cora intake (B4/D1 RESTART PENDING)
+
+From the 2026-06-13 sweep audit, in three batches (all on origin/main, HEAD `3bc2788`):
+- **B1 (DONE, no restart):** scheduler de-collided across 03:00-09:00 AZ -- 11 morning
+  tasks moved to unique minutes via `deployment/restagger-morning-tasks-2026-06-13.ps1`
+  (idempotent; verified live "OK: no two ... share a clock time"). Surfaced a stray
+  `cowork-cora-drive-extractor` at 04:00 (moved to 04:05) that may be a stale sibling of
+  `Cora - Drive Sweep` (06:00) / `cowork-cora-kb-sync-drive` (04:30) -- worth a look.
+- **B3 (`a4c32cd`, SCRIPT-SIDE, live at next capture fire):** `fireflies_action_extractor`
+  roster-grounds Haiku action items -- drops FYI/completed (`is_actionable`), validates
+  assignee against org-roles (off-roster -> unassigned; precise matcher, NO unanchored
+  substring), caps title length. NOTE: "Cora - Meeting Action Capture" is currently
+  DISABLED, so B3 stays dormant until that task is re-enabled.
+- **B4 (`a4c32cd`, BOT-LOADED, RESTART PENDING):** `reply_formatter` also flattens markdown
+  list markers + backticks/code-fences (280-char cap stays log-only, already correct).
+- **D1 (`a4c32cd`, BOT-LOADED, RESTART PENDING):** messages in #info-for-cora (`C0B5BNP6YKY`)
+  now route into the Harrison-gated knowledge-review queue (GENERIC update, no canonical
+  auto-write -- D-011), PHI refused incl. the D-050 LEX admin-PHI class for LEX-entity
+  askers, entity from org-roles, with a "logged-pending-review" ack. The path did NOT
+  exist before (channel posts were silently dropped).
+
+A 37-agent adversarial review caught + fixed 6 real bugs before commit: substring
+mis-assign (Lex->Alex), canonicalization GID regression (Jen/Jennifer), string-`false`
+is_actionable, the missing LEX-PHI gate, the weekend never-DM'd auto-dismiss in
+`run_knowledge_review` (Step 0 now gated on `dm_message_ts`; script-side), and a
+non-string-assignee crash. Full suite **4144 passed / 41 skipped**.
+
+**TO ACTIVATE B4 + D1:** from elevated PS, `.\deployment\restart-cora.ps1` (new reusable
+clean-restart helper: import-smoke gate + doctrine-5 kill + single-instance verify). This
+SUPERSEDES the [VERIFY] note below for B4/D1 ONLY -- D-050 / DM-fix / Phase-5-d1 stay live.
+
 ### [VERIFY] 2026-06-13 D-050 + plain-DM Q&A fix + Phase 5 d1 are ALL LIVE -- NO restart pending (the "RESTART REQUIRED" labels below are STALE)
 
 Read-only probe this session (no restart, no writes). The live `cora.exe` started
