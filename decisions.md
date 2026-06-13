@@ -1363,3 +1363,83 @@ keywords. +19 tests including the exact bug-string regression, preview-stage
 refusal, true-positive/negative sets, custodian-allowed, outside-LEX-not-flagged,
 the finance channel-scope pin, and an owner-exclusion adversarial identical-query
 pin. D-011 / D-044 untouched -- notes remain the user's own advisory data.
+
+## D-051 -- 6/13 sweep: meeting-capture grounding, reply-formatter lists/code, #info-for-cora intake, dismiss-gate fix (2026-06-13)
+
+**Context:** The 2026-06-13 sweep audit produced four changes -- B1 (scheduler
+stagger), B3 (fireflies action-item grounding), B4 (reply_formatter), D1
+(#info-for-cora intake). A 37-agent adversarial Workflow review of the diff
+(7 finder angles -> dedup -> 1-vote verify) caught 6 real bugs the green
+4132-test suite did NOT. Shipped a4c32cd (+ restart helper 3bc2788, TOM b4d0f5d);
+full suite 4144 passed / 41 skipped; B4+D1 restarted live 2026-06-13 ~14:09 AZ
+via the new deployment/restart-cora.ps1.
+
+**Decisions (doctrine):**
+
+1. **Roster-ground meeting-capture assignees by VALIDATION, never canonicalize.**
+   _ground_and_filter_items keeps the PARSED assignee name when it confidently
+   matches an org-roles person, and nulls it (unassigned) otherwise. Do NOT
+   substitute the canonical org-roles name: downstream _resolve_assignee_gid
+   matches against Fireflies attendee displayNames, and a legal name ("Jennifer
+   Mortensen") will not substring-match a nickname displayName ("Jen Mortensen")
+   -> silently orphaned task. Off-roster -> unassigned is the safe default;
+   mis-assignment is the failure to avoid.
+
+2. **Name matching must be ANCHORED -- no unbounded substring.** _match_roster_name
+   uses exact-full / exact-first-name(unambiguous) / first-name-prefix>=3(unique)
+   / fuzzy-0.88(unambiguous). The old unanchored `n in full_name` mapped short
+   off-roster tokens to whoever contained them: "Lex"->Alex Cordova, "Ann"->Hannah
+   Grant, "Al"->first-alphabetical, "Mort"->Jennifer Mortensen. Same family as
+   D-034: a guard that fires confidently on a non-confident match is worse than
+   no guard.
+
+3. **Booleans from an LLM may arrive as strings or 0/1 -- normalize, never
+   identity-compare.** `is_actionable is False` missed JSON `"false"` and `0`.
+   Use a normalizer (False / 0 / "false"/"no"/"none"/"0" -> not actionable;
+   missing/None -> actionable). Applies to any LLM-emitted boolean flag.
+
+4. **#info-for-cora is a Harrison-gated knowledge intake, never an auto-write.**
+   Channel messages route into knowledge_review.propose_update as a GENERIC
+   pending item (surfaces in the 7am review DM; on thumbs-up the GENERIC executor
+   posts to #hjrg-leadership -- NO canonical-memory auto-write; D-011 intact). PHI
+   refused at intake: is_phi_risk always, plus is_lex_billing_status_phi (D-050)
+   ONLY for a LEX-entity asker (scoped so a non-LEX business fact about a named
+   buyer's PO authorization is not over-refused). Entity = asker's org-roles
+   primary (FNDR fallback). Bot/edit/non-string messages ignored.
+
+5. **knowledge_review Step 0 must NOT auto-dismiss a never-DM'd PENDING entry.**
+   The 48h auto-dismiss is now gated on dm_message_ts (extracted, tested
+   _auto_dismiss_stale_pending): only entries Harrison was actually shown and left
+   unreacted for 48h are dismissed. A proposal created at an arbitrary time (an
+   #info-for-cora note Friday evening, next weekday review Monday 7am, >48h later)
+   was being dismissed BEFORE it was ever DM'd -- silent loss. Any source that
+   proposes PENDING-without-DM (gap_autofill, friction, this intake) relies on it.
+
+6. **reply_formatter also flattens markdown LIST markers + `inline code` / ```
+   fences``` (line-anchored, so mid-line " - " and hyphenated words survive); the
+   280-char cap stays LOG-ONLY (never hard-truncate -- truncation drops real
+   answer text). Non-string assignee coerced to None on the empty-roster path.**
+
+7. **deployment/restart-cora.ps1** is the reusable clean restart: import-smoke
+   gate (never restart into a broken import) + doctrine-5 kill filter
+   (\Scripts\cora.exe / cora.main) + single 3-process-instance verify. Activates
+   bot-loaded code at HEAD without a ship script's commit/pytest logic.
+
+8. **Scheduler: no two enabled Cora tasks share a clock minute in 03:00-09:00 AZ**
+   (the weekly-health stagger alarm). restagger-morning-tasks-2026-06-13.ps1
+   changes trigger START TIME only (preserves recurrence / Settings / Principal),
+   idempotent. Surfaced a stray cowork-cora-drive-extractor at 04:00 (moved to
+   04:05) -- possible stale sibling of Cora - Drive Sweep (06:00); open question.
+
+9. **.env hygiene (reinforces D-022 + the dead-man-ping incident):** a stray
+   `Klaviyo: pk_...` line (accidental paste; unused -- the only klaviyo reference
+   in code is klaviyo.com in an email skip-list) tripped python-dotenv ("could not
+   parse statement") on every startup; removed byte-safe (UTF-8 no-BOM). Every
+   .env line is KEY=VALUE -- no label:value pastes, no BOM; watch the import-smoke
+   for a dotenv parse warning after any .env edit.
+
+**Process note:** the adversarial diff review found 6 confirmed bugs a green suite
+missed (substring mis-assign, canonicalization GID regression, string-`false`
+is_actionable, missing LEX-PHI gate at intake, never-DM'd auto-dismiss,
+non-string-assignee crash). Lock: review significant diffs adversarially before
+committing.
