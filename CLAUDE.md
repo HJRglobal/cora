@@ -8,6 +8,30 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [VERIFY] 2026-06-13 D-050 + plain-DM Q&A fix + Phase 5 d1 are ALL LIVE -- NO restart pending (the "RESTART REQUIRED" labels below are STALE)
+
+Read-only probe this session (no restart, no writes). The live `cora.exe` started
+**6/12 22:41:35 AZ**, which post-dates every commit -- HEAD `ccb6d07` (D-050) was
+committed 22:31:56, its `.pyc` compiled 22:24 (pyc newer than source, both before the
+process start => no stale-pyc trap). That 22:41 restart loaded D-050, the two DM-Q&A
+fixes (`9e8e21f` / `a6a9804`), and Phase 5 d1 (`01a12ed`) together. Four converging checks:
+1. Behavioral probe of `user_notes.resolve_save_scope` with REAL ids -> Justin
+   `U0B3AEJCYGP` (non-custodian) in `#llc-finance` AND in a DM both REFUSED; Harrison
+   (custodian) allowed into the LEX store; the same string in an `#f3e-*` (non-LEX)
+   channel correctly NOT flagged; `is_phi_risk` still False (opt-in, not folded in). 7/7.
+2. mtime forensics: `phi_guard.py` / `user_notes.py` pyc newer than py, both pre-22:41
+   -> the running process holds D-050 bytecode (not a stale build).
+3. `tests/test_user_notes.py` D-050 subset: 27/27 pass on disk.
+4. The LIVE process logged `cora.user_notes: user_note SAVED` + `cora_remember SAVED`
+   at 10:54 AZ **today** -- the module that holds the gate is executing in prod now.
+
+Consequence: the coordinated D-050 ship-restart is **obsolete** -- it would activate
+nothing new. `e462883` (recon/briefing) is script-side and lives at the next fire
+regardless. Only FUTURE bot-loaded changes need a fresh restart. Do NOT re-fire
+`ship-phi-billing-gate-fix-2026-06-12.ps1 -Restart` to "activate" D-050. Optional human
+belt-and-suspenders re-test: a non-custodian posts "Cora, remember Bob Smith's billing
+authorization is pending" in `#llc-finance` -> must refuse.
+
 ### [BUG FIX] 2026-06-12 PHI save gate -- billing/authorization tied to a named individual now refused in LEX scope (SHIPPED; RESTART REQUIRED -- D-050)
 
 Live miss in `#llc-finance` (2026-06-12 15:05): Justin Moran (NOT a PHI custodian) said
