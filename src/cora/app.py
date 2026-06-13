@@ -32,6 +32,7 @@ from . import historical_access
 from . import finance_receipts
 from . import model_router
 from . import org_roles
+from . import phi_guard
 from .prompt_loader import load_prompt
 from . import rate_limiter
 from .reply_formatter import format_reply
@@ -167,6 +168,16 @@ def _entity_finance_channel(entity: str) -> str | None:
 
 # Resolved at first event via auth.test() - the bot's own user ID. Used to
 # filter reaction_added events down to "user reacted to a Cora message" only.
+# #info-for-cora intake channel (D1): user-fed facts here are routed into the
+# Harrison-gated knowledge-review queue instead of being dropped. Patchable in
+# tests via app_module.INFO_FOR_CORA_CHANNEL_ID.
+INFO_FOR_CORA_CHANNEL_ID = "C0B5BNP6YKY"
+_INFO_FOR_CORA_SKIP_SUBTYPES = frozenset({
+    "message_changed", "message_deleted", "channel_join", "channel_leave",
+    "channel_topic", "channel_purpose", "channel_name", "channel_archive",
+    "channel_unarchive", "bot_message", "thread_broadcast",
+})
+
 _CORA_BOT_USER_ID: str | None = None
 
 
@@ -1263,6 +1274,99 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
 
 # Message event handler — correction capture + active-thread follow-up routing.
 # Bolt requires an explicit event listener for "message" events.
+def _handle_info_for_cora(event: dict, client) -> None:
+    """Intake for #info-for-cora: route a user-fed fact into the Harrison-gated
+    knowledge-review queue so it surfaces in the next 7am review DM instead of
+    being silently dropped. NEVER auto-writes canonical memory (D-011) -- the
+    write is gated on Harrison's reaction (a GENERIC update posts to
+    #hjrg-leadership on approval). PHI is refused (it belongs in the EHR)."""
+    if event.get("bot_id") or event.get("subtype") in _INFO_FOR_CORA_SKIP_SUBTYPES:
+        return
+    user_id = event.get("user", "")
+    text = (event.get("text") or "").strip()
+    ts = event.get("ts", "")
+    if not user_id or not text or user_id == _CORA_BOT_USER_ID:
+        return
+
+    channel = event.get("channel", "")
+    reply_ts = event.get("thread_ts") or ts
+
+    def _ack(msg: str) -> None:
+        try:
+            client.chat_postMessage(
+                channel=channel, text=msg, thread_ts=reply_ts,
+                unfurl_links=False, unfurl_media=False,
+            )
+        except Exception as exc:  # noqa: BLE001 -- ack failure must not break intake
+            log.warning("info-for-cora: ack post failed: %s", exc)
+
+    # Entity = the asker's org-roles primary entity (advisory; FNDR fallback).
+    # Computed BEFORE the PHI gate so the LEX administrative-PHI augmentation
+    # can be scoped to LEX-entity askers.
+    entity, author_name = "FNDR", user_id
+    try:
+        rec = org_roles.get_role(user_id)
+        if rec:
+            author_name = rec.name or user_id
+            if rec.entity:
+                entity = rec.entity
+    except Exception as exc:  # noqa: BLE001
+        log.warning("info-for-cora: org_roles lookup failed: %s", exc)
+
+    # PHI never enters the canonical pipeline. Base clinical/identifier check
+    # always; for a LEX-entity asker also apply the D-050 administrative-PHI
+    # augmentation (a named person + billing/authorization/eligibility), which
+    # is_phi_risk does not cover. Scoped to LEX so an ordinary business fact
+    # about a named buyer's PO authorization in a non-LEX channel is not refused.
+    try:
+        is_phi = phi_guard.is_phi_risk(text)
+        if not is_phi and entity.upper().startswith("LEX"):
+            is_phi = phi_guard.is_lex_billing_status_phi(text)
+        if is_phi:
+            log.info("info-for-cora: PHI-flagged contribution refused user=%s", user_id)
+            _ack("Thanks, but that reads like client / PHI information -- I can't capture "
+                 "that here. Client data belongs in the EHR, not in Cora's memory.")
+            return
+    except Exception as exc:  # noqa: BLE001 -- fail safe: drop rather than risk PHI
+        log.warning("info-for-cora: phi check failed (dropping): %s", exc)
+        return
+
+    update_id = f"infocora-{ts or user_id}"
+    # Idempotency: Slack retries can deliver the same message ts more than once.
+    try:
+        if any(u.get("update_id") == update_id
+               for u in knowledge_review.load_proposed_updates()):
+            return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("info-for-cora: dedup check failed (continuing): %s", exc)
+
+    try:
+        knowledge_review.propose_update(
+            update_id=update_id,
+            update_type=knowledge_review.UPDATE_TYPE_GENERIC,
+            description=f"#info-for-cora from {author_name} ({entity}): {text[:240]}",
+            payload={
+                "text": text,
+                "author_id": user_id,
+                "author_name": author_name,
+                "entity": entity,
+                "channel": "info-for-cora",
+                "source": "info-for-cora",
+                "message_ts": ts,
+            },
+            source_evidence=text,
+            confidence="MED",
+        )
+    except Exception as exc:  # noqa: BLE001 -- intake must never break the bot
+        log.warning("info-for-cora: propose_update failed: %s", exc)
+        return
+
+    log.info("info-for-cora: queued contribution user=%s entity=%s id=%s",
+             user_id, entity, update_id)
+    _ack("Got it -- logged for Harrison's review. It won't become shared org "
+         "knowledge until he approves it.")
+
+
 @app.event("message")
 def handle_message_event(event: dict, client) -> None:
     """Thread reply handler: correction capture and active-thread follow-up routing.
@@ -1361,6 +1465,13 @@ def handle_message_event(event: dict, client) -> None:
 
     # Hard block: never respond in permanently blocked channels
     if _is_blocked_channel(event.get("channel", "")):
+        return
+
+    # #info-for-cora intake (D1): users post facts here; route them into the
+    # Harrison-gated knowledge-review queue (top-level AND thread replies), then
+    # stop -- this channel is intake-only, not a Q&A surface.
+    if event.get("channel", "") == INFO_FOR_CORA_CHANNEL_ID:
+        _handle_info_for_cora(event, client)
         return
 
     # Only interested in thread replies (has thread_ts != ts)

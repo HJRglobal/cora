@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from cora.tools.asana_client import (
     set_task_custom_fields,
 )
 from cora.tools.project_resolver import resolve_project as _resolve_project_smart
+from cora import org_roles
 
 log = logging.getLogger(__name__)
 
@@ -79,22 +81,41 @@ _TASK_NOTES_TEMPLATE = (
 # Haiku model for parsing (cost-efficient)
 _HAIKU_MODEL = "claude-haiku-4-5"
 
-# Haiku prompt for action item parsing
-_PARSE_PROMPT = """You are parsing meeting action items into structured tasks.
+# Max characters for a captured task title (post-processing hard cap).
+_MAX_TASK_LEN = 160
 
-Given the following raw action items text from a meeting, extract each distinct task
-and return a JSON array. Each element must have exactly these fields:
-  - "task": a clear, concise task description (string)
-  - "assignee_name": the person responsible by name (string or null if unclear)
-  - "due_mention": any date or timeframe mentioned for this task (string or null)
+# Haiku prompt for action item parsing. {roster} is the org roster (the only
+# valid assignees); {action_items_text} is the raw meeting text.
+_PARSE_PROMPT = """You are extracting ACTION ITEMS from meeting notes into structured tasks.
 
-Return ONLY valid JSON -- no markdown, no explanation. Example:
+The organization's people (the ONLY valid assignees) are:
+{roster}
+
+Rules:
+1. Output ONLY a valid JSON array -- no markdown, no explanation.
+2. Each element has exactly these fields:
+   - "task": a concise, forward-looking imperative (string)
+   - "assignee_name": the OWNER's name (string) or null
+   - "due_mention": any date/timeframe mentioned (string) or null
+   - "is_actionable": boolean
+3. "is_actionable" is true ONLY for a concrete action someone must still DO. Set
+   it false for status updates, recaps, FYIs, or anything already completed
+   ("Tommy sent the proposal" is NOT actionable; "Tommy to send the proposal" is).
+4. "task": do NOT include already-done clauses or restate the discussion. Keep it
+   under 140 characters.
+5. "assignee_name": infer who actually OWNS the task -- NOT whoever was speaking.
+   It MUST be one of the people listed above, written exactly as listed. If the
+   owner is unclear or is not on that list, use null. Never guess.
+6. Fix obvious speech-to-text errors using the people list and context (a garbled
+   name that clearly matches one listed person; an obvious word slip).
+
+Example:
 [
-  {{"task": "Send proposal to client", "assignee_name": "Tommy", "due_mention": "by Friday"}},
-  {{"task": "Update inventory spreadsheet", "assignee_name": null, "due_mention": null}}
+  {{"task": "Send the Q3 proposal to the client", "assignee_name": "Tommy Anderson", "due_mention": "by Friday", "is_actionable": true}},
+  {{"task": "Inventory sheet is already updated", "assignee_name": null, "due_mention": null, "is_actionable": false}}
 ]
 
-Action items text:
+Meeting notes / action items:
 {action_items_text}"""
 
 
@@ -267,6 +288,132 @@ def _resolve_assignee_gid(
 
 
 # ---------------------------------------------------------------------------
+# Roster grounding (B3) -- validate assignees against org-roles, drop FYIs,
+# cap title length. Keeps Cora from mis-assigning the speaker or inventing a
+# name out of a transcription slip.
+# ---------------------------------------------------------------------------
+
+def _roster_names() -> list[str]:
+    """Sorted unique person names from org-roles.yaml (the valid assignees)."""
+    try:
+        return sorted({r.name for r in org_roles.all_roles() if r.name})
+    except Exception as exc:  # noqa: BLE001 -- grounding must degrade gracefully
+        log.warning("org_roles roster unavailable: %s", exc)
+        return []
+
+
+def _match_roster_name(name: str | None, roster: list[str]) -> str | None:
+    """Map a spoken/parsed name to a canonical roster name, or None.
+
+    Match order (each step requires an UNAMBIGUOUS hit):
+      1. exact case-insensitive full name
+      2. exact first name (exactly one person has it)
+      3. first-name prefix, len >= 3 (e.g. "Jen" -> "Jennifer Mortensen")
+         resolving to exactly one person
+      4. fuzzy match (cutoff 0.88) against full + unambiguous first names, for
+         transcription slips ("Harrson" -> "Harrison Rogers")
+    None means no confident match -> leave the task unassigned rather than
+    mis-assign it. There is deliberately NO unanchored-substring rule: it mapped
+    short off-roster tokens like "Lex" -> "Alex Cordova", "Ann" -> "Hannah Grant",
+    "Al" -> first alphabetical match -- exactly the mis-assignment this layer
+    exists to prevent.
+    """
+    if not name or not roster:
+        return None
+    n = name.strip().lower()
+    if not n:
+        return None
+    # 1. exact full name
+    for r in roster:
+        if r.lower() == n:
+            return r
+    # first-name -> [full names] index
+    first_index: dict[str, list[str]] = {}
+    for r in roster:
+        parts = r.lower().split()
+        if parts:
+            first_index.setdefault(parts[0], []).append(r)
+    # 2. exact first name, unambiguous
+    if n in first_index and len(first_index[n]) == 1:
+        return first_index[n][0]
+    # 3. first-name prefix (>= 3 chars) resolving to exactly one person
+    if len(n) >= 3:
+        matched = {
+            full for fn, fulls in first_index.items()
+            if fn.startswith(n) for full in fulls
+        }
+        if len(matched) == 1:
+            return next(iter(matched))
+    # 4. fuzzy against full + unambiguous first names (transcription slips)
+    pool: dict[str, str] = {r.lower(): r for r in roster}
+    for fn, fulls in first_index.items():
+        if len(fulls) == 1:
+            pool.setdefault(fn, fulls[0])
+    close = difflib.get_close_matches(n, list(pool.keys()), n=1, cutoff=0.88)
+    return pool[close[0]] if close else None
+
+
+def _is_explicitly_not_actionable(value: object) -> bool:
+    """True only for an EXPLICIT falsey actionable flag. Missing/None defaults
+    to actionable (kept). Handles the LLM habit of emitting booleans as strings
+    or 0/1 -- 'false'/'no'/'none'/'0'/0/False all mean not actionable."""
+    if value is None or value is True:
+        return False
+    if isinstance(value, bool):  # value is False here
+        return True
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"false", "no", "none", "0", "n"}
+    return False
+
+
+def _ground_and_filter_items(
+    items: list[dict[str, Any]], roster: list[str]
+) -> list[dict[str, Any]]:
+    """Apply B3 grounding to raw Haiku items.
+
+    - drop items whose is_actionable flag is explicitly falsey (FYIs / completed)
+    - VALIDATE assignee_name against the roster: keep the parsed name as-is when
+      it confidently matches a roster person, else None. We do NOT substitute the
+      canonical org-roles name -- the downstream GID resolver matches the name
+      against Fireflies attendee displayNames, and a nickname/displayName
+      ("Jen Mortensen") would not substring-match a canonical legal name
+      ("Jennifer Mortensen"), silently orphaning the task.
+    - coerce a non-string assignee to None so the downstream .lower() never crashes
+    - cap task length; drop empties
+    Returns the legacy {task, assignee_name, due_mention} shape.
+    """
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _is_explicitly_not_actionable(item.get("is_actionable")):
+            continue
+        task = str(item.get("task") or "").strip()
+        if not task:
+            continue
+        if len(task) > _MAX_TASK_LEN:
+            task = task[:_MAX_TASK_LEN].rstrip()
+        assignee = item.get("assignee_name")
+        if not isinstance(assignee, str):
+            assignee = None  # non-string (list/number) -> never crash downstream
+        else:
+            assignee = assignee.strip() or None
+            # Off-roster -> safer unassigned than mis-assigned. On a confident
+            # match keep the PARSED name (not canonical) so the downstream
+            # displayName resolver still works.
+            if roster and assignee and _match_roster_name(assignee, roster) is None:
+                assignee = None
+        out.append({
+            "task": task,
+            "assignee_name": assignee,
+            "due_mention": item.get("due_mention") or None,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Claude Haiku parsing
 # ---------------------------------------------------------------------------
 
@@ -285,7 +432,11 @@ def _parse_action_items_with_haiku(action_items_text: str) -> list[dict[str, Any
         return []
 
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = _PARSE_PROMPT.format(action_items_text=action_items_text.strip())
+    roster = _roster_names()
+    roster_block = "\n".join(f"- {n}" for n in roster) if roster else "(roster unavailable)"
+    prompt = _PARSE_PROMPT.format(
+        roster=roster_block, action_items_text=action_items_text.strip()
+    )
 
     try:
         response = client.messages.create(
@@ -305,20 +456,11 @@ def _parse_action_items_with_haiku(action_items_text: str) -> list[dict[str, Any
         if not isinstance(parsed, list):
             log.warning("Haiku returned non-list JSON: %r", raw[:200])
             return []
-        # Validate each item has required fields
-        result = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            task = str(item.get("task") or "").strip()
-            if not task:
-                continue
-            result.append({
-                "task": task,
-                "assignee_name": item.get("assignee_name") or None,
-                "due_mention": item.get("due_mention") or None,
-            })
-        return result
+        # Keep raw items (incl. is_actionable) for grounding; _ground_and_filter_items
+        # does FYI-filtering, roster validation, and length capping, returning the
+        # legacy {task, assignee_name, due_mention} shape.
+        raw_items = [item for item in parsed if isinstance(item, dict)]
+        return _ground_and_filter_items(raw_items, roster)
     except json.JSONDecodeError as exc:
         log.warning("Haiku JSON parse failed: %s", exc)
         return []

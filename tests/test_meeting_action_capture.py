@@ -240,6 +240,7 @@ class TestParseActionItemsWithHaiku:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_client_cls,
+            patch.object(fae, "_roster_names", return_value=[]),  # parse-only: no grounding
         ):
             mock_client_cls.return_value.messages.create.return_value = mock_response
             result = fae._parse_action_items_with_haiku("Tommy should send proposal by Friday")
@@ -757,3 +758,131 @@ class TestProjectRouting:
 
         assert mock_create.call_args.kwargs["project_gid"] == "PROJ1"
         mock_cf.assert_called_once_with("777", {"S": "S0"})
+
+
+# ---------------------------------------------------------------------------
+# Roster grounding (B3, 2026-06-13)
+# ---------------------------------------------------------------------------
+
+class TestRosterGrounding:
+    # Includes the names whose substrings used to collide: Alex/Alina (Al),
+    # Alex Cordova (Lex), Hannah Grant (Ann), Jennifer Mortensen (Mort/Jen).
+    ROSTER = ["Alex Cordova", "Alina Thomas", "Hannah Grant", "Harrison Rogers",
+              "Jennifer Mortensen", "Larry Stone", "Tommy Anderson"]
+
+    def test_exact_full_name(self):
+        assert fae._match_roster_name("Tommy Anderson", self.ROSTER) == "Tommy Anderson"
+
+    def test_first_name_maps_to_full(self):
+        assert fae._match_roster_name("Tommy", self.ROSTER) == "Tommy Anderson"
+
+    def test_case_insensitive(self):
+        assert fae._match_roster_name("hannah", self.ROSTER) == "Hannah Grant"
+
+    def test_transcription_slip_fuzzy(self):
+        assert fae._match_roster_name("Harrson", self.ROSTER) == "Harrison Rogers"
+
+    def test_first_name_prefix_unambiguous(self):
+        # "Jen" is a prefix of exactly one first name (Jennifer) -> resolves.
+        assert fae._match_roster_name("Jen", self.ROSTER) == "Jennifer Mortensen"
+
+    def test_off_roster_returns_none(self):
+        assert fae._match_roster_name("Some Vendor", self.ROSTER) is None
+
+    def test_substring_tokens_no_longer_mis_assign(self):
+        # The bug the review caught: unanchored substring matched these.
+        assert fae._match_roster_name("Lex", self.ROSTER) is None   # was -> Alex Cordova
+        assert fae._match_roster_name("Ann", self.ROSTER) is None   # was -> Hannah Grant
+        assert fae._match_roster_name("Al", self.ROSTER) is None    # was -> first 'al' match
+        assert fae._match_roster_name("Mort", self.ROSTER) is None  # was -> Jennifer Mortensen
+
+    def test_empty_inputs_return_none(self):
+        assert fae._match_roster_name("Tommy", []) is None
+        assert fae._match_roster_name(None, self.ROSTER) is None
+        assert fae._match_roster_name("  ", self.ROSTER) is None
+
+    def test_fyi_dropped_and_assignee_validated_not_canonicalized(self):
+        # Validate-only: the PARSED name is kept on a match (not the canonical),
+        # so the downstream displayName resolver still works.
+        items = [
+            {"task": "Tommy sent the proposal", "assignee_name": "Tommy",
+             "due_mention": None, "is_actionable": False},
+            {"task": "Send the deck", "assignee_name": "Hannah",
+             "due_mention": "Friday", "is_actionable": True},
+        ]
+        out = fae._ground_and_filter_items(items, self.ROSTER)
+        assert len(out) == 1
+        assert out[0]["task"] == "Send the deck"
+        assert out[0]["assignee_name"] == "Hannah"          # parsed name kept, NOT "Hannah Grant"
+        assert out[0]["due_mention"] == "Friday"
+
+    def test_nickname_kept_for_downstream_resolution(self):
+        # "Jen" matches Jennifer Mortensen but we KEEP "Jen" so the attendee
+        # displayName "Jen Mortensen" still resolves downstream.
+        items = [{"task": "Email the guardians", "assignee_name": "Jen",
+                  "due_mention": None, "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, self.ROSTER)[0]["assignee_name"] == "Jen"
+
+    def test_missing_is_actionable_is_kept(self):
+        items = [{"task": "Do the thing", "assignee_name": None, "due_mention": None}]
+        assert len(fae._ground_and_filter_items(items, self.ROSTER)) == 1
+
+    def test_string_false_and_zero_dropped(self):
+        items = [
+            {"task": "string false", "assignee_name": None, "is_actionable": "false"},
+            {"task": "int zero", "assignee_name": None, "is_actionable": 0},
+            {"task": "string true kept", "assignee_name": None, "is_actionable": "true"},
+        ]
+        out = fae._ground_and_filter_items(items, self.ROSTER)
+        assert [o["task"] for o in out] == ["string true kept"]
+
+    def test_off_roster_assignee_nulled(self):
+        items = [{"task": "Call the vendor", "assignee_name": "Random Person",
+                  "due_mention": None, "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, self.ROSTER)[0]["assignee_name"] is None
+
+    def test_non_string_assignee_coerced_to_none(self):
+        # A list/number assignee must not crash the downstream .lower().
+        items = [{"task": "x", "assignee_name": ["Tommy", "Alex"], "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, self.ROSTER)[0]["assignee_name"] is None
+
+    def test_assignee_kept_when_no_roster(self):
+        items = [{"task": "Call the vendor", "assignee_name": "Tommy",
+                  "due_mention": None, "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, [])[0]["assignee_name"] == "Tommy"
+
+    def test_long_task_capped(self):
+        items = [{"task": "x" * 300, "assignee_name": None,
+                  "due_mention": None, "is_actionable": True}]
+        out = fae._ground_and_filter_items(items, self.ROSTER)
+        assert len(out[0]["task"]) <= fae._MAX_TASK_LEN
+
+    def test_empty_task_dropped(self):
+        items = [{"task": "   ", "assignee_name": "Tommy",
+                  "due_mention": None, "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, self.ROSTER) == []
+
+    def test_non_dict_item_skipped(self):
+        items = ["not a dict", {"task": "ok", "assignee_name": None, "due_mention": None}]
+        out = fae._ground_and_filter_items(items, self.ROSTER)
+        assert len(out) == 1 and out[0]["task"] == "ok"
+
+    def test_parse_applies_grounding(self):
+        data = [
+            {"task": "Ship the order", "assignee_name": "Tommy",
+             "due_mention": "Monday", "is_actionable": True},
+            {"task": "Order already shipped", "assignee_name": "Tommy",
+             "due_mention": None, "is_actionable": False},
+        ]
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(data))]
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch("anthropic.Anthropic") as mock_cls,
+            patch.object(fae, "_roster_names", return_value=["Tommy Anderson", "Hannah Grant"]),
+        ):
+            mock_cls.return_value.messages.create.return_value = mock_response
+            result = fae._parse_action_items_with_haiku("some action items")
+        assert len(result) == 1                       # FYI item dropped
+        assert result[0]["task"] == "Ship the order"
+        assert result[0]["assignee_name"] == "Tommy"  # validated, parsed name kept

@@ -8,6 +8,7 @@ place WRITE_CONFIRMED and the [CORA_KNOWLEDGE_GAP: ...] marker are stripped.
 Conversational replies get:
   - markdown bold (**x** / __x__) flattened to plain text
   - markdown tables flattened to prose; horizontal rules + headers removed
+  - markdown bullet/numbered list markers stripped; `inline code` + ``` fences flattened
   - em/en dashes replaced with a hyphen (voice contract bans em-dashes)
   - emoji and :shortcode: tokens stripped
   - source-opacity lint: bare docs.google.com / drive.google.com / app.asana.com
@@ -45,6 +46,13 @@ _BOLD_STAR_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _BOLD_UNDER_RE = re.compile(r"__([^_\n]+)__")
 _HEADER_RE = re.compile(r"^\s*#{1,6}\s+", re.MULTILINE)
 _HR_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$")
+
+# --- code + lists --------------------------------------------------------
+# Conversational replies should read as prose, not as a code block or a
+# markdown list (the 2026-06-11 nudge thread used numbered lists + backticks).
+_CODE_FENCE_RE = re.compile(r"^[ \t]*```[^\n]*$", re.MULTILINE)   # drop ``` fence lines
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")                       # `code` -> code
+_LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", re.MULTILINE)  # leading bullet/number
 
 # --- dashes --------------------------------------------------------------
 # figure dash, en dash, em dash, horizontal bar -> hyphen
@@ -138,6 +146,13 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _BOLD_STAR_RE.sub(r"\1", work)
     work = _BOLD_UNDER_RE.sub(r"\1", work)
 
+    # 2b. Code: drop ``` fence lines, unwrap `inline code`, strip stray backticks.
+    # Runs before the source-opacity lint so a redactable id wrapped in backticks
+    # (e.g. `gid 12345...`) is unwrapped first, then still redacted.
+    work = _CODE_FENCE_RE.sub("", work)
+    work = _INLINE_CODE_RE.sub(r"\1", work)
+    work = work.replace("`", "")
+
     # 3. Strip leading markdown headers (keep the header text as plain prose).
     work = _HEADER_RE.sub("", work)
 
@@ -146,6 +161,11 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
 
     # 5. Remove horizontal rules (whole-line).
     work = "\n".join(line for line in work.split("\n") if not _HR_RE.match(line))
+
+    # 5b. Strip leading markdown list markers (bullets + numbered) -> plain lines.
+    # Line-anchored, so mid-line " - " (e.g. flattened table cells) and hyphenated
+    # words ("well-being") are untouched.
+    work = _LIST_MARKER_RE.sub("", work)
 
     # 6. Dashes -> hyphen (voice contract bans em-dashes).
     work = _DASH_RE.sub("-", work)

@@ -263,3 +263,57 @@ class TestRedactionShells:
     def test_sanctioned_slack_link_untouched(self):
         out = format_reply("Open <https://app.asana.com/0/1/2|the task> when ready.")
         assert "<https://app.asana.com/0/1/2|the task>" in out
+
+
+# --- lists + code (B4, 2026-06-13) ---------------------------------------
+
+
+class TestListsAndCode:
+    def test_bullet_dash_marker_stripped(self):
+        out = format_reply("- send the deck\n- ping Tommy")
+        assert "send the deck" in out and "ping Tommy" in out
+        assert not any(ln.lstrip().startswith(("- ", "* ", "+ ")) for ln in out.split("\n"))
+
+    def test_bullet_star_marker_stripped(self):
+        out = format_reply("* one\n* two")
+        assert "one" in out and "two" in out
+        assert "* one" not in out
+
+    def test_numbered_list_marker_stripped(self):
+        out = format_reply("1. first thing\n2. second thing")
+        assert "first thing" in out and "second thing" in out
+        assert "1." not in out and "2." not in out
+
+    def test_numbered_paren_marker_stripped(self):
+        out = format_reply("1) alpha\n2) beta")
+        assert "alpha" in out and "beta" in out
+        assert "1)" not in out
+
+    def test_inline_code_unwrapped(self):
+        out = format_reply("Run the `restagger` script now")
+        assert "restagger" in out
+        assert "`" not in out
+
+    def test_code_fence_flattened(self):
+        out = format_reply("Do this:\n```bash\nls -la\n```\nthen stop")
+        assert "```" not in out
+        assert "ls -la" in out
+
+    def test_inline_code_gid_still_redacted(self):
+        # Source-opacity must still win after the backtick unwrap.
+        out = format_reply("the task is `gid 1215472268404903`")
+        assert "1215472268404903" not in out
+
+    def test_hyphenated_word_preserved(self):
+        out = format_reply("This is about well-being and follow-up")
+        assert "well-being" in out and "follow-up" in out
+
+    def test_midline_dash_separator_preserved(self):
+        # A non-line-start " - " (e.g. flattened table output) must survive.
+        out = format_reply("Status - open and ready")
+        assert "Status - open and ready" in out
+
+    def test_slack_bold_label_not_eaten_by_list_strip(self):
+        # "*Status:*" has no space after the star -> not a bullet, must survive.
+        out = format_reply("*Status:* open")
+        assert "*Status:*" in out

@@ -193,6 +193,29 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
         log.error("gap-executor: unexpected error for update %s: %s", uid_short, exc, exc_info=True)
 
 
+def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
+    """Flip to DISMISSED, in place, only PENDING entries that have ALREADY been
+    DM'd to Harrison (dm_message_ts set) and left unreacted past cutoff_dt.
+    Returns the count dismissed.
+
+    A never-DM'd PENDING entry is intentionally left alone -- Harrison has not
+    seen it yet (Step 2 DMs it this run). Dismissing un-shown entries on age
+    alone silently drops a contribution posted right before a >48h gap (e.g. an
+    #info-for-cora note Friday evening whose next review is Monday 7am)."""
+    from datetime import datetime as _dt
+    n = 0
+    for e in entries:
+        if e.get("state") == "PENDING" and e.get("dm_message_ts"):
+            try:
+                if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
+                    e["state"] = "DISMISSED"
+                    e["resolved_at"] = now_dt.isoformat()
+                    n += 1
+            except Exception:
+                pass
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -217,36 +240,30 @@ def main() -> int:
         _reset_all_dm_ts()
         log.info("Reset dm_message_ts on all PENDING items — they will be re-sent individually")
 
-    # ─── Step 0: Auto-dismiss PENDING entries older than 48h ─────────────────
-    # Stale entries pile up unreviewed and clutter the DM queue. Any gap
-    # that Harrison hasn't acted on within 48h is auto-dismissed — the next
-    # reconciliation run will re-surface anything still genuinely actionable.
+    # ─── Step 0: Auto-dismiss stale entries Harrison has SEEN but not acted on ─
+    # Only entries already DM'd (dm_message_ts set) and left unreacted past 48h
+    # are dismissed. A never-DM'd PENDING entry is NOT dismissed here -- Step 2
+    # DMs it this run. Otherwise a fact posted right before a >48h gap (e.g. an
+    # #info-for-cora note Friday evening, next review Monday 7am) would be
+    # silently dropped before Harrison ever saw it.
     if not args.dry_run:
         import json as _json
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
-        cutoff = _dt.now(_tz.utc) - _td(hours=48)
+        now = _dt.now(_tz.utc)
+        cutoff = now - _td(hours=48)
         auto_dismissed = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
                 raw = _PROPOSED_UPDATES_PATH.read_text(encoding="utf-8")
                 entries = [_json.loads(l) for l in raw.splitlines() if l.strip()]
-                for e in entries:
-                    if e.get("state") == "PENDING":
-                        try:
-                            proposed = _dt.fromisoformat(e["proposed_at"])
-                            if proposed < cutoff:
-                                e["state"] = "DISMISSED"
-                                e["resolved_at"] = _dt.now(_tz.utc).isoformat()
-                                auto_dismissed += 1
-                        except Exception:
-                            pass
+                auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now)
                 _PROPOSED_UPDATES_PATH.write_text(
                     "\n".join(_json.dumps(e) for e in entries) + "\n",
                     encoding="utf-8",
                 )
         if auto_dismissed:
-            log.info("Auto-dismissed %d stale PENDING entries (>48h old)", auto_dismissed)
+            log.info("Auto-dismissed %d stale entries (DM'd >48h ago, no reaction)", auto_dismissed)
 
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()
