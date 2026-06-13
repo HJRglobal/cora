@@ -481,6 +481,119 @@ class TestRaisePin:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PHI billing/authorization/client-status classifier — 2026-06-12 live-miss regression
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestPHIBillingStatusClassifier:
+    """Regression for the 2026-06-12 #llc-finance miss: Justin (NOT a PHI
+    custodian) said 'Cora, remember Bob Smith's billing authorization is
+    pending' and cora_remember STAGED the save instead of refusing. Root
+    cause: the base clinical/identifier PHI patterns carry no 'billing' /
+    'authorization' keyword, so a named individual's administrative status
+    slipped through. The LEX-scope augmentation now catches it; the gate runs
+    at the PREVIEW stage (first tool call), not after a confirm round-trip.
+    """
+
+    BUG = "Bob Smith's billing authorization is pending"
+
+    def test_base_classifier_misses_billing_string(self):
+        # The original gap: base is_phi_risk has no admin-term coverage.
+        from cora.phi_guard import is_phi_risk
+        assert is_phi_risk(self.BUG) is False
+
+    def test_lex_augmentation_flags_billing_string(self):
+        from cora.phi_guard import is_lex_billing_status_phi
+        assert is_lex_billing_status_phi(self.BUG) is True
+
+    @pytest.mark.parametrize("text", [
+        "Bob Smith's billing authorization is pending",
+        "the client's authorization is pending",
+        "member eligibility lapsed for this individual",
+        "client status changed to inactive",
+        "Bob's prior auth was approved",
+    ])
+    def test_augmentation_true_positives(self, text):
+        from cora.phi_guard import is_lex_billing_status_phi
+        assert is_lex_billing_status_phi(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "the wifi password is alpha123",
+        "schedule the team standup for Monday",
+        "Q4 revenue authorization from the board",       # no individual
+        "renew the Costco invoice for the F3E retail order",
+        "Tommy will handle the Sprouts billing",          # name not possessive/recipient
+    ])
+    def test_augmentation_true_negatives(self, text):
+        from cora.phi_guard import is_lex_billing_status_phi
+        assert is_lex_billing_status_phi(text) is False
+
+    def test_non_custodian_refused_in_lex_channel(self, monkeypatch):
+        # Real classifier (no monkeypatch). Non-custodian -> phi_allowed False.
+        monkeypatch.setattr(user_notes.lex_phi_access, "phi_allowed",
+                            lambda *a, **k: False)
+        d = user_notes.resolve_save_scope(self.BUG, "LEX-LLC", "UJUSTIN", is_dm=False)
+        assert not d.allowed
+        assert d.reason == user_notes.PHI_REFUSAL
+
+    def test_custodian_in_lex_channel_allowed_to_lex_store(self, monkeypatch):
+        monkeypatch.setattr(user_notes.lex_phi_access, "phi_allowed",
+                            lambda *a, **k: True)
+        d = user_notes.resolve_save_scope(self.BUG, "LEX-LLC", "U0B2RM2JYJ1", is_dm=False)
+        assert d.allowed and d.entity == "LEX-LLC" and d.sub_entity == "LEX-LLC"
+
+    def test_billing_string_not_flagged_in_plain_f3e_channel(self):
+        # Outside LEX scope (and not a DM) the augmentation does not fire, so a
+        # legitimate note about a named buyer's authorization is saved normally.
+        d = user_notes.resolve_save_scope(self.BUG, "F3E", "UTOMMY", is_dm=False)
+        assert d.allowed and d.entity == "F3E"
+
+    def test_billing_string_flagged_in_dm_for_non_custodian(self, monkeypatch):
+        # A DM is LEX-eligible scope: the augmentation fires, and a
+        # non-custodian is refused (closes the DM PHI-into-FNDR-store path).
+        monkeypatch.setattr(user_notes.lex_phi_access, "phi_allowed",
+                            lambda *a, **k: False)
+        d = user_notes.resolve_save_scope(self.BUG, "FNDR", "UJUSTIN", is_dm=True)
+        assert not d.allowed and d.reason == user_notes.PHI_REFUSAL
+
+    def test_refusal_fires_at_preview_stage_before_confirm(self, kb, monkeypatch):
+        # The refusal must come back on the FIRST tool call (NO confirmed flag),
+        # not after a preview/confirm round-trip. This is the structural half of
+        # the fix: resolve_save_scope runs ahead of the confirmed gate.
+        from cora.tools import tool_dispatch as td
+        monkeypatch.setattr(td, "_notes_kb", lambda: (kb, threading.Lock()))
+        monkeypatch.setattr(user_notes.lex_phi_access, "phi_allowed",
+                            lambda *a, **k: False)
+        out = td._tool_cora_remember(
+            "UJUSTIN", "LEX-LLC",
+            {"note_text": self.BUG, "_channel_id": "C_LLC_FINANCE"},  # no confirmed
+        )
+        assert out == user_notes.PHI_REFUSAL
+        assert "preview" not in out.lower()
+        assert kb.list_user_notes("UJUSTIN") == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Owner-exclusion adversarial pin (D-049 load-bearing privacy invariant)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestOwnerExclusionAdversarial:
+    """Explicit confirmation that a non-owner can NEVER retrieve another user's
+    note via the read overlay, even with a byte-identical query (identical
+    embedding vector). Complements TestOwnerExclusionSQL; pinned per the
+    2026-06-12 one-ship coverage request."""
+
+    def test_identical_query_from_other_user_returns_nothing(self, kb):
+        # "alpha" embeds on axis 1 (test mock) so the owner's same-axis query
+        # retrieves; the contrast is that the IDENTICAL query from anyone else
+        # returns nothing -- owner exclusion is enforced in SQL, not by relevance.
+        _save(kb, owner=OWNER, text="alpha: the Tucson stove vendor is Apex Appliance")
+        q = "alpha Tucson stove vendor"
+        assert len(kb.search_user_notes(q, owner_slack=OWNER)) == 1
+        assert kb.search_user_notes(q, owner_slack=OTHER) == []
+        assert kb.search_user_notes(q, owner_slack="U_THIRD") == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Wiring — exposure, functions, timeouts, prompt coverage
 # ──────────────────────────────────────────────────────────────────────────────
 

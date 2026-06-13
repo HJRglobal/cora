@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import lex_phi_access
-from .phi_guard import is_phi_risk
+from .phi_guard import is_lex_billing_status_phi, is_phi_risk
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +100,18 @@ def resolve_save_scope(
     entity = (channel_entity or "FNDR").strip() or "FNDR"
     sub_entity = entity if entity.upper().startswith("LEX-") else None
 
-    if not is_phi_risk(note_text or ""):
+    text = note_text or ""
+    phi = is_phi_risk(text)
+    # In LEX scope (LEX/LEX-*) or a DM, the base clinical/identifier patterns
+    # are not enough: a named individual's billing / authorization /
+    # eligibility / client-status is PHI even with no clinical keyword (the
+    # 2026-06-12 "Bob Smith's billing authorization is pending" miss). The
+    # augmentation is scoped here so ordinary business notes about a named
+    # buyer's authorization in a non-LEX channel are not over-flagged.
+    if not phi and (_is_lex_scope(entity) or is_dm):
+        phi = is_lex_billing_status_phi(text)
+
+    if not phi:
         return SaveDecision(allowed=True, entity=entity, sub_entity=sub_entity)
 
     if not lex_phi_access.phi_allowed(owner_slack, entity, is_dm=is_dm):

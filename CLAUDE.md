@@ -8,6 +8,37 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [BUG FIX] 2026-06-12 PHI save gate -- billing/authorization tied to a named individual now refused in LEX scope (SHIPPED; RESTART REQUIRED -- D-050)
+
+Live miss in `#llc-finance` (2026-06-12 15:05): Justin Moran (NOT a PHI custodian) said
+"Cora, remember Bob Smith's billing authorization is pending" and `cora_remember` STAGED
+the save instead of issuing the PHI refusal. **Root cause:** `phi_guard.is_phi_risk`
+returned False -- the base patterns key on CLINICAL / IDENTIFIER keywords, and "billing
+authorization" tied to a name carries none, so `resolve_save_scope` took the non-PHI
+branch and never reached the custodian gate. Blast-radius-1 held (staged only, never
+confirmed, owner-only -- verified: 0 'Bob Smith' chunks, 1 total user_note = Harrison's).
+
+**Fix (all bot-process -- restart REQUIRED; ship PS1 `deployment/ship-phi-billing-gate-fix-2026-06-12.ps1 -Restart`):**
+1. `phi_guard.is_lex_billing_status_phi()` -- admin term (billing/authorization/
+   eligibility/coverage/claims/units/placement) + a specific individual (possessive
+   proper name OR care-recipient noun), or explicit client-status phrasing. **Opt-in;
+   NOT folded into `is_phi_risk`** so session_capture / reconciliation are unchanged.
+2. `user_notes.resolve_save_scope` applies it only in LEX scope OR a DM (outside LEX a
+   named buyer's authorization is ordinary business; a DM is LEX-eligible scope and would
+   otherwise be a PHI-into-FNDR-store path).
+3. `_tool_cora_remember` runs the PHI/scope gate BEFORE the confirm gate -- refusal fires
+   on the FIRST tool call (preview stage), never staged. `cora_remember` description gains
+   a PHI nudge so the model doesn't self-preview a PHI-shaped LEX note.
+4. +19 tests (exact bug-string regression, preview-stage refusal, true-pos/neg,
+   custodian-allowed, outside-LEX-not-flagged) plus belt-and-suspenders pins for the
+   finance channel-scope gate (item a) and owner-exclusion adversarial identical-query
+   (item b) -- both already covered; pinned for one-ship. Doctrine: **D-050**.
+
+**Finance positive path PASSES, no fix needed** (Harrison-verified: `finance-access-audit.jsonl`
+got a clean line for Justin's #hjr-finance pull -- 12 cross-mailbox chunks). Live re-test
+plan (post-restart): Justin PHI refusal in #llc-finance; Justin finance out-of-channel
+refusal; Hannah save+retrieve; Tommy Tucson cross-user negative.
+
 ### [BUG FIX] 2026-06-12 morning failures -- backfill flooded the recon window; briefing task killed (SHIPPED, script-side, NO restart needed)
 
 Cowork's morning report, one root cause / three symptoms: reconciliation windowed "last

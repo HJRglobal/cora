@@ -2606,6 +2606,25 @@ def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
     from cora import user_notes
 
     input_data = _input or {}
+    note_text = str(input_data.get("note_text", "") or "").strip()
+    if not note_text:
+        return "cora_remember: note_text is required and cannot be empty."
+    is_dm = str(input_data.get("_channel_id", "") or "").startswith("D")
+
+    # PHI / scope gate runs BEFORE the staged-write confirm gate. A save that
+    # PHI policy will refuse (e.g. a non-custodian saving a named individual's
+    # billing/authorization in a LEX channel) is rejected on the FIRST tool
+    # call -- never staged as a "Saving to YOUR notes..." preview, never
+    # confirmed. Deterministic, code-layer (D-034); the preview/confirm round
+    # trip below is reached only for an allowed save.
+    decision = user_notes.resolve_save_scope(note_text, entity, slack_user_id, is_dm)
+    if not decision.allowed:
+        log.info(
+            "cora_remember PHI-REFUSED owner=%s entity=%s is_dm=%s",
+            slack_user_id, entity, is_dm,
+        )
+        return decision.reason
+
     confirmed = input_data.get("confirmed", False)
     if confirmed is not True:
         return (
@@ -2616,20 +2635,7 @@ def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
             "yes, then call again with confirmed=true."
         )
 
-    note_text = str(input_data.get("note_text", "") or "").strip()
-    if not note_text:
-        return "cora_remember: note_text is required and cannot be empty."
     share_requested = bool(input_data.get("share_requested", False))
-    is_dm = str(input_data.get("_channel_id", "") or "").startswith("D")
-
-    decision = user_notes.resolve_save_scope(note_text, entity, slack_user_id, is_dm)
-    if not decision.allowed:
-        log.info(
-            "cora_remember PHI-REFUSED owner=%s entity=%s is_dm=%s",
-            slack_user_id, entity, is_dm,
-        )
-        return decision.reason
-
     kb, kb_lock = _notes_kb()
     if kb is None:
         return (
@@ -4615,7 +4621,13 @@ TOOL_DEFINITIONS = [
             "\"I'll save that to your notes; org-wide sharing needs Harrison's review.\"\n"
             "\n"
             "The result may include a heads-up that the note conflicts with existing "
-            "org knowledge — relay it to the user verbatim; the note is still saved."
+            "org knowledge — relay it to the user verbatim; the note is still saved.\n"
+            "\n"
+            "PHI: in a Lexington channel, do NOT promise to save or show a preview for "
+            "a note about a specific individual's health, billing, authorization, "
+            "eligibility, or client status — call this tool and let the gate decide. It "
+            "refuses unless the saver is an authorized LEX custodian, and relaying its "
+            "refusal verbatim is the correct response."
         ),
         "input_schema": {
             "type": "object",

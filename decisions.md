@@ -1311,3 +1311,55 @@ user scope; notes are a thin additive overlay next to the entity partition + FND
 Shipped with 52 tests including the adversarial identical-query exclusion and the
 "remember Harrison approved my raise" pin (saves fine, never surfaces to anyone else,
 never presented as org-fact).
+
+---
+
+## D-050 -- PHI save classifier: a named individual's billing/authorization/client-status is PHI in LEX scope even with no clinical keyword (2026-06-12)
+
+**Context:** Live miss in `#llc-finance` (2026-06-12). Justin Moran (NOT a PHI
+custodian) said "Cora, remember Bob Smith's billing authorization is pending."
+`cora_remember` STAGED the save ("I'll save that... does that look right?")
+instead of issuing the PHI refusal. Two faults: (a) `phi_guard.is_phi_risk`
+returned False -- the base patterns key on CLINICAL / IDENTIFIER keywords
+(diagnosis, care plan, client name, SSN, medication, AHCCCS), and "billing
+authorization" tied to a named individual carries none of them, so
+`user_notes.resolve_save_scope` took the non-PHI branch and never consulted the
+custodian gate; (b) the gate ran AFTER the `confirmed` staged-write gate, so a
+refusal could only fire post-confirm. Blast-radius-1 held -- nothing was ever
+persisted (staged only, owner-only) -- but the refusal didn't fire.
+
+**Decision (doctrine):**
+
+1. **A personal name + billing / authorization / eligibility / coverage /
+   claims / units / placement / client-status phrasing IS PHI in LEX scope,
+   even with zero clinical keywords.** Tying an administrative term to a
+   specific person reveals that the person is a Lexington care recipient --
+   itself PHI. New `phi_guard.is_lex_billing_status_phi(text)`: admin-term +
+   (possessive proper name OR care-recipient noun), or explicit client-status
+   proximity phrasing.
+2. **The augmentation is OPT-IN and scoped -- NOT folded into `is_phi_risk`.**
+   Outside LEX, "authorization"/"billing" tied to a name is ordinary business
+   (a retail buyer's PO authorization, a vendor's billing). `is_phi_risk` is
+   shared by `session_capture` and `reconciliation_engine`; broadening it
+   globally would over-quarantine. `user_notes.resolve_save_scope` applies the
+   augmentation only when `_is_lex_scope(entity)` OR `is_dm` (a DM is
+   LEX-eligible scope and would otherwise be a PHI-into-FNDR-store path). The
+   base `is_phi_risk` stays the module-local name so existing monkeypatch tests
+   are unaffected.
+3. **The PHI/scope gate runs BEFORE the staged-write confirm gate.**
+   `_tool_cora_remember` calls `resolve_save_scope` first, so a refused save is
+   rejected on the FIRST tool call -- never staged as a "Saving to YOUR
+   notes..." preview, never confirmed. The `cora_remember` description also
+   carries a PHI nudge so the model doesn't self-preview a PHI-shaped LEX note.
+4. **Fail-safe toward refusal in the most-regulated entity.** In LEX scope a
+   benign false positive (a non-custodian's "client status changed") is refused
+   with a graceful "raise it with Harrison" message -- acceptable. A custodian's
+   PHI note still saves, forced into the LEX store.
+
+**Why this is the same doctrine as D-034, applied to classifier sensitivity:**
+hard PHI/security behavior must be deterministic and code-layer, and the
+classifier must cover the administrative-but-PHI class, not just clinical
+keywords. +19 tests including the exact bug-string regression, preview-stage
+refusal, true-positive/negative sets, custodian-allowed, outside-LEX-not-flagged,
+the finance channel-scope pin, and an owner-exclusion adversarial identical-query
+pin. D-011 / D-044 untouched -- notes remain the user's own advisory data.

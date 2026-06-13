@@ -152,6 +152,20 @@ def test_missing_allowlist_fails_closed(tmp_path, monkeypatch):
     assert d.action == "pass"  # no channel pin -> the finance path doesn't exist
 
 
+def test_finance_retrieval_is_channel_scoped_both_directions():
+    """2026-06-12 one-ship pin (task item a): the finance retrieval power is
+    REFUSED for an allowlisted user OUTSIDE #hjr-finance (no grant anywhere
+    else -- it falls back to normal Tier-2 'pass'), AND refused for a
+    non-allowlisted user even INSIDE the channel."""
+    # Allowlisted (Eric, Jerry) outside the pinned channel -> never a finance grant.
+    for uid in ("UERIC", "UJERRY"):
+        d = fr.check_request(uid, "C_SOME_OTHER_CHANNEL", "pull all invoices since April")
+        assert d.action == "pass" and d.mode != "finance"
+    # Non-allowlisted inside the channel -> explicit refusal.
+    d = fr.check_request("UHANNAH", _FIN_CHANNEL, "pull all invoices since April")
+    assert d.action == "respond" and "finance team" in d.message
+
+
 # ── PHI exclusion ─────────────────────────────────────────────────────────────
 
 def test_finance_drop_phi():
