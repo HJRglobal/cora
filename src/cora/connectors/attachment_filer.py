@@ -2,14 +2,24 @@
 Claude, and stores them in the canonically correct HJR-Founder-OS Drive folder.
 
 Flow (per monitored account):
-  1. List unprocessed emails with attachments since last watermark.
-  2. Skip any already recorded in filed-message-ids.json (cross-account dedup, 30-day TTL).
+  1. List emails with attachments since the per-account watermark.
+  2. Skip any message already in the message ledger (no re-classify on re-scan).
   3. Call Claude (haiku) to classify each attachment: entity, subfolder, canonical
      filename, or skip if the attachment isn't worth archiving.
-  4. For each "file" decision: download bytes → ensure Drive folder → upload → KB index.
-  5. Record the RFC Message-ID in filed-message-ids.json (invisible — no Gmail labels).
-  6. Advance the per-account watermark.
+  4. For each "file" decision: download bytes → compute md5 → if that content was
+     already filed (content ledger, folder-agnostic) skip, else ensure Drive
+     folder → upload (Drive also dedups by name + md5) → KB index → append the
+     content row to disk immediately.
+  5. Mark the message processed in the message ledger.
+  6. Advance + persist the per-account watermark IMMEDIATELY (per account, not at
+     end-of-run) so a Task-Scheduler kill never discards progress.
   7. Post a Slack summary to EMAIL_FILING_NOTIFY_CHANNEL if anything was filed.
+
+Idempotency is JSONL-ledger-based + crash-safe (data/state/filer-*.jsonl) and
+content-aware (md5) so the same document arriving via multiple emails / under
+different LLM-chosen names / into different folders is filed exactly once. No
+Gmail labels are written (the org moved to invisible JSON dedup in commit
+396d8e4; see filer_ledger.py for the full root-cause).
 
 Org-wide: the monitored account list lives in
   data/maps/monitored-email-accounts.yaml
@@ -28,6 +38,7 @@ Drive path:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -42,11 +53,14 @@ import yaml
 from slack_sdk import WebClient as _SlackWebClient
 from slack_sdk.errors import SlackApiError as _SlackApiError
 
+from . import filer_ledger
 from .drive_connector import (
     DriveConnectorError,
     DriveFile,
     drive_file_to_document,
     ensure_folder_path,
+    list_folder_files_with_md5,
+    resolve_folder_path,
     upload_file,
 )
 from .gmail_reader import (
@@ -66,8 +80,14 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ACCOUNTS_PATH = _REPO_ROOT / "data" / "maps" / "monitored-email-accounts.yaml"
 _WATERMARKS_PATH = _REPO_ROOT / "data" / "cache" / "email-filing-watermarks.json"
-_FILED_IDS_PATH = _REPO_ROOT / "data" / "cache" / "filed-message-ids.json"
-_DEDUP_TTL_DAYS = 30
+
+# Self-imposed wall-clock budget. The Task Scheduler job has a 15-min hard
+# ExecutionTimeLimit that SIGKILLs the process -- which previously killed runs
+# before the end-of-run state save, freezing the watermark and re-scanning weeks
+# of mail every run. We now stop cleanly under that limit (default 13 min),
+# persisting per-account progress so the next run resumes. Doctrine: script-side
+# self-bounding is the real control; the Task Scheduler limit only backstops it.
+_RUN_BUDGET_SECONDS = int(os.environ.get("EMAIL_FILING_RUN_BUDGET_SECONDS", "780"))
 
 # Maps entity code → Drive folder name under HJR-Founder-OS
 _ENTITY_TO_DRIVE_FOLDER: dict[str, str] = {
@@ -129,28 +149,6 @@ def _load_watermarks() -> dict[str, int]:
 def _save_watermarks(marks: dict[str, int]) -> None:
     _WATERMARKS_PATH.parent.mkdir(parents=True, exist_ok=True)
     _WATERMARKS_PATH.write_text(json.dumps(marks, indent=2))
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Cross-account deduplication (Fix 2)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-def _load_filed_ids() -> dict[str, int]:
-    """Load {rfc_message_id: filed_at_ts}, pruning entries older than _DEDUP_TTL_DAYS."""
-    if not _FILED_IDS_PATH.exists():
-        return {}
-    try:
-        data = json.loads(_FILED_IDS_PATH.read_text())
-    except Exception:
-        return {}
-    cutoff = int(time.time()) - _DEDUP_TTL_DAYS * 86400
-    return {k: v for k, v in data.items() if isinstance(v, int) and v > cutoff}
-
-
-def _save_filed_ids(filed_ids: dict[str, int]) -> None:
-    _FILED_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _FILED_IDS_PATH.write_text(json.dumps(filed_ids, indent=2))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -341,17 +339,29 @@ def _canonical_filename(
 def process_email(
     user_email: str,
     message_id: str,
+    *,
     dry_run: bool = False,
     kb=None,
     entity_hint: str | None = None,
-    filed_ids: dict[str, int] | None = None,
+    content_ledger: dict[str, dict[str, Any]] | None = None,
+    seen_messages: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Process one email: classify → download → upload → index → record.
+    """Process one email: classify → download → md5-dedup → upload → index → record.
 
-    Returns a list of filing results (one per filed attachment). Empty list
-    means all attachments were skipped or the email was already processed.
-    No Gmail labels are applied — dedup is handled invisibly via filed-message-ids.json.
+    Two idempotency layers (crash-safe, persisted incrementally):
+      * message ledger — a fully-processed message is never re-classified
+        (skips the Claude call entirely on re-scan).
+      * content ledger — the same bytes (md5), arriving via ANY message under
+        ANY name into ANY folder, are filed exactly once.
+
+    Returns a list of NEW filing results (one per newly-filed attachment). An
+    empty list means everything was skipped, deduped, or already processed.
     """
+    if content_ledger is None:
+        content_ledger = {}
+    if seen_messages is None:
+        seen_messages = set()
+
     try:
         msg = get_message(user_email, message_id)
     except GmailReaderError as exc:
@@ -359,11 +369,11 @@ def process_email(
         return []
 
     meta = parse_message_metadata(msg)
-    rfc_msg_id = meta.get("rfc_message_id", "")
+    msg_key = filer_ledger.make_msg_key(meta.get("rfc_message_id", ""), meta["message_id"])
 
-    # Dedup: already filed from this or another inbox (invisible — no Gmail labels)
-    if rfc_msg_id and filed_ids is not None and rfc_msg_id in filed_ids:
-        log.debug("Message %r already filed — skipping", rfc_msg_id[:60])
+    # Message-level dedup: skip re-classification of a fully-processed message.
+    if filer_ledger.message_done(seen_messages, msg_key):
+        log.debug("Message %r already processed — skipping (no re-classify)", msg_key[:60])
         return []
 
     # PHI guardrail: skip LEX inbox emails that match client-care subject patterns
@@ -394,9 +404,11 @@ def process_email(
     att_by_name = {a["filename"]: a for a in raw_attachments}
 
     results: list[dict[str, Any]] = []
+    skipped_count = 0
 
     for decision in decisions:
         if decision.get("action") != "file":
+            skipped_count += 1
             log.debug(
                 "Skip %r: %s",
                 decision.get("filename"), decision.get("reason", ""),
@@ -437,11 +449,25 @@ def process_email(
             })
             continue
 
-        # Download
+        # Download (needed to compute the content hash + to upload)
         try:
             content = download_attachment(user_email, message_id, att)
         except GmailReaderError as exc:
             log.warning("Download failed for %r: %s", orig_filename, exc)
+            continue
+
+        content_md5 = hashlib.md5(content).hexdigest()
+        content_sha256 = hashlib.sha256(content).hexdigest()
+
+        # Content-level dedup: these exact bytes were already filed (possibly via
+        # a different email / name / folder). Skip — do not create a duplicate.
+        prior = filer_ledger.content_record(content_ledger, content_md5)
+        if prior is not None:
+            log.info(
+                "Content already filed (md5=%s) as %s — skipping %r",
+                content_md5, prior.get("drive_path", "?"), orig_filename,
+            )
+            skipped_count += 1
             continue
 
         # Ensure folder exists in Drive
@@ -451,16 +477,24 @@ def process_email(
             log.warning("Folder creation failed for %r: %s", drive_path_display, exc)
             continue
 
-        # Upload
+        # Upload (upload_file dedups by name AND by content md5 within the folder)
         try:
             file_id, web_link = upload_file(
-                folder_id, canonical, content, att["mime_type"]
+                folder_id, canonical, content, att["mime_type"], content_md5=content_md5,
             )
         except DriveConnectorError as exc:
             log.warning("Upload failed for %r: %s", canonical, exc)
             continue
 
         log.info("Filed %r -> %s (%s)", orig_filename, drive_path_display, web_link)
+
+        # Record content hash immediately so the very next attachment / message /
+        # run dedups against it even if this run is killed mid-flight.
+        filer_ledger.append_content(
+            content_ledger, content_md5,
+            file_id=file_id, web_link=web_link, drive_path=drive_path_display,
+            canonical=canonical, sha256=content_sha256, source_email=user_email,
+        )
 
         # Immediate KB indexing so Cora can answer questions without waiting for next sync
         if kb is not None:
@@ -494,9 +528,14 @@ def process_email(
             "dry_run": False,
         })
 
-    # Record RFC Message-ID so this email is never re-processed (invisible dedup)
-    if rfc_msg_id and filed_ids is not None and not dry_run:
-        filed_ids[rfc_msg_id] = int(time.time())
+    # Mark the whole message processed so a re-scan never re-classifies it.
+    # (Crash before this point => message reprocessed next run, but already-filed
+    # attachments are caught by the content ledger above => still no duplicate.)
+    if not dry_run:
+        filer_ledger.record_message_done(
+            seen_messages, msg_key,
+            filed=len(results), skipped=skipped_count, subject=meta["subject"],
+        )
 
     return results
 
@@ -512,12 +551,19 @@ def process_account(
     *,
     dry_run: bool = False,
     kb=None,
-    filed_ids: dict[str, int] | None = None,
+    content_ledger: dict[str, dict[str, Any]] | None = None,
+    seen_messages: set[str] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Run the full filer pipeline for one monitored email account.
 
     Returns a summary dict:
-        {email, messages_scanned, filed, skipped, errors}
+        {email, messages_scanned, filed, skipped, errors, list_failed, budget_hit}
+
+    `list_failed` is True only if the message LISTING itself failed (so the
+    caller must NOT advance the watermark). Per-message file errors do NOT set
+    it — re-scanning is cheap and the ledgers dedup, so a single bad attachment
+    must never permanently freeze the watermark (the 2026-05-28 → 06-14 bug).
     """
     user_email = account["email"]
     entity_hint: str | None = account.get("entity_default")
@@ -536,6 +582,8 @@ def process_account(
         "skipped": 0,
         "errors": 0,
         "filed_items": [],
+        "list_failed": False,
+        "budget_hit": False,
     }
 
     try:
@@ -543,17 +591,25 @@ def process_account(
     except GmailReaderError as exc:
         log.error("Cannot list messages for %s: %s", user_email, exc)
         summary["errors"] += 1
+        summary["list_failed"] = True
         return summary
 
     summary["messages_scanned"] = len(message_ids)
     log.info("%s: %d messages with attachments to examine", user_email, len(message_ids))
 
     for msg_id in message_ids:
+        if deadline is not None and time.time() > deadline:
+            log.warning(
+                "%s: run budget hit mid-account — stopping (watermark NOT advanced; resumes next run)",
+                user_email,
+            )
+            summary["budget_hit"] = True
+            break
         try:
             filed = process_email(
                 user_email, msg_id,
-                dry_run=dry_run, kb=kb,
-                entity_hint=entity_hint, filed_ids=filed_ids,
+                dry_run=dry_run, kb=kb, entity_hint=entity_hint,
+                content_ledger=content_ledger, seen_messages=seen_messages,
             )
         except Exception as exc:
             log.exception("Unexpected error processing %s/%s: %s", user_email, msg_id, exc)
@@ -592,28 +648,106 @@ def run_filer(
         return []
 
     watermarks = _load_watermarks()
-    filed_ids = _load_filed_ids()
+    # Ledgers loaded ONCE into memory (O(1) checks); rows are appended to disk
+    # the instant something is filed, so progress survives a kill mid-run.
+    content_ledger = filer_ledger.load_content_ledger()
+    seen_messages = filer_ledger.load_message_ledger()
     run_start = int(time.time())
+    deadline = run_start + _RUN_BUDGET_SECONDS
     summaries: list[dict[str, Any]] = []
 
     for account in accounts:
+        if time.time() > deadline:
+            log.warning(
+                "Run budget (%ds) exhausted before %s — deferring remaining accounts "
+                "to next run", _RUN_BUDGET_SECONDS, account["email"],
+            )
+            break
+
         summary = process_account(
-            account, watermarks, dry_run=dry_run, kb=kb, filed_ids=filed_ids,
+            account, watermarks, dry_run=dry_run, kb=kb,
+            content_ledger=content_ledger, seen_messages=seen_messages,
+            deadline=deadline,
         )
         summaries.append(summary)
 
-        # Advance watermark for this account if no errors
-        if not dry_run and summary["errors"] == 0:
+        # Advance + PERSIST the watermark per-account, immediately. Advance
+        # whenever the listing succeeded AND we finished the account within
+        # budget — per-message file errors do not block it (ledgers dedup any
+        # re-scan). A budget-hit account keeps its old watermark so the
+        # unprocessed tail is re-listed next run. Saving per-account (not once at
+        # the very end) is what breaks the kill-before-save spiral.
+        if not dry_run and not summary["list_failed"] and not summary["budget_hit"]:
             watermarks[account["email"]] = run_start
-            log.info(
-                "Watermark advanced for %s -> %d", account["email"], run_start
-            )
-
-    if not dry_run:
-        _save_watermarks(watermarks)
-        _save_filed_ids(filed_ids)
+            _save_watermarks(watermarks)
+            log.info("Watermark advanced + saved for %s -> %d", account["email"], run_start)
 
     return summaries
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Reconcile — seed the content ledger from files already in Drive
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def reconcile_ledger_from_drive(
+    entities: list[str] | None = None,
+) -> dict[str, int]:
+    """Seed the content ledger from binary files already in the filer's Drive
+    subfolders, so the next live run dedups against documents already on Drive.
+
+    Read-only: never uploads, never creates folders, never modifies Drive. For
+    each existing {entity}/{subfolder}, every binary file's md5Checksum that
+    isn't already in the ledger is recorded. Run this once after deploying the
+    crash-safe ledger (and after any manual de-dupe cleanup) so the very next
+    run skips documents whose canonical copy already lives in Drive — regardless
+    of which name/folder the classifier would otherwise pick.
+
+    Returns {scanned, seeded, ledger_size}.
+    """
+    content_ledger = filer_ledger.load_content_ledger()
+    targets = [e.upper() for e in (entities or list(_ENTITY_TO_DRIVE_FOLDER.keys()))]
+    scanned = 0
+    seeded = 0
+
+    for ent in targets:
+        folder = _ENTITY_TO_DRIVE_FOLDER.get(ent)
+        if not folder:
+            log.warning("reconcile: unknown entity %r — skipping", ent)
+            continue
+        for sub in sorted(_VALID_SUBFOLDERS):
+            try:
+                leaf_id = resolve_folder_path([folder, sub])
+            except DriveConnectorError as exc:
+                log.warning("reconcile: lookup failed for %s/%s: %s", folder, sub, exc)
+                continue
+            if not leaf_id:
+                continue  # folder doesn't exist yet — nothing to seed
+            try:
+                files = list_folder_files_with_md5(leaf_id)
+            except DriveConnectorError as exc:
+                log.warning("reconcile: list failed for %s/%s: %s", folder, sub, exc)
+                continue
+            for f in files:
+                scanned += 1
+                md5 = f.get("md5Checksum")
+                if not md5 or md5 in content_ledger:
+                    continue
+                filer_ledger.append_content(
+                    content_ledger, md5,
+                    file_id=f["id"], web_link=f.get("webViewLink", ""),
+                    drive_path=f"{folder}/{sub}/{f.get('name', '')}",
+                    canonical=f.get("name", ""), sha256="", source_email="reconcile",
+                )
+                seeded += 1
+            if files:
+                log.info("reconcile: %s/%s — %d files scanned", folder, sub, len(files))
+
+    log.info(
+        "reconcile complete: scanned=%d seeded=%d ledger_size=%d",
+        scanned, seeded, len(content_ledger),
+    )
+    return {"scanned": scanned, "seeded": seeded, "ledger_size": len(content_ledger)}
 
 
 # ────────────────────────────────────────────────────────────────────────────

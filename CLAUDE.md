@@ -16,11 +16,12 @@ From the 2026-06-13 sweep audit, in three batches (all on origin/main, HEAD `3bc
   (idempotent; verified live "OK: no two ... share a clock time"). Surfaced a stray
   `cowork-cora-drive-extractor` at 04:00 (moved to 04:05) that may be a stale sibling of
   `Cora - Drive Sweep` (06:00) / `cowork-cora-kb-sync-drive` (04:30) -- worth a look.
-- **B3 (`a4c32cd`, SCRIPT-SIDE, live at next capture fire):** `fireflies_action_extractor`
+- **B3 (`a4c32cd`, SCRIPT-SIDE, LIVE):** `fireflies_action_extractor`
   roster-grounds Haiku action items -- drops FYI/completed (`is_actionable`), validates
   assignee against org-roles (off-roster -> unassigned; precise matcher, NO unanchored
-  substring), caps title length. NOTE: "Cora - Meeting Action Capture" is currently
-  DISABLED, so B3 stays dormant until that task is re-enabled.
+  substring), caps title length. CORRECTION 2026-06-14: "Cora - Meeting Action Capture"
+  is ENABLED + firing hourly (verified live, result 0) -- B3 is LIVE, NOT dormant. See
+  the D-052 entry (LEX capture relaxed + scoped) shipped 2026-06-14.
 - **B4 (`a4c32cd`, BOT-LOADED, RESTART PENDING):** `reply_formatter` also flattens markdown
   list markers + backticks/code-fences (280-char cap stays log-only, already correct).
 - **D1 (`a4c32cd`, BOT-LOADED, RESTART PENDING):** messages in #info-for-cora (`C0B5BNP6YKY`)
@@ -1216,7 +1217,7 @@ Three code-level anti-recurrence fixes for the issues the 2026-06-06 hygiene-asa
 
 **Fix 3 — Captured tasks routed into projects (commits `8991289` mechanism + `2020f91` live)**
 - Problem: Fireflies-captured action items created with NO project → untaggable orphans cluttering My Tasks.
-- New `data/maps/meeting-capture-projects.yaml` maps each entity → its catch-all Asana project. All GIDs sourced from asana-project-map.yaml and cross-checked (catch_all_gid per entity). BDM intentionally excluded (empty). LEX* entries populated but inert — PHI guardrail skips all LEX meetings before routing ever runs.
+- New `data/maps/meeting-capture-projects.yaml` maps each entity → its catch-all Asana project. All GIDs sourced from asana-project-map.yaml and cross-checked (catch_all_gid per entity). BDM intentionally excluded (empty). ~~LEX* entries populated but inert — PHI guardrail skips all LEX meetings before routing ever runs.~~ **SUPERSEDED 2026-06-14 (D-052): LEX meetings now flow through capture, SCOPED — LEX* entries are ACTIVE for routing (LEX-only projects via `_resolve_lex_project`, validated allowlist); LEX-LBHS excluded (Part 2). See D-052.**
 - Captured tasks now: routed into project + `Status=Not Started` + `Priority=Medium` stamped at creation.
 - **⬜ Open**: Entity custom-field option GIDs not yet supplied → entity tagging still OFF. Field GIDs when ready:
   - Entity field: `1214487026542596`

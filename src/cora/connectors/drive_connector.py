@@ -619,20 +619,89 @@ def ensure_folder_path(path_segments: list[str]) -> str:
     return current_id
 
 
+def list_folder_files_with_md5(parent_folder_id: str) -> list[dict]:
+    """List direct children of a folder with their md5Checksum (binary files only).
+
+    Returns dicts {id, name, md5Checksum, webViewLink}. Folders + Google-native
+    files (which have no md5Checksum) are skipped. Used by upload_file's content
+    backstop and by the attachment-filer --reconcile pass to seed the content
+    ledger from files already in Drive.
+    """
+    service = _build_drive_service()
+    out: list[dict] = []
+    page_token: str | None = None
+    while True:
+        try:
+            resp = service.files().list(
+                q=f"'{parent_folder_id}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, md5Checksum, webViewLink, mimeType)",
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute()
+        except HttpError as exc:
+            raise DriveConnectorError(
+                f"Folder md5 listing failed for {parent_folder_id}: {exc}"
+            ) from exc
+        for f in resp.get("files", []):
+            if f.get("md5Checksum"):
+                out.append(f)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def resolve_folder_path(path_segments: list[str]) -> str | None:
+    """Read-only sibling of ensure_folder_path: return the leaf folder ID if the
+    whole path already exists, else None. Never creates folders.
+
+    Used by the attachment-filer --reconcile pass, which must only read existing
+    Drive folders (never materialize empty ones).
+    """
+    service = _build_drive_service()
+    current_id = _resolve_root_folder_id(service)
+    for segment in path_segments:
+        try:
+            resp = service.files().list(
+                q=(
+                    f"name = '{segment}' "
+                    f"and mimeType = '{_FOLDER_MIME}' "
+                    f"and '{current_id}' in parents "
+                    f"and trashed = false"
+                ),
+                fields="files(id, name)",
+                pageSize=5,
+            ).execute()
+        except HttpError as exc:
+            raise DriveConnectorError(
+                f"Folder lookup failed for {segment!r}: {exc}"
+            ) from exc
+        files = resp.get("files", [])
+        if not files:
+            return None
+        current_id = files[0]["id"]
+    return current_id
+
+
 def upload_file(
     parent_folder_id: str,
     filename: str,
     content: bytes,
     mime_type: str,
+    content_md5: str | None = None,
 ) -> tuple[str, str]:
     """Upload bytes as a new file in parent_folder_id. Returns (file_id, web_view_link).
 
-    If a file with the same name already exists in that folder, the upload is skipped
-    and the existing file's ID + link are returned to preserve idempotency.
+    Idempotency, two layers (both return the existing file instead of uploading):
+      1. Same NAME already in the folder -> skip (cheap, single query).
+      2. Same CONTENT (content_md5 matches an existing file's md5Checksum in the
+         folder) -> skip, even under a different name. This catches the LLM
+         renaming the same document across runs. Only runs when content_md5 is
+         supplied and the name check missed.
     """
     service = _build_drive_service()
 
-    # Dedup: check for existing file with same name in same folder
+    # Layer 1 — name dedup: check for existing file with same name in same folder
     try:
         resp = service.files().list(
             q=(
@@ -653,6 +722,16 @@ def upload_file(
             filename, parent_folder_id,
         )
         return existing[0]["id"], existing[0].get("webViewLink", "")
+
+    # Layer 2 — content dedup: same md5 under a different name in this folder
+    if content_md5:
+        for f in list_folder_files_with_md5(parent_folder_id):
+            if f.get("md5Checksum") == content_md5:
+                log.info(
+                    "Drive md5 dedup: %r matches existing %r (md5=%s) in folder %s — skipping upload",
+                    filename, f.get("name"), content_md5, parent_folder_id,
+                )
+                return f["id"], f.get("webViewLink", "")
 
     media = MediaIoBaseUpload(
         io.BytesIO(content),

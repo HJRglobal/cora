@@ -1517,3 +1517,82 @@ activate it; my commit (c2c4088) was scoped to my own files only.
 **Tests:** `tests/test_phi_scrubber.py`, `tests/test_lex_meeting_capture.py`,
 `tests/test_fireflies_dedup.py`, plus updated `tests/test_meeting_action_capture.py`.
 Full suite 4,200 passed / 41 skipped.
+
+---
+
+## D-053 · Email attachment auto-filer is crash-safe + content-aware idempotent (2026-06-14)
+
+**Context:** A 2026-06-14 Drive-hygiene cleanup found the auto-filer creating
+many byte-identical duplicates (the single OSN Amended Personal Guarantee PDF
+had been filed 6× across `legal/` and `contracts/`, under 4 different names).
+
+**Root cause (the prompt's "no ledger / bad naming" diagnosis was wrong):**
+The filer ALREADY had a message-id dedup dict (`data/cache/filed-message-ids.json`)
+and `upload_file()` ALREADY deduped by exact name. Both failed because:
+1. The state dict + per-account watermark were saved ONLY at the very end of
+   `run_filer()`. The Task Scheduler job's 15-min `ExecutionTimeLimit` SIGKILLed
+   the process before that save — every run, since 2026-05-28. So the watermark
+   froze at May 28, every 4-hourly run re-scanned ~2.5 weeks × 12 inboxes
+   (500-750 re-files/run), which guaranteed the next 15-min kill: a death
+   spiral. `filed-message-ids.json` never even existed on disk. Evidence:
+   `"Watermark advanced"` logged in-loop daily but `"Total filed"` (logged after
+   `run_filer` returns) appeared 0× in any log; the 14:00 run died at exactly
+   14:15:01.
+2. The same document arrives via DISTINCT emails (an original Dropbox-Sign
+   notice + a "Fwd:" of it) with different Message-IDs + Dates, classified
+   independently by the LLM into different names/folders. Neither a message-id
+   ledger nor a same-name Drive check can dedup that — only content (md5) can.
+
+**Decision — idempotency is crash-safe + content-aware + persisted incrementally:**
+- Two append-only JSONL ledgers in `data/state/` (`filer_ledger.py`), loaded once
+  per run into memory and appended the instant something is filed → a kill loses
+  at most the in-flight line:
+  - **content ledger** keyed on **md5** (matches Drive's `md5Checksum`, so one
+    value backs the local ledger, the in-folder Drive backstop, and `--reconcile`).
+    Folder-agnostic: the same bytes are filed once regardless of email/name/folder.
+  - **message ledger** keyed on `rfc_message_id` (falling back to `gmail:<id>`
+    when the header is absent — the old code short-circuited on an empty rfc id
+    and silently never deduped). Lets a re-scanned message skip re-classification.
+- `upload_file()` gains a second dedup layer: same `content_md5` under a
+  DIFFERENT name in the target folder → skip (was name-only).
+- Watermark advances + is **saved per account, immediately** (not once at
+  end-of-run) — this is what breaks the kill-before-save spiral. It advances
+  whenever the listing succeeded; per-message file errors no longer freeze it
+  (the ledgers make a re-scan safe), so one bad attachment can't pin a
+  watermark forever again.
+- `run_filer()` **self-bounds** at `EMAIL_FILING_RUN_BUDGET_SECONDS` (default
+  780s/13min) and exits cleanly, persisting per-account progress; the next run
+  resumes. Doctrine reaffirmed: script-side self-bounding is the real control;
+  the Task Scheduler limit only backstops it. Task limit raised 15→20 min for
+  catch-up headroom.
+- `--reconcile` (read-only) seeds the content ledger from files already in Drive
+  so the next run dedups against the canonical copy left after a manual cleanup,
+  regardless of which folder the LLM would pick. Run once after deploy.
+
+**Naming:** the date prefix already came from the email Date header (correct);
+the LLM's description/folder variance is now non-load-bearing because md5 dedup
+catches duplicates regardless of name. No separate classification cache needed.
+
+**Gmail label:** NOT re-introduced. The prompt asked to apply a `Cora-Filed`
+label, but commit 396d8e4 deliberately removed it for invisible JSON dedup. The
+crash-safe JSON+md5 design fully fixes the bug without writing to anyone's
+mailbox, so 396d8e4 stands.
+
+**Activation:** Scheduled task spawns a fresh process per run → the fix went
+live on disk immediately; NO bot restart needed (the filer is not the bot). Verified
+live in the 18:00 AZ 2026-06-14 run: harrison's watermark advanced off May 28
+and saved per-account; the OSN guarantee Fwd hit the new md5 backstop
+(`Drive md5 dedup … skipping upload`) and the duplicate Dropbox-Sign email hit
+the content ledger (`Content already filed … skipping`) — zero new dupes.
+`--reconcile` then seeded 488 hashes (531 total). Remaining 11 accounts catch
+their watermark up over the next few 4-hourly runs.
+
+**Tests:** `tests/test_filer_ledger.py` (22) + `tests/test_attachment_filer.py`
+(34): file-once-then-zero, same-content-different-message, md5 preseed skip,
+deterministic date-from-header, dry-run writes nothing, per-account watermark
+save, list-failed/budget-hit don't advance, reconcile seeds + dedups,
+`upload_file` name/md5/no-match. Full suite 4,234 passed / 41 skipped.
+
+**Follow-up (Harrison, optional):** re-run `deployment\setup-attachment-filer-task.ps1`
+from elevated PowerShell to apply the 15→20-min ExecutionTimeLimit (the rest is
+already live + self-healing).

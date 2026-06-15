@@ -52,9 +52,15 @@ $Trigger = New-ScheduledTaskTrigger `
     -Once `
     -At (Get-Date -Minute 0 -Second 0).AddHours(1)
 
-# Settings: don't start if on battery; stop if it runs > 15 minutes
+# Settings: don't start if on battery; hard kill at 20 min.
+# The script self-bounds at ~13 min (EMAIL_FILING_RUN_BUDGET_SECONDS=780) and
+# persists per-account progress as it goes, so it exits cleanly well before this
+# limit. The 20-min limit is only a backstop + gives headroom for catch-up runs.
+# (Previously 15 min: with a frozen watermark the run re-scanned ~2.5 weeks of
+# mail and was killed BEFORE the end-of-run state save, so dedup never persisted.
+# Per-account incremental saves + the self-bound fix that; see filer_ledger.py.)
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
     -StartWhenAvailable `
     -DontStopIfGoingOnBatteries:$false
 
