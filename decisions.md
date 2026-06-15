@@ -1501,11 +1501,18 @@ that reuse one link are kept separate by the start-time window.
 **Basis:** Lexington BAA confirmed in place (Emily + legal 2026-06-09); Harrison
 is sole authority on PHI access posture (founder doctrine 2026-05-21).
 
-**Activation:** Both changes are script-side. WI1 runs in the "Cora - Meeting
-Action Capture" scheduled task — currently DISABLED, so WI1 is DORMANT until
-that task is re-enabled. WI2 runs in the nightly "Cora - KB Sync (Fireflies)"
-task (3:30am AZ); it activates at the next fire. Neither change is in the bot's
-serving path, so a bot restart is not required for them to take effect.
+**Activation:** Both changes are script-side; each scheduled task spawns a fresh
+process that imports the current on-disk source, so no bot restart is required.
+WI1 runs in the "Cora - Meeting Action Capture" scheduled task — verified
+2026-06-14 to be **ENABLED** and firing hourly (last run 17:00 AZ, result 0),
+which CONTRADICTS the founder docs that still call it "disabled" (stale —
+flagged to Harrison). WI1 therefore goes LIVE at the next hourly fire (~18:00 AZ
+2026-06-14): LEX operational meetings begin producing scoped, PHI-scrubbed Asana
+tasks. WI2 runs in `cowork-cora-kb-sync-fireflies` (3:30am AZ daily); it
+activates at the next fire. Bot restart was HELD: a concurrent Code session's
+uncommitted attachment-filer WIP (drive_connector.py / attachment_filer.py /
+run_attachment_filer.py / filer_ledger.py) is on disk, and a restart would
+activate it; my commit (c2c4088) was scoped to my own files only.
 
 **Tests:** `tests/test_phi_scrubber.py`, `tests/test_lex_meeting_capture.py`,
 `tests/test_fireflies_dedup.py`, plus updated `tests/test_meeting_action_capture.py`.
