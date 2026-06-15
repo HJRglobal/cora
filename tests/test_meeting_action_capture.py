@@ -341,21 +341,24 @@ class TestParseActionItemsWithHaiku:
 # ---------------------------------------------------------------------------
 
 class TestPhiGuardrail:
-    def test_lex_meetings_always_skipped(self):
-        """LEX entity meetings are always skipped (not just clinical keywords)."""
-        # run_action_capture checks entity == "LEX" and skips
-        transcript = _make_transcript(title="Lexington Services Staff Sync")
-        # Entity for this title should be LEX
+    def test_lex_title_classifies_to_lex(self):
+        """A Lexington-titled meeting classifies to the LEX entity."""
         from cora.connectors.fireflies_connector import _classify_entity
-        entity = _classify_entity("Lexington Services Staff Sync")
-        assert entity == "LEX"
+        assert _classify_entity("Lexington Services Staff Sync") == "LEX"
 
-    def test_lex_entity_channel_not_mapped(self):
-        """LEX has no entry in _ENTITY_CHANNEL (ensures no accidental posting)."""
-        assert "LEX" not in fae._ENTITY_CHANNEL
+    def test_lex_routes_only_to_lex_channels(self):
+        """LEX (relaxed 2026-06-14) routes ONLY to LEX channels in the allowlist."""
+        # LEX + included sub-entities are present and every LEX channel is in the
+        # hard-containment allowlist (hard rail #2).
+        assert "LEX" in fae._ENTITY_CHANNEL
+        for code, chan in fae._ENTITY_CHANNEL.items():
+            if code.upper().startswith("LEX"):
+                assert chan in fae._LEX_CHANNEL_ALLOWLIST
+        # LBHS is excluded from capture -> it must have NO digest channel.
+        assert "LEX-LBHS" not in fae._ENTITY_CHANNEL
 
     def test_phi_meeting_flagged(self):
-        """PHI detection still works for other PHI keywords on LEX."""
+        """PHI detection still works for clinical title keywords on LEX."""
         from cora.connectors.fireflies_connector import _is_phi_meeting
         assert _is_phi_meeting("Patient Intake Meeting", "LEX") is True
 
@@ -376,8 +379,16 @@ class TestChannelRouting:
     def test_osn_routes_to_osn_leadership(self):
         assert fae._ENTITY_CHANNEL["OSN"] == "#osn-leadership"
 
-    def test_lex_not_in_channel_map(self):
-        assert "LEX" not in fae._ENTITY_CHANNEL
+    def test_lex_routes_to_lex_leadership(self):
+        # LEX capture relaxed 2026-06-14: GM-level LEX -> #lex-leadership.
+        assert fae._ENTITY_CHANNEL["LEX"] == "C0B3A3U7WS3"
+
+    def test_lex_llc_routes_to_llc_leadership(self):
+        assert fae._ENTITY_CHANNEL["LEX-LLC"] == "C0B5SJDHB9C"
+
+    def test_lbhs_has_no_channel(self):
+        # Excluded from capture (42 CFR Part 2) -> no digest channel at all.
+        assert "LEX-LBHS" not in fae._ENTITY_CHANNEL
 
     def test_fndr_routes_to_fndr(self):
         assert fae._ENTITY_CHANNEL["FNDR"] == "#fndr"
@@ -489,14 +500,23 @@ class TestRunActionCapture:
         assert result["meetings_processed"] == 1
         assert result["tasks_created"] == 2  # 2 parsed tasks
 
-    def test_lex_meetings_skipped(self, tmp_path):
-        """LEX meetings are skipped entirely."""
-        transcript = _make_transcript(title="Lexington Services Staff Sync")
+    def test_lex_lbhs_meeting_skipped(self, tmp_path):
+        """LEX-LBHS meetings stay excluded (42 CFR Part 2), even with LEX capture on."""
+        # Jared Harker attendee -> sub-entity LEX-LBHS (excluded).
+        transcript = _make_transcript(
+            title="Lexington Services Ops Sync",
+            attendees=[{"displayName": "Jared Harker", "email": "jared@lexingtonservices.com"}],
+        )
         mock_ff_data = {"transcripts": [transcript]}
         watermark_path = tmp_path / "watermark.json"
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
+            patch.object(fae, "_lex_scope_cfg", {
+                "enabled": True,
+                "included_sub_entities": ["LEX", "LEX-LLC", "LEX-LLA", "LEX-LTS"],
+                "excluded_sub_entities": ["LEX-LBHS"],
+            }),
             patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -507,6 +527,25 @@ class TestRunActionCapture:
         mock_create.assert_not_called()
         assert result["meetings_processed"] == 0
         assert result["tasks_created"] == 0
+
+    def test_lex_capture_disabled_skips_all_lex(self, tmp_path):
+        """With the scope config disabled, ALL LEX meetings are skipped (old behavior)."""
+        transcript = _make_transcript(title="Lexington Services Staff Sync")
+        mock_ff_data = {"transcripts": [transcript]}
+        watermark_path = tmp_path / "watermark.json"
+
+        with (
+            patch.object(fae, "_WATERMARK_PATH", watermark_path),
+            patch.object(fae, "_lex_scope_cfg", {"enabled": False}),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+        ):
+            result = fae.run_action_capture(dry_run=True)
+
+        mock_anth.assert_not_called()
+        mock_create.assert_not_called()
+        assert result["meetings_processed"] == 0
 
     def test_no_action_items_skipped(self, tmp_path):
         """Transcripts with no action items are skipped."""

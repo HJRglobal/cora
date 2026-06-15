@@ -6,7 +6,12 @@ After each meeting completes in Fireflies, this module:
 3. Creates Asana tasks for each action item (assignee resolved from attendee emails)
 4. Posts a digest to the entity's leadership Slack channel
 
-PHI guardrail: LEX meetings are always skipped entirely.
+PHI posture (Harrison directive 2026-06-14): LEX OPERATIONAL meetings now flow
+through capture, but SCOPED -- LEX tasks route only into LEX Asana projects,
+LEX digests post only to LEX channels, task text is PHI-scrubbed, and LEX-LBHS
+stays excluded (42 CFR Part 2). Scope lives in
+data/maps/meeting-capture-lex-scope.yaml. Clinically-titled LEX meetings are
+still skipped (minimum-necessary). Non-LEX behavior is unchanged.
 Watermark: data/state/meeting_action_watermark.json stores last processed timestamp.
 
 Usage:
@@ -35,6 +40,7 @@ from cora.connectors.fireflies_connector import (
     _graphql_query,
     _is_phi_meeting,
     _parse_date,
+    _tag_fireflies_sub_entity,
     FirefliesConnectorError,
 )
 from cora.tools.asana_client import (
@@ -44,6 +50,7 @@ from cora.tools.asana_client import (
     set_task_custom_fields,
 )
 from cora.tools.project_resolver import resolve_project as _resolve_project_smart
+from cora.phi_guard import scrub_lex_phi
 from cora import org_roles
 
 log = logging.getLogger(__name__)
@@ -56,9 +63,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "meeting_action_watermark.json"
 _ASANA_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 _PROJECT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "meeting-capture-projects.yaml"
+_LEX_SCOPE_PATH = _REPO_ROOT / "data" / "maps" / "meeting-capture-lex-scope.yaml"
 _DEFAULT_LOOKBACK_HOURS = 24
 
-# Entity -> leadership Slack channel mapping (LEX is intentionally absent -- PHI)
+# Entity -> leadership Slack channel mapping.
+# LEX entries added 2026-06-14 (LEX capture relaxed). Channel IDs are the
+# canonical leadership channels from data/maps/entity-channels.yaml. LLC has its
+# own #llc-leadership; LTS/LLA and GM-level LEX route to #lex-leadership (the
+# GM-level channel, which can see all sub-entities). LEX-LBHS is excluded from
+# capture entirely (42 CFR Part 2), so it needs no digest channel. The
+# _LEX_CHANNEL_ALLOWLIST below is the hard containment check: a LEX digest may
+# ONLY post to one of these channels.
 _ENTITY_CHANNEL: dict[str, str] = {
     "F3E":     "#f3-leadership",
     "OSN":     "#osn-leadership",
@@ -69,7 +84,17 @@ _ENTITY_CHANNEL: dict[str, str] = {
     "HJRG":    "#hjrg-leadership",
     "FNDR":    "#fndr",
     "F3C":     "#fndr",  # route F3 Community to founder channel
+    "LEX":     "C0B3A3U7WS3",  # #lex-leadership (GM-level)
+    "LEX-LLC": "C0B5SJDHB9C",  # #llc-leadership
+    "LEX-LLA": "C0B3A3U7WS3",  # #lex-leadership (GM-level; LLA has no own channel)
+    "LEX-LTS": "C0B3A3U7WS3",  # #lex-leadership (GM-level; LTS has no own channel)
 }
+
+# Hard containment: the ONLY channels a LEX digest may post to. Built from the
+# LEX* entries above so it can never drift from them.
+_LEX_CHANNEL_ALLOWLIST: frozenset[str] = frozenset(
+    v for k, v in _ENTITY_CHANNEL.items() if k.upper().startswith("LEX")
+)
 
 # Asana task notes template
 _TASK_NOTES_TEMPLATE = (
@@ -255,6 +280,176 @@ def _capture_custom_fields(entity: str) -> dict[str, str]:
     if entity_field and entity_opt:
         fields[entity_field] = entity_opt
     return fields
+
+
+# ---------------------------------------------------------------------------
+# LEX capture scope + PHI containment (Harrison directive 2026-06-14)
+# ---------------------------------------------------------------------------
+# LEX operational meetings now flow through capture, but SCOPED. These helpers
+# enforce: (a) which LEX sub-entities are in scope (LBHS excluded -- Part 2),
+# (b) LEX tasks land ONLY in LEX-scoped Asana projects, (c) task text is
+# PHI-scrubbed, keeping staff names. Non-LEX paths never touch any of this.
+
+_lex_scope_cfg: dict[str, Any] | None = None      # module-level cache
+_known_lex_projects: frozenset[str] | None = None  # module-level cache
+_staff_names_cache: set[str] | None = None         # module-level cache
+
+# GID-bearing keys in asana-project-map.yaml -- used to enumerate LEX projects.
+_PROJECT_GID_KEYS = {
+    "catch_all_gid", "project_gid",
+    "event_project_gid", "social_project_gid", "fallback_project_gid",
+}
+
+
+def _load_lex_scope_cfg() -> dict[str, Any]:
+    """Load meeting-capture-lex-scope.yaml (enabled + include/exclude lists)."""
+    global _lex_scope_cfg
+    if _lex_scope_cfg is not None:
+        return _lex_scope_cfg
+    try:
+        _lex_scope_cfg = yaml.safe_load(
+            _LEX_SCOPE_PATH.read_text(encoding="utf-8")
+        ) or {}
+    except Exception as exc:
+        # Fail SAFE: if the scope config can't be read, treat LEX capture as
+        # disabled (revert to old skip-all behavior) rather than processing
+        # LEX meetings with unknown scope.
+        log.warning("Could not load meeting-capture-lex-scope.yaml: %s -- LEX capture OFF", exc)
+        _lex_scope_cfg = {"enabled": False}
+    return _lex_scope_cfg
+
+
+def _lex_capture_enabled() -> bool:
+    """Master switch for LEX meeting capture (fail-safe OFF on config error)."""
+    return bool(_load_lex_scope_cfg().get("enabled"))
+
+
+def _lex_sub_entity_allowed(scoped_entity: str) -> bool:
+    """True if `scoped_entity` (e.g. 'LEX-LLC' / 'LEX') is in capture scope.
+
+    FAIL-CLOSED: a sub-entity that is explicitly excluded, OR not present in the
+    included list, is NOT allowed. Excluded always wins (LBHS / Part 2).
+    """
+    cfg = _load_lex_scope_cfg()
+    excluded = {str(s).upper() for s in (cfg.get("excluded_sub_entities") or [])}
+    included = {str(s).upper() for s in (cfg.get("included_sub_entities") or [])}
+    code = scoped_entity.upper()
+    if code in excluded:
+        return False
+    return code in included
+
+
+def _collect_gids(node: Any, out: set[str]) -> None:
+    """Recursively collect project GIDs (values under _PROJECT_GID_KEYS)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _PROJECT_GID_KEYS and isinstance(v, str) and v.strip():
+                out.add(v.strip())
+            else:
+                _collect_gids(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_gids(item, out)
+
+
+def _known_lex_project_gids() -> frozenset[str]:
+    """Allowlist of LEX-scoped Asana project GIDs.
+
+    Union of (a) the LEX* entries in meeting-capture-projects.yaml `projects:`
+    and (b) every project GID under any LEX* entity in asana-project-map.yaml.
+    A captured LEX task MUST land in one of these -- this is the deterministic
+    guard behind hard rail #1 (LEX tasks never reach a non-LEX project).
+    """
+    global _known_lex_projects
+    if _known_lex_projects is not None:
+        return _known_lex_projects
+    gids: set[str] = set()
+    # (a) meeting-capture-projects.yaml LEX* projects
+    proj = (_load_capture_project_cfg().get("projects") or {})
+    for k, v in proj.items():
+        if str(k).upper().startswith("LEX") and isinstance(v, str) and v.strip():
+            gids.add(v.strip())
+    # (b) asana-project-map.yaml LEX* entity sections
+    try:
+        from cora.tools import project_resolver as _pr
+        data = _pr._load_map()
+        for ent, cfg in (data.get("entities") or {}).items():
+            if str(ent).upper().startswith("LEX"):
+                _collect_gids(cfg, gids)
+    except Exception as exc:
+        log.warning("Could not load asana-project-map for LEX allowlist: %s", exc)
+    _known_lex_projects = frozenset(gids)
+    return _known_lex_projects
+
+
+def _resolve_lex_project(
+    scoped_entity: str,
+    task_text: str,
+    assignee_gid: str | None,
+    meeting_title: str | None,
+) -> str | None:
+    """Resolve a LEX-scoped Asana project GID for a captured LEX task.
+
+    Tries the smart resolver (entity-scoped to LEX configs, so structurally it
+    can only return LEX projects), then VALIDATES the result against the known
+    LEX project allowlist, then falls back to the explicit LEX catch-all from
+    meeting-capture-projects.yaml. Returns None ONLY when no LEX project is
+    configured at all -- the caller then skips the task rather than ever
+    creating it outside LEX scope.
+    """
+    known = _known_lex_project_gids()
+    gid = _resolve_project_smart(
+        entity=scoped_entity, task_text=task_text,
+        assignee_gid=assignee_gid, meeting_title=meeting_title,
+    )
+    if gid and gid in known:
+        return gid
+    if gid and gid not in known:
+        log.error(
+            "LEX routing produced non-LEX project %s for %s -- forcing LEX catch-all",
+            gid, scoped_entity,
+        )
+    # Fall back to the explicit LEX catch-all (sub-entity, then GM-level LEX).
+    fallback = _resolve_capture_project(scoped_entity) or _resolve_capture_project("LEX")
+    if fallback and fallback in known:
+        log.warning(
+            "LEX mapping gap for %s -- routing captured task to LEX catch-all %s",
+            scoped_entity, fallback,
+        )
+        return fallback
+    if fallback:
+        log.error(
+            "LEX catch-all %s for %s is not a known LEX project -- skipping task to avoid leak",
+            fallback, scoped_entity,
+        )
+    else:
+        log.error("No LEX project configured for %s -- skipping task to avoid leak", scoped_entity)
+    return None
+
+
+def _staff_allowed_names() -> set[str]:
+    """Staff/operational names to PRESERVE during PHI scrubbing (from org-roles)."""
+    global _staff_names_cache
+    if _staff_names_cache is not None:
+        return _staff_names_cache
+    try:
+        names = {r.name for r in org_roles.all_roles() if r.name}
+    except Exception as exc:  # noqa: BLE001 -- degrade gracefully
+        log.warning("org_roles roster unavailable for PHI scrub: %s", exc)
+        names = set()
+    _staff_names_cache = names
+    return _staff_names_cache
+
+
+def _scrub_lex_text(raw: str) -> str:
+    """PHI-scrub a LEX task string. FAIL-SAFE: on scrubber error, keep the task
+    but truncate the raw line and flag it for human review (never drop it)."""
+    try:
+        return scrub_lex_phi(raw, _staff_allowed_names())
+    except Exception as exc:  # noqa: BLE001 -- fail-safe per directive
+        log.error("LEX PHI scrubber failed (%s) -- flagging task for review", exc)
+        snippet = (raw or "")[:80].rstrip()
+        return f"{snippet} [review for PHI]"
 
 
 def _resolve_assignee_gid(
@@ -607,14 +802,31 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
 
         entity = _classify_entity(title)
 
-        # PHI guardrail: skip ALL LEX meetings (not just clinical ones)
-        if entity == "LEX":
-            log.info("PHI guardrail: skipping LEX meeting %r", title)
-            continue
+        # ── LEX PHI posture (Harrison directive 2026-06-14) ─────────────────
+        # LEX operational meetings now flow through capture, SCOPED to LEX-only
+        # projects + channels with PHI-scrubbed text. LEX-LBHS stays excluded
+        # (42 CFR Part 2). Clinically-titled LEX meetings stay skipped below.
+        is_lex = entity == "LEX"
+        route_entity = entity  # sub-entity for LEX (e.g. LEX-LLC); entity otherwise
+        if is_lex:
+            if not _lex_capture_enabled():
+                log.info("LEX capture disabled in config -- skipping LEX meeting %r", title)
+                continue
+            scoped = _tag_fireflies_sub_entity(transcript) or "LEX"
+            if not _lex_sub_entity_allowed(scoped):
+                # Audit line: excluded sub-entity (e.g. LBHS / Part 2) or out of scope.
+                log.info(
+                    "LEX capture scope excludes %s -- skipping meeting %r (Part-2/PHI posture)",
+                    scoped, title,
+                )
+                continue
+            route_entity = scoped
+            log.info("LEX capture: processing %s meeting %r (PHI-scrubbed)", scoped, title)
 
-        # Also apply clinical PHI check for any meeting
+        # Clinical-title PHI guard (LEX only; kept as belt-and-suspenders even
+        # with LEX capture on -- minimum-necessary, don't process clinical mtgs).
         if _is_phi_meeting(title, entity):
-            log.info("PHI guardrail (clinical): skipping %r", title)
+            log.info("PHI guardrail (clinical title): skipping %r", title)
             continue
 
         summary = transcript.get("summary") or {}
@@ -642,19 +854,25 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         log.info("Processing %d action items from %r", len(parsed_tasks), title)
         result["meetings_processed"] += 1
 
+        # For LEX, the meeting title can itself carry PHI -- scrub it before it
+        # appears in task notes or the Slack digest. Non-LEX keeps the raw title.
+        display_title = _scrub_lex_text(title) if is_lex else title
+
         # Route captured tasks into the most-specific project via smart resolver.
         # The resolver applies keyword + assignee + brand + meeting-title rules
         # from data/maps/asana-project-map.yaml, falling back to catch-all per entity.
         # Legacy meeting-capture-projects.yaml is kept for custom_fields config only.
-        capture_fields = _capture_custom_fields(entity)
+        capture_fields = _capture_custom_fields(route_entity)
         # Note: per-task routing happens inside the task loop (assignee varies per task).
-        # We do an entity-level pre-check here just for logging.
-        entity_catch_all = _resolve_project_smart(entity=entity, task_text="", meeting_title=title)
-        if not entity_catch_all:
-            log.warning(
-                "No project configured for entity %s (not even catch-all). "
-                "Tasks will be orphaned. Add entity to asana-project-map.yaml.", entity,
-            )
+        # We do an entity-level pre-check here just for logging (non-LEX only --
+        # LEX routing is validated per-task inside _resolve_lex_project).
+        if not is_lex:
+            entity_catch_all = _resolve_project_smart(entity=entity, task_text="", meeting_title=title)
+            if not entity_catch_all:
+                log.warning(
+                    "No project configured for entity %s (not even catch-all). "
+                    "Tasks will be orphaned. Add entity to asana-project-map.yaml.", entity,
+                )
 
         created_tasks: list[dict[str, Any]] = []
 
@@ -663,28 +881,55 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
             assignee_name = item.get("assignee_name")
             due_mention = item.get("due_mention")
 
+            # PHI minimum-necessary: for LEX, scrub the task title + the due
+            # mention (a date can be a DOB). Assignee resolution still uses the
+            # parsed assignee_name (a staff name, kept by the scrubber anyway).
+            if is_lex:
+                task_name = _scrub_lex_text(task_name)
+                due_mention = _scrub_lex_text(due_mention) if due_mention else due_mention
+
             # Resolve assignee GID
             assignee_gid = _resolve_assignee_gid(assignee_name, attendees)
 
-            # Smart project routing: use task text + assignee + meeting title
-            # for the most-specific project match.
-            capture_project_gid = _resolve_project_smart(
-                entity=entity,
-                task_text=task_name,
-                assignee_gid=assignee_gid,
-                meeting_title=title,
-            )
+            # Project routing. LEX is routed + validated to LEX-scoped projects
+            # ONLY (hard rail #1); non-LEX uses the smart resolver as before.
+            if is_lex:
+                capture_project_gid = _resolve_lex_project(
+                    route_entity, task_name, assignee_gid, display_title,
+                )
+                if not capture_project_gid:
+                    # No LEX-scoped project at all -- skip rather than ever
+                    # create a LEX task outside LEX scope. (_resolve_lex_project
+                    # already logged the reason.)
+                    continue
+            else:
+                capture_project_gid = _resolve_project_smart(
+                    entity=entity,
+                    task_text=task_name,
+                    assignee_gid=assignee_gid,
+                    meeting_title=title,
+                )
             log.debug(
                 "project_resolver: task=%r entity=%s -> project_gid=%s",
-                task_name, entity, capture_project_gid,
+                task_name, route_entity, capture_project_gid,
             )
 
-            # Build task notes
-            notes = _TASK_NOTES_TEMPLATE.format(
-                meeting_title=title,
-                meeting_date=meeting_date_str,
-                raw_text=action_items_text[:500],
-            )
+            # Build task notes. For LEX, omit the raw action-item dump entirely
+            # (minimum-necessary) -- the note carries only operational context,
+            # PHI-scrubbed; full detail stays in Fireflies.
+            if is_lex:
+                notes = (
+                    "Auto-captured from a Lexington meeting.\n"
+                    f"Date: {meeting_date_str}\n"
+                    f"Meeting: {display_title}\n"
+                    "PHI minimized for Asana/Slack; full context in Fireflies."
+                )
+            else:
+                notes = _TASK_NOTES_TEMPLATE.format(
+                    meeting_title=title,
+                    meeting_date=meeting_date_str,
+                    raw_text=action_items_text[:500],
+                )
             if due_mention:
                 notes += f"\nDue mention: {due_mention}"
 
@@ -753,8 +998,10 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         # later in the run doesn't lose dedup state for meetings already done.
         _write_watermark(max(latest_ts, since_ts), processed_ids)
 
-        # Store results keyed by (entity, meeting_title) for Slack posting
-        key = f"{entity}||{title}"
+        # Store results keyed by (route_entity, display_title) for Slack posting.
+        # For LEX, route_entity is the sub-entity (-> its LEX channel) and
+        # display_title is the scrubbed title.
+        key = f"{route_entity}||{display_title}"
         entity_results.setdefault(key, []).extend(created_tasks)
 
     # Post Slack digests per meeting
@@ -763,6 +1010,14 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
         channel = _ENTITY_CHANNEL.get(entity_code)
         if not channel:
             log.info("No channel mapped for entity %s -- skipping Slack post", entity_code)
+            continue
+        # Hard rail #2: a LEX digest may ONLY post to a LEX channel. If routing
+        # ever produced a non-LEX channel for a LEX meeting, refuse to post.
+        if entity_code.upper().startswith("LEX") and channel not in _LEX_CHANNEL_ALLOWLIST:
+            log.error(
+                "LEX digest channel %r for %s is not a LEX channel -- NOT posting (PHI containment)",
+                channel, entity_code,
+            )
             continue
         _post_slack_summary(channel, meeting_title, tasks, dry_run=dry_run)
 

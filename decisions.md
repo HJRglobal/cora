@@ -1443,3 +1443,70 @@ missed (substring mis-assign, canonicalization GID regression, string-`false`
 is_actionable, missing LEX-PHI gate at intake, never-DM'd auto-dismiss,
 non-string-assignee crash). Lock: review significant diffs adversarially before
 committing.
+
+---
+
+## D-052 · LEX meetings flow through Meeting Action Capture (scoped) + Fireflies ingest dedup (2026-06-14)
+
+**Context:** Two changes to the Fireflies pipeline, bundled (they share a
+restart). (1) Per Harrison directive (2026-06-14), Lexington OPERATIONAL
+meetings should produce Asana action items instead of being skipped wholesale.
+(2) Org-wide Fireflies rollout means several attendees' notetakers capture the
+SAME meeting, ingesting near-identical transcripts as separate KB rows
+(observed 6/13: Voyager/Copa x2, F3 Amazon Weekly x2 on 6/10).
+
+**Decision (WI1 — LEX capture relaxed, SCOPED to the capture pipeline only):**
+The blanket `entity == "LEX"` skip in `fireflies_action_extractor.run_action_capture`
+is replaced by a scope check. This change touches the Fireflies meeting ->
+action-item -> Asana pipeline ONLY — NOT Slack Q&A PHI behavior, the
+reconciliation engine, the LEX PHI custodian gate, or any other surface.
+Hard rails enforced in code:
+  1. LEX-derived tasks route ONLY into LEX-scoped Asana projects. New
+     `_resolve_lex_project()` resolves via the (entity-scoped) smart resolver,
+     VALIDATES the result against `_known_lex_project_gids()` (union of LEX*
+     entries in meeting-capture-projects.yaml + every project GID under any LEX*
+     entity in asana-project-map.yaml), then falls back to the LEX catch-all.
+     Returns None only if no LEX project exists at all -> the task is SKIPPED
+     (never created outside LEX scope).
+  2. A LEX digest posts ONLY to a LEX channel. `_ENTITY_CHANNEL` gained LEX /
+     LEX-LLC / LEX-LLA / LEX-LTS (channel IDs from entity-channels.yaml; LLC ->
+     #llc-leadership, the rest -> #lex-leadership GM). `_LEX_CHANNEL_ALLOWLIST`
+     (built from those entries) is a hard check before any LEX post.
+  3. cross_entity_guard + sibling_guard untouched + still enforced elsewhere;
+     the capture pipeline never routes a LEX task to a non-LEX project/channel.
+  4. Task title + notes are PHI-scrubbed (`phi_guard.scrub_lex_phi`, keeping
+     staff names from org-roles); LEX notes omit the raw action-item dump
+     entirely (minimum-necessary). Fail-safe: a scrubber exception keeps the
+     task but truncates + flags it "[review for PHI]" rather than dropping it.
+  5. ENTITY TOGGLE — LEX-LBHS is EXCLUDED by default (42 CFR Part 2; a BAA does
+     NOT waive Part 2). Scope lives in `data/maps/meeting-capture-lex-scope.yaml`
+     (enabled + included/excluded sub-entities); excluded always wins; one-line
+     change to flip LBHS on later. A clinically-titled LEX meeting is STILL
+     skipped (existing `_is_phi_meeting` guard, kept as belt-and-suspenders).
+Scope is FAIL-SAFE OFF: an unreadable scope config disables LEX capture (reverts
+to the old skip-all behavior). Sub-entity is resolved from Fireflies attendees
+via `_tag_fireflies_sub_entity` (untagged GM-level -> "LEX").
+
+**Decision (WI2 — Fireflies ingest dedup):** `backfill()` now fetches the full
+window, then collapses duplicate-meeting transcripts before chunk/embed, keyed
+on `(meeting_link, start_time)` within +/-5 min (fallback when no meeting_link:
+normalized_title + participant-email set + start window). The most-complete
+copy (sentence count, then summary length, then title length; smallest id on
+tie) is kept; the rest are dropped. `meeting_link` was added to the transcripts
+GraphQL query. A persistent ledger (`data/state/fireflies-dedup-ledger.json`)
+records which ids collapsed into which canonical: re-running sync drops any
+previously-collapsed id immediately (never resurrects it). Recurring meetings
+that reuse one link are kept separate by the start-time window.
+
+**Basis:** Lexington BAA confirmed in place (Emily + legal 2026-06-09); Harrison
+is sole authority on PHI access posture (founder doctrine 2026-05-21).
+
+**Activation:** Both changes are script-side. WI1 runs in the "Cora - Meeting
+Action Capture" scheduled task — currently DISABLED, so WI1 is DORMANT until
+that task is re-enabled. WI2 runs in the nightly "Cora - KB Sync (Fireflies)"
+task (3:30am AZ); it activates at the next fire. Neither change is in the bot's
+serving path, so a bot restart is not required for them to take effect.
+
+**Tests:** `tests/test_phi_scrubber.py`, `tests/test_lex_meeting_capture.py`,
+`tests/test_fireflies_dedup.py`, plus updated `tests/test_meeting_action_capture.py`.
+Full suite 4,200 passed / 41 skipped.

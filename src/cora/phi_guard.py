@@ -161,3 +161,153 @@ def is_lex_billing_status_phi(text: str) -> bool:
     ):
         return True
     return bool(_CLIENT_STATUS_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
+# LEX action-item PHI scrubber (Meeting Action Capture, 2026-06-14)
+# ---------------------------------------------------------------------------
+# Used by the Fireflies meeting-action-capture pipeline when LEX OPERATIONAL
+# meetings are processed (Harrison directive 2026-06-14). Minimum-necessary: a
+# captured task should carry the OPERATIONAL action, not transcribe clinical
+# detail. This is a best-effort redactor over a SHORT action-item string (a task
+# title / one-line note), NOT a transcript. It drops obvious client-identifying
+# PHI -- member full names, DOB, diagnoses, medication names -- while keeping
+# staff / operational names (passed in `allowed_names`).
+#
+# It is INTENTIONALLY recall-biased (over-redacts before it under-redacts): in
+# the most-regulated entity, dropping a place name's possessive is a far cheaper
+# error than leaking a member's diagnosis. It is the text layer of a
+# defense-in-depth stack -- NOT a substitute for the LBHS/Part-2 exclusion or
+# the project/channel containment rails.
+
+# DOB tied to an explicit birth cue. Standalone dates are NOT touched so an
+# operational due date ("by 6/30") survives.
+_DOB_RE = re.compile(
+    r"\b(?:d\.?o\.?b\.?|date\s+of\s+birth|born(?:\s+on)?)\b[\s:]*"
+    r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})",
+    re.IGNORECASE,
+)
+
+# ICD-10 codes require the decimal point -> specific enough to redact anywhere.
+_ICD10_RE = re.compile(r"\b[A-TV-Z][0-9]{2}\.[0-9]{1,4}\b")
+
+# Curated diagnosis terms common in AZ DDD / behavioral-health context. "add"
+# is deliberately omitted (collides with add/address/additional). \w* absorbs
+# plurals / suffixes (autism -> autistic handled by listing the stem).
+_DIAGNOSIS_TERMS = [
+    "autism", "autistic", "asperger", "asd", "adhd",
+    "anxiety", "depression", "depressive", "bipolar", "schizophreni",
+    "ptsd", "ocd", "epileps", "seizure disorder", "cerebral palsy",
+    "down syndrome", "intellectual disability", "developmental delay",
+    "developmental disability", "fetal alcohol", "fragile x",
+    "oppositional defiant", "conduct disorder", "psychosis", "psychotic",
+    "nonverbal", "non-verbal", "substance use disorder", "substance abuse",
+]
+_DIAGNOSIS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in _DIAGNOSIS_TERMS) + r")\w*",
+    re.IGNORECASE,
+)
+# "diagnosed with X" / "diagnosis of X" -> keep the cue, redact the diagnosis.
+_DIAGNOSED_WITH_RE = re.compile(
+    r"\b(diagnos(?:ed|is)\s+(?:with|of)\s+)([A-Za-z][\w\s'-]{0,40}?)(?=[.,;:]|\band\b|$)",
+    re.IGNORECASE,
+)
+
+# Medication context: keep the cue word, redact the adjacent drug token.
+_MED_CONTEXT_RE = re.compile(
+    r"\b(medications?|meds|prescriptions?|prescribed|dosage|dose|titrat\w*)\b"
+    r"([\s:]+)([A-Za-z][\w-]+)",
+    re.IGNORECASE,
+)
+_DOSE_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|ml|mg/kg)\b", re.IGNORECASE)
+# Curated common psych / behavioral meds (recall booster; not exhaustive).
+_MED_NAMES = [
+    "risperidone", "risperdal", "aripiprazole", "abilify", "adderall",
+    "methylphenidate", "ritalin", "concerta", "vyvanse", "strattera",
+    "fluoxetine", "prozac", "sertraline", "zoloft", "lexapro", "escitalopram",
+    "clonidine", "guanfacine", "intuniv", "lamotrigine", "lamictal",
+    "valproate", "depakote", "lithium", "quetiapine", "seroquel",
+    "olanzapine", "zyprexa", "clozapine", "haloperidol", "melatonin",
+]
+_MED_NAME_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(m) for m in _MED_NAMES) + r")\b",
+    re.IGNORECASE,
+)
+
+# A care-recipient noun immediately followed by a proper name -> drop the name.
+_CARE_RECIPIENT_NAME_RE = re.compile(
+    r"\b(client|patient|member|individual|participant|recipient|consumer|guardian|parent)"
+    r"\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b",
+)
+
+
+def _staff_name_index(allowed_names: set[str] | None) -> tuple[set[str], set[str]]:
+    """Return (full-name set, first-name-token set) of staff to PRESERVE."""
+    full = {n.strip().lower() for n in (allowed_names or set()) if n and n.strip()}
+    first = {n.split()[0] for n in full if n.split()}
+    return full, first
+
+
+def _is_staff_name(name: str, full: set[str], first: set[str]) -> bool:
+    """True if *name* should be PRESERVED as a staff/operational name.
+
+    Errs toward NOT-staff (-> redact) for safety: a multi-token name is staff
+    only on an exact full-name match; a single token is staff only if it is a
+    known staff first name.
+    """
+    nm = name.strip().lower()
+    if nm in full:
+        return True
+    toks = nm.split()
+    return len(toks) == 1 and toks[0] in first
+
+
+def scrub_lex_phi(text: str, allowed_names: set[str] | None = None) -> str:
+    """Best-effort PHI redaction for a SHORT LEX action-item string.
+
+    Redacts DOB, diagnoses (term list + "diagnosed with X" + ICD-10),
+    medications (cue+token, dose, curated names), and client-identifying proper
+    names (care-recipient-noun + name, and possessive names) that are NOT in
+    *allowed_names* (the staff roster). Preserves staff/operational names.
+
+    Pure transform: it may raise on a pathological input -- callers in the
+    capture pipeline wrap it in a fail-safe (truncate + "[review for PHI]").
+    """
+    if not text:
+        return text
+    full, first = _staff_name_index(allowed_names)
+    out = text
+
+    # 1. DOB (explicit birth cue + date)
+    out = _DOB_RE.sub("[DOB redacted]", out)
+    # 2. "diagnosed with X" / "diagnosis of X" -> keep cue, redact content
+    out = _DIAGNOSED_WITH_RE.sub(lambda m: m.group(1) + "[diagnosis redacted]", out)
+    # 3. diagnosis terms anywhere
+    out = _DIAGNOSIS_RE.sub("[diagnosis redacted]", out)
+    # 4. ICD-10 codes
+    out = _ICD10_RE.sub("[dx code redacted]", out)
+    # 5. medication cue + adjacent token (keep cue, redact the drug). MUST run
+    #    before the dose step -- the dose placeholder contains the word "dose",
+    #    which is itself a med-context cue and would otherwise re-trigger here.
+    out = _MED_CONTEXT_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}[medication redacted]", out
+    )
+    # 6. curated medication names
+    out = _MED_NAME_RE.sub("[medication redacted]", out)
+    # 7. dose amounts (last, per the note above)
+    out = _DOSE_RE.sub("[dose redacted]", out)
+
+    # 8. care-recipient noun + proper name -> drop the name (keep the noun).
+    #    On a STAFF match keep the whole phrase (group 0), incl. the name.
+    def _cr(m: "re.Match[str]") -> str:
+        return m.group(0) if _is_staff_name(m.group(2), full, first) \
+            else f"{m.group(1)} [name redacted]"
+    out = _CARE_RECIPIENT_NAME_RE.sub(_cr, out)
+
+    # 9. possessive proper names not on the staff roster -> "[client]'s"
+    def _poss(m: "re.Match[str]") -> str:
+        name = re.sub(r"['’]s$", "", m.group(0))
+        return m.group(0) if _is_staff_name(name, full, first) else "[client]'s"
+    out = _NAME_POSSESSIVE_RE.sub(_poss, out)
+
+    return out

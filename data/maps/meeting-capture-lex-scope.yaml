@@ -1,0 +1,53 @@
+# Meeting Action Capture -- LEX sub-entity scope (PHI posture)
+# ==============================================================================
+# Per Harrison directive 2026-06-14: Lexington OPERATIONAL meetings now flow
+# through Meeting Action Capture (staff syncs, compliance, scheduling, ops)
+# instead of being skipped wholesale. Their action items become Asana tasks.
+#
+# This change is SCOPED to the Fireflies meeting -> action-item -> Asana
+# pipeline ONLY. It does NOT touch Cora's Slack Q&A PHI behavior, the
+# reconciliation engine, the LEX PHI custodian gate, or any other surface.
+#
+# PHI rails enforced by the capture pipeline regardless of this config:
+#   1. LEX-derived tasks route ONLY into LEX-scoped Asana projects
+#      (data/maps/meeting-capture-projects.yaml + asana-project-map.yaml LEX*).
+#   2. LEX digests post ONLY to LEX channels (data/maps/entity-channels.yaml).
+#   3. Task title/notes are PHI-scrubbed (phi_guard.scrub_lex_phi) -- the task
+#      carries the operational action, not transcribed clinical detail
+#      (minimum-necessary).
+#   4. cross_entity_guard + sibling_guard remain fully enforced elsewhere; the
+#      capture pipeline never routes a LEX task to a non-LEX project/channel.
+#
+# Basis: the Lexington BAA is confirmed in place (Emily + legal 2026-06-09) and
+# Harrison is sole authority on PHI access posture (founder doctrine
+# 2026-05-21). Clinically-titled LEX meetings (treatment plan, session note,
+# intake, etc.) are STILL skipped before routing (minimum-necessary) -- see
+# fireflies_connector._is_phi_meeting / _PHI_TITLE_KEYWORDS.
+#
+# ------------------------------------------------------------------------------
+# LEX-LBHS / 42 CFR Part 2:
+#   LEX-LBHS is EXCLUDED by default. A BAA does NOT waive 42 CFR Part 2
+#   substance-use-disorder confidentiality, which is stricter than HIPAA. To
+#   enable LBHS capture later, move "LEX-LBHS" from excluded_sub_entities into
+#   included_sub_entities -- a one-line change. Do this ONLY with explicit
+#   Part-2 sign-off.
+# ------------------------------------------------------------------------------
+#
+# A meeting's sub-entity is resolved from its Fireflies attendees
+# (fireflies_connector._tag_fireflies_sub_entity). A LEX meeting with no
+# sub-entity signal (GM-level / cross-sub-entity) is treated as "LEX".
+#
+# enabled: master switch. Set to false to revert to the old "skip all LEX
+# meetings" behavior without touching code.
+
+enabled: true
+
+included_sub_entities:
+  - LEX        # GM-level / cross-sub-entity (untagged) Lexington meetings
+  - LEX-LLC    # DDD / HCBS / DTA operations
+  - LEX-LLA    # Lex Life Academy school/clinic operations
+  - LEX-LTS    # Lexington Therapies operations
+
+excluded_sub_entities:
+  - LEX-LBHS   # 42 CFR Part 2 substance-use confidentiality -- keep OFF until
+               # explicit Part-2 sign-off. A BAA does not waive Part 2.
