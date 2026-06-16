@@ -1787,8 +1787,9 @@ deployment/
    `Python312\python.exe` (the actual bot). So the query returns 3 rows for ONE
    instance: 1 cora.exe + 2 python.exe. More than that = stacked; confirm via the
    log (a single "Cora starting up" + one monotonic heartbeat sequence). FYI the
-   service task action is `uv.exe run cora` (pre-D-005 legacy; flagged 2026-06-11,
-   unchanged -- migrating it to .venv\Scripts\python.exe -m needs a Harrison call).
+   service task action is `.venv\Scripts\cora.exe` (verified live 2026-06-16 via
+   `schtasks /query /tn cowork-cora-service /v`; D-005 compliant). The older
+   "uv.exe run cora" note was STALE -- there is no `uv` in the live action.
 
 6. **Import smoke test** -- Before every commit:
    `.venv\Scripts\python.exe -c "from src.cora.app import app"`
