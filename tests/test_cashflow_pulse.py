@@ -270,3 +270,24 @@ def test_run_flagged_count():
         mock_wc.return_value = _mock_slack_client()
         result = pulse.run(dry_run=True)
     assert result["flagged"] == len(pulse.PULSE_ENTITIES)
+
+
+# ---------------------------------------------------------------------------
+# _pulse_enabled -- daily push disabled by default (2026-06-16, gate G-E / N1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["true", "True", "TRUE", "1", "yes", "on", " true "])
+def test_pulse_enabled_true_values(monkeypatch, value):
+    monkeypatch.setenv("CASH_PULSE_ENABLED", value)
+    assert pulse._pulse_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "disabled", "  "])
+def test_pulse_enabled_false_values(monkeypatch, value):
+    monkeypatch.setenv("CASH_PULSE_ENABLED", value)
+    assert pulse._pulse_enabled() is False
+
+
+def test_pulse_enabled_unset(monkeypatch):
+    monkeypatch.delenv("CASH_PULSE_ENABLED", raising=False)
+    assert pulse._pulse_enabled() is False

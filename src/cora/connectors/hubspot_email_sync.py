@@ -52,6 +52,16 @@ _INTERNAL_DOMAINS: frozenset[str] = frozenset({
 })
 
 
+def _dm_prompts_enabled() -> bool:
+    """Ambiguous-match DM prompts are OFF by default (2026-06-16, audit N6).
+
+    The hourly "confirm attachment / no active deals" DMs were relentless and
+    memory-less. No prompt fires unless CORA_HUBSPOT_EMAIL_SYNC_DM_ENABLED=true.
+    Full Alex+Tommy + exactly-one-active-deal scoping lands in Phase 1.8.
+    """
+    return os.environ.get("CORA_HUBSPOT_EMAIL_SYNC_DM_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── State management ────────────────────────────────────────────────────────────
 
 def _load_state() -> dict[str, Any]:
@@ -345,8 +355,9 @@ def sync_user(
             continue  # no known HubSpot contacts in this thread
 
         if len(matched_contacts) > 1:
-            # Ambiguous — send one reaction DM per candidate so owner can pick with 👍/👎
-            if slack_uid and not dry_run:
+            # Ambiguous — send one reaction DM per candidate so owner can pick with 👍/👎.
+            # Gated OFF by default (audit N6); full Alex+Tommy scoping in Phase 1.8.
+            if slack_uid and not dry_run and _dm_prompts_enabled():
                 subject = (messages[-1].get("subject", "") or
                            messages[0].get("subject", "(no subject)") if messages else "(no subject)")
                 first_name = display_name.split()[0]

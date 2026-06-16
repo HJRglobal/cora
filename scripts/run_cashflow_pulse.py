@@ -228,10 +228,29 @@ def run(dry_run: bool = False) -> dict[str, int]:
     }
 
 
+def _pulse_enabled() -> bool:
+    """Daily Cash Pulse push is disabled by default (2026-06-16, gate G-E).
+
+    The 3:30 PM pulse posted stale, internally-contradictory cash figures
+    (audit N1) and stays off until the oversized-sheet read defect is fixed
+    (Phase 1.2). Set CASH_PULSE_ENABLED=true to re-enable the scheduled push.
+    ``--dry-run`` always bypasses this guard for manual preview.
+    """
+    return os.environ.get("CASH_PULSE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cross-Entity Cash Flow Pulse")
     parser.add_argument("--dry-run", action="store_true", help="Log output instead of sending DM")
     args = parser.parse_args()
+
+    if not args.dry_run and not _pulse_enabled():
+        log.warning(
+            "Cash Flow Pulse disabled (CASH_PULSE_ENABLED not true) -- exiting "
+            "without sending. Re-enable with CASH_PULSE_ENABLED=true, or preview "
+            "with --dry-run."
+        )
+        sys.exit(0)
 
     result = run(dry_run=args.dry_run)
     log.info("cashflow_pulse result: %s", result)
