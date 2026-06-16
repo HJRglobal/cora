@@ -63,16 +63,24 @@ def find_orphans(conn, vec_table: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def delete_orphans(conn, vec_table: str, chunk_ids: list[str]) -> int:
-    """Delete the given chunk_ids from vec_table. Returns rows deleted."""
-    if not chunk_ids:
-        return 0
-    placeholders = ",".join("?" * len(chunk_ids))
-    cur = conn.execute(
-        f"DELETE FROM {vec_table} WHERE chunk_id IN ({placeholders})",
-        chunk_ids,
-    )
-    return cur.rowcount
+def delete_orphans(conn, vec_table: str, chunk_ids: list[str], batch_size: int = 500) -> int:
+    """Delete the given chunk_ids from vec_table, in batches. Returns rows deleted.
+
+    Batched to stay under SQLite's bound-variable limit -- the live KB had 38,642
+    orphans per table, and a single IN(...) with that many params raises
+    "too many SQL variables". vec0 DELETE supports an IN-list of bound params (see
+    store.upsert_documents), just not tens of thousands at once.
+    """
+    total = 0
+    for i in range(0, len(chunk_ids), batch_size):
+        batch = chunk_ids[i:i + batch_size]
+        placeholders = ",".join("?" * len(batch))
+        cur = conn.execute(
+            f"DELETE FROM {vec_table} WHERE chunk_id IN ({placeholders})",
+            batch,
+        )
+        total += cur.rowcount
+    return total
 
 
 def main() -> int:

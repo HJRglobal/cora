@@ -52,3 +52,17 @@ def test_delete_orphans_removes_only_orphans():
 def test_delete_orphans_empty_is_noop():
     c = _conn()
     assert sweep.delete_orphans(c, "knowledge_vec_bin", []) == 0
+
+
+def test_delete_orphans_batches_large_lists():
+    # Regression: 38,642 orphans per table blew SQLite's bound-variable limit
+    # ("too many SQL variables") when passed as a single IN(...). Must batch.
+    c = _conn()
+    c.execute("INSERT INTO knowledge_chunks VALUES ('keep')")
+    ids = [f"orphan{i}" for i in range(1200)]  # spans multiple batches
+    c.executemany("INSERT INTO knowledge_vec_bin VALUES (?)",
+                  [("keep",)] + [(i,) for i in ids])
+    deleted = sweep.delete_orphans(c, "knowledge_vec_bin", ids, batch_size=500)
+    assert deleted == 1200
+    remaining = [r[0] for r in c.execute("SELECT chunk_id FROM knowledge_vec_bin")]
+    assert remaining == ["keep"]
