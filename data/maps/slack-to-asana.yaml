@@ -128,3 +128,23 @@ users:
   - slack_user_id: U0B6LQNSR25
     asana_email: jasrdorfman@gmail.com
     display_name: Jason Dorfman
+
+  # --- Identity-only rows (in org-roles.yaml; no Asana GID yet) ---
+  # Added 2026-06-16 (Phase 1.1, audit N4) so these users RESOLVE for briefings,
+  # calendar, and @mention assignment instead of rendering as "unknown user".
+  # With no asana_user_gid, the create-task gate reports "no Asana mapping" for
+  # them rather than guessing. Add the GID here once each has an Asana account.
+
+  # Aaron Ferrucci -- LEX-LLC Programs Director + PHI custodian. Asana invite
+  # issued 2026-06-11; GID not yet visible via the API (pending acceptance).
+  - slack_user_id: U0B3PS32A22
+    asana_email: programdirector@lexingtonservices.com
+    display_name: Aaron Ferrucci
+
+  # Sara Fonseca -- LLC marketing freelancer. No Asana/Google mapping yet.
+  - slack_user_id: U0B9JS3JW07
+    display_name: Sara Fonseca
+
+  # Jerry Reick -- HJRG Staff Accountant. Asana GID TBD (add when known).
+  - slack_user_id: U0B4L7886PJ
+    display_name: Jerry Reick
