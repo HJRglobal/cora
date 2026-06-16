@@ -58,3 +58,33 @@ def test_bad_proposed_at_ignored():
     e = {"state": "PENDING", "dm_message_ts": "1.1", "proposed_at": "not-a-date", "resolved_at": None}
     assert rkr._auto_dismiss_stale_pending([e], now - timedelta(hours=48), now) == 0
     assert e["state"] == "PENDING"
+
+
+# ── Single-instance run lock (audit N2: triple-post race guard) ──────────────
+
+def test_run_lock_acquire_then_block(tmp_path, monkeypatch):
+    import logging
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "knowledge-review.lock")
+    log = logging.getLogger("test")
+    assert rkr._acquire_run_lock(log) is True          # first run takes it
+    assert (tmp_path / "knowledge-review.lock").exists()
+    assert rkr._acquire_run_lock(log) is False         # concurrent run is blocked
+    rkr._release_run_lock()                            # release frees it
+    assert not (tmp_path / "knowledge-review.lock").exists()
+    assert rkr._acquire_run_lock(log) is True          # next run can take it again
+    rkr._release_run_lock()
+
+
+def test_run_lock_stale_is_reclaimed(tmp_path, monkeypatch):
+    import logging
+    import os as _os
+    import time as _time
+    lock = tmp_path / "knowledge-review.lock"
+    monkeypatch.setattr(rkr, "_LOCK_PATH", lock)
+    monkeypatch.setattr(rkr, "_LOCK_STALE_SECONDS", 1)
+    log = logging.getLogger("test")
+    assert rkr._acquire_run_lock(log) is True
+    old = _time.time() - 10                            # age the lock past stale window
+    _os.utime(lock, (old, old))
+    assert rkr._acquire_run_lock(log) is True          # stale lock cleared + reacquired
+    rkr._release_run_lock()

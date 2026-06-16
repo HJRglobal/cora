@@ -24,6 +24,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +45,40 @@ from cora.knowledge_review import (  # noqa: E402
 )
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+
+# Single-instance run lock (audit N2): the pending-DM batch posted 3x at
+# 11:51/11:53/11:53 when invocations overlapped before dm_message_ts was
+# patched. A best-effort lockfile makes a concurrent invocation a no-op.
+_LOCK_PATH = Path(__file__).resolve().parents[1] / "data" / "state" / "knowledge-review.lock"
+_LOCK_STALE_SECONDS = 20 * 60
+
+
+def _acquire_run_lock(log: logging.Logger) -> bool:
+    """Return True if this process took the run lock, False if a fresh run holds it."""
+    _LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        age = time.time() - _LOCK_PATH.stat().st_mtime
+        if age > _LOCK_STALE_SECONDS:
+            log.warning("Clearing stale knowledge-review lock (age %.0fs)", age)
+            _LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(str(_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n".encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_run_lock() -> None:
+    try:
+        _LOCK_PATH.unlink()
+    except OSError:
+        pass
 
 
 def _setup_logging() -> None:
@@ -232,6 +267,15 @@ def main() -> int:
     log = logging.getLogger("knowledge-review")
     log.info("=" * 60)
     log.info("Knowledge review run starting (dry_run=%s)", args.dry_run)
+
+    # N2 race guard: refuse to run if another invocation is already in flight,
+    # so the same PENDING batch can't be DM'd two or three times in a row.
+    if not args.dry_run:
+        if not _acquire_run_lock(log):
+            log.warning("Another knowledge-review run holds the lock — skipping this invocation.")
+            return 0
+        import atexit
+        atexit.register(_release_run_lock)
 
     exit_code = 0
 
