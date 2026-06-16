@@ -342,3 +342,22 @@ def test_verify_fail_open_on_bad_json(monkeypatch):
 
 def test_verify_empty_input():
     assert verify_decisions_with_haiku([]) == []
+
+
+# ── _post_enabled (audit N2/N3: decision-capture posting muted by default) ────
+
+@pytest.mark.parametrize("value", ["true", "True", "1", "yes", "on", " true "])
+def test_post_enabled_true(monkeypatch, value):
+    monkeypatch.setenv("DECISION_CAPTURE_POST_ENABLED", value)
+    assert cd._post_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "  "])
+def test_post_enabled_false(monkeypatch, value):
+    monkeypatch.setenv("DECISION_CAPTURE_POST_ENABLED", value)
+    assert cd._post_enabled() is False
+
+
+def test_post_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("DECISION_CAPTURE_POST_ENABLED", raising=False)
+    assert cd._post_enabled() is False

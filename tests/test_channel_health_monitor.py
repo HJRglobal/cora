@@ -104,6 +104,23 @@ def test_build_report_no_sheet_names():
     assert "spreadsheet" not in report.lower()
 
 
+def test_build_report_caps_long_lists():
+    # audit N9: a 400+ line raw dump must become a capped summary + file reference
+    dead = [{"id": f"C{i:05d}", "name": f"dead-{i}"} for i in range(40)]
+    report = chm.build_report(100, dead, [], full_report_path="logs/channel-health-x.md")
+    assert "dead-0 (" in report                  # first item shown
+    assert "dead-39" not in report               # beyond the preview cap
+    assert "...and 25 more" in report            # 40 - 15 = 25
+    assert "logs/channel-health-x.md" in report  # full list referenced
+    assert "40 total" in report                  # total count surfaced
+
+
+def test_build_report_short_list_not_capped():
+    report = chm.build_report(10, [{"id": "C1", "name": "only-one"}], [])
+    assert "only-one" in report
+    assert "...and" not in report                # no truncation marker for short lists
+
+
 # ---------------------------------------------------------------------------
 # run()
 # ---------------------------------------------------------------------------

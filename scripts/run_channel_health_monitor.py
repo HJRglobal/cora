@@ -46,6 +46,7 @@ HJRG_LEADERSHIP_CHANNEL = "C0B3K67J10T"
 ENTITY_CHANNELS_FILE = _REPO_ROOT / "data" / "maps" / "entity-channels.yaml"
 DEAD_WINDOW_DAYS = 30
 RATE_LIMIT_SLEEP = 0.3  # seconds between conversations_history calls
+_PREVIEW_N = 15  # cap inline channel lists; the full list goes to a file (audit N9)
 
 
 # ---------------------------------------------------------------------------
@@ -88,28 +89,45 @@ def build_report(
     checked: int,
     dead_channels: list[dict[str, Any]],
     missing_channels: list[dict[str, Any]],
+    full_report_path: str | None = None,
 ) -> str:
-    """Build the Slack message for the health report."""
+    """Build the Slack message for the health report.
+
+    Inline lists are capped at _PREVIEW_N (audit N9: the raw dump of 184 dead +
+    252 unmapped channel IDs was a 400+ line wall). The complete list is written
+    to a file and referenced here instead of dumped.
+    """
     today = date.today().isoformat()
     lines = [f":health: *Channel Health Report -- {today}*", ""]
 
-    if dead_channels:
-        lines.append(f":zzz: *Dead channels (0 messages in {DEAD_WINDOW_DAYS}d):*")
-        for ch in dead_channels:
-            lines.append(f"  - #{ch['name']} ({ch['id']}) -- consider archiving")
-        lines.append("")
-    else:
-        lines.append(f":zzz: *Dead channels:* none -- all channels active in {DEAD_WINDOW_DAYS}d")
+    def _section(items, header_active, header_empty, suffix):
+        if not items:
+            lines.append(header_empty)
+            lines.append("")
+            return
+        lines.append(header_active)
+        for ch in items[:_PREVIEW_N]:
+            lines.append(f"  - #{ch['name']} ({ch['id']}) -- {suffix}")
+        extra = len(items) - _PREVIEW_N
+        if extra > 0:
+            tail = f"  ...and {extra} more"
+            if full_report_path:
+                tail += f" (full list: {full_report_path})"
+            lines.append(tail)
         lines.append("")
 
-    if missing_channels:
-        lines.append(":question: *Channels Cora is in but NOT in entity-channels.yaml:*")
-        for ch in missing_channels:
-            lines.append(f"  - #{ch['name']} ({ch['id']}) -- add to entity-channels.yaml")
-        lines.append("")
-    else:
-        lines.append(":question: *Unmapped channels:* none -- all channels are mapped")
-        lines.append("")
+    _section(
+        dead_channels,
+        f":zzz: *Dead channels (0 messages in {DEAD_WINDOW_DAYS}d) -- {len(dead_channels)} total:*",
+        f":zzz: *Dead channels:* none -- all channels active in {DEAD_WINDOW_DAYS}d",
+        "consider archiving",
+    )
+    _section(
+        missing_channels,
+        f":question: *Channels Cora is in but NOT in entity-channels.yaml -- {len(missing_channels)} total:*",
+        ":question: *Unmapped channels:* none -- all channels are mapped (entity-channels.yaml)",
+        "add to entity-channels.yaml",
+    )
 
     healthy = checked - len(dead_channels)
     lines.append(
@@ -119,6 +137,26 @@ def build_report(
     )
 
     return "\n".join(lines)
+
+
+def _write_full_list(
+    dead_channels: list[dict[str, Any]],
+    missing_channels: list[dict[str, Any]],
+) -> Path:
+    """Write the complete dead + unmapped channel lists to a dated file so the
+    Slack post can stay a summary (audit N9). Returns the file path."""
+    out_dir = _REPO_ROOT / "logs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"channel-health-{date.today().isoformat()}.md"
+    out = [f"# Channel Health Report -- {date.today().isoformat()}", ""]
+    out.append(f"## Dead channels (0 messages in {DEAD_WINDOW_DAYS}d) -- {len(dead_channels)}")
+    out.extend(f"- #{ch['name']} ({ch['id']})" for ch in dead_channels)
+    out.append("")
+    out.append(f"## Unmapped channels (not in entity-channels.yaml) -- {len(missing_channels)}")
+    out.extend(f"- #{ch['name']} ({ch['id']})" for ch in missing_channels)
+    out.append("")
+    path.write_text("\n".join(out), encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +207,10 @@ def run(dry_run: bool = False) -> dict[str, int]:
             missing_channels.append({"id": ch_id, "name": ch_name})
 
     channels_checked = len(channels)
-    report = build_report(channels_checked, dead_channels, missing_channels)
+    full_path = _write_full_list(dead_channels, missing_channels)
+    report = build_report(
+        channels_checked, dead_channels, missing_channels, f"logs/{full_path.name}"
+    )
 
     if dry_run:
         log.info("[DRY RUN] Would post to %s:\n%s", HJRG_LEADERSHIP_CHANNEL, report)

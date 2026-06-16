@@ -364,6 +364,14 @@ def find_channel_id(slack_client, channel_name: str) -> str | None:
     return None
 
 
+def _post_enabled() -> bool:
+    """Decision-capture Slack posting is OFF by default (audit N2/N3: ~90% of
+    proposals were filler/transcript fragments and there is no working approve
+    path). Re-enabled by Phase 1.5 (precision) / 2.4 (one-click write) or
+    DECISION_CAPTURE_POST_ENABLED=true."""
+    return os.environ.get("DECISION_CAPTURE_POST_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capture decisions from Fireflies + Slack.")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
@@ -405,6 +413,20 @@ def main() -> int:
 
     if not verified:
         log.info("Nothing new to surface. Exiting.")
+        if rejected_fps:
+            save_surfaced(SURFACED_PATH, rejected_fps)
+            log.info("Recorded %d Haiku-rejected fingerprint(s)", len(rejected_fps))
+        return 0
+
+    # Posting is muted by default until the precision + one-click-approve rebuild
+    # (audit N2/N3). Record Haiku-rejected fingerprints so they never re-incur
+    # cost, but do NOT mark verified candidates surfaced -- so they can post once
+    # DECISION_CAPTURE_POST_ENABLED is set (Phase 1.5/2.4).
+    if not _post_enabled():
+        log.info(
+            "Decision-capture posting muted (DECISION_CAPTURE_POST_ENABLED not true) -- "
+            "%d verified candidate(s) not posted (Phase 1.5/2.4).", len(verified),
+        )
         if rejected_fps:
             save_surfaced(SURFACED_PATH, rejected_fps)
             log.info("Recorded %d Haiku-rejected fingerprint(s)", len(rejected_fps))

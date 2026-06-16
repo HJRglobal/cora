@@ -141,6 +141,13 @@ def _post_to_slack(message: str) -> bool:
         return False
 
 
+def _post_enabled() -> bool:
+    """Completion-sweep Slack posting is OFF by default (audit N3: near-zero
+    precision -- it matched BDM video tasks to bare "done"/"paid"/"received").
+    Re-enabled by Phase 1.5 (precision rebuild) or COMPLETION_SWEEP_POST_ENABLED=true."""
+    return os.environ.get("COMPLETION_SWEEP_POST_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -174,19 +181,32 @@ def main() -> int:
 
     log.info("Detection complete: %d candidates above threshold", len(candidates))
 
-    # 4. Build and post digest
+    # 4. Build digest. Posting is muted by default until the precision rebuild
+    #    (audit N3); Phase 1.5 re-enables it. Detection + audit still run so we
+    #    keep signal -- we just don't flood #hjrg-leadership with low-precision hits.
     digest = completion_detector.format_sweep_digest(candidates)
 
-    # Always post — even the "nothing found" message is useful signal.
-    posted = _post_to_slack(digest)
+    if _post_enabled():
+        posted = _post_to_slack(digest)
+        rc = 0 if posted else 1
+        err = None if posted else "slack_error"
+    else:
+        log.info(
+            "Completion-sweep posting muted (COMPLETION_SWEEP_POST_ENABLED not true) -- "
+            "%d candidate(s) detected, not posted (Phase 1.5).", len(candidates),
+        )
+        posted = False
+        rc = 0
+        err = "muted"
 
-    # 5. Mark sent (dedup for next 48h)
-    if candidates:
+    # 5. Mark sent (dedup for next 48h) only when actually posted, so muted
+    #    candidates can still surface once posting is re-enabled.
+    if candidates and posted:
         completion_detector.mark_candidates_sent(candidates)
 
-    _write_audit(candidates=len(candidates), posted=posted, error=None if posted else "slack_error")
+    _write_audit(candidates=len(candidates), posted=posted, error=err)
     log.info("=== Completion sweep done — %d candidates, posted=%s ===", len(candidates), posted)
-    return 0 if posted else 1
+    return rc
 
 
 if __name__ == "__main__":
