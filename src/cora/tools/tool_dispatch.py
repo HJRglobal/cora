@@ -148,11 +148,28 @@ def resolve_name_to_slack_user_id(name: str, channel_entity: str | None = None) 
          Only used when neither 1 nor 2 hit, to handle aliases we haven't added yet.
       4. No match — return (None, None).
     """
+    import re
+
     if not name or not name.strip():
         return None, None
 
-    needle = name.strip().lower()
+    raw = name.strip()
     slack_asana_map = _load_slack_asana_map()
+
+    # Slack mention syntax (<@U123>, <@U123|label>) or a bare Slack ID -> resolve
+    # directly. An unknown Slack ID returns no-match (ask), never a guess (N4).
+    m = re.match(r"^<@([UW][A-Z0-9]+)(?:\|[^>]*)?>$", raw)
+    slack_id_candidate = m.group(1) if m else (raw if re.fullmatch(r"[UW][A-Z0-9]{6,}", raw) else None)
+    if slack_id_candidate:
+        user = slack_asana_map.get(slack_id_candidate)
+        if user:
+            return user["slack_user_id"], user.get("display_name")
+        return None, None
+
+    # Strip a leading "@" so "@Tommy" matches "Tommy Anderson" (audit N4).
+    needle = raw.lstrip("@").strip().lower()
+    if not needle:
+        return None, None
     aliases_config = _load_user_aliases()
 
     # Build a display_name → user record lookup
@@ -203,15 +220,27 @@ def resolve_name_to_slack_user_id(name: str, channel_entity: str | None = None) 
         log.info("Ambiguous name %r matches multiple canonical users: %s", name, canonical_matches)
         return None, f"Multiple users match '{name}': {canonical_matches}. Tell the user which one they meant."
 
-    # 3. Substring match on display_name (fallback for un-aliased nicknames)
-    substring_hits = [u for key, u in by_display.items() if needle in key]
-    if len(substring_hits) == 1:
-        user = substring_hits[0]
-        return user["slack_user_id"], user.get("display_name")
-    if len(substring_hits) > 1:
-        names = [u.get("display_name", "?") for u in substring_hits]
-        log.info("Substring lookup for %r ambiguous, matches: %s", name, names)
-        return None, f"Multiple users match '{name}': {names}. Tell the user which one they meant."
+    # 3. Word-anchored prefix match on display_name (fallback for un-aliased
+    #    nicknames). Anchored to a word boundary + min length 3 so a short needle
+    #    can't mis-resolve to the wrong person (the B3 lesson: no unanchored
+    #    substring). Multiple distinct matches -> ask rather than guess.
+    if len(needle) >= 3:
+        seen_ids: set[str] = set()
+        word_hits: list[dict[str, Any]] = []
+        for key, u in by_display.items():
+            words = key.split()
+            if needle in words or any(w.startswith(needle) for w in words):
+                sid = u["slack_user_id"]
+                if sid not in seen_ids:
+                    seen_ids.add(sid)
+                    word_hits.append(u)
+        if len(word_hits) == 1:
+            user = word_hits[0]
+            return user["slack_user_id"], user.get("display_name")
+        if len(word_hits) > 1:
+            names = [u.get("display_name", "?") for u in word_hits]
+            log.info("Word-anchored lookup for %r ambiguous, matches: %s", name, names)
+            return None, f"Multiple users match '{name}': {names}. Tell the user which one they meant."
 
     # 4. No match
     return None, None
