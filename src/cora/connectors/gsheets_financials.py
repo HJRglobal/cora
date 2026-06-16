@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import time
+from datetime import date
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -63,6 +64,12 @@ _DEFAULT_CASHFLOW_SHEET_NAME = "CF_SUMMARY"
 # Cache TTL: 30 minutes. The sheet is updated weekly; we refresh aggressively
 # enough that Justin/Hayden edits surface within the hour.
 _CACHE_TTL_SECONDS = 1800
+
+# A weekly Standing-ACTUALS figure older than this many days means the sheet is
+# behind (not updated) -- consumers should surface it as stale, not as current
+# (audit N1: the pulse showed the same 5/29 week for 2+ weeks because the SHEET
+# was behind, not a read failure). The connector read itself is sound.
+_STALE_AFTER_DAYS = 10
 
 # Portfolio-level row labels (case-insensitive substring match)
 _PORTFOLIO_TOTAL_LABELS = frozenset({
@@ -157,6 +164,26 @@ class CashflowSummary:
 
     def lex_entities(self) -> list[EntityRow]:
         return [e for e in self.entities if e.entity_code.upper().startswith("LEX")]
+
+    def data_age_days(self, today: Optional[date] = None) -> Optional[int]:
+        """Age in days of the latest-actual week vs `today`.
+
+        None if the week label can't be parsed. The connector read is sound; this
+        measures whether the SHEET itself is behind (audit N1).
+        """
+        wd = _parse_week_date(self.week_label, today=today)
+        if wd is None:
+            return None
+        return ((today or date.today()) - wd).days
+
+    def is_stale(self, today: Optional[date] = None, max_age_days: int = _STALE_AFTER_DAYS) -> bool:
+        """True if the latest-actual week is older than max_age_days (default 10).
+
+        Consumers should label a stale figure "as of <week> (sheet may be behind)"
+        rather than presenting it as the current week.
+        """
+        age = self.data_age_days(today)
+        return age is not None and age > max_age_days
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -415,6 +442,32 @@ def _is_date_like(val: str) -> bool:
         re.match(r"^\d{1,2}/\d{1,2}(/\d{2,4})?$", val)   # slash: 5/19 or 5/19/2026
         or re.match(r"^\d{1,2}-\d{1,2}(-\d{2,4})?$", val) # dash:  10-17 or 10-17-2026
     )
+
+
+def _parse_week_date(week_label: str, today: Optional[date] = None) -> Optional[date]:
+    """Parse the date out of a week label ("Week of 5-29", "Week of 5/29/2026").
+
+    Infers the year as the most recent past occurrence when none is present.
+    Returns None if no date can be found (so freshness checks fail safe).
+    """
+    if not week_label:
+        return None
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", week_label)
+    if not m:
+        return None
+    today = today or date.today()
+    mo, da, yr_raw = int(m.group(1)), int(m.group(2)), m.group(3)
+    try:
+        if yr_raw:
+            yr = int(yr_raw)
+            yr += 2000 if yr < 100 else 0
+            return date(yr, mo, da)
+        d = date(today.year, mo, da)
+        if d > today:                       # no year given + future -> last year's week
+            d = date(today.year - 1, mo, da)
+        return d
+    except ValueError:
+        return None
 
 
 def _normalize_label(val: str) -> str:
