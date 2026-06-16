@@ -715,6 +715,49 @@ uncommitted). Wiring + restart land in the next clean-window commit.
 
 ---
 
+## D-033 -- (reserved -- numbering gap; decision-log namespacing) (2026-06-06)
+
+**Decision:** No standalone cora-repo decision was recorded under D-033; the
+sequence skipped from D-032 to D-034. This stub closes the phantom-number gap
+(audit F-14) so future readers do not hunt for a missing entry.
+
+**Namespacing (LOCKED 2026-06-16):** this repo's decision log and the Founder OS
+decision log run two INDEPENDENT, colliding D-### sequences. Going forward, cite
+repo decisions as **CORA-###** and founder decisions as **FNDR-###**; historical
+numbers are NOT renumbered. Note that "D-033" in the FOUNDER log is a DIFFERENT
+decision (the Drive large-file 3MB->15MB spill-file read pattern) and does not
+apply here.
+
+---
+
+## D-034 -- Cross-entity firewall: deterministic pre-LLM keyword interception (code beats prompt; SQL-layer blast radius) (2026-06-06)
+
+**Context:** Entity-scoped channels must never surface another entity's data. A
+prompt-only instruction ("don't answer cross-entity") drifts: the model routes to
+a tool and returns data before applying the scope check. This is the doctrine
+cited 6x across the repo (it had no defining header until this backfill, F-14).
+
+**Decision:** `src/cora/cross_entity_guard.py` -- a deterministic keyword
+interceptor wired at two sites in `app.py` BEFORE any Claude API call (the mention
+handler and the thread-follow-up path). Eight entity keyword dicts
+(F3E/LEX/OSN/UFL/BDM/HJRP/HJRPROD/F3C); FNDR + HJRG are pass-through aggregators;
+PAIRED_ENTITIES = {F3E<->F3C} (brand + nonprofit pairing is intentional). A
+cross-entity question in an entity channel gets a complete refusal string,
+pre-LLM, with zero tool calls and zero data. Keywords "energy drink"/"shopify"/
+"dtc" were removed from F3E to avoid OSN false positives. Commits 9076b42 ->
+3748203; tests `test_cross_entity_guard.py` + `test_cross_entity_firewall.py`.
+
+**Doctrine (LOCKED, cited widely):** Prompt-only enforcement is insufficient for a
+HARD requirement (security, privacy, blast-radius). Enforce in CODE at the
+earliest intercept point before any LLM call. Same lesson as `sibling_guard.py`
+(2026-05-24) and the personal-notes SQL-layer exclusion (D-049): the load-bearing
+control lives at the data/boundary layer, never in the prompt.
+
+**Reason:** Verified live -- an F3E question in #osn-leadership redirected in ~17s
+with no tool call and no data. Immune to model drift.
+
+---
+
 ## D-035 -- WAL-mode in-place VACUUM does NOT shrink the database file (2026-06-09)
 
 **Decision:** To reclaim disk from `cora_kb.db`, use `VACUUM INTO 'copy.db'` (then swap the
