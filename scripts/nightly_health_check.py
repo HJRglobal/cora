@@ -72,31 +72,29 @@ class CheckResult:
 
 # Tasks intentionally Disabled (Harrison-directed). Keep in sync with
 # project_scheduled_tasks_registry.md "Disabled tasks" section.
-# Reconciled against live `schtasks /Query` 2026-06-11 (14-day infra review):
-# Deal Task Sync / Asana Hygiene Nudges / Channel Health Monitor / OSN Metrics
-# Digest were re-enabled with the 2026-06-06 Tier 3 registrations -- removed.
-# Deal Aging Alerts / Weekly Pipeline Digest are live-Disabled (Make.com
-# migration 2026-06-05) -- added.
-# NOTE: qbo-token-refresh was RE-ENABLED 2026-06-04 -- it is expected Ready.
-_EXPECTED_DISABLED = {
-    # Gmail sync -- precision too low (paused)
-    "cowork-cora-asana-email-sync",
-    "cowork-cora-hubspot-email-sync",
-    # Wrong-entity content bug (fix queued)
-    "cowork-cora-proactive-gaps",
-    # Moved to Make.com 2026-06-05
-    "Cora - HubSpot Deal Monitor",
-    "Cora - Shopify DTC Summary",
-    "Cora - Deal Aging Alerts",
-    "Cora - Weekly Pipeline Digest",
-    # Clover retired 2026-06-05
-    "Cora - Clover Daily Summary",
-    # LinkedIn Spy moved to Make.com 2026-06-05
-    "Cora - LinkedIn Spy",
-    # Meeting Action Capture -- intentionally disabled (currently paused)
-    "Cora - Meeting Action Capture",
-}
-_EXPECTED_RUNNING  = {"cowork-cora-service"}
+def _load_task_state_config() -> tuple[set[str], set[str]]:
+    """Load intended (disabled, running) task-name sets from config (audit N8).
+
+    Single source of truth: data/maps/scheduled-task-state.yaml. Reconcile it
+    when you enable/disable a task. Falls back to a minimal safe default
+    (service expected running, nothing expected disabled) so a missing or broken
+    config never turns a benign state into a CRITICAL.
+    """
+    path = _REPO_ROOT / "data" / "maps" / "scheduled-task-state.yaml"
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        disabled = {str(x) for x in (data.get("disabled") or [])}
+        running = {str(x) for x in (data.get("running") or [])} or {"cowork-cora-service"}
+        return disabled, running
+    except Exception:
+        return set(), {"cowork-cora-service"}
+
+
+# Intended scheduled-task state. NOTE: "Cora - Meeting Action Capture" is ENABLED
+# (D-052) and must NOT be listed as intended-disabled. A disabled-state drift is a
+# WARNING, never a CRITICAL -- only the always-on service being down is CRITICAL.
+_EXPECTED_DISABLED, _EXPECTED_RUNNING = _load_task_state_config()
 
 # Friendly labels for the report
 _TASK_LABELS: dict[str, str] = {
@@ -237,9 +235,44 @@ def _restart_cora(dry_run: bool) -> str:
         return f"Restart attempted but failed: {exc}"
 
 
+def _classify_task_states(
+    task_states: dict[str, str],
+    intended_disabled: set[str],
+    expected_running: set[str],
+) -> tuple[list[str], list[str], int]:
+    """Pure classifier (audit N8). Returns (critical, warn, ok_count).
+
+    A disabled-state drift is a WARNING, never a CRITICAL -- a Disabled task is a
+    deliberate admin action, not an outage, and Task Scheduler never auto-flips
+    it. The ONLY task-state CRITICAL is the always-on service not Running.
+    """
+    critical: list[str] = []
+    warn: list[str] = []
+    ok = 0
+    for name, status in task_states.items():
+        if name in intended_disabled:
+            if "Disabled" in status:
+                ok += 1
+            else:
+                warn.append(f"{name}: intended Disabled, found {status} "
+                            f"(re-disable, or update scheduled-task-state.yaml)")
+        elif name in expected_running:
+            if "Running" in status:
+                ok += 1
+            else:
+                critical.append(f"{name}: expected Running, found {status}")
+        elif "Ready" in status or "Running" in status:
+            ok += 1
+        elif "Disabled" in status:
+            warn.append(f"{name}: unexpectedly Disabled "
+                        f"(add to scheduled-task-state.yaml if intentional)")
+        else:
+            warn.append(f"{name}: unexpected status '{status}'")
+    return critical, warn, ok
+
+
 def check_scheduled_tasks() -> list[CheckResult]:
-    """Check all Cora scheduled tasks for unexpected states."""
-    results: list[CheckResult] = []
+    """Check all Cora scheduled tasks for unexpected states (audit N8)."""
     try:
         out = subprocess.run(
             ["schtasks", "/Query", "/FO", "CSV", "/NH"],
@@ -248,52 +281,38 @@ def check_scheduled_tasks() -> list[CheckResult]:
     except Exception as exc:
         return [CheckResult("Scheduled tasks", "warn", f"schtasks query failed: {exc}")]
 
-    problems: list[str] = []
-    ok_count = 0
+    task_states: dict[str, str] = {}
     for line in out.splitlines():
         parts = line.strip().strip('"').split('","')
         if len(parts) < 3:
             continue
         raw_name = parts[0].lstrip("\\")
-        status = parts[2] if len(parts) > 2 else "?"
-
         if not (raw_name.startswith("cowork-cora") or raw_name.startswith("Cora")):
             continue
+        status = parts[2]
+        prev = task_states.get(raw_name)
+        # schtasks can emit one row per trigger; prefer a non-Ready status.
+        if prev is None or (("Running" in status or "Disabled" in status) and "Ready" in prev):
+            task_states[raw_name] = status
 
-        short = raw_name
+    critical, warn, ok_count = _classify_task_states(
+        task_states, _EXPECTED_DISABLED, _EXPECTED_RUNNING
+    )
 
-        if short in _EXPECTED_DISABLED:
-            if "Disabled" in status:
-                ok_count += 1
-            else:
-                problems.append(f"{short}: expected Disabled, got {status}")
-            continue
-
-        if short in _EXPECTED_RUNNING:
-            if "Running" in status:
-                ok_count += 1
-            else:
-                problems.append(f"{short}: expected Running, got {status}")
-            continue
-
-        # All others should be Ready
-        if "Ready" in status:
-            ok_count += 1
-        elif "Disabled" in status:
-            problems.append(f"{short}: unexpectedly Disabled")
-        elif "Running" in status:
-            # Check if stuck (can't easily check duration here — just note it)
-            ok_count += 1  # Running is acceptable for short-running tasks
-        else:
-            problems.append(f"{short}: unexpected status '{status}'")
-
-    if problems:
+    results: list[CheckResult] = []
+    if critical:
         results.append(CheckResult(
             "Scheduled tasks", "critical",
-            f"{len(problems)} task(s) in unexpected state:\n" +
-            "\n".join(f"  - {p}" for p in problems)
+            f"{len(critical)} task(s) in a CRITICAL state:\n" +
+            "\n".join(f"  - {p}" for p in critical)
         ))
-    else:
+    if warn:
+        results.append(CheckResult(
+            "Scheduled tasks", "warn",
+            f"{len(warn)} task(s) drifted from intended state:\n" +
+            "\n".join(f"  - {p}" for p in warn)
+        ))
+    if not critical and not warn:
         results.append(CheckResult(
             "Scheduled tasks", "ok",
             f"All {ok_count} tasks in expected state."

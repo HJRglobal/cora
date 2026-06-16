@@ -1,0 +1,33 @@
+# Intended scheduled-task state -- single source of truth for the nightly health
+# check (scripts/nightly_health_check.py, audit N8). Reconcile this file whenever
+# you enable or disable a Cora task.
+#
+# Severity contract: a disabled-state drift (a task listed here found enabled, or
+# a task NOT here found disabled) is a WARNING, never a CRITICAL -- a Disabled
+# task is a deliberate admin action, not an outage, and Task Scheduler never
+# auto-flips it. The ONLY task-state CRITICAL is the always-on service
+# (`running`) not being Running.
+#
+# DO NOT list "Cora - Meeting Action Capture" here: it is ENABLED (D-052).
+
+running:
+  - cowork-cora-service
+
+disabled:
+  # Gmail sync -- precision too low (paused)
+  - cowork-cora-asana-email-sync
+  - cowork-cora-hubspot-email-sync
+  # Wrong-entity content bug (fix queued)
+  - cowork-cora-proactive-gaps
+  # Moved to Make.com 2026-06-05
+  - Cora - HubSpot Deal Monitor
+  - Cora - Shopify DTC Summary
+  - Cora - Deal Aging Alerts
+  - Cora - Weekly Pipeline Digest
+  # Clover retired 2026-06-05/06 (D-027 / D-032)
+  - Cora - Clover Daily Summary
+  - cowork-clover-daily-pull
+  # LinkedIn Spy owned by Make.com (gate G-C, 2026-06-16)
+  - Cora - LinkedIn Spy
+  # Cash Pulse disabled 2026-06-16 (gate G-E / audit N1)
+  - Cora - Cash Flow Pulse
