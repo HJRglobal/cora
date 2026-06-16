@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""OBSOLETE as of 2026-06-08: knowledge_vec was dropped (the binary fast path
-replaced the float vec0 index). This script targeted knowledge_vec orphans; that
-table no longer exists. Orphans now live in knowledge_vec_bin / knowledge_vec_f32
-and are prevented going forward by the upsert DELETE that keeps both in sync.
-Kept for reference; repoint to knowledge_vec_bin/_f32 if an orphan sweep is ever
-needed again.
+"""Remove orphaned vector rows -- embeddings whose knowledge_chunks row is gone.
 
-Remove orphaned rows from knowledge_vec that have no matching knowledge_chunks entry.
+sqlite-vec's vec0 virtual tables (knowledge_vec_bin, knowledge_vec_f32) do not
+enforce referential integrity, so a crash mid-upsert, the binary-index migration,
+or a source item that is deleted-and-never-reingested can leave embedding rows
+whose chunk_id no longer exists in knowledge_chunks. Orphans waste space and can
+surface in searches with no metadata. (Audit F-15: ~38,642 such rows.)
 
-sqlite-vec's vec0 virtual table does not enforce referential integrity, so a
-crash or early exit during upsert_documents() can leave embedding rows in
-knowledge_vec whose chunk_id no longer exists in knowledge_chunks.  These
-orphans waste space and can be surfaced in knn searches, returning results with
-no metadata.
+Scope note: the upsert path keeps both vec tables in sync on RE-INGEST
+(store.upsert_documents deletes bin+f32+chunks for the re-ingested source_id). A
+source item deleted at the source and never re-ingested is NOT pruned by upsert
+alone -- this sweep reclaims those. A true source-delete prune (a connector
+diffing current vs prior source items) is a separate follow-up; this periodic
+sweep is the mitigation.
 
-Usage:
-    python scripts/cleanup_stale_vec.py [--dry-run]
+Usage (--dry-run is safe anytime; stop Cora before --apply):
+    python scripts/cleanup_stale_vec.py            # dry-run: report orphan counts
+    python scripts/cleanup_stale_vec.py --apply    # delete orphans from both tables
 
-Exit codes:
-    0  clean (no orphans found, or orphans deleted successfully)
-    1  fatal error
+After --apply, reclaim disk with VACUUM INTO (D-035, scripts/reclaim_kb_space.py)
+-- a plain in-place VACUUM in WAL mode reports success but does not shrink the file.
+
+Exit codes: 0 ok, 1 fatal error.
 """
 
 import argparse
@@ -38,6 +40,8 @@ from cora.knowledge_base import schema  # noqa: E402
 CORA_REPO_ROOT = Path(__file__).resolve().parents[1]
 KB_DB_PATH = CORA_REPO_ROOT / "data" / "cora_kb.db"
 
+_VEC_TABLES = ("knowledge_vec_bin", "knowledge_vec_f32")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -46,14 +50,39 @@ logging.basicConfig(
 log = logging.getLogger("cleanup-stale-vec")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report orphans but do not delete them",
+def find_orphans(conn, vec_table: str) -> list[str]:
+    """Return chunk_ids in vec_table that have no matching knowledge_chunks row."""
+    rows = conn.execute(
+        f"""
+        SELECT v.chunk_id
+        FROM {vec_table} v
+        LEFT JOIN knowledge_chunks k ON k.chunk_id = v.chunk_id
+        WHERE k.chunk_id IS NULL
+        """
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_orphans(conn, vec_table: str, chunk_ids: list[str]) -> int:
+    """Delete the given chunk_ids from vec_table. Returns rows deleted."""
+    if not chunk_ids:
+        return 0
+    placeholders = ",".join("?" * len(chunk_ids))
+    cur = conn.execute(
+        f"DELETE FROM {vec_table} WHERE chunk_id IN ({placeholders})",
+        chunk_ids,
     )
+    return cur.rowcount
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Sweep orphaned KB vector rows.")
+    parser.add_argument("--apply", action="store_true",
+                        help="Delete orphans (default is a dry-run report).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report only (this is the default; kept for compatibility).")
     args = parser.parse_args()
+    apply_changes = args.apply and not args.dry_run
 
     if not KB_DB_PATH.exists():
         log.error("KB database not found: %s", KB_DB_PATH)
@@ -61,47 +90,33 @@ def main() -> int:
 
     log.info("Opening KB database: %s", KB_DB_PATH)
     conn = schema.connect(KB_DB_PATH)
-
+    total = 0
     try:
-        # Find vec rowids whose chunk_id is not in knowledge_chunks.
-        rows = conn.execute(
-            """
-            SELECT v.chunk_id
-            FROM knowledge_vec v
-            LEFT JOIN knowledge_chunks k ON k.chunk_id = v.chunk_id
-            WHERE k.chunk_id IS NULL
-            """
-        ).fetchall()
+        for vec_table in _VEC_TABLES:
+            try:
+                orphans = find_orphans(conn, vec_table)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not scan %s: %s", vec_table, exc)
+                continue
+            total += len(orphans)
+            log.info("%s: %d orphan(s)", vec_table, len(orphans))
+            if orphans and apply_changes:
+                deleted = delete_orphans(conn, vec_table, orphans)
+                conn.commit()
+                log.info("%s: deleted %d orphan(s)", vec_table, deleted)
 
-        orphan_ids = [r[0] for r in rows]
-
-        if not orphan_ids:
-            log.info("No orphaned vec rows found — knowledge_vec is clean.")
-            conn.close()
-            return 0
-
-        log.info("Found %d orphaned vec row(s).", len(orphan_ids))
-        for oid in orphan_ids:
-            log.info("  orphan chunk_id=%s", oid)
-
-        if args.dry_run:
-            log.info("Dry-run mode — no rows deleted.")
-            conn.close()
-            return 0
-
-        placeholders = ",".join("?" * len(orphan_ids))
-        cur = conn.execute(
-            f"DELETE FROM knowledge_vec WHERE chunk_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.commit()
-        log.info("Deleted %d orphaned vec row(s).", cur.rowcount)
-
-    except Exception as exc:
+        if total == 0:
+            log.info("No orphaned vec rows found -- KB vec tables are clean.")
+        elif not apply_changes:
+            log.info("Dry-run: %d total orphan(s) across %d table(s). Re-run with "
+                     "--apply (Cora stopped) to delete, then VACUUM INTO.",
+                     total, len(_VEC_TABLES))
+        else:
+            log.info("Deleted orphans. Reclaim disk with VACUUM INTO (reclaim_kb_space.py).")
+    except Exception as exc:  # noqa: BLE001
         log.error("cleanup failed: %s", exc, exc_info=True)
         conn.close()
         return 1
-
     conn.close()
     return 0
 
