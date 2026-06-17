@@ -54,10 +54,15 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 # Action: run via venv python (Task Scheduler has no user PATH; D-005)
-$ScriptArgs = "`"$ScriptPath`""
+# --time-budget-min 18 keeps the script self-bounding under the 20-min
+# ExecutionTimeLimit below: a slow run degrades gracefully (skip + audit) at
+# 18 min instead of being SIGKILLed at the task limit with no trace
+# (2026-06-12). The two values must move together; the script default (9 min)
+# fits the OLD 10-min limit, so an un-re-registered task is still safe.
+$ScriptArgs = "`"$ScriptPath`" --time-budget-min 18"
 $Mode = "review-driven (per-user review DMs to Harrison; :+1: enables delivery)"
 if ($SendUsers) {
-    $ScriptArgs = "`"$ScriptPath`" --send-users"
+    $ScriptArgs = "`"$ScriptPath`" --send-users --time-budget-min 18"
     $Mode = "force-deliver to ALL users (--send-users)"
 }
 
@@ -72,9 +77,10 @@ $Trigger = New-ScheduledTaskTrigger `
     -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday `
     -At "7:30am"
 
-# Settings: stop if it runs > 10 minutes; start if missed while machine was off
+# Settings: stop if it runs > 20 minutes (the script self-bounds at 18 min, so
+# this limit should never be hit); start if missed while the machine was off.
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
     -StartWhenAvailable `
     -DontStopIfGoingOnBatteries:$false
 

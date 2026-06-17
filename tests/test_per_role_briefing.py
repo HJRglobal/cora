@@ -664,3 +664,32 @@ class TestDoubleFireLock:
         _os.utime(rdb._RUN_LOCK_PATH, (old, old))
         assert rdb._acquire_run_lock() is True     # stale lock cleared + reacquired
         rdb._release_run_lock()
+
+
+# ---------------------------------------------------------------------------
+# Time-budget alignment + pipeline-snapshot framing (1.7c)
+# ---------------------------------------------------------------------------
+
+class TestBudgetAndPrompt:
+    def test_default_time_budget_fits_task_limit(self):
+        # The default self-budget MUST be under the live 10-min task
+        # ExecutionTimeLimit so the script self-bounds before a SIGKILL.
+        assert rdb._parse_args([]).time_budget_min < 10.0
+
+    def test_setup_script_keeps_budget_under_task_limit(self):
+        # When the task is re-registered, the passed budget (18) must stay
+        # under the bumped ExecutionTimeLimit (20).
+        src = (_REPO_ROOT / "deployment" / "setup-daily-briefing-task.ps1").read_text(
+            encoding="utf-8"
+        )
+        assert "--time-budget-min 18" in src
+        assert "New-TimeSpan -Minutes 20" in src
+
+    def test_prompt_frames_pipeline_as_snapshot(self, registry):
+        rec = org_roles.get_role("U101")
+        prompt = rdb._build_briefing_prompt(rec, "SECTIONS", "CONTEXT", "Monday")
+        assert "open-pipeline snapshot" in prompt
+        assert "gain or decline" in prompt
+        # regression: existing guardrails survive the extraction
+        assert "Do NOT add financial figures" in prompt
+        assert "Good morning, Tara!" in prompt

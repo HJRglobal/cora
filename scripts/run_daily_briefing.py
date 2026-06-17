@@ -348,6 +348,39 @@ def _query_user_chunks(display_name: str, first_name: str) -> list[dict]:
 
 # ---- Claude Haiku synthesis ----------------------------------------------------
 
+def _build_briefing_prompt(
+    rec: RoleRecord, sections_text: str, context_text: str, today_str: str
+) -> str:
+    """Assemble the Haiku prompt for one user's briefing (extracted so it is
+    directly testable without an API call)."""
+    first_name = rec.name.split()[0]
+    return (
+        f"You are Cora, an AI chief-of-staff assistant for HJR Global.\n"
+        f"Write a concise morning briefing DM for {rec.name}, whose role is: {rec.role}.\n\n"
+        f"Today: {today_str}\n\n"
+        f"== Their plate (role-scoped; sections below are authoritative) ==\n"
+        f"{sections_text}\n\n"
+        f"== Recent Activity Mentioning {first_name} (last 25h: Slack, Gmail, Meetings) ==\n"
+        f"{context_text}\n\n"
+        f"Instructions:\n"
+        f"- Begin with: Good morning, {first_name}!\n"
+        f"- Open with a one-line acknowledgment of their role and lanes where relevant\n"
+        f"- List 2-4 open tasks needing attention today (prioritize overdue or due today); "
+        f"preserve any <url|name> Slack links verbatim\n"
+        f"- Mention today's calendar in one line if events exist\n"
+        f"- If a DEAL PIPELINE section is present, give a 1-2 line role-relevant summary. "
+        f"Treat any dollar total as today's open-pipeline snapshot -- it shifts as deals "
+        f"close or change stage -- so do NOT describe it as a gain or decline versus a prior day\n"
+        f"- If a STALLED DECISIONS section is present, surface the 1-2 most urgent items\n"
+        f"- Summarize 1-3 notable activity items that directly involve {first_name}\n"
+        f"- End with a single-sentence offer to help\n"
+        f"- Keep total under 320 words, plain text, no markdown headers or bullet symbols\n"
+        f"- If no tasks AND no relevant activity, say it is a quiet start and offer to help\n"
+        f"- Do NOT add financial figures not present above\n"
+        f"- Do NOT fabricate tasks or events not shown above"
+    )
+
+
 def _synthesize(
     *,
     api_key: str,
@@ -368,29 +401,7 @@ def _synthesize(
         chunk_lines.append(f"[{src}/{ent}] {title}: {snippet}")
     context_text = "\n".join(chunk_lines) if chunk_lines else "(no recent activity found)"
 
-    prompt = (
-        f"You are Cora, an AI chief-of-staff assistant for HJR Global.\n"
-        f"Write a concise morning briefing DM for {rec.name}, whose role is: {rec.role}.\n\n"
-        f"Today: {today_str}\n\n"
-        f"== Their plate (role-scoped; sections below are authoritative) ==\n"
-        f"{sections_text}\n\n"
-        f"== Recent Activity Mentioning {first_name} (last 25h: Slack, Gmail, Meetings) ==\n"
-        f"{context_text}\n\n"
-        f"Instructions:\n"
-        f"- Begin with: Good morning, {first_name}!\n"
-        f"- Open with a one-line acknowledgment of their role and lanes where relevant\n"
-        f"- List 2-4 open tasks needing attention today (prioritize overdue or due today); "
-        f"preserve any <url|name> Slack links verbatim\n"
-        f"- Mention today's calendar in one line if events exist\n"
-        f"- If a DEAL PIPELINE section is present, give a 1-2 line role-relevant summary\n"
-        f"- If a STALLED DECISIONS section is present, surface the 1-2 most urgent items\n"
-        f"- Summarize 1-3 notable activity items that directly involve {first_name}\n"
-        f"- End with a single-sentence offer to help\n"
-        f"- Keep total under 320 words, plain text, no markdown headers or bullet symbols\n"
-        f"- If no tasks AND no relevant activity, say it is a quiet start and offer to help\n"
-        f"- Do NOT add financial figures not present above\n"
-        f"- Do NOT fabricate tasks or events not shown above"
-    )
+    prompt = _build_briefing_prompt(rec, sections_text, context_text, today_str)
 
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
@@ -564,12 +575,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--time-budget-min",
         type=float,
-        default=90.0,
-        help="wall-clock budget in minutes for the build loop (default: 90). "
-             "Users not yet built when it runs out are skipped with an audit "
-             "line -- a degraded run beats a Task-Scheduler termination "
-             "(2026-06-12: the task was killed at its time limit mid-run with "
-             "zero users finished and nothing in the audit log).",
+        default=9.0,
+        help="wall-clock budget in minutes for the build loop (default: 9). "
+             "MUST stay under the task's ExecutionTimeLimit (live = 10 min) so "
+             "the script self-bounds (graceful skip + audit line) BEFORE the "
+             "scheduler SIGKILLs it -- the 90-min default never engaged because "
+             "the 10-min task limit always killed first (2026-06-12: killed "
+             "mid-run, zero users finished, nothing in the audit log). The setup "
+             "script raises both together (task 20 min / budget 18) on re-register.",
     )
     args = p.parse_args(argv)
     if args.digest_only and args.send_users:
