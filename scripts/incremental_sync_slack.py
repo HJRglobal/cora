@@ -43,6 +43,7 @@ from cora.connectors.slack_connector import (  # noqa: E402
     _CHANNEL_FETCH_SLEEP,
 )
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
+from cora.slack_sweep_policy import should_ingest  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
 
 import yaml  # noqa: E402
@@ -206,6 +207,9 @@ def main() -> int:
     for ch in channels:
         ch_id = ch["id"]
         ch_name = ch["name"]
+        if not should_ingest(ch_name, ch_id, bool(ch.get("is_private"))):
+            log.info("Skipping #%s -- ingestion deny-list (Phase 1.4)", ch_name)
+            continue
         entity = _resolve_entity(ch_name, routes)
         sub_entity = _resolve_sub_entity(entity, ch_name)
 

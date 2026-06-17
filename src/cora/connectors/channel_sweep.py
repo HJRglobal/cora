@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..slack_sweep_policy import should_ingest
+
 log = logging.getLogger(__name__)
 
 _CHANNEL_FETCH_SLEEP = 1.2   # seconds between channel fetches (Tier-3 rate limit)
@@ -206,6 +208,7 @@ def run_sweep(
     active_channels = [
         ch for ch in channels
         if ch["name"] not in _EXCLUDED_CHANNEL_NAMES
+        and should_ingest(ch["name"], ch.get("id"), bool(ch.get("is_private")))
     ]
     log.info("channel_sweep: %d joined channels (%d after exclusions)", len(channels), len(active_channels))
 

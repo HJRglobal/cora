@@ -1,0 +1,54 @@
+# Slack ingestion deny-list (Phase 1.4, audit F-1/F-2 + gate G-A, 2026-06-16).
+# ---------------------------------------------------------------------------
+# Both Slack sweeps call slack_sweep_policy.should_ingest() before reading a
+# channel: the KB-ingest sweep (scripts/incremental_sync_slack.py) and the
+# per-user synthesis sweep (src/cora/connectors/channel_sweep.py). A channel
+# matching ANY rule below is skipped entirely -- it is never ingested into the KB.
+#
+# DENY-LIST model (NOT an allow-list): every channel NOT listed here is ingested
+# as before, public OR private. This deliberately does NOT block all private
+# channels -- doing so would drop the legit private leadership/finance channels.
+# Only the sensitive set is denied.
+#
+# Matching: deny_by_name is case-insensitive exact; deny_by_glob is fnmatch
+# (* and ?), case-insensitive; deny_by_id is an exact Slack channel ID.
+# Edit this file and the sweeps pick it up at their next run (no bot restart).
+
+deny_by_name:
+  # Personal / family (Harrison 2026-06-16). The first three are currently
+  # ingested (routed to FNDR via the catch-all) -> they are also purged once.
+  - personal-tasks                       # C0B7PMLM9D5
+  - kids-schedules-and-tasks             # C0B7PMLQ26B
+  - alison-s-previously-assigned-tasks   # C0B88QGBDNG
+  # Not currently ingested (no ID in the registry/watermark) but deny by name
+  # so a re-creation can never be swept (2026-06-03 sprawl incident names).
+  - family-travel-plans
+  - home-management
+  - staff-wage-increase
+  # NDA / M&A sensitive
+  - lbhs-copa-diligence                  # C0B88QJAUMS
+  # Workspace default (already outbound-blocked in channel-routing.yaml)
+  - general-do-not-use                   # C0B2NMLK7CK
+  - all-hjr-global                       # legacy name for general-do-not-use
+
+deny_by_glob:
+  # LEX-LBHS removed from the KB (G-A.2 -- a BAA does not waive 42 CFR Part 2).
+  # Prefix glob covers lbhs, lbhs-leadership, lbhs-finance, lbhs-copa-diligence.
+  - "lbhs*"
+  # LEX-LTS removed from the KB (G-A.2 -- therapy PHI, Provider Type 15).
+  - "lts*"
+
+deny_by_id:
+  - C0B2NMLK7CK   # general-do-not-use (also denied by name; belt + suspenders)
+  # Cora internal knowledge-queue channels for the removed sub-entities. They
+  # are private and hold no human content, but are LBHS/LTS-scoped -- and the
+  # lbhs*/lts* PREFIX globs do NOT catch the cora-kq-lex-* names, so deny by ID.
+  - C0B76Q7QX09   # cora-kq-lex-lbhs
+  - C0B6YJ1MQFM   # cora-kq-lex-lts
+
+# Optional private allow-list. If NON-empty, a PRIVATE channel ingests only if
+# it is listed here (and not denied above); an EMPTY/absent list means no private
+# restriction -- private channels ingest unless denied (the deny-list model).
+# Left empty deliberately: we do NOT want to stop ingesting private leadership/
+# finance channels. Populate only to switch to a stricter private posture.
+private_allowlist: []
