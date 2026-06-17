@@ -1,0 +1,15 @@
+# HubSpot email-sync scope (Phase 1.8 — N6 / Harrison #8)
+#
+# The Gmail -> HubSpot email-association sync scans ONLY these mailboxes, and
+# only associates a thread when the matched contact is on an ACTIVE (open) deal.
+# Everyone else is not scanned at all; "no active deal" threads are skipped
+# (never prompted) and remembered so a thread is never re-asked.
+#
+# An empty/missing list scans nobody (fail-closed off) -- the feature was
+# previously over-broad, so the safe default is to scan no mailbox.
+#
+# Note: the scheduled task "cowork-cora-hubspot-email-sync" is currently
+# DISABLED. This scoping makes the feature safe whenever it is re-enabled.
+monitored_emails:
+  - alex@hjrglobal.com   # Alex Cordova (HubSpot owner 160262948)
+  - tommy@f3energy.com   # Tommy Anderson (HubSpot owner 162944825)

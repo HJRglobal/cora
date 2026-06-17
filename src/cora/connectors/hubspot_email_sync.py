@@ -36,8 +36,10 @@ log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HUBSPOT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-hubspot.yaml"
+_SCOPE_PATH   = _REPO_ROOT / "data" / "maps" / "hubspot-email-sync-scope.yaml"
 _STATE_PATH   = _REPO_ROOT / "data" / "hubspot-email-sync-state.json"
 _PENDING_PATH = _REPO_ROOT / "data" / "hubspot-email-sync-pending.json"
+_SKIPPED_PATH = _REPO_ROOT / "data" / "hubspot-email-sync-skipped.json"
 _DEFAULT_LOOKBACK = 7 * 24 * 3600  # 7 days on first run
 _PORTAL_ID = "246351746"
 
@@ -88,6 +90,49 @@ def _load_users() -> list[dict[str, str]]:
     except Exception as exc:
         log.error("Failed to load %s: %s", _HUBSPOT_MAP_PATH, exc)
         return []
+
+
+def _load_scope() -> set[str]:
+    """Lowercase set of mailboxes the email sync is allowed to scan.
+
+    Phase 1.8 (N6 / Harrison #8): association is scoped to Alex + Tommy only.
+    Missing/empty config => empty set => NO mailbox is scanned (fail-closed off;
+    the feature was over-broad, so the safe default is "scan nobody").
+    """
+    try:
+        data = yaml.safe_load(_SCOPE_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("email_sync: could not read scope %s: %s", _SCOPE_PATH, exc)
+        return set()
+    return {str(e).strip().lower() for e in (data.get("monitored_emails") or []) if str(e).strip()}
+
+
+# ── Skip ledger (durable "never re-ask a thread") ────────────────────────────
+# A thread we deliberately did NOT associate (no active deal) or DM'd once is
+# recorded here so it is never re-evaluated. Logged threads are NOT recorded --
+# the per-message watermark check keeps logging new messages on an active
+# deal's thread correctly.
+
+def _load_skipped() -> dict[str, Any]:
+    if _SKIPPED_PATH.exists():
+        try:
+            return json.loads(_SKIPPED_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _is_thread_skipped(thread_id: str, skipped: dict[str, Any]) -> bool:
+    return thread_id in skipped
+
+
+def _mark_thread_skipped(thread_id: str, reason: str, skipped: dict[str, Any]) -> None:
+    skipped[thread_id] = {"reason": reason, "ts": int(time.time())}
+
+
+def _save_skipped(skipped: dict[str, Any]) -> None:
+    _SKIPPED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SKIPPED_PATH.write_text(json.dumps(skipped, indent=2), encoding="utf-8")
 
 
 # ── Email address helpers ───────────────────────────────────────────────────────
@@ -266,6 +311,7 @@ def sync_user(
     user: dict[str, str],
     state: dict[str, Any],
     dry_run: bool = False,
+    skipped: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """Sync Gmail → HubSpot for one user. Returns stats dict."""
     from cora.connectors.gmail_reader import (
@@ -275,10 +321,13 @@ def sync_user(
     )
     from cora.tools.hubspot_client import (
         HubSpotClientError,
-        get_contact_deal_ids,
+        get_open_deal_ids_for_contact,
         log_email_engagement,
         search_contact_by_email,
     )
+
+    if skipped is None:
+        skipped = {}
 
     owner_email: str = user.get("hubspot_email", "")
     owner_id: str    = user.get("hubspot_owner_id", "")
@@ -321,18 +370,23 @@ def sync_user(
         if not messages:
             continue
 
-        # Dedup is handled by the watermark (last_synced_ts) — no Gmail label needed
+        # Advance the watermark for EVERY thread we see (even skipped ones) so a
+        # skipped thread does not re-list every run.
+        for msg in messages:
+            if msg.get("date_ts", 0) > new_last_ts:
+                new_last_ts = msg["date_ts"]
+
+        # Never re-evaluate a thread we already decided not to associate (N6:
+        # the "Needed Items- Rogers" thread was re-prompted ~10x). Logged
+        # threads are NOT recorded -- the per-message check below keeps logging
+        # new messages on an active deal's thread.
+        if _is_thread_skipped(thread_id, skipped):
+            continue
 
         # Find external participants
         external = _external_participants(messages, owner_email)
         if not external:
-            # Purely internal thread — skip
-            continue
-
-        # Update watermark to latest message in thread
-        for msg in messages:
-            if msg.get("date_ts", 0) > new_last_ts:
-                new_last_ts = msg["date_ts"]
+            continue  # purely internal thread
 
         # Look up each external participant in HubSpot — collect ALL matches
         matched_contacts: list[tuple[str, str]] = []  # [(contact_id, contact_name), ...]
@@ -354,28 +408,41 @@ def sync_user(
         if not matched_contacts:
             continue  # no known HubSpot contacts in this thread
 
-        if len(matched_contacts) > 1:
-            # Ambiguous — send one reaction DM per candidate so owner can pick with 👍/👎.
-            # Gated OFF by default (audit N6); full Alex+Tommy scoping in Phase 1.8.
+        # Phase 1.8 (N6 / Harrison #8): associate ONLY with a contact on an
+        # ACTIVE deal. A transient HubSpot failure must NOT look like "no active
+        # deal", so on error we retry next run WITHOUT recording a skip.
+        try:
+            active: list[tuple[str, str, list[str]]] = []  # (cid, name, open_deal_ids)
+            for cid, cname in matched_contacts:
+                open_ids = get_open_deal_ids_for_contact(cid)
+                if open_ids:
+                    active.append((cid, cname, open_ids))
+        except HubSpotClientError as exc:
+            log.warning("[%s] open-deal lookup failed (transient) thread=%s: %s",
+                        display_name, thread_id, exc)
+            continue
+
+        if not active:
+            # No matched contact is on an active deal -> never prompt, never log
+            # "to contact only"; remember so the thread is never re-asked.
+            _mark_thread_skipped(thread_id, "no_active_deal", skipped)
+            stats["skipped"] += 1
+            continue
+
+        if len(active) > 1:
+            # Genuine ambiguity among ACTIVE deals -> DM only if explicitly
+            # enabled (default OFF, audit N6); record either way so it is asked
+            # at most once, never re-prompted.
             if slack_uid and not dry_run and _dm_prompts_enabled():
-                subject = (messages[-1].get("subject", "") or
-                           messages[0].get("subject", "(no subject)") if messages else "(no subject)")
-                first_name = display_name.split()[0]
-
-                for cid, cname in matched_contacts[:3]:  # cap at 3 options
-                    c_deal_ids = get_contact_deal_ids(cid)
-                    deal_line = ""
-                    if c_deal_ids:
-                        deal_url = (f"https://app.hubspot.com/contacts/"
-                                    f"{_PORTAL_ID}/deal/{c_deal_ids[0]}")
-                        deal_line = f"\n*Deal:* <{deal_url}|Open in HubSpot>"
-                    else:
-                        deal_line = "\n_No active deals — would log to contact only._"
-
+                subject = messages[-1].get("subject", "") or "(no subject)"
+                for cid, cname, open_ids in active[:3]:  # cap at 3 options
+                    deal_url = (f"https://app.hubspot.com/contacts/"
+                                f"{_PORTAL_ID}/deal/{open_ids[0]}")
                     dm_text = (
                         f":email: *Ambiguous email match — confirm attachment*\n\n"
                         f"*Subject:* {subject}\n"
-                        f"*Contact:* {cname}{deal_line}\n\n"
+                        f"*Contact:* {cname}\n"
+                        f"*Deal:* <{deal_url}|Open in HubSpot>\n\n"
                         f"👍 attach this thread  ·  👎 skip"
                     )
                     msg_ts = _dm_user_with_ts(slack_uid, dm_text)
@@ -387,23 +454,16 @@ def sync_user(
                             owner_id=owner_id,
                             contact_id=cid,
                             contact_name=cname,
-                            deal_ids=c_deal_ids,
+                            deal_ids=open_ids,
                             messages=messages,
                         )
                         stats["dm_sent"] += 1
-
+            _mark_thread_skipped(thread_id, "ambiguous_active", skipped)
             stats["skipped"] += 1
             continue
 
-        matched_contact_id   = matched_contacts[0][0]
-        matched_contact_name = matched_contacts[0][1]
-
-        # Get associated deals
-        deal_ids = get_contact_deal_ids(matched_contact_id)
-
-        if not deal_ids:
-            # Contact has no deals — still log to contact, just no deal association
-            pass
+        # Exactly one contact on an active deal -> log the thread to that deal.
+        matched_contact_id, matched_contact_name, deal_ids = active[0]
 
         # Log each message in the thread as a HubSpot email engagement
         logged_count = 0
@@ -458,21 +518,39 @@ def sync_user(
 
 
 def run_sync(dry_run: bool = False) -> None:
-    """Run full Gmail→HubSpot sync for all users in slack-to-hubspot.yaml."""
+    """Run the Gmail→HubSpot sync for the scoped users only.
+
+    Phase 1.8 (N6 / Harrison #8): scoped to the mailboxes in
+    hubspot-email-sync-scope.yaml (Alex + Tommy). Other mailboxes are not
+    scanned at all; an empty/missing scope file scans nobody (fail-closed off).
+    """
     users = _load_users()
     if not users:
         log.warning("No users found in %s", _HUBSPOT_MAP_PATH)
         return
 
+    scope = _load_scope()
+    if not scope:
+        log.warning("email_sync: scope is empty (%s) — scanning nobody", _SCOPE_PATH)
+        return
+    scoped_users = [u for u in users if str(u.get("hubspot_email", "")).strip().lower() in scope]
+    skipped_count = len(users) - len(scoped_users)
+    log.info("email_sync: %d/%d users in scope (%d out of scope)",
+             len(scoped_users), len(users), skipped_count)
+    if not scoped_users:
+        log.warning("email_sync: no scoped users matched the map — nothing to do")
+        return
+
     state = _load_state()
+    skipped = _load_skipped()
     total_logged = 0
     total_threads = 0
 
-    for user in users:
+    for user in scoped_users:
         display = user.get("display_name", user.get("hubspot_email", "?"))
         log.info("--- Syncing %s ---", display)
         try:
-            stats = sync_user(user, state, dry_run=dry_run)
+            stats = sync_user(user, state, dry_run=dry_run, skipped=skipped)
         except Exception as exc:
             log.error("[%s] Unexpected error: %s", display, exc)
             continue
@@ -487,5 +565,6 @@ def run_sync(dry_run: bool = False) -> None:
 
     if not dry_run:
         _save_state(state)
+        _save_skipped(skipped)
 
     log.info("Sync complete: %d threads scanned, %d logged to HubSpot", total_threads, total_logged)

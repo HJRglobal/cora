@@ -634,6 +634,50 @@ def get_contact_deal_ids(contact_id: str) -> list[str]:
         return []
 
 
+def get_open_deal_ids_for_contact(contact_id: str) -> list[str]:
+    """Return a contact's OPEN deal IDs (closedwon / closedlost excluded).
+
+    Phase 1.8 (N6 / Harrison #8): the Gmail->HubSpot email sync associates a
+    thread ONLY when the matched contact is on an active deal. Reuses the same
+    closed-stage detection as get_owner_deals. Returns [] for a genuinely empty
+    set (no deals, or all closed). RAISES HubSpotClientError on a transient HTTP
+    failure of the batch-read so the caller can retry instead of treating an
+    outage as "no active deal" and permanently skipping the thread.
+    """
+    deal_ids = get_contact_deal_ids(contact_id)
+    if not deal_ids:
+        return []
+    if not _STAGE_NAME_CACHE:
+        _refresh_pipeline_cache()
+
+    hdrs = _headers()
+    body = {"properties": ["dealstage"], "inputs": [{"id": did} for did in deal_ids]}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/crm/v3/objects/deals/batch/read", headers=hdrs, json=body
+            )
+    except httpx.RequestError as exc:
+        raise HubSpotClientError(f"HubSpot network error: {exc}") from exc
+    if r.status_code == 429:
+        raise HubSpotClientError("HubSpot 429 — rate-limited; retry shortly")
+    if r.status_code >= 500:
+        raise HubSpotClientError(f"HubSpot {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code != 200:
+        raise HubSpotClientError(f"HubSpot {r.status_code}: {r.text[:200]}")
+
+    open_ids: list[str] = []
+    for d in r.json().get("results", []) or []:
+        stage_id = (d.get("properties") or {}).get("dealstage", "")
+        stage_label = _STAGE_NAME_CACHE.get(stage_id, stage_id).lower()
+        if "closed" in stage_label and ("won" in stage_label or "lost" in stage_label):
+            continue
+        did = str(d.get("id", ""))
+        if did:
+            open_ids.append(did)
+    return open_ids
+
+
 def log_email_engagement(
     from_email: str,
     to_emails: list[str],
