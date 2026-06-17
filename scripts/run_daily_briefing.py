@@ -102,6 +102,15 @@ _THUMBS_UP            = {"+1", "thumbsup"}
 _THUMBS_DOWN          = {"-1", "thumbsdown"}
 _PENDING_MAX_AGE_DAYS = 30
 
+# Single-instance run lock (N7 / double-fire): the brief was seen firing twice
+# minutes apart (a StartWhenAvailable late-fire + a near-simultaneous retry).
+# A concurrent invocation is a clean no-op. Stale window comfortably exceeds the
+# effective run time (the task ExecutionTimeLimit, currently 10 min; 18-min
+# self-budget once re-registered) yet clears well before the next weekday run.
+# Same atomic O_CREAT|O_EXCL idiom as the knowledge-review lock.
+_RUN_LOCK_PATH          = _REPO_ROOT / "data" / "state" / "daily-briefing.lock"
+_RUN_LOCK_STALE_SECONDS = 30 * 60
+
 # ---- Logging -----------------------------------------------------------------
 
 logging.basicConfig(
@@ -159,6 +168,40 @@ def _save_delivery_state(state: dict) -> None:
         )
     except OSError as exc:
         log.warning("Could not persist briefing delivery state: %s", exc)
+
+
+# ---- Single-instance run lock (double-fire guard) ------------------------------
+
+def _acquire_run_lock() -> bool:
+    """Return True if this process took the run lock, False if a fresh run holds it.
+
+    A stale lock (older than _RUN_LOCK_STALE_SECONDS, e.g. left by a run the task
+    scheduler SIGKILLed at its ExecutionTimeLimit) is reclaimed.
+    """
+    _RUN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        age = time.time() - _RUN_LOCK_PATH.stat().st_mtime
+        if age > _RUN_LOCK_STALE_SECONDS:
+            log.warning("Clearing stale daily-briefing lock (age %.0fs)", age)
+            _RUN_LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(str(_RUN_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, f"{os.getpid()} {time.time():.0f}\n".encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_run_lock() -> None:
+    try:
+        _RUN_LOCK_PATH.unlink()
+    except OSError:
+        pass
 
 
 def _harrison_verdict(client: SlackWebClient, channel: str, ts: str) -> str | None:
@@ -513,6 +556,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="limit to one user (slack_id or case-insensitive name substring)",
     )
     p.add_argument(
+        "--force",
+        action="store_true",
+        help="bypass the single-instance run lock (for an intentional manual "
+             "re-fire the same day; the scheduled task never sets this)",
+    )
+    p.add_argument(
         "--time-budget-min",
         type=float,
         default=90.0,
@@ -536,6 +585,23 @@ def main(argv: list[str] | None = None) -> int:
         mode = "review_only"
     else:
         mode = "review_driven"  # deliver to enabled users, review the rest
+
+    # Double-fire guard (N7): only the automated delivery paths take the lock.
+    # --dry-run / --user / --force bypass it. A concurrent invocation (the
+    # observed 2-min-apart double-fire) becomes a clean, audited no-op.
+    take_lock = not (args.dry_run or args.force or args.user)
+    if take_lock and not _acquire_run_lock():
+        log.warning("Another daily-briefing run holds the lock -- skipping (double-fire guard).")
+        _write_audit([{"ts": time.time(), "event": "run_skipped_locked", "mode": mode}])
+        return 0
+    try:
+        return _run(args, mode)
+    finally:
+        if take_lock:
+            _release_run_lock()
+
+
+def _run(args: argparse.Namespace, mode: str) -> int:
     log.info("=== Daily briefing starting (mode=%s, dry_run=%s) ===", mode, args.dry_run)
     run_started = time.time()
     build_deadline = time.monotonic() + args.time_budget_min * 60.0

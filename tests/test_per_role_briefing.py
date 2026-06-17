@@ -99,6 +99,14 @@ def state_path(tmp_path):
         yield p
 
 
+@pytest.fixture(autouse=True)
+def _isolate_run_lock(tmp_path):
+    """Every test gets its own daily-briefing lock path -- the real
+    data/state/daily-briefing.lock is never touched and tests never contend."""
+    with patch.object(rdb, "_RUN_LOCK_PATH", tmp_path / "daily-briefing.lock"):
+        yield
+
+
 def _read_state(p: Path) -> dict:
     if not p.exists():
         return {"enabled": {}, "declined": {}, "pending_reviews": []}
@@ -585,3 +593,74 @@ class TestTimeBudgetAndRunAudit:
         assert rc == 0
         end = [e for e in audit if e.get("event") == "run_end"]
         assert len(end) == 1 and end[0]["dry_run"] is True
+
+
+# ---------------------------------------------------------------------------
+# Double-fire single-instance lock (N7)
+# ---------------------------------------------------------------------------
+
+class TestDoubleFireLock:
+    """The brief was seen firing twice minutes apart. The automated delivery
+    paths take a single-instance lock; a concurrent invocation is a clean
+    no-op. --dry-run / --user / --force bypass the lock."""
+
+    def _hold_lock(self):
+        rdb._RUN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rdb._RUN_LOCK_PATH.write_text("99999 held", encoding="utf-8")
+
+    def test_concurrent_run_is_noop(self, registry, state_path):
+        self._hold_lock()
+        client = _mock_slack()
+        rc = _run_main([], client)
+        assert rc == 0
+        client.chat_postMessage.assert_not_called()
+        client.conversations_open.assert_not_called()
+
+    def test_locked_noop_writes_audit_line(self, registry, state_path):
+        self._hold_lock()
+        audit: list[dict] = []
+        client = _mock_slack()
+        with patch.dict("os.environ", _ENV), \
+             patch.object(rdb, "SlackWebClient", return_value=client), \
+             patch.object(rdb, "_write_audit", side_effect=lambda e: audit.extend(e)):
+            rc = rdb.main([])
+        assert rc == 0
+        assert any(x.get("event") == "run_skipped_locked" for x in audit)
+
+    def test_lock_released_after_normal_run(self, registry, state_path):
+        client = _mock_slack()
+        _run_main([], client)
+        assert not rdb._RUN_LOCK_PATH.exists()
+
+    def test_force_bypasses_lock(self, registry, state_path):
+        self._hold_lock()
+        client = _mock_slack()
+        rc = _run_main(["--force"], client)
+        assert rc == 0
+        assert client.chat_postMessage.call_count >= 1  # ran despite the held lock
+
+    def test_dry_run_ignores_lock(self, registry, state_path):
+        self._hold_lock()
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "", "ANTHROPIC_API_KEY": "key"}), \
+             patch.object(rdb, "build_user_briefing", side_effect=lambda rec, **k: f"B::{rec.name}"):
+            rc = rdb.main(["--dry-run"])
+        assert rc == 0  # dry-run never takes the lock
+
+    def test_acquire_then_block_then_release(self):
+        assert rdb._acquire_run_lock() is True
+        assert rdb._RUN_LOCK_PATH.exists()
+        assert rdb._acquire_run_lock() is False   # concurrent invocation blocked
+        rdb._release_run_lock()
+        assert not rdb._RUN_LOCK_PATH.exists()
+        assert rdb._acquire_run_lock() is True     # next run reacquires
+        rdb._release_run_lock()
+
+    def test_stale_lock_is_reclaimed(self):
+        import os as _os
+        import time as _time
+        rdb._RUN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        assert rdb._acquire_run_lock() is True
+        old = _time.time() - (rdb._RUN_LOCK_STALE_SECONDS + 60)
+        _os.utime(rdb._RUN_LOCK_PATH, (old, old))
+        assert rdb._acquire_run_lock() is True     # stale lock cleared + reacquired
+        rdb._release_run_lock()
