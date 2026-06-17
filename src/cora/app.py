@@ -510,6 +510,12 @@ def _dispatch_qa(
             question_embedding,
         )
     else:
+        # PHI scrub gate (F-2 / 2.3): custodians in LEX scope get full PHI; every
+        # other asker has retrieved LEX chunk text PHI-scrubbed in context_loader.
+        # Fail-closed (non-custodian -> False -> scrub) via lex_phi_access.
+        phi_custodian = (
+            lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm) if user_id else False
+        )
         static_text, kb_text = load_context_parts(
             entity,
             query=user_message,
@@ -524,6 +530,7 @@ def _dispatch_qa(
             # the cache_storable check below keeps it out of the shared cache.
             asker_slack_id=user_id or "",
             asker_is_dm=is_dm,
+            phi_custodian=phi_custodian,
         )
     # A response built on UNSTRIPPED personal chunks (owner's own mail, or an
     # unrestricted asker) must not enter the shared semantic cache.

@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from cora import historical_access, user_notes
+from cora import historical_access, user_notes, phi_guard, org_roles
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 
 log = logging.getLogger(__name__)
@@ -216,6 +216,7 @@ def load_context_parts(
     kb_meta: dict | None = None,
     asker_slack_id: str | None = None,
     asker_is_dm: bool = False,
+    phi_custodian: bool = False,
 ) -> tuple[str, str]:
     """Return (static_text, kb_text) for the entity, kept as separate strings.
 
@@ -263,6 +264,7 @@ def load_context_parts(
         entity, query, k=effective_k, query_vec=query_vec,
         asker_emails=asker_emails, asker_unrestricted=asker_unrestricted,
         kb_meta=kb_meta, asker_slack_id=asker_slack_id, asker_is_dm=asker_is_dm,
+        phi_custodian=phi_custodian,
     ) or ""
     return static_text, kb_section
 
@@ -449,6 +451,7 @@ def _try_kb_retrieve(
     kb_meta: dict | None = None,
     asker_slack_id: str | None = None,
     asker_is_dm: bool = False,
+    phi_custodian: bool = False,
 ) -> str | None:
     """Search the KB and return a formatted context block. Returns None on any failure.
 
@@ -521,6 +524,13 @@ def _try_kb_retrieve(
         if kb_meta is not None and unstripped_personal:
             kb_meta["unstripped_personal"] = True
 
+        # Content-level PHI scrub (F-2 / 2.3): a LEX-authorized NON-custodian whose
+        # question misses the `phi` keyword gate could otherwise surface raw PHI
+        # from a LEX chunk. Scrub retrieved LEX chunk text for non-custodians;
+        # custodians (phi_custodian=True) and non-LEX retrievals are untouched.
+        if kb_entity == "LEX" and not phi_custodian:
+            relevant = _apply_lex_phi_scrub(relevant)
+
         log.info(
             "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
             len(relevant), len(results), entity,
@@ -531,6 +541,35 @@ def _try_kb_retrieve(
     if notes_block:
         return f"{main_block}\n\n{notes_block}" if main_block else notes_block
     return main_block
+
+
+def _apply_lex_phi_scrub(results: list) -> list:
+    """Content-level PHI redaction for a NON-custodian's LEX retrieval (F-2 / 2.3).
+
+    The `phi` keyword topic-gate + entity-siloing + custodian gate are the access
+    controls; this is defense-in-depth for the residual where a LEX-authorized
+    non-custodian asks a question that misses the keyword list and a retrieved LEX
+    chunk carries raw PHI. Reuses phi_guard.scrub_lex_phi over each chunk's
+    content, preserving staff/operational names (the org-roles roster) so ordinary
+    LEX ops content stays readable. Custodians never reach this path (callers gate
+    on phi_custodian); non-LEX retrievals are never scrubbed.
+
+    Fail-open on a scrub error (keep the chunk) -- a regex glitch must never blank
+    an answer; ACCESS is already fail-closed upstream at the custodian gate.
+    """
+    try:
+        staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+    except Exception:  # noqa: BLE001
+        staff = set()
+    for r in results:
+        try:
+            r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "LEX PHI scrub failed on chunk %s; leaving content as-is",
+                getattr(r, "chunk_id", "?"),
+            )
+    return results
 
 
 def _format_kb_chunks(chunks: list) -> str:
