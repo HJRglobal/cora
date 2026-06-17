@@ -93,3 +93,26 @@ def test_lex_gm_still_routes_to_lex_md(monkeypatch, tmp_path):
 
     assert "GM-level" in result
     assert "FNDR fallback" not in result
+
+
+# --- Diagnostic-hedging nudge (Phase 2.5 / F-22) ---
+
+
+def test_universal_rules_carry_diagnostic_hedging_nudge():
+    """F-22: every prompt instructs Cora to hedge on infrastructure she can't see."""
+    rules = pl._UNIVERSAL_RULES
+    assert "Diagnosing infrastructure you can't see" in rules
+    assert "Make.com" in rules
+    assert "scheduled task" in rules
+    assert "Do not confidently blame your own code" in rules
+
+
+def test_composed_prompt_includes_hedging_nudge(monkeypatch, tmp_path):
+    """The hedging nudge ships to every entity prompt (it lives in _UNIVERSAL_RULES)."""
+    _clear_cache()
+    (tmp_path / "f3e.md").write_text("F3E system prompt", encoding="utf-8")
+    monkeypatch.setattr(pl, "_PROMPTS_DIR", tmp_path)
+
+    result = pl.load_prompt("F3E")
+
+    assert "Diagnosing infrastructure you can't see" in result
