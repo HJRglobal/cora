@@ -26,22 +26,33 @@ custom_fields:
   status_not_started_option: "1214566926973276"
   priority_field_gid: "1204547177535963"
   priority_medium_option: "1204547177535965"
-  # Entity is an enum field: each entity code maps to a DIFFERENT option GID.
-  # Fill these in to enable Entity tagging on captured tasks (look up the option
-  # GIDs from the Entity custom field). Leave empty to skip Entity tagging.
+  # Entity is an enum field: each entity (route) code maps to a DIFFERENT option
+  # GID. A captured task is tagged with its route-entity's Entity option, plus
+  # Status=Not Started + Priority=Medium (above), at creation.
   #
-  # PREREQUISITE (verified 2026-06-16, Phase 1.10 — see design/asana-architecture.md §5):
-  # the Entity/Status/Priority fields are NOT attached to the capture-target
-  # projects yet (e.g. [F3E] Operations - General, [HJRG] Operations - General
-  # all return custom_field_settings: []). Until Harrison attaches the FNDR
-  # portfolio fields to those projects, set_task_custom_fields skips ALL of them
-  # (Status + Priority included), so filling entity_options here changes nothing.
-  # Enablement order: (1) attach fields to the projects, (2) read the Entity
-  # enum option GIDs from a project that now has the field, (3) fill the map.
-  entity_options: {}
-    # F3E: ""
-    # OSN: ""
-    # HJRG: ""
+  # ENABLED 2026-06-16 (Phase 1.10): the Entity/Status/Priority fields were
+  # attached to the 10 capture catch-all projects via
+  # scripts/attach_capture_custom_fields.py (design/asana-architecture.md Sec 5),
+  # and the option GIDs below were read live from the Entity custom field
+  # (1214487026542596). Tagging activates at the next capture fire (script-side,
+  # no bot restart). set_task_custom_fields stays fail-safe: a field not on a
+  # task's project is skipped, never fatal. (HJRP-RR has no Entity option, so its
+  # captured tasks get Status/Priority only.)
+  entity_options:
+    FNDR: "1214487026542597"
+    HJRG: "1214487026542598"
+    F3E: "1214487026542599"
+    F3C: "1214487026542600"
+    UFL: "1214487026542601"
+    POD: "1214487026542602"
+    HJRPROD: "1214566927301309"
+    HJRP: "1214487026542603"
+    BDM: "1214487026542604"
+    OSN: "1214487026542608"
+    LEX: "1214566588327157"
+    LEX-LLC: "1214487026542605"
+    LEX-LLA: "1214487026542606"
+    LEX-LBHS: "1214487026542607"
 
 # entity code -> Asana project GID to drop captured tasks into.
 # Populated 2026-06-06 with per-entity catch-all "Operations — General" project
