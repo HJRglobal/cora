@@ -320,6 +320,54 @@ def check_scheduled_tasks() -> list[CheckResult]:
     return results
 
 
+_QBO_MONITOR_TASK = "Cora - QBO Token Monitor"
+
+
+def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
+    """The QBO token monitor must keep FIRING daily -- if it silently stops, a
+    realm could expire unnoticed and finance answers fail silently. WARN if it's
+    missing or hasn't run in >36h. Last-result is deliberately NOT gated: the
+    monitor's exit 1 = a real token finding it already DM'd, not a monitor fault.
+    `now` is injectable for tests."""
+    now = now or datetime.now()
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/Query", "/TN", _QBO_MONITOR_TASK, "/V", "/FO", "LIST"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("QBO token monitor", "warn", f"schtasks query failed: {exc}")
+    if proc.returncode != 0:
+        return CheckResult(
+            "QBO token monitor", "warn",
+            f"'{_QBO_MONITOR_TASK}' not registered -- QBO token expiries go "
+            r"unmonitored. Run deployment\setup-qbo-token-monitor-task.ps1.")
+    last_run = ""
+    for line in proc.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Last Run Time:"):
+            last_run = s.split(":", 1)[1].strip()
+            break
+    if not last_run or last_run.upper().startswith("N/A") or "never" in last_run.lower():
+        return CheckResult("QBO token monitor", "warn", f"'{_QBO_MONITOR_TASK}' has never run.")
+    parsed = None
+    for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(last_run, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return CheckResult("QBO token monitor", "ok", f"Registered; last run {last_run}.")
+    age_h = (now - parsed).total_seconds() / 3600
+    if age_h > 36:
+        return CheckResult(
+            "QBO token monitor", "warn",
+            f"'{_QBO_MONITOR_TASK}' last ran {age_h:.0f}h ago (expected daily) -- "
+            "it may have stopped firing.")
+    return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
+
+
 def check_logs_24h() -> list[CheckResult]:
     """Scan last 24h log files for ERRORs and critical patterns."""
     results: list[CheckResult] = []
@@ -694,6 +742,9 @@ def main() -> int:
 
     log.info("Checking scheduled tasks...")
     all_results.extend(check_scheduled_tasks())
+
+    log.info("Checking QBO token monitor freshness...")
+    all_results.append(check_qbo_monitor())
 
     log.info("Scanning logs (last 24h)...")
     all_results.extend(check_logs_24h())

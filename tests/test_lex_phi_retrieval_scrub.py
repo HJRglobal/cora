@@ -85,6 +85,19 @@ def test_apply_lex_phi_scrub_neutralizes_title_and_deeplink(monkeypatch):
     assert out[0].title == "LEX knowledge base entry"
 
 
+def test_apply_lex_phi_scrub_redacts_cue_adjacent_bare_name(monkeypatch):
+    # B5: a bare client name near a cue ("client, Madison" / "session") that
+    # scrub_lex_phi's immediate-noun rule misses must be redacted on the
+    # non-custodian retrieval path; staff + non-PHI prose survive.
+    _patch_staff(monkeypatch)
+    body = "Shaun Hawkins noted the client, Madison, attended the session on 6/30."
+    out = cl._apply_lex_phi_scrub([_result(body)])
+    scrubbed = out[0].content
+    assert "Madison" not in scrubbed
+    assert "Shaun Hawkins" in scrubbed   # staff preserved
+    assert "6/30" in scrubbed            # operational date survives (numeric)
+
+
 # ── retrieval path: LEX non-custodian / custodian / non-LEX ──────────────────
 def _wire_kb(monkeypatch, results):
     monkeypatch.setattr(cl, "_KB_DB_PATH", Path(__file__).resolve().parent)  # a dir that .exists()

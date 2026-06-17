@@ -311,3 +311,191 @@ def scrub_lex_phi(text: str, allowed_names: set[str] | None = None) -> str:
     out = _NAME_POSSESSIVE_RE.sub(_poss, out)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Cue-proximity + care-noun-governed bare-name redaction (B5, 2026-06-17) -- RETRIEVAL-ONLY
+# ---------------------------------------------------------------------------
+# scrub_lex_phi catches a client name only when IMMEDIATELY preceded by a
+# care-recipient noun ("client John") or possessive ("Bob's"). This adds, for a
+# NON-custodian's RETRIEVED LEX content ONLY (context_loader._apply_lex_phi_scrub,
+# NOT the meeting-capture path), two passes that catch bare client names the
+# immediate-noun rule misses.
+#
+# Hardened after the 2026-06-17 adversarial review, which proved a single
+# Title-case-near-cue sweep was wrong in BOTH directions -- it LEAKED admin-cue
+# names (units/AHCCCS/EVV), ALLCAPS/accented names, and a client whose given name
+# matched a staff first name; and it SHREDDED ordinary prose (sentence-initial
+# verbs, the cue words themselves, staff names glued to a trailing word). Two
+# passes fix both:
+#   PASS 1 (care-noun-governed): a name DIRECTLY after a care-recipient noun is a
+#     client -> redact ANY-case form (Title/ALLCAPS/lowercase/accented), unless it
+#     is a common word/verb or an exact staff FULL name. Context wins over the
+#     roster's first-name guess (so a client "Aaron" after "the client," redacts).
+#   PASS 2 (Title-case near a cue): redact a Title-case name within `window` of a
+#     cue, guarded so a token that IS a cue word / function word / common ops verb
+#     is NOT a name, a staff first name (incl. nicknames) is preserved (NON-governed
+#     -> could be staff), and a greedy span keeps a leading staff full-name prefix.
+# NOT a non-PHI proper-noun allowlist: a place/vendor near a cue is still redacted
+# (fail-safe; Harrison 2026-06-17). NOTE the ALLCAPS/lowercase/accented coverage is
+# PASS-1 (governed) ONLY -- PASS 2 is Title-case. Documented residuals (access
+# controls -- custodian gate + phi topic-gate + entity-siloing -- are primary, and
+# 2.3 already neutralizes the chunk title + deep-link where bare names cluster):
+#   (a) a bare client name with NO cue anywhere near it; and
+#   (b) a NON-governed ALLCAPS name near a cue (PASS 2 won't match ALLCAPS; broad
+#       ALLCAPS matching is deliberately avoided -- it would shred acronyms/entity
+#       codes near cues). Both are accepted; not closable by regex without NLP or
+#       net-negative over-redaction.
+
+_PHI_CUE_RE = re.compile(
+    r"\b(?:client|patient|member|individual|participant|recipient|consumer|guardian"
+    r"|parent|caregiver|sessions?|appointments?|appt|iep|isp|behavior\w*|incidents?"
+    r"|placements?|discharg\w*|admit\w*|admission|authoriz\w*|auth|eligib\w*|diagnos\w*"
+    r"|medications?|meds|prescription\w*|habilitation|hab|respite|goals?"
+    # admin / AZ DDD-AHCCCS program cues (review HIGH): care-recipient status leaks
+    # via billing / units / program identifiers, not just clinical words.
+    r"|units?|billing|billed|invoice\w*|reimburs\w*|claims?|coverage|copay|deductible"
+    r"|enroll\w*|disenroll\w*|ahcccs|ddd|evv|olcr|dta|dtt|progress\s+notes?"
+    r"|service\s+(?:hours?|code)|plan\s+of\s+care)\b",
+    re.IGNORECASE,
+)
+
+# Care-recipient noun governing a following name (PASS 1), through light punctuation.
+# The NOUN is case-insensitive via (?i:...) but the rest is case-SENSITIVE: a
+# multi-word name continuation must start uppercase (Title/ALLCAPS), so a lowercase
+# verb run after the noun ("client was present for") is NOT captured as a name.
+_CARE_NOUN_RE = re.compile(
+    r"\b(?i:client|patient|member|individual|participant|recipient|consumer|guardian"
+    r"|parent|caregiver)s?\b[\s,:;.\-]{1,4}"
+    r"([A-Za-zÀ-ſ][\wÀ-ſ'’\-]*(?:\s+[A-ZÀ-ſ][\wÀ-ſ'’\-]*){0,2})"
+)
+
+# Title-case name (incl. accented start, interior caps "McKenna", apostrophe/
+# hyphen), 1-3 words. Bounded {0,1}/{0,2}, no nested unbounded quantifier -> no ReDoS.
+_PROPER_NAME_RE = re.compile(
+    r"\b[A-ZÀ-ſ][a-zÀ-ſ]+(?:[A-ZÀ-ſ][a-zÀ-ſ]+)?"
+    r"(?:\s+[A-ZÀ-ſ][a-zÀ-ſ]+(?:[A-ZÀ-ſ][a-zÀ-ſ]+)?){0,2}"
+)
+
+# Common English words that are frequently Title-case in prose -- function words +
+# common ops/comms/clinical verbs + a few common nouns. NOT a proper-noun allowlist;
+# deliberately omits any word that doubles as a common first name or month
+# (will/may/mark/grace/hope/dawn/june/april/august) so those stay redactable.
+_NONNAME_STOPWORDS = frozenset({
+    # function words / auxiliaries / modals (no name collisions)
+    "the", "this", "that", "these", "those", "a", "an", "and", "or", "but", "so",
+    "for", "with", "from", "per", "to", "of", "in", "on", "at", "by", "as", "if",
+    "then", "than", "is", "are", "was", "were", "be", "been", "being", "has", "have",
+    "had", "do", "does", "did", "he", "she", "it", "we", "they", "you", "his", "her",
+    "hers", "their", "our", "your", "its", "him", "them", "us", "no", "not", "yes",
+    "also", "still", "now", "next", "new", "when", "where", "what", "who", "why",
+    "which", "while", "because", "after", "before", "since", "until", "each", "every",
+    "all", "any", "some", "more", "most", "please", "thanks", "re", "fwd",
+    "should", "would", "could", "can", "cannot", "must", "might", "shall",
+    # common ops / comms / clinical verbs (review over-redaction fix)
+    "met", "sent", "called", "discussed", "reviewed", "scheduled", "rescheduled",
+    "completed", "updated", "submitted", "cancelled", "canceled", "confirmed",
+    "ordered", "coordinated", "checked", "added", "planned", "emailed", "approved",
+    "logged", "billed", "received", "processed", "attended", "contacted", "spoke",
+    "talked", "asked", "noted", "created", "closed", "opened", "started", "finished",
+    "arrived", "missed", "requested", "needs", "needed", "visited", "followed",
+    "reached", "documented", "entered", "uploaded", "shared", "assigned", "set",
+    "got", "made", "took", "gave", "ran", "went", "left", "kept", "held", "booked",
+    "filed", "signed", "paid", "owes", "owed", "pending",
+    # common nouns frequently capitalized at sentence start or after a cue
+    "meeting", "meetings", "notes", "note", "report", "reports", "form", "forms",
+    "file", "files", "copy", "team", "plan", "plans", "visit", "visits", "week",
+    "weeks", "today", "tomorrow", "update", "status", "summary", "review", "draft",
+    "email", "call", "follow", "followup",
+})
+
+# Staff first-name nicknames <-> formal forms (review MED: 'Jen' for Jennifer
+# Mortensen was redacted). Only activates for names whose counterpart IS on the
+# roster, so it cannot shield an arbitrary client name.
+_FIRST_NAME_ALIASES = {
+    "jennifer": ("jen", "jenny"), "jeffrey": ("jeff",), "michael": ("mike",),
+    "robert": ("rob", "bob"), "matthew": ("matt",), "thomas": ("tom",),
+    "christopher": ("chris",), "alexander": ("alex",), "daniel": ("dan",),
+    "joshua": ("josh",), "nicholas": ("nick",), "jonathan": ("jon",),
+    "samantha": ("sam",), "harrison": ("harry",),
+}
+
+_CUE_WINDOW = 120  # chars; widened from 40 (review MED) to span multi-clause sentences
+
+
+def _alias_first_names(first: set[str]) -> set[str]:
+    """Nicknames/formal-forms of roster first names (bidirectional; roster-anchored)."""
+    extra: set[str] = set()
+    for formal, nicks in _FIRST_NAME_ALIASES.items():
+        if formal in first:
+            extra.update(nicks)
+        for n in nicks:
+            if n in first:
+                extra.add(formal)
+                extra.update(x for x in nicks if x != n)
+    return extra
+
+
+def _redact_multi(toks: list[str], full: set[str], first: set[str]) -> str:
+    """Multi-token Title-case span: preserve a leading EXACT staff full-name prefix
+    (so 'Shaun Hawkins Reviewed' keeps the name), redact the rest token-wise."""
+    for n in (3, 2):
+        if len(toks) >= n and " ".join(toks[:n]).lower() in full:
+            tail = []
+            for t in toks[n:]:
+                low = t.lower()
+                if _PHI_CUE_RE.fullmatch(t) or low in _NONNAME_STOPWORDS or low in first:
+                    tail.append(t)
+                else:
+                    tail.append("[name redacted]")
+            return " ".join(toks[:n] + tail)
+    return "[name redacted]"
+
+
+def redact_cue_adjacent_names(
+    text: str, allowed_names: set[str] | None = None, window: int = _CUE_WINDOW
+) -> str:
+    """Redact a bare client name on a NON-custodian's retrieved LEX content (two
+    passes -- see module section above). RETRIEVAL-ONLY; do NOT call from the
+    meeting-capture path. No-op when the text contains no PHI cue, so ordinary
+    operational prose is never touched. Pure transform."""
+    if not text:
+        return text
+    if not _PHI_CUE_RE.search(text):
+        return text  # no PHI context anywhere -> ordinary prose untouched
+    full, first = _staff_name_index(allowed_names)
+    first = first | _alias_first_names(first)
+
+    # PASS 1 -- a name directly governed by a care-recipient noun is a client.
+    def _gov(m: "re.Match[str]") -> str:
+        name = m.group(1)
+        if " " not in name:  # single token
+            low = name.lower()
+            if low in _NONNAME_STOPWORDS or _PHI_CUE_RE.fullmatch(name):
+                return m.group(0)        # "client called", "member session"
+        if name.strip().lower() in full:
+            return m.group(0)            # an explicit staff full name (rare)
+        prefix = m.group(0)[: m.start(1) - m.start(0)]
+        return prefix + "[name redacted]"
+
+    out = _CARE_NOUN_RE.sub(_gov, text)
+
+    # PASS 2 -- Title-case name within `window` of a cue (recomputed on PASS-1 out).
+    cue_spans = [(mm.start(), mm.end()) for mm in _PHI_CUE_RE.finditer(out)]
+
+    def _near(s: int, e: int) -> bool:
+        return any(s <= ce + window and e >= cs - window for cs, ce in cue_spans)
+
+    def _broad(m: "re.Match[str]") -> str:
+        span = m.group(0)
+        if not _near(m.start(), m.end()):
+            return span
+        toks = span.split()
+        if len(toks) == 1:
+            low = toks[0].lower()
+            if _PHI_CUE_RE.fullmatch(toks[0]) or low in _NONNAME_STOPWORDS or low in first:
+                return span
+            return "[name redacted]"
+        return _redact_multi(toks, full, first)
+
+    return _PROPER_NAME_RE.sub(_broad, out)

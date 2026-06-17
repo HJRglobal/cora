@@ -574,6 +574,11 @@ def _apply_lex_phi_scrub(results: list) -> list:
     for r in results:
         try:
             r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
+            # B5 (2026-06-17): also redact a bare non-staff name sitting near a PHI
+            # cue (the residual scrub_lex_phi misses -- "the client, Madison, ..." /
+            # "incident involving Jalen"). Retrieval-only; cue-scoped so ordinary
+            # ops prose is untouched. Inside the same try -> fail-closed on error.
+            r.content = phi_guard.redact_cue_adjacent_names(r.content, allowed_names=staff)
         except Exception:  # noqa: BLE001 -- fail CLOSED, never surface raw PHI
             log.warning(
                 "LEX PHI scrub failed on chunk %s; WITHHOLDING content (fail-closed)",

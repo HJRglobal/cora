@@ -82,3 +82,42 @@ def test_meeting_action_capture_ready_is_ok():
         {"Cora - Meeting Action Capture": "Ready"}, _DIS, _RUN
     )
     assert crit == [] and warn == [] and ok == 1
+
+
+# ── QBO token-monitor freshness meta-check (B5/#5, 2026-06-17) ────────────────
+from datetime import datetime  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+def _mock_schtasks(monkeypatch, returncode, last_run=None):
+    stdout = ""
+    if last_run is not None:
+        stdout = (f"TaskName: \\Cora - QBO Token Monitor\n"
+                  f"Last Run Time: {last_run}\nLast Result: 0\nStatus: Ready\n")
+    monkeypatch.setattr(
+        hc.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""))
+
+
+def test_qbo_monitor_missing_is_warn(monkeypatch):
+    _mock_schtasks(monkeypatch, returncode=1)
+    r = hc.check_qbo_monitor()
+    assert r.status == "warn" and "not registered" in r.detail
+
+
+def test_qbo_monitor_recent_is_ok(monkeypatch):
+    _mock_schtasks(monkeypatch, 0, last_run="6/18/2026 6:50:00 AM")
+    r = hc.check_qbo_monitor(now=datetime(2026, 6, 18, 8, 0, 0))
+    assert r.status == "ok"
+
+
+def test_qbo_monitor_stale_is_warn(monkeypatch):
+    _mock_schtasks(monkeypatch, 0, last_run="6/18/2026 6:50:00 AM")
+    r = hc.check_qbo_monitor(now=datetime(2026, 6, 20, 8, 0, 0))  # ~49h later
+    assert r.status == "warn" and "stopped firing" in r.detail
+
+
+def test_qbo_monitor_never_run_is_warn(monkeypatch):
+    _mock_schtasks(monkeypatch, 0, last_run="N/A")
+    r = hc.check_qbo_monitor()
+    assert r.status == "warn" and "never run" in r.detail
