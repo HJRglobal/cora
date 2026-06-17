@@ -36,7 +36,9 @@ def main() -> int:
         print(f"KB DB not found at {_DB_PATH} -- nothing to purge.")
         return 0
 
-    conn = sqlite3.connect(str(_DB_PATH))
+    # 30s busy timeout: the live bot holds the same DB open, so wait out a brief
+    # concurrent write rather than racing it.
+    conn = sqlite3.connect(str(_DB_PATH), timeout=30)
     try:
         cur = conn.execute(
             "SELECT COUNT(*) FROM semantic_cache WHERE entity LIKE 'LEX%'"
@@ -51,9 +53,14 @@ def main() -> int:
         print(f"Deleted {n} LEX semantic-cache row(s). LEX answers will rebuild on demand.")
         return 0
     except sqlite3.OperationalError as exc:
-        # Table may not exist yet (no cache writes) -- nothing to purge.
-        print(f"semantic_cache not present or unreadable ({exc}) -- nothing to purge.")
-        return 0
+        msg = str(exc).lower()
+        if "no such table" in msg:
+            # Cache never written (no cached replies yet) -- nothing to purge.
+            print("semantic_cache table absent (no cache writes yet) -- nothing to purge.")
+            return 0
+        # A lock (DB busy) or other operational error is NOT success -- surface it.
+        print(f"ERROR: could not purge ({exc}). DB may be locked -- re-run in a moment.")
+        return 1
     finally:
         conn.close()
 
