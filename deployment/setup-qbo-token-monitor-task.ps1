@@ -5,7 +5,9 @@
 # (reads the local token store only); the separate 02:00 refresh task is what
 # actually rotates tokens.
 #
-# Run from ELEVATED PowerShell:
+# Runs at LIMITED privilege (least-privilege -- the monitor only reads the local
+# token store + posts HTTPS; it does NOT need RunLevel Highest), so it can be
+# registered from a NORMAL (non-elevated) PowerShell:
 #   cd C:\Users\Harri\code\cora
 #   .\deployment\setup-qbo-token-monitor-task.ps1
 #
@@ -40,7 +42,6 @@ $task = Register-ScheduledTask `
     -Action   $Action `
     -Trigger  $Trigger `
     -Settings $Settings `
-    -RunLevel Highest `
     -Force
 
 Write-Host "Registered: $($task.TaskName)  State: $($task.State)"
