@@ -48,6 +48,15 @@ MIN_FUZZY_RATIO = 0.35
 # Fuzzy ratio that, combined with a high-confidence source, reaches HIGH tier.
 HIGH_FUZZY_RATIO = 0.60
 
+# Short task names ("Pay rent", "Sign contract") match too easily on partial
+# strings — require a near-exact fuzzy ratio for them. (Phase 1.5 precision.)
+_SHORT_NAME_FUZZY_FLOOR = 0.80
+_SHORT_NAME_MAX_WORDS = 2
+
+# Weak completion verbs (paid/received/confirmed/...) get a confidence penalty
+# even when bound to a business object — inherently lower-trust than "shipped".
+_WEAK_VERB_PENALTY = 0.85
+
 # Don't re-recommend the same (task_gid, source_id) within this window.
 DEDUP_WINDOW_HOURS = 48
 
@@ -66,25 +75,21 @@ _SIGNAL_MATCH_CAP = 500
 
 # ── Completion signal vocabulary ───────────────────────────────────────────
 
-# Verbs that strongly imply completion. Applied as whole-word regex.
-_COMPLETION_VERBS = (
+# Verbs that STRONGLY imply completion on their own. Applied as whole-word
+# regex — these carry an implicit object ("shipped", "executed", "wrapped up").
+_STRONG_COMPLETION_VERBS = (
     r"complet(?:ed?|ion)",
     r"finish(?:ed|es)?",
-    r"\bdone\b",
     r"shipped?",
     r"launch(?:ed)?",
     r"sign(?:ed)?",
     r"closed?",
     r"resolved?",
-    r"paid",
-    r"receiv(?:ed)?",
-    r"confirm(?:ed)?",
     r"approved?",
     r"submitted?",
     r"delivered?",
     r"executed?",
     r"wrapped?\s+up",
-    r"sent\s+(?:over|out|the)",
     r"went\s+live",
     r"went\s+(?:through|out)",
     r"is\s+live",
@@ -97,10 +102,101 @@ _COMPLETION_VERBS = (
     r"cancell?ed",
 )
 
+# Verbs too GENERIC to imply completion alone — they fire constantly in chatter
+# ("are we done?", "rent paid?", "did you receive it?"). A weak verb only counts
+# as a signal when a concrete business object is present in the same sentence,
+# AND that object must also appear in the matched task name (verb-noun binding).
+_WEAK_COMPLETION_VERBS = (
+    r"\bdone\b",
+    r"paid",
+    r"receiv(?:ed)?",
+    r"confirm(?:ed)?",
+    r"sent\s+(?:over|out|the)",
+)
+
+_STRONG_COMPLETION_RE = re.compile(
+    r"(?:" + r"|".join(_STRONG_COMPLETION_VERBS) + r")", re.IGNORECASE,
+)
+_WEAK_COMPLETION_RE = re.compile(
+    r"(?:" + r"|".join(_WEAK_COMPLETION_VERBS) + r")", re.IGNORECASE,
+)
+# Backward-compatible union (reconciliation_engine imports _COMPLETION_RE).
 _COMPLETION_RE = re.compile(
-    r"(?:" + r"|".join(_COMPLETION_VERBS) + r")",
+    r"(?:" + r"|".join(_STRONG_COMPLETION_VERBS + _WEAK_COMPLETION_VERBS) + r")",
     re.IGNORECASE,
 )
+
+# Concrete deliverable nouns that bind a weak completion verb to a real task.
+# Stored as singular+plural; _business_nouns() singularises for comparison.
+_BUSINESS_OBJECTS = frozenset({
+    "invoice", "invoices", "payment", "payments", "deposit", "deposits",
+    "contract", "contracts", "agreement", "agreements", "form", "forms",
+    "order", "orders", "shipment", "shipments", "delivery", "deliveries",
+    "report", "reports", "deck", "decks", "proposal", "proposals",
+    "document", "documents", "doc", "docs", "file", "files", "paperwork",
+    "application", "applications", "check", "checks", "wire", "wires",
+    "transfer", "transfers", "refund", "refunds", "audit", "audits",
+    "reconciliation", "filing", "filings", "return", "returns",
+    "registration", "renewal", "renewals", "sample", "samples",
+    "deliverable", "deliverables", "asset", "assets", "design", "designs",
+    "draft", "drafts", "package", "packages", "task", "tasks", "rent",
+})
+
+
+def _business_nouns(text: str) -> frozenset[str]:
+    """Return the business-object nouns present in `text`, singularised."""
+    found: set[str] = set()
+    for w in re.findall(r"[a-z]+", text.lower()):
+        if w in _BUSINESS_OBJECTS:
+            found.add(w[:-1] if w.endswith("s") and len(w) > 3 else w)
+    return frozenset(found)
+
+
+def _completion_kind(sentence: str) -> Optional[bool]:
+    """Classify a sentence's completion signal.
+
+    Returns:
+      None  — no completion signal (skip the sentence)
+      False — STRONG completion verb (high-trust)
+      True  — WEAK verb bound to a concrete business object (lower-trust;
+              penalised at scoring + requires noun overlap with the task)
+    """
+    if _STRONG_COMPLETION_RE.search(sentence):
+        return False
+    if _WEAK_COMPLETION_RE.search(sentence) and _business_nouns(sentence):
+        return True
+    return None
+
+
+# Cora's own messages must never feed back in as completion signals.
+# Author-based exclusion (where author is populated, e.g. Gmail "Cora via Slack"
+# notifications). Slack chunks have NULL author, so Cora's own digests posted to
+# Slack are caught by the content-signature check below instead.
+_BOT_AUTHOR_EXACT = frozenset({"cora", "cora bot", "cora_bot", "cora_system", "u0b44mdgc5r"})
+_BOT_AUTHOR_MARKERS = ("cora via slack", "notification@slack-mail.com")
+
+# Distinctive boilerplate from Cora's own completion digest — used to drop the
+# self-reinforcing loop when those posts are re-ingested from Slack (NULL author).
+_CORA_SELF_SIGNATURES = (
+    "completion candidates",
+    "completion sweep",
+    "cora does not auto-complete",
+    "these are recommendations only",
+)
+
+
+def _is_bot_author(author: str | None) -> bool:
+    a = (author or "").strip().lower()
+    if not a:
+        return False
+    if a in _BOT_AUTHOR_EXACT:
+        return True
+    return any(m in a for m in _BOT_AUTHOR_MARKERS)
+
+
+def _is_cora_self_post(content: str | None) -> bool:
+    c = (content or "").lower()
+    return any(sig in c for sig in _CORA_SELF_SIGNATURES)
 
 # Source confidence weights — Fireflies transcripts are the most reliable
 # because they capture spoken decisions directly.
@@ -126,6 +222,8 @@ class CompletionSignal:
     source_ts: float      # ingested_at unix timestamp of the KB chunk
     deep_link: str        # clickable link back to source (Slack mrkdwn or URL)
     title: str            # chunk title (meeting name, email subject, etc.)
+    author: str = ""      # chunk author; used to drop bot-authored messages
+    is_weak: bool = False  # matched only a weak verb (penalised at scoring)
 
 
 @dataclass
@@ -278,7 +376,7 @@ def extract_signals_from_db(
         rows = conn.execute(
             f"""
             SELECT source, source_id, entity, content, deep_link, title,
-                   ingested_at
+                   ingested_at, author
             FROM knowledge_chunks
             WHERE ingested_at >= ?
               AND source != 'static_md'
@@ -291,12 +389,19 @@ def extract_signals_from_db(
         conn.close()
 
     signals: list[CompletionSignal] = []
-    for source, source_id, entity, content, deep_link, title, ingested_at in rows:
+    for source, source_id, entity, content, deep_link, title, ingested_at, author in rows:
+        # Drop Cora's own messages so they never feed back as completion signals:
+        # bot-authored chunks (populated author, e.g. "Cora via Slack" Gmail
+        # notifications) and Cora's own completion-digest posts re-ingested from
+        # Slack (NULL author → caught by content signature).
+        if _is_bot_author(author) or _is_cora_self_post(content):
+            continue
         # Sentence-level scan: split on ". " / "\n" and test each sentence
         # so we can return a tighter excerpt than the full chunk.
         sentences = re.split(r"(?<=[.!?])\s+|\n+", content or "")
         for sentence in sentences:
-            if not _COMPLETION_RE.search(sentence):
+            kind = _completion_kind(sentence)
+            if kind is None:
                 continue
             weight = _SOURCE_WEIGHTS.get(source or "static_md", 0.50)
             signals.append(
@@ -309,6 +414,8 @@ def extract_signals_from_db(
                     source_ts=float(ingested_at or 0),
                     deep_link=deep_link or "",
                     title=title or "",
+                    author=author or "",
+                    is_weak=bool(kind),
                 )
             )
     log.info(
@@ -333,7 +440,8 @@ def extract_signals_from_text(
     signals: list[CompletionSignal] = []
     sentences = re.split(r"(?<=[.!?])\s+|\n+", text or "")
     for sentence in sentences:
-        if not _COMPLETION_RE.search(sentence):
+        kind = _completion_kind(sentence)
+        if kind is None:
             continue
         signals.append(
             CompletionSignal(
@@ -345,6 +453,7 @@ def extract_signals_from_text(
                 source_ts=time.time(),
                 deep_link=deep_link,
                 title=title,
+                is_weak=bool(kind),
             )
         )
     return signals
@@ -381,21 +490,33 @@ def _build_task_word_sets(open_tasks: list[dict]) -> list[tuple[dict, frozenset[
     return [(t, _word_set(t.get("name") or "")) for t in open_tasks]
 
 
+def _is_short_task_name(name: str) -> bool:
+    """A task name is "short" (≤ _SHORT_NAME_MAX_WORDS significant words or
+    ≤ 18 chars) when it is so terse that a partial fuzzy match is unreliable —
+    e.g. "Pay rent", "Sign contract". These require a near-exact ratio."""
+    words = re.findall(r"[a-z0-9]+", name.lower())
+    return len(name.strip()) <= 18 or len(words) <= _SHORT_NAME_MAX_WORDS
+
+
 def _best_task_match(
     signal: CompletionSignal,
     task_word_pairs: list[tuple[dict, frozenset[str]]],
 ) -> tuple[dict, float] | None:
-    """Return the (task_dict, fuzzy_ratio) pair with the highest ratio above
-    MIN_FUZZY_RATIO, or None if no task clears the threshold.
+    """Return the (task_dict, fuzzy_ratio) pair with the highest ratio that
+    clears the (possibly length-adjusted) floor, or None if none qualify.
 
-    Word-intersection pre-filter: skip SequenceMatcher entirely when the signal
-    shares no significant words with the task name — makes the inner loop ~10×
-    faster on large signal sets.
+    Precision guards (Phase 1.5):
+      • Word-intersection pre-filter — skip SequenceMatcher when the signal
+        shares no significant words with the task name (also ~10× faster).
+      • Weak-verb binding — a weak-verb signal ("invoice paid") only matches a
+        task that shares the concrete business object ("...invoice...").
+      • Short-name floor — terse task names require ≥ _SHORT_NAME_FUZZY_FLOOR.
     """
     text = signal.signal_text
     sig_words = _word_set(text)
+    sig_nouns = _business_nouns(text) if signal.is_weak else frozenset()
     best_task: dict | None = None
-    best_ratio = MIN_FUZZY_RATIO  # anything below this is ignored
+    best_ratio = MIN_FUZZY_RATIO  # anything at/below this is ignored
 
     for task, task_words in task_word_pairs:
         name = task.get("name") or ""
@@ -404,8 +525,13 @@ def _best_task_match(
         # Skip SequenceMatcher when there's no word overlap at all.
         if sig_words and task_words and not sig_words.intersection(task_words):
             continue
+        # Weak-verb signals must share a concrete business object with the task
+        # name — "invoice paid" only matches a task that is about an invoice.
+        if signal.is_weak and not (sig_nouns and (sig_nouns & _business_nouns(name))):
+            continue
         ratio = _fuzzy_ratio(text, name)
-        if ratio > best_ratio:
+        floor = _SHORT_NAME_FUZZY_FLOOR if _is_short_task_name(name) else MIN_FUZZY_RATIO
+        if ratio >= floor and ratio > best_ratio:
             best_ratio = ratio
             best_task = task
 
@@ -414,15 +540,23 @@ def _best_task_match(
     return best_task, best_ratio
 
 
-def compute_confidence(source_weight: float, fuzzy_ratio: float) -> float:
+def compute_confidence(
+    source_weight: float, fuzzy_ratio: float, *, is_weak: bool = False,
+) -> float:
     """Blend source reliability and name-match quality into a single score.
 
-    Formula: weight * 0.55 + fuzzy_ratio * 0.45
-    Fireflies (0.90) + HIGH_FUZZY (0.60) → 0.90*0.55 + 0.60*0.45 = 0.765 (MID+)
-    Fireflies (0.90) + perfect (1.00)    → 0.90*0.55 + 1.00*0.45 = 0.945 (HIGH)
-    Slack (0.75)     + HIGH_FUZZY (0.60) → 0.75*0.55 + 0.60*0.45 = 0.6825 (MID)
+    Formula: weight * 0.45 + fuzzy_ratio * 0.55 (match quality weighted above
+    source — Phase 1.5 precision rebalance), then × _WEAK_VERB_PENALTY when the
+    signal matched only a generic/weak completion verb.
+
+    Fireflies (0.90) + perfect (1.00)    → 0.90*0.45 + 1.00*0.55 = 0.955 (HIGH)
+    Fireflies (0.90) + HIGH_FUZZY (0.60) → 0.90*0.45 + 0.60*0.55 = 0.735 (MID)
+    Slack (0.75)     + HIGH_FUZZY (0.60) → 0.75*0.45 + 0.60*0.55 = 0.6675 (MID)
     """
-    return round(source_weight * 0.55 + fuzzy_ratio * 0.45, 4)
+    score = source_weight * 0.45 + fuzzy_ratio * 0.55
+    if is_weak:
+        score *= _WEAK_VERB_PENALTY
+    return round(score, 4)
 
 
 # ── Top-level orchestration ────────────────────────────────────────────────
@@ -458,7 +592,7 @@ def match_signals_to_tasks(
         if match is None:
             continue
         task, ratio = match
-        conf = compute_confidence(signal.source_weight, ratio)
+        conf = compute_confidence(signal.source_weight, ratio, is_weak=signal.is_weak)
         if conf < min_confidence:
             continue
 

@@ -22,8 +22,14 @@ from cora.tools.completion_detector import (
     CompletionSignal,
     _COMPLETION_RE,
     _SOURCE_WEIGHTS,
+    _WEAK_VERB_PENALTY,
+    _business_nouns,
+    _completion_kind,
     _fuzzy_ratio,
+    _is_bot_author,
+    _is_cora_self_post,
     _is_deduped,
+    _is_short_task_name,
     _mark_deduped,
     compute_confidence,
     detect_candidates,
@@ -88,15 +94,16 @@ def _insert_chunk(
     title: str = "F3 Weekly 5/22",
     deep_link: str = "https://fireflies.ai/view/ff-001",
     ingested_at: int | None = None,
+    author: str | None = None,
 ) -> None:
     if ingested_at is None:
         ingested_at = int(time.time()) - 60  # 1 minute ago
     conn = sqlite3.connect(str(db_path))
     conn.execute(
         """INSERT INTO knowledge_chunks
-           (chunk_id, source, source_id, entity, content, title, deep_link, ingested_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (chunk_id, source, source_id, entity, content, title, deep_link, ingested_at),
+           (chunk_id, source, source_id, entity, content, title, deep_link, ingested_at, author)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (chunk_id, source, source_id, entity, content, title, deep_link, ingested_at, author),
     )
     conn.commit()
     conn.close()
@@ -257,11 +264,13 @@ class TestExtractSignalsFromText:
         assert len(signals) >= 2
 
     def test_source_weight_set_correctly(self):
-        signals = extract_signals_from_text("Done.", source="fireflies", entity="F3E")
+        # NB: bare "Done." no longer signals (weak verb, no business object) —
+        # use a strong-verb sentence to exercise source weighting.
+        signals = extract_signals_from_text("Shipped.", source="fireflies", entity="F3E")
         assert signals[0].source_weight == _SOURCE_WEIGHTS["fireflies"]
 
     def test_unknown_source_gets_default_weight(self):
-        signals = extract_signals_from_text("Done.", source="custom_source", entity="F3E")
+        signals = extract_signals_from_text("Shipped.", source="custom_source", entity="F3E")
         assert 0 < signals[0].source_weight <= 1.0
 
     def test_deep_link_and_title_passed_through(self):
@@ -679,3 +688,123 @@ class TestToolDispatchWiring:
     def test_handler_callable(self):
         from cora.tools.tool_dispatch import _TOOL_FUNCTIONS
         assert callable(_TOOL_FUNCTIONS["fndr_completion_candidates"])
+
+
+# ── Phase 1.5 precision: weak-verb binding ─────────────────────────────────
+
+class TestWeakVerbBinding:
+
+    def test_strong_verb_is_not_weak(self):
+        sigs = extract_signals_from_text("Shipped the order.", source="fireflies")
+        assert len(sigs) == 1
+        assert sigs[0].is_weak is False
+
+    def test_weak_verb_with_business_noun_is_weak(self):
+        sigs = extract_signals_from_text("The invoice was paid.", source="slack")
+        assert len(sigs) == 1
+        assert sigs[0].is_weak is True
+
+    def test_weak_verb_without_business_noun_drops(self):
+        # generic completion token with no concrete object → no signal
+        assert extract_signals_from_text("Are we done with this?", source="slack") == []
+        assert extract_signals_from_text("Confirmed.", source="slack") == []
+
+    def test_completion_kind_classification(self):
+        assert _completion_kind("We shipped it.") is False          # strong
+        assert _completion_kind("Invoice paid.") is True            # weak + noun
+        assert _completion_kind("Yep, done.") is None               # weak, no noun
+        assert _completion_kind("Let's schedule a call.") is None   # nothing
+
+    def test_business_nouns_singularises(self):
+        assert "invoice" in _business_nouns("two invoices received")
+        assert "form" in _business_nouns("the forms are done")
+        assert _business_nouns("just a quick chat") == frozenset()
+
+    def test_weak_signal_requires_noun_overlap_with_task(self, tmp_dedup_db):
+        sig = extract_signals_from_text("Invoice paid.", source="fireflies")[0]
+        match = _make_task(name="Invoice paid")             # shares the noun
+        no_noun = _make_task(name="Paid leave policy")       # shares "paid", not the noun
+        assert len(match_signals_to_tasks([sig], [match], apply_dedup=False)) == 1
+        assert match_signals_to_tasks([sig], [no_noun], apply_dedup=False) == []
+
+
+# ── Phase 1.5 precision: bot / self-post exclusion ─────────────────────────
+
+class TestBotAuthorExclusion:
+
+    @pytest.mark.parametrize("author,expected", [
+        (None, False), ("", False), ("Hannah Grant", False),
+        ("cora", True), ("Cora Bot", True), ("U0B44MDGC5R", True),
+        ("Cora via Slack <notification@slack-mail.com>", True),
+    ])
+    def test_is_bot_author(self, author, expected):
+        assert _is_bot_author(author) is expected
+
+    def test_db_skips_bot_authored_chunk(self, tmp_kb_db):
+        _insert_chunk(
+            tmp_kb_db, chunk_id="b1",
+            content="Shipped the order to the warehouse.",
+            author="Cora via Slack <notification@slack-mail.com>",
+        )
+        assert extract_signals_from_db(db_path=tmp_kb_db) == []
+
+    def test_db_keeps_human_authored_chunk(self, tmp_kb_db):
+        _insert_chunk(
+            tmp_kb_db, chunk_id="h1",
+            content="Shipped the order to the warehouse.",
+            author="Hannah Grant",
+        )
+        assert len(extract_signals_from_db(db_path=tmp_kb_db)) >= 1
+
+
+class TestCoraSelfPostExclusion:
+
+    def test_is_cora_self_post(self):
+        assert _is_cora_self_post("🧹 Completion candidates — last 24h ...")
+        assert _is_cora_self_post("These are recommendations only — Cora ...")
+        assert not _is_cora_self_post("We shipped the order.")
+
+    def test_db_skips_self_digest(self, tmp_kb_db):
+        _insert_chunk(
+            tmp_kb_db, chunk_id="s1", source="slack",
+            content="Completion candidates — last 25h. Shipped the order to Nimbl.",
+        )
+        assert extract_signals_from_db(db_path=tmp_kb_db) == []
+
+
+# ── Phase 1.5 precision: short-name fuzzy floor ────────────────────────────
+
+class TestShortNameFloor:
+
+    @pytest.mark.parametrize("name,short", [
+        ("Sign contract", True), ("Pay rent", True), ("Task 5", True),
+        ("[F3E] Ship inventory to Nimbl", False),
+        ("[HJRG] Execute vendor contract", False),
+    ])
+    def test_is_short_task_name(self, name, short):
+        assert _is_short_task_name(name) is short
+
+    def test_partial_match_to_short_name_rejected(self, tmp_dedup_db):
+        # ratio ~0.67 (< 0.80 floor) to a terse task name → rejected
+        sig = extract_signals_from_text("Signed the contract today.", source="fireflies")[0]
+        short_task = _make_task(name="Sign contract")
+        assert match_signals_to_tasks([sig], [short_task], apply_dedup=False) == []
+
+    def test_near_exact_match_to_short_name_passes(self, tmp_dedup_db):
+        sig = extract_signals_from_text("Sign contract.", source="fireflies")[0]
+        short_task = _make_task(name="Sign contract")
+        assert len(match_signals_to_tasks([sig], [short_task], apply_dedup=False)) == 1
+
+
+# ── Phase 1.5 precision: weak-verb confidence penalty ──────────────────────
+
+class TestWeakVerbPenalty:
+
+    def test_weak_scores_below_strong(self):
+        strong = compute_confidence(0.90, 0.80, is_weak=False)
+        weak = compute_confidence(0.90, 0.80, is_weak=True)
+        assert weak < strong
+        assert weak == pytest.approx(strong * _WEAK_VERB_PENALTY, abs=1e-3)
+
+    def test_default_is_not_weak(self):
+        assert compute_confidence(0.90, 0.80) == compute_confidence(0.90, 0.80, is_weak=False)
