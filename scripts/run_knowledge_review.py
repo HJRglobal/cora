@@ -39,6 +39,7 @@ from cora.knowledge_review import (  # noqa: E402
     get_pending_updates,
     propose_update,
     resolve_update,
+    send_dm_to_harrison,
     send_individual_dms,
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_GENERIC,
@@ -51,6 +52,46 @@ LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 # patched. A best-effort lockfile makes a concurrent invocation a no-op.
 _LOCK_PATH = Path(__file__).resolve().parents[1] / "data" / "state" / "knowledge-review.lock"
 _LOCK_STALE_SECONDS = 20 * 60
+
+# ── Phase 2.4 rebuild knobs (gate G-D) ───────────────────────────────────────
+# Auto-expire: a PENDING item Harrison has SEEN (DM'd) but not acted on for this
+# many days is auto-dismissed. Relaxed from the prior 48h now that new-item DMs
+# batch WEEKLY (a 48h kill would drop an item before its next weekly review).
+_PENDING_EXPIRY_DAYS = 14
+
+# Auto-approve: HIGH-confidence NON-canonical GENERIC updates write WITHOUT a
+# Harrison 👍 (the "I told Cora and she forgot" loop, Harrison #9). Scoped to
+# known-answers writes only -- design/known-answers/*.md is operational KB, NOT
+# canonical memory. Canonical writes (decision_capture -> decisions.md) and
+# external actions (asana_task/task_close/hubspot_note) and efficiency findings
+# ALWAYS require a 👍 (D-011 intact). Capped so a backlog can't flood in one run.
+_AUTO_APPROVE_TYPES = frozenset({"known_answer"})
+_MAX_AUTO_APPROVE_PER_RUN = 10
+
+# Weekly digest: new-item DMs are sent only on this weekday (Mon=0) in AZ time.
+# Reaction-processing, auto-approve, and auto-expire still run EVERY scheduled
+# day so approvals are acted on promptly and the queue is maintained daily.
+_DIGEST_WEEKDAY = 0  # Monday
+
+
+def _is_digest_day() -> bool:
+    """True if today (America/Phoenix) is the weekly digest day."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Phoenix")).weekday() == _DIGEST_WEEKDAY
+    except Exception:
+        # If tz data is unavailable, fail toward sending (better a DM than silence).
+        return True
+
+
+def _auto_approve_eligible(update: dict) -> bool:
+    """True if this PENDING update may be written WITHOUT a Harrison 👍 (G-D):
+    a HIGH-confidence non-canonical GENERIC (known-answers) update."""
+    return (
+        update.get("state") == "PENDING"
+        and update.get("update_type") in _AUTO_APPROVE_TYPES
+        and (update.get("confidence") or "").upper() == "HIGH"
+    )
 
 
 def _acquire_run_lock(log: logging.Logger) -> bool:
@@ -245,6 +286,7 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
                 if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
                     e["state"] = "DISMISSED"
                     e["resolved_at"] = now_dt.isoformat()
+                    e["resolved_reason"] = "auto_expired_dmd_unreacted"
                     n += 1
             except Exception:
                 pass
@@ -260,6 +302,10 @@ def main() -> int:
     parser.add_argument(
         "--reset-dm-ts", action="store_true",
         help="Clear dm_message_ts on all PENDING items so they get re-sent as individual DMs",
+    )
+    parser.add_argument(
+        "--force-digest", action="store_true",
+        help="Send the new-item DM digest regardless of the weekly digest weekday",
     )
     args = parser.parse_args()
 
@@ -295,7 +341,7 @@ def main() -> int:
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
         now = _dt.now(_tz.utc)
-        cutoff = now - _td(hours=48)
+        cutoff = now - _td(days=_PENDING_EXPIRY_DAYS)
         auto_dismissed = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
@@ -307,7 +353,8 @@ def main() -> int:
                     encoding="utf-8",
                 )
         if auto_dismissed:
-            log.info("Auto-dismissed %d stale entries (DM'd >48h ago, no reaction)", auto_dismissed)
+            log.info("Auto-dismissed %d stale entries (DM'd >%dd ago, no reaction)",
+                     auto_dismissed, _PENDING_EXPIRY_DAYS)
 
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()
@@ -341,6 +388,29 @@ def main() -> int:
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
 
+    # ─── Step 1.5: Auto-approve HIGH-confidence non-canonical GENERIC updates ─
+    # (gate G-D, Harrison #9.) HIGH-confidence known-answers writes persist
+    # WITHOUT a 👍 -- closes the "I told Cora and she forgot" loop. Canonical
+    # writes (decision_capture) + external actions + efficiency findings always
+    # require a reaction. Capped per run so a backlog can't flood. Runs daily.
+    auto_approved = 0
+    if not args.dry_run:
+        slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
+        eligible = [u for u in get_pending_updates() if _auto_approve_eligible(u)]
+        if len(eligible) > _MAX_AUTO_APPROVE_PER_RUN:
+            log.info("Capping auto-approve: %d eligible -> top %d this run",
+                     len(eligible), _MAX_AUTO_APPROVE_PER_RUN)
+            eligible = eligible[:_MAX_AUTO_APPROVE_PER_RUN]
+        for u in eligible:
+            uid = u["update_id"]
+            log.info("AUTO-APPROVE [%s] %s (HIGH non-canonical) — %s",
+                     u.get("update_type"), uid[:8], u.get("description", "")[:120])
+            _execute_approved_update(u, slack_token, log)
+            resolve_update(uid, "APPROVED", reason="auto_approved_high_generic")
+            auto_approved += 1
+        if auto_approved:
+            log.info("Auto-approved %d HIGH-confidence non-canonical update(s)", auto_approved)
+
     # ─── Step 2: Send DM batch for any still-PENDING updates ─────────────────
     # Cap at 5 DMs per run — keeps Harrison's review queue manageable.
     _MAX_DMS_PER_RUN = 5
@@ -366,6 +436,25 @@ def main() -> int:
             log.warning("SLACK_BOT_TOKEN not set — cannot send DM, exit_code=2")
             exit_code = 2
         return exit_code
+
+    # Weekly digest cadence: only send NEW-item DMs on the digest weekday (reaction
+    # processing, auto-approve, and auto-expire above already ran). --force-digest
+    # overrides for a manual/ad-hoc send.
+    if not (_is_digest_day() or args.force_digest):
+        log.info(
+            "Not the weekly digest day — %d new item(s) deferred to the next digest",
+            len(unsent),
+        )
+        return exit_code
+
+    # Digest header so Harrison sees the batch as one weekly review, then the
+    # individually-reactable cards.
+    send_dm_to_harrison(
+        f"Cora weekly knowledge review: {len(unsent)} item(s) below. "
+        f"React 👍 to approve or 👎 to dismiss each. "
+        f"Un-actioned items auto-expire in {_PENDING_EXPIRY_DAYS} days.",
+        slack_token,
+    )
 
     log.info("Sending %d individual DMs to Harrison (user=%s)...", len(unsent), HARRISON_SLACK_USER_ID)
     sent_map = send_individual_dms(unsent, slack_token)  # {update_id: ts}

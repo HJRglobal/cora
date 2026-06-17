@@ -88,3 +88,109 @@ def test_run_lock_stale_is_reclaimed(tmp_path, monkeypatch):
     _os.utime(lock, (old, old))
     assert rkr._acquire_run_lock(log) is True          # stale lock cleared + reacquired
     rkr._release_run_lock()
+
+
+# ── Phase 2.4 rebuild: auto-expire reason, auto-approve gate, weekly digest ──
+
+def test_dismissed_entry_records_reason():
+    now = _now()
+    e = _entry(dm_ts="1700.1", age_hours=400)
+    assert rkr._auto_dismiss_stale_pending([e], now - timedelta(days=14), now) == 1
+    assert e["resolved_reason"] == "auto_expired_dmd_unreacted"
+
+
+def test_auto_approve_eligible_matrix():
+    def u(update_type, confidence, state="PENDING"):
+        return {"update_type": update_type, "confidence": confidence, "state": state}
+    # HIGH non-canonical known_answer -> eligible
+    assert rkr._auto_approve_eligible(u("known_answer", "HIGH")) is True
+    # Lower confidence -> not eligible
+    assert rkr._auto_approve_eligible(u("known_answer", "MED")) is False
+    assert rkr._auto_approve_eligible(u("known_answer", "LOW")) is False
+    # Canonical / external types never auto-approve, even at HIGH
+    assert rkr._auto_approve_eligible(u("decision_capture", "HIGH")) is False
+    assert rkr._auto_approve_eligible(u("asana_task", "HIGH")) is False
+    assert rkr._auto_approve_eligible(u("hubspot_note", "HIGH")) is False
+    assert rkr._auto_approve_eligible(u("efficiency", "HIGH")) is False
+    # Already-resolved never auto-approves
+    assert rkr._auto_approve_eligible(u("known_answer", "HIGH", state="APPROVED")) is False
+
+
+def test_is_digest_day_returns_bool():
+    assert isinstance(rkr._is_digest_day(), bool)
+
+
+def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
+    """Confirm -> save -> retrieve (Harrison #9): a HIGH known_answer auto-approves,
+    writes to known-answers, and is APPROVED with the auto-approve reason."""
+    import importlib
+    kr = importlib.import_module("cora.knowledge_review")
+
+    proposed = tmp_path / "proposed.jsonl"
+    reply_log = tmp_path / "reply.jsonl"
+    ka_dir = tmp_path / "known-answers"
+    resolved = tmp_path / "resolved.jsonl"
+
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", reply_log)
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # isolate Step 1.5
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(ka_dir))
+    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(resolved))
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "")  # _post_to_slack no-ops; no network
+
+    kr.propose_update(
+        update_id="ka-1",
+        update_type="known_answer",
+        description="F3E Anaheim warehouse address",
+        payload={
+            "entity": "FNDR",
+            "question": "What's the F3E Anaheim warehouse address?",
+            "answer": "1234 Example St, Anaheim CA.",
+            "gap_ts": "g-1",
+        },
+        confidence="HIGH",
+    )
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    # Saved: the answer is now in the known-answers file.
+    written = (ka_dir / "fndr.md").read_text(encoding="utf-8")
+    assert "1234 Example St, Anaheim CA." in written
+    # Persisted state: APPROVED with the auto-approve audit reason.
+    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-1"]
+    assert entries and entries[0]["state"] == "APPROVED"
+    assert entries[0]["resolved_reason"] == "auto_approved_high_generic"
+    # Gap marked resolved (the retrieve-side ledger).
+    assert resolved.exists() and "g-1" in resolved.read_text(encoding="utf-8")
+
+
+def test_med_known_answer_not_auto_approved(tmp_path, monkeypatch):
+    """A MED-confidence known_answer stays PENDING (only HIGH auto-approves)."""
+    import importlib
+    kr = importlib.import_module("cora.knowledge_review")
+
+    proposed = tmp_path / "proposed.jsonl"
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
+    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved.jsonl"))
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "")
+
+    kr.propose_update(
+        update_id="ka-med",
+        update_type="known_answer",
+        description="lower-confidence fact",
+        payload={"entity": "FNDR", "question": "q", "answer": "a", "gap_ts": "g"},
+        confidence="MED",
+    )
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-med"]
+    assert entries and entries[0]["state"] == "PENDING"  # not auto-approved

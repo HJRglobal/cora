@@ -206,13 +206,15 @@ def load_reply_log() -> list[dict[str, Any]]:
     return list(reversed(entries))
 
 
-def resolve_update(update_id: str, new_state: str) -> bool:
+def resolve_update(update_id: str, new_state: str, reason: str = "") -> bool:
     """Update state of an entry in cora-proposed-memory-updates.jsonl.
 
     Rewrites the full file atomically. Returns True if the entry was found and
     updated, False if not found (already resolved or never proposed).
 
-    new_state must be one of: 'APPROVED', 'DISMISSED', 'COMMENT_REQUESTED'
+    new_state must be one of: 'APPROVED', 'DISMISSED', 'COMMENT_REQUESTED'.
+    reason (optional) is recorded as resolved_reason for the audit trail -- used
+    to distinguish a Harrison 👍 from an auto-approve / auto-expire (Phase 2.4).
     """
     if not _PROPOSED_UPDATES_PATH.exists():
         return False
@@ -232,6 +234,8 @@ def resolve_update(update_id: str, new_state: str) -> bool:
                 if entry.get("update_id") == update_id and entry.get("state") == "PENDING":
                     entry["state"] = new_state
                     entry["resolved_at"] = _now_iso()
+                    if reason:
+                        entry["resolved_reason"] = reason
                     found = True
                 entries.append(entry)
 
