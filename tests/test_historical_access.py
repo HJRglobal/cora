@@ -484,8 +484,9 @@ def test_app_wires_gate_before_intent_classification():
 def test_app_grant_skips_semantic_cache():
     assert "retrieval_grant is None" in _APP_SRC
     assert "cache_storable" in _APP_SRC
-    # Both cache-store call sites are guarded.
-    assert _APP_SRC.count("if cache_storable:") == 2
+    # Both cache-store call sites are guarded by cache_storable (Phase 2.1 also
+    # excludes verbatim tables from the cache: `and not is_structured_table`).
+    assert _APP_SRC.count("if cache_storable and not is_structured_table:") == 2
 
 
 def test_app_has_dm_retrieval_branch():

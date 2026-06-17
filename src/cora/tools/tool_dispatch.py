@@ -44,6 +44,52 @@ HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
 }
 
 
+# --- Verbatim-table tools (Phase 2.1 egress opt-out) ---
+#
+# These tools return pre-formatted financial/data tables or dashboards that must
+# reach Slack EXACTLY as the tool produced them -- the egress boundary's voice
+# pass (markdown-table flatten, dash/list strip, char-cap) would mangle them, and
+# they are already source-opaque by construction (no sheet names / URLs). When a
+# reply incorporates one of these, claude_client sets meta["used_verbatim_tool"]
+# and app.py sends it with cora_verbatim=True so the boundary leaves it raw.
+#
+# This REPLACES the old too-broad `is_tool_output=bool(used_tools)` heuristic,
+# which made EVERY tool-using reply bypass the formatter (so a prose answer that
+# merely looked something up went out unsanitized). Lookup/confirmation tools
+# (asana_get_my_tasks, get_my_events, *_create_*, cora_my_notes, ...) are NOT
+# here: their output is synthesized into prose that should still be sanitized.
+VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
+    # Financial / QBO
+    "financial_get_cashflow",
+    "financial_get_pulse",
+    "financial_get_close_pack",
+    "osn_financial_pulse",
+    "qbo_get_profit_loss",
+    "qbo_get_balance_sheet",
+    "qbo_get_ar_aging",
+    "qbo_get_ap_aging",
+    "qbo_get_recent_transactions",
+    # Sales / pipeline / decision dashboards
+    "f3e_hubspot_pipeline_summary",
+    "fndr_open_decisions",
+    "fndr_press_pipeline_summary",
+    "fndr_contracts_dashboard",
+    # Inventory
+    "f3e_inventory_pulse",
+    "f3e_inventory_by_location",
+    "f3e_shopify_inventory",
+    "f3e_shopify_sales_pulse",
+    # Ads / Polar
+    "ads_get_performance_summary",
+    "ads_get_channel_breakdown",
+    "ads_get_subbrand_performance",
+    "ads_get_pixel_attribution",
+    "ads_get_cm_waterfall",
+    # Composite plate (role + tasks + calendar + pipeline, with sanctioned links)
+    "whats_on_my_plate",
+})
+
+
 # --- Entity scope filter ---
 #
 # Asana projects in the HJR Global workspace are named with an entity prefix

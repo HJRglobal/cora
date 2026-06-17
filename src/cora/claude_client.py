@@ -15,7 +15,12 @@ from typing import Callable, Optional
 import anthropic
 
 from .config import config
-from .tools.tool_dispatch import TOOL_DEFINITIONS, dispatch, tools_for_entity
+from .tools.tool_dispatch import (
+    TOOL_DEFINITIONS,
+    VERBATIM_TABLE_TOOLS,
+    dispatch,
+    tools_for_entity,
+)
 
 log = logging.getLogger(__name__)
 
@@ -336,6 +341,22 @@ def _dispatch_tools_parallel(
     ]
 
 
+def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
+    """Record which tools a reply used into the caller's meta dict.
+
+    Sets meta["tool_names"] (cumulative) and meta["used_verbatim_tool"] (True once
+    any VERBATIM_TABLE_TOOLS member fires). app.py reads used_verbatim_tool to send
+    that reply with cora_verbatim=True (egress boundary leaves it un-mangled). This
+    is the precise replacement for the old bool(used_tools) bypass."""
+    if meta is None:
+        return
+    names = [n for n in (getattr(b, "name", "") for b in tool_use_blocks) if n]
+    if names:
+        meta.setdefault("tool_names", []).extend(names)
+        if any(n in VERBATIM_TABLE_TOOLS for n in names):
+            meta["used_verbatim_tool"] = True
+
+
 def generate_response(
     system_prompt: str,
     context: str,
@@ -389,6 +410,8 @@ def generate_response(
 
     if meta is not None:
         meta["used_tools"] = False
+        meta["used_verbatim_tool"] = False
+        meta["tool_names"] = []
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         response = _create_with_retry(
@@ -424,6 +447,7 @@ def generate_response(
         tool_use_blocks = [
             b for b in response.content if getattr(b, "type", None) == "tool_use"
         ]
+        _record_tool_meta(meta, tool_use_blocks)
         tool_results = _dispatch_tools_parallel(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use", channel_name=channel_name,
@@ -522,6 +546,8 @@ def generate_response_streaming(
 
     if meta is not None:
         meta["used_tools"] = False
+        meta["used_verbatim_tool"] = False
+        meta["tool_names"] = []
 
     def _maybe_push(text: str) -> None:
         if update_callback is not None:
@@ -607,6 +633,7 @@ def generate_response_streaming(
         tool_use_blocks = [
             b for b in final.content if getattr(b, "type", None) == "tool_use"
         ]
+        _record_tool_meta(meta, tool_use_blocks)
         tool_results = _dispatch_tools_parallel(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use (stream)", channel_name=channel_name,

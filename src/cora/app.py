@@ -582,15 +582,19 @@ def _dispatch_qa(
         response_text = _extract_and_log_gap(
             response_text, entity, channel_name, user_id, user_message, latency_ms,
         )
-        # D-032: conversational replies pass through the deterministic voice
-        # formatter; tool outputs bypass. Applied before the cache store so
-        # cached replays are already-formatted.
-        response_text = format_reply(
-            response_text, is_tool_output=bool(gen_meta.get("used_tools")),
-        )
+        # D-032 / Phase 2.1: conversational replies pass through the deterministic
+        # voice formatter; only genuine verbatim-table tools bypass it. The old
+        # bool(used_tools) heuristic bypassed EVERY tool-using reply (so a prose
+        # answer that merely looked something up went out unsanitized) -- now
+        # gated on used_verbatim_tool (set by claude_client from VERBATIM_TABLE_TOOLS).
+        # Applied before the cache store so cached replays are already-formatted.
+        is_structured_table = bool(gen_meta.get("used_verbatim_tool"))
+        response_text = format_reply(response_text, is_tool_output=is_structured_table)
         response_text = _fix_lex_channel_names(response_text)
         response_text = _validate_channel_links(response_text, client)
-        if cache_storable:
+        # Verbatim tables are time-sensitive and must not be re-sanitized on a
+        # cache replay (which sends without cora_verbatim), so never cache them.
+        if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
@@ -601,6 +605,7 @@ def _dispatch_qa(
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
+            cora_verbatim=is_structured_table,
         )
         active_thread_store.register(channel_id, register_ts)
         return
@@ -663,15 +668,17 @@ def _dispatch_qa(
     response_text = _extract_and_log_gap(
         response_text, entity, channel_name, user_id, user_message, latency_ms,
     )
-    # D-032: conversational replies pass through the deterministic voice
-    # formatter; tool outputs bypass. Applied before the cache store so
+    # D-032 / Phase 2.1: conversational replies pass through the deterministic
+    # voice formatter; only genuine verbatim-table tools bypass it (used_verbatim_tool,
+    # not the old too-broad bool(used_tools)). Applied before the cache store so
     # cached replays are already-formatted.
-    response_text = format_reply(
-        response_text, is_tool_output=bool(gen_meta.get("used_tools")),
-    )
+    is_structured_table = bool(gen_meta.get("used_verbatim_tool"))
+    response_text = format_reply(response_text, is_tool_output=is_structured_table)
     response_text = _fix_lex_channel_names(response_text)
     response_text = _validate_channel_links(response_text, client)
-    if cache_storable:
+    # Verbatim tables are never cached (time-sensitive + must not be re-sanitized
+    # on a cache replay that sends without cora_verbatim).
+    if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
@@ -686,6 +693,7 @@ def _dispatch_qa(
             channel=placeholder_channel,
             ts=placeholder_ts,
             text=response_text,
+            cora_verbatim=is_structured_table,
         )
     except Exception as exc:  # noqa: BLE001
         log.error(
@@ -697,6 +705,7 @@ def _dispatch_qa(
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
+            cora_verbatim=is_structured_table,
         )
 
     # Register AFTER the response is confirmed posted so only successful
