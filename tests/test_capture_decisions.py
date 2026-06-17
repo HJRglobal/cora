@@ -361,3 +361,48 @@ def test_post_enabled_false(monkeypatch, value):
 def test_post_disabled_by_default(monkeypatch):
     monkeypatch.delenv("DECISION_CAPTURE_POST_ENABLED", raising=False)
     assert cd._post_enabled() is False
+
+
+# ── _is_nondecision (Phase 1.5 precision pre-filter) ─────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "Should we cancel the July 10 event?",
+    "Going forward, should we ship on Friday?",
+    "We will ship if the margins improve.",
+    "We're considering remote-only work.",
+    "Maybe we lock the date next week.",
+    "Let's discuss the launch date.",
+    "We might pivot to a new vendor.",
+])
+def test_is_nondecision_true(text):
+    assert cd._is_nondecision(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "We have decided to cancel the July 10 event.",
+    "Going forward, Tessa is part-time remote.",
+    "We are going with vendor X.",
+    "The launch is locked for June 15.",
+])
+def test_is_nondecision_false(text):
+    assert cd._is_nondecision(text) is False
+
+
+def test_extract_rejects_question_despite_score():
+    # "going forward," scores 2 + "cancel" 1 = 3, but the question form is not a decision.
+    assert extract_decision_sentences("Going forward, should we cancel the event?") == []
+
+
+def test_extract_rejects_contingency_despite_score():
+    # "going forward," (2) + "we will" (1) = 3, but the "if" makes it hypothetical.
+    assert extract_decision_sentences("Going forward, we will ship if the margins improve.") == []
+
+
+def test_extract_keeps_real_decision_over_prefilter():
+    out = extract_decision_sentences("Going forward, we are going with the lower-cost vendor.")
+    assert any("going with" in d.lower() for d in out)
+
+
+def test_verify_prompt_anchored_with_examples():
+    assert "KEEP" in cd._VERIFY_PROMPT and "REJECT" in cd._VERIFY_PROMPT
+    assert "?" in cd._VERIFY_PROMPT  # includes a question reject example

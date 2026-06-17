@@ -93,6 +93,25 @@ def score_sentence(text: str) -> int:
     return sum(weight for pattern, weight in _DECISION_PATTERNS if pattern.search(text))
 
 
+# Questions and contingent/hypothetical musings are NOT resolved decisions —
+# reject them before scoring, regardless of keyword score. (Phase 1.5 precision.)
+_CONTINGENCY_RE = re.compile(
+    r"\b(?:if|maybe|perhaps|might|could|should\s+we|would\s+we|"
+    r"think(?:ing)?\s+about|consider(?:ing)?|explor(?:e|ing)|what\s+if|"
+    r"not\s+sure|tbd|to\s+be\s+determined|"
+    r"let'?s\s+(?:discuss|talk|revisit)|circle\s+back)\b",
+    re.I,
+)
+
+
+def _is_nondecision(text: str) -> bool:
+    """True if a sentence is a question or a contingent/hypothetical musing
+    (not a resolved decision) — a deterministic pre-filter ahead of scoring."""
+    if text.rstrip().endswith("?"):
+        return True
+    return bool(_CONTINGENCY_RE.search(text))
+
+
 def extract_decision_sentences(text: str) -> list[str]:
     """Split text into sentences and return those that look like decisions."""
     # Simple sentence splitter — not perfect but good enough
@@ -103,6 +122,8 @@ def extract_decision_sentences(text: str) -> list[str]:
         if len(sent) < 20 or len(sent) > 500:
             continue
         if len(sent.split()) < _MIN_WORDS:
+            continue
+        if _is_nondecision(sent):  # questions / hypotheticals / contingencies
             continue
         if score_sentence(sent) >= _MIN_SCORE:
             results.append(sent)
@@ -208,12 +229,19 @@ def deduplicate(candidates: list[dict], surfaced: set[str]) -> list[dict]:
 
 _VERIFY_PROMPT = """You are filtering candidate sentences pulled from meeting \
 transcripts. Keep ONLY sentences that record an actual business DECISION, \
-commitment, or resolved direction (e.g. "we decided to cancel X", "going \
-forward we will use Y", "the launch is locked for June 15").
+commitment, or resolved direction.
 
-REJECT: backchannel and filler ("verify confirmed", "yep, sounds good"), \
-questions, hypotheticals, vague musings, status chatter, and anything where \
-no concrete choice was actually made.
+KEEP (a concrete choice was made):
+- "We decided to ship Friday."
+- "Going forward, remote only."
+- "Cancelled the June event."
+- "The launch is locked for June 15."
+
+REJECT (no resolved choice):
+- questions: "Could we reconsider the date?", "Should we ship Friday?"
+- hypotheticals / contingencies: "We might explore remote work.", "We will ship if margins improve."
+- discussion in progress: "Let's discuss shipping Friday.", "Still thinking about it."
+- backchannel / filler / status chatter: "Yep, confirmed.", "Sounds good.", "Verify confirmed."
 
 For each item, return whether it is a real decision and, if so, a concise \
 one-sentence restatement of the decision (no speaker names, no filler).
@@ -267,6 +295,12 @@ def verify_decisions_with_haiku(candidates: list[dict]) -> list[dict]:
         if not isinstance(verdicts, list):
             log.warning("Haiku returned non-list verdicts — fail-open")
             return candidates
+        if len(verdicts) != len(batch):
+            log.warning(
+                "Haiku verdict count mismatch: %d verdicts for %d candidates "
+                "(un-scored items are dropped, fail-closed)",
+                len(verdicts), len(batch),
+            )
     except json.JSONDecodeError as exc:
         log.warning("Haiku verdict JSON parse failed (%s) — fail-open", exc)
         return candidates
