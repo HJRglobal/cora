@@ -268,9 +268,9 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
             task_name = (gap.payload.get("task_name") or gap.title or "a task").strip()
             task_url  = gap.payload.get("task_url", "")
             if task_url:
-                task_lines.append(f"â€¢ <{task_url}|{task_name}>")
+                task_lines.append(f"- <{task_url}|{task_name}>")
             else:
-                task_lines.append(f"â€¢ {task_name}")
+                task_lines.append(f"- {task_name}")
 
         tasks_block = "\n".join(task_lines)
         msg = (
@@ -278,7 +278,7 @@ def _dm_stale_task_assignees(gaps: list[ReconciliationGap]) -> None:
             f"suggests one or more of your open tasks may already be wrapped up:\n\n"
             f"{tasks_block}\n\n"
             f"Could you check and mark them complete in Asana if they're done? "
-            f"No pressure -- just keeping the board tidy. Thanks! ðŸ™Œ"
+            f"No pressure -- just keeping the board tidy. Thanks!"
         )
 
         try:
