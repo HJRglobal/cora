@@ -429,6 +429,61 @@ def set_task_custom_fields(task_gid: str, custom_fields: dict[str, str]) -> bool
         return False
 
 
+def list_project_custom_field_gids(project_gid: str) -> set[str]:
+    """Return the set of custom-field GIDs currently attached to a project.
+
+    Used to make custom-field attachment idempotent (skip fields already on the
+    project). Raises AsanaClientError on failure.
+    """
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/projects/{project_gid}",
+                params={"opt_fields": "custom_field_settings.custom_field.gid"},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+    if r.status_code != 200:
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+    settings = (r.json().get("data") or {}).get("custom_field_settings") or []
+    return {
+        str((s.get("custom_field") or {}).get("gid", ""))
+        for s in settings
+        if (s.get("custom_field") or {}).get("gid")
+    }
+
+
+def add_project_custom_field_setting(
+    project_gid: str, custom_field_gid: str, *, is_important: bool = True
+) -> dict[str, Any]:
+    """Attach an EXISTING custom field to a project (POST addCustomFieldSetting).
+
+    Passes the exact custom_field GID, so it can NEVER create a duplicate field
+    (the failure mode a UI/Chrome-Agent attach risks). Idempotency is the
+    caller's job (see list_project_custom_field_gids). Raises AsanaClientError
+    on failure; returns the created custom_field_setting dict.
+    """
+    headers = {"Authorization": f"Bearer {_pat()}", "Content-Type": "application/json"}
+    body = {"data": {"custom_field": str(custom_field_gid), "is_important": is_important}}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/projects/{project_gid}/addCustomFieldSetting",
+                json=body,
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(
+            f"Asana addCustomFieldSetting {r.status_code} for project {project_gid} "
+            f"field {custom_field_gid}: {r.text[:200]}"
+        )
+    return r.json().get("data") or {}
+
+
 def _utcnow() -> int:
     """Current UTC epoch seconds (wrapper for test patchability)."""
     import time as _time
