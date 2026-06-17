@@ -29,6 +29,15 @@ custom_fields:
   # Entity is an enum field: each entity code maps to a DIFFERENT option GID.
   # Fill these in to enable Entity tagging on captured tasks (look up the option
   # GIDs from the Entity custom field). Leave empty to skip Entity tagging.
+  #
+  # PREREQUISITE (verified 2026-06-16, Phase 1.10 — see design/asana-architecture.md §5):
+  # the Entity/Status/Priority fields are NOT attached to the capture-target
+  # projects yet (e.g. [F3E] Operations - General, [HJRG] Operations - General
+  # all return custom_field_settings: []). Until Harrison attaches the FNDR
+  # portfolio fields to those projects, set_task_custom_fields skips ALL of them
+  # (Status + Priority included), so filling entity_options here changes nothing.
+  # Enablement order: (1) attach fields to the projects, (2) read the Entity
+  # enum option GIDs from a project that now has the field, (3) fill the map.
   entity_options: {}
     # F3E: ""
     # OSN: ""
