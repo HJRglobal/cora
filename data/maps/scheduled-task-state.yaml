@@ -27,7 +27,8 @@ disabled:
   # Clover retired 2026-06-05/06 (D-027 / D-032)
   - Cora - Clover Daily Summary
   - cowork-clover-daily-pull
-  # LinkedIn Spy owned by Make.com (gate G-C, 2026-06-16)
-  - Cora - LinkedIn Spy
   # Cash Pulse disabled 2026-06-16 (gate G-E / audit N1)
   - Cora - Cash Flow Pulse
+# NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
+# Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
+# listed here. A removed task is not an "expected disabled" task.
