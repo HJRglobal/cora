@@ -178,14 +178,18 @@ def _run_dispatch_qa(verbatim: bool):
 
 
 def test_dispatch_qa_formats_lookup_grounded_reply():
-    """A reply that used a non-verbatim (lookup) tool is STILL formatted (2.1 fix)."""
+    """A reply that used a non-verbatim (lookup) tool is STILL voice-formatted
+    inline (the 2.1b fix to the old too-broad bool(used_tools) bypass)."""
     kwargs = _run_dispatch_qa(verbatim=False)
     assert kwargs["text"] == _FORMATTED_REPLY
-    assert kwargs["cora_verbatim"] is False
 
 
-def test_dispatch_qa_bypasses_formatting_for_verbatim_table():
-    """A reply that used a verbatim-table tool is sent raw with cora_verbatim=True."""
+def test_dispatch_qa_skips_inline_format_for_verbatim_table():
+    """A reply that used a verbatim-table tool skips the inline voice formatter
+    (the table is preserved). The egress boundary's universal safety layer still
+    runs at send time (not exercised here -- say is a mock)."""
     kwargs = _run_dispatch_qa(verbatim=True)
     assert kwargs["text"] == _RAW_REPLY
-    assert kwargs["cora_verbatim"] is True
+    # The send no longer carries a cora_verbatim kwarg (the boundary is SAFETY-only
+    # and does not voice-flatten, so no opt-out signal is needed).
+    assert "cora_verbatim" not in kwargs

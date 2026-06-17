@@ -16,7 +16,50 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from cora.reply_formatter import (  # noqa: E402
     CONVERSATIONAL_CHAR_CAP,
     format_reply,
+    redact_links_and_ids,
 )
+
+
+class TestRedactLinksAndIds:
+    """The SAFETY subset used by the egress boundary -- redact URLs/IDs WITHOUT
+    flattening structure."""
+
+    def test_redacts_bare_drive_url(self):
+        out = redact_links_and_ids("Filed to https://drive.google.com/file/d/abc today")
+        assert "drive.google.com" not in out
+
+    def test_preserves_sanctioned_link(self):
+        msg = "See <https://drive.google.com/file/d/abc|the doc>"
+        assert redact_links_and_ids(msg) == msg
+
+    def test_redacts_gid_and_long_id(self):
+        out = redact_links_and_ids("gid 1204525779609669 and 9876543210987654")
+        assert "1204525779609669" not in out and "9876543210987654" not in out
+
+    def test_does_not_flatten_structure(self):
+        table = "```\nA    B\n1    2\n```"
+        assert redact_links_and_ids(table) == table  # fences + alignment preserved
+
+    def test_does_not_strip_emoji_or_emdash(self):
+        msg = "Sync failed — retry 🔴"
+        out = redact_links_and_ids(msg)
+        assert "—" in out and "🔴" in out
+
+
+class TestSheetNameRedaction:
+    """format_reply replaces named sheet identifiers with a neutral phrase
+    (conversational source-opacity) -- grammatically, not by deletion."""
+
+    def test_standing_actuals_sheet_replaced(self):
+        out = format_reply("See the Standing ACTUALS sheet for details.")
+        assert "Standing ACTUALS" not in out
+        assert "the cash flow model" in out
+        assert "for details." in out  # sentence stays grammatical
+
+    def test_cf_summary_replaced(self):
+        out = format_reply("Numbers live in the CF_SUMMARY tab.")
+        assert "CF_SUMMARY" not in out
+        assert "the cash flow model" in out
 
 
 # --- markdown stripping --------------------------------------------------

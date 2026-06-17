@@ -59,13 +59,28 @@ def test_apply_lex_phi_scrub_redacts_phi_keeps_staff(monkeypatch):
     assert "Shaun Hawkins" in scrubbed  # staff name preserved
 
 
-def test_apply_lex_phi_scrub_fail_open_on_error(monkeypatch):
+def test_apply_lex_phi_scrub_fail_closed_on_error(monkeypatch):
     _patch_staff(monkeypatch)
-    monkeypatch.setattr(cl.phi_guard, "scrub_lex_phi", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(
+        cl.phi_guard, "scrub_lex_phi",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
     r = _result(_PHI_TEXT)
     out = cl._apply_lex_phi_scrub([r])
-    # Scrub raised -> chunk kept unchanged (fail-open; access is fail-closed upstream).
-    assert out[0].content == _PHI_TEXT
+    # Scrub raised -> content WITHHELD (fail-closed); raw PHI never surfaces.
+    assert "Bob Smith" not in out[0].content
+    assert "withheld" in out[0].content.lower()
+
+
+def test_apply_lex_phi_scrub_scrubs_title(monkeypatch):
+    _patch_staff(monkeypatch)
+    r = _result("benign body")
+    r.title = "client Bob Smith intake DOB 03/15/1990"
+    out = cl._apply_lex_phi_scrub([r])
+    # Title is rendered into the context block (and the deep-link label), so it is
+    # scrubbed too for the care-recipient/possessive/DOB patterns.
+    assert "Bob Smith" not in out[0].title
+    assert "1990" not in out[0].title
 
 
 # ── retrieval path: LEX non-custodian / custodian / non-LEX ──────────────────
@@ -110,3 +125,18 @@ def test_non_lex_retrieval_is_never_scrubbed(monkeypatch):
     text = cl._try_kb_retrieve("F3E", "anything", phi_custodian=False)
     assert text is not None
     assert "Bob Smith" in text  # scrub does not run outside LEX scope
+
+
+# ── Cache PHI-leak guard (custodian answers never enter the shared cache) ────
+_APP_SRC = (Path(__file__).resolve().parent.parent / "src" / "cora" / "app.py").read_text(
+    encoding="utf-8"
+)
+
+
+def test_custodian_answer_excluded_from_semantic_cache():
+    """A custodian's un-scrubbed LEX answer must not be cacheable -- the
+    user-agnostic semantic cache would replay it to a non-custodian, bypassing the
+    retrieval scrub. Pinned at the cache_storable expression."""
+    assert "and not phi_custodian" in _APP_SRC
+    # phi_custodian is defaulted before the retrieval branch so it's always in scope.
+    assert "phi_custodian = False" in _APP_SRC

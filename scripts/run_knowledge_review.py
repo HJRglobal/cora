@@ -25,7 +25,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -68,6 +68,17 @@ _PENDING_EXPIRY_DAYS = 14
 _AUTO_APPROVE_TYPES = frozenset({"known_answer"})
 _MAX_AUTO_APPROVE_PER_RUN = 10
 
+# Auto-approve floor: items proposed BEFORE this timestamp are never auto-approved.
+# Initialized to "now" on the first run after this feature ships, so the
+# pre-existing PENDING backlog (proposed before the feature) is NOT auto-written
+# on the first post-restart run -- it rides the normal review/expire flow. Only
+# genuinely NEW HIGH machine-mined known-answers (proposed after the floor)
+# auto-approve.
+_AUTOAPPROVE_FLOOR_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "state"
+    / "knowledge-review-autoapprove-floor.txt"
+)
+
 # Weekly digest: new-item DMs are sent only on this weekday (Mon=0) in AZ time.
 # Reaction-processing, auto-approve, and auto-expire still run EVERY scheduled
 # day so approvals are acted on promptly and the queue is maintained daily.
@@ -75,23 +86,50 @@ _DIGEST_WEEKDAY = 0  # Monday
 
 
 def _is_digest_day() -> bool:
-    """True if today (America/Phoenix) is the weekly digest day."""
+    """True if today (Arizona) is the weekly digest day.
+
+    Arizona observes NO DST, so a fixed UTC-7 offset is correct AND robust on
+    hosts without the IANA tz DB. ZoneInfo('America/Phoenix') raises
+    ZoneInfoNotFoundError on this host (no tzdata), which previously fell through
+    the bare except to True and silently defeated the weekly cadence. Matches the
+    fixed-offset pattern in strategy_memo.py / run_due_date_escalation.py."""
+    az_now = datetime.now(timezone(timedelta(hours=-7)))
+    return az_now.weekday() == _DIGEST_WEEKDAY
+
+
+def _autoapprove_floor() -> str:
+    """ISO timestamp before which PENDING items are NEVER auto-approved.
+
+    Initialized to 'now' on first call so the pre-existing backlog rides the
+    normal review/expire flow instead of flooding the KB on the first run.
+    Returns '' on any error -> the caller auto-approves NOTHING (fail-safe)."""
     try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/Phoenix")).weekday() == _DIGEST_WEEKDAY
+        if _AUTOAPPROVE_FLOOR_PATH.exists():
+            return _AUTOAPPROVE_FLOOR_PATH.read_text(encoding="utf-8").strip()
+        _AUTOAPPROVE_FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        _AUTOAPPROVE_FLOOR_PATH.write_text(now, encoding="utf-8")
+        return now
     except Exception:
-        # If tz data is unavailable, fail toward sending (better a DM than silence).
-        return True
+        return ""
 
 
 def _auto_approve_eligible(update: dict) -> bool:
     """True if this PENDING update may be written WITHOUT a Harrison 👍 (G-D):
-    a HIGH-confidence non-canonical GENERIC (known-answers) update."""
-    return (
-        update.get("state") == "PENDING"
-        and update.get("update_type") in _AUTO_APPROVE_TYPES
-        and (update.get("confidence") or "").upper() == "HIGH"
-    )
+    a HIGH-confidence non-canonical GENERIC (known-answers) update from a TRUSTED
+    automated source. Excludes answer_source=='teammate_dm' -- those carry a
+    HARD-CODED confidence='HIGH' for arbitrary teammate free text (not an assessed
+    HIGH), so they stay Harrison-gated. The backlog floor (proposed_at >= floor) is
+    applied by the caller."""
+    if update.get("state") != "PENDING":
+        return False
+    if update.get("update_type") not in _AUTO_APPROVE_TYPES:
+        return False
+    if (update.get("confidence") or "").upper() != "HIGH":
+        return False
+    if (update.get("payload") or {}).get("answer_source") == "teammate_dm":
+        return False
+    return True
 
 
 def _acquire_run_lock(log: logging.Logger) -> bool:
@@ -396,7 +434,11 @@ def main() -> int:
     auto_approved = 0
     if not args.dry_run:
         slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
-        eligible = [u for u in get_pending_updates() if _auto_approve_eligible(u)]
+        floor = _autoapprove_floor()  # excludes the pre-existing backlog; "" -> none
+        eligible = [
+            u for u in get_pending_updates()
+            if _auto_approve_eligible(u) and floor and u.get("proposed_at", "") >= floor
+        ]
         if len(eligible) > _MAX_AUTO_APPROVE_PER_RUN:
             log.info("Capping auto-approve: %d eligible -> top %d this run",
                      len(eligible), _MAX_AUTO_APPROVE_PER_RUN)

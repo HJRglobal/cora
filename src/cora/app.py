@@ -499,6 +499,12 @@ def _dispatch_qa(
     # (volatile). static_text becomes a cached system block; kb_text rides in the
     # uncached block alongside runtime_context. See claude_client._build_cached_system.
     kb_meta: dict = {}
+    # PHI cache-leak guard: a custodian's LEX answer is NOT PHI-scrubbed (they are
+    # authorized for full PHI), so it must NEVER enter the shared, user-agnostic
+    # semantic cache -- a cache hit replays the stored text to whoever asks a
+    # similar question next, bypassing the retrieval-path scrub entirely. Defaulted
+    # here so it is in scope for cache_storable regardless of which branch runs.
+    phi_custodian = False
     if retrieval_grant is not None:
         # Tier-2 grant: owner-authorized retrieval REPLACES normal KB
         # retrieval, and the static portfolio context is withheld — explicit
@@ -533,8 +539,13 @@ def _dispatch_qa(
             phi_custodian=phi_custodian,
         )
     # A response built on UNSTRIPPED personal chunks (owner's own mail, or an
-    # unrestricted asker) must not enter the shared semantic cache.
-    cache_storable = retrieval_grant is None and not kb_meta.get("unstripped_personal")
+    # unrestricted asker) must not enter the shared semantic cache. Nor may a
+    # custodian's un-scrubbed LEX answer (PHI cache-leak guard above).
+    cache_storable = (
+        retrieval_grant is None
+        and not kb_meta.get("unstripped_personal")
+        and not phi_custodian
+    )
     prompt = load_prompt(entity)
     chosen_model = model_router.choose_model(user_message)
     log.info(
@@ -612,7 +623,6 @@ def _dispatch_qa(
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
-            cora_verbatim=is_structured_table,
         )
         active_thread_store.register(channel_id, register_ts)
         return
@@ -700,7 +710,6 @@ def _dispatch_qa(
             channel=placeholder_channel,
             ts=placeholder_ts,
             text=response_text,
-            cora_verbatim=is_structured_table,
         )
     except Exception as exc:  # noqa: BLE001
         log.error(
@@ -712,7 +721,6 @@ def _dispatch_qa(
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
-            cora_verbatim=is_structured_table,
         )
 
     # Register AFTER the response is confirmed posted so only successful
@@ -774,6 +782,26 @@ def handle_cora_ask(ack, body, client) -> None:
         "cora_ask slash channel=#%s user=%s entity=%s question=%.80s",
         channel_name, user_id, entity, text,
     )
+
+    # Access guards -- parity with handle_mention (pre-LLM, fail-closed). /cora-ask
+    # previously dispatched with NO guards, leaving the best-effort content scrub as
+    # the only PHI defense on this path. Refusals post ephemerally (asker-only).
+    is_dm = str(channel_id).startswith("D")
+    if user_id:
+        phi_custodian = lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm)
+        access_block = user_access.check_access(user_id, entity, text, phi_custodian=phi_custodian)
+        if access_block:
+            log.info("cora_ask: user_access blocked user=%s entity=%s", user_id, entity)
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text=access_block)
+            return
+    sibling_redirect = sibling_guard.check_redirect(entity, text)
+    if sibling_redirect:
+        client.chat_postEphemeral(channel=channel_id, user=user_id, text=sibling_redirect)
+        return
+    cross_redirect = cross_entity_guard.check_cross_entity(text, entity)
+    if cross_redirect:
+        client.chat_postEphemeral(channel=channel_id, user=user_id, text=cross_redirect)
+        return
 
     # Build a say-equivalent that posts to the channel (not in a thread)
     def _say(**kwargs) -> dict:

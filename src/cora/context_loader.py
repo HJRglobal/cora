@@ -554,8 +554,11 @@ def _apply_lex_phi_scrub(results: list) -> list:
     LEX ops content stays readable. Custodians never reach this path (callers gate
     on phi_custodian); non-LEX retrievals are never scrubbed.
 
-    Fail-open on a scrub error (keep the chunk) -- a regex glitch must never blank
-    an answer; ACCESS is already fail-closed upstream at the custodian gate.
+    FAIL-CLOSED on a scrub error: WITHHOLD the chunk (replace content + title with
+    a placeholder) rather than surface raw PHI -- matches the capture pipeline's
+    _scrub_lex_text and the codebase's fail-closed PHI doctrine. Also scrubs
+    r.title (LEX chunk titles are frequently client-named files/meetings, and
+    _format_kb_chunks renders the title + the deep-link label derived from it).
     """
     try:
         staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
@@ -564,11 +567,18 @@ def _apply_lex_phi_scrub(results: list) -> list:
     for r in results:
         try:
             r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
-        except Exception:  # noqa: BLE001
+            if getattr(r, "title", ""):
+                r.title = phi_guard.scrub_lex_phi(r.title, allowed_names=staff)
+        except Exception:  # noqa: BLE001 -- fail CLOSED, never surface raw PHI
             log.warning(
-                "LEX PHI scrub failed on chunk %s; leaving content as-is",
+                "LEX PHI scrub failed on chunk %s; WITHHOLDING (fail-closed)",
                 getattr(r, "chunk_id", "?"),
             )
+            r.content = "[content withheld -- PHI scrub error]"
+            try:
+                r.title = "[withheld]"
+            except Exception:  # noqa: BLE001
+                pass
     return results
 
 

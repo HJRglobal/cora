@@ -89,6 +89,18 @@ _BARE_DOC_URL_RE = re.compile(
 _GID_RE = re.compile(r"\bgid[:=]?\s*\d{4,}\b", re.IGNORECASE)
 _NAKED_ID_RE = re.compile(r"\b\d{16,}\b")
 
+# Sheet/tab identifiers that must never appear in a conversational reply (the
+# 2026-06-08 SEV-1 "named the sheet" class). Replaced with a NEUTRAL phrase (not
+# deleted) so the sentence stays grammatical. Conversational-only: this runs
+# inside format_reply, which the egress boundary does NOT apply to proactive
+# sends (an ops alert may legitimately reference a sheet).
+_SHEET_IDENT_RE = re.compile(
+    r"\b(?:the\s+)?Standing\s+ACTUALS(?:\s+(?:sheet|spreadsheet|tab))?\b"
+    r"|\bCF[_\s]?SUMMARY(?:\s+(?:sheet|tab))?\b",
+    re.IGNORECASE,
+)
+_SHEET_IDENT_REPLACEMENT = "the cash flow model"
+
 # Redaction shells: when a redacted URL sat inside parens or a markdown link,
 # the surrounding "()" / "[label]()" survives as a visible artifact (live
 # 2026-06-11 follow-up replies). Clean them after the redaction pass.
@@ -178,6 +190,8 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _BARE_DOC_URL_RE.sub("", work)
     work = _GID_RE.sub("", work)
     work = _NAKED_ID_RE.sub("", work)
+    # 8a. Named sheet identifiers -> neutral phrase (conversational source-opacity).
+    work = _SHEET_IDENT_RE.sub(_SHEET_IDENT_REPLACEMENT, work)
 
     # 8b. Clean redaction shells the lint leaves behind: "[label]()" -> label,
     # then any empty "()" / "[]" pairs.
@@ -200,4 +214,36 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     if len(work) > CONVERSATIONAL_CHAR_CAP:
         log.warning("reply_over_cap: %d chars (cap %d)", len(work), CONVERSATIONAL_CHAR_CAP)
 
+    return work
+
+
+def redact_links_and_ids(text: str) -> str:
+    """Redact bare source URLs + naked GIDs/long IDs; preserve sanctioned
+    <url|label> links and <@mentions>. The SAFETY subset of the source-opacity
+    lint, usable on ANY content -- it does NOT flatten markdown, strip emoji,
+    collapse whitespace, or touch table/code structure -- so the egress boundary
+    can run it on EVERY outbound message (proactive tables/cards included) without
+    mangling layout. Conversational voice-flattening stays in format_reply.
+
+    Pure function; returns the input on falsy/non-str.
+    """
+    if not text:
+        return text
+    tokens: list[str] = []
+
+    def _protect(m: re.Match) -> str:
+        tokens.append(m.group(0))
+        return _PLACEHOLDER.format(len(tokens) - 1)
+
+    work = _SLACK_TOKEN_RE.sub(_protect, text)
+    work = _BARE_DOC_URL_RE.sub("", work)
+    work = _GID_RE.sub("", work)
+    work = _NAKED_ID_RE.sub("", work)
+    # Clean only the shells a redaction leaves behind (no structural reflow).
+    work = _EMPTY_MD_LINK_RE.sub(r"\1", work)
+    work = _EMPTY_PARENS_RE.sub("", work)
+    work = _EMPTY_BRACKETS_RE.sub("", work)
+    work = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", work)
+    for i, tok in enumerate(tokens):
+        work = work.replace(_PLACEHOLDER.format(i), tok)
     return work

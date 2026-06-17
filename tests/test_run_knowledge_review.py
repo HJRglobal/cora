@@ -116,8 +116,39 @@ def test_auto_approve_eligible_matrix():
     assert rkr._auto_approve_eligible(u("known_answer", "HIGH", state="APPROVED")) is False
 
 
-def test_is_digest_day_returns_bool():
-    assert isinstance(rkr._is_digest_day(), bool)
+def test_is_digest_day_deterministic(monkeypatch):
+    """Fixed AZ (-7) offset, robust without tzdata. 2026-06-15 is a Monday."""
+    import datetime as _dt
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return _dt.datetime(2026, 6, 15, 12, 0, tzinfo=tz)  # Monday, AZ noon
+
+    monkeypatch.setattr(rkr, "datetime", _FakeDatetime)
+    monkeypatch.setattr(rkr, "_DIGEST_WEEKDAY", 0)  # Monday
+    assert rkr._is_digest_day() is True
+    monkeypatch.setattr(rkr, "_DIGEST_WEEKDAY", 2)  # Wednesday
+    assert rkr._is_digest_day() is False
+
+
+def test_autoapprove_floor_inits_and_excludes_old_backlog(tmp_path, monkeypatch):
+    floor_file = tmp_path / "floor.txt"
+    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", floor_file)
+    floor = rkr._autoapprove_floor()            # first call inits to "now"
+    assert floor and floor_file.exists()
+    assert rkr._autoapprove_floor() == floor    # stable on subsequent calls
+    # An old backlog item is type/confidence-eligible but excluded by the floor.
+    old = {"state": "PENDING", "update_type": "known_answer", "confidence": "HIGH",
+           "proposed_at": "2020-01-01T00:00:00+00:00", "payload": {}}
+    assert rkr._auto_approve_eligible(old) is True
+    assert old["proposed_at"] < floor           # the caller's floor filter drops it
+
+
+def test_autoapprove_excludes_teammate_dm():
+    base = {"state": "PENDING", "update_type": "known_answer", "confidence": "HIGH"}
+    assert rkr._auto_approve_eligible({**base, "payload": {"answer_source": "teammate_dm"}}) is False
+    assert rkr._auto_approve_eligible({**base, "payload": {"answer_source": "slack_kb"}}) is True
 
 
 def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
@@ -131,9 +162,12 @@ def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
     ka_dir = tmp_path / "known-answers"
     resolved = tmp_path / "resolved.jsonl"
 
+    floor_file = tmp_path / "floor.txt"
+    floor_file.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")  # old floor
     monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
     monkeypatch.setattr(kr, "_REPLY_LOG_PATH", reply_log)
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", floor_file)
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # isolate Step 1.5
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(ka_dir))
@@ -176,6 +210,7 @@ def test_med_known_answer_not_auto_approved(tmp_path, monkeypatch):
     monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
     monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
