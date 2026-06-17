@@ -489,6 +489,7 @@ class TestRunActionCapture:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ"),
             patch("httpx.Client") as mock_http,
         ):
             fae._email_to_asana_gid = {"tommy@hjrglobal.com": "1111"}
@@ -498,7 +499,9 @@ class TestRunActionCapture:
         mock_create.assert_not_called()
         # Slack HTTP should not have been called (dry_run)
         assert result["meetings_processed"] == 1
-        assert result["tasks_created"] == 2  # 2 parsed tasks
+        # both parsed tasks have a resolved project (patched) -> both pass the
+        # Phase 1.5 project guard (assignee is not required)
+        assert result["tasks_created"] == 2
 
     def test_lex_lbhs_meeting_skipped(self, tmp_path):
         """LEX-LBHS meetings stay excluded (42 CFR Part 2), even with LEX capture on."""
@@ -605,6 +608,7 @@ class TestRunActionCapture:
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task",
                   side_effect=AsanaClientError("PAT invalid")),
+            patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ"),
             patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
         ):
             fae._email_to_asana_gid = {}
@@ -671,6 +675,7 @@ class TestDedupHardening:
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
                 patch("anthropic.Anthropic") as mock_anth,
                 patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+                patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ"),
                 patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
                 patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
             ):
@@ -925,3 +930,99 @@ class TestRosterGrounding:
         assert len(result) == 1                       # FYI item dropped
         assert result[0]["task"] == "Ship the order"
         assert result[0]["assignee_name"] == "Tommy"  # validated, parsed name kept
+
+
+# ---------------------------------------------------------------------------
+# Precision guards (Phase 1.5): FYI/Cora-actor noise filter
+# ---------------------------------------------------------------------------
+
+class TestPrecisionNoiseFilter:
+    ROSTER = ["Tommy Anderson", "Hannah Grant"]
+
+    def test_fyi_prefix_items_dropped(self):
+        items = [
+            {"task": "FYI the warehouse closes early Friday", "assignee_name": "Tommy", "is_actionable": True},
+            {"task": "Heads up - rent is due", "assignee_name": "Tommy", "is_actionable": True},
+            {"task": "Status update: launch on track", "assignee_name": None, "is_actionable": True},
+        ]
+        assert fae._ground_and_filter_items(items, self.ROSTER) == []
+
+    def test_cora_actor_dropped(self):
+        items = [{"task": "Cora posted the weekly digest", "assignee_name": None, "is_actionable": True}]
+        assert fae._ground_and_filter_items(items, self.ROSTER) == []
+
+    def test_cora_as_object_kept(self):
+        # "Cora" as recipient, not actor -> a real task, kept.
+        items = [{"task": "Send Cora the updated roster", "assignee_name": "Tommy", "is_actionable": True}]
+        out = fae._ground_and_filter_items(items, self.ROSTER)
+        assert len(out) == 1 and out[0]["task"] == "Send Cora the updated roster"
+
+    def test_fyi_inside_text_kept(self):
+        # FYI not at the start -> real action, kept (anchored match).
+        items = [{"task": "Send the FYI deck to the board", "assignee_name": "Tommy", "is_actionable": True}]
+        assert len(fae._ground_and_filter_items(items, self.ROSTER)) == 1
+
+    def test_is_noise_task_unit(self):
+        assert fae._is_noise_task("FYI: nothing to do") is True
+        assert fae._is_noise_task("Cora will post the digest") is True
+        assert fae._is_noise_task("Ship the order to Nimbl") is False
+
+
+# ---------------------------------------------------------------------------
+# Precision guards (Phase 1.5): project-required (no orphan tasks)
+# ---------------------------------------------------------------------------
+
+class TestProjectGuard:
+    def setup_method(self):
+        fae._email_to_asana_gid = None
+
+    def _haiku(self, tasks):
+        mock = MagicMock()
+        mock.content = [MagicMock(text=json.dumps(tasks))]
+        return mock
+
+    def test_no_project_skips_task(self, tmp_path):
+        """A non-LEX task whose project does not resolve is skipped, not orphaned."""
+        transcript = _make_transcript()
+        wpath = tmp_path / "wm.json"
+        with (
+            patch.object(fae, "_WATERMARK_PATH", wpath),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value={"transcripts": [transcript]}),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value=None),
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
+            patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+        ):
+            fae._email_to_asana_gid = {"tommy@hjrglobal.com": "1111"}
+            mock_anth.return_value.messages.create.return_value = self._haiku(
+                [{"task": "Send proposal to client", "assignee_name": "Tommy",
+                  "due_mention": None, "is_actionable": True}]
+            )
+            result = fae.run_action_capture(dry_run=False)
+        mock_create.assert_not_called()
+        assert result["tasks_created"] == 0
+
+    def test_resolved_project_creates_task(self, tmp_path):
+        transcript = _make_transcript()
+        wpath = tmp_path / "wm.json"
+        with (
+            patch.object(fae, "_WATERMARK_PATH", wpath),
+            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value={"transcripts": [transcript]}),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
+            patch("anthropic.Anthropic") as mock_anth,
+            patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ"),
+            patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
+            patch("cora.connectors.fireflies_action_extractor.find_recent_duplicate_task", return_value=None),
+            patch("cora.connectors.fireflies_action_extractor._post_slack_summary"),
+        ):
+            fae._email_to_asana_gid = {"tommy@hjrglobal.com": "1111"}
+            mock_create.return_value = {"gid": "9", "permalink_url": ""}
+            mock_anth.return_value.messages.create.return_value = self._haiku(
+                [{"task": "Send proposal to client", "assignee_name": "Tommy",
+                  "due_mention": None, "is_actionable": True}]
+            )
+            result = fae.run_action_capture(dry_run=False)
+        mock_create.assert_called_once()
+        assert result["tasks_created"] == 1

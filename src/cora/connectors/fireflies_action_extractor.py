@@ -25,6 +25,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -563,6 +564,25 @@ def _is_explicitly_not_actionable(value: object) -> bool:
     return False
 
 
+# Secondary precision net (Phase 1.5): Haiku sets is_actionable=false for FYIs,
+# but can misclassify. Drop items whose text is clearly informational and items
+# where Cora is the actor (re-ingested bot messages). Conservative: the FYI
+# match is ANCHORED at the start so "Send the FYI deck" is kept; the Cora match
+# requires Cora as the subject so "Send Cora the report" is kept.
+_NOISE_PREFIX_RE = re.compile(
+    r"^\s*(?:fyi\b|for your information\b|heads[\s-]?up\b|just an? fyi\b|"
+    r"no action\b|for awareness\b|status update\b|just an update\b|reminder:)",
+    re.I,
+)
+_CORA_ACTOR_RE = re.compile(r"\bcora\s+(?:posted|said|says|will|should)\b", re.I)
+
+
+def _is_noise_task(task: str) -> bool:
+    """True if a parsed action item is informational (FYI/status) or has Cora as
+    the actor -- a secondary net behind Haiku's is_actionable classification."""
+    return bool(_NOISE_PREFIX_RE.search(task) or _CORA_ACTOR_RE.search(task))
+
+
 def _ground_and_filter_items(
     items: list[dict[str, Any]], roster: list[str]
 ) -> list[dict[str, Any]]:
@@ -587,6 +607,8 @@ def _ground_and_filter_items(
             continue
         task = str(item.get("task") or "").strip()
         if not task:
+            continue
+        if _is_noise_task(task):  # FYI / status / Cora-actor -> not a real action
             continue
         if len(task) > _MAX_TASK_LEN:
             task = task[:_MAX_TASK_LEN].rstrip()
@@ -913,6 +935,17 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
                 "project_resolver: task=%r entity=%s -> project_gid=%s",
                 task_name, route_entity, capture_project_gid,
             )
+
+            # Precision (Phase 1.5): never create a task without a resolved
+            # project -- it would orphan in the assignee's My Tasks. LEX already
+            # skips above (no LEX-scoped project); this makes the guard explicit
+            # and symmetric for every entity.
+            if not capture_project_gid:
+                log.info(
+                    "[SKIPPED] no project resolved -- task=%r entity=%s (would orphan)",
+                    task_name, route_entity,
+                )
+                continue
 
             # Build task notes. For LEX, omit the raw action-item dump entirely
             # (minimum-necessary) -- the note carries only operational context,
