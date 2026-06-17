@@ -11,18 +11,14 @@
 | `cowork-cora-backup` | Daily 04:30 AZ | `scripts/backup_logs.py` | Backup KB + logs to Drive |
 | `cowork-cora-influencer-scan` | Every 2 hours | `scripts/run_influencer_scan.py` | Posts to #f3-sales |
 | `Cora - Email Attachment Filer` | Every 4 hours | `scripts/run_attachment_filer.py` | Files attachments to Drive |
-| `Cora - LinkedIn Spy` | Every Monday 08:00 | `scripts/run_linkedin_spy.py` | Posts to #f3e-sales |
-
-**LinkedIn Spy quick ops:**
+**LinkedIn Spy — RETIRED (Phase 1.8, gate G-C / D-027).** The Python Apollo
+writer (`run_linkedin_spy.py` + `apollo_client.py` + `linkedin_spy_client.py` +
+`linkedin-spy-search-config.yaml`) was removed; **Make scenario 4769263 is the
+sole owner** (no Python double-write). To unregister the leftover (disabled)
+host task:
 ```powershell
-Start-ScheduledTask -TaskName "Cora - LinkedIn Spy"
-Get-ScheduledTaskInfo -TaskName "Cora - LinkedIn Spy" | Select LastRunTime, LastTaskResult
-notepad data\maps\linkedin-spy-search-config.yaml
 .\deployment\remove-linkedin-spy-task.ps1
 ```
-
-> **Apollo trial expires June 10, 2026.** Scanner silently returns 0 results after expiry.
-> Upgrade at https://app.apollo.io/#/settings/billing before June 7.
 
 ---
 
