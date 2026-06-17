@@ -2825,8 +2825,16 @@ def _safe_plate_section(label: str, builder: Callable[..., Any], *args: Any) -> 
     return str(out)
 
 
-def _plate_asana_section(target_id: str, entity: str) -> str:
-    """Open Asana tasks for the target, entity-scoped. Fail-soft string."""
+def _plate_asana_section(
+    target_id: str, entity: str, drop_stale_days: int | None = None
+) -> str:
+    """Open Asana tasks for the target, entity-scoped. Fail-soft string.
+
+    drop_stale_days: when set, drop tasks overdue by more than this many days
+    (abandoned backlog) before scoping/capping -- the daily brief opts in
+    (N7 / Harrison #1) so stale 2025 goal tasks stop surfacing every morning;
+    the on-demand plate tool leaves it None (keeps everything).
+    """
     # Sub-entities canonicalize to their parent for the task filter --
     # ENTITY_PROJECT_PREFIXES has no LEX-LLC/OSNGF/... keys, so a raw
     # sub-entity fell through _filter_tasks_by_entity UNFILTERED. A
@@ -2842,6 +2850,8 @@ def _plate_asana_section(target_id: str, entity: str) -> str:
     except asana_client.AsanaClientError as exc:
         log.warning("whats_on_my_plate asana error user=%s: %s", target_id, exc)
         return "(Temporary issue reaching Asana -- task list unavailable right now.)"
+    if drop_stale_days is not None:
+        all_tasks = asana_client.drop_stale_tasks(all_tasks, max_overdue_days=drop_stale_days)
     filtered = _filter_tasks_by_entity(all_tasks, entity)
     # Due-dated tasks first so the 10-item cap keeps the most urgent work
     # (2026-06-11 exit-gate nit: a long no-due-date list crowded out dated tasks).

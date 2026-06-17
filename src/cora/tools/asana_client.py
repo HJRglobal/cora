@@ -29,6 +29,8 @@ Phase 3+ paths (deferred):
 
 import logging
 import os
+import re
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -479,6 +481,61 @@ def sort_tasks_due_first(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return (0, str(due)) if due else (1, "")
 
     return sorted(tasks, key=_key)
+
+
+# A task whose due date is more than this many days in the past is treated as
+# abandoned backlog. The morning brief surfaced long-dead goal-tracking tasks
+# ("Sales & Revenue Goals due 2025-02-04", "HJR Podcast due 2025-01-31") every
+# single day (N7 / Harrison #1). A task explicitly flagged P0 is kept no matter
+# how overdue -- a genuinely critical item must still surface.
+_DEFAULT_STALE_OVERDUE_DAYS = 90
+_P0_RE = re.compile(r"\bP0\b", re.IGNORECASE)
+
+
+def _parse_due_date(raw: str) -> date | None:
+    """Parse an Asana due_on ('YYYY-MM-DD') or due_at (ISO 8601) into a date.
+
+    Returns None for empty/unparseable input -- the caller KEEPS such tasks
+    (we never drop a task we cannot confidently date).
+    """
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _task_is_high_priority(task: dict[str, Any]) -> bool:
+    """True if the task name or notes carries an explicit, word-bounded P0 marker."""
+    text = f"{task.get('name') or ''} {task.get('notes') or ''}"
+    return bool(_P0_RE.search(text))
+
+
+def drop_stale_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    max_overdue_days: int = _DEFAULT_STALE_OVERDUE_DAYS,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Drop tasks whose due date is more than ``max_overdue_days`` in the past.
+
+    KEPT (never dropped): tasks with no due date, future or recently-overdue
+    tasks, tasks whose due date cannot be parsed, and any task explicitly
+    flagged P0. This removes long-abandoned goal-tracking artifacts that
+    cluttered the morning brief every day (N7 / Harrison #1) without touching
+    live work. Opt-in per caller -- the on-demand plate tool keeps everything;
+    the daily brief opts in.
+    """
+    if today is None:
+        today = datetime.now().date()
+    cutoff = today - timedelta(days=max_overdue_days)
+    kept: list[dict[str, Any]] = []
+    for t in tasks:
+        due = _parse_due_date(t.get("due_on") or t.get("due_at") or "")
+        if due is None or due >= cutoff or _task_is_high_priority(t):
+            kept.append(t)
+    return kept
 
 
 def format_tasks_for_llm(

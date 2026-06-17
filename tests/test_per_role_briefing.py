@@ -241,6 +241,16 @@ class TestComposeSections:
             out = rdb._compose_sections(rec)
         assert "DEAL PIPELINE\n(Deal pipeline section unavailable right now.)" in out
 
+    def test_brief_opts_into_stale_task_filter(self, registry):
+        # N7 / Harrison #1: the brief passes its stale-overdue threshold to the
+        # SHARED task builder so abandoned 2025 goal tasks stop surfacing daily.
+        rec = org_roles.get_role("U101")
+        with patch.object(rdb, "_plate_asana_section", return_value="T") as asana, \
+             patch.object(rdb, "_plate_calendar_section", return_value="C"), \
+             patch.object(rdb, "_plate_hubspot_section", return_value=None):
+            rdb._compose_sections(rec)
+        assert asana.call_args.args[-1] == rdb._BRIEFING_STALE_OVERDUE_DAYS
+
 
 # ---------------------------------------------------------------------------
 # Review mode (DEFAULT -- one DM per user to Harrison)

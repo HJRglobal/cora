@@ -89,6 +89,12 @@ _MAX_CHUNKS        = 20    # per-user cap before sending to Haiku
 _MAX_CHUNK_CHARS   = 500   # truncate long chunks
 _HAIKU_MODEL       = "claude-haiku-4-5-20251001"
 
+# Drop tasks overdue by more than this many days from the brief's task feed
+# (N7 / Harrison #1): abandoned goal-tracking tasks ("Sales & Revenue Goals
+# due 2025-02-04") surfaced every morning. The on-demand plate tool keeps
+# everything; only the proactive brief vets out stale backlog.
+_BRIEFING_STALE_OVERDUE_DAYS = 90
+
 # Review-driven enablement state (who Harrison has thumbed up/down, plus the
 # review messages still awaiting his reaction).
 _DELIVERY_STATE_PATH  = _REPO_ROOT / "data" / "state" / "briefing-delivery.json"
@@ -236,7 +242,10 @@ def _compose_sections(rec: RoleRecord) -> str:
 
     sections: list[str] = ["\n".join(header)]
     sections.append(
-        "OPEN TASKS\n" + _safe_plate_section("Open tasks", _plate_asana_section, sid, entity)
+        "OPEN TASKS\n"
+        + _safe_plate_section(
+            "Open tasks", _plate_asana_section, sid, entity, _BRIEFING_STALE_OVERDUE_DAYS
+        )
     )
     sections.append(
         "CALENDAR\n" + _safe_plate_section("Calendar", _plate_calendar_section, sid)
