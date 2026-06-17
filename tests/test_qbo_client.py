@@ -289,11 +289,14 @@ class TestFormatPnlForLlm:
         result = format_pnl_for_llm(_pnl_report(), "F3E", "2025-01-01", "2025-03-31")
         assert "F3E" in result
 
-    @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
-    def test_contains_deep_link_anchor(self, _mock):
+    def test_no_source_branding(self):
+        # B2: source-opaque -- no 'QBO'/'intuit'/companyId/'Open in' / deep link.
         result = format_pnl_for_llm(_pnl_report(), "F3E", "2025-01-01", "2025-03-31")
-        assert f"companyId={_REALM_ID}" in result
-        assert "<" in result and "|" in result  # Slack mrkdwn link shape
+        assert "QBO" not in result
+        assert "intuit" not in result.lower()
+        assert "companyId" not in result
+        assert "Open in" not in result
+        assert "Profit and Loss" in result
 
     @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
     def test_contains_section_data(self, _mock):
@@ -323,11 +326,13 @@ class TestFormatBalanceSheetForLlm:
         result = format_balance_sheet_for_llm(_bs_report(), "HJRG", "2025-06-15")
         assert "HJRG" in result
 
-    @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
-    def test_contains_deep_link(self, _mock):
+    def test_no_source_branding(self):
         result = format_balance_sheet_for_llm(_bs_report(), "HJRG", "2025-06-15")
-        assert f"companyId={_REALM_ID}" in result
-        assert "balancesheet" in result
+        assert "QBO" not in result
+        assert "intuit" not in result.lower()
+        assert "companyId" not in result
+        assert "balancesheet" not in result.lower()
+        assert "Balance Sheet" in result
 
     @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
     def test_contains_section_totals(self, _mock):
@@ -354,11 +359,13 @@ class TestFormatArAgingForLlm:
         result = format_ar_aging_for_llm(_aging_report(), "OSN")
         assert "OSN" in result
 
-    @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
-    def test_contains_ar_deep_link(self, _mock):
+    def test_no_source_branding(self):
         result = format_ar_aging_for_llm(_aging_report(), "OSN")
-        assert "agedreceivables" in result
-        assert f"companyId={_REALM_ID}" in result
+        assert "QBO" not in result
+        assert "intuit" not in result.lower()
+        assert "agedreceivables" not in result.lower()
+        assert "companyId" not in result
+        assert "AR Aging" in result
 
     @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
     def test_contains_aging_buckets(self, _mock):
@@ -380,11 +387,13 @@ class TestFormatApAgingForLlm:
         result = format_ap_aging_for_llm(_aging_report(), "LEX")
         assert "LEX" in result
 
-    @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
-    def test_contains_ap_deep_link(self, _mock):
+    def test_no_source_branding(self):
         result = format_ap_aging_for_llm(_aging_report(), "LEX")
-        assert "agedpayables" in result
-        assert f"companyId={_REALM_ID}" in result
+        assert "QBO" not in result
+        assert "intuit" not in result.lower()
+        assert "agedpayables" not in result.lower()
+        assert "companyId" not in result
+        assert "AP Aging" in result
 
     @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
     def test_contains_aging_buckets(self, _mock):
@@ -414,11 +423,13 @@ class TestFormatRecentTransactionsForLlm:
         result = format_recent_transactions_for_llm(self._payload(), "F3E", 30)
         assert "F3E" in result
 
-    @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
-    def test_contains_transactions_deep_link(self, _mock):
+    def test_no_source_branding(self):
         result = format_recent_transactions_for_llm(self._payload(), "F3E", 30)
-        assert "transactions" in result
-        assert f"companyId={_REALM_ID}" in result
+        assert "QBO" not in result
+        assert "intuit" not in result.lower()
+        assert "companyId" not in result
+        assert "Open in" not in result
+        assert "Recent activity" in result
 
     @patch("cora.tools.qbo_client._realm_id", return_value=_REALM_ID)
     def test_counts_items_correctly(self, _mock):

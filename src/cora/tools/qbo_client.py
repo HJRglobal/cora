@@ -327,98 +327,71 @@ def format_pnl_for_llm(
     start_date: str,
     end_date: str,
 ) -> str:
-    """Render a P&L into a few lines of Slack-mrkdwn for Claude to use in a reply."""
-    try:
-        realm_id = _realm_id(entity)
-    except QboAuthError:
-        realm_id = "unknown"
-    link = _deep_link("profit_and_loss", realm_id)
+    """Render a P&L into a few lines of Slack-mrkdwn for Claude to use in a reply.
 
-    header = (report.get("Header") or {})
-    report_name = header.get("ReportName", "Profit and Loss")
+    Source-opaque (B2): names the report type, never the system. QBO tools are
+    VERBATIM_TABLE_TOOLS so this output bypasses reply_formatter's source-opacity
+    lint, and the egress boundary preserves sanctioned <url|label> links -- so any
+    'QBO'/'Open in QBO'/intuit deep link emitted here would reach Slack verbatim.
+    Strip it at source instead.
+    """
     period = f"{start_date} to {end_date}"
 
     totals = _extract_top_level_sections(report)
     if not totals:
         return (
-            f"QBO {report_name} for {entity} ({period}) returned no summary rows. "
-            f"Full report: <{link}|Open in QuickBooks>. Tell the user to open it directly."
+            f"Profit and Loss for {entity} ({period}) returned no summary rows. "
+            f"Ask finance for the detailed report."
         )
 
-    lines = [f"QBO {report_name} for {entity} ({period}):"]
+    lines = [f"Profit and Loss for {entity} ({period}):"]
     for section, value in totals.items():
         lines.append(f"  • {section}: {value}")
-    lines.append(f"Open in QBO: <{link}|{report_name} for {entity}>")
     return "\n".join(lines)
 
 
 def format_balance_sheet_for_llm(report: dict[str, Any], entity: str, as_of_date: str) -> str:
-    """Render Balance Sheet top-line numbers + deep link."""
-    try:
-        realm_id = _realm_id(entity)
-    except QboAuthError:
-        realm_id = "unknown"
-    link = _deep_link("balance_sheet", realm_id)
-
+    """Render Balance Sheet top-line numbers. Source-opaque (B2 -- see format_pnl)."""
     totals = _extract_top_level_sections(report)  # same extractor — sections live at top level too
-    lines = [f"QBO Balance Sheet for {entity} (as of {as_of_date}):"]
+    lines = [f"Balance Sheet for {entity} (as of {as_of_date}):"]
     if totals:
         for section, value in totals.items():
             lines.append(f"  • {section}: {value}")
     else:
-        lines.append("  (no summary rows in response — see full report)")
-    lines.append(f"Open in QBO: <{link}|Balance Sheet for {entity}>")
+        lines.append("  (no summary rows in response)")
     return "\n".join(lines)
 
 
 def format_ar_aging_for_llm(report: dict[str, Any], entity: str) -> str:
-    """Render AR aging buckets + deep link."""
-    try:
-        realm_id = _realm_id(entity)
-    except QboAuthError:
-        realm_id = "unknown"
-    link = _deep_link("ar_aging", realm_id)
+    """Render AR aging buckets. Source-opaque (B2 -- see format_pnl)."""
     totals = _extract_top_level_sections(report)
-    lines = [f"QBO AR Aging for {entity}:"]
+    lines = [f"AR Aging for {entity}:"]
     if totals:
         for section, value in totals.items():
             lines.append(f"  • {section}: {value}")
     else:
-        lines.append("  (no aging buckets in response — see full report)")
-    lines.append(f"Open in QBO: <{link}|AR Aging for {entity}>")
+        lines.append("  (no aging buckets in response)")
     return "\n".join(lines)
 
 
 def format_ap_aging_for_llm(report: dict[str, Any], entity: str) -> str:
-    """Render AP aging buckets + deep link."""
-    try:
-        realm_id = _realm_id(entity)
-    except QboAuthError:
-        realm_id = "unknown"
-    link = _deep_link("ap_aging", realm_id)
+    """Render AP aging buckets. Source-opaque (B2 -- see format_pnl)."""
     totals = _extract_top_level_sections(report)
-    lines = [f"QBO AP Aging for {entity}:"]
+    lines = [f"AP Aging for {entity}:"]
     if totals:
         for section, value in totals.items():
             lines.append(f"  • {section}: {value}")
     else:
-        lines.append("  (no aging buckets in response — see full report)")
-    lines.append(f"Open in QBO: <{link}|AP Aging for {entity}>")
+        lines.append("  (no aging buckets in response)")
     return "\n".join(lines)
 
 
 def format_recent_transactions_for_llm(payload: dict[str, Any], entity: str, days: int) -> str:
-    """Render a 'recent activity' digest with counts + open links."""
-    try:
-        realm_id = _realm_id(entity)
-    except QboAuthError:
-        realm_id = "unknown"
-    link = _deep_link("transactions", realm_id)
-
-    # QBO QueryResponse keys are the singular capitalized QBO entity names.
+    """Render a 'recent activity' digest with counts. Source-opaque (B2 -- see format_pnl)."""
+    # QueryResponse keys are the singular capitalized accounting entity names.
     _qbo_response_keys = {"invoices": "Invoice", "bills": "Bill", "payments": "Payment"}
 
-    lines = [f"QBO recent activity for {entity} (last {days} days):"]
+    lines = [f"Recent activity for {entity} (last {days} days):"]
     for kind in ("invoices", "bills", "payments"):
         section = payload.get(kind) or {}
         if "error" in section:
@@ -426,5 +399,4 @@ def format_recent_transactions_for_llm(payload: dict[str, Any], entity: str, day
             continue
         items = section.get(_qbo_response_keys[kind]) or []
         lines.append(f"  • {kind}: {len(items)} updated")
-    lines.append(f"Open in QBO: <{link}|Transactions for {entity}>")
     return "\n".join(lines)
