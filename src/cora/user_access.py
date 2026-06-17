@@ -17,6 +17,7 @@ Harrison (root authority) bypasses all checks.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,39 @@ _permissions_loaded_at: float = 0.0
 _PERMISSIONS_TTL = 60.0  # seconds
 
 _HARRISON_ID = "U0B2RM2JYJ1"
+
+
+# ── 'legal' deflection (Phase 1.6 precision) ───────────────────────────────
+# The blanket keyword list over-blocked ordinary business talk that merely
+# mentions a contract / agreement / liability ("distribution agreement volume",
+# "liability insurance for the warehouse"). Block the 'legal' topic only when the
+# message names a genuinely privileged/contentious matter, OR pairs a legal-
+# adjacent word with a sensitivity signal. Word-bounded to avoid substring false
+# positives ("sue" inside "issue").
+_LEGAL_STRONG_RE = re.compile(
+    r"\b(?:lawsuit|litigation|attorney|counsel|subpoena|deposition|"
+    r"indemnif\w*|cease and desist|breach of contract|privileged|"
+    r"arbitration|legal action|legal advice|legal opinion)\b",
+    re.I,
+)
+_LEGAL_WEAK_RE = re.compile(
+    r"\b(?:contract|agreement|nda|legal|liabilit\w*)\b", re.I,
+)
+_LEGAL_SENSITIVITY_RE = re.compile(
+    r"\b(?:dispute|breach|sue|suing|sued|lawsuit|litigation|attorney|counsel|"
+    r"default|penalty|violation|damages|negligence|settlement|arbitration|"
+    r"liable|enforce|terminat\w*)\b",
+    re.I,
+)
+
+
+def _legal_is_blocked(msg_lower: str) -> bool:
+    """True only for a genuine legal matter: a privileged/contentious term on its
+    own, or a legal-adjacent word paired with a sensitivity signal. Ordinary
+    business mentions of a contract/agreement/liability are allowed."""
+    if _LEGAL_STRONG_RE.search(msg_lower):
+        return True
+    return bool(_LEGAL_WEAK_RE.search(msg_lower) and _LEGAL_SENSITIVITY_RE.search(msg_lower))
 
 
 def _load_permissions() -> dict[str, Any]:
@@ -179,8 +213,13 @@ def check_access(
         # Authorized LEX PHI custodian (in LEX scope) — skip the phi block only.
         if topic == "phi" and phi_custodian:
             continue
-        patterns = topic_patterns.get(topic, [])
-        if any(p in msg_lower for p in patterns):
+        if topic == "legal":
+            # Two-signal precision (Phase 1.6) instead of a blanket keyword match.
+            matched = _legal_is_blocked(msg_lower)
+        else:
+            patterns = topic_patterns.get(topic, [])
+            matched = any(p in msg_lower for p in patterns)
+        if matched:
             redirects = {
                 "financials": "Financial questions go to Harrison or Justin.",
                 "hr": "HR matters go to Hannah Grant or Harrison.",
