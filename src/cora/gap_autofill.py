@@ -653,6 +653,22 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
             return False, "known_answer payload has no answer text -- skipped"
 
         target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")
+
+        # Idempotency (B6): the knowledge-review auto-approve path executes this
+        # BEFORE it marks the proposed update APPROVED, so a SIGKILL between the
+        # two leaves the update PENDING and it re-runs next pass. apply always
+        # appends, so without a guard a crash-recovery re-run duplicates the fact
+        # block + the resolved line. Two guards close both crash windows:
+        #   (1) gap already in the resolved ledger -> fully applied last run, no-op
+        #       (covers a crash between _execute_approved_update and resolve_update).
+        #   (2) otherwise skip the .md append if this exact Q/A block is already
+        #       present (covers a crash between the append below and the
+        #       resolved-ledger write, plus blank gap_ts which has no ledger key).
+        if gap_ts and gap_ts in _load_resolved_ids():
+            log.info("gap_autofill: gap %s already resolved -- skipping duplicate apply",
+                     gap_ts)
+            return True, "gap already resolved -- skipped duplicate write"
+
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         source_note = {"slack_kb": "mined from Slack",
                        "teammate_dm": "teammate DM"}.get(
@@ -663,7 +679,12 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
             f"A: {answer}",
             "",
         ]
-        _append_to_section(target_file, "## Known facts", entry_lines)
+        existing = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
+        if f"Q: {question}\nA: {answer}" in existing:
+            log.info("gap_autofill: identical Q/A already in %s -- skipping append",
+                     target_file.name)
+        else:
+            _append_to_section(target_file, "## Known facts", entry_lines)
 
         if gap_ts:
             resolved_path = _resolved_path()

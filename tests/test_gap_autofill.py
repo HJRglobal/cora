@@ -445,6 +445,55 @@ class TestApplyKnownAnswer:
         assert ok
         assert ga.load_open_gaps() == []
 
+    # --- idempotency (B6) ----------------------------------------------------
+    def _seed_f3e(self, paths):
+        ka_dir = paths / "known-answers"
+        ka_dir.mkdir(exist_ok=True)
+        (ka_dir / "f3e.md").write_text(
+            "# F3E\n\n## Routing rules\n\n## Known facts\n\n## Other\n",
+            encoding="utf-8")
+        return ka_dir
+
+    def test_idempotent_on_resolved_gap(self, paths):
+        """Window A: a full apply completed but the update stayed PENDING (crash
+        before resolve_update). The re-run must not duplicate the fact block or
+        the resolved line."""
+        ka_dir = self._seed_f3e(paths)
+        ok1, _ = ga.apply_known_answer(self._payload())
+        assert ok1
+        ok2, msg2 = ga.apply_known_answer(self._payload())  # crash-recovery re-run
+        assert ok2
+        assert "already resolved" in msg2
+        content = (ka_dir / "f3e.md").read_text(encoding="utf-8")
+        assert content.count("A: June 15, 2026.") == 1
+        ids = [json.loads(l)["id"] for l in
+               (paths / "resolved.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert ids.count("2026-06-01T00:00:00+00:00") == 1
+
+    def test_idempotent_crash_between_append_and_resolved(self, paths):
+        """Window B: the .md append succeeded but the resolved-ledger write did
+        not (crash between the two). The re-run must skip the duplicate append and
+        still complete the resolved write."""
+        ka_dir = self._seed_f3e(paths)
+        ga.apply_known_answer(self._payload())
+        (paths / "resolved.jsonl").write_text("", encoding="utf-8")  # simulate the lost write
+        ok2, _ = ga.apply_known_answer(self._payload())
+        assert ok2
+        content = (ka_dir / "f3e.md").read_text(encoding="utf-8")
+        assert content.count("A: June 15, 2026.") == 1
+        resolved = [l for l in
+                    (paths / "resolved.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(resolved) == 1
+
+    def test_idempotent_content_dedup_blank_gap_ts(self, paths):
+        """Blank gap_ts has no ledger key; the content-dedup guard alone must
+        prevent a duplicate fact block on a re-run."""
+        ka_dir = self._seed_f3e(paths)
+        ga.apply_known_answer(self._payload(gap_ts=""))
+        ga.apply_known_answer(self._payload(gap_ts=""))
+        content = (ka_dir / "f3e.md").read_text(encoding="utf-8")
+        assert content.count("A: June 15, 2026.") == 1
+
 
 # ---------------------------------------------------------------------------
 # Layer A -- wiring assertions
