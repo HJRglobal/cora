@@ -239,11 +239,12 @@ def redact_links_and_ids(text: str) -> str:
     work = _BARE_DOC_URL_RE.sub("", work)
     work = _GID_RE.sub("", work)
     work = _NAKED_ID_RE.sub("", work)
-    # Clean only the shells a redaction leaves behind (no structural reflow).
+    # Clean only the shells a redaction leaves behind (no structural reflow). The
+    # whitespace/space-before-punct collapse is deliberately NOT applied here -- it
+    # would break the fixed-width / decimal-aligned columns of proactive tables.
     work = _EMPTY_MD_LINK_RE.sub(r"\1", work)
     work = _EMPTY_PARENS_RE.sub("", work)
     work = _EMPTY_BRACKETS_RE.sub("", work)
-    work = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", work)
     for i, tok in enumerate(tokens):
         work = work.replace(_PLACEHOLDER.format(i), tok)
     return work

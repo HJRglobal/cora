@@ -44,14 +44,17 @@ HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
 }
 
 
-# --- Verbatim-table tools (Phase 2.1 egress opt-out) ---
+# --- Verbatim-table tools (Phase 2.1 inline-formatter opt-out) ---
 #
-# These tools return pre-formatted financial/data tables or dashboards that must
-# reach Slack EXACTLY as the tool produced them -- the egress boundary's voice
-# pass (markdown-table flatten, dash/list strip, char-cap) would mangle them, and
-# they are already source-opaque by construction (no sheet names / URLs). When a
-# reply incorporates one of these, claude_client sets meta["used_verbatim_tool"]
-# and app.py sends it with cora_verbatim=True so the boundary leaves it raw.
+# These tools return pre-formatted financial/data tables or dashboards that the
+# inline conversational voice pass (format_reply: markdown-table flatten, dash/
+# list strip, char-cap) would mangle. When a reply incorporates one of these,
+# claude_client sets meta["used_verbatim_tool"] and app.py SKIPS the inline
+# format_reply for that reply (is_tool_output=True) and keeps it out of the cache.
+# NOTE: the egress boundary still applies the universal SAFETY layer (mojibake +
+# bare-URL/GID/16+digit-ID redaction) to every send, including these -- it does
+# NOT voice-flatten, so tables survive, but a tool must not emit a bare 16+ digit
+# id unwrapped (it would be redacted). Tables are source-opaque by construction.
 #
 # This REPLACES the old too-broad `is_tool_output=bool(used_tools)` heuristic,
 # which made EVERY tool-using reply bypass the formatter (so a prose answer that

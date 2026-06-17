@@ -610,8 +610,7 @@ def _dispatch_qa(
         response_text = format_reply(response_text, is_tool_output=is_structured_table)
         response_text = _fix_lex_channel_names(response_text)
         response_text = _validate_channel_links(response_text, client)
-        # Verbatim tables are time-sensitive and must not be re-sanitized on a
-        # cache replay (which sends without cora_verbatim), so never cache them.
+        # Verbatim tables are time-sensitive (financial figures), so never cache them.
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         log.info(
@@ -693,8 +692,7 @@ def _dispatch_qa(
     response_text = format_reply(response_text, is_tool_output=is_structured_table)
     response_text = _fix_lex_channel_names(response_text)
     response_text = _validate_channel_links(response_text, client)
-    # Verbatim tables are never cached (time-sensitive + must not be re-sanitized
-    # on a cache replay that sends without cora_verbatim).
+    # Verbatim tables are never cached (time-sensitive financial figures).
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
 

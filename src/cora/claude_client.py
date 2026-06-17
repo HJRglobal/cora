@@ -345,9 +345,12 @@ def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
     """Record which tools a reply used into the caller's meta dict.
 
     Sets meta["tool_names"] (cumulative) and meta["used_verbatim_tool"] (True once
-    any VERBATIM_TABLE_TOOLS member fires). app.py reads used_verbatim_tool to send
-    that reply with cora_verbatim=True (egress boundary leaves it un-mangled). This
-    is the precise replacement for the old bool(used_tools) bypass."""
+    any VERBATIM_TABLE_TOOLS member fires). app.py reads used_verbatim_tool to SKIP
+    the inline voice formatter (format_reply is_tool_output=True) for that reply so
+    the table is not flattened, and to keep it out of the semantic cache. The egress
+    boundary still applies the universal SAFETY layer (mojibake + URL/GID/long-ID
+    redaction) to it. This is the precise replacement for the old bool(used_tools)
+    bypass."""
     if meta is None:
         return
     names = [n for n in (getattr(b, "name", "") for b in tool_use_blocks) if n]

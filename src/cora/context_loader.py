@@ -554,11 +554,18 @@ def _apply_lex_phi_scrub(results: list) -> list:
     LEX ops content stays readable. Custodians never reach this path (callers gate
     on phi_custodian); non-LEX retrievals are never scrubbed.
 
-    FAIL-CLOSED on a scrub error: WITHHOLD the chunk (replace content + title with
-    a placeholder) rather than surface raw PHI -- matches the capture pipeline's
-    _scrub_lex_text and the codebase's fail-closed PHI doctrine. Also scrubs
-    r.title (LEX chunk titles are frequently client-named files/meetings, and
-    _format_kb_chunks renders the title + the deep-link label derived from it).
+    FAIL-CLOSED on a scrub error: WITHHOLD the chunk content rather than surface raw
+    PHI -- matches the capture pipeline's _scrub_lex_text and the codebase's
+    fail-closed PHI doctrine.
+
+    Titles, filenames, and the pre-baked deep-link LABEL are the highest-density
+    LEX client identifiers (Fireflies meeting titles, per-client filenames) and are
+    frequently BARE names that scrub_lex_phi cannot reliably catch (it keys on a
+    care-recipient cue or possessive). The deep_link is also pre-wrapped at ingest
+    (`<permalink|title>`) so _format_kb_chunks renders its embedded label verbatim,
+    NOT a re-scrubbed title. So for a non-custodian we NEUTRALIZE the citation
+    entirely (generic title, no link); the scrubbed content still carries the
+    answer's substance, and the deep_link URL was only an opaque file/GID id anyway.
     """
     try:
         staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
@@ -567,18 +574,19 @@ def _apply_lex_phi_scrub(results: list) -> list:
     for r in results:
         try:
             r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
-            if getattr(r, "title", ""):
-                r.title = phi_guard.scrub_lex_phi(r.title, allowed_names=staff)
         except Exception:  # noqa: BLE001 -- fail CLOSED, never surface raw PHI
             log.warning(
-                "LEX PHI scrub failed on chunk %s; WITHHOLDING (fail-closed)",
+                "LEX PHI scrub failed on chunk %s; WITHHOLDING content (fail-closed)",
                 getattr(r, "chunk_id", "?"),
             )
             r.content = "[content withheld -- PHI scrub error]"
-            try:
-                r.title = "[withheld]"
-            except Exception:  # noqa: BLE001
-                pass
+        # Neutralize the citation (title + deep-link label) -- client names leak
+        # through both and the scrub can't reliably catch bare names.
+        try:
+            r.title = "LEX knowledge base entry"
+            r.deep_link = ""
+        except Exception:  # noqa: BLE001
+            pass
     return results
 
 

@@ -72,15 +72,17 @@ def test_apply_lex_phi_scrub_fail_closed_on_error(monkeypatch):
     assert "withheld" in out[0].content.lower()
 
 
-def test_apply_lex_phi_scrub_scrubs_title(monkeypatch):
+def test_apply_lex_phi_scrub_neutralizes_title_and_deeplink(monkeypatch):
     _patch_staff(monkeypatch)
     r = _result("benign body")
-    r.title = "client Bob Smith intake DOB 03/15/1990"
+    # A BARE client-name title + a pre-baked deep-link whose LABEL is the same bare
+    # name (the dominant LEX form; scrub_lex_phi can't catch a cue-less name).
+    r.title = "Jalen Alicea Progress Review"
+    r.deep_link = "<https://app.fireflies.ai/view/abc|Jalen Alicea Progress Review>"
     out = cl._apply_lex_phi_scrub([r])
-    # Title is rendered into the context block (and the deep-link label), so it is
-    # scrubbed too for the care-recipient/possessive/DOB patterns.
-    assert "Bob Smith" not in out[0].title
-    assert "1990" not in out[0].title
+    assert "Alicea" not in out[0].title           # title neutralized
+    assert out[0].deep_link == ""                  # link dropped -> label can't leak
+    assert out[0].title == "LEX knowledge base entry"
 
 
 # ── retrieval path: LEX non-custodian / custodian / non-LEX ──────────────────
