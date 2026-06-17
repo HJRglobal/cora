@@ -30,7 +30,7 @@ from ..slack_sweep_policy import should_ingest
 log = logging.getLogger(__name__)
 
 _CHANNEL_FETCH_SLEEP = 1.2   # seconds between channel fetches (Tier-3 rate limit)
-_MAX_MSG_PER_CHANNEL = 500   # cap per channel per run
+_MAX_MESSAGES_PER_CHANNEL = 500   # cap per channel per run
 _SYNTHESIS_MODEL = "claude-haiku-4-5-20251001"
 
 # Channels excluded from sweep (noise / irrelevant to synthesis)
@@ -85,10 +85,10 @@ def list_joined_channels(client) -> list[dict]:
 
 
 def fetch_channel_messages(client, channel_id: str, oldest_ts: str) -> list[dict]:
-    """Fetch up to _MAX_MSG_PER_CHANNEL messages from a channel since oldest_ts."""
+    """Fetch up to _MAX_MESSAGES_PER_CHANNEL messages from a channel since oldest_ts."""
     messages: list[dict] = []
     cursor = None
-    while len(messages) < _MAX_MSG_PER_CHANNEL:
+    while len(messages) < _MAX_MESSAGES_PER_CHANNEL:
         kwargs: dict = {
             "channel": channel_id,
             "oldest": oldest_ts,
