@@ -145,3 +145,36 @@ def test_wrapper_no_text_passes_through():
     wrapped(object(), channel="C1", blocks=[{"type": "section"}])
     assert "text" not in captured
     assert captured["blocks"] == [{"type": "section"}]
+
+
+# ── AsyncWebClient guard (B3) ─────────────────────────────────────────────────
+import pytest  # noqa: E402
+
+
+def test_async_guard_is_noop_when_async_absent_and_sync_install_holds():
+    # Absence-safe: install must still return True and the sync wrapper must hold
+    # whether or not slack_sdk's async client / aiohttp is importable.
+    assert slack_egress.install_egress_sanitizer() is True
+    from slack_sdk.web.client import WebClient
+    assert getattr(WebClient.chat_postMessage, "_cora_egress_wrapped", False)
+    # Calling the guard directly must never raise, even with aiohttp absent.
+    slack_egress._guard_async_webclient()
+
+
+def test_async_guard_is_idempotent():
+    # Calling install / the guard repeatedly does not change behavior or raise.
+    slack_egress._guard_async_webclient()
+    slack_egress._guard_async_webclient()
+    assert slack_egress.install_egress_sanitizer() is True
+
+
+def test_async_webclient_construction_is_forbidden():
+    # Positive guard: if the async client IS importable (aiohttp installed), the
+    # guard must make construction raise. Skipped in the current venv (no aiohttp).
+    try:
+        from slack_sdk.web.async_client import AsyncWebClient
+    except Exception:  # pragma: no cover -- aiohttp not installed in this env
+        pytest.skip("AsyncWebClient unavailable (aiohttp not installed)")
+    slack_egress._guard_async_webclient()
+    with pytest.raises(RuntimeError, match="sync-only"):
+        AsyncWebClient(token="xoxb-test")

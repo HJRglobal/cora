@@ -21,10 +21,12 @@ digests, the strategy memo), intentional SIGNAL emoji on cards (confidence dots,
 alerts that name a system ("the QuickBooks sync failed"). The safety layer here
 never breaks tables/emoji and never strips a system name from an ops alert.
 
-NOT covered (documented residual, Phase 3): ~11 scheduled senders that POST raw
-JSON to slack.com/api via httpx/requests bypass slack_sdk.WebClient and thus this
-patch; the async WebClient is not patched (the bot is sync-only today). See the
-forensic rebuild log.
+NOT covered (documented residual, Phase 3): a handful of scheduled senders that
+POST raw JSON to slack.com/api via httpx/requests bypass slack_sdk.WebClient and
+thus this patch -- those wrap text with slack_egress.sanitize_text at the POST
+site instead (see B1). The async WebClient is not wrapped (the bot is sync-only);
+instead its construction is GUARDED to raise loudly (B3), so an async send can't
+silently bypass the boundary. See the forensic rebuild log.
 """
 
 from __future__ import annotations
@@ -125,6 +127,36 @@ def _make_wrapper(original):
     return wrapper
 
 
+def _guard_async_webclient() -> None:
+    """Forbid AsyncWebClient instantiation (B3): an async Slack send would bypass
+    the sync-WebClient patch and egress UNSANITIZED. Cora is sync-only, so the
+    correct posture is to FORBID the bypass, not silently tolerate it -- fail LOUD
+    at construction so the single-boundary invariant can't regress unnoticed (a
+    future maintainer who deliberately adds async Slack hits this, sees the
+    message, and routes through the sync client or extends the boundary). Fully
+    no-op when slack_sdk's async client / aiohttp is absent (the current env --
+    aiohttp isn't installed, so AsyncWebClient isn't even importable). Idempotent."""
+    try:
+        from slack_sdk.web.async_client import AsyncWebClient
+    except Exception:  # noqa: BLE001 -- async client / aiohttp not importable: nothing to guard
+        return
+    if getattr(AsyncWebClient, "_cora_async_guarded", False):
+        return
+    _orig_init = AsyncWebClient.__init__
+
+    @functools.wraps(_orig_init)
+    def _guarded_init(self, *args, **kwargs):
+        raise RuntimeError(
+            "Cora is sync-only: AsyncWebClient bypasses the egress sanitizer. "
+            "Route Slack sends through the sync slack_sdk.WebClient (which is "
+            "patched), or extend slack_egress to wrap AsyncWebClient.chat_*."
+        )
+
+    AsyncWebClient.__init__ = _guarded_init  # type: ignore[assignment]
+    AsyncWebClient._cora_async_guarded = True  # type: ignore[attr-defined]
+    log.info("egress: AsyncWebClient construction guarded (sync-only invariant)")
+
+
 def install_egress_sanitizer() -> bool:
     """Patch slack_sdk's sync WebClient text-send methods to sanitize the message
     body. Idempotent (safe to call repeatedly / from multiple entry points).
@@ -146,6 +178,11 @@ def install_egress_sanitizer() -> bool:
         if getattr(original, "_cora_egress_wrapped", False):
             continue
         setattr(WebClient, name, _make_wrapper(original))
+
+    try:
+        _guard_async_webclient()
+    except Exception:  # noqa: BLE001 -- the async guard must NEVER break the sync install
+        log.debug("async-webclient guard skipped", exc_info=True)
 
     _installed = True
     log.info("egress sanitizer installed on WebClient %s", ", ".join(_SEND_METHODS))
