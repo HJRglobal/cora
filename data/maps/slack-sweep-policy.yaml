@@ -39,12 +39,26 @@ deny_by_glob:
   - "lts*"
 
 deny_by_id:
-  - C0B2NMLK7CK   # general-do-not-use (also denied by name; belt + suspenders)
-  # Cora internal knowledge-queue channels for the removed sub-entities. They
-  # are private and hold no human content, but are LBHS/LTS-scoped -- and the
-  # lbhs*/lts* PREFIX globs do NOT catch the cora-kq-lex-* names, so deny by ID.
-  - C0B76Q7QX09   # cora-kq-lex-lbhs
-  - C0B6YJ1MQFM   # cora-kq-lex-lts
+  # Full sensitive-channel ID list (1.4 recon, 2026-06-16). Denying by ID too
+  # makes the deny-list rename-robust AND is the source the one-time purge
+  # (scripts/purge_denied_kb.py) uses to remove already-ingested slack chunks.
+  - C0B2NMLK7CK   # general-do-not-use (also denied by name)
+  # Personal / family
+  - C0B7PMLM9D5   # personal-tasks
+  - C0B7PMLQ26B   # kids-schedules-and-tasks
+  - C0B88QGBDNG   # alison-s-previously-assigned-tasks
+  # NDA / M&A
+  - C0B88QJAUMS   # lbhs-copa-diligence
+  # LBHS (removed -- G-A.2)
+  - C0B5ULELCFL   # lbhs
+  - C0B5WFJK1UZ   # lbhs-leadership
+  - C0B5Y8ZA2Q4   # lbhs-finance
+  - C0B76Q7QX09   # cora-kq-lex-lbhs (private; lbhs* prefix glob misses cora-kq-* name)
+  # LTS (removed -- G-A.2)
+  - C0B6NUHC6HW   # lts
+  - C0B5Y8Y5UTW   # lts-leadership
+  - C0B5D6VUWS3   # lts-finance
+  - C0B6YJ1MQFM   # cora-kq-lex-lts (private; lts* prefix glob misses cora-kq-* name)
 
 # Optional private allow-list. If NON-empty, a PRIVATE channel ingests only if
 # it is listed here (and not denied above); an EMPTY/absent list means no private
