@@ -187,6 +187,7 @@ def _post_stage_change(
         log.info("[DRY RUN] Would post to %s:\n%s", channel, text)
         return
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.post(
@@ -195,7 +196,7 @@ def _post_stage_change(
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json={"channel": channel, "text": text},
+                json={"channel": channel, "text": sanitize_text(text)},
             )
         data = r.json()
         if not data.get("ok"):

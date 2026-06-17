@@ -267,11 +267,12 @@ def send_alert(token: str, channel: str, issues: list[dict]) -> bool:
         "_Suppress dupes for 1 h automatically. See `data/security/alert_history.json` to reset._",
     ]
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     try:
         resp = httpx.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"channel": channel, "text": "\n".join(lines)},
+            json={"channel": channel, "text": sanitize_text("\n".join(lines))},
             timeout=15,
         )
         data = resp.json()

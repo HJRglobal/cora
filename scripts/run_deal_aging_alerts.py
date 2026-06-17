@@ -223,6 +223,7 @@ def _send_slack_dm(
         log.info("[DRY RUN] Would DM %s:\n%s", recipient_id, text)
         return True
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.post(
@@ -231,7 +232,7 @@ def _send_slack_dm(
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json={"channel": recipient_id, "text": text},
+                json={"channel": recipient_id, "text": sanitize_text(text)},
             )
         data = r.json()
         if data.get("ok"):
@@ -257,6 +258,7 @@ def _send_fallback_channel(text: str, dry_run: bool = False) -> bool:
         log.info("[DRY RUN] Would post to %s:\n%s", _FALLBACK_CHANNEL, text)
         return True
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.post(
@@ -265,7 +267,7 @@ def _send_fallback_channel(text: str, dry_run: bool = False) -> bool:
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json={"channel": _FALLBACK_CHANNEL, "text": text},
+                json={"channel": _FALLBACK_CHANNEL, "text": sanitize_text(text)},
             )
         data = r.json()
         if data.get("ok"):

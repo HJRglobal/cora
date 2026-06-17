@@ -168,11 +168,12 @@ def _post_to_slack(month_label: str, due_date: str, fighter_count: int, skipped:
         f"Required: 2 IG stories + 1 IG post, tagging @f3energy + #DrinkF3.\n"
         f"_<@{_ALEX_SLACK_ID}> use `@Cora show fighter compliance` to see status anytime._"
     )
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     try:
         requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"channel": _F3_ATHLETES_CHANNEL, "text": text, "mrkdwn": True},
+            json={"channel": _F3_ATHLETES_CHANNEL, "text": sanitize_text(text), "mrkdwn": True},
             timeout=10,
         )
     except Exception as exc:

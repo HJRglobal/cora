@@ -728,6 +728,7 @@ def _post_slack_summary(
         log.info("[DRY RUN] Would post to %s:\n%s", channel, text)
         return
 
+    from ..slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the class WebClient patch; sanitize at source
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.post(
@@ -736,7 +737,7 @@ def _post_slack_summary(
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json={"channel": channel, "text": text},
+                json={"channel": channel, "text": sanitize_text(text)},
             )
         data = r.json()
         if not data.get("ok"):

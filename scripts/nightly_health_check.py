@@ -645,11 +645,12 @@ def _build_report(all_results: list[CheckResult], run_time: float) -> str:
 def _post_to_slack(message: str, token: str, channel: str) -> None:
     try:
         import httpx
+        from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
         httpx.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}",
                      "Content-Type": "application/json"},
-            json={"channel": channel, "text": message,
+            json={"channel": channel, "text": sanitize_text(message),
                   "unfurl_links": False, "unfurl_media": False},
             timeout=15,
         )

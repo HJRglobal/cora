@@ -63,10 +63,11 @@ def _post_to_slack(text: str) -> bool:
         return False
 
     channel = _NOTIFY_CHANNEL.lstrip("#")
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"channel": channel, "text": text, "mrkdwn": True},
+        json={"channel": channel, "text": sanitize_text(text), "mrkdwn": True},
         timeout=15,
     )
     data = resp.json() if resp.ok else {}

@@ -111,13 +111,14 @@ def _post_slack_message(channel: str, text: str) -> bool:
         log.error("influencer_overdue_alerts: SLACK_BOT_TOKEN not set — cannot post")
         return False
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: raw POST bypasses the WebClient patch
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={"channel": channel, "text": text, "mrkdwn": True},
+        json={"channel": channel, "text": sanitize_text(text), "mrkdwn": True},
         timeout=15,
     )
     data = resp.json() if resp.ok else {}
