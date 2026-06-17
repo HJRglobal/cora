@@ -62,6 +62,81 @@ class TestSheetNameRedaction:
         assert "the cash flow model" in out
 
 
+class TestDrivePathRedaction:
+    """format_reply redacts HJR-Founder-OS Drive document PATHS (B0, green-lit
+    2026-06-17) to a neutral phrase -- conversational source-opacity. Must NOT
+    match ordinary prose: the slash-segments + doc extension are the prose guard."""
+
+    # --- positives: a named Drive document path must be redacted -------------
+    def test_live_leak_xlsx_path_redacted(self):
+        out = format_reply(
+            "The figures live in 02-F3-Energy/production/f3-production-master-register.xlsx today.")
+        assert "02-F3-Energy" not in out
+        assert ".xlsx" not in out
+        assert "a portfolio document" in out
+        assert "today." in out  # sentence stays grammatical
+
+    def test_shared_pdf_path_redacted(self):
+        out = format_reply("It is in _shared/projects/cora/design/spec.pdf right now.")
+        assert "_shared/projects" not in out
+        assert "a portfolio document" in out
+
+    def test_hjrg_gsheet_path_redacted(self):
+        out = format_reply(
+            "Pulled from 01-HJR-Global/accounting/live-sheets/hjrg_weekly-cash-flow_LIVE.gsheet.")
+        assert "01-HJR-Global" not in out
+        assert ".gsheet" not in out
+        assert "a portfolio document" in out
+
+    def test_strategy_memo_docx_path_redacted(self):
+        out = format_reply("See 00-Founder/_strategy-memos/2026-06/memo.docx for the writeup.")
+        assert "00-Founder/_strategy-memos" not in out
+        assert "a portfolio document" in out
+
+    def test_pptx_and_csv_extensions_redacted(self):
+        out = format_reply("Deck 07-Big-D-Media/decks/q3.pptx and 09-One-Stop-Nutrition/data/sales.csv.")
+        assert ".pptx" not in out
+        assert ".csv" not in out
+        assert out.count("a portfolio document") == 2
+
+    # --- negatives: ordinary prose must survive verbatim ---------------------
+    def test_bare_word_production_survives(self):
+        out = format_reply("We are ramping production this quarter.")
+        assert "ramping production this quarter." in out
+        assert "a portfolio document" not in out
+
+    def test_shared_drive_phrase_survives(self):
+        out = format_reply("It is in the _shared drive somewhere.")
+        assert "_shared drive" in out
+        assert "a portfolio document" not in out
+
+    def test_pdf_word_without_path_survives(self):
+        out = format_reply("I attached a pdf of the deck.")
+        assert "a pdf of the deck." in out
+        assert "a portfolio document" not in out
+
+    def test_md_path_not_redacted(self):
+        # Doc-only by design: a bare .md path is left alone (avoids "README.md" prose).
+        out = format_reply("It is logged in memory/decisions.md for the record.")
+        assert "memory/decisions.md" in out
+        assert "a portfolio document" not in out
+
+    def test_two_digit_building_number_survives(self):
+        out = format_reply("The 02 building has 11 tenants.")
+        assert "The 02 building has 11 tenants." in out
+        assert "a portfolio document" not in out
+
+    def test_sanctioned_link_with_path_label_survives(self):
+        # A sanctioned <url|label> is token-protected; its internals are untouched.
+        raw = "See <https://drive.google.com/file/d/abc|02-F3-Energy/x.pdf>."
+        out = format_reply(raw)
+        assert "<https://drive.google.com/file/d/abc|02-F3-Energy/x.pdf>" in out
+
+    def test_tool_output_bypass_leaves_path(self):
+        raw = "Stored at 02-F3-Energy/production/register.xlsx"
+        assert format_reply(raw, is_tool_output=True) == raw
+
+
 # --- markdown stripping --------------------------------------------------
 
 

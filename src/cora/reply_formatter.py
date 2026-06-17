@@ -101,6 +101,24 @@ _SHEET_IDENT_RE = re.compile(
 )
 _SHEET_IDENT_REPLACEMENT = "the cash flow model"
 
+# HJR-Founder-OS Drive file PATHS that name a document (the 2026-06-17 /cora-ask
+# leak: Cora composed "02-F3-Energy/production/...xlsx" into prose -- source-opacity
+# prompt drift the URL/gid/sheet-name lints above don't catch). Match an entity
+# folder prefix (NN-Name | _shared | memory | inventory | outputs) + at least one
+# "/segment" + a DOCUMENT extension, replaced with a neutral phrase. Anchored so
+# ordinary prose ("ramping production", "the _shared drive", "a pdf of the deck")
+# cannot match -- the required slash-segments + doc extension are the prose guard.
+# Conversational-only (runs in format_reply, NOT the egress boundary): a proactive
+# ops alert may legitimately reference a file path. Doc extensions only -- a bare
+# .md path is intentionally NOT matched (avoids eating "README.md"-style prose).
+_DRIVE_PATH_RE = re.compile(
+    r"\b(?:[0-9]{2}-[A-Za-z][A-Za-z0-9-]*|_shared|memory|inventory|outputs)"
+    r"(?:/[^\s<>|]+)+"
+    r"\.(?:xlsx|gsheet|pdf|docx|pptx|csv)\b",
+    re.IGNORECASE,
+)
+_DRIVE_PATH_REPLACEMENT = "a portfolio document"
+
 # Redaction shells: when a redacted URL sat inside parens or a markdown link,
 # the surrounding "()" / "[label]()" survives as a visible artifact (live
 # 2026-06-11 follow-up replies). Clean them after the redaction pass.
@@ -192,6 +210,8 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _NAKED_ID_RE.sub("", work)
     # 8a. Named sheet identifiers -> neutral phrase (conversational source-opacity).
     work = _SHEET_IDENT_RE.sub(_SHEET_IDENT_REPLACEMENT, work)
+    # 8a'. Drive document PATHS -> neutral phrase (same conversational scoping).
+    work = _DRIVE_PATH_RE.sub(_DRIVE_PATH_REPLACEMENT, work)
 
     # 8b. Clean redaction shells the lint leaves behind: "[label]()" -> label,
     # then any empty "()" / "[]" pairs.
