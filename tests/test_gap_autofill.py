@@ -494,6 +494,26 @@ class TestApplyKnownAnswer:
         content = (ka_dir / "f3e.md").read_text(encoding="utf-8")
         assert content.count("A: June 15, 2026.") == 1
 
+    def test_content_dedup_anchored_not_fooled_by_embedded_body(self, paths):
+        """A bare Q/A pair quoted MID-BODY inside an earlier entry's answer must NOT
+        false-positive-skip a distinct new gap (anchor to line boundaries)."""
+        ka_dir = self._seed_f3e(paths)
+        f3e = ka_dir / "f3e.md"
+        # earlier entry whose answer body quotes the exchange (Q mid-line, not anchored)
+        seeded = f3e.read_text(encoding="utf-8").replace(
+            "## Known facts",
+            "## Known facts\n\n"
+            "**[2026-05-01] launch recap** _(mined from Slack)_\n"
+            "Q: What did the launch thread say?\n"
+            "A: Tommy asked: Q: When does Pure launch?\n"
+            "A: June 15, 2026. -- and Larry confirmed.\n",
+        )
+        f3e.write_text(seeded, encoding="utf-8")
+        ok, _ = ga.apply_known_answer(self._payload(gap_ts=""))
+        assert ok
+        # the new real block was appended (not skipped by the embedded copy)
+        assert "Pure launch date" in f3e.read_text(encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
 # Layer A -- wiring assertions

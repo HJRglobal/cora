@@ -14,6 +14,7 @@ No HTTP calls, no token files, no QBO auth required.
 """
 
 import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -459,3 +460,17 @@ class TestFormatRecentTransactionsForLlm:
     def test_days_parameter_in_output(self, _mock):
         result = format_recent_transactions_for_llm(self._payload(), "F3E", 90)
         assert "90" in result
+
+
+class TestQboToolDescriptionsSourceOpaque:
+    """B2 follow-up (adversarial review MED): the QBO tool DESCRIPTIONS must not
+    advertise a clickable QBO deep link -- that primed the model to fabricate an
+    'open in QuickBooks (qbo.intuit.com/...)' line that the egress boundary did not
+    redact. Source-level guard so the claim can't creep back."""
+
+    def test_no_qbo_deep_link_claim_in_tool_descriptions(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "src" / "cora" / "tools" / "tool_dispatch.py").read_text(encoding="utf-8")
+        assert "QBO deep link" not in src
+        assert "clickable QBO" not in src
+        assert "QBO transactions deep link" not in src

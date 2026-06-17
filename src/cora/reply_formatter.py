@@ -79,7 +79,12 @@ _EMOJI_RE = re.compile(
 # --- source-opacity lint -------------------------------------------------
 _BARE_DOC_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?"
-    r"(?:docs\.google\.com|drive\.google\.com|app\.asana\.com|notion\.so)"
+    # *.intuit.com (bounded {0,3} subdomain depth -> no ReDoS) added as B2
+    # defense-in-depth: a bare/fabricated qbo.intuit.com report link is redacted
+    # here AND on the egress boundary, covering the conversational-fabrication and
+    # WebClient-bypass paths the QBO tool-description fix can't fully prevent.
+    r"(?:docs\.google\.com|drive\.google\.com|app\.asana\.com|notion\.so"
+    r"|(?:[a-z0-9-]+\.){0,3}intuit\.com)"
     # ')' excluded so a URL inside "(...)" or a markdown link "[label](...)"
     # leaves a balanced empty shell for the 8b cleanup (these URLs never
     # legitimately contain a close-paren).
@@ -103,17 +108,22 @@ _SHEET_IDENT_REPLACEMENT = "the cash flow model"
 
 # HJR-Founder-OS Drive file PATHS that name a document (the 2026-06-17 /cora-ask
 # leak: Cora composed "02-F3-Energy/production/...xlsx" into prose -- source-opacity
-# prompt drift the URL/gid/sheet-name lints above don't catch). Match an entity
-# folder prefix (NN-Name | _shared | memory | inventory | outputs) + at least one
-# "/segment" + a DOCUMENT extension, replaced with a neutral phrase. Anchored so
-# ordinary prose ("ramping production", "the _shared drive", "a pdf of the deck")
-# cannot match -- the required slash-segments + doc extension are the prose guard.
-# Conversational-only (runs in format_reply, NOT the egress boundary): a proactive
-# ops alert may legitimately reference a file path. Doc extensions only -- a bare
-# .md path is intentionally NOT matched (avoids eating "README.md"-style prose).
+# prompt drift the URL/gid/sheet-name lints above don't catch). Match a Founder-OS
+# root (an NN-Entity folder, e.g. "02-F3-Energy"/"00-Founder", or "_shared") + at
+# least one "/segment" + a DOCUMENT extension, replaced with a neutral phrase.
+# Anchored so ordinary prose ("ramping production", "the _shared drive", "a pdf of
+# the deck") cannot match -- the required slash-segments + doc extension are the
+# prose guard. The per-segment class EXCLUDES '/' so each separator is consumed
+# exactly once: this is a non-overlapping quantifier (no (a+)+ ambiguity), which
+# avoids catastrophic backtracking / ReDoS on a long path-shaped reply that lacks
+# a trailing doc extension. Roots are limited to NN-Entity + _shared (the green-lit
+# scope) so generic dir names ("outputs/dist/x.csv", "memory/blob.pdf") in echoed
+# build/log output are left alone. Conversational-only (runs in format_reply, NOT
+# the egress boundary): a proactive ops alert may legitimately reference a path.
+# Doc extensions only -- a bare .md path is NOT matched (avoids "README.md" prose).
 _DRIVE_PATH_RE = re.compile(
-    r"\b(?:[0-9]{2}-[A-Za-z][A-Za-z0-9-]*|_shared|memory|inventory|outputs)"
-    r"(?:/[^\s<>|]+)+"
+    r"\b(?:[0-9]{2}-[A-Za-z][A-Za-z0-9-]*|_shared)"
+    r"(?:/[^\s<>|/]+)+"
     r"\.(?:xlsx|gsheet|pdf|docx|pptx|csv)\b",
     re.IGNORECASE,
 )

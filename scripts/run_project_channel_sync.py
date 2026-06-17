@@ -225,10 +225,11 @@ def _create_channel_and_invite(
         f"• *Pin key decisions* by reacting 📚 to any message.\n\n"
         f"_To stop auto-creating channels for a project type, update `data/maps/project-channel-denylist.yaml`._"
     )
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: WebClient sender imports no cora module; route through the boundary
     try:
         client.chat_postMessage(
             channel=ch_id,
-            text=welcome,
+            text=sanitize_text(welcome),
             unfurl_links=False,
             unfurl_media=False,
         )

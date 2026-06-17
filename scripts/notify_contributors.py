@@ -145,9 +145,10 @@ def main() -> None:
         message = _build_message(name, entities, tier)
 
         try:
+            from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: WebClient sender imports no cora module; route through the boundary
             client.chat_postMessage(
                 channel=uid,   # DM to user ID directly
-                text=message,
+                text=sanitize_text(message),
                 unfurl_links=False,
                 unfurl_media=False,
             )

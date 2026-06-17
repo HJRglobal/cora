@@ -62,6 +62,18 @@ class TestEvaluate:
         assert not has_failure
         assert rows[0]["status"] == "STALE"
 
+    def test_string_timestamp_is_invalid_not_crash(self):
+        tokens = {"OSN": {"refresh_token": "rt", "refresh_token_expires_at": "1780000000",
+                          "last_refreshed_at": 1}}
+        rows, has_failure = mod.evaluate(tokens, NOW)
+        assert has_failure
+        assert rows[0]["status"] == "INVALID"
+
+    def test_non_dict_realm_value_is_invalid(self):
+        rows, has_failure = mod.evaluate({"OSN": "not-a-dict"}, NOW)
+        assert has_failure
+        assert rows[0]["status"] == "INVALID"
+
 
 class TestMain:
     def _store(self, tmp_path, monkeypatch, data):
@@ -106,6 +118,27 @@ class TestMain:
         assert len(calls) == 1
         assert "OSN" in calls[0][0]
         assert calls[0][1] is True
+
+    def test_null_store_exits_two(self, tmp_path, monkeypatch):
+        f = tmp_path / "qbo-tokens.json"
+        f.write_text("null", encoding="utf-8")
+        monkeypatch.setattr(qbo_oauth, "_TOKEN_FILE", f)
+        assert mod.main([]) == 2
+
+    def test_list_store_exits_two(self, tmp_path, monkeypatch):
+        f = tmp_path / "qbo-tokens.json"
+        f.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(qbo_oauth, "_TOKEN_FILE", f)
+        assert mod.main([]) == 2
+
+    def test_alert_exception_does_not_mask_exit_code(self, tmp_path, monkeypatch):
+        self._store(tmp_path, monkeypatch,
+                    {"OSN": {"refresh_token": "rt", "refresh_token_expires_at": 1,
+                             "last_refreshed_at": 1}})
+        def boom(text, dry):
+            raise RuntimeError("slack down hard")
+        monkeypatch.setattr(mod, "_send_alert", boom)
+        assert mod.main(["--alert"]) == 1  # alert raise must not mask the EXPIRED exit code
 
 
 class TestSendAlert:

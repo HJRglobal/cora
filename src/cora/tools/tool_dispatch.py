@@ -1431,7 +1431,7 @@ def _resolve_qbo_entity(channel_entity: str, override: str | None) -> tuple[str 
 
 
 def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Fetch Profit and Loss for an entity over a period. Returns a Slack-mrkdwn summary + QBO link."""
+    """Fetch Profit and Loss for an entity over a period. Returns a source-opaque Slack-mrkdwn summary (no QBO link)."""
     channel_name = (_input or {}).get("_channel_name", "")
     if not _is_tier1_channel(entity, channel_name):
         return _QBO_TIER1_REQUIRED
@@ -3701,8 +3701,8 @@ TOOL_DEFINITIONS = [
             "'show me the P&L', 'how did we do in January', 'quarterly results'. "
             "For quarterly questions: Q1 = '2026-01-01 to 2026-03-31', Q2 = '2026-04-01 to 2026-06-30', "
             "Q3 = '2026-07-01 to 2026-09-30', Q4 = '2026-10-01 to 2026-12-31'. "
-            "Returns top-line section totals (Income, COGS, Net Income) plus a clickable "
-            "QBO deep link to the full report. The tool defaults to the channel's entity, "
+            "Returns top-line section totals (Income, COGS, Net Income). Present the numbers "
+            "directly; do NOT add a QuickBooks/QBO link or name the source system. The tool defaults to the channel's entity, "
             "but the `entity` parameter can override (use it in FNDR/HJRG channels where "
             "the user names a specific entity). The `period` parameter controls the date "
             "range -- defaults to last_30_days. CALL THIS BEFORE financial_get_close_pack "
@@ -3731,7 +3731,8 @@ TOOL_DEFINITIONS = [
             "a specific date (defaults to today). Use this when a user in a TIER_1 channel "
             "asks about assets, liabilities, equity, cash position, balance sheet, or "
             "financial position. Returns top-level section totals (Total Assets, Total "
-            "Liabilities, Equity) plus a clickable QBO deep link to the full report. The "
+            "Liabilities, Equity). Present the numbers directly; do NOT add a QuickBooks/QBO "
+            "link or name the source system. The "
             "`entity` parameter overrides the channel's entity. Refuse in TIER_3 channels."
         ),
         "input_schema": {
@@ -3756,8 +3757,9 @@ TOOL_DEFINITIONS = [
             "entity. Use this when a user in a TIER_1 channel asks about open invoices, "
             "money owed to the business, customer collections, or AR aging buckets — "
             "phrases like 'who owes us money', 'what's outstanding on receivables', 'AR "
-            "aging report'. Returns aging buckets (current, 1-30, 31-60, 61-90, 91+) plus "
-            "a clickable QBO deep link. The `entity` parameter overrides the channel's "
+            "aging report'. Returns aging buckets (current, 1-30, 31-60, 61-90, 91+). "
+            "Present the numbers directly; do NOT add a QuickBooks/QBO link or name the "
+            "source system. The `entity` parameter overrides the channel's "
             "entity. Refuse in TIER_3 channels."
         ),
         "input_schema": {
@@ -3778,8 +3780,9 @@ TOOL_DEFINITIONS = [
             "entity. Use this when a user in a TIER_1 channel asks about unpaid vendor "
             "bills, money we owe, payables aging buckets, or upcoming vendor payments — "
             "phrases like 'what do we owe', 'AP aging', 'vendor balances outstanding'. "
-            "Returns aging buckets (current, 1-30, 31-60, 61-90, 91+) plus a clickable "
-            "QBO deep link. The `entity` parameter overrides the channel's entity. "
+            "Returns aging buckets (current, 1-30, 31-60, 61-90, 91+). Present the numbers "
+            "directly; do NOT add a QuickBooks/QBO link or name the source system. The "
+            "`entity` parameter overrides the channel's entity. "
             "Refuse in TIER_3 channels."
         ),
         "input_schema": {
@@ -3802,7 +3805,8 @@ TOOL_DEFINITIONS = [
             "channel asks about recent QBO activity, what's been entered recently, or "
             "wants a high-level pulse on the books — phrases like 'what's been happening "
             "in QBO', 'any new invoices this week', 'recent activity'. Returns counts per "
-            "type plus a clickable QBO transactions deep link. The `entity` parameter "
+            "type. Present the counts directly; do NOT add a QuickBooks/QBO link or name "
+            "the source system. The `entity` parameter "
             "overrides the channel's entity. Refuse in TIER_3 channels."
         ),
         "input_schema": {

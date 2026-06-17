@@ -45,6 +45,22 @@ class TestRedactLinksAndIds:
         out = redact_links_and_ids(msg)
         assert "—" in out and "🔴" in out
 
+    def test_redacts_bare_intuit_qbo_url(self):
+        # B2 defense-in-depth: a fabricated bare QBO report link is redacted.
+        out = redact_links_and_ids("Open it at qbo.intuit.com/app/profitandloss?reset=1 today")
+        assert "intuit.com" not in out
+        assert "Open it at" in out and "today" in out
+
+    def test_preserves_sanctioned_intuit_link(self):
+        msg = "See <https://qbo.intuit.com/app/profitandloss|the report>"
+        assert redact_links_and_ids(msg) == msg
+
+    def test_intuit_pattern_no_redos(self):
+        import time
+        start = time.perf_counter()
+        redact_links_and_ids("a" * 5000 + " no-intuit-here")
+        assert time.perf_counter() - start < 1.0
+
 
 class TestSheetNameRedaction:
     """format_reply replaces named sheet identifiers with a neutral phrase
@@ -135,6 +151,29 @@ class TestDrivePathRedaction:
     def test_tool_output_bypass_leaves_path(self):
         raw = "Stored at 02-F3-Energy/production/register.xlsx"
         assert format_reply(raw, is_tool_output=True) == raw
+
+    def test_no_catastrophic_backtracking(self):
+        # ReDoS guard (adversarial review HIGH): a long path-shaped reply with no
+        # trailing doc extension must NOT explode the regex. The non-slash segment
+        # class makes matching linear; the old (?:/[^space]+)+ form took ~40s at 30
+        # segments. 200 segments must complete near-instantly.
+        import time
+        evil = "Here is the file: 02-F3-Energy/" + "/".join(["a"] * 200) + "/final-version"
+        start = time.perf_counter()
+        out = format_reply(evil)
+        assert time.perf_counter() - start < 2.0  # linear; old exponential = minutes
+        assert "a portfolio document" not in out  # no doc extension -> not a match
+
+    def test_generic_outputs_path_survives(self):
+        # Roots limited to NN-Entity + _shared -> a generic build/log path is left alone.
+        out = format_reply("Build wrote outputs/dist/report.csv last run.")
+        assert "outputs/dist/report.csv" in out
+        assert "a portfolio document" not in out
+
+    def test_generic_memory_path_survives(self):
+        out = format_reply("Cache is in memory/objects/blob.pdf on disk.")
+        assert "memory/objects/blob.pdf" in out
+        assert "a portfolio document" not in out
 
 
 # --- markdown stripping --------------------------------------------------

@@ -191,9 +191,10 @@ def main() -> int:
 
     try:
         from slack_sdk import WebClient
+        from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: WebClient sender imports no cora module; route through the boundary
         WebClient(token=token).chat_postMessage(
             channel=_NOTIFY_CH,
-            text=report,
+            text=sanitize_text(report),
             unfurl_links=False,
             unfurl_media=False,
         )

@@ -184,9 +184,10 @@ def main() -> int:
         print(f"ERROR: Could not find #{TARGET_CHANNEL}", file=sys.stderr)
         return 1
 
+    from cora.slack_egress import sanitize_text  # noqa: PLC0415 -- B1: WebClient sender imports no cora module; route through the boundary
     resp = client.chat_postMessage(
         channel=channel_id,
-        text=msg,
+        text=sanitize_text(msg),
         unfurl_links=False,
         unfurl_media=False,
     )

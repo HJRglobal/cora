@@ -680,7 +680,14 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
             "",
         ]
         existing = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
-        if f"Q: {question}\nA: {answer}" in existing:
+        # Anchor the dedup to a real fact block (Q-line at line start, A-line ending
+        # a line) so a bare "Q:..\nA:.." embedded inside ANOTHER entry's answer body
+        # can't false-positive-skip a distinct new gap (adversarial review LOW).
+        block_re = re.compile(
+            r"^Q: " + re.escape(question) + r"\nA: " + re.escape(answer) + r"$",
+            re.MULTILINE,
+        )
+        if existing and block_re.search(existing):
             log.info("gap_autofill: identical Q/A already in %s -- skipping append",
                      target_file.name)
         else:

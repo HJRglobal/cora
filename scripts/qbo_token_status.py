@@ -44,10 +44,16 @@ _FAILURE = frozenset({"EXPIRED", "INVALID"})       # -> exit 1
 _ALERTABLE = _FAILURE | {"WARN", "STALE"}          # -> DM on --alert
 
 
+def _num(v) -> float:
+    """Coerce a stored timestamp to a number; non-numeric (str/None/bool/etc.) -> 0,
+    so a malformed entry classifies INVALID rather than crashing the comparison."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
 def _classify(tok: dict, now: float, warn_days: int) -> tuple[str, str]:
     """Classify one realm's token from stored timestamps only. Returns (status, detail)."""
-    rt_exp = tok.get("refresh_token_expires_at") or 0
-    last = tok.get("last_refreshed_at") or 0
+    rt_exp = _num(tok.get("refresh_token_expires_at"))
+    last = _num(tok.get("last_refreshed_at"))
     err = tok.get("error")
     if err:
         return "INVALID", f"error: {str(err)[:60]}"
@@ -70,7 +76,7 @@ def evaluate(tokens: dict, now: float, warn_days: int = _DEFAULT_WARN_DAYS):
     """Return (rows, has_failure). Pure; takes `now` for testability."""
     rows = []
     for entity, tok in sorted(tokens.items()):
-        status, detail = _classify(tok or {}, now, warn_days)
+        status, detail = _classify(tok if isinstance(tok, dict) else {}, now, warn_days)
         rows.append({"entity": entity, "status": status, "detail": detail})
     has_failure = any(r["status"] in _FAILURE for r in rows)
     return rows, has_failure
@@ -131,6 +137,11 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 -- corrupt store is a distinct failure
         print(f"ERROR reading token store: {exc}")
         return 2
+    # A file that parses but has the wrong shape (null / [] / a scalar) would crash
+    # evaluate(tokens.items()); treat it as corrupt (exit 2), not a token failure.
+    if not isinstance(tokens, dict):
+        print(f"ERROR: token store is not a dict (got {type(tokens).__name__})")
+        return 2
 
     now = time.time()
     rows, has_failure = evaluate(tokens, now, args.warn_days)
@@ -138,7 +149,12 @@ def main(argv=None) -> int:
     print(_format_report(rows))
 
     if args.alert and any(r["status"] in _ALERTABLE for r in rows):
-        _send_alert(_format_alert(rows), args.dry_run)
+        # An alert failure must NEVER affect the exit code (the contract _send_alert
+        # documents); enforce it at the call site too.
+        try:
+            _send_alert(_format_alert(rows), args.dry_run)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[alert] dispatch failed: {exc}")
 
     return 1 if has_failure else 0
 
