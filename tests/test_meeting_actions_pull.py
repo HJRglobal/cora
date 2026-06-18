@@ -17,6 +17,7 @@ doctrine: patch directly-imported names ON the importing module
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -62,6 +63,12 @@ def _mk_transcript(
         },
         "meeting_attendees": attendees,
     }
+
+
+def _ms(year: int, month: int, day: int) -> int:
+    """Epoch-ms for (y,m,d) at 17:00 UTC -> UTC date == AZ date == (y,m,d)
+    (17:00 UTC is 10:00 AZ, same calendar day), so date matching is unambiguous."""
+    return int(datetime(year, month, day, 17, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
 
 @pytest.fixture(autouse=True)
@@ -286,6 +293,259 @@ class TestDedupAndMatch:
         assert ma._match_query("budget class", ts) == []
 
 
+class TestExtractSelectors:
+    """Fix A: parse date + ordinal selectors out of a free-text hint."""
+
+    def test_month_day(self):
+        d, o, r = ma._extract_selectors("Lexington Progress June 18")
+        assert d == (None, 6, 18, False) and o is None and r.lower() == "lexington progress"
+
+    def test_month_abbrev_with_year(self):
+        d, o, r = ma._extract_selectors("Dec 3, 2026 board call")
+        assert d == (2026, 12, 3, False) and "board" in r.lower()
+
+    def test_month_day_with_ordinal_suffix(self):
+        d, _, r = ma._extract_selectors("June 18th sync")
+        assert d == (None, 6, 18, False) and r.lower() == "sync"
+
+    def test_iso_date(self):
+        d, _, r = ma._extract_selectors("2026-06-18 board strategy")
+        assert d == (2026, 6, 18, False) and "2026" not in r and "board strategy" in r.lower()
+
+    def test_numeric_date(self):
+        d, o, r = ma._extract_selectors("standup 6/18")
+        assert d == (None, 6, 18, False) and r.lower() == "standup"
+
+    def test_numeric_date_two_digit_year(self):
+        d, _, _ = ma._extract_selectors("6/18/26")
+        assert d == (2026, 6, 18, False)
+
+    def test_today(self):
+        with patch.object(ma, "_today_az", return_value=(2026, 6, 18)):
+            d, o, r = ma._extract_selectors("today")
+        assert d == (2026, 6, 18, True) and o is None and r == ""
+
+    def test_yesterday(self):
+        with patch.object(ma, "_today_az", return_value=(2026, 6, 18)):
+            d, _, _ = ma._extract_selectors("yesterday's marketing sync")
+        assert d == (2026, 6, 17, True)
+
+    def test_the_18th(self):
+        d, o, r = ma._extract_selectors("the 18th")
+        assert d == (None, None, 18, False) and o is None and r == ""
+
+    def test_bare_digit_ordinal_is_position_not_day(self):
+        # "2nd" alone -> position 2 (symmetric with "second"), NOT day-of-month 2.
+        d, o, r = ma._extract_selectors("2nd")
+        assert o == 2 and d is None and r == ""
+
+    def test_day_of_month_above_eight_stays_a_date(self):
+        # "9th"+ aren't ordinal words -> day-of-month, not a position.
+        d, o, r = ma._extract_selectors("the 9th")
+        assert d == (None, None, 9, False) and o is None
+
+    def test_ordinal_first_one(self):
+        d, o, r = ma._extract_selectors("the first one")
+        assert d is None and o == 1 and r == ""
+
+    def test_ordinal_second_with_title(self):
+        d, o, r = ma._extract_selectors("Lexington Progress the second one")
+        assert d is None and o == 2 and r.lower() == "lexington progress"
+
+    def test_ordinal_last(self):
+        _, o, r = ma._extract_selectors("last one")
+        assert o == -1 and r == ""
+
+    def test_bare_ordinal_word(self):
+        _, o, r = ma._extract_selectors("first")
+        assert o == 1 and r == ""
+
+    def test_digit_ordinal_one_is_position_not_day(self):
+        # "1st one" -> position 1, NOT day-of-month 1.
+        d, o, r = ma._extract_selectors("1st one")
+        assert o == 1 and d is None and r == ""
+
+    def test_plain_title_no_selectors(self):
+        d, o, r = ma._extract_selectors("F3 Marketing Sync")
+        assert d is None and o is None and r == "F3 Marketing Sync"
+
+    def test_first_inside_title_not_ordinal(self):
+        # "First Quarter Review" must NOT be read as an ordinal selection.
+        d, o, r = ma._extract_selectors("First Quarter Review")
+        assert o is None and d is None and r == "First Quarter Review"
+
+    def test_bare_month_without_day_not_date(self):
+        # A bare month word with no day is NOT a date (don't break a title).
+        d, _, r = ma._extract_selectors("May Strategy Offsite")
+        assert d is None and r == "May Strategy Offsite"
+
+    def test_invalid_numeric_month_rejected(self):
+        # "26-06" (month 26) is not a valid date and must be left in the title.
+        d, _, _ = ma._extract_selectors("2026-06 planning")
+        assert d is None
+
+
+class TestResolveMeetings:
+    """Fix A: date/ordinal-aware resolution (the D-054 pick-list bug)."""
+
+    def _two_lp(self):
+        t18 = _mk_transcript(tid="LP18", title="Lexington Progress",
+                             meeting_link="https://m/18", date_ms=_ms(2026, 6, 18))
+        t11 = _mk_transcript(tid="LP11", title="Lexington Progress",
+                             meeting_link="https://m/11", date_ms=_ms(2026, 6, 11))
+        return ma._dedup_meetings([t18, t11])  # newest-first: [LP18, LP11]
+
+    def test_picklist_date_selection_resolves_to_offered_meeting(self):
+        out = ma._resolve_meetings("Lexington Progress June 18", self._two_lp())
+        assert [t["id"] for t in out] == ["LP18"]
+
+    def test_date_token_does_not_break_title_match(self):
+        out = ma._resolve_meetings("Lexington Progress June 11", self._two_lp())
+        assert [t["id"] for t in out] == ["LP11"]
+
+    def test_pure_date_resolves(self):
+        out = ma._resolve_meetings("June 18", self._two_lp())
+        assert [t["id"] for t in out] == ["LP18"]
+
+    def test_numeric_date_resolves(self):
+        out = ma._resolve_meetings("6/11", self._two_lp())
+        assert [t["id"] for t in out] == ["LP11"]
+
+    def test_date_no_match_returns_empty_not_wrong_meeting(self):
+        # June 17 has no meeting -> empty (clean not-found), NOT a wrong one.
+        assert ma._resolve_meetings("Lexington Progress June 17", self._two_lp()) == []
+
+    def test_stray_word_does_not_block_date_resolution(self):
+        # "meeting" breaks the all-tokens title match; the date still pins it.
+        out = ma._resolve_meetings("Lexington Progress meeting June 18", self._two_lp())
+        assert [t["id"] for t in out] == ["LP18"]
+
+    def test_today_resolves(self):
+        with patch.object(ma, "_today_az", return_value=(2026, 6, 18)):
+            out = ma._resolve_meetings("today", self._two_lp())
+        assert [t["id"] for t in out] == ["LP18"]
+
+    def test_day_of_month_resolves(self):
+        out = ma._resolve_meetings("the 11th", self._two_lp())
+        assert [t["id"] for t in out] == ["LP11"]
+
+    def test_ordinal_with_title_selects_position(self):
+        ts = self._two_lp()  # [LP18, LP11]
+        assert [t["id"] for t in ma._resolve_meetings("Lexington Progress the first one", ts)] == ["LP18"]
+        assert [t["id"] for t in ma._resolve_meetings("Lexington Progress the last one", ts)] == ["LP11"]
+        assert [t["id"] for t in ma._resolve_meetings("Lexington Progress the second one", ts)] == ["LP11"]
+
+    def test_bare_ordinal_selects_from_full_list(self):
+        ts = self._two_lp()
+        assert [t["id"] for t in ma._resolve_meetings("the first one", ts)] == ["LP18"]
+        assert [t["id"] for t in ma._resolve_meetings("last one", ts)] == ["LP11"]
+
+    def test_plain_title_still_returns_both_for_picklist(self):
+        out = ma._resolve_meetings("Lexington Progress", self._two_lp())
+        assert {t["id"] for t in out} == {"LP18", "LP11"}
+
+    def test_title_given_no_match_with_ordinal_returns_empty(self):
+        # A title was given but matched nothing -> don't guess by position.
+        assert ma._resolve_meetings("Budget Review first one", self._two_lp()) == []
+
+    def test_empty_query_returns_empty(self):
+        assert ma._resolve_meetings("", self._two_lp()) == []
+
+    def test_ordinal_out_of_range_returns_empty(self):
+        # "the eighth one" but only two candidates -> empty (clean not-found).
+        assert ma._resolve_meetings("Lexington Progress the eighth one", self._two_lp()) == []
+
+
+class TestResolveRemediation:
+    """D-051 review fixes: title-first union, no wrong-meeting substitution,
+    date-in-title resolution, ordinal cap, UTC-only explicit dates."""
+
+    def test_exact_title_with_date_token_resolves_via_title(self):
+        # "Q2 6/30 Forecast" is the exact TITLE; the meeting is on 6/18, not 6/30.
+        # The in-title date must NOT hijack resolution into a not-found.
+        qf = _mk_transcript(tid="QF", title="Q2 6/30 Forecast", date_ms=_ms(2026, 6, 18))
+        assert [t["id"] for t in ma._resolve_meetings("Q2 6/30 Forecast", [qf])] == ["QF"]
+
+    def test_ordinal_suffix_title_resolves_via_title(self):
+        # "11th Hour Review" titled meeting on June 5 (not the 11th).
+        hr = _mk_transcript(tid="HR", title="11th Hour Review", date_ms=_ms(2026, 6, 5))
+        assert [t["id"] for t in ma._resolve_meetings("11th Hour Review", [hr])] == ["HR"]
+
+    def test_title_match_and_date_disagree_returns_picklist(self):
+        # User types "G2 1/2 Onboarding" (exact title of ONB, on Feb 1). Stripping
+        # "1/2" -> residual "G2 Onboarding" which substring-matches a DIFFERENT
+        # meeting (RECAP, on Jan 2). Must return BOTH (pick-list), never silently
+        # pick the date-matched RECAP.
+        onb = _mk_transcript(tid="ONB", title="G2 1/2 Onboarding", meeting_link="https://m/o", date_ms=_ms(2026, 2, 1))
+        recap = _mk_transcript(tid="RECAP", title="G2 Onboarding Recap", meeting_link="https://m/r", date_ms=_ms(2026, 1, 2))
+        ts = ma._dedup_meetings([onb, recap])
+        out = {t["id"] for t in ma._resolve_meetings("G2 1/2 Onboarding", ts)}
+        assert out == {"ONB", "RECAP"}
+
+    def test_unmatched_title_plus_date_does_not_substitute_wrong_meeting(self):
+        # "Lexington Progress June 18" but NO Lexington Progress meeting exists;
+        # an unrelated 'F3 Marketing Sync' IS on June 18. Must NOT resolve to it.
+        mkt = _mk_transcript(tid="MKT", title="F3 Marketing Sync", date_ms=_ms(2026, 6, 18))
+        assert ma._resolve_meetings("Lexington Progress June 18", [mkt]) == []
+
+    def test_date_present_still_multiple_returns_picklist(self):
+        # Two distinct same-title meetings on the same UTC day -> pick-list, not a
+        # silent single resolution.
+        a = _mk_transcript(tid="A", title="Daily Sync", meeting_link="https://m/a", date_ms=_ms(2026, 6, 18))
+        b = _mk_transcript(tid="B", title="Daily Sync", meeting_link="https://m/b", date_ms=_ms(2026, 6, 18))
+        ts = ma._dedup_meetings([a, b])
+        assert {t["id"] for t in ma._resolve_meetings("Daily Sync June 18", ts)} == {"A", "B"}
+
+    def test_bare_ordinal_capped_to_picklist_size(self):
+        # 10 visible meetings; the pick-list shows only the first _PICKLIST_CAP.
+        # "the last one" must select the last SHOWN row, not the 10th unseen one.
+        ts = [
+            _mk_transcript(tid=f"M{i:02d}", title="Daily Standup",
+                           meeting_link=f"https://m/{i}", date_ms=_ms(2026, 6, 18 - i if 18 - i >= 1 else 1) - i * 1000)
+            for i in range(10)
+        ]
+        ts = sorted(ts, key=lambda t: t["date"], reverse=True)  # newest-first
+        out = ma._resolve_meetings("the last one", ts)
+        assert len(out) == 1 and out[0]["id"] == ts[ma._PICKLIST_CAP - 1]["id"]
+
+    def test_explicit_date_matches_utc_label_only_not_az_phantom(self):
+        # A meeting at 02:00 UTC June 18 is LABELED 2026-06-18 (UTC). An explicit
+        # "June 17" (its AZ-local day) must NOT resolve it -- only "June 18" does.
+        t = _mk_transcript(tid="B18", title="Evening Sync",
+                           date_ms=int(datetime(2026, 6, 18, 2, 0, tzinfo=timezone.utc).timestamp() * 1000))
+        assert ma._resolve_meetings("June 17", [t]) == []
+        assert [x["id"] for x in ma._resolve_meetings("June 18", [t])] == ["B18"]
+
+
+class TestDateHintMatching:
+    def test_explicit_date_utc_only(self):
+        # 02:00 UTC June 18 -> UTC day 18, AZ day 17. Explicit hint matches UTC only.
+        t = _mk_transcript(date_ms=int(datetime(2026, 6, 18, 2, 0, tzinfo=timezone.utc).timestamp() * 1000))
+        assert ma._date_hint_matches(t, (None, 6, 18, False))
+        assert not ma._date_hint_matches(t, (None, 6, 17, False))
+
+    def test_relative_date_matches_either_utc_or_az(self):
+        # Same boundary meeting: a RELATIVE hint matches the AZ-local day too.
+        t = _mk_transcript(date_ms=int(datetime(2026, 6, 18, 2, 0, tzinfo=timezone.utc).timestamp() * 1000))
+        assert ma._date_hint_matches(t, (2026, 6, 17, True))   # AZ day
+        assert ma._date_hint_matches(t, (2026, 6, 18, True))   # UTC day
+
+    def test_no_date_no_match(self):
+        assert not ma._date_hint_matches(_mk_transcript(date_ms=None), (None, 6, 18, False))
+
+
+class TestAzClock:
+    def test_az_tz_is_fixed_utc_minus_7(self):
+        # North-Star invariant: AZ is a fixed UTC-7 offset, never zoneinfo.
+        from datetime import timedelta
+        assert ma._AZ_TZ.utcoffset(None) == timedelta(hours=-7)
+
+    def test_shift_day_month_and_year_boundaries(self):
+        assert ma._shift_day((2026, 6, 1), -1) == (2026, 5, 31)
+        assert ma._shift_day((2026, 1, 1), -1) == (2025, 12, 31)
+        assert ma._shift_day((2026, 3, 1), -1) == (2026, 2, 28)
+
+
 class TestAttendeeGate:
     def test_attended_via_email_fallback(self):
         t = _mk_transcript(attendees=[{"displayName": None, "email": ASKER_EMAIL}])
@@ -371,6 +631,8 @@ class TestPreview:
         assert "Lex Care Sync" not in out
 
     def test_not_found(self, asker_identity):
+        # FIX B: an unmatched hint with a pullable meeting present returns the
+        # REAL meeting list (grounding) so Cora can't fabricate a meeting/date.
         with (
             patch.object(ma, "_recent_transcripts", return_value=[_mk_transcript()]),
             patch.object(ma, "_asker_attended", return_value=True),
@@ -379,6 +641,63 @@ class TestPreview:
         ):
             out = ma.run_meeting_action_items(ASKER, "F3E", _input(meeting_query="nonexistent topic"))
         assert "couldn't find" in out
+        assert "[id:01TID]" in out  # grounded with the real meeting, not a fabrication
+
+    def test_not_found_plain_when_nothing_pullable(self, asker_identity):
+        # No pullable meetings here (non-attendee filtered all out) -> plain
+        # message, no list to ground with.
+        with (
+            patch.object(ma, "_recent_transcripts", return_value=[_mk_transcript()]),
+            patch.object(ma, "_asker_attended", return_value=False),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+        ):
+            out = ma.run_meeting_action_items(ASKER, "F3E", _input(meeting_query="anything"))
+        assert "couldn't find" in out and "[id:" not in out
+
+    def test_picklist_then_date_followup_resolves_single(self, asker_identity):
+        # The D-054 disambiguation bug end-to-end: a bare title yields a pick-list,
+        # then a DATE follow-up (which title-only matching couldn't resolve) must
+        # resolve to exactly the meeting the user named -- no fabrication.
+        t18 = _mk_transcript(tid="LP18", title="F3 Marketing Sync",
+                             meeting_link="https://m/18", date_ms=_ms(2026, 6, 18))
+        t11 = _mk_transcript(tid="LP11", title="F3 Marketing Sync",
+                             meeting_link="https://m/11", date_ms=_ms(2026, 6, 11))
+        parsed = [{"task": "Send the deck", "assignee_name": ASKER_NAME, "due_mention": None}]
+        with (
+            patch.object(ma, "_recent_transcripts", return_value=[t18, t11]),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+            patch.object(fae, "_parse_action_items_with_haiku", return_value=parsed),
+        ):
+            picklist = ma.run_meeting_action_items(ASKER, "F3E", _input(meeting_query="f3 marketing"))
+            out = ma.run_meeting_action_items(ASKER, "F3E", _input(meeting_query="f3 marketing june 18"))
+        assert "[id:LP18]" in picklist and "[id:LP11]" in picklist  # pick-list offered both
+        assert "2026-06-18" in out and "Send the deck" in out       # resolved to June 18
+        assert 'transcript_id="LP18"' in out                        # confirm targets the right one
+        assert "couldn't find" not in out.lower()
+
+    def test_grounded_not_found_excludes_lex_meeting_in_f3e_channel(self, asker_identity):
+        # FIX B is security-sensitive: the grounded not-found list reuses the
+        # scope-filtered `visible` set, so a LEX meeting must NOT leak into an
+        # F3E channel's grounded list (D-052 invariant).
+        f3e = _mk_transcript(tid="F3", title="F3 Sync", meeting_link="https://m/f")
+        lex = _mk_transcript(tid="LX", title="Lex Care Sync", meeting_link="https://m/l")
+        with (
+            patch.object(ma, "_recent_transcripts", return_value=[f3e, lex]),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", side_effect=lambda t: "LEX" if "lex" in t.lower() else "F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", side_effect=lambda tr: "LEX-LLC" if "lex" in (tr.get("title") or "").lower() else None),
+            patch.object(fae, "_lex_capture_enabled", return_value=True),
+            patch.object(fae, "_lex_sub_entity_allowed", return_value=True),
+            patch.object(ma, "_is_phi_meeting", return_value=False),
+        ):
+            out = ma.run_meeting_action_items(ASKER, "F3E", _input(meeting_query="nonexistent xyz"))
+        assert "couldn't find" in out.lower()
+        assert "[id:F3]" in out             # the in-scope F3E meeting IS grounded
+        assert "[id:LX]" not in out          # the LEX meeting is NOT leaked
+        assert "Lex Care Sync" not in out
 
     def test_single_match_preview_shows_my_items(self, asker_identity):
         t = _mk_transcript(title="F3 Marketing Sync")

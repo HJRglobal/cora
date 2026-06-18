@@ -163,6 +163,76 @@ _STOPWORDS = frozenset({
     "make", "take", "follow", "update", "review", "meeting", "team", "next",
 })
 
+# ── Date / ordinal selectors (pick-list follow-up resolution) ────────────────
+# A pick-list reply often selects by DATE ("June 18", "6/18", "today", "the
+# 18th") or POSITION ("the first one", "last one") rather than echoing the
+# hidden [id:...]. Title-only matching can't resolve those (a date/ordinal token
+# isn't in the title), so we parse them, strip them, then title-match the rest.
+#
+# America/Phoenix is a fixed UTC-7 (no DST). ZoneInfo RAISES on this host (see
+# repo doctrine), so use a fixed offset -- never zoneinfo.
+_AZ_TZ = timezone(timedelta(hours=-7))
+
+_MONTHS: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+_ORDINAL_WORDS: dict[str, int] = {
+    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "sixth": 6, "6th": 6,
+    "seventh": 7, "7th": 7, "eighth": 8, "8th": 8, "last": -1,
+}
+
+_MONTH_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))  # longest-first
+# "June 18", "Jun 18th", "December 3, 2026"
+_RE_MONTH_DAY = re.compile(
+    rf"\b({_MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{{4}}))?\b",
+    re.IGNORECASE,
+)
+# ISO "2026-06-18" -- matched BEFORE the bare m/d regex so the year is captured
+# and the whole span (incl. the year) is consumed (not left as a "2026" token).
+_RE_ISO_DATE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+# "6/18", "06-18", "6/18/2026", "6/18/26" (US month/day order)
+_RE_NUMERIC_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
+# relative day
+_RE_RELATIVE_DATE = re.compile(r"\b(today|yesterday)\b", re.IGNORECASE)
+# bare day-of-month ordinal: "the 18th", "18th" (requires the st/nd/rd/th suffix
+# so it never matches a plain number)
+_RE_DAY_ORDINAL = re.compile(r"\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
+_ORD_ALT = "|".join(_ORDINAL_WORDS)
+# ordinal SELECTION with explicit "one" context ("the first one", "2nd one")
+_RE_ORDINAL_SELECT = re.compile(rf"\b(?:the\s+)?({_ORD_ALT})\s+one\b", re.IGNORECASE)
+# a query that is ENTIRELY an ordinal word ("first", "the last") -> selection
+_RE_ORDINAL_BARE = re.compile(rf"^(?:the\s+)?({_ORD_ALT})$", re.IGNORECASE)
+# Pure filler left after stripping a selector -> treat as no title (so it can't
+# become a bogus title filter). Only true filler; generic-but-real title words
+# like "sync"/"standup" are NOT here.
+_RESIDUAL_JUNK = frozenset({
+    "", "the", "one", "that", "that one", "the one", "meeting", "the meeting",
+    "call", "the call", "from", "from the meeting", "for",
+})
+# Filler words dropped on the LENIENT title retry (when the residual didn't
+# title-match): so "Lexington Progress meeting June 18" still resolves via its
+# real "Lexington Progress" core, WITHOUT falling back to the full meeting list
+# (which would risk a wrong-meeting substitution). Generic-but-real title words
+# (sync/standup/review/...) are NOT here -- they stay as discriminators.
+_FILLER_TOKENS = frozenset({
+    "the", "a", "an", "our", "my", "your", "with", "for", "on", "from", "about",
+    "meeting", "meetings", "mtg", "call", "calls",
+})
+
+
+def _strip_filler(text: str) -> str:
+    """Drop leading/standalone filler words from a residual title (lenient retry)."""
+    out = [
+        w for w in re.split(r"\s+", (text or "").strip())
+        if w and w.lower().strip(".,;:-'\"") not in _FILLER_TOKENS
+    ]
+    return " ".join(out).strip()
+
 _module_slack_map: dict[str, dict] | None = None  # module-level cache
 
 
@@ -496,6 +566,210 @@ def _meeting_date_str(transcript: dict) -> str:
         datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
         if ts else "unknown date"
     )
+
+
+# ── Date / ordinal-aware resolution (pick-list follow-up) ────────────────────
+
+def _today_az() -> tuple[int, int, int]:
+    now = datetime.now(_AZ_TZ)
+    return (now.year, now.month, now.day)
+
+
+def _shift_day(ymd: tuple[int, int, int], delta_days: int) -> tuple[int, int, int]:
+    base = datetime(ymd[0], ymd[1], ymd[2], tzinfo=_AZ_TZ) + timedelta(days=delta_days)
+    return (base.year, base.month, base.day)
+
+
+def _meeting_ymd_utc(transcript: dict) -> tuple[int, int, int] | None:
+    """The meeting's (year, month, day) in UTC -- the SAME day the pick-list
+    labels it (_meeting_date_str uses UTC). None if no parseable date."""
+    ts = _parse_date(transcript.get("date"))
+    if not ts:
+        return None
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return (dt.year, dt.month, dt.day)
+
+
+def _meeting_ymds(transcript: dict) -> set[tuple[int, int, int]]:
+    """The meeting's (year, month, day) in BOTH UTC and AZ-local. Used only for
+    RELATIVE hints ("today"/"yesterday"), which the user means in AZ from their
+    seat -- so an evening-AZ meeting (next-day UTC) still answers to "yesterday".
+    Empty when the transcript has no parseable date."""
+    ts = _parse_date(transcript.get("date"))
+    if not ts:
+        return set()
+    out: set[tuple[int, int, int]] = set()
+    for tz in (timezone.utc, _AZ_TZ):
+        dt = datetime.fromtimestamp(ts, tz=tz)
+        out.add((dt.year, dt.month, dt.day))
+    return out
+
+
+def _date_hint_matches(
+    transcript: dict, hint: tuple[int | None, int | None, int, bool]
+) -> bool:
+    """True if the transcript's date matches a (year|None, month|None, day,
+    relative) hint.
+
+    EXPLICIT dates ("June 18", "6/18", "the 18th") match ONLY the UTC day -- the
+    exact day the pick-list showed the user, so a typed date can never resolve a
+    meeting labeled a different day. RELATIVE dates ("today"/"yesterday") match
+    EITHER the UTC or the AZ-local day (the user means AZ; the label is UTC).
+    year/month may be None (a bare day-of-month matches on day alone)."""
+    y, m, d, relative = hint
+    if relative:
+        days = _meeting_ymds(transcript)
+    else:
+        u = _meeting_ymd_utc(transcript)
+        days = {u} if u else set()
+    for (yy, mm, dd) in days:
+        if d is not None and dd != d:
+            continue
+        if m is not None and mm != m:
+            continue
+        if y is not None and yy != y:
+            continue
+        return True
+    return False
+
+
+def _extract_selectors(
+    query: str,
+) -> tuple[tuple[int | None, int | None, int, bool] | None, int | None, str]:
+    """Pull a DATE hint and/or an ORDINAL selection out of the query.
+
+    Returns (date_hint, ordinal, residual): date_hint is (year|None, month|None,
+    day, relative_bool) or None; ordinal is 1-based (or -1 for "last") or None;
+    residual is the query with the date/ordinal tokens removed (the title part).
+    Ordinals are only recognized as a SELECTION ("first one", "the last", or a
+    query that is ENTIRELY an ordinal word) -- never a bare "first" living inside
+    a title like "First Quarter Review"."""
+    residual = query or ""
+    ordinal: int | None = None
+
+    # 1) Ordinal selection WITH explicit "one" context ("the first one").
+    om = _RE_ORDINAL_SELECT.search(residual)
+    if om:
+        ordinal = _ORDINAL_WORDS.get(om.group(1).lower())
+        residual = residual[: om.start()] + " " + residual[om.end():]
+
+    # 2) Bare ordinal: the WHOLE query is just an ordinal word ("first", "2nd",
+    #    "the last"). Checked BEFORE the date regexes so a bare digit-ordinal
+    #    ("2nd"/"3rd") is a POSITION like its word form, not day-of-month 2/3.
+    #    (Day-of-month "the 18th"/"9th"+ falls through -- not in _ORDINAL_WORDS.)
+    if ordinal is None:
+        bm = _RE_ORDINAL_BARE.match(residual.strip())
+        if bm:
+            ordinal = _ORDINAL_WORDS.get(bm.group(1).lower())
+            residual = ""
+
+    # 3) Date hint (first match wins): ISO, month-name+day, numeric m/d,
+    #    relative, then bare day-of-month ordinal. relative=True only for
+    #    today/yesterday (the only AZ-from-the-user's-seat readings).
+    date_hint: tuple[int | None, int | None, int, bool] | None = None
+    if residual:
+        iso = _RE_ISO_DATE.search(residual)
+        if iso:
+            year, mon, day = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
+            if 1 <= mon <= 12 and 1 <= day <= 31:
+                date_hint = (year, mon, day, False)
+                residual = residual[: iso.start()] + " " + residual[iso.end():]
+        if date_hint is None:
+            md = _RE_MONTH_DAY.search(residual)
+            if md:
+                mon = _MONTHS.get(md.group(1).lower())
+                day = int(md.group(2))
+                year = int(md.group(3)) if md.group(3) else None
+                if mon and 1 <= day <= 31:
+                    date_hint = (year, mon, day, False)
+                    residual = residual[: md.start()] + " " + residual[md.end():]
+        if date_hint is None:
+            nd = _RE_NUMERIC_DATE.search(residual)
+            if nd:
+                mon = int(nd.group(1))
+                day = int(nd.group(2))
+                yr = nd.group(3)
+                year = (2000 + int(yr)) if (yr and len(yr) == 2) else (int(yr) if yr else None)
+                if 1 <= mon <= 12 and 1 <= day <= 31:
+                    date_hint = (year, mon, day, False)
+                    residual = residual[: nd.start()] + " " + residual[nd.end():]
+        if date_hint is None:
+            rd = _RE_RELATIVE_DATE.search(residual)
+            if rd:
+                ry, rm, rday = _today_az()
+                if rd.group(1).lower() == "yesterday":
+                    ry, rm, rday = _shift_day((ry, rm, rday), -1)
+                date_hint = (ry, rm, rday, True)
+                residual = residual[: rd.start()] + " " + residual[rd.end():]
+        if date_hint is None:
+            dd = _RE_DAY_ORDINAL.search(residual)
+            if dd:
+                day = int(dd.group(1))
+                if 1 <= day <= 31:
+                    date_hint = (None, None, day, False)
+                    residual = residual[: dd.start()] + " " + residual[dd.end():]
+
+    residual = re.sub(r"\s+", " ", residual).strip(" \t-,.;:")
+    if residual.lower() in _RESIDUAL_JUNK:
+        residual = ""
+    return date_hint, ordinal, residual
+
+
+def _resolve_meetings(query: str, transcripts: list[dict]) -> list[dict]:
+    """Resolve a free-text meeting hint to transcript(s) -- DATE- and ORDINAL-
+    aware (a pick-list follow-up that selects by date or position resolves to the
+    offered meeting). `transcripts` is newest-first (from _dedup_meetings).
+
+    Plain title queries are unchanged. When a date/ordinal IS present, the
+    FULL-query title match is preferred: if the user's exact words (date-looking
+    tokens and all) name a real meeting title -- e.g. "Q2 6/30 Forecast" or
+    "11th Hour Review" -- that title match is honored, and the selector
+    interpretation is the FALLBACK. The two interpretations are UNION'd: if they
+    disagree (the title names meeting A while a stripped date pins meeting B) we
+    return BOTH as a pick-list rather than silently choosing one -- so the tool
+    NEVER silently resolves to the wrong meeting. A real title that matches
+    nothing is NOT replaced by a date/position guess over unrelated meetings."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    date_hint, ordinal, residual = _extract_selectors(q)
+    # The FULL, un-stripped query as a title (so an in-title date isn't hijacked).
+    title_full = _match_query(q, transcripts)
+    if date_hint is None and ordinal is None:
+        return title_full  # plain-title path (identical to the old behavior)
+
+    # Selector interpretation: title-match the residual, then narrow by
+    # date/ordinal. A non-empty residual that doesn't match is retried leniently
+    # (filler words dropped); only an ALL-filler residual becomes a pure
+    # date/ordinal query over the full set -- a real-but-unmatched title yields
+    # no selector match (no wrong-meeting fall-back).
+    if residual:
+        title_base = _match_query(residual, transcripts)
+        if not title_base:
+            core = _strip_filler(residual)
+            title_base = list(transcripts) if not core else _match_query(core, transcripts)
+    else:
+        title_base = list(transcripts)
+
+    if date_hint is not None:
+        sel = [t for t in title_base if _date_hint_matches(t, date_hint)]
+    else:
+        # Ordinal selects by position within the rows actually shown (capped to
+        # the pick-list size), 1-based, newest-first; "last" = the last shown.
+        pool = title_base[:_PICKLIST_CAP]
+        if not pool or ordinal is None:
+            sel = []
+        elif ordinal == -1:
+            sel = [pool[-1]]
+        elif 1 <= ordinal <= len(pool):
+            sel = [pool[ordinal - 1]]
+        else:
+            sel = []
+
+    # Union title_full + selector result, deduped by object identity, preserving
+    # the newest-first order of `transcripts`. >1 -> the caller shows a pick-list.
+    chosen = {id(t) for t in title_full} | {id(t) for t in sel}
+    return [t for t in transcripts if id(t) in chosen]
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +1247,7 @@ def run_meeting_action_items(
         )
 
     # ── PREVIEW / RESOLVE (read-only) ───────────────────────────────────────
+    visible: list[dict] = []  # in scope for the grounded not-found fallback below
     try:
         if transcript_id:
             transcript = _fetch_transcript_by_id(transcript_id)
@@ -1002,16 +1277,31 @@ def run_meeting_action_items(
                     visible[:_PICKLIST_CAP],
                     "Which meeting do you want your action items from? Recent meetings you attended:",
                 )
-            transcripts = _match_query(meeting_query, visible)
+            # Date/ordinal-aware so a pick-list follow-up ("June 18", "the first
+            # one") resolves to the offered meeting -- title-only matching can't.
+            transcripts = _resolve_meetings(meeting_query, visible)
     except FirefliesConnectorError as exc:
         log.warning("meeting_actions resolve failed: %s", exc)
         return "I couldn't reach the meeting service just now -- please try again shortly."
 
     if not transcripts:
+        # Ground the model: when the hint doesn't resolve but the asker DOES have
+        # pullable meetings here, return the real list so Cora relays actual
+        # titles/dates instead of fabricating one (the 2026-06-18 "last one was
+        # June 4" hallucination). Falls to a plain message only when nothing is
+        # pullable here (e.g. a transcript_id miss, where `visible` is empty).
+        if visible:
+            return _format_picklist(
+                visible[:_PICKLIST_CAP],
+                f"I couldn't find a meeting matching \"{meeting_query}\" that you "
+                f"attended in the last {_WINDOW_DAYS} days and can pull here. These "
+                "are the ones you attended that I CAN pull from -- tell me which one "
+                "(by title or date):",
+            )
         return (
             f"I couldn't find a meeting you attended in the last {_WINDOW_DAYS} days "
-            f"matching \"{meeting_query}\" that I can pull here. Try a more specific "
-            "title or a date."
+            f"matching \"{meeting_query}\" that I can pull here. Tell me a more "
+            "specific title or date, or ask from the right channel."
         )
     if len(transcripts) > 1:
         return _format_picklist(

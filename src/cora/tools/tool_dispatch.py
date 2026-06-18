@@ -4821,14 +4821,25 @@ TOOL_DEFINITIONS = [
             "ATTENDED, only surfaces a meeting where it belongs (Lexington meetings "
             "only in Lexington channels; an entity's meeting in that entity's / a "
             "founder channel / a DM), and PHI-scrubs Lexington content. If it refuses, "
-            "relay the refusal -- don't try to work around it."
+            "relay the refusal -- don't try to work around it.\n"
+            "\n"
+            "RELAY THE TOOL'S RESULT -- IT IS THE ANSWER. This tool is the ONLY "
+            "source of which meetings the user attended and what was assigned to them. "
+            "When it returns a pick-list, a refusal, or a 'couldn't find a meeting...' "
+            "message, relay THAT (and ask the user to pick if it's a list). Do NOT "
+            "consult the calendar, your knowledge base, or memory for this question, "
+            "and NEVER invent or guess a meeting date, attendee, or 'your last "
+            "meeting was on ...' -- if the tool didn't return it, you don't know it. "
+            "On a pick-list follow-up, call again carrying BOTH the title and the "
+            "user's date/position (e.g. meeting_query='Lexington Progress June 18' or "
+            "'Lexington Progress, the first one'), or the [id:...] from the list."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "meeting_query": {
                     "type": "string",
-                    "description": "The user's hint for which meeting -- a title, keywords, or a date (e.g. 'F3 marketing sync', 'yesterday's budget class'). Omit to get a list of the user's recent meetings to choose from.",
+                    "description": "The user's hint for which meeting -- a title, keywords, and/or a date or pick-list selection. Accepts a title ('F3 marketing sync'), a date ('June 18', '6/18', 'today', 'yesterday', 'the 18th'), a position ('the first one', 'last one'), or a combination ('Lexington Progress June 18'). When the user is choosing from a pick-list, carry their original title forward together with the date/position. Omit to get a list of the user's recent meetings to choose from.",
                 },
                 "transcript_id": {
                     "type": "string",
