@@ -7,7 +7,7 @@ Store: f3energy.myshopify.com (one store, three domains: F3Energy.com / F3Pure.c
 
 Auth: SHOPIFY_F3E_ACCESS_TOKEN + SHOPIFY_F3E_STORE env vars.
 
-Behavioral contract (mirrors clover_client.py):
+Behavioral contract (mirrors gsheets_financials.py):
   - Source-opaque: never surface store URLs, token values, or "Shopify" unless asked
   - All monetary values returned as float USD
   - Raises ShopifyConnectorError on auth/API failure
