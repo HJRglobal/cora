@@ -73,9 +73,11 @@ SPRAWL_CUTOFF_EPOCH = SPRAWL_CUTOFF.timestamp()
 # on the final digit) are never matched. Linear regex (no nested quantifier).
 _DUP_SUFFIX_RE = re.compile(r"^(?P<base>.+)-[2-9]$")
 
-# How many recent messages to scan when deciding activity (enough to skip a burst
-# of system events at the top of a channel's history).
-_ACTIVITY_PAGE = 30
+# How many recent messages to scan per page when deciding activity, and how many
+# pages to walk past an all-system burst (Cora's channel-join automation can stack
+# 30+ `channel_join` events atop a channel's history -- see _check_channel_activity).
+_ACTIVITY_PAGE = 100
+_MAX_ACTIVITY_PAGES = 3
 
 # conversations.history message subtypes that are SYSTEM events, not real content.
 # A channel whose only recent entry is one of these (e.g. a member joining) is
@@ -97,31 +99,68 @@ _SYSTEM_SUBTYPES = frozenset({
 def _check_channel_activity(slack_client, channel_id: str, lookback_seconds: int) -> bool:
     """Return True if the channel has a real (non-system) message within the window.
 
-    Fetches one page of recent history (newest first) and uses the newest message
-    that is NOT a system event (join/leave/topic/purpose/etc.), comparing its ts to
-    the cutoff. This avoids two failure modes proved live 2026-06-17:
-      - the conversations.history `oldest`-without-`latest` + small-`limit` quirk
-        returned an EMPTY page even for active channels (#cora-build had a same-day
-        message yet read "0 in 30d") -> the ~10x dead over-report;
-      - counting a `channel_join`/system event as activity would mask a genuinely
-        abandoned channel whose only recent entry is a join (#bdm).
-    Errors -> assume active (never flag a channel dead because the API failed).
-    A page of only system events (or empty) -> dead.
+    Walks recent history and returns True on the FIRST real (non-system) message
+    whose ts is at/after the cutoff -- order-independent for the "active" verdict
+    (any in-window real message anywhere in the scanned pages -> active), so it does
+    not rely on Slack's message ordering to decide liveness. Avoids the failure modes
+    proved live 2026-06-17:
+      - NO `oldest` param: the conversations.history `oldest`-without-`latest` +
+        small-`limit` quirk returned an EMPTY page even for active channels
+        (#cora-build had a same-day message yet read "0 in 30d") -> the ~10x dead
+        over-report;
+      - system events (channel_join/leave/topic/purpose/...) are skipped, so a
+        channel whose only recent entry is a join reads dead (#bdm);
+      - paginates PAST an all-system burst (Cora's channel-join automation can stack
+        30+ `channel_join` events atop history, which would otherwise bury the last
+        real message off page 1 and falsely read dead) up to _MAX_ACTIVITY_PAGES.
+    Verdicts: a real message in-window -> active; a page that contained real but
+    out-of-window message(s) -> dead (history is newest-first across pages, so older
+    pages can't beat it); an all-system/empty page with no more history -> dead;
+    the page cap hit while still only seeing system events -> assume ACTIVE (fail
+    safe). Errors / missing / unparseable ts -> assume active (never flag a channel
+    dead on a read we can't trust).
+    Known limitation (pre-existing, accepted): conversations.history omits thread
+    replies, so a channel whose only recent activity is replies under an old parent
+    reads dead. The G-F human gate covers this on the archive list.
     """
     cutoff = time.time() - lookback_seconds
-    try:
-        resp = slack_client.conversations_history(channel=channel_id, limit=_ACTIVITY_PAGE)
-    except Exception as exc:
-        log.warning("conversations_history failed for %s: %s", channel_id, exc)
-        return True  # Assume active on error (don't flag as dead)
-    for msg in (resp.get("messages") or []):
-        if msg.get("subtype") in _SYSTEM_SUBTYPES:
-            continue
+    cursor: str | None = None
+    for _ in range(_MAX_ACTIVITY_PAGES):
+        kwargs: dict[str, Any] = {"channel": channel_id, "limit": _ACTIVITY_PAGE}
+        if cursor:
+            kwargs["cursor"] = cursor
         try:
-            return float(msg.get("ts", 0)) >= cutoff  # newest real message decides
-        except (TypeError, ValueError):
-            return True  # unparseable ts -> don't flag dead
-    return False  # no real message in the page -> dead
+            resp = slack_client.conversations_history(**kwargs)
+        except Exception as exc:
+            log.warning("conversations_history failed for %s: %s", channel_id, exc)
+            return True  # assume active on error (don't flag as dead)
+
+        saw_real = False
+        for msg in (resp.get("messages") or []):
+            if msg.get("subtype") in _SYSTEM_SUBTYPES:
+                continue
+            saw_real = True
+            ts = msg.get("ts")
+            if not ts:
+                return True  # a real message we can't time -> don't flag dead
+            try:
+                if float(ts) >= cutoff:
+                    return True  # real message within the window -> active
+            except (TypeError, ValueError):
+                return True  # unparseable ts -> don't flag dead
+            # real but out-of-window; keep scanning the page for an in-window one
+
+        if saw_real:
+            # Saw real message(s) but none in-window. History is newest-first across
+            # pages, so any further (older) page is also out-of-window -> dead.
+            return False
+        # Whole page was system-only / empty: look deeper only if more history exists.
+        if not resp.get("has_more"):
+            return False
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            return False
+    return True  # page cap hit, only system events seen -> assume active (fail safe)
 
 
 def _find_duplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -223,6 +262,7 @@ def _build_archive_candidates(
 def _build_sprawl_review(
     sprawl: list[dict[str, Any]],
     dead_ids: set[str],
+    exclude_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """INFORMATIONAL review list (NOT archive recommendations).
 
@@ -233,11 +273,16 @@ def _build_sprawl_review(
     #f3-production-run-2, #wikipedia-presence-*, ...). Surfaced so Harrison can scan
     them, never auto-recommended for archival. A dead-but-ROUTED sprawl channel
     (#llc-leadership) is excluded -- a real entity route means it was adopted.
+    `exclude_ids` (the archive-candidate ids) are dropped so a channel never appears
+    in BOTH the Archive-candidates and the Sprawl-review section of one post.
     """
+    exclude_ids = exclude_ids or set()
     return [
         {"id": s["id"], "name": s["name"]}
         for s in sprawl
-        if s["id"] in dead_ids and not entity_router.is_mapped(s["name"])
+        if s["id"] in dead_ids
+        and s["id"] not in exclude_ids
+        and not entity_router.is_mapped(s["name"])
     ]
 
 
@@ -336,18 +381,26 @@ def _write_full_list(
     duplicates: list[dict[str, Any]],
     sprawl: list[dict[str, Any]],
     archive_candidates: list[dict[str, Any]],
+    sprawl_review: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Write the complete signal lists to a dated file so the Slack post can stay a
     summary (audit N9). Returns the file path."""
+    sprawl_review = sprawl_review or []
     out_dir = _REPO_ROOT / "logs"
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"channel-health-{date.today().isoformat()}.md"
     out = [f"# Channel Health Report -- {date.today().isoformat()}", ""]
 
-    out.append(f"## Archive candidates (review before archiving) -- {len(archive_candidates)}")
+    out.append(f"## Archive candidates -- '-N' duplicate pairs only -- {len(archive_candidates)}")
     out.extend(f"- #{ch['name']} ({ch['id']}) -- {ch['reason']}" for ch in archive_candidates)
     out.append("")
-    out.append(f"## Dead channels (0 messages in {DEAD_WINDOW_DAYS}d) -- {len(dead_channels)}")
+    out.append(
+        f"## Sprawl review (Cora-created since 2026-06-03, dead + no route; "
+        f"INFORMATIONAL -- may be live-but-quiet workstreams) -- {len(sprawl_review)}"
+    )
+    out.extend(f"- #{ch['name']} ({ch['id']})" for ch in sprawl_review)
+    out.append("")
+    out.append(f"## Dead channels (no real message in {DEAD_WINDOW_DAYS}d) -- {len(dead_channels)}")
     out.extend(f"- #{ch['name']} ({ch['id']})" for ch in dead_channels)
     out.append("")
     out.append(f"## Unmapped channels (no route in channel-routing.yaml) -- {len(unmapped_channels)}")
@@ -357,7 +410,7 @@ def _write_full_list(
     out.extend(f"- #{ch['name']} ({ch['id']}) -- duplicate of #{ch['base']}" for ch in duplicates)
     out.append("")
     out.append(
-        f"## Cora-created since 2026-06-03 (sprawl; may be adopted -- confirm before archiving) "
+        f"## Cora-created since 2026-06-03 -- full set (superset of Sprawl review) "
         f"-- {len(sprawl)}"
     )
     out.extend(f"- #{ch['name']} ({ch['id']})" for ch in sprawl)
@@ -436,11 +489,14 @@ def run(dry_run: bool = False) -> dict[str, int]:
     sprawl = _find_sprawl_channels(channels)
     dead_ids = {d["id"] for d in dead_channels}
     archive_candidates = _build_archive_candidates(duplicates, dead_ids)
-    sprawl_review = _build_sprawl_review(sprawl, dead_ids)
+    sprawl_review = _build_sprawl_review(
+        sprawl, dead_ids, exclude_ids={c["id"] for c in archive_candidates}
+    )
 
     channels_checked = len(channels)
     full_path = _write_full_list(
-        dead_channels, unmapped_channels, duplicates, sprawl, archive_candidates
+        dead_channels, unmapped_channels, duplicates, sprawl, archive_candidates,
+        sprawl_review=sprawl_review,
     )
     report = build_report(
         channels_checked,

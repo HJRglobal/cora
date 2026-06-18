@@ -179,6 +179,27 @@ def test_sprawl_review_excludes_active():
     assert out == []
 
 
+def test_sprawl_review_excludes_archive_candidate_ids():
+    # Cross-dedup: a channel already an archive candidate must NOT also appear in
+    # the sprawl-review section of the same post.
+    sprawl = [{"id": "C7", "name": "mystery-2", "created": 0}]  # dead + unmapped
+    out = chm._build_sprawl_review(sprawl, dead_ids={"C7"}, exclude_ids={"C7"})
+    assert out == []
+
+
+def test_archive_candidates_both_dead_reason():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
+    out = chm._build_archive_candidates(dups, dead_ids={"C1", "C2"})
+    assert "both dead 30d" in out[0]["reason"]
+
+
+def test_archive_candidates_both_active_reason():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
+    out = chm._build_archive_candidates(dups, dead_ids=set())
+    assert "both active" in out[0]["reason"]
+    assert "review which to keep" in out[0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # _check_channel_activity -- newest NON-system message vs the 30d cutoff
 # ---------------------------------------------------------------------------
@@ -243,6 +264,63 @@ def test_check_channel_activity_error_returns_true():
 def test_check_channel_activity_unparseable_ts_returns_true():
     client = _hist({"text": "weird", "ts": "not-a-number"})
     assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_missing_ts_returns_true():
+    # MED/LOW fix: a real message with no ts -> can't time it -> assume active
+    # (was wrongly read DEAD by float(msg.get("ts", 0))).
+    client = _hist({"text": "no ts here"})
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_order_independent():
+    # Active verdict must not depend on ordering: an in-window real message anywhere
+    # in the page -> active, even if an older real message appears before it.
+    client = _hist(
+        {"text": "older", "ts": _ts(40)},
+        {"text": "recent", "ts": _ts(0.5)},
+    )
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_paginates_past_system_burst():
+    # MEDIUM fix: Cora's join automation can stack a full page of channel_join atop
+    # history; the real in-window message sits on page 2 and must still read active.
+    page1 = {
+        "messages": [{"subtype": "channel_join", "ts": _ts(2)} for _ in range(100)],
+        "has_more": True,
+        "response_metadata": {"next_cursor": "CUR2"},
+    }
+    page2 = {"messages": [{"text": "real recent", "ts": _ts(1)}]}
+    client = MagicMock()
+    client.conversations_history.side_effect = [page1, page2]
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+    assert client.conversations_history.call_count == 2
+
+
+def test_check_channel_activity_all_system_no_more_is_dead():
+    # All-system page with no further history -> genuinely dead.
+    page = {
+        "messages": [{"subtype": "channel_join", "ts": _ts(2)}],
+        "has_more": False,
+    }
+    client = MagicMock()
+    client.conversations_history.return_value = page
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is False
+
+
+def test_check_channel_activity_page_cap_fails_safe_active():
+    # Endless all-system pages -> hit the page cap -> assume ACTIVE (fail safe),
+    # never wrongly flag dead off a system-event wall.
+    page = {
+        "messages": [{"subtype": "channel_join", "ts": _ts(1)}],
+        "has_more": True,
+        "response_metadata": {"next_cursor": "CUR"},
+    }
+    client = MagicMock()
+    client.conversations_history.return_value = page
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+    assert client.conversations_history.call_count == chm._MAX_ACTIVITY_PAGES
 
 
 # ---------------------------------------------------------------------------
@@ -320,15 +398,35 @@ def test_write_full_list_renders_all_sections(tmp_path, monkeypatch):
         duplicates=[{"id": "C3", "name": "x-2", "base": "x", "base_id": "C9"}],
         sprawl=[{"id": "C4", "name": "sprawl1", "created": 0}],
         archive_candidates=[{"id": "C3", "name": "x-2", "reason": "duplicate of #x"}],
+        sprawl_review=[{"id": "C4", "name": "sprawl1"}],
     )
     text = path.read_text(encoding="utf-8")
     assert "Archive candidates" in text
+    assert "Sprawl review" in text
     assert "Dead channels" in text
     assert "Unmapped channels (no route in channel-routing.yaml)" in text
     assert "duplicate channels" in text
     assert "Cora-created since 2026-06-03" in text
     for name in ("dead1", "unmapped1", "x-2", "sprawl1"):
         assert name in text
+
+
+def test_write_full_list_archive_section_is_dups_only(tmp_path, monkeypatch):
+    # Slack/file parity: a sprawl-only channel must appear under the sprawl sections,
+    # NOT under the file's "Archive candidates" section (which is dups-only).
+    monkeypatch.setattr(chm, "_REPO_ROOT", tmp_path)
+    path = chm._write_full_list(
+        dead_channels=[{"id": "C4", "name": "sprawl-only"}],
+        unmapped_channels=[{"id": "C4", "name": "sprawl-only"}],
+        duplicates=[],
+        sprawl=[{"id": "C4", "name": "sprawl-only", "created": 0}],
+        archive_candidates=[],  # dups-only -> empty here
+        sprawl_review=[{"id": "C4", "name": "sprawl-only"}],
+    )
+    text = path.read_text(encoding="utf-8")
+    archive_section = text.split("## Sprawl review")[0]  # everything before sprawl-review
+    assert "sprawl-only" not in archive_section  # not recommended for archival
+    assert "sprawl-only" in text                  # but present in the review/sprawl sections
 
 
 def test_build_report_healthy_count():
