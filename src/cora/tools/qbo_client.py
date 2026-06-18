@@ -210,16 +210,26 @@ def get_profit_loss(
     start_date: str | None = None,
     end_date: str | None = None,
     class_ref: str | None = None,
+    accounting_method: str | None = None,
 ) -> dict[str, Any]:
     """Fetch ProfitAndLoss report. Defaults to last 30 days if dates omitted.
 
     For HJRP sub-properties (HJRP-1337, HJRP-1555), pass the entity code and
     the class_ref will be auto-resolved from _HJRP_CLASS_MAP. Alternatively
     pass class_ref explicitly to filter by a specific QBO class code.
+
+    accounting_method: "Accrual" or "Cash". When omitted (default), QBO renders
+    the report in each COMPANY's own default report basis -- which differs per
+    realm, so figures from different companies are not comparable. Pass an
+    explicit basis when comparing across realms (e.g. the OSN per-store digest
+    pins "Accrual" so all 4 stores are on the same basis and the label is true).
     """
     if not start_date or not end_date:
         start_date, end_date = _default_date_range(30)
     params: dict = {"start_date": start_date, "end_date": end_date, "minorversion": "65"}
+
+    if accounting_method:
+        params["accounting_method"] = accounting_method
 
     # Auto-resolve class for HJRP sub-property entities
     resolved_class = class_ref or _HJRP_CLASS_MAP.get(entity)
@@ -357,10 +367,12 @@ def extract_pnl_revenue(report: dict[str, Any]) -> float | None:
     for name, value in totals.items():
         if name.strip().lower() in ("income", "total income"):
             return _parse_money(value)
-    # Fallback: an income-ish section that is neither "Other Income" nor a net line.
+    # Fallback: an income-ish section that is neither "Other Income" nor the
+    # "Net Income" bottom line. Exclude "net income" as a phrase (not any "net"
+    # substring) so a legit "Net Sales Income"-style revenue line still matches.
     for name, value in totals.items():
         nl = name.strip().lower()
-        if "income" in nl and "other" not in nl and "net" not in nl:
+        if "income" in nl and "other" not in nl and not nl.startswith("net income"):
             return _parse_money(value)
     return None
 

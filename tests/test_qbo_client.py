@@ -239,6 +239,12 @@ class TestParseMoney:
     def test_lone_parens_is_none(self):
         assert _parse_money("()") is None
 
+    def test_zero_is_zero_not_none(self):
+        # Load-bearing: 0.0 (a real zero week) must be distinct from None (no data).
+        assert _parse_money("0.00") == 0.0
+        assert _parse_money("0.00") is not None
+        assert _parse_money("0") == 0.0
+
 
 # ── extract_pnl_revenue ─────────────────────────────────────────────────────────
 
@@ -282,6 +288,53 @@ class TestExtractPnlRevenue:
             _make_section_row("Other Income", "5000.00"),
         )
         assert extract_pnl_revenue(report) == 80000.0
+
+    def test_zero_income_returns_zero_not_none(self):
+        # A genuine zero-revenue week is kept (0.0), NOT dropped as "no data" (None).
+        report = _make_report(_make_section_row("Income", "0.00"))
+        r = extract_pnl_revenue(report)
+        assert r == 0.0
+        assert r is not None
+
+    def test_parens_negative_revenue_end_to_end(self):
+        report = _make_report(_make_section_row("Income", "(1,234.56)"))
+        assert extract_pnl_revenue(report) == -1234.56
+
+    def test_net_sales_income_matched_by_fallback(self):
+        # No exact "Income" section -> the fallback must still match a "Net Sales
+        # Income"-style revenue line (it must NOT be excluded as a "net" line).
+        report = _make_report(_make_section_row("Net Sales Income", "42000.00"))
+        assert extract_pnl_revenue(report) == 42000.0
+
+
+class TestGetProfitLossParams:
+    """get_profit_loss request-param assembly (no HTTP -- _request is patched)."""
+
+    def test_accounting_method_threaded(self):
+        import cora.tools.qbo_client as qc
+        captured = {}
+
+        def _fake(entity, path, params=None):
+            captured["entity"] = entity
+            captured["params"] = params
+            return {"Rows": {"Row": []}}
+
+        with patch.object(qc, "_request", side_effect=_fake):
+            qc.get_profit_loss("OSNGW", "2026-06-08", "2026-06-14", accounting_method="Accrual")
+        assert captured["entity"] == "OSNGW"
+        assert captured["params"]["accounting_method"] == "Accrual"
+
+    def test_accounting_method_omitted_by_default(self):
+        import cora.tools.qbo_client as qc
+        captured = {}
+
+        def _fake(entity, path, params=None):
+            captured["params"] = params
+            return {"Rows": {"Row": []}}
+
+        with patch.object(qc, "_request", side_effect=_fake):
+            qc.get_profit_loss("OSNGW", "2026-06-08", "2026-06-14")
+        assert "accounting_method" not in captured["params"]
 
 
 # ── _deep_link ────────────────────────────────────────────────────────────────

@@ -30,3 +30,18 @@ def test_no_clover_client_references_in_src_or_scripts():
     assert not offenders, (
         "clover_client is retired but still referenced by: " + ", ".join(sorted(offenders))
     )
+
+
+def test_no_clover_daily_summary_ps1_or_task_resurrected():
+    """No deployment/scripts .ps1 may re-register the retired Clover daily summary."""
+    offenders = []
+    for base in (_REPO / "deployment", _REPO / "scripts"):
+        if not base.exists():
+            continue
+        for path in base.rglob("*.ps1"):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if "run_clover_daily_summary" in text or "clover_client" in text:
+                offenders.append(str(path.relative_to(_REPO)))
+    assert not offenders, (
+        "Clover daily-summary task/script resurrected in: " + ", ".join(sorted(offenders))
+    )

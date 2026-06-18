@@ -38,6 +38,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 load_dotenv(_REPO_ROOT / ".env")
 
+import cora  # noqa: E402,F401 -- installs the egress sanitizer (cora/__init__.py) at module load
+
 LOG_DIR = _REPO_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 

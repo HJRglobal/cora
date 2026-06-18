@@ -130,7 +130,10 @@ def _fetch_week_revenue(start: str, end: str) -> dict[str, float]:
     out: dict[str, float] = {}
     for entity in _OSN_ENTITIES:
         try:
-            report = get_profit_loss(entity, start, end)
+            # Pin Accrual so all 4 stores are on the SAME basis (each is a separate
+            # QBO company with its own default report preference) and the digest's
+            # "accrual" label is actually true.
+            report = get_profit_loss(entity, start, end, accounting_method="Accrual")
         except QboClientError as exc:
             log.warning("P&L fetch failed for %s (%s..%s): %s", entity, start, end, exc)
             continue
@@ -146,11 +149,16 @@ def build_message(
     this_week: dict[str, float],
     last_week: dict[str, float],
     week_of: str,
+    missing: list[str] | None = None,
 ) -> str:
     """Build the DM text for Matt.
 
     this_week / last_week map entity code (OSNGW/OSNGM/OSNGF/OSNVV) -> revenue.
+    missing: store codes that returned no data this week (failed fetch / no Income
+    section). Surfaced explicitly so a partial-outage week is not mistaken for a
+    complete picture, and the total is flagged as covering only N of the stores.
     """
+    missing = missing or []
     stores: list[dict] = []
     for code, revenue in this_week.items():
         lw_rev = last_week.get(code, 0.0)
@@ -174,11 +182,16 @@ def build_message(
 
     lines.append("")
 
+    if missing:
+        names = ", ".join(_store_label(STORE_NAMES.get(c, c)) for c in missing)
+        lines.append(f":grey_question: *No data this week for:* {names} (will retry next run)")
+
     total_this = sum(s["revenue"] for s in stores)
     total_last = sum(last_week.get(s["store_code"], 0.0) for s in stores)
+    total_suffix = f" ({len(stores)} of {len(_OSN_ENTITIES)} stores)" if missing else ""
     lines.append(
         f"*Total for the week:* {_format_currency(total_this)} | "
-        f"WoW: {_format_wow(_calc_wow_pct(total_this, total_last))}"
+        f"WoW: {_format_wow(_calc_wow_pct(total_this, total_last))}{total_suffix}"
     )
 
     flagged = [s for s in stores if s["wow_pct"] is not None and s["wow_pct"] < WOW_FLAG_THRESHOLD]
@@ -230,7 +243,8 @@ def run(dry_run: bool = False, today: date | None = None) -> dict[str, int]:
 
     last_week = _fetch_week_revenue(prior_start, prior_end)
 
-    message = build_message(this_week, last_week, week_of)
+    missing = [code for code in _OSN_ENTITIES if code not in this_week]
+    message = build_message(this_week, last_week, week_of, missing=missing)
 
     slack_client = WebClient(token=bot_token)
     try:

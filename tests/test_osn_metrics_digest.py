@@ -140,7 +140,7 @@ def test_fetch_week_revenue_extracts_income():
         "OSNGF": _pnl(3000.0),
         "OSNVV": _pnl(2000.0),
     }
-    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en: reports[e]):
+    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en, **kw: reports[e]):
         out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
     assert out == {"OSNGW": 5000.0, "OSNGM": 4000.0, "OSNGF": 3000.0, "OSNVV": 2000.0}
 
@@ -152,14 +152,14 @@ def test_fetch_week_revenue_skips_store_with_no_income():
         "OSNGF": _pnl(3000.0),
         "OSNVV": _pnl(2000.0),
     }
-    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en: reports[e]):
+    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en, **kw: reports[e]):
         out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
     assert "OSNGM" not in out
     assert out == {"OSNGW": 5000.0, "OSNGF": 3000.0, "OSNVV": 2000.0}
 
 
 def test_fetch_week_revenue_skips_store_on_api_error():
-    def _se(entity, start, end):
+    def _se(entity, start, end, **kwargs):
         if entity == "OSNGM":
             raise osn.QboClientError("realm down")
         return _pnl(1000.0)
@@ -168,6 +168,30 @@ def test_fetch_week_revenue_skips_store_on_api_error():
         out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
     assert "OSNGM" not in out
     assert len(out) == 3
+
+
+def test_fetch_week_revenue_keeps_zero_revenue_store():
+    # A genuine zero-revenue week (0.0) is KEPT (contrast: no-income -> dropped).
+    reports = {
+        "OSNGW": _pnl(5000.0),
+        "OSNGM": _pnl(0.0),
+        "OSNGF": _pnl(3000.0),
+        "OSNVV": _pnl(2000.0),
+    }
+    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en, **kw: reports[e]):
+        out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
+    assert "OSNGM" in out
+    assert out["OSNGM"] == 0.0
+
+
+def test_fetch_week_revenue_pins_accrual():
+    mock = MagicMock(return_value=_pnl(1000.0))
+    with patch.object(osn, "get_profit_loss", mock):
+        osn._fetch_week_revenue("2026-06-08", "2026-06-14")
+    # Every store call pins Accrual so the 4 separate realms are on one basis.
+    assert mock.call_count == 4
+    for call in mock.call_args_list:
+        assert call.kwargs.get("accounting_method") == "Accrual"
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +250,28 @@ def test_build_message_labels_source_change():
 
 def test_build_message_is_source_opaque():
     msg = osn.build_message({"OSNGW": 4000.0}, {"OSNGW": 3000.0}, "2026-06-08").lower()
-    for banned in ("clover", "quickbooks", "qbo", "realm", "intuit"):
+    for banned in ("clover", "quickbooks", "qbo", "realm", "intuit", "merchant"):
         assert banned not in msg
+
+
+def test_build_message_surfaces_missing_stores_and_partial_total():
+    msg = osn.build_message(
+        {"OSNGW": 4000.0, "OSNGF": 3000.0}, {"OSNGW": 4000.0, "OSNGF": 3000.0},
+        "2026-06-08", missing=["OSNGM", "OSNVV"],
+    )
+    assert "No data this week for" in msg
+    assert "G & McKellips" in msg     # OSNGM display name
+    assert "Val Vista & Pecos" in msg  # OSNVV display name
+    assert "2 of 4 stores" in msg      # total flagged as partial
+
+
+def test_build_message_no_missing_line_when_complete():
+    msg = osn.build_message(
+        {"OSNGW": 4000.0}, {"OSNGW": 4000.0}, "2026-06-08", missing=[]
+    )
+    assert "No data this week for" not in msg
+    assert "of 4 stores" not in msg
+    assert "Total for the week:" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +323,26 @@ def test_run_no_stores_skips_dm(monkeypatch):
     client.conversations_open.assert_not_called()
     assert result["stores_fetched"] == 0
     assert result["error"] == 0
+
+
+def test_run_partial_outage_surfaces_missing(monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+
+    def _se(entity, start, end, **kw):
+        if entity == "OSNVV":
+            raise osn.QboClientError("realm down")
+        return _pnl(2000.0)
+
+    client = _mock_slack()
+    with patch.object(osn, "get_profit_loss", side_effect=_se), \
+         patch("slack_sdk.WebClient", return_value=client):
+        result = osn.run(dry_run=False, today=date(2026, 6, 15))
+
+    assert result["stores_fetched"] == 3  # 3 of 4 succeeded
+    sent = client.chat_postMessage.call_args.kwargs["text"]
+    assert "No data this week for" in sent
+    assert "Val Vista & Pecos" in sent   # the missing store is named
+    assert "3 of 4 stores" in sent        # total flagged partial
 
 
 def test_run_dm_failure_returns_error(monkeypatch):

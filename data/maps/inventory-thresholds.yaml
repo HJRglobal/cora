@@ -1,6 +1,10 @@
 # Inventory alert thresholds for Cora proactive reorder alerts.
-# alert_below: post alert when units_available falls below this number.
-# 7-day throttle per SKU/item to avoid spam.
+#
+# REFERENCE-ONLY as of 2026-06-17: NO code reads this file. The OSN section was
+# removed with the Clover retirement (Phase 3 item C), and the F3E pass keys off
+# the emoji flags hardcoded in cora.tools.inventory_client.get_f3e_inventory_pulse_text
+# (see the emoji legend below), not this YAML. Kept as documentation of those
+# thresholds; wire it back in if the F3E pass ever moves to data-driven thresholds.
 
 f3e:
   # F3E SKU thresholds (cases). Matched against inventory pulse text flags (emoji).
