@@ -609,16 +609,29 @@ def _parse_mcp_body(response: httpx.Response) -> dict:
         or "\ndata:" in text
     )
     if is_sse:
-        obj = None
+        # A streamable-HTTP response may carry multiple SSE events (e.g. a
+        # notifications/progress event before/after the actual result). Return
+        # the JSON-RPC RESPONSE object -- the chunk bearing 'result' or 'error'
+        # -- not merely the last parsable chunk; progress notifications carry
+        # 'method'/'params' and are correctly skipped. Fall back to the last
+        # parsable object only if none looks like a response.
+        response_obj = None
+        last_parsable = None
         for line in text.splitlines():
             stripped = line.strip()
-            if stripped.startswith("data:"):
-                chunk = stripped[len("data:"):].strip()
-                if chunk and chunk != "[DONE]":
-                    try:
-                        obj = json.loads(chunk)
-                    except json.JSONDecodeError:
-                        continue
+            if not stripped.startswith("data:"):
+                continue
+            chunk = stripped[len("data:"):].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            last_parsable = parsed
+            if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+                response_obj = parsed
+        obj = response_obj if response_obj is not None else last_parsable
         if obj is None:
             raise PolarConnectorError("Could not parse Polar MCP SSE response.")
         return obj

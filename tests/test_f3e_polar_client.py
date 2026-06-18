@@ -990,3 +990,73 @@ class TestMcpTransport:
         with pytest.raises(PolarConnectorError, match="conversation_id"):
             self._run(server, monkeypatch)
         assert server.counts["generate_report"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Category 13 — MCP SSE parsing (multi-event streamable HTTP)
+# ---------------------------------------------------------------------------
+
+def _multi_sse_response(objs) -> MagicMock:
+    m = MagicMock()
+    m.status_code = 200
+    m.headers = {"content-type": "text/event-stream"}
+    m.text = "".join("event: message\ndata: " + json.dumps(o) + "\n\n" for o in objs)
+    return m
+
+
+class TestMcpSseParsing:
+    """_parse_mcp_body returns the JSON-RPC response (result/error) event, not
+    merely the last data: chunk -- the MCP transport may interleave progress
+    notifications with the result."""
+
+    def test_picks_result_after_progress_notification(self):
+        notif = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1}}
+        result = {"jsonrpc": "2.0", "id": 3, "result": {"structuredContent": {"query_id": "q"}}}
+        obj = polar_client._parse_mcp_body(_multi_sse_response([notif, result]))
+        assert obj.get("id") == 3 and "result" in obj
+
+    def test_picks_result_before_trailing_notification(self):
+        result = {"jsonrpc": "2.0", "id": 3, "result": {"structuredContent": {"query_id": "q"}}}
+        notif = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 2}}
+        obj = polar_client._parse_mcp_body(_multi_sse_response([result, notif]))
+        assert obj.get("id") == 3 and "result" in obj
+
+    def test_error_event_preferred_over_notifications(self):
+        notif = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}
+        err = {"jsonrpc": "2.0", "id": 3, "error": {"code": -32000, "message": "boom"}}
+        obj = polar_client._parse_mcp_body(_multi_sse_response([notif, err]))
+        assert "error" in obj
+
+    def test_falls_back_to_last_when_no_response_object(self):
+        n1 = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"p": 1}}
+        n2 = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"p": 2}}
+        obj = polar_client._parse_mcp_body(_multi_sse_response([n1, n2]))
+        assert obj["params"]["p"] == 2
+
+    def test_generate_report_survives_interleaved_progress(self, monkeypatch):
+        """End-to-end: a progress notification before the result must not break
+        the report parse."""
+        _clear_all()
+        progress = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 0.5}}
+
+        def post(url, headers=None, json=None, **kw):
+            body = json or {}
+            method = body.get("method")
+            if method == "initialize":
+                return _sse_response({"jsonrpc": "2.0", "id": body.get("id"),
+                                      "result": {"protocolVersion": "2025-06-18", "capabilities": {}}})
+            if method == "notifications/initialized":
+                return _accepted_response()
+            name = body["params"]["name"]
+            cid = body.get("id")
+            if name == "get_context":
+                return _multi_sse_response([progress, _tool_result_obj(
+                    cid, structured={"conversation_id": "conv_x"})])
+            return _multi_sse_response([progress, _tool_result_obj(cid, structured=_MCP_REPORT)])
+
+        _mcp_env(monkeypatch)
+        with patch("src.cora.connectors.polar_client.httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.post.side_effect = post
+            result = generate_report(["total_marketing_spend"], [], "2026-05-19", "2026-06-17")
+        assert isinstance(result, PolarReport)
+        assert result.query_id == "qid_mcp"
