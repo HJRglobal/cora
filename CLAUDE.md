@@ -8,6 +8,33 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ## TOP OF MIND (TOM)
 
+### [SHIPPED] 2026-06-17 Forensic rebuild PHASE 3 -- MOSTLY COMPLETE + LIVE (main @ `3ac4656`, suite 4581; C + 3.1 remain)
+
+Phase-3 quick-win + egress-completeness + PHI-hardening, twice-adversarially-reviewed (D-051), LIVE + merged across two cycles. `main` = `origin/main` = `3ac4656`; suite 4500 -> 4581.
+
+SHIPPED + LIVE:
+- **B6** (`9156759`) -- `apply_known_answer` idempotent (resolved-ledger short-circuit + line-anchored content-dedup); closes the auto-approve crash-recovery dup-write. (B7 verified DOES-NOT-HOLD -- `proposed_action` is audit-file-only.)
+- **B2** (`5dcdbea` + `801486d`) -- stripped QBO source-branding + the intuit deep-link from the 5 `format_*_for_llm` AND the 5 QBO tool descriptions; added `*.intuit.com` to `_BARE_DOC_URL_RE` (egress + format_reply). Verbatim finance replies are now source-opaque.
+- **B0** (`b33c84d`, GREEN-LIT) -- Drive document-PATH redactor in `reply_formatter.format_reply` (conversational-only).
+- **B3** (`c04c5ad`) -- `AsyncWebClient.__init__` construction guard (defense-in-depth; no-op when aiohttp absent).
+- **B1** (`066271a` + `801486d`) -- 12 raw-HTTP Slack senders + 6 WebClient-bypass scripts (`capture_decisions` / `post_gap_digest_slack` / `run_feedback_health_report` / `notify_contributors` / `send_approver_onboarding_dms` / `run_project_channel_sync` -- import no `cora` module, so the class-level patch never installs in-process) routed through `slack_egress.sanitize_text`; `tests/test_no_raw_slack_post.py` CI guard (2 rules).
+- **B5 (b)** -- `phi_guard.redact_cue_adjacent_names` wired into `context_loader._apply_lex_phi_scrub` (retrieval-only; meeting-capture path untouched). Two passes: care-noun-governed (any-case) + Title-case within 120 chars of a cue (guarded against cue-words/verbs/staff-names/nicknames). +21 tests; re-review SHIP-READY (one LOW non-governed-ALLCAPS residual accepted -- access controls + 2.3 title-neutralization are primary).
+- **3.2** (`c924091`) -- `tests/test_channel_sweep.py` + constant rename. The two `list_joined_channels` differ INTENTIONALLY (public-only synthesis vs all-types KB) -> deliberately NOT merged.
+- **3.3** (`2e21208` + `801486d`) -- `qbo_token_status.py` -> `evaluate()`+`main()` exit-code + `--alert` 11-realm monitor; REGISTERED LIVE (daily 06:50 AZ, Limited runlevel, test-fired clean). VERIFY-FIRST: all 11 realms valid (~100d) -- the "only F3E live" framing was wrong.
+- **#5** -- `nightly_health_check.check_qbo_monitor()` WARNs if the monitor is missing or hasn't fired in >36h. Activates at the next 8:45am health-check fire.
+- **3.4** -- staged Slack-archive list (`2026-06-17_fndr_cora-slack-archive-staged.md`); Harrison executes the archives (gate G-F).
+- **B4** -- QuickBooks attribution accepted as prompt-enforced (no code; B2 + the intuit allowlist code-redact the link/branding; the bare word "QuickBooks" stays prompt-governed). F-19 = prompt-enforced.
+
+**Two D-051 adversarial reviews caught real bugs the green suite hid:** an 8-agent branch review found a HIGH ReDoS in `_DRIVE_PATH_RE` (nested quantifier over a `/`-delimited string, ~40s freeze on a long path-shaped reply -> exclude `/` from the inner class + regression test), the B1 WebClient-bypass class (the strengthened guard found a 6th sender), B2's stale tool descriptions re-priming a QBO link, and B6 line-anchoring; then B5's own focused 3-agent review found the first single-sweep version wrong in BOTH directions (leaked admin-cue/ALLCAPS names + shredded verbs/dates/articles) -> rebuilt two-pass, re-review SHIP-READY. All fixed before each restart.
+
+**Cycle map:** Cycle 1 (restart heartbeat 22:24:53Z -> merge `0d45115..0433e00`) activated B6/B2/B0+intuit/B3/B1-fireflies; Cycle 2 (restart 23:12:52Z -> merge `0433e00..3ac4656`) activated B5. `main` = `3ac4656`. All bot-loaded + reviewed Phase-3 work is LIVE + DR-baselined.
+
+**REMAINING (decision-locked, NOT built):**
+- **C** -- rebuild `run_osn_metrics_digest.py` on QBO per-store P&L (OSNGW/OSNGM/OSNGF/OSNVV -> revenue + WoW; DROP transaction-count/AOV; label the source change vs Clover) + strip the OSN/Clover pass from `run_inventory_alerts.py` (KEEP F3E) + delete `clover_client.py` / `run_clover_daily_summary.py` / their tests / the clover-summary task `.ps1` + fix the stale `shopify_client.py:10` docstring + add an `import cora.connectors.clover_client raises` regression. Sequence the deletes so the suite stays green at each commit. WARNING: OSN per-SKU inventory alerts have NO QBO equivalent (lost with Clover unless a replacement POS source is named). VERIFY-FIRST: both Clover-importing tasks run clean/no-op today (OSN output silently dead since the Clover retirement; they do not error).
+- **3.1** -- KB retention (keyed on `ingested_at`, gmail+drive only) + int8 vector quantization (new `knowledge_vec_i8` table + recall-guard >=0.80 before the irreversible f32 drop). Host size/latency lever; dedicated session off the 02:00-06:30 sync window. Pickup prompt staged at `_shared/projects/cora/2026-06-17_fndr_cora-code-prompt-phase3-C-and-31.md`.
+
+**Doctrines (D-051):** a regex bare-name redactor over free prose is caught between over/under-redaction -> scope to care-noun-governance + cue-proximity-with-guards (access controls are primary); a WebClient sender in a process that imports no `cora` module bypasses the class-level egress patch (sanitize explicitly or import `cora`; the CI guard enforces both); a nested-quantifier regex over a delimiter-rich string is a ReDoS (exclude the delimiter from the inner class). Full record: `_shared/projects/cora/2026-06-16_fndr_cora-rebuild-execution-log.md` (PHASE 3 section).
+
 ### [SHIPPED] 2026-06-13 6/13-sweep fixes -- B1 stagger (done), B3 grounding + B4 reply-formatter + D1 info-for-cora intake (B4/D1 RESTART PENDING)
 
 From the 2026-06-13 sweep audit, in three batches (all on origin/main, HEAD `3bc2788`):
