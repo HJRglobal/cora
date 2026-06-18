@@ -1,6 +1,6 @@
 """Unit tests for entity_router.route()."""
 
-from cora.entity_router import route
+from cora.entity_router import is_mapped, matched_pattern, route
 
 
 # --- F3 Energy ---
@@ -186,3 +186,57 @@ def test_random_channel_defaults_to_fndr():
 
 def test_unknown_channel_defaults_to_fndr():
     assert route("some-unknown-channel-xyz") == "FNDR"
+
+
+# --- matched_pattern() / is_mapped() ---
+
+
+def test_matched_pattern_explicit_route():
+    """A real entity channel returns its own pattern, not the catch-all."""
+    assert matched_pattern("osn-leadership") == "osn-*"
+
+
+def test_matched_pattern_bare_entity():
+    assert matched_pattern("f3e") == "f3e"
+
+
+def test_matched_pattern_catchall_for_unknown():
+    """A channel with no dedicated route matches only the trailing '*' catch-all."""
+    assert matched_pattern("mystery-channel-xyz") == "*"
+
+
+def test_is_mapped_true_for_routed_entity_channels():
+    # Operational / sub channels that are well-routed but absent from
+    # entity-channels.yaml -- the false-positive class the old monitor over-reported.
+    for name in (
+        "osn-recon-pilot",
+        "f3-pure-launch",
+        "bdm-osn",
+        "llc-operations",
+        "rogers-ranch-bookings",
+        "polar-metrics",
+        "clover-daily",
+    ):
+        assert is_mapped(name) is True, name
+
+
+def test_is_mapped_true_for_explicit_fndr_and_silent_channels():
+    """Explicit FNDR/HJRG + silent feed channels resolve to FNDR but ARE mapped."""
+    for name in ("hjrg-leadership", "fndr", "fndr-general", "asana-feed", "general-do-not-use"):
+        assert is_mapped(name) is True, name
+
+
+def test_is_mapped_false_for_catchall_only():
+    """Channels matching only the '*' catch-all are unmapped (no dedicated route)."""
+    for name in ("mystery-channel", "some-unknown-channel-xyz", "random-2026-thing"):
+        assert is_mapped(name) is False, name
+
+
+def test_is_mapped_never_diverges_from_route_catchall():
+    """is_mapped() False <=> route() reached the catch-all (not an explicit FNDR rule)."""
+    # Unmapped -> route still returns FNDR (catch-all), but is_mapped is False.
+    assert route("totally-unknown-zzz") == "FNDR"
+    assert is_mapped("totally-unknown-zzz") is False
+    # Explicit FNDR -> route returns FNDR AND is_mapped is True.
+    assert route("hjrg") == "FNDR"
+    assert is_mapped("hjrg") is True
