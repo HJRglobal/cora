@@ -113,12 +113,12 @@ def test_find_sprawl_skips_missing_metadata():
 
 
 # ---------------------------------------------------------------------------
-# _build_archive_candidates
+# _build_archive_candidates -- "-N" duplicate pairs ONLY (sprawl is demoted)
 # ---------------------------------------------------------------------------
 
 def test_archive_candidates_include_duplicates():
     dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
-    out = chm._build_archive_candidates(dups, [], dead_ids=set())
+    out = chm._build_archive_candidates(dups, dead_ids=set())
     assert len(out) == 1
     assert out[0]["id"] == "C2"
     assert "duplicate of #osn" in out[0]["reason"]
@@ -127,7 +127,7 @@ def test_archive_candidates_include_duplicates():
 def test_archive_candidates_dead_dup_active_base():
     # The '-N' dup is the dead one -> candidate is the dup; line names #osn active.
     dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
-    out = chm._build_archive_candidates(dups, [], dead_ids={"C2"})
+    out = chm._build_archive_candidates(dups, dead_ids={"C2"})
     assert out[0]["id"] == "C2"
     assert "dead 30d" in out[0]["reason"]
     assert "#osn active" in out[0]["reason"]
@@ -137,63 +137,112 @@ def test_archive_candidates_inverted_dead_base_active_dup():
     # CONFIRMED MEDIUM fix: team migrated TO #osn-2; #osn (base) is the dead one.
     # The candidate must be the ABANDONED ORIGINAL #osn, NOT the live #osn-2.
     dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
-    out = chm._build_archive_candidates(dups, [], dead_ids={"C1"})
+    out = chm._build_archive_candidates(dups, dead_ids={"C1"})
     assert out[0]["id"] == "C1"            # the dead original, not the live dup
     assert out[0]["name"] == "osn"
     assert "abandoned original" in out[0]["reason"]
     assert "#osn-2" in out[0]["reason"]    # names the live one so it can't mislead
 
 
-def test_archive_candidates_include_dead_unmapped_sprawl_only():
+def test_archive_candidates_exclude_sprawl():
+    # Sprawl is NO LONGER an archive candidate -- duplicates only.
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
+    out = chm._build_archive_candidates(dups, dead_ids=set())
+    assert [c["id"] for c in out] == ["C2"]
+
+
+# ---------------------------------------------------------------------------
+# _build_sprawl_review -- INFORMATIONAL (dead + unmapped Cora-created sprawl)
+# ---------------------------------------------------------------------------
+
+def test_sprawl_review_includes_dead_unmapped():
     sprawl = [
-        {"id": "C3", "name": "events-mood", "created": 0},     # dead + unmapped -> candidate
-        {"id": "C4", "name": "events-pure", "created": 0},     # active -> excluded
+        {"id": "C3", "name": "events-mood", "created": 0},   # dead + unmapped -> review
+        {"id": "C4", "name": "events-pure", "created": 0},   # active -> excluded
     ]
-    out = chm._build_archive_candidates([], sprawl, dead_ids={"C3"})
+    out = chm._build_sprawl_review(sprawl, dead_ids={"C3"})
     assert [c["id"] for c in out] == ["C3"]
-    assert "sprawl" in out[0]["reason"]
+    assert out[0]["name"] == "events-mood"
 
 
-def test_archive_candidates_exclude_dead_but_routed_sprawl():
-    # A Cora-created leadership channel (real entity route) that simply went quiet
-    # must NOT be promoted to an archive candidate, even when dead.
+def test_sprawl_review_excludes_dead_but_routed():
+    # A Cora-created leadership channel (real entity route) that went quiet must NOT
+    # appear -- a route means it was adopted for real work.
     sprawl = [{"id": "C5", "name": "llc-leadership", "created": 0}]
-    out = chm._build_archive_candidates([], sprawl, dead_ids={"C5"})
+    out = chm._build_sprawl_review(sprawl, dead_ids={"C5"})
     assert out == []
 
 
-def test_archive_candidates_dedup_dup_and_sprawl():
-    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
-    sprawl = [{"id": "C2", "name": "osn-2", "created": 0}]
-    out = chm._build_archive_candidates(dups, sprawl, dead_ids={"C2"})
-    assert [c["id"] for c in out] == ["C2"]  # appears once, as the duplicate
+def test_sprawl_review_excludes_active():
+    sprawl = [{"id": "C6", "name": "tucson-site-launch", "created": 0}]
+    out = chm._build_sprawl_review(sprawl, dead_ids=set())
+    assert out == []
 
 
 # ---------------------------------------------------------------------------
-# _check_channel_activity
+# _check_channel_activity -- newest NON-system message vs the 30d cutoff
 # ---------------------------------------------------------------------------
 
-def test_check_channel_activity_active():
-    mock_client = MagicMock()
-    mock_client.conversations_history.return_value = {
-        "messages": [{"text": "hello", "ts": "1234"}]
-    }
-    result = chm._check_channel_activity(mock_client, "C0B123", 30 * 86400)
-    assert result is True
+def _ts(days_ago: float) -> str:
+    import time
+    return str(time.time() - days_ago * 86400)
 
 
-def test_check_channel_activity_dead():
-    mock_client = MagicMock()
-    mock_client.conversations_history.return_value = {"messages": []}
-    result = chm._check_channel_activity(mock_client, "C0B123", 30 * 86400)
-    assert result is False
+def _hist(*messages):
+    mock = MagicMock()
+    mock.conversations_history.return_value = {"messages": list(messages)}
+    return mock
+
+
+def test_check_channel_activity_recent_real_message_active():
+    client = _hist({"text": "hi", "ts": _ts(0.5)})
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_old_real_message_dead():
+    client = _hist({"text": "stale", "ts": _ts(40)})
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is False
+
+
+def test_check_channel_activity_recent_join_old_real_is_dead():
+    # The #bdm case proved live: newest entry is a channel_join (recent), but the
+    # newest REAL message is 40d old -> dead. System events must not count.
+    client = _hist(
+        {"subtype": "channel_join", "ts": _ts(18)},
+        {"text": "last real post", "ts": _ts(40)},
+    )
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is False
+
+
+def test_check_channel_activity_skips_system_to_recent_real():
+    client = _hist(
+        {"subtype": "channel_join", "ts": _ts(2)},
+        {"text": "recent real", "ts": _ts(3)},
+    )
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_only_system_messages_dead():
+    client = _hist(
+        {"subtype": "channel_join", "ts": _ts(1)},
+        {"subtype": "channel_purpose", "ts": _ts(1)},
+    )
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is False
+
+
+def test_check_channel_activity_empty_dead():
+    assert chm._check_channel_activity(_hist(), "C0B123", 30 * 86400) is False
 
 
 def test_check_channel_activity_error_returns_true():
-    mock_client = MagicMock()
-    mock_client.conversations_history.side_effect = Exception("API error")
-    result = chm._check_channel_activity(mock_client, "C0B123", 30 * 86400)
-    assert result is True  # assume active on error
+    client = MagicMock()
+    client.conversations_history.side_effect = Exception("API error")
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
+
+
+def test_check_channel_activity_unparseable_ts_returns_true():
+    client = _hist({"text": "weird", "ts": "not-a-number"})
+    assert chm._check_channel_activity(client, "C0B123", 30 * 86400) is True
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +286,21 @@ def test_build_report_lists_archive_candidates():
 def test_build_report_no_archive_candidates():
     report = chm.build_report(10, [], [])
     assert "Archive candidates:* none" in report
+
+
+def test_build_report_lists_sprawl_review():
+    review = [{"id": "C0BSPR", "name": "tucson-site-launch"}]
+    report = chm.build_report(10, [], [], sprawl_review=review)
+    assert "Sprawl review" in report
+    assert "NOT archive recommendations" in report
+    assert "tucson-site-launch" in report
+
+
+def test_build_report_no_sprawl_review_section_when_empty():
+    # An empty sprawl-review must NOT add a header (keeps the weekly post tight).
+    report = chm.build_report(10, [], [])
+    assert "Sprawl review" not in report
+    assert "0 sprawl-review" in report  # but the summary line still reports the count
 
 
 def test_build_report_caps_archive_candidates():
@@ -312,7 +376,10 @@ def test_run_no_token_returns_early(monkeypatch):
     result = chm.run(dry_run=True)
     assert result == chm._zero_result()
     # uniform 6-key shape on every path (no KeyError for a future consumer)
-    assert set(result) == {"channels_checked", "dead", "missing", "duplicates", "sprawl", "archive_candidates"}
+    assert set(result) == {
+        "channels_checked", "dead", "missing", "duplicates",
+        "sprawl", "archive_candidates", "sprawl_review",
+    }
 
 
 def test_run_dry_run_no_post(monkeypatch):
@@ -420,8 +487,9 @@ def test_run_excludes_denied_channels(monkeypatch):
 
 
 def test_run_integration_duplicates_sprawl_archive(monkeypatch):
-    # End-to-end wiring inside run(): a base+'-2' pair and a Cora-created dead
-    # unmapped channel must flow into duplicates / sprawl / archive_candidates.
+    # End-to-end wiring inside run(): a base+'-2' pair feeds archive_candidates;
+    # a Cora-created dead unmapped channel feeds the INFORMATIONAL sprawl_review
+    # (NOT archive_candidates -- the post-merge demote).
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     after = _after_cutoff()
     channels = [
@@ -444,4 +512,5 @@ def test_run_integration_duplicates_sprawl_archive(monkeypatch):
     assert result["channels_checked"] == 3
     assert result["duplicates"] == 1          # retail-portfolio-2
     assert result["sprawl"] == 1              # events-mood
-    assert result["archive_candidates"] == 2  # dead dup + dead unmapped sprawl
+    assert result["archive_candidates"] == 1  # the dup pair only
+    assert result["sprawl_review"] == 1       # events-mood (dead + unmapped, informational)

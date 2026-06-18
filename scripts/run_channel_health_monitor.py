@@ -73,25 +73,55 @@ SPRAWL_CUTOFF_EPOCH = SPRAWL_CUTOFF.timestamp()
 # on the final digit) are never matched. Linear regex (no nested quantifier).
 _DUP_SUFFIX_RE = re.compile(r"^(?P<base>.+)-[2-9]$")
 
+# How many recent messages to scan when deciding activity (enough to skip a burst
+# of system events at the top of a channel's history).
+_ACTIVITY_PAGE = 30
+
+# conversations.history message subtypes that are SYSTEM events, not real content.
+# A channel whose only recent entry is one of these (e.g. a member joining) is
+# effectively dead -- so these do NOT count as activity (the #bdm case: newest
+# message is a channel_join, newest real message is 38d old -> dead).
+_SYSTEM_SUBTYPES = frozenset({
+    "channel_join", "channel_leave", "channel_topic", "channel_purpose",
+    "channel_name", "channel_archive", "channel_unarchive",
+    "channel_posting_permissions", "group_join", "group_leave", "group_topic",
+    "group_purpose", "group_name", "bot_add", "bot_remove", "bot_disable",
+    "bot_enable", "pinned_item", "unpinned_item",
+})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _check_channel_activity(slack_client, channel_id: str, lookback_seconds: int) -> bool:
-    """Return True if channel has at least 1 message in the lookback window."""
+    """Return True if the channel has a real (non-system) message within the window.
+
+    Fetches one page of recent history (newest first) and uses the newest message
+    that is NOT a system event (join/leave/topic/purpose/etc.), comparing its ts to
+    the cutoff. This avoids two failure modes proved live 2026-06-17:
+      - the conversations.history `oldest`-without-`latest` + small-`limit` quirk
+        returned an EMPTY page even for active channels (#cora-build had a same-day
+        message yet read "0 in 30d") -> the ~10x dead over-report;
+      - counting a `channel_join`/system event as activity would mask a genuinely
+        abandoned channel whose only recent entry is a join (#bdm).
+    Errors -> assume active (never flag a channel dead because the API failed).
+    A page of only system events (or empty) -> dead.
+    """
+    cutoff = time.time() - lookback_seconds
     try:
-        oldest = time.time() - lookback_seconds
-        resp = slack_client.conversations_history(
-            channel=channel_id,
-            limit=1,
-            oldest=str(oldest),
-        )
-        messages = resp.get("messages", [])
-        return len(messages) > 0
+        resp = slack_client.conversations_history(channel=channel_id, limit=_ACTIVITY_PAGE)
     except Exception as exc:
         log.warning("conversations_history failed for %s: %s", channel_id, exc)
         return True  # Assume active on error (don't flag as dead)
+    for msg in (resp.get("messages") or []):
+        if msg.get("subtype") in _SYSTEM_SUBTYPES:
+            continue
+        try:
+            return float(msg.get("ts", 0)) >= cutoff  # newest real message decides
+        except (TypeError, ValueError):
+            return True  # unparseable ts -> don't flag dead
+    return False  # no real message in the page -> dead
 
 
 def _find_duplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -141,22 +171,21 @@ def _find_sprawl_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def _build_archive_candidates(
     duplicates: list[dict[str, Any]],
-    sprawl: list[dict[str, Any]],
     dead_ids: set[str],
 ) -> list[dict[str, Any]]:
-    """High-confidence archive candidates for the self-staging report (gate G-F).
+    """HIGH-CONFIDENCE archive candidates -- "-N" duplicate pairs ONLY.
 
-    Conservative on purpose -- this feeds an automated weekly post, so it must not
-    cry wolf and must never point Harrison at a LIVE channel:
-      - "-N" duplicate pairs: the archive target is whichever member is dead. If the
-        ORIGINAL (#osn) is dead and the '-N' (#osn-2) is live, the team migrated TO
-        the '-N' -- so the candidate is the ORIGINAL, not the live '-N'. The reason
-        always carries both members' status so the line can't be read as
-        "archive the active one."
-      - sprawl channels that are dead AND have no dedicated entity route (a routed
-        channel like #llc-leadership was adopted for real work, even if quiet -- so
-        a dead-but-routed sprawl channel is NOT promoted to a candidate).
-    Deduped by id.
+    A `<base>-N` channel whose base also exists is structurally redundant; that's
+    a reliable signal. (The noisier "Cora-created sprawl" set is demoted to an
+    INFORMATIONAL review list -- see `_build_sprawl_review` -- because many such
+    channels are live workstreams that are merely Slack-quiet.)
+
+    Must never point Harrison at a LIVE channel: the candidate is whichever member
+    of the pair is dead. If the ORIGINAL (#osn) is dead and the '-N' (#osn-2) is
+    live, the team migrated TO the '-N' -> the candidate is the ORIGINAL, not the
+    live '-N'. The reason always carries both members' status so the line can't be
+    read as "archive the active one." Deduped by id. Cora never archives -- gate G-F,
+    Harrison executes every archive.
     """
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -185,17 +214,31 @@ def _build_archive_candidates(
             elif dup_dead:
                 status = f"this '-N' dup dead {DEAD_WINDOW_DAYS}d, #{d['base']} active"
             else:
-                status = f"both active -- review which to keep"
+                status = "both active -- review which to keep"
             _add(d["id"], d["name"], f"duplicate of #{d['base']} ({status})")
 
-    for s in sprawl:
-        if s["id"] not in dead_ids or entity_router.is_mapped(s["name"]):
-            continue
-        _add(
-            s["id"], s["name"],
-            f"Cora-created 2026-06-03 sprawl, dead {DEAD_WINDOW_DAYS}d, no entity route",
-        )
     return candidates
+
+
+def _build_sprawl_review(
+    sprawl: list[dict[str, Any]],
+    dead_ids: set[str],
+) -> list[dict[str, Any]]:
+    """INFORMATIONAL review list (NOT archive recommendations).
+
+    Channels the Cora bot created on/after the 2026-06-03 sprawl date that are now
+    dead AND have no entity route. Demoted from "archive candidate" to "review"
+    because many are LIVE workstreams that are merely Slack-quiet -- the work lives
+    in Cowork/Asana/Drive, not Slack (#tiktok-shop-build, #tucson-site-launch,
+    #f3-production-run-2, #wikipedia-presence-*, ...). Surfaced so Harrison can scan
+    them, never auto-recommended for archival. A dead-but-ROUTED sprawl channel
+    (#llc-leadership) is excluded -- a real entity route means it was adopted.
+    """
+    return [
+        {"id": s["id"], "name": s["name"]}
+        for s in sprawl
+        if s["id"] in dead_ids and not entity_router.is_mapped(s["name"])
+    ]
 
 
 def build_report(
@@ -203,6 +246,7 @@ def build_report(
     dead_channels: list[dict[str, Any]],
     unmapped_channels: list[dict[str, Any]],
     archive_candidates: list[dict[str, Any]] | None = None,
+    sprawl_review: list[dict[str, Any]] | None = None,
     full_report_path: str | None = None,
 ) -> str:
     """Build the Slack message for the health report.
@@ -212,13 +256,15 @@ def build_report(
     file and referenced here instead of dumped.
     """
     archive_candidates = archive_candidates or []
+    sprawl_review = sprawl_review or []
     today = date.today().isoformat()
     lines = [f":health: *Channel Health Report -- {today}*", ""]
 
     def _section(items, header_active, header_empty, suffix):
         if not items:
-            lines.append(header_empty)
-            lines.append("")
+            if header_empty:  # blank header_empty -> omit the section entirely
+                lines.append(header_empty)
+                lines.append("")
             return
         lines.append(header_active)
         for ch in items[:_PREVIEW_N]:
@@ -263,13 +309,22 @@ def build_report(
         ":question: *Unmapped channels:* none -- every joined channel has an entity route",
         "add a route to design/channel-routing.yaml",
     )
+    _section(
+        sprawl_review,
+        f":eyes: *Sprawl review -- Cora-created since 2026-06-03, dead + no route "
+        f"(may be live-but-quiet workstreams; NOT archive recommendations) -- "
+        f"{len(sprawl_review)} total:*",
+        "",  # nothing printed when empty (keeps the post tight)
+        "review -- confirm unused before archiving",
+    )
 
     healthy = checked - len(dead_channels)
     lines.append(
         f":white_check_mark: {healthy} channels healthy | "
         f"{len(dead_channels)} dead | "
         f"{len(unmapped_channels)} unmapped | "
-        f"{len(archive_candidates)} archive candidates"
+        f"{len(archive_candidates)} archive candidates | "
+        f"{len(sprawl_review)} sprawl-review"
     )
 
     return "\n".join(lines)
@@ -325,6 +380,7 @@ def _zero_result() -> dict[str, int]:
         "duplicates": 0,
         "sprawl": 0,
         "archive_candidates": 0,
+        "sprawl_review": 0,
     }
 
 
@@ -379,7 +435,8 @@ def run(dry_run: bool = False) -> dict[str, int]:
     duplicates = _find_duplicate_channels(channels)
     sprawl = _find_sprawl_channels(channels)
     dead_ids = {d["id"] for d in dead_channels}
-    archive_candidates = _build_archive_candidates(duplicates, sprawl, dead_ids)
+    archive_candidates = _build_archive_candidates(duplicates, dead_ids)
+    sprawl_review = _build_sprawl_review(sprawl, dead_ids)
 
     channels_checked = len(channels)
     full_path = _write_full_list(
@@ -390,6 +447,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
         dead_channels,
         unmapped_channels,
         archive_candidates=archive_candidates,
+        sprawl_review=sprawl_review,
         full_report_path=f"logs/{full_path.name}",
     )
 
@@ -403,9 +461,9 @@ def run(dry_run: bool = False) -> dict[str, int]:
             )
             log.info(
                 "Channel health report posted: %d checked, %d dead, %d unmapped, "
-                "%d archive candidates",
+                "%d archive candidates, %d sprawl-review",
                 channels_checked, len(dead_channels), len(unmapped_channels),
-                len(archive_candidates),
+                len(archive_candidates), len(sprawl_review),
             )
         except Exception as exc:
             log.error("Failed to post report: %s", exc)
@@ -417,6 +475,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
         "duplicates": len(duplicates),
         "sprawl": len(sprawl),
         "archive_candidates": len(archive_candidates),
+        "sprawl_review": len(sprawl_review),
     }
 
 
