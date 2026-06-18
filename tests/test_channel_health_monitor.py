@@ -16,24 +16,135 @@ import run_channel_health_monitor as chm  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# _load_entity_channel_ids
+# Unmapped = router catch-all (NOT entity-channels.yaml). This was the ~10x
+# over-report bug: every well-routed operational/sub channel read "unmapped"
+# because it wasn't in entity-channels.yaml's ~22 leadership/finance IDs.
 # ---------------------------------------------------------------------------
 
-def test_load_entity_channel_ids_returns_set():
-    ids = chm._load_entity_channel_ids()
-    assert isinstance(ids, set)
-    assert len(ids) > 0
+def test_routed_operational_channels_are_not_unmapped():
+    from cora import entity_router
+    # None of these are in entity-channels.yaml, but all have a real route.
+    for name in ("osn-recon-pilot", "f3-pure-launch", "bdm-osn", "llc-operations"):
+        assert entity_router.is_mapped(name) is True, name
 
 
-def test_load_entity_channel_ids_contains_known_channels():
-    ids = chm._load_entity_channel_ids()
-    assert "C0B3K67J10T" in ids   # hjrg-leadership
-    assert "C0B4KRQT3LY" in ids   # f3e-leadership
+def test_truly_unrouted_channel_is_unmapped():
+    from cora import entity_router
+    assert entity_router.is_mapped("mystery-channel-xyz") is False
 
 
-def test_load_entity_channel_ids_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(chm, "ENTITY_CHANNELS_FILE", tmp_path / "missing.yaml")
-    assert chm._load_entity_channel_ids() == set()
+# ---------------------------------------------------------------------------
+# _find_duplicate_channels
+# ---------------------------------------------------------------------------
+
+def test_find_duplicates_flags_dash_n_when_base_exists():
+    channels = [
+        {"id": "C1", "name": "retail-portfolio"},
+        {"id": "C2", "name": "retail-portfolio-2"},
+        {"id": "C3", "name": "osn"},
+        {"id": "C4", "name": "osn-2"},
+    ]
+    dups = chm._find_duplicate_channels(channels)
+    ids = {d["id"] for d in dups}
+    assert ids == {"C2", "C4"}
+    assert {d["base"] for d in dups} == {"retail-portfolio", "osn"}
+
+
+def test_find_duplicates_skips_dash_n_without_base():
+    # No bare #ecom-portfolio joined -> the -2 is not a duplicate of a known channel.
+    channels = [{"id": "C1", "name": "ecom-portfolio-2"}]
+    assert chm._find_duplicate_channels(channels) == []
+
+
+def test_find_duplicates_ignores_building_and_store_codes():
+    # #hjrp-1337 / #hjrp-1555 must NOT be read as duplicates of #hjrp.
+    channels = [
+        {"id": "C1", "name": "hjrp"},
+        {"id": "C2", "name": "hjrp-1337"},
+        {"id": "C3", "name": "hjrp-1555"},
+    ]
+    assert chm._find_duplicate_channels(channels) == []
+
+
+# ---------------------------------------------------------------------------
+# _find_sprawl_channels
+# ---------------------------------------------------------------------------
+
+def _after_cutoff() -> int:
+    return int(chm.SPRAWL_CUTOFF_EPOCH) + 86400
+
+
+def _before_cutoff() -> int:
+    return int(chm.SPRAWL_CUTOFF_EPOCH) - 86400
+
+
+def test_sprawl_cutoff_is_2026_06_03_az():
+    from datetime import datetime, timedelta, timezone
+    expected = datetime(2026, 6, 3, tzinfo=timezone(timedelta(hours=-7))).timestamp()
+    assert chm.SPRAWL_CUTOFF_EPOCH == expected
+
+
+def test_find_sprawl_flags_cora_created_after_cutoff():
+    channels = [
+        {"id": "C1", "name": "events-mood", "creator": chm.CORA_BOT_USER_ID, "created": _after_cutoff()},
+    ]
+    sprawl = chm._find_sprawl_channels(channels)
+    assert [s["id"] for s in sprawl] == ["C1"]
+
+
+def test_find_sprawl_skips_other_creator():
+    channels = [
+        {"id": "C1", "name": "f3e-leadership", "creator": "U0HARRISON", "created": _after_cutoff()},
+    ]
+    assert chm._find_sprawl_channels(channels) == []
+
+
+def test_find_sprawl_skips_before_cutoff():
+    # #cora-kq-* were created by Cora on 2026-05-30, before the sprawl wave.
+    channels = [
+        {"id": "C1", "name": "cora-kq-f3e", "creator": chm.CORA_BOT_USER_ID, "created": _before_cutoff()},
+    ]
+    assert chm._find_sprawl_channels(channels) == []
+
+
+def test_find_sprawl_skips_missing_metadata():
+    channels = [{"id": "C1", "name": "legacy-channel"}]
+    assert chm._find_sprawl_channels(channels) == []
+
+
+# ---------------------------------------------------------------------------
+# _build_archive_candidates
+# ---------------------------------------------------------------------------
+
+def test_archive_candidates_always_include_duplicates():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+    out = chm._build_archive_candidates(dups, [], dead_ids=set())
+    assert len(out) == 1
+    assert out[0]["id"] == "C2"
+    assert "duplicate of #osn (active)" in out[0]["reason"]
+
+
+def test_archive_candidates_mark_dead_duplicates():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+    out = chm._build_archive_candidates(dups, [], dead_ids={"C2"})
+    assert "dead 30d" in out[0]["reason"]
+
+
+def test_archive_candidates_include_dead_sprawl_only():
+    sprawl = [
+        {"id": "C3", "name": "events-mood", "created": 0},   # dead -> candidate
+        {"id": "C4", "name": "llc-leadership", "created": 0},  # active -> excluded
+    ]
+    out = chm._build_archive_candidates([], sprawl, dead_ids={"C3"})
+    assert [c["id"] for c in out] == ["C3"]
+    assert "sprawl" in out[0]["reason"]
+
+
+def test_archive_candidates_dedup_dup_and_sprawl():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+    sprawl = [{"id": "C2", "name": "osn-2", "created": 0}]
+    out = chm._build_archive_candidates(dups, sprawl, dead_ids={"C2"})
+    assert [c["id"] for c in out] == ["C2"]  # appears once, as the duplicate
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +196,25 @@ def test_build_report_lists_dead_channels():
     assert "C0BDEAD1" in report
 
 
-def test_build_report_lists_missing_channels():
-    missing = [{"id": "C0BNEW1", "name": "new-channel"}]
-    report = chm.build_report(10, [], missing)
+def test_build_report_lists_unmapped_channels():
+    unmapped = [{"id": "C0BNEW1", "name": "new-channel"}]
+    report = chm.build_report(10, [], unmapped)
     assert "new-channel" in report
-    assert "entity-channels.yaml" in report
+    assert "channel-routing.yaml" in report
+    assert "entity-channels.yaml" not in report  # old (wrong) source must be gone
+
+
+def test_build_report_lists_archive_candidates():
+    cands = [{"id": "C0BDUP", "name": "osn-2", "reason": "duplicate of #osn (dead 30d)"}]
+    report = chm.build_report(10, [], [], archive_candidates=cands)
+    assert "Archive candidates" in report
+    assert "osn-2" in report
+    assert "duplicate of #osn" in report
+
+
+def test_build_report_no_archive_candidates():
+    report = chm.build_report(10, [], [])
+    assert "Archive candidates:* none" in report
 
 
 def test_build_report_healthy_count():
