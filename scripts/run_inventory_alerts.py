@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Inventory + Reorder Alerts -- F3E and OSN inventory threshold monitoring.
+"""Inventory + Reorder Alerts -- F3E inventory threshold monitoring.
 
 F3E pass:
   Calls get_f3e_inventory_pulse_text() and posts flagged items (lines
   containing the warning/critical emoji) to #f3e-leadership.
 
-OSN pass:
-  Calls clover_client.get_all_stores_inventory() and checks each store's
-  low-stock items against configured thresholds. Posts alerts to
-  #osn-leadership.
+(The OSN pass was removed 2026-06-17 with the Clover retirement -- per-SKU
+store inventory has no QBO equivalent, so OSN low-stock alerts are no longer
+produced unless a replacement POS/inventory source is named.)
 
-Throttle: 7-day per-SKU/item key to prevent spam.
+Throttle: 7-day per-SKU key to prevent spam.
 
 Usage (Windows Task Scheduler):
     python scripts/run_inventory_alerts.py [--dry-run]
 
 Environment variables required:
     SLACK_BOT_TOKEN              For posting alerts
-    (F3E uses Drive/Google creds; OSN uses CLOVER_* env vars)
+    (F3E uses Drive/Google creds)
 """
 
 from __future__ import annotations
@@ -38,8 +37,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 load_dotenv(_REPO_ROOT / ".env")
-
-import yaml  # noqa: E402
 
 LOG_DIR = _REPO_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -62,12 +59,10 @@ log = logging.getLogger("inventory_alerts")
 # ---------------------------------------------------------------------------
 
 _THROTTLE_PATH = _REPO_ROOT / "data" / "state" / "inventory_alert_throttle.json"
-_THRESHOLDS_PATH = _REPO_ROOT / "data" / "maps" / "inventory-thresholds.yaml"
 _THROTTLE_SECONDS = 7 * 86400  # 7 days
 
-# Channel IDs -- use leadership channels (no dedicated #f3e-ops or #osn-ops yet)
+# Channel ID -- use leadership channel (no dedicated #f3e-ops yet)
 _F3E_CHANNEL = "C0B4KRQT3LY"   # #f3e-leadership (fallback for #f3e-ops)
-_OSN_CHANNEL = "C0B3TCEF4KT"   # #osn-leadership (fallback for #osn-ops)
 
 # Warning/critical emoji from inventory_client.py
 _FLAG_CRITICAL = "\U0001f6a8"  # 🚨
@@ -92,14 +87,6 @@ def _save_throttle(throttle: dict) -> None:
 def _is_throttled(throttle: dict, key: str) -> bool:
     ts = throttle.get(key)
     return ts is not None and (time.time() - ts) < _THROTTLE_SECONDS
-
-
-def _load_thresholds() -> dict:
-    try:
-        return yaml.safe_load(_THRESHOLDS_PATH.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        log.warning("Failed to load thresholds: %s", exc)
-        return {}
 
 
 def _post_message(slack_client, channel: str, text: str, dry_run: bool) -> bool:
@@ -177,64 +164,6 @@ def run_f3e_pass(slack_client, throttle: dict, dry_run: bool) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# OSN Pass
-# ---------------------------------------------------------------------------
-
-def run_osn_pass(slack_client, throttle: dict, thresholds: dict, dry_run: bool) -> dict[str, Any]:
-    stats = {"posted": 0, "throttled": 0, "error": None}
-
-    osn_thresholds = thresholds.get("osn") or []
-    if not osn_thresholds:
-        log.info("No OSN thresholds configured")
-        return stats
-
-    try:
-        from cora.connectors.clover_client import get_all_stores_inventory, CloverConnectorError
-        store_summaries = get_all_stores_inventory()
-    except Exception as exc:
-        stats["error"] = str(exc)
-        log.error("OSN Clover inventory fetch error: %s", exc)
-        return stats
-
-    # Aggregate all low-stock items across stores
-    low_stock_map: dict[str, list[str]] = {}  # item_name -> [store_names]
-    for summary in store_summaries:
-        for item in summary.low_stock_items:
-            item_name_lower = item.name.lower()
-            for threshold in osn_thresholds:
-                threshold_item = threshold.get("item", "").lower()
-                if threshold_item and threshold_item in item_name_lower:
-                    if item.name not in low_stock_map:
-                        low_stock_map[item.name] = []
-                    low_stock_map[item.name].append(summary.store_name)
-
-    if not low_stock_map:
-        log.info("OSN inventory: no items below threshold")
-        return stats
-
-    # Throttle + collect new alerts
-    new_alerts: list[str] = []
-    for item_name, store_names in low_stock_map.items():
-        key = f"osn:{item_name.lower()}"
-        if _is_throttled(throttle, key):
-            stats["throttled"] += 1
-            continue
-        store_list = ", ".join(store_names)
-        new_alerts.append(f"  - *{item_name}* low at: {store_list}")
-        throttle[key] = time.time()
-
-    if not new_alerts:
-        return stats
-
-    msg = ":warning: *OSN Inventory Alert*\nLow stock detected across stores:\n" + "\n".join(new_alerts)
-    if _post_message(slack_client, _OSN_CHANNEL, msg, dry_run):
-        stats["posted"] = len(new_alerts)
-        log.info("Posted OSN inventory alert: %d items", len(new_alerts))
-
-    return stats
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -248,15 +177,11 @@ def main(dry_run: bool = False) -> dict[str, Any]:
 
     slack = SlackWebClient(token=bot_token)
     throttle = _load_throttle()
-    thresholds = _load_thresholds()
 
     log.info("Starting inventory alerts, dry_run=%s", dry_run)
 
     f3e_stats = run_f3e_pass(slack, throttle, dry_run)
     log.info("F3E pass: %s", f3e_stats)
-
-    osn_stats = run_osn_pass(slack, throttle, thresholds, dry_run)
-    log.info("OSN pass: %s", osn_stats)
 
     if not dry_run:
         _save_throttle(throttle)
@@ -265,9 +190,6 @@ def main(dry_run: bool = False) -> dict[str, Any]:
         "f3e_posted": f3e_stats.get("posted", 0),
         "f3e_throttled": f3e_stats.get("throttled", 0),
         "f3e_error": f3e_stats.get("error"),
-        "osn_posted": osn_stats.get("posted", 0),
-        "osn_throttled": osn_stats.get("throttled", 0),
-        "osn_error": osn_stats.get("error"),
     }
     log.info("Inventory alerts complete: %s", result)
     return result
