@@ -1738,3 +1738,35 @@ pick-list scope filter, LEX/cross-entity not enumerated, DM signal, scrub;
 confirm: staged-write, attendee/scope/LEX re-check, content-integrity,
 LEX-only routing, LBHS exclusion, cap) + inverted
 `tests/test_nightly_health_check.py` pin.
+
+---
+
+**Follow-up (`96cbdbe`, 2026-06-18) -- date/ordinal-aware resolution + relay grounding.**
+A live LEX smoke (STEP-0 logs) showed the pull tool FIRED on all 3 pulls but never
+resolved (no PREVIEW line): the preview path used `_match_query` (TITLE substring
+only), so a date follow-up ("Lexington Progress June 18") didn't match the title and
+the model then FABRICATED "the last meeting was June 4." Routing was fine -- the gap
+was resolution + relay-grounding, not a missing tool call.
+- **Fix A:** new `_extract_selectors` (dates: ISO / month+day / m/d / today-yesterday /
+  "the 18th"; ordinals: "first/second/last", bare "2nd"=position) + `_resolve_meetings`,
+  replacing the title-only match in the preview path. Prefers the FULL-query title
+  match (so an in-title date like "Q2 6/30 Forecast" isn't hijacked), unions the
+  selector interpretation, and returns a PICK-LIST when they disagree -- it NEVER
+  silently resolves the wrong meeting, and a real-but-unmatched title is not replaced
+  by a date/position guess. Explicit dates match the UTC-label day (== what the
+  pick-list shows); relative dates match UTC or AZ; ordinals select within the
+  displayed cap. AZ = fixed UTC-7 (ZoneInfo raises on this host).
+- **Fix B (relay):** on a resolution miss WITH pullable meetings present, return the
+  real scope-filtered visible pick-list so the model relays actual titles/dates
+  instead of inventing one; the `meeting_action_items` tool description now forbids
+  calendar/KB substitution or fabricating a meeting date for this query class.
+- D-051 adversarial review (4 lenses) caught a HIGH wrong-meeting substitution + the
+  dual-date / ordinal-cap / "2nd"-vs-"second" MEDIUMs -- all remediated.
+  `test_meeting_actions_pull.py` -> 113 tests; follow-up suite green.
+- Doctrine: title-substring resolution silently misses date/ordinal follow-ups -- a
+  conversational resolver must parse dates + ordinals AND fall back to the real
+  pick-list rather than let the model fabricate a meeting/date.
+- Ship state: the CORE flip (70c8365) is already merged + restarted (live ~18:51 UTC
+  2026-06-18); this follow-up needs its OWN merge + restart to go live (the live bot
+  has the core flip but not the date/ordinal fix yet). Bundle the restart with the
+  polar MCP-auth fix so the working tree carries both.
