@@ -28,12 +28,15 @@ def test_state_config_loads():
     assert "cowork-clover-daily-pull" in disabled  # was missing -> false CRITICAL
 
 
-def test_meeting_action_capture_not_intended_disabled():
-    # D-052: Meeting Action Capture is ENABLED. Listing it caused a daily false
-    # CRITICAL ("expected Disabled, got Ready").
+def test_meeting_action_capture_now_intended_disabled():
+    # 2026-06-18 push -> pull: the auto-create "Cora - Meeting Action Capture"
+    # task is RETIRED (disabled); meeting items are created on request via the
+    # meeting_action_items pull tool. It is now an EXPECTED-disabled task, so the
+    # nightly check finds no drift once Harrison runs the disable script.
+    # (Supersedes the D-052 "must NOT be listed as intended-disabled" pin.)
     disabled, _ = hc._load_task_state_config()
-    assert "Cora - Meeting Action Capture" not in disabled
-    assert "Cora - Meeting Action Capture" not in hc._EXPECTED_DISABLED
+    assert "Cora - Meeting Action Capture" in disabled
+    assert "Cora - Meeting Action Capture" in hc._EXPECTED_DISABLED
 
 
 # ── classifier severity (drift = warn, service-down = critical) ──────────────

@@ -91,9 +91,11 @@ def _load_task_state_config() -> tuple[set[str], set[str]]:
         return set(), {"cowork-cora-service"}
 
 
-# Intended scheduled-task state. NOTE: "Cora - Meeting Action Capture" is ENABLED
-# (D-052) and must NOT be listed as intended-disabled. A disabled-state drift is a
-# WARNING, never a CRITICAL -- only the always-on service being down is CRITICAL.
+# Intended scheduled-task state. NOTE (2026-06-18): "Cora - Meeting Action
+# Capture" is now intended-DISABLED -- the PUSH auto-create model was retired in
+# favor of the meeting_action_items PULL tool (supersedes the D-052 "ENABLED"
+# note). A disabled-state drift is a WARNING, never a CRITICAL -- only the
+# always-on service being down is CRITICAL.
 _EXPECTED_DISABLED, _EXPECTED_RUNNING = _load_task_state_config()
 
 # Friendly labels for the report

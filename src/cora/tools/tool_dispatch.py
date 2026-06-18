@@ -2838,6 +2838,16 @@ def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str
     )
 
 
+def _tool_meeting_action_items(slack_user_id: str, entity: str, _input: dict) -> str:
+    """PULL flow: summarize a meeting + the asker's action items, then (on a
+    confirmed second call) create the selected ones as Asana tasks assigned to
+    the asker. Replaces the retired auto-create push. Thin wrapper -- all logic
+    (attendee gate, channel/DM scope, D-052 LEX rails, staged-write create) lives
+    in cora.tools.meeting_actions. Lazy import avoids any import-order surprise."""
+    from cora.tools import meeting_actions  # noqa: PLC0415
+    return meeting_actions.run_meeting_action_items(slack_user_id, entity, _input or {})
+
+
 # --- Catalog: tool definitions exposed to Claude ---
 
 
@@ -4780,6 +4790,63 @@ TOOL_DEFINITIONS = [
             "required": ["note_id", "confirmed"],
         },
     },
+    {
+        "name": "meeting_action_items",
+        "description": (
+            "Pull a meeting's summary + the action items meant for the ASKING USER, "
+            "then (only after they confirm) create the chosen ones as Asana tasks "
+            "assigned to them. Use this when someone asks 'what were my action items "
+            "from <meeting>?', 'summarize the <meeting> and what I need to do', "
+            "'recap my to-dos from yesterday's call', etc. Cora does NOT auto-create "
+            "tasks from meetings -- this tool is how a meeting attendee turns their "
+            "own items into tasks, on request.\n"
+            "\n"
+            "TWO-STEP PROTOCOL (never skip):\n"
+            "1. PREVIEW (read-only): call WITHOUT confirmed, passing meeting_query "
+            "(the title/keywords/date the user gave). The result is a summary + the "
+            "user's numbered action items + a hidden transcript_id and instructions. "
+            "Show the user the summary and items, then ASK which they want created. "
+            "Do NOT call again until they answer.\n"
+            "   - If the result is a numbered PICK-LIST (the hint matched several "
+            "meetings, or the user gave no hint), show the titles+dates and ask which "
+            "they mean, then call again with transcript_id set to that meeting's id "
+            "from the [id:...] tag (still WITHOUT confirmed -- that just loads it).\n"
+            "2. CREATE (staged write): once the user picks items, call again with "
+            "confirmed=true, transcript_id (from step 1), and selected_items set to "
+            "the EXACT task texts they chose. The tool creates them assigned to the "
+            "user and returns a confirmation to relay verbatim. If they want none, "
+            "create nothing.\n"
+            "\n"
+            "The tool enforces its own safety: it only works for meetings the asker "
+            "ATTENDED, only surfaces a meeting where it belongs (Lexington meetings "
+            "only in Lexington channels; an entity's meeting in that entity's / a "
+            "founder channel / a DM), and PHI-scrubs Lexington content. If it refuses, "
+            "relay the refusal -- don't try to work around it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "meeting_query": {
+                    "type": "string",
+                    "description": "The user's hint for which meeting -- a title, keywords, or a date (e.g. 'F3 marketing sync', 'yesterday's budget class'). Omit to get a list of the user's recent meetings to choose from.",
+                },
+                "transcript_id": {
+                    "type": "string",
+                    "description": "The meeting's id from a prior PREVIEW result or pick-list ([id:...]). REQUIRED on the confirmed create call. Never shown to the user.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Set true ONLY on the create call, after the user has seen the items and chosen which to create. Requires transcript_id + selected_items.",
+                },
+                "selected_items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "On the confirmed create call: the exact task texts the user chose, copied verbatim from the PREVIEW list.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -4805,6 +4872,7 @@ TOOL_DEFINITIONS = [
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "whats_on_my_plate",
+    "meeting_action_items",
     "cora_remember",
     "cora_my_notes",
     "cora_forget_note",
@@ -4968,6 +5036,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_remember": _tool_cora_remember,
     "cora_my_notes": _tool_cora_my_notes,
     "cora_forget_note": _tool_cora_forget_note,
+    # Meeting action items -- PULL flow (replaces the retired auto-create push)
+    "meeting_action_items": _tool_meeting_action_items,
 }
 
 
@@ -5015,6 +5085,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "hubspot_add_note": 20,
     "slack_send_dm": 12,
     "whats_on_my_plate": 25,  # multi-source composite (Asana + Calendar x2 + HubSpot)
+    "meeting_action_items": 25,  # Fireflies window fetch + Haiku parse (preview); bounded creates (confirm)
     # Personal notes: remember = embed + conflict probe + upsert (default 15s
     # tier is right); list/delete are local SQL.
     "cora_remember": 15,

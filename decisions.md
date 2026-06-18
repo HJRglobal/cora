@@ -1639,3 +1639,102 @@ save, list-failed/budget-hit don't advance, reconcile seeds + dedups,
 **Follow-up (Harrison, optional):** re-run `deployment\setup-attachment-filer-task.ps1`
 from elevated PowerShell to apply the 15→20-min ExecutionTimeLimit (the rest is
 already live + self-healing).
+
+---
+
+## D-054 · Meeting action capture flips PUSH -> PULL (user-initiated, staged-write) (2026-06-18)
+
+**Context:** A Track-A reliability item under the locked North Star
+(`_shared/projects/cora/2026-06-18_fndr_cora-north-star-and-two-track-plan.md`).
+Demi (#bdm-leadership) asked Cora to "take these 14 tasks out of Asana" and
+"don't auto-capture our calls" -- the hourly "Cora - Meeting Action Capture"
+task was auto-creating + auto-ASSIGNING Asana tasks from every meeting (a
+decision-MAKER behavior). This embodies the North-Star invariant
+**decision-SUPPORT, not decision-MAKER**. SUPERSEDES the lighter
+`capture_mode: auto|opt-in|off` idea (triage Conv-2C / North-Star §5-A.4): no
+entity should get silent auto-create; pull is the cleaner answer.
+
+**Decision -- retire the push, add a PULL tool:**
+- New global-core tool `meeting_action_items` (`src/cora/tools/meeting_actions.py`,
+  registered in tool_dispatch). A meeting ATTENDEE asks Cora for a meeting's
+  summary + the action items meant for THEM; Cora returns them (read-only
+  preview); the user confirms which to create; Cora then creates ONLY those, as
+  tasks assigned to the ASKER, via the staged-write `confirmed=true` gate.
+- The hourly "Cora - Meeting Action Capture" task is DISABLED
+  (`deployment/disable-meeting-action-capture-2026-06-18.ps1`; added to
+  `scheduled-task-state.yaml` disabled list; the D-052 "it is ENABLED" pin +
+  its nightly-health-check regression test are INVERTED). The extractor module
+  + its YAML maps STAY -- they are the reuse source for the pull flow, not dead
+  code. **This globally retires auto-create.**
+- Fireflies KB ingest + recall (`cowork-cora-kb-sync-fireflies`) are UNTOUCHED:
+  "recall any item from any meeting" stays the existing entity-scoped,
+  PHI-guarded Cora Q&A path.
+
+**Security model (the tool self-enforces -- entity-scoping is a perf hint, not a
+boundary):**
+- ATTENDEE GATE (primary): the resolution window is fetched by the asker's own
+  email (`participant_email`), and preview + confirm + the transcript_id-direct
+  path each re-verify attendee membership. A non-attendee gets nothing.
+- CHANNEL/DM SCOPE GATE applied to EVERY candidate BEFORE a pick-list is built
+  (`_visible_meetings`): LEX meetings only in a LEX channel / a LEX person's DM;
+  a specific-entity meeting only in that entity's channel, a founder/HJRG
+  channel, or any DM. An empty filtered list names nothing.
+- LEX RAILS carried forward verbatim from D-052: a meeting is LEX if ANY of
+  title-classifies-LEX / a NAMED LEX lead attends / an attendee email is on a
+  Lexington DOMAIN (closes the generic-title-Jen/Aaron-meeting leak the
+  name-only detector missed). LEX capture enabled + sub-entity in scope
+  (LEX-LBHS / 42 CFR Part 2 EXCLUDED, most-restrictive-wins) + clinical title
+  skipped + title/summary/items/due PHI-scrubbed + LEX-only project routing
+  (None -> skip, never create outside LEX scope). cross_entity_guard +
+  sibling_guard (pre-dispatch in app.py) unchanged.
+- Asker creates only their OWN tasks (items owned by another on-roster person
+  are excluded; off-roster-named + unowned are claimable). Confirmed creates are
+  integrity-checked against the meeting's (scrubbed-for-LEX) action-item text so
+  fabricated / cross-meeting text can't be persisted.
+
+**is_dm wiring (found + worked around):** the QA tool loop threads
+`channel_name` but NOT `channel_id` into `dispatch()`
+(`_dispatch_tools_parallel`), so `_channel_id` is empty for QA-loop tools and
+`is_dm` would be permanently False. Threading `channel_id` globally was REJECTED
+-- it would also activate `financial_get_cashflow`'s dormant Slack file-upload
+(it reads `_channel_id`) and `cora_remember`'s dormant DM-PHI path. So
+`meeting_action_items` derives `is_dm` from the already-threaded
+`_channel_name == "dm"` signal (set at app.py for DMs). The broader latent gap
+(cora_remember DM-PHI + financial upload both dormant in the QA loop) is flagged
+for Harrison, NOT fixed here (out of scope; would need its own review).
+
+**Two-Cora future:** the LEX half of this tool RELOCATES to the isolated
+BAA LEX-Cora at the North-Star split (same logic, different instance; it reuses
+LEX rails that already live in this Cora -- adds no split cost). NOT throwaway.
+
+**v1.1 (noted, not built):** a proactive post-meeting DM offer to each attendee
+("here are your candidate items -- want me to create any?") to drive adoption
+while preserving the confirm gate. Residual (shared with the retired push path):
+a LEX-adjacent program meeting with NO Lexington-staff signal (no LEX title /
+named lead / Lexington domain -- e.g. a probation budget class organized by a
+non-LEX staffer) still classifies non-LEX; closing that needs content-based PHI
+detection (a Track-B item).
+
+**Process:** two adversarial diff reviews (D-051). Review 1 (4 lenses) found 2
+HIGH confidentiality defects (pick-list bypassed the scope gate; LEX detection
+was title-only) + a CRITICAL-tagged is_dm-wiring gap (fail-safe) + MEDIUMs --
+all a green suite missed; all fixed. Review 2 (3 lenses, on the remediation)
+confirmed the core fixes CLOSED + found 3 fail-safe residuals (the
+email-domain LEX gap, a scrub-vs-raw match drop, an off-roster docstring
+mismatch) -- all fixed. Doctrine reaffirmed: a pick-list / enumeration surface
+needs the same scope gate as the single-item surface; LEX detection must use
+participant DOMAIN + name, not title alone; a content-integrity check over
+PHI-scrubbed text must compare like-for-like (scrub both sides).
+
+**Activation:** BOT-LOADED (new tool in tool_dispatch) -> restart REQUIRED.
+Deployment order (per review): run the disable `.ps1` FIRST (or in the same
+window), THEN restart -- so the push task isn't still firing after the pull
+tool goes live. Live smoke after restart: one non-LEX user pull + one LEX user
+pull (correct PHI/scope). Full suite 4,749 passed / 42 skipped.
+
+**Tests:** `tests/test_meeting_actions_pull.py` (helpers: scope/LEX gate,
+classify w/ domain signal, dedup, attendee gate, item-match; preview:
+pick-list scope filter, LEX/cross-entity not enumerated, DM signal, scrub;
+confirm: staged-write, attendee/scope/LEX re-check, content-integrity,
+LEX-only routing, LBHS exclusion, cap) + inverted
+`tests/test_nightly_health_check.py` pin.

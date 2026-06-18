@@ -7,13 +7,16 @@
 # task is a deliberate admin action, not an outage, and Task Scheduler never
 # auto-flips it. The ONLY task-state CRITICAL is the always-on service
 # (`running`) not being Running.
-#
-# DO NOT list "Cora - Meeting Action Capture" here: it is ENABLED (D-052).
 
 running:
   - cowork-cora-service
 
 disabled:
+  # PUSH meeting capture RETIRED 2026-06-18 (push -> pull). The auto-create task
+  # is disabled; meeting action items are now created on request via the
+  # meeting_action_items pull tool. SUPERSEDES the prior D-052 "it is ENABLED"
+  # note. Flip with deployment/disable-meeting-action-capture-2026-06-18.ps1.
+  - Cora - Meeting Action Capture
   # Gmail sync -- precision too low (paused)
   - cowork-cora-asana-email-sync
   - cowork-cora-hubspot-email-sync
