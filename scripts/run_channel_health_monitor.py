@@ -43,6 +43,7 @@ load_dotenv(_REPO_ROOT / ".env")
 
 from cora import entity_router  # noqa: E402
 from cora.connectors.slack_connector import list_joined_channels, SlackConnectorError  # noqa: E402
+from cora.slack_sweep_policy import is_denied  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,15 +98,22 @@ def _find_duplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, A
     """Return channels named '<base>-N' (N in 2-9) whose '<base>' is also joined.
 
     This is the 2026-06-03 sprawl '-2' duplicate pattern (TOM 0n: #osn-2,
-    #f3-events-2, #retail-portfolio-2, ...). Name-only -- no API call.
+    #f3-events-2, #retail-portfolio-2, ...). Name-only -- no API call. Each dup
+    carries the base channel's id so the archive logic can compare which member of
+    the pair is dead (the original or the '-N').
     """
-    names = {ch.get("name") for ch in channels if ch.get("name")}
+    name_to_id: dict[str, str] = {}
+    for ch in channels:
+        nm = ch.get("name")
+        if nm and nm not in name_to_id:
+            name_to_id[nm] = ch["id"]
     dups: list[dict[str, Any]] = []
     for ch in channels:
         name = ch.get("name") or ""
         m = _DUP_SUFFIX_RE.match(name)
-        if m and m.group("base") in names:
-            dups.append({"id": ch["id"], "name": name, "base": m.group("base")})
+        if m and m.group("base") in name_to_id:
+            base = m.group("base")
+            dups.append({"id": ch["id"], "name": name, "base": base, "base_id": name_to_id[base]})
     return dups
 
 
@@ -139,33 +147,54 @@ def _build_archive_candidates(
     """High-confidence archive candidates for the self-staging report (gate G-F).
 
     Conservative on purpose -- this feeds an automated weekly post, so it must not
-    cry wolf:
-      - every "-N" duplicate (structurally redundant with an existing channel),
-        annotated dead/active so Harrison sees whether the dup is the live one;
-      - every sprawl channel that is ALSO dead (created in the 2026-06-03 wave and
-        since abandoned). Sprawl channels that are still active are EXCLUDED -- the
-        archive doc warns some were adopted for real work.
-    Deduped by id (a dup that's also dead-sprawl appears once, as a duplicate).
+    cry wolf and must never point Harrison at a LIVE channel:
+      - "-N" duplicate pairs: the archive target is whichever member is dead. If the
+        ORIGINAL (#osn) is dead and the '-N' (#osn-2) is live, the team migrated TO
+        the '-N' -- so the candidate is the ORIGINAL, not the live '-N'. The reason
+        always carries both members' status so the line can't be read as
+        "archive the active one."
+      - sprawl channels that are dead AND have no dedicated entity route (a routed
+        channel like #llc-leadership was adopted for real work, even if quiet -- so
+        a dead-but-routed sprawl channel is NOT promoted to a candidate).
+    Deduped by id.
     """
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
+
+    def _add(cid, name, reason):
+        if cid in seen:
+            return
+        candidates.append({"id": cid, "name": name, "reason": reason})
+        seen.add(cid)
+
     for d in duplicates:
-        status = f"dead {DEAD_WINDOW_DAYS}d" if d["id"] in dead_ids else "active"
-        candidates.append({
-            "id": d["id"],
-            "name": d["name"],
-            "reason": f"duplicate of #{d['base']} ({status})",
-        })
-        seen.add(d["id"])
+        dup_dead = d["id"] in dead_ids
+        base_id = d.get("base_id")
+        base_dead = bool(base_id) and base_id in dead_ids
+        if base_dead and not dup_dead:
+            # Inverted case: the original is abandoned, the team uses the '-N'.
+            # Point at the ORIGINAL, not the live dup.
+            _add(
+                base_id, d["base"],
+                f"abandoned original -- #{d['name']} (the '-N' dup) is the live one; "
+                f"#{d['base']} is dead {DEAD_WINDOW_DAYS}d",
+            )
+        else:
+            if dup_dead and base_dead:
+                status = f"both dead {DEAD_WINDOW_DAYS}d"
+            elif dup_dead:
+                status = f"this '-N' dup dead {DEAD_WINDOW_DAYS}d, #{d['base']} active"
+            else:
+                status = f"both active -- review which to keep"
+            _add(d["id"], d["name"], f"duplicate of #{d['base']} ({status})")
+
     for s in sprawl:
-        if s["id"] in seen or s["id"] not in dead_ids:
+        if s["id"] not in dead_ids or entity_router.is_mapped(s["name"]):
             continue
-        candidates.append({
-            "id": s["id"],
-            "name": s["name"],
-            "reason": f"Cora-created 2026-06-03 sprawl, dead {DEAD_WINDOW_DAYS}d",
-        })
-        seen.add(s["id"])
+        _add(
+            s["id"], s["name"],
+            f"Cora-created 2026-06-03 sprawl, dead {DEAD_WINDOW_DAYS}d, no entity route",
+        )
     return candidates
 
 
@@ -286,13 +315,26 @@ def _write_full_list(
 # Main
 # ---------------------------------------------------------------------------
 
+def _zero_result() -> dict[str, int]:
+    """Uniform result shape so every return path has the same keys (a consumer
+    reading result['archive_candidates'] never KeyErrors on an early return)."""
+    return {
+        "channels_checked": 0,
+        "dead": 0,
+        "missing": 0,
+        "duplicates": 0,
+        "sprawl": 0,
+        "archive_candidates": 0,
+    }
+
+
 def run(dry_run: bool = False) -> dict[str, int]:
     from slack_sdk import WebClient
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not bot_token:
         log.error("SLACK_BOT_TOKEN not set")
-        return {"channels_checked": 0, "dead": 0, "missing": 0}
+        return _zero_result()
 
     slack_client = WebClient(token=bot_token)
 
@@ -300,12 +342,17 @@ def run(dry_run: bool = False) -> dict[str, int]:
         all_channels = list_joined_channels()
     except SlackConnectorError as exc:
         log.error("Failed to list channels: %s", exc)
-        return {"channels_checked": 0, "dead": 0, "missing": 0}
+        return _zero_result()
 
-    # Filter to non-DM, non-MPIM channels only
+    # Filter to non-DM, non-MPIM channels, and drop deny-listed channels
+    # (data/maps/slack-sweep-policy.yaml: personal/family, #lbhs-*/#lts-* PHI, NDA,
+    # general-do-not-use). Those are intentionally out of Cora's KB scope -- the
+    # monitor must not "add a route" for them, and must not re-broadcast their names
+    # in the weekly #hjrg-leadership post.
     channels = [
         ch for ch in all_channels
         if not ch.get("is_im") and not ch.get("is_mpim")
+        and not is_denied(ch.get("name") or "", ch.get("id"))
     ]
 
     dead_channels: list[dict[str, Any]] = []

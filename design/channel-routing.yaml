@@ -232,6 +232,15 @@ routes:
   - pattern: "fndr*"
     entity: FNDR
 
+  # Cora's own operational channels — build/smoke/health/filing/kb-log/feedback +
+  # the #info-for-cora intake. FNDR-scope (same as the catch-all would give them);
+  # explicit so they don't read as "unmapped" in the channel-health monitor.
+  # cora-kq-* are matched earlier at the top of the file (first match wins).
+  - pattern: "cora-*"
+    entity: FNDR
+  - pattern: "info-for-cora"
+    entity: FNDR
+
   # Catch-all → founder-level context with explicit framing in response
   - pattern: "*"
     entity: FNDR

@@ -116,32 +116,54 @@ def test_find_sprawl_skips_missing_metadata():
 # _build_archive_candidates
 # ---------------------------------------------------------------------------
 
-def test_archive_candidates_always_include_duplicates():
-    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+def test_archive_candidates_include_duplicates():
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
     out = chm._build_archive_candidates(dups, [], dead_ids=set())
     assert len(out) == 1
     assert out[0]["id"] == "C2"
-    assert "duplicate of #osn (active)" in out[0]["reason"]
+    assert "duplicate of #osn" in out[0]["reason"]
 
 
-def test_archive_candidates_mark_dead_duplicates():
-    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+def test_archive_candidates_dead_dup_active_base():
+    # The '-N' dup is the dead one -> candidate is the dup; line names #osn active.
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
     out = chm._build_archive_candidates(dups, [], dead_ids={"C2"})
+    assert out[0]["id"] == "C2"
     assert "dead 30d" in out[0]["reason"]
+    assert "#osn active" in out[0]["reason"]
 
 
-def test_archive_candidates_include_dead_sprawl_only():
+def test_archive_candidates_inverted_dead_base_active_dup():
+    # CONFIRMED MEDIUM fix: team migrated TO #osn-2; #osn (base) is the dead one.
+    # The candidate must be the ABANDONED ORIGINAL #osn, NOT the live #osn-2.
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
+    out = chm._build_archive_candidates(dups, [], dead_ids={"C1"})
+    assert out[0]["id"] == "C1"            # the dead original, not the live dup
+    assert out[0]["name"] == "osn"
+    assert "abandoned original" in out[0]["reason"]
+    assert "#osn-2" in out[0]["reason"]    # names the live one so it can't mislead
+
+
+def test_archive_candidates_include_dead_unmapped_sprawl_only():
     sprawl = [
-        {"id": "C3", "name": "events-mood", "created": 0},   # dead -> candidate
-        {"id": "C4", "name": "llc-leadership", "created": 0},  # active -> excluded
+        {"id": "C3", "name": "events-mood", "created": 0},     # dead + unmapped -> candidate
+        {"id": "C4", "name": "events-pure", "created": 0},     # active -> excluded
     ]
     out = chm._build_archive_candidates([], sprawl, dead_ids={"C3"})
     assert [c["id"] for c in out] == ["C3"]
     assert "sprawl" in out[0]["reason"]
 
 
+def test_archive_candidates_exclude_dead_but_routed_sprawl():
+    # A Cora-created leadership channel (real entity route) that simply went quiet
+    # must NOT be promoted to an archive candidate, even when dead.
+    sprawl = [{"id": "C5", "name": "llc-leadership", "created": 0}]
+    out = chm._build_archive_candidates([], sprawl, dead_ids={"C5"})
+    assert out == []
+
+
 def test_archive_candidates_dedup_dup_and_sprawl():
-    dups = [{"id": "C2", "name": "osn-2", "base": "osn"}]
+    dups = [{"id": "C2", "name": "osn-2", "base": "osn", "base_id": "C1"}]
     sprawl = [{"id": "C2", "name": "osn-2", "created": 0}]
     out = chm._build_archive_candidates(dups, sprawl, dead_ids={"C2"})
     assert [c["id"] for c in out] == ["C2"]  # appears once, as the duplicate
@@ -217,6 +239,34 @@ def test_build_report_no_archive_candidates():
     assert "Archive candidates:* none" in report
 
 
+def test_build_report_caps_archive_candidates():
+    cands = [{"id": f"C{i:03d}", "name": f"cand-{i}", "reason": "duplicate of #x"} for i in range(20)]
+    report = chm.build_report(100, [], [], archive_candidates=cands, full_report_path="logs/x.md")
+    assert "cand-0 (" in report           # first shown
+    assert "cand-19" not in report        # beyond the 15-item preview cap
+    assert "...and 5 more" in report      # 20 - 15
+    assert "logs/x.md" in report          # full list referenced
+
+
+def test_write_full_list_renders_all_sections(tmp_path, monkeypatch):
+    monkeypatch.setattr(chm, "_REPO_ROOT", tmp_path)
+    path = chm._write_full_list(
+        dead_channels=[{"id": "C1", "name": "dead1"}],
+        unmapped_channels=[{"id": "C2", "name": "unmapped1"}],
+        duplicates=[{"id": "C3", "name": "x-2", "base": "x", "base_id": "C9"}],
+        sprawl=[{"id": "C4", "name": "sprawl1", "created": 0}],
+        archive_candidates=[{"id": "C3", "name": "x-2", "reason": "duplicate of #x"}],
+    )
+    text = path.read_text(encoding="utf-8")
+    assert "Archive candidates" in text
+    assert "Dead channels" in text
+    assert "Unmapped channels (no route in channel-routing.yaml)" in text
+    assert "duplicate channels" in text
+    assert "Cora-created since 2026-06-03" in text
+    for name in ("dead1", "unmapped1", "x-2", "sprawl1"):
+        assert name in text
+
+
 def test_build_report_healthy_count():
     dead = [{"id": "C0B1", "name": "dead1"}, {"id": "C0B2", "name": "dead2"}]
     report = chm.build_report(10, dead, [])
@@ -260,7 +310,9 @@ def _make_channels(ids_names: list[tuple[str, str]]) -> list[dict]:
 def test_run_no_token_returns_early(monkeypatch):
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     result = chm.run(dry_run=True)
-    assert result == {"channels_checked": 0, "dead": 0, "missing": 0}
+    assert result == chm._zero_result()
+    # uniform 6-key shape on every path (no KeyError for a future consumer)
+    assert set(result) == {"channels_checked", "dead", "missing", "duplicates", "sprawl", "archive_candidates"}
 
 
 def test_run_dry_run_no_post(monkeypatch):
@@ -346,4 +398,50 @@ def test_run_handles_list_channels_error(monkeypatch):
          patch("slack_sdk.WebClient"):
         result = chm.run(dry_run=True)
 
-    assert result == {"channels_checked": 0, "dead": 0, "missing": 0}
+    assert result == chm._zero_result()
+
+
+def test_run_excludes_denied_channels(monkeypatch):
+    # Deny-listed sensitive channels (slack-sweep-policy.yaml) must NOT appear in
+    # the monitor report at all -- no "add a route", no weekly name re-broadcast.
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    channels = _make_channels([
+        ("C0BLBHS", "lbhs-leadership"),          # denied (lbhs* glob + by id-list)
+        ("C0BKIDS", "kids-schedules-and-tasks"),  # denied (by name)
+        ("C0BREAL", "f3e-leadership"),            # kept
+    ])
+    with patch.object(chm, "list_joined_channels", return_value=channels), \
+         patch.object(chm, "_check_channel_activity", return_value=True), \
+         patch("slack_sdk.WebClient") as mock_wc:
+        mock_wc.return_value = MagicMock()
+        result = chm.run(dry_run=True)
+
+    assert result["channels_checked"] == 1  # only f3e-leadership survives the deny-list
+
+
+def test_run_integration_duplicates_sprawl_archive(monkeypatch):
+    # End-to-end wiring inside run(): a base+'-2' pair and a Cora-created dead
+    # unmapped channel must flow into duplicates / sprawl / archive_candidates.
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    after = _after_cutoff()
+    channels = [
+        {"id": "C_BASE", "name": "retail-portfolio", "is_im": False, "is_mpim": False, "is_private": False},
+        {"id": "C_DUP", "name": "retail-portfolio-2", "is_im": False, "is_mpim": False, "is_private": False},
+        {"id": "C_SPR", "name": "events-mood", "is_im": False, "is_mpim": False, "is_private": False,
+         "creator": chm.CORA_BOT_USER_ID, "created": after},
+    ]
+    dead = {"C_DUP", "C_SPR"}  # base active; dup + sprawl dead
+
+    def _activity(_client, ch_id, _lookback):
+        return ch_id not in dead
+
+    with patch.object(chm, "list_joined_channels", return_value=channels), \
+         patch.object(chm, "_check_channel_activity", side_effect=_activity), \
+         patch("slack_sdk.WebClient") as mock_wc:
+        mock_wc.return_value = MagicMock()
+        result = chm.run(dry_run=True)
+
+    assert result["channels_checked"] == 3
+    assert result["duplicates"] == 1          # retail-portfolio-2
+    assert result["sprawl"] == 1              # events-mood
+    assert result["archive_candidates"] == 2  # dead dup + dead unmapped sprawl

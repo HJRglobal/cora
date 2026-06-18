@@ -1,5 +1,6 @@
 """Unit tests for entity_router.route()."""
 
+from cora import entity_router as er
 from cora.entity_router import is_mapped, matched_pattern, route
 
 
@@ -240,3 +241,25 @@ def test_is_mapped_never_diverges_from_route_catchall():
     # Explicit FNDR -> route returns FNDR AND is_mapped is True.
     assert route("hjrg") == "FNDR"
     assert is_mapped("hjrg") is True
+
+
+def test_catchall_is_the_last_and_only_wildcard_route():
+    """is_mapped() assumes the trailing '*' catch-all is the LAST route and the
+    ONLY one. If a future YAML edit changes that, is_mapped() would silently
+    misclassify every channel -- fail loudly here instead."""
+    assert er._ROUTES[-1]["pattern"] == er._CATCHALL_PATTERN
+    assert sum(1 for r in er._ROUTES if r["pattern"] == er._CATCHALL_PATTERN) == 1
+
+
+def test_cora_ops_channels_are_mapped():
+    """Cora's own operational channels resolve to FNDR via explicit cora-* route
+    (not the catch-all), so the health monitor doesn't nag them as 'unmapped'."""
+    for name in ("cora-build", "cora-health", "cora-filing", "cora-kb-log", "info-for-cora"):
+        assert route(name) == "FNDR", name
+        assert is_mapped(name) is True, name
+
+
+def test_cora_kq_still_routes_to_its_entity_not_swallowed_by_cora_glob():
+    """The cora-* route must NOT shadow the earlier explicit cora-kq-* routes."""
+    assert route("cora-kq-f3e") == "F3E"
+    assert route("cora-kq-lex-llc") == "LEX-LLC"
