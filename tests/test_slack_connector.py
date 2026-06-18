@@ -230,6 +230,31 @@ class TestListJoinedChannels:
         assert len(result) == 1
         assert result[0]["id"] == "C0A"
 
+    def test_includes_created_and_creator(self):
+        channels = [
+            {"id": "C0A", "name": "f3e-leadership", "is_member": True,
+             "is_private": False, "is_im": False, "is_mpim": False,
+             "created": 1748000000, "creator": "U0B44MDGC5R"},
+        ]
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = self._mock_response(channels)
+        with patch.object(sc, "_build_client", return_value=mock_client):
+            result = sc.list_joined_channels()
+        assert result[0]["created"] == 1748000000
+        assert result[0]["creator"] == "U0B44MDGC5R"
+
+    def test_created_creator_default_to_none_when_absent(self):
+        channels = [
+            {"id": "C0A", "name": "old-channel", "is_member": True,
+             "is_private": False, "is_im": False, "is_mpim": False},
+        ]
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = self._mock_response(channels)
+        with patch.object(sc, "_build_client", return_value=mock_client):
+            result = sc.list_joined_channels()
+        assert result[0]["created"] is None
+        assert result[0]["creator"] is None
+
     def test_pagination_followed(self):
         page1 = [{"id": "C01", "name": "ch1", "is_member": True,
                   "is_private": False, "is_im": False, "is_mpim": False}]

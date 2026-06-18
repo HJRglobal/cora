@@ -98,7 +98,13 @@ def list_joined_channels() -> list[dict[str, Any]]:
         "is_private": bool,
         "is_im": bool,
         "is_mpim": bool,
+        "created": int|None,  channel creation epoch (from conversations.list)
+        "creator": str|None,  Slack user/bot id that created the channel
       }
+
+    `created` + `creator` come free from the existing conversations.list response
+    (no extra API call). They let consumers spot the 2026-06-03 sprawl wave
+    (channels created by the Cora bot user). Both are None when Slack omits them.
 
     Pagination is handled transparently.
     Raises SlackConnectorError on API failure.
@@ -132,6 +138,8 @@ def list_joined_channels() -> list[dict[str, Any]]:
                 "is_private": ch.get("is_private", False),
                 "is_im": ch.get("is_im", False),
                 "is_mpim": ch.get("is_mpim", False),
+                "created": ch.get("created"),
+                "creator": ch.get("creator"),
             })
 
         meta = resp.get("response_metadata") or {}
