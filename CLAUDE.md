@@ -6,7 +6,49 @@ TOM entries are newest-first. Do not edit past TOM entries.
 
 ---
 
+## STANDING OPERATING LOOP -- standing doctrine; read first; applies to EVERY Cora Code session + cascade
+
+This is the canonical cadence for all Cora build/fix work. It is standing doctrine, not session-specific. Each new chunk of work runs these 8 steps in order:
+
+| # | Step | Who | Gate / rule |
+|---|------|-----|-------------|
+| 1 | **Branch** off `main` | Code session | `git checkout main` -> `git pull` -> `git checkout -b claude/<name>`. Never build on `main`. |
+| 2 | **Build test-gated** | Code session | Import-smoke (`from src.cora.app import app`) + full pytest on EVERY slice. Never commit on red. One commit per verified slice (`git commit -F <tempfile>`; no PS here-strings -- BOM). VERIFY-FIRST: reconcile every plan/audit claim against live code before building. |
+| 3 | **Adversarial review** | Code session | Required before any bot restart or irreversible/high-stakes change (D-051). Parallel multi-agent diff review; fix confirmed defects, re-gate. A green suite is NOT sufficient alone. |
+| 4 | **Push the feature branch** | Code session | `git push -u origin claude/<name>`. NEVER push/commit to `main` from a Code session. |
+| 5 | **SAVE** | Code session | Update the execution log + Drive design docs; update the Code-agent memory (`project_*.md` + `MEMORY.md`); write a dated capture note to `00-Founder/_session-captures/YYYY-MM/`. |
+| 6 | **CASCADE** | Code preps -> Cowork executes (thumbs-up-gated) | Code drafts the canonical entries into the cascade report (new dated section: founder `CLAUDE.md` TOM entry + `memory/decisions.md` entries). Cowork PROMOTES them one at a time on Harrison's thumbs-up (D-011). UPDATE/supersede stale TOM entries -- never duplicate. Code sessions must NOT write founder `CLAUDE.md`/`decisions.md` directly. |
+| 7 | **MERGE** | Harrison | After review: `git fetch . claude/<name>:main` then `git push origin main` (PS 5.1 -- two lines, no `&&`). Fast-forward pointer move. Code stages; Harrison runs. |
+| 8 | **RESTART** | Harrison | ONLY if bot-loaded modules changed. `deployment\restart-cora.ps1` (elevated), after the merge, then live smoke. Script-side changes need NO restart (working-tree-is-live). |
+
+**Decision rules:**
+- **Script-side vs bot-loaded -> restart?** A scheduled-task script activates at its next fire from the working tree (no restart). A module the always-on bot imports activates only at the next restart. Know which before promising "live."
+- **STOP and ask Harrison before:** a bot restart, any connector write (Slack/HubSpot/Asana/Drive/QBO), elevated/irreversible PowerShell, or any KB write/delete. Stage those (`--dry-run` / vetted script); Harrison executes.
+- **Canonical memory is thumbs-up-gated (D-011).** Founder `CLAUDE.md` TOM + `memory/decisions.md` change only with Harrison's explicit thumbs-up, via Cowork -- never from a Code session.
+- **Cascade ordering:** step 6 may run AFTER step 7 (merge) so the cascade entry can cite the merged hash. The loop is closed once step 6 is done; restart (8) is N/A when no bot-loaded code changed.
+- **The Full Cascade Prompt** (the reusable text Harrison pastes into Cowork to run step 6) lives in the cascade report appendix at `_shared/projects/cora/*COWORK-CASCADE-REPORT.md`.
+
+---
+
 ## TOP OF MIND (TOM)
+
+### [SHIPPED] 2026-06-17 Forensic rebuild PHASE 3 FINAL CLEANUP -- Item C COMPLETE + KB retention prune COMPLETE; int8 DEFERRED (branch `claude/rebuild-phase3-cleanup`, PUSHED, awaiting `main` merge; suite 4604)
+
+The two decision-locked Phase-3 tails. Branch off `main`@`0da781d`, PUSHED, NOT merged (Harrison moves `main`). 5 commits, suite 4581 -> 4604 / 42 skipped, every slice import-smoke + full-suite gated. NO bot restart (both items script-side -> activate at next fire from the working tree). NO host KB run (3.1 `--apply`/VACUUM are Harrison-gated).
+
+ITEM C -- rebuild OSN metrics on QBO + retire Clover:
+- `99839e5` C track 2 -- `qbo_client.extract_pnl_revenue()` (top-line Income, source-opaque, None when no Income) + `_parse_money()`; `run_osn_metrics_digest.py` rebuilt on `get_profit_loss` across the 4 OSN realms (OSNGW/OSNGM/OSNGF/OSNVV -- separate QBO companies). Window = last completed Mon-Sun vs prior week. Dropped txns + AOV; source-change labeled. Tests rewritten against QBO.
+- `051ca95` C track 1a -- stripped the OSN pass + `clover_client` import + threshold loader from `run_inventory_alerts.py` (KEPT the F3E pass).
+- `877e6a6` C track 1b -- deleted `clover_client.py` + `run_clover_daily_summary.py` + their tests + `setup-clover-daily-summary-task.ps1`; fixed the `shopify_client.py:10` docstring; added `test_clover_retired.py`.
+- `cac02e4` C review remediation -- a 7-agent D-051 review (2 SHIP, 1 risk-flag) caught 3 defects a green suite hid: HIGH silent-partial-digest (failed/no-income store dropped from ranking AND total -> now surfaces "No data this week for: <store>" + flags "N of 4 stores"); MEDIUM unpinned `accounting_method` across 4 separate QBO companies -> added the param + pinned `Accrual`; MEDIUM 0.0-vs-None contract untested -> pinned.
+- VERIFY-FIRST: F-13's "both tasks error nightly" was WRONG -- both were silent NO-OPs (OSN metrics digest passed the invalid Clover period `"this_week"`; inventory OSN pass read a now-absent `osn:` threshold key).
+
+ITEM 3.1 -- KB retention prune BUILT; int8 DEFERRED:
+- `d54ba13` `scripts/prune_kb_retention.py` -- gmail/drive_sweep ONLY; dry-run default; conservative `ingested_at` AND content-date AND-guard default; opt-in `--by-content-date`; batched <=500 cascade across all present vec tables; heartbeat-guarded.
+- VERIFY-FIRST (live dry-runs): the whole corpus was freshly (re)ingested 2026-05-28..06-17, so the `ingested_at` 18-month default prunes 0 today + for ~18 months (AND-guard protects the backfill); `date_modified` IS populated for drive_sweep (plan assumed NULL), so a `--by-content-date` 18-month prune cuts ~14,024 chunks (~2.5%: gmail 3,345 + drive_sweep 10,679). KB total 571,223 chunks.
+- int8 DEFERRED (Option 1): sqlite-vec 0.1.9 has NO range param (only `'unit'`); the viable workaround changes the L2 distance magnitude -> would silently break the content-gating thresholds (`_KB_MAX_DISTANCE=1.30` / gap_autofill / user_notes 1.05) unless rescaled by an approximation on a gating path; int8 is disk-only (~2.9 GB, NOT a latency lever); the f32 drop is irreversible. Revisit if sqlite-vec gains range-quantize or real host disk pressure justifies a full host recall+threshold validation.
+
+Doctrines (this session): a no-op-but-misleading task can masquerade as "erroring" -- verify the actual runtime path; pin the QBO `accounting_method` when comparing figures across separate companies; an int8 re-rank that returns int8-space L2 distances silently breaks every fixed distance-threshold consumer. Full record: `_shared/projects/cora/2026-06-16_fndr_cora-rebuild-execution-log.md` ("PHASE 3 CLEANUP SESSION").
 
 ### [SHIPPED] 2026-06-17 Forensic rebuild PHASE 3 -- MOSTLY COMPLETE + LIVE (main @ `3ac4656`, suite 4581; C + 3.1 remain)
 
