@@ -118,6 +118,60 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
     return tasks[:max_tasks]
 
 
+def get_project_tasks(project_gid: str, max_tasks: int = _API_MAX_LIMIT) -> list[dict[str, Any]]:
+    """Fetch incomplete tasks in a project (GET /projects/{gid}/tasks).
+
+    Read-only. `completed_since=now` returns only incomplete tasks. Same opt_fields
+    + pagination contract as get_user_tasks. Used by the F3E daily ecom+ops brief to
+    surface open Run-2 production tasks regardless of assignee.
+
+    Returns a list of task dicts (empty if none). Raises AsanaClientError on auth /
+    network / 5xx failure.
+    """
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    tasks: list[dict[str, Any]] = []
+    offset: str | None = None
+
+    while len(tasks) < max_tasks:
+        params: dict[str, Any] = {
+            "completed_since": "now",  # incomplete-only filter
+            "limit": min(_API_MAX_LIMIT, max_tasks - len(tasks)),
+            "opt_fields": ",".join([
+                "name",
+                "due_on",
+                "due_at",
+                "completed",
+                "assignee.name",
+                "permalink_url",
+            ]),
+        }
+        if offset:
+            params["offset"] = offset
+
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as c:
+                r = c.get(f"{_BASE}/projects/{project_gid}/tasks", params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+        if r.status_code == 401:
+            raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+        if r.status_code == 403:
+            raise AsanaClientError(f"Asana 403 — PAT lacks permission for project {project_gid}")
+        if r.status_code >= 500:
+            raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+        if r.status_code != 200:
+            raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+        body = r.json()
+        tasks.extend(body.get("data", []) or [])
+        offset = (body.get("next_page") or {}).get("offset")
+        if not offset:
+            break
+
+    return tasks[:max_tasks]
+
+
 def create_task(
     *,
     name: str,
