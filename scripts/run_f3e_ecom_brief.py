@@ -6,28 +6,26 @@ brief from existing Cora connectors (DTC / Paid / Subs / Retail / Inventory /
 Production / Ops) and posts it once daily to #f3-ops-cockpit.
 
 Guardrails:
-  - Source-opaque. #f3-ops-cockpit is NOT a finance-tier channel, so the cash line
-    is OMITTED here (it points to #f3-finance). No platform/sheet names.
-  - Entity [F3 Energy]. The post is routed through the egress boundary: importing a
+  - SOURCE-OPAQUE (f3e.md non-negotiable): section labels never name the underlying
+    platform ("DTC" not "Shopify", "Paid (blended)" not "Polar", "Retail pipeline"
+    not "HubSpot"). No platform/sheet names, no ad-network names.
+  - #f3-ops-cockpit is NOT a finance-tier channel, so the cash line is OMITTED here
+    (it points to #f3-finance).
+  - Entity [F3 Energy]. The post routes through the egress boundary: importing a
     cora module installs the sanitizer (cora/__init__), so the WebClient post below
-    is auto-sanitized like every other send (D-032).
-  - Fail-soft: every section degrades to a "not available" line on its source's
-    error, so one dead connector never blocks the brief. Polar (Paid + Subs)
-    renders "Polar not connected yet" when credentials are absent / unauthed.
+    is auto-sanitized like every other send (D-032) -- which also repairs the source
+    mojibake em-dashes that appear in some HubSpot deal names.
+  - FAIL-SOFT: every section degrades to a "not available" line on any error, and
+    build_brief() never raises (each section call is guarded), so one dead/garbage
+    source never blocks the brief. Paid + Subs render "not connected yet" when the
+    analytics source is unauthed.
   - D-029: this is intelligence (multi-source synthesis), not a mechanical
-    single-source push. Retire the standalone Make DTC scenario once this is live.
+    single-source push.
 
 Usage:
     .venv\\Scripts\\python.exe scripts/run_f3e_ecom_brief.py [--dry-run] [--channel C...]
     --dry-run        read sources + print the brief; post nothing
     --channel CID    override the target channel (smoke to #cora-build = C0B4B0URRQS)
-
-Environment (all optional; each missing source degrades gracefully):
-    SLACK_BOT_TOKEN            post
-    SHOPIFY_F3E_ACCESS_TOKEN   DTC + inventory
-    POLAR_CLIENT_ID/SECRET     paid + subscriptions  (or POLAR_API_KEY)
-    HUBSPOT_PRIVATE_APP_TOKEN  retail pipeline
-    ASANA_PAT                  production / ops
 """
 
 from __future__ import annotations
@@ -63,7 +61,7 @@ log = logging.getLogger("f3e_ecom_brief")
 # ---------------------------------------------------------------------------
 
 COCKPIT_CHANNEL = "C0BC9KED61W"   # #f3-ops-cockpit (private; Cora is a member)
-SMOKE_CHANNEL = "C0B4B0URRQS"     # #cora-build (smoke target)
+SMOKE_CHANNEL = "C0B4B0URRQS"     # #cora-build (smoke target + failure-notice sink)
 RUN2_PROJECT_GID = "1215472268404903"  # [F3E] F3 Production - Run 2
 
 _AZ_TZ = timezone(timedelta(hours=-7))  # Arizona = UTC-7 year-round (no DST)
@@ -84,8 +82,12 @@ _SUB_METRICS = [
     "recharge_sales_products.computed.churned_subscriptions",
 ]
 
-# F3E Retail pipeline closed stages (open pipeline = everything else).
-_CLOSED_STAGE_IDS = frozenset({"3760235206", "3760235207"})  # Closed Won, Closed Lost
+# F3E Retail pipeline closed stages -- reference the module constants so this can
+# never drift from hubspot_client on which stages are terminal. Open = everything else.
+_CLOSED_STAGE_IDS = frozenset({
+    hubspot_client._F3E_CLOSED_WON_ID,
+    hubspot_client._F3E_CLOSED_LOST_ID,
+})
 
 _INVENTORY_PREVIEW = 5  # cap low-stock SKUs named inline
 
@@ -113,7 +115,7 @@ def _money(value: Any) -> str:
 
 
 def _pct_delta(current: Any, prior: Any) -> str:
-    """'(+12%)' / '(-5%)' vs the prior window; '' when prior is 0/absent (no base)."""
+    """'(+12% vs prior 30d)' / '(-5% ...)'; '' when prior is 0/absent (no base)."""
     cur, pr = _num(current), _num(prior)
     if pr <= 0:
         return ""
@@ -122,17 +124,21 @@ def _pct_delta(current: Any, prior: Any) -> str:
 
 
 def _windows(today: date) -> tuple[tuple[str, str], tuple[str, str]]:
-    """(current, prior) ISO date ranges for a trailing-30d vs prior-30d compare."""
-    cur = ((today - timedelta(days=_WINDOW_DAYS)).isoformat(), today.isoformat())
+    """(current, prior) ISO date ranges, strictly NON-overlapping, for a trailing
+    30d vs prior 30d compare. prior ends the day before current starts."""
+    cur_start = today - timedelta(days=_WINDOW_DAYS)
+    cur = (cur_start.isoformat(), today.isoformat())
     prior = (
-        (today - timedelta(days=2 * _WINDOW_DAYS)).isoformat(),
-        (today - timedelta(days=_WINDOW_DAYS)).isoformat(),
+        (cur_start - timedelta(days=_WINDOW_DAYS)).isoformat(),
+        (cur_start - timedelta(days=1)).isoformat(),
     )
     return cur, prior
 
 
 # ---------------------------------------------------------------------------
-# Section builders -- each fail-soft (returns a string; never raises)
+# Section builders -- each returns a string; connector errors degrade in-place.
+# build_brief() additionally guards every call, so an unexpected error (e.g. a
+# null field in otherwise-good data) degrades that one section instead of the brief.
 # ---------------------------------------------------------------------------
 
 def _dtc_line() -> str:
@@ -141,10 +147,10 @@ def _dtc_line() -> str:
         d30 = shopify_client.get_sales_pulse("30d")
     except shopify_client.ShopifyConnectorError as exc:
         log.warning("DTC section unavailable: %s", exc)
-        return "- *DTC (Shopify):* not available"
-    top = d7.top_products[0].title if d7.top_products else "-"
+        return "- *DTC:* not available"
+    top = (d7.top_products[0].title or "-") if d7.top_products else "-"
     return (
-        f"- *DTC (Shopify):* {_money(d7.net_revenue_usd)} net / {d7.order_count} ord / "
+        f"- *DTC:* {_money(d7.net_revenue_usd)} net / {d7.order_count} ord / "
         f"{_money(d7.avg_order_value_usd)} AOV (7d) | 30d {_money(d30.net_revenue_usd)} net | top {top}"
     )
 
@@ -166,26 +172,20 @@ def _paid_line(today: date) -> str:
         prior = _polar_report(_PAID_METRICS, [_PAID_DIMENSION], prior_w)
     except polar_client.PolarConnectorError as exc:
         log.warning("Paid section unavailable: %s", exc)
-        return "- *Paid (Polar):* Polar not connected yet"
+        return "- *Paid (blended):* not connected yet"
 
     spend = cur.total_data.get("total_marketing_spend")
     mer = _num(cur.total_data.get("blended_roas"))
     bnet = cur.total_data.get("blended_net_sales")
     bnet_prior = prior.total_data.get("blended_net_sales")
-
-    # Top channel by spend (sort client-side; never trust ordering param shape).
-    channels = [
-        r for r in cur.table_data
-        if _num(r.get("total_marketing_spend")) > 0 and r.get(_PAID_DIMENSION)
-    ]
-    channels.sort(key=lambda r: _num(r.get("total_marketing_spend")), reverse=True)
-    top_channel = channels[0].get(_PAID_DIMENSION) if channels else "-"
-
     delta = _pct_delta(bnet, bnet_prior)
+    delta_seg = f" {delta}" if delta else ""
+    # Top channel is deliberately NOT surfaced -- naming the ad network (Meta/TikTok/
+    # Google) violates the f3e.md source-opacity rule. Spend/MER/net are the signal.
     return (
-        f"- *Paid (Polar):* {_money(spend)} spend / {mer:.2f}x MER / "
-        f"{_money(bnet)} blended net {delta} / top {top_channel} _(30d, blended)_"
-    ).replace("  ", " ")
+        f"- *Paid (blended):* {_money(spend)} spend / {mer:.2f}x MER / "
+        f"{_money(bnet)} net{delta_seg} _(30d)_"
+    )
 
 
 def _subs_line(today: date) -> str:
@@ -195,13 +195,14 @@ def _subs_line(today: date) -> str:
         prior = _polar_report(_SUB_METRICS, [], prior_w)
     except polar_client.PolarConnectorError as exc:
         log.warning("Subs section unavailable: %s", exc)
-        return "- *Subs (ReCharge):* Polar not connected yet"
+        return "- *Subscriptions:* not connected yet"
 
     net = cur.total_data.get("recharge_sales_products.computed.net_sales")
     net_prior = prior.total_data.get("recharge_sales_products.computed.net_sales")
     active = int(_num(cur.total_data.get("recharge_sales_products.raw.total_active_subscriptions")))
     delta = _pct_delta(net, net_prior)
-    return f"- *Subs (ReCharge):* {_money(net)} net / {active} active {delta} _(30d)_".replace("  ", " ")
+    delta_seg = f" {delta}" if delta else ""
+    return f"- *Subscriptions:* {_money(net)} net / {active} active{delta_seg} _(30d)_"
 
 
 def _retail_line() -> str:
@@ -209,7 +210,7 @@ def _retail_line() -> str:
         deals = hubspot_client.get_deals_by_pipeline(hubspot_client.PIPELINE_F3E_RETAIL)
     except hubspot_client.HubSpotClientError as exc:
         log.warning("Retail section unavailable: %s", exc)
-        return "- *Retail (HubSpot):* not available"
+        return "- *Retail pipeline:* not available"
 
     open_deals = [
         d for d in deals
@@ -218,9 +219,9 @@ def _retail_line() -> str:
     total = sum(_num((d.get("properties") or {}).get("amount")) for d in open_deals)
     open_deals.sort(key=lambda d: _num((d.get("properties") or {}).get("amount")), reverse=True)
     top3 = ", ".join(
-        (d.get("properties") or {}).get("dealname", "?") for d in open_deals[:3]
+        ((d.get("properties") or {}).get("dealname") or "?") for d in open_deals[:3]
     ) or "-"
-    return f"- *Retail (HubSpot):* {_money(total)} open across {len(open_deals)} deals | hot: {top3}"
+    return f"- *Retail pipeline:* {_money(total)} open across {len(open_deals)} deals | hot: {top3}"
 
 
 def _inventory_line() -> str:
@@ -254,7 +255,8 @@ def _ops_lines(today: date) -> list[str]:
     overdue = []
     upcoming_due: list[date] = []
     for t in open_tasks:
-        d = asana_client._parse_due_date(t.get("due_on") or "")
+        # Mirror the repo pattern (drop_stale_tasks) -- coalesce due_on/due_at.
+        d = asana_client._parse_due_date(t.get("due_on") or t.get("due_at") or "")
         if d is None:
             continue
         if d < today:
@@ -269,22 +271,43 @@ def _ops_lines(today: date) -> list[str]:
     )
     if overdue:
         overdue_sorted = asana_client.sort_tasks_due_first(overdue)
-        names = "; ".join(t.get("name", "?") for t in overdue_sorted[:3])
+        names = "; ".join((t.get("name") or "?") for t in overdue_sorted[:3])
         ops = f"- *Ops:* overdue -- {names}"
     else:
         ops = "- *Ops:* none overdue"
     return [prod, ops]
 
 
+# ---------------------------------------------------------------------------
+# Fail-soft section guards -- an unexpected error degrades ONE section, never
+# the whole brief (invariant: build_brief never raises).
+# ---------------------------------------------------------------------------
+
+def _safe(fn, fallback: str, *args) -> str:
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 -- fail-soft is the whole point
+        log.warning("section %s failed: %s", getattr(fn, "__name__", "?"), exc)
+        return fallback
+
+
+def _safe_lines(fn, fallback: list[str], *args) -> list[str]:
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("section %s failed: %s", getattr(fn, "__name__", "?"), exc)
+        return fallback
+
+
 def build_brief(today: date | None = None) -> str:
     today = today or _az_today()
     lines = [f"*[F3 Energy] Daily Ecom + Ops -- {today:%a %b} {today.day}*", ""]
-    lines.append(_dtc_line())
-    lines.append(_paid_line(today))
-    lines.append(_subs_line(today))
-    lines.append(_retail_line())
-    lines.append(_inventory_line())
-    lines.extend(_ops_lines(today))
+    lines.append(_safe(_dtc_line, "- *DTC:* not available"))
+    lines.append(_safe(_paid_line, "- *Paid (blended):* not available", today))
+    lines.append(_safe(_subs_line, "- *Subscriptions:* not available", today))
+    lines.append(_safe(_retail_line, "- *Retail pipeline:* not available"))
+    lines.append(_safe(_inventory_line, "- *Inventory:* not available"))
+    lines.extend(_safe_lines(_ops_lines, ["- *Production (Run-2):* not available"], today))
     lines.append("")
     lines.append("_Cash -> #f3-finance_")
     return "\n".join(lines)
@@ -299,7 +322,7 @@ def run(dry_run: bool = False, channel: str = COCKPIT_CHANNEL, today: date | Non
 
     if dry_run:
         log.info("[DRY RUN] Would post to %s:\n%s", channel, brief)
-        return {"posted": False, "channel": channel, "chars": len(brief)}
+        return {"posted": False, "channel": channel, "chars": len(brief), "dry_run": True}
 
     from slack_sdk import WebClient
 
@@ -314,7 +337,16 @@ def run(dry_run: bool = False, channel: str = COCKPIT_CHANNEL, today: date | Non
         log.info("F3E ecom brief posted to %s (%d chars)", channel, len(brief))
         return {"posted": True, "channel": channel, "chars": len(brief)}
     except Exception as exc:
-        log.error("Failed to post F3E ecom brief: %s", exc)
+        log.error("Failed to post F3E ecom brief to %s: %s", channel, exc)
+        # Make a silent no-post detectable: best-effort failure notice to #cora-build.
+        if channel != SMOKE_CHANNEL:
+            try:
+                slack_client.chat_postMessage(
+                    channel=SMOKE_CHANNEL,
+                    text=f"[F3 Energy] daily ecom brief FAILED to post to {channel}: {exc}",
+                )
+            except Exception:  # noqa: BLE001 -- best effort; never mask the real error
+                pass
         return {"posted": False, "channel": channel, "error": str(exc)}
 
 
@@ -330,3 +362,6 @@ if __name__ == "__main__":
 
     result = run(dry_run=args.dry_run, channel=args.channel)
     log.info("f3e_ecom_brief result: %s", result)
+    # Exit nonzero on a real (non-dry-run) post failure so the scheduled task's
+    # "Last Result" surfaces a silent no-post instead of always reading success.
+    sys.exit(0 if (args.dry_run or result.get("posted")) else 1)
