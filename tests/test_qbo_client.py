@@ -22,6 +22,8 @@ import pytest
 from cora.tools.qbo_client import (
     _deep_link,
     _extract_top_level_sections,
+    _parse_money,
+    extract_pnl_revenue,
     format_ap_aging_for_llm,
     format_ar_aging_for_llm,
     format_balance_sheet_for_llm,
@@ -203,6 +205,83 @@ class TestExtractTopLevelSections:
         }
         result = _extract_top_level_sections({"Rows": {"Row": [row]}})
         assert result["Assets"] == "99999.99"
+
+
+# ── _parse_money ──────────────────────────────────────────────────────────────
+
+class TestParseMoney:
+    """Tests for _parse_money() -- QBO summary value -> float USD."""
+
+    def test_plain_decimal(self):
+        assert _parse_money("12345.67") == 12345.67
+
+    def test_thousands_separator(self):
+        assert _parse_money("12,345.67") == 12345.67
+
+    def test_dollar_sign(self):
+        assert _parse_money("$1,000.00") == 1000.0
+
+    def test_parens_are_negative(self):
+        assert _parse_money("(1,234.56)") == -1234.56
+
+    def test_integer_string(self):
+        assert _parse_money("500") == 500.0
+
+    def test_empty_string_is_none(self):
+        assert _parse_money("") is None
+
+    def test_none_is_none(self):
+        assert _parse_money(None) is None
+
+    def test_garbage_is_none(self):
+        assert _parse_money("n/a") is None
+
+    def test_lone_parens_is_none(self):
+        assert _parse_money("()") is None
+
+
+# ── extract_pnl_revenue ─────────────────────────────────────────────────────────
+
+class TestExtractPnlRevenue:
+    """Tests for extract_pnl_revenue() -- top-line revenue from a P&L report."""
+
+    def test_income_section(self):
+        report = _make_report(
+            _make_section_row("Income", "50000.00"),
+            _make_section_row("Expenses", "30000.00"),
+            _make_section_row("Net Income", "20000.00"),
+        )
+        assert extract_pnl_revenue(report) == 50000.0
+
+    def test_total_income_label(self):
+        report = _make_report(_make_section_row("Total Income", "12345.00"))
+        assert extract_pnl_revenue(report) == 12345.0
+
+    def test_case_insensitive(self):
+        report = _make_report(_make_section_row("INCOME", "999.00"))
+        assert extract_pnl_revenue(report) == 999.0
+
+    def test_no_income_section_returns_none(self):
+        report = _make_report(_make_section_row("Expenses", "30000.00"))
+        assert extract_pnl_revenue(report) is None
+
+    def test_empty_report_returns_none(self):
+        assert extract_pnl_revenue({}) is None
+
+    def test_other_income_not_treated_as_top_line(self):
+        report = _make_report(_make_section_row("Other Income", "100.00"))
+        assert extract_pnl_revenue(report) is None
+
+    def test_net_income_not_treated_as_revenue(self):
+        report = _make_report(_make_section_row("Net Income", "20000.00"))
+        assert extract_pnl_revenue(report) is None
+
+    def test_income_preferred_over_other_income(self):
+        report = _make_report(
+            _make_section_row("Income", "80000.00"),
+            _make_section_row("Other Income", "5000.00"),
+        )
+        assert extract_pnl_revenue(report) == 80000.0
 
 
 # ── _deep_link ────────────────────────────────────────────────────────────────

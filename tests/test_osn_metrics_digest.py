@@ -1,9 +1,14 @@
-"""Tests for run_osn_metrics_digest.py -- Feature #17."""
+"""Tests for run_osn_metrics_digest.py -- OSN weekly metrics on QBO P&L.
+
+Rebuilt 2026-06-17 (Phase 3 item C): the prior Clover (point-of-sale) source was
+retired. The digest now derives per-store revenue + WoW from each store's QBO
+P&L; transaction count + average ticket are gone (no QBO equivalent).
+"""
 
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,41 +19,32 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 import run_osn_metrics_digest as osn  # noqa: E402
-from cora.connectors.clover_client import StoreSalesSummary  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures -- minimal QBO P&L report envelopes
 # ---------------------------------------------------------------------------
 
-def _make_store(code: str, name: str, revenue: float, txns: int, refunds: float = 0.0) -> StoreSalesSummary:
-    from dataclasses import dataclass
-    return StoreSalesSummary(
-        store_code=code,
-        store_name=name,
-        period="this_week",
-        revenue_usd=revenue,
-        transaction_count=txns,
-        avg_ticket_usd=revenue / txns if txns > 0 else 0.0,
-        refund_total_usd=refunds,
-        refund_count=0,
-        net_revenue_usd=revenue - refunds,
-    )
+def _pnl(income: float) -> dict:
+    """A minimal QBO P&L report with a single Income section."""
+    return {"Rows": {"Row": [
+        {
+            "type": "Section",
+            "Header": {"ColData": [{"value": "Income"}]},
+            "Summary": {"ColData": [{"value": "Total Income"}, {"value": str(income)}]},
+        },
+    ]}}
 
 
-def _make_four_stores(revenues: list[float] | None = None) -> list[StoreSalesSummary]:
-    if revenues is None:
-        revenues = [4231.0, 3890.0, 3550.0, 2910.0]
-    stores_data = [
-        ("GW",  "Gilbert & Warner"),
-        ("GF",  "Greenfield & 60"),
-        ("MK",  "Gilbert & McKellips"),
-        ("VVP", "Val Vista & Pecos"),
-    ]
-    return [
-        _make_store(code, name, rev, 150)
-        for (code, name), rev in zip(stores_data, revenues)
-    ]
+def _pnl_no_income() -> dict:
+    """A P&L report with no Income section (e.g. an expense-only sub-ledger)."""
+    return {"Rows": {"Row": [
+        {
+            "type": "Section",
+            "Header": {"ColData": [{"value": "Expenses"}]},
+            "Summary": {"ColData": [{"value": "Total Expenses"}, {"value": "1000"}]},
+        },
+    ]}}
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +52,11 @@ def _make_four_stores(revenues: list[float] | None = None) -> list[StoreSalesSum
 # ---------------------------------------------------------------------------
 
 def test_calc_wow_pct_positive():
-    result = osn._calc_wow_pct(1100.0, 1000.0)
-    assert abs(result - 10.0) < 0.01
+    assert abs(osn._calc_wow_pct(1100.0, 1000.0) - 10.0) < 0.01
 
 
 def test_calc_wow_pct_negative():
-    result = osn._calc_wow_pct(900.0, 1000.0)
-    assert abs(result + 10.0) < 0.01
+    assert abs(osn._calc_wow_pct(900.0, 1000.0) + 10.0) < 0.01
 
 
 def test_calc_wow_pct_zero_last_week():
@@ -90,13 +84,11 @@ def test_format_wow_none():
 
 
 def test_format_wow_flag_below_threshold():
-    result = osn._format_wow(-15.0)
-    assert "⚠️" in result
+    assert "⚠️" in osn._format_wow(-15.0)
 
 
 def test_format_wow_no_flag_above_threshold():
-    result = osn._format_wow(-5.0)
-    assert "⚠️" not in result
+    assert "⚠️" not in osn._format_wow(-5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -112,61 +104,130 @@ def test_store_label_unknown():
 
 
 # ---------------------------------------------------------------------------
+# _week_ranges -- completed-week comparison
+# ---------------------------------------------------------------------------
+
+def test_week_ranges_fired_monday():
+    (this_s, this_e), (prior_s, prior_e), week_of = osn._week_ranges(date(2026, 6, 15))  # Monday
+    assert (this_s, this_e) == ("2026-06-08", "2026-06-14")
+    assert (prior_s, prior_e) == ("2026-06-01", "2026-06-07")
+    assert week_of == "2026-06-08"
+
+
+def test_week_ranges_fired_midweek():
+    # Wednesday 2026-06-17 -- still reports the last *completed* week (6/8-6/14)
+    (this_s, this_e), (prior_s, prior_e), _ = osn._week_ranges(date(2026, 6, 17))
+    assert (this_s, this_e) == ("2026-06-08", "2026-06-14")
+    assert (prior_s, prior_e) == ("2026-06-01", "2026-06-07")
+
+
+def test_week_ranges_are_seven_days_each():
+    (this_s, this_e), (prior_s, prior_e), _ = osn._week_ranges(date(2026, 6, 15))
+    assert (date.fromisoformat(this_e) - date.fromisoformat(this_s)).days == 6
+    assert (date.fromisoformat(prior_e) - date.fromisoformat(prior_s)).days == 6
+    # prior week ends the day before this week starts -- contiguous, no gap/overlap
+    assert (date.fromisoformat(this_s) - date.fromisoformat(prior_e)).days == 1
+
+
+# ---------------------------------------------------------------------------
+# _fetch_week_revenue
+# ---------------------------------------------------------------------------
+
+def test_fetch_week_revenue_extracts_income():
+    reports = {
+        "OSNGW": _pnl(5000.0),
+        "OSNGM": _pnl(4000.0),
+        "OSNGF": _pnl(3000.0),
+        "OSNVV": _pnl(2000.0),
+    }
+    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en: reports[e]):
+        out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
+    assert out == {"OSNGW": 5000.0, "OSNGM": 4000.0, "OSNGF": 3000.0, "OSNVV": 2000.0}
+
+
+def test_fetch_week_revenue_skips_store_with_no_income():
+    reports = {
+        "OSNGW": _pnl(5000.0),
+        "OSNGM": _pnl_no_income(),
+        "OSNGF": _pnl(3000.0),
+        "OSNVV": _pnl(2000.0),
+    }
+    with patch.object(osn, "get_profit_loss", side_effect=lambda e, s, en: reports[e]):
+        out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
+    assert "OSNGM" not in out
+    assert out == {"OSNGW": 5000.0, "OSNGF": 3000.0, "OSNVV": 2000.0}
+
+
+def test_fetch_week_revenue_skips_store_on_api_error():
+    def _se(entity, start, end):
+        if entity == "OSNGM":
+            raise osn.QboClientError("realm down")
+        return _pnl(1000.0)
+
+    with patch.object(osn, "get_profit_loss", side_effect=_se):
+        out = osn._fetch_week_revenue("2026-06-08", "2026-06-14")
+    assert "OSNGM" not in out
+    assert len(out) == 3
+
+
+# ---------------------------------------------------------------------------
 # build_message
 # ---------------------------------------------------------------------------
 
-def test_build_message_contains_header():
-    this_week = _make_four_stores()
-    last_week = _make_four_stores()
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
+def test_build_message_contains_header_and_week():
+    msg = osn.build_message({"OSNGW": 4231.0}, {"OSNGW": 4000.0}, "2026-06-08")
     assert "OSN Weekly Metrics" in msg
-
-
-def test_build_message_contains_week_of():
-    this_week = _make_four_stores()
-    last_week = _make_four_stores()
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
-    assert "2026-06-02" in msg
+    assert "2026-06-08" in msg
 
 
 def test_build_message_sorted_by_revenue_descending():
-    revenues = [1000.0, 4000.0, 2000.0, 3000.0]
-    this_week = _make_four_stores(revenues)
-    last_week = _make_four_stores(revenues)
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
-    # "1." should be in front of the highest-revenue store
-    lines = msg.split("\n")
-    rank1_line = next((l for l in lines if l.startswith("1.")), "")
-    assert "4,000" in rank1_line or "Greenfield" in rank1_line  # $4000 store is GF
+    this = {"OSNGW": 1000.0, "OSNGF": 4000.0, "OSNGM": 2000.0, "OSNVV": 3000.0}
+    msg = osn.build_message(this, this, "2026-06-08")
+    rank1 = next(line for line in msg.split("\n") if line.startswith("1."))
+    assert "Greenfield & 60" in rank1  # the $4,000 store (OSNGF)
 
 
 def test_build_message_contains_total():
-    this_week = _make_four_stores()
-    last_week = _make_four_stores()
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
-    assert "Total this week" in msg
+    msg = osn.build_message({"OSNGW": 4231.0}, {"OSNGW": 4000.0}, "2026-06-08")
+    assert "Total for the week" in msg
 
 
 def test_build_message_flags_big_decline():
-    this_week = _make_four_stores([4000.0, 3000.0, 2000.0, 500.0])   # VVP dropped a lot
-    last_week = _make_four_stores([4000.0, 3000.0, 2000.0, 2000.0])
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
+    this = {"OSNGW": 4000.0, "OSNGM": 3000.0, "OSNGF": 2000.0, "OSNVV": 500.0}
+    last = {"OSNGW": 4000.0, "OSNGM": 3000.0, "OSNGF": 2000.0, "OSNVV": 2000.0}
+    msg = osn.build_message(this, last, "2026-06-08")
     assert "Flagged" in msg
     assert "⚠️" in msg
 
 
 def test_build_message_no_flags_when_stable():
-    this_week = _make_four_stores([4000.0, 3900.0, 3500.0, 3000.0])
-    last_week = _make_four_stores([4000.0, 3900.0, 3500.0, 3000.0])
-    msg = osn.build_message(this_week, last_week, "2026-06-02")
+    this = {"OSNGW": 4000.0, "OSNGM": 3900.0, "OSNGF": 3500.0, "OSNVV": 3000.0}
+    msg = osn.build_message(this, this, "2026-06-08")
     assert "Flagged" not in msg
 
 
 def test_build_message_no_last_week_data():
-    this_week = _make_four_stores()
-    msg = osn.build_message(this_week, [], "2026-06-02")
-    # Should still produce output without crashing
+    msg = osn.build_message({"OSNGW": 4000.0}, {}, "2026-06-08")
     assert "OSN Weekly Metrics" in msg
+    assert "--" in msg  # WoW shows "--" when there is no prior-week figure
+
+
+def test_build_message_drops_txns_and_aov():
+    msg = osn.build_message({"OSNGW": 4000.0}, {"OSNGW": 4000.0}, "2026-06-08").lower()
+    assert "txns" not in msg
+    assert "aov" not in msg
+    assert "avg ticket" not in msg
+
+
+def test_build_message_labels_source_change():
+    msg = osn.build_message({"OSNGW": 4000.0}, {"OSNGW": 4000.0}, "2026-06-08")
+    assert "accrual" in msg.lower()
+
+
+def test_build_message_is_source_opaque():
+    msg = osn.build_message({"OSNGW": 4000.0}, {"OSNGW": 3000.0}, "2026-06-08").lower()
+    for banned in ("clover", "quickbooks", "qbo", "realm", "intuit"):
+        assert banned not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -187,50 +248,44 @@ def test_run_no_token(monkeypatch):
 
 def test_run_dry_run_no_dm_sent(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-    stores = _make_four_stores()
-
-    with patch.object(osn, "get_all_stores_sales_pulse", return_value=stores), \
+    with patch.object(osn, "get_profit_loss", return_value=_pnl(2000.0)), \
          patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
-        osn.run(dry_run=True)
-
+        osn.run(dry_run=True, today=date(2026, 6, 15))
     client.conversations_open.assert_not_called()
 
 
 def test_run_sends_dm_to_matt(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-    stores = _make_four_stores()
-
-    with patch.object(osn, "get_all_stores_sales_pulse", return_value=stores), \
+    with patch.object(osn, "get_profit_loss", return_value=_pnl(2000.0)), \
          patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
-        result = osn.run(dry_run=False)
-
+        result = osn.run(dry_run=False, today=date(2026, 6, 15))
     client.conversations_open.assert_called_once_with(users=["U0B3PS7RFJA"])
+    client.chat_postMessage.assert_called_once()
     assert result["stores_fetched"] == 4
+    assert result["error"] == 0
 
 
 def test_run_no_stores_skips_dm(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-
-    with patch.object(osn, "get_all_stores_sales_pulse", return_value=[]), \
+    with patch.object(osn, "get_profit_loss", side_effect=osn.QboClientError("down")), \
          patch("slack_sdk.WebClient") as mock_wc:
         client = _mock_slack()
         mock_wc.return_value = client
-        result = osn.run(dry_run=False)
-
+        result = osn.run(dry_run=False, today=date(2026, 6, 15))
     client.conversations_open.assert_not_called()
     assert result["stores_fetched"] == 0
+    assert result["error"] == 0
 
 
-def test_run_clover_error(monkeypatch):
+def test_run_dm_failure_returns_error(monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-
-    with patch.object(osn, "get_all_stores_sales_pulse", side_effect=osn.CloverConnectorError("fail")), \
-         patch("slack_sdk.WebClient") as mock_wc:
-        mock_wc.return_value = _mock_slack()
-        result = osn.run(dry_run=False)
-
-    assert result.get("error") == 1
+    client = _mock_slack()
+    client.chat_postMessage.side_effect = Exception("slack down")
+    with patch.object(osn, "get_profit_loss", return_value=_pnl(2000.0)), \
+         patch("slack_sdk.WebClient", return_value=client):
+        result = osn.run(dry_run=False, today=date(2026, 6, 15))
+    assert result["error"] == 1

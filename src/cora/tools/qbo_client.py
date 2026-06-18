@@ -321,6 +321,50 @@ def _extract_top_level_sections(report: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def _parse_money(raw: str | None) -> float | None:
+    """Parse a QBO summary value string into a float USD, or None if unparseable.
+
+    Handles plain decimals ("12345.67"), thousands separators ("12,345.67"), a
+    leading "$", and accounting-negative parentheses ("(1,234.56)" -> -1234.56).
+    """
+    if not raw:
+        return None
+    t = raw.strip().replace(",", "").replace("$", "").strip()
+    negative = t.startswith("(") and t.endswith(")")
+    t = t.strip("()").strip()
+    if not t:
+        return None
+    try:
+        value = float(t)
+    except ValueError:
+        return None
+    return -value if negative else value
+
+
+def extract_pnl_revenue(report: dict[str, Any]) -> float | None:
+    """Return the top-line Income (revenue) total from a P&L report as float USD.
+
+    This is source-opaque accrual revenue from the books -- NOT a register /
+    payment gross total, so it will not match a prior point-of-sale figure 1:1.
+    Returns None when the report has no recognizable Income section (so a caller
+    can skip that entity rather than mis-report $0).
+    """
+    totals = _extract_top_level_sections(report)
+    if not totals:
+        return None
+    # QBO labels the top revenue section "Income"; some report shapes use
+    # "Total Income". Match those exactly (case-insensitive) first.
+    for name, value in totals.items():
+        if name.strip().lower() in ("income", "total income"):
+            return _parse_money(value)
+    # Fallback: an income-ish section that is neither "Other Income" nor a net line.
+    for name, value in totals.items():
+        nl = name.strip().lower()
+        if "income" in nl and "other" not in nl and "net" not in nl:
+            return _parse_money(value)
+    return None
+
+
 def format_pnl_for_llm(
     report: dict[str, Any],
     entity: str,
