@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -70,6 +71,7 @@ class InventoryVariant:
     sku: str
     qty_on_hand: int
     low_stock: bool
+    product_type: str = ""
 
 
 @dataclass
@@ -307,12 +309,13 @@ def get_inventory_status(
     products = _get_paginated(
         f"{_base_url(store)}/products.json",
         token,
-        params={"limit": _PAGE_SIZE, "fields": "id,title,variants"},
+        params={"limit": _PAGE_SIZE, "fields": "id,title,product_type,variants"},
     )
 
     variants: list[InventoryVariant] = []
     for product in products:
         product_title = product.get("title") or "Unknown product"
+        product_type = (product.get("product_type") or "").strip()
         for v in product.get("variants") or []:
             variant_title = (v.get("title") or "").strip()
             if variant_title.lower() in ("default title", "default"):
@@ -325,6 +328,7 @@ def get_inventory_status(
                 sku=sku,
                 qty_on_hand=qty,
                 low_stock=(qty <= low_stock_threshold),
+                product_type=product_type,
             ))
 
     _cache_set(cache_key, variants)
@@ -451,13 +455,66 @@ def _get_locations() -> dict[str, int]:
 
 
 def _infer_brand_from_title(product_title: str) -> str:
-    """Infer F3 brand bucket (Energy / Mood / Pure) from a Shopify product title."""
+    """Infer F3 brand bucket (Energy / Mood / Pure) from a Shopify product title.
+
+    NOTE: this is a brand *bucketer*, not a beverage filter -- it defaults
+    un-matched titles to "Energy", so it would mislabel apparel as a brand.
+    Use is_beverage_product() to separate beverages from apparel/merch.
+    """
     t = product_title.lower()
     if "pure" in t:
         return "Pure"
     if "mood" in t:
         return "Mood"
     return "Energy"
+
+
+# Beverage vs. apparel/merch classification for the F3E Shopify catalog.
+#
+# The live catalog (verified 2026-06-18) tags every beverage with a product_type
+# ("Pure Drink" / "Mood Drink" / "Energy Drink" / "Energy & Mood Drink" /
+# "Energy") and leaves apparel/merch (tees, hats, pullovers) product_type BLANK.
+# So product_type is the primary, reliable signal. The title heuristic is only a
+# fallback for products whose product_type is blank or unrecognized (e.g. if
+# someone forgets to set it), and it is merch-exclude-FIRST so a merch item that
+# happens to carry a beverage word in its title (e.g. "F3 Energy Koozie") is
+# still excluded. Word-boundary matching avoids substring false-hits ("cap" in
+# "escapade", "hat" in "what", "pack" in "backpack").
+#
+# NOTE: "bottle" is deliberately NOT a merch token. Merch is checked BEFORE
+# beverage, so a token that also appears in beverage names ("F3 Pure Sparkling
+# Water Bottle", "Energy 16oz Bottle") would silently FALSE-EXCLUDE a real
+# low-stock beverage -- the cardinal failure this filter exists to prevent.
+# F3 ships cans today (caught by "cans?" in the beverage pattern) and has no
+# bottle/drinkware merch; if a drinkware merch line ever needs excluding, give
+# it a dedicated product_type, never a beverage-vocabulary-overlapping title word.
+_MERCH_PATTERN = re.compile(
+    r"\b(?:t[\s-]?shirt|tee|shirt|pullover|hoodie|sweatshirt|crewneck|jacket|"
+    r"joggers?|shorts|socks?|hat|cap|beanie|apparel|merch|sticker|koozie|mug|"
+    r"tumbler|gear)\b"
+)
+_BEVERAGE_PATTERN = re.compile(
+    r"\b(?:drink|energy|mood|pure|beverage|variety|\d*[\s-]?pack|cans?)\b"
+)
+
+
+def is_beverage_product(product_type: str, product_title: str = "") -> bool:
+    """True if a Shopify product is an F3 *beverage* (not apparel/merch).
+
+    product_type is the primary signal (every live beverage carries one;
+    apparel/merch leaves it blank). product_title is a merch-exclude-first
+    fallback used only when product_type is blank or unrecognized.
+    """
+    pt = (product_type or "").strip().lower()
+    if _MERCH_PATTERN.search(pt):
+        return False
+    if _BEVERAGE_PATTERN.search(pt):
+        return True
+    # Blank or unrecognized product_type -> title fallback (merch wins ties).
+    title = (product_title or "").lower()
+    if _MERCH_PATTERN.search(title):
+        return False
+    return bool(_BEVERAGE_PATTERN.search(title))
 
 
 def get_inventory_by_location(

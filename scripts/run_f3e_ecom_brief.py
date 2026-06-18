@@ -231,7 +231,24 @@ def _inventory_line() -> str:
         log.warning("Inventory section unavailable: %s", exc)
         return "- *Inventory:* not available"
 
-    low = [v for v in variants if getattr(v, "low_stock", False)]
+    # Beverage-only: this is the drink-line ecom/ops cockpit, so exclude
+    # apparel/merch (draft tees, hats, pullovers) that would otherwise bury the
+    # real beverage signal (e.g. Pure Variety Pack at 0). product_type is the
+    # reliable discriminator; is_beverage_product falls back to the title when a
+    # product is un-typed. (Filtered here, not in the connector, so the Slack
+    # Q&A / inventory paths still see the full catalog.)
+    beverages = [
+        v for v in variants
+        if shopify_client.is_beverage_product(
+            getattr(v, "product_type", ""), getattr(v, "product_title", "")
+        )
+    ]
+    log.info(
+        "inventory section: %d beverage SKUs of %d total (apparel/merch excluded)",
+        len(beverages), len(variants),
+    )
+
+    low = [v for v in beverages if getattr(v, "low_stock", False)]
     if not low:
         return "- *Inventory:* all healthy"
     low.sort(key=lambda v: getattr(v, "qty_on_hand", 0))
