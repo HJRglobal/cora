@@ -93,7 +93,8 @@ def test_create_task_resolves_assignee_via_aliases():
         "due_on": None,
         "projects": [],
     }
-    with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock:
+    with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
         result = td._tool_asana_create_task(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
@@ -108,6 +109,101 @@ def test_create_task_resolves_assignee_via_aliases():
     # Shaun's Asana GID from the real slack-to-asana.yaml shipped in the repo
     assert call_kwargs["assignee_gid"] == "1209093544422692"
     assert "WRITE_CONFIRMED" in result
+
+
+# ---------------------------------------------------------------------------
+# WS3: cross-entity-safe routing + LEX PHI scrub + exact-name dedup
+# ---------------------------------------------------------------------------
+
+_F3E_CATCH_ALL = "1215470928454227"   # [F3E] Operations — General
+_LEX_CATCH_ALL = "1215470944114390"   # [LEX-LLC] Operations — General
+
+
+def test_explicit_cross_entity_project_is_dropped_and_rerouted():
+    """A LEX project GID passed from an F3E channel must NOT be used; the task is
+    re-routed to an F3E project and the re-route is surfaced."""
+    created = {"gid": "1", "permalink_url": "http://x", "projects": []}
+    with patch.object(td.asana_client, "create_task", return_value=created) as mock, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+        result = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="F3E",
+            _input={"title": "Plan something", "confirmed": True, "project_gid": _LEX_CATCH_ALL},
+        )
+    assert mock.call_args.kwargs["project_gid"] != _LEX_CATCH_ALL
+    assert "belongs to" in result.lower()
+
+
+def test_no_orphan_routes_to_entity_catch_all():
+    """When the resolver finds nothing, an entity-scoped channel routes to that
+    entity's catch-all -- never a silent My-Tasks orphan."""
+    created = {"gid": "1", "permalink_url": "http://x", "projects": []}
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="F3E",
+            _input={"title": "Some F3E task", "confirmed": True},
+        )
+    assert mock.call_args.kwargs["project_gid"] == _F3E_CATCH_ALL
+
+
+def test_lex_channel_scrubs_phi_and_routes_lex():
+    """A task created from a Lexington channel is PHI-scrubbed and lands in a LEX
+    project, and the scrub is surfaced."""
+    created = {"gid": "1", "permalink_url": "http://x", "projects": []}
+    with patch.object(td.org_roles, "all_roles", return_value=[]), \
+         patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: (t or "").replace("John Doe", "[client]")), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+        result = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="LEX-LLC",
+            _input={"title": "Follow up with John Doe re billing", "confirmed": True},
+        )
+    assert mock.call_args.kwargs["name"] == "Follow up with [client] re billing"
+    from cora.tools import project_resolver as pr
+    owners = pr.project_owner_entities(mock.call_args.kwargs["project_gid"])
+    assert any(str(o).upper().startswith("LEX") for o in owners)
+    assert "phi-scrubbed" in result.lower()
+
+
+def test_dedup_refuses_then_force_creates():
+    """An exact-name open task in the target project blocks the create (surfaced);
+    force_duplicate=true overrides."""
+    existing = [{"gid": "OLD", "name": "Send the deck", "permalink_url": "http://old"}]
+    created = {"gid": "NEW", "permalink_url": "http://new", "projects": []}
+    with patch.object(td.asana_client, "get_project_tasks", return_value=existing), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock:
+        blocked = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="F3E",
+            _input={"title": "Send the deck", "confirmed": True},
+        )
+        assert "already exists" in blocked.lower()
+        assert "force_duplicate" in blocked
+        mock.assert_not_called()
+
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="F3E",
+            _input={"title": "Send the deck", "confirmed": True, "force_duplicate": True},
+        )
+        mock.assert_called_once()
+
+
+def test_unconfirmed_preview_surfaces_lex_scrub():
+    """The unconfirmed refusal includes the resolved preview + the LEX scrub note
+    so the user sees it BEFORE approving (the WS3 invariant clamp)."""
+    with patch.object(td.org_roles, "all_roles", return_value=[]), \
+         patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: (t or "").replace("John Doe", "[client]")):
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="LEX-LLC",
+            _input={"title": "Call John Doe"},
+        )
+    assert "refused" in out.lower()
+    assert "[client]" in out          # scrubbed title shown in preview
+    assert "phi-scrubbed" in out.lower()
 
 
 def test_create_task_refuses_unresolvable_assignee():

@@ -207,6 +207,77 @@ def resolve_project(
     return None
 
 
+# Keys whose values are project GIDs, anywhere in an entity's config block.
+_PROJECT_GID_KEYS = {
+    "catch_all_gid", "project_gid", "fallback_project_gid",
+    "event_project_gid", "social_project_gid",
+}
+
+
+def _collect_gids(node: Any, out: set[str]) -> None:
+    """Recursively collect project GIDs (values under _PROJECT_GID_KEYS)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _PROJECT_GID_KEYS and isinstance(v, (str, int)) and str(v).strip():
+                out.add(str(v).strip())
+            else:
+                _collect_gids(v, out)
+    elif isinstance(node, list):
+        for it in node:
+            _collect_gids(it, out)
+
+
+def project_owner_entities(project_gid: str) -> set[str]:
+    """Return the set of entity codes whose config references this project GID.
+
+    A GID can be owned by several entities (e.g. the HJRG general project is the
+    shared catch-all for both FNDR and HJRG; the LEX-LLC ops project is the LEX
+    catch-all too). Returns an empty set for a GID not in the map.
+    """
+    data = _load_map()
+    owners: set[str] = set()
+    for ent, cfg in (data.get("entities") or {}).items():
+        gids: set[str] = set()
+        _collect_gids(cfg, gids)
+        if str(project_gid) in gids:
+            owners.add(ent)
+    return owners
+
+
+def _family(entity: str) -> str:
+    """Collapse an entity/sub-entity/store code to its family for ownership checks."""
+    up = (entity or "").upper()
+    for p in ("HJRPROD", "HJRP", "HJRG", "LEX", "OSN"):
+        if up.startswith(p):
+            return p
+    return up.split("-")[0]
+
+
+def belongs_to_entity(project_gid: str, entity: str) -> bool:
+    """True if a project GID is owned by the entity's family or a shared
+    aggregator (FNDR/HJRG). Fail-OPEN for a GID not in the map (can't prove it
+    foreign -- it may be a real project Cora doesn't route to)."""
+    owners = project_owner_entities(project_gid)
+    if not owners:
+        return True
+    fam = _family(entity)
+    for o in owners:
+        if o in ("FNDR", "HJRG") or _family(o) == fam:
+            return True
+    return False
+
+
+def entity_catch_all(entity: str) -> str | None:
+    """Return the catch-all project GID for an entity (parent fallback), or None."""
+    data = _load_map()
+    ents = data.get("entities") or {}
+    cfg = ents.get(entity) or ents.get(entity.split("-")[0])
+    if not cfg:
+        return None
+    g = cfg.get("catch_all_gid")
+    return str(g).strip() if g else None
+
+
 def get_blocked_project_gids() -> set[str]:
     """Return the set of hard-blocked project GIDs (Harrison Private)."""
     data = _load_map()

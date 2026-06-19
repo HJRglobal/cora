@@ -517,6 +517,110 @@ def _tool_get_user_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
     return f"[Looking up tasks for: {info}]\n\n{formatted}"
 
 
+_AGGREGATOR_CREATE_ENTITIES = frozenset({"FNDR", "HJRG"})
+
+
+def _norm_task_key(name: str) -> str:
+    """Normalize a task name for exact-name dedup (collapse ws, cap 160, lower)."""
+    s = " ".join((name or "").split())
+    return s[:160].rstrip().lower()
+
+
+def _find_open_dup(project_gid: str, title: str) -> str | None:
+    """Permalink/gid of an existing OPEN task with the same normalized name in the
+    project, else None. Fail-OPEN -- a dedup read must never block a legit create.
+    (Exact-name only -- a reworded duplicate from LLM rephrasing still slips; this
+    is the floor, not a complete dedup.)"""
+    if not project_gid:
+        return None
+    try:
+        key = _norm_task_key(title)
+        for t in asana_client.get_project_tasks(project_gid, max_tasks=500):
+            if _norm_task_key(t.get("name") or "") == key:
+                return t.get("permalink_url") or t.get("gid") or "an existing task"
+    except Exception as exc:  # noqa: BLE001 -- dedup is best-effort
+        log.warning("asana_create_task: dedup scan failed for %s: %s", project_gid, exc)
+    return None
+
+
+def _plan_asana_create(
+    entity: str,
+    title: str,
+    notes: str | None,
+    project_gid: str | None,
+    assignee_gid: str | None,
+) -> dict:
+    """Decide the final project + (for a Lexington channel) PHI-scrub the task,
+    with NO silent cross-entity re-routing. Returns title/notes/project_gid plus
+    human-readable `notices` to surface at the confirm gate. No network calls.
+
+    INVARIANT (WS3): never silently file a task into another entity's project, and
+    never silently scrub a deliberately cross-entity task -- every adjustment is
+    recorded in `notices` and shown in the preview before the user confirms.
+    """
+    from cora.tools import project_resolver as pr
+
+    ent_upper = (entity or "FNDR").upper()
+    is_aggregator = ent_upper in _AGGREGATOR_CREATE_ENTITIES
+    is_lex = ent_upper == "LEX" or ent_upper.startswith("LEX-")
+    notices: list[str] = []
+
+    # 1. Drop an explicit project_gid that belongs to a DIFFERENT entity family.
+    if project_gid and not is_aggregator and not pr.belongs_to_entity(project_gid, ent_upper):
+        owners = ", ".join(sorted(pr.project_owner_entities(project_gid))) or "another entity"
+        notices.append(
+            f"the project you named belongs to {owners}, not {ent_upper}; I routed this "
+            f"to a {ent_upper} project instead"
+        )
+        project_gid = None
+
+    # 2. Smart routing when no (valid) project was supplied.
+    if not project_gid:
+        try:
+            resolved = pr.resolve_project(
+                entity=entity, task_text=title + (" " + (notes or "")), assignee_gid=assignee_gid
+            )
+            if resolved and not pr.is_blocked_project(resolved):
+                project_gid = resolved
+        except Exception as exc:  # noqa: BLE001
+            log.warning("asana_create_task: project_resolver failed (%s)", exc)
+
+    # 3. No silent My-Tasks orphan for an entity-scoped channel.
+    if not project_gid and not is_aggregator:
+        ca = pr.entity_catch_all(entity)
+        if ca and not pr.is_blocked_project(ca):
+            project_gid = ca
+
+    # 4. Lexington channel: PHI-scrub (minimum-necessary) + keep it in LEX scope.
+    lex_scrub_error = False
+    if is_lex:
+        try:
+            from .. import phi_guard
+            staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+            new_title = phi_guard.scrub_lex_phi(title, allowed_names=staff)
+            new_notes = phi_guard.scrub_lex_phi(notes, allowed_names=staff) if notes else notes
+            if new_title != title or (notes and new_notes != notes):
+                notices.append("PHI-scrubbed the task for Lexington (minimum-necessary)")
+            title, notes = new_title, new_notes
+        except Exception as exc:  # noqa: BLE001 -- fail CLOSED on PHI
+            log.warning("asana_create_task: LEX PHI scrub failed (%s)", exc)
+            lex_scrub_error = True
+        if not lex_scrub_error and project_gid:
+            owners = pr.project_owner_entities(project_gid)
+            if owners and not any(str(o).upper().startswith("LEX") for o in owners):
+                ca = pr.entity_catch_all(entity)
+                project_gid = ca if (ca and not pr.is_blocked_project(ca)) else None
+                notices.append("routed to a Lexington project")
+
+    return {
+        "title": title,
+        "notes": notes,
+        "project_gid": project_gid,
+        "notices": notices,
+        "lex_scrub_error": lex_scrub_error,
+    }
+
+
 def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> str:
     """Create a new Asana task in the HJR Global workspace.
 
@@ -540,19 +644,6 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         return (
             "asana_create_task called without a `title`. Tell the user what the "
             "task should be named — Cora won't create unnamed tasks."
-        )
-
-    # The confirmation gate
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "asana_create_task refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a preview block (title, assignee, "
-            "project, due date, notes) AND received their explicit approval "
-            "in their next message ('yes', 'approve', 'create it', or similar). "
-            "If you have NOT done that yet, do it now: format a clear preview "
-            "and ask the user to confirm. If you HAVE shown a preview and the "
-            "user approved, call this tool again with confirmed=true."
         )
 
     # Resolve assignee
@@ -599,48 +690,58 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         )
 
     # Optional fields
-    project_gid = (input_data.get("project_gid") or "").strip() or None
     notes = input_data.get("notes") or None
     due_on = (input_data.get("due_on") or "").strip() or None
+    explicit_project = (input_data.get("project_gid") or "").strip() or None
+    force_duplicate = input_data.get("force_duplicate", False) is True
 
-    # Smart project routing: if no explicit project_gid was given, resolve one
-    # from the entity + task context so tasks never land as orphans.
-    if not project_gid:
-        try:
-            from cora.tools.project_resolver import resolve_project, is_blocked_project
-            resolved = resolve_project(
-                entity=entity,
-                task_text=title + (" " + (notes or "")),
-                assignee_gid=assignee_gid,
+    # Plan routing + (LEX) PHI scrub -- no silent cross-entity re-route, no orphan.
+    plan = _plan_asana_create(entity, title, notes, explicit_project, assignee_gid)
+    if plan["lex_scrub_error"]:
+        return (
+            "asana_create_task: I couldn't safely prepare this Lexington task for "
+            "confidentiality. Tell the user to create it directly in Asana."
+        )
+    f_title, f_notes, f_project = plan["title"], plan["notes"], plan["project_gid"]
+
+    # The confirmation gate (defense in depth) -- surface routing/scrub in the preview.
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        preview = [
+            "asana_create_task refused: `confirmed` must be set to true ONLY after you "
+            "have shown the user this preview block AND received their explicit approval "
+            "('yes' / 'approve' / 'create it'):",
+            f"- Task: {f_title}",
+            f"- Assignee: {assignee_display}",
+            f"- Due: {due_on or '(none)'}",
+        ]
+        if plan["notices"]:
+            preview.append("- Note: " + "; ".join(plan["notices"]))
+        preview.append("If they approve, call again with confirmed=true.")
+        return "\n".join(preview)
+
+    # Dedup gate: surface a likely duplicate instead of silently creating one.
+    if f_project and not force_duplicate:
+        dup = _find_open_dup(f_project, f_title)
+        if dup:
+            return (
+                f"asana_create_task: an OPEN task named {f_title!r} already exists in that "
+                f"project ({dup}). Tell the user it already exists. If it is truly a "
+                f"separate task, call again with force_duplicate=true."
             )
-            if resolved:
-                if is_blocked_project(resolved):
-                    log.warning(
-                        "asana_create_task: resolver returned blocked project %s for entity=%s "
-                        "-- routing to None (task will land in My Tasks)",
-                        resolved, entity,
-                    )
-                else:
-                    project_gid = resolved
-                    log.info(
-                        "asana_create_task: smart resolver -> project_gid=%s for entity=%s title=%r",
-                        project_gid, entity, title,
-                    )
-        except Exception as exc:
-            log.warning("asana_create_task: project_resolver failed (%s) -- proceeding without project", exc)
 
     try:
         created = asana_client.create_task(
-            name=title,
+            name=f_title,
             assignee_gid=assignee_gid,
-            project_gid=project_gid,
-            notes=notes,
+            project_gid=f_project,
+            notes=f_notes,
             due_on=due_on,
         )
     except asana_client.AsanaClientError as exc:
         log.warning(
             "asana_create_task FAILED asker=%s title=%r assignee=%s exc=%s",
-            slack_user_id, title, assignee_gid, exc,
+            slack_user_id, f_title, assignee_gid, exc,
         )
         return (
             f"Asana create_task error: {exc}. Tell the user the task wasn't created. "
@@ -649,15 +750,14 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         )
 
     log.info(
-        "asana_create_task CREATED asker=%s title=%r assignee=%s task_gid=%s permalink=%s",
-        slack_user_id,
-        title,
-        assignee_display,
-        created.get("gid", ""),
-        created.get("permalink_url", ""),
+        "asana_create_task CREATED asker=%s title=%r assignee=%s task_gid=%s project=%s notices=%s",
+        slack_user_id, f_title, assignee_display, created.get("gid", ""), f_project, plan["notices"],
     )
 
-    return asana_client.format_created_task_for_llm(created)
+    out = asana_client.format_created_task_for_llm(created)
+    if plan["notices"]:
+        out += "\n(" + "; ".join(plan["notices"]) + ")"
+    return out
 
 
 def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3241,11 +3341,15 @@ TOOL_DEFINITIONS = [
                 },
                 "project_gid": {
                     "type": "string",
-                    "description": "Optional. Asana project GID. If omitted, task lands in the assignee's My Tasks. Cora's v1 doesn't resolve project names automatically — if the user wants a specific project, they can move the task in Asana after creation.",
+                    "description": "Optional. Asana project GID. Usually OMIT it — the tool auto-routes to the right project for this channel's entity (and never into another entity's project). A project belonging to a different entity is dropped and re-routed (surfaced in the preview).",
+                },
+                "force_duplicate": {
+                    "type": "boolean",
+                    "description": "Optional. The tool refuses to create a task whose name already matches an OPEN task in the target project, and tells you so. Only set true if the user confirms it is genuinely a separate task after seeing that warning.",
                 },
                 "confirmed": {
                     "type": "boolean",
-                    "description": "Required. Set to true ONLY after you have shown the user a preview and received explicit approval. If false or omitted, the tool refuses.",
+                    "description": "Required. Set to true ONLY after you have shown the user the tool's preview (it includes the resolved project + any Lexington PHI-scrub note) and received explicit approval. If false or omitted, the tool refuses and returns the preview for you to show.",
                 },
             },
             "required": ["title", "confirmed"],
