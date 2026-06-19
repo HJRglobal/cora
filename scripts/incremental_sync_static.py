@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
+from cora.kb_exclusions import is_cora_internal_path  # noqa: E402
 
 CORA_REPO_ROOT = Path(__file__).resolve().parents[1]
 KB_DB_PATH = CORA_REPO_ROOT / "data" / "cora_kb.db"
@@ -83,6 +84,10 @@ def classify_entity(path: Path) -> str:
 
 def file_to_document(path: Path) -> Document | None:
     if is_phi_path(path):
+        return None
+    # Cora's own build/audit/forensic docs are operational metadata, not org
+    # knowledge — keep them out of the KB (they fabricate "diagnostics" via RAG).
+    if is_cora_internal_path(path):
         return None
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -146,10 +151,15 @@ def main() -> int:
 
     # Walk + filter to modified-since-watermark files
     modified_files: list[Path] = []
+    skipped_cora_internal = 0
     for path in FOUNDER_OS_ROOT.rglob("*.md"):
         if not path.is_file():
             continue
         if is_phi_path(path):
+            continue
+        # Cora's own build/audit/forensic docs are NOT org knowledge — never ingest.
+        if is_cora_internal_path(path):
+            skipped_cora_internal += 1
             continue
         if any(part.startswith(".") for part in path.parts):
             continue
@@ -162,6 +172,8 @@ def main() -> int:
         if mtime > last_sync_ts:
             modified_files.append(path)
 
+    if skipped_cora_internal:
+        log.info("Excluded %d Cora build/audit docs from ingest (cora-internal)", skipped_cora_internal)
     log.info("Discovered %d modified-since-watermark files (out of full tree walk)", len(modified_files))
 
     if not modified_files:

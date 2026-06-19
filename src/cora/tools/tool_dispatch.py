@@ -3070,6 +3070,79 @@ def _tool_whats_on_my_plate(slack_user_id: str, entity: str, _input: dict) -> st
     return "\n\n".join(sections)
 
 
+def _tool_cora_self_check(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Report Cora's REAL operational state (read-only) from LIVE signals.
+
+    Heartbeat freshness, KB chunk count, and source sync watermarks — NEVER the
+    knowledge base (which must not narrate Cora's own build/audit docs as a
+    "diagnostic"). Detailed by-source counts + watermarks are founder-level
+    (FNDR/HJRG) only; other channels get heartbeat + total chunks.
+    """
+    import time as _time
+
+    from .. import health_endpoint
+
+    detail = entity in ("FNDR", "HJRG")
+    lines: list[str] = ["Cora self-check (live operational state):"]
+
+    # 1. Heartbeat — the real liveness signal.
+    try:
+        age = health_endpoint.heartbeat_age_seconds()
+        if age is None:
+            lines.append("- Heartbeat: MISSING — starting up or wedged.")
+        elif age <= health_endpoint.FRESH_SECS:
+            lines.append(f"- Heartbeat: fresh ({int(age)}s ago).")
+        else:
+            lines.append(
+                f"- Heartbeat: STALE ({int(age)}s ago; fresh threshold {health_endpoint.FRESH_SECS}s)."
+            )
+    except Exception:  # noqa: BLE001
+        lines.append("- Heartbeat: unavailable.")
+
+    # 2. KB size + sync watermarks (real DB reads via the shared instance).
+    try:
+        kb, kb_lock = _notes_kb()
+        if kb is None:
+            lines.append("- Knowledge base: unavailable.")
+        else:
+            with kb_lock:
+                st = kb.stats()
+                watermarks = {
+                    s: kb.get_sync_state(s)
+                    for s in ("static_md", "slack", "asana", "fireflies", "drive", "gmail")
+                }
+            total = int(st.get("total_chunks", 0) or 0)
+            lines.append(f"- Knowledge base: {total:,} chunks.")
+            if detail:
+                by_src = st.get("by_source", {}) or {}
+                top = ", ".join(f"{k} {int(v):,}" for k, v in list(by_src.items())[:6])
+                if top:
+                    lines.append(f"  - by source: {top}")
+                now = _time.time()
+                fresh_bits = []
+                for src, ws in watermarks.items():
+                    if ws and ws[0]:
+                        hours = (now - float(ws[0])) / 3600.0
+                        fresh_bits.append(f"{src} {hours:.0f}h ago")
+                if fresh_bits:
+                    lines.append("  - last sync: " + ", ".join(fresh_bits))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cora_self_check KB read failed: %s", exc)
+        lines.append("- Knowledge base: read error.")
+
+    if not detail:
+        lines.append("(Detailed counts + sync state are founder-level — ask in a founder channel.)")
+
+    lines.append("")
+    lines.append(
+        "NOTE for Cora: relay ONLY these live signals as your status. Do NOT add "
+        "anything from the knowledge base about your own status, build, audits, or "
+        "'diagnostics' — those documents are not operational truth."
+    )
+    log.info("cora_self_check actor=%s entity=%s detail=%s", slack_user_id, entity, detail)
+    return "\n".join(lines)
+
+
 TOOL_DEFINITIONS = [
     {
         "name": "asana_get_my_tasks",
@@ -4858,6 +4931,24 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "cora_self_check",
+        "description": (
+            "Report Cora's REAL operational status from LIVE signals: heartbeat "
+            "freshness, knowledge-base size, and last sync times. Call this for "
+            "ANY question about Cora's own state -- 'are you working?', 'what's "
+            "your status?', 'is the KB up to date?', 'diagnose yourself', 'is "
+            "everything healthy?'. CRITICAL: this tool is the ONLY source of "
+            "Cora's status. Do NOT answer such questions from the knowledge base "
+            "or memory -- the KB must never be used to narrate Cora's own build, "
+            "audit, or 'diagnostic' notes as fact. Relay the tool's output."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -4898,6 +4989,7 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "slack_send_dm",
     "financial_get_cashflow",
     "fndr_open_decisions",
+    "cora_self_check",
 })
 
 # QBO + Drive close-pack financial depth — only entities that have QBO
@@ -5047,6 +5139,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_remember": _tool_cora_remember,
     "cora_my_notes": _tool_cora_my_notes,
     "cora_forget_note": _tool_cora_forget_note,
+    # Read-only operational self-status (heartbeat + KB size + sync watermarks)
+    "cora_self_check": _tool_cora_self_check,
     # Meeting action items -- PULL flow (replaces the retired auto-create push)
     "meeting_action_items": _tool_meeting_action_items,
 }
@@ -5102,6 +5196,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_remember": 15,
     "cora_my_notes": 8,
     "cora_forget_note": 8,
+    "cora_self_check": 8,
 }
 _DEFAULT_TOOL_TIMEOUT = 15
 
