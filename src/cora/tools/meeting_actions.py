@@ -70,6 +70,7 @@ from cora.connectors.fireflies_connector import (
     _parse_date,
     _resolve_participant_slack_ids,
     _tag_fireflies_sub_entity,
+    classify_lex_meeting,
 )
 from cora.tools import asana_client
 from cora.tools.project_resolver import is_blocked_project, resolve_project
@@ -430,48 +431,27 @@ def _lex_domain_subentity(transcript: dict) -> str | None:
 
 
 def _lex_scope_subentity(transcript: dict) -> str:
-    """Resolve the LEX sub-entity used for the gate/exclusion decision.
-
-    Combines the name-based detector + the email-domain detector, MOST-RESTRICTIVE
-    WINS (an LBHS / Part-2 signal from EITHER source forces LEX-LBHS so the gate
-    excludes it). Falls back to GM-level "LEX" (the safe default -- allowed,
-    scrubbed, GM-scoped) when no sub-entity can be pinned.
-    """
-    try:
-        name_sub = _tag_fireflies_sub_entity(transcript) or ""
-    except Exception as exc:  # noqa: BLE001
-        log.debug("meeting_actions: sub-entity tag failed: %s", exc)
-        name_sub = ""
-    domain_sub = _lex_domain_subentity(transcript) or ""
-    if name_sub == "LEX-LBHS" or domain_sub == "LEX-LBHS":
-        return "LEX-LBHS"          # 42 CFR Part 2 -- most restrictive
-    if name_sub:
-        return name_sub            # specific name-based sub-entity (LTS/LLA/LLC)
-    if domain_sub:
-        return domain_sub          # domain-based (LEX-LTS) or GM-level "LEX"
-    return "LEX"
+    """Resolve the LEX sub-entity for the gate/exclusion decision via the shared
+    detector (fireflies_connector.classify_lex_meeting). Most-restrictive wins
+    (an LBHS / Part-2 signal forces LEX-LBHS so the gate excludes it); GM-level
+    "LEX" is the safe fallback (allowed, scrubbed, GM-scoped)."""
+    return classify_lex_meeting(transcript).sub_entity or "LEX"
 
 
 def _classify_meeting(transcript: dict) -> tuple[str, bool]:
-    """Return (meeting_entity, is_lex).
-
-    is_lex if ANY of: the title classifies LEX, a NAMED LEX lead attends
-    (_tag_fireflies_sub_entity), or an attendee's email is on a Lexington DOMAIN
-    (_lex_domain_subentity). The domain signal catches a generically-titled LEX
-    meeting attended only by Jen/Aaron/line-staff -- none of the four named leads
-    -- that title + name signals alone miss, so the LEX rails + PHI scrub still
-    apply. When LEX, meeting_entity is "LEX".
-    """
+    """Return (meeting_entity, is_lex) via the SHARED LEX detector
+    (fireflies_connector.classify_lex_meeting) -- the same detector the KB-ingest
+    path uses. It adds program-title / known-organizer / government-client
+    signals on top of title + named-lead + email-domain, so a generically-titled
+    Lexington program meeting (e.g. a probation "Budget Class" organized by an
+    @hjrglobal.com staffer with *.maricopa.gov clients) resolves to LEX and gets
+    the LEX rails + PHI scrub. When LEX, meeting_entity is "LEX"; otherwise the
+    title-based non-LEX entity."""
+    v = classify_lex_meeting(transcript)
+    if v.is_lex:
+        return "LEX", True
     title = (transcript.get("title") or "").strip()
-    base = _classify_entity(title)
-    try:
-        name_sub = _tag_fireflies_sub_entity(transcript) or ""
-    except Exception as exc:  # noqa: BLE001
-        log.debug("meeting_actions: sub-entity tag failed: %s", exc)
-        name_sub = ""
-    domain_sub = _lex_domain_subentity(transcript) or ""
-    is_lex = base == "LEX" or str(name_sub).upper().startswith("LEX") or bool(domain_sub)
-    return ("LEX" if is_lex else base), is_lex
+    return _classify_entity(title), False
 
 
 def _asker_attended(transcript: dict, asker_emails: set[str], slack_user_id: str) -> bool:

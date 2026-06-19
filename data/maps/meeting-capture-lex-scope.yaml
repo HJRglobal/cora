@@ -51,3 +51,34 @@ included_sub_entities:
 excluded_sub_entities:
   - LEX-LBHS   # 42 CFR Part 2 substance-use confidentiality -- keep OFF until
                # explicit Part-2 sign-off. A BAA does not waive Part 2.
+
+# ------------------------------------------------------------------------------
+# Shared LEX meeting DETECTOR tuning (WS2, 2026-06-19)
+# ------------------------------------------------------------------------------
+# These ADD to the detector's baked-in defaults (fireflies_connector.py); they
+# never replace them. The detector (classify_lex_meeting) is the single source
+# of truth used by BOTH the KB-ingest path AND the meeting-capture pull tool.
+# A meeting matching a PROGRAM / DDD title, or organized by a known LEX-program
+# organizer hosting government/client (*.gov) attendees, is classified LEX and
+# HARD-EXCLUDED from the KB (never ingested) -- but the capture path still routes
+# its action items LEX-scoped + PHI-scrubbed. Root case: a Lexington probation
+# "1st Budget Class" (organizer @hjrglobal.com, *.maricopa.gov clients) was
+# tagged HJRG and ingested, exposing client PII outside LEX.
+
+# LEX client-facing / program meeting titles (substring, case-insensitive).
+lex_program_title_patterns: []
+  # - budget class            (already a default)
+  # - financial literacy      (already a default)
+  # add new program titles here as they appear
+
+# DDD / developmental-disabilities meeting titles -> hard-exclude from KB.
+ddd_title_patterns: []
+
+# HJRG/other-domain staff who ORGANIZE Lexington programs. Counts as a LEX signal
+# only when corroborated (a program title, a Lexington-domain/named attendee, or
+# government/client attendees). alina@hjrglobal.com is a baked-in default.
+lex_program_organizers: []
+
+# External / government CLIENT email-domain suffixes. A match counts as LEX only
+# when corroborated by another LEX signal. ".gov" is a baked-in default.
+external_client_domains: []

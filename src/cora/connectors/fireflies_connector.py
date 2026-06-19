@@ -22,6 +22,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -212,6 +213,191 @@ def _is_phi_meeting(title: str, entity: str) -> bool:
         return False
     title_lower = title.lower()
     return any(kw in title_lower for kw in _PHI_TITLE_KEYWORDS)
+
+
+# ── Shared LEX meeting detector (WS2, 2026-06-19) ─────────────────────────────
+# ONE detector, used by BOTH the KB-ingest path (backfill, below) AND the
+# meeting-capture pull tool (meeting_actions). Title-only classification missed
+# LEX program/client meetings with a generic title and no Lexington-domain or
+# named-lead attendee -- e.g. a Lexington probation "1st Budget Class" organized
+# by an @hjrglobal.com staffer (Alina) with *.maricopa.gov participants. Those
+# were tagged HJRG/FNDR and ingested, exposing criminal-justice client PII
+# outside LEX. This detector adds program-title / known-organizer / government-
+# client-domain signals on top of the existing title + named-lead + email-domain.
+#
+# hard_exclude_kb = a LEX PROGRAM / CLIENT-facing / DDD / clinical / LBHS meeting.
+# Per Harrison (2026-06-19) those are NEVER ingested into the KB (hard-exclude,
+# not scrub). Plain LEX OPERATIONAL meetings (staff sync / ops / compliance)
+# still ingest LEX-scoped, exactly as before. The capture path uses is_lex +
+# sub_entity (its own gate decides capture); it still routes a program meeting's
+# items LEX-scoped + PHI-scrubbed (it does not consult hard_exclude_kb).
+
+# The LEX title keywords already maintained in _ENTITY_KEYWORDS (single source).
+_LEX_TITLE_KEYWORDS: list[str] = next(
+    (kw for ent, kw in _ENTITY_KEYWORDS if ent == "LEX"), []
+)
+
+# Lexington email domains -> sub-entity (most restrictive first; LBHS/Part 2 wins).
+_LEX_EMAIL_DOMAINS: list[tuple[str, str]] = [
+    ("lexingtonbhs.com", "LEX-LBHS"),
+    ("lexingtontherapyservices.com", "LEX-LTS"),
+    ("lexingtonservices.com", "LEX"),
+]
+
+_DEFAULT_LEX_PROGRAM_TITLE_PATTERNS = [
+    "budget class", "financial literacy", "financial class", "life skills",
+    "day program", "day treatment", "hcbs", "dta", "parenting class",
+    "anger management", "re-entry", "reentry", "job readiness",
+    "employment readiness", "independent living", "skill building",
+    "skills building", "community integration", "probation", "drug court",
+]
+_DEFAULT_DDD_TITLE_PATTERNS = [
+    "ddd", "division of developmental disabilities", "isp meeting", "isp review",
+    "individual service plan", "olcr",
+]
+# HJRG/other-domain staff who ORGANIZE Lexington programs (the gap the email-
+# domain signal misses). Counts as a LEX signal only when corroborated.
+_DEFAULT_LEX_PROGRAM_ORGANIZERS = ["alina@hjrglobal.com"]
+# External / government CLIENT domain suffixes. A .gov attendee is a strong
+# client-facing signal but counts as LEX only when corroborated by another LEX
+# signal (so an HJRG regulatory meeting with one .gov attendee is not LEX).
+_DEFAULT_EXTERNAL_CLIENT_DOMAIN_SUFFIXES = [".gov"]
+
+_LEX_DETECT_CFG_PATH = (
+    Path(__file__).resolve().parents[3] / "data" / "maps" / "meeting-capture-lex-scope.yaml"
+)
+_lex_detect_cfg: dict | None = None
+
+
+def _load_lex_detect_cfg() -> dict:
+    """Additive LEX-detection lists from meeting-capture-lex-scope.yaml merged
+    onto baked-in defaults. Fail-safe: defaults only on a read error."""
+    global _lex_detect_cfg
+    if _lex_detect_cfg is not None:
+        return _lex_detect_cfg
+    extra: dict = {}
+    try:
+        extra = yaml.safe_load(_LEX_DETECT_CFG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("lex-detect cfg read failed (%s) -- defaults only", exc)
+        extra = {}
+
+    def _merge(key: str, default: list[str]) -> list[str]:
+        vals = list(default)
+        for v in (extra.get(key) or []):
+            s = str(v).strip().lower()
+            if s and s not in vals:
+                vals.append(s)
+        return vals
+
+    _lex_detect_cfg = {
+        "program_titles": _merge("lex_program_title_patterns", _DEFAULT_LEX_PROGRAM_TITLE_PATTERNS),
+        "ddd_titles": _merge("ddd_title_patterns", _DEFAULT_DDD_TITLE_PATTERNS),
+        "organizers": _merge("lex_program_organizers", _DEFAULT_LEX_PROGRAM_ORGANIZERS),
+        "client_domain_suffixes": _merge(
+            "external_client_domains", _DEFAULT_EXTERNAL_CLIENT_DOMAIN_SUFFIXES
+        ),
+    }
+    return _lex_detect_cfg
+
+
+@dataclass(frozen=True)
+class LexVerdict:
+    """Result of the shared LEX meeting detector."""
+
+    is_lex: bool
+    sub_entity: str | None
+    hard_exclude_kb: bool
+    reason: str
+
+
+def _transcript_emails(transcript: dict) -> set[str]:
+    """Lowercased set of attendee + participant + organizer/host emails."""
+    out: set[str] = set()
+    for a in (transcript.get("meeting_attendees") or []):
+        if isinstance(a, dict):
+            e = (a.get("email") or "").strip().lower()
+            if e:
+                out.add(e)
+    for p in (transcript.get("participants") or []):
+        if isinstance(p, str) and p.strip():
+            out.add(p.strip().lower())
+    for k in ("organizer_email", "host_email"):
+        e = (transcript.get(k) or "").strip().lower()
+        if e:
+            out.add(e)
+    return out
+
+
+def _lex_domain_sub(emails: set[str]) -> str | None:
+    for domain, code in _LEX_EMAIL_DOMAINS:
+        if any(e.endswith("@" + domain) for e in emails):
+            return code
+    return None
+
+
+def classify_lex_meeting(transcript: dict) -> LexVerdict:
+    """Single source of truth: is this a Lexington meeting, which sub-entity, and
+    must it be hard-excluded from the KB? Used by BOTH ingest and capture."""
+    cfg = _load_lex_detect_cfg()
+    tl = (transcript.get("title") or "").lower()
+    emails = _transcript_emails(transcript)
+    organizer = (
+        (transcript.get("organizer_email") or transcript.get("host_email") or "").strip().lower()
+    )
+
+    domain_sub = _lex_domain_sub(emails)
+    try:
+        name_sub = _tag_fireflies_sub_entity(transcript)
+    except Exception:  # noqa: BLE001
+        name_sub = None
+    title_lex = any(kw in tl for kw in _LEX_TITLE_KEYWORDS)
+    program = any(p in tl for p in cfg["program_titles"])
+    ddd = any(p in tl for p in cfg["ddd_titles"])
+    clinical = any(p in tl for p in _PHI_TITLE_KEYWORDS)
+    lex_org = bool(organizer) and organizer in cfg["organizers"]
+    domains = {e.split("@", 1)[1] for e in emails if "@" in e}
+    gov = any(d.endswith(tuple(cfg["client_domain_suffixes"])) for d in domains)
+
+    # A known LEX-program organizer hosting external/government CLIENTS is a LEX
+    # program even with a generic title.
+    org_plus_gov = lex_org and gov
+    # "strong" = a self-sufficient LEX signal (organizer-alone / gov-alone are not).
+    strong = bool(domain_sub or name_sub or title_lex or program or ddd or org_plus_gov)
+
+    signals: list[str] = []
+    if domain_sub:
+        signals.append("domain")
+    if name_sub:
+        signals.append("named-lead")
+    if title_lex:
+        signals.append("title")
+    if program:
+        signals.append("program")
+    if ddd:
+        signals.append("ddd")
+    if org_plus_gov:
+        signals.append("organizer+client-gov")
+    elif lex_org and strong:
+        signals.append("organizer")
+    if gov and strong and not org_plus_gov:
+        signals.append("client-gov")
+
+    if not signals:
+        return LexVerdict(False, None, False, "no-lex-signal")
+
+    if domain_sub == "LEX-LBHS" or name_sub == "LEX-LBHS":
+        sub: str | None = "LEX-LBHS"
+    elif name_sub:
+        sub = name_sub
+    elif domain_sub:
+        sub = domain_sub
+    else:
+        sub = "LEX"
+
+    hard = bool(program or ddd or clinical or org_plus_gov or (gov and strong) or sub == "LEX-LBHS")
+    reason = "+".join(signals) + ("|kb-exclude" if hard else "")
+    return LexVerdict(True, sub, hard, reason)
 
 
 def _graphql_query(query: str, variables: dict | None = None) -> dict:
@@ -597,6 +783,7 @@ def backfill(since: datetime) -> Iterator[Document]:
     transcript_count = 0
     skipped_phi = 0
     skipped_empty = 0
+    skipped_lex_excluded = 0
     for t in winners:
         title = (t.get("title") or "").strip()
         if not title:
@@ -604,6 +791,16 @@ def backfill(since: datetime) -> Iterator[Document]:
             continue
 
         entity = _classify_entity(title)
+
+        # Shared LEX detector: hard-exclude LEX program/client/DDD/LBHS/clinical
+        # meetings from the KB entirely (WS2). Plain LEX ops still ingest LEX-scoped.
+        lexv = classify_lex_meeting(t)
+        if lexv.is_lex:
+            if lexv.hard_exclude_kb:
+                skipped_lex_excluded += 1
+                log.info("LEX hard-exclude from KB: %r (%s)", title, lexv.reason)
+                continue
+            entity = "LEX"
 
         if _is_phi_meeting(title, entity):
             skipped_phi += 1
@@ -650,8 +847,9 @@ def backfill(since: datetime) -> Iterator[Document]:
         transcript_count += 1
 
     log.info(
-        "Fireflies backfill done: %d transcripts yielded, %d skipped for PHI, %d skipped empty",
-        transcript_count, skipped_phi, skipped_empty,
+        "Fireflies backfill done: %d transcripts yielded, %d skipped for PHI, "
+        "%d LEX program/client hard-excluded from KB, %d skipped empty",
+        transcript_count, skipped_phi, skipped_lex_excluded, skipped_empty,
     )
 
 

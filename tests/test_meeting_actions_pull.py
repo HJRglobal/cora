@@ -161,7 +161,10 @@ class TestLexGate:
             patch.object(ma, "_tag_fireflies_sub_entity", return_value="LEX-LBHS"),
             patch.object(fae, "_lex_sub_entity_allowed", return_value=False),
         ):
-            ok, reason, scoped = ma._lex_gate(_mk_transcript(), "Lex Sync", "LEX")
+            ok, reason, scoped = ma._lex_gate(
+                _mk_transcript(attendees=[{"displayName": "x", "email": "staff@lexingtonbhs.com"}]),
+                "Lex Sync", "LEX",
+            )
         assert not ok and scoped == "LEX-LBHS"
 
     def test_clinical_title_skipped(self):
@@ -181,26 +184,26 @@ class TestLexGate:
             patch.object(fae, "_lex_sub_entity_allowed", return_value=True),
             patch.object(ma, "_is_phi_meeting", return_value=False),
         ):
-            ok, reason, scoped = ma._lex_gate(_mk_transcript(), "LLC Ops Sync", "LEX")
+            ok, reason, scoped = ma._lex_gate(
+                _mk_transcript(attendees=[{"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"}]),
+                "LLC Ops Sync", "LEX",
+            )
         assert ok and scoped == "LEX-LLC"
 
 
 class TestClassifyMeeting:
     def test_title_classified_lex(self):
-        with (
-            patch.object(ma, "_classify_entity", return_value="LEX"),
-            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
-        ):
-            ent, is_lex = ma._classify_meeting(_mk_transcript(title="Lexington Sync"))
+        # Real LEX title keyword -> the shared detector classifies LEX.
+        ent, is_lex = ma._classify_meeting(_mk_transcript(title="Lexington Services Sync"))
         assert ent == "LEX" and is_lex
 
     def test_participant_detected_lex_despite_generic_title(self):
-        # FIX (HIGH): title classifies non-LEX, but a LEX attendee is present.
-        with (
-            patch.object(ma, "_classify_entity", return_value="FNDR"),
-            patch.object(ma, "_tag_fireflies_sub_entity", return_value="LEX-LLC"),
-        ):
-            ent, is_lex = ma._classify_meeting(_mk_transcript(title="Tuesday Sync"))
+        # Title classifies non-LEX, but a NAMED LEX lead (Shaun) attends ->
+        # the shared detector still classifies LEX.
+        ent, is_lex = ma._classify_meeting(_mk_transcript(
+            title="Tuesday Sync",
+            attendees=[{"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"}],
+        ))
         assert ent == "LEX" and is_lex
 
     def test_non_lex(self):
@@ -764,12 +767,13 @@ class TestPreview:
     def test_generic_title_lex_refused_via_participant_detector(self, asker_identity):
         # FIX (HIGH): a generically-titled meeting with a NAMED LEX lead is treated
         # as LEX and refused in a non-LEX channel (title classified FNDR).
-        t = _mk_transcript(tid="GEN", title="Tuesday Sync")
+        t = _mk_transcript(
+            tid="GEN", title="Tuesday Sync",
+            attendees=[{"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"}],
+        )
         with (
             patch.object(ma, "_fetch_transcript_by_id", return_value=t),
             patch.object(ma, "_asker_attended", return_value=True),
-            patch.object(ma, "_classify_entity", return_value="FNDR"),
-            patch.object(ma, "_tag_fireflies_sub_entity", return_value="LEX-LLC"),
         ):
             out = ma.run_meeting_action_items(ASKER, "F3E", _input(transcript_id="GEN"))
         assert "Lexington" in out
@@ -813,14 +817,15 @@ class TestPreview:
         assert "MEETING:" in out
 
     def test_lex_meeting_preview_scrubbed_in_lex_channel(self, asker_identity):
-        t = _mk_transcript(title="LLC Ops Sync", short_summary="client John Doe DOB 1/1/90")
+        t = _mk_transcript(
+            title="LLC Ops Sync", short_summary="client John Doe DOB 1/1/90",
+            attendees=[{"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"}],
+        )
         parsed = [{"task": "Follow up re client", "assignee_name": ASKER_NAME, "due_mention": None}]
         with (
             patch.object(ma, "_recent_transcripts", return_value=[t]),
             patch.object(ma, "_asker_attended", return_value=True),
-            patch.object(ma, "_classify_entity", return_value="LEX"),
             patch.object(fae, "_lex_capture_enabled", return_value=True),
-            patch.object(ma, "_tag_fireflies_sub_entity", return_value="LEX-LLC"),
             patch.object(fae, "_lex_sub_entity_allowed", return_value=True),
             patch.object(ma, "_is_phi_meeting", return_value=False),
             patch.object(fae, "_parse_action_items_with_haiku", return_value=parsed),
@@ -1078,13 +1083,12 @@ class TestConfirm:
 
     def test_confirm_lex_routes_to_lex_project_and_scrubs(self, asker_identity):
         t = _mk_transcript(title="LLC Ops Sync", action_items="**Tommy Anderson**\nFollow up re billing authorization (Fri)\n")
+        t["meeting_attendees"].append({"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"})
         created = {"gid": "T1", "permalink_url": "https://app.asana.com/t/1"}
         with (
             patch.object(ma, "_fetch_transcript_by_id", return_value=t),
             patch.object(ma, "_asker_attended", return_value=True),
-            patch.object(ma, "_classify_entity", return_value="LEX"),
             patch.object(fae, "_lex_capture_enabled", return_value=True),
-            patch.object(ma, "_tag_fireflies_sub_entity", return_value="LEX-LLC"),
             patch.object(fae, "_lex_sub_entity_allowed", return_value=True),
             patch.object(ma, "_is_phi_meeting", return_value=False),
             patch.object(fae, "_resolve_lex_project", return_value="LEX_PROJ") as mock_lex_proj,
@@ -1110,6 +1114,7 @@ class TestConfirm:
         # reaches LEX project routing -- which returns None -> task is skipped,
         # NEVER created outside LEX scope.
         t = _mk_transcript(title="LLC Ops Sync", action_items="**Tommy Anderson**\nfollow up on billing authorization (Fri)\n")
+        t["meeting_attendees"].append({"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"})
         with (
             patch.object(ma, "_fetch_transcript_by_id", return_value=t),
             patch.object(ma, "_asker_attended", return_value=True),
@@ -1159,6 +1164,7 @@ class TestConfirm:
             title="LLC Ops Sync",
             action_items="**Tommy Anderson**\nfollow up with Lucas about billing\n",
         )
+        t["meeting_attendees"].append({"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"})
         created = {"gid": "T1", "permalink_url": ""}
         with (
             patch.object(ma, "_fetch_transcript_by_id", return_value=t),
