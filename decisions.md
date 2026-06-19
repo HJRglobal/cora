@@ -1770,3 +1770,29 @@ was resolution + relay-grounding, not a missing tool call.
   2026-06-18); this follow-up needs its OWN merge + restart to go live (the live bot
   has the core flip but not the date/ordinal fix yet). Bundle the restart with the
   polar MCP-auth fix so the working tree carries both.
+
+**Follow-up 2 (`b5da8ae` + `96ec591`, 2026-06-18) -- deterministic project-scoped dedup
+(the smoke duplicate).** The 2026-06-18 live smoke confirmed the pull CREATED a duplicate
+of a task the retired push had already made (Asana `1215849728768964` vs `1215697338246453`,
+identical name, same `[F3E] Operations -- General` project), despite the 7-day dedup. Root
+cause: `find_recent_duplicate_task` resolves existing tasks via Asana TYPEAHEAD, which is
+fuzzy/prefix-oriented and unreliable for the long descriptive names action items carry -> it
+returned None -> the create proceeded.
+- **Fix:** before creating, a DETERMINISTIC exact-name check against the TARGET project's open
+  tasks (`asana_client.get_project_tasks`, cached once per project per confirm-call) via a
+  shared `_dedup_key` (collapse whitespace + truncate-to-`_MAX_TASK_LEN` + lowercase, applied to
+  BOTH sides). The typeahead lookup stays a SECONDARY workspace-wide net. Both FAIL OPEN. A match
+  is reported transparently ("already had an open task -- not duplicated"), never a silent skip.
+- **A 3-lens D-051 review found a HIGH + 2 MEDIUM, all fixed (then a clean 2-lens re-review):**
+  HIGH -- the retired push scrubbed-AFTER-truncating (a long LEX name could exceed 160) while the
+  pull scrubs-then-truncates (<=160), so the stored names diverged and the exact match missed; the
+  `_dedup_key` both-sides truncation closes the length/order divergence (residual: PHI straddling
+  char 160 can still differ in content -- narrow, LEX-only, transient since the push is retired,
+  fail-open). MEDIUM -- an Asana create error was misreported as "no project to land in" (now a
+  separate `create_failed` bucket with honest wording). MEDIUM -- the project scan capped at 500
+  open tasks with no ordering (now logs on cap-hit; best-effort, typeahead backstop). NIT -- the
+  same item selected twice in one call now creates once (in-call `created_keys` guard).
+- Doctrine: dedup by exact name must compare against an authoritative project task list, not Asana
+  typeahead (unreliable for long names); when two code paths build a name in different
+  scrub/truncate orders, normalize BOTH sides for comparison. Branch `claude/meeting-actions-dedup-fix`;
+  bot-loaded -> needs its own merge + restart. Pull suite -> 120 tests; full suite 4,832 passed.
