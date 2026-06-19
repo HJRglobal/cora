@@ -93,6 +93,9 @@ def asker_identity():
         patch.object(ma, "_load_slack_map", return_value=slack_map),
         patch.object(ma.org_roles, "get_role", return_value=None),
         patch.object(fae, "_roster_names", return_value=[ASKER_NAME, "Harrison Rogers", "Larry Stone"]),
+        # Default: target project has no open tasks -> project-scoped dedup finds
+        # nothing (create proceeds). Dedup tests override this return value.
+        patch.object(ma.asana_client, "get_project_tasks", return_value=[]),
     ):
         yield
 
@@ -925,8 +928,35 @@ class TestConfirm:
             )
         assert "Asana mapping isn't set up" in out
 
-    def test_confirm_skips_duplicate(self, asker_identity):
+    def test_confirm_skips_duplicate_project_scoped(self, asker_identity):
+        # REGRESSION (2026-06-18 smoke): the typeahead dedup missed an identical
+        # open task and the pull created a duplicate. The project-scoped exact-name
+        # check must catch it deterministically -> not created, reported as
+        # already-open (not a silent skip).
         t = _mk_transcript()  # action_items mentions "deck"
+        with (
+            patch.object(ma, "_fetch_transcript_by_id", return_value=t),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+            patch.object(ma, "resolve_project", return_value="PROJ"),
+            patch.object(ma, "is_blocked_project", return_value=False),
+            # The target project ALREADY has an open task with the identical name.
+            patch.object(ma.asana_client, "get_project_tasks",
+                         return_value=[{"gid": "EXISTING_PROJ", "name": "Send the deck", "completed": False}]),
+            patch.object(ma.asana_client, "create_task") as mock_create,
+        ):
+            out = ma.run_meeting_action_items(
+                ASKER, "F3E",
+                _input(confirmed=True, transcript_id="01TID", selected_items=["Send the deck"]),
+            )
+        mock_create.assert_not_called()              # no duplicate created
+        assert "already have an open task" in out    # transparent, not silent
+
+    def test_confirm_skips_duplicate_typeahead_secondary(self, asker_identity):
+        # Project scan finds nothing (fixture default []), but the workspace-wide
+        # typeahead net still catches a cross-project name match.
+        t = _mk_transcript()
         with (
             patch.object(ma, "_fetch_transcript_by_id", return_value=t),
             patch.object(ma, "_asker_attended", return_value=True),
@@ -942,7 +972,32 @@ class TestConfirm:
                 _input(confirmed=True, transcript_id="01TID", selected_items=["Send the deck"]),
             )
         mock_create.assert_not_called()
-        assert "wasn't able to create" in out
+        assert "already have an open task" in out
+
+    def test_confirm_dedup_fails_open_on_scan_error(self, asker_identity):
+        # If the project scan errors, fail OPEN (create) -- never block a real
+        # task on a dedup read failure.
+        t = _mk_transcript()
+        created = {"gid": "T1", "permalink_url": ""}
+        with (
+            patch.object(ma, "_fetch_transcript_by_id", return_value=t),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+            patch.object(ma, "resolve_project", return_value="PROJ"),
+            patch.object(ma, "is_blocked_project", return_value=False),
+            patch.object(ma.asana_client, "get_project_tasks", side_effect=Exception("boom")),
+            patch.object(ma.asana_client, "find_recent_duplicate_task", return_value=None),
+            patch.object(ma.asana_client, "set_task_custom_fields", return_value=True),
+            patch.object(fae, "_capture_custom_fields", return_value={}),
+            patch.object(ma.asana_client, "create_task", return_value=created) as mock_create,
+        ):
+            out = ma.run_meeting_action_items(
+                ASKER, "F3E",
+                _input(confirmed=True, transcript_id="01TID", selected_items=["Send the deck"]),
+            )
+        mock_create.assert_called_once()             # fail-open: created despite scan error
+        assert "WRITE_CONFIRMED" in out
 
     def test_confirm_lex_routes_to_lex_project_and_scrubs(self, asker_identity):
         t = _mk_transcript(title="LLC Ops Sync", action_items="**Tommy Anderson**\nFollow up re billing authorization (Fri)\n")
