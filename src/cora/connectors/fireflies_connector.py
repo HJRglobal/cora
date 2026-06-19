@@ -244,10 +244,18 @@ _LEX_EMAIL_DOMAINS: list[tuple[str, str]] = [
     ("lexingtonservices.com", "LEX"),
 ]
 
+# CARE/clinical-program titles that are LEX/healthcare-specific (an F3/OSN/podcast/
+# HR meeting is never titled these) -> SELF-SUFFICIENT LEX signal, like DDD/clinical.
+# Closes the review-2 gap: a genuine LEX care meeting run by a non-allowlisted
+# @hjrglobal.com facilitator with only private-email clients (no .gov) is still caught.
+_DEFAULT_LEX_CARE_TITLE_PATTERNS = [
+    "hcbs", "dta", "day treatment", "anger management",
+]
+# Business-AMBIGUOUS program titles (these recur in F3/OSN/HR/podcast contexts) ->
+# count as LEX ONLY when corroborated by a real LEX signal.
 _DEFAULT_LEX_PROGRAM_TITLE_PATTERNS = [
     "budget class", "financial literacy", "financial class", "life skills",
-    "day program", "day treatment", "hcbs", "dta", "parenting class",
-    "anger management", "re-entry", "reentry", "job readiness",
+    "day program", "parenting class", "re-entry", "reentry", "job readiness",
     "employment readiness", "independent living", "skill building",
     "skills building", "community integration", "probation", "drug court",
 ]
@@ -306,6 +314,7 @@ def _load_lex_detect_cfg() -> dict:
 
     _lex_detect_cfg = {
         "program_titles": _merge("lex_program_title_patterns", _DEFAULT_LEX_PROGRAM_TITLE_PATTERNS),
+        "care_titles": _merge("lex_care_title_patterns", _DEFAULT_LEX_CARE_TITLE_PATTERNS),
         "ddd_titles": _merge("ddd_title_patterns", _DEFAULT_DDD_TITLE_PATTERNS),
         "organizers": _merge("lex_program_organizers", _DEFAULT_LEX_PROGRAM_ORGANIZERS),
         "client_domain_suffixes": _merge(
@@ -371,6 +380,7 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
         re.search(r"\blex-", tl)
     )
     program = any(p in tl for p in cfg["program_titles"])
+    care = any(p in tl for p in cfg["care_titles"])
     ddd = any(p in tl for p in cfg["ddd_titles"])
     clinical = any(p in tl for p in _PHI_TITLE_KEYWORDS)
     lex_org = bool(organizer) and organizer in cfg["organizers"]
@@ -381,8 +391,8 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
     # Unambiguous LEX identity: a Lexington email domain, a named LEX lead, or a
     # LEX title keyword.
     strong_id = bool(domain_sub or name_sub or title_lex)
-    # DDD + clinical titles are LEX/healthcare-specific -> self-sufficient.
-    specific_lex_title = bool(ddd or clinical)
+    # DDD / clinical / care titles are LEX/healthcare-specific -> self-sufficient.
+    specific_lex_title = bool(ddd or clinical or care)
     # A known LEX-program organizer hosting government/CLIENT (.gov) attendees is a
     # LEX program even with a generic title (the "Budget Class" root case).
     org_plus_gov = lex_org and gov
@@ -403,6 +413,8 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
         signals.append("named-lead")
     if title_lex:
         signals.append("title")
+    if care:
+        signals.append("care")
     if ddd:
         signals.append("ddd")
     if clinical:
@@ -423,7 +435,7 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
 
     # Once known LEX, a program / DDD / clinical / government-client / LBHS meeting
     # is client-facing -> hard-exclude from the KB.
-    hard = bool(program or ddd or clinical or gov or sub == "LEX-LBHS")
+    hard = bool(program or care or ddd or clinical or gov or sub == "LEX-LBHS")
     reason = "+".join(signals) + ("|kb-exclude" if hard else "")
     return LexVerdict(True, sub, hard, reason)
 

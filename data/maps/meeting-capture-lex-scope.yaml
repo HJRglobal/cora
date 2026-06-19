@@ -71,6 +71,11 @@ lex_program_title_patterns: []
   # - financial literacy      (already a default)
   # add new program titles here as they appear
 
+# LEX care/clinical-program titles that are LEX-specific (HCBS, DTA, day treatment,
+# anger management) -> SELF-SUFFICIENT (no corroboration needed), unlike the
+# business-ambiguous program titles above. Adds to the baked-in defaults.
+lex_care_title_patterns: []
+
 # DDD / developmental-disabilities meeting titles -> hard-exclude from KB.
 ddd_title_patterns: []
 

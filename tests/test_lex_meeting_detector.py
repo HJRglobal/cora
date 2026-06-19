@@ -162,6 +162,16 @@ class TestAmbiguousProgramTitles:
         v = fc.classify_lex_meeting(_t(title="DDD ISP Meeting"))
         assert v.is_lex is True and v.hard_exclude_kb is True
 
+    def test_care_titles_self_sufficient_without_corroboration(self):
+        # Review-2 fix: LEX care/clinical-program titles are caught even with a
+        # NON-allowlisted @hjrglobal.com organizer + private-email-only clients (no .gov).
+        for title in ("Day Treatment Session", "Anger Management Group", "HCBS Planning"):
+            v = fc.classify_lex_meeting(_t(
+                title=title, organizer="casey@hjrglobal.com",
+                attendees=[("Client", "client@gmail.com")],
+            ))
+            assert v.is_lex is True and v.hard_exclude_kb is True, title
+
 
 class TestConfigRobustness:
     """Review fix #4: malformed lex-scope YAML must degrade to defaults, never crash
