@@ -1796,3 +1796,53 @@ returned None -> the create proceeded.
   typeahead (unreliable for long names); when two code paths build a name in different
   scrub/truncate orders, normalize BOTH sides for comparison. Branch `claude/meeting-actions-dedup-fix`;
   bot-loaded -> needs its own merge + restart. Pull suite -> 120 tests; full suite 4,832 passed.
+
+---
+
+## D-055 - Track A P0 reliability/privacy block (WS1-WS4) (2026-06-19)
+
+**Context:** First North-Star Track A (reliability) build off `main`@`23e4bf6`, in an
+isolated worktree. Four workstreams from the 20-report synthesis P0 block.
+
+**Decisions / what shipped (branch `claude/track-a-p0-reliability`, 6 commits, NOT merged):**
+- **WS1** - Cora's own build/audit/forensic/code-prompt docs (under `_shared/projects/cora/`
+  + cora-build session captures) were ingested as `static_md`/FNDR and RAG-narrated as a
+  fabricated "diagnostic" (the Minute Press miss). New `kb_exclusions.py` shared predicate
+  (folder + narrow filename rule) wired into `incremental_sync_static.py`; new read-only
+  `cora_self_check` tool + prompt nudge routes status/diagnose queries to LIVE state, never
+  the KB; gated purge script (live dry-run: 921 chunks/152 files + the fabricated note
+  `0ca8e649`).
+- **WS2** - ONE shared LEX detector `fireflies_connector.classify_lex_meeting` used by BOTH
+  ingest + the capture pull tool. Signals: LEX email-domain, named lead, LEX title kw
+  (word-boundary `\blex-`), self-sufficient CARE (hcbs/dta/day-treatment/anger-management) +
+  DDD + clinical titles, and CORROBORATION-required ambiguous program titles + known-organizer
+  + .gov. LEX program/client/DDD/clinical/LBHS are HARD-EXCLUDED from KB ingest (decided:
+  exclude, not scrub); plain LEX ops still ingest LEX-scoped. Closes the "1st Budget Class"
+  (probation, alina@hjrglobal.com organizer, maricopa.gov clients) leak. Gated purge (88 chunks).
+- **WS3** - the general staged-write `asana_create_task` had a confirm gate but NO dedup /
+  cross-entity validation / LEX scrub (the CREATE-bypass). Added `_plan_asana_create` (drop
+  cross-entity project_gid; no-orphan -> entity catch-all; LEX channel -> PHI scrub + LEX-only
+  project, fail-CLOSED on an unverified project) + exact-name dedup fail-OPEN. INVARIANT CLAMP:
+  every adjustment SURFACED in the unconfirmed preview, never silent. FNDR/HJRG no-op.
+- **WS4** - cross-entity vendor/contact fallback (the genuine Minute Press fix): when an
+  entity-scoped search is empty AND the asker has cross-entity authority, search the wider
+  portfolio (reusing per-entity `kb.search`), confidence-LABEL, EXCLUDE LEX for non-custodians
+  (two layers). Replaces a confident "no record" with a labeled wider result.
+
+**Doctrines:**
+- Cora's own build/audit docs are NOT org knowledge - keep them out of the KB or RAG fabricates
+  self-"diagnostics"; status queries must read LIVE state (heartbeat/KB-counts/watermarks).
+- A LEX meeting classifier must split CARE/clinical-specific titles (self-sufficient) from
+  business-AMBIGUOUS program titles (corroboration-required) - the budget-class root case is
+  caught via organizer+gov / a Lexington-domain attendee, not the bare program title.
+- A general staged-write tool that can be reached in any channel must carry the SAME
+  entity-routing + PHI rails as the specialized path, fail-CLOSED for LEX, and SURFACE every
+  routing/scrub adjustment at the confirm gate (decision-SUPPORT, not silent decision-MAKER).
+- PHI fail-CLOSED; dedup fail-OPEN; a config loader must coerce malformed shapes to defaults so
+  a hand-edit never crashes the nightly ingest.
+
+**Process:** two adversarial D-051 reviews (14-agent, then 4-agent on the remediation) found 8 +
+1 confirmed real findings the green suite hid - ALL fixed before any merge. Full suite 4,888
+passed / 3 pre-existing env-failures / 42 skipped. Bot-loaded changes -> Harrison merges + ONE
+coordinated restart. All KB purges (`purge_cora_internal_kb.py`, `purge_lex_program_kb.py`) are
+dry-run-default + Harrison-gated.
