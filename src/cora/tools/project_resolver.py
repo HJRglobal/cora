@@ -268,10 +268,15 @@ def belongs_to_entity(project_gid: str, entity: str) -> bool:
 
 
 def entity_catch_all(entity: str) -> str | None:
-    """Return the catch-all project GID for an entity (parent fallback), or None."""
+    """Return the catch-all project GID for an entity, or None.
+
+    Falls back exact -> hyphen-parent (LEX-LLC -> LEX) -> family (OSNGW -> OSN, for
+    the no-hyphen store codes) so an entity-scoped channel never silently orphans
+    when only the family has a configured project.
+    """
     data = _load_map()
     ents = data.get("entities") or {}
-    cfg = ents.get(entity) or ents.get(entity.split("-")[0])
+    cfg = ents.get(entity) or ents.get(entity.split("-")[0]) or ents.get(_family(entity))
     if not cfg:
         return None
     g = cfg.get("catch_all_gid")

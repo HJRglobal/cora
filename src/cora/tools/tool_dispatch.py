@@ -585,11 +585,17 @@ def _plan_asana_create(
         except Exception as exc:  # noqa: BLE001
             log.warning("asana_create_task: project_resolver failed (%s)", exc)
 
-    # 3. No silent My-Tasks orphan for an entity-scoped channel.
+    # 3. No silent My-Tasks orphan for an entity-scoped channel. If the entity has
+    #    no configured project at all (e.g. BDM), SURFACE the orphan -- never silent.
     if not project_gid and not is_aggregator:
         ca = pr.entity_catch_all(entity)
         if ca and not pr.is_blocked_project(ca):
             project_gid = ca
+        else:
+            notices.append(
+                f"no {ent_upper} project is configured, so this lands in the assignee's "
+                f"My Tasks -- move it in Asana if it needs a project"
+            )
 
     # 4. Lexington channel: PHI-scrub (minimum-necessary) + keep it in LEX scope.
     lex_scrub_error = False
@@ -607,10 +613,19 @@ def _plan_asana_create(
             lex_scrub_error = True
         if not lex_scrub_error and project_gid:
             owners = pr.project_owner_entities(project_gid)
-            if owners and not any(str(o).upper().startswith("LEX") for o in owners):
-                ca = pr.entity_catch_all(entity)
+            is_confirmed_lex = bool(owners) and any(
+                str(o).upper().startswith("LEX") for o in owners
+            )
+            if not is_confirmed_lex:
+                # Fail CLOSED: a project we cannot POSITIVELY confirm is LEX-owned
+                # (including an unmapped/ad-hoc GID, owners==empty) is dropped to the
+                # LEX catch-all -- a Lexington task must never land outside LEX scope.
+                ca = pr.entity_catch_all(entity) or pr.entity_catch_all("LEX")
                 project_gid = ca if (ca and not pr.is_blocked_project(ca)) else None
-                notices.append("routed to a Lexington project")
+                notices.append(
+                    "routed to a Lexington project (an unverified project was dropped "
+                    "to protect client confidentiality)"
+                )
 
     return {
         "title": title,

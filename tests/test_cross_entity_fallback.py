@@ -93,3 +93,33 @@ def test_fallback_respects_distance_threshold():
     with patch.object(cl, "get_shared_kb", return_value=fake):
         out = cl._try_cross_entity_fallback("printer", _VEC, "F3E", frozenset(), True, False)
     assert out is None
+
+
+class _MisTagKB:
+    """search() returns a chunk tagged entity='LEX' regardless of the entity asked
+    -- simulates a mis-tagged chunk slipping past entity-column filtering, the exact
+    input the WS4 belt-and-suspenders (layer-2) filter exists to stop."""
+
+    def __init__(self):
+        self.searched: list[str] = []
+
+    def search(self, query, entity, k=8, max_age_days=None, include_fndr=True,
+               query_vec=None, sub_entity=None):
+        self.searched.append(entity)
+        return [_sr("LEX", "client PHI contact", chunk_id="mis")]
+
+
+def test_fallback_layer2_drops_mistagged_lex_for_non_custodian():
+    # Review fix #8: even if a LEX-tagged chunk is returned under a non-LEX entity
+    # search, the layer-2 filter must drop it for a non-custodian.
+    fake = _MisTagKB()
+    with patch.object(cl, "get_shared_kb", return_value=fake):
+        out = cl._try_cross_entity_fallback("contact", _VEC, "F3E", frozenset(), True, False)
+    assert out is None
+
+
+def test_fallback_layer2_keeps_mistagged_lex_for_custodian():
+    fake = _MisTagKB()
+    with patch.object(cl, "get_shared_kb", return_value=fake):
+        out = cl._try_cross_entity_fallback("contact", _VEC, "F3E", frozenset(), True, True)
+    assert out is not None and "client PHI contact" in out

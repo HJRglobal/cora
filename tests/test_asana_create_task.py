@@ -206,6 +206,51 @@ def test_unconfirmed_preview_surfaces_lex_scrub():
     assert "phi-scrubbed" in out.lower()
 
 
+def test_lex_unmapped_project_gid_fails_closed():
+    """Review fix #1: a LEX-channel task with an UNMAPPED explicit project_gid must
+    be dropped to a LEX project, never honored (fail-CLOSED, not fail-OPEN)."""
+    created = {"gid": "1", "permalink_url": "http://x", "projects": []}
+    with patch.object(td.org_roles, "all_roles", return_value=[]), \
+         patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: t), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="LEX-LLC",
+            _input={"title": "Follow up", "confirmed": True, "project_gid": "999999999999"},
+        )
+    used = mock.call_args.kwargs["project_gid"]
+    assert used != "999999999999"
+    from cora.tools import project_resolver as pr
+    assert used and any(str(o).upper().startswith("LEX") for o in pr.project_owner_entities(used))
+    assert "unverified" in out.lower()
+
+
+def test_lex_scrub_failure_fails_closed():
+    """Review fix #5: if PHI scrub raises, refuse and NEVER create the task."""
+    with patch.object(td.org_roles, "all_roles", return_value=[]), \
+         patch("cora.phi_guard.scrub_lex_phi", side_effect=RuntimeError("scrub boom")), \
+         patch.object(td.asana_client, "create_task") as mock_create, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="LEX-LLC",
+            _input={"title": "Follow up with John Doe re billing", "confirmed": True},
+        )
+    assert "couldn't safely prepare" in out.lower()
+    mock_create.assert_not_called()   # raw PHI title must NEVER reach Asana
+
+
+def test_dedup_fails_open_on_read_error():
+    """Review fix #7: a dedup read error must NOT block a legitimate create."""
+    created = {"gid": "NEW", "permalink_url": "http://new", "projects": []}
+    with patch.object(td.asana_client, "get_project_tasks", side_effect=Exception("read failed")), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock:
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="F3E",
+            _input={"title": "Send the deck", "confirmed": True},
+        )
+    mock.assert_called_once()
+
+
 def test_create_task_refuses_unresolvable_assignee():
     """Unknown assignee → tool returns a graceful error string (no API call)."""
     with patch.object(td.asana_client, "create_task") as mock:

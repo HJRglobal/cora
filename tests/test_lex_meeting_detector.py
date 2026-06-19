@@ -6,6 +6,8 @@ case it must catch: a Lexington probation "1st Budget Class" (organizer
 @hjrglobal.com, *.maricopa.gov clients, generic title) -> LEX + hard-exclude.
 """
 
+from unittest.mock import patch
+
 from cora.connectors import fireflies_connector as fc
 
 
@@ -126,3 +128,95 @@ class TestMeetingActionsDelegation:
         ))
         assert is_lex is False
         assert entity == "F3E"
+
+
+class TestAmbiguousProgramTitles:
+    """Review fix #3: a business-AMBIGUOUS program title alone must NOT classify a
+    non-LEX meeting as LEX (and silently hard-exclude it from the KB)."""
+
+    def test_program_title_without_corroboration_not_lex(self):
+        for title in (
+            "F3 Financial Class Q3",
+            "Day Program Marketing Sync",
+            "Podcast: Financial Literacy for Founders",
+            "Independent Living Content Plan",
+        ):
+            v = fc.classify_lex_meeting(_t(title=title, attendees=[("X", "x@f3energy.com")]))
+            assert v.is_lex is False, title
+            assert v.hard_exclude_kb is False, title
+
+    def test_program_title_corroborated_by_lex_domain_is_lex(self):
+        v = fc.classify_lex_meeting(_t(
+            title="1st Budget Class",
+            attendees=[("Jen", "jen@lexingtonservices.com")],
+        ))
+        assert v.is_lex is True and v.hard_exclude_kb is True
+
+    def test_lex_substring_word_boundary(self):
+        # "lex-" must match at a word boundary only, not inside Duplex-/Complex-.
+        assert fc.classify_lex_meeting(_t(title="Complex Pricing Review")).is_lex is False
+        assert fc.classify_lex_meeting(_t(title="Duplex-ready Listing Prep")).is_lex is False
+
+    def test_ddd_title_still_self_sufficient(self):
+        # DDD is LEX/healthcare-specific -> stays self-sufficient (no corroboration).
+        v = fc.classify_lex_meeting(_t(title="DDD ISP Meeting"))
+        assert v.is_lex is True and v.hard_exclude_kb is True
+
+
+class TestConfigRobustness:
+    """Review fix #4: malformed lex-scope YAML must degrade to defaults, never crash
+    or char-iterate a bare string into single-letter patterns."""
+
+    def _reload_with(self, tmp_path, content):
+        p = tmp_path / "scope.yaml"
+        p.write_text(content, encoding="utf-8")
+        fc._lex_detect_cfg = None
+        try:
+            with patch.object(fc, "_LEX_DETECT_CFG_PATH", p):
+                return fc._load_lex_detect_cfg()
+        finally:
+            fc._lex_detect_cfg = None  # let other tests reload the real file
+
+    def test_non_dict_yaml_falls_back_to_defaults(self, tmp_path):
+        cfg = self._reload_with(tmp_path, "just a bare string\n")
+        assert "budget class" in cfg["program_titles"]
+        assert "alina@hjrglobal.com" in cfg["organizers"]
+
+    def test_per_key_string_not_char_iterated(self, tmp_path):
+        cfg = self._reload_with(tmp_path, 'lex_program_title_patterns: "town hall"\n')
+        assert "town hall" in cfg["program_titles"]   # added as ONE pattern
+        assert "t" not in cfg["program_titles"]        # NOT split into characters
+        assert "budget class" in cfg["program_titles"] # defaults preserved
+
+
+class TestBackfillHardExcludeWiring:
+    """Review fix #6: exercise backfill()'s actual ingest-prevention wiring, not just
+    the verdict -- a LEX program/client meeting must never be yielded for KB ingest."""
+
+    def _t(self, tid, title, link, attendees, organizer=""):
+        return {
+            "id": tid, "title": title, "date": 1_780_000_000, "meeting_link": link,
+            "duration": 1800, "organizer_email": organizer,
+            "summary": {"overview": "ov", "action_items": "do x"},
+            "sentences": [{"index": i, "speaker_name": "A", "text": f"l{i}"} for i in range(4)],
+            "meeting_attendees": attendees,
+        }
+
+    def test_program_meeting_excluded_ops_meeting_ingested(self, tmp_path):
+        from datetime import datetime, timezone
+        bc = self._t("BC", "1st Budget Class", "Lbc",
+                     [{"displayName": "PO", "email": "po@maricopa.gov"}], "alina@hjrglobal.com")
+        ops = self._t("OPS", "Lexington Services Ops Sync", "Lops",
+                      [{"displayName": "Shaun Hawkins", "email": "shaun@lexingtonservices.com"}])
+        osn = self._t("OSN1", "OSN Store Inventory", "Losn",
+                      [{"displayName": "Matt", "email": "matt@onestopnutrition.com"}])
+        with (
+            patch.object(fc, "_DEDUP_LEDGER_PATH", tmp_path / "led.json"),
+            patch.object(fc, "_graphql_query", return_value={"transcripts": [bc, ops, osn]}),
+        ):
+            docs = list(fc.backfill(datetime(2020, 1, 1, tzinfo=timezone.utc)))
+        ids = {d.source_id for d in docs}
+        assert "BC" not in ids               # LEX program/client meeting hard-excluded
+        assert "OPS" in ids and "OSN1" in ids
+        ent = {d.source_id: d.entity for d in docs}
+        assert ent["OPS"] == "LEX"           # plain LEX ops still ingests LEX-scoped

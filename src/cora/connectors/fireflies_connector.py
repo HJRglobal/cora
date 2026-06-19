@@ -277,14 +277,28 @@ def _load_lex_detect_cfg() -> dict:
         return _lex_detect_cfg
     extra: dict = {}
     try:
-        extra = yaml.safe_load(_LEX_DETECT_CFG_PATH.read_text(encoding="utf-8")) or {}
+        loaded = yaml.safe_load(_LEX_DETECT_CFG_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            extra = loaded
+        elif loaded is not None:
+            log.warning(
+                "lex-detect cfg is not a mapping (%s) -- using defaults only",
+                type(loaded).__name__,
+            )
     except Exception as exc:  # noqa: BLE001
         log.debug("lex-detect cfg read failed (%s) -- defaults only", exc)
         extra = {}
 
     def _merge(key: str, default: list[str]) -> list[str]:
         vals = list(default)
-        for v in (extra.get(key) or []):
+        raw = extra.get(key)
+        if isinstance(raw, str):
+            raw = [raw]            # a bare string is ONE pattern, not a char sequence
+        if not isinstance(raw, list):
+            raw = []               # ignore any other shape (int/dict/None)
+        for v in raw:
+            if not isinstance(v, (str, int, float)):
+                continue
             s = str(v).strip().lower()
             if s and s not in vals:
                 vals.append(s)
@@ -351,19 +365,36 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
         name_sub = _tag_fireflies_sub_entity(transcript)
     except Exception:  # noqa: BLE001
         name_sub = None
-    title_lex = any(kw in tl for kw in _LEX_TITLE_KEYWORDS)
+    # title_lex: a LEX keyword in the title. "lex-" is matched at a WORD BOUNDARY
+    # so it does not fire on "Duplex-"/"Complex-".
+    title_lex = any(kw in tl for kw in _LEX_TITLE_KEYWORDS if kw != "lex-") or bool(
+        re.search(r"\blex-", tl)
+    )
     program = any(p in tl for p in cfg["program_titles"])
     ddd = any(p in tl for p in cfg["ddd_titles"])
     clinical = any(p in tl for p in _PHI_TITLE_KEYWORDS)
     lex_org = bool(organizer) and organizer in cfg["organizers"]
     domains = {e.split("@", 1)[1] for e in emails if "@" in e}
-    gov = any(d.endswith(tuple(cfg["client_domain_suffixes"])) for d in domains)
+    suffixes = tuple(cfg["client_domain_suffixes"])
+    gov = bool(suffixes) and any(d.endswith(suffixes) for d in domains)
 
-    # A known LEX-program organizer hosting external/government CLIENTS is a LEX
-    # program even with a generic title.
+    # Unambiguous LEX identity: a Lexington email domain, a named LEX lead, or a
+    # LEX title keyword.
+    strong_id = bool(domain_sub or name_sub or title_lex)
+    # DDD + clinical titles are LEX/healthcare-specific -> self-sufficient.
+    specific_lex_title = bool(ddd or clinical)
+    # A known LEX-program organizer hosting government/CLIENT (.gov) attendees is a
+    # LEX program even with a generic title (the "Budget Class" root case).
     org_plus_gov = lex_org and gov
-    # "strong" = a self-sufficient LEX signal (organizer-alone / gov-alone are not).
-    strong = bool(domain_sub or name_sub or title_lex or program or ddd or org_plus_gov)
+    # PROGRAM titles ("budget class", "financial literacy", "day program", ...) are
+    # business-AMBIGUOUS, so they count ONLY when corroborated by a real LEX signal.
+    # Otherwise a non-LEX "F3 Financial Class" or a podcast "Financial Literacy"
+    # would be mis-classified LEX and silently hard-excluded from the KB.
+    program_corroborated = program and bool(strong_id or specific_lex_title or lex_org or gov)
+
+    is_lex = bool(strong_id or specific_lex_title or program_corroborated or org_plus_gov)
+    if not is_lex:
+        return LexVerdict(False, None, False, "no-lex-signal")
 
     signals: list[str] = []
     if domain_sub:
@@ -372,19 +403,14 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
         signals.append("named-lead")
     if title_lex:
         signals.append("title")
-    if program:
-        signals.append("program")
     if ddd:
         signals.append("ddd")
+    if clinical:
+        signals.append("clinical")
+    if program_corroborated:
+        signals.append("program")
     if org_plus_gov:
         signals.append("organizer+client-gov")
-    elif lex_org and strong:
-        signals.append("organizer")
-    if gov and strong and not org_plus_gov:
-        signals.append("client-gov")
-
-    if not signals:
-        return LexVerdict(False, None, False, "no-lex-signal")
 
     if domain_sub == "LEX-LBHS" or name_sub == "LEX-LBHS":
         sub: str | None = "LEX-LBHS"
@@ -395,7 +421,9 @@ def classify_lex_meeting(transcript: dict) -> LexVerdict:
     else:
         sub = "LEX"
 
-    hard = bool(program or ddd or clinical or org_plus_gov or (gov and strong) or sub == "LEX-LBHS")
+    # Once known LEX, a program / DDD / clinical / government-client / LBHS meeting
+    # is client-facing -> hard-exclude from the KB.
+    hard = bool(program or ddd or clinical or gov or sub == "LEX-LBHS")
     reason = "+".join(signals) + ("|kb-exclude" if hard else "")
     return LexVerdict(True, sub, hard, reason)
 
@@ -794,7 +822,14 @@ def backfill(since: datetime) -> Iterator[Document]:
 
         # Shared LEX detector: hard-exclude LEX program/client/DDD/LBHS/clinical
         # meetings from the KB entirely (WS2). Plain LEX ops still ingest LEX-scoped.
-        lexv = classify_lex_meeting(t)
+        # On a detector error, SKIP this transcript (privacy-safe) rather than crash
+        # the whole nightly sync -- a malformed transcript can't be proven non-LEX.
+        try:
+            lexv = classify_lex_meeting(t)
+        except Exception as exc:  # noqa: BLE001
+            skipped_lex_excluded += 1
+            log.warning("LEX detector error on %r (%s) -- skipping to be safe", title, exc)
+            continue
         if lexv.is_lex:
             if lexv.hard_exclude_kb:
                 skipped_lex_excluded += 1
