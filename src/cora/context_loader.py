@@ -509,6 +509,18 @@ def _try_kb_retrieve(
     if not relevant and not notes_block:
         log.info("KB returned %d chunks but none passed distance threshold %.2f",
                  len(results), _KB_MAX_DISTANCE)
+        # WS4: cross-entity fallback for a cross-entity-authorized asker (the
+        # founder, or a founder-channel asker) looking for a shared vendor/contact
+        # tagged to a DIFFERENT entity. Replaces a confident "no record" with a
+        # confidence-labeled wider-portfolio result. LEX excluded for non-custodians.
+        fallback = _try_cross_entity_fallback(
+            query, query_vec, kb_entity, asker_emails, asker_unrestricted, phi_custodian,
+        )
+        if fallback:
+            if kb_meta is not None:
+                kb_meta["cross_entity_fallback"] = True
+                kb_meta["unstripped_personal"] = True  # asker-scoped -> never cache
+            return fallback
         return None
 
     main_block = ""
@@ -593,6 +605,86 @@ def _apply_lex_phi_scrub(results: list) -> list:
         except Exception:  # noqa: BLE001
             pass
     return results
+
+
+# Business entities searched in the cross-entity fallback (WS4). LEX is added
+# only for a custodian in LEX scope; the channel's own entity is dropped (already
+# searched). FNDR is the founder corpus.
+_CROSS_ENTITY_FALLBACK_ENTITIES: tuple[str, ...] = (
+    "F3E", "F3C", "OSN", "UFL", "BDM", "HJRP", "HJRPROD", "HJRG", "FNDR",
+)
+
+
+def _try_cross_entity_fallback(
+    query: str,
+    query_vec: list[float] | None,
+    kb_entity: str,
+    asker_emails: frozenset[str] | None,
+    asker_unrestricted: bool,
+    phi_custodian: bool,
+) -> str | None:
+    """When an entity-scoped search is empty AND the asker has cross-entity
+    authority (the founder, or a founder/holdco channel), search the wider
+    portfolio for a shared vendor/contact tagged to another entity. Returns a
+    CONFIDENCE-LABELED block, or None when nothing is found (never a fabricated
+    "no record"). Reuses the security-reviewed per-entity kb.search().
+
+    LEX-store is EXCLUDED unless the asker is a LEX custodian in LEX scope
+    (phi_custodian): a printer's identity is harmless cross-entity, a Lexington
+    clinical/client contact is not.
+    """
+    if not (asker_unrestricted or kb_entity in ("FNDR", "HJRG")):
+        return None
+    kb = get_shared_kb()
+    if kb is None:
+        return None
+
+    entities = [e for e in _CROSS_ENTITY_FALLBACK_ENTITIES if e != kb_entity]
+    if phi_custodian and kb_entity != "LEX" and "LEX" not in entities:
+        entities.append("LEX")
+
+    seen: set[str] = set()
+    merged: list = []
+    try:
+        with _SHARED_KB_LOCK:
+            for ent in entities:
+                res = kb.search(
+                    query, entity=ent, k=_KB_TOP_K, max_age_days=_KB_MAX_AGE_DAYS,
+                    include_fndr=False, query_vec=query_vec,
+                )
+                for r in res:
+                    if r.distance <= _KB_MAX_DISTANCE and r.chunk_id not in seen:
+                        seen.add(r.chunk_id)
+                        merged.append(r)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cross-entity fallback search failed: %s", exc)
+        return None
+
+    # Belt-and-suspenders: never surface a LEX chunk to a non-custodian, even if
+    # one slipped through entity tagging.
+    if not phi_custodian:
+        merged = [r for r in merged if (r.entity or "").upper() != "LEX"]
+    if not merged:
+        return None
+
+    merged.sort(key=lambda r: r.distance)
+    merged = merged[:_KB_TOP_K]
+    merged, _ = historical_access.apply_tier1(
+        merged, asker_emails or frozenset(), asker_unrestricted,
+    )
+    if not merged:
+        return None
+
+    log.info(
+        "cross-entity fallback: %d chunks from %s (channel=%s)",
+        len(merged), sorted({r.entity for r in merged}), kb_entity,
+    )
+    block = _format_kb_chunks(merged)
+    return (
+        "_Nothing in this channel's own records. A wider portfolio search turned up "
+        "the following — confirm before acting, and note it may belong to another "
+        "entity:_\n\n" + block
+    )
 
 
 def _format_kb_chunks(chunks: list) -> str:
