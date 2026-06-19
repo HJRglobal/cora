@@ -831,6 +831,38 @@ class TestPreview:
 
 
 # ---------------------------------------------------------------------------
+# Project-scoped dedup helpers
+# ---------------------------------------------------------------------------
+
+class TestProjectDedup:
+    def test_exact_name_match(self):
+        cache = {}
+        with patch.object(ma.asana_client, "get_project_tasks",
+                           return_value=[{"gid": "G1", "name": "Send the deck"}]):
+            assert ma._existing_open_dup("PROJ", "Send the deck", cache) == "G1"
+            assert ma._existing_open_dup("PROJ", "send  THE   deck", cache) == "G1"  # ws+case
+            assert ma._existing_open_dup("PROJ", "Different task", cache) is None
+
+    def test_matches_across_truncation_divergence(self):
+        # HIGH (review): the retired push scrubbed-AFTER-truncating, so a long LEX
+        # name can be stored >160 chars; the pull truncates at 160. _dedup_key
+        # truncates BOTH sides so the exact-name lookup still catches it.
+        long_name = "Follow up with the Lexington billing team regarding " + "details " * 20  # >160
+        assert len(long_name) > ma.fae._MAX_TASK_LEN
+        pull_name = long_name[:ma.fae._MAX_TASK_LEN].rstrip()  # what the pull stores
+        cache = {}
+        with patch.object(ma.asana_client, "get_project_tasks",
+                           return_value=[{"gid": "GLEX", "name": long_name}]):
+            assert ma._existing_open_dup("PROJ", pull_name, cache) == "GLEX"
+
+    def test_fail_open_on_scan_error(self):
+        cache = {}
+        with patch.object(ma.asana_client, "get_project_tasks", side_effect=Exception("boom")):
+            assert ma._existing_open_dup("PROJ", "anything", cache) is None  # fail open
+        assert cache["PROJ"] is None  # cached so we don't re-fetch the failing scan
+
+
+# ---------------------------------------------------------------------------
 # Confirm / create (staged write) — entry point
 # ---------------------------------------------------------------------------
 
@@ -998,6 +1030,51 @@ class TestConfirm:
             )
         mock_create.assert_called_once()             # fail-open: created despite scan error
         assert "WRITE_CONFIRMED" in out
+
+    def test_confirm_create_failure_reported_honestly(self, asker_identity):
+        # MEDIUM (review): an Asana create error must NOT be misreported as
+        # "no project to land in" -- it's a save failure.
+        t = _mk_transcript()
+        with (
+            patch.object(ma, "_fetch_transcript_by_id", return_value=t),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+            patch.object(ma, "resolve_project", return_value="PROJ"),
+            patch.object(ma, "is_blocked_project", return_value=False),
+            patch.object(ma.asana_client, "find_recent_duplicate_task", return_value=None),
+            patch.object(ma.asana_client, "create_task",
+                         side_effect=ma.asana_client.AsanaClientError("429 rate limited")),
+        ):
+            out = ma.run_meeting_action_items(
+                ASKER, "F3E",
+                _input(confirmed=True, transcript_id="01TID", selected_items=["Send the deck"]),
+            )
+        assert "no project" not in out.lower()       # not the false attribution
+        assert "couldn't be saved" in out.lower()
+
+    def test_confirm_same_item_twice_creates_once(self, asker_identity):
+        # NIT (review): the same item selected twice in one call must create once.
+        t = _mk_transcript()
+        created = {"gid": "T1", "permalink_url": ""}
+        with (
+            patch.object(ma, "_fetch_transcript_by_id", return_value=t),
+            patch.object(ma, "_asker_attended", return_value=True),
+            patch.object(ma, "_classify_entity", return_value="F3E"),
+            patch.object(ma, "_tag_fireflies_sub_entity", return_value=None),
+            patch.object(ma, "resolve_project", return_value="PROJ"),
+            patch.object(ma, "is_blocked_project", return_value=False),
+            patch.object(ma.asana_client, "find_recent_duplicate_task", return_value=None),
+            patch.object(ma.asana_client, "set_task_custom_fields", return_value=True),
+            patch.object(fae, "_capture_custom_fields", return_value={}),
+            patch.object(ma.asana_client, "create_task", return_value=created) as mock_create,
+        ):
+            ma.run_meeting_action_items(
+                ASKER, "F3E",
+                _input(confirmed=True, transcript_id="01TID",
+                       selected_items=["Send the deck", "Send the deck"]),
+            )
+        mock_create.assert_called_once()             # not twice
 
     def test_confirm_lex_routes_to_lex_project_and_scrubs(self, asker_identity):
         t = _mk_transcript(title="LLC Ops Sync", action_items="**Tommy Anderson**\nFollow up re billing authorization (Fri)\n")

@@ -1010,26 +1010,51 @@ def _format_picklist(matches: list[dict], header: str) -> str:
 # Create (the staged write)
 # ---------------------------------------------------------------------------
 
+def _dedup_key(name: str) -> str:
+    """Normalize a task name for dedup comparison.
+
+    Collapse internal whitespace, truncate to the same _MAX_TASK_LEN cap creation
+    applies, then lowercase. Truncating BOTH sides neutralizes the name-construction
+    ORDER difference between the retired push (truncated RAW then scrubbed -- a long
+    LEX name could end up >160) and this pull (scrubs then truncates at 160), and the
+    whitespace-collapse absorbs minor LLM-relay drift. RESIDUAL (documented, accepted):
+    when PHI straddles char 160 the scrubbed CONTENT can still differ (scrub-before vs
+    scrub-after truncation) -- a narrow LEX-only, >160-char, TRANSIENT (push retired)
+    case that fails OPEN (a duplicate, never a blocked legitimate task).
+    """
+    s = re.sub(r"\s+", " ", (name or "").strip())
+    if len(s) > fae._MAX_TASK_LEN:
+        s = s[:fae._MAX_TASK_LEN].rstrip()
+    return s.lower()
+
+
 def _open_task_names_in_project(project_gid: str, cache: dict) -> dict[str, str] | None:
-    """normalized open-task-name -> gid for a project's INCOMPLETE tasks.
+    """normalized open-task-name (_dedup_key) -> gid for a project's INCOMPLETE tasks.
 
     Fetched once per project per confirm-call (cached in `cache`). Returns None
     on any fetch error so the caller FAILS OPEN (a dedup read must never block a
     legitimate create). Deterministic -- this replaces the Asana typeahead lookup,
     which is unreliable for the long descriptive names action items carry (it let
-    a duplicate through in the 2026-06-18 smoke).
+    a duplicate through in the 2026-06-18 smoke). Best-effort: scans at most
+    _DEDUP_SCAN_MAX open tasks (project order, not newest-first) -- a duplicate
+    past that ceiling is missed (logged); the typeahead net is the backstop.
     """
     if project_gid in cache:
         return cache[project_gid]
     namemap: dict[str, str] | None
     try:
         tasks = asana_client.get_project_tasks(project_gid, max_tasks=_DEDUP_SCAN_MAX)
+        if len(tasks) >= _DEDUP_SCAN_MAX:
+            log.warning(
+                "meeting_actions: dedup scan hit the %d-task cap for project %s -- "
+                "a duplicate beyond the cap may be missed", _DEDUP_SCAN_MAX, project_gid,
+            )
         namemap = {}
         for t in tasks:
-            nm = (t.get("name") or "").strip().lower()
+            key = _dedup_key(t.get("name") or "")
             gid = t.get("gid")
-            if nm and gid:
-                namemap.setdefault(nm, gid)  # first wins; we only need existence
+            if key and gid:
+                namemap.setdefault(key, gid)  # first wins; we only need existence
     except Exception as exc:  # noqa: BLE001 -- dedup is best-effort; fail OPEN
         log.warning("meeting_actions: project dedup scan failed for %s: %s", project_gid, exc)
         namemap = None
@@ -1038,16 +1063,16 @@ def _open_task_names_in_project(project_gid: str, cache: dict) -> dict[str, str]
 
 
 def _existing_open_dup(project_gid: str, task_name: str, cache: dict) -> str | None:
-    """Return the GID of an existing OPEN task with this exact name in the TARGET
-    project, else None. Project-scoped + deterministic: an open task with the same
-    name in the same project (where both push and pull route) is the duplicate
+    """Return the GID of an existing OPEN task with this (normalized) name in the
+    TARGET project, else None. Project-scoped + deterministic: an open task with the
+    same name in the same project (where both push and pull route) is the duplicate
     class the typeahead dedup missed."""
     if not project_gid or not task_name:
         return None
     namemap = _open_task_names_in_project(project_gid, cache)
     if not namemap:
         return None
-    return namemap.get(task_name.strip().lower())
+    return namemap.get(_dedup_key(task_name))
 
 
 def _create_selected(
@@ -1088,9 +1113,11 @@ def _create_selected(
     )
 
     created: list[dict] = []
-    skipped: list[str] = []
-    not_in_meeting: list[str] = []
-    already_open: list[str] = []
+    skipped: list[str] = []          # no project to land in
+    not_in_meeting: list[str] = []   # failed the meeting-content integrity check
+    already_open: list[str] = []     # an open task already exists (not duplicated)
+    create_failed: list[str] = []    # Asana create call errored
+    created_keys: set[str] = set()   # dedup-keys created THIS call (in-call dup guard)
     _proj_dedup_cache: dict[str, dict[str, str] | None] = {}  # project_gid -> {name: gid} | None
     deadline = time.monotonic() + _CREATE_BUDGET_SEC
     budget_hit = False
@@ -1148,11 +1175,18 @@ def _create_selected(
             created.append({"task_name": task_name, "permalink_url": "", "gid": "dry-run"})
             continue
 
+        # In-call guard: the same item selected twice in one confirm shouldn't
+        # create two tasks (the project namemap was fetched before this loop).
+        key = _dedup_key(task_name)
+        if key in created_keys:
+            already_open.append(task_name)
+            continue
+
         # Creation-time dedup: don't double-create a task that already exists open.
-        # PRIMARY (deterministic): exact-name match among the TARGET project's open
-        # tasks -- catches the duplicate class the typeahead missed in the smoke
-        # (a push-created task identical to a pull request, both in the same
-        # capture project). SECONDARY: the workspace-wide typeahead net for a
+        # PRIMARY (deterministic): normalized exact-name match among the TARGET
+        # project's open tasks -- catches the duplicate class the typeahead missed
+        # in the smoke (a push-created task identical to a pull request, both in the
+        # same capture project). SECONDARY: the workspace-wide typeahead net for a
         # cross-project name match (best-effort; unreliable for long names).
         dup = _existing_open_dup(project_gid, task_name, _proj_dedup_cache)
         if not dup:
@@ -1171,7 +1205,7 @@ def _create_selected(
             )
         except asana_client.AsanaClientError as exc:
             log.warning("meeting_actions create failed for %r: %s", task_name, exc)
-            skipped.append(task_name)
+            create_failed.append(task_name)
             continue
         gid = task.get("gid", "")
         if gid and capture_fields:
@@ -1179,15 +1213,16 @@ def _create_selected(
                 asana_client.set_task_custom_fields(gid, capture_fields)
             except Exception as exc:  # noqa: BLE001 -- field tagging best-effort
                 log.debug("meeting_actions custom-field tagging skipped: %s", exc)
+        created_keys.add(key)
         created.append({"task_name": task_name, "permalink_url": task.get("permalink_url", ""), "gid": gid})
 
     log.info(
-        "meeting_action_items CREATE asker=%s meeting=%r entity=%s created=%d already_open=%d skipped=%d not_in_meeting=%d budget_hit=%s",
-        slack_user_id, title, route_entity, len(created), len(already_open), len(skipped), len(not_in_meeting), budget_hit,
+        "meeting_action_items CREATE asker=%s meeting=%r entity=%s created=%d already_open=%d skipped=%d not_in_meeting=%d create_failed=%d budget_hit=%s",
+        slack_user_id, title, route_entity, len(created), len(already_open), len(skipped), len(not_in_meeting), len(create_failed), budget_hit,
     )
 
     if not created:
-        if already_open and not (skipped or not_in_meeting):
+        if already_open and not (skipped or not_in_meeting or create_failed):
             n = len(already_open)
             return (
                 f"You already have an open task for "
@@ -1195,6 +1230,8 @@ def _create_selected(
                 "duplicate. Find them in Asana under your open tasks."
             )
         msg = "I wasn't able to create any of those tasks."
+        if create_failed:
+            msg += " (Some couldn't be saved to Asana -- please try again.)"
         if already_open:
             msg += " (Some already had an open task -- not duplicated.)"
         if not_in_meeting:
@@ -1217,6 +1254,8 @@ def _create_selected(
     tail_notes = []
     if already_open:
         tail_notes.append(f"{len(already_open)} already had an open task -- not duplicated")
+    if create_failed:
+        tail_notes.append(f"{len(create_failed)} couldn't be saved to Asana -- try again")
     if skipped:
         tail_notes.append(f"skipped {len(skipped)} (no project to land in)")
     if not_in_meeting:
