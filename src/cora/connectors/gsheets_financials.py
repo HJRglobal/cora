@@ -150,6 +150,10 @@ class CashflowSummary:
     opening_balance: Optional[float] = None
     closing_balance: Optional[float] = None
     parse_warnings: list[str] = field(default_factory=list)
+    # Chronological ending-cash series across ALL weeks in the sheet (WS7).
+    # Each item: {"week": str, "ending_cash": Optional[float], "is_actual": bool}.
+    # Empty when the sheet has no recognizable Ending-Cash row.
+    ending_cash_series: list[dict] = field(default_factory=list)
 
     def entity_by_code(self, code: str) -> Optional[EntityRow]:
         """Look up a single entity by canonical code (case-insensitive)."""
@@ -158,6 +162,25 @@ class CashflowSummary:
             (e for e in self.entities if e.entity_code.upper() == code_up),
             None,
         )
+
+    def ending_cash_outlook(self, weeks: int = 4) -> list[dict]:
+        """Return the current week's ending cash + the next `weeks` forecast weeks.
+
+        Anchors on the latest-actual week (the one in week_label); returns that
+        entry plus up to `weeks` chronologically-following entries. Empty if the
+        sheet had no Ending-Cash row. Each item is a series dict (week / ending_cash
+        / is_actual). The forward entries are FORECAST ending cash.
+        """
+        if not self.ending_cash_series:
+            return []
+        target = self.week_label.replace("Week of ", "").strip()
+        idx = next(
+            (i for i, e in enumerate(self.ending_cash_series) if e.get("week") == target),
+            None,
+        )
+        if idx is None:
+            idx = 0
+        return self.ending_cash_series[idx: idx + 1 + max(0, weeks)]
 
     def osn_entities(self) -> list[EntityRow]:
         return [e for e in self.entities if e.entity_code.upper().startswith("OSN")]
@@ -597,6 +620,15 @@ def _find_latest_actual_week(
     return None
 
 
+def _ordered_weeks(col_map: list[tuple[str, str]]) -> list[str]:
+    """Distinct week labels in column (left->right = chronological) order."""
+    seen: list[str] = []
+    for week, _ct in col_map:
+        if week and week not in seen:
+            seen.append(week)
+    return seen
+
+
 def _parse_cashflow_csv(
     csv_text: str,
     modified_date: str,
@@ -670,6 +702,7 @@ def _parse_cashflow_csv(
     entity_rows: list[EntityRow] = []
     portfolio_forecast = portfolio_actual = portfolio_diff = None
     opening_balance = closing_balance = None
+    ending_cash_row: Optional[list[str]] = None
 
     for row in data_rows:
         if not row or not row[0].strip():
@@ -692,6 +725,7 @@ def _parse_cashflow_csv(
 
         if _label_matches_any(label, _CLOSING_BALANCE_LABELS):
             closing_balance = forecast if forecast is not None else actual
+            ending_cash_row = row  # capture for the multi-week outlook series
             continue
 
         # Skip rows that have no numeric data at all (section headers, etc.)
@@ -710,6 +744,18 @@ def _parse_cashflow_csv(
     if not entity_rows:
         warnings.append("No entity rows with numeric data were found in CSV")
 
+    # ── Build the chronological ending-cash series across all weeks (WS7) ──
+    ending_cash_series: list[dict] = []
+    if ending_cash_row is not None:
+        for wk in _ordered_weeks(col_map):
+            actual_cols = [i for i, (w, ct) in enumerate(col_map) if w == wk and ct == "ACTUAL"]
+            forecast_cols = [i for i, (w, ct) in enumerate(col_map) if w == wk and ct == "FORECAST"]
+            val = _get_col(ending_cash_row, actual_cols)
+            is_actual = val is not None
+            if val is None:
+                val = _get_col(ending_cash_row, forecast_cols)
+            ending_cash_series.append({"week": wk, "ending_cash": val, "is_actual": is_actual})
+
     return CashflowSummary(
         week_label=week_label,
         as_of_date=modified_date,
@@ -720,6 +766,7 @@ def _parse_cashflow_csv(
         opening_balance=opening_balance,
         closing_balance=closing_balance,
         parse_warnings=warnings,
+        ending_cash_series=ending_cash_series,
     )
 
 
