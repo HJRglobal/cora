@@ -583,6 +583,7 @@ def main() -> int:
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
                 entries = []
+                malformed: list[str] = []
                 for _l in _PROPOSED_UPDATES_PATH.read_text(encoding="utf-8").splitlines():
                     _l = _l.strip()
                     if not _l:
@@ -590,9 +591,13 @@ def main() -> int:
                     try:
                         entries.append(_json.loads(_l))
                     except _json.JSONDecodeError:
-                        pass  # skip a malformed line rather than crash the run
+                        # Preserve malformed lines verbatim rather than crash OR
+                        # silently drop them (no-silent-data-loss invariant).
+                        malformed.append(_l)
+                        log.warning("Step 0: preserving 1 malformed ledger line on rewrite")
                 auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now)
-                _write_entries_atomic(_PROPOSED_UPDATES_PATH, entries)  # atomic — no partial-write window
+                # atomic — no partial-write window; malformed lines kept verbatim.
+                _write_entries_atomic(_PROPOSED_UPDATES_PATH, entries, raw_lines=malformed)
         if auto_dismissed:
             log.info("Auto-dismissed %d stale entries (DM'd >%dd ago, no reaction)",
                      auto_dismissed, _PENDING_EXPIRY_DAYS)

@@ -42,7 +42,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .phi_guard import is_phi_risk
+from .phi_guard import is_phi_risk, is_lex_billing_status_phi
 
 log = logging.getLogger(__name__)
 
@@ -716,9 +716,22 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
     """
     try:
         entity = (payload.get("entity") or "FNDR").strip().upper()
-        text = (payload.get("text") or payload.get("note") or "").strip()
+        # Normalize to a single line so the dedup search below is reliable and the
+        # stored fact is a clean one-liner (adversarial review LOW: a multi-line
+        # contribution otherwise defeated the line-anchored dedup regex).
+        text = re.sub(r"\s+", " ", (payload.get("text") or payload.get("note") or "")).strip()
         if not text:
             return False, "info-for-cora payload has no text -- skipped"
+        # Fail-closed PHI re-check at the IRREVERSIBLE write (adversarial review
+        # MEDIUM). This is a durable write to an always-loaded known-answers file;
+        # the #info-for-cora intake admin-PHI gate is LEX-ASKER-scoped, so a non-LEX
+        # asker pasting a named LEX client's billing/auth status would slip through.
+        # Apply BOTH the clinical check and the admin augmentation UNCONDITIONALLY
+        # here (entity-agnostic) — a missed legit named-admin fact is a far cheaper
+        # error than persisting PHI into the wrong-entity surface.
+        if is_phi_risk(text) or is_lex_billing_status_phi(text):
+            log.info("gap_autofill: contributed note refused (PHI) -- not persisted")
+            return False, "contribution looks like PHI -- not persisted"
         author = (payload.get("author_name") or "").strip()
 
         target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")

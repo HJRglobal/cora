@@ -116,11 +116,20 @@ def _existing_update_ids() -> set[str]:
     return _live_update_ids() | _archive_update_ids()
 
 
-def _write_entries_atomic(path: Path, entries: list[dict[str, Any]]) -> None:
-    """Rewrite a JSONL ledger atomically (tmp + replace) — no partial-write window."""
+def _write_entries_atomic(
+    path: Path,
+    entries: list[dict[str, Any]],
+    raw_lines: list[str] | None = None,
+) -> None:
+    """Rewrite a JSONL ledger atomically (tmp + replace) — no partial-write window.
+
+    raw_lines are unparseable lines preserved VERBATIM (written first) so a rewrite
+    never silently drops malformed data (adversarial review MEDIUM)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
+        for line in (raw_lines or []):
+            fh.write(line + "\n")
         for entry in entries:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     tmp.replace(path)
@@ -170,17 +179,10 @@ def rotate_resolved(max_age_days: int = 3, now: datetime | None = None) -> int:
         with _ARCHIVE_PATH.open("a", encoding="utf-8") as fh:
             for rec in archive:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        # Restore any malformed lines verbatim on rewrite.
-        keep_lines = [k for k in keep if "__malformed__" not in k]
+        # Rewrite the live file (malformed lines preserved verbatim).
+        keep_records = [k for k in keep if "__malformed__" not in k]
         malformed = [k["__malformed__"] for k in keep if "__malformed__" in k]
-        _PROPOSED_UPDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _PROPOSED_UPDATES_PATH.with_suffix(_PROPOSED_UPDATES_PATH.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for line in malformed:
-                fh.write(line + "\n")
-            for rec in keep_lines:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        tmp.replace(_PROPOSED_UPDATES_PATH)
+        _write_entries_atomic(_PROPOSED_UPDATES_PATH, keep_records, raw_lines=malformed)
         # Invalidate caches (both files changed).
         global _SEEN_IDS_CACHE, _SEEN_IDS_KEY, _ARCHIVE_IDS_CACHE, _ARCHIVE_IDS_KEY
         _SEEN_IDS_CACHE = None
@@ -321,7 +323,9 @@ def propose_update(
     }
     _PROPOSED_UPDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _UPDATES_LOCK:
-        if update_id in _existing_update_ids():
+        # Short-circuit membership against the two cached sets (live, then archive)
+        # instead of materializing their union every call (adversarial review LOW).
+        if update_id in _live_update_ids() or update_id in _archive_update_ids():
             log.info("knowledge_review: skip duplicate propose update_id=%s type=%s",
                      update_id, update_type)
             return False

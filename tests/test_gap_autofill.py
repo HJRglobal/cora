@@ -591,3 +591,42 @@ class TestApplyContributedNote:
         ok, _ = ga.apply_contributed_note({"entity": "NOPE", "text": "fact about nothing"})
         assert ok
         assert (tmp_path / "fndr.md").exists()
+
+
+# == WS17-B Commit-B review follow-ups: apply_contributed_note PHI + dedup ======
+
+def test_contributed_note_refuses_admin_phi(tmp_path, monkeypatch):
+    # A non-LEX asker pasting a named LEX client's admin status must NOT persist
+    # (fail-closed execute-time re-check, entity-agnostic).
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, summary = ga.apply_contributed_note(
+        {"entity": "OSN", "text": "Bob Smith's AHCCCS authorization is pending."})
+    assert ok is False and "PHI" in summary
+    assert not (tmp_path / "osn.md").exists()
+
+
+def test_contributed_note_keeps_legit_business_fact(tmp_path, monkeypatch):
+    # The unconditional admin check must NOT over-refuse generic business phrasing.
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, _ = ga.apply_contributed_note(
+        {"entity": "F3E", "text": "The buyer PO is authorized for next week."})
+    assert ok is True
+    assert "authorized" in (tmp_path / "f3e.md").read_text(encoding="utf-8")
+
+
+def test_contributed_note_lex_subentity_writes_lex_md(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, _ = ga.apply_contributed_note(
+        {"entity": "LEX-LLC", "text": "LLC staff use the new kiosk for clock-in."})
+    assert ok is True
+    assert (tmp_path / "lex.md").exists()  # sub-entity shares the LEX file
+
+
+def test_contributed_note_multiline_dedups(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    p = {"entity": "FNDR", "text": "Line one of a note.\nLine two of the note."}
+    assert ga.apply_contributed_note(p)[0]
+    assert ga.apply_contributed_note(p)[0]
+    content = (tmp_path / "fndr.md").read_text(encoding="utf-8")
+    # Normalized to one line, written once.
+    assert content.count("Line one of a note. Line two of the note.") == 1

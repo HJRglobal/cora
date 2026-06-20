@@ -687,3 +687,42 @@ class TestLedgerRotation:
         kr._write_entries_atomic(p, [{"a": 1}, {"b": 2}])
         lines = [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
         assert len(lines) == 2 and json.loads(lines[0]) == {"a": 1}
+
+
+@pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable on this mount")
+class TestRotationCrashWindow:
+    """The crash-safe ordering (archive FIRST, then shrink live) can leave a row in
+    BOTH files if it crashes between. The live∪archive idempotency must still dedup
+    it, and a re-rotation must be harmless."""
+
+    def test_id_in_both_files_still_dedups_and_rerotates(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        live = tmp_path / "live.jsonl"
+        arch = tmp_path / "arch.jsonl"
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=10)).isoformat()
+        rec = {"update_id": "dup-1", "state": "DISMISSED", "resolved_at": old}
+        # Simulate a partial rotation: the row exists in BOTH archive and live.
+        live.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        arch.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", live), \
+             patch.object(kr, "_ARCHIVE_PATH", arch):
+            kr._SEEN_IDS_CACHE = None
+            kr._SEEN_IDS_KEY = None
+            kr._ARCHIVE_IDS_CACHE = None
+            kr._ARCHIVE_IDS_KEY = None
+            # Idempotency sees it (live∪archive) -> no re-propose.
+            assert kr.propose_update(update_id="dup-1", update_type="asana_task",
+                                     description="d", payload={}) is False
+            # Re-rotation is harmless: the live copy moves to archive (a dup line,
+            # set-deduped), live ends empty of it.
+            kr._SEEN_IDS_CACHE = None
+            kr._ARCHIVE_IDS_CACHE = None
+            n = kr.rotate_resolved(max_age_days=3, now=now)
+        assert n == 1
+        live_ids = {json.loads(l)["update_id"]
+                    for l in live.read_text(encoding="utf-8").splitlines() if l.strip()}
+        assert "dup-1" not in live_ids
+        # archive still contains it (idempotency intact across the crash window)
+        assert "dup-1" in {json.loads(l)["update_id"]
+                           for l in arch.read_text(encoding="utf-8").splitlines() if l.strip()}
