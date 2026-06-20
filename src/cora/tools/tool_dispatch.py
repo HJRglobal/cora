@@ -800,14 +800,60 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     return out
 
 
-def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str):
-    """Resolve a task to act on. Returns (gid, label, error). An explicit gid wins;
-    otherwise match `task_name` against the asker's OWN open tasks (so complete /
-    delete can't act on an arbitrary task by guesswork)."""
-    if task_gid:
-        return str(task_gid).strip(), (task_name or task_gid).strip(), None
+_FOUNDER_SLACK_ID = "U0B2RM2JYJ1"  # Harrison -- portfolio-wide task authority
+
+
+def _lex_safe_label(label: str, entity: str) -> str:
+    """PHI-scrub a task label before echoing it into a LEX channel (a manually-created
+    task name can carry a client name). Non-LEX labels pass through unchanged."""
+    if not (entity or "").upper().startswith("LEX"):
+        return label
+    try:
+        from .. import phi_guard
+        staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+        return phi_guard.scrub_lex_phi(label, allowed_names=staff)
+    except Exception:  # noqa: BLE001 -- never let a scrub error echo raw PHI
+        return "your Lexington task"
+
+
+def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entity: str = ""):
+    """Resolve a task to act on. Returns (gid, label, error).
+
+    OWNERSHIP (WS5 invariant): complete/delete act ONLY on the asker's OWN open tasks,
+    on BOTH the gid and name paths. A raw gid is NOT trusted blindly -- a teammate's
+    gid is visible via asana_get_user_tasks, and the shared workspace PAT would
+    otherwise let anyone complete/delete anyone's task through the confirm gate. The
+    portfolio founder + FNDR/HJRG channels are exempt (cross-entity authority by design).
+    """
+    unrestricted = slack_user_id == _FOUNDER_SLACK_ID or (entity or "").upper() in ("FNDR", "HJRG")
     asker = _load_slack_asana_map().get(slack_user_id)
     agid = str((asker or {}).get("asana_user_gid", "") or "")
+    task_gid = (task_gid or "").strip()
+
+    if task_gid:
+        if unrestricted:
+            return task_gid, (task_name or task_gid).strip(), None
+        if not agid:
+            return None, None, (
+                "I can't verify that task is yours -- your Slack->Asana mapping is "
+                "missing. Ask Harrison to add your row."
+            )
+        try:
+            tasks = asana_client.get_user_tasks(agid)
+        except asana_client.AsanaClientError as exc:
+            return None, None, f"Couldn't verify that task is yours ({exc})."
+        owned = next(
+            (t for t in tasks if not t.get("completed") and str(t.get("gid")) == task_gid),
+            None,
+        )
+        if not owned:
+            return None, None, (
+                "That task isn't one of your open tasks -- I can only complete or "
+                "delete tasks assigned to you."
+            )
+        return task_gid, (owned.get("name") or task_name or task_gid), None
+
+    # Name path -- inherently scoped to the asker's own open tasks.
     if not agid:
         return None, None, (
             "I can't look up your tasks -- your Slack->Asana mapping is missing. "
@@ -843,9 +889,11 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
         slack_user_id,
         (input_data.get("task_gid") or "").strip(),
         (input_data.get("task_name") or "").strip(),
+        entity,
     )
     if err:
         return err
+    label = _lex_safe_label(label, entity)
     if input_data.get("confirmed", False) is not True:
         return (
             f"asana_complete_task refused: show the user the preview "
@@ -867,9 +915,11 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
         slack_user_id,
         (input_data.get("task_gid") or "").strip(),
         (input_data.get("task_name") or "").strip(),
+        entity,
     )
     if err:
         return err
+    label = _lex_safe_label(label, entity)
     if input_data.get("confirmed", False) is not True:
         return (
             f"asana_delete_task refused: deleting a task is PERMANENT (completing is "
@@ -3500,7 +3550,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to complete."},
-                "task_gid": {"type": "string", "description": "Optional Asana task gid, if known (skips name matching)."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid (skips name matching, but the task is still verified to be one of YOUR open tasks unless you are the founder/an aggregator channel)."},
                 "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the matched task and getting explicit approval."},
             },
             "required": [],
@@ -3519,7 +3569,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to delete."},
-                "task_gid": {"type": "string", "description": "Optional Asana task gid, if known (skips name matching)."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid (skips name matching, but the task is still verified to be one of YOUR open tasks unless you are the founder/an aggregator channel)."},
                 "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the matched task and getting explicit approval to PERMANENTLY delete it."},
             },
             "required": [],

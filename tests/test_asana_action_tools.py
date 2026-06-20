@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 import cora.tools.tool_dispatch as td
 
-HARRISON = "U0B2RM2JYJ1"
+HARRISON = "U0B2RM2JYJ1"        # the founder -- gid path is exempt from the ownership check
+TOMMY = "U0B3RU5Q55G"           # a NON-founder mapped user (ownership check applies)
 SHAUN_GID = "1209093544422692"  # Shaun Hawkins, from the real slack-to-asana.yaml
 
 
@@ -46,6 +47,32 @@ class TestCompleteTask:
         mock.assert_not_called()
         assert "several" in out.lower()
 
+    def test_gid_not_owned_refused_for_non_founder(self):
+        # A non-founder passing a gid that is NOT one of their open tasks is refused
+        # (closes the cross-user complete/delete hole the P1 review caught).
+        with patch.object(td.asana_client, "get_user_tasks",
+                          return_value=[{"gid": "mine", "name": "My task", "completed": False}]), \
+             patch.object(td.asana_client, "complete_task") as mock:
+            out = td._tool_asana_complete_task(TOMMY, "F3E",
+                                               {"task_gid": "someone-elses", "confirmed": True})
+        mock.assert_not_called()
+        assert "isn't one of your open tasks" in out.lower()
+
+    def test_gid_owned_allowed_for_non_founder(self):
+        with patch.object(td.asana_client, "get_user_tasks",
+                          return_value=[{"gid": "mine", "name": "My task", "completed": False}]), \
+             patch.object(td.asana_client, "complete_task", return_value={}) as mock:
+            out = td._tool_asana_complete_task(TOMMY, "F3E", {"task_gid": "mine", "confirmed": True})
+        mock.assert_called_once_with("mine")
+        assert "WRITE_CONFIRMED" in out
+
+    def test_founder_gid_exempt_from_ownership_check(self):
+        # The founder has portfolio-wide authority -> gid path is not ownership-scoped.
+        with patch.object(td.asana_client, "complete_task", return_value={}) as mock:
+            out = td._tool_asana_complete_task(HARRISON, "F3E", {"task_gid": "any-gid", "confirmed": True})
+        mock.assert_called_once_with("any-gid")
+        assert "WRITE_CONFIRMED" in out
+
 
 class TestDeleteTask:
     def test_refuses_without_confirmed_and_warns_permanent(self):
@@ -57,6 +84,16 @@ class TestDeleteTask:
             out = td._tool_asana_delete_task(HARRISON, "FNDR", {"task_gid": "123", "confirmed": True})
         mock.assert_called_once_with("123")
         assert "WRITE_CONFIRMED" in out and "deleted" in out.lower()
+
+    def test_delete_gid_not_owned_refused_for_non_founder(self):
+        # The irreversible one: a non-founder can't delete someone else's task by gid.
+        with patch.object(td.asana_client, "get_user_tasks",
+                          return_value=[{"gid": "mine", "name": "My task", "completed": False}]), \
+             patch.object(td.asana_client, "delete_task") as mock:
+            out = td._tool_asana_delete_task(TOMMY, "F3E",
+                                             {"task_gid": "someone-elses", "confirmed": True})
+        mock.assert_not_called()
+        assert "isn't one of your open tasks" in out.lower()
 
 
 class TestCreateWithFollowers:
@@ -71,5 +108,6 @@ class TestCreateWithFollowers:
                 "follower_names": ["Shaun"],
             })
         mock.assert_called_once()
-        assert mock.call_args.args[1] == [SHAUN_GID] or mock.call_args.args[0] == "T1"
+        assert mock.call_args.args[0] == "T1"            # added to the created task
+        assert mock.call_args.args[1] == [SHAUN_GID]     # 'Shaun' resolved to his real gid
         assert "following" in out.lower()
