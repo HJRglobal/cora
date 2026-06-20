@@ -1894,3 +1894,52 @@ HIGH + two test gaps; all fixed on `8b4557d` before push. Full suite 4,909 passe
 env-failures / 42 skipped. Bot-loaded changes -> Harrison merges (WS11 then `986b0eb`) + the same
 coordinated restart as P0. KB purges remain dry-run-default + Harrison-gated (handed off as an
 exact elevated stop -> dry-run -> apply -> reclaim -> restart -> smoke sequence).
+
+## D-057 - WS1-DRIVE: the self-diagnostic KB leak ran through drive_sweep, not static_md (2026-06-19)
+
+**Context:** WS1 (D-055) excluded Cora's build/audit docs from the static_md path and purged
+by source_id PATH. Post-merge verification of the LIVE KB showed the static_md path held ZERO
+`_shared/projects/cora/` content (the P0 "921 + fabricated note" was a synthetic test DB,
+never live), so the purge Harrison ran found 0. The ACTUAL leak: `drive_sweep` walks Harrison's
+whole Google Drive (the Founder OS lives there) and ingests `cora-rebuild-execution-log.md`,
+`cora-forensic-findings-report.md`, `cora-exec-summary.md` ("Forensic Audit Executive Summary"),
+`CORA_IMPROVEMENT_BACKLOG.md`, the north-star plan, code-prompts, and raw `cora-*.log` files
+under a Drive-FILE-ID source_id with the filename in `title` -- which no PATH rule can see.
+~329-480 chunks of exactly the self-diagnostic material the fix exists to remove, live + re-ingesting.
+
+**What shipped (branch `claude/track-a-drive-sweep-leak`, 4 commits, NOT merged):**
+- `kb_exclusions.is_cora_internal_title()` matches the stored filename (the only signal on a
+  Drive-copy source_id). Both edges anchored: keywords with `\b`, the `cora` token with a left
+  lookbehind `(?<![a-z0-9])` (never a mid-word substring -- pecora/decora/mancora/incora spared).
+  Underscores normalized `_`->`-` before matching so `\b` works across both separators
+  (`CORA_IMPROVEMENT_BACKLOG` matches). A `cora-*.log` rule. A `_LEGIT_FAMILY_RE` NEGATIVE guard
+  (reference|wishlist|mapping|f3-monitor-privacy) that spares those families EVEN with a soft
+  keyword suffix, but NOT when a STRONG build keyword is also present.
+- `drive_sweep` BOTH ingest loops guarded with `is_cora_internal_title(filename, broad=True)`
+  (fail-safe to the WIDER exclusion at ingest: over-excluding Cora's own ops docs is harmless,
+  under-excluding re-opens the leak). Stops re-ingestion on the next nightly sweep.
+- `purge_cora_internal_kb.py` `target_drive_doc_copies()` scans `drive_sweep`+`drive_asset` by
+  title OR source_id; `--scope targeted|broad`; writes a FULL file manifest to `logs/`.
+  Live dry-run: targeted 387 / broad 496 chunks.
+
+**Doctrines:**
+- A path/folder-based KB exclusion is INCOMPLETE when the same docs are also swept from Drive
+  under file-id source_ids -- match the stored TITLE (filename) too.
+- An ingest guard should FAIL-SAFE to the wider exclusion (over-exclude is harmless; under-exclude
+  re-opens the leak); a one-time DESTRUCTIVE purge should stay CONSERVATIVE by default + opt-in for
+  the full clean + write an auditable manifest (the inline log caps at 40).
+- `\b` is not a boundary at `_` (underscore is a word char) -- normalize `_`->`-` before anchoring,
+  or underscore-named docs silently escape. And `\b`/`cora[-_]` has no LEFT boundary -- anchor the
+  token edge with a lookbehind or "cora" matches mid-word (pecora/Cora-the-person -> over-delete).
+- Over-deletion is the cardinal sin on a one-time destructive op: prefer a documented UNDER-match
+  (space-named / keyword-first Cora docs; reversible at ingest, backstopped by cora_self_check+WS4)
+  over widening matches in a way that risks deleting legit data.
+
+**Process:** THREE adversarial D-051 reviews (8 + 6 + 5 agents) each confirmed a real HIGH the
+green suite hid -- (1) targeted missing audit/review/sweep, (2) the `\b`-underscore under-match +
+targeted ingest scope, (3) the missing cora-token left boundary -- all fixed before merge.
+Validated against ALL 75 live drive_sweep cora-token titles (broad catches 69; spares only the 4
+legit families + a fireflies note + space-named human notes). Full suite 4,949 passed / 3
+pre-existing env-failures / 42 skipped. Bot-loaded? NO -- both surfaces are script-side (drive_sweep
+is a scheduled task; the purge is a script). No bot restart needed. Harrison merges + re-runs the
+purge (recommended `--scope broad`, dry-run manifest reviewed first).

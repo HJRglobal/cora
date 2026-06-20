@@ -43,6 +43,7 @@ from typing import Any
 import yaml
 
 from cora.connectors.drive_entity_detect import detect_entity_from_filename
+from cora.kb_exclusions import is_cora_internal_title
 from cora.knowledge_base.store import Document
 from cora.phi_guard import _PHI_PATTERNS
 
@@ -616,6 +617,18 @@ def sweep_user(
                 continue
             seen_file_ids.add(file_id)
 
+            # WS1: never ingest Cora's OWN build/audit/forensic docs or runtime logs.
+            # drive_sweep walks the Founder OS Drive tree, so these would otherwise
+            # land in the KB under a Drive-file-id source_id no path rule can catch,
+            # and Cora would recite her own audit notes as fact (the Minute Press miss).
+            # broad=True: fail-safe to the WIDER exclusion at ingest -- over-excluding
+            # Cora's own ops docs from the KB is harmless; under-excluding re-opens the
+            # self-diagnostic leak (the targeted set alone misses cora-code-* etc.).
+            if is_cora_internal_title(filename, broad=True):
+                stats.setdefault("cora_internal_skipped", 0)
+                stats["cora_internal_skipped"] += 1
+                continue
+
             # Skip very small files (likely empty/template)
             size_str = file_meta.get("size", "0")
             try:
@@ -935,6 +948,15 @@ def _process_single_folder_files(
                 stats["dedup_skipped"] += 1
                 continue
             seen_file_ids.add(file_id)
+
+            # WS1: never ingest Cora's OWN build/audit/forensic docs or runtime logs.
+            # broad=True: fail-safe to the WIDER exclusion at ingest -- over-excluding
+            # Cora's own ops docs from the KB is harmless; under-excluding re-opens the
+            # self-diagnostic leak (the targeted set alone misses cora-code-* etc.).
+            if is_cora_internal_title(filename, broad=True):
+                stats.setdefault("cora_internal_skipped", 0)
+                stats["cora_internal_skipped"] += 1
+                continue
 
             try:
                 if int(file_meta.get("size", "0")) < 200:

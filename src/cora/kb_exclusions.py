@@ -7,22 +7,55 @@ tree. They are OPERATIONAL metadata, not org knowledge. Ingesting them into the
 KB lets Cora retrieve and recite her own audit notes — and even her own system
 prompts — as fact (the fabricated-"diagnostic" failure mode that prompted WS1).
 
-This predicate keeps that doc set OUT of static_md ingestion
-(``incremental_sync_static.py``) and powers the one-time purge
-(``purge_cora_internal_kb.py``). One rule, two surfaces:
+This predicate keeps that doc set OUT of KB ingestion and powers the one-time
+purge (``purge_cora_internal_kb.py``). One rule, several surfaces:
 
-  - ``is_cora_internal_path(Path)``      — used at INGEST time (walk + file_to_document)
-  - ``is_cora_internal_source_id(str)``  — used at PURGE time (stored source_id; may
-                                            use ``\\`` or ``/`` separators)
+  - ``is_cora_internal_path(Path)``      — INGEST, static_md walk (``incremental_sync_static.py``)
+  - ``is_cora_internal_source_id(str)``  — PURGE, by stored source_id (``\\`` or ``/`` separators)
+  - ``is_cora_internal_title(str)``      — INGEST (``drive_sweep``) + PURGE, by the stored
+                                            filename/``title``. ``drive_sweep`` walks Harrison's
+                                            whole Drive (the Founder OS lives there), so these
+                                            docs land under a Drive-FILE-ID source_id with the
+                                            filename in ``title`` — the path rules can't see
+                                            them, so we match the filename instead.
+
+Why the title surface exists (the WS1-completion finding, 2026-06-19): the
+static_md path was empty; the real leak was ``drive_sweep`` ingesting
+``cora-rebuild-execution-log.md``, ``cora-forensic-findings-report.md``,
+``cora-*.log``, etc. straight from Drive under file-id source_ids that no
+path rule could match.
 
 Scope notes:
   * The folder rule is the keystone: anything under ``_shared/projects/cora/``.
     Sibling projects (gmail-deep-dive, reddit-strategy, wikipedia-strategy, …)
     are NOT matched and stay ingested — only the ``cora`` project is excluded.
-  * The filename rule is defense-in-depth for a Cora build doc COPIED elsewhere
-    (e.g. a code-prompt pasted into a session-capture or an entity projects/
-    folder). It is deliberately narrow — requires a ``cora-``/``cora_`` prefix
-    AND a build keyword — so ordinary business docs are never caught.
+  * The filename rule is the workhorse for Drive copies (no path on the source_id).
+    Requires a ``cora`` token AND a WHOLE-WORD build keyword. Both edges are anchored:
+    the keyword with ``\\b`` (so "fix" never fires inside "fixed", "plan" inside
+    "planning") and the ``cora`` token with a left lookbehind ``(?<![a-z0-9])`` so it is
+    never a mid-word substring ("pecora", "decora", "mancora", "incora", "deCORAtions"
+    are all spared). Underscores are normalized to hyphens first so ``\\b`` works across
+    both separators (``CORA_IMPROVEMENT_BACKLOG`` matches). The targeted set includes
+    audit/review/sweep -- Cora's own self-audits are the docs that produced the diagnostic.
+  * A NEGATIVE guard (``_LEGIT_FAMILY_RE``) spares the named business-doc families
+    (``…-cora-reference``, ``…_cora-wishlist``, ``…-cora-mapping``,
+    ``cora-f3-monitor-privacy-policy``) EVEN with a soft keyword suffix
+    (``cora-wishlist-review``) -- but NOT when a STRONG build keyword is also present
+    (``cora-mapping-rebuild-execution-log`` is a genuine build doc and IS caught).
+  * ``broad=True`` is used by the drive_sweep INGEST guard (over-excluding Cora's own
+    ops docs is harmless; under-excluding re-opens the leak) and by the purge
+    ``--scope broad`` full clean. It adds the long tail of Cora ops/session docs.
+
+  ACCEPTED LIMITATIONS (filename heuristic; mitigated by the human-gated dry-run on the
+  destructive purge + the cora_self_check/WS4 behavioral backstops):
+    - A doc for a person/entity literally named "Cora" plus a build keyword
+      (``Cora_Martinez_performance_review``) still matches. Rare; the affected doc
+      types (HR, LEX client files) are sensitive and not wanted broadly in the KB anyway.
+    - SPACE-delimited Cora doc names (``CORA Task Notes``) and keyword-BEFORE-cora
+      orderings (``rebuild-...-cora.md``) UNDER-match. Non-canonical (Cora's real build
+      docs are hyphen-``cora``-first), reversible at ingest. Not widened on purpose:
+      normalizing spaces / decoupling order would worsen the person-name over-match
+      above, and over-deletion is the cardinal sin on a one-time destructive purge.
 """
 
 from __future__ import annotations
@@ -34,14 +67,56 @@ from pathlib import Path
 # metadata, never org knowledge.
 _CORA_WORKSPACE_SEGMENTS: tuple[str, ...] = ("_shared", "projects", "cora")
 
-# Defense-in-depth: catch Cora build docs copied outside the workspace folder.
-# Must contain a ``cora-``/``cora_`` prefix AND a build-doc keyword.
+# Keyword matching anchors on \b...\b over a name where underscores have first been
+# normalized to hyphens (see _name_is_build_doc). Two bugs this avoids, both caught by
+# the WS1-DRIVE reviews: (1) sub-word over-match -- "fix" must not fire inside "fixed",
+# "plan" inside "planning"; \b blocks that (the char after is alphanumeric). (2) the
+# underscore under-match -- \b is NOT a boundary at "_" (underscore is a word char), so
+# WITHOUT normalization "CORA_IMPROVEMENT_BACKLOG" would escape; normalizing _->- fixes it.
+
+# TARGETED filename rule: a ``cora`` token AND a build-doc keyword token. Default for the
+# purge; the unambiguous self-diagnostic class (forensic/rebuild/audit/review/findings/
+# exec-summary/backlog ...). Real docs like cora-slack-comms-review / cora-14-day-infra-
+# review / cora-exec-summary ("Forensic Audit Executive Summary") are the ones that
+# caused the fabricated diagnostic, so they live here, not in broad.
 _CORA_BUILD_DOC_RE = re.compile(
-    r"cora[-_].*?("
+    r"(?<![a-z0-9])cora[-_].*?\b("
     r"forensic|rebuild|execution-log|code-prompt|build-plan|build-queue|"
     r"master-build|cascade-report|cascade|incident-triage|north-star|"
-    r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum"
-    r")",
+    r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum|"
+    r"audit|review|sweep|exec-summary|backlog"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Cora's raw runtime logs (e.g. ``cora-2026-06-06.log``). Never org knowledge.
+_CORA_LOG_RE = re.compile(r"^cora[-_].*\.log$", re.IGNORECASE)
+
+# BROAD: the long tail of Cora ops/build/session docs. The drive_sweep INGEST guard uses
+# THIS scope (over-excluding Cora's own ops docs from the KB is harmless; under-excluding
+# re-opens the self-diagnostic leak), and the purge --scope broad uses it for a full clean.
+_CORA_BUILD_DOC_BROAD_RE = re.compile(
+    r"(?<![a-z0-9])cora[-_].*?\b("
+    r"proposal|game-plan|overhaul|redesign|training|checklist|scaling|comms|infra|"
+    r"spec|wiring|closeout|kickoff|gap|plan|prompt|caching|connector|setup|dedup|"
+    r"session|whats-on|knowledge|nudge|guard|filer|fix|brief|"
+    r"code|build|bootstrap|connections|archive|backfill"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Negative guard: legit business docs that merely CARRY a cora- token. These named
+# families are spared in BOTH scopes EVEN WITH a soft keyword suffix
+# (e.g. cora-wishlist-review). But a family name that ALSO carries a STRONG build
+# keyword (cora-mapping-rebuild-execution-log) is a genuine build doc and is NOT spared.
+_LEGIT_FAMILY_RE = re.compile(
+    r"(?<![a-z0-9])cora[-_](?:reference|wishlist|mapping|f3-monitor-privacy)",
+    re.IGNORECASE,
+)
+_CORA_STRONG_BUILD_RE = re.compile(
+    r"(?<![a-z0-9])cora[-_].*?\b("
+    r"forensic|rebuild|execution-log|cascade|incident-triage|north-star|findings|audit"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -49,6 +124,11 @@ _CORA_BUILD_DOC_RE = re.compile(
 def _segments(s: str) -> list[str]:
     """Split a path or source_id on either separator into non-empty segments."""
     return [p for p in re.split(r"[\\/]+", s or "") if p]
+
+
+def _basename(raw: str) -> str:
+    parts = _segments(raw)
+    return parts[-1] if parts else (raw or "")
 
 
 def _contains_subsequence(parts: list[str], seq: tuple[str, ...]) -> bool:
@@ -60,12 +140,31 @@ def _contains_subsequence(parts: list[str], seq: tuple[str, ...]) -> bool:
     return any(lp[i : i + n] == ls for i in range(len(lp) - n + 1))
 
 
-def _is_cora_internal(raw: str) -> bool:
+def _name_is_build_doc(name: str, *, broad: bool = False) -> bool:
+    # Normalize underscores to hyphens so \b keyword anchoring works across BOTH
+    # separators (CORA_IMPROVEMENT_BACKLOG.md must match, like cora-improvement-backlog).
+    norm = (name or "").replace("_", "-")
+    is_build = bool(
+        _CORA_BUILD_DOC_RE.search(norm)
+        or _CORA_LOG_RE.match(norm)
+        or (broad and _CORA_BUILD_DOC_BROAD_RE.search(norm))
+    )
+    if not is_build:
+        return False
+    # A protected business-doc family is spared ONLY when it carries no STRONG build
+    # keyword -- so f3-brand-assets-cora-reference / cora-wishlist-review stay safe, but
+    # cora-mapping-rebuild-execution-log (a genuine build doc) is still caught.
+    if _LEGIT_FAMILY_RE.search(norm) and not _CORA_STRONG_BUILD_RE.search(norm):
+        return False
+    return True
+
+
+def _is_cora_internal(raw: str, *, broad: bool = False) -> bool:
     parts = _segments(raw)
     if _contains_subsequence(parts, _CORA_WORKSPACE_SEGMENTS):
         return True
     name = parts[-1] if parts else (raw or "")
-    return bool(_CORA_BUILD_DOC_RE.search(name))
+    return _name_is_build_doc(name, broad=broad)
 
 
 def is_cora_internal_path(path: Path) -> bool:
@@ -76,3 +175,19 @@ def is_cora_internal_path(path: Path) -> bool:
 def is_cora_internal_source_id(source_id: str) -> bool:
     """True if a stored KB source_id refers to a Cora build/audit/forensic doc."""
     return _is_cora_internal(source_id or "")
+
+
+def is_cora_internal_title(title: str, *, broad: bool = False) -> bool:
+    """True if a stored KB ``title`` (a Drive filename) is a Cora build/audit doc.
+
+    Used where the source_id carries no path — chiefly ``drive_sweep`` copies of
+    Founder-OS Drive files, whose source_id is a Drive file id. A Drive display name
+    may itself contain ``/`` (e.g. a date like "6/4"), so we match the FULL title
+    (the keyword search finds the cora- token wherever it sits) AND its basename — we
+    must never path-split a filename and lose the token. ``broad=True`` widens to
+    Cora's full ops/build doc set; the default stays narrow (build/audit + logs).
+    """
+    title = title or ""
+    return _name_is_build_doc(title, broad=broad) or _name_is_build_doc(
+        _basename(title), broad=broad
+    )

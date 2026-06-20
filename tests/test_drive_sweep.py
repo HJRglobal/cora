@@ -468,6 +468,70 @@ class TestSweepUser:
         assert stats["files_enumerated"] == 0
         kb.upsert_documents.assert_not_called()
 
+    def test_cora_internal_doc_skipped_before_extract(self):
+        # WS1-DRIVE: a Cora build/audit doc is skipped at ingest BEFORE extraction,
+        # so it never reaches the KB and re-poisons RAG (the Minute Press leak vector).
+        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR",
+                "enabled": True, "dwd_eligible": True, "drive_sweep": True}
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+
+        with patch("cora.connectors.drive_sweep._build_drive_service") as mock_build:
+            mock_build.return_value = self._make_drive_service([
+                {"id": "fc1", "name": "2026-06-16_fndr_cora-rebuild-execution-log.md",
+                 "mimeType": "text/markdown",
+                 "modifiedTime": "2026-06-16T00:00:00Z", "size": "9000"}
+            ])
+            with patch("cora.connectors.drive_sweep._extract_content") as mock_extract:
+                stats = sweep_user(user, "/fake/sa.json", kb, anthropic_client,
+                                   freshness_days=30, dry_run=False)
+
+        assert stats.get("cora_internal_skipped", 0) >= 1
+        kb.upsert_documents.assert_not_called()
+        mock_extract.assert_not_called()  # guard fires BEFORE extraction
+
+    def test_legit_cora_adjacent_doc_not_skipped(self):
+        # Negative control: a legit cora-ADJACENT business doc is NOT skipped.
+        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "F3E",
+                "enabled": True, "dwd_eligible": True, "drive_sweep": True}
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+
+        with patch("cora.connectors.drive_sweep._build_drive_service") as mock_build:
+            mock_build.return_value = self._make_drive_service([
+                {"id": "fc2", "name": "f3-brand-assets-cora-reference.md",
+                 "mimeType": "text/markdown",
+                 "modifiedTime": "2026-06-16T00:00:00Z", "size": "9000"}
+            ])
+            with patch("cora.connectors.drive_sweep._extract_content") as mock_extract:
+                mock_extract.return_value = "F3 brand reference content " * 20
+                stats = sweep_user(user, "/fake/sa.json", kb, anthropic_client,
+                                   freshness_days=30, dry_run=False)
+
+        assert stats.get("cora_internal_skipped", 0) == 0
+        kb.upsert_documents.assert_called()  # legit doc still ingested
+
+    def test_founders_os_loop_skips_cora_internal(self):
+        # The dominant real leak vector: the founders_os folder walk must guard too.
+        from cora.connectors.drive_sweep import _process_single_folder_files
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+        service = self._make_drive_service([
+            {"id": "fos1", "name": "2026-06-16_fndr_cora-forensic-findings-report.md",
+             "mimeType": "text/markdown", "modifiedTime": "2026-06-16T00:00:00Z", "size": "9000"}
+        ])
+        stats = {"files_enumerated": 0, "files_extracted": 0, "chunks_ingested": 0,
+                 "phi_skipped": 0, "noise_filtered": 0, "dedup_skipped": 0}
+        with patch("cora.connectors.drive_sweep._extract_content") as mock_extract:
+            _process_single_folder_files(
+                service=service, folder_id="F", label="FNDR", effective_entity="FNDR",
+                kb=kb, anthropic_client=anthropic_client, cutoff_str="2020-01-01T00:00:00Z",
+                dry_run=False, is_lex=False, score_threshold=4, seen_file_ids=set(), stats=stats,
+            )
+        assert stats.get("cora_internal_skipped", 0) >= 1
+        kb.upsert_documents.assert_not_called()
+        mock_extract.assert_not_called()  # guard fires BEFORE extraction
+
 
 # ── run_sweep ─────────────────────────────────────────────────────────────────
 

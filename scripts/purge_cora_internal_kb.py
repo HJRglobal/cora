@@ -42,11 +42,20 @@ load_dotenv()
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
-from cora.kb_exclusions import is_cora_internal_source_id  # noqa: E402
+from cora.kb_exclusions import (  # noqa: E402
+    is_cora_internal_source_id,
+    is_cora_internal_title,
+)
 from cora.knowledge_base import schema  # noqa: E402
 
 KB_DB_PATH = _REPO / "data" / "cora_kb.db"
 _BATCH = 500
+
+# drive_sweep + drive_asset copy Founder-OS Drive files into the KB under a
+# Drive-FILE-ID source_id with the filename in `title` -- the path-based
+# source_id rule can't see them, so we match the stored title here. (This is the
+# dominant leak vector that the static_md-only purge missed; see WS1-DRIVE.)
+_DRIVE_COPY_SOURCES = ("drive_sweep", "drive_asset")
 
 # Suspicious-fabrication phrases for the opt-in user_note sweep. These are the
 # shapes of a fabricated self-"diagnostic" note (e.g. the Minute Press miss).
@@ -72,6 +81,29 @@ def target_static_md(conn) -> tuple[list[str], list[str]]:
             ids.append(chunk_id)
             sources.add(str(source_id or ""))
     return ids, sorted(sources)
+
+
+def target_drive_doc_copies(conn, *, broad: bool = False) -> tuple[list[str], list[str]]:
+    """Read-only. Cora build/audit docs ingested as Drive copies (drive_sweep/asset).
+
+    Matches on the stored `title` (the filename) OR the source_id, since the Drive
+    copy's source_id is a file id with no path. `broad=True` widens to Cora's full
+    ops/build doc set. Returns (chunk_ids, sample 'title' filenames).
+    """
+    ph = ",".join("?" * len(_DRIVE_COPY_SOURCES))
+    rows = conn.execute(
+        f"SELECT chunk_id, source_id, title FROM knowledge_chunks WHERE source IN ({ph})",
+        _DRIVE_COPY_SOURCES,
+    ).fetchall()
+    ids: list[str] = []
+    names: set[str] = set()
+    for chunk_id, source_id, title in rows:
+        if is_cora_internal_title(str(title or ""), broad=broad) or is_cora_internal_source_id(
+            str(source_id or "")
+        ):
+            ids.append(chunk_id)
+            names.add(str(title or source_id or ""))
+    return ids, sorted(names)
 
 
 def target_notes(conn, pattern: str) -> list[tuple[str, str, str]]:
@@ -112,8 +144,13 @@ def main() -> int:
                     help="Also sweep+delete suspicious user_note chunks (opt-in).")
     ap.add_argument("--note-pattern", default=_DEFAULT_NOTE_PATTERN,
                     help="Regex (case-insensitive) for the suspicious-note sweep.")
+    ap.add_argument("--scope", choices=("targeted", "broad"), default="targeted",
+                    help="Drive-copy breadth. targeted (default): build/audit/forensic/"
+                         "log artifacts. broad: also reviews/proposals/plans/specs/"
+                         "code-session docs (still cora- + keyword; legit docs spared).")
     args = ap.parse_args()
     apply_changes = args.apply and not args.dry_run
+    broad = args.scope == "broad"
 
     db_path = Path(args.db)
     if not db_path.exists():
@@ -123,13 +160,39 @@ def main() -> int:
     conn = schema.connect(db_path)
     try:
         static_ids, static_sources = target_static_md(conn)
-        log.info("=== Purge scope (Cora build/audit docs) ===")
+        log.info("=== Purge scope (Cora build/audit docs) [drive-copy scope=%s] ===", args.scope)
         log.info("  STATIC_MD cora-internal chunks: %d  (across %d files)",
                  len(static_ids), len(static_sources))
         for sid in static_sources[:40]:
             log.info("      %s", sid)
         if len(static_sources) > 40:
             log.info("      ... +%d more files", len(static_sources) - 40)
+
+        drive_ids, drive_names = target_drive_doc_copies(conn, broad=broad)
+        log.info("  DRIVE-COPY (drive_sweep/drive_asset) cora-internal chunks: %d  (across %d files)",
+                 len(drive_ids), len(drive_names))
+        for nm in drive_names[:40]:
+            log.info("      %s", nm)
+        if len(drive_names) > 40:
+            log.info("      ... +%d more files (see full manifest below)", len(drive_names) - 40)
+
+        # Full auditable manifest: the inline log samples at 40, so write EVERY
+        # selected filename to disk -- a broad --apply must be reviewable in full
+        # before it irreversibly deletes anything.
+        try:
+            manifest = _REPO / "logs" / f"purge-cora-internal-{args.scope}.txt"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            with manifest.open("w", encoding="utf-8") as fh:
+                fh.write(f"# Cora-internal purge manifest  scope={args.scope}\n")
+                fh.write(f"# static_md files ({len(static_sources)}):\n")
+                for s in static_sources:
+                    fh.write(f"  {s}\n")
+                fh.write(f"# drive-copy files ({len(drive_names)}):\n")
+                for n in drive_names:
+                    fh.write(f"  {n}\n")
+            log.info("  Full file manifest written -> %s", manifest)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("  could not write manifest: %s", exc)
 
         note_hits: list[tuple[str, str, str]] = []
         if args.include_notes:
@@ -144,10 +207,10 @@ def main() -> int:
             for chunk_id, source_id, excerpt in preview:
                 log.info("      [%s] %s", chunk_id, excerpt)
 
-        to_delete = list(static_ids) + [h[0] for h in note_hits]
+        to_delete = list(static_ids) + list(drive_ids) + [h[0] for h in note_hits]
         log.info("  TOTAL chunks that --apply would delete: %d "
-                 "(static_md %d%s)",
-                 len(to_delete), len(static_ids),
+                 "(static_md %d + drive-copy %d%s)",
+                 len(to_delete), len(static_ids), len(drive_ids),
                  f" + notes {len(note_hits)}" if args.include_notes else "")
 
         if not apply_changes:
