@@ -358,7 +358,7 @@ def upload_to_drive(png_bytes: bytes, filename: str, folder_id: str) -> str:
     try:
         import io
         from googleapiclient.http import MediaIoBaseUpload
-        from .drive_connector import _build_drive_service
+        from .drive_connector import _build_drive_service, safe_drive_create
     except ImportError as exc:
         raise ShopifyUploadError(f"Drive dependencies not available: {exc}") from exc
 
@@ -376,10 +376,8 @@ def upload_to_drive(png_bytes: bytes, filename: str, folder_id: str) -> str:
         io.BytesIO(png_bytes), mimetype="image/png", resumable=False
     )
     try:
-        result = (
-            service.files()
-            .create(body=file_metadata, media_body=media, fields="id,webViewLink,name")
-            .execute()
+        result = safe_drive_create(
+            service, body=file_metadata, media_body=media, fields="id,webViewLink,name"
         )
     except Exception as exc:
         raise ShopifyUploadError(f"Drive upload failed: {exc}") from exc

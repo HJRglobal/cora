@@ -8,15 +8,22 @@ Covers only the functions that don't require a real Google Drive service:
   - drive_file_to_document
 """
 
+import re
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
 
+import cora
 from cora.connectors.drive_connector import (
+    DriveConnectorError,
     DriveFile,
     _classify_entity,
     _is_blacklisted_path,
     _natural_title,
     _parent_folder_name,
     drive_file_to_document,
+    safe_drive_create,
 )
 from cora.knowledge_base.store import Document
 
@@ -279,3 +286,118 @@ class TestDriveFileToDocument:
         )
         doc = drive_file_to_document(df)
         assert doc.entity == "FNDR"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# safe_drive_create — WS8 preventive Drive guardrail
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSafeDriveCreate:
+
+    def _service_returning(self, result):
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = result
+        return service
+
+    def test_rejects_missing_parents(self):
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt"})
+        # Guard fires BEFORE any API call
+        service.files.return_value.create.assert_not_called()
+
+    def test_rejects_empty_parents(self):
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt", "parents": []})
+        service.files.return_value.create.assert_not_called()
+
+    def test_rejects_none_parents(self):
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt", "parents": None})
+        service.files.return_value.create.assert_not_called()
+
+    def test_rejects_permissions_in_body(self):
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="permissions"):
+            safe_drive_create(
+                service,
+                body={
+                    "name": "f.txt",
+                    "parents": ["folder-1"],
+                    "permissions": [{"type": "any" "one", "role": "reader"}],
+                },
+            )
+        service.files.return_value.create.assert_not_called()
+
+    def test_passes_through_valid_create(self):
+        service = self._service_returning({"id": "file-123", "webViewLink": "u"})
+        out = safe_drive_create(
+            service,
+            body={"name": "f.txt", "parents": ["folder-1"]},
+            fields="id,webViewLink",
+        )
+        assert out == {"id": "file-123", "webViewLink": "u"}
+        service.files.return_value.create.assert_called_once()
+        _, kwargs = service.files.return_value.create.call_args
+        assert kwargs["body"]["parents"] == ["folder-1"]
+        assert kwargs["fields"] == "id,webViewLink"
+
+    def test_media_body_threaded(self):
+        service = self._service_returning({"id": "f"})
+        media_sentinel = object()
+        safe_drive_create(
+            service,
+            body={"name": "f.png", "parents": ["folder-1"]},
+            media_body=media_sentinel,
+            fields="id",
+        )
+        _, kwargs = service.files.return_value.create.call_args
+        assert kwargs["media_body"] is media_sentinel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Repo-wide regression guard — no automation applies public link-sharing (WS8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNoPublicShareInCodebase:
+    """The runtime safe_drive_create() guard covers files().create bodies, but the
+    real anyone-with-link vector is the Drive permissions-create endpoint, which a
+    create-body guard cannot see. This static scan fails if any code path under
+    src/cora or scripts/ introduces public Drive sharing.
+
+    Patterns are assembled from fragments so this test file never matches itself.
+    """
+
+    def _scan_dirs(self):
+        pkg_root = Path(cora.__file__).resolve().parent          # .../src/cora
+        repo_root = pkg_root.parent.parent                       # repo root
+        return [d for d in (pkg_root, repo_root / "scripts") if d.exists()]
+
+    def test_no_public_share_constructs(self):
+        anyone = "any" + "one"
+        pat_link = re.compile(anyone + "WithLink")
+        pat_type = re.compile(r"""['"]type['"]\s*:\s*['"]""" + anyone + r"""['"]""")
+        pat_perm = re.compile(r"\.permissions\(\)\s*\.\s*create\(")
+        patterns = [(pat_link, "anyone-with-link literal"),
+                    (pat_type, "type:anyone permission body"),
+                    (pat_perm, "permissions-create call")]
+
+        offenders: list[str] = []
+        scanned = 0
+        for d in self._scan_dirs():
+            for py in d.rglob("*.py"):
+                if py.name == Path(__file__).name:
+                    continue  # this test file references the patterns intentionally
+                scanned += 1
+                text = py.read_text(encoding="utf-8", errors="ignore")
+                for pat, label in patterns:
+                    if pat.search(text):
+                        offenders.append(f"{py}: {label}")
+
+        assert scanned > 0, "grep-guard scanned no files — path resolution broke"
+        assert not offenders, (
+            "WS8: automation must never apply public Drive sharing. Found:\n"
+            + "\n".join(offenders)
+        )

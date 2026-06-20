@@ -566,6 +566,43 @@ def backfill(modified_after: int | None = None) -> Iterator:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def safe_drive_create(service, *, body: dict, media_body=None, fields: str | None = None) -> dict:
+    """Guarded wrapper around ``service.files().create(...).execute()`` (WS8).
+
+    Enforces two PREVENTIVE invariants on every Drive create performed by Cora
+    automation, so a future regression fails loudly instead of silently
+    mis-placing or over-sharing a file:
+
+      1. ``parents`` MUST be present and non-empty — no automation file or folder
+         is ever created in My Drive ROOT. A root-drop is a silent data-placement
+         bug; fail-closed instead.
+      2. ``permissions`` MUST NOT be set in the create body — Cora automation never
+         applies anyone-with-link sharing. Sharing is a deliberate, human-clicked
+         action, never a side effect of a create. (The primary public-share vector
+         is the Drive permissions-create endpoint, which the CI grep-guard test
+         covers; this body check is the belt-and-suspenders.)
+
+    Raises DriveConnectorError BEFORE the API call on a violation. HttpError from
+    the create itself is NOT caught here — call sites keep their own contextual
+    error handling (so "folder creation failed for X" messages survive unchanged).
+    """
+    parents = body.get("parents") if isinstance(body, dict) else None
+    if not parents:
+        raise DriveConnectorError(
+            "Drive create blocked: 'parents' is required and must be non-empty "
+            "(automation never writes to My Drive root). Resolve a folder id via "
+            "ensure_folder_path() first."
+        )
+    if "permissions" in body:
+        raise DriveConnectorError(
+            "Drive create blocked: 'permissions' must not be set at create time "
+            "(automation never applies anyone-with-link sharing)."
+        )
+    return service.files().create(
+        body=body, media_body=media_body, fields=fields
+    ).execute()
+
+
 def ensure_folder_path(path_segments: list[str]) -> str:
     """Find or create a nested folder path under HJR-Founder-OS. Returns the leaf folder ID.
 
@@ -601,14 +638,15 @@ def ensure_folder_path(path_segments: list[str]) -> str:
             current_id = files[0]["id"]
         else:
             try:
-                folder = service.files().create(
+                folder = safe_drive_create(
+                    service,
                     body={
                         "name": segment,
                         "mimeType": _FOLDER_MIME,
                         "parents": [current_id],
                     },
                     fields="id",
-                ).execute()
+                )
                 current_id = folder["id"]
                 log.info("Created Drive folder %r (id=%s)", segment, current_id)
             except HttpError as exc:
@@ -740,11 +778,12 @@ def upload_file(
     )
 
     try:
-        result = service.files().create(
+        result = safe_drive_create(
+            service,
             body={"name": filename, "parents": [parent_folder_id]},
             media_body=media,
             fields="id,webViewLink",
-        ).execute()
+        )
     except HttpError as exc:
         raise DriveConnectorError(
             f"Drive upload failed for {filename!r}: {exc}"
