@@ -182,6 +182,17 @@ class TestIsCoraInternalTitle:
         "osn_cora-wishlist-spec.md",
     ]
 
+    # --- 'cora' as a SUBSTRING inside another word is NOT a cora token (review-3
+    # HIGH: missing left boundary). These must be spared in BOTH scopes. ---
+    CORA_SUBSTRING_SPARED = [
+        "pecora_audit.md",                 # surname Pecora
+        "pecora-dairy-invoice-review.pdf",
+        "decora-findings.md",
+        "mancora-beach-review.pdf",        # place Mancora
+        "incora-2026-audit.pdf",           # vendor Incora
+        "decorations.log",
+    ]
+
     def test_targeted_catches_build_docs(self):
         for name in self.CAUGHT:
             assert is_cora_internal_title(name), name
@@ -251,6 +262,13 @@ class TestIsCoraInternalTitle:
                      "2026-06-10_fndr_cora-per-user-email-drive-access-build.md",
                      "2026-06-12_fndr_cowork-cora-gmail-fireflies-kb-backfill.md"]:
             assert is_cora_internal_title(name, broad=True), f"broad ingest should block: {name}"
+
+    def test_cora_substring_in_other_word_spared(self):
+        # The cora token needs a LEFT boundary -- 'cora' inside pecora/decora/mancora/
+        # incora/decorations is not a cora token and must never be purged.
+        for name in self.CORA_SUBSTRING_SPARED:
+            assert not is_cora_internal_title(name), f"substring over-match (targeted): {name}"
+            assert not is_cora_internal_title(name, broad=True), f"substring over-match (broad): {name}"
 
     def test_title_with_path_prefix_uses_basename(self):
         # Some titles arrive with a folder prefix; match on the basename.

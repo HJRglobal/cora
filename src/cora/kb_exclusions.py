@@ -30,18 +30,32 @@ Scope notes:
     Sibling projects (gmail-deep-dive, reddit-strategy, wikipedia-strategy, …)
     are NOT matched and stay ingested — only the ``cora`` project is excluded.
   * The filename rule is the workhorse for Drive copies (no path on the source_id).
-    Requires a ``cora-``/``cora_`` token AND a WHOLE-WORD build keyword (matched with
-    ``\\b`` so "fix" never fires inside "fixed", "plan" inside "planning", etc.), or a
-    ``cora-….log`` runtime log. The targeted set includes audit/review/sweep -- Cora's
-    own self-audits/reviews are the docs that produced the fabricated diagnostic.
-  * A hard NEGATIVE guard (``_LEGIT_FAMILY_RE``) spares the named business-doc
-    families (``…-cora-reference``, ``…_cora-wishlist``, ``…-cora-mapping``,
-    ``cora-f3-monitor-privacy-policy``) in BOTH scopes even with a keyword suffix, so
-    e.g. ``cora-wishlist-review.md`` is never purged. ("deCORAtions" never matches at
-    all -- there is no ``cora-`` token.)
-  * ``broad=True`` (PURGE opt-in, ``--scope broad``) adds the long tail of Cora ops
-    docs (proposals, plans, specs, code-session docs, fixes, training/checklist).
-    Still token-anchored + family-guarded, so the legit business docs above stay safe.
+    Requires a ``cora`` token AND a WHOLE-WORD build keyword. Both edges are anchored:
+    the keyword with ``\\b`` (so "fix" never fires inside "fixed", "plan" inside
+    "planning") and the ``cora`` token with a left lookbehind ``(?<![a-z0-9])`` so it is
+    never a mid-word substring ("pecora", "decora", "mancora", "incora", "deCORAtions"
+    are all spared). Underscores are normalized to hyphens first so ``\\b`` works across
+    both separators (``CORA_IMPROVEMENT_BACKLOG`` matches). The targeted set includes
+    audit/review/sweep -- Cora's own self-audits are the docs that produced the diagnostic.
+  * A NEGATIVE guard (``_LEGIT_FAMILY_RE``) spares the named business-doc families
+    (``…-cora-reference``, ``…_cora-wishlist``, ``…-cora-mapping``,
+    ``cora-f3-monitor-privacy-policy``) EVEN with a soft keyword suffix
+    (``cora-wishlist-review``) -- but NOT when a STRONG build keyword is also present
+    (``cora-mapping-rebuild-execution-log`` is a genuine build doc and IS caught).
+  * ``broad=True`` is used by the drive_sweep INGEST guard (over-excluding Cora's own
+    ops docs is harmless; under-excluding re-opens the leak) and by the purge
+    ``--scope broad`` full clean. It adds the long tail of Cora ops/session docs.
+
+  ACCEPTED LIMITATIONS (filename heuristic; mitigated by the human-gated dry-run on the
+  destructive purge + the cora_self_check/WS4 behavioral backstops):
+    - A doc for a person/entity literally named "Cora" plus a build keyword
+      (``Cora_Martinez_performance_review``) still matches. Rare; the affected doc
+      types (HR, LEX client files) are sensitive and not wanted broadly in the KB anyway.
+    - SPACE-delimited Cora doc names (``CORA Task Notes``) and keyword-BEFORE-cora
+      orderings (``rebuild-...-cora.md``) UNDER-match. Non-canonical (Cora's real build
+      docs are hyphen-``cora``-first), reversible at ingest. Not widened on purpose:
+      normalizing spaces / decoupling order would worsen the person-name over-match
+      above, and over-deletion is the cardinal sin on a one-time destructive purge.
 """
 
 from __future__ import annotations
@@ -66,7 +80,7 @@ _CORA_WORKSPACE_SEGMENTS: tuple[str, ...] = ("_shared", "projects", "cora")
 # review / cora-exec-summary ("Forensic Audit Executive Summary") are the ones that
 # caused the fabricated diagnostic, so they live here, not in broad.
 _CORA_BUILD_DOC_RE = re.compile(
-    r"cora[-_].*?\b("
+    r"(?<![a-z0-9])cora[-_].*?\b("
     r"forensic|rebuild|execution-log|code-prompt|build-plan|build-queue|"
     r"master-build|cascade-report|cascade|incident-triage|north-star|"
     r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum|"
@@ -82,7 +96,7 @@ _CORA_LOG_RE = re.compile(r"^cora[-_].*\.log$", re.IGNORECASE)
 # THIS scope (over-excluding Cora's own ops docs from the KB is harmless; under-excluding
 # re-opens the self-diagnostic leak), and the purge --scope broad uses it for a full clean.
 _CORA_BUILD_DOC_BROAD_RE = re.compile(
-    r"cora[-_].*?\b("
+    r"(?<![a-z0-9])cora[-_].*?\b("
     r"proposal|game-plan|overhaul|redesign|training|checklist|scaling|comms|infra|"
     r"spec|wiring|closeout|kickoff|gap|plan|prompt|caching|connector|setup|dedup|"
     r"session|whats-on|knowledge|nudge|guard|filer|fix|brief|"
@@ -96,11 +110,11 @@ _CORA_BUILD_DOC_BROAD_RE = re.compile(
 # (e.g. cora-wishlist-review). But a family name that ALSO carries a STRONG build
 # keyword (cora-mapping-rebuild-execution-log) is a genuine build doc and is NOT spared.
 _LEGIT_FAMILY_RE = re.compile(
-    r"cora[-_](?:reference|wishlist|mapping|f3-monitor-privacy)",
+    r"(?<![a-z0-9])cora[-_](?:reference|wishlist|mapping|f3-monitor-privacy)",
     re.IGNORECASE,
 )
 _CORA_STRONG_BUILD_RE = re.compile(
-    r"cora[-_].*?\b("
+    r"(?<![a-z0-9])cora[-_].*?\b("
     r"forensic|rebuild|execution-log|cascade|incident-triage|north-star|findings|audit"
     r")\b",
     re.IGNORECASE,
