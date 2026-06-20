@@ -449,7 +449,15 @@ def run_proposal_loop(
     effective_cutoff = max(cutoff_ts, last_propose_ts)
     log.info("drive_extractor proposals: reading facts since %s", effective_cutoff)
 
-    # Query pending facts
+    # Query pending facts. The freshness window (extracted_at >= cutoff) is an
+    # INTENTIONAL product bound: Drive-extracted facts are surfaced only while
+    # recent (a 3-week-old "X is a photographer" fact has little value). Ordering
+    # is HIGH-confidence first, then OLDEST-first within a tier, so when the
+    # per-run cap bites it defers the FRESHEST facts (which have the most window
+    # time left to be drained on a later run) rather than the ones about to age
+    # out. A large historical backfill is NOT drained by this daily proposer --
+    # that is the triage tool's job (or a one-time DRIVE_EXTRACTOR_MAX_PROPOSALS_
+    # PER_RUN bump); the per-run cap exists to stop a single run flooding review.
     try:
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
@@ -460,7 +468,7 @@ def run_proposal_loop(
             FROM drive_extracted_facts
             WHERE extracted_at >= ?
               AND confidence IN ('HIGH', 'MED')
-            ORDER BY confidence DESC, extracted_at DESC
+            ORDER BY confidence DESC, extracted_at ASC
             """,
             (effective_cutoff,),
         ).fetchall()
@@ -475,8 +483,10 @@ def run_proposal_loop(
     run_start = int(time.time())
     newly_proposed = 0   # appended this run (excludes idempotency-skipped dups)
     capped = False       # True if the per-run cap stopped us before the last fact
+    examined = 0         # facts looked at this run (for the deferred-count log)
 
     for fact in facts:
+        examined += 1
         entity = fact["entity"] or "FNDR"
         fact_type = fact["fact_type"]
         subject = fact["subject"]
@@ -550,10 +560,18 @@ def run_proposal_loop(
                 newly_proposed += 1
                 if newly_proposed >= _MAX_PROPOSALS_PER_RUN:
                     capped = True
+                    deferred = len(facts) - examined
+                    # Observability (no silent caps): surface the in-window backlog
+                    # the cap deferred. These re-run next pass while still inside the
+                    # freshness window; any that age past the window are intentionally
+                    # not surfaced (stale). A persistently large number here means a
+                    # backfill is in progress -> use the triage tool or bump the cap.
                     log.warning(
                         "drive_extractor: per-run proposal cap (%d) reached — "
-                        "remaining candidates deferred to next run (watermark held)",
-                        _MAX_PROPOSALS_PER_RUN,
+                        "%d in-window candidate(s) deferred to a later run (watermark held). "
+                        "If this stays high, a backfill is draining slowly; bump "
+                        "DRIVE_EXTRACTOR_MAX_PROPOSALS_PER_RUN or run the triage tool.",
+                        _MAX_PROPOSALS_PER_RUN, deferred,
                     )
                     break
         except Exception as exc:

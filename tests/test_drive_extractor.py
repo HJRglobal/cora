@@ -556,3 +556,44 @@ class TestRunProposalLoopCap:
         assert stats["proposed"] == 2   # only newly-appended count
         assert stats["skipped"] == 2    # the two dups
         assert stats["capped"] is True
+
+
+# == Class 11: run_proposal_loop cross-run forward-progress (WS17-B item 2) =====
+
+class TestRunProposalLoopForwardProgress:
+    """Integration test against the REAL propose_update: a capped run defers the
+    remainder, and successive runs drain it via idempotency without dropping or
+    duplicating any fact. This is the test that would have caught the silent-drop
+    risk the adversarial review flagged."""
+
+    def _seed_n(self, db, n, prefix):
+        for i in range(n):
+            _seed_fact(db, f"{prefix}{i}", f"src-{prefix}{i}", "FNDR",
+                       "person", f"Subject {prefix}{i}", "some factual detail text")
+
+    def test_three_runs_drain_seven_facts_no_loss(self, tmp_db, tmp_path, monkeypatch):
+        import cora.connectors.drive_extractor as de
+        import cora.knowledge_review as kr
+        monkeypatch.setattr(de, "_MAX_PROPOSALS_PER_RUN", 3)
+        ledger = tmp_path / "proposed.jsonl"
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", ledger)
+
+        self._seed_n(tmp_db, 7, "z")  # 7 candidate facts, cap 3
+
+        kr._SEEN_IDS_CACHE = None
+        s1 = run_proposal_loop(db_path=tmp_db)      # real propose_update
+        assert s1["proposed"] == 3 and s1["capped"] is True
+
+        kr._SEEN_IDS_CACHE = None                    # simulate a fresh process
+        s2 = run_proposal_loop(db_path=tmp_db)
+        assert s2["proposed"] == 3 and s2["skipped"] == 3 and s2["capped"] is True
+
+        kr._SEEN_IDS_CACHE = None
+        s3 = run_proposal_loop(db_path=tmp_db)
+        assert s3["proposed"] == 1 and s3["skipped"] == 6 and s3["capped"] is False
+
+        # Exactly 7 distinct facts landed — none dropped, none duplicated.
+        ids = {json.loads(l)["update_id"]
+               for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()}
+        assert len(ids) == 7
+        assert all(i.startswith("drive_fact:") for i in ids)

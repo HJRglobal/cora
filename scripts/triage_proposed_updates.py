@@ -130,6 +130,15 @@ def main() -> int:
 
     records = _load_records(ledger)
     total = len(records)
+    # Capture the ledger fingerprint at load time. The live bot appends to this
+    # file (#info-for-cora) with no cross-process lock, so on --apply we re-check
+    # this just before the rewrite and abort if it changed — otherwise a fresh
+    # human contribution landing mid-apply would be overwritten AND absent from
+    # the .bak (irreversible loss of exactly the protected type).
+    try:
+        _load_fp = (ledger.stat().st_mtime, ledger.stat().st_size)
+    except OSError:
+        _load_fp = None
 
     # Census of current PENDING state, and the dismissal set.
     pending_by_type: Counter = Counter()
@@ -210,7 +219,18 @@ def main() -> int:
         print("\nNothing to dismiss -- ledger unchanged.")
         return 0
 
-    # ── Apply: backup, then rewrite with state flipped ───────────────────────
+    # ── Apply: re-check the ledger hasn't changed since load, then back up ────
+    try:
+        now_fp = (ledger.stat().st_mtime, ledger.stat().st_size)
+    except OSError:
+        now_fp = None
+    if _load_fp is None or now_fp != _load_fp:
+        print("\nABORT: the ledger changed since it was loaded (a live process may "
+              "have appended). Nothing was written. Re-run --apply when the bot and "
+              "scheduled producers are idle.")
+        return 1
+
+    # ── Backup, then rewrite with state flipped ──────────────────────────────
     bak_path = ledger.with_name(ledger.name + f".bak-{stamp}")
     shutil.copy2(ledger, bak_path)
     print(f"\nBackup written: {bak_path}")
