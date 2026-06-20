@@ -124,6 +124,13 @@ class TestIsCoraInternalTitle:
         "2026-06-17_fndr_cora-slack-incident-triage.md",
         "2026-06-17_fndr_cora-rebuild-phase3-scope.md",
         "2026-06-08_fndr_cora-code-prompt-caching-split-phase0.md",
+        # self-audit / review / sweep docs are the self-diagnostic class -> TARGETED
+        # (review HIGH finding: these escaped the default purge + re-ingested before).
+        "2026-06-13_fndr_cora-slack-sweep-bug-audit.md",
+        "2026-06-09_fndr_cora-slack-sweep-audit-and-plan.md",
+        "2026-06-08_fndr_cora-slack-comms-review.md",
+        "2026-06-11_fndr_cora-14-day-infra-review.md",
+        "2026-06-11_fndr_cora-knowledge-review-slack-sweep.md",
     ]
 
     # --- legit business / Cora-adjacent docs that MUST be spared in BOTH scopes ---
@@ -138,15 +145,34 @@ class TestIsCoraInternalTitle:
         "F3 Energy Koozie order.md",
     ]
 
-    # --- BROAD-only: Cora ops docs caught only with broad=True ---
+    # --- BROAD-only: long-tail Cora ops docs caught only with broad=True ---
     BROAD_ONLY = [
         "2026-06-08_fndr_cora-scaling-memory-game-plan.md",
         "2026-06-16_fndr_cora-redesign-overhaul-proposal.md",
         "2026-06-06_fndr_cora-team-training-manual.md",
         "cora-tool-ship-checklist.md",
-        "2026-06-11_fndr_cora-14-day-infra-review.md",
-        "2026-06-13_fndr_cora-code-6-13-sweep.md",
         "2026-06-18_fndr_cora-polar-mcp-auth-fix.md",
+    ]
+
+    # --- sub-word collisions: a build keyword INSIDE a larger word must NOT fire
+    # in either scope (review MEDIUM 2b -- \b token anchoring) ---
+    SUBWORD_SPARED = [
+        "cora-fixed-assets-register.md",     # 'fix' inside 'fixed'
+        "cora-fixtures-list.md",             # 'fix' inside 'fixtures'
+        "cora-planning-retreat.md",          # 'plan' inside 'planning'
+        "cora-specification-of-brand.md",    # 'spec' inside 'specification'
+        "cora-debrief.md",                   # 'brief' inside 'debrief'
+        "cora-infrastructure-doc.md",        # 'infra' inside 'infrastructure'
+    ]
+
+    # --- protected families with a build-keyword SUFFIX must still be spared in
+    # both scopes (review MEDIUM 2a -- _LEGIT_FAMILY_RE negative guard) ---
+    PROTECTED_SUFFIX_SPARED = [
+        "cora-wishlist-review.md",
+        "f3-brand-assets-cora-reference-and-comms.md",
+        "slack-to-cora-mapping-spec.md",
+        "cora-f3-monitor-privacy-review.md",
+        "osn_cora-wishlist-spec.md",
     ]
 
     def test_targeted_catches_build_docs(self):
@@ -171,6 +197,19 @@ class TestIsCoraInternalTitle:
         for name in self.BROAD_ONLY:
             assert not is_cora_internal_title(name), f"should be targeted-spared: {name}"
             assert is_cora_internal_title(name, broad=True), f"broad should catch: {name}"
+
+    def test_subword_collisions_spared_both_scopes(self):
+        # \b anchoring: a keyword inside a larger word must never fire.
+        for name in self.SUBWORD_SPARED:
+            assert not is_cora_internal_title(name), f"sub-word over-match (targeted): {name}"
+            assert not is_cora_internal_title(name, broad=True), f"sub-word over-match (broad): {name}"
+
+    def test_protected_family_suffix_variants_spared(self):
+        # The negative guard keeps the named business-doc families safe even when a
+        # build keyword is appended.
+        for name in self.PROTECTED_SUFFIX_SPARED:
+            assert not is_cora_internal_title(name), f"protected family purged (targeted): {name}"
+            assert not is_cora_internal_title(name, broad=True), f"protected family purged (broad): {name}"
 
     def test_title_with_path_prefix_uses_basename(self):
         # Some titles arrive with a folder prefix; match on the basename.

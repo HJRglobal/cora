@@ -30,14 +30,18 @@ Scope notes:
     Sibling projects (gmail-deep-dive, reddit-strategy, wikipedia-strategy, …)
     are NOT matched and stay ingested — only the ``cora`` project is excluded.
   * The filename rule is the workhorse for Drive copies (no path on the source_id).
-    It is deliberately narrow — requires a ``cora-``/``cora_`` prefix AND a build
-    keyword, or a ``cora-….log`` runtime log — so ordinary business docs
-    (``f3-brand-assets-cora-reference.md``, ``…_cora-wishlist.md``,
-    ``…-cora-mapping.md``, "deCORAtions" emails) are never caught.
-  * ``broad=True`` (PURGE opt-in, ``--scope broad``) adds the rest of Cora's ops
-    docs (reviews, proposals, plans, specs, code-session docs, fixes). Still
-    anchored to ``cora-``/``cora_`` + keyword, so the legit business docs above
-    stay safe.
+    Requires a ``cora-``/``cora_`` token AND a WHOLE-WORD build keyword (matched with
+    ``\\b`` so "fix" never fires inside "fixed", "plan" inside "planning", etc.), or a
+    ``cora-….log`` runtime log. The targeted set includes audit/review/sweep -- Cora's
+    own self-audits/reviews are the docs that produced the fabricated diagnostic.
+  * A hard NEGATIVE guard (``_LEGIT_FAMILY_RE``) spares the named business-doc
+    families (``…-cora-reference``, ``…_cora-wishlist``, ``…-cora-mapping``,
+    ``cora-f3-monitor-privacy-policy``) in BOTH scopes even with a keyword suffix, so
+    e.g. ``cora-wishlist-review.md`` is never purged. ("deCORAtions" never matches at
+    all -- there is no ``cora-`` token.)
+  * ``broad=True`` (PURGE opt-in, ``--scope broad``) adds the long tail of Cora ops
+    docs (proposals, plans, specs, code-session docs, fixes, training/checklist).
+    Still token-anchored + family-guarded, so the legit business docs above stay safe.
 """
 
 from __future__ import annotations
@@ -49,14 +53,23 @@ from pathlib import Path
 # metadata, never org knowledge.
 _CORA_WORKSPACE_SEGMENTS: tuple[str, ...] = ("_shared", "projects", "cora")
 
-# TARGETED filename rule: ``cora-``/``cora_`` prefix AND a build-doc keyword.
-# This is the default for ingest + purge — the unambiguous build/audit artifacts.
+# Every keyword is matched as a WHOLE token via \b...\b -- so "fix" never fires
+# inside "fixed"/"fixtures", "plan" inside "planning", "spec" inside
+# "specification", "brief" inside "debrief", "infra" inside "infrastructure".
+# (Sub-word substring matching was the WS1-DRIVE review's MEDIUM over-match bug.)
+
+# TARGETED filename rule: ``cora-``/``cora_`` prefix AND a build-doc keyword token.
+# Default for ingest + purge -- the unambiguous build/audit/forensic/review artifacts
+# (the self-diagnostic class). 'audit', 'review', 'sweep' live HERE (not broad): real
+# self-audit docs like cora-slack-comms-review.md / cora-14-day-infra-review.md /
+# cora-slack-sweep-bug-audit.md are the very docs that caused the fabricated diagnostic.
 _CORA_BUILD_DOC_RE = re.compile(
-    r"cora[-_].*?("
+    r"cora[-_].*?\b("
     r"forensic|rebuild|execution-log|code-prompt|build-plan|build-queue|"
     r"master-build|cascade-report|cascade|incident-triage|north-star|"
-    r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum"
-    r")",
+    r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum|"
+    r"audit|review|sweep"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -64,16 +77,24 @@ _CORA_BUILD_DOC_RE = re.compile(
 _CORA_LOG_RE = re.compile(r"^cora[-_].*\.log$", re.IGNORECASE)
 
 # BROAD (opt-in, purge only): the rest of Cora's ops/build docs. Still requires a
-# ``cora-``/``cora_`` prefix + keyword, so legit business docs that merely mention
-# Cora (``…-cora-reference``, ``…-cora-wishlist``, ``…-cora-mapping``,
-# ``cora-f3-monitor-privacy-policy``) are still NOT matched.
+# ``cora-``/``cora_`` token + a WHOLE-WORD keyword.
 _CORA_BUILD_DOC_BROAD_RE = re.compile(
-    r"cora[-_].*?("
-    r"audit|review|proposal|backlog|exec-summary|game-plan|overhaul|redesign|"
-    r"training|checklist|scaling|comms|infra|sweep|spec|wiring|closeout|kickoff|"
+    r"cora[-_].*?\b("
+    r"proposal|backlog|exec-summary|game-plan|overhaul|redesign|"
+    r"training|checklist|scaling|comms|infra|spec|wiring|closeout|kickoff|"
     r"gap|plan|prompt|caching|connector|setup|dedup|session|whats-on|knowledge|"
     r"nudge|guard|filer|fix|brief"
-    r")",
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Hard negative guard: legit business docs that merely CARRY a cora- token. These
+# named families must NEVER be purged in EITHER scope, even with a build-keyword
+# SUFFIX (e.g. ``cora-wishlist-review.md`` or ``...-cora-reference-and-comms.md``).
+# Checked BEFORE any positive keyword match. (The folder rule still independently
+# catches a doc physically inside the cora workspace, by design.)
+_LEGIT_FAMILY_RE = re.compile(
+    r"cora[-_](?:reference|wishlist|mapping|f3-monitor-privacy)",
     re.IGNORECASE,
 )
 
@@ -98,6 +119,8 @@ def _contains_subsequence(parts: list[str], seq: tuple[str, ...]) -> bool:
 
 
 def _name_is_build_doc(name: str, *, broad: bool = False) -> bool:
+    if _LEGIT_FAMILY_RE.search(name):
+        return False  # protected business-doc family -- never a build doc by name
     if _CORA_BUILD_DOC_RE.search(name) or _CORA_LOG_RE.match(name):
         return True
     return bool(broad and _CORA_BUILD_DOC_BROAD_RE.search(name))

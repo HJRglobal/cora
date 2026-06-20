@@ -174,7 +174,25 @@ def main() -> int:
         for nm in drive_names[:40]:
             log.info("      %s", nm)
         if len(drive_names) > 40:
-            log.info("      ... +%d more files", len(drive_names) - 40)
+            log.info("      ... +%d more files (see full manifest below)", len(drive_names) - 40)
+
+        # Full auditable manifest: the inline log samples at 40, so write EVERY
+        # selected filename to disk -- a broad --apply must be reviewable in full
+        # before it irreversibly deletes anything.
+        try:
+            manifest = _REPO / "logs" / f"purge-cora-internal-{args.scope}.txt"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            with manifest.open("w", encoding="utf-8") as fh:
+                fh.write(f"# Cora-internal purge manifest  scope={args.scope}\n")
+                fh.write(f"# static_md files ({len(static_sources)}):\n")
+                for s in static_sources:
+                    fh.write(f"  {s}\n")
+                fh.write(f"# drive-copy files ({len(drive_names)}):\n")
+                for n in drive_names:
+                    fh.write(f"  {n}\n")
+            log.info("  Full file manifest written -> %s", manifest)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("  could not write manifest: %s", exc)
 
         note_hits: list[tuple[str, str, str]] = []
         if args.include_notes:
