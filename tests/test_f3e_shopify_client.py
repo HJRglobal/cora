@@ -34,6 +34,7 @@ from cora.connectors.shopify_client import (
     get_inventory_status,
     get_sales_pulse,
     graphql,
+    is_beverage_product,
 )
 
 
@@ -355,6 +356,86 @@ def test_get_inventory_status_uses_constant_threshold(mock_paginate, env_vars):
     result = get_inventory_status()
     # qty == threshold means low_stock = True (<=)
     assert result[0].low_stock is True
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_get_inventory_status_captures_product_type(mock_paginate, env_vars):
+    """product_type is fetched + passed through to the variant (v1.1)."""
+    mock_paginate.return_value = [
+        {"title": "F3 Pure Variety Pack", "product_type": "Pure Drink",
+         "variants": [_make_variant(qty=0)]},
+        {"title": "UFL Globe T-Shirt", "variants": [_make_variant(qty=0)]},  # no product_type key
+    ]
+    result = get_inventory_status()
+    by_title = {v.product_title: v for v in result}
+    assert by_title["F3 Pure Variety Pack"].product_type == "Pure Drink"
+    assert by_title["UFL Globe T-Shirt"].product_type == ""  # missing -> ""
+    # the fetch requests product_type so the field is populated
+    _, kwargs = mock_paginate.call_args
+    assert "product_type" in kwargs["params"]["fields"]
+
+
+# ── is_beverage_product ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("product_type, title", [
+    # Live beverage product_types (verified 2026-06-18) -> beverages.
+    ("Pure Drink", "F3 PURE Original - 12 Pack"),
+    ("Mood Drink", "Orangesicle Mood - 12 Pack"),
+    ("Energy Drink", "Citrus Clarity Energy - 12 Pack"),
+    ("Energy & Mood Drink", "Energy Variety - 12 Pack"),
+    ("Energy", "Strawberry Lemonade Energy - 12 Pack"),
+    ("Pure Drink", "F3 Pure Variety Pack - 12 Pack (4 Flavors)"),  # the buried signal
+])
+def test_is_beverage_product_true_for_beverages(product_type, title):
+    assert is_beverage_product(product_type, title) is True
+
+
+@pytest.mark.parametrize("title", [
+    # Live apparel/merch (verified 2026-06-18) -> all have BLANK product_type.
+    "F3 Calm the Noise Pullover",
+    "F3 Hat",
+    "F3 Rising Tide T-Shirt",
+    "UFL Globe T-Shirt",
+    "UFL Hat",
+])
+def test_is_beverage_product_false_for_apparel(title):
+    assert is_beverage_product("", title) is False
+
+
+def test_is_beverage_product_merch_type_wins_over_beverage_title():
+    """A merch item with a beverage word in its title is still excluded."""
+    assert is_beverage_product("Apparel", "F3 Energy Tee") is False
+    # Blank type, merch-exclude-first on the title:
+    assert is_beverage_product("", "F3 Energy Koozie") is False
+
+
+def test_is_beverage_product_untyped_beverage_title_fallback():
+    """A beverage that someone forgot to type still passes via the title."""
+    assert is_beverage_product("", "F3 Energy - 12 Pack") is True
+    assert is_beverage_product(None, "Mood Variety Pack") is True
+
+
+def test_is_beverage_product_word_boundaries():
+    """Substring collisions must not false-match in the title fallback
+    ('cap' in 'escapade', 'pack' in 'backpack')."""
+    # Blank product_type forces the title path; 'cap' must NOT fire inside
+    # 'Escapade', so the beverage word 'Energy' wins -> True.
+    assert is_beverage_product("", "Escapade Energy - 12 Pack") is True
+    # 'pack' must not match inside 'backpack' (a hypothetical merch item)
+    assert is_beverage_product("", "F3 Backpack") is False
+    # truly ambiguous (no type, no beverage/merch word) -> not a confirmed beverage
+    assert is_beverage_product("", "Mystery Box") is False
+
+
+def test_is_beverage_product_bottle_is_not_merch():
+    """A bottled/glass beverage must NOT be false-excluded -- 'bottle' is a
+    beverage-vocabulary word, so it is deliberately NOT a merch token (a
+    silent false-exclude of a low-stock beverage is the cardinal failure)."""
+    assert is_beverage_product("Energy Drink", "Energy 16oz Bottle - 12 Pack") is True
+    assert is_beverage_product("Glass Bottle Drink", "") is True
+    assert is_beverage_product("", "F3 Pure Sparkling Water Bottle - 12 Pack") is True
+    # canned beverages stay safe (regression on the existing 'cans?' token)
+    assert is_beverage_product("", "F3 Energy 16oz Can") is True
 
 
 # ── _get_paginated error handling ─────────────────────────────────────────────

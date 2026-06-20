@@ -177,8 +177,11 @@ def test_retail_line_null_dealname_does_not_crash():
 # Inventory
 # ---------------------------------------------------------------------------
 
-def _variant(title, vtitle, qty, low):
-    return InventoryVariant(product_title=title, variant_title=vtitle, sku="s", qty_on_hand=qty, low_stock=low)
+def _variant(title, vtitle, qty, low, ptype="Energy Drink"):
+    return InventoryVariant(
+        product_title=title, variant_title=vtitle, sku="s",
+        qty_on_hand=qty, low_stock=low, product_type=ptype,
+    )
 
 
 def test_inventory_all_healthy():
@@ -188,7 +191,10 @@ def test_inventory_all_healthy():
 
 
 def test_inventory_flags_low():
-    variants = [_variant("Pure", "Variety", 3, True), _variant("Mood", "12pk", 8, True)]
+    variants = [
+        _variant("Pure", "Variety", 3, True, ptype="Pure Drink"),
+        _variant("Mood", "12pk", 8, True, ptype="Mood Drink"),
+    ]
     with patch.object(brief.shopify_client, "get_inventory_status", return_value=variants):
         line = brief._inventory_line()
     assert "2 low/critical" in line
@@ -199,6 +205,36 @@ def test_inventory_degrades():
     with patch.object(brief.shopify_client, "get_inventory_status",
                       side_effect=ShopifyConnectorError("x")):
         assert brief._inventory_line() == "- *Inventory:* not available"
+
+
+def test_inventory_excludes_apparel():
+    """Apparel/merch (blank product_type) must NOT surface in the beverage brief,
+    even when it is the lowest-stock item -- the v1.1 fix."""
+    variants = [
+        _variant("UFL Globe T-Shirt", "M", 0, True, ptype=""),
+        _variant("F3 Calm the Noise Pullover", "L", 1, True, ptype=""),
+        _variant("F3 Hat", "OS", 2, True, ptype=""),
+        _variant("F3 Pure Variety Pack - 12 Pack", "", 0, True, ptype="Pure Drink"),
+        _variant("Original Energy - 12 Pack", "", 4, True, ptype="Energy Drink"),
+    ]
+    with patch.object(brief.shopify_client, "get_inventory_status", return_value=variants):
+        line = brief._inventory_line()
+    # Only the 2 beverages are counted/named; apparel is gone.
+    assert "2 low/critical" in line
+    assert "Pure Variety Pack" in line
+    assert "Original Energy" in line
+    for merch in ("T-Shirt", "Pullover", "Hat"):
+        assert merch not in line
+
+
+def test_inventory_all_apparel_low_reads_healthy():
+    """If the only low-stock items are apparel, the beverage line reads healthy."""
+    variants = [
+        _variant("UFL Globe T-Shirt", "M", 0, True, ptype=""),
+        _variant("Original Energy - 12 Pack", "", 500, False, ptype="Energy Drink"),
+    ]
+    with patch.object(brief.shopify_client, "get_inventory_status", return_value=variants):
+        assert brief._inventory_line() == "- *Inventory:* all healthy"
 
 
 # ---------------------------------------------------------------------------
