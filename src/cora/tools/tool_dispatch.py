@@ -769,10 +769,119 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         slack_user_id, f_title, assignee_display, created.get("gid", ""), f_project, plan["notices"],
     )
 
+    # Optional followers so a task meant for >1 person surfaces for all of them
+    # (Asana allows ONE assignee but many followers).
+    added_followers: list[str] = []
+    follower_names = input_data.get("follower_names") or []
+    if follower_names and created.get("gid"):
+        fgids: list[str] = []
+        for nm in follower_names:
+            rid, _info = resolve_name_to_slack_user_id(str(nm), channel_entity=entity)
+            if not rid:
+                continue
+            fu = _load_slack_asana_map().get(rid) or {}
+            g = str(fu.get("asana_user_gid", "") or "")
+            if g and "REPLACE" not in g and g != assignee_gid:
+                fgids.append(g)
+                added_followers.append(fu.get("display_name", str(nm)))
+        if fgids:
+            try:
+                asana_client.add_task_followers(str(created["gid"]), fgids)
+            except asana_client.AsanaClientError as exc:
+                log.warning("asana_create_task: add followers failed: %s", exc)
+                added_followers = []
+
     out = asana_client.format_created_task_for_llm(created)
-    if plan["notices"]:
-        out += "\n(" + "; ".join(plan["notices"]) + ")"
+    extras = list(plan["notices"])
+    if added_followers:
+        extras.append("following: " + ", ".join(added_followers))
+    if extras:
+        out += "\n(" + "; ".join(extras) + ")"
     return out
+
+
+def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str):
+    """Resolve a task to act on. Returns (gid, label, error). An explicit gid wins;
+    otherwise match `task_name` against the asker's OWN open tasks (so complete /
+    delete can't act on an arbitrary task by guesswork)."""
+    if task_gid:
+        return str(task_gid).strip(), (task_name or task_gid).strip(), None
+    asker = _load_slack_asana_map().get(slack_user_id)
+    agid = str((asker or {}).get("asana_user_gid", "") or "")
+    if not agid:
+        return None, None, (
+            "I can't look up your tasks -- your Slack->Asana mapping is missing. "
+            "Give me the task's id, or ask Harrison to add your row."
+        )
+    if not task_name:
+        return None, None, "Tell me which task (a name or an id)."
+    try:
+        tasks = asana_client.get_user_tasks(agid)
+    except asana_client.AsanaClientError as exc:
+        return None, None, f"Couldn't read your tasks ({exc})."
+    key = _norm_task_key(task_name)
+    opent = [t for t in tasks if not t.get("completed")]
+    matches = [t for t in opent if _norm_task_key(t.get("name") or "") == key]
+    if not matches:
+        matches = [t for t in opent if key and key in _norm_task_key(t.get("name") or "")]
+    if not matches:
+        return None, None, f"No open task of yours matches {task_name!r}."
+    if len(matches) > 1:
+        names = "; ".join((t.get("name") or "?") for t in matches[:6])
+        return None, None, (
+            f"Several open tasks of yours match {task_name!r}: {names}. "
+            f"Be more specific or give the task id."
+        )
+    t = matches[0]
+    return str(t.get("gid") or ""), (t.get("name") or task_name), None
+
+
+def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Mark one of the asker's tasks complete (staged-write, confirmed gate)."""
+    input_data = _input or {}
+    gid, label, err = _resolve_asker_task(
+        slack_user_id,
+        (input_data.get("task_gid") or "").strip(),
+        (input_data.get("task_name") or "").strip(),
+    )
+    if err:
+        return err
+    if input_data.get("confirmed", False) is not True:
+        return (
+            f"asana_complete_task refused: show the user the preview "
+            f"'Mark complete: {label}' and get explicit approval, then call again "
+            f"with confirmed=true."
+        )
+    try:
+        asana_client.complete_task(gid)
+    except asana_client.AsanaClientError as exc:
+        return f"Couldn't complete that task ({exc}). Tell the user it was NOT marked done."
+    log.info("asana_complete_task actor=%s gid=%s", slack_user_id, gid)
+    return f'WRITE_CONFIRMED -- post exactly: Done -- marked "{label}" complete in Asana.'
+
+
+def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> str:
+    """PERMANENTLY delete one of the asker's tasks (staged-write, confirmed gate)."""
+    input_data = _input or {}
+    gid, label, err = _resolve_asker_task(
+        slack_user_id,
+        (input_data.get("task_gid") or "").strip(),
+        (input_data.get("task_name") or "").strip(),
+    )
+    if err:
+        return err
+    if input_data.get("confirmed", False) is not True:
+        return (
+            f"asana_delete_task refused: deleting a task is PERMANENT (completing is "
+            f"usually better). Show the user 'Permanently delete: {label}' and get "
+            f"explicit approval, then call again with confirmed=true."
+        )
+    try:
+        asana_client.delete_task(gid)
+    except asana_client.AsanaClientError as exc:
+        return f"Couldn't delete that task ({exc}). Tell the user it was NOT deleted."
+    log.info("asana_delete_task actor=%s gid=%s label=%r", slack_user_id, gid, label)
+    return f'WRITE_CONFIRMED -- post exactly: Deleted "{label}" from Asana.'
 
 
 def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3346,6 +3455,11 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Optional. Name of the teammate to assign the task to (first name, full name, or common alias — 'Sean' / 'Shaun' / 'Shaun Hawkins' all resolve). If omitted, the task is assigned to the @-mentioning user.",
                 },
+                "follower_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. Extra teammates to add as FOLLOWERS (Asana has one assignee but many followers) so a task meant for two people surfaces for both. Names/aliases, same resolution as assignee_name.",
+                },
                 "notes": {
                     "type": "string",
                     "description": "Optional. Task description / context. Becomes the Asana task notes field.",
@@ -3368,6 +3482,47 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["title", "confirmed"],
+        },
+    },
+    {
+        "name": "asana_complete_task",
+        "description": (
+            "Mark one of the ASKING USER's open Asana tasks COMPLETE. Use when they say "
+            "'mark X done', 'complete the X task', 'close out X', 'I finished X'. "
+            "REQUIRED PATTERN (staged-write): on the first turn, call with task_name (or "
+            "task_gid if you have it) WITHOUT confirmed -- the tool resolves the task and "
+            "returns a refusal telling you which task it matched; show the user that "
+            "preview ('Mark complete: <task>') and get explicit approval, THEN call again "
+            "with confirmed=true. The tool only matches the asker's OWN open tasks; if it "
+            "reports zero or multiple matches, relay that and ask them to clarify."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to complete."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid, if known (skips name matching)."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the matched task and getting explicit approval."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "asana_delete_task",
+        "description": (
+            "PERMANENTLY DELETE one of the asking user's Asana tasks. Deletion is "
+            "IRREVERSIBLE -- prefer asana_complete_task unless the user explicitly wants it "
+            "gone. Same staged-write pattern: first call with task_name (no confirmed) to "
+            "resolve + preview ('Permanently delete: <task>'), get explicit approval, THEN "
+            "call with confirmed=true. Only matches the asker's OWN open tasks."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to delete."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid, if known (skips name matching)."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the matched task and getting explicit approval to PERMANENTLY delete it."},
+            },
+            "required": [],
         },
     },
     {
@@ -5100,6 +5255,8 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "asana_get_my_tasks",
     "asana_get_user_tasks",
     "asana_create_task",
+    "asana_complete_task",
+    "asana_delete_task",
     "gmail_create_draft",
     "gmail_inbox",
     "calendar_get_my_events",
@@ -5203,6 +5360,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_get_my_tasks": _tool_get_my_tasks,
     "asana_get_user_tasks": _tool_get_user_tasks,
     "asana_create_task": _tool_asana_create_task,
+    "asana_complete_task": _tool_asana_complete_task,
+    "asana_delete_task": _tool_asana_delete_task,
     "gmail_create_draft": _tool_gmail_create_draft,
     "gmail_inbox": _tool_gmail_inbox,
     "calendar_get_my_events": _tool_get_my_events,
@@ -5282,6 +5441,8 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "influencer_get_status": 8,
     # Normal — single external API call
     "asana_create_task": 12,
+    "asana_complete_task": 12,
+    "asana_delete_task": 12,
     "f3e_hubspot_pipeline_summary": 12,
     "fndr_contracts_dashboard": 12,
     "fndr_press_pipeline_summary": 12,

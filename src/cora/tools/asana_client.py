@@ -294,6 +294,74 @@ def complete_task(task_gid: str) -> dict[str, Any]:
     return r.json().get("data") or {}
 
 
+def delete_task(task_gid: str) -> None:
+    """PERMANENTLY delete an Asana task (DELETE /tasks/{gid}).
+
+    Irreversible. Callers must stage a confirm gate first. Raises AsanaClientError
+    on failure.
+    """
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("delete_task requires a non-empty task_gid")
+
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.delete(f"{_BASE}/tasks/{task_gid}", headers=headers)
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot delete task {task_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+
+def add_task_followers(task_gid: str, follower_gids: list[str]) -> dict[str, Any]:
+    """Add followers to a task (POST /tasks/{gid}/addFollowers).
+
+    Asana allows ONE assignee but many followers, so a task meant for two people
+    surfaces for both. Returns the updated task dict. Raises on failure.
+    """
+    gids = [str(g).strip() for g in (follower_gids or []) if str(g).strip()]
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("add_task_followers requires a non-empty task_gid")
+    if not gids:
+        raise AsanaClientError("add_task_followers requires at least one follower gid")
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/tasks/{task_gid}/addFollowers",
+                json={"data": {"followers": gids}},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot add followers to task {task_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
 def create_task_comment(task_gid: str, text: str) -> dict[str, Any]:
     """Post a comment (story) on an Asana task.
 
