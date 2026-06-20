@@ -1,4 +1,4 @@
-# Setup Windows Scheduled Task: Cora cash-flow snapshot writer (WS7), daily 06:40 AZ.
+# Setup Windows Scheduled Task: Cora cash-flow snapshot writer (WS7), daily 06:45 AZ.
 #
 # Does ONE read of the CF_SUMMARY tab and writes a labeled JSON snapshot to
 # 00-Founder/_cash-snapshot/cashflow-latest.json on the Google-Drive mount, so the
@@ -6,10 +6,10 @@
 # is F3-Energy-Holdings-only). Fail-soft: a read error leaves the previous snapshot
 # in place and exits non-zero. NOT bot-loaded -- runs as its own task; no restart.
 #
-# Slot: 06:40 AZ daily, AHEAD of the morning briefs (~07:00/07:30) so the snapshot
-# is fresh when they run. Confirm 06:40 does not collide with another enabled task
-# in the 03:00-09:00 window (scheduler de-collide doctrine, B1 2026-06-13); adjust
-# -HourMin if needed.
+# Slot: 06:45 AZ daily, AHEAD of the morning briefs (~07:00/07:30) so the snapshot
+# is fresh when they run. 06:45 is a verified-free minute (06:40 = Asana Hygiene
+# Nudges, 06:50 = QBO Token Monitor) per the scheduler de-collide doctrine (B1
+# 2026-06-13); confirm against the live schedule before changing -HourMin.
 #
 # Run from elevated PowerShell:
 #     cd C:\Users\Harri\code\cora
@@ -24,7 +24,7 @@ $RepoRoot   = "C:\Users\Harri\code\cora"
 $PythonExe  = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"
 $TaskName   = "Cora - Cash Snapshot"
 $ScriptPath = "C:\Users\Harri\code\cora\scripts\write_cashflow_snapshot.py"
-$HourMin    = "06:40"
+$HourMin    = "06:45"
 
 if (-not (Test-Path $PythonExe)) {
     Write-Error "Python not found at $PythonExe. Check the venv."

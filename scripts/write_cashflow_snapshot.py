@@ -42,6 +42,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from dotenv import load_dotenv  # noqa: E402
+
+# Load .env so GOOGLE_SERVICE_ACCOUNT_JSON (and any other connector creds) are set
+# when this runs as a standalone scheduled task OUTSIDE the bot process. Without
+# this the Drive/Sheets connector is disabled and the snapshot never writes.
+# Matches the convention every other credential-reading script in scripts/ uses.
+load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=True)
+
 from cora.connectors import gsheets_financials as gf  # noqa: E402
 
 log = logging.getLogger("write_cashflow_snapshot")
