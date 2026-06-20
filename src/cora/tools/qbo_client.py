@@ -205,6 +205,37 @@ _HJRP_CLASS_MAP: dict[str, str] = {
 }
 
 
+# Per-entity accounting-basis policy for the CONVERSATIONAL P&L path (WS6).
+#
+# EMPTY BY DEFAULT, AND DELIBERATELY SO. The conversational tool labels whatever
+# basis QBO actually rendered (read from the report header — see _report_basis),
+# which is always TRUTHFUL. Listing an entity here FORCES that basis instead of
+# the company default — use it to make a conversational P&L match the basis of the
+# books Harrison files for that entity.
+#
+# Do NOT blanket-set "Accrual": LEX-LLC is genuinely cash-basis and LBHS differs
+# (42-CFR-Part-2), so a global default would produce confidently-wrong figures.
+# Harrison/Justin populate this per entity once each entity's filed basis is
+# confirmed, e.g.:
+#     "F3E": "Accrual",
+#     "LEX-LLC": "Cash",
+# (The OSN per-store metrics digest pins Accrual independently in
+# run_osn_metrics_digest.py; that path is unchanged.)
+_ENTITY_PNL_BASIS: dict[str, str] = {}
+
+
+def entity_pnl_basis(entity: str) -> str | None:
+    """Return the configured P&L accounting-basis override for an entity, or None.
+
+    None means "use the company's own QBO default" (the conversational reply then
+    labels whatever basis QBO actually rendered). A value ("Accrual"/"Cash") forces
+    that basis. Case-insensitive entity lookup.
+    """
+    if not entity:
+        return None
+    return _ENTITY_PNL_BASIS.get(entity.upper())
+
+
 def get_profit_loss(
     entity: str,
     start_date: str | None = None,
@@ -331,6 +362,20 @@ def _extract_top_level_sections(report: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def _report_basis(report: dict[str, Any]) -> str | None:
+    """Return the accounting basis QBO actually used to render a report.
+
+    Reads ``Header.ReportBasis`` ("Accrual" / "Cash"). Returns None when the field
+    is absent so a formatter can OMIT the label rather than fabricate a basis. This
+    is the truthful signal of what the figures represent regardless of whether an
+    accounting_method override was passed.
+    """
+    basis = ((report or {}).get("Header") or {}).get("ReportBasis")
+    if isinstance(basis, str) and basis.strip():
+        return basis.strip()
+    return None
+
+
 def _parse_money(raw: str | None) -> float | None:
     """Parse a QBO summary value string into a float USD, or None if unparseable.
 
@@ -392,15 +437,20 @@ def format_pnl_for_llm(
     Strip it at source instead.
     """
     period = f"{start_date} to {end_date}"
+    basis = _report_basis(report)
+    # Truthful basis label (WS6): figures on a different basis are not comparable
+    # across entities, and a cash-basis figure legitimately disagrees with an
+    # accrual filed report — labelling makes that explicable instead of silent.
+    basis_tag = f" [{basis} basis]" if basis else ""
 
     totals = _extract_top_level_sections(report)
     if not totals:
         return (
-            f"Profit and Loss for {entity} ({period}) returned no summary rows. "
+            f"Profit and Loss for {entity} ({period}){basis_tag} returned no summary rows. "
             f"Ask finance for the detailed report."
         )
 
-    lines = [f"Profit and Loss for {entity} ({period}):"]
+    lines = [f"Profit and Loss for {entity} ({period}){basis_tag}:"]
     for section, value in totals.items():
         lines.append(f"  • {section}: {value}")
     return "\n".join(lines)

@@ -20,9 +20,12 @@ from unittest.mock import patch
 import pytest
 
 from cora.tools.qbo_client import (
+    _ENTITY_PNL_BASIS,
     _deep_link,
     _extract_top_level_sections,
     _parse_money,
+    _report_basis,
+    entity_pnl_basis,
     extract_pnl_revenue,
     format_ap_aging_for_llm,
     format_ar_aging_for_llm,
@@ -449,6 +452,61 @@ class TestFormatPnlForLlm:
         result = format_pnl_for_llm(_pnl_report(), "F3E", "2025-01-01", "2025-03-31")
         assert "2025-01-01" in result
         assert "2025-03-31" in result
+
+
+# ── WS6: accounting-basis labelling + per-entity override ─────────────────────
+
+def _pnl_report_with_basis(basis: str):
+    rep = _pnl_report()
+    rep["Header"]["ReportBasis"] = basis
+    return rep
+
+
+class TestReportBasisLabel:
+    def test_cash_basis_labeled(self):
+        out = format_pnl_for_llm(_pnl_report_with_basis("Cash"), "LEX-LLC", "2025-01-01", "2025-03-31")
+        assert "[Cash basis]" in out
+
+    def test_accrual_basis_labeled(self):
+        out = format_pnl_for_llm(_pnl_report_with_basis("Accrual"), "F3E", "2025-01-01", "2025-03-31")
+        assert "[Accrual basis]" in out
+
+    def test_no_basis_field_omits_label_not_fabricated(self):
+        # _pnl_report() has a Header with no ReportBasis -> never invent a basis.
+        out = format_pnl_for_llm(_pnl_report(), "F3E", "2025-01-01", "2025-03-31")
+        assert "basis]" not in out
+
+    def test_basis_label_on_empty_report_fallback(self):
+        empty = {"Header": {"ReportName": "Profit and Loss", "ReportBasis": "Cash"},
+                 "Rows": {"Row": []}}
+        out = format_pnl_for_llm(empty, "LEX-LLC", "2025-01-01", "2025-03-31")
+        assert "[Cash basis]" in out
+
+    def test_report_basis_extractor(self):
+        assert _report_basis({"Header": {"ReportBasis": "Accrual"}}) == "Accrual"
+        assert _report_basis({"Header": {"ReportBasis": "  Cash  "}}) == "Cash"
+        assert _report_basis({"Header": {"ReportName": "P&L"}}) is None
+        assert _report_basis({"Header": {"ReportBasis": ""}}) is None
+        assert _report_basis({}) is None
+
+
+class TestEntityPnlBasisOverride:
+    def test_default_map_is_empty_no_blanket_accrual(self):
+        # INVARIANT CLAMP: never blanket-Accrual. The override map ships empty;
+        # Harrison/Justin populate per entity once each filed basis is confirmed.
+        assert _ENTITY_PNL_BASIS == {}
+
+    def test_unset_entity_returns_none(self):
+        assert entity_pnl_basis("F3E") is None
+        assert entity_pnl_basis("LEX-LLC") is None
+
+    def test_empty_entity_returns_none(self):
+        assert entity_pnl_basis("") is None
+
+    def test_override_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setitem(_ENTITY_PNL_BASIS, "F3E", "Accrual")
+        assert entity_pnl_basis("f3e") == "Accrual"
+        assert entity_pnl_basis("F3E") == "Accrual"
 
 
 # ── format_balance_sheet_for_llm ──────────────────────────────────────────────

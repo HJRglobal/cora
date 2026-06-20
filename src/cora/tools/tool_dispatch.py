@@ -1718,8 +1718,13 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
     # For HJRP sub-properties, pass the sub-entity code so qbo_client
     # auto-resolves the correct QBO class filter (1337 or 1555 building).
     qbo_entity = target if target not in ("HJRP-1337", "HJRP-1555") else target
+    # WS6: pass the per-entity basis override when configured (else company
+    # default). format_pnl_for_llm labels whatever basis QBO actually rendered.
+    basis = qbo_client.entity_pnl_basis(qbo_entity)
     try:
-        report = qbo_client.get_profit_loss(qbo_entity, start_date, end_date)
+        report = qbo_client.get_profit_loss(
+            qbo_entity, start_date, end_date, accounting_method=basis
+        )
     except qbo_client.QboClientError as exc:
         log.warning("QBO P&L tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
