@@ -597,3 +597,93 @@ class TestProposeUpdateIdempotency:
             assert kr.propose_update(update_id="new-1", update_type="generic",
                                      description="d", payload={}) is True
             assert self._count(path) == 2
+
+
+@pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable on this mount")
+class TestLedgerRotation:
+    """WS17-B item 8: rotate resolved rows to the archive, keep the live file small,
+    and preserve idempotency (archived ids never re-proposed)."""
+
+    def _write(self, path, recs):
+        path.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+
+    def _reset(self):
+        kr._SEEN_IDS_CACHE = None
+        kr._SEEN_IDS_KEY = None
+        kr._ARCHIVE_IDS_CACHE = None
+        kr._ARCHIVE_IDS_KEY = None
+
+    def test_archives_old_resolved_keeps_pending_and_recent(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        live = tmp_path / "live.jsonl"
+        arch = tmp_path / "arch.jsonl"
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=10)).isoformat()
+        recent = (now - timedelta(hours=1)).isoformat()
+        self._write(live, [
+            {"update_id": "p1", "state": "PENDING", "resolved_at": None},
+            {"update_id": "d_old", "state": "DISMISSED", "resolved_at": old},
+            {"update_id": "a_old", "state": "APPROVED", "resolved_at": old},
+            {"update_id": "d_recent", "state": "DISMISSED", "resolved_at": recent},
+        ])
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", live), \
+             patch.object(kr, "_ARCHIVE_PATH", arch):
+            self._reset()
+            n = kr.rotate_resolved(max_age_days=3, now=now)
+        assert n == 2
+        live_ids = {json.loads(l)["update_id"]
+                    for l in live.read_text(encoding="utf-8").splitlines() if l.strip()}
+        arch_ids = {json.loads(l)["update_id"]
+                    for l in arch.read_text(encoding="utf-8").splitlines() if l.strip()}
+        assert live_ids == {"p1", "d_recent"}
+        assert arch_ids == {"d_old", "a_old"}
+
+    def test_rotation_preserves_idempotency(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        live = tmp_path / "live.jsonl"
+        arch = tmp_path / "arch.jsonl"
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=10)).isoformat()
+        self._write(live, [{"update_id": "gap-x", "state": "DISMISSED", "resolved_at": old}])
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", live), \
+             patch.object(kr, "_ARCHIVE_PATH", arch):
+            self._reset()
+            kr.rotate_resolved(max_age_days=3, now=now)
+            self._reset()
+            # gap-x is now archived (not in live) — must still dedup, no re-flood.
+            appended = kr.propose_update(update_id="gap-x", update_type="asana_task",
+                                         description="d", payload={})
+        assert appended is False
+
+    def test_preserves_malformed_lines(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        live = tmp_path / "live.jsonl"
+        arch = tmp_path / "arch.jsonl"
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=10)).isoformat()
+        live.write_text(
+            json.dumps({"update_id": "d", "state": "DISMISSED", "resolved_at": old}) + "\n"
+            + "{ not valid json\n",
+            encoding="utf-8",
+        )
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", live), \
+             patch.object(kr, "_ARCHIVE_PATH", arch):
+            self._reset()
+            kr.rotate_resolved(max_age_days=3, now=now)
+        assert "{ not valid json" in live.read_text(encoding="utf-8")
+
+    def test_nothing_old_enough_is_noop(self, tmp_path):
+        live = tmp_path / "live.jsonl"
+        arch = tmp_path / "arch.jsonl"
+        self._write(live, [{"update_id": "p", "state": "PENDING", "resolved_at": None}])
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", live), \
+             patch.object(kr, "_ARCHIVE_PATH", arch):
+            self._reset()
+            assert kr.rotate_resolved(max_age_days=3) == 0
+        assert not arch.exists()
+
+    def test_write_entries_atomic_roundtrip(self, tmp_path):
+        p = tmp_path / "x.jsonl"
+        kr._write_entries_atomic(p, [{"a": 1}, {"b": 2}])
+        lines = [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(lines) == 2 and json.loads(lines[0]) == {"a": 1}

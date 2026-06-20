@@ -394,3 +394,28 @@ def test_operational_routed_not_dmd_to_harrison(tmp_path, monkeypatch):
     entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "hn-1"]
     assert entries and entries[0]["state"] == "DISMISSED"
     assert entries[0]["resolved_reason"].startswith("routed_to_owner:")
+
+
+# == WS17-B item 5: _execute_approved_update routes info-for-cora -> known-answers
+
+def test_execute_approved_info_for_cora_writes_known_answers(tmp_path, monkeypatch):
+    import logging
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    update = {
+        "update_id": "infocora-1", "update_type": "generic", "description": "d",
+        "payload": {"source": "info-for-cora", "entity": "FNDR",
+                    "text": "A founder-level fact worth keeping.", "author_name": "Harrison"},
+    }
+    rkr._execute_approved_update(update, "", logging.getLogger("t"))  # empty token -> Slack no-ops
+    assert "A founder-level fact worth keeping." in (tmp_path / "fndr.md").read_text(encoding="utf-8")
+
+
+def test_execute_approved_drive_generic_does_not_write_known_answers(tmp_path, monkeypatch):
+    import logging
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    update = {
+        "update_id": "drive_fact:1", "update_type": "generic", "description": "Person: X",
+        "payload": {"entity": "FNDR", "subject": "X"},  # no info-for-cora source
+    }
+    rkr._execute_approved_update(update, "", logging.getLogger("t"))
+    assert not (tmp_path / "fndr.md").exists()  # operational generic only posts; no KB write

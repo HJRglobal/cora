@@ -174,13 +174,17 @@ def get_shared_kb():
             return None
     return _shared_kb
 
+# Built from the canonical write map (known_answers_map.ENTITY_FILES) so the read
+# side can never drift behind the write side again — the bug where gap answers for
+# HJRP/UFL/F3C/HJRPROD were written to files Cora never read (WS17-B item 6).
+# LEX sub-entity keys are EXCLUDED on purpose: their answers all share lex.md and
+# surface only at the LEX (GM) level, never inside a sibling sub-entity channel.
+from .known_answers_map import ENTITY_FILES as _ENTITY_FILES  # noqa: E402
+
 _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
-    "F3E":  _KNOWN_ANSWERS_DIR / "f3e.md",
-    "LEX":  _KNOWN_ANSWERS_DIR / "lex.md",
-    "OSN":  _KNOWN_ANSWERS_DIR / "osn.md",
-    "BDM":  _KNOWN_ANSWERS_DIR / "bdm.md",
-    "HJRG": _KNOWN_ANSWERS_DIR / "fndr.md",
-    "FNDR": _KNOWN_ANSWERS_DIR / "fndr.md",
+    entity: _KNOWN_ANSWERS_DIR / filename
+    for entity, filename in _ENTITY_FILES.items()
+    if not entity.startswith("LEX-")
 }
 
 _TTL = 300  # seconds

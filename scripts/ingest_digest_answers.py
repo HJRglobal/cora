@@ -28,14 +28,12 @@ DEFAULT_OUTPUT_DIR = Path(
     "G:/My Drive/HJR-Founder-OS/_shared/projects/cora/knowledge-gaps"
 )
 
-ENTITY_FILES: dict[str, str] = {
-    "F3E":  "f3e.md",
-    "LEX":  "lex.md",
-    "OSN":  "osn.md",
-    "BDM":  "bdm.md",
-    "HJRG": "fndr.md",
-    "FNDR": "fndr.md",
-}
+# Canonical entity -> known-answers filename, shared with gap_autofill (the
+# primary, automated flow) and context_loader so the maps can't drift (WS17-B
+# item 7). This legacy manual-digest path is DEPRECATED — see the deprecation
+# notice in main(); the gap_autofill loop is the supported owner of these files.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from cora.known_answers_map import ENTITY_FILES  # noqa: E402
 
 ENTITY_FULL_NAMES: dict[str, str] = {
     "fndr": "Founder / Cross-portfolio",
@@ -198,6 +196,13 @@ def append_to_section(file_path: Path, section_header: str, entry_lines: list[st
 
 def main() -> int:
     args = parse_args()
+
+    print(
+        "DEPRECATED (WS17-B): superseded by the automated gap_autofill loop, which "
+        "owns design/known-answers/*.md. Entity map is now imported from "
+        "cora.known_answers_map (no longer a local copy). See "
+        "design/knowledge-pipeline.md.\n"
+    )
 
     # Resolve digest path
     digest_path = args.digest

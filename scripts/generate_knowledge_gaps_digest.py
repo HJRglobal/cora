@@ -238,6 +238,14 @@ def _render_entity_block(lines: list[str], entity: str, gaps: list[dict]) -> Non
 def main() -> int:
     args = parse_args()
 
+    print(
+        "DEPRECATED (WS17-B): the manual gap-digest flow is superseded by the "
+        "automated gap_autofill loop (mine -> Harrison 👍 -> known-answers), which "
+        "owns design/known-answers/*.md and gap escalation to domain owners. "
+        "Retire this script + ingest_digest_answers.py + the cowork-cora-digest "
+        "task. See design/knowledge-pipeline.md.\n"
+    )
+
     # Parse --since
     since: datetime | None
     if args.all:

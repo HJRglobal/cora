@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _REPLY_LOG_PATH = _REPO_ROOT / "data" / "cora-reply-log.jsonl"
 _PROPOSED_UPDATES_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.jsonl"
+# Cold storage for rotated resolved/dismissed rows (WS17-B item 8). Keeps the live
+# ledger small (PENDING + recently-resolved) so the per-op read+rewrite stays cheap.
+_ARCHIVE_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.archive.jsonl"
 
 _REPLY_LOCK = Lock()
 _UPDATES_LOCK = Lock()
@@ -47,28 +50,14 @@ _UPDATES_LOCK = Lock()
 # same _UPDATES_LOCK that guards the append.
 _SEEN_IDS_CACHE: set[str] | None = None
 _SEEN_IDS_KEY: tuple[str, float] | None = None  # (ledger path, mtime)
+_ARCHIVE_IDS_CACHE: set[str] | None = None
+_ARCHIVE_IDS_KEY: tuple[str, float] | None = None  # (archive path, mtime)
 
 
-def _existing_update_ids() -> set[str]:
-    """Return the set of update_ids already in the ledger (cache keyed on path+mtime).
-
-    Keyed on BOTH the path and its mtime so the cache invalidates when the ledger
-    is rewritten (a concurrent producer's append) AND when _PROPOSED_UPDATES_PATH
-    is monkeypatched to a different file (tests). Must be called while holding
-    _UPDATES_LOCK (it mutates the module cache)."""
-    global _SEEN_IDS_CACHE, _SEEN_IDS_KEY
-    try:
-        mtime = _PROPOSED_UPDATES_PATH.stat().st_mtime
-    except OSError:
-        _SEEN_IDS_CACHE = set()
-        _SEEN_IDS_KEY = None
-        return _SEEN_IDS_CACHE
-    key = (str(_PROPOSED_UPDATES_PATH), mtime)
-    if _SEEN_IDS_CACHE is not None and _SEEN_IDS_KEY == key:
-        return _SEEN_IDS_CACHE
+def _ids_in_file(path: Path) -> set[str]:
     ids: set[str] = set()
     try:
-        with _PROPOSED_UPDATES_PATH.open(encoding="utf-8") as fh:
+        with path.open(encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -81,10 +70,124 @@ def _existing_update_ids() -> set[str]:
                 if uid:
                     ids.add(uid)
     except OSError:
-        ids = set()
-    _SEEN_IDS_CACHE = ids
-    _SEEN_IDS_KEY = key
+        pass
     return ids
+
+
+def _live_update_ids() -> set[str]:
+    """update_ids in the LIVE ledger (cache keyed on path+mtime). Holds _UPDATES_LOCK."""
+    global _SEEN_IDS_CACHE, _SEEN_IDS_KEY
+    try:
+        mtime = _PROPOSED_UPDATES_PATH.stat().st_mtime
+    except OSError:
+        _SEEN_IDS_CACHE = set()
+        _SEEN_IDS_KEY = None
+        return _SEEN_IDS_CACHE
+    key = (str(_PROPOSED_UPDATES_PATH), mtime)
+    if _SEEN_IDS_CACHE is not None and _SEEN_IDS_KEY == key:
+        return _SEEN_IDS_CACHE
+    _SEEN_IDS_CACHE = _ids_in_file(_PROPOSED_UPDATES_PATH)
+    _SEEN_IDS_KEY = key
+    return _SEEN_IDS_CACHE
+
+
+def _archive_update_ids() -> set[str]:
+    """update_ids in the ARCHIVE (cache keyed on path+mtime). Holds _UPDATES_LOCK."""
+    global _ARCHIVE_IDS_CACHE, _ARCHIVE_IDS_KEY
+    try:
+        mtime = _ARCHIVE_PATH.stat().st_mtime
+    except OSError:
+        _ARCHIVE_IDS_CACHE = set()
+        _ARCHIVE_IDS_KEY = None
+        return _ARCHIVE_IDS_CACHE
+    key = (str(_ARCHIVE_PATH), mtime)
+    if _ARCHIVE_IDS_CACHE is not None and _ARCHIVE_IDS_KEY == key:
+        return _ARCHIVE_IDS_CACHE
+    _ARCHIVE_IDS_CACHE = _ids_in_file(_ARCHIVE_PATH)
+    _ARCHIVE_IDS_KEY = key
+    return _ARCHIVE_IDS_CACHE
+
+
+def _existing_update_ids() -> set[str]:
+    """All known update_ids = LIVE ledger ∪ ARCHIVE. The archive union is what keeps
+    idempotency correct AFTER rotation — a resolved item moved to cold storage must
+    still never be re-proposed (e.g. a re-detected reconciliation gap Harrison already
+    dismissed). Must be called while holding _UPDATES_LOCK."""
+    return _live_update_ids() | _archive_update_ids()
+
+
+def _write_entries_atomic(path: Path, entries: list[dict[str, Any]]) -> None:
+    """Rewrite a JSONL ledger atomically (tmp + replace) — no partial-write window."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def rotate_resolved(max_age_days: int = 3, now: datetime | None = None) -> int:
+    """Move resolved (APPROVED/DISMISSED) rows older than max_age_days to the
+    archive, keeping the live ledger to PENDING + recently-resolved (WS17-B item 8).
+    Returns the number of rows rotated. Crash-safe ORDER: append to the archive
+    FIRST, then rewrite the live file — a crash between leaves rows in BOTH (the
+    id-union dedups; the next rotation re-archives harmlessly) rather than losing
+    them. Never raises into the caller is the caller's job; this raises on I/O."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - max_age_days * 86400
+    with _UPDATES_LOCK:
+        if not _PROPOSED_UPDATES_PATH.exists():
+            return 0
+        keep: list[dict[str, Any]] = []
+        archive: list[dict[str, Any]] = []
+        with _PROPOSED_UPDATES_PATH.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    keep.append({"__malformed__": line})  # never drop unparseable data
+                    continue
+                state = rec.get("state")
+                resolved_at = rec.get("resolved_at")
+                old_enough = False
+                if state in ("APPROVED", "DISMISSED") and resolved_at:
+                    try:
+                        ra = datetime.fromisoformat(str(resolved_at).replace("Z", "+00:00"))
+                        if ra.tzinfo is None:
+                            ra = ra.replace(tzinfo=timezone.utc)
+                        old_enough = ra.timestamp() < cutoff
+                    except Exception:
+                        old_enough = False  # unparseable -> keep (fail-safe)
+                (archive if old_enough else keep).append(rec)
+
+        if not archive:
+            return 0
+        # Append to archive FIRST (crash-safe), then shrink the live file.
+        _ARCHIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _ARCHIVE_PATH.open("a", encoding="utf-8") as fh:
+            for rec in archive:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # Restore any malformed lines verbatim on rewrite.
+        keep_lines = [k for k in keep if "__malformed__" not in k]
+        malformed = [k["__malformed__"] for k in keep if "__malformed__" in k]
+        _PROPOSED_UPDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PROPOSED_UPDATES_PATH.with_suffix(_PROPOSED_UPDATES_PATH.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for line in malformed:
+                fh.write(line + "\n")
+            for rec in keep_lines:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        tmp.replace(_PROPOSED_UPDATES_PATH)
+        # Invalidate caches (both files changed).
+        global _SEEN_IDS_CACHE, _SEEN_IDS_KEY, _ARCHIVE_IDS_CACHE, _ARCHIVE_IDS_KEY
+        _SEEN_IDS_CACHE = None
+        _SEEN_IDS_KEY = None
+        _ARCHIVE_IDS_CACHE = None
+        _ARCHIVE_IDS_KEY = None
+        return len(archive)
 
 # ── Harrison's Slack user ID (from data/maps/slack-to-asana.yaml) ────────────
 # Hardcoded for security — we never want to accidentally DM a non-Harrison user

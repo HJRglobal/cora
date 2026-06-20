@@ -1991,36 +1991,10 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         except Exception as exc:
             log.warning("email_sync reaction handler failed: %s", exc)
 
-    # ── 📚 bookmark: works on ANY message, not just Cora's ───────────────────
-    # When a team member reacts 📚 to any message, capture its text as a
-    # pending KB contribution and route it to the entity's KQ channel for approval.
-    if event_type == "reaction_added" and reaction == "books" and reactor and channel_id:
-        try:
-            hist = client.conversations_history(
-                channel=channel_id, latest=message_ts, limit=1, inclusive=True
-            )
-            msgs = (hist.get("messages") or [])
-            msg_text = msgs[0].get("text", "").strip() if msgs else ""
-            if msg_text:
-                entity = route(channel_name) if channel_name else "FNDR"
-                _handle_note(
-                    client=client,
-                    say=lambda **kw: None,  # no ack — reaction is silent
-                    entity=entity,
-                    channel_id=channel_id,
-                    channel_name=channel_name,
-                    user_id=reactor,
-                    content=msg_text,
-                    original_ts=message_ts,
-                    kind="bookmark",
-                )
-                log.info(
-                    "bookmark reaction cid=queued channel=#%s reactor=%s",
-                    channel_name, reactor,
-                )
-        except Exception as exc:
-            log.warning("bookmark reaction handler failed: %s", exc)
-        # bookmarks are on any message — don't gate the rest on bot_user_id
+    # NOTE (WS17-B item 10): a second 📚-bookmark handler used to live here calling
+    # _handle_note(kind="bookmark"). It was DEAD — the books branch above
+    # (_handle_bookmark_reaction) returns first, so this never ran. Removed to keep
+    # one bookmark path. _handle_bookmark_reaction is the live one.
 
     item_user = event.get("item_user", "")
     bot_user_id = _resolve_bot_user_id(client)

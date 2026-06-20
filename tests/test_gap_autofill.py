@@ -557,3 +557,37 @@ class TestWiring:
             encoding="utf-8")
         assert "fail-closed" in src.lower()
         assert "D-011" in src
+
+
+# == WS17-B item 5: apply_contributed_note (#info-for-cora -> known-answers) ====
+
+class TestApplyContributedNote:
+    def test_writes_to_entity_known_answers(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        ok, summary = ga.apply_contributed_note(
+            {"entity": "F3E", "text": "The Anaheim warehouse is at 123 Main St.",
+             "author_name": "Tommy"})
+        assert ok
+        content = (tmp_path / "f3e.md").read_text(encoding="utf-8")
+        assert "123 Main St." in content
+        assert "Tommy" in content
+        assert "## Known facts" in content
+
+    def test_dedups_identical_text(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        p = {"entity": "FNDR", "text": "A unique contributed fact.", "author_name": "X"}
+        assert ga.apply_contributed_note(p)[0]
+        assert ga.apply_contributed_note(p)[0]
+        content = (tmp_path / "fndr.md").read_text(encoding="utf-8")
+        assert content.count("A unique contributed fact.") == 1
+
+    def test_empty_text_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        ok, _ = ga.apply_contributed_note({"entity": "FNDR", "text": "   "})
+        assert ok is False
+
+    def test_unknown_entity_falls_back_to_fndr(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        ok, _ = ga.apply_contributed_note({"entity": "NOPE", "text": "fact about nothing"})
+        assert ok
+        assert (tmp_path / "fndr.md").exists()

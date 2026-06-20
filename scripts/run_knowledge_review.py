@@ -59,6 +59,13 @@ _LOCK_STALE_SECONDS = 20 * 60
 # batch WEEKLY (a 48h kill would drop an item before its next weekly review).
 _PENDING_EXPIRY_DAYS = 14
 
+# Ledger hygiene (WS17-B item 8): resolved/dismissed rows older than this are
+# rotated out of the live ledger into the archive each run, keeping the hot-path
+# reads (correlate / get_pending / per-op rewrite) on a small file. Kept a few
+# days so a just-dismissed item can still correlate a late reaction / dedup a
+# Slack retry before it moves to cold storage.
+_ARCHIVE_AFTER_DAYS = 3
+
 # Auto-approve: HIGH-confidence NON-canonical GENERIC updates write WITHOUT a
 # Harrison 👍 (the "I told Cora and she forgot" loop, Harrison #9). Scoped to
 # known-answers writes only -- design/known-answers/*.md is operational KB, NOT
@@ -325,6 +332,23 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             log.info("gap-executor: hubspot_note posted to #%s uid=%s", notify_ch, uid_short)
             _post_to_slack(slack_token, notify_ch, msg)
 
+        elif update_type == "generic" and payload.get("source") == "info-for-cora":
+            # WS17-B item 5: an approved #info-for-cora contribution actually
+            # LEARNS now -- it's written to the entity's known-answers file (the
+            # runtime-loaded store), not just posted as a Slack suggestion.
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.gap_autofill import apply_contributed_note
+            ok, summary = apply_contributed_note(payload)
+            snippet = (payload.get("text") or desc)[:300]
+            if ok:
+                msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` learned a "
+                       f"contributed note ({summary}):\n> {snippet}")
+                log.info("gap-executor: info-for-cora note applied uid=%s", uid_short)
+            else:
+                msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"
+                log.warning("gap-executor: info-for-cora note failed uid=%s: %s", uid_short, summary)
+            _post_to_slack(slack_token, notify_ch, msg)
+
         else:
             msg = f":information_source: *Gap executor* `[{uid_short}]` ({update_type}): {desc[:300]}"
             log.info("gap-executor: generic action posted uid=%s", uid_short)
@@ -550,22 +574,37 @@ def main() -> int:
     if not args.dry_run:
         import json as _json
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
+        from cora.knowledge_review import (
+            _PROPOSED_UPDATES_PATH, _UPDATES_LOCK, _write_entries_atomic, rotate_resolved,
+        )
         now = _dt.now(_tz.utc)
         cutoff = now - _td(days=_PENDING_EXPIRY_DAYS)
         auto_dismissed = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
-                raw = _PROPOSED_UPDATES_PATH.read_text(encoding="utf-8")
-                entries = [_json.loads(l) for l in raw.splitlines() if l.strip()]
+                entries = []
+                for _l in _PROPOSED_UPDATES_PATH.read_text(encoding="utf-8").splitlines():
+                    _l = _l.strip()
+                    if not _l:
+                        continue
+                    try:
+                        entries.append(_json.loads(_l))
+                    except _json.JSONDecodeError:
+                        pass  # skip a malformed line rather than crash the run
                 auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now)
-                _PROPOSED_UPDATES_PATH.write_text(
-                    "\n".join(_json.dumps(e) for e in entries) + "\n",
-                    encoding="utf-8",
-                )
+                _write_entries_atomic(_PROPOSED_UPDATES_PATH, entries)  # atomic — no partial-write window
         if auto_dismissed:
             log.info("Auto-dismissed %d stale entries (DM'd >%dd ago, no reaction)",
                      auto_dismissed, _PENDING_EXPIRY_DAYS)
+
+        # Ledger hygiene (item 8): rotate old resolved rows to the archive so the
+        # live file stays small. Fail-soft — a rotation error must not block review.
+        try:
+            n_rot = rotate_resolved(_ARCHIVE_AFTER_DAYS)
+            if n_rot:
+                log.info("Rotated %d resolved row(s) to the archive", n_rot)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ledger rotation failed (non-fatal): %s", exc)
 
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()

@@ -595,20 +595,10 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
 # run_knowledge_review.py after a thumbs-up; D-011 gate already passed)
 # ---------------------------------------------------------------------------
 
-# Mirrors ENTITY_FILES in scripts/ingest_digest_answers.py -- keep in sync.
-_ENTITY_FILES: dict[str, str] = {
-    "F3E": "f3e.md",
-    "LEX": "lex.md",
-    "LEX-LLC": "lex.md",
-    "LEX-LLA": "lex.md",
-    "LEX-LBHS": "lex.md",
-    "LEX-LTS": "lex.md",
-    "OSN": "osn.md",
-    "BDM": "bdm.md",
-    "HJRP": "hjrp.md",
-    "HJRG": "fndr.md",
-    "FNDR": "fndr.md",
-}
+# Canonical entity -> known-answers filename. Shared with context_loader (read
+# side) and scripts/ingest_digest_answers.py (legacy write side) via
+# known_answers_map so the three can never drift (WS17-B item 6/7).
+from .known_answers_map import ENTITY_FILES as _ENTITY_FILES  # noqa: E402
 
 
 def _append_to_section(file_path: Path, section_header: str, entry_lines: list[str]) -> None:
@@ -713,4 +703,47 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
                       f"(entity {entity}); gap marked resolved")
     except Exception as exc:  # noqa: BLE001 -- executor must not crash the run
         log.error("gap_autofill: apply_known_answer failed: %s", exc, exc_info=True)
+        return False, f"apply failed: {exc}"
+
+
+def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
+    """Write a Harrison-approved #info-for-cora contribution to known-answers.
+
+    WS17-B item 5. A #info-for-cora post is a free-form fact (no Q/A, no gap_ts);
+    on Harrison's 👍 it should actually make Cora smarter -- persist it to the
+    entity's known-answers file (the same runtime-loaded store gap fills use)
+    instead of only posting a Slack suggestion. Never raises (executor safety).
+    """
+    try:
+        entity = (payload.get("entity") or "FNDR").strip().upper()
+        text = (payload.get("text") or payload.get("note") or "").strip()
+        if not text:
+            return False, "info-for-cora payload has no text -- skipped"
+        author = (payload.get("author_name") or "").strip()
+
+        target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        attribution = f" (contributed via #info-for-cora by {author})" if author else \
+                      " (contributed via #info-for-cora)"
+        entry_lines = [
+            f"**[{today}] Team note{attribution}**",
+            text,
+            "",
+        ]
+        existing = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
+        # Dedup on the exact fact text on its own line so the same contribution
+        # approved twice isn't written twice.
+        line_re = re.compile(r"^" + re.escape(text) + r"$", re.MULTILINE)
+        if existing and line_re.search(existing):
+            log.info("gap_autofill: contributed note already in %s -- skipping",
+                     target_file.name)
+        else:
+            _append_to_section(target_file, "## Known facts", entry_lines)
+
+        log.info("gap_autofill: applied #info-for-cora note -> %s (entity %s)",
+                 target_file.name, entity)
+        return True, (f"contribution written to design/known-answers/"
+                      f"{target_file.name} (entity {entity})")
+    except Exception as exc:  # noqa: BLE001 -- executor must not crash the run
+        log.error("gap_autofill: apply_contributed_note failed: %s", exc, exc_info=True)
         return False, f"apply failed: {exc}"
