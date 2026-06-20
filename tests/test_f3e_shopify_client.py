@@ -518,8 +518,7 @@ def test_format_inventory_empty():
 def test_format_inventory_all_stocked_low_stock_only():
     variants = [_make_variant_obj(low=False), _make_variant_obj(low=False)]
     text = format_inventory_for_llm(variants, low_stock_only=True)
-    assert "All" in text
-    assert "stocked" in text
+    assert "adequately stocked" in text   # WS11: now "<summary> -- all adequately stocked."
 
 
 def test_format_inventory_shows_low_stock_items():
