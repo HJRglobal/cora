@@ -179,7 +179,9 @@ class CashflowSummary:
             None,
         )
         if idx is None:
-            idx = 0
+            # Target week not in the series -> no outlook (fail-CLOSED; never anchor
+            # on the oldest week, which would present a stale runway as current).
+            return []
         return self.ending_cash_series[idx: idx + 1 + max(0, weeks)]
 
     def osn_entities(self) -> list[EntityRow]:

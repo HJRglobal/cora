@@ -58,15 +58,24 @@ def _default_out_path() -> Path:
 def build_snapshot(summary: gf.CashflowSummary, generated_at_iso: str, weeks: int = 4) -> dict:
     """Serialize a CashflowSummary into the labeled snapshot dict (pure)."""
     lts = summary.entity_by_code("LEX-LTS")
+    outlook = summary.ending_cash_outlook(weeks=weeks)
+    age = summary.data_age_days()
     return {
         "generated_at_utc": generated_at_iso,
         "week_label": summary.week_label,
         "as_of_date": summary.as_of_date,
-        "is_stale": summary.is_stale(),
-        "data_age_days": summary.data_age_days(),
-        # Real ending-cash BALANCES (portfolio Ending-Cash row).
-        "portfolio_ending_cash": summary.closing_balance,
-        "ending_cash_outlook": summary.ending_cash_outlook(weeks=weeks),
+        # Fail-CLOSED freshness (D-051): an unparseable week label -> data_age_days is
+        # None -> treat as STALE so the consumer shows "unavailable" rather than
+        # presenting unknown-age cash as current.
+        "is_stale": summary.is_stale() or age is None,
+        "data_age_days": age,
+        # Headline ending cash MIRRORS the outlook anchor (same actual-first
+        # precedence) so the brief never shows two different "this week ending cash"
+        # figures (D-051: closing_balance is forecast-first, the outlook is
+        # actual-first; they disagreed mid-week). Falls back to closing_balance only
+        # when the outlook is empty (target week not in the series).
+        "portfolio_ending_cash": (outlook[0]["ending_cash"] if outlook else summary.closing_balance),
+        "ending_cash_outlook": outlook,
         # Per-entity WEEKLY CASH-FLOW rows (forecast/actual), not ending balances.
         "entities": [
             {
@@ -129,10 +138,16 @@ def main(argv: list[str] | None = None) -> int:
                  len(snapshot["entities"]), len(snapshot["ending_cash_outlook"]), out_path)
         return 0
 
-    _atomic_write_json(out_path, snapshot)
+    try:
+        _atomic_write_json(out_path, snapshot)
+    except OSError as exc:
+        # Fail-soft: e.g. the Drive mount (G:) isn't present when the task fires.
+        # Leave the previous snapshot in place; surface the failure via exit code.
+        log.error("Cash snapshot write failed (%s) — previous snapshot left untouched", exc)
+        return 1
     log.info(
         "Wrote cash snapshot: %s (week=%s, as_of=%s, stale=%s, %d entities)",
-        out_path, summary.week_label, summary.as_of_date, summary.is_stale(),
+        out_path, summary.week_label, summary.as_of_date, snapshot["is_stale"],
         len(snapshot["entities"]),
     )
     return 0

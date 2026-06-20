@@ -587,11 +587,14 @@ def safe_drive_create(service, *, body: dict, media_body=None, fields: str | Non
     error handling (so "folder creation failed for X" messages survive unchanged).
     """
     parents = body.get("parents") if isinstance(body, dict) else None
-    if not parents:
+    # Require parents AND that every entry is a non-empty string folder id — a
+    # parents=[''] (e.g. an ensure_folder_path that returned '') would otherwise
+    # slip past a bare truthiness check and resolve toward root (D-051).
+    if not parents or not all(isinstance(p, str) and p.strip() for p in parents):
         raise DriveConnectorError(
-            "Drive create blocked: 'parents' is required and must be non-empty "
-            "(automation never writes to My Drive root). Resolve a folder id via "
-            "ensure_folder_path() first."
+            "Drive create blocked: 'parents' is required and every entry must be a "
+            "non-empty folder id (automation never writes to My Drive root). Resolve "
+            "a folder id via ensure_folder_path() first."
         )
     if "permissions" in body:
         raise DriveConnectorError(

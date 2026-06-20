@@ -100,8 +100,12 @@ def get_user_tasks(
     from ..asana_filters import is_system_noise_task  # noqa: PLC0415
 
     fields = opt_fields if opt_fields is not None else _DEFAULT_TASK_OPT_FIELDS
+    # Always request 'name' so the source-level system-noise filter can't fail OPEN
+    # on a narrow opt_fields that omits it (WS12 / D-051).
+    if "name" not in fields:
+        fields = ["name", *fields]
     headers = {"Authorization": f"Bearer {_pat()}"}
-    tasks: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []  # REAL (non-system-reminder) tasks only
     offset: str | None = None
 
     while len(tasks) < max_tasks:
@@ -131,14 +135,16 @@ def get_user_tasks(
             raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
 
         body = r.json()
-        tasks.extend(body.get("data", []) or [])
+        # Drop Asana system-reminder tasks PER PAGE (WS12), so noise never consumes
+        # the max_tasks budget and under-reports real tasks for a noise-heavy user.
+        for t in (body.get("data", []) or []):
+            if not is_system_noise_task(t.get("name", "")):
+                tasks.append(t)
         offset = (body.get("next_page") or {}).get("offset")
         if not offset:
             break
 
-    # Drop Asana system-reminder tasks at the source (WS12) before truncating.
-    real = [t for t in tasks if not is_system_noise_task(t.get("name", ""))]
-    return real[:max_tasks]
+    return tasks[:max_tasks]
 
 
 def get_project_tasks(project_gid: str, max_tasks: int = _API_MAX_LIMIT) -> list[dict[str, Any]]:

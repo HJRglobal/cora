@@ -64,14 +64,18 @@ OVERDUE_THRESHOLD   = 14     # days past due_on to qualify
 MAX_PER_USER        = 5      # Tier-1 nudges per user per run
 MAX_TOTAL           = 25     # Tier-1 nudges total per run
 MAX_TIER0           = 15     # Tier-0 (critical) nudges per run — bypass the Tier-1 caps
+MAX_TIER0_PER_USER  = 5      # Tier-0 nudges per user per run (so one user can't take the whole Tier-0 budget)
 KB_LOOKBACK_DAYS    = 30     # days to look back in KB for signal
 
-# Tier-0 = compliance / financial-deadline / LEX-revalidation / P0 / urgent. These
-# nudges bypass the volume caps (bounded by MAX_TIER0) so a critical overdue task is
-# never starved on a high-volume day (WS10). Tight word-boundary patterns avoid
-# Tier-0 inflation (a random "audit trail" mention won't escalate a routine task).
+# Tier-0 = compliance / LEX-revalidation / P0 / urgent. These nudges bypass the
+# Tier-1 volume caps (bounded by MAX_TIER0 + MAX_TIER0_PER_USER) so a critical
+# overdue task is never starved on a high-volume day (WS10). Patterns are
+# HIGH-SIGNAL only — bare "audit"/"deadline" were DROPPED (D-051 review: they
+# escalated routine HJR task titles like "Drive cleanup audit" / "BCB ingredient
+# deadline", letting one user bypass MAX_PER_USER). A compliance audit still
+# matches via "compliance"; a real revalidation via "revalidat".
 _TIER0_RE = re.compile(
-    r"🚨|\bp0\b|\burgent\b|\bcompliance\b|revalidat|\baudit\b|\bdeadline\b|lex[- ]reval",
+    r"🚨|\bp0\b|\burgent\b|\bcompliance\b|revalidat|lex[- ]reval",
     re.IGNORECASE,
 )
 
@@ -240,6 +244,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
         tasks = sorted(tasks, key=lambda t: _importance_tier(t.get("name", "")))
 
         user_nudges = 0
+        user_tier0_nudges = 0
         for task in tasks:
             task_gid = task.get("gid", "")
             task_name = task.get("name", "")
@@ -280,6 +285,28 @@ def run(dry_run: bool = False) -> dict[str, int]:
                 skipped_throttle += 1
                 continue
 
+            # Importance-aware volume budget (WS10). Decide BEFORE the expensive
+            # KB-signal query + the LIVE-Asana closed_task_guard call, so a
+            # cap-deferred task does not trigger an API/DB hit (D-051 review: the
+            # old post-guard placement issued unbounded live Asana reads on a
+            # backlog day). Tier-0 (critical) bypasses the Tier-1 caps, bounded by
+            # MAX_TIER0 + MAX_TIER0_PER_USER; Tier-1 respects MAX_TOTAL +
+            # MAX_PER_USER. Cap-cut tasks are logged to hygiene-deferred.jsonl
+            # (informational; recovery is automatic — next run re-sorts Tier-0 first).
+            tier = _importance_tier(task_name)
+            if tier == 0:
+                if tier0_nudges >= MAX_TIER0 or user_tier0_nudges >= MAX_TIER0_PER_USER:
+                    if not dry_run:
+                        _record_deferred(task_gid, task_name, display_name, tier, "tier0_cap", run_id)
+                    deferred += 1
+                    continue
+            else:
+                if total_nudges >= MAX_TOTAL or user_nudges >= MAX_PER_USER:
+                    if not dry_run:
+                        _record_deferred(task_gid, task_name, display_name, tier, "volume_cap", run_id)
+                    deferred += 1
+                    continue
+
             # KB signal check
             if _has_kb_signal(task_name):
                 log.debug("Skipping task with recent KB signal: %s", task_name)
@@ -297,24 +324,6 @@ def run(dry_run: bool = False) -> dict[str, int]:
             ):
                 skipped_closed += 1
                 continue
-
-            # Importance-aware volume budget (WS10). The task is now genuinely
-            # nudge-eligible. Tier-0 bypasses the Tier-1 caps (bounded by
-            # MAX_TIER0); Tier-1 respects MAX_TOTAL + MAX_PER_USER. Anything cut is
-            # recorded to hygiene-deferred.jsonl (recovery is automatic next run).
-            tier = _importance_tier(task_name)
-            if tier == 0:
-                if tier0_nudges >= MAX_TIER0:
-                    if not dry_run:
-                        _record_deferred(task_gid, task_name, display_name, tier, "tier0_cap", run_id)
-                    deferred += 1
-                    continue
-            else:
-                if total_nudges >= MAX_TOTAL or user_nudges >= MAX_PER_USER:
-                    if not dry_run:
-                        _record_deferred(task_gid, task_name, display_name, tier, "volume_cap", run_id)
-                    deferred += 1
-                    continue
 
             comment = _build_comment(first_name, overdue_days, task_gid)
 
@@ -349,6 +358,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
             nudges_sent += 1
             if tier == 0:
                 tier0_nudges += 1
+                user_tier0_nudges += 1
             else:
                 user_nudges += 1
                 total_nudges += 1

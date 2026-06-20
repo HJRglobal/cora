@@ -77,7 +77,10 @@ def test_outlook_empty_when_no_ending_cash_row():
     assert cs.ending_cash_series == []
 
 
-def test_outlook_falls_back_to_start_when_target_not_in_series():
+def test_outlook_empty_when_target_not_in_series():
+    # D-051: fail CLOSED — when the anchor week isn't in the series, return [] (no
+    # outlook) rather than anchoring on the oldest week (which would present a
+    # stale runway as the current outlook).
     cs = CashflowSummary(
         week_label="Week of 12/31/2099",  # not in the series
         as_of_date="2026-06-16",
@@ -86,5 +89,4 @@ def test_outlook_falls_back_to_start_when_target_not_in_series():
             {"week": "6/16/2026", "ending_cash": 2.0, "is_actual": False},
         ],
     )
-    out = cs.ending_cash_outlook(weeks=1)
-    assert [e["week"] for e in out] == ["6/09/2026", "6/16/2026"]
+    assert cs.ending_cash_outlook(weeks=1) == []

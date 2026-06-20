@@ -508,9 +508,15 @@ class TestImportanceTier:
     def test_revalidation_is_tier0(self):
         assert nudges._importance_tier("AZ DDD Therapy Revalidation") == 0
 
-    def test_compliance_and_audit_tier0(self):
+    def test_compliance_is_tier0(self):
         assert nudges._importance_tier("Compliance review") == 0
-        assert nudges._importance_tier("Respond to the HCBS audit") == 0
+        assert nudges._importance_tier("Compliance audit response") == 0  # via "compliance"
+
+    def test_bare_audit_and_deadline_are_tier1(self):
+        # D-051: bare "audit"/"deadline" were DROPPED (they over-escalated routine
+        # HJR task titles). A compliance audit still escalates via "compliance".
+        assert nudges._importance_tier("Q3 Drive cleanup audit") == 1
+        assert nudges._importance_tier("BCB ingredient deadline") == 1
 
     def test_routine_is_tier1(self):
         assert nudges._importance_tier("Follow up with Larry on the deck") == 1
@@ -542,6 +548,47 @@ def test_run_tier0_bypasses_volume_caps(tmp_path, monkeypatch):
     assert result["deferred"] >= 1
     assert mock_comment.call_count == 1
     assert mock_comment.call_args.args[0] == "crit"  # the Tier-0 task, not the Tier-1
+
+
+def test_run_tier0_per_user_cap(tmp_path, monkeypatch):
+    """One user with many genuine Tier-0 tasks is capped at MAX_TIER0_PER_USER
+    (D-051: a single user must not consume the whole Tier-0 budget / get spammed)."""
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "DEFERRED_FILE", tmp_path / "deferred.jsonl")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    monkeypatch.setattr(nudges, "MAX_TIER0_PER_USER", 3)
+    tasks = [_make_task(f"c{i}", f"Compliance review {i}", _overdue_date(20)) for i in range(8)]
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=tasks), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    assert result["tier0_nudges"] == 3       # capped per-user
+    assert mock_comment.call_count == 3
+    assert result["deferred"] >= 5
+
+
+def test_run_cap_deferral_skips_guard_api_call(tmp_path, monkeypatch):
+    """D-051 regression: a cap-deferred Tier-1 task must NOT trigger the live-Asana
+    closed_task_guard (the cap decision runs BEFORE the guard)."""
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "DEFERRED_FILE", tmp_path / "deferred.jsonl")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    monkeypatch.setattr(nudges, "MAX_TOTAL", 0)
+    monkeypatch.setattr(nudges, "MAX_PER_USER", 0)
+    tasks = [_make_task(f"t{i}", f"Routine task {i}", _overdue_date(20)) for i in range(4)]
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=tasks), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False) as mock_guard, \
+         patch("run_asana_hygiene_nudges.create_task_comment"):
+        result = nudges.run(dry_run=False)
+
+    assert result["nudges_sent"] == 0
+    assert result["deferred"] == 4
+    mock_guard.assert_not_called()  # cap-deferred tasks never reach the live guard
 
 
 def test_run_tier0_respects_max_tier0(tmp_path, monkeypatch):

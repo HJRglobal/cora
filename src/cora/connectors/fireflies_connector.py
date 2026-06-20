@@ -537,6 +537,11 @@ def _parse_date(date_field) -> int | None:
 # duplicate (idempotent).
 
 _DEDUP_TOLERANCE_SEC = 300  # +/- 5 min: notetaker copies of one meeting cluster here
+# Tighter window for merging two transcripts that share a title+participants key but
+# carry DIFFERENT links (the multi-organizer case). True copies of one meeting start
+# at the same instant; this window keeps them while refusing to collapse two
+# different same-titled/same-attendee meetings that merely fall inside +/-5 min (WS13).
+_TITLE_MERGE_TOLERANCE_SEC = 180  # +/- 3 min
 _DEDUP_LEDGER_PATH = Path(__file__).resolve().parents[3] / "data" / "state" / "fireflies-dedup-ledger.json"
 _DEDUP_LEDGER_MAX = 5000  # cap entries (only duplicated meetings get one)
 
@@ -677,11 +682,22 @@ def _dedup_transcripts(transcripts: list[dict], ledger: dict) -> tuple[list[dict
         ts = _ts(t)
         placed = False
         for c in clusters:
-            # Same meeting if ANY key matches (link OR title+participants) within
-            # the window — closes the multi-organizer / different-link gap (WS13).
-            if (keys & c["keys"]) and abs(ts - c["anchor"]) <= _DEDUP_TOLERANCE_SEC:
+            dt = abs(ts - c["anchor"])
+            if dt > _DEDUP_TOLERANCE_SEC:
+                continue
+            overlap = keys & c["keys"]
+            if not overlap:
+                continue
+            # A shared LINK = the same meeting instance within the window. A shared
+            # TITLE+participants key WITHOUT a shared link is the multi-organizer
+            # (different-link) case (WS13) — merge it only under a TIGHT window, so
+            # two genuinely-DIFFERENT meetings that happen to share a generic title +
+            # the same attendee set can't be collapsed (which would silently DROP one
+            # from the KB). Cluster keys are the ANCHOR's only (no accumulation), so a
+            # later copy can never transitively bridge via a borrowed link key.
+            link_overlap = any(k[0] == "link" for k in overlap)
+            if link_overlap or dt <= _TITLE_MERGE_TOLERANCE_SEC:
                 c["members"].append(t)
-                c["keys"] |= keys  # a link-matched copy still lends its title key
                 placed = True
                 break
         if not placed:

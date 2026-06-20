@@ -119,6 +119,27 @@ class TestSystemNoiseFilteredAtSource:
             tasks = asana_client.get_user_tasks("u1", max_tasks=50)
         assert len(tasks) == 2
 
+    def test_noise_does_not_consume_budget(self):
+        # D-051: filtering happens PER PAGE, so a noise-heavy page doesn't undercount
+        # real tasks — the loop keeps paginating until max_tasks REAL tasks.
+        page1 = [{"gid": "n", "name": "It's time to update your goal"},
+                 {"gid": "1", "name": "Real A"}]
+        page2 = [{"gid": "2", "name": "Real B"}]
+        client, factory = _client_returning([_resp(page1, next_offset="tok"), _resp(page2)])
+        with patch.object(asana_client.httpx, "Client", factory):
+            tasks = asana_client.get_user_tasks("u1", max_tasks=2)
+        assert [t["gid"] for t in tasks] == ["1", "2"]  # noise dropped, 2 REAL returned
+
+    def test_name_force_included_when_caller_omits_it(self):
+        # D-051: a narrow opt_fields without 'name' must NOT disable the filter.
+        page = [{"gid": "n", "name": "It's time to update your goal"}, {"gid": "1", "name": "Real"}]
+        client, factory = _client_returning([_resp(page)])
+        with patch.object(asana_client.httpx, "Client", factory):
+            tasks = asana_client.get_user_tasks("u1", max_tasks=50, opt_fields=["due_on"])
+        sent = client.get.call_args.kwargs["params"]["opt_fields"]
+        assert "name" in sent  # forced in
+        assert [t["gid"] for t in tasks] == ["1"]  # noise still filtered
+
 
 class TestOptFieldsThreading:
     """WS12: opt_fields param defaults to the rich set; a narrow list is honored."""

@@ -72,6 +72,40 @@ def test_build_snapshot_is_source_opaque():
         assert forbidden not in blob
 
 
+def test_portfolio_ending_cash_mirrors_outlook_anchor():
+    # D-051: headline must equal the outlook anchor (same actual-first precedence),
+    # not the legacy forecast-first closing_balance, or the brief shows two numbers.
+    s = CashflowSummary(
+        week_label="Week of 6/09/2026",
+        as_of_date="2026-06-16",
+        closing_balance=999.0,  # legacy forecast-first value (intentionally different)
+        ending_cash_series=[
+            {"week": "6/09/2026", "ending_cash": 110000.0, "is_actual": True},
+            {"week": "6/16/2026", "ending_cash": 90000.0, "is_actual": False},
+        ],
+    )
+    snap = wcs.build_snapshot(s, "2026-06-19T21:00:00+00:00", weeks=1)
+    assert snap["portfolio_ending_cash"] == 110000.0
+    assert snap["ending_cash_outlook"][0]["ending_cash"] == 110000.0
+
+
+def test_portfolio_ending_cash_falls_back_to_closing_when_no_outlook():
+    s = CashflowSummary(week_label="Week of 6/09/2026", as_of_date="2026-06-16",
+                        closing_balance=500.0)  # empty series -> no outlook
+    snap = wcs.build_snapshot(s, "2026-06-19T21:00:00+00:00")
+    assert snap["ending_cash_outlook"] == []
+    assert snap["portfolio_ending_cash"] == 500.0
+
+
+def test_is_stale_failclosed_on_unparseable_week():
+    # D-051: an unparseable week label -> data_age_days None -> is_stale must be True
+    s = CashflowSummary(week_label="Week of (no date)", as_of_date="2026-06-16",
+                        closing_balance=100.0)
+    snap = wcs.build_snapshot(s, "2026-06-19T21:00:00+00:00")
+    assert snap["data_age_days"] is None
+    assert snap["is_stale"] is True
+
+
 # ── main(): write + fail-soft ─────────────────────────────────────────────────
 
 def test_main_writes_snapshot(tmp_path, monkeypatch):
@@ -105,3 +139,16 @@ def test_main_failsoft_leaves_previous_snapshot(tmp_path, monkeypatch):
     assert rc == 1
     # Previous snapshot untouched (no stale overwrite, no deletion).
     assert json.loads(out.read_text(encoding="utf-8")) == {"previous": True}
+
+
+def test_main_failsoft_on_write_error(tmp_path, monkeypatch):
+    # D-051: a WRITE error (e.g. Drive mount G: not present) must fail-soft
+    # (return 1), not crash with an unhandled traceback.
+    monkeypatch.setattr(wcs.gf, "get_cashflow", lambda tab_name=None: _summary())
+
+    def _raise(path, payload):
+        raise OSError("G: not mounted")
+
+    monkeypatch.setattr(wcs, "_atomic_write_json", _raise)
+    rc = wcs.main(["--out", str(tmp_path / "x.json")])
+    assert rc == 1

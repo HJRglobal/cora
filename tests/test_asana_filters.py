@@ -12,6 +12,13 @@ def test_goal_reminder_plural_matches():
     assert is_system_noise_task("It's time to update your goals for Q3") is True
 
 
+def test_curly_apostrophe_still_matches():
+    # D-051: Asana often renders the typographic apostrophe (U+2019); it must
+    # normalize to ASCII or the filter fails open.
+    assert is_system_noise_task("It’s time to update your goals") is True
+    assert is_system_noise_task("It’s time to update your goal") is True
+
+
 def test_case_insensitive():
     assert is_system_noise_task("IT'S TIME TO UPDATE YOUR GOAL") is True
 

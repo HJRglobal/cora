@@ -318,6 +318,21 @@ class TestSafeDriveCreate:
             safe_drive_create(service, body={"name": "f.txt", "parents": None})
         service.files.return_value.create.assert_not_called()
 
+    def test_rejects_empty_string_parent_element(self):
+        # D-051: parents=[''] must not slip past the guard toward root.
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt", "parents": [""]})
+        service.files.return_value.create.assert_not_called()
+
+    def test_rejects_whitespace_and_nonstring_parent_element(self):
+        service = self._service_returning({"id": "x"})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt", "parents": ["  "]})
+        with pytest.raises(DriveConnectorError, match="parents"):
+            safe_drive_create(service, body={"name": "f.txt", "parents": [None]})
+        service.files.return_value.create.assert_not_called()
+
     def test_rejects_permissions_in_body(self):
         service = self._service_returning({"id": "x"})
         with pytest.raises(DriveConnectorError, match="permissions"):

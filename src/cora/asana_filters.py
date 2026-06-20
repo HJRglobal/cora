@@ -15,7 +15,8 @@ from __future__ import annotations
 
 # Case-insensitive substring terms identifying Asana-generated system tasks.
 # "it's time to update your goal" substring-matches the singular AND plural
-# ("...your goals") reminder titles Asana emits.
+# ("...your goals") reminder titles Asana emits. Apostrophes are normalized (see
+# below), so this stores the ASCII form only.
 SYSTEM_NOISE_SKIP_TERMS: frozenset[str] = frozenset({
     "it's time to update your goal",
 })
@@ -25,5 +26,8 @@ def is_system_noise_task(task_name: str | None) -> bool:
     """True if a task name matches an Asana system-reminder pattern (not real work)."""
     if not task_name:
         return False
-    lower = task_name.lower()
+    # Normalize the curly/right-single-quote (U+2019) to ASCII — Asana renders many
+    # auto-generated titles with the typographic apostrophe ("It's time..."), which
+    # would otherwise slip past the ASCII-apostrophe term and fail OPEN (D-051).
+    lower = task_name.lower().replace("’", "'")
     return any(term in lower for term in SYSTEM_NOISE_SKIP_TERMS)

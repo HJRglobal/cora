@@ -182,6 +182,34 @@ class TestMultiOrganizerDedup:
         assert collapsed == 0   # degenerate ("solo", id) keys never cross-match
         assert sorted(w["id"] for w in winners) == ["a", "b"]
 
+    def test_different_links_same_title_outside_tight_window_not_merged(self):
+        """Two DIFFERENT meetings, same generic title + same attendees, different
+        links, 4 min apart (inside +/-5min but OUTSIDE the +/-3min title-merge
+        window) -> must NOT collapse (a title-only cross-link match needs tight
+        time coincidence; else one meeting's transcript would be silently dropped)."""
+        a = _t("a", title="Weekly Sync", date_ts=BASE, link="https://zoom/A",
+               attendees=[{"email": "x@hjr.com"}, {"email": "y@hjr.com"}])
+        b = _t("b", title="Weekly Sync", date_ts=BASE + 240, link="https://meet/B",
+               attendees=[{"email": "x@hjr.com"}, {"email": "y@hjr.com"}])
+        winners, _, collapsed = ffc._dedup_transcripts([a, b], {})
+        assert collapsed == 0
+        assert sorted(w["id"] for w in winners) == ["a", "b"]
+
+    def test_no_transitive_bridge_via_borrowed_link(self):
+        """A(L1,Weekly) and B(L2,Weekly) collapse via the title key (tight window);
+        a third transcript C(L2, a DIFFERENT title) must NOT be pulled in via a
+        'borrowed' L2 key — cluster keys are the anchor's only (no accumulation)."""
+        a = _t("a", title="Weekly Sync", date_ts=BASE, link="https://zoom/L1", n_sentences=3,
+               attendees=[{"email": "x@hjr.com"}])
+        b = _t("b", title="Weekly Sync", date_ts=BASE + 60, link="https://zoom/L2", n_sentences=99,
+               attendees=[{"email": "x@hjr.com"}])
+        c = _t("c", title="OSN Recon", date_ts=BASE + 120, link="https://zoom/L2",
+               attendees=[{"email": "z@hjr.com"}])
+        winners, _, collapsed = ffc._dedup_transcripts([a, b, c], {})
+        assert collapsed == 1                     # only B collapses into A
+        assert "c" in [w["id"] for w in winners]  # C never bridged in
+        assert sorted(w["id"] for w in winners) == ["b", "c"]  # B is most complete
+
 
 # ---------------------------------------------------------------------------
 # Ledger persistence
