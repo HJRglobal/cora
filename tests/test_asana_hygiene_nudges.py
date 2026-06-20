@@ -492,3 +492,101 @@ def test_run_permanent_exclusion_skips_without_api_call(tmp_path, monkeypatch):
 
     mock_comment.assert_not_called()
     assert result["skipped_closed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# WS10: importance tiering — Tier-0 (critical) never starved by the volume cap
+# ---------------------------------------------------------------------------
+
+class TestImportanceTier:
+    def test_p0_is_tier0(self):
+        assert nudges._importance_tier("P0 ship the thing") == 0
+
+    def test_emoji_is_tier0(self):
+        assert nudges._importance_tier("🚨 AHCCCS deadline") == 0
+
+    def test_revalidation_is_tier0(self):
+        assert nudges._importance_tier("AZ DDD Therapy Revalidation") == 0
+
+    def test_compliance_and_audit_tier0(self):
+        assert nudges._importance_tier("Compliance review") == 0
+        assert nudges._importance_tier("Respond to the HCBS audit") == 0
+
+    def test_routine_is_tier1(self):
+        assert nudges._importance_tier("Follow up with Larry on the deck") == 1
+        assert nudges._importance_tier("") == 1
+
+    def test_no_substring_false_positive(self):
+        # word-boundary "p0" must not match inside another token
+        assert nudges._importance_tier("Review ip0 sensor logs") == 1
+
+
+def test_run_tier0_bypasses_volume_caps(tmp_path, monkeypatch):
+    """With both Tier-1 caps at 0, a Tier-0 task still fires; Tier-1 is deferred."""
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "DEFERRED_FILE", tmp_path / "deferred.jsonl")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    monkeypatch.setattr(nudges, "MAX_TOTAL", 0)
+    monkeypatch.setattr(nudges, "MAX_PER_USER", 0)
+    t1 = _make_task("t1", "Routine task A", _overdue_date(20))
+    t0 = _make_task("crit", "🚨 P0 compliance revalidation deadline", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[t1, t0]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    assert result["tier0_nudges"] == 1
+    assert result["nudges_sent"] == 1
+    assert result["deferred"] >= 1
+    assert mock_comment.call_count == 1
+    assert mock_comment.call_args.args[0] == "crit"  # the Tier-0 task, not the Tier-1
+
+
+def test_run_tier0_respects_max_tier0(tmp_path, monkeypatch):
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "DEFERRED_FILE", tmp_path / "deferred.jsonl")
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    monkeypatch.setattr(nudges, "MAX_TIER0", 1)
+    crit1 = _make_task("c1", "🚨 Compliance deadline one", _overdue_date(20))
+    crit2 = _make_task("c2", "🚨 Compliance deadline two", _overdue_date(20))
+
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[crit1, crit2]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
+         patch("run_asana_hygiene_nudges.create_task_comment") as mock_comment:
+        result = nudges.run(dry_run=False)
+
+    assert result["tier0_nudges"] == 1
+    assert result["deferred"] >= 1
+    assert mock_comment.call_count == 1
+
+
+def test_run_deferred_ledger_written_live_not_dry(tmp_path, monkeypatch):
+    deferred_file = tmp_path / "deferred.jsonl"
+    monkeypatch.setattr(nudges, "THROTTLE_FILE", tmp_path / "throttle.json")
+    monkeypatch.setattr(nudges, "DEFERRED_FILE", deferred_file)
+    monkeypatch.setattr(nudges, "KB_DB_FILE", tmp_path / "cora_kb.db")
+    monkeypatch.setattr(nudges, "MAX_TOTAL", 0)
+    monkeypatch.setattr(nudges, "MAX_PER_USER", 0)
+    task = _make_task("def1", "Routine deferred task", _overdue_date(20))
+
+    # dry-run: counted but NOTHING written
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.create_task_comment"):
+        dry = nudges.run(dry_run=True)
+    assert dry["deferred"] >= 1
+    assert not deferred_file.exists()
+
+    # live: the deferred row is recorded
+    with patch.object(nudges, "_load_users", return_value=[_make_users()[0]]), \
+         patch("run_asana_hygiene_nudges.get_user_tasks", return_value=[task]), \
+         patch("run_asana_hygiene_nudges.closed_task_guard", return_value=False), \
+         patch("run_asana_hygiene_nudges.create_task_comment"):
+        live = nudges.run(dry_run=False)
+    assert live["deferred"] >= 1
+    assert deferred_file.exists()
+    rows = [json.loads(l) for l in deferred_file.read_text().splitlines() if l.strip()]
+    assert any(r.get("task_gid") == "def1" for r in rows)

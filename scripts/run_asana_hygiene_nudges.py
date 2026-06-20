@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -53,15 +54,26 @@ log = logging.getLogger("asana_hygiene_nudges")
 # ---------------------------------------------------------------------------
 
 THROTTLE_FILE = _REPO_ROOT / "data" / "state" / "hygiene_nudge_throttle.json"
+DEFERRED_FILE = _REPO_ROOT / "data" / "state" / "hygiene-deferred.jsonl"
 USER_MAP_FILE = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 KB_DB_FILE    = _REPO_ROOT / "data" / "cora_kb.db"
 
 THROTTLE_DAYS       = 7      # days between nudges on the same task (this system)
 CROSS_SYSTEM_DAYS   = 14     # skip if EITHER nudge system touched the task within this window
 OVERDUE_THRESHOLD   = 14     # days past due_on to qualify
-MAX_PER_USER        = 5      # nudges per user per run
-MAX_TOTAL           = 25     # nudges total per run
+MAX_PER_USER        = 5      # Tier-1 nudges per user per run
+MAX_TOTAL           = 25     # Tier-1 nudges total per run
+MAX_TIER0           = 15     # Tier-0 (critical) nudges per run — bypass the Tier-1 caps
 KB_LOOKBACK_DAYS    = 30     # days to look back in KB for signal
+
+# Tier-0 = compliance / financial-deadline / LEX-revalidation / P0 / urgent. These
+# nudges bypass the volume caps (bounded by MAX_TIER0) so a critical overdue task is
+# never starved on a high-volume day (WS10). Tight word-boundary patterns avoid
+# Tier-0 inflation (a random "audit trail" mention won't escalate a routine task).
+_TIER0_RE = re.compile(
+    r"🚨|\bp0\b|\burgent\b|\bcompliance\b|revalidat|\baudit\b|\bdeadline\b|lex[- ]reval",
+    re.IGNORECASE,
+)
 
 # Strings that indicate Visibility CPA tasks -- skip these
 _VISIBILITY_SKIP_TERMS = frozenset([
@@ -103,6 +115,36 @@ def _load_users() -> list[dict[str, Any]]:
 def _is_visibility_task(task_name: str) -> bool:
     lower = task_name.lower()
     return any(term in lower for term in _VISIBILITY_SKIP_TERMS)
+
+
+def _importance_tier(task_name: str) -> int:
+    """0 = Tier-0 critical (bypasses the volume caps); 1 = normal."""
+    return 0 if _TIER0_RE.search(task_name or "") else 1
+
+
+def _record_deferred(task_gid: str, task_name: str, assignee: str,
+                     tier: int, reason: str, run_id: str) -> None:
+    """Append a cap-deferred nudge to hygiene-deferred.jsonl (informational).
+
+    Recovery is automatic: the next run re-sorts Tier-0 first and re-evaluates,
+    so a deferred task resurfaces — this ledger is for visibility into whether the
+    volume cap is ever a real problem, not a recovery queue.
+    """
+    try:
+        DEFERRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": run_id,
+            "task_gid": task_gid,
+            "task_name": task_name[:120],
+            "assignee": assignee,
+            "tier": tier,
+            "reason": reason,
+        }
+        with DEFERRED_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception as exc:  # never let logging block a run
+        log.warning("Could not record deferred nudge for %s: %s", task_gid, exc)
 
 
 def _is_lex_task(task: dict[str, Any]) -> bool:
@@ -174,7 +216,9 @@ def run(dry_run: bool = False) -> dict[str, int]:
     skipped_throttle = 0
     skipped_signal = 0
     skipped_closed = 0
-    total_nudges = 0
+    total_nudges = 0    # Tier-1 nudges this run
+    tier0_nudges = 0    # Tier-0 (critical) nudges this run
+    deferred = 0        # nudge-eligible tasks cut by a volume cap
 
     for user in users:
         asana_gid = user.get("asana_user_gid")
@@ -190,13 +234,13 @@ def run(dry_run: bool = False) -> dict[str, int]:
             log.warning("Failed to get tasks for %s: %s", display_name, exc)
             continue
 
+        # Tier-0 (compliance / LEX-revalidation / P0 / urgent) FIRST so a count-cap
+        # day never starves a critical nudge (WS10). Stable sort keeps Asana order
+        # within a tier.
+        tasks = sorted(tasks, key=lambda t: _importance_tier(t.get("name", "")))
+
         user_nudges = 0
         for task in tasks:
-            if total_nudges >= MAX_TOTAL:
-                break
-            if user_nudges >= MAX_PER_USER:
-                break
-
             task_gid = task.get("gid", "")
             task_name = task.get("name", "")
             due_on = task.get("due_on") or ""
@@ -254,6 +298,24 @@ def run(dry_run: bool = False) -> dict[str, int]:
                 skipped_closed += 1
                 continue
 
+            # Importance-aware volume budget (WS10). The task is now genuinely
+            # nudge-eligible. Tier-0 bypasses the Tier-1 caps (bounded by
+            # MAX_TIER0); Tier-1 respects MAX_TOTAL + MAX_PER_USER. Anything cut is
+            # recorded to hygiene-deferred.jsonl (recovery is automatic next run).
+            tier = _importance_tier(task_name)
+            if tier == 0:
+                if tier0_nudges >= MAX_TIER0:
+                    if not dry_run:
+                        _record_deferred(task_gid, task_name, display_name, tier, "tier0_cap", run_id)
+                    deferred += 1
+                    continue
+            else:
+                if total_nudges >= MAX_TOTAL or user_nudges >= MAX_PER_USER:
+                    if not dry_run:
+                        _record_deferred(task_gid, task_name, display_name, tier, "volume_cap", run_id)
+                    deferred += 1
+                    continue
+
             comment = _build_comment(first_name, overdue_days, task_gid)
 
             if not dry_run:
@@ -285,8 +347,11 @@ def run(dry_run: bool = False) -> dict[str, int]:
 
             throttle[task_gid] = now_ts
             nudges_sent += 1
-            user_nudges += 1
-            total_nudges += 1
+            if tier == 0:
+                tier0_nudges += 1
+            else:
+                user_nudges += 1
+                total_nudges += 1
 
     if not dry_run and nudges_sent > 0:
         _save_throttle(throttle)
@@ -294,9 +359,11 @@ def run(dry_run: bool = False) -> dict[str, int]:
     return {
         "tasks_checked": tasks_checked,
         "nudges_sent": nudges_sent,
+        "tier0_nudges": tier0_nudges,
         "skipped_throttle": skipped_throttle,
         "skipped_signal": skipped_signal,
         "skipped_closed": skipped_closed,
+        "deferred": deferred,
     }
 
 

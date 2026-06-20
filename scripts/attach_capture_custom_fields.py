@@ -63,12 +63,38 @@ def field_gids(cfg: dict) -> dict[str, str]:
 
 
 def project_gids(cfg: dict) -> dict[str, str]:
-    """Return {project_gid: first-entity-label} for non-empty catch-all GIDs (deduped)."""
+    """Return {project_gid: label} for every project that should carry the capture
+    custom fields, deduped (first label wins, empties skipped).
+
+    Sources (WS10 — closes the coverage gap beyond the per-entity catch-alls):
+      - `projects:`                 per-entity "Operations — General" catch-alls
+      - `new_projects_2026_06_08:`  the function-specific Harrison-owned projects
+                                    (sales/leasing/tech/etc.) that were created
+                                    without the fields attached
+      - `field_target_projects:`    ad-hoc extra GIDs (e.g. TikTok Shop, Wikipedia
+                                    Presence, press-pipeline) — Harrison-editable
+
+    BDM client projects are NEVER listed in this config, so they are excluded by
+    construction (the BDM catch-all is also intentionally blank).
+    """
     seen: dict[str, str] = {}
-    for ent, gid in (cfg.get("projects") or {}).items():
+
+    def _add(gid, label):
         gid = str(gid or "").strip()
         if gid and gid not in seen:
-            seen[gid] = str(ent)
+            seen[gid] = str(label)
+
+    for ent, gid in (cfg.get("projects") or {}).items():
+        _add(gid, ent)
+    for ent, items in (cfg.get("new_projects_2026_06_08") or {}).items():
+        for it in (items or []):
+            if isinstance(it, dict):
+                _add(it.get("gid"), ent)
+    for it in (cfg.get("field_target_projects") or []):
+        if isinstance(it, dict):
+            _add(it.get("gid"), it.get("label") or "extra")
+        else:
+            _add(it, "extra")
     return seen
 
 

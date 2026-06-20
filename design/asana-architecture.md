@@ -133,12 +133,46 @@ no custom-field tags. Routing correctness does NOT depend on the fields.
 
 ---
 
-## 6. Sources of truth
+## 6. Overdue-task nudge lane (D-045a + WS10 + WS12)
+
+Distinct from CAPTURE (§3-§5, which CREATES tasks): the nudge lane COMMENTS on
+already-overdue tasks to prod the assignee. There is exactly **one** @-mention
+nudge engine.
+
+- **Sole owner:** the daily scheduled task `Cora - Asana Hygiene Nudges` (6:30am AZ,
+  `scripts/run_asana_hygiene_nudges.py`). The weekly Cowork `hygiene-asana` Step
+  4.6b nudge-firing is disabled and **Make 4768887 is permanently deactivated**
+  (D-045a). **Never** re-activate Make 4768887 or build a parallel nudge automation.
+- **Shared throttle:** both this job and the weekly closure sweep read+append the
+  ONE ledger `closure-nudges-throttle.jsonl` via `cora.nudge_ledger`
+  (`recently_nudged`, 14-day cross-system window; D-031 ≤1 comment/task/7d).
+- **Closed-task guard:** before any comment, `nudge_ledger.closed_task_guard()`
+  re-fetches live completion and writes a permanent `already_closed` exclusion
+  (shared by both lanes) so a task that closed between listing and firing is never
+  nudged (fails open on API error). Skipped in `--dry-run`.
+- **Eligibility:** task has a `due_on`, is ≥14 days overdue, is not a Visibility-CPA
+  task, is not an Asana system reminder (filtered at the `get_user_tasks` source via
+  `cora.asana_filters.is_system_noise_task` — WS12), has no recent KB signal, and
+  is past the throttle window.
+- **Importance budget (WS10):** each user's eligible tasks are sorted **Tier-0 first**
+  (`_importance_tier` — compliance / financial-deadline / LEX-revalidation / P0 /
+  urgent). Tier-0 nudges BYPASS the Tier-1 caps (`MAX_TOTAL` 25 / `MAX_PER_USER` 5),
+  bounded by `MAX_TIER0` (15), so a critical overdue task is never starved on a
+  high-volume day. A nudge-eligible task cut by a cap is logged to
+  `data/state/hygiene-deferred.jsonl` — **informational only**; recovery is automatic
+  (the next run re-sorts Tier-0 first and re-evaluates), NOT a recovery queue.
+
+---
+
+## 7. Sources of truth
 
 | File | Holds |
 |---|---|
 | `data/maps/asana-project-map.yaml` | The full routing taxonomy: catch-alls, assignee / meeting-title / brand / keyword rules, blocked projects, per-entity project GIDs. |
-| `data/maps/meeting-capture-projects.yaml` | Per-entity capture catch-all GIDs + the custom-field GIDs/options. |
+| `data/maps/meeting-capture-projects.yaml` | Per-entity capture catch-all GIDs + the custom-field GIDs/options + `field_target_projects` (extra projects to receive the Entity/Status/Priority fields). |
 | `00-Founder/asana-governance-standard-2026-06-08.md` | Org-level naming, ownership, team taxonomy, the 2026-06-08 restructure. |
 | `src/cora/tools/project_resolver.py` | The resolver that applies the map. |
 | `src/cora/connectors/fireflies_action_extractor.py` | The capture pipeline + safety rails (§4). |
+| `src/cora/asana_filters.py` | Shared system-reminder filter (applied at the `get_user_tasks` source). |
+| `scripts/run_asana_hygiene_nudges.py` | The sole overdue-task nudge engine (§6). |
+| `scripts/attach_capture_custom_fields.py` | Idempotently attaches Entity/Status/Priority to capture-target + `field_target_projects` (§5). |

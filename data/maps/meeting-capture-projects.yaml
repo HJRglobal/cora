@@ -105,3 +105,12 @@ new_projects_2026_06_08:
     - gid: "1215477549068105"  # [OSN] Vendor — Good Pudding
   LEX:
     - gid: "1215477796340344"  # [LEX] Strategic — 2026 Planning
+
+# ------------------------------------------------------------------------------
+# Extra projects to receive the Entity/Status/Priority custom fields (WS10).
+# scripts/attach_capture_custom_fields.py attaches the fields to the catch-alls
+# AND new_projects_2026_06_08 above AND every GID listed here. Use this for active
+# projects created later that lack the fields (e.g. TikTok Shop, Wikipedia
+# Presence, the press pipeline). Add `- gid: "..."  # [LABEL]` rows, then run the
+# script --dry-run (Harrison reviews) then live. NEVER list a BDM client project.
+field_target_projects: []

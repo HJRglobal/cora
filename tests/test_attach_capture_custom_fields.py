@@ -110,3 +110,46 @@ def test_real_config_loads_fields_and_projects():
     assert f.get("Entity") == "1214487026542596"
     assert f.get("Status") and f.get("Priority")
     assert "1215470928454227" in acf.project_gids(cfg)  # F3E catch-all
+
+
+# ---- WS10: coverage beyond the catch-alls -------------------------------------
+
+def test_project_gids_includes_new_2026_06_08_projects():
+    cfg = {
+        "projects": {"F3E": "CATCHALL"},
+        "new_projects_2026_06_08": {
+            "F3E": [{"gid": "NEW1"}, {"gid": "NEW2"}],
+            "HJRP": [{"gid": "NEW3"}],
+        },
+    }
+    out = acf.project_gids(cfg)
+    assert out["CATCHALL"] == "F3E"
+    assert "NEW1" in out and "NEW2" in out and "NEW3" in out
+
+
+def test_project_gids_includes_field_target_projects():
+    cfg = {
+        "projects": {"F3E": "CATCHALL"},
+        "field_target_projects": [
+            {"gid": "TIKTOK", "label": "F3E TikTok"},
+            "WIKI",  # bare string also accepted
+        ],
+    }
+    out = acf.project_gids(cfg)
+    assert out["TIKTOK"] == "F3E TikTok"
+    assert out["WIKI"] == "extra"
+
+
+def test_real_config_covers_new_projects():
+    # The 2026-06-08 function-specific projects must now be in the attach set.
+    out = acf.project_gids(acf.load_cfg())
+    assert "1215477882565190" in out  # [F3E] Sales — Wholesale & Retail Pipeline
+    assert "1215477882706087" in out  # [HJRP] Leasing — Active Leases & Renewals
+
+
+def test_dedup_keeps_first_label_across_sources():
+    cfg = {
+        "projects": {"F3E": "DUP"},
+        "new_projects_2026_06_08": {"HJRP": [{"gid": "DUP"}]},  # same GID, later source
+    }
+    assert acf.project_gids(cfg)["DUP"] == "F3E"  # first (catch-all) label wins
