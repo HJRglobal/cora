@@ -621,7 +621,10 @@ def sweep_user(
             # drive_sweep walks the Founder OS Drive tree, so these would otherwise
             # land in the KB under a Drive-file-id source_id no path rule can catch,
             # and Cora would recite her own audit notes as fact (the Minute Press miss).
-            if is_cora_internal_title(filename):
+            # broad=True: fail-safe to the WIDER exclusion at ingest -- over-excluding
+            # Cora's own ops docs from the KB is harmless; under-excluding re-opens the
+            # self-diagnostic leak (the targeted set alone misses cora-code-* etc.).
+            if is_cora_internal_title(filename, broad=True):
                 stats.setdefault("cora_internal_skipped", 0)
                 stats["cora_internal_skipped"] += 1
                 continue
@@ -947,7 +950,10 @@ def _process_single_folder_files(
             seen_file_ids.add(file_id)
 
             # WS1: never ingest Cora's OWN build/audit/forensic docs or runtime logs.
-            if is_cora_internal_title(filename):
+            # broad=True: fail-safe to the WIDER exclusion at ingest -- over-excluding
+            # Cora's own ops docs from the KB is harmless; under-excluding re-opens the
+            # self-diagnostic leak (the targeted set alone misses cora-code-* etc.).
+            if is_cora_internal_title(filename, broad=True):
                 stats.setdefault("cora_internal_skipped", 0)
                 stats["cora_internal_skipped"] += 1
                 continue

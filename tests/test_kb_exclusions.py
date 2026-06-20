@@ -131,6 +131,13 @@ class TestIsCoraInternalTitle:
         "2026-06-08_fndr_cora-slack-comms-review.md",
         "2026-06-11_fndr_cora-14-day-infra-review.md",
         "2026-06-11_fndr_cora-knowledge-review-slack-sweep.md",
+        "2026-06-16_fndr_cora-exec-summary.md",          # "Forensic Audit Executive Summary"
+        # underscore-delimited forms MUST match too (review-2 HIGH: \b is not a
+        # boundary at "_"; we normalize _->- before matching).
+        "CORA_IMPROVEMENT_BACKLOG.md",
+        "cora_audit.md",
+        "cora_forensic_report.md",
+        "cora_rebuild_execution_log.md",
     ]
 
     # --- legit business / Cora-adjacent docs that MUST be spared in BOTH scopes ---
@@ -206,10 +213,44 @@ class TestIsCoraInternalTitle:
 
     def test_protected_family_suffix_variants_spared(self):
         # The negative guard keeps the named business-doc families safe even when a
-        # build keyword is appended.
+        # SOFT build keyword is appended.
         for name in self.PROTECTED_SUFFIX_SPARED:
             assert not is_cora_internal_title(name), f"protected family purged (targeted): {name}"
             assert not is_cora_internal_title(name, broad=True), f"protected family purged (broad): {name}"
+
+    def test_family_with_strong_keyword_is_caught(self):
+        # review-2 MEDIUM: the family guard is a NARROWING refinement, not an early veto.
+        # A family name that ALSO carries a STRONG build keyword is a genuine build doc.
+        for name in ["cora-mapping-rebuild-execution-log.md",
+                     "cora-reference-forensic-findings.md",
+                     "cora-mapping-audit.md"]:
+            assert is_cora_internal_title(name), f"family+strong should be caught: {name}"
+
+    def test_underscore_delimited_keywords_caught(self):
+        # review-2 HIGH: \b is not a boundary at "_"; we normalize _->- so these match.
+        for name in ["CORA_IMPROVEMENT_BACKLOG.md", "cora_audit.md",
+                     "cora_forensic_report.md", "cora_rebuild_execution_log.md",
+                     "cora_review.md"]:
+            assert is_cora_internal_title(name), f"underscore form should match: {name}"
+        # but an underscore-delimited SUB-word must still be spared
+        assert not is_cora_internal_title("cora_fixed_assets.md")  # 'fixed' != 'fix'
+
+    def test_slash_in_drive_filename_not_mangled(self):
+        # A Drive display name can contain "/" (e.g. a date). We must not path-split a
+        # filename and lose the cora- token.
+        assert is_cora_internal_title("cora-rebuild-execution-log 6/4.md")
+        # space-named human notes ("CORA Task Notes 6/4") have no cora- token -> spared
+        assert not is_cora_internal_title("CORA Task Notes 6/4")
+
+    def test_ingest_broad_catches_review_escapees(self):
+        # review-2 HIGH: docs that escaped the targeted ingest guard. The guard now uses
+        # broad scope, so these are blocked at ingest.
+        for name in ["2026-06-18_fndr_cora-code-meeting-actions-pull.md",
+                     "2026-06-14_fndr_cora-connections-cowork-bootstrap.md",
+                     "2026-06-17_fndr_cora-slack-archive-staged.md",
+                     "2026-06-10_fndr_cora-per-user-email-drive-access-build.md",
+                     "2026-06-12_fndr_cowork-cora-gmail-fireflies-kb-backfill.md"]:
+            assert is_cora_internal_title(name, broad=True), f"broad ingest should block: {name}"
 
     def test_title_with_path_prefix_uses_basename(self):
         # Some titles arrive with a folder prefix; match on the basename.
