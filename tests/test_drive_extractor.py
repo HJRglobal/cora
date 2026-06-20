@@ -502,3 +502,57 @@ class TestIntegration:
         call_kwargs = mock_kr.call_args[1]
         assert "ADF Distribution Q1 2026" in call_kwargs.get("description", "")
         assert "F3E" in call_kwargs.get("description", "")
+
+
+# ── Class 10: run_proposal_loop — per-run cap (WS17-B item 2) ─────────────────
+
+class TestRunProposalLoopCap:
+    """A backfill once proposed ~17k facts in one run. The per-run cap bounds new
+    proposals; when it bites we hold the watermark so deferred facts re-run (not
+    silently dropped) and idempotency-skipped dups don't count toward the cap."""
+
+    def _seed_n(self, db, n, prefix):
+        for i in range(n):
+            _seed_fact(db, f"{prefix}{i}", f"src-{prefix}{i}", "FNDR",
+                       "person", f"Subject {prefix}{i}", "some factual detail text")
+
+    def test_cap_bites_and_holds_watermark(self, tmp_db, monkeypatch):
+        import cora.connectors.drive_extractor as de
+        monkeypatch.setattr(de, "_MAX_PROPOSALS_PER_RUN", 2)
+        self._seed_n(tmp_db, 4, "f")
+        with patch("cora.knowledge_review.propose_update", return_value=True) as mock:
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats["proposed"] == 2
+        assert stats["capped"] is True
+        assert mock.call_count == 2  # stopped at the cap, didn't scan the rest
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute("SELECT last_sync_at FROM sync_state WHERE source=?",
+                           (_WATERMARK_PROPOSE,)).fetchone()
+        conn.close()
+        assert row is None  # watermark NOT advanced -> deferred facts re-run next time
+
+    def test_under_cap_advances_watermark(self, tmp_db, monkeypatch):
+        import cora.connectors.drive_extractor as de
+        monkeypatch.setattr(de, "_MAX_PROPOSALS_PER_RUN", 50)
+        self._seed_n(tmp_db, 3, "g")
+        with patch("cora.knowledge_review.propose_update", return_value=True):
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats["proposed"] == 3
+        assert stats["capped"] is False
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute("SELECT last_sync_at FROM sync_state WHERE source=?",
+                           (_WATERMARK_PROPOSE,)).fetchone()
+        conn.close()
+        assert row is not None and row[0] > 0  # watermark advanced
+
+    def test_dedup_skips_do_not_count_toward_cap(self, tmp_db, monkeypatch):
+        import cora.connectors.drive_extractor as de
+        monkeypatch.setattr(de, "_MAX_PROPOSALS_PER_RUN", 2)
+        self._seed_n(tmp_db, 4, "h")
+        # First two are already-proposed dups (False), then two genuinely new (True).
+        with patch("cora.knowledge_review.propose_update",
+                   side_effect=[False, False, True, True]):
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats["proposed"] == 2   # only newly-appended count
+        assert stats["skipped"] == 2    # the two dups
+        assert stats["capped"] is True

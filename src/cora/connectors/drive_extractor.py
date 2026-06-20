@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -66,6 +67,13 @@ _WATERMARK_PROPOSE = "drive_extractor_proposals"
 
 # Proposal lookback: facts extracted in the last N seconds
 _PROPOSAL_LOOKBACK_SECONDS = 7 * 86400  # 7 days
+
+# Per-run proposal cap (WS17-B item 2). A single backfill once extracted ~17k
+# facts and proposed every one in a single run, flooding the review ledger. Cap
+# the number of NEW proposals per run; when the cap bites we do NOT advance the
+# proposal watermark, so the remainder is picked up (deduped) on the next run
+# rather than silently dropped. Env-overridable for backfills.
+_MAX_PROPOSALS_PER_RUN = int(os.environ.get("DRIVE_EXTRACTOR_MAX_PROPOSALS_PER_RUN", "50"))
 
 # Minimum content length to bother extracting
 _MIN_CONTENT_CHARS = 50
@@ -465,6 +473,8 @@ def run_proposal_loop(
     log.info("drive_extractor proposals: %d candidate facts", len(facts))
 
     run_start = int(time.time())
+    newly_proposed = 0   # appended this run (excludes idempotency-skipped dups)
+    capped = False       # True if the per-run cap stopped us before the last fact
 
     for fact in facts:
         entity = fact["entity"] or "FNDR"
@@ -516,7 +526,7 @@ def run_proposal_loop(
             continue
 
         try:
-            propose_update(
+            appended = propose_update(
                 update_id=f"drive_fact:{fact_id}",
                 update_type=update_type,
                 description=description,
@@ -531,13 +541,33 @@ def run_proposal_loop(
                 source_evidence=f"Drive file: {source_id}",
                 confidence=confidence,
             )
-            stats["proposed"] += 1
+            # propose_update returns False when the id already exists (re-run /
+            # backfill) — those don't count as proposed or toward the per-run cap.
+            if appended is False:
+                stats["skipped"] += 1
+            else:
+                stats["proposed"] += 1
+                newly_proposed += 1
+                if newly_proposed >= _MAX_PROPOSALS_PER_RUN:
+                    capped = True
+                    log.warning(
+                        "drive_extractor: per-run proposal cap (%d) reached — "
+                        "remaining candidates deferred to next run (watermark held)",
+                        _MAX_PROPOSALS_PER_RUN,
+                    )
+                    break
         except Exception as exc:
             log.warning("drive_extractor: propose_update failed for %s: %s", fact_id[:12], exc)
             stats["errors"] += 1
 
-    # Advance proposal watermark
-    if not dry_run:
+    stats["capped"] = capped
+
+    # Advance proposal watermark.
+    # When the per-run cap stopped us early we must NOT advance the watermark,
+    # or the deferred facts would be skipped on the next run (silent data loss).
+    # Holding the watermark lets the next run re-query them; already-proposed
+    # facts are then idempotency-skipped, so the run makes forward progress.
+    if not dry_run and not capped:
         try:
             conn = sqlite3.connect(str(db))
             conn.execute(

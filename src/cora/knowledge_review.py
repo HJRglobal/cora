@@ -38,6 +38,54 @@ _PROPOSED_UPDATES_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.jso
 _REPLY_LOCK = Lock()
 _UPDATES_LOCK = Lock()
 
+# ── Append-time idempotency (WS17-B item 2) ──────────────────────────────────
+# propose_update is otherwise a blind append: a backfill / re-run that re-derives
+# the same deterministic update_id (drive_fact:<id>, reconciliation gap_id,
+# infocora-<ts>) would re-flood the ledger. We keep a process-cached set of every
+# update_id already on disk, invalidated whenever the file's mtime changes (so a
+# concurrent producer process's appends are picked up). Built lazily under the
+# same _UPDATES_LOCK that guards the append.
+_SEEN_IDS_CACHE: set[str] | None = None
+_SEEN_IDS_KEY: tuple[str, float] | None = None  # (ledger path, mtime)
+
+
+def _existing_update_ids() -> set[str]:
+    """Return the set of update_ids already in the ledger (cache keyed on path+mtime).
+
+    Keyed on BOTH the path and its mtime so the cache invalidates when the ledger
+    is rewritten (a concurrent producer's append) AND when _PROPOSED_UPDATES_PATH
+    is monkeypatched to a different file (tests). Must be called while holding
+    _UPDATES_LOCK (it mutates the module cache)."""
+    global _SEEN_IDS_CACHE, _SEEN_IDS_KEY
+    try:
+        mtime = _PROPOSED_UPDATES_PATH.stat().st_mtime
+    except OSError:
+        _SEEN_IDS_CACHE = set()
+        _SEEN_IDS_KEY = None
+        return _SEEN_IDS_CACHE
+    key = (str(_PROPOSED_UPDATES_PATH), mtime)
+    if _SEEN_IDS_CACHE is not None and _SEEN_IDS_KEY == key:
+        return _SEEN_IDS_CACHE
+    ids: set[str] = set()
+    try:
+        with _PROPOSED_UPDATES_PATH.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                uid = rec.get("update_id")
+                if uid:
+                    ids.add(uid)
+    except OSError:
+        ids = set()
+    _SEEN_IDS_CACHE = ids
+    _SEEN_IDS_KEY = key
+    return ids
+
 # ── Harrison's Slack user ID (from data/maps/slack-to-asana.yaml) ────────────
 # Hardcoded for security — we never want to accidentally DM a non-Harrison user
 # for approval-gate decisions.
@@ -129,12 +177,16 @@ def propose_update(
     confidence: str = "HIGH",
     dm_message_ts: str = "",
     dm_channel_id: str = "",
-) -> None:
-    """Record a proposed update in PENDING state.
+) -> bool:
+    """Record a proposed update in PENDING state. Returns True if appended,
+    False if skipped as a duplicate (an entry with this update_id already exists).
 
     Called by run_knowledge_review.py after sending Harrison a DM. The
     dm_message_ts is the Slack message timestamp of the DM — used to correlate
     Harrison's reaction back to this entry.
+
+    Idempotent (WS17-B item 2): a re-run/backfill that re-derives an existing
+    deterministic update_id is a no-op, so producers can't re-flood the queue.
 
     Entry schema:
     {
@@ -166,12 +218,27 @@ def propose_update(
     }
     _PROPOSED_UPDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _UPDATES_LOCK:
+        if update_id in _existing_update_ids():
+            log.info("knowledge_review: skip duplicate propose update_id=%s type=%s",
+                     update_id, update_type)
+            return False
         with _PROPOSED_UPDATES_PATH.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # Keep the cache valid without a full re-scan: record the new id and the
+        # post-write key so the next caller in this process doesn't rebuild.
+        global _SEEN_IDS_CACHE, _SEEN_IDS_KEY
+        if _SEEN_IDS_CACHE is not None:
+            _SEEN_IDS_CACHE.add(update_id)
+        try:
+            _SEEN_IDS_KEY = (str(_PROPOSED_UPDATES_PATH),
+                             _PROPOSED_UPDATES_PATH.stat().st_mtime)
+        except OSError:
+            _SEEN_IDS_KEY = None
     log.info(
         "knowledge_review: proposed update_id=%s type=%s confidence=%s",
         update_id, update_type, confidence,
     )
+    return True
 
 
 def load_proposed_updates() -> list[dict[str, Any]]:

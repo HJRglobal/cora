@@ -552,3 +552,48 @@ class TestSendDmInterface:
             _client_factory=lambda: mock_client,
         )
         assert result == "1717600000.000000"
+
+
+@pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable on this mount")
+class TestProposeUpdateIdempotency:
+    """WS17-B item 2: propose_update is idempotent on update_id, so a re-run /
+    backfill that re-derives an existing id can't re-flood the ledger."""
+
+    def _count(self, path):
+        return len([l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()])
+
+    def test_duplicate_id_not_appended(self, tmp_path):
+        path = tmp_path / "updates.jsonl"
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", path):
+            kr._SEEN_IDS_CACHE = None
+            first = kr.propose_update(update_id="dup-1", update_type="known_answer",
+                                      description="d", payload={})
+            second = kr.propose_update(update_id="dup-1", update_type="known_answer",
+                                       description="d again", payload={})
+            assert first is True
+            assert second is False
+            assert self._count(path) == 1  # only the first append landed
+
+    def test_distinct_ids_each_append(self, tmp_path):
+        path = tmp_path / "updates.jsonl"
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", path):
+            kr._SEEN_IDS_CACHE = None
+            assert kr.propose_update(update_id="a", update_type="generic",
+                                     description="d", payload={}) is True
+            assert kr.propose_update(update_id="b", update_type="generic",
+                                     description="d", payload={}) is True
+            assert self._count(path) == 2
+
+    def test_dedup_sees_external_append(self, tmp_path):
+        """An id written by another process (cache rebuilt on mtime change) is deduped."""
+        path = tmp_path / "updates.jsonl"
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", path):
+            kr._SEEN_IDS_CACHE = None
+            # Simulate a concurrent producer process appending directly.
+            path.write_text(json.dumps({"update_id": "ext-1", "state": "PENDING"}) + "\n",
+                            encoding="utf-8")
+            assert kr.propose_update(update_id="ext-1", update_type="generic",
+                                     description="d", payload={}) is False
+            assert kr.propose_update(update_id="new-1", update_type="generic",
+                                     description="d", payload={}) is True
+            assert self._count(path) == 2

@@ -229,3 +229,168 @@ def test_med_known_answer_not_auto_approved(tmp_path, monkeypatch):
 
     entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-med"]
     assert entries and entries[0]["state"] == "PENDING"  # not auto-approved
+
+
+# == WS17-B items 3 + 4: knowledge/operational split + owner routing ==========
+
+def test_is_knowledge_item_classification():
+    assert rkr._is_knowledge_item({"update_type": "known_answer"}) is True
+    assert rkr._is_knowledge_item({"update_type": "efficiency"}) is True
+    assert rkr._is_knowledge_item(
+        {"update_type": "generic", "payload": {"source": "info-for-cora"}}) is True
+    # Operational nudges are NOT knowledge:
+    assert rkr._is_knowledge_item({"update_type": "hubspot_note"}) is False
+    assert rkr._is_knowledge_item({"update_type": "asana_task"}) is False
+    assert rkr._is_knowledge_item({"update_type": "decision_capture"}) is False
+    assert rkr._is_knowledge_item({"update_type": "task_close"}) is False
+    # A drive-extractor generic (no info-for-cora source) is operational:
+    assert rkr._is_knowledge_item({"update_type": "generic", "payload": {}}) is False
+
+
+def test_routing_floor_inits_and_is_stable(tmp_path, monkeypatch):
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", tmp_path / "rfloor.txt")
+    f = rkr._routing_floor()
+    assert f and (tmp_path / "rfloor.txt").exists()
+    assert rkr._routing_floor() == f  # stable
+
+
+def _op(uid, utype, entity, proposed="2026-06-01T00:00:00+00:00", confidence="MED"):
+    return {"update_id": uid, "update_type": utype, "confidence": confidence,
+            "state": "PENDING", "proposed_at": proposed,
+            "payload": {"entity": entity}, "description": utype + " " + uid}
+
+
+def test_route_operational_to_owners(tmp_path, monkeypatch):
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")  # old -> all eligible
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+
+    sent = MagicMock(return_value="ts-1")
+    resolved = MagicMock(return_value=True)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
+    monkeypatch.setattr(rkr, "resolve_update", resolved)
+
+    items = [
+        _op("op1", "hubspot_note", "F3E"),       # -> Tommy
+        _op("op2", "decision_capture", "FNDR"),  # -> Harrison
+        _op("lex1", "asana_task", "LEX-LLC"),    # PHI -> never routed
+        _op("old", "hubspot_note", "F3E", proposed="1999-01-01T00:00:00+00:00"),  # below floor
+    ]
+    n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
+    assert n == 2
+    routed_ids = {c.args[0] for c in resolved.call_args_list}
+    assert routed_ids == {"op1", "op2"}
+    for c in resolved.call_args_list:
+        assert c.args[1] == "DISMISSED"
+        assert c.kwargs["reason"].startswith("routed_to_owner:")
+    assert "lex1" not in routed_ids and "old" not in routed_ids
+
+
+def test_route_per_owner_cap(tmp_path, monkeypatch):
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    monkeypatch.setattr(rkr, "_MAX_OWNER_DMS_PER_OWNER", 2)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", MagicMock(return_value="ts"))
+    monkeypatch.setattr(rkr, "resolve_update", MagicMock(return_value=True))
+    items = [_op("f" + str(i), "hubspot_note", "F3E") for i in range(5)]  # all -> Tommy
+    n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
+    assert n == 2  # per-owner cap
+
+
+def test_route_failed_dm_leaves_pending(tmp_path, monkeypatch):
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", MagicMock(return_value=None))  # DM fails
+    resolved = MagicMock(return_value=True)
+    monkeypatch.setattr(rkr, "resolve_update", resolved)
+    n = rkr._route_operational_to_owners([_op("op1", "hubspot_note", "F3E")],
+                                         "xoxb-test", logging.getLogger("t"))
+    assert n == 0
+    resolved.assert_not_called()  # not marked resolved -> retried next run
+
+
+def test_route_nothing_without_token():
+    import logging
+    assert rkr._route_operational_to_owners([_op("op1", "hubspot_note", "F3E")],
+                                            "", logging.getLogger("t")) == 0
+
+
+def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
+    """Item 4: a MED known_answer DMs Harrison on a NON-digest day (no Monday gate)."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+
+    proposed = tmp_path / "proposed.jsonl"
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # NOT Monday
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+
+    header = MagicMock(return_value="hdr")
+    individual = MagicMock(return_value={"ka-med": "ts1"})
+    route = MagicMock(return_value=0)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", header)
+    monkeypatch.setattr(rkr, "send_individual_dms", individual)
+    monkeypatch.setattr(rkr, "_route_operational_to_owners", route)
+
+    kr.propose_update(update_id="ka-med", update_type="known_answer",
+                      description="a med fact", payload={"entity": "FNDR"}, confidence="MED")
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    individual.assert_called_once()  # DM'd despite non-Monday (item 4)
+    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-med"]
+    assert entries and entries[0]["dm_message_ts"] == "ts1"
+
+
+def test_operational_routed_not_dmd_to_harrison(tmp_path, monkeypatch):
+    """Item 3: an operational nudge is routed to its owner, NOT DM'd to Harrison."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+
+    proposed = tmp_path / "proposed.jsonl"
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+
+    individual = MagicMock(return_value={})
+    header = MagicMock(return_value="hdr")
+    sent = MagicMock(return_value="ts-owner")
+    monkeypatch.setattr(rkr, "send_individual_dms", individual)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", header)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
+
+    kr.propose_update(update_id="hn-1", update_type="hubspot_note",
+                      description="deal X no activity", payload={"entity": "F3E"},
+                      confidence="MED")
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    sent.assert_called_once()       # routed to the F3E owner
+    individual.assert_not_called()  # NOT in Harrison's knowledge DM batch
+    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "hn-1"]
+    assert entries and entries[0]["state"] == "DISMISSED"
+    assert entries[0]["resolved_reason"].startswith("routed_to_owner:")

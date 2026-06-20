@@ -79,10 +79,37 @@ _AUTOAPPROVE_FLOOR_PATH = (
     / "knowledge-review-autoapprove-floor.txt"
 )
 
-# Weekly digest: new-item DMs are sent only on this weekday (Mon=0) in AZ time.
-# Reaction-processing, auto-approve, and auto-expire still run EVERY scheduled
-# day so approvals are acted on promptly and the queue is maintained daily.
+# Weekly digest weekday (Mon=0) in AZ time. NOTE (WS17-B item 4): the knowledge
+# stream no longer waits for this day — known_answer / efficiency / #info-for-cora
+# items now DM Harrison on EVERY scheduled run so the learning loop isn't stalled
+# 5/week. _is_digest_day() is retained as a tested utility (and for any future
+# weekly summary) but no longer gates the drain.
 _DIGEST_WEEKDAY = 0  # Monday
+
+# ── WS17-B drain split (items 3 + 4) ─────────────────────────────────────────
+# Harrison's queue is for KNOWLEDGE (things that make Cora smarter) + the ratify.
+# Operational "nudge" types are NOT his job — they route to the entity's domain
+# owner as an actionable suggestion (Cora is decision-SUPPORT, not -MAKER; the
+# owner acts in the native tool). A #info-for-cora generic is a human knowledge
+# contribution, so it rides the knowledge stream, not the operational one.
+_KNOWLEDGE_TYPES = frozenset({"known_answer", "efficiency"})
+_OPERATIONAL_TYPES = frozenset(
+    {"asana_task", "task_close", "hubspot_note", "decision_capture", "generic"}
+)
+
+_MAX_KNOWLEDGE_DMS_PER_RUN = 10   # Harrison's daily knowledge queue
+_MAX_OWNER_DMS_PER_RUN = 10       # total operational items routed to owners per run
+_MAX_OWNER_DMS_PER_OWNER = 5      # per-owner cap so no single owner is flooded
+
+# Operational-routing floor: only operational items proposed at/after this stamp
+# are routed to owners. Initialized to "now" on the first routing run so the
+# pre-existing operational backlog (proposed before WS17-B) is NEVER freshly DM'd
+# to a teammate months late — it rides Harrison's gated bulk-triage instead.
+# "" -> route nothing (fail-safe), mirroring the auto-approve floor.
+_ROUTING_FLOOR_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "state"
+    / "knowledge-review-routing-floor.txt"
+)
 
 
 def _is_digest_day() -> bool:
@@ -331,6 +358,152 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
     return n
 
 
+def _routing_floor() -> str:
+    """ISO timestamp before which operational items are NEVER routed to owners.
+
+    Initialized to 'now' on first call so the pre-WS17-B operational backlog isn't
+    freshly DM'd to teammates. Returns '' on any error -> route NOTHING (fail-safe).
+    Mirrors _autoapprove_floor()."""
+    try:
+        if _ROUTING_FLOOR_PATH.exists():
+            return _ROUTING_FLOOR_PATH.read_text(encoding="utf-8").strip()
+        _ROUTING_FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        _ROUTING_FLOOR_PATH.write_text(now, encoding="utf-8")
+        return now
+    except Exception:
+        return ""
+
+
+def _is_knowledge_item(update: dict) -> bool:
+    """True if this update belongs in Harrison's knowledge queue (vs an operational
+    nudge routed to an owner). Knowledge = known_answer / efficiency, or a generic
+    contributed via #info-for-cora (a human-fed fact, not machine noise)."""
+    utype = update.get("update_type")
+    if utype in _KNOWLEDGE_TYPES:
+        return True
+    if utype == "generic" and (update.get("payload") or {}).get("source") == "info-for-cora":
+        return True
+    return False
+
+
+def _send_dm_to_user(user_id: str, text: str, slack_token: str, _client_factory=None) -> str | None:
+    """DM an arbitrary Slack user. Returns message_ts on success, None on failure.
+
+    Distinct from knowledge_review.send_dm_to_harrison (hard-coded to Harrison) so
+    that module keeps its Harrison-only discipline; operational nudges go to owners."""
+    if not slack_token or not user_id:
+        return None
+    try:
+        if _client_factory is not None:
+            client = _client_factory()
+        else:
+            from slack_sdk import WebClient as _WC
+            client = _WC(token=slack_token)
+        dm = client.conversations_open(users=[user_id])["channel"]["id"]
+        resp = client.chat_postMessage(
+            channel=dm, text=text, unfurl_links=False, unfurl_media=False,
+        )
+        return resp.get("ts", "")
+    except Exception as exc:  # noqa: BLE001 — a failed owner DM must not crash the run
+        logging.getLogger("knowledge-review").warning(
+            "route-to-owner: DM to %s failed: %s", user_id, exc
+        )
+        return None
+
+
+def _format_owner_dm(update: dict) -> str:
+    """Owner-facing card for an operational suggestion. Cora is decision-SUPPORT:
+    the owner acts in the native tool (HubSpot/Asana/decisions); Cora does not."""
+    utype = update.get("update_type", "generic")
+    desc = update.get("description", "(no description)")
+    payload = update.get("payload") or {}
+    label = {
+        "asana_task": "Suggested Asana task",
+        "task_close": "Asana task may be done",
+        "hubspot_note": "Suggested HubSpot note",
+        "decision_capture": "Possible decision to record",
+        "generic": "FYI",
+    }.get(utype, utype)
+    lines = [f":information_source: *{label}* (from Cora):", desc[:600]]
+    deal_url = payload.get("deal_url")
+    task_url = payload.get("task_url")
+    if deal_url:
+        lines.append(f"<{deal_url}|Open the deal>")
+    if task_url:
+        lines.append(f"<{task_url}|Open the task>")
+    lines.append("\n_This is a suggestion — handle it directly in the tool if it's right. "
+                 "No reply needed._")
+    return "\n".join(lines)
+
+
+def _route_operational_to_owners(
+    items: list[dict], slack_token: str, log: logging.Logger, _client_factory=None,
+) -> int:
+    """Route operational-nudge items to their entity's domain owner. Returns count routed.
+
+    Each routed item is DM'd to the owner (decision-SUPPORT) then marked DISMISSED
+    with reason 'routed_to_owner:<id>'. Guardrails:
+      * LEX* entities are NEVER routed (PHI) — left PENDING.
+      * Only items proposed >= the routing floor are routed (no stale-backlog spam).
+      * Per-owner + per-run caps so no owner is flooded; deferred counts are logged.
+    """
+    if not items or not slack_token:
+        return 0
+    try:
+        from cora.gap_autofill import resolve_owner
+    except Exception as exc:  # noqa: BLE001
+        log.warning("route-to-owner: could not import resolve_owner: %s", exc)
+        return 0
+
+    floor = _routing_floor()
+    if not floor:
+        log.warning("route-to-owner: no routing floor — routing nothing this run")
+        return 0
+
+    # HIGH-confidence first, then oldest first (stable).
+    eligible = [u for u in items if u.get("proposed_at", "") >= floor]
+    eligible.sort(key=lambda u: (0 if u.get("confidence") == "HIGH" else 1,
+                                 u.get("proposed_at", "")))
+
+    routed = 0
+    deferred_cap = 0
+    skipped_lex = 0
+    skipped_no_owner = 0
+    per_owner: dict[str, int] = {}
+
+    for u in eligible:
+        if routed >= _MAX_OWNER_DMS_PER_RUN:
+            deferred_cap += 1
+            continue
+        entity = ((u.get("payload") or {}).get("entity") or "FNDR").strip().upper()
+        if entity.startswith("LEX"):
+            skipped_lex += 1
+            continue
+        owner = resolve_owner(entity)
+        if not owner:
+            skipped_no_owner += 1
+            continue
+        if per_owner.get(owner, 0) >= _MAX_OWNER_DMS_PER_OWNER:
+            deferred_cap += 1
+            continue
+        ts = _send_dm_to_user(owner, _format_owner_dm(u), slack_token, _client_factory)
+        if not ts:
+            continue  # DM failed — leave PENDING, retry next run
+        resolve_update(u["update_id"], "DISMISSED", reason=f"routed_to_owner:{owner}")
+        per_owner[owner] = per_owner.get(owner, 0) + 1
+        routed += 1
+
+    if routed or deferred_cap or skipped_lex or skipped_no_owner:
+        log.info(
+            "route-to-owner: routed=%d deferred(cap)=%d skipped(lex)=%d skipped(no-owner)=%d "
+            "below-floor=%d",
+            routed, deferred_cap, skipped_lex, skipped_no_owner,
+            len([u for u in items if u.get("proposed_at", "") < floor]),
+        )
+    return routed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -343,7 +516,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--force-digest", action="store_true",
-        help="Send the new-item DM digest regardless of the weekly digest weekday",
+        help="(Deprecated since WS17-B: knowledge items now DM every run.) Accepted for compatibility.",
     )
     args = parser.parse_args()
 
@@ -453,63 +626,77 @@ def main() -> int:
         if auto_approved:
             log.info("Auto-approved %d HIGH-confidence non-canonical update(s)", auto_approved)
 
-    # ─── Step 2: Send DM batch for any still-PENDING updates ─────────────────
-    # Cap at 5 DMs per run — keeps Harrison's review queue manageable.
-    _MAX_DMS_PER_RUN = 5
+    # ─── Step 2: Drain PENDING updates (WS17-B items 3 + 4) ──────────────────
+    # Split the unsent queue: operational "nudge" items route to their entity's
+    # domain owner (Cora is decision-SUPPORT); knowledge items (known_answer /
+    # efficiency / #info-for-cora contributions) DM Harrison DAILY — no longer
+    # Monday-gated, so the learning loop isn't stalled 5/week. Reaction-processing,
+    # auto-approve, and auto-expire (Steps 0/1/1.5) already ran above.
     pending = get_pending_updates()
     unsent = [u for u in pending if not u.get("dm_message_ts")]
-    if len(unsent) > _MAX_DMS_PER_RUN:
-        log.info("Capping DM batch: %d unsent -> sending top %d (HIGH confidence first)",
-                 len(unsent), _MAX_DMS_PER_RUN)
-        unsent = sorted(unsent, key=lambda u: 0 if u.get("confidence") == "HIGH" else 1)
-        unsent = unsent[:_MAX_DMS_PER_RUN]
-    log.info("Found %d PENDING updates to DM Harrison about (%d not yet sent)", len(pending), len(unsent))
-
-    if not unsent:
-        log.info("All pending updates already have DM timestamps — nothing new to send")
-        return exit_code
+    knowledge_unsent = [u for u in unsent if _is_knowledge_item(u)]
+    operational_unsent = [u for u in unsent if not _is_knowledge_item(u)]
+    log.info(
+        "Step 2 drain: %d PENDING, %d unsent (%d knowledge, %d operational)",
+        len(pending), len(unsent), len(knowledge_unsent), len(operational_unsent),
+    )
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
-    if not slack_token or args.dry_run:
-        if args.dry_run:
-            for i, u in enumerate(unsent, 1):
-                log.info("[DRY RUN] Item %d/%d: %s", i, len(unsent), u.get("description", "?")[:120])
-        else:
-            log.warning("SLACK_BOT_TOKEN not set — cannot send DM, exit_code=2")
-            exit_code = 2
+
+    if args.dry_run:
+        for i, u in enumerate(knowledge_unsent[:_MAX_KNOWLEDGE_DMS_PER_RUN], 1):
+            log.info("[DRY RUN] knowledge %d: %s", i, u.get("description", "?")[:120])
+        log.info("[DRY RUN] would route up to %d operational item(s) to owners",
+                 len(operational_unsent))
         return exit_code
 
-    # Weekly digest cadence: only send NEW-item DMs on the digest weekday (reaction
-    # processing, auto-approve, and auto-expire above already ran). --force-digest
-    # overrides for a manual/ad-hoc send.
-    if not (_is_digest_day() or args.force_digest):
+    if not slack_token:
+        log.warning("SLACK_BOT_TOKEN not set — cannot send DMs / route, exit_code=2")
+        return 2
+
+    # ── 2a: Route operational nudges to domain owners (floor-gated, capped) ──
+    try:
+        n_routed = _route_operational_to_owners(operational_unsent, slack_token, log)
+        if n_routed:
+            log.info("Routed %d operational nudge(s) to domain owners", n_routed)
+    except Exception as exc:  # noqa: BLE001 — routing must not block the knowledge DM
+        log.warning("route-to-owner: unexpected error (continuing): %s", exc)
+
+    # ── 2b: Knowledge items → Harrison, every run (item 4) ──────────────────
+    k = knowledge_unsent
+    if len(k) > _MAX_KNOWLEDGE_DMS_PER_RUN:
+        log.info("Capping knowledge DMs: %d -> top %d (HIGH first)",
+                 len(k), _MAX_KNOWLEDGE_DMS_PER_RUN)
+        k = sorted(k, key=lambda u: 0 if u.get("confidence") == "HIGH" else 1)
+        k = k[:_MAX_KNOWLEDGE_DMS_PER_RUN]
+
+    if not k:
+        log.info("No knowledge items to DM Harrison this run")
         log.info(
-            "Not the weekly digest day — %d new item(s) deferred to the next digest",
-            len(unsent),
+            "Knowledge review complete — approved=%d dismissed=%d pending=%d (exit=%d)",
+            len(approved_updates), len(dismissed_updates), len(pending), exit_code,
         )
         return exit_code
 
-    # Digest header so Harrison sees the batch as one weekly review, then the
-    # individually-reactable cards.
     send_dm_to_harrison(
-        f"Cora weekly knowledge review: {len(unsent)} item(s) below. "
+        f"Cora knowledge review: {len(k)} item(s) below for your approval. "
         f"React 👍 to approve or 👎 to dismiss each. "
         f"Un-actioned items auto-expire in {_PENDING_EXPIRY_DAYS} days.",
         slack_token,
     )
-
-    log.info("Sending %d individual DMs to Harrison (user=%s)...", len(unsent), HARRISON_SLACK_USER_ID)
-    sent_map = send_individual_dms(unsent, slack_token)  # {update_id: ts}
+    log.info("Sending %d individual knowledge DMs to Harrison (user=%s)...",
+             len(k), HARRISON_SLACK_USER_ID)
+    sent_map = send_individual_dms(k, slack_token)  # {update_id: ts}
 
     if sent_map:
-        log.info("Sent %d/%d DMs successfully", len(sent_map), len(unsent))
-        for update in unsent:
+        log.info("Sent %d/%d knowledge DMs successfully", len(sent_map), len(k))
+        for update in k:
             ts = sent_map.get(update["update_id"])
             if ts:
                 _patch_dm_ts(update["update_id"], ts)
         log.info("Patched dm_message_ts on %d entries", len(sent_map))
     else:
-        log.warning("No DMs were sent — check SLACK_BOT_TOKEN and im:write scope")
+        log.warning("No knowledge DMs were sent — check SLACK_BOT_TOKEN and im:write scope")
         exit_code = 2
 
     log.info(
