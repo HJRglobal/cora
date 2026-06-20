@@ -1,8 +1,7 @@
 r"""Daily backup — copies operational data to Google Drive for disaster recovery.
 
-Backs up:
-- data/cora_kb.db (CRITICAL — the entire knowledge base; uses SQLite online backup API)
-- data/*.db feature databases (influencer, hubspot snapshots, etc.; online backup API)
+Backs up (the SMALL, stateful, hard-to-regenerate set):
+- data/*.db feature databases (influencer, hubspot snapshots, milestones; online backup API)
 - .env + the Google service-account JSON, bundled into a SINGLE ENCRYPTED blob
   (secrets-YYYY-MM-DD.enc). Requires CORA_BACKUP_PASSPHRASE in the environment;
   if unset, the secrets step is skipped (it never writes plaintext secrets).
@@ -10,8 +9,16 @@ Backs up:
 - Recent main log files (last 7 days)
 - .resolved-gaps.jsonl (tracks which gaps have been ingested)
 
-After writing, the run VERIFIES the KB backup actually landed at the destination and
-returns a non-zero exit code if it did not (so a silent offsite failure is caught).
+NOT backed up by default: data/cora_kb.db (~6 GB). It is REGENERABLE from the
+connectors (code in GitHub) — backing it up daily was a large Drive-quota cost for
+near-zero DR value. Rebuild procedure: deployment/kb-rebuild.md. Pass --include-kb
+for a one-off full snapshot (e.g. before a risky migration).
+
+Live-log retention is handled separately by compact_logs.py (gzip/purge by age) and
+this run prunes backup directories older than --keep-days (default 30).
+
+After writing, the run VERIFIES the offsite backup landed (the KB if --include-kb,
+otherwise the small DR set) and returns non-zero if nothing landed.
 
 Destination: G:\My Drive\HJR-Founder-OS\_shared\projects\cora\backups\YYYY-MM-DD\
 
@@ -81,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Back up main cora-*.log files from the last N days (default: 7).",
     )
     parser.add_argument(
+        "--include-kb",
+        action="store_true",
+        help="Also back up the ~6 GB cora_kb.db (off by default — it's regenerable; "
+             "see deployment/kb-rebuild.md). Use for a one-off full snapshot.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be copied without actually doing it.",
@@ -130,9 +143,16 @@ def backup_snapshots(dest_dir: Path, dry_run: bool) -> int:
     return count
 
 
-def backup_kb_database(dest_dir: Path, dry_run: bool) -> bool:
-    """Back up cora_kb.db using SQLite online backup API (safe while Cora is running)."""
-    print("[1/7] Backing up knowledge base (cora_kb.db)...")
+def backup_kb_database(dest_dir: Path, dry_run: bool, include_kb: bool) -> bool | None:
+    """Back up cora_kb.db (ONLY when include_kb). Returns None when intentionally
+    skipped (the default — the KB is regenerable, see deployment/kb-rebuild.md);
+    True/False is an attempted backup's success/failure."""
+    print("[1/7] Knowledge base (cora_kb.db)...")
+    if not include_kb:
+        print("  SKIP (regenerable): cora_kb.db is NOT backed up to Drive -- it rebuilds "
+              "from the connectors (deployment/kb-rebuild.md), saving ~6 GB/day. "
+              "Pass --include-kb for a one-off full snapshot.")
+        return None
     if not KB_DB_PATH.exists():
         print(f"  SKIP: {KB_DB_PATH} does not exist yet.")
         return False
@@ -337,18 +357,25 @@ def backup_secrets(dest_dir: Path, dry_run: bool) -> str:
     return "ok"
 
 
-def verify_offsite(dest_dir: Path, kb_ok: bool, dry_run: bool) -> bool:
-    """Confirm the critical KB backup actually materialized at the destination.
+def verify_offsite(dest_dir: Path, kb_status, include_kb: bool, dry_run: bool) -> bool:
+    """Confirm the offsite backup actually materialized.
 
-    This is the loud-failure guard: a backup run that 'succeeds' but leaves no KB
-    file at the offsite path is a silent DR failure. Returns False in that case so
-    main() can exit non-zero.
+    Loud-failure guard against a run that 'succeeds' but leaves nothing offsite.
+    With --include-kb, verify the KB landed. By default (KB excluded, regenerable),
+    verify the small DR set landed (an EMPTY backup dir is the silent failure now).
     """
-    print("Verifying offsite KB backup...")
+    print("Verifying offsite backup...")
     if dry_run:
         print("  [dry-run] skipping verification.")
         return True
-    if not kb_ok:
+    if not include_kb:
+        files = [p for p in dest_dir.glob("*") if p.is_file()] if dest_dir.exists() else []
+        if not files:
+            print(f"  FAIL: {dest_dir} is empty -- nothing landed offsite.")
+            return False
+        print(f"  OK: {len(files)} file(s) landed (KB excluded by design -- regenerable).")
+        return True
+    if not kb_status:
         print("  FAIL: the KB backup step reported failure.")
         return False
     dst = dest_dir / "cora_kb.db"
@@ -390,20 +417,20 @@ def main() -> int:
 
     ensure_dir(dest_dir, args.dry_run)
 
-    kb_ok = backup_kb_database(dest_dir, args.dry_run)
+    kb_status = backup_kb_database(dest_dir, args.dry_run, args.include_kb)
     critical_count = backup_critical_files(dest_dir, args.dry_run)
     main_log_count = backup_recent_main_logs(dest_dir, args.include_main_logs_days, args.dry_run)
     snapshot_count = backup_snapshots(dest_dir, args.dry_run)
     feature_db_count = backup_feature_dbs(dest_dir, args.dry_run)
     secrets_status = backup_secrets(dest_dir, args.dry_run)
     pruned_count = prune_old_backups(args.backup_root, args.keep_days, args.dry_run)
-    offsite_ok = verify_offsite(dest_dir, kb_ok, args.dry_run)
+    offsite_ok = verify_offsite(dest_dir, kb_status, args.include_kb, args.dry_run)
 
     print()
     print("=" * 60)
     print("  Summary")
     print("=" * 60)
-    print(f"  KB database backed up:    {'YES' if kb_ok else 'NO (see above)'}")
+    print(f"  KB database backed up:    {'SKIPPED (regenerable)' if kb_status is None else ('YES' if kb_status else 'NO (see above)')}")
     print(f"  Feature DBs backed up:    {feature_db_count}")
     print(f"  Secrets (encrypted):      {secrets_status}")
     print(f"  Critical files backed up: {critical_count}")

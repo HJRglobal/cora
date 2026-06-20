@@ -297,7 +297,13 @@ def get_sales_pulse(period: str = "today") -> SalesSummary:
 def get_inventory_status(
     low_stock_threshold: int = LOW_STOCK_THRESHOLD,
 ) -> list[InventoryVariant]:
-    """Return variant-level inventory for all F3E products."""
+    """Return variant-level inventory for all F3E products.
+
+    Correctness invariants (WS11): on-hand is clamped to >= 0 (Shopify's
+    `inventory_quantity` goes NEGATIVE on oversell -- an accounting flag, never a
+    real "units left"), and variant rows are DEDUPED by Shopify variant id so a
+    paginated overlap or a product listed twice can't inflate the count.
+    """
     cache_key = f"inventory:{low_stock_threshold}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -310,7 +316,7 @@ def get_inventory_status(
         params={"limit": _PAGE_SIZE, "fields": "id,title,variants"},
     )
 
-    variants: list[InventoryVariant] = []
+    by_variant_id: dict[str, InventoryVariant] = {}
     for product in products:
         product_title = product.get("title") or "Unknown product"
         for v in product.get("variants") or []:
@@ -318,20 +324,35 @@ def get_inventory_status(
             if variant_title.lower() in ("default title", "default"):
                 variant_title = ""
             sku = v.get("sku") or ""
-            qty = int(v.get("inventory_quantity") or 0)
-            variants.append(InventoryVariant(
+            # Clamp: Shopify oversell can report a negative inventory_quantity.
+            qty = max(0, int(v.get("inventory_quantity") or 0))
+            vid = str(v.get("id") or f"{product_title}|{variant_title}|{sku}")
+            by_variant_id[vid] = InventoryVariant(
                 product_title=product_title,
                 variant_title=variant_title,
                 sku=sku,
                 qty_on_hand=qty,
                 low_stock=(qty <= low_stock_threshold),
-            ))
+            )
 
+    variants = list(by_variant_id.values())
     _cache_set(cache_key, variants)
+
+    total_units = sum(v.qty_on_hand for v in variants)
+    unique_skus = len({v.sku for v in variants if v.sku})
+    zero_count = sum(1 for v in variants if v.qty_on_hand == 0)
     low_count = sum(1 for v in variants if v.low_stock)
+    # Consistency guard: total_units==0 must coincide with every variant at 0.
+    # (Mathematically guaranteed post-clamp; the guard catches a future regression
+    # that re-introduces negatives or a bad aggregation.)
+    if (total_units == 0) != (zero_count == len(variants)):
+        log.warning(
+            "shopify inventory INCONSISTENT: total_units=%d zero=%d/%d variants",
+            total_units, zero_count, len(variants),
+        )
     log.info(
-        "shopify inventory total_variants=%d low_stock=%d threshold=%d",
-        len(variants), low_count, low_stock_threshold,
+        "shopify inventory variants=%d skus=%d units=%d zero=%d low_stock=%d threshold=%d",
+        len(variants), unique_skus, total_units, zero_count, low_count, low_stock_threshold,
     )
     return variants
 
@@ -377,11 +398,21 @@ def format_inventory_for_llm(
     if not variants:
         return "No inventory data available."
 
+    # SKUs != variants: one product has several variants (size/flavor), so report
+    # both counts + total units on hand so the snapshot is self-consistent (WS11).
+    unique_skus = len({v.sku for v in variants if v.sku}) or len(variants)
+    total_units = sum(v.qty_on_hand for v in variants)
+    summary = f"{unique_skus} SKUs / {len(variants)} variants, {total_units:,} units on hand"
+
     if low_stock_only:
         flagged = [v for v in variants if v.low_stock]
         if not flagged:
-            return f"*F3E inventory:* All {len(variants)} SKUs adequately stocked."
-        lines = [f"*F3E inventory -- low stock ({len(flagged)} SKUs):*", ""]
+            return f"*F3E inventory:* {summary} -- all adequately stocked."
+        flagged_skus = len({v.sku for v in flagged if v.sku}) or len(flagged)
+        lines = [
+            f"*F3E inventory -- low stock ({flagged_skus} SKUs, {len(flagged)} variants):* _{summary}_",
+            "",
+        ]
         for v in sorted(flagged, key=lambda x: x.qty_on_hand):
             label = v.product_title
             if v.variant_title:
@@ -391,7 +422,7 @@ def format_inventory_for_llm(
                 entry += f" [SKU: {v.sku}]"
             lines.append(entry)
     else:
-        lines = [f"*F3E inventory ({len(variants)} SKUs):*", ""]
+        lines = [f"*F3E inventory ({summary}):*", ""]
         by_product: dict[str, list[InventoryVariant]] = {}
         for v in variants:
             by_product.setdefault(v.product_title, []).append(v)
@@ -515,7 +546,8 @@ def get_inventory_by_location(
     inv_by_item: dict[int, int] = {}
     for lvl in inv_levels:
         if lvl.get("inventory_item_id") is not None:
-            inv_by_item[int(lvl["inventory_item_id"])] = int(lvl.get("available") or 0)
+            # Clamp: Shopify oversell can report negative `available` (WS11).
+            inv_by_item[int(lvl["inventory_item_id"])] = max(0, int(lvl.get("available") or 0))
 
     if not inv_by_item:
         empty: list[LocationSKU] = []

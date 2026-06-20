@@ -106,27 +106,29 @@ class TestBackupSecretsGating:
 # ── offsite verification (the loud-failure guard) ───────────────────────────
 
 class TestVerifyOffsite:
+    # These exercise the --include-kb path (KB verification). The default
+    # (KB-excluded) verification is covered by test_backup_kb_excluded.py.
     def test_fail_when_kb_step_failed(self, tmp_path):
         bl = _load("backup_logs")
-        assert bl.verify_offsite(tmp_path, kb_ok=False, dry_run=False) is False
+        assert bl.verify_offsite(tmp_path, False, include_kb=True, dry_run=False) is False
 
     def test_fail_when_dst_missing(self, tmp_path):
         bl = _load("backup_logs")
-        assert bl.verify_offsite(tmp_path, kb_ok=True, dry_run=False) is False
+        assert bl.verify_offsite(tmp_path, True, include_kb=True, dry_run=False) is False
 
     def test_fail_when_dst_empty(self, tmp_path):
         bl = _load("backup_logs")
         (tmp_path / "cora_kb.db").write_bytes(b"")
-        assert bl.verify_offsite(tmp_path, kb_ok=True, dry_run=False) is False
+        assert bl.verify_offsite(tmp_path, True, include_kb=True, dry_run=False) is False
 
     def test_pass_when_dst_present(self, tmp_path):
         bl = _load("backup_logs")
         (tmp_path / "cora_kb.db").write_bytes(b"x" * 1024)
-        assert bl.verify_offsite(tmp_path, kb_ok=True, dry_run=False) is True
+        assert bl.verify_offsite(tmp_path, True, include_kb=True, dry_run=False) is True
 
     def test_dry_run_always_passes(self, tmp_path):
         bl = _load("backup_logs")
-        assert bl.verify_offsite(tmp_path, kb_ok=False, dry_run=True) is True
+        assert bl.verify_offsite(tmp_path, False, include_kb=True, dry_run=True) is True
 
 
 # ── feature-DB backup excludes the main KB ──────────────────────────────────
