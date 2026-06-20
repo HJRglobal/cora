@@ -1846,3 +1846,51 @@ isolated worktree. Four workstreams from the 20-report synthesis P0 block.
 passed / 3 pre-existing env-failures / 42 skipped. Bot-loaded changes -> Harrison merges + ONE
 coordinated restart. All KB purges (`purge_cora_internal_kb.py`, `purge_lex_program_kb.py`) are
 dry-run-default + Harrison-gated.
+
+## D-056 - Track A P1 reliability block (WS11 + WS-BACKUP + WS5) (2026-06-19)
+
+**Context:** Second Track A build, off the just-merged `main`@`3d1ffc8`, isolated worktree
+`cora-wt-track-a-p1` (branch `claude/track-a-p1`, 4 commits, NOT merged - Harrison merges after
+the P0 restart). Three workstreams from the P1 block.
+
+**Decisions / what shipped:**
+- **WS11** (`shopify_client.py`) - the F3E inventory snapshot was internally contradictory:
+  Shopify oversell returns NEGATIVE `inventory_quantity`, and multi-variant SKUs were counted as
+  distinct SKUs, so a brand could read "all stocked, low" while units > 0. `get_inventory_status`
+  now clamps qty to >= 0, dedups by variant `id`, and reports `unique_skus` vs `variants` +
+  `total_units` with a consistency guard; `get_inventory_by_location` clamps `available` >= 0;
+  `format_inventory_for_llm` stops mislabeling variants as SKUs. NOTE: the merch->beverage filter
+  is on the separate unmerged `986b0eb` and overlaps `shopify_client.py` ADDITIVELY -> merge WS11
+  FIRST, then `986b0eb`.
+- **WS-BACKUP** (`backup_logs.py`) - the daily Drive backup was copying the ~6 GB regenerable
+  `cora_kb.db` every run (the KB is rebuildable from source connectors). `cora_kb.db` is now
+  EXCLUDED by default (`--include-kb` opt-in); `verify_offsite` reframed so the daily run still
+  FAILS LOUD on a genuinely empty/broken backup but PASSES when the small DR set landed with the
+  KB excluded; the small stateful set (feature DBs, encrypted secrets, jsonl, logs) is still
+  backed up. New `deployment/kb-rebuild.md` documents the rebuild path with real script names.
+- **WS5** (`asana_client.py` + `tool_dispatch.py`) - new conversational write tools:
+  `asana_complete_task` (staged), `asana_delete_task` (confirm-gated, IRREVERSIBLE, warns
+  permanent), and `follower_names` on create (resolve names -> `add_task_followers` after create).
+  Both action tools resolve a task ONLY within the asker's OWN open tasks, on BOTH the gid and
+  name paths (founder + FNDR/HJRG exempt). LEX-safe labels on output.
+
+**Doctrines:**
+- An inventory/quantity summary must be SELF-CONSISTENT: clamp provider oversell to >= 0 and
+  separate the unique-SKU count from the variant/line count, or the rollup contradicts itself
+  (all-zero while units > 0).
+- Do NOT back up a large REGENERABLE artifact (the vector KB) on the daily DR run - back up only
+  the small stateful set + secrets, and keep the loud-on-empty verify; document the rebuild path.
+- A conversational write tool that can act on a task by raw gid MUST verify the gid is one of the
+  ASKER's own open tasks - a shared-workspace PAT exposes every teammate's gid via
+  `get_user_tasks`, so a confirm gate alone lets a non-founder complete or PERMANENTLY DELETE
+  anyone's task. Ownership scoping belongs on the gid path too, not just the name path. (This was
+  the P1 review's HIGH finding; the founder + FNDR/HJRG retain cross-entity authority by design.)
+- A passing test can still be a coverage hole: an `assert A or B` where `B` is always true never
+  exercises `A` (the tautological follower assertion). Pin both call arguments unconditionally and
+  add the NON-privileged actor's negative case.
+
+**Process:** one adversarial D-051 review (3-lens) over the P1 diff confirmed the gid-ownership
+HIGH + two test gaps; all fixed on `8b4557d` before push. Full suite 4,909 passed / 3 pre-existing
+env-failures / 42 skipped. Bot-loaded changes -> Harrison merges (WS11 then `986b0eb`) + the same
+coordinated restart as P0. KB purges remain dry-run-default + Harrison-gated (handed off as an
+exact elevated stop -> dry-run -> apply -> reclaim -> restart -> smoke sequence).
