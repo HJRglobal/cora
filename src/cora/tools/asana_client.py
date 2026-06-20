@@ -57,16 +57,49 @@ def _pat() -> str:
     return val
 
 
-def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[dict[str, Any]]:
+# Default opt_fields for a per-user task fetch. The plate/digest paths need the
+# rich set (projects/sections/notes for display); high-volume consumers
+# (reconciliation) pass a narrower set to cut response/token size (WS12).
+_DEFAULT_TASK_OPT_FIELDS: list[str] = [
+    "name",
+    "due_on",
+    "due_at",
+    "completed",
+    "assignee.gid",   # needed for user_identity reverse lookup (@mention in digests)
+    "assignee.name",  # human-readable fallback when reverse lookup misses
+    "projects.name",
+    "memberships.section.name",
+    "memberships.project.name",
+    "notes",
+    "permalink_url",  # Slack deep link — user clicks to edit in Asana
+]
+
+
+def get_user_tasks(
+    user_gid: str,
+    max_tasks: int = _DEFAULT_MAX_TASKS,
+    opt_fields: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Fetch incomplete tasks assigned to a user.
 
     Paginates when max_tasks > 100 (Asana 400s on limit > 100 — the 5/31
     reconciliation "scale increase" to max_tasks=200 silently broke every
     fetch until 2026-06-11).
 
+    opt_fields: which task fields to request. Defaults to the rich display set;
+    pass a narrow list (e.g. reconciliation: name/assignee/permalink) to cut the
+    response payload + downstream token cost (WS12).
+
+    Asana system-reminder tasks (goal-update reminders) are filtered out at this
+    source, so they never surface in reconciliation, the brief, or the plate
+    (WS12 — the skip used to live only in the hygiene-nudge script).
+
     Returns a list of task dicts. Empty list if no incomplete tasks.
     Raises AsanaClientError on auth / network / 5xx failure.
     """
+    from ..asana_filters import is_system_noise_task  # noqa: PLC0415
+
+    fields = opt_fields if opt_fields is not None else _DEFAULT_TASK_OPT_FIELDS
     headers = {"Authorization": f"Bearer {_pat()}"}
     tasks: list[dict[str, Any]] = []
     offset: str | None = None
@@ -77,19 +110,7 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
             "workspace": _WORKSPACE_GID,
             "completed_since": "now",  # incomplete-only filter
             "limit": min(_API_MAX_LIMIT, max_tasks - len(tasks)),
-            "opt_fields": ",".join([
-                "name",
-                "due_on",
-                "due_at",
-                "completed",
-                "assignee.gid",   # needed for user_identity reverse lookup (@mention in digests)
-                "assignee.name",  # human-readable fallback when reverse lookup misses
-                "projects.name",
-                "memberships.section.name",
-                "memberships.project.name",
-                "notes",
-                "permalink_url",  # Slack deep link — user clicks to edit in Asana
-            ]),
+            "opt_fields": ",".join(fields),
         }
         if offset:
             params["offset"] = offset
@@ -115,7 +136,9 @@ def get_user_tasks(user_gid: str, max_tasks: int = _DEFAULT_MAX_TASKS) -> list[d
         if not offset:
             break
 
-    return tasks[:max_tasks]
+    # Drop Asana system-reminder tasks at the source (WS12) before truncating.
+    real = [t for t in tasks if not is_system_noise_task(t.get("name", ""))]
+    return real[:max_tasks]
 
 
 def get_project_tasks(project_gid: str, max_tasks: int = _API_MAX_LIMIT) -> list[dict[str, Any]]:

@@ -119,12 +119,17 @@ def _fetch_open_tasks() -> list[dict]:
         users = mapping.get("users", [])
         all_tasks: dict[str, dict] = {}  # gid -> task (dedup)
 
+        # Narrow opt_fields: reconciliation passes use only name / assignee /
+        # permalink (gid is always returned), so drop the token-heavy nested
+        # fields (notes / projects / memberships) from this high-volume fetch (WS12).
+        _recon_fields = ["name", "completed", "assignee.gid", "assignee.name", "permalink_url"]
+
         for user in users:
             asana_gid = user.get("asana_user_gid", "") or user.get("asana_gid", "")
             if not asana_gid:
                 continue
             try:
-                tasks = get_user_tasks(asana_gid, max_tasks=200)
+                tasks = get_user_tasks(asana_gid, max_tasks=200, opt_fields=_recon_fields)
                 for t in tasks:
                     task_gid = t.get("gid") or t.get("id", "")
                     if task_gid:

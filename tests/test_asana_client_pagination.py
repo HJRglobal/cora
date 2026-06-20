@@ -97,6 +97,49 @@ class TestPagination:
         assert client.get.call_count == 1
 
 
+class TestSystemNoiseFilteredAtSource:
+    """WS12: goal-reminder system tasks are dropped at the get_user_tasks source."""
+
+    def test_goal_reminder_dropped(self):
+        page = [
+            {"gid": "1", "name": "Ship the deck"},
+            {"gid": "2", "name": "It's time to update your goal"},
+            {"gid": "3", "name": "Call the vendor"},
+        ]
+        client, factory = _client_returning([_resp(page)])
+        with patch.object(asana_client.httpx, "Client", factory):
+            tasks = asana_client.get_user_tasks("u1", max_tasks=50)
+        gids = [t["gid"] for t in tasks]
+        assert gids == ["1", "3"]  # system reminder removed
+
+    def test_real_tasks_all_kept(self):
+        page = [{"gid": "1", "name": "A"}, {"gid": "2", "name": "B"}]
+        client, factory = _client_returning([_resp(page)])
+        with patch.object(asana_client.httpx, "Client", factory):
+            tasks = asana_client.get_user_tasks("u1", max_tasks=50)
+        assert len(tasks) == 2
+
+
+class TestOptFieldsThreading:
+    """WS12: opt_fields param defaults to the rich set; a narrow list is honored."""
+
+    def test_default_opt_fields_include_notes_and_projects(self):
+        client, factory = _client_returning([_resp([{"gid": "1"}])])
+        with patch.object(asana_client.httpx, "Client", factory):
+            asana_client.get_user_tasks("u1", max_tasks=10)
+        sent = client.get.call_args.kwargs["params"]["opt_fields"]
+        assert "notes" in sent and "projects.name" in sent
+
+    def test_narrow_opt_fields_passed_through(self):
+        narrow = ["name", "permalink_url", "assignee.gid"]
+        client, factory = _client_returning([_resp([{"gid": "1"}])])
+        with patch.object(asana_client.httpx, "Client", factory):
+            asana_client.get_user_tasks("u1", max_tasks=10, opt_fields=narrow)
+        sent = client.get.call_args.kwargs["params"]["opt_fields"]
+        assert sent == "name,permalink_url,assignee.gid"
+        assert "notes" not in sent and "memberships" not in sent
+
+
 class TestErrorsStillRaise:
     def test_400_raises(self):
         r = MagicMock()

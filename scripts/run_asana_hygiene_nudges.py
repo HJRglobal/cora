@@ -70,12 +70,10 @@ _VISIBILITY_SKIP_TERMS = frozenset([
 ])
 
 # Asana auto-generated system reminders that are NOT real work -- skip these.
-# "It's time to update your goal(s)" is created automatically by Asana Goals; it
-# is not an actionable task and was being nudged daily (surfaced by hygiene-asana
-# 2026-06-10 -- 6 of these were open + getting nudged). Substring, case-folded.
-_SYSTEM_NOISE_SKIP_TERMS = frozenset([
-    "it's time to update your goal",
-])
+# The canonical term set + matcher now live in cora.asana_filters (WS12) so the
+# nudge lane, reconciliation, the brief, and the plate share ONE definition and
+# cannot drift. get_user_tasks also filters these at the source.
+from cora.asana_filters import is_system_noise_task as _is_system_noise_task  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -105,12 +103,6 @@ def _load_users() -> list[dict[str, Any]]:
 def _is_visibility_task(task_name: str) -> bool:
     lower = task_name.lower()
     return any(term in lower for term in _VISIBILITY_SKIP_TERMS)
-
-
-def _is_system_noise_task(task_name: str) -> bool:
-    """True for Asana auto-generated, non-actionable system reminders."""
-    lower = task_name.lower()
-    return any(term in lower for term in _SYSTEM_NOISE_SKIP_TERMS)
 
 
 def _is_lex_task(task: dict[str, Any]) -> bool:
