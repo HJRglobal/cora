@@ -1943,3 +1943,85 @@ legit families + a fireflies note + space-named human notes). Full suite 4,949 p
 pre-existing env-failures / 42 skipped. Bot-loaded? NO -- both surfaces are script-side (drive_sweep
 is a scheduled task; the purge is a script). No bot restart needed. Harrison merges + re-runs the
 purge (recommended `--scope broad`, dry-run manifest reviewed first).
+
+## D-058 - Track A P1-tail + P2 block (WS6/7/8/9/10/12/13/15) (2026-06-20)
+
+**Context:** Third Track A build off `main`@`de519b5` (pushed to origin first), isolated
+worktree `cora-wt-remainder` (branch `claude/track-a-p1tail-p2`, 10 commits, NOT merged).
+The P1-tail + P2 remainder from the 20-report synthesis. WS14 / WS16 / the is_dm-channel_id
+gap are NO-CODE deliverables (verify-only / D-011 draft / PHI-review-defer) and are handed
+off, not built. WS17-A/B are a later session.
+
+**Decisions / what shipped:**
+- **WS8** (`drive_connector.py` + `photoroom_client.py`) - PREVENTIVE Drive guardrails:
+  `safe_drive_create` fails CLOSED if a create has no non-empty-string `parents` (no
+  My-Drive-root write) or sets `permissions` inline (no anyone-with-link); wired at all 3
+  create sites. A repo grep-guard test bans `anyoneWithLink` / `type:anyone` / a
+  permissions-create call anywhere in src+scripts (the real public-share vector the body
+  check can't see; patterns assembled from fragments so the test never matches itself).
+- **WS9** (`attachment_filer.py` + `inventory_client.py` + `canonical-files.yaml`) -
+  VERIFY-FIRST killed the "root-drop" premise (invalid classifications are SKIPPED, never
+  root-written; D-053 dedup already shipped). Residuals only: a pinned canonical inventory
+  fileId (deterministic, fail-OPEN to name-search) + the always-named-folder invariant
+  (comment + tests). Doc-type map + forwarded-handling DEFERRED.
+- **WS6** (`qbo_client.py` + `tool_dispatch.py`) - the conversational P&L now LABELS the
+  basis QBO actually rendered (`Header.ReportBasis`), never fabricated, and passes an
+  optional per-entity override `_ENTITY_PNL_BASIS` that ships EMPTY (INVARIANT CLAMP: never
+  blanket-Accrual; LEX-LLC is cash, LBHS differs). No lex.md band-aid existed to retire
+  (premise wrong). QBO stays READ-ONLY.
+- **WS7** (`gsheets_financials.py` + `scripts/write_cashflow_snapshot.py` + setup ps1) - the
+  daily-brief cash was DEAD; built a Cowork-readable surface (Harrison-locked: NOT a Cash
+  Pulse re-enable). New `ending_cash_series` + `ending_cash_outlook(weeks)`; a standalone
+  scheduled writer dumps a labeled, source-opaque JSON to `00-Founder/_cash-snapshot/` on
+  the Drive mount; fail-SOFT (read OR write error leaves the prior snapshot + exits nonzero,
+  no silent stale fallback).
+- **WS13** (`fireflies_connector.py`) - multi-organizer dedup: cluster on EITHER link OR
+  title+participants, but a title-only cross-link merge requires a TIGHT window
+  (`_TITLE_MERGE_TOLERANCE_SEC` 180s) and cluster keys are the ANCHOR's only (no
+  accumulation), so two genuinely-different same-title/same-attendee meetings can't merge
+  and a borrowed link can't transitively bridge. Empty-recording guard unchanged.
+- **WS12** (`asana_filters.py` + `asana_client.py` + reconciliation + nudge script) - one
+  shared system-reminder filter applied at the `get_user_tasks` SOURCE (every caller gets
+  clean lists), filtered PER PAGE so noise never consumes the `max_tasks` budget, curly-
+  apostrophe-normalized, `name` force-included in `opt_fields`; reconciliation requests
+  narrow fields (drops notes/projects/memberships it never reads).
+- **WS10** (`run_asana_hygiene_nudges.py` + `attach_capture_custom_fields.py` +
+  `asana-architecture.md`) - VERIFY-FIRST confirmed the nudge lane is already the sole owner
+  (Make 4768887 deactivated, shared throttle, closed-task guard). Added Tier-0 importance
+  (compliance/revalidat/p0/urgent/emoji; bare audit/deadline DROPPED) that bypasses the
+  Tier-1 caps bounded by MAX_TIER0 + MAX_TIER0_PER_USER, with the cap-decision BEFORE the
+  expensive kb-signal/closed-task-guard so a backlog day issues no unbounded Asana reads;
+  cap-cut tasks logged to `hygiene-deferred.jsonl` (informational, auto-recovers next run).
+  Custom-field attach extended to the 2026-06-08 projects + a `field_target_projects` list
+  (apply stays Harrison-gated). The design doc gained the nudge-lane section.
+- **WS15** (`user-aliases.yaml`) - Sara Fonseca alias (name resolution was failing).
+
+**Doctrines:**
+- A KB exclusion / source filter applied at a SHARED source helps every consumer at once -
+  but verify no existing caller depends on the removed items (reconciliation reads only
+  name/gid/permalink/assignee, so the narrow opt_fields drop nothing) and force-include the
+  field the filter keys on (`name`) so a narrow caller can't fail it OPEN.
+- A dedup/merge over a fuzzy identity must prefer UNDER-merge (a harmless duplicate) over
+  OVER-merge (irreversible data loss): require a tight time window + anchor-only keys for a
+  cross-link title match; never accumulate keys that let a later copy transitively bridge.
+- A freshness/availability flag must fail CLOSED on indeterminate input (an unparseable week
+  -> stale, not fresh), and two figures on the same surface must share one precedence
+  (headline mirrors the outlook anchor) or they will disagree mid-week.
+- A per-run cap that drops work needs an IMPORTANCE tier so a compliance/P0 task is never
+  starved - but the tier regex must be high-signal (bare "audit"/"deadline" over-escalate),
+  the bypass needs a per-user sub-cap, and the cap decision must run BEFORE any per-task API
+  call or a backlog day fans out unbounded reads.
+- Label the basis a financial source actually used (read it back), never force a default you
+  can't verify per entity; an override map ships EMPTY and is a Harrison/Justin policy input.
+
+**Process:** one 6-lens adversarial D-051 review found 3 MEDIUM (WS13 data-loss merge, WS10
+unbounded-reads + over-escalation, WS7 fail-open freshness + headline disagreement) + LOWs
+the green 5,021-suite hid; ALL fixed in one remediation commit; a 3-lens second-pass review
+confirmed every finding CLOSED with ZERO new defects (SHIP x3). Full suite 5,035 passed / 42
+skipped / 0 failed (with `GOOGLE_SERVICE_ACCOUNT_JSON` set; the 3 gsheets cache tests are
+env-gated, green on the host). Bot-loaded? PARTIAL - WS6/WS12-source-filter/WS8-guard touch
+bot-imported modules (activate at the next restart, restart-safe); WS7/WS9/WS10/WS13 are
+script-side (their scheduled tasks import on-disk source). Harrison merges + ONE coordinated
+restart; registers `setup-cashflow-snapshot-task.ps1`; populates `_ENTITY_PNL_BASIS` per
+entity when ready. META: the green suite caught NONE of the 3 MEDIUMs - adversarial diff
+review did, again.
