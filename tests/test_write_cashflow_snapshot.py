@@ -39,29 +39,46 @@ def _summary() -> CashflowSummary:
     )
 
 
+def _lts_summary() -> CashflowSummary:
+    """A CF_LTS-tab read (separate from CF_SUMMARY): LTS ending cash + outlook."""
+    return CashflowSummary(
+        week_label="Week of 6/09/2026",
+        as_of_date="2026-06-16",
+        closing_balance=214861.0,
+        ending_cash_series=[
+            {"week": "6/09/2026", "ending_cash": 214861.0, "is_actual": True},
+            {"week": "6/16/2026", "ending_cash": 175751.0, "is_actual": False},
+            {"week": "6/23/2026", "ending_cash": 84751.0, "is_actual": False},
+        ],
+    )
+
+
 # ── build_snapshot ──────────────────────────────────────────────────────────
 
 def test_build_snapshot_shape_and_labels():
-    snap = wcs.build_snapshot(_summary(), "2026-06-19T21:00:00+00:00", weeks=2)
+    snap = wcs.build_snapshot(_summary(), "2026-06-19T21:00:00+00:00", weeks=2,
+                              lts_summary=_lts_summary())
     assert snap["generated_at_utc"] == "2026-06-19T21:00:00+00:00"
     assert snap["week_label"] == "Week of 6/09/2026"
     assert snap["as_of_date"] == "2026-06-16"
     assert snap["portfolio_ending_cash"] == 1347657.0
-    # entities carry both canonical code + human label
-    codes = {e["code"] for e in snap["entities"]}
-    assert {"F3E", "LEX-LTS"} <= codes
+    # the dead per-entity `entities` field is gone (CF_SUMMARY has no per-entity rows)
+    assert "entities" not in snap
     # outlook = current + next 2 weeks
     assert [o["week"] for o in snap["ending_cash_outlook"]] == ["6/09/2026", "6/16/2026", "6/23/2026"]
-    # lex_lts convenience pointer
+    # lex_lts comes from the separate CF_LTS read: ending cash + matching outlook
     assert snap["lex_lts"]["code"] == "LEX-LTS"
-    assert snap["lex_lts"]["actual"] == 4200.0
+    assert snap["lex_lts"]["ending_cash"] == 214861.0
+    assert [o["week"] for o in snap["lex_lts"]["ending_cash_outlook"]] == \
+        ["6/09/2026", "6/16/2026", "6/23/2026"]
 
 
 def test_build_snapshot_lts_none_when_absent():
-    s = _summary()
-    s.entities = [e for e in s.entities if e.entity_code != "LEX-LTS"]
-    snap = wcs.build_snapshot(s, "2026-06-19T21:00:00+00:00")
+    # No CF_LTS read provided (the separate read failed) -> lex_lts is null, and
+    # the portfolio headline still populates.
+    snap = wcs.build_snapshot(_summary(), "2026-06-19T21:00:00+00:00")
     assert snap["lex_lts"] is None
+    assert snap["portfolio_ending_cash"] == 1347657.0
 
 
 def test_build_snapshot_is_source_opaque():
@@ -117,6 +134,23 @@ def test_main_writes_snapshot(tmp_path, monkeypatch):
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["portfolio_ending_cash"] == 1347657.0
     assert data["ending_cash_outlook"]  # non-empty
+
+
+def test_main_lts_failsoft_still_writes(tmp_path, monkeypatch):
+    # CF_SUMMARY ok but the SEPARATE CF_LTS read fails -> lex_lts null, snapshot
+    # still written (rc 0). The portfolio headline must not depend on CF_LTS.
+    def _by_tab(tab_name=None):
+        if tab_name == "CF_LTS":
+            raise GsheetsConnectorError("LTS read failed")
+        return _summary()
+
+    monkeypatch.setattr(wcs.gf, "get_cashflow", _by_tab)
+    out = tmp_path / "cashflow-latest.json"
+    rc = wcs.main(["--out", str(out)])
+    assert rc == 0
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["lex_lts"] is None
+    assert data["portfolio_ending_cash"] == 1347657.0
 
 
 def test_main_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):

@@ -2,15 +2,17 @@
 
 The Cowork daily-morning-brief SKILL has no way to read portfolio cash: its own
 QBO connector is F3-Energy-Holdings-only (no realm param), and the all-entity cash
-lives only in Cora's gsheets connector. This standalone scheduled writer does ONE
-read of the CF_SUMMARY tab and writes a small, labeled JSON snapshot to a local
-path on the Google-Drive mount (Drive-for-Desktop syncs it), which the brief SKILL
-then reads. NOT bot-loaded — runs as its own scheduled task.
+lives only in Cora's gsheets connector. This standalone scheduled writer reads the
+CF_SUMMARY (portfolio) tab plus the CF_LTS tab and writes a small, labeled JSON
+snapshot to a local path on the Google-Drive mount (Drive-for-Desktop syncs it),
+which the brief SKILL then reads. NOT bot-loaded — runs as its own scheduled task.
 
-Snapshot contents (each LABELED with entity + as-of date):
-  - portfolio ending cash (current week)
-  - the ending-cash outlook: current week + next ~4 FORECAST weeks
-  - per-entity weekly cash-flow rows (incl. LEX-LTS)
+Snapshot contents (LABELED, source-opaque):
+  - portfolio ending cash (current week) + the ending-cash outlook
+    (current week + next ~4 FORECAST weeks), from the CF_SUMMARY tab
+  - the cash-tight LEX-LTS ending-cash line + its outlook, from a separate CF_LTS
+    read (null if that read fails). CF_SUMMARY is the portfolio-totals tab and has
+    no per-entity rows, so per-entity cash needs its own CF_* tab.
   - freshness: as_of_date, is_stale (sheet behind >10d), data_age_days,
     generated_at_utc (snapshot write time)
 
@@ -63,9 +65,43 @@ def _default_out_path() -> Path:
     return Path(override) if override else _DEFAULT_OUT
 
 
-def build_snapshot(summary: gf.CashflowSummary, generated_at_iso: str, weeks: int = 4) -> dict:
-    """Serialize a CashflowSummary into the labeled snapshot dict (pure)."""
-    lts = summary.entity_by_code("LEX-LTS")
+def _lts_block(lts: gf.CashflowSummary | None, weeks: int) -> dict | None:
+    """Build the LEX-LTS ending-cash line from a CF_LTS-tab summary.
+
+    Returns None if the CF_LTS read failed (the portfolio headline still writes).
+    LTS is the cash-tight entity Harrison tracks; this surfaces its ending cash +
+    the same forward outlook as the portfolio line.
+    """
+    if lts is None:
+        return None
+    outlook = lts.ending_cash_outlook(weeks=weeks)
+    age = lts.data_age_days()
+    return {
+        "code": "LEX-LTS",
+        "label": "LEX-LTS",
+        "week_label": lts.week_label,
+        # Mirror the outlook anchor (actual-first); fall back to closing_balance
+        # only when the outlook is empty.
+        "ending_cash": (outlook[0]["ending_cash"] if outlook else lts.closing_balance),
+        "ending_cash_outlook": outlook,
+        "is_stale": lts.is_stale() or age is None,
+        "data_age_days": age,
+    }
+
+
+def build_snapshot(
+    summary: gf.CashflowSummary,
+    generated_at_iso: str,
+    weeks: int = 4,
+    lts_summary: gf.CashflowSummary | None = None,
+) -> dict:
+    """Serialize the portfolio + LEX-LTS cash lines into the snapshot dict (pure).
+
+    `summary` is the CF_SUMMARY (portfolio) read; `lts_summary` is the separate
+    CF_LTS read (None if it failed). CF_SUMMARY is the portfolio-totals tab and has
+    no per-entity rows, so per-entity cash comes from its own CF_* tab — here only
+    LEX-LTS, the cash-tight entity Harrison tracks.
+    """
     outlook = summary.ending_cash_outlook(weeks=weeks)
     age = summary.data_age_days()
     return {
@@ -84,25 +120,12 @@ def build_snapshot(summary: gf.CashflowSummary, generated_at_iso: str, weeks: in
         # when the outlook is empty (target week not in the series).
         "portfolio_ending_cash": (outlook[0]["ending_cash"] if outlook else summary.closing_balance),
         "ending_cash_outlook": outlook,
-        # Per-entity WEEKLY CASH-FLOW rows (forecast/actual), not ending balances.
-        "entities": [
-            {
-                "code": e.entity_code,
-                "label": e.label,
-                "forecast": e.forecast,
-                "actual": e.actual,
-            }
-            for e in summary.entities
-        ],
-        # Convenience pointer for the cash-tight LEX-LTS line (from CF_SUMMARY).
-        "lex_lts": (
-            {"code": lts.entity_code, "label": lts.label,
-             "forecast": lts.forecast, "actual": lts.actual}
-            if lts else None
-        ),
+        # The cash-tight LEX-LTS ending-cash line, from a SEPARATE CF_LTS read
+        # (null if that read failed). CF_SUMMARY cannot supply per-entity cash.
+        "lex_lts": _lts_block(lts_summary, weeks),
         "parse_warnings": list(summary.parse_warnings),
-        "_note": "Per-entity rows are weekly cash flow; ending_cash_outlook is "
-                 "portfolio ending-cash balances (current + forecast weeks).",
+        "_note": "ending_cash_outlook is portfolio ending-cash balances (current + "
+                 "forecast weeks); lex_lts is the LEX-LTS ending-cash line.",
     }
 
 
@@ -137,13 +160,26 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Cashflow read failed (%s) — previous snapshot left untouched", exc)
         return 1
 
+    # LEX-LTS ending-cash line: a SEPARATE CF_LTS tab read, FAIL-SOFT. A CF_LTS
+    # failure must not sink the snapshot (the portfolio headline is the primary
+    # need) -- on error lex_lts is simply null.
+    lts_summary = None
+    try:
+        lts_summary = gf.get_cashflow(tab_name=gf.ENTITY_TO_TAB["LEX-LTS"])
+    except Exception as exc:
+        # Optional enrichment — ANY failure degrades lex_lts to null and never sinks
+        # the portfolio snapshot (the connector wraps API errors, but a truly
+        # fail-soft optional read catches everything).
+        log.warning("LEX-LTS cashflow read failed (%s) — lex_lts will be null", exc)
+
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    snapshot = build_snapshot(summary, generated_at, weeks=args.weeks)
+    snapshot = build_snapshot(summary, generated_at, weeks=args.weeks, lts_summary=lts_summary)
 
     if args.dry_run:
         print(json.dumps(snapshot, indent=2, ensure_ascii=False))
-        log.info("[DRY RUN] would write %d entities + %d outlook weeks to %s",
-                 len(snapshot["entities"]), len(snapshot["ending_cash_outlook"]), out_path)
+        log.info("[DRY RUN] would write %d outlook weeks (lex_lts=%s) to %s",
+                 len(snapshot["ending_cash_outlook"]),
+                 "yes" if snapshot["lex_lts"] else "no", out_path)
         return 0
 
     try:
@@ -154,9 +190,9 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Cash snapshot write failed (%s) — previous snapshot left untouched", exc)
         return 1
     log.info(
-        "Wrote cash snapshot: %s (week=%s, as_of=%s, stale=%s, %d entities)",
+        "Wrote cash snapshot: %s (week=%s, as_of=%s, stale=%s, lex_lts=%s)",
         out_path, summary.week_label, summary.as_of_date, snapshot["is_stale"],
-        len(snapshot["entities"]),
+        "yes" if snapshot["lex_lts"] else "no",
     )
     return 0
 
