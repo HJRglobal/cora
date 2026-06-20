@@ -1,0 +1,15 @@
+# Canonical Drive file IDs for high-value recurring files.
+#
+# A consumer PREFERS the pinned file_id (deterministic — immune to the title
+# collisions and modifiedTime ties that a name-based search could otherwise
+# resolve to the wrong copy). On 404 / trashed / any error, the consumer falls
+# back to name-based search and logs a warning, so this file can never hard-break
+# a lookup.
+#
+# Confirmed 2026-06-19 (Cowork verify-first run). Harrison-editable: update the id
+# here if the canonical file is replaced — no code change needed. An env var
+# (e.g. F3E_INVENTORY_FILE_ID) overrides the pinned id at runtime.
+
+f3e_weekly_inventory:
+  file_id: "1sI_ejagawGdenipksSCwdU611Rlt4bxm"
+  fallback_name: "F3 Energy LLC - Weekly Inventory Report.xlsx"

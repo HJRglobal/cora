@@ -229,6 +229,61 @@ class TestProcessAccountBudget:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Always-named-folder invariant (WS9): an invalid classification is SKIPPED,
+# never filed to root / a limbo folder.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAlwaysNamedFolderInvariant:
+    def test_unknown_entity_is_skipped_not_uploaded(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        upload = _patch_pipeline(
+            monkeypatch, meta=_meta(),
+            decisions=_decisions(entity="ACME", subfolder="legal"),
+        )
+        out = af.process_email("harrison@hjrglobal.com", "m1",
+                               content_ledger={}, seen_messages=set())
+        assert out == []
+        assert upload.call_count == 0
+
+    def test_unknown_subfolder_is_skipped_not_uploaded(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        upload = _patch_pipeline(
+            monkeypatch, meta=_meta(),
+            decisions=_decisions(entity="OSN", subfolder="todo"),
+        )
+        out = af.process_email("harrison@hjrglobal.com", "m1",
+                               content_ledger={}, seen_messages=set())
+        assert out == []
+        assert upload.call_count == 0
+
+    def test_valid_classification_targets_named_entity_folder(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        seen_segments = {}
+
+        def _ensure(segs):
+            seen_segments["segs"] = list(segs)
+            return "folder-" + "/".join(segs)
+
+        monkeypatch.setattr(af, "get_message", lambda u, m: {"id": m})
+        monkeypatch.setattr(af, "parse_message_metadata", lambda msg: _meta())
+        monkeypatch.setattr(af, "classify_attachments",
+                            lambda meta_, atts, entity_hint=None: _decisions(entity="OSN", subfolder="legal"))
+        monkeypatch.setattr(af, "download_attachment", lambda u, m, a: b"BYTES")
+        monkeypatch.setattr(af, "ensure_folder_path", _ensure)
+        upload = MagicMock(return_value=("file1", "https://drive/file1"))
+        monkeypatch.setattr(af, "upload_file", upload)
+
+        out = af.process_email("harrison@hjrglobal.com", "m1",
+                               content_ledger={}, seen_messages=set())
+        assert len(out) == 1
+        # Folder is a named, non-empty 2-segment path under an entity folder.
+        segs = seen_segments["segs"]
+        assert len(segs) == 2 and all(s for s in segs)
+        assert segs[1] == "legal"
+        assert upload.call_count == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # run_filer — incremental per-account watermark persistence
 # ─────────────────────────────────────────────────────────────────────────────
 

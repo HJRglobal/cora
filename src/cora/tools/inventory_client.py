@@ -22,6 +22,7 @@ import io
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,32 @@ _SHEET_OFFICE = "117 office"
 # ── Drive search ──────────────────────────────────────────────────────────────
 _REPORT_FILENAME = "F3 Energy LLC - Weekly Inventory Report.xlsx"
 
+# Env var that overrides the pinned canonical file id at runtime.
+_INVENTORY_FILE_ID_ENV = "F3E_INVENTORY_FILE_ID"
+
+
+def _canonical_inventory_file_id() -> str | None:
+    """Return the pinned canonical fileId for the weekly inventory report, or None.
+
+    Resolution order: env override -> data/maps/canonical-files.yaml. Fail-OPEN:
+    any error returns None so the caller falls back to name-based search. The
+    pinned id makes the lookup deterministic (immune to title collisions and
+    modifiedTime ties).
+    """
+    env = os.environ.get(_INVENTORY_FILE_ID_ENV, "").strip()
+    if env:
+        return env
+    try:
+        import yaml  # noqa: PLC0415
+        path = Path(__file__).resolve().parents[3] / "data" / "maps" / "canonical-files.yaml"
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        fid = ((data.get("f3e_weekly_inventory") or {}).get("file_id") or "").strip()
+        return fid or None
+    except Exception as exc:  # missing / malformed yaml -> name-search fallback
+        log.debug("canonical-files.yaml unreadable (%s) — using name search", exc)
+        return None
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Drive helpers
@@ -95,12 +122,37 @@ def _build_service():
 
 
 def _find_latest_file(service) -> tuple[str, str]:
-    """Search Drive for the most-recently-modified inventory report.
+    """Resolve the canonical weekly inventory report. Returns (file_id, modified_iso).
 
-    Returns (file_id, modified_iso).  Picks the largest file among results
-    sharing the same modifiedTime (the largest has the most complete data —
-    all three sections).
+    Prefers the PINNED canonical fileId (deterministic). On 404 / trashed /
+    unreadable, falls back to name-based search: most-recently-modified, largest
+    among results sharing that modifiedTime (the largest has the most complete
+    data — all three sections).
     """
+    # Layer 1 — pinned canonical fileId (deterministic, no title-collision risk).
+    canonical = _canonical_inventory_file_id()
+    if canonical:
+        try:
+            meta = service.files().get(
+                fileId=canonical, fields="id, modifiedTime, trashed"
+            ).execute()
+            if meta and not meta.get("trashed", False):
+                log.info(
+                    "Inventory: using pinned canonical file %s (modified %s)",
+                    meta.get("id"), meta.get("modifiedTime"),
+                )
+                return meta["id"], meta.get("modifiedTime", "")
+            log.warning(
+                "Inventory canonical file %s missing/trashed — falling back to name search",
+                canonical,
+            )
+        except Exception as exc:
+            log.warning(
+                "Inventory canonical file %s lookup failed (%s) — falling back to name search",
+                canonical, exc,
+            )
+
+    # Layer 2 — name-based search fallback (legacy heuristic).
     try:
         resp = service.files().list(
             q=f"name = '{_REPORT_FILENAME}' and trashed = false",

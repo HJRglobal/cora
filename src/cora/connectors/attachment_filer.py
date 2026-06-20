@@ -419,6 +419,12 @@ def process_email(
         subfolder = decision.get("subfolder", "").lower()
         orig_filename = decision.get("filename", "")
 
+        # INVARIANT (WS9): every file that reaches upload_file() has a VALID entity
+        # AND a valid subfolder, so it always lands in a named HJR-Founder-OS/{entity}/
+        # {subfolder} path — never My Drive root, never a review/limbo folder. A
+        # malformed classification (unknown entity or subfolder) is SKIPPED here, not
+        # filed somewhere ambiguous. (Pairs with WS8 safe_drive_create, which fails
+        # closed if a create ever reaches it without a parent folder.)
         if entity not in _VALID_ENTITIES:
             log.warning("Unknown entity %r in decision for %r — skipping", entity, orig_filename)
             continue
