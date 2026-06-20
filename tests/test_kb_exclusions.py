@@ -8,7 +8,11 @@ the file_to_document wiring in the static sync script.
 import sys
 from pathlib import Path
 
-from cora.kb_exclusions import is_cora_internal_path, is_cora_internal_source_id
+from cora.kb_exclusions import (
+    is_cora_internal_path,
+    is_cora_internal_source_id,
+    is_cora_internal_title,
+)
 
 _DRIVE = r"G:\My Drive\HJR-Founder-OS"
 
@@ -102,3 +106,83 @@ class TestStaticSyncWiring:
         doc = sync.file_to_document(f)
         assert doc is not None
         assert doc.source == "static_md"
+
+
+class TestIsCoraInternalTitle:
+    """The WS1-completion fix: drive_sweep copies Founder-OS Drive files into the KB
+    under a Drive-file-id source_id with the filename in `title`. The path rules
+    can't see them, so we match the title. These are the REAL live filenames."""
+
+    # --- TARGETED: genuine build/audit/forensic artifacts -> caught ---
+    CAUGHT = [
+        "2026-06-16_fndr_cora-rebuild-execution-log.md",
+        "2026-06-16_fndr_cora-rebuild-COWORK-CASCADE-REPORT.md",
+        "2026-06-16_fndr_cora-forensic-findings-report.md",
+        "2026-06-16_fndr_cora-audit-addendum-runtime-evidence.md",
+        "2026-06-16_fndr_cora-rebuild-master-build-plan.md",
+        "2026-06-18_fndr_cora-north-star-and-two-track-plan.md",
+        "2026-06-17_fndr_cora-slack-incident-triage.md",
+        "2026-06-17_fndr_cora-rebuild-phase3-scope.md",
+        "2026-06-08_fndr_cora-code-prompt-caching-split-phase0.md",
+    ]
+
+    # --- legit business / Cora-adjacent docs that MUST be spared in BOTH scopes ---
+    SPARED = [
+        "f3-brand-assets-cora-reference.md",
+        "2026-05-23_lex_cora-wishlist.md",
+        "2026-06-11_lex_llc-channel-routing-cora-mapping.md",
+        "cora-f3-monitor-privacy-policy.md",
+        "CLAUDE.md",                       # founder/entity brief -- never exclude
+        "decisions.md",
+        "Christmas Decorations",           # substring 'cora' inside 'deCORAtions'
+        "F3 Energy Koozie order.md",
+    ]
+
+    # --- BROAD-only: Cora ops docs caught only with broad=True ---
+    BROAD_ONLY = [
+        "2026-06-08_fndr_cora-scaling-memory-game-plan.md",
+        "2026-06-16_fndr_cora-redesign-overhaul-proposal.md",
+        "2026-06-06_fndr_cora-team-training-manual.md",
+        "cora-tool-ship-checklist.md",
+        "2026-06-11_fndr_cora-14-day-infra-review.md",
+        "2026-06-13_fndr_cora-code-6-13-sweep.md",
+        "2026-06-18_fndr_cora-polar-mcp-auth-fix.md",
+    ]
+
+    def test_targeted_catches_build_docs(self):
+        for name in self.CAUGHT:
+            assert is_cora_internal_title(name), name
+            assert is_cora_internal_title(name, broad=True), name  # broad is a superset
+
+    def test_spares_legit_docs_both_scopes(self):
+        for name in self.SPARED:
+            assert not is_cora_internal_title(name), f"targeted leak-protect FAIL: {name}"
+            assert not is_cora_internal_title(name, broad=True), f"broad leak-protect FAIL: {name}"
+
+    def test_runtime_logs_caught(self):
+        for log in ("cora-2026-06-06.log", "cora-2026-05-28.log", "cora_debug.log"):
+            assert is_cora_internal_title(log), log
+        # a non-cora log is not ours
+        assert not is_cora_internal_title("server-2026-06-06.log")
+        # 'cora' inside another word is not a cora log
+        assert not is_cora_internal_title("decorations.log")
+
+    def test_broad_only_docs(self):
+        for name in self.BROAD_ONLY:
+            assert not is_cora_internal_title(name), f"should be targeted-spared: {name}"
+            assert is_cora_internal_title(name, broad=True), f"broad should catch: {name}"
+
+    def test_title_with_path_prefix_uses_basename(self):
+        # Some titles arrive with a folder prefix; match on the basename.
+        assert is_cora_internal_title("00-Founder/cora-forensic-findings-report.md")
+        assert is_cora_internal_title(r"sub\cora-2026-06-06.log")
+
+    def test_empty_and_none_safe(self):
+        assert not is_cora_internal_title("")
+        assert not is_cora_internal_title(None)  # type: ignore[arg-type]
+
+    def test_log_rule_also_on_source_id_and_path(self):
+        # The .log rule folds into the shared predicate, so a cora-*.log ingested
+        # under any path/source_id is caught everywhere, not just by title.
+        assert is_cora_internal_source_id("logs/cora-2026-06-06.log")
+        assert is_cora_internal_path(Path("C:/x/cora-2026-06-06.log"))
