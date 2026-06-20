@@ -568,6 +568,32 @@ def _meeting_dedup_key(transcript: dict) -> tuple:
     return ("title", _normalize_title(transcript.get("title")), _participant_set(transcript))
 
 
+def _meeting_dedup_keys(transcript: dict) -> list[tuple]:
+    """All identity keys a transcript can match a cluster on (WS13).
+
+    A meeting captured by two attendees' notetakers can carry DIFFERENT
+    meeting_links, so the link key alone misses that duplicate. Return BOTH:
+      - ("link", meeting_link) when a link is present, AND
+      - ("title", normalized_title, participant_email_set) when BOTH the title
+        AND the participant set are non-empty (an empty/anonymous transcript must
+        never cross-match on a degenerate ("title", "", frozenset()) key).
+    Clustering treats two transcripts as the same meeting if ANY key matches
+    within the time window. A transcript with neither a link nor a meaningful
+    title+participants gets a unique ("solo", id) key so it clusters with nothing.
+    """
+    keys: list[tuple] = []
+    link = (transcript.get("meeting_link") or "").strip().lower()
+    if link:
+        keys.append(("link", link))
+    ntitle = _normalize_title(transcript.get("title"))
+    pset = _participant_set(transcript)
+    if ntitle and pset:
+        keys.append(("title", ntitle, pset))
+    if not keys:
+        keys.append(("solo", transcript.get("id") or ""))
+    return keys
+
+
 def _transcript_completeness(transcript: dict) -> tuple[int, int, int]:
     """Completeness proxy: (sentence count, summary length, title length).
 
@@ -643,20 +669,23 @@ def _dedup_transcripts(transcripts: list[dict], ledger: dict) -> tuple[list[dict
         key=lambda t: (_ts(t), t.get("id") or ""),
     )
 
-    clusters: list[dict] = []  # {"key": tuple, "anchor": int, "members": [dict]}
+    clusters: list[dict] = []  # {"keys": set[tuple], "anchor": int, "members": [dict]}
     for t in ordered:
         if (t.get("id") or "") in dropped_ids:
             continue  # idempotency: a previously-collapsed copy never resurrects
-        key = _meeting_dedup_key(t)
+        keys = set(_meeting_dedup_keys(t))
         ts = _ts(t)
         placed = False
         for c in clusters:
-            if c["key"] == key and abs(ts - c["anchor"]) <= _DEDUP_TOLERANCE_SEC:
+            # Same meeting if ANY key matches (link OR title+participants) within
+            # the window — closes the multi-organizer / different-link gap (WS13).
+            if (keys & c["keys"]) and abs(ts - c["anchor"]) <= _DEDUP_TOLERANCE_SEC:
                 c["members"].append(t)
+                c["keys"] |= keys  # a link-matched copy still lends its title key
                 placed = True
                 break
         if not placed:
-            clusters.append({"key": key, "anchor": ts, "members": [t]})
+            clusters.append({"keys": set(keys), "anchor": ts, "members": [t]})
 
     def _winner_sort_key(t: dict):
         comp = _transcript_completeness(t)

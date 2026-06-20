@@ -135,6 +135,55 @@ class TestDedup:
 
 
 # ---------------------------------------------------------------------------
+# Multi-organizer: one meeting captured by two notetakers -> DIFFERENT links (WS13)
+# ---------------------------------------------------------------------------
+
+class TestMultiOrganizerDedup:
+    def test_dedup_keys_includes_both_link_and_title(self):
+        t = _t("a", title="Ops", date_ts=BASE, link="https://zoom/A",
+               attendees=[{"email": "a@x.com"}])
+        keys = ffc._meeting_dedup_keys(t)
+        assert ("link", "https://zoom/a") in keys
+        assert any(k[0] == "title" for k in keys)
+
+    def test_different_links_same_title_collapses(self):
+        a = _t("a", title="13 WCF Review", date_ts=BASE, link="https://zoom/A", n_sentences=3,
+               attendees=[{"email": "x@hjr.com"}, {"email": "y@hjr.com"}])
+        b = _t("b", title="13 WCF Review", date_ts=BASE + 90, link="https://meet/B", n_sentences=80,
+               attendees=[{"email": "x@hjr.com"}, {"email": "y@hjr.com"}])
+        winners, _, collapsed = ffc._dedup_transcripts([a, b], {})
+        assert collapsed == 1
+        assert [w["id"] for w in winners] == ["b"]  # most complete kept
+
+    def test_different_links_same_title_outside_window_both_kept(self):
+        a = _t("a", title="13 WCF Review", date_ts=BASE, link="https://zoom/A",
+               attendees=[{"email": "x@hjr.com"}])
+        b = _t("b", title="13 WCF Review", date_ts=BASE + 1200, link="https://meet/B",
+               attendees=[{"email": "x@hjr.com"}])  # 20 min apart > tolerance
+        winners, _, collapsed = ffc._dedup_transcripts([a, b], {})
+        assert collapsed == 0
+        assert sorted(w["id"] for w in winners) == ["a", "b"]
+
+    def test_different_links_different_titles_not_merged(self):
+        a = _t("a", title="F3 Weekly", date_ts=BASE, link="https://zoom/A",
+               attendees=[{"email": "x@hjr.com"}])
+        b = _t("b", title="OSN Recon", date_ts=BASE + 60, link="https://meet/B",
+               attendees=[{"email": "z@hjr.com"}])
+        winners, _, collapsed = ffc._dedup_transcripts([a, b], {})
+        assert collapsed == 0
+        assert sorted(w["id"] for w in winners) == ["a", "b"]
+
+    def test_empty_title_no_attendees_no_link_never_merges(self):
+        a = {"id": "a", "title": "", "date": BASE, "meeting_link": None,
+             "summary": {"overview": "", "action_items": ""}, "sentences": [], "meeting_attendees": []}
+        b = {"id": "b", "title": "", "date": BASE + 30, "meeting_link": None,
+             "summary": {"overview": "", "action_items": ""}, "sentences": [], "meeting_attendees": []}
+        winners, _, collapsed = ffc._dedup_transcripts([a, b], {})
+        assert collapsed == 0   # degenerate ("solo", id) keys never cross-match
+        assert sorted(w["id"] for w in winners) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
 # Ledger persistence
 # ---------------------------------------------------------------------------
 
