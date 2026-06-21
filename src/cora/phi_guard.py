@@ -207,6 +207,18 @@ _DIAGNOSIS_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in _DIAGNOSIS_TERMS) + r")\w*",
     re.IGNORECASE,
 )
+# Wellness-overlap terms legitimately appear in F3E Mood / wellness business copy
+# ("Mood helps with anxiety"), so the WRITE-gate clinical check (is_clinical_phi)
+# EXCLUDES them to avoid over-refusing legit product facts. Their clinical FRAMING
+# ("diagnosed with anxiety") is still caught by _DIAGNOSED_WITH_RE, and the scrubber
+# (scrub_lex_phi) still redacts them in LEX meeting context where they ARE PHI.
+_WELLNESS_OVERLAP_TERMS = frozenset({"anxiety", "depression", "depressive"})
+_CLINICAL_DX_RE = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(t) for t in _DIAGNOSIS_TERMS if t not in _WELLNESS_OVERLAP_TERMS
+    ) + r")\w*",
+    re.IGNORECASE,
+)
 # "diagnosed with X" / "diagnosis of X" -> keep the cue, redact the diagnosis.
 _DIAGNOSED_WITH_RE = re.compile(
     r"\b(diagnos(?:ed|is)\s+(?:with|of)\s+)([A-Za-z][\w\s'-]{0,40}?)(?=[.,;:]|\band\b|$)",
@@ -233,6 +245,40 @@ _MED_NAME_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(m) for m in _MED_NAMES) + r")\b",
     re.IGNORECASE,
 )
+
+
+def is_clinical_phi(text: str) -> bool:
+    """True if *text* carries clinical PHI that is_phi_risk's keyword set misses.
+
+    Closes the diagnosis/medication gap on the known-answers WRITE gate (WS17-B
+    pre-merge fix): is_phi_risk keys on the literal words 'diagnosis'/'medication'
+    but NOT bare diagnosis terms (autism / ADHD / nonverbal / Down syndrome),
+    'diagnosed with X', or psych-drug NAMES (risperidone, ...). Those detectors
+    otherwise live only inside scrub_lex_phi (a redactor), which the write gate
+    never calls.
+
+    Entity-agnostic + fail-safe: a missed legit fact is far cheaper than persisting
+    clinical PHI into a durable, always-loaded knowledge file. DELIBERATELY narrow to
+    avoid over-refusing legitimate F3E / OSN business facts:
+      - NO name redaction (would refuse legit possessive names like "Larry's deck").
+      - NO dose / med-CONTEXT cue ('dose' / 'mg') -- those appear in F3E/OSN
+        supplement copy ("a 200mg dose of caffeine").
+      - EXCLUDES the wellness-overlap terms (anxiety / depression) -- F3 Mood's core
+        positioning; their clinical FRAMING ("diagnosed with anxiety") is still caught.
+    Accepted residuals (covered by the human thumbs-up gate + is_phi_risk /
+    is_lex_billing_status_phi): a bare soft-term about a person, and a non-curated
+    drug name with no 'medication' keyword.
+    """
+    if not text:
+        return False
+    return bool(
+        _DOB_RE.search(text)
+        or _DIAGNOSED_WITH_RE.search(text)
+        or _ICD10_RE.search(text)
+        or _CLINICAL_DX_RE.search(text)
+        or _MED_NAME_RE.search(text)
+    )
+
 
 # A care-recipient noun immediately followed by a proper name -> drop the name.
 _CARE_RECIPIENT_NAME_RE = re.compile(

@@ -42,7 +42,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .phi_guard import is_phi_risk, is_lex_billing_status_phi
+from .phi_guard import is_phi_risk, is_lex_billing_status_phi, is_clinical_phi
 
 log = logging.getLogger(__name__)
 
@@ -342,7 +342,7 @@ def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | N
     if not isinstance(verdict, dict) or not verdict.get("answerable"):
         return None
     answer = str(verdict.get("answer") or "").strip()
-    if not answer or is_phi_risk(answer):
+    if not answer or is_phi_risk(answer) or is_clinical_phi(answer):
         return None
     confidence = str(verdict.get("confidence") or "MED").upper()
     if confidence not in ("HIGH", "MED", "LOW"):
@@ -548,7 +548,7 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
         save_pending_asks(asks)
         return "No problem -- thanks for letting me know. I'll find another route."
 
-    if is_phi_risk(reply_text):
+    if is_phi_risk(reply_text) or is_clinical_phi(reply_text):
         stored["state"] = "REJECTED_PHI"
         stored["replied_at"] = _now_iso()
         asks[stored["ask_id"]] = stored
@@ -726,10 +726,12 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
         # MEDIUM). This is a durable write to an always-loaded known-answers file;
         # the #info-for-cora intake admin-PHI gate is LEX-ASKER-scoped, so a non-LEX
         # asker pasting a named LEX client's billing/auth status would slip through.
-        # Apply BOTH the clinical check and the admin augmentation UNCONDITIONALLY
-        # here (entity-agnostic) — a missed legit named-admin fact is a far cheaper
-        # error than persisting PHI into the wrong-entity surface.
-        if is_phi_risk(text) or is_lex_billing_status_phi(text):
+        # Apply the base PHI check, the clinical diagnosis/medication check
+        # (is_clinical_phi -- WS17-B pre-merge fix; closes the autism/ADHD/nonverbal/
+        # risperidone class is_phi_risk misses), AND the LEX admin augmentation
+        # UNCONDITIONALLY here (entity-agnostic) -- a missed legit fact is a far
+        # cheaper error than persisting PHI into a durable knowledge surface.
+        if is_phi_risk(text) or is_lex_billing_status_phi(text) or is_clinical_phi(text):
             log.info("gap_autofill: contributed note refused (PHI) -- not persisted")
             return False, "contribution looks like PHI -- not persisted"
         author = (payload.get("author_name") or "").strip()
