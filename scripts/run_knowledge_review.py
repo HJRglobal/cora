@@ -66,25 +66,14 @@ _PENDING_EXPIRY_DAYS = 14
 # Slack retry before it moves to cold storage.
 _ARCHIVE_AFTER_DAYS = 3
 
-# Auto-approve: HIGH-confidence NON-canonical GENERIC updates write WITHOUT a
-# Harrison 👍 (the "I told Cora and she forgot" loop, Harrison #9). Scoped to
-# known-answers writes only -- design/known-answers/*.md is operational KB, NOT
-# canonical memory. Canonical writes (decision_capture -> decisions.md) and
-# external actions (asana_task/task_close/hubspot_note) and efficiency findings
-# ALWAYS require a 👍 (D-011 intact). Capped so a backlog can't flood in one run.
-_AUTO_APPROVE_TYPES = frozenset({"known_answer"})
-_MAX_AUTO_APPROVE_PER_RUN = 10
-
-# Auto-approve floor: items proposed BEFORE this timestamp are never auto-approved.
-# Initialized to "now" on the first run after this feature ships, so the
-# pre-existing PENDING backlog (proposed before the feature) is NOT auto-written
-# on the first post-restart run -- it rides the normal review/expire flow. Only
-# genuinely NEW HIGH machine-mined known-answers (proposed after the floor)
-# auto-approve.
-_AUTOAPPROVE_FLOOR_PATH = (
-    Path(__file__).resolve().parents[1] / "data" / "state"
-    / "knowledge-review-autoapprove-floor.txt"
-)
+# ── WS17-C (D-060): the silent auto-approve is RETIRED ───────────────────────
+# Previously, HIGH-confidence machine-mined known_answer updates wrote to
+# design/known-answers/*.md WITHOUT a Harrison 👍 (the old Step 1.5). Per the
+# System-2 fold decision, EVERYTHING now routes through Harrison's 👍 (D-011
+# intact) -- each knowledge DM now carries Cora's read so the review is
+# low-effort. The _AUTO_APPROVE_TYPES / _MAX_AUTO_APPROVE_PER_RUN /
+# _AUTOAPPROVE_FLOOR_PATH constants, _autoapprove_floor(), and
+# _auto_approve_eligible() are gone.
 
 # Weekly digest weekday (Mon=0) in AZ time. NOTE (WS17-B item 4): the knowledge
 # stream no longer waits for this day — known_answer / efficiency / #info-for-cora
@@ -129,41 +118,6 @@ def _is_digest_day() -> bool:
     fixed-offset pattern in strategy_memo.py / run_due_date_escalation.py."""
     az_now = datetime.now(timezone(timedelta(hours=-7)))
     return az_now.weekday() == _DIGEST_WEEKDAY
-
-
-def _autoapprove_floor() -> str:
-    """ISO timestamp before which PENDING items are NEVER auto-approved.
-
-    Initialized to 'now' on first call so the pre-existing backlog rides the
-    normal review/expire flow instead of flooding the KB on the first run.
-    Returns '' on any error -> the caller auto-approves NOTHING (fail-safe)."""
-    try:
-        if _AUTOAPPROVE_FLOOR_PATH.exists():
-            return _AUTOAPPROVE_FLOOR_PATH.read_text(encoding="utf-8").strip()
-        _AUTOAPPROVE_FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(timezone.utc).isoformat()
-        _AUTOAPPROVE_FLOOR_PATH.write_text(now, encoding="utf-8")
-        return now
-    except Exception:
-        return ""
-
-
-def _auto_approve_eligible(update: dict) -> bool:
-    """True if this PENDING update may be written WITHOUT a Harrison 👍 (G-D):
-    a HIGH-confidence non-canonical GENERIC (known-answers) update from a TRUSTED
-    automated source. Excludes answer_source=='teammate_dm' -- those carry a
-    HARD-CODED confidence='HIGH' for arbitrary teammate free text (not an assessed
-    HIGH), so they stay Harrison-gated. The backlog floor (proposed_at >= floor) is
-    applied by the caller."""
-    if update.get("state") != "PENDING":
-        return False
-    if update.get("update_type") not in _AUTO_APPROVE_TYPES:
-        return False
-    if (update.get("confidence") or "").upper() != "HIGH":
-        return False
-    if (update.get("payload") or {}).get("answer_source") == "teammate_dm":
-        return False
-    return True
 
 
 def _acquire_run_lock(log: logging.Logger) -> bool:
@@ -642,33 +596,6 @@ def main() -> int:
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
-
-    # ─── Step 1.5: Auto-approve HIGH-confidence non-canonical GENERIC updates ─
-    # (gate G-D, Harrison #9.) HIGH-confidence known-answers writes persist
-    # WITHOUT a 👍 -- closes the "I told Cora and she forgot" loop. Canonical
-    # writes (decision_capture) + external actions + efficiency findings always
-    # require a reaction. Capped per run so a backlog can't flood. Runs daily.
-    auto_approved = 0
-    if not args.dry_run:
-        slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
-        floor = _autoapprove_floor()  # excludes the pre-existing backlog; "" -> none
-        eligible = [
-            u for u in get_pending_updates()
-            if _auto_approve_eligible(u) and floor and u.get("proposed_at", "") >= floor
-        ]
-        if len(eligible) > _MAX_AUTO_APPROVE_PER_RUN:
-            log.info("Capping auto-approve: %d eligible -> top %d this run",
-                     len(eligible), _MAX_AUTO_APPROVE_PER_RUN)
-            eligible = eligible[:_MAX_AUTO_APPROVE_PER_RUN]
-        for u in eligible:
-            uid = u["update_id"]
-            log.info("AUTO-APPROVE [%s] %s (HIGH non-canonical) — %s",
-                     u.get("update_type"), uid[:8], u.get("description", "")[:120])
-            _execute_approved_update(u, slack_token, log)
-            resolve_update(uid, "APPROVED", reason="auto_approved_high_generic")
-            auto_approved += 1
-        if auto_approved:
-            log.info("Auto-approved %d HIGH-confidence non-canonical update(s)", auto_approved)
 
     # ─── Step 2: Drain PENDING updates (WS17-B items 3 + 4) ──────────────────
     # Split the unsent queue: operational "nudge" items route to their entity's

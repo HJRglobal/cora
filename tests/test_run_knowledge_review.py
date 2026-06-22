@@ -99,23 +99,6 @@ def test_dismissed_entry_records_reason():
     assert e["resolved_reason"] == "auto_expired_dmd_unreacted"
 
 
-def test_auto_approve_eligible_matrix():
-    def u(update_type, confidence, state="PENDING"):
-        return {"update_type": update_type, "confidence": confidence, "state": state}
-    # HIGH non-canonical known_answer -> eligible
-    assert rkr._auto_approve_eligible(u("known_answer", "HIGH")) is True
-    # Lower confidence -> not eligible
-    assert rkr._auto_approve_eligible(u("known_answer", "MED")) is False
-    assert rkr._auto_approve_eligible(u("known_answer", "LOW")) is False
-    # Canonical / external types never auto-approve, even at HIGH
-    assert rkr._auto_approve_eligible(u("decision_capture", "HIGH")) is False
-    assert rkr._auto_approve_eligible(u("asana_task", "HIGH")) is False
-    assert rkr._auto_approve_eligible(u("hubspot_note", "HIGH")) is False
-    assert rkr._auto_approve_eligible(u("efficiency", "HIGH")) is False
-    # Already-resolved never auto-approves
-    assert rkr._auto_approve_eligible(u("known_answer", "HIGH", state="APPROVED")) is False
-
-
 def test_is_digest_day_deterministic(monkeypatch):
     """Fixed AZ (-7) offset, robust without tzdata. 2026-06-15 is a Monday."""
     import datetime as _dt
@@ -132,28 +115,11 @@ def test_is_digest_day_deterministic(monkeypatch):
     assert rkr._is_digest_day() is False
 
 
-def test_autoapprove_floor_inits_and_excludes_old_backlog(tmp_path, monkeypatch):
-    floor_file = tmp_path / "floor.txt"
-    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", floor_file)
-    floor = rkr._autoapprove_floor()            # first call inits to "now"
-    assert floor and floor_file.exists()
-    assert rkr._autoapprove_floor() == floor    # stable on subsequent calls
-    # An old backlog item is type/confidence-eligible but excluded by the floor.
-    old = {"state": "PENDING", "update_type": "known_answer", "confidence": "HIGH",
-           "proposed_at": "2020-01-01T00:00:00+00:00", "payload": {}}
-    assert rkr._auto_approve_eligible(old) is True
-    assert old["proposed_at"] < floor           # the caller's floor filter drops it
-
-
-def test_autoapprove_excludes_teammate_dm():
-    base = {"state": "PENDING", "update_type": "known_answer", "confidence": "HIGH"}
-    assert rkr._auto_approve_eligible({**base, "payload": {"answer_source": "teammate_dm"}}) is False
-    assert rkr._auto_approve_eligible({**base, "payload": {"answer_source": "slack_kb"}}) is True
-
-
-def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
-    """Confirm -> save -> retrieve (Harrison #9): a HIGH known_answer auto-approves,
-    writes to known-answers, and is APPROVED with the auto-approve reason."""
+def test_high_known_answer_requires_thumbs_up(tmp_path, monkeypatch):
+    """WS17-C: the silent auto-approve is RETIRED. A HIGH-confidence known_answer
+    with NO Harrison reaction must (a) stay PENDING, (b) NOT be written to
+    known-answers, (c) NOT resolve its gap, and (d) still be DM'd to Harrison so
+    he can 👍 it. (Inverts the pre-WS17-C auto-approve roundtrip.)"""
     import importlib
     kr = importlib.import_module("cora.knowledge_review")
 
@@ -162,17 +128,27 @@ def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
     ka_dir = tmp_path / "known-answers"
     resolved = tmp_path / "resolved.jsonl"
 
-    floor_file = tmp_path / "floor.txt"
-    floor_file.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")  # old floor
     monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
     monkeypatch.setattr(kr, "_REPLY_LOG_PATH", reply_log)
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
-    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", floor_file)
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # isolate Step 1.5
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(ka_dir))
     monkeypatch.setenv("RESOLVED_GAPS_PATH", str(resolved))
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "")  # _post_to_slack no-ops; no network
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-dummy")  # enable the Step-2 DM path
+    # Keep the WS17-C enrichment off the network in this unit test (no-op if Part 3
+    # hasn't wired it yet; raising=False makes the setattr safe either way).
+    monkeypatch.setattr(rkr, "build_coras_read", lambda u: "", raising=False)
+
+    # Capture the DM instead of hitting Slack; record which items were "sent".
+    sent: dict[str, str] = {}
+
+    def _fake_individual(updates, token, _client_factory=None):
+        for u in updates:
+            sent[u["update_id"]] = "111.1"
+        return dict(sent)
+
+    monkeypatch.setattr(rkr, "send_individual_dms", _fake_individual)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: None)
 
     kr.propose_update(
         update_id="ka-1",
@@ -190,45 +166,24 @@ def test_high_known_answer_roundtrip_persists(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
     rkr.main()
 
-    # Saved: the answer is now in the known-answers file.
-    written = (ka_dir / "fndr.md").read_text(encoding="utf-8")
-    assert "1234 Example St, Anaheim CA." in written
-    # Persisted state: APPROVED with the auto-approve audit reason.
+    # (a) stays PENDING -- no reaction means no resolution.
     entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-1"]
-    assert entries and entries[0]["state"] == "APPROVED"
-    assert entries[0]["resolved_reason"] == "auto_approved_high_generic"
-    # Gap marked resolved (the retrieve-side ledger).
-    assert resolved.exists() and "g-1" in resolved.read_text(encoding="utf-8")
+    assert entries and entries[0]["state"] == "PENDING"
+    # (b) NOT written to known-answers (no ungated write).
+    assert not (ka_dir / "fndr.md").exists()
+    # (c) gap NOT resolved.
+    assert not resolved.exists()
+    # (d) it WAS DM'd to Harrison for his 👍.
+    assert sent.get("ka-1") == "111.1"
 
 
-def test_med_known_answer_not_auto_approved(tmp_path, monkeypatch):
-    """A MED-confidence known_answer stays PENDING (only HIGH auto-approves)."""
-    import importlib
-    kr = importlib.import_module("cora.knowledge_review")
-
-    proposed = tmp_path / "proposed.jsonl"
-    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
-    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
-    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
-    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
-    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)
-    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
-    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved.jsonl"))
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "")
-
-    kr.propose_update(
-        update_id="ka-med",
-        update_type="known_answer",
-        description="lower-confidence fact",
-        payload={"entity": "FNDR", "question": "q", "answer": "a", "gap_ts": "g"},
-        confidence="MED",
-    )
-    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
-    rkr.main()
-
-    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "ka-med"]
-    assert entries and entries[0]["state"] == "PENDING"  # not auto-approved
+def test_no_auto_approve_symbols_remain():
+    """WS17-C: the auto-approve machinery is fully removed (no dangling refs)."""
+    for name in (
+        "_auto_approve_eligible", "_autoapprove_floor",
+        "_AUTO_APPROVE_TYPES", "_MAX_AUTO_APPROVE_PER_RUN", "_AUTOAPPROVE_FLOOR_PATH",
+    ):
+        assert not hasattr(rkr, name), f"{name} should be gone after WS17-C"
 
 
 # == WS17-B items 3 + 4: knowledge/operational split + owner routing ==========
@@ -334,7 +289,6 @@ def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
     monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
     kr._SEEN_IDS_CACHE = None
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
-    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # NOT Monday
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
@@ -368,7 +322,6 @@ def test_operational_routed_not_dmd_to_harrison(tmp_path, monkeypatch):
     monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
     kr._SEEN_IDS_CACHE = None
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
-    monkeypatch.setattr(rkr, "_AUTOAPPROVE_FLOOR_PATH", tmp_path / "floor.txt")
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
     floor = tmp_path / "rfloor.txt"
     floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
