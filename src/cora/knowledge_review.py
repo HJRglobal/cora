@@ -494,6 +494,11 @@ def format_single_item_dm(update: dict[str, Any]) -> str:
     if evidence:
         snippet = evidence[:300].replace("\n", " ")
         lines.append(f"_Source: {snippet}_")
+    # WS17-C: Cora's read (advisory; computed + stashed by run_knowledge_review,
+    # "" when unavailable). Decision-SUPPORT only -- never affects the gate.
+    coras_read = update.get("_coras_read", "")
+    if coras_read:
+        lines.append(coras_read)
     lines.append("\n👍 Approve · 👎 Dismiss")
     return "\n".join(lines)
 

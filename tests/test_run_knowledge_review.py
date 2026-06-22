@@ -135,9 +135,8 @@ def test_high_known_answer_requires_thumbs_up(tmp_path, monkeypatch):
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(ka_dir))
     monkeypatch.setenv("RESOLVED_GAPS_PATH", str(resolved))
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-dummy")  # enable the Step-2 DM path
-    # Keep the WS17-C enrichment off the network in this unit test (no-op if Part 3
-    # hasn't wired it yet; raising=False makes the setattr safe either way).
-    monkeypatch.setattr(rkr, "build_coras_read", lambda u: "", raising=False)
+    # Keep the WS17-C enrichment off the network/KB in this unit test.
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None, raising=False)
 
     # Capture the DM instead of hitting Slack; record which items were "sent".
     sent: dict[str, str] = {}
@@ -291,6 +290,7 @@ def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
     monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
     monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(rkr, "_is_digest_day", lambda: False)  # NOT Monday
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
 
     header = MagicMock(return_value="hdr")

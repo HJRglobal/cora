@@ -44,6 +44,7 @@ from cora.knowledge_review import (  # noqa: E402
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_GENERIC,
 )
+from cora.coras_read import build_coras_read  # noqa: E402  (WS17-C enrichment)
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 
@@ -482,6 +483,40 @@ def _route_operational_to_owners(
     return routed
 
 
+def _attach_coras_read(items: list[dict], log: logging.Logger) -> None:
+    """Attach a fail-soft 'Cora's read' to each KNOWLEDGE item (WS17-C Part 3).
+
+    Decision-SUPPORT only: the read is advisory text stashed on the in-memory
+    update dict -- never persisted, never affects Harrison's gate. Opens ONE
+    KnowledgeBase for the batch (items are already capped at the per-run knowledge
+    cap); ANY error -- dead KB, missing API key, LLM/parse failure -- leaves the
+    item without a read and never blocks the DM.
+    """
+    if not items:
+        return
+    kb = None
+    try:
+        from cora.coras_read import _KB_DB_PATH
+        from cora.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(_KB_DB_PATH, check_same_thread=False)
+    except Exception as exc:  # noqa: BLE001 -- fall back to no read
+        log.warning("coras_read: batch KB open failed (%s) -- proceeding without reads", exc)
+        kb = None
+    try:
+        for it in items:
+            try:
+                it["_coras_read"] = build_coras_read(it, kb=kb)
+            except Exception as exc:  # noqa: BLE001 -- a read failure must not block the DM
+                log.warning("coras_read: attach failed for %s (%s)",
+                            str(it.get("update_id", "?"))[:8], exc)
+    finally:
+        if kb is not None:
+            try:
+                kb.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -648,6 +683,10 @@ def main() -> int:
             len(approved_updates), len(dismissed_updates), len(pending), exit_code,
         )
         return exit_code
+
+    # ── WS17-C: attach Cora's read to each knowledge item (decision-SUPPORT) ──
+    # Fail-soft -- a dead KB / LLM never blocks the DM; the read is advisory only.
+    _attach_coras_read(k, log)
 
     send_dm_to_harrison(
         f"Cora knowledge review: {len(k)} item(s) below for your approval. "
