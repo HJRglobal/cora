@@ -1010,76 +1010,6 @@ def _extract_and_log_gap(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_queue_channel_id(client, entity: str, fallback_channel_id: str) -> str:
-    """Find the Slack channel ID for the per-entity queue, falling back to #hjrg-leadership."""
-    target_names = [
-        team_learning.get_queue_channel(entity),  # e.g. cora-kq-osngm
-        team_learning.APPROVAL_CHANNEL,           # hjrg-leadership
-    ]
-    try:
-        resp = client.conversations_list(types="public_channel,private_channel", limit=200)
-        channels = {ch["name"]: ch["id"] for ch in resp.get("channels", [])}
-        for name in target_names:
-            if name in channels:
-                return channels[name]
-    except Exception as exc:
-        log.warning("_resolve_queue_channel_id: conversations_list failed: %s", exc)
-    return fallback_channel_id
-
-
-def _queue_contribution(
-    *,
-    client,
-    entity: str,
-    channel_id: str,
-    channel_name: str,
-    user_id: str,
-    content: str,
-    original_ts: str,
-    kind: str = "note",
-) -> None:
-    """Store a confirmed contribution and post its approval card to the queue channel.
-
-    Called by the Path-0 confirmation loop once the author has said 'yes'.
-    Also used internally when bypassing the paraphrase step is appropriate.
-    """
-    cid = team_learning.store_contribution(
-        kind=kind,
-        entity=entity,
-        channel_id=channel_id,
-        channel_name=channel_name,
-        author=user_id,
-        content=content,
-        original_ts=original_ts,
-    )
-
-    queue_name = team_learning.get_queue_channel(entity)
-    card_text = team_learning.build_approval_card(
-        kind=kind,
-        entity=entity,
-        channel_name=channel_name,
-        author=user_id,
-        content=content,
-        contribution_id=cid,
-    )
-    try:
-        approval_ch_id = _resolve_queue_channel_id(client, entity, channel_id)
-        post_resp = client.chat_postMessage(
-            channel=approval_ch_id,
-            text=card_text,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        approval_ts = post_resp.get("ts", "")
-        team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
-        log.info(
-            "team_learning: posted approval card cid=%s kind=%s queue=#%s ts=%s",
-            cid[:8], kind, queue_name, approval_ts,
-        )
-    except Exception as exc:
-        log.error("team_learning: failed to post approval card cid=%s: %s", cid[:8], exc)
-
-
 def _handle_note(
     *,
     client,
@@ -1110,6 +1040,28 @@ def _handle_note(
     if not ok:
         say(text=reason, thread_ts=original_ts, unfurl_links=False, unfurl_media=False)
         log.info("team_learning: scope rejection user=%s entity=%s", user_id, entity)
+        return
+
+    # PHI never enters the knowledge pipeline. screen_contribution covers scope/
+    # injection/length but NOT PHI, and the raw note is about to be sent to Haiku
+    # for paraphrasing -- so refuse it here first. Mirrors _handle_info_for_cora;
+    # the write-time re-check in apply_contributed_note is the entity-agnostic backstop.
+    try:
+        # is_clinical_phi catches the diagnosis/medication class is_phi_risk misses
+        # (WS17-B fix) -- important here because the raw note is about to hit Haiku.
+        note_is_phi = phi_guard.is_phi_risk(content) or phi_guard.is_clinical_phi(content)
+        if not note_is_phi and entity.upper().startswith("LEX"):
+            note_is_phi = phi_guard.is_lex_billing_status_phi(content)
+    except Exception as exc:  # noqa: BLE001 -- fail safe: drop rather than risk PHI
+        log.warning("team_learning: phi check failed (dropping): %s", exc)
+        note_is_phi = True
+    if note_is_phi:
+        say(
+            text=("Thanks, but that reads like client / PHI information -- I can't capture "
+                  "that here. Client data belongs in the EHR, not in Cora's memory."),
+            thread_ts=original_ts, unfurl_links=False, unfurl_media=False,
+        )
+        log.info("team_learning: PHI-flagged note refused user=%s entity=%s", user_id, entity)
         return
 
     paraphrase = team_learning.paraphrase_note(content, entity)
@@ -1544,23 +1496,81 @@ def handle_message_event(event: dict, client) -> None:
         say = lambda **kw: client.chat_postMessage(channel=channel_id, **kw)
 
         if team_learning.is_confirmation(text):
-            # Author confirmed — queue the contribution and clear state
+            # Author confirmed -- fold the contribution into the ONE Harrison-gated
+            # knowledge queue (WS17-C). No #cora-kq approval card / per-entity
+            # approver anymore: propose a GENERIC update (source=info-for-cora) so on
+            # Harrison's 👍 it writes to known-answers/{entity}.md via
+            # apply_contributed_note -- the same path #info-for-cora uses.
             team_learning.clear_pending_confirm(channel_id, thread_ts)
-            target_ch = team_learning.kq_channel_for_entity(pending["entity"])
-            _queue_contribution(
-                client=client,
-                entity=pending["entity"],
-                channel_id=channel_id,
-                channel_name=pending["channel_name"],
-                user_id=user_id,
-                content=pending["raw_content"],
-                original_ts=thread_ts,
-                kind=pending["kind"],
-            )
-            confirmed_text = (
-                f"{pending['paraphrase']}\n\n"
-                f"✅ Confirmed — queued for approval in #{target_ch}."
-            )
+
+            # Prefer the author-confirmed paraphrase (it incorporates any inline
+            # corrections); fall back to the raw note if paraphrasing failed.
+            text_to_store = (pending.get("paraphrase") or pending["raw_content"]).strip()
+            entity = pending["entity"]  # route(channel) -- specific tag, not an org_roles re-derive
+            author_name = pending["author"]
+            try:
+                rec = org_roles.get_role(user_id)
+                if rec and rec.name:
+                    author_name = rec.name
+            except Exception as exc:  # noqa: BLE001
+                log.warning("team_note: org_roles lookup failed: %s", exc)
+
+            # PHI never enters the knowledge pipeline. Screen the FINAL text being
+            # proposed (catches PHI introduced via an inline correction). Mirrors
+            # _handle_info_for_cora; apply_contributed_note re-checks at the write.
+            phi_hit = False
+            try:
+                phi_hit = (phi_guard.is_phi_risk(text_to_store)
+                           or phi_guard.is_clinical_phi(text_to_store))
+                if not phi_hit and entity.upper().startswith("LEX"):
+                    phi_hit = phi_guard.is_lex_billing_status_phi(text_to_store)
+            except Exception as exc:  # noqa: BLE001 -- fail safe: drop
+                log.warning("team_note: phi check failed (dropping): %s", exc)
+                phi_hit = True
+
+            if phi_hit:
+                confirmed_text = (
+                    "That reads like client / PHI information, so I can't add it to "
+                    "Cora's memory. Client data belongs in the EHR."
+                )
+                log.info("team_learning: PHI-flagged contribution dropped at confirm user=%s", user_id)
+            else:
+                update_id = f"teamnote-{thread_ts}"
+                try:
+                    already = any(
+                        u.get("update_id") == update_id
+                        for u in knowledge_review.load_proposed_updates()
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("team_note: dedup check failed (continuing): %s", exc)
+                    already = False
+                if not already:
+                    try:
+                        knowledge_review.propose_update(
+                            update_id=update_id,
+                            update_type=knowledge_review.UPDATE_TYPE_GENERIC,
+                            description=f"Team note from {author_name} ({entity}): {text_to_store[:240]}",
+                            payload={
+                                "text": text_to_store,
+                                "author_id": user_id,
+                                "author_name": author_name,
+                                "entity": entity,
+                                "channel": pending["channel_name"],
+                                "source": "info-for-cora",
+                                "kind": pending["kind"],
+                                "message_ts": thread_ts,
+                            },
+                            source_evidence=pending["raw_content"],
+                            confidence="MED",
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- confirm must not break the bot
+                        log.warning("team_note: propose_update failed: %s", exc)
+                confirmed_text = (
+                    f"{pending['paraphrase']}\n\n"
+                    "✅ Logged for Harrison's review. It won't become shared org "
+                    "knowledge until he approves it."
+                )
+
             # Feature 7: Update preview message in-place instead of posting a new reply
             preview_ts = pending.get("preview_msg_ts")
             if preview_ts:
@@ -1574,20 +1584,11 @@ def handle_message_event(event: dict, client) -> None:
                     )
                 except Exception as exc:
                     log.warning("staged_write_update: chat.update failed ts=%s: %s", preview_ts, exc)
-                    # Fallback: post as new reply
-                    say(
-                        text=f"✅ Logged and queued for approval in #{target_ch}.",
-                        thread_ts=thread_ts,
-                        unfurl_links=False,
-                        unfurl_media=False,
-                    )
+                    say(text=confirmed_text, thread_ts=thread_ts,
+                        unfurl_links=False, unfurl_media=False)
             else:
-                say(
-                    text=f"✅ Logged and queued for approval in #{target_ch}.",
-                    thread_ts=thread_ts,
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
+                say(text=confirmed_text, thread_ts=thread_ts,
+                    unfurl_links=False, unfurl_media=False)
             # Feature 2: React ✅ to the user's confirming message
             try:
                 client.reactions_add(
@@ -1786,47 +1787,73 @@ def _handle_bookmark_reaction(
         log.info("bookmark_reaction: scope rejection reactor=%s entity=%s", reactor, entity)
         return
 
-    cid = team_learning.store_contribution(
-        kind="note",
-        entity=entity,
-        channel_id=channel_id,
-        channel_name=channel_name,
-        author=reactor,
-        content=content,
-        original_ts=message_ts,
-    )
-
-    queue_name = team_learning.get_queue_channel(entity)
-    card_text = team_learning.build_approval_card(
-        kind="note",
-        entity=entity,
-        channel_name=channel_name,
-        author=reactor,
-        content=content,
-        contribution_id=cid,
-    )
+    # PHI never enters the knowledge pipeline (screen_contribution has no PHI check).
     try:
-        approval_ch_id = _resolve_queue_channel_id(client, entity, channel_id)
-        post_resp = client.chat_postMessage(
-            channel=approval_ch_id,
-            text=card_text,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-        approval_ts = post_resp.get("ts", "")
-        team_learning.set_approval_msg(cid, approval_ts, approval_ch_id)
-        log.info(
-            "bookmark_reaction: staged cid=%s entity=%s queue=#%s", cid[:8], entity, queue_name
-        )
-    except Exception as exc:
-        log.error("bookmark_reaction: failed to post approval card cid=%s: %s", cid[:8], exc)
+        bm_is_phi = phi_guard.is_phi_risk(content) or phi_guard.is_clinical_phi(content)
+        if not bm_is_phi and entity.upper().startswith("LEX"):
+            bm_is_phi = phi_guard.is_lex_billing_status_phi(content)
+    except Exception as exc:  # noqa: BLE001 -- fail safe: drop rather than risk PHI
+        log.warning("bookmark_reaction: phi check failed (dropping): %s", exc)
+        bm_is_phi = True
+    if bm_is_phi:
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id, user=reactor,
+                text=("📚 That reads like client / PHI information -- I can't capture it. "
+                      "Client data belongs in the EHR, not in Cora's memory."),
+            )
+        except Exception as exc:
+            log.warning("bookmark_reaction: ephemeral phi-fail: %s", exc)
+        log.info("bookmark_reaction: PHI-flagged content dropped reactor=%s entity=%s", reactor, entity)
         return
+
+    # Fold into the ONE Harrison-gated knowledge queue (WS17-C). A bookmark has no
+    # paraphrase step, so capture the raw message text. On Harrison's 👍 it writes
+    # to known-answers/{entity}.md via apply_contributed_note -- the same path
+    # #info-for-cora uses. No #cora-kq card / per-entity approver anymore.
+    author_name = reactor
+    try:
+        rec = org_roles.get_role(reactor)
+        if rec and rec.name:
+            author_name = rec.name
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bookmark_reaction: org_roles lookup failed: %s", exc)
+
+    update_id = f"bookmark-{message_ts}"
+    try:
+        already = any(u.get("update_id") == update_id
+                      for u in knowledge_review.load_proposed_updates())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bookmark_reaction: dedup check failed (continuing): %s", exc)
+        already = False
+    if not already:
+        try:
+            knowledge_review.propose_update(
+                update_id=update_id,
+                update_type=knowledge_review.UPDATE_TYPE_GENERIC,
+                description=f"Bookmarked by {author_name} ({entity}): {content[:240]}",
+                payload={
+                    "text": content,
+                    "author_id": reactor,
+                    "author_name": author_name,
+                    "entity": entity,
+                    "channel": channel_name,
+                    "source": "info-for-cora",
+                    "kind": "bookmark",
+                    "message_ts": message_ts,
+                },
+                source_evidence=content,
+                confidence="MED",
+            )
+        except Exception as exc:  # noqa: BLE001 -- must not break the bot
+            log.warning("bookmark_reaction: propose_update failed: %s", exc)
+            return
 
     try:
         client.chat_postEphemeral(
-            channel=channel_id,
-            user=reactor,
-            text=f"📚 Queued for *{entity}* review in `#{queue_name}`. Thanks!",
+            channel=channel_id, user=reactor,
+            text=(f"📚 Logged for Harrison's review. It won't become shared *{entity}* "
+                  "knowledge until he approves it."),
         )
     except Exception as exc:
         log.warning("bookmark_reaction: ephemeral confirm failed: %s", exc)
@@ -2010,22 +2037,6 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
         if sched_reply:
             client.chat_postMessage(channel=channel_id, text=sched_reply)
 
-    # ── Team learning: approval/decline of pending contributions ──────────────
-    # Only process ✅ / ❌ on reaction_added (not removal). Look up by the ts
-    # of the approval card Cora posted.
-    if event_type == "reaction_added" and reaction in ("white_check_mark", "x"):
-        contribution = team_learning.lookup_by_approval_ts(message_ts)
-        if contribution:
-            _process_contribution_reaction(
-                client=client,
-                contribution=contribution,
-                reaction=reaction,
-                approval_channel_id=channel_id,
-                approval_msg_ts=message_ts,
-                reactor_id=reactor,
-            )
-            # Fall through to also log the reaction as normal feedback
-
     # ── Knowledge-review: capture Harrison 👍/👎/💬 on proposed-update DMs ──
     # Only log when Harrison (sole-authority reactor) reacts with an actionable
     # emoji AND the update corresponds to a DM channel (starts with "D").
@@ -2067,112 +2078,6 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
             entity=entity,
             message_ts=message_ts,
         )
-
-
-def _process_contribution_reaction(
-    *,
-    client,
-    contribution: dict,
-    reaction: str,
-    approval_channel_id: str,
-    approval_msg_ts: str,
-    reactor_id: str | None = None,
-) -> None:
-    """Process a ✅ or ❌ on a pending contribution approval card."""
-    entity = contribution.get("entity", "")
-    # Harrison (founder) can approve any entity. Registered entity approvers can
-    # approve only their authorized entities. Anyone else is ignored.
-    if reactor_id != _FOUNDER_ID and not team_learning.is_approver(reactor_id, entity):
-        log.warning(
-            "team_learning: KB reaction from unauthorized reactor %s for entity %s — ignored",
-            reactor_id, entity,
-        )
-        return
-
-    import datetime as _dt
-    cid = contribution["contribution_id"]
-    if reaction == "white_check_mark":
-        # Approve: ingest to KB
-        success = team_learning.ingest_contribution(contribution)
-        team_learning.resolve_contribution(cid, "approved")
-        if success:
-            reply = f"✅ Contribution `[{cid[:8]}]` approved and added to Cora's knowledge base."
-        else:
-            reply = (
-                f"⚠️ Approved `[{cid[:8]}]` but KB ingest failed — "
-                "check logs. Contribution marked approved but not in KB."
-            )
-        log.info("team_learning: contribution %s approved ingest_ok=%s", cid[:8], success)
-
-        # Feature 2: React ✅ to the approval card to signal it was processed
-        try:
-            client.reactions_add(
-                channel=approval_channel_id,
-                name="white_check_mark",
-                timestamp=approval_msg_ts,
-            )
-        except Exception as _react_exc:
-            if "already_reacted" not in str(_react_exc):
-                log.warning("react_to_approve: reactions.add failed: %s", _react_exc)
-
-        # Post audit record to Harrison's private KB log channel
-        kind = contribution.get("kind", "note")
-        kind_label = "Team Note" if kind == "note" else ("Bookmark" if kind == "bookmark" else "Correction")
-        approver_mention = f"<@{reactor_id}>" if reactor_id else "_(unknown)_"
-        author_mention = f"<@{contribution['author']}>"
-        approved_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-        content_preview = contribution.get("content", "")[:600]
-        audit_text = (
-            f"📋 *KB Approval* `[{cid[:8]}]`\n"
-            f"*Approved by:* {approver_mention}  |  "
-            f"*Entity:* {contribution['entity']}  |  "
-            f"*Kind:* {kind_label}\n"
-            f"*Submitted by:* {author_mention}  |  "
-            f"*Source:* #{contribution['channel_name']}  |  "
-            f"*At:* {approved_at}\n"
-            f"```\n{content_preview}\n```"
-        )
-        try:
-            client.chat_postMessage(
-                channel=team_learning.KB_AUDIT_CHANNEL,
-                text=audit_text,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
-        except Exception as exc:
-            log.warning("team_learning: failed to post KB audit record cid=%s: %s", cid[:8], exc)
-    else:
-        # Decline
-        team_learning.resolve_contribution(cid, "declined")
-        reply = f"❌ Contribution `[{cid[:8]}]` declined. Nothing added to KB."
-        log.info("team_learning: contribution %s declined", cid[:8])
-
-    try:
-        client.chat_postMessage(
-            channel=approval_channel_id,
-            thread_ts=approval_msg_ts,
-            text=reply,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-    except Exception as exc:
-        log.warning("team_learning: failed to post resolution reply: %s", exc)
-
-    # Feature 3: Pin approved decisions to the entity's leadership channel
-    if reaction == "white_check_mark" and _is_decision_content(contribution.get("content", "")):
-        leadership_ch = _entity_leadership_channel(contribution.get("entity", ""))
-        original_ts = contribution.get("original_ts")
-        if leadership_ch and original_ts:
-            try:
-                client.pins_add(channel=leadership_ch, timestamp=original_ts)
-                log.info(
-                    "pin_decision: pinned cid=%s to #%s ts=%s",
-                    contribution.get("contribution_id", "?")[:8], leadership_ch, original_ts,
-                )
-            except Exception as exc:
-                err_str = str(exc)
-                if "already_pinned" not in err_str and "no_pin" not in err_str:
-                    log.warning("pin_decision: pins.add failed: %s", exc)
 
 
 @app.event("reaction_added")

@@ -707,12 +707,14 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
 
 
 def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
-    """Write a Harrison-approved #info-for-cora contribution to known-answers.
+    """Write a Harrison-approved knowledge contribution to known-answers.
 
-    WS17-B item 5. A #info-for-cora post is a free-form fact (no Q/A, no gap_ts);
-    on Harrison's 👍 it should actually make Cora smarter -- persist it to the
-    entity's known-answers file (the same runtime-loaded store gap fills use)
-    instead of only posting a Slack suggestion. Never raises (executor safety).
+    WS17-B item 5 + WS17-C fold. A free-form fact (no Q/A, no gap_ts) from
+    #info-for-cora OR a folded team note/bookmark/correction (all proposed with
+    payload source 'info-for-cora'); on Harrison's 👍 it persists to the entity's
+    known-answers file (the same runtime-loaded store gap fills use) instead of
+    only posting a Slack suggestion. payload['kind']/['channel'] drive the
+    provenance label. Never raises (executor safety).
     """
     try:
         entity = (payload.get("entity") or "FNDR").strip().upper()
@@ -735,13 +737,22 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
             log.info("gap_autofill: contributed note refused (PHI) -- not persisted")
             return False, "contribution looks like PHI -- not persisted"
         author = (payload.get("author_name") or "").strip()
+        # Source-aware provenance (WS17-C): a folded team note/bookmark/correction
+        # records the channel it came from; a #info-for-cora post records that.
+        kind = (payload.get("kind") or "").strip().lower()
+        channel = (payload.get("channel") or "").strip()
+        if kind in ("note", "correction", "bookmark") and channel and channel != "info-for-cora":
+            src_label = {"bookmark": "Bookmark", "correction": "Correction"}.get(kind, "Team note")
+            where = f" from #{channel}"
+        else:
+            src_label = "Team note"
+            where = " via #info-for-cora"
+        by = f" by {author}" if author else ""
 
         target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        attribution = f" (contributed via #info-for-cora by {author})" if author else \
-                      " (contributed via #info-for-cora)"
         entry_lines = [
-            f"**[{today}] Team note{attribution}**",
+            f"**[{today}] {src_label}{where}{by}**",
             text,
             "",
         ]

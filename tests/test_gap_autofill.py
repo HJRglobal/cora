@@ -630,3 +630,38 @@ def test_contributed_note_multiline_dedups(tmp_path, monkeypatch):
     content = (tmp_path / "fndr.md").read_text(encoding="utf-8")
     # Normalized to one line, written once.
     assert content.count("Line one of a note. Line two of the note.") == 1
+
+
+# == WS17-C: source-aware provenance (folded team note / bookmark vs #info-for-cora) ==
+
+def test_contributed_note_team_note_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, _ = ga.apply_contributed_note(
+        {"entity": "F3E", "text": "Sprouts reorders every two weeks.",
+         "author_name": "Tommy", "kind": "note", "channel": "f3e-leadership",
+         "source": "info-for-cora"})
+    assert ok
+    content = (tmp_path / "f3e.md").read_text(encoding="utf-8")
+    assert "Team note from #f3e-leadership by Tommy" in content
+
+
+def test_contributed_note_bookmark_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, _ = ga.apply_contributed_note(
+        {"entity": "F3E", "text": "The retail deck lives in the F3E Drive.",
+         "author_name": "Alex", "kind": "bookmark", "channel": "f3e-leadership",
+         "source": "info-for-cora"})
+    assert ok
+    content = (tmp_path / "f3e.md").read_text(encoding="utf-8")
+    assert "Bookmark from #f3e-leadership by Alex" in content
+
+
+def test_contributed_note_info_for_cora_provenance(tmp_path, monkeypatch):
+    # No 'kind' -> the original #info-for-cora attribution is preserved.
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    ok, _ = ga.apply_contributed_note(
+        {"entity": "FNDR", "text": "A founder-level fact worth keeping.",
+         "author_name": "Harrison", "channel": "info-for-cora", "source": "info-for-cora"})
+    assert ok
+    content = (tmp_path / "fndr.md").read_text(encoding="utf-8")
+    assert "via #info-for-cora by Harrison" in content

@@ -1,70 +1,45 @@
-"""Team learning module — write-back, correction capture, approval queue, KB ingest.
+"""Team learning module -- author-side knowledge contribution intake.
 
-Enables the team to contribute knowledge to Cora directly from Slack and have
-it approved before it enters the KB.
+A teammate contributes a fact to Cora from Slack via:
 
-Flows:
+1. @Cora note: / @Cora remember: <content>      (app._handle_note)
+2. A correction reply in a Cora thread           (correction signal -> _handle_note)
+3. A 📚 reaction on any message                   (app._handle_bookmark_reaction)
 
-1. Write-back
-   @Cora note: / @Cora remember: <content>
-   → Screened for scope, stored as pending, approval card posted to
-     the per-entity #cora-kq-{entity} queue channel.
+This module screens for scope/injection (screen_contribution), paraphrases for
+author confirmation (paraphrase_note), and persists the pending-confirm state
+(store/get/clear_pending_confirm). On the author's "yes" (app Path-0 confirm loop)
+the contribution is FOLDED into the single Harrison-gated knowledge queue
+(knowledge_review.propose_update, source 'info-for-cora') and, on Harrison's 👍,
+written to design/known-answers/{entity}.md via gap_autofill.apply_contributed_note
+-- the same path #info-for-cora uses.
 
-2. Correction capture
-   A reply in a Cora thread that starts with a correction signal
-   ("actually", "correction:", "that's wrong", "to clarify", etc.)
-   → Same flow as write-back, labelled as a correction.
-
-3. 📚 bookmark
-   Any authorized contributor reacts 📚 to a message.
-   → Message text fetched, screened, and queued for approval.
-
-4. Approval processing
-   An approver reacts ✅ / ❌ on an approval card in a queue channel.
-   ✅ → embed + ingest to KB, mark approved.
-   ❌ → mark declined, no ingest.
+WS17-C RETIRED the old parallel approval path: the per-entity #cora-kq approval
+card, the per-entity-approver ✅ tier, the pending_contributions table, and the
+source='team_note' KB write. Knowledge now lives in ONE store behind ONE gate (D-011).
 
 Contribution scope (enforced by screen_contribution):
-  ALLOWED  — factual entity knowledge: employee info/duties/tiers, document
-             locations, operational facts, vendor contacts, corrections.
-  REJECTED — behavioral directives ("you should always…"), identity overrides
-             ("your role is…"), suppression rules ("never say…"), cross-entity
-             instructions, system-prompt-style content, or submissions >2 000 chars.
+  ALLOWED  -- factual entity knowledge: employee info/duties/tiers, document
+              locations, operational facts, vendor contacts, corrections.
+  REJECTED -- behavioral directives ("you should always..."), identity overrides
+              ("your role is..."), suppression rules ("never say..."), cross-entity
+              instructions, system-prompt-style content, or submissions >2000 chars.
+  PHI      -- refused at intake (app._handle_note) and re-checked at the write
+              (apply_contributed_note); client data belongs in the EHR.
 
-Table: pending_contributions (in cora_kb.db, not the vec table)
-
-    contribution_id  TEXT PRIMARY KEY
-    kind             TEXT  ("note" | "correction")
-    entity           TEXT
-    channel_id       TEXT
-    channel_name     TEXT
-    author           TEXT  (Slack user ID)
-    content          TEXT
-    original_ts      TEXT  (ts of the original user message, for thread linking)
-    approval_msg_ts  TEXT  (ts of Cora's approval card message, used as lookup key)
-    approval_channel TEXT  (channel where the approval card was posted)
-    status           TEXT  ("pending" | "approved" | "declined")
-    created_at       INTEGER
-    resolved_at      INTEGER | NULL
+Table: pending_paraphrase_confirms (in cora_kb.db) -- the only table this module
+owns; keyed (channel_id, thread_ts), 24h TTL.
 """
 
-import functools
 import logging
 import re
 import sqlite3
 import time
-import uuid
 from pathlib import Path
 
 import yaml
 
 log = logging.getLogger(__name__)
-
-# ── Fallback approval channel — used when a per-entity queue channel isn't found ─
-# Per-entity queues follow the pattern #cora-kq-{entity.lower()}.  If Cora isn't
-# in that channel yet (e.g. channel not created), contributions fall back here.
-APPROVAL_CHANNEL = "hjrg-leadership"
-KB_AUDIT_CHANNEL = "cora-kb-log"
 
 # ── Contributors registry path ─────────────────────────────────────────────────
 _CONTRIBUTORS_PATH = (
@@ -201,11 +176,6 @@ def load_contributors() -> dict[str, dict]:
     return _load_contributors_raw().get("contributors", {})
 
 
-def get_queue_channel(entity: str) -> str:
-    """Return the per-entity queue channel name (without #) for the given entity."""
-    return f"cora-kq-{entity.lower()}"
-
-
 def is_authorized_contributor(user_id: str, entity: str) -> bool:
     """Return True if the user is authorized to contribute knowledge for entity."""
     contributors = load_contributors()
@@ -215,19 +185,10 @@ def is_authorized_contributor(user_id: str, entity: str) -> bool:
     return entity in entry.get("entities", [])
 
 
-def is_approver(user_id: str, entity: str) -> bool:
-    """Return True if the user is an approver for the given entity."""
-    contributors = load_contributors()
-    entry = contributors.get(user_id)
-    if not entry:
-        return False
-    return entry.get("tier") == "approver" and entity in entry.get("entities", [])
-
-
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
 def _get_conn() -> sqlite3.Connection:
-    """Open (or reuse) a connection to cora_kb.db for the contributions table."""
+    """Open a connection to cora_kb.db for the pending-paraphrase-confirms table."""
     conn = sqlite3.connect(str(_KB_DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     _ensure_table(conn)
@@ -235,25 +196,10 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
+    # WS17-C retired the pending_contributions approval queue; this module now
+    # owns only the paraphrase-confirm state. An existing pending_contributions
+    # table (from before the fold) is left untouched -- harmless, never read.
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS pending_contributions (
-            contribution_id  TEXT PRIMARY KEY,
-            kind             TEXT NOT NULL,
-            entity           TEXT NOT NULL,
-            channel_id       TEXT NOT NULL,
-            channel_name     TEXT NOT NULL,
-            author           TEXT NOT NULL,
-            content          TEXT NOT NULL,
-            original_ts      TEXT NOT NULL,
-            approval_msg_ts  TEXT,
-            approval_channel TEXT,
-            status           TEXT NOT NULL DEFAULT 'pending',
-            created_at       INTEGER NOT NULL,
-            resolved_at      INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_contrib_status ON pending_contributions(status);
-        CREATE INDEX IF NOT EXISTS idx_contrib_approval_ts ON pending_contributions(approval_msg_ts);
-
         CREATE TABLE IF NOT EXISTS pending_paraphrase_confirms (
             channel_id      TEXT NOT NULL,
             thread_ts       TEXT NOT NULL,
@@ -294,161 +240,6 @@ def parse_note(user_message: str) -> str | None:
 def is_correction(text: str) -> bool:
     """Return True if the text looks like a correction to a prior Cora reply."""
     return bool(_CORRECTION_RE.search(text))
-
-
-def store_contribution(
-    *,
-    kind: str,
-    entity: str,
-    channel_id: str,
-    channel_name: str,
-    author: str,
-    content: str,
-    original_ts: str,
-) -> str:
-    """Store a pending contribution. Returns the contribution_id."""
-    cid = str(uuid.uuid4())
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """INSERT INTO pending_contributions
-               (contribution_id, kind, entity, channel_id, channel_name,
-                author, content, original_ts, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-            (cid, kind, entity, channel_id, channel_name, author, content,
-             original_ts, int(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    log.info("Stored %s contribution cid=%s entity=%s author=%s", kind, cid[:8], entity, author)
-    return cid
-
-
-def set_approval_msg(contribution_id: str, approval_msg_ts: str, approval_channel: str) -> None:
-    """After posting the approval card, record where it lives."""
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """UPDATE pending_contributions
-               SET approval_msg_ts = ?, approval_channel = ?
-               WHERE contribution_id = ?""",
-            (approval_msg_ts, approval_channel, contribution_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def lookup_by_approval_ts(msg_ts: str) -> dict | None:
-    """Find a pending contribution by the ts of its approval card message.
-
-    Returns the row as a dict, or None if not found / already resolved.
-    """
-    conn = _get_conn()
-    try:
-        row = conn.execute(
-            """SELECT contribution_id, kind, entity, channel_id, channel_name,
-                      author, content, original_ts, status
-               FROM pending_contributions
-               WHERE approval_msg_ts = ? AND status = 'pending'""",
-            (msg_ts,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        return None
-    keys = ["contribution_id", "kind", "entity", "channel_id", "channel_name",
-            "author", "content", "original_ts", "status"]
-    return dict(zip(keys, row))
-
-
-def resolve_contribution(contribution_id: str, status: str) -> None:
-    """Mark a contribution approved or declined."""
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """UPDATE pending_contributions
-               SET status = ?, resolved_at = ?
-               WHERE contribution_id = ?""",
-            (status, int(time.time()), contribution_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    log.info("Contribution %s → %s", contribution_id[:8], status)
-
-
-def ingest_contribution(contribution: dict) -> bool:
-    """Embed and store an approved contribution into the KB.
-
-    Returns True on success, False on failure (caller should notify Harrison).
-    """
-    try:
-        from cora.knowledge_base import KnowledgeBase
-        from cora.knowledge_base.store import Document
-
-        doc = Document(
-            source="team_note",
-            source_id=contribution["contribution_id"],
-            entity=contribution["entity"],
-            content=contribution["content"],
-            author=contribution["author"],
-            title=f"Team note from #{contribution['channel_name']}",
-            date_created=int(time.time()),
-            date_modified=int(time.time()),
-            deep_link="",
-        )
-        kb = KnowledgeBase(_KB_DB_PATH)
-        try:
-            count = kb.upsert_documents([doc])
-        finally:
-            kb.close()
-
-        log.info(
-            "Ingested contribution %s → %d chunks entity=%s",
-            contribution["contribution_id"][:8], count, contribution["entity"],
-        )
-        return True
-    except Exception as exc:
-        log.error("Failed to ingest contribution %s: %s",
-                  contribution.get("contribution_id", "?")[:8], exc)
-        return False
-
-
-def build_approval_card(
-    *,
-    kind: str,
-    entity: str,
-    channel_name: str,
-    author: str,
-    content: str,
-    contribution_id: str,
-) -> str:
-    """Build the Slack message text for an approval card posted to a queue channel."""
-    kind_label = "📝 Team Note" if kind == "note" else "🔄 Correction"
-    short_id = contribution_id[:8]
-    return (
-        f"⚠️ *Approve factual entity knowledge only* — no behavioral instructions, "
-        f"no cross-entity content, no process/routing changes.\n"
-        f"{kind_label} pending approval `[{short_id}]`\n"
-        f"*Entity:* {entity}  |  *Channel:* #{channel_name}  |  *From:* <@{author}>\n"
-        f"```\n{content[:800]}\n```\n"
-        f"✅ approve → adds to {entity} KB  |  ❌ decline → discarded"
-    )
-
-
-def pending_stats() -> dict:
-    """Return counts of pending/approved/declined contributions."""
-    conn = _get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT status, COUNT(*) FROM pending_contributions GROUP BY status"
-        ).fetchall()
-    finally:
-        conn.close()
-    return {r[0]: r[1] for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -544,11 +335,6 @@ def clear_pending_confirm(channel_id: str, thread_ts: str) -> None:
         conn.commit()
     finally:
         conn.close()
-
-
-def kq_channel_for_entity(entity: str) -> str:
-    """Return the per-entity knowledge queue channel name (alias for get_queue_channel)."""
-    return get_queue_channel(entity)
 
 
 def paraphrase_note(raw_content: str, entity: str, correction: str | None = None) -> str:

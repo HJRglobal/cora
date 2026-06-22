@@ -68,15 +68,6 @@ class TestPendingConfirmCRUD:
 
 
 # ---------------------------------------------------------------------------
-# kq_channel_for_entity
-# ---------------------------------------------------------------------------
-
-def test_kq_channel_for_entity():
-    assert tl.kq_channel_for_entity("F3E") == tl.get_queue_channel("F3E")
-    assert tl.kq_channel_for_entity("OSN") == "cora-kq-osn"
-
-
-# ---------------------------------------------------------------------------
 # is_confirmation
 # ---------------------------------------------------------------------------
 
