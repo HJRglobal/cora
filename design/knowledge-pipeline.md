@@ -39,10 +39,22 @@ producer proposes into it via `knowledge_review.propose_update` (idempotent on
   to a teammate). **LEX entities are never routed (PHI).**
 
 ### The gate (D-011, unchanged)
-Harrison's 👍 promotes. The only carve-out is the pre-existing **auto-approve**:
-HIGH-confidence machine-mined `known_answer` (NOT teammate-DM, NOT canonical),
-floored to exclude the legacy backlog. Canonical writes (`decisions.md`) and all
-external actions always require a 👍.
+Harrison's 👍 promotes — **every** knowledge item, no exception. WS17-C (D-060)
+RETIRED the prior auto-approve carve-out (HIGH-confidence machine-mined
+`known_answer` items used to write WITHOUT a 👍); they now ride the daily DM like
+everything else. Canonical writes (`decisions.md`) and all external actions still
+require a 👍.
+
+### Cora's read (WS17-C)
+Every KNOWLEDGE proposal DM now carries a short, advisory **"Cora's read"**
+(`src/cora/coras_read.py`): she retrieves across her own sources (entity-scoped,
+PHI-filtered, `user_note`/`team_note` excluded) + checks the entity's existing
+known-answers, and classifies the claim — CORROBORATED / CONFLICTS / ADDS-CONTEXT /
+NET-NEW + a one-line note — so the 👍 review is low-effort. It is **decision-SUPPORT
+only**: fail-soft (any error → no read, the DM still sends), PHI-scrubbed,
+source-opaque, entity-scoped, and it NEVER approves or writes anything. Computed at
+send time (`run_knowledge_review._attach_coras_read`), stashed on the in-memory
+update, never persisted.
 
 ---
 
@@ -67,12 +79,22 @@ channel.
 
 `scripts/generate_knowledge_gaps_digest.py` + `scripts/ingest_digest_answers.py`
 (task `cowork-cora-digest`, daily 5am) were a parallel, hand-edited path to the
-SAME `known-answers/*.md` files (2 of 44 gaps ever resolved that way). They now
-print a DEPRECATED banner and share the canonical map. **Action for Harrison:**
-disable the `cowork-cora-digest` scheduled task — the automated `gap_autofill` loop
-is the supported owner. (The separate "Cowork-native cora-knowledge-review
-founder-memory loop" the older notes mention is a Cowork SKILL / Drive artifact,
-not a repo task — there is exactly one repo task running the live System-1 loop.)
+SAME `known-answers/*.md` files (2 of 44 gaps ever resolved that way). They print a
+DEPRECATED banner and share the canonical map. **`cowork-cora-digest` is Disabled on
+the host** (WS17-B) and WS17-C records it in `data/maps/scheduled-task-state.yaml`
+so the nightly health check stops warning "unexpectedly Disabled" every day. The
+automated `gap_autofill` loop is the supported owner. (The "Cowork-native
+cora-knowledge-review founder-memory loop" older notes mention is a Cowork SKILL /
+Drive artifact, not a repo task.)
+
+**`cowork-cora-gap-digest` (weekly Mon 8am, `scripts/post_gap_digest_slack.py`) —
+KEPT (WS17-C decision).** It is a SEPARATE task: a channel-visible rollup of the OPEN
+gaps in `logs/knowledge-gaps.jsonl` posted to `#hjrg-leadership` (a "what Cora still
+can't answer" view), distinct in audience and function from the daily Harrison-only
+knowledge-review APPROVAL DM. It shares the gaps source but is not the approval loop,
+so it is not strictly redundant — left enabled, flagged as a low-priority retirement
+candidate: if the leadership-channel rollup goes unused, disable it and add it to
+`scheduled-task-state.yaml`.
 
 ---
 
@@ -88,33 +110,33 @@ never re-proposed. All rewrites are atomic (tmp + replace).
 
 ---
 
-## System 2 — team knowledge contributions (status + recommendation)
+## System 2 — team knowledge contributions (FOLDED, WS17-C / D-060)
 
-A **separate** system (`team_learning.py`) lets a teammate contribute knowledge via
-`note:`/`remember:`, a correction-reply, or a 📚 bookmark → an approval card in
-`#cora-kq-{entity}` → on ✅, an ingested KB chunk with `source="team_note"` (broadly
-retrievable in Q&A). It is fully wired but has **0 contributions ever ingested**
-(2 submitted, both declined). WS17-B removed a dead duplicate bookmark handler
-(`app.py`) but did NOT change System 2's behavior.
+`team_learning.py` lets a teammate contribute knowledge via `note:`/`remember:`, a
+correction-reply, or a 📚 bookmark. **As of WS17-C it no longer runs a parallel
+queue.** The old path (an approval card in `#cora-kq-{entity}` → a per-entity
+approver ✅ → an ingested KB chunk with `source="team_note"`) is RETIRED. There were
+**0 `team_note` chunks ever ingested** (verified), so nothing migrated.
 
-**Why it's idle (diagnosis):** discovery friction (you must know the `note:`
-syntax), every registered user is an *approver* (no plain contributors), and the
-14 `#cora-kq-*` queue channels must exist or cards silently fall back to
-`#hjrg-leadership`.
+The fold: on the author's "yes" (the kept paraphrase-confirm loop), the confirmed
+contribution — and a 📚 bookmark — calls `knowledge_review.propose_update` with
+`update_type="generic"`, `payload.source="info-for-cora"`, an entity tag, and
+`payload.kind` (note/correction/bookmark). On Harrison's 👍 it executes the existing
+`#info-for-cora` branch → `gap_autofill.apply_contributed_note` →
+`known-answers/{entity}.md`. A teammate-taught fact and a mined/told fact now share
+ONE gate and ONE store. `apply_contributed_note`'s attribution is source-aware (e.g.
+"Team note from #f3e-leadership by …" vs "via #info-for-cora").
 
-**Recommendation for Harrison (a structural call — NOT made here):** **fold** team
-contributions into System 1's knowledge write target so there is genuinely ONE
-knowledge store. Concretely: an approved team contribution would write to
-`known-answers/{entity}.md` (the runtime-loaded context) via the shared writer,
-the same path `#info-for-cora` now uses — instead of a divergent `team_note` KB
-chunk. This unifies "a teammate taught Cora a fact" and "Cora mined/was-told a
-fact" onto one gate and one store. Trade-off to weigh: `team_note` chunks are
-retrieved via KB semantic search (good for long-tail recall), while
-`known-answers` is always-loaded per-entity context (good for high-value, frequently
-needed facts) — folding changes *how* a contribution surfaces. **Alternative if
-kept separate:** verify the 14 `#cora-kq-*` channels exist, register plain-
-contributor users, and surface the `note:` syntax in onboarding. Either way, this
-is Harrison's decision; this build only flags it.
+**KEPT** in `team_learning.py`: the author paraphrase-confirm loop,
+`screen_contribution` (scope/injection), `is_authorized_contributor` (who may
+submit), `parse_note` / `is_correction` / `is_confirmation`. **Added**: a PHI intake
+gate on the note + bookmark paths (`is_phi_risk` + `is_clinical_phi`, plus LEX
+`is_lex_billing_status_phi`) — `screen_contribution` never checked PHI and the note
+hits Haiku for paraphrasing; `apply_contributed_note`'s three-predicate write gate
+stays the backstop. **Sole gate:** only Harrison approves; the 9 per-entity approvers
+no longer write to the KB (decision-SUPPORT / sole-authority, D-034). The retired
+approver path's `#cora-kb-log` audit + decision-pinning side-effects are dropped (a
+known-answers line is not a decision to pin).
 
 ---
 

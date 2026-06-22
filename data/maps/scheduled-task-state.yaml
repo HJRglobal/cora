@@ -32,6 +32,10 @@ disabled:
   - cowork-clover-daily-pull
   # Cash Pulse disabled 2026-06-16 (gate G-E / audit N1)
   - Cora - Cash Flow Pulse
+  # Legacy manual gap digest, superseded by the daily knowledge-review DM drain
+  # (WS17-B). Already Disabled on the host; recorded here in WS17-C so the nightly
+  # health check stops warning "unexpectedly Disabled" every day.
+  - cowork-cora-digest
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
