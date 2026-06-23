@@ -123,3 +123,21 @@ class TestInfoForCoraIntake:
                 _event(text="American Discount Foods PO authorization is approved", user="U_TOMMY"),
                 client)
         assert prop.called  # business fact, not PHI -> proposed
+
+    def test_clinical_phi_refused_non_lex_poster(self):
+        # MF-1 (WS17-C): is_phi_risk misses the clinical class (diagnosis/meds);
+        # is_clinical_phi must catch it at intake even for a NON-LEX poster, so it
+        # never reaches the ledger or the Haiku enrichment. is_phi_risk is forced
+        # False to prove is_clinical_phi is the catcher.
+        client = MagicMock()
+        f3e_role = app_module.org_roles.RoleRecord(
+            slack_id="U_TOMMY", name="Tommy Anderson", role="Sales", entity="F3E")
+        with patch.object(app_module.phi_guard, "is_phi_risk", return_value=False), \
+             patch.object(app_module.org_roles, "get_role", return_value=f3e_role), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="Our participant was diagnosed with autism and is on risperidone",
+                       user="U_TOMMY"),
+                client)
+        assert not prop.called
+        assert "EHR" in client.chat_postMessage.call_args.kwargs["text"]

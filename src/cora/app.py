@@ -1068,7 +1068,7 @@ def _handle_note(
     preview_resp = say(
         text=(
             f"{paraphrase}\n\n"
-            "Does that capture it? Reply *yes* to queue for approval, "
+            "Does that capture it? Reply *yes* to log it for Harrison's review, "
             "or correct anything above."
         ),
         thread_ts=original_ts,
@@ -1307,13 +1307,15 @@ def _handle_info_for_cora(event: dict, client) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("info-for-cora: org_roles lookup failed: %s", exc)
 
-    # PHI never enters the canonical pipeline. Base clinical/identifier check
-    # always; for a LEX-entity asker also apply the D-050 administrative-PHI
-    # augmentation (a named person + billing/authorization/eligibility), which
-    # is_phi_risk does not cover. Scoped to LEX so an ordinary business fact
-    # about a named buyer's PO authorization in a non-LEX channel is not refused.
+    # PHI never enters the canonical pipeline. is_phi_risk + is_clinical_phi ALWAYS
+    # (is_clinical_phi catches the diagnosis/medication class is_phi_risk misses --
+    # WS17-B); for a LEX-entity asker also apply the D-050 administrative-PHI
+    # augmentation (a named person + billing/authorization/eligibility). The
+    # LEX-billing check stays LEX-scoped so an ordinary business fact about a named
+    # buyer's PO authorization in a non-LEX channel is not refused; the unconditional
+    # write gate (apply_contributed_note) is the entity-agnostic backstop.
     try:
-        is_phi = phi_guard.is_phi_risk(text)
+        is_phi = phi_guard.is_phi_risk(text) or phi_guard.is_clinical_phi(text)
         if not is_phi and entity.upper().startswith("LEX"):
             is_phi = phi_guard.is_lex_billing_status_phi(text)
         if is_phi:
@@ -1528,6 +1530,7 @@ def handle_message_event(event: dict, client) -> None:
                 log.warning("team_note: phi check failed (dropping): %s", exc)
                 phi_hit = True
 
+            logged = False  # True only once the contribution is actually queued
             if phi_hit:
                 confirmed_text = (
                     "That reads like client / PHI information, so I can't add it to "
@@ -1544,7 +1547,9 @@ def handle_message_event(event: dict, client) -> None:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("team_note: dedup check failed (continuing): %s", exc)
                     already = False
-                if not already:
+                if already:
+                    logged = True  # an earlier delivery of this 'yes' already queued it
+                else:
                     try:
                         knowledge_review.propose_update(
                             update_id=update_id,
@@ -1563,13 +1568,22 @@ def handle_message_event(event: dict, client) -> None:
                             source_evidence=pending["raw_content"],
                             confidence="MED",
                         )
+                        logged = True
                     except Exception as exc:  # noqa: BLE001 -- confirm must not break the bot
                         log.warning("team_note: propose_update failed: %s", exc)
-                confirmed_text = (
-                    f"{pending['paraphrase']}\n\n"
-                    "✅ Logged for Harrison's review. It won't become shared org "
-                    "knowledge until he approves it."
-                )
+                if logged:
+                    confirmed_text = (
+                        f"{pending['paraphrase']}\n\n"
+                        "✅ Logged for Harrison's review. It won't become shared org "
+                        "knowledge until he approves it."
+                    )
+                else:
+                    # pending state is already cleared above, so the note can't be
+                    # recovered automatically -- tell the truth, never fake a ✅.
+                    confirmed_text = (
+                        "Sorry, I couldn't log that just now -- please resend the note "
+                        "so it isn't lost."
+                    )
 
             # Feature 7: Update preview message in-place instead of posting a new reply
             preview_ts = pending.get("preview_msg_ts")
@@ -1589,23 +1603,46 @@ def handle_message_event(event: dict, client) -> None:
             else:
                 say(text=confirmed_text, thread_ts=thread_ts,
                     unfurl_links=False, unfurl_media=False)
-            # Feature 2: React ✅ to the user's confirming message
-            try:
-                client.reactions_add(
-                    channel=channel_id,
-                    name="white_check_mark",
-                    timestamp=event["ts"],
-                )
-            except Exception as exc:
-                err_str = str(exc)
-                if "already_reacted" not in err_str:
-                    log.warning("react_to_confirm: reactions.add failed: %s", exc)
+            # Feature 2: React ✅ ONLY when the note was actually queued (not on a
+            # PHI refusal or a failed propose).
+            if logged:
+                try:
+                    client.reactions_add(
+                        channel=channel_id,
+                        name="white_check_mark",
+                        timestamp=event["ts"],
+                    )
+                except Exception as exc:
+                    err_str = str(exc)
+                    if "already_reacted" not in err_str:
+                        log.warning("react_to_confirm: reactions.add failed: %s", exc)
             log.info(
                 "team_learning: confirmed channel=#%s user=%s kind=%s",
                 channel_name, user_id, pending["kind"],
             )
         else:
-            # Author is correcting — re-paraphrase incorporating the correction
+            # Author is correcting. Screen the correction text for PHI BEFORE it
+            # reaches Haiku (paraphrase_note embeds it in the prompt) and before it
+            # can launder PHI past the confirm gate. Mirrors _handle_note.
+            corr_entity = pending["entity"]
+            corr_phi = False
+            try:
+                corr_phi = phi_guard.is_phi_risk(text) or phi_guard.is_clinical_phi(text)
+                if not corr_phi and corr_entity.upper().startswith("LEX"):
+                    corr_phi = phi_guard.is_lex_billing_status_phi(text)
+            except Exception as exc:  # noqa: BLE001 -- fail safe: drop the correction
+                log.warning("team_note: correction phi check failed (dropping): %s", exc)
+                corr_phi = True
+            if corr_phi:
+                say(
+                    text=("That correction reads like client / PHI information, so I "
+                          "can't apply it. Client data belongs in the EHR -- the "
+                          "previous version is unchanged."),
+                    thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+                )
+                log.info("team_learning: PHI-flagged correction dropped user=%s", user_id)
+                return
+            # Re-paraphrase incorporating the (PHI-screened) correction.
             updated = team_learning.paraphrase_note(
                 pending["raw_content"], pending["entity"], correction=text
             )
@@ -1618,7 +1655,7 @@ def handle_message_event(event: dict, client) -> None:
                         ts=preview_ts,
                         text=(
                             f"{updated}\n\n"
-                            "Does that capture it? Reply *yes* to queue for approval, "
+                            "Does that capture it? Reply *yes* to log it for Harrison's review, "
                             "or correct anything above."
                         ),
                         unfurl_links=False,

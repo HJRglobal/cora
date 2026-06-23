@@ -117,7 +117,7 @@ def _paired_entities(kb_entity: str) -> set[str]:
 def _retrieve_evidence(kb: Any, claim: str, entity: str) -> list[Any]:
     """Entity-scoped KB search, filtered to non-PHI, non-excluded-source chunks
     within the distance ceiling. Returns excerpt strings."""
-    from .phi_guard import is_phi_risk, is_clinical_phi
+    from .phi_guard import is_phi_risk, is_clinical_phi, is_lex_billing_status_phi
 
     kb_entity, sub_entity = _entity_scope(entity)
     hits: list[Any] = []
@@ -139,9 +139,12 @@ def _retrieve_evidence(kb: Any, claim: str, entity: str) -> list[Any]:
             continue
         content = getattr(r, "content", "") or ""
         # Drop PHI chunks before they reach the prompt -- is_clinical_phi catches
-        # the diagnosis/medication class is_phi_risk misses (WS17-B), important
-        # because this evidence is sent to the LLM.
+        # the diagnosis/medication class is_phi_risk misses (WS17-B); for LEX also
+        # drop the administrative-billing class. This evidence is sent to the LLM,
+        # so the input filter mirrors the output _scrub (symmetric three predicates).
         if not content or is_phi_risk(content) or is_clinical_phi(content):
+            continue
+        if kb_entity == "LEX" and is_lex_billing_status_phi(content):
             continue
         out.append(content[:600])
         if len(out) >= _SEARCH_K:
@@ -174,7 +177,9 @@ def _classify(claim: str, prior: str, evidence: list[str]) -> dict | None:
     )
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        # Bounded so a slow/hung LLM call never delays or blocks the 7am DM run --
+        # advisory enrichment must never gate the knowledge DM.
+        client = anthropic.Anthropic(api_key=api_key, timeout=15.0, max_retries=1)
         resp = client.messages.create(
             model=_HAIKU_MODEL, max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
@@ -223,6 +228,12 @@ def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
     try:
         claim, entity = _claim_and_entity(update)
         if not claim:
+            return ""
+        # Defense-in-depth: never send a PHI claim to the LLM, even if an upstream
+        # intake gate regressed. Fail-closed; do not cache a PHI claim.
+        from .phi_guard import is_phi_risk, is_clinical_phi, is_lex_billing_status_phi
+        if (is_phi_risk(claim) or is_clinical_phi(claim)
+                or (entity.upper().startswith("LEX") and is_lex_billing_status_phi(claim))):
             return ""
         cache_key = (entity, claim[:200])
         if cache_key in _CACHE:

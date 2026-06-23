@@ -132,6 +132,39 @@ def test_bookmark_phi_refused(monkeypatch, fold_env):
     fold_env.assert_not_called()
 
 
+def test_confirm_correction_phi_refused(monkeypatch):
+    # MF-2: a PHI correction must NOT reach Haiku (paraphrase_note) and must not
+    # overwrite the pending paraphrase. The confirm-yes gate alone is insufficient
+    # because the correction text reaches the LLM before any 'yes'.
+    monkeypatch.setattr(app_module, "_resolve_channel_name", lambda c, cid: "f3e-leadership")
+    monkeypatch.setattr(app_module.team_learning, "get_pending_confirm", lambda cid, tts: _pending())
+    para = MagicMock()
+    store = MagicMock()
+    monkeypatch.setattr(app_module.team_learning, "paraphrase_note", para)
+    monkeypatch.setattr(app_module.team_learning, "store_pending_confirm", store)
+    client = MagicMock()
+    app_module.handle_message_event(
+        _confirm_event(text="actually, client Jordan Smith was diagnosed with autism and is on risperidone"),
+        client)
+    para.assert_not_called()    # never sent to Haiku
+    store.assert_not_called()   # pending paraphrase left unchanged
+    posted = " ".join(str(c.kwargs.get("text", "")) for c in client.chat_postMessage.call_args_list)
+    assert "EHR" in posted
+
+
+def test_confirm_propose_failure_no_false_success(monkeypatch, fold_env):
+    # MF-4: if propose_update raises, the user must get an honest retry message
+    # (not a fake "✅ Logged") and NO success reaction -- the note can't silently vanish.
+    monkeypatch.setattr(app_module.team_learning, "get_pending_confirm", lambda cid, tts: _pending())
+    fold_env.side_effect = RuntimeError("ledger write failed")
+    client = MagicMock()
+    app_module.handle_message_event(_confirm_event(), client)
+    posted = " ".join(str(c.kwargs.get("text", "")) for c in client.chat_postMessage.call_args_list)
+    assert "couldn't log" in posted.lower()
+    assert "Logged for Harrison" not in posted
+    client.reactions_add.assert_not_called()
+
+
 def test_retired_symbols_gone():
     # The #cora-kq approval card + per-entity-approver path is fully removed.
     for name in ("_process_contribution_reaction", "_queue_contribution",

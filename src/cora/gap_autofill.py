@@ -644,7 +644,7 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
 
         target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")
 
-        # Idempotency (B6): the knowledge-review auto-approve path executes this
+        # Idempotency (B6): the knowledge-review executor (on Harrison's 👍) runs this
         # BEFORE it marks the proposed update APPROVED, so a SIGKILL between the
         # two leaves the update PENDING and it re-runs next pass. apply always
         # appends, so without a guard a crash-recovery re-run duplicates the fact

@@ -102,7 +102,7 @@ _MAX_OWNER_DMS_PER_OWNER = 5      # per-owner cap so no single owner is flooded
 # are routed to owners. Initialized to "now" on the first routing run so the
 # pre-existing operational backlog (proposed before WS17-B) is NEVER freshly DM'd
 # to a teammate months late — it rides Harrison's gated bulk-triage instead.
-# "" -> route nothing (fail-safe), mirroring the auto-approve floor.
+# "" -> route nothing (fail-safe).
 _ROUTING_FLOOR_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "state"
     / "knowledge-review-routing-floor.txt"
@@ -341,8 +341,7 @@ def _routing_floor() -> str:
     """ISO timestamp before which operational items are NEVER routed to owners.
 
     Initialized to 'now' on first call so the pre-WS17-B operational backlog isn't
-    freshly DM'd to teammates. Returns '' on any error -> route NOTHING (fail-safe).
-    Mirrors _autoapprove_floor()."""
+    freshly DM'd to teammates. Returns '' on any error -> route NOTHING (fail-safe)."""
     try:
         if _ROUTING_FLOOR_PATH.exists():
             return _ROUTING_FLOOR_PATH.read_text(encoding="utf-8").strip()
@@ -636,8 +635,8 @@ def main() -> int:
     # Split the unsent queue: operational "nudge" items route to their entity's
     # domain owner (Cora is decision-SUPPORT); knowledge items (known_answer /
     # efficiency / #info-for-cora contributions) DM Harrison DAILY — no longer
-    # Monday-gated, so the learning loop isn't stalled 5/week. Reaction-processing,
-    # auto-approve, and auto-expire (Steps 0/1/1.5) already ran above.
+    # Monday-gated, so the learning loop isn't stalled 5/week. Reaction-processing
+    # and auto-expire (Steps 0/1) already ran above.
     pending = get_pending_updates()
     unsent = [u for u in pending if not u.get("dm_message_ts")]
     knowledge_unsent = [u for u in unsent if _is_knowledge_item(u)]

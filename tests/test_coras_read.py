@@ -182,6 +182,58 @@ def test_format_single_item_dm_appends_read():
     assert out.index("Cora's read") < out.index("👍 Approve")  # before the footer
 
 
+def test_phi_claim_not_sent_to_llm(monkeypatch):
+    # MF-3: a PHI claim must be refused BEFORE _classify (defense-in-depth, even if
+    # an upstream intake gate regressed).
+    classify = MagicMock(return_value={"verdict": "NET-NEW", "note": "x"})
+    monkeypatch.setattr(cr, "_classify", classify)
+    upd = _update(text="the participant was diagnosed with autism and prescribed risperidone")
+    assert cr.build_coras_read(upd, kb=_fake_kb([_hit("ctx")])) == ""
+    classify.assert_not_called()
+
+
+def test_lex_billing_evidence_excluded(monkeypatch):
+    # MF-5: a LEX administrative-billing-PHI chunk (named person + auth, no clinical
+    # keyword) must be dropped from the evidence for a LEX-scoped retrieval.
+    captured = {}
+
+    def fake_classify(claim, prior, evidence):
+        captured["ev"] = evidence
+        return {"verdict": "NET-NEW", "note": "x"}
+    monkeypatch.setattr(cr, "_classify", fake_classify)
+    hits = [_hit("Bob Smith's billing authorization is pending for next month."),
+            _hit("The LLC fleet uses the new kiosk for clock-in.")]
+    cr.build_coras_read(_update(text="how does LLC clock-in work", entity="LEX-LLC"),
+                        kb=_fake_kb(hits))
+    joined = " ".join(captured["ev"])
+    assert "billing authorization" not in joined  # LEX admin-PHI chunk dropped
+    assert "kiosk" in joined
+
+
+def test_classify_constructs_client_with_timeout(monkeypatch):
+    # MF-6: the LLM client is bounded so a hung call never delays/blocks the 7am DM.
+    import sys
+    import types
+    captured = {}
+
+    class _FakeMsgs:
+        def create(self, **kw):
+            return types.SimpleNamespace(
+                content=[types.SimpleNamespace(text='{"verdict":"NET-NEW","note":"ok"}')])
+
+    class _FakeAnthropic:
+        def __init__(self, **kw):
+            captured.update(kw)
+            self.messages = _FakeMsgs()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=_FakeAnthropic))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    out = cr._classify("a claim", "prior", ["evidence"])
+    assert out == {"verdict": "NET-NEW", "note": "ok"}
+    assert captured.get("timeout") == 15.0
+    assert captured.get("max_retries") == 1
+
+
 def test_format_single_item_dm_no_read_when_absent():
     import cora.knowledge_review as kr
     update = {"update_type": "known_answer", "confidence": "HIGH", "description": "A fact",
