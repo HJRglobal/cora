@@ -240,3 +240,33 @@ def test_format_single_item_dm_no_read_when_absent():
               "payload": {}}
     out = kr.format_single_item_dm(update)
     assert "Cora's read" not in out
+
+
+def test_billing_phi_claim_not_sent_to_llm_even_when_non_lex(monkeypatch):
+    # WS17-C pre-merge fix (PHI-egress asymmetry): a folded contribution carries the
+    # AUTHOR's entity (e.g. a custodian like Harrison=FNDR), but a named-client LEX
+    # billing/authorization claim (no clinical keyword) must NOT reach the LLM
+    # regardless of the carried entity. is_lex_billing is now UNCONDITIONAL on the
+    # claim egress screen (was entity.startswith("LEX")-gated -> a real leak).
+    classify = MagicMock(return_value={"verdict": "NET-NEW", "note": "x"})
+    monkeypatch.setattr(cr, "_classify", classify)
+    upd = _update(text="Bob Smith's billing authorization is pending.", entity="FNDR")
+    assert cr.build_coras_read(upd, kb=_fake_kb([_hit("ctx")])) == ""
+    classify.assert_not_called()
+
+
+def test_billing_phi_evidence_excluded_even_when_non_lex(monkeypatch):
+    # The evidence billing filter is now entity-agnostic (truly symmetric with _scrub):
+    # a billing-PHI chunk is dropped before the prompt even for a NON-LEX retrieval.
+    captured = {}
+
+    def fake_classify(claim, prior, evidence):
+        captured["ev"] = evidence
+        return {"verdict": "NET-NEW", "note": "x"}
+    monkeypatch.setattr(cr, "_classify", fake_classify)
+    hits = [_hit("Maria Lopez's billing authorization is pending for next month."),
+            _hit("The Anaheim warehouse is at 500 Brand Blvd.")]
+    cr.build_coras_read(_update(entity="F3E"), kb=_fake_kb(hits))
+    joined = " ".join(captured["ev"])
+    assert "billing authorization" not in joined   # admin-PHI dropped even for non-LEX
+    assert "Brand Blvd" in joined

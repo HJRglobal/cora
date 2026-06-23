@@ -1049,9 +1049,12 @@ def _handle_note(
     try:
         # is_clinical_phi catches the diagnosis/medication class is_phi_risk misses
         # (WS17-B fix) -- important here because the raw note is about to hit Haiku.
-        note_is_phi = phi_guard.is_phi_risk(content) or phi_guard.is_clinical_phi(content)
-        if not note_is_phi and entity.upper().startswith("LEX"):
-            note_is_phi = phi_guard.is_lex_billing_status_phi(content)
+        # is_lex_billing_status_phi UNCONDITIONAL (entity-agnostic): the raw note is
+        # about to hit Haiku via paraphrase_note, and a non-LEX-tagged note can carry
+        # named-client LEX billing PHI (independent-review catch, WS17-C). Mirror the
+        # write gate + the coras_read egress screen.
+        note_is_phi = (phi_guard.is_phi_risk(content) or phi_guard.is_clinical_phi(content)
+                       or phi_guard.is_lex_billing_status_phi(content))
     except Exception as exc:  # noqa: BLE001 -- fail safe: drop rather than risk PHI
         log.warning("team_learning: phi check failed (dropping): %s", exc)
         note_is_phi = True
@@ -1627,9 +1630,11 @@ def handle_message_event(event: dict, client) -> None:
             corr_entity = pending["entity"]
             corr_phi = False
             try:
-                corr_phi = phi_guard.is_phi_risk(text) or phi_guard.is_clinical_phi(text)
-                if not corr_phi and corr_entity.upper().startswith("LEX"):
-                    corr_phi = phi_guard.is_lex_billing_status_phi(text)
+                # is_lex_billing_status_phi UNCONDITIONAL: the correction is about to hit
+                # Haiku via paraphrase_note; a non-LEX-tagged correction can carry LEX
+                # billing PHI (independent-review catch, WS17-C).
+                corr_phi = (phi_guard.is_phi_risk(text) or phi_guard.is_clinical_phi(text)
+                            or phi_guard.is_lex_billing_status_phi(text))
             except Exception as exc:  # noqa: BLE001 -- fail safe: drop the correction
                 log.warning("team_note: correction phi check failed (dropping): %s", exc)
                 corr_phi = True

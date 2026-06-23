@@ -139,12 +139,12 @@ def _retrieve_evidence(kb: Any, claim: str, entity: str) -> list[Any]:
             continue
         content = getattr(r, "content", "") or ""
         # Drop PHI chunks before they reach the prompt -- is_clinical_phi catches
-        # the diagnosis/medication class is_phi_risk misses (WS17-B); for LEX also
-        # drop the administrative-billing class. This evidence is sent to the LLM,
-        # so the input filter mirrors the output _scrub (symmetric three predicates).
-        if not content or is_phi_risk(content) or is_clinical_phi(content):
-            continue
-        if kb_entity == "LEX" and is_lex_billing_status_phi(content):
+        # the diagnosis/medication class is_phi_risk misses (WS17-B), and the
+        # administrative-billing class is dropped UNCONDITIONALLY (not just for
+        # kb_entity==LEX): this evidence is sent to the LLM, so the input filter is
+        # truly symmetric with the output _scrub (all three predicates, entity-agnostic).
+        if (not content or is_phi_risk(content) or is_clinical_phi(content)
+                or is_lex_billing_status_phi(content)):
             continue
         out.append(content[:600])
         if len(out) >= _SEARCH_K:
@@ -230,10 +230,15 @@ def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
         if not claim:
             return ""
         # Defense-in-depth: never send a PHI claim to the LLM, even if an upstream
-        # intake gate regressed. Fail-closed; do not cache a PHI claim.
+        # intake gate regressed. is_lex_billing_status_phi is UNCONDITIONAL (entity-
+        # agnostic): a folded contribution carries the AUTHOR's entity (e.g. a custodian
+        # like Harrison=FNDR), but the TEXT can be named-client LEX billing/authorization
+        # PHI with no clinical keyword -- and claim[:600] is about to be sent to the
+        # Anthropic API. Entity-gating this (the WS17-C oversight an independent pass
+        # caught) would let that PHI egress to the LLM. Fail-closed; never cache PHI.
         from .phi_guard import is_phi_risk, is_clinical_phi, is_lex_billing_status_phi
         if (is_phi_risk(claim) or is_clinical_phi(claim)
-                or (entity.upper().startswith("LEX") and is_lex_billing_status_phi(claim))):
+                or is_lex_billing_status_phi(claim)):
             return ""
         cache_key = (entity, claim[:200])
         if cache_key in _CACHE:
