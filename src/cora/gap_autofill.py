@@ -642,6 +642,17 @@ def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
         if not answer:
             return False, "known_answer payload has no answer text -- skipped"
 
+        # Fail-closed PHI re-check at the IRREVERSIBLE write, entity-agnostic --
+        # mirrors apply_contributed_note (D-059: a durable knowledge write needs the
+        # 3-predicate re-check). The clinical class is caught upstream in draft_answer,
+        # but a mined LEX administrative-billing answer (named person + authorization,
+        # no clinical keyword) would otherwise reach this durable write unscreened.
+        # Both known-answers writers now apply the same three predicates at the write.
+        _blob = f"{question}\n{answer}"
+        if is_phi_risk(_blob) or is_clinical_phi(_blob) or is_lex_billing_status_phi(_blob):
+            log.info("gap_autofill: known_answer refused (PHI) -- not persisted")
+            return False, "answer looks like PHI -- not persisted"
+
         target_file = _known_answers_dir() / _ENTITY_FILES.get(entity, "fndr.md")
 
         # Idempotency (B6): the knowledge-review executor (on Harrison's 👍) runs this

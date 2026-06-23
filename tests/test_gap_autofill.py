@@ -656,6 +656,30 @@ def test_contributed_note_bookmark_provenance(tmp_path, monkeypatch):
     assert "Bookmark from #f3e-leadership by Alex" in content
 
 
+def test_known_answer_refuses_phi_write(tmp_path, monkeypatch):
+    # WS17-C 2nd-pass hardening: the known_answer write gate now mirrors
+    # apply_contributed_note -- a LEX admin-billing answer (no clinical keyword)
+    # must NOT persist to the durable known-answers file.
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved.jsonl"))
+    ok, summary = ga.apply_known_answer(
+        {"entity": "LEX", "question": "what is Bob Smith's billing status?",
+         "answer": "Bob Smith's billing authorization is pending.", "gap_ts": "g1"})
+    assert ok is False and "PHI" in summary
+    assert not (tmp_path / "lex.md").exists()
+
+
+def test_known_answer_keeps_legit_fact(tmp_path, monkeypatch):
+    # The unconditional write gate must not over-refuse a plain business fact.
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved.jsonl"))
+    ok, _ = ga.apply_known_answer(
+        {"entity": "F3E", "question": "where is the warehouse?",
+         "answer": "The Anaheim warehouse is at 500 Brand Blvd.", "gap_ts": "g2"})
+    assert ok is True
+    assert "Brand Blvd" in (tmp_path / "f3e.md").read_text(encoding="utf-8")
+
+
 def test_contributed_note_info_for_cora_provenance(tmp_path, monkeypatch):
     # No 'kind' -> the original #info-for-cora attribution is preserved.
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
