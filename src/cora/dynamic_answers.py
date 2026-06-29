@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -10,7 +11,12 @@ import yaml
 log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
-_DYNAMIC_DIR = _REPO_ROOT / "design" / "known-answers" / "dynamic"
+# Independent override (NOT coupled to KNOWN_ANSWERS_DIR): dynamic snapshots are
+# written by their own refresh path which still targets the repo, so repointing the
+# read here at Drive without moving that writer would serve a stale copy. Defaults to
+# the repo; only set DYNAMIC_ANSWERS_DIR once the snapshot writer is also relocated.
+_DYNAMIC_DIR = Path(os.environ.get("DYNAMIC_ANSWERS_DIR")
+                    or _REPO_ROOT / "design" / "known-answers" / "dynamic")
 
 _TTL = 300  # seconds
 

@@ -514,6 +514,30 @@ class TestApplyKnownAnswer:
         # the new real block was appended (not skipped by the embedded copy)
         assert "Pure launch date" in f3e.read_text(encoding="utf-8")
 
+    # --- atomic write (Drive-materialization 2026-06-29) ---------------------
+    def test_write_is_atomic_no_tmp_leftover(self, paths):
+        """_append_to_section writes via temp-file + rename so the Drive-resident
+        known-answers file Tag reads can never be observed half-written. After a
+        successful apply, no .tmp residue remains and the fact is fully present."""
+        ka_dir = paths / "known-answers"
+        ok, _ = ga.apply_known_answer(self._payload(entity="OSN"))
+        assert ok
+        target = ka_dir / "osn.md"
+        assert target.exists()
+        assert "A: June 15, 2026." in target.read_text(encoding="utf-8")
+        # no orphaned temp file anywhere under the known-answers dir
+        assert list(ka_dir.glob("*.tmp")) == []
+        assert list(ka_dir.rglob("*.tmp")) == []
+
+    def test_append_to_section_uses_atomic_helper(self):
+        """Guard: the known-answers writers must route through the crash-safe
+        helper, not a bare write_text (regression against re-introducing a
+        non-atomic write to a Drive-resident file)."""
+        import inspect
+        src = inspect.getsource(ga._append_to_section)
+        assert "_atomic_write_text" in src
+        assert "file_path.write_text(" not in src
+
 
 # ---------------------------------------------------------------------------
 # Layer A -- wiring assertions

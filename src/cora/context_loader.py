@@ -8,6 +8,7 @@ KB retrieval is query-dependent.
 
 import datetime
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -123,7 +124,13 @@ def _load_scoped_dynamic_answers(entity: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
-_KNOWN_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers"
+# Drive-materialization (2026-06-29): the known-answers read path is env-overridable
+# so it can point at Drive _brain/known-answers/ (the store Tag also reads), matching
+# the write side in gap_autofill._known_answers_dir(). Read at MODULE IMPORT, so a
+# change to KNOWN_ANSWERS_DIR takes effect on the next bot restart (context_loader is
+# bot-loaded). Mirrors the gap_autofill `or`-fallback pattern exactly.
+_KNOWN_ANSWERS_DIR = Path(os.environ.get("KNOWN_ANSWERS_DIR")
+                          or _REPO_ROOT / "design" / "known-answers")
 _KB_DB_PATH = _REPO_ROOT / "data" / "cora_kb.db"
 
 # Phase 3 KB retrieval config — top-K chunks injected into context per query.

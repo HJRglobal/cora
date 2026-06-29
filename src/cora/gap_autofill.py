@@ -131,6 +131,20 @@ def _write_json(path: Path, data: Any) -> None:
     tmp.replace(path)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Crash-safe text write (temp-file + os.replace), same pattern as _write_json.
+
+    Drive-materialization (2026-06-29): with KNOWN_ANSWERS_DIR pointed at the Drive
+    _brain/known-answers/ store that Tag reads live, a partial/interrupted write would
+    leave Tag (and Cora) reading a half-written known-answers file. temp+rename makes
+    the swap atomic on the same filesystem (the .tmp sits in the same dir as the target).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def load_state() -> dict[str, Any]:
     """Per-gap autofill state, keyed by gap ts. States: proposed | asked | exhausted."""
     return _read_json(_state_path(), {})
@@ -608,10 +622,9 @@ def _append_to_section(file_path: Path, section_header: str, entry_lines: list[s
     so both flows produce identically-shaped known-answers files.
     """
     if not file_path.exists():
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
+        _atomic_write_text(
+            file_path,
             f"# Known Answers\n\n## Routing rules\n\n{section_header}\n",
-            encoding="utf-8",
         )
     content = file_path.read_text(encoding="utf-8")
     lines = content.rstrip("\n").split("\n")
@@ -625,7 +638,7 @@ def _append_to_section(file_path: Path, section_header: str, entry_lines: list[s
             insert_at = i
             break
     lines = lines[:insert_at] + [""] + entry_lines + lines[insert_at:]
-    file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_text(file_path, "\n".join(lines) + "\n")
 
 
 def apply_known_answer(payload: dict[str, Any]) -> tuple[bool, str]:
