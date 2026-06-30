@@ -39,3 +39,13 @@ disabled:
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
+
+# Expected-ENABLED tasks worth documenting as single-source-of-truth. The current
+# nightly_health_check._load_expected() reads only `disabled` + `running` (an
+# enabled task simply must NOT be in `disabled`), so this section is documentary +
+# forward-compatible -- it will not false-WARN and is ready if the health check is
+# extended to assert expected-enabled tasks.
+enabled:
+  # Daily 07:06 AZ PHI re-scan over _brain/swept/ (defense-in-depth behind the
+  # materializer's inline _phi_wall). Added 2026-06-30 (lex-swept-phi-check spec).
+  - Cora - LEX Swept PHI Check
