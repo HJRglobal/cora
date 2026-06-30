@@ -66,6 +66,16 @@ _LBHS_SIGNAL_RE = re.compile(
     r"\b(LBHS|BHRF|COPA|Behavioral Health Services|Jared Harker)\b", re.IGNORECASE
 )
 
+# Lexington/Medicaid PROGRAM cue. Used ONLY by the non-LEX backstop: is_lex_billing_status_phi
+# is by design a LEX-scope-only detector (phi_guard note) — "client"/"member"/"billing"/
+# "invoice" are ordinary commercial words, so firing it unconditionally on BDM/F3E/OSN
+# digests over-drops legit content. A name+invoice reveals care-recipient PHI ONLY when tied
+# to a care program; this cue is that tie. (The LEX branch does not use this — it scrubs +
+# drops on any billing-status PHI regardless, which is correct in LEX scope.)
+_LEX_CONTEXT_RE = re.compile(
+    r"\b(AHCCCS|DDD|Medicaid|HCBS|Lexington|LBHS|BHRF|behavioral health)\b", re.IGNORECASE
+)
+
 _DEFAULT_LOOKBACK_HOURS = 26        # first run / missing-watermark seed (daily + overlap)
 _MAX_CHUNKS_PER_SOURCE = 2000       # bound a catch-up run after downtime
 _MAX_CHARS_PER_SOURCE = 8000        # cap the distill input per source
@@ -301,8 +311,15 @@ def _phi_wall(entity: str, body: str) -> str | None:
             log.warning("drive_materializer: LEX digest still trips PHI after scrub — DROPPED")
             return None
         return scrubbed
-    if phi_guard.is_clinical_phi(body) or phi_guard.is_lex_billing_status_phi(body):
-        log.warning("drive_materializer: %s digest contains client-level PHI (mis-tagged LEX?) — DROPPED", entity)
+    # Non-LEX backstop: drop on clinical PHI ALWAYS. Drop on named-billing/status PHI ONLY
+    # when a Lexington/Medicaid-program cue is ALSO present — otherwise ordinary commercial
+    # "client billing / invoice" language (BDM/F3E/OSN core vocab) would over-drop every run.
+    # A name+invoice with no care-program context does not reveal care-recipient status.
+    if phi_guard.is_clinical_phi(body):
+        log.warning("drive_materializer: %s digest contains clinical PHI (mis-tagged LEX?) — DROPPED", entity)
+        return None
+    if phi_guard.is_lex_billing_status_phi(body) and _LEX_CONTEXT_RE.search(body):
+        log.warning("drive_materializer: %s digest ties a care-recipient billing/status to a Lexington context — DROPPED", entity)
         return None
     return body
 

@@ -297,6 +297,25 @@ class TestPhiWallReviewFixes:
         assert not (Path(env) / "swept" / "HJRG" / "2026-06-29.md").exists()
         assert dm._load_watermarks().get(dm._wm_key("HJRG", "gmail")) is None  # not advanced
 
+    def test_non_lex_legit_commercial_billing_is_kept(self, kb, env):
+        """The non-LEX backstop must NOT shred ordinary commercial 'client billing /
+        invoice' language (BDM/F3E/OSN core vocab) — it drops named-billing PHI ONLY with
+        a Lexington/Medicaid-program cue. A retail client-billing digest with NO LEX cue
+        is WRITTEN, not dropped (guards the review-2 over-drop regression)."""
+        _insert(kb, source="gmail", entity="BDM", ingested_at=NOW, cid="b")
+        legit = (
+            "## Decisions\n- (none)\n## Action items / follow-ups\n- (none)\n"
+            "## Key facts & updates\n- Billed the Sprouts client for the May retainer; "
+            "the OSN client account is now active.\n"
+            "## Notable communications\n- (none)\n## Who-owns-what changes\n- (none)\n"
+        )
+        stats = dm.run(today=date(2026, 6, 29), client=FakeClient(text=legit), kb=kb,
+                       lookback_hours=24 * 3650)
+        assert stats["entities_written"] == 1
+        out = Path(env) / "swept" / "BDM" / "2026-06-29.md"
+        assert out.exists()
+        assert "Sprouts client" in out.read_text(encoding="utf-8")
+
     def test_lex_bare_client_names_never_reach_drive(self, kb, env):
         """Bare client names near a PHI cue ('the client, Madison' / 'incident involving
         Jalen') must be redacted (redact_cue_adjacent_names) or the file dropped — never
