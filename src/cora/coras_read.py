@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -59,8 +60,28 @@ _VERDICTS = {
     "NET-NEW": "🆕",
 }
 
+
+@dataclass(frozen=True)
+class CorasRead:
+    """The structured result of one knowledge-proposal read.
+
+    `verdict` is "" when no read could be produced (any fail-soft path); otherwise
+    one of the four _VERDICTS keys. `line` is the rendered DM string ("" when no
+    read). The verdict is the corroboration signal the graduated-trust shadow pass
+    consumes (WS17-C left it transient -- only the rendered line was kept); persisting
+    it lets the shadow log record what graduated trust WOULD have decided. This struct
+    is decision-SUPPORT only and is never persisted to the canonical knowledge ledger.
+    """
+
+    verdict: str
+    note: str
+    line: str
+
+
+_EMPTY_READ = CorasRead(verdict="", note="", line="")
+
 # Per-process cache so the same claim isn't classified twice in one run.
-_CACHE: dict[tuple[str, str], str] = {}
+_CACHE: dict[tuple[str, str], CorasRead] = {}
 
 _PROMPT = """\
 You compare a PROPOSED fact against what an internal company assistant already
@@ -219,16 +240,23 @@ def _scrub(text: str, entity: str) -> str:
     return text.strip()
 
 
-def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
-    """Return a one-line "Cora's read" for a knowledge proposal, or "" (fail-soft).
+def build_coras_read_struct(update: dict[str, Any], *, kb: Any = None) -> CorasRead:
+    """Return the structured "Cora's read" for a knowledge proposal (fail-soft).
 
-    Decision-SUPPORT only: this never writes or approves anything. kb is injected
-    in tests; in production a KnowledgeBase is opened against the live KB and closed.
+    On any fail-soft path returns `_EMPTY_READ` (verdict == "" and line == ""), so
+    callers can branch on either. `build_coras_read` is a thin wrapper that returns
+    only `.line`, keeping the DM rendering byte-identical to before this split.
+
+    Decision-SUPPORT only: this never writes or approves anything. The verdict it
+    exposes is the corroboration signal the graduated-trust shadow pass logs; it is
+    not persisted to the canonical knowledge ledger and never affects the gate. kb is
+    injected in tests; in production a KnowledgeBase is opened against the live KB and
+    closed.
     """
     try:
         claim, entity = _claim_and_entity(update)
         if not claim:
-            return ""
+            return _EMPTY_READ
         # Defense-in-depth: never send a PHI claim to the LLM, even if an upstream
         # intake gate regressed. is_lex_billing_status_phi is UNCONDITIONAL (entity-
         # agnostic): a folded contribution carries the AUTHOR's entity (e.g. a custodian
@@ -239,7 +267,7 @@ def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
         from .phi_guard import is_phi_risk, is_clinical_phi, is_lex_billing_status_phi
         if (is_phi_risk(claim) or is_clinical_phi(claim)
                 or is_lex_billing_status_phi(claim)):
-            return ""
+            return _EMPTY_READ
         cache_key = (entity, claim[:200])
         if cache_key in _CACHE:
             return _CACHE[cache_key]
@@ -252,7 +280,7 @@ def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
                 own_kb = True
             except Exception as exc:  # noqa: BLE001
                 log.warning("coras_read: KB open failed (%s)", exc)
-                return ""
+                return _EMPTY_READ
         try:
             evidence = _retrieve_evidence(kb, claim, entity)
             prior = _read_prior(entity)
@@ -265,18 +293,28 @@ def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
 
         verdict_obj = _classify(claim, prior, evidence)
         if not verdict_obj:
-            return ""
+            return _EMPTY_READ
         verdict = str(verdict_obj.get("verdict") or "").strip().upper()
         if verdict not in _VERDICTS:
-            return ""
+            return _EMPTY_READ
         note = _scrub(str(verdict_obj.get("note") or "").strip(), entity)
         emoji = _VERDICTS[verdict]
         # The verdict label is fixed/safe; only the model's free-text note is scrubbed.
         line = f"🧠 *Cora's read:* {emoji} {verdict}"
         if note:
             line += f": {note}"
-        _CACHE[cache_key] = line
-        return line
+        result = CorasRead(verdict=verdict, note=note, line=line)
+        _CACHE[cache_key] = result
+        return result
     except Exception as exc:  # noqa: BLE001 -- never block the DM
         log.warning("coras_read: build failed (%s)", exc)
-        return ""
+        return _EMPTY_READ
+
+
+def build_coras_read(update: dict[str, Any], *, kb: Any = None) -> str:
+    """Return a one-line "Cora's read" for a knowledge proposal, or "" (fail-soft).
+
+    Thin wrapper over build_coras_read_struct preserved for every existing caller
+    (run_knowledge_review's DM enrichment) -- returns exactly the rendered line.
+    """
+    return build_coras_read_struct(update, kb=kb).line

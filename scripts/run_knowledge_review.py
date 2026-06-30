@@ -44,7 +44,8 @@ from cora.knowledge_review import (  # noqa: E402
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_GENERIC,
 )
-from cora.coras_read import build_coras_read  # noqa: E402  (WS17-C enrichment)
+from cora.coras_read import build_coras_read_struct  # noqa: E402  (WS17-C enrichment)
+from cora import graduated_trust_shadow as gts  # noqa: E402  (graduated-trust SHADOW)
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 
@@ -504,7 +505,13 @@ def _attach_coras_read(items: list[dict], log: logging.Logger) -> None:
     try:
         for it in items:
             try:
-                it["_coras_read"] = build_coras_read(it, kb=kb)
+                # build_coras_read_struct exposes the structured verdict (WS17-C left
+                # it transient). it["_coras_read"] stays the rendered LINE so the DM is
+                # byte-identical; it["_coras_read_verdict"] is consumed by the
+                # graduated-trust SHADOW pass (decision-SUPPORT, never read by the DM).
+                res = build_coras_read_struct(it, kb=kb)
+                it["_coras_read"] = res.line
+                it["_coras_read_verdict"] = res.verdict
             except Exception as exc:  # noqa: BLE001 -- a read failure must not block the DM
                 log.warning("coras_read: attach failed for %s (%s)",
                             str(it.get("update_id", "?"))[:8], exc)
@@ -530,7 +537,23 @@ def main() -> int:
         "--force-digest", action="store_true",
         help="(Deprecated since WS17-B: knowledge items now DM every run.) Accepted for compatibility.",
     )
+    parser.add_argument(
+        "--report", action="store_true",
+        help="Print the graduated-trust SHADOW report (counts by tier, would-Tier-0 "
+             "rate/week, would-Tier-0 false-positive rate) and exit. Read-only -- no "
+             "lock, no drain, no DMs.",
+    )
+    parser.add_argument(
+        "--report-days", type=int, default=None,
+        help="With --report: limit to shadow decisions from the last N days.",
+    )
     args = parser.parse_args()
+
+    # ── Graduated-trust SHADOW report mode (read-only; no lock, no drain) ────────
+    if args.report:
+        stats = gts.build_report(LOG_DIR, days=args.report_days)
+        print(gts.format_report(stats))
+        return 0
 
     _setup_logging()
     log = logging.getLogger("knowledge-review")
@@ -631,6 +654,17 @@ def main() -> int:
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
 
+    # ── Graduated-trust SHADOW: append the real Harrison reaction to the shadow
+    # log so --report can mark would-Tier-0 items he thumbs-down'd as false
+    # positives. Records ALL resolved reactions (joined by update_id at report
+    # time). Non-dry-run only (a dry run does not resolve, so it must not record
+    # a reaction that didn't actually happen). FAIL-SOFT -- acts on nothing.
+    if not args.dry_run and pairs:
+        try:
+            gts.record_shadow_reactions(pairs, log_dir=LOG_DIR, logger=log)
+        except Exception as exc:  # noqa: BLE001 -- shadow must never affect the run
+            log.warning("graduated-shadow: reaction logging error (ignored): %s", exc)
+
     # ─── Step 2: Drain PENDING updates (WS17-B items 3 + 4) ──────────────────
     # Split the unsent queue: operational "nudge" items route to their entity's
     # domain owner (Cora is decision-SUPPORT); knowledge items (known_answer /
@@ -686,6 +720,18 @@ def main() -> int:
     # ── WS17-C: attach Cora's read to each knowledge item (decision-SUPPORT) ──
     # Fail-soft -- a dead KB / LLM never blocks the DM; the read is advisory only.
     _attach_coras_read(k, log)
+
+    # ── Graduated-trust SHADOW (2026-06-29): for each knowledge item being DM'd,
+    # compute + PERSIST what graduated trust WOULD have done (tier/decision using
+    # the coras_read verdict just attached). ACTS ON NOTHING -- every item below
+    # still DMs Harrison exactly as today; this only appends to the shadow log.
+    # FAIL-SOFT: a logging error must never affect the DM or the gate.
+    try:
+        n_shadow = gts.record_shadow_decisions(k, log_dir=LOG_DIR, logger=log)
+        if n_shadow:
+            log.info("graduated-shadow: logged %d shadow decision(s)", n_shadow)
+    except Exception as exc:  # noqa: BLE001 -- shadow must never block the DM
+        log.warning("graduated-shadow: decision logging error (ignored): %s", exc)
 
     send_dm_to_harrison(
         f"Cora knowledge review: {len(k)} item(s) below for your approval. "

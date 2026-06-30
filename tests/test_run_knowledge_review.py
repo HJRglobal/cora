@@ -372,3 +372,102 @@ def test_execute_approved_drive_generic_does_not_write_known_answers(tmp_path, m
     }
     rkr._execute_approved_update(update, "", logging.getLogger("t"))
     assert not (tmp_path / "fndr.md").exists()  # operational generic only posts; no KB write
+
+
+# == Graduated-trust SHADOW: acts on nothing, byte-identical DM/approve path =====
+
+def test_format_single_item_dm_ignores_shadow_fields():
+    """The DM render must be byte-identical whether or not the shadow pass stashed
+    its fields on the item dict (the shadow verdict/tier are never shown)."""
+    import cora.knowledge_review as kr
+    base = {"update_type": "known_answer", "confidence": "HIGH", "description": "A fact",
+            "payload": {}, "_coras_read": "🧠 *Cora's read:* ✅ CORROBORATED: ok"}
+    baseline = kr.format_single_item_dm(dict(base))
+    enriched = dict(base)
+    enriched.update({"_coras_read_verdict": "CORROBORATED", "shadow_tier": 0,
+                     "shadow_decision": "would-auto-approve"})
+    assert kr.format_single_item_dm(enriched) == baseline
+
+
+def test_shadow_acts_on_nothing_byte_identical(tmp_path, monkeypatch):
+    """End-to-end: run the drain with shadow ON vs OFF over identical inputs.
+
+    Asserts (a) the rendered DM text is byte-identical, (b) the ledger states are
+    identical, (c) a would-auto-approve (Tier-0) item still stays PENDING and is
+    still DM'd to Harrison (shadow acted on nothing), and (d) shadow ON wrote a
+    shadow log while shadow OFF wrote none.
+    """
+    import json as _json
+    from types import SimpleNamespace
+    import cora.knowledge_review as kr
+
+    # Fake org so the proposed item classifies as a would-auto-approve (Tier 0) --
+    # the strongest "acts on nothing" case: it WOULD auto-approve, yet stays gated.
+    monkeypatch.setattr(
+        "cora.org_roles.get_role",
+        lambda sid: SimpleNamespace(external=False, all_entities=["F3E"])
+        if sid == "U-TOMMY" else None)
+    monkeypatch.setattr(
+        "cora.gap_autofill.resolve_owner",
+        lambda e: "U-TOMMY" if (e or "").strip().upper() == "F3E" else None)
+
+    def _fake_attach(items, log):
+        for it in items:
+            it["_coras_read"] = "🧠 *Cora's read:* ✅ CORROBORATED: ok"
+            it["_coras_read_verdict"] = "CORROBORATED"
+
+    def run_once(tag, shadow_on):
+        proposed = tmp_path / f"proposed-{tag}.jsonl"
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+        monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / f"reply-{tag}.jsonl")
+        kr._SEEN_IDS_CACHE = None
+        kr._SEEN_IDS_KEY = None
+        kr._ARCHIVE_IDS_CACHE = None
+        kr._ARCHIVE_IDS_KEY = None
+        logs = tmp_path / f"logs-{tag}"
+        monkeypatch.setattr(rkr, "LOG_DIR", logs)
+        monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / f"kr-{tag}.lock")
+        monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", tmp_path / f"floor-{tag}.txt")
+        monkeypatch.setattr(rkr, "_attach_coras_read", _fake_attach)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("CORA_GRADUATED_SHADOW", "1" if shadow_on else "0")
+
+        captured: dict[str, str] = {}
+
+        def fake_individual(updates, token, _client_factory=None):
+            for u in updates:
+                captured[u["update_id"]] = kr.format_single_item_dm(u)
+            return {u["update_id"]: f"ts-{u['update_id']}" for u in updates}
+
+        monkeypatch.setattr(rkr, "send_individual_dms", fake_individual)
+        monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+
+        kr.propose_update(
+            update_id="ka-x", update_type="known_answer",
+            description="F3E ops dashboard",
+            payload={"entity": "F3E", "question": "where is the dashboard",
+                     "answer": "the F3E ops dashboard lives in Polar",
+                     "answered_by": "U-TOMMY"},
+            confidence="HIGH")
+        monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+        rkr.main()
+        states = {e["update_id"]: e["state"] for e in kr.load_proposed_updates()}
+        return dict(captured), states, logs
+
+    dm_on, st_on, logs_on = run_once("on", True)
+    dm_off, st_off, logs_off = run_once("off", False)
+
+    # (a) rendered DM byte-identical regardless of shadow
+    assert dm_on and dm_on == dm_off
+    # (b) ledger states identical
+    assert st_on == st_off
+    # (c) the item still PENDING -> shadow auto-approved NOTHING
+    assert st_on["ka-x"] == "PENDING"
+    # (d) shadow ON wrote a log; OFF wrote none
+    on_files = list(logs_on.glob("graduated-trust-shadow-*.jsonl"))
+    assert on_files, "shadow ON should have written a shadow log"
+    assert not (logs_off.exists() and list(logs_off.glob("graduated-trust-shadow-*.jsonl")))
+    # ...and the shadow record confirms it WOULD have auto-approved (Tier 0)
+    recs = [_json.loads(l) for l in on_files[0].read_text(encoding="utf-8").splitlines()]
+    ka = [r for r in recs if r.get("update_id") == "ka-x" and r["type"] == "shadow_decision"]
+    assert ka and ka[0]["shadow_tier"] == 0 and ka[0]["shadow_decision"] == "would-auto-approve"
