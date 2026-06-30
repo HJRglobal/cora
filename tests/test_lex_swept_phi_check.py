@@ -217,6 +217,30 @@ def test_quarantine_failure_alert_labels_correctly(tmp_path, monkeypatch):
     assert "dry-run" not in col.alerts[0].lower()
 
 
+def test_non_lex_business_lbhs_mention_not_flagged():
+    # REGRESSION (2026-06-30 review MED): the holdco discusses LBHS/COPA/BHRF/Jared Harker
+    # as BUSINESS entities (M&A / financials) with zero PHI -> must NOT be quarantined (the
+    # wall writes these non-LEX digests; an unconditional LBHS flag false-quarantined them).
+    assert mod.scan_body(
+        "HJRG", "## Key facts & updates\n- The LBHS Voyager/Copa BHRF financial model is "
+        "loss-making as modeled.\n").is_hit is False
+    assert mod.scan_body(
+        "FNDR", "## Decisions\n- Jared Harker's LBHS stake remains under diligence; no "
+        "commitment yet.\n").is_hit is False
+
+
+def test_lex_lbhs_signal_still_flagged():
+    # In a LEX digest, the wall drops ANY LBHS signal -> the scanner still flags it.
+    assert mod.scan_body("LEX", "Program update references BHRF intake coordination.").is_hit is True
+    assert "lbhs_42cfr_part2" in mod.scan_body("LEX", "BHRF caseload review.").detectors
+
+
+def test_non_lex_lbhs_with_actual_phi_still_flagged():
+    # An LBHS mention that actually carries PHI in a non-LEX digest still trips clinical.
+    r = mod.scan_body("HJRG", "LBHS note: a member was diagnosed with schizophrenia.")
+    assert r.is_hit and "clinical_phi" in r.detectors
+
+
 def test_entity_resolved_from_segment_after_swept(tmp_path):
     # A deeper-nested file is still attributed to its top-level entity dir (LEX), getting
     # the strict LEX branch -- not mis-branched to the non-LEX backstop.

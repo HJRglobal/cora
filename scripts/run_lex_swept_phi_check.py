@@ -10,13 +10,20 @@ check doesn't.
 
 NO DRIFT: the detectors are IMPORTED from `phi_guard` + `drive_materializer` — the same
 functions/regexes the wall uses (`is_clinical_phi`, `is_lex_billing_status_phi`,
-`_LBHS_SIGNAL_RE`, `scrub_lex_phi`/`redact_cue_adjacent_names`, `_LEX_CONTEXT_RE`,
-`_lex_staff_names`). `scan_body` mirrors `_phi_wall`'s ENTITY-AWARE structure (LEX branch
-vs non-LEX backstop) so it (a) never false-positives on non-LEX vendor possessives /
-commercial "client billing", and (b) is a strict SUPERSET of what the wall drops — it
-ALSO flags a `scrub_lex_phi` diff on a LEX file, which catches the regression case
-(raw PHI written without the wall's scrub) that re-running the wall would silently
-re-scrub-and-pass.
+`_LBHS_SIGNAL_RE`, `_LEX_CONTEXT_RE`, `_lex_staff_names`, and phi_guard's name regexes via
+`_has_unredacted_client_name`). `scan_body` runs them on the body AS-IS — NOT on a
+re-scrubbed copy — because (a) a written swept file is already the wall's output (a regression
+file is raw), so the detectors-on-body are a strict SUPERSET of the wall's checks-on-scrubbed
+(scrubbing only REMOVES PHI); (b) they are idempotent-safe on the scrub placeholders
+(`[medication redacted]` / `[client]'s` / `[name redacted]` trip none of them); and (c) it
+is ENTITY-AWARE (LEX branch vs non-LEX backstop) so it never false-positives on non-LEX
+vendor possessives / commercial "client billing" / bare BUSINESS mentions of LBHS.
+We deliberately do NOT re-run `scrub_lex_phi` for a string-diff: it RE-WRAPS its own
+placeholders (`[medication redacted]` -> `[medication [medication redacted]]` via
+`_MED_CONTEXT_RE`), which would false-quarantine a clean med-mentioning LEX digest daily
+(review 2026-06-30). The bare-client-name regression that diff was meant to catch is detected
+DIRECTLY + idempotent-safe by `_has_unredacted_client_name` (LEX branch), reusing phi_guard's
+SAME name regexes + staff filter.
 
 ON A HIT: quarantine + alert (entity / date / which-detector — NEVER the offending text)
 + audit log. Quarantine = rename in place to `{date}.QUARANTINED.md` inside the same
@@ -140,23 +147,29 @@ def scan_body(entity: str, body: str) -> ScanResult:
     e = (entity or "").strip().upper()
     detectors: list[str] = []
 
-    # Leaks in ANY swept file (matches the wall's clinical drop for all entities; LBHS
-    # in a non-LEX digest is also a leak the re-scan flags, stricter than the wall).
+    # Clinical PHI is a leak in ANY digest (matches the wall's clinical drop for both the
+    # LEX and non-LEX branches; idempotent-safe on the scrub placeholders).
     if phi_guard.is_clinical_phi(body):
         detectors.append("clinical_phi")
-    if dm._LBHS_SIGNAL_RE.search(body):
-        detectors.append("lbhs_42cfr_part2")
 
     if e == "LEX":
+        # The wall drops ANY LBHS / 42-CFR-Part-2 signal in a LEX digest -> flag it.
+        if dm._LBHS_SIGNAL_RE.search(body):
+            detectors.append("lbhs_42cfr_part2")
         if phi_guard.is_lex_billing_status_phi(body):
             detectors.append("named_billing_status_phi")
         if _has_unredacted_client_name(body):
             detectors.append("client_name")
     else:
-        # Non-LEX backstop: a care-recipient billing/status only when a Lexington/Medicaid
-        # PROGRAM cue is ALSO present, so ordinary commercial "client billing" is not
-        # flagged (matches the wall's non-LEX branch). No name net here -- non-LEX digests
-        # legitimately carry vendor/company possessives.
+        # Non-LEX backstop -- mirrors the wall's non-LEX branch EXACTLY (clinical above +
+        # named-billing only with a Lexington/Medicaid PROGRAM cue, so ordinary commercial
+        # "client billing" is not flagged; no name net -- non-LEX digests legitimately carry
+        # vendor/company possessives). It deliberately does NOT flag a BARE LBHS/COPA/BHRF/
+        # Jared-Harker signal: the holdco legitimately discusses those as BUSINESS entities
+        # (M&A / financials) with zero PHI, and the wall writes such digests (review 2026-06-30:
+        # an unconditional LBHS flag false-quarantined the holdco's "LBHS Voyager/Copa BHRF
+        # financial model" digest daily). An LBHS mention that actually carries PHI still
+        # trips clinical (above) or named-billing (below -- LBHS satisfies _LEX_CONTEXT_RE).
         if phi_guard.is_lex_billing_status_phi(body) and dm._LEX_CONTEXT_RE.search(body):
             detectors.append("named_billing_status_phi_lex_context")
 
