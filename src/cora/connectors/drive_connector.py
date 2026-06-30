@@ -265,8 +265,16 @@ def _is_blacklisted_path(path_segments: list[str]) -> bool:
     """
     lower_segments = [s.lower() for s in path_segments]
 
+    # Drive-materialization (2026-06-29): exclude the _brain/swept/ subtree (the nightly
+    # distilled digests) from any Drive-API walk so they never feed back into the KB.
+    # Require BOTH segments so _brain/known-answers, _brain/reference, _brain/people are
+    # NEVER excluded (they MUST keep ingesting).
+    seg_set = set(lower_segments)
+    if "_brain" in seg_set and "swept" in seg_set:
+        return True
+
     # Check 1: any segment exactly matches a blacklist entry
-    if set(lower_segments) & _BLACKLIST_SEGMENTS:
+    if seg_set & _BLACKLIST_SEGMENTS:
         return True
 
     # Check 2: the last segment (filename) matches a sensitive-file pattern

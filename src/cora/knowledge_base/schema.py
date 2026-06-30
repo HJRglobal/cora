@@ -68,6 +68,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunks_entity       ON knowledge_chunks(entity);
         CREATE INDEX IF NOT EXISTS idx_chunks_date_mod     ON knowledge_chunks(date_modified DESC);
         CREATE INDEX IF NOT EXISTS idx_chunks_source_id    ON knowledge_chunks(source, source_id);
+        -- Serves the Drive-materialization watermark query (get_chunks_since):
+        -- WHERE source=? AND entity=? AND ingested_at>? — lets sqlite seek to the
+        -- watermark instead of scanning a whole (source,entity) partition nightly.
+        CREATE INDEX IF NOT EXISTS idx_chunks_src_ent_ing  ON knowledge_chunks(source, entity, ingested_at);
 
         CREATE TABLE IF NOT EXISTS sync_state (
             source                TEXT PRIMARY KEY,

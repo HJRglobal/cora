@@ -719,6 +719,60 @@ class KnowledgeBase:
             "by_entity": by_entity,
         }
 
+    def get_chunks_since(
+        self,
+        *,
+        source: str,
+        entity: str,
+        since_ts: int,
+        exclude_sub_entities: tuple[str, ...] | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        """Non-vector metadata query: chunks for (source, entity) ingested after since_ts.
+
+        Drive-materialization (2026-06-29): the nightly materializer reads the day's
+        NEW swept chunks WITHOUT an embedding query (no vector search, no index rebuild).
+        Returned OLDEST-FIRST so the caller can advance a per-(entity, source) watermark
+        to the max ingested_at it actually processed (a fail-closed per-entity skip then
+        never drops a day). `ingested_at` is unix-epoch seconds.
+
+        exclude_sub_entities drops those sub_entity tags while KEEPING NULL (GM-level)
+        rows — used for LEX to hard-exclude LEX-LBHS (42 CFR Part 2) from materialization
+        while still materializing GM-level + LLC/LTS/LLA content.
+
+        user_note is never a valid source here (the blast-radius-1 invariant): callers
+        pass only swept sources, and this guard makes that structural.
+        """
+        if source == USER_NOTE_SOURCE:
+            return []
+        sql = (
+            "SELECT chunk_id, source_id, title, content, date_modified, "
+            "ingested_at, sub_entity, author, deep_link "
+            "FROM knowledge_chunks WHERE source = ? AND entity = ? AND ingested_at > ?"
+        )
+        params: list[Any] = [source, entity, int(since_ts)]
+        if exclude_sub_entities:
+            ph = ",".join("?" * len(exclude_sub_entities))
+            sql += f" AND (sub_entity IS NULL OR sub_entity NOT IN ({ph}))"
+            params.extend(exclude_sub_entities)
+        sql += " ORDER BY ingested_at ASC LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {
+                "chunk_id": r[0],
+                "source_id": r[1],
+                "title": r[2] or "",
+                "content": r[3] or "",
+                "date_modified": r[4],
+                "ingested_at": r[5],
+                "sub_entity": r[6],
+                "author": r[7] or "",
+                "deep_link": r[8] or "",
+            }
+            for r in rows
+        ]
+
     def get_sync_state(self, source: str) -> tuple[int, int | None] | None:
         """Return (last_sync_at, last_source_modified) for a source, or None if no record."""
         row = self._conn.execute(

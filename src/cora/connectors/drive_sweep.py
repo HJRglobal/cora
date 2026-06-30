@@ -825,6 +825,10 @@ _ENTITY_SUB_MAP: dict[str, dict[str, str]] = {
 _FOUNDERS_OS_SKIP_FOLDERS = frozenset({
     "_archive", "archive", "old", "backup", "temp", ".cache",
     ".tmp", "node_modules", ".git",
+    # Drive-materialization (2026-06-29): the nightly _brain/swept/ digests. _brain is
+    # already unmapped here (no entity -> skipped), so this is defense-in-depth in case
+    # _brain is ever mapped; it must NEVER feed back into the KB.
+    "swept",
 })
 
 _LEX_SCORE_THRESHOLD = 6

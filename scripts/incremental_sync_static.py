@@ -71,6 +71,19 @@ def is_phi_path(path: Path) -> bool:
     return bool(parts_lower & PHI_BLACKLIST_SEGMENTS)
 
 
+def is_swept_path(path: Path) -> bool:
+    """Exclude the _brain/swept/ subtree (the nightly Drive-materialization output).
+
+    Drive-materialization (2026-06-29): this sync rglobs the whole Founder OS tree
+    including _brain. Without this guard it would re-ingest _brain/swept/ digests ->
+    next materialization re-distills its own output -> loop + KB bloat. Require BOTH
+    "_brain" AND "swept" segments so _brain/known-answers, _brain/reference, and
+    _brain/people are NEVER excluded (they MUST keep ingesting).
+    """
+    parts_lower = {p.lower() for p in path.parts}
+    return "_brain" in parts_lower and "swept" in parts_lower
+
+
 def classify_entity(path: Path) -> str:
     try:
         rel = path.relative_to(FOUNDER_OS_ROOT)
@@ -84,6 +97,8 @@ def classify_entity(path: Path) -> str:
 
 def file_to_document(path: Path) -> Document | None:
     if is_phi_path(path):
+        return None
+    if is_swept_path(path):
         return None
     # Cora's own build/audit/forensic docs are operational metadata, not org
     # knowledge — keep them out of the KB (they fabricate "diagnostics" via RAG).
@@ -156,6 +171,9 @@ def main() -> int:
         if not path.is_file():
             continue
         if is_phi_path(path):
+            continue
+        # Drive-materialization output — never re-ingest (loop guard).
+        if is_swept_path(path):
             continue
         # Cora's own build/audit/forensic docs are NOT org knowledge — never ingest.
         if is_cora_internal_path(path):
