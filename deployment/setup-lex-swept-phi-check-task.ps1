@@ -37,10 +37,13 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# D-005: absolute .venv python + absolute script path + WorkingDirectory
+# D-005: absolute .venv python + absolute script path + WorkingDirectory.
+# --all re-scans the whole (small: ~1 file/entity/day) swept tree so a >26h missed run
+# (machine asleep / skipped fire) never leaves a written file unscanned. Quarantined
+# files are skipped; clean files re-scan as cheap no-ops.
 $action = New-ScheduledTaskAction `
     -Execute $PythonExe `
-    -Argument "`"$ScriptPath`"" `
+    -Argument "`"$ScriptPath`" --all" `
     -WorkingDirectory $RepoRoot
 
 $trigger = New-ScheduledTaskTrigger -Daily -At $HourMin

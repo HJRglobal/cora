@@ -74,18 +74,20 @@ _HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 # fail-safe direction is over-scan -> a benign false alarm, never a missed leak.
 import re  # noqa: E402
 
-_HEADER_LINE_RES = (
-    re.compile(r"^#\s+.*swept-knowledge digest.*$", re.IGNORECASE),
-    re.compile(r"^_Auto-distilled by Cora\b.*_\s*$", re.IGNORECASE),
-    re.compile(r"^_LEX:.*LBHS.*excluded.*_\s*$", re.IGNORECASE),
-)
+# Strip ONLY the materializer's LEX header line -- it literally contains
+# "LBHS (42 CFR Part 2) excluded", which would false-match the LBHS regex. The title
+# ("# LEX — swept-knowledge digest ...") and the auto-distilled note trip NO detector,
+# so they are deliberately NOT stripped (stripping more risks dropping a real body line
+# that happens to match -- the unsafe direction). A body bullet exactly matching the
+# LEX-header pattern is implausible.
+_LEX_HEADER_LINE_RE = re.compile(r"^_LEX:.*LBHS.*excluded.*_\s*$", re.IGNORECASE)
 
 
 def distilled_body(content: str) -> str:
-    """Drop the materializer's PHI-free header boilerplate; return the distilled body."""
+    """Drop the materializer's LEX header line (its only PHI-detector false-positive);
+    return the rest verbatim for scanning."""
     return "\n".join(
-        ln for ln in content.splitlines()
-        if not any(rx.match(ln) for rx in _HEADER_LINE_RES)
+        ln for ln in content.splitlines() if not _LEX_HEADER_LINE_RE.match(ln)
     )
 
 
@@ -97,47 +99,64 @@ class ScanResult:
     detectors: list[str] = field(default_factory=list)
 
 
+def _has_unredacted_client_name(body: str) -> bool:
+    """A care-recipient-noun + ProperName, or a non-staff possessive ProperName, that
+    `scrub_lex_phi` would redact -- detected DIRECTLY (idempotent-safe) instead of via a
+    string-diff. Reuses phi_guard's SAME name regexes + staff filter (no drift). On a
+    properly-written LEX file these are already "[name redacted]" / "[client]'s" (the
+    placeholders do NOT match the Title-case name patterns -> no false positive); a hit
+    means a RAW client name slipped through (a wall regression). Fail-CLOSED on error."""
+    try:
+        staff = dm._lex_staff_names()  # fail-soft to empty set inside (over-redact = safe)
+        full, first = phi_guard._staff_name_index(staff)
+        for m in phi_guard._CARE_RECIPIENT_NAME_RE.finditer(body):
+            if not phi_guard._is_staff_name(m.group(2), full, first):
+                return True
+        for m in phi_guard._NAME_POSSESSIVE_RE.finditer(body):
+            name = re.sub(r"['’]s$", "", m.group(0))
+            if not phi_guard._is_staff_name(name, full, first):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 -- fail-CLOSED (treat as a hit), like the wall's scrub
+        return True
+
+
 def scan_body(entity: str, body: str) -> ScanResult:
-    """Re-scan a WRITTEN swept body for PHI using the SAME imported detectors as the
-    wall. Entity-aware (LEX vs non-LEX) so it matches the wall's behavior and never
-    false-positives on non-LEX vendor possessives / commercial billing. A strict
-    SUPERSET of `_phi_wall` drops (adds the LEX scrub-diff regression net + flags any
-    LBHS signal in any entity)."""
+    """Re-scan a WRITTEN swept body for PHI using the SAME imported detectors as the wall.
+
+    The detectors run on the body AS-IS -- NOT on a re-scrubbed copy. A WRITTEN swept
+    file is already the wall's output (double-scrubbed for LEX); a regression file is raw.
+    is_clinical_phi / is_lex_billing_status_phi / the LBHS regex / the name regexes are
+    (a) a strict SUPERSET of the wall's checks-on-scrubbed (scrubbing only REMOVES PHI,
+    so a raw body trips whatever its scrubbed form would) and (b) idempotent-safe on the
+    scrub placeholders ([medication redacted] / [client]'s / [name redacted] trip none of
+    them). We deliberately do NOT re-run scrub_lex_phi for a string-diff: scrub_lex_phi
+    RE-WRAPS its own placeholders (`[medication redacted]` -> `[medication [medication
+    redacted]]` via _MED_CONTEXT_RE), so a clean med-mentioning LEX digest would
+    false-quarantine every day (the 2026-06-30 review HIGH). The bare-client-name
+    regression the string-diff was meant to catch is detected directly + idempotent-safe
+    by `_has_unredacted_client_name`. Entity-aware so non-LEX vendor possessives /
+    commercial billing never false-fire."""
     e = (entity or "").strip().upper()
     detectors: list[str] = []
 
+    # Leaks in ANY swept file (matches the wall's clinical drop for all entities; LBHS
+    # in a non-LEX digest is also a leak the re-scan flags, stricter than the wall).
+    if phi_guard.is_clinical_phi(body):
+        detectors.append("clinical_phi")
+    if dm._LBHS_SIGNAL_RE.search(body):
+        detectors.append("lbhs_42cfr_part2")
+
     if e == "LEX":
-        staff = dm._lex_staff_names()
-        try:
-            scrubbed = phi_guard.scrub_lex_phi(body, allowed_names=staff)
-            # The doubly-scrubbed text (matches _phi_wall) is used ONLY for the
-            # LBHS/clinical/billing checks below -- NOT for the diff.
-            double = phi_guard.redact_cue_adjacent_names(scrubbed, allowed_names=staff)
-        except Exception:  # noqa: BLE001 -- fail-CLOSED, exactly like the wall
-            return ScanResult(True, ["scrub_error_fail_closed"])
-        # Diff on scrub_lex_phi ALONE (the spec's named detector): it redacts only
-        # diagnoses/meds/DOB/client-names/possessives, so a diff means RAW PHI is in
-        # the written artifact that the write-time scrub should have removed (a wall
-        # regression). It is idempotent on a properly-materialized (post-scrub) file,
-        # so no false positive. (redact_cue_adjacent_names is deliberately EXCLUDED
-        # from the diff -- it's recall-biased and rewrites ordinary Title-case words
-        # near a cue, e.g. "Key" in a "## Key facts" header, which would false-fire.)
-        if scrubbed != body:
-            detectors.append("scrub_lex_phi_diff")
-        if dm._LBHS_SIGNAL_RE.search(double):
-            detectors.append("lbhs_42cfr_part2")
-        if phi_guard.is_clinical_phi(double):
-            detectors.append("clinical_phi")
-        if phi_guard.is_lex_billing_status_phi(double):
+        if phi_guard.is_lex_billing_status_phi(body):
             detectors.append("named_billing_status_phi")
+        if _has_unredacted_client_name(body):
+            detectors.append("client_name")
     else:
-        # Non-LEX backstop (a holdco/founder digest can span Lexington via a mis-tagged
-        # chunk). No scrub-diff here: scrubbing a non-LEX digest would false-positive on
-        # ordinary vendor/company possessives ("Walmart's order").
-        if phi_guard.is_clinical_phi(body):
-            detectors.append("clinical_phi")
-        if dm._LBHS_SIGNAL_RE.search(body):
-            detectors.append("lbhs_42cfr_part2")
+        # Non-LEX backstop: a care-recipient billing/status only when a Lexington/Medicaid
+        # PROGRAM cue is ALSO present, so ordinary commercial "client billing" is not
+        # flagged (matches the wall's non-LEX branch). No name net here -- non-LEX digests
+        # legitimately carry vendor/company possessives.
         if phi_guard.is_lex_billing_status_phi(body) and dm._LEX_CONTEXT_RE.search(body):
             detectors.append("named_billing_status_phi_lex_context")
 
@@ -153,11 +172,19 @@ class FileFinding:
     date: str
     detectors: list[str]
     quarantined_to: Path | None = None
+    quarantine_failed: bool = False   # a real rename was attempted and raised (PHI file still LIVE)
 
 
 def _entity_of(path: Path) -> str:
-    """`_brain/swept/{ENTITY}/{date}.md` -> ENTITY (the parent dir name)."""
-    return path.parent.name
+    """`.../_brain/swept/{ENTITY}/{date}.md` -> ENTITY. Resolve the segment AFTER `swept`
+    (not the immediate parent) so a deeper-nested file is still attributed to its top-level
+    entity dir and gets the correct (LEX vs non-LEX) branch -- a mis-branch to the less
+    strict non-LEX backstop could miss a LEX-only check."""
+    parts = path.parts
+    for i, seg in enumerate(parts[:-1]):
+        if seg.lower() == "swept":
+            return parts[i + 1]
+    return path.parent.name  # fallback (no `swept` segment)
 
 
 def _date_of(path: Path) -> str:
@@ -187,7 +214,12 @@ def quarantine_file(path: Path, *, now: datetime | None = None) -> Path:
 def build_alert(hits: list[FileFinding], errors: list[tuple[Path, str]]) -> str:
     lines = [f":rotating_light: *LEX swept PHI check* — {len(hits)} file(s) flagged"]
     for h in hits:
-        q = f"  ->  quarantined `{h.quarantined_to.name}`" if h.quarantined_to else "  (dry-run, not quarantined)"
+        if h.quarantined_to:
+            q = f"  ->  quarantined `{h.quarantined_to.name}`"
+        elif h.quarantine_failed:
+            q = "  ->  :x: QUARANTINE FAILED — file still LIVE, manual action needed"
+        else:
+            q = "  (dry-run, not quarantined)"
         lines.append(f"- *{h.entity}* {h.date}: detectors `{', '.join(h.detectors)}`{q}")
     if errors:
         lines.append(f":warning: {len(errors)} file(s) could not be read (UNVERIFIED — not passed):")
@@ -202,6 +234,8 @@ def build_alert(hits: list[FileFinding], errors: list[tuple[Path, str]]) -> str:
 def _iter_swept_files(root: Path, *, since_hours: int, all_files: bool, now: datetime) -> list[Path]:
     out: list[Path] = []
     cutoff = now.timestamp() - since_hours * 3600
+    # sorted(glob) forces the walk eagerly so a mid-tree listing error raises HERE
+    # (caught + surfaced by run(), never silently dropping the readable siblings).
     for f in sorted(root.glob("**/*.md")):
         if f.name.endswith(_QUARANTINE_SUFFIX) or ".QUARANTINED." in f.name:
             continue  # already handled
@@ -239,7 +273,14 @@ def run(
         log.warning("lex-swept-phi-check: swept root %s does not exist — nothing to scan", root)
         return {"scanned": 0, "hits": [], "errors": [], "root_missing": True}
 
-    for f in _iter_swept_files(root, since_hours=since_hours, all_files=all_files, now=now):
+    try:
+        files = _iter_swept_files(root, since_hours=since_hours, all_files=all_files, now=now)
+    except Exception as exc:  # noqa: BLE001 -- a tree-walk failure must NOT abort silently
+        log.error("lex-swept-phi-check: could not enumerate swept files under %s: %s", root, exc)
+        errors.append((root, f"tree walk failed: {exc}"))
+        files = []
+
+    for f in files:
         try:
             content = f.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 -- fail-soft; NEVER silently pass
@@ -253,17 +294,23 @@ def run(
             log.info("lex-swept-phi-check: clean entity=%s file=%s", entity, f.name)
             continue
         quarantined = None
+        qfailed = False
         if not dry_run:
             try:
                 quarantined = quarantine_file(f, now=now)
             except Exception as exc:  # noqa: BLE001 -- a quarantine failure must still alert
-                log.error("lex-swept-phi-check: quarantine FAILED for %s: %s", f, exc)
+                qfailed = True
+                log.error(
+                    "lex-swept-phi-check: quarantine FAILED for %s: %s — PHI file still LIVE",
+                    f, exc,
+                )
         # Audit: entity/date/detectors + quarantine target ONLY — never the body.
         log.warning(
             "lex-swept-phi-check: PHI HIT entity=%s date=%s detectors=%s quarantined=%s",
-            entity, date, res.detectors, (quarantined.name if quarantined else "(dry-run/failed)"),
+            entity, date, res.detectors,
+            (quarantined.name if quarantined else ("FAILED-still-live" if qfailed else "dry-run")),
         )
-        hits.append(FileFinding(f, entity, date, res.detectors, quarantined))
+        hits.append(FileFinding(f, entity, date, res.detectors, quarantined, quarantine_failed=qfailed))
 
     if not hits and not errors:
         log.info("lex-swept-phi-check: %d files scanned, 0 PHI", scanned)  # heartbeat

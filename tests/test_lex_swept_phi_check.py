@@ -157,6 +157,77 @@ def test_drift_guard_same_detector_objects():
     assert mod.dm is dm
     assert mod.dm._LBHS_SIGNAL_RE is dm._LBHS_SIGNAL_RE
     assert mod.dm._LEX_CONTEXT_RE is dm._LEX_CONTEXT_RE
+    # the bare-client-name net reuses phi_guard's SAME name regexes (no reimplementation)
+    assert mod.phi_guard._CARE_RECIPIENT_NAME_RE is phi_guard._CARE_RECIPIENT_NAME_RE
+    assert mod.phi_guard._NAME_POSSESSIVE_RE is phi_guard._NAME_POSSESSIVE_RE
+
+
+def test_realistic_wall_output_med_mention_is_clean(tmp_path):
+    # REGRESSION (2026-06-30 review HIGH): feed the scanner the WALL'S ACTUAL output for a
+    # medication-mentioning LEX body. The old string-diff re-wrapped the [medication
+    # redacted] placeholder and falsely quarantined this daily; the redesign must pass it.
+    root = _swept_root(tmp_path)
+    raw = ("## Key facts & updates\n- Meds review covered melatonin and a dose change; "
+           "staff coordinated transport for the DTA program.\n")
+    scrubbed_body = dm._phi_wall("LEX", raw)
+    assert scrubbed_body is not None                           # wall scrubbed-and-KEPT (not dropped)
+    assert "[medication redacted]" in scrubbed_body            # the placeholder that broke the old diff
+    _write(root, "LEX", "2026-06-30", scrubbed_body, lex_header=True)
+    stats = mod.run(swept_root=root, all_files=True, now=_NOW)
+    assert stats["hits"] == []                                 # clean -> not re-quarantined
+
+
+def test_bare_client_name_regression_detected(tmp_path):
+    # A regression: a LEX file written with a RAW client name (no diagnosis/billing). Only
+    # the name net catches it -> proves the direct (idempotent-safe) name detector works.
+    root = _swept_root(tmp_path)
+    _write(root, "LEX", "2026-06-30",
+           "## Notable communications\n- Transport coordinated for client Madison Pearce to the DTA site.\n",
+           lex_header=True)
+    stats = mod.run(swept_root=root, all_files=True, now=_NOW)
+    assert len(stats["hits"]) == 1
+    assert "client_name" in stats["hits"][0].detectors
+
+
+def test_staff_name_in_lex_digest_not_flagged(tmp_path):
+    # A LEX digest naming STAFF (on the org roster) must NOT trip the client-name net.
+    root = _swept_root(tmp_path)
+    _write(root, "LEX", "2026-06-30",
+           "## Who-owns-what changes\n- Shaun Hawkins took over DTA scheduling; Jen Mortensen covers intake.\n",
+           lex_header=True)
+    stats = mod.run(swept_root=root, all_files=True, now=_NOW)
+    assert stats["hits"] == []
+
+
+def test_quarantine_failure_alert_labels_correctly(tmp_path, monkeypatch):
+    root = _swept_root(tmp_path)
+    _write(root, "LEX", "2026-06-30", "## x\n- A client was diagnosed with autism.\n", lex_header=True)
+
+    def _boom(path, **kw):
+        raise PermissionError("locked by Drive sync")
+
+    monkeypatch.setattr(mod, "quarantine_file", _boom)
+    col = _Collector()
+    stats = mod.run(swept_root=root, all_files=True, now=_NOW, alert_fn=col)
+    assert len(stats["hits"]) == 1
+    assert stats["hits"][0].quarantine_failed is True
+    assert stats["hits"][0].quarantined_to is None
+    assert len(col.alerts) == 1
+    assert "quarantine failed" in col.alerts[0].lower()        # urgent, not mislabeled
+    assert "dry-run" not in col.alerts[0].lower()
+
+
+def test_entity_resolved_from_segment_after_swept(tmp_path):
+    # A deeper-nested file is still attributed to its top-level entity dir (LEX), getting
+    # the strict LEX branch -- not mis-branched to the non-LEX backstop.
+    root = _swept_root(tmp_path)
+    nested = root / "LEX" / "sub"
+    nested.mkdir(parents=True)
+    f = nested / "2026-06-30.md"
+    f.write_text("## x\n- Transport for client Madison Pearce.\n", encoding="utf-8")
+    assert mod._entity_of(f) == "LEX"
+    stats = mod.run(swept_root=root, all_files=True, now=_NOW)
+    assert len(stats["hits"]) == 1                              # LEX branch name-net fired
 
 
 def test_read_error_surfaced_not_silently_passed(tmp_path):
