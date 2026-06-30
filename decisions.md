@@ -2025,3 +2025,102 @@ script-side (their scheduled tasks import on-disk source). Harrison merges + ONE
 restart; registers `setup-cashflow-snapshot-task.ps1`; populates `_ENTITY_PNL_BASIS` per
 entity when ready. META: the green suite caught NONE of the 3 MEDIUMs - adversarial diff
 review did, again.
+
+
+## D-061 - Per-person involvement dossier (North Star pillar 4): cora_person_dossier + weekly refresh (2026-06-30)
+
+**Context:** Re-homes the per-person involvement / founder check-in capability from the
+deprecated Tag Founder Bundle onto Cora, per
+`_shared/projects/cora/2026-06-29_fndr_cora-per-person-layer-build-spec.md` (section 10
+decisions LOCKED). Branch `claude/per-person-dossier` off `main`@`e0a77c6`; MERGED to main.
+
+**Decisions / what shipped:**
+- `src/cora/person_identity.py` - PersonIdentity resolver derived ONLY from the 5 maintained
+  YAMLs (org-roles + slack-to-asana + slack-to-hubspot + user-aliases +
+  monitored-email-accounts). NO new map (anti-drift). `lex_staff` on the PRIMARY entity (so a
+  cross-entity controller like Justin is NOT misclassified - his incidental LEX activity is
+  caught by the non-LEX clinical backstop); `external` (Jason); `exclude_personal_mailbox`
+  (Demi - also structurally empty mailbox); `exclude_maricopa` (Alina). The two non-structural
+  flags are a small in-code constant (LOCKED policy, not a parallel identity map).
+- `src/cora/tools/person_dossier.py` - founder-or-self access gate (peer refused with NO target
+  leak), DM-only surface gate (deterministic peer-wall, D-034), fail-soft multi-source pull
+  (Gmail DWD per-mailbox / Fireflies deduped via meeting_actions helpers / Asana / HubSpot
+  stage-label / Calendar this+next week; Drive PENDING v1), LEX PHI wall mirroring
+  `drive_materializer._phi_wall` (scrub PRE-synthesis, drop on surviving clinical/named-billing;
+  non-LEX clinical backstop), Sonnet synthesis (fail-soft), write-back replacing the dossier's
+  "Recent involvements" section / preserving "Durable notes" / normalizing "by Tag" -> "by Cora".
+- `tool_dispatch.py` - `cora_person_dossier` registered (global-core, founder-or-self handler via
+  `_load_supervisor_hierarchy().founder_slack_id` || `_HARRISON_SLACK_ID`); timeout 25 -> 45 ->
+  60s after the live smoke (`15d0f83`). `model_router.py` - check-in phrasings -> Sonnet.
+- `scripts/run_person_dossier_refresh.py` + `deployment/setup-person-dossier-refresh-task.ps1`
+  (task `cowork-cora-person-dossier-refresh`, Sun 16:30 AZ, self-bounded). `scripts/check_identity_map.py`
+  roster-drift guard vs `_brain/reference/team-identity-map.md`. Tests: `test_person_identity.py`
+  + `test_person_dossier.py` (35).
+
+**Process:** A 3-agent adversarial D-051 review BEFORE the restart caught a real HIGH the green
+5,179-suite + self-review both missed - `_gmail_block` scrubbed by `mailboxes[0]` only, so a
+non-lex_staff target whose LEX mailbox isn't first (Justin) would leak that mailbox's PHI
+subjects to the LLM + into the written dossier; fixed via PER-MAILBOX scrub. Plus a peer-wall MED
+(no surface gate -> a check-in in a shared channel would post the summary to peers; fixed with the
+DM-only gate) and a Fireflies LBHS-domain MED. Then the LIVE in-Slack DM smoke caught a latency
+bug the suite couldn't: the 5-connector + internal-Sonnet pull ran ~38s SEQUENTIALLY and blew the
+25s dispatch timeout (the model got "timed out" while the orphaned worker still wrote the dossier);
+fixed by parallelizing the source pulls (pull 28s -> 6.9s; full build ~38s -> 31.9s) + the 45->60s
+timeout. Suite 5184. Merged to main; bot restarted x2 (running the parallel code); in-Slack DM
+smoke PASSED (917-char real summary, no timeout); gate smoke all-pass (peer-refuse-no-leak,
+DM-only redirect, graceful); Tommy write-back verified. META: the green suite caught NEITHER the
+PHI HIGH nor the latency bug - the adversarial pass and the live smoke did. DOCTRINES: a tool that
+makes its OWN internal LLM call + multiple connector pulls must fan the pulls out concurrently AND
+carry a timeout well above the single-API default; a dispatch timeout never kills the orphaned
+worker thread (it finishes + writes anyway). Phase 2 deferred: Drive "recent files" source; the
+self-serve "what's on my radar" overlay.
+
+
+## D-062 - lex-swept-phi-check: daily defense-in-depth PHI re-scan over _brain/swept/ (2026-06-30)
+
+**Context:** The North Star cited a "lex-swept-phi-check (daily 07:06)" net behind the drive
+materializer's inline `_phi_wall` but it did NOT exist in the repo. Built per
+`_shared/projects/cora/2026-06-29_fndr_cora-lex-swept-phi-check-spec.md` (recommendation: build
+it). Branch `claude/lex-swept-phi-check` off `main`@`15d0f83`; MERGED to main@`ae859df`.
+SCRIPT-SIDE - no bot restart.
+
+**Decisions / what shipped:**
+- `scripts/run_lex_swept_phi_check.py` - re-reads every written `_brain/swept/**/*.md` and re-runs
+  the SAME PHI detectors the wall uses, IMPORTED from `phi_guard` + `drive_materializer` (no
+  drift): `is_clinical_phi`, `is_lex_billing_status_phi`, `_LBHS_SIGNAL_RE`, `_LEX_CONTEXT_RE`,
+  `_lex_staff_names`, + phi_guard's name regexes via `_has_unredacted_client_name`. On a hit:
+  quarantine (rename IN PLACE to `{date}.QUARANTINED.md`) + alert Harrison (DM + #cora-health;
+  entity/date/detector ONLY, NEVER the PHI text) + audit log. Clean run = heartbeat
+  ("N files scanned, 0 PHI"). Fail-soft: read + tree-walk errors surfaced as UNVERIFIED (alerted),
+  never silently passed. Quarantine-failure alert labels "file still LIVE" (not "dry-run").
+- `deployment/setup-lex-swept-phi-check-task.ps1` - task "Cora - LEX Swept PHI Check", daily 07:06
+  AZ (after the 05:45 materializer), runs `--all` so a >26h missed run leaves no gap. Recorded
+  expected-enabled in `data/maps/scheduled-task-state.yaml` (documentary `enabled:` key;
+  nightly_health_check reads only disabled/running, so inert + forward-compatible).
+  `tests/test_lex_swept_phi_check.py` (19).
+
+**Key design (reviewer-validated):**
+- `scan_body` runs the detectors on the body AS-IS (NOT a re-scrubbed copy): a written swept file
+  is already the wall's output, a regression file is raw; detectors-on-body are a strict SUPERSET
+  of the wall's checks-on-scrubbed (scrubbing only REMOVES PHI) AND idempotent-safe on the
+  placeholders. Do NOT reintroduce a `scrub_lex_phi` string-diff - scrub_lex_phi is NOT idempotent
+  (it re-wraps `[medication redacted]` -> `[medication [medication redacted]]` via `_MED_CONTEXT_RE`).
+- Quarantine = rename IN PLACE within `_brain/swept/` (stays KB-excluded: the exclusion keys on a
+  path having BOTH `_brain` AND `swept` segments); `_brain/_quarantine/` was REJECTED (has `_brain`
+  but not `swept` -> WOULD be re-ingested).
+- LBHS check is ENTITY-AWARE (matches the wall): flag in the LEX branch; in non-LEX rely on clinical
+  + named-billing-with-context, so a bare BUSINESS mention of LBHS/COPA/BHRF/Jared Harker in a
+  holdco M&A digest is NOT false-quarantined.
+
+**Process:** A 3-reviewer adversarial pass (false-negative/parity/containment, robustness,
+leak/false-positive). Two reviewers INDEPENDENTLY caught a real HIGH the green 5,195-suite missed
+(the non-idempotent scrub-diff would false-quarantine clean med-mentioning LEX digests daily ->
+alert fatigue). A re-review (the 3rd reviewer's process crashed, re-run focused) caught a MED (the
+unconditional LBHS flag false-quarantined holdco business-entity LBHS digests). Both fixed +
+regression-tested; re-review confirmed no PHI leak, idempotency fixed, true superset preserved.
+Suite 5203; dry-run over the live 13 swept files = 0 PHI. Merged + task registered (Ready, daily
+07:06 AZ) + final dry-run clean. META: the green suite caught the scrub-diff HIGH ZERO times - two
+independent adversarial reviewers did. DOCTRINE: an artifact-level PHI re-scan must reuse the
+wall's exact detectors AND run them on the written body as-is (re-scrubbing is non-idempotent);
+the in-place `.QUARANTINED.md` rename is the safe quarantine; an LBHS signal is PHI in LEX scope
+but a business entity name in a holdco digest - gate it entity-aware or it false-fires on M&A.
