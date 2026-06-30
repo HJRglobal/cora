@@ -174,13 +174,17 @@ def test_alina_maricopa_meetings_excluded(monkeypatch):
     assert "Maricopa" not in text
 
 
-def test_jason_external_limited(monkeypatch):
+def test_jason_external_limited():
+    # External consultant: no DWD mailbox, no Asana, no HubSpot -> the internal
+    # sources are all skipped and the dossier naturally narrows to engagement scope.
     jason = _mk(slug="jason-dorfman", name="Jason Dorfman", entity="F3E", external=True,
                 mailboxes=[], primary_email="jasrdorfman@gmail.com",
-                all_emails=["jasrdorfman@gmail.com"], asana_gid=None)
-    assert pd._gmail_block(jason, 14) == ("skipped", "")     # no DWD mailbox
-    assert pd._asana_block(jason) == ("skipped", "")          # no Asana account
-    assert pd._calendar_block(jason)[0] == "ok" or pd._calendar_block(jason)[0] in ("empty", "error", "skipped")
+                all_emails=["jasrdorfman@gmail.com"], asana_gid=None, hubspot_owner_id=None)
+    assert jason.external is True
+    assert pd._gmail_block(jason, 14) == ("skipped", "")      # no DWD mailbox
+    assert pd._asana_block(jason) == ("skipped", "")           # no Asana account
+    assert pd._hubspot_block(jason) == ("skipped", "")         # no HubSpot owner
+    assert pd._calendar_block(jason) == ("skipped", "")        # no impersonable mailbox
 
 
 # ── fail-soft + dedupe + hubspot ────────────────────────────────────────────────
@@ -285,6 +289,84 @@ def test_write_back_empty_body_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_PEOPLE_DIR", str(tmp_path))
     (tmp_path / "tommy-anderson.md").write_text(_SEED, encoding="utf-8")
     assert pd.write_back(_mk(), "   ") is False
+
+
+def test_gmail_per_mailbox_scrub_isolates_lex_box(monkeypatch):
+    """REGRESSION (PHI HIGH): a non-lex_staff target whose LEX mailbox is NOT first in
+    the list must still have that mailbox's content scrubbed before synthesis -- the
+    single-scrub-by-mailboxes[0] bug would have leaked it."""
+    justin = _mk(slug="justin-moran", name="Justin Moran", entity="HJRG", lex_staff=False,
+                 primary_email="justin@hjrglobal.com",
+                 mailboxes=["justin@hjrglobal.com", "justin@lexingtonservices.com"],
+                 all_emails=["justin@hjrglobal.com", "justin@lexingtonservices.com"])
+
+    def fake_inbox(email, query=None, max_results=None):
+        if "lexingtonservices" in email:
+            return [{"subject": "client Madison diagnosed with autism - billing follow-up",
+                     "from": "x@x.com", "to": "", "date_ts": None}]
+        return [{"subject": "Q3 budget review", "from": "hayden@visibilitycpa.com",
+                 "to": "", "date_ts": None}]
+
+    monkeypatch.setattr(pd.gmail_reader, "get_inbox_summary", fake_inbox)
+    monkeypatch.setattr(pd, "_staff_names", lambda: {"Justin Moran"})
+    status, text = pd._gmail_block(justin, 14)
+    assert status == "ok"
+    assert "Q3 budget review" in text          # non-LEX mailbox passes through unredacted
+    assert "Madison" not in text                # LEX mailbox client name scrubbed
+    assert "autism" not in text.lower()         # diagnosis scrubbed
+
+
+def test_fireflies_drops_lbhs_by_attendee_domain(monkeypatch):
+    """REGRESSION: a generically-titled meeting with a @lexingtonbhs.com attendee is
+    dropped (42 CFR Part 2) even when the classifier reports non-LEX."""
+    p = _mk()
+    lbhs = {
+        "id": "L", "title": "Weekly Sync", "date": _ms(2026, 6, 18), "meeting_link": "l",
+        "participants": [], "summary": {"short_summary": "client progress", "action_items": ""},
+        "meeting_attendees": [{"displayName": "Jen", "email": "jen@lexingtonbhs.com"}],
+    }
+    monkeypatch.setattr(ma, "_recent_transcripts", lambda emails: [lbhs])
+    monkeypatch.setattr(ma, "_dedup_meetings", lambda ts: list(ts))
+    monkeypatch.setattr(ma, "_classify_meeting", lambda t: ("FNDR", False))  # mis-tag as non-LEX
+    status, text = pd._fireflies_block(p, 14)
+    assert status == "empty"                    # the only meeting was dropped
+
+
+def test_handler_dm_only_surface_gate(monkeypatch):
+    """REGRESSION (peer-wall MED): the dossier renders ONLY in a DM. A non-DM channel
+    refuses-and-redirects WITHOUT building; a DM builds. Access gate still runs first."""
+    from cora.tools import tool_dispatch as td
+    built: dict = {}
+
+    def fake_build(target, **kw):
+        built["slug"] = target.slug
+        return pd.DossierResult(target.slug, "THE REPLY")
+
+    monkeypatch.setattr(pd, "build_dossier", fake_build)
+
+    # Self check-in in a shared channel -> redirect, no build.
+    out = td._tool_cora_person_dossier(TOMMY, "F3E", {"_channel_name": "f3e-leadership"})
+    assert "built" not in built and "slug" not in built
+    assert "DM me" in out
+
+    # Self check-in in a DM -> builds and returns the reply.
+    out2 = td._tool_cora_person_dossier(TOMMY, "F3E", {"_channel_name": "dm"})
+    assert built.get("slug") == "tommy-anderson"
+    assert out2 == "THE REPLY"
+
+    # Peer naming a teammate in a DM -> STILL refused by the access gate (no leak),
+    # and the surface gate is never reached.
+    built.clear()
+    out3 = td._tool_cora_person_dossier(TOMMY, "F3E", {"_channel_name": "dm", "person": "Shaun"})
+    assert "slug" not in built
+    assert "shaun" not in out3.lower()
+
+
+def test_source_specs_all_resolve_to_callables():
+    """Guard against a typo'd _SOURCE_SPECS name silently becoming 'unavailable' forever."""
+    for label, fname, _takes_days in pd._SOURCE_SPECS:
+        fn = getattr(pd, fname, None)
+        assert callable(fn), f"_SOURCE_SPECS entry {label!r} -> {fname!r} is not a callable"
 
 
 def test_build_writes_back_on_clean_synthesis(tmp_path, monkeypatch):

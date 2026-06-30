@@ -184,7 +184,7 @@ def _gmail_block(p: PersonIdentity, days: int) -> tuple[str, str]:
     if p.exclude_personal_mailbox or not p.mailboxes:
         return ("skipped", "")
     query = f"newer_than:{max(1, days)}d -in:spam -in:trash -in:chats"
-    lines: list[str] = []
+    blocks: list[str] = []
     any_ok = False
     for mbox in p.mailboxes:
         try:
@@ -196,6 +196,7 @@ def _gmail_block(p: PersonIdentity, days: int) -> tuple[str, str]:
         except Exception as exc:  # noqa: BLE001 -- one mailbox must not kill the block
             log.warning("person_dossier gmail unexpected %s: %s", mbox, exc)
             continue
+        mbox_lines: list[str] = []
         for m in msgs:
             subj = (m.get("subject") or "(no subject)").strip()
             frm = re.sub(r"\s*<[^>]+>", "", (m.get("from") or "")).strip()
@@ -208,14 +209,24 @@ def _gmail_block(p: PersonIdentity, days: int) -> tuple[str, str]:
                     day = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
                 except Exception:  # noqa: BLE001
                     day = ""
-            lines.append(f"- {subj} (with {corr[:60]}{', ' + day if day else ''})")
+            mbox_lines.append(f"- {subj} (with {corr[:60]}{', ' + day if day else ''})")
+        if not mbox_lines:
+            continue
+        # Scrub THIS mailbox's lines by ITS OWN domain. A LEX mailbox
+        # (e.g. justin@lexingtonservices.com) is scrubbed even when the TARGET
+        # is not lex_staff and the mailbox isn't first in the list -- the bug a
+        # single scrub-by-mailboxes[0] would leak; a non-LEX mailbox is left
+        # un-over-redacted. _maybe_scrub fail-closes to "" on a scrub error.
+        block = _maybe_scrub(
+            p, slack_egress.repair_mojibake("\n".join(mbox_lines)), source_email=mbox
+        )
+        if block.strip():
+            blocks.append(block)
     if not any_ok:
         return ("error", "")
-    if not lines:
+    if not blocks:
         return ("empty", "")
-    text = "\n".join(lines[: _GMAIL_MAX * 2])
-    return ("ok", _maybe_scrub(p, slack_egress.repair_mojibake(text),
-                               source_email=p.mailboxes[0]))
+    return ("ok", "\n".join(blocks))
 
 
 def _fireflies_block(p: PersonIdentity, days: int) -> tuple[str, str]:
@@ -241,16 +252,23 @@ def _fireflies_block(p: PersonIdentity, days: int) -> tuple[str, str]:
             meeting_entity, is_lex = ma._classify_meeting(t)
         except Exception:  # noqa: BLE001
             meeting_entity, is_lex = ("FNDR", False)
-        if is_lex:
-            # Drop LBHS / 42-CFR-Part-2 and clinically-titled LEX meetings outright.
-            if _LBHS_SIGNAL_RE.search(title) or phi_guard.is_clinical_phi(title):
+        # Treat a meeting as LEX-touching if the shared classifier says so OR any
+        # attendee is on a Lexington domain -- so the gist is scrubbed even when a
+        # generically-titled LEX meeting slips the title/name-based classifier (the
+        # live pull has no prior KB filter, unlike drive_materializer).
+        lex_touch = is_lex or _meeting_touches_lex_domain(t)
+        if lex_touch:
+            # Drop LBHS / 42-CFR-Part-2 (by signal OR @lexingtonbhs.com attendee) and
+            # clinically-titled meetings outright.
+            if (_meeting_touches_lbhs(t) or _LBHS_SIGNAL_RE.search(title)
+                    or phi_guard.is_clinical_phi(title)):
                 continue
         day = ma._meeting_date_str(t)
         summary = t.get("summary") or {}
         gist = (summary.get("short_summary") or summary.get("overview")
                 or (summary.get("action_items") or "")[:300] or "").strip()
-        title_s = _scrub_lex_block(title) if is_lex else title
-        gist_s = _scrub_lex_block(gist) if is_lex else gist
+        title_s = _scrub_lex_block(title) if lex_touch else title
+        gist_s = _scrub_lex_block(gist) if lex_touch else gist
         seg = f"- {title_s} ({day})"
         if gist_s:
             seg += f": {gist_s[:300]}"
@@ -258,6 +276,26 @@ def _fireflies_block(p: PersonIdentity, days: int) -> tuple[str, str]:
     if not lines:
         return ("empty", "")
     return ("ok", _maybe_scrub(p, slack_egress.repair_mojibake("\n".join(lines))))
+
+
+def _meeting_emails(transcript: dict) -> list[str]:
+    out: list[str] = []
+    for a in (transcript.get("meeting_attendees") or []):
+        if isinstance(a, dict) and a.get("email"):
+            out.append(str(a["email"]).strip().lower())
+    out += [str(pp).strip().lower() for pp in (transcript.get("participants") or []) if isinstance(pp, str)]
+    return [e for e in out if e]
+
+
+def _meeting_touches_lex_domain(transcript: dict) -> bool:
+    """True if any attendee/participant email is on a Lexington domain -- a scrub
+    backstop independent of the title/name-based classifier."""
+    return any(_is_lex_mailbox(e) for e in _meeting_emails(transcript))
+
+
+def _meeting_touches_lbhs(transcript: dict) -> bool:
+    """True if any attendee/participant is on the LBHS domain (42 CFR Part 2 -> drop)."""
+    return any(e.endswith("@lexingtonbhs.com") for e in _meeting_emails(transcript))
 
 
 def _is_maricopa_meeting(transcript: dict, title: str) -> bool:
@@ -337,14 +375,19 @@ def _hubspot_block(p: PersonIdentity) -> tuple[str, str]:
 
 def _calendar_block(p: PersonIdentity) -> tuple[str, str]:
     """This-week + next-week calendar events for the target (forward-looking;
-    get_user_events is forward-only -- Fireflies covers past meetings)."""
-    if p.exclude_personal_mailbox or not p.primary_email:
+    get_user_events is forward-only -- Fireflies covers past meetings).
+
+    Impersonates a DWD-ELIGIBLE mailbox (primary_email when it's DWD, else the first
+    mailbox). A target with only a non-DWD address (e.g. Jason's personal Gmail) or
+    no mailbox is skipped -- never a failing impersonation call."""
+    if p.exclude_personal_mailbox or not p.mailboxes:
         return ("skipped", "")
+    cal_email = p.primary_email if p.primary_email in set(p.mailboxes) else p.mailboxes[0]
     parts: list[str] = []
     any_ok = False
     for when in ("this_week", "next_week"):
         try:
-            events, label = calendar_client.get_user_events(p.primary_email, when=when)
+            events, label = calendar_client.get_user_events(cal_email, when=when)
             any_ok = True
         except calendar_client.CalendarClientError as exc:
             log.warning("person_dossier calendar %s %s: %s", p.slug, when, exc)
@@ -361,7 +404,7 @@ def _calendar_block(p: PersonIdentity) -> tuple[str, str]:
         return ("empty", "")
     text = "\n".join(parts)
     return ("ok", _maybe_scrub(p, slack_egress.repair_mojibake(text),
-                               source_email=p.primary_email))
+                               source_email=cal_email))
 
 
 def _drive_block(p: PersonIdentity) -> tuple[str, str]:

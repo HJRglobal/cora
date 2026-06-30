@@ -3444,12 +3444,30 @@ def _tool_cora_person_dossier(slack_user_id: str, entity: str, _input: dict) -> 
     days = max(1, min(days, 30))
 
     founder = _load_supervisor_hierarchy().get("founder_slack_id") or _HARRISON_SLACK_ID
+    # Access gate FIRST so a peer-surveillance request is refused with no target leak
+    # BEFORE the surface check (a peer must never learn the surface rule reveals a target).
     target, refusal = person_dossier.resolve_access(slack_user_id, person_arg, founder)
     if refusal:
         log.info("cora_person_dossier refused asker=%s had_person=%s", slack_user_id, bool(person_arg))
         return refusal
     if target is None:
         return "I couldn't resolve that person -- ask Harrison to check the people map."
+
+    # PEER-WALL (deterministic, D-034): a dossier is readable by Harrison + that person
+    # only and must NEVER be rendered into a shared channel. The QA loop threads
+    # _channel_name ("dm" for IMs); _channel_id (starts "D") is the belt. In any non-DM
+    # surface, refuse-and-redirect to a DM -- do NOT pull/build (no involvement content
+    # is produced where a peer could see it). Applies to BOTH self and founder check-ins.
+    is_dm = (
+        str(inp.get("_channel_name", "") or "").strip().lower() == "dm"
+        or str(inp.get("_channel_id", "") or "").startswith("D")
+    )
+    if not is_dm:
+        log.info("cora_person_dossier redirected-to-DM asker=%s target=%s", slack_user_id, target.slug)
+        return (
+            "Involvement summaries are private -- readable by Harrison and that person "
+            "only, never posted in a shared channel. DM me directly and I'll pull it."
+        )
 
     log.info("cora_person_dossier asker=%s target=%s days=%d", slack_user_id, target.slug, days)
     try:

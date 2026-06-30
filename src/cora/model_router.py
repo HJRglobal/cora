@@ -85,13 +85,13 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\bhow'?s? my day\b",
     # cora_person_dossier composite queries -- same multi-source-narration risk as
     # whats_on_my_plate (Haiku misnarrates degraded/empty sources). Force Sonnet for
-    # founder check-ins + self check-ins.
+    # founder check-ins + self check-ins. Anchored to a person/self subject so ordinary
+    # phrases ("our involvement with the D-Backs", "been working on the deck") don't match.
     r"\bcheck in on\b",
-    r"\bbeen working on\b",
-    r"\bbeen involved in\b",
-    r"\b(recent )?involvement\b",
-    r"\bwhat (has|have) \w+ been (working|up to|doing)\b",
+    r"\bwhat (has|have) \w+ been (working|up to|doing|involved)\b",
     r"\bwhat have i been (working|up to|doing|involved)\b",
+    r"\bwhat i'?ve been (working|up to|doing)\b",
+    r"\b\w+'?s (recent )?involvement\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 
