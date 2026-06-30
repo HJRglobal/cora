@@ -83,6 +83,15 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\bwhat (do|did|does) (i|\w+) have going on\b",
     r"\bmy (day|workload) (look|looking)\b",
     r"\bhow'?s? my day\b",
+    # cora_person_dossier composite queries -- same multi-source-narration risk as
+    # whats_on_my_plate (Haiku misnarrates degraded/empty sources). Force Sonnet for
+    # founder check-ins + self check-ins.
+    r"\bcheck in on\b",
+    r"\bbeen working on\b",
+    r"\bbeen involved in\b",
+    r"\b(recent )?involvement\b",
+    r"\bwhat (has|have) \w+ been (working|up to|doing)\b",
+    r"\bwhat have i been (working|up to|doing|involved)\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 

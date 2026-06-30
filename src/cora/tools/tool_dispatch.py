@@ -3422,6 +3422,44 @@ def _tool_cora_self_check(slack_user_id: str, entity: str, _input: dict) -> str:
     return "\n".join(lines)
 
 
+def _tool_cora_person_dossier(slack_user_id: str, entity: str, _input: dict) -> str:
+    """On-demand per-person involvement dossier (North Star pillar 4).
+
+    FOUNDER-OR-SELF gate (deterministic, pre-pull): Harrison may check in on any
+    teammate; everyone else may profile ONLY themselves -- a peer-surveillance
+    request is refused with NO target leak (the name is never resolved). Then a
+    multi-source composite (email / meetings / tasks / deals / calendar) is pulled
+    fail-soft, PHI-walled for LEX staff, synthesized (Sonnet), and written back to
+    the person's `_brain/people/{slug}.md` dossier (decision 10.2 = ON). The dossier
+    is peer-walled -- readable by Harrison + that person only, never posted to a
+    channel and never about a peer. Lazy import avoids any import-order surprise."""
+    from cora.tools import person_dossier  # noqa: PLC0415
+
+    inp = _input or {}
+    person_arg = str(inp.get("person") or "").strip()
+    try:
+        days = int(inp.get("days") or 14)
+    except (TypeError, ValueError):
+        days = 14
+    days = max(1, min(days, 30))
+
+    founder = _load_supervisor_hierarchy().get("founder_slack_id") or _HARRISON_SLACK_ID
+    target, refusal = person_dossier.resolve_access(slack_user_id, person_arg, founder)
+    if refusal:
+        log.info("cora_person_dossier refused asker=%s had_person=%s", slack_user_id, bool(person_arg))
+        return refusal
+    if target is None:
+        return "I couldn't resolve that person -- ask Harrison to check the people map."
+
+    log.info("cora_person_dossier asker=%s target=%s days=%d", slack_user_id, target.slug, days)
+    try:
+        result = person_dossier.build_dossier(target, days=days)
+    except Exception as exc:  # noqa: BLE001 -- never crash the dispatch
+        log.exception("cora_person_dossier build crashed for %s", target.slug)
+        return f"I hit a snag pulling that involvement summary ({exc}). Tell the user to try again shortly."
+    return result.reply
+
+
 TOOL_DEFINITIONS = [
     {
         "name": "asana_get_my_tasks",
@@ -5278,6 +5316,41 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "cora_person_dossier",
+        "description": (
+            "Pull a teammate's recent WORK involvement -- a founder check-in or a "
+            "self check-in. Use for phrases like 'what has <person> been working on "
+            "(lately/this week)?', 'check in on <person>', '<person>'s recent "
+            "involvement', or self: 'what have I been working on?', 'what have I been "
+            "involved in lately?'. Returns a synthesized 'Recent involvements' summary "
+            "from the person's email, meetings, tasks, deals, and calendar (last 14 "
+            "days by default). "
+            "ACCESS (enforced in code, do not second-guess): ONLY Harrison may pass a "
+            "`person`; everyone else gets THEIR OWN involvement only -- a request to "
+            "profile a teammate from a non-founder is refused. Omit `person` for a "
+            "self check-in. Work-involvement only; never personal life; LEX staff are "
+            "PHI-walled. The result is private to Harrison + that person -- never repost "
+            "it to a channel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {
+                    "type": "string",
+                    "description": (
+                        "The teammate to check in on, by name (Harrison only). Omit "
+                        "entirely for a self check-in (the asker's own involvement)."
+                    ),
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window in days (default 14, max 30).",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -5321,6 +5394,7 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "financial_get_cashflow",
     "fndr_open_decisions",
     "cora_self_check",
+    "cora_person_dossier",
 })
 
 # QBO + Drive close-pack financial depth — only entities that have QBO
@@ -5474,6 +5548,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_forget_note": _tool_cora_forget_note,
     # Read-only operational self-status (heartbeat + KB size + sync watermarks)
     "cora_self_check": _tool_cora_self_check,
+    # Per-person involvement dossier (founder-or-self; North Star pillar 4)
+    "cora_person_dossier": _tool_cora_person_dossier,
     # Meeting action items -- PULL flow (replaces the retired auto-create push)
     "meeting_action_items": _tool_meeting_action_items,
 }
@@ -5526,6 +5602,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "slack_send_dm": 12,
     "whats_on_my_plate": 25,  # multi-source composite (Asana + Calendar x2 + HubSpot)
     "meeting_action_items": 25,  # Fireflies window fetch + Haiku parse (preview); bounded creates (confirm)
+    "cora_person_dossier": 25,  # multi-source pull (Gmail + Fireflies + Asana + HubSpot + Calendar) + Sonnet synth
     # Personal notes: remember = embed + conflict probe + upsert (default 15s
     # tier is right); list/delete are local SQL.
     "cora_remember": 15,
