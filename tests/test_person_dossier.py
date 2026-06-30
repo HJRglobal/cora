@@ -206,6 +206,26 @@ def test_fail_soft_one_dead_source_still_renders(monkeypatch):
     assert res.body is not None                   # dossier still synthesized
 
 
+def test_assemble_sources_parallel_preserves_order_and_coverage(monkeypatch):
+    """Sources run concurrently (2026-06-30 fix for the 25s dispatch timeout), but the
+    assembled blocks must stay in canonical _SOURCE_SPECS order, not completion order,
+    and coverage must reflect each source's status."""
+    p = _mk()
+    monkeypatch.setattr(pd, "_gmail_block", lambda p, days: ("ok", "EMAIL_BLOCK"))
+    monkeypatch.setattr(pd, "_fireflies_block", lambda p, days: ("ok", "MEETINGS_BLOCK"))
+    monkeypatch.setattr(pd, "_asana_block", lambda p: ("empty", ""))
+    monkeypatch.setattr(pd, "_hubspot_block", lambda p: ("ok", "DEALS_BLOCK"))
+    monkeypatch.setattr(pd, "_calendar_block", lambda p: ("error", ""))
+    monkeypatch.setattr(pd, "_drive_block", lambda p: ("pending", ""))
+    signals, coverage = pd._assemble_sources(p, 14)
+    assert signals.index("EMAIL_BLOCK") < signals.index("MEETINGS_BLOCK") < signals.index("DEALS_BLOCK")
+    assert "Tasks" not in signals and "(empty" not in signals  # empty source omitted from blocks
+    assert coverage == {
+        "Email": "ok", "Meetings": "ok", "Tasks": "empty",
+        "Deals": "ok", "Calendar": "error", "Docs": "pending",
+    }
+
+
 def test_fireflies_dedupe_collapses_duplicate_copies(monkeypatch):
     p = _mk()
     dup_a = {

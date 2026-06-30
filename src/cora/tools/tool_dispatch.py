@@ -5620,7 +5620,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "slack_send_dm": 12,
     "whats_on_my_plate": 25,  # multi-source composite (Asana + Calendar x2 + HubSpot)
     "meeting_action_items": 25,  # Fireflies window fetch + Haiku parse (preview); bounded creates (confirm)
-    "cora_person_dossier": 25,  # multi-source pull (Gmail + Fireflies + Asana + HubSpot + Calendar) + Sonnet synth
+    "cora_person_dossier": 45,  # multi-source pull (Gmail + Fireflies + Asana + HubSpot + Calendar, now CONCURRENT) + internal Sonnet synth; 25s was too tight (live smoke 2026-06-30 hit ~38s sequential)
     # Personal notes: remember = embed + conflict probe + upsert (default 15s
     # tier is right); list/delete are local SQL.
     "cora_remember": 15,

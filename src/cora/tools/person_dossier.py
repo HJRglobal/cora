@@ -428,17 +428,46 @@ _SOURCE_SPECS: tuple[tuple[str, str, bool], ...] = (
 )
 
 
+def _run_source(label: str, fname: str, takes_days: bool, p: PersonIdentity, days: int) -> tuple[str, str]:
+    """Run one source block fail-soft. Resolves the fn by NAME at call time so tests'
+    monkeypatches are picked up. Returns (status, text)."""
+    fn = globals().get(fname)
+    try:
+        return fn(p, days) if takes_days else fn(p)
+    except Exception as exc:  # noqa: BLE001 -- a source raising must never kill the dossier
+        log.warning("person_dossier: source %s crashed for %s: %s", label, p.slug, exc)
+        return ("error", "")
+
+
 def _assemble_sources(p: PersonIdentity, days: int) -> tuple[str, dict[str, str]]:
-    """Run every source fail-soft. Returns (labeled_source_text, coverage map)."""
+    """Run every source CONCURRENTLY (independent I/O) + fail-soft. Returns
+    (labeled_source_text, coverage map), blocks in canonical _SOURCE_SPECS order.
+
+    Parallel because the sequential pull (~38s for a 5-connector target) blew the
+    25s dispatch tool-timeout in the 2026-06-30 live smoke; the slowest single source
+    (multi-mailbox Gmail) now overlaps the others instead of summing. The dispatch
+    wrapper already runs the whole tool in a worker thread, so this nested pool just
+    fans the I/O out within that thread."""
+    import concurrent.futures as _cf
+
+    results: dict[str, tuple[str, str]] = {}
+    with _cf.ThreadPoolExecutor(max_workers=len(_SOURCE_SPECS)) as ex:
+        futs = {
+            ex.submit(_run_source, label, fname, takes_days, p, days): label
+            for label, fname, takes_days in _SOURCE_SPECS
+        }
+        for fut in _cf.as_completed(futs):
+            label = futs[fut]
+            try:
+                results[label] = fut.result()
+            except Exception as exc:  # noqa: BLE001 -- belt; _run_source already catches
+                log.warning("person_dossier: source %s future failed for %s: %s", label, p.slug, exc)
+                results[label] = ("error", "")
+
     blocks: list[str] = []
     coverage: dict[str, str] = {}
-    for label, fname, takes_days in _SOURCE_SPECS:
-        fn = globals().get(fname)  # resolve by name -> picks up test monkeypatches
-        try:
-            status, text = fn(p, days) if takes_days else fn(p)
-        except Exception as exc:  # noqa: BLE001 -- a source raising must never kill the dossier
-            log.warning("person_dossier: source %s crashed for %s: %s", label, p.slug, exc)
-            status, text = ("error", "")
+    for label, _fname, _td in _SOURCE_SPECS:  # canonical order, not completion order
+        status, text = results.get(label, ("error", ""))
         coverage[label] = status
         if status == "ok" and text.strip():
             blocks.append(f"### {label}\n{text.strip()}")
