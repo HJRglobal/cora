@@ -100,6 +100,55 @@ def _save_watermarks(wm: dict[str, int]) -> None:
     tmp.replace(p)
 
 
+# ── Change 3: flywheel-ledger mirror (DR / portability) ─────────────────────
+# The flywheel's working ledgers stay LOCAL: they are high-frequency, lock-protected
+# appends that the live knowledge-review + gap pipeline reads AND writes. We MIRROR them
+# to Drive _brain/_flywheel/ once per run (a snapshot COPY) rather than live-appending to
+# the G: mount — Drive-for-Desktop conflicts on rapid concurrent appends. This is DR +
+# future-portability insurance; the canonical ledgers remain local by design (readers are
+# deliberately NOT repointed at Drive — that would reintroduce the append-conflict).
+_FLYWHEEL_LEDGERS: tuple[tuple[str, str], ...] = (
+    ("data", "cora-proposed-memory-updates.jsonl"),
+    ("data", "cora-proposed-memory-updates.archive.jsonl"),
+    ("data", "cora-reply-log.jsonl"),
+    ("logs", "knowledge-gaps.jsonl"),
+    ("design/known-answers", ".resolved-gaps.jsonl"),
+)
+
+
+def _flywheel_dir() -> Path:
+    return Path(os.environ.get("FLYWHEEL_MIRROR_DIR")
+                or r"G:\My Drive\HJR-Founder-OS\_brain\_flywheel")
+
+
+def mirror_flywheel_ledgers(repo_root: Path | None = None) -> list[str]:
+    """Snapshot-copy the flywheel ledgers to Drive _brain/_flywheel/. Never raises.
+
+    Returns the basenames mirrored; skips ledgers that don't exist yet. Atomic per file
+    (temp + replace). A one-way COPY only — the canonical ledgers stay local.
+    """
+    root = repo_root or _REPO_ROOT
+    dest = _flywheel_dir()
+    mirrored: list[str] = []
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001 — DR mirror must never break the run
+        log.warning("drive_materializer: flywheel mirror dir unavailable: %s", exc)
+        return mirrored
+    for sub, name in _FLYWHEEL_LEDGERS:
+        src = root / sub / name
+        try:
+            if not src.exists():
+                continue
+            tmp = dest / (name + ".tmp")
+            tmp.write_bytes(src.read_bytes())
+            tmp.replace(dest / name)
+            mirrored.append(name)
+        except Exception as exc:  # noqa: BLE001 — one bad file must not abort the mirror
+            log.warning("drive_materializer: flywheel mirror failed for %s: %s", name, exc)
+    return mirrored
+
+
 # ── LLM distillation (fail-closed) ──────────────────────────────────────────────
 
 def _get_client(client: Any = None) -> Any:
@@ -323,6 +372,12 @@ def run(
 
         if not dry_run:
             _save_watermarks(wm)
+            # Change 3: end-of-run DR mirror of the flywheel ledgers (never fails the run).
+            try:
+                stats["flywheel_mirrored"] = mirror_flywheel_ledgers()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("drive_materializer: flywheel mirror error: %s", exc)
+                stats["flywheel_mirrored"] = []
     finally:
         if own_kb:
             try:

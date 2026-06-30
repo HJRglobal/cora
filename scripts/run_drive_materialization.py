@@ -73,9 +73,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     log.info(
-        "done: %d written, %d skipped, %d LEX-dropped, %d no-new-content; files=%d",
+        "done: %d written, %d skipped, %d LEX-dropped, %d no-new-content; files=%d; flywheel-mirrored=%d",
         stats["entities_written"], stats["entities_skipped"],
         stats["lex_dropped"], stats["entities_no_new"], len(stats["files"]),
+        len(stats.get("flywheel_mirrored", [])),
     )
     for f in stats["files"]:
         log.info("  wrote %s", f)

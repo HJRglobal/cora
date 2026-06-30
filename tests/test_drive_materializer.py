@@ -77,6 +77,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("SWEPT_DIR", str(tmp_path / "swept"))
     monkeypatch.setenv("MATERIALIZATION_WATERMARK_PATH", str(tmp_path / "wm.json"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")  # so _get_client wouldn't bail (we inject anyway)
+    # CRITICAL: point the flywheel mirror at tmp so run()'s end-of-run mirror never
+    # touches the real Drive _brain/_flywheel during tests.
+    monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel"))
     return tmp_path
 
 
@@ -241,3 +244,37 @@ class TestSweptIngestGuards:
     def test_drive_sweep_skip_folders_includes_swept(self):
         from cora.connectors import drive_sweep as ds
         assert "swept" in ds._FOUNDERS_OS_SKIP_FOLDERS
+
+
+# ── Change 3: flywheel-ledger mirror ─────────────────────────────────────────
+
+class TestFlywheelMirror:
+    def test_mirrors_existing_ledgers_skips_missing(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        (repo / "data").mkdir(parents=True)
+        (repo / "logs").mkdir(parents=True)
+        (repo / "design" / "known-answers").mkdir(parents=True)
+        (repo / "data" / "cora-proposed-memory-updates.jsonl").write_text('{"a":1}\n', encoding="utf-8")
+        (repo / "logs" / "knowledge-gaps.jsonl").write_text('{"g":1}\n', encoding="utf-8")
+        (repo / "design" / "known-answers" / ".resolved-gaps.jsonl").write_text('{"id":"x"}\n', encoding="utf-8")
+        # cora-reply-log.jsonl + the archive intentionally absent -> must be skipped, not error
+        dest = tmp_path / "flywheel"
+        monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(dest))
+        mirrored = dm.mirror_flywheel_ledgers(repo_root=repo)
+        assert set(mirrored) == {
+            "cora-proposed-memory-updates.jsonl", "knowledge-gaps.jsonl", ".resolved-gaps.jsonl",
+        }
+        assert (dest / "cora-proposed-memory-updates.jsonl").read_text(encoding="utf-8") == '{"a":1}\n'
+        assert (dest / ".resolved-gaps.jsonl").read_text(encoding="utf-8") == '{"id":"x"}\n'
+        assert not (dest / "cora-reply-log.jsonl").exists()   # missing source -> skipped
+        assert list(dest.glob("*.tmp")) == []                 # atomic, no temp residue
+
+    def test_mirror_never_raises_when_all_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel"))
+        assert dm.mirror_flywheel_ledgers(repo_root=tmp_path / "empty-repo") == []
+
+    def test_run_invokes_mirror_at_end(self, kb, env):
+        _insert(kb, source="gmail", entity="F3E", ingested_at=NOW, cid="x")
+        stats = dm.run(today=date(2026, 6, 29), client=FakeClient(), kb=kb, lookback_hours=24 * 3650)
+        assert "flywheel_mirrored" in stats   # mirror ran (key present) on a non-dry run
+
