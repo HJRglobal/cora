@@ -755,7 +755,10 @@ class KnowledgeBase:
             ph = ",".join("?" * len(exclude_sub_entities))
             sql += f" AND (sub_entity IS NULL OR sub_entity NOT IN ({ph}))"
             params.extend(exclude_sub_entities)
-        sql += " ORDER BY ingested_at ASC LIMIT ?"
+        # chunk_id secondary key makes the LIMIT page deterministic (a whole upsert batch
+        # shares one ingested_at second, so ties are common); the caller pairs this with a
+        # boundary-second re-fetch when the page is full (see drive_materializer.run()).
+        sql += " ORDER BY ingested_at ASC, chunk_id ASC LIMIT ?"
         params.append(int(limit))
         rows = self._conn.execute(sql, params).fetchall()
         return [

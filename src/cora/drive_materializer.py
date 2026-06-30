@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import phi_guard
+from . import phi_guard, org_roles
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,15 @@ SWEPT_SOURCES: tuple[str, ...] = (
 
 # LEX-LBHS = 42 CFR Part 2; never materialized to Drive under any circumstance.
 _LEX_EXCLUDE_SUB: tuple[str, ...] = ("LEX-LBHS",)
+
+# Belt for NULL-tagged Part-2 content: the sub_entity tagger is precision-first (a
+# behavioral-health chunk that never literally says "LBHS" stays NULL and would slip past
+# the _LEX_EXCLUDE_SUB query filter), so we ALSO drop the whole LEX digest if any explicit
+# LBHS / 42-CFR-Part-2 signal appears in the distilled body. Mirrors the LBHS keyword set
+# in knowledge_base/lex_sub_entity.py (kept in sync intentionally).
+_LBHS_SIGNAL_RE = re.compile(
+    r"\b(LBHS|BHRF|COPA|Behavioral Health Services|Jared Harker)\b", re.IGNORECASE
+)
 
 _DEFAULT_LOOKBACK_HOURS = 26        # first run / missing-watermark seed (daily + overlap)
 _MAX_CHUNKS_PER_SOURCE = 2000       # bound a catch-up run after downtime
@@ -181,6 +190,7 @@ Rules:
 - "Notable communications": one line each, "who -> who: outcome" (the gist + the result), never a transcript.
 - Be concrete (staff/vendor names, amounts, dates) where it is ordinary business activity.
 - If the input is thin, produce a short digest. Do NOT invent facts that are not in the input.
+- PHI rule (EVERY unit, since holdco/founder digests can span Lexington, a care provider): NEVER include any individual care-recipient's name (a client / patient / member) or their billing / authorization / eligibility / coverage status. Staff and vendor names are fine.
 {lex_rule}
 Input:
 ---
@@ -247,27 +257,52 @@ def _distill_entity(entity: str, source_chunks: dict[str, list], client: Any) ->
     return raw or None
 
 
+def _lex_staff_names() -> set[str]:
+    """Staff roster to PRESERVE during LEX scrubbing (so staff names aren't redacted but
+    client names are). Mirrors context_loader._apply_lex_phi_scrub. Fail-soft to empty
+    (empty = over-redact, the safe direction)."""
+    try:
+        return {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _phi_wall(entity: str, body: str) -> str | None:
     """Return the safe body to write, or None to DROP the entity's file this run.
 
-    LEX: scrub with scrub_lex_phi (fail-closed on scrub error), then DROP if clinical
-    PHI or named-billing PHI still trips after scrubbing. Redaction placeholders like
-    "[diagnosis redacted]" deliberately do NOT trip is_clinical_phi / is_lex_billing_status_phi.
-    Non-LEX: a defense-in-depth clinical-PHI backstop — should never trip; if it does,
-    something is mis-tagged, so drop rather than write.
+    LEX: mirror the live non-custodian retrieval scrub stack (context_loader.
+    _apply_lex_phi_scrub) — scrub_lex_phi THEN redact_cue_adjacent_names with the staff
+    roster, so a bare client name near a PHI cue ("the client, Madison" / "incident
+    involving Jalen") is caught, not just cue-adjacent possessives. Fail-CLOSED on any
+    scrub error. Then DROP the whole file if (a) an explicit LBHS / 42-CFR-Part-2 signal
+    appears (the belt for NULL-tagged mis-classified Part-2 content the sub_entity filter
+    misses), or (b) clinical PHI or named-billing/status PHI survives the scrub. Redaction
+    placeholders ("[diagnosis redacted]", "[client]'s", "[name redacted]") deliberately do
+    NOT trip is_clinical_phi / is_lex_billing_status_phi, so a properly-scrubbed digest is
+    written, not over-dropped.
+
+    Non-LEX: a holdco/founder digest can legitimately span Lexington (a finance meeting
+    that names a Lexington client's authorization status), so apply the SAME client-level
+    drop — clinical OR named-billing/status — as a backstop against a mis-tagged LEX chunk
+    reaching an HJRG/FNDR digest on the org-wide-readable Drive store.
     """
     if entity == "LEX":
         try:
-            scrubbed = phi_guard.scrub_lex_phi(body, allowed_names=None)
+            staff = _lex_staff_names()
+            scrubbed = phi_guard.scrub_lex_phi(body, allowed_names=staff)
+            scrubbed = phi_guard.redact_cue_adjacent_names(scrubbed, allowed_names=staff)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             log.warning("drive_materializer: LEX scrub error — dropping LEX file: %s", exc)
+            return None
+        if _LBHS_SIGNAL_RE.search(scrubbed):
+            log.warning("drive_materializer: LEX digest carries an LBHS/42-CFR-Part-2 signal — DROPPED")
             return None
         if phi_guard.is_clinical_phi(scrubbed) or phi_guard.is_lex_billing_status_phi(scrubbed):
             log.warning("drive_materializer: LEX digest still trips PHI after scrub — DROPPED")
             return None
         return scrubbed
-    if phi_guard.is_clinical_phi(body):
-        log.warning("drive_materializer: %s digest unexpectedly contains clinical PHI — DROPPED", entity)
+    if phi_guard.is_clinical_phi(body) or phi_guard.is_lex_billing_status_phi(body):
+        log.warning("drive_materializer: %s digest contains client-level PHI (mis-tagged LEX?) — DROPPED", entity)
         return None
     return body
 
@@ -310,6 +345,9 @@ def run(
     """
     now = int(time.time())
     lookback = (lookback_hours if lookback_hours is not None else _DEFAULT_LOOKBACK_HOURS) * 3600
+    # The YYYY-MM-DD filename is box-local (AZ) PRESENTATION only; chunk selection +
+    # watermarking are epoch-based (TZ-correct). The 05:45 AZ slot stays away from local
+    # midnight, so one run can't straddle two AZ dates — keep it away from midnight.
     today_str = (today or datetime.now().date()).isoformat()
     stats: dict[str, Any] = {
         "entities_written": 0, "entities_skipped": 0, "lex_dropped": 0,
@@ -330,7 +368,7 @@ def run(
         for entity in ENTITY_CODES:
             exclude = _LEX_EXCLUDE_SUB if entity == "LEX" else None
             source_chunks: dict[str, list] = {}
-            source_maxts: dict[str, int] = {}
+            source_adv: dict[str, int] = {}
             for source in SWEPT_SOURCES:
                 since = wm.get(_wm_key(entity, source)) or (now - lookback)
                 try:
@@ -343,7 +381,28 @@ def run(
                     chunks = []
                 if chunks:
                     source_chunks[source] = chunks
-                    source_maxts[source] = max(int(c["ingested_at"]) for c in chunks)
+                    ats = [int(c["ingested_at"]) for c in chunks]
+                    mx = max(ats)
+                    full_page = len(chunks) >= _MAX_CHUNKS_PER_SOURCE
+                    # Boundary-safe watermark: an upsert batch stamps MANY chunks with one
+                    # ingested_at second, so a full page may have SPLIT that second.
+                    # Advancing to mx then querying `> mx` would silently drop the rest of
+                    # that second. On a full page advance to mx-1 so the whole boundary
+                    # second is re-fetched next run (the daily file is overwritten
+                    # idempotently — re-processing is harmless), converging over a few runs.
+                    if full_page and min(ats) == mx:
+                        # Pathological: the ENTIRE full page is ONE second — mx-1 would
+                        # re-fetch the same second forever. Advance past it and log LOUDLY
+                        # (the tail of this one second beyond the page limit is not
+                        # materialized — visible, never silent, never an infinite loop).
+                        log.warning(
+                            "drive_materializer: %s/%s has >=%d chunks at one ingested_at=%d; "
+                            "advancing past it (tail beyond the page limit not materialized)",
+                            entity, source, _MAX_CHUNKS_PER_SOURCE, mx,
+                        )
+                        source_adv[source] = mx
+                    else:
+                        source_adv[source] = (mx - 1) if full_page else mx
 
             if not source_chunks:
                 stats["entities_no_new"] += 1
@@ -366,12 +425,15 @@ def run(
             if not dry_run:
                 path = _write_swept_file(entity, today_str, doc)
                 stats["files"].append(str(path))
-                for source, mx in source_maxts.items():
-                    wm[_wm_key(entity, source)] = mx
+                for source, adv in source_adv.items():
+                    wm[_wm_key(entity, source)] = adv
+                # Persist incrementally so a mid-loop crash never replays a completed
+                # entity's distill (LLM cost) — the day's progress survives.
+                _save_watermarks(wm)
             stats["entities_written"] += 1
 
         if not dry_run:
-            _save_watermarks(wm)
+            # watermarks already persisted incrementally per written entity above.
             # Change 3: end-of-run DR mirror of the flywheel ledgers (never fails the run).
             try:
                 stats["flywheel_mirrored"] = mirror_flywheel_ledgers()

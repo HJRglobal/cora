@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
-from cora.kb_exclusions import is_cora_internal_path  # noqa: E402
+from cora.kb_exclusions import is_cora_internal_path, is_swept_path  # noqa: E402
 
 CORA_REPO_ROOT = Path(__file__).resolve().parents[1]
 KB_DB_PATH = CORA_REPO_ROOT / "data" / "cora_kb.db"
@@ -71,17 +71,8 @@ def is_phi_path(path: Path) -> bool:
     return bool(parts_lower & PHI_BLACKLIST_SEGMENTS)
 
 
-def is_swept_path(path: Path) -> bool:
-    """Exclude the _brain/swept/ subtree (the nightly Drive-materialization output).
-
-    Drive-materialization (2026-06-29): this sync rglobs the whole Founder OS tree
-    including _brain. Without this guard it would re-ingest _brain/swept/ digests ->
-    next materialization re-distills its own output -> loop + KB bloat. Require BOTH
-    "_brain" AND "swept" segments so _brain/known-answers, _brain/reference, and
-    _brain/people are NEVER excluded (they MUST keep ingesting).
-    """
-    parts_lower = {p.lower() for p in path.parts}
-    return "_brain" in parts_lower and "swept" in parts_lower
+# is_swept_path now lives in cora.kb_exclusions (shared with migrate_static_md so a
+# third static walk can never drift). Imported above.
 
 
 def classify_entity(path: Path) -> str:

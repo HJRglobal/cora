@@ -278,3 +278,88 @@ class TestFlywheelMirror:
         stats = dm.run(today=date(2026, 6, 29), client=FakeClient(), kb=kb, lookback_hours=24 * 3650)
         assert "flywheel_mirrored" in stats   # mirror ran (key present) on a non-dry run
 
+
+# ── D-051 review fixes: PHI wall hardening ───────────────────────────────────
+
+class TestPhiWallReviewFixes:
+    def test_non_lex_entity_drops_named_lex_billing_phi(self, kb, env):
+        """A holdco/founder digest can span Lexington (a finance meeting naming a client's
+        auth status). The non-LEX backstop must drop named-billing PHI, not just clinical."""
+        _insert(kb, source="gmail", entity="HJRG", ingested_at=NOW, cid="h")
+        dirty = (
+            "## Decisions\n- (none)\n## Action items / follow-ups\n- (none)\n"
+            "## Key facts & updates\n- Bob Smith's AHCCCS prior authorization is still pending.\n"
+            "## Notable communications\n- (none)\n## Who-owns-what changes\n- (none)\n"
+        )
+        stats = dm.run(today=date(2026, 6, 29), client=FakeClient(text=dirty), kb=kb,
+                       lookback_hours=24 * 3650)
+        assert stats["entities_skipped"] >= 1
+        assert not (Path(env) / "swept" / "HJRG" / "2026-06-29.md").exists()
+        assert dm._load_watermarks().get(dm._wm_key("HJRG", "gmail")) is None  # not advanced
+
+    def test_lex_bare_client_names_never_reach_drive(self, kb, env):
+        """Bare client names near a PHI cue ('the client, Madison' / 'incident involving
+        Jalen') must be redacted (redact_cue_adjacent_names) or the file dropped — never
+        written verbatim to the org-wide-readable store."""
+        _insert(kb, source="gmail", entity="LEX", ingested_at=NOW, sub_entity=None, cid="gm")
+        body = (
+            "## Decisions\n- (none)\n## Action items / follow-ups\n"
+            "- Follow up on the client, Madison, and the incident involving Jalen.\n"
+            "## Key facts & updates\n- (none)\n## Notable communications\n- (none)\n"
+            "## Who-owns-what changes\n- (none)\n"
+        )
+        dm.run(today=date(2026, 6, 29), client=FakeClient(text=body), kb=kb, lookback_hours=24 * 3650)
+        out = Path(env) / "swept" / "LEX" / "2026-06-29.md"
+        content = out.read_text(encoding="utf-8") if out.exists() else ""
+        assert "Madison" not in content
+        assert "Jalen" not in content
+
+    def test_lex_dropped_on_lbhs_signal_in_body(self, kb, env):
+        """A NULL-tagged chunk can carry mis-classified Part-2 content; if any explicit
+        LBHS/42-CFR signal appears in the distilled body, drop the whole LEX file."""
+        _insert(kb, source="gmail", entity="LEX", ingested_at=NOW, sub_entity=None, cid="gm")
+        body = (
+            "## Decisions\n- (none)\n## Action items / follow-ups\n- (none)\n"
+            "## Key facts & updates\n- The BHRF census held steady this week.\n"
+            "## Notable communications\n- (none)\n## Who-owns-what changes\n- (none)\n"
+        )
+        stats = dm.run(today=date(2026, 6, 29), client=FakeClient(text=body), kb=kb,
+                       lookback_hours=24 * 3650)
+        assert stats["lex_dropped"] == 1
+        assert not (Path(env) / "swept" / "LEX" / "2026-06-29.md").exists()
+
+
+# ── D-051 review fix: watermark boundary convergence (no silent day-loss) ─────
+
+class TestWatermarkBoundary:
+    def test_full_page_split_converges_across_runs_no_loss(self, kb, env, monkeypatch):
+        """With a page limit smaller than the backlog spanning multiple seconds, repeated
+        runs together cover EVERY chunk (the mx-1 boundary re-fetch prevents day-loss)."""
+        monkeypatch.setattr(dm, "_MAX_CHUNKS_PER_SOURCE", 3)
+        for n in range(5):
+            _insert(kb, source="gmail", entity="F3E", ingested_at=NOW + n,
+                    content=f"CHUNK{n}-unique-body", cid=f"c{n}")
+        fc = FakeClient()
+        for _ in range(3):  # converge
+            dm.run(today=date(2026, 6, 29), client=fc, kb=kb, lookback_hours=24 * 3650)
+        allp = "\n".join(fc.prompts)
+        for n in range(5):
+            assert f"CHUNK{n}-unique-body" in allp, f"CHUNK{n} was never materialized (day-loss)"
+
+
+# ── D-051 review fix: migrate_static_md (full KB-rebuild) loop guard ─────────
+
+class TestMigrateStaticSweptGuard:
+    def test_migrate_static_md_skips_swept(self, tmp_path, monkeypatch):
+        import migrate_static_md as msm
+        root = Path(r"G:\My Drive\HJR-Founder-OS")
+        # is_swept_path (imported from kb_exclusions) used by the rebuild path
+        assert msm.is_swept_path(root / "_brain" / "swept" / "F3E" / "2026-06-29.md")
+        assert not msm.is_swept_path(root / "_brain" / "known-answers" / "f3e.md")
+        # file_to_document returns None for a swept path (before any read)
+        swept = tmp_path / "_brain" / "swept" / "LEX" / "2026-06-29.md"
+        swept.parent.mkdir(parents=True, exist_ok=True)
+        swept.write_text("# digest", encoding="utf-8")
+        monkeypatch.setattr(msm, "FOUNDER_OS_ROOT", tmp_path)
+        assert msm.file_to_document(swept) is None
+

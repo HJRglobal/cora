@@ -177,6 +177,21 @@ def is_cora_internal_source_id(source_id: str) -> bool:
     return _is_cora_internal(source_id or "")
 
 
+def is_swept_path(path: Path) -> bool:
+    """True if a filesystem path is under the _brain/swept/ materialization subtree.
+
+    Drive-materialization (2026-06-29): _brain/swept/{ENTITY}/YYYY-MM-DD.md holds the
+    nightly distilled digests. EVERY static-tree KB ingest walk (incremental_sync_static
+    AND migrate_static_md — the full rebuild) must skip them, or they feed back into the
+    KB (loop + bloat, and a LEX-aggregate digest re-ingested as FNDR-scoped static_md).
+    Require BOTH "_brain" AND "swept" segments so the curated _brain layers
+    (known-answers / reference / people) are NEVER excluded — they MUST keep ingesting.
+    Shared here (with is_cora_internal_path) so a third static walk can't drift again.
+    """
+    parts_lower = {p.lower() for p in path.parts}
+    return "_brain" in parts_lower and "swept" in parts_lower
+
+
 def is_cora_internal_title(title: str, *, broad: bool = False) -> bool:
     """True if a stored KB ``title`` (a Drive filename) is a Cora build/audit doc.
 

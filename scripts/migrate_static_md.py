@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
+from cora.kb_exclusions import is_cora_internal_path, is_swept_path  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +91,14 @@ def file_to_document(path: Path) -> Document | None:
     if is_phi_path(path):
         log.info("PHI guardrail: skipping %s", path)
         return None
+    # Drive-materialization output: never re-ingest the nightly _brain/swept/ digests
+    # (loop + bloat) — the full-rebuild path must apply the same guard as the incremental.
+    if is_swept_path(path):
+        return None
+    # Cora's own build/audit/forensic docs are operational metadata, not org knowledge
+    # (parity with incremental_sync_static + the kb-rebuild.md guard claim).
+    if is_cora_internal_path(path):
+        return None
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
@@ -131,6 +140,12 @@ def discover_files() -> list[Path]:
             continue
         if is_phi_path(path):
             log.info("PHI guardrail: skipping %s", path)
+            continue
+        # Drive-materialization output — never re-ingest (loop guard, both static walks).
+        if is_swept_path(path):
+            continue
+        # Cora's own build/audit/forensic docs are not org knowledge.
+        if is_cora_internal_path(path):
             continue
         # Skip obvious noise: .obsidian dot-dirs, archive folders, etc.
         if any(part.startswith(".") for part in path.parts):
