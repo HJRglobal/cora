@@ -5,17 +5,21 @@ because prompt-only enforcement is unreliable (same doctrine as the cross-entity
 and sibling guards). Applied in app.py immediately before posting, in the same
 place WRITE_CONFIRMED and the [CORA_KNOWLEDGE_GAP: ...] marker are stripped.
 
-Conversational replies get:
-  - markdown bold (**x** / __x__) flattened to plain text
-  - markdown tables flattened to prose; horizontal rules + headers removed
-  - markdown bullet/numbered list markers stripped; `inline code` + ``` fences flattened
+Conversational replies get (Slack-native mrkdwn -- 2026-06-30 format standard):
+  - markdown bold (**x** / __x__) CONVERTED to Slack bold (*x*), not stripped
+  - a markdown header line (# H) converted to a Slack bold label line (*H*)
+  - unordered list markers (-, *, +) normalized to Slack bullets (•); numbered
+    lists (1.) kept intact; markdown tables flattened; horizontal rules removed;
+    `inline code` + ``` fences flattened
   - em/en dashes replaced with a hyphen (voice contract bans em-dashes)
-  - emoji and :shortcode: tokens stripped
+  - emoji + :shortcode: tokens filtered to a small FUNCTIONAL allowlist
+    (check / warning / red / yellow / green / pushpin); all other emoji stripped
   - source-opacity lint: bare docs.google.com / drive.google.com / app.asana.com
-    / notion.so URLs and naked Asana/Slack IDs (gid <digits>, 16+ digit numbers)
-    are redacted. Sanctioned Slack <url|label> links and <@mentions> are preserved.
-  - 280-char cap measured + logged (NOT hard-truncated -- truncation is worse than
-    length; the cap is enforced primarily via the prompt).
+    / notion.so / *.intuit.com URLs and naked Asana/Slack IDs (gid <digits>, 16+
+    digit numbers) are redacted. Sanctioned Slack <url|label> links and <@mentions>
+    are preserved.
+  - ~900-char soft cap measured + logged (NOT hard-truncated -- truncation is worse
+    than length; length is governed primarily via the prompt).
 
 is_tool_output=True bypasses ALL of the above. Financial pulses, decision queues,
 dashboard/pipeline tool outputs are presented exactly as the tool returned them
@@ -32,7 +36,10 @@ import re
 
 log = logging.getLogger(__name__)
 
-CONVERSATIONAL_CHAR_CAP = 280
+# Soft cap: log-only, never truncates. Tiered standard (2026-06-30) -- a simple
+# reply is 1-3 sentences; a structured multi-part reply may run longer. This
+# threshold flags only genuine walls so the log signal stays meaningful.
+CONVERSATIONAL_CHAR_CAP = 900
 
 # --- Slack entity protection ---------------------------------------------
 # Slack angle-bracket tokens are sanctioned: <url|label>, <url>, <@U123>,
@@ -44,37 +51,74 @@ _PLACEHOLDER = "\x00CORATOK{}\x00"
 # --- markdown ------------------------------------------------------------
 _BOLD_STAR_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _BOLD_UNDER_RE = re.compile(r"__([^_\n]+)__")
-_HEADER_RE = re.compile(r"^\s*#{1,6}\s+", re.MULTILINE)
+_HEADER_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _HR_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$")
 
 # --- code + lists --------------------------------------------------------
-# Conversational replies should read as prose, not as a code block or a
-# markdown list (the 2026-06-11 nudge thread used numbered lists + backticks).
+# 2026-06-30 format standard: KEEP list structure (Slack-native). Unordered
+# markers normalize to a Slack bullet; numbered lists (1. / 1)) are left intact
+# (Slack renders them). Code fences / inline code still flatten.
 _CODE_FENCE_RE = re.compile(r"^[ \t]*```[^\n]*$", re.MULTILINE)   # drop ``` fence lines
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")                       # `code` -> code
-_LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", re.MULTILINE)  # leading bullet/number
+# Unordered bullet markers only (-, *, +) + a trailing space. Numbered lists are
+# NOT matched (kept intact). A "*Label:*" bold line is NOT matched (no space after *).
+_UL_MARKER_RE = re.compile(r"^([ \t]*)[-*+][ \t]+", re.MULTILINE)
 
 # --- dashes --------------------------------------------------------------
 # figure dash, en dash, em dash, horizontal bar -> hyphen
 _DASH_RE = re.compile(r"[‒–—―]")
 
-# --- emoji + shortcodes --------------------------------------------------
+# --- emoji + shortcodes (functional allowlist -- 2026-06-30) -------------
+# Cora may use a SMALL functional set as status markers; everything else is
+# stripped (deterministic "sparing + functional", not prompt-only). Allowlist
+# by BASE codepoint; variation selectors / ZWJ / keycap are matched as part of
+# the cluster so an allowed emoji keeps its exact presentation and a decorative
+# sequence is removed whole.
+_ALLOWED_EMOJI_BASES = frozenset({
+    "✅",       # white check mark
+    "⚠",       # warning sign (may carry a trailing VS16 -> warning emoji)
+    "\U0001F534",   # red circle
+    "\U0001F7E1",   # yellow circle
+    "\U0001F7E2",   # green circle
+    "\U0001F4CC",   # pushpin
+})
+_ALLOWED_SHORTCODES = frozenset({
+    "white_check_mark", "warning", "red_circle",
+    "large_yellow_circle", "large_green_circle", "pushpin",
+})
 # Shortcodes must start with a letter so timestamps like 12:30:45 are untouched.
 _SHORTCODE_RE = re.compile(r":[a-z][a-z0-9_+\-]*:")
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F300-\U0001FAFF"  # symbols & pictographs (incl. 1F534 red, 1F7E1 yellow, 1F6A8 siren)
-    "\U0001F000-\U0001F0FF"  # mahjong / dominoes / cards
-    "\U00002600-\U000027BF"  # misc symbols + dingbats (incl. 2705 check, 274C cross, 2728 sparkles)
-    "\U00002300-\U000023FF"  # technical (incl. 23F3 hourglass, 231A watch)
-    "\U00002B00-\U00002BFF"  # misc symbols & arrows (incl. 2B50 star)
-    "\U0001F1E6-\U0001F1FF"  # regional indicator (flags)
-    "\U0000FE00-\U0000FE0F"  # variation selectors
-    "\U0000200D"             # zero-width joiner (emoji sequences)
-    "\U000020E3"             # combining enclosing keycap
-    "]+",
+# One emoji cluster = a base pictograph (group 1) + optional VS16/keycap and
+# ZWJ-joined continuations, so a multi-codepoint decorative sequence is one match.
+_EMOJI_CLUSTER_RE = re.compile(
+    "([\U0001F300-\U0001FAFF"   # symbols & pictographs (incl. 1F534 red, 1F6A8 siren)
+    "\U0001F000-\U0001F0FF"     # mahjong / dominoes / cards
+    "\U00002600-\U000027BF"     # misc symbols + dingbats (incl. 2705 check, 2728 sparkles)
+    "\U00002300-\U000023FF"     # technical (incl. 23F3 hourglass, 231A watch)
+    "\U00002B00-\U00002BFF"     # misc symbols & arrows (incl. 2B50 star)
+    "\U0001F1E6-\U0001F1FF])"   # regional indicator (flags)
+    "(?:[︀-️⃣]|‍[\U0001F300-\U0001FAFF\U00002600-\U000027BF])*",
     flags=re.UNICODE,
 )
+
+
+def _emoji_cluster_replace(m: "re.Match") -> str:
+    """Keep an emoji cluster only if its base codepoint is allowlisted."""
+    return m.group(0) if m.group(1) in _ALLOWED_EMOJI_BASES else ""
+
+
+def _shortcode_replace(m: "re.Match") -> str:
+    """Keep a :shortcode: only if it is an allowlisted functional marker."""
+    return m.group(0) if m.group(0).strip(":") in _ALLOWED_SHORTCODES else ""
+
+
+def _header_to_bold(m: "re.Match") -> str:
+    """A markdown header line -> a single Slack bold label line. Strip ALL '*' from
+    the header text (not just the ends) so interior emphasis -- which step 2 reliably
+    produces (e.g. '## **Key** takeaways' -> '## *Key* takeaways') -- cannot yield an
+    unbalanced, dangling-asterisk label ('*Key* takeaways*')."""
+    txt = m.group(1).replace("*", "").strip()
+    return f"*{txt}*" if txt else ""
 
 # --- source-opacity lint -------------------------------------------------
 _BARE_DOC_URL_RE = re.compile(
@@ -182,9 +226,10 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
 
     work = _SLACK_TOKEN_RE.sub(_protect, text)
 
-    # 2. Flatten markdown bold to plain text.
-    work = _BOLD_STAR_RE.sub(r"\1", work)
-    work = _BOLD_UNDER_RE.sub(r"\1", work)
+    # 2. Convert markdown bold to Slack single-asterisk bold (*x*), not strip.
+    # The model emits **x**/__x__; Slack `text=` renders only *x*.
+    work = _BOLD_STAR_RE.sub(r"*\1*", work)
+    work = _BOLD_UNDER_RE.sub(r"*\1*", work)
 
     # 2b. Code: drop ``` fence lines, unwrap `inline code`, strip stray backticks.
     # Runs before the source-opacity lint so a redactable id wrapped in backticks
@@ -193,8 +238,8 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _INLINE_CODE_RE.sub(r"\1", work)
     work = work.replace("`", "")
 
-    # 3. Strip leading markdown headers (keep the header text as plain prose).
-    work = _HEADER_RE.sub("", work)
+    # 3. Convert a markdown header line to a Slack bold label line (*Header*).
+    work = _HEADER_RE.sub(_header_to_bold, work)
 
     # 4. Tables -> prose (before HR removal so separator rows are handled here).
     work = _flatten_tables(work)
@@ -202,17 +247,18 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     # 5. Remove horizontal rules (whole-line).
     work = "\n".join(line for line in work.split("\n") if not _HR_RE.match(line))
 
-    # 5b. Strip leading markdown list markers (bullets + numbered) -> plain lines.
-    # Line-anchored, so mid-line " - " (e.g. flattened table cells) and hyphenated
-    # words ("well-being") are untouched.
-    work = _LIST_MARKER_RE.sub("", work)
+    # 5b. Normalize unordered list markers to Slack bullets; keep numbered lists.
+    # Line-anchored, so mid-line " - " (flattened table cells) and hyphenated
+    # words ("well-being") are untouched; a "*Label:*" bold line is untouched
+    # (the marker needs a trailing space, which "*Label:*" lacks).
+    work = _UL_MARKER_RE.sub(r"\1• ", work)
 
     # 6. Dashes -> hyphen (voice contract bans em-dashes).
     work = _DASH_RE.sub("-", work)
 
-    # 7. Strip emoji + :shortcode: tokens.
-    work = _SHORTCODE_RE.sub("", work)
-    work = _EMOJI_RE.sub("", work)
+    # 7. Filter emoji + :shortcode: to the functional allowlist; strip the rest.
+    work = _SHORTCODE_RE.sub(_shortcode_replace, work)
+    work = _EMOJI_CLUSTER_RE.sub(_emoji_cluster_replace, work)
 
     # 8. Source-opacity lint (sanctioned links are placeholders, so safe).
     work = _BARE_DOC_URL_RE.sub("", work)
@@ -222,6 +268,30 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     work = _SHEET_IDENT_RE.sub(_SHEET_IDENT_REPLACEMENT, work)
     # 8a'. Drive document PATHS -> neutral phrase (same conversational scoping).
     work = _DRIVE_PATH_RE.sub(_DRIVE_PATH_REPLACEMENT, work)
+
+    # 8a''. Belt-and-suspenders for the two conversational-only identifier lints
+    # (sheet names 8a, Drive paths 8a') -- unlike the URL/GID lints they have NO
+    # egress-boundary backstop. Step 2 now CONVERTS **bold** -> *bold* (the
+    # pre-2026-06-30 code stripped the markers), so a marker the model dropped
+    # INSIDE an identifier ("Standing **ACTUALS**" -> "Standing *ACTUALS*",
+    # "run.**xlsx**" -> "run.*xlsx*") splits the literal anchor and the lint above
+    # misses it. Re-scan an asterisk-stripped view; if it exposes an identifier the
+    # emphasized pass missed, re-run the full source-opacity pass on that view and
+    # adopt it -- a reply naming a restricted sheet/path is scrubbed even at the
+    # cost of its display emphasis (correctness > formatting when restricted content
+    # is present). Only fires when a '*' is present AND a de-emphasized identifier
+    # matches, so ordinary bolded replies keep their formatting untouched.
+    if "*" in work:
+        _deemph = work.replace("*", "")
+        if _deemph != work and (
+            _SHEET_IDENT_RE.search(_deemph) or _DRIVE_PATH_RE.search(_deemph)
+        ):
+            _deemph = _BARE_DOC_URL_RE.sub("", _deemph)
+            _deemph = _GID_RE.sub("", _deemph)
+            _deemph = _NAKED_ID_RE.sub("", _deemph)
+            _deemph = _SHEET_IDENT_RE.sub(_SHEET_IDENT_REPLACEMENT, _deemph)
+            _deemph = _DRIVE_PATH_RE.sub(_DRIVE_PATH_REPLACEMENT, _deemph)
+            work = _deemph
 
     # 8b. Clean redaction shells the lint leaves behind: "[label]()" -> label,
     # then any empty "()" / "[]" pairs.
@@ -240,7 +310,7 @@ def format_reply(text: str, *, is_tool_output: bool = False) -> str:
     for i, tok in enumerate(tokens):
         work = work.replace(_PLACEHOLDER.format(i), tok)
 
-    # 11. Measure the 280-char cap. Log only -- never hard-truncate.
+    # 11. Measure the soft char cap. Log only -- never hard-truncate.
     if len(work) > CONVERSATIONAL_CHAR_CAP:
         log.warning("reply_over_cap: %d chars (cap %d)", len(work), CONVERSATIONAL_CHAR_CAP)
 

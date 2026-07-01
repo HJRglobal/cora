@@ -129,7 +129,9 @@ def test_verbatim_table_tools_are_real_tools():
 # ---------------------------------------------------------------------------
 
 _RAW_REPLY = "Heads up — the **deck** is ready 🚀"
-_FORMATTED_REPLY = "Heads up - the deck is ready"
+# 2026-06-30 format standard: **deck** -> *deck* (converted, not stripped);
+# em-dash -> hyphen; decorative rocket stripped (not in the functional allowlist).
+_FORMATTED_REPLY = "Heads up - the *deck* is ready"
 
 
 def _routing_hints():

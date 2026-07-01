@@ -77,6 +77,21 @@ class TestSheetNameRedaction:
         assert "CF_SUMMARY" not in out
         assert "the cash flow model" in out
 
+    def test_sheet_name_with_interior_bold_still_redacted(self):
+        # Step 2 converts **ACTUALS** -> *ACTUALS*; the inserted '*' must NOT let the
+        # sheet identifier slip past the (no-egress-backstop) conversational lint.
+        # Regression guard for the 2026-06-30 convert-vs-strip change.
+        out = format_reply("See the Standing **ACTUALS** sheet for details.")
+        assert "Standing ACTUALS" not in out
+        assert "Standing *ACTUALS*" not in out
+        assert "the cash flow model" in out
+
+    def test_cf_summary_with_interior_bold_still_redacted(self):
+        out = format_reply("Numbers live in the CF_**SUMMARY** tab.")
+        assert "CF_SUMMARY" not in out
+        assert "CF_*SUMMARY*" not in out
+        assert "the cash flow model" in out
+
 
 class TestDrivePathRedaction:
     """format_reply redacts HJR-Founder-OS Drive document PATHS (B0, green-lit
@@ -114,6 +129,22 @@ class TestDrivePathRedaction:
         assert ".pptx" not in out
         assert ".csv" not in out
         assert out.count("a portfolio document") == 2
+
+    def test_drive_path_with_bold_extension_still_redacted(self):
+        # **xlsx** -> *xlsx* splits the \\.ext anchor of _DRIVE_PATH_RE; the
+        # de-emphasized fallback must still redact the path (no egress backstop).
+        out = format_reply(
+            "Figures live in 02-F3-Energy/production/register.**xlsx** today.")
+        assert "02-F3-Energy" not in out
+        assert ".xlsx" not in out
+        assert ".*xlsx*" not in out
+        assert "a portfolio document" in out
+
+    def test_ordinary_bolded_reply_keeps_emphasis(self):
+        # The de-emphasized fallback must NOT fire on a normal bolded reply that
+        # contains no sheet/path identifier -- formatting is preserved.
+        out = format_reply("The **deck** is ready and the **budget** is approved.")
+        assert "*deck*" in out and "*budget*" in out
 
     # --- negatives: ordinary prose must survive verbatim ---------------------
     def test_bare_word_production_survives(self):
@@ -180,22 +211,31 @@ class TestDrivePathRedaction:
 
 
 class TestMarkdownStripping:
-    def test_double_star_bold_flattened(self):
-        assert format_reply("The status is **open** today") == "The status is open today"
+    def test_double_star_bold_to_slack(self):
+        # ** ** -> Slack single-asterisk bold, NOT stripped (Slack renders *x*).
+        assert format_reply("The status is **open** today") == "The status is *open* today"
 
-    def test_double_underscore_bold_flattened(self):
-        assert format_reply("It is __urgent__ now") == "It is urgent now"
+    def test_double_underscore_bold_to_slack(self):
+        assert format_reply("It is __urgent__ now") == "It is *urgent* now"
 
-    def test_header_removed(self):
+    def test_header_to_bold_label(self):
         out = format_reply("# Summary\nCash is fine")
         assert "#" not in out
-        assert "Summary" in out
+        assert "*Summary*" in out
         assert "Cash is fine" in out
 
-    def test_subheader_removed(self):
+    def test_subheader_to_bold_label(self):
         out = format_reply("### Details here\nbody")
         assert not out.startswith("#")
-        assert "Details here" in out
+        assert "*Details here*" in out
+
+    def test_header_with_interior_bold_no_dangling_asterisk(self):
+        # '## **Key** takeaways' -> step 2 -> '## *Key* takeaways' -> the header
+        # conversion must yield a balanced single label, not '*Key* takeaways*'.
+        out = format_reply("## **Key** takeaways\nbody")
+        assert "*Key takeaways*" in out
+        assert "takeaways*" not in out.replace("*Key takeaways*", "")  # no dangling *
+        assert out.count("*") == 2  # exactly one balanced bold span on the label
 
     def test_horizontal_rule_removed(self):
         out = format_reply("Above\n---\nBelow")
@@ -244,22 +284,41 @@ class TestDashes:
 # --- emoji + shortcodes --------------------------------------------------
 
 
-class TestEmojiStripping:
-    def test_siren_emoji_stripped(self):
+class TestEmojiAllowlist:
+    def test_nonallowlisted_siren_stripped(self):
         out = format_reply("🚨 Deadline is today")
         assert "🚨" not in out
         assert "Deadline is today" in out
 
-    def test_check_emoji_stripped(self):
-        out = format_reply("Done ✅")
-        assert "✅" not in out
+    def test_check_emoji_survives(self):
+        # ✅ is a functional allowlisted marker -> kept.
+        assert "✅" in format_reply("Done ✅")
 
-    def test_colored_circle_emoji_stripped(self):
+    def test_warning_emoji_survives(self):
+        assert "⚠" in format_reply("⚠️ over the cap")
+
+    def test_status_circles_survive(self):
         out = format_reply("🔴 over budget 🟡 watch 🟢 ok")
         for e in ("🔴", "🟡", "🟢"):
-            assert e not in out
+            assert e in out
 
-    def test_shortcode_stripped(self):
+    def test_pushpin_survives(self):
+        assert "📌" in format_reply("📌 deadline 6/30")
+
+    def test_decorative_emoji_stripped(self):
+        out = format_reply("great work 🎉 keep it 🔥 up 💪")
+        for e in ("🎉", "🔥", "💪"):
+            assert e not in out
+        assert "great work" in out and "keep it" in out
+
+    def test_mixed_run_keeps_allowed_drops_decorative(self):
+        # ✅ (allowed) adjacent to 🎉 (decorative): keep ✅, drop 🎉.
+        assert format_reply("shipped ✅🎉") == "shipped ✅"
+
+    def test_allowed_shortcode_survives(self):
+        assert ":white_check_mark:" in format_reply("done :white_check_mark:")
+
+    def test_decorative_shortcode_stripped(self):
         out = format_reply("Nice work :tada: team")
         assert ":tada:" not in out
         assert "Nice work" in out and "team" in out
@@ -341,21 +400,21 @@ class TestToolOutputBypass:
         assert format_reply(raw, is_tool_output=True) == raw
 
 
-# --- 280-char cap --------------------------------------------------------
+# --- ~900-char soft cap --------------------------------------------------
 
 
 class TestCharCap:
     def test_cap_constant(self):
-        assert CONVERSATIONAL_CHAR_CAP == 280
+        assert CONVERSATIONAL_CHAR_CAP == 900
 
     def test_over_cap_not_truncated(self):
-        long = "word " * 100  # 500 chars
+        long = "word " * 250  # ~1250 chars
         out = format_reply(long)
         # Not hard-truncated -- the full (cleaned) answer is returned.
         assert len(out) > CONVERSATIONAL_CHAR_CAP
 
     def test_over_cap_logs_warning(self, caplog):
-        long = "x" * 400
+        long = "x" * 1000
         with caplog.at_level(logging.WARNING):
             format_reply(long)
         assert any("reply_over_cap" in r.message for r in caplog.records)
@@ -389,7 +448,7 @@ class TestEdgeCases:
         out = format_reply(text)
         for bad in ("##", "**", "—", "🚨", ":tada:", "docs.google.com", "1215472268404903"):
             assert bad not in out
-        assert "Status is open" in out
+        assert "Status is *open*" in out
 
 
 # --- redaction shells (2026-06-11 live artifact) ---------------------------
@@ -426,25 +485,25 @@ class TestRedactionShells:
 
 
 class TestListsAndCode:
-    def test_bullet_dash_marker_stripped(self):
+    def test_bullet_dash_to_slack_bullet(self):
         out = format_reply("- send the deck\n- ping Tommy")
-        assert "send the deck" in out and "ping Tommy" in out
+        assert "• send the deck" in out and "• ping Tommy" in out
+        # old markdown markers are gone (converted, not left as -, *, +)
         assert not any(ln.lstrip().startswith(("- ", "* ", "+ ")) for ln in out.split("\n"))
 
-    def test_bullet_star_marker_stripped(self):
+    def test_bullet_star_to_slack_bullet(self):
         out = format_reply("* one\n* two")
-        assert "one" in out and "two" in out
+        assert "• one" in out and "• two" in out
         assert "* one" not in out
 
-    def test_numbered_list_marker_stripped(self):
+    def test_numbered_list_kept(self):
+        # Numbered lists render natively in Slack -> keep them intact.
         out = format_reply("1. first thing\n2. second thing")
-        assert "first thing" in out and "second thing" in out
-        assert "1." not in out and "2." not in out
+        assert "1. first thing" in out and "2. second thing" in out
 
-    def test_numbered_paren_marker_stripped(self):
+    def test_numbered_paren_kept(self):
         out = format_reply("1) alpha\n2) beta")
-        assert "alpha" in out and "beta" in out
-        assert "1)" not in out
+        assert "1) alpha" in out and "2) beta" in out
 
     def test_inline_code_unwrapped(self):
         out = format_reply("Run the `restagger` script now")
