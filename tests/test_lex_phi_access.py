@@ -134,11 +134,14 @@ def test_check_access_phi_allowed_with_custodian(_inject_phi_blocked_user):
 
 def test_custodian_flag_does_not_unblock_other_topics(_inject_phi_blocked_user):
     # phi_custodian must NOT relax financials (or any non-phi block).
+    # "cash flow" is a genuine company-finance signal; the block still fires and
+    # the redirect names the financial topic. (No tier passed => non-TIER_1 =>
+    # financials block applies, per the 2026-06-30 over-deflection fix.)
     block = user_access.check_access(
         JEN, "LEX-LLC", "what is the cash flow this week", phi_custodian=True
     )
     assert block is not None
-    assert "Financial" in block
+    assert "financ" in block.lower()
 
 
 def test_custodian_flag_does_not_bypass_entity_auth(_inject_phi_blocked_user):

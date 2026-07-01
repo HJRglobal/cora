@@ -152,6 +152,17 @@ class TestHandleDmQa:
         app_module._handle_dm_qa(_event(), MagicMock(), TOMMY, "remember X")
         assert qa_mocks.access.call_count == 1
 
+    def test_dm_tier_pinned_tier3_even_for_hjrg_primary(self, qa_mocks):
+        # invariants-0 (2026-06-30 review): a DM is not a leadership/finance
+        # channel, so its financials tier must be TIER_3 structurally — NOT derived
+        # from the asker's org-roles entity (an HJRG-primary user would otherwise
+        # get TIER_1 in a DM and have the company-financials block suppressed). This
+        # guards against a revert to entity-derived DM tier.
+        qa_mocks.get_role.return_value = SimpleNamespace(primary_entity="HJRG")
+        app_module._handle_dm_qa(_event(), MagicMock(), TOMMY,
+                                 "what is our company cash position")
+        assert qa_mocks.access.call_args.kwargs["tier"] == "TIER_3"
+
     def test_threaded_dm_replies_into_the_thread(self, qa_mocks):
         # Slack's AI-assistant "Chat" pane (Agents & AI Apps mode) runs every
         # conversation as a thread on the im channel — replies must follow it.

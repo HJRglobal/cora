@@ -787,9 +787,17 @@ def handle_cora_ask(ack, body, client) -> None:
     is_dm = str(channel_id).startswith("D")
     if user_id:
         phi_custodian = lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm)
-        access_block = user_access.check_access(user_id, entity, text, phi_custodian=phi_custodian)
+        tier = channel_classifier.tier_label(
+            entity, channel_classifier.classify_function(channel_name)
+        )
+        access_block = user_access.check_access(
+            user_id, entity, text, phi_custodian=phi_custodian, tier=tier
+        )
         if access_block:
-            log.info("cora_ask: user_access blocked user=%s entity=%s", user_id, entity)
+            log.info(
+                "cora_ask: user_access blocked user=%s entity=%s reason=%s",
+                user_id, entity, access_block[:80],
+            )
             client.chat_postEphemeral(channel=channel_id, user=user_id, text=access_block)
             return
     sibling_redirect = sibling_guard.check_redirect(entity, text)
@@ -883,6 +891,11 @@ def handle_mention(event: dict, say: callable, client) -> None:
         channel_name, user_id, entity,
     )
 
+    # Channel financial tier (leadership/finance/founder/build => TIER_1). Used by
+    # the user_access financials block (permitted in TIER_1) and the help block.
+    function = channel_classifier.classify_function(channel_name)
+    tier = channel_classifier.tier_label(entity, function)
+
     # ── User access check — entity + sensitive topic authorization ────────────
     if user_id:
         # LEX PHI custodian gate (fail-closed). Grants the `phi` topic ONLY to an
@@ -893,7 +906,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
             user_id, entity, is_dm=str(channel_id).startswith("D")
         )
         access_block = user_access.check_access(
-            user_id, entity, user_message, phi_custodian=phi_custodian
+            user_id, entity, user_message, phi_custodian=phi_custodian, tier=tier
         )
         if access_block:
             log.info(
@@ -907,8 +920,6 @@ def handle_mention(event: dict, say: callable, client) -> None:
     # Help-intent interception
     if help_responder.is_help_intent(user_message):
         log.info("help-intent detected channel=#%s user=%s", channel_name, user_id)
-        function = channel_classifier.classify_function(channel_name)
-        tier = channel_classifier.tier_label(entity, function)
         help_text = help_responder.build_message(entity, function, tier)
         say(text=help_text, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
         return
@@ -1215,20 +1226,31 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
             kwargs.pop("thread_ts", None)
         return client.chat_postMessage(channel=dm_channel, **kwargs)
 
+    # DM financial tier: a DM is NOT a leadership/finance channel, so it is TIER_3
+    # for the financials-block purpose — structurally, not via entity. Deriving it
+    # from the asker's org-roles entity would make an HJRG-primary user's DM read
+    # TIER_1 (is_tier_1 short-circuits True for HJRG), which would silently suppress
+    # the company-financials deflection for a financials-blocked user if the roster
+    # ever changed. Pin TIER_3 so the guarantee is roster-independent. Harrison
+    # (root) is exempt from every topic block regardless of tier.
+    function = channel_classifier.classify_function("dm")
+    tier = "TIER_3"
+
     # PHI custodian relaxation: DMs count as LEX scope for allowlisted
     # custodians (lex_phi_access doctrine); everyone else unchanged.
     phi_custodian = lex_phi_access.phi_allowed(user_id, entity, is_dm=True)
     access_block = user_access.check_access(
-        user_id, entity, text, phi_custodian=phi_custodian
+        user_id, entity, text, phi_custodian=phi_custodian, tier=tier
     )
     if access_block:
-        log.info("dm_qa: user_access blocked user=%s entity=%s", user_id, entity)
+        log.info(
+            "dm_qa: user_access blocked user=%s entity=%s reason=%s",
+            user_id, entity, access_block[:80],
+        )
         _say(text=access_block, unfurl_links=False, unfurl_media=False)
         return
 
     if help_responder.is_help_intent(text):
-        function = channel_classifier.classify_function("dm")
-        tier = channel_classifier.tier_label(entity, function)
         _say(text=help_responder.build_message(entity, function, tier),
              unfurl_links=False, unfurl_media=False)
         return
