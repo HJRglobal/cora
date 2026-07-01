@@ -46,7 +46,6 @@ users:
     sensitive_topics_blocked:
       - financials   # P&L, cash flow — those go to Harrison/Justin
       - hr
-      - legal
       - cap_table
 
   U0B3RU5Q55G:  # Tommy Anderson — F3E retail sales only
@@ -56,7 +55,6 @@ users:
     sensitive_topics_blocked:
       - financials
       - hr
-      - legal
       - cap_table
 
   U0B3PS7RFJA:  # Matt Petrovich — OSN ops across all 4 stores
