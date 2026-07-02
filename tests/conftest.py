@@ -347,6 +347,13 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "KNOWLEDGE_GAPS_LOG_PATH", str(tmp_path / "knowledge-gaps.jsonl")
     )
+    # WS-3 golden-set auto-growth: executor tests that drive
+    # _execute_approved_update fire the auto-growth hook -- isolate its target
+    # so a test fixture's fake fact can never land in the repo's real
+    # data/evals/golden-set-auto.yaml (it did, once, before this line).
+    monkeypatch.setenv(
+        "GOLDEN_SET_AUTO_PATH", str(tmp_path / "golden-set-auto.yaml")
+    )
     try:
         import cora.gap_detection as _gd
         _gd._THREAD_LOGGED.clear()
