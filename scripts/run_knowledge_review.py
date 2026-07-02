@@ -264,6 +264,17 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                     f"({summary}):\n> Q: {q_short}\n> A: {(payload.get('answer') or '')[:300]}"
                 )
                 log.info("gap-executor: known_answer applied uid=%s", uid_short)
+                # WS-3 golden-set auto-growth: every Harrison-approved fact
+                # becomes a standing L1 eval case. Fires only on ok=True (the
+                # durable write's PHI re-check passed); id-idempotent, so the
+                # dedup-skip / crash-recovery ok=True returns can't double-add.
+                # Fail-soft -- never affects the executor or the D-011 gate.
+                try:
+                    from cora.golden_set import append_case_from_known_answer
+                    append_case_from_known_answer(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)",
+                                exc_info=True)
             else:
                 msg = f":warning: *Gap executor* `[{uid_short}]` known_answer failed: {summary}"
                 log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
@@ -310,6 +321,14 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` learned a "
                        f"contributed note ({summary}):\n> {snippet}")
                 log.info("gap-executor: info-for-cora note applied uid=%s", uid_short)
+                # WS-3 golden-set auto-growth (same contract as the
+                # known_answer branch above).
+                try:
+                    from cora.golden_set import append_case_from_note
+                    append_case_from_note(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)",
+                                exc_info=True)
             else:
                 msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"
                 log.warning("gap-executor: info-for-cora note failed uid=%s: %s", uid_short, summary)
