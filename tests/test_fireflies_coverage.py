@@ -3,6 +3,9 @@
 Coverage:
   - load_dwd_humans(): drops shared inboxes, collapses cross-domain aliases
     (slack_user_id / shared email / normalized name), reads the real roster.
+  - seat scope (2026-07-01): fireflies_seat flags restrict the roster to
+    seat-holders; flag honored via any collapsed alias entry; flag-free file
+    keeps full-roster behavior.
   - classify(): all 3 statuses, alias-aware + case-insensitive matching,
     recency refinement, and the correctness lock (never promote a non-member).
   - format_digest() / nudge_text(): content + branch-by-status.
@@ -131,6 +134,64 @@ def fixture_yaml(tmp_path) -> Path:
     return p
 
 
+# Seat-scoped roster (2026-07-01 right-size): flags present -> only seat-holders kept.
+_SEAT_FIXTURE_YAML = """
+accounts:
+  - email: harrison@hjrglobal.com
+    name: Harrison Rogers
+    enabled: true
+    dwd_eligible: true
+    entity_default: FNDR
+    slack_user_id: U_HARRISON
+    fireflies_seat: true
+  # Tommy: two collapsed entries; the flag sits ONLY on the f3energy alias entry,
+  # while the representative/primary resolves to the hjrglobal entry.
+  - email: tommy@hjrglobal.com
+    name: Tommy Anderson (HJRG)
+    enabled: true
+    dwd_eligible: true
+    entity_default: F3E
+    known_aliases: [tommy@f3energy.com]
+    slack_user_id: U_TOMMY
+  - email: tommy@f3energy.com
+    name: Tommy Anderson
+    enabled: true
+    dwd_eligible: true
+    entity_default: F3E
+    slack_user_id: U_TOMMY
+    fireflies_seat: true
+  # invited seat-holder (not yet a Fireflies member) -- still in scope
+  - email: alex@f3energy.com
+    name: Alex Cordova
+    enabled: true
+    dwd_eligible: true
+    entity_default: F3E
+    slack_user_id: U_ALEX
+    fireflies_seat: true
+  # removed from Fireflies at the 6/22 right-size -- stay enabled for Gmail/Drive
+  # ingestion but must fall out of the coverage monitor's scope (no flag)
+  - email: micah@hjrglobal.com
+    name: Micah Kessler
+    enabled: true
+    dwd_eligible: true
+    entity_default: FNDR
+    slack_user_id: U_MICAH
+  - email: eric@hjrglobal.com
+    name: Eric Canku
+    enabled: true
+    dwd_eligible: true
+    entity_default: F3E
+    slack_user_id: U_ERIC
+"""
+
+
+@pytest.fixture()
+def seat_fixture_yaml(tmp_path) -> Path:
+    p = tmp_path / "monitored-email-accounts.yaml"
+    p.write_text(_SEAT_FIXTURE_YAML, encoding="utf-8")
+    return p
+
+
 # ── load_dwd_humans ─────────────────────────────────────────────────────────
 
 
@@ -184,6 +245,67 @@ class TestLoadDwdHumans:
             assert not any(
                 e.split("@")[0] in {"payables", "receipts", "service"} for e in h.all_emails
             )
+
+
+# ── seat scope (2026-07-01 right-size) ──────────────────────────────────────
+
+
+class TestSeatScope:
+    def test_only_flagged_humans_returned(self, seat_fixture_yaml):
+        humans = load_dwd_humans(seat_fixture_yaml)
+        names = {h.name for h in humans}
+        assert names == {"Harrison Rogers", "Tommy Anderson", "Alex Cordova"}
+
+    def test_removed_person_excluded(self, seat_fixture_yaml):
+        # Micah/Eric stay in the file (Gmail/Drive ingestion) but carry no seat flag.
+        humans = load_dwd_humans(seat_fixture_yaml)
+        emails = {e for h in humans for e in h.all_emails}
+        assert "micah@hjrglobal.com" not in emails
+        assert "eric@hjrglobal.com" not in emails
+
+    def test_invited_seat_holder_included(self, seat_fixture_yaml):
+        humans = load_dwd_humans(seat_fixture_yaml)
+        assert any("alex@f3energy.com" in h.all_emails for h in humans)
+
+    def test_flag_via_collapsed_alias_entry(self, seat_fixture_yaml):
+        # The flag sits on tommy@f3energy.com; the collapsed human's representative
+        # (and primary_email) is the hjrglobal entry -- the component must still
+        # count as flagged.
+        humans = load_dwd_humans(seat_fixture_yaml)
+        tommy = [h for h in humans if h.slack_user_id == "U_TOMMY"]
+        assert len(tommy) == 1
+        assert tommy[0].primary_email == "tommy@hjrglobal.com"
+        assert "tommy@f3energy.com" in tommy[0].all_emails
+
+    def test_no_flags_backward_compat(self, fixture_yaml):
+        # A roster with zero fireflies_seat flags behaves exactly as before:
+        # Harrison, Larry, Alex, Micah = 4 humans.
+        humans = load_dwd_humans(fixture_yaml)
+        assert len(humans) == 4
+        assert any("micah@hjrglobal.com" in h.all_emails for h in humans)
+
+    def test_real_roster_is_the_ten_seat_holders(self):
+        # integration: the production roster is seat-scoped to exactly the 10
+        # seat-holders of the 2026-07-01 right-size. Update the YAML flags AND
+        # this set together when seats change.
+        humans = load_dwd_humans()
+        names = {h.name for h in humans}
+        assert names == {
+            "Harrison Rogers",
+            "Hannah Grant",
+            "Justin Moran",
+            "Alina Thomas",
+            "Larry Stone",
+            "Tommy Anderson",
+            "Shaun Hawkins",
+            "Jennifer Mortensen",
+            "Alex Cordova",
+            "Daniel Sion",
+        }
+        # the 6/22-removed people must never re-enter the monitor's scope
+        for gone in ("Micah Kessler", "Elena Meirndorf", "Eric Canku",
+                     "Jeff Montgomery", "Matt Petrovich", "Jake Lichtman"):
+            assert gone not in names
 
 
 # ── classify ────────────────────────────────────────────────────────────────

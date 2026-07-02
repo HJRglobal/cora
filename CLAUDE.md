@@ -32,6 +32,20 @@ This is the canonical cadence for all Cora build/fix work. It is standing doctri
 
 ## TOP OF MIND (TOM)
 
+### [SHIPPED] 2026-07-01 Fireflies coverage monitor re-scoped to SEAT-HOLDERS (branch `claude/fireflies-seat-scope`, PUSHED, awaiting `main` merge; suite 5492; SCRIPT-SIDE -- no restart)
+
+After the 6/22 Fireflies Enterprise right-size (5 removed: Micah/Elena/Eric/Jeff/Matt; Jake invite cancelled), the removed people correctly stayed in `monitored-email-accounts.yaml` for Gmail/Drive KB ingestion -- but the weekly coverage monitor (`cowork-cora-fireflies-coverage`, `--nudge`, Mon 08:10 AZ after the B1 restagger) read the full DWD roster and would DM them wrong "accept your Fireflies invite" nudges.
+
+- **Roster flag:** `fireflies_seat: true` on exactly 10 entries (harrison/hannah/justin/alina/daniel @hjrglobal, larry@bigd.media, tommy@f3energy, alex@f3energy, shaun/jen @lexingtonservices); key documented in the YAML header. Flag ONE entry per human.
+- **Loader:** `fireflies_coverage.load_dwd_humans()` -- seat-scope mode detected across the whole file; the flag is honored via ANY of a human's collapsed alias entries (e.g. the flag on tommy@f3energy keeps the Tommy component whose primary is tommy@hjrglobal). Zero flags => full-roster behavior (backward-compatible). `load_dwd_humans` has exactly ONE consumer (this monitor); all other YAML readers use their own keys -- unaffected.
+- **Tests:** `TestSeatScope` (6 new; 34 in file): flagged-only, removed-excluded, invited-included, flag-via-collapsed-alias-entry, no-flags-backward-compat, real-roster set-equality pin of the 10 names (update flags + pin together when seats change). Suite 5492 passed / 42 skipped.
+- **Live dry-run verified:** exactly 10 humans -- 4 COVERED (Harrison 598 / Larry 22 / Shaun 5 / Alina 2), 3 MEMBER_NO_RECORDINGS (Hannah + Tommy older-recordings-none-in-30d, Jen), 3 NOT_A_MEMBER = the open invites (Alex/Justin/Daniel). None of the removed six.
+- **Interim `--digest-only` flip is MOOT:** the monitor is script-side (reads the working tree at each fire); the change landed 7/1, next fire Mon 7/6 08:10 is already seat-scoped. Task arg stays `--nudge`.
+- **NOTE for Monday 7/6:** the nudge run will DM up to 6 SEAT-HOLDERS, not just the 3 invited -- Hannah/Jen/Tommy are members without recent recordings and get the "connect your calendar" nudge. Legitimate under the maximize-Enterprise plan (2026-07-01 decision, HIPAA off), flagged so it isn't read as a regression.
+- **Do NOT re-run `deployment/setup-fireflies-coverage-task.ps1`** (no arg change needed) -- it would re-register at 08:00 and undo the 08:10 restagger.
+
+Doctrine: population-scoping for a people-facing nudge tool belongs in the DATA (a roster flag evaluated across the collapsed alias component), not in disabling the task -- the same file can safely serve ingestion (broad) and nudging (narrow) audiences. Founder-side decision logged separately (2026-07-01, Fireflies Enterprise maximization plan).
+
 ### [SHIPPED] 2026-06-17 Forensic rebuild PHASE 3 FINAL CLEANUP -- Item C COMPLETE + KB retention prune COMPLETE; int8 DEFERRED (branch `claude/rebuild-phase3-cleanup`, PUSHED, awaiting `main` merge; suite 4604)
 
 The two decision-locked Phase-3 tails. Branch off `main`@`0da781d`, PUSHED, NOT merged (Harrison moves `main`). 5 commits, suite 4581 -> 4604 / 42 skipped, every slice import-smoke + full-suite gated. NO bot restart (both items script-side -> activate at next fire from the working tree). NO host KB run (3.1 `--apply`/VACUUM are Harrison-gated).
