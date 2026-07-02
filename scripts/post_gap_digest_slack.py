@@ -1,4 +1,14 @@
+# ── RETIRED 2026-07-02 (hygiene session, Harrison-approved) -- do not run ────
+# Superseded by gap_autofill -> the daily knowledge-review DM: both read
+# logs/knowledge-gaps.jsonl, and per-gap surfacing to Harrison already happens
+# there, so this weekly #hjrg-leadership rollup is a duplicate surface.
+# The host task "cowork-cora-gap-digest" is disabled by Harrison AFTER the
+# merge (host step); expected-disabled is recorded in
+# data/maps/scheduled-task-state.yaml so the nightly health check stays clean.
+# Kept for history; no other module imports this script.
 """Post a weekly knowledge-gap digest to #hjrg-leadership.
+
+RETIRED 2026-07-02 -- see the header comment above; do not run or re-register.
 
 Reads logs/knowledge-gaps.jsonl, aggregates the top gaps from the past 7 days
 (or a custom window), and posts a concise Slack-formatted summary to

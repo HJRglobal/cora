@@ -27,6 +27,7 @@ def test_state_config_loads():
     assert "Cora - Clover Daily Summary" in disabled
     assert "cowork-clover-daily-pull" in disabled  # was missing -> false CRITICAL
     assert "cowork-cora-digest" in disabled  # WS17-C: silences the daily false WARN
+    assert "cowork-cora-gap-digest" in disabled  # retired 2026-07-02 (hygiene S1)
 
 
 def test_meeting_action_capture_now_intended_disabled():

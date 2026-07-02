@@ -36,6 +36,12 @@ disabled:
   # (WS17-B). Already Disabled on the host; recorded here in WS17-C so the nightly
   # health check stops warning "unexpectedly Disabled" every day.
   - cowork-cora-digest
+  # Weekly #hjrg-leadership gap digest retired 2026-07-02, superseded by
+  # gap_autofill -> the daily knowledge-review DM (both read knowledge-gaps.jsonl;
+  # per-gap surfacing to Harrison already happens there). Harrison disables the
+  # host task AFTER the hygiene-session merge; until then the daily check WARNs
+  # "expected disabled but enabled" -- that WARN is the reminder, not a defect.
+  - cowork-cora-gap-digest
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
@@ -49,3 +55,5 @@ enabled:
   # Daily 07:06 AZ PHI re-scan over _brain/swept/ (defense-in-depth behind the
   # materializer's inline _phi_wall). Added 2026-06-30 (lex-swept-phi-check spec).
   - Cora - LEX Swept PHI Check
+  # Weekly Mon 09:05 AZ golden-set evals -> #cora-health. Added 2026-07-02 (D-066).
+  - Cora - KB Evals
