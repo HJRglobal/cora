@@ -348,3 +348,46 @@ def redact_links_and_ids(text: str) -> str:
     for i, tok in enumerate(tokens):
         work = work.replace(_PLACEHOLDER.format(i), tok)
     return work
+
+
+# Whole fenced code blocks (```...```) protected as single units so bold
+# conversion can never rewrite ** inside a fixed-width proactive table.
+# Non-greedy across lines; an unterminated fence is left alone (no match).
+_FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+# Inline `code` spans, protected for the same reason.
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
+
+
+def normalize_slack_bold(text: str) -> str:
+    """Convert markdown bold (**text** / __text__) to Slack bold (*text*) --
+    and do NOTHING else (WS-5, closes the 2026-07-01 format-arc deferral).
+
+    For LLM-composed PROACTIVE senders (daily briefing, strategy memo, finance
+    recap) that egress outside format_reply's conversational path. Unlike
+    format_reply this is code-fence- and table-safe: fenced blocks and inline
+    code spans are protected wholesale (format_reply DELETES fences, so it
+    never needed a fence guard -- proactive senders keep theirs). Sanctioned
+    Slack <...> tokens are protected the same way as redact_links_and_ids.
+    Idempotent (converting already-*bold* text is a no-op: ** is required to
+    match). Pure function; returns the input on falsy/non-str.
+
+    Deliberately NOT hooked into slack_egress.sanitize_text: the boundary is
+    kept to universal SAFETY transforms (2026-06-17 review); bold conversion
+    is per-sender opt-in.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    tokens: list[str] = []
+
+    def _protect(m: re.Match) -> str:
+        tokens.append(m.group(0))
+        return _PLACEHOLDER.format(len(tokens) - 1)
+
+    work = _FENCED_BLOCK_RE.sub(_protect, text)
+    work = _INLINE_CODE_SPAN_RE.sub(_protect, work)
+    work = _SLACK_TOKEN_RE.sub(_protect, work)
+    work = _BOLD_STAR_RE.sub(r"*\1*", work)
+    work = _BOLD_UNDER_RE.sub(r"*\1*", work)
+    for i, tok in enumerate(tokens):
+        work = work.replace(_PLACEHOLDER.format(i), tok)
+    return work

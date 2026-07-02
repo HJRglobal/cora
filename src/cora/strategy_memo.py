@@ -863,9 +863,13 @@ def deliver_to_harrison(memo_body: str, *, today: date | None = None) -> bool:
         log.error("strategy_memo: SLACK_BOT_TOKEN not set -- cannot DM")
         return False
     today = today or _today()
+    # WS-5: normalize markdown bold in the SLACK copy only -- Sonnet emits
+    # literal ** and this path bypasses format_reply. The .md file written by
+    # write_memo_file keeps raw markdown (bold intended there).
+    from .reply_formatter import normalize_slack_bold
     text = (f":compass: *Weekly Portfolio Strategy Memo -- {today.isoformat()}*\n"
             "_Advisory only. Full copy filed to 00-Founder/_strategy-memos._\n\n"
-            f"{memo_body}")
+            f"{normalize_slack_bold(memo_body)}")
     try:
         client = WebClient(token=token)
         resp = client.conversations_open(users=[HARRISON_SLACK_ID])
