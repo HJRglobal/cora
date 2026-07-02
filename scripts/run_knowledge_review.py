@@ -68,6 +68,16 @@ _PENDING_EXPIRY_DAYS = 14
 # Slack retry before it moves to cold storage.
 _ARCHIVE_AFTER_DAYS = 3
 
+# WS-4 ledger boundedness: an OPERATIONAL item still PENDING and never routed
+# to an owner after this many days auto-archives as DISMISSED with
+# resolved_reason="expired_unrouted" (mirrors the knowledge 14d auto-expire).
+# The owner drain moves 10/day and the routing floor excludes the pre-WS17-B
+# backlog entirely, so unrouted operational rows otherwise accumulate without
+# bound (PENDING grew 3,772 -> 4,277 in the last week of June 2026).
+# KNOWLEDGE items are exempt -- the D-051 rule (never auto-dismiss a never-DM'd
+# entry) still protects everything in Harrison's queue.
+_OPERATIONAL_UNROUTED_EXPIRY_DAYS = 14
+
 # ── WS17-C (D-060): the silent auto-approve is RETIRED ───────────────────────
 # Previously, HIGH-confidence machine-mined known_answer updates wrote to
 # design/known-answers/*.md WITHOUT a Harrison 👍 (the old Step 1.5). Per the
@@ -254,6 +264,17 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                     f"({summary}):\n> Q: {q_short}\n> A: {(payload.get('answer') or '')[:300]}"
                 )
                 log.info("gap-executor: known_answer applied uid=%s", uid_short)
+                # WS-3 golden-set auto-growth: every Harrison-approved fact
+                # becomes a standing L1 eval case. Fires only on ok=True (the
+                # durable write's PHI re-check passed); id-idempotent, so the
+                # dedup-skip / crash-recovery ok=True returns can't double-add.
+                # Fail-soft -- never affects the executor or the D-011 gate.
+                try:
+                    from cora.golden_set import append_case_from_known_answer
+                    append_case_from_known_answer(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)",
+                                exc_info=True)
             else:
                 msg = f":warning: *Gap executor* `[{uid_short}]` known_answer failed: {summary}"
                 log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
@@ -300,6 +321,14 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` learned a "
                        f"contributed note ({summary}):\n> {snippet}")
                 log.info("gap-executor: info-for-cora note applied uid=%s", uid_short)
+                # WS-3 golden-set auto-growth (same contract as the
+                # known_answer branch above).
+                try:
+                    from cora.golden_set import append_case_from_note
+                    append_case_from_note(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)",
+                                exc_info=True)
             else:
                 msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"
                 log.warning("gap-executor: info-for-cora note failed uid=%s: %s", uid_short, summary)
@@ -335,6 +364,40 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
                     n += 1
             except Exception:
                 pass
+    return n
+
+
+def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
+    """Flip to DISMISSED, in place, OPERATIONAL entries that are still PENDING,
+    were never DM'd anywhere (no dm_message_ts -- not to Harrison, not routed
+    to an owner), and are older than cutoff_dt. Returns the count expired.
+
+    WS-4 ledger boundedness. This is a DELIBERATE, spec'd exception to the
+    D-051 never-dismiss-unseen rule, scoped strictly to the operational nudge
+    stream: those items route to owners at 10/run behind a routing floor, so
+    anything unrouted after 14 days (below-floor backlog, LEX-skipped rows,
+    cap overflow) is structurally unroutable dead weight that otherwise grows
+    the ledger forever. Knowledge items (known_answer / efficiency /
+    #info-for-cora generics) are EXEMPT -- Harrison's queue keeps the
+    never-expire-unseen guarantee. Unknown update_types are also left alone
+    (fail-safe)."""
+    from datetime import datetime as _dt
+    n = 0
+    for e in entries:
+        if e.get("state") != "PENDING" or e.get("dm_message_ts"):
+            continue
+        if _is_knowledge_item(e):
+            continue
+        if e.get("update_type") not in _OPERATIONAL_TYPES:
+            continue
+        try:
+            if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
+                e["state"] = "DISMISSED"
+                e["resolved_at"] = now_dt.isoformat()
+                e["resolved_reason"] = "expired_unrouted"
+                n += 1
+        except Exception:
+            pass
     return n
 
 
@@ -591,6 +654,7 @@ def main() -> int:
         now = _dt.now(_tz.utc)
         cutoff = now - _td(days=_PENDING_EXPIRY_DAYS)
         auto_dismissed = 0
+        expired_unrouted = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
                 entries = []
@@ -607,11 +671,22 @@ def main() -> int:
                         malformed.append(_l)
                         log.warning("Step 0: preserving 1 malformed ledger line on rewrite")
                 auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now)
+                # WS-4 ledger boundedness: expire never-routed OPERATIONAL rows
+                # past their own cutoff in the SAME pass/rewrite. Knowledge
+                # items are exempt (D-051 never-expire-unseen preserved).
+                unrouted_cutoff = now - _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS)
+                expired_unrouted = _auto_expire_unrouted_operational(
+                    entries, unrouted_cutoff, now)
                 # atomic — no partial-write window; malformed lines kept verbatim.
                 _write_entries_atomic(_PROPOSED_UPDATES_PATH, entries, raw_lines=malformed)
         if auto_dismissed:
             log.info("Auto-dismissed %d stale entries (DM'd >%dd ago, no reaction)",
                      auto_dismissed, _PENDING_EXPIRY_DAYS)
+        if expired_unrouted:
+            log.info("Expired %d unrouted operational entr%s (PENDING >%dd, never "
+                     "DM'd/routed) as expired_unrouted",
+                     expired_unrouted, "y" if expired_unrouted == 1 else "ies",
+                     _OPERATIONAL_UNROUTED_EXPIRY_DAYS)
 
         # Ledger hygiene (item 8): rotate old resolved rows to the archive so the
         # live file stays small. Fail-soft — a rotation error must not block review.

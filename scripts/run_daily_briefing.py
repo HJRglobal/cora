@@ -410,7 +410,11 @@ def _synthesize(
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
-    return resp.content[0].text.strip()
+    # WS-5: Haiku emits literal **bold** despite the prompt; this composer
+    # egresses outside format_reply's conversational path, so normalize here --
+    # one call covers both the user-DM delivery and the Harrison review copy.
+    from cora.reply_formatter import normalize_slack_bold
+    return normalize_slack_bold(resp.content[0].text.strip())
 
 
 def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str:

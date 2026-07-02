@@ -14,6 +14,7 @@ that entity. FNDR channels (founder-level + catch-all) see everything.
 
 import concurrent.futures
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -5495,6 +5496,13 @@ def tools_for_entity(entity: str, cross_entity: bool = False) -> list[dict]:
     entity (FNDR/HJRG) gets the full set. An unknown entity falls back to the
     global core only — safe, never a crash.
     """
+    # WS-3 eval isolation (lens R3): the offline eval harness
+    # (scripts/run_kb_evals.py) must be side-effect-free -- no tool can be
+    # OFFERED to Claude in eval mode, so no staged write / connector call can
+    # ever execute from eval traffic. Read at call time; the bot process never
+    # sets this env var. dispatch() carries the belt-and-braces refusal.
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return []
     if cross_entity or entity in _FULL_ACCESS_ENTITIES:
         return list(TOOL_DEFINITIONS)
     canon = _SUBENTITY_PARENT.get(entity, entity)
@@ -5651,6 +5659,12 @@ def dispatch(
     channel_id and thread_ts are injected for Feature 6 file uploads and any
     future tools that need to post directly to Slack channels.
     """
+    # WS-3 eval isolation, belt-and-braces (lens R3): tools_for_entity already
+    # offers NO tools in eval mode, so this only fires if a code path bypasses
+    # the offer gate. Never executes a tool from eval traffic.
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        log.warning("dispatch refused in eval mode: %s", tool_name)
+        return "Tool use is disabled in eval mode."
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if not fn:
         log.warning("Unknown tool name requested by model: %s", tool_name)

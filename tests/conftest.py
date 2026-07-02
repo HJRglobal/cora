@@ -337,6 +337,28 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CLOSURE_NUDGE_LOG_PATH", str(tmp_path / "closure-nudges-throttle.jsonl")
     )
+    # WS-1 gap detection: isolate the dedup/cap state file and the gap log so
+    # app-level tests that drive _dispatch_qa can never write the repo's real
+    # data/state/gap_detection_state.json or logs/knowledge-gaps.jsonl. Tests
+    # exercising these directly override the same env vars.
+    monkeypatch.setenv(
+        "GAP_DETECTION_STATE_PATH", str(tmp_path / "gap_detection_state.json")
+    )
+    monkeypatch.setenv(
+        "KNOWLEDGE_GAPS_LOG_PATH", str(tmp_path / "knowledge-gaps.jsonl")
+    )
+    # WS-3 golden-set auto-growth: executor tests that drive
+    # _execute_approved_update fire the auto-growth hook -- isolate its target
+    # so a test fixture's fake fact can never land in the repo's real
+    # data/evals/golden-set-auto.yaml (it did, once, before this line).
+    monkeypatch.setenv(
+        "GOLDEN_SET_AUTO_PATH", str(tmp_path / "golden-set-auto.yaml")
+    )
+    try:
+        import cora.gap_detection as _gd
+        _gd._THREAD_LOGGED.clear()
+    except Exception:
+        pass
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:

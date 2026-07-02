@@ -24,6 +24,7 @@ from . import help_responder
 from . import knowledge_review
 from . import intent_classifier as ic
 from . import knowledge_gaps
+from . import gap_detection
 from . import gap_autofill
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
@@ -599,6 +600,12 @@ def _dispatch_qa(
         latency_ms = int((time.monotonic() - t0) * 1000)
         response_text = _extract_and_log_gap(
             response_text, entity, channel_name, user_id, user_message, latency_ms,
+            kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
+            # No thread root (e.g. /cora-ask) -> no thread key; "C123:None"
+            # would collapse every slash-command ask in a channel into one
+            # 48h dedup bucket (adversarial review LOW).
+            thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+            thread_context=bool(prior_messages),
         )
         # D-032 / Phase 2.1: conversational replies pass through the deterministic
         # voice formatter; only genuine verbatim-table tools bypass it. The old
@@ -683,6 +690,9 @@ def _dispatch_qa(
     latency_ms = int((time.monotonic() - t0) * 1000)
     response_text = _extract_and_log_gap(
         response_text, entity, channel_name, user_id, user_message, latency_ms,
+        kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
+        thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+        thread_context=bool(prior_messages),
     )
     # D-032 / Phase 2.1: conversational replies pass through the deterministic
     # voice formatter; only genuine verbatim-table tools bypass it (used_verbatim_tool,
@@ -986,11 +996,40 @@ def _extract_and_log_gap(
     user_id: str | None,
     user_message: str,
     latency_ms: int,
+    *,
+    kb_meta: dict | None = None,
+    gen_meta: dict | None = None,
+    is_dm: bool = False,
+    thread_key: str = "",
+    thread_context: bool = False,
 ) -> str:
-    """Pull the [CORA_KNOWLEDGE_GAP: ...] sentinel out of the response (if present),
-    log the gap, and return the cleaned response text."""
+    """Pull the [CORA_KNOWLEDGE_GAP: ...] sentinel out of the response (if
+    present), log the gap, and return the cleaned response text.
+
+    WS-1: when NO sentinel is present, the deterministic detectors in
+    gap_detection run instead (kb_miss / unknown_response) -- the sentinel is
+    behaviorally unreliable as the only intake (44 gaps ever), so detection is
+    now code-level (the instrumentation twin of D-034). Deterministic guard
+    refusals never reach this helper (every guard returns before _dispatch_qa
+    calls the LLM), and gap_detection vetoes LLM-generated deflections, LEX
+    entities, PHI, smalltalk, dedups 7d, and caps per day. Fail-soft: a
+    detector error never affects the response.
+    """
     match = _GAP_RE.search(response_text)
     if not match:
+        gap_detection.maybe_log_gap(
+            entity=entity,
+            channel=channel_name,
+            user=user_id,
+            question=user_message,
+            response_text=response_text,
+            latency_ms=latency_ms,
+            kb_meta=kb_meta,
+            gen_meta=gen_meta,
+            is_dm=is_dm,
+            thread_key=thread_key,
+            thread_context=thread_context,
+        )
         return response_text
     gap_desc = match.group(1).strip()
     cleaned = _GAP_RE.sub("", response_text).rstrip()
@@ -1002,6 +1041,8 @@ def _extract_and_log_gap(
         response_chars=len(cleaned),
         gap=gap_desc,
         latency_ms=latency_ms,
+        detector="llm_sentinel",
+        private_source=is_dm,
     )
     # Per-user feedback attribution — enriches gap event with display name.
     # channel_id not available in this helper scope; best-effort with channel_name.

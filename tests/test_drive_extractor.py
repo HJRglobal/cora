@@ -555,7 +555,49 @@ class TestRunProposalLoopCap:
             stats = run_proposal_loop(db_path=tmp_db)
         assert stats["proposed"] == 2   # only newly-appended count
         assert stats["skipped"] == 2    # the two dups
+        # WS-4 cap-order fix: the cap landed exactly on the LAST fact, so
+        # nothing was actually deferred -- capped is False and the watermark
+        # advances (the old post-propose check held it pointlessly, costing a
+        # full re-query round). capped=True is reserved for genuinely
+        # unexamined facts (see test_cap_bites_and_holds_watermark).
+        assert stats["capped"] is False
+
+    def test_cap_zero_proposes_nothing(self, tmp_db, monkeypatch):
+        # WS-4: the old post-propose cap check leaked 1 proposal/run at cap 0.
+        import cora.connectors.drive_extractor as de
+        monkeypatch.setattr(de, "_MAX_PROPOSALS_PER_RUN", 0)
+        self._seed_n(tmp_db, 3, "i")
+        with patch("cora.knowledge_review.propose_update", return_value=True) as mock:
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats["proposed"] == 0
         assert stats["capped"] is True
+        assert mock.call_count == 0
+
+    def test_pause_gate_short_circuits(self, tmp_db, monkeypatch):
+        # WS-4 disposition: DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0 pauses the
+        # proposal loop entirely (call-time read, no watermark movement) while
+        # extraction stays untouched.
+        monkeypatch.setenv("DRIVE_EXTRACTOR_PROPOSALS_ENABLED", "0")
+        self._seed_n(tmp_db, 3, "j")
+        with patch("cora.knowledge_review.propose_update", return_value=True) as mock:
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats["paused"] is True
+        assert stats["proposed"] == 0
+        assert mock.call_count == 0
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute("SELECT last_sync_at FROM sync_state WHERE source=?",
+                           (_WATERMARK_PROPOSE,)).fetchone()
+        conn.close()
+        assert row is None  # watermark untouched -- resume picks up cleanly
+
+    def test_pause_gate_default_is_enabled(self, tmp_db, monkeypatch):
+        monkeypatch.delenv("DRIVE_EXTRACTOR_PROPOSALS_ENABLED", raising=False)
+        self._seed_n(tmp_db, 1, "k")
+        with patch("cora.knowledge_review.propose_update", return_value=True) as mock:
+            stats = run_proposal_loop(db_path=tmp_db)
+        assert stats.get("paused") is not True
+        assert stats["proposed"] == 1
+        assert mock.call_count == 1
 
 
 # == Class 11: run_proposal_loop cross-run forward-progress (WS17-B item 2) =====

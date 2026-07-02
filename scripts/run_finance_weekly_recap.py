@@ -249,9 +249,12 @@ def _post_recap(text: str, dry_run: bool, bot_token: str) -> None:
     # B1: this script uses WebClient but imports no cora.* module, so the
     # class-level egress patch (installed from cora/__init__.py) never runs in this
     # process. Sanitize the body explicitly so it can't egress unsanitized.
+    # WS-5: Haiku is prompted for Slack *bold* but can still emit literal ** --
+    # normalize alongside the explicit sanitize (idempotent on already-correct text).
     from cora.slack_egress import sanitize_text  # noqa: PLC0415
+    from cora.reply_formatter import normalize_slack_bold  # noqa: PLC0415
     client = WebClient(token=bot_token)
-    text = sanitize_text(text)
+    text = normalize_slack_bold(sanitize_text(text))
     should_sched, post_at = _should_schedule(dry_run)
 
     try:

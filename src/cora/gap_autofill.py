@@ -62,6 +62,11 @@ ESCALATE_AFTER_HOURS = 72    # gap must be at least this old before a DM ask
 ASK_TTL_HOURS = 96           # pending ask expires after this (no re-ask)
 MAX_ASKS_PER_RUN = 3
 
+# WS-1: gaps open longer than this with no resolution auto-close as expired,
+# so the 6am run's Haiku spend stays pointed at live gaps instead of re-mining
+# a stale set forever.
+GAP_TTL_DAYS = 30
+
 # DM keywords that belong to the OSN shift scheduler -- a top-level DM reply
 # matching these is never treated as a gap answer (threaded replies always win).
 _SHIFT_KEYWORDS = (
@@ -229,6 +234,34 @@ def gap_age_hours(gap: dict[str, Any]) -> float:
     except Exception:
         return 0.0
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+
+
+def expire_stale_gaps(dry_run: bool = False, ttl_days: int = GAP_TTL_DAYS) -> int:
+    """Close open gaps older than ttl_days as 'expired' (WS-1 gap TTL).
+
+    Writes an 'expired' record to the shared resolved ledger -- the same file
+    the digest flow and apply_known_answer use -- so an expired gap leaves
+    load_open_gaps() for every consumer at once. Idempotent (an already-
+    resolved gap is not open). Returns the number of gaps expired.
+    """
+    stale = [g for g in load_open_gaps()
+             if gap_age_hours(g) > ttl_days * 24]
+    if not stale or dry_run:
+        return len(stale)
+    resolved_path = _resolved_path()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_path.open("a", encoding="utf-8") as fh:
+        for gap in stale:
+            fh.write(json.dumps({
+                "id": gap.get("ts", ""),
+                "action": "expired",
+                "timestamp": _now_iso(),
+                "target_entity": gap.get("entity", "FNDR"),
+                "captured_entity": gap.get("entity", "FNDR"),
+                "source": "gap_ttl",
+            }, ensure_ascii=False) + "\n")
+    log.info("gap_autofill: expired %d gap(s) older than %dd", len(stale), ttl_days)
+    return len(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -436,12 +469,46 @@ def resolve_owner(entity: str) -> str | None:
 
 
 def should_escalate(gap: dict[str, Any]) -> bool:
-    """Eligibility for a teammate DM ask. LEX + PHI gaps never escalate."""
+    """Eligibility for a teammate DM ask. LEX + PHI gaps never escalate.
+
+    WS-1: DM-originated gaps never escalate either -- escalation quotes the
+    question text to a domain owner, and a question asked in a private DM must
+    not be re-broadcast to a third party. Mining stays allowed (its output is
+    Harrison-gated, D-011).
+
+    WS-1 review (R1b): company-finance gaps never escalate either. The
+    unknown_response detector now reliably logs finance-tool misses (the
+    locked UNKNOWN_RESPONSE) from TIER_1 channels, and an escalation DM would
+    quote that restricted-finance question to a domain owner who may be
+    financials-blocked (D-064). The D-064 canon matcher decides; the finance
+    unknown already has its own #hjrg-finance notification loop, and mining
+    stays allowed (Harrison-gated).
+    """
     entity = (gap.get("entity") or "").strip().upper()
     if entity.startswith("LEX"):
         return False
+    if gap.get("private_source") or (gap.get("channel") or "").strip().lower() == "dm":
+        return False
+    # kb_miss gaps are mining-only telemetry, never an owner ask: the detector
+    # is retrieval-side and can fire on a question Cora answered correctly
+    # from static context -- DMing an owner to supply an answer Cora already
+    # gave is pure noise (adversarial review MEDIUM). unknown_response and
+    # llm_sentinel gaps reflect an actual failed answer and stay eligible.
+    if gap.get("detector") == "kb_miss":
+        return False
     text = f"{gap.get('question', '')} {gap.get('gap', '')}"
-    if is_phi_risk(text):
+    # Same 3-predicate PHI union as the write gates (adversarial review HIGH:
+    # is_phi_risk alone misses bare clinical terms + named-person admin-PHI,
+    # and escalation quotes this text verbatim to a possibly-non-custodian).
+    if is_phi_risk(text) or is_clinical_phi(text) or is_lex_billing_status_phi(text):
+        return False
+    try:
+        from .user_access import _financials_is_blocked
+        if _financials_is_blocked(text.lower()):
+            return False
+    except Exception:  # noqa: BLE001 -- fail CLOSED on a guard error
+        log.warning("gap_autofill: finance screen errored -- not escalating",
+                    exc_info=True)
         return False
     return gap_age_hours(gap) >= ESCALATE_AFTER_HOURS
 

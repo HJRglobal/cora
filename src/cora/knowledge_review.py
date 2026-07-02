@@ -55,6 +55,12 @@ _ARCHIVE_IDS_KEY: tuple[str, float] | None = None  # (archive path, mtime)
 
 
 def _ids_in_file(path: Path) -> set[str]:
+    """update_ids in one ledger file. A MISSING file is an empty set (normal
+    for a fresh repo); any OTHER read error RAISES -- after the WS-4 expiry +
+    rotation, the archive is the SOLE idempotency barrier for thousands of
+    drive-fact ids, and failing open (empty set) on a transient read error
+    would let a producer silently re-propose the whole population. A loud
+    failure aborts that propose and retries next run (watermark held)."""
     ids: set[str] = set()
     try:
         with path.open(encoding="utf-8") as fh:
@@ -66,10 +72,12 @@ def _ids_in_file(path: Path) -> set[str]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 uid = rec.get("update_id")
                 if uid:
                     ids.add(uid)
-    except OSError:
+    except FileNotFoundError:
         pass
     return ids
 
@@ -496,9 +504,12 @@ def format_single_item_dm(update: dict[str, Any]) -> str:
         lines.append(f"_Source: {snippet}_")
     # WS17-C: Cora's read (advisory; computed + stashed by run_knowledge_review,
     # "" when unavailable). Decision-SUPPORT only -- never affects the gate.
+    # WS-5: the read is Haiku-composed and can carry literal **bold** into this
+    # DM (a proactive surface outside format_reply) -- normalize it here.
     coras_read = update.get("_coras_read", "")
     if coras_read:
-        lines.append(coras_read)
+        from .reply_formatter import normalize_slack_bold
+        lines.append(normalize_slack_bold(coras_read))
     lines.append("\n👍 Approve · 👎 Dismiss")
     return "\n".join(lines)
 

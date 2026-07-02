@@ -639,6 +639,51 @@ def check_disk_space() -> CheckResult:
         return CheckResult("Disk space", "warn", f"Could not check disk: {exc}")
 
 
+def check_flywheel() -> list[CheckResult]:
+    """Knowledge-flywheel throughput (WS-2) — catch the loop silently dying.
+
+    The flywheel flatlined for 2+ weeks in June 2026 (0 knowledge DMs, gap log
+    dry since 6/15, zero shadow records) and nothing alarmed. Metrics +
+    thresholds live in ONE place — cora.flywheel_metrics — shared with the
+    weekly health report, so the two surfaces can never drift (the
+    _EXPECTED_DISABLED false-CRITICAL failure mode). This is the only call
+    site that updates the pending-size baseline history (one write/day).
+
+    Severity is warn-only by design: throughput degradation is not an outage
+    (a critical would flip the task's Last Result nonzero). First-week note:
+    these WILL warn while the WS-1 starvation fixes bed in — that is correct;
+    do not suppress.
+    """
+    try:
+        from cora import flywheel_metrics as fm
+        metrics = fm.collect(update_baseline=True)
+        alarms = fm.evaluate(metrics)
+        results = [
+            CheckResult("Flywheel", "warn", msg) for _sev, msg in alarms
+        ]
+        # WS-3 guard: this script loads .env (override=True), so if
+        # CORA_EVAL_MODE ever lands in .env (the HEALTH_PING_URL
+        # template-append precedent), it is visible here -- and the BOT would
+        # silently offer ZERO tools on its next restart. Catch it within 24h.
+        if os.environ.get("CORA_EVAL_MODE"):
+            results.append(CheckResult(
+                "Flywheel", "critical",
+                "CORA_EVAL_MODE is set in this environment -- if it is in "
+                ".env, the bot offers NO tools after its next restart. "
+                "Remove the line (only scripts/run_kb_evals.py may set it, "
+                "in-process).",
+            ))
+        # One info-level OK line carrying the gauge numbers either way.
+        summary = "; ".join(fm.format_lines(metrics)[:3])
+        results.append(CheckResult(
+            "Flywheel throughput", "ok" if not alarms else "warn", summary,
+        ))
+        return results
+    except Exception as exc:  # noqa: BLE001 — a broken gauge never fails the run
+        return [CheckResult("Flywheel", "warn",
+                            f"Could not compute flywheel metrics: {exc}")]
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 
@@ -762,6 +807,9 @@ def main() -> int:
 
     log.info("Checking disk space...")
     all_results.append(check_disk_space())
+
+    log.info("Checking knowledge-flywheel throughput...")
+    all_results.extend(check_flywheel())
 
     run_time = time.time() - t0
 
