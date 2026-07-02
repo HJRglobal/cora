@@ -425,6 +425,23 @@ def run_proposal_loop(
 
     Returns dict with: proposed, skipped, errors.
     """
+    # WS-4 pause gate (2026-07-01 disposition, Harrison-ratified at merge):
+    # read at CALL time -- not module import -- so a .env flip takes effect at
+    # the task's next fire with no elevated-PS task change and no restart.
+    # Default ENABLED (behavior-preserving); pause with
+    # DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0 in .env. Extraction (Build 2) is
+    # unaffected and NEITHER watermark moves, so resuming picks up where the
+    # pause began (subject to the 7-day freshness window, by design).
+    _gate = os.environ.get("DRIVE_EXTRACTOR_PROPOSALS_ENABLED", "1").strip().lower()
+    if _gate in ("0", "false", "no", "off"):
+        log.info(
+            "drive_extractor proposals: PAUSED (DRIVE_EXTRACTOR_PROPOSALS_ENABLED=%s) "
+            "-- extraction unaffected; no proposals made; watermarks held",
+            _gate,
+        )
+        return {"proposed": 0, "skipped": 0, "errors": 0, "capped": False,
+                "paused": True}
+
     from cora.knowledge_review import propose_update  # local import for testability
 
     db = Path(db_path) if db_path else _default_db_path()
@@ -486,6 +503,27 @@ def run_proposal_loop(
     examined = 0         # facts looked at this run (for the deferred-count log)
 
     for fact in facts:
+        # Cap check at the TOP of the iteration (WS-4): the old post-propose
+        # check leaked one proposal per run at cap 0, and held the watermark
+        # even when the cap landed exactly on the last fact (nothing actually
+        # deferred). Checking here fixes both; `capped` is True only when
+        # facts genuinely remain unexamined.
+        if newly_proposed >= _MAX_PROPOSALS_PER_RUN:
+            capped = True
+            deferred = len(facts) - examined
+            # Observability (no silent caps): surface the in-window backlog
+            # the cap deferred. These re-run next pass while still inside the
+            # freshness window; any that age past the window are intentionally
+            # not surfaced (stale). A persistently large number here means a
+            # backfill is in progress -> use the triage tool or bump the cap.
+            log.warning(
+                "drive_extractor: per-run proposal cap (%d) reached — "
+                "%d in-window candidate(s) deferred to a later run (watermark held). "
+                "If this stays high, a backfill is draining slowly; bump "
+                "DRIVE_EXTRACTOR_MAX_PROPOSALS_PER_RUN or run the triage tool.",
+                _MAX_PROPOSALS_PER_RUN, deferred,
+            )
+            break
         examined += 1
         entity = fact["entity"] or "FNDR"
         fact_type = fact["fact_type"]
@@ -558,22 +596,6 @@ def run_proposal_loop(
             else:
                 stats["proposed"] += 1
                 newly_proposed += 1
-                if newly_proposed >= _MAX_PROPOSALS_PER_RUN:
-                    capped = True
-                    deferred = len(facts) - examined
-                    # Observability (no silent caps): surface the in-window backlog
-                    # the cap deferred. These re-run next pass while still inside the
-                    # freshness window; any that age past the window are intentionally
-                    # not surfaced (stale). A persistently large number here means a
-                    # backfill is in progress -> use the triage tool or bump the cap.
-                    log.warning(
-                        "drive_extractor: per-run proposal cap (%d) reached — "
-                        "%d in-window candidate(s) deferred to a later run (watermark held). "
-                        "If this stays high, a backfill is draining slowly; bump "
-                        "DRIVE_EXTRACTOR_MAX_PROPOSALS_PER_RUN or run the triage tool.",
-                        _MAX_PROPOSALS_PER_RUN, deferred,
-                    )
-                    break
         except Exception as exc:
             log.warning("drive_extractor: propose_update failed for %s: %s", fact_id[:12], exc)
             stats["errors"] += 1
