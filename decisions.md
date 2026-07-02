@@ -2027,6 +2027,101 @@ entity when ready. META: the green suite caught NONE of the 3 MEDIUMs - adversar
 review did, again.
 
 
+## D-059 - WS17-B: the "gets smarter daily" knowledge pipeline (2026-06-21)
+
+_Backfilled 2026-07-02 (hygiene session): shipped 2026-06-21 but never logged here -- the
+log jumped D-058 -> D-061. Condensed from the founder-canon record (TOM 0vv) + the WS17-B
+capture note; see `design/knowledge-pipeline.md` for the boundary doc._
+
+**Context:** The North-Star Phase-1 knowledge loop was structurally dead: ONE flat
+proposed-updates ledger held 17,952 PENDING but only 5 items had EVER been DM'd to
+Harrison -- uncapped producers (a single drive run dumped ~17k), a drain capped at
+<=5/run Mondays-only, ~80% dead-end types, and the actual learning stream
+(`known_answer`) at ~11 lifetime. Merged `main`=`origin/main`=`3931049`; bot restarted
+clean 20:28Z; suite 5,079.
+
+**Decisions / what shipped:**
+- Producers capped + `propose_update` idempotent (no re-flood on re-runs).
+- Operational nudges route to DOMAIN OWNERS (floor-gated, LEX fail-closed,
+  decision-SUPPORT) so Harrison's queue is knowledge + founder + ratify only.
+- The knowledge drain decoupled from Monday/5-cap -> DMs DAILY.
+- Approved `#info-for-cora`/generic items now WRITE `design/known-answers/{entity}.md`
+  (previously a Slack-only dead-end); canonical `known_answers_map.py` closes the
+  silent HJRP/UFL/F3C/HJRPROD non-learning bug (those files were written but never read).
+- Ledger bounded: resolved rows rotate to an archive; live UNION archive backs
+  idempotency. Legacy manual digest de-conflicted; `cowork-cora-digest` DISABLED.
+- Boundary doc `design/knowledge-pipeline.md` (the single Harrison-gated promotion
+  queue). D-034 invariants + the D-011 thumbs-up gate intact.
+- Bulk-dismiss (bot down): 14,354 dead-end PENDING cleared (hubspot_note 9,855 +
+  decision_capture 3,015 + generic 1,484); the 11 known_answer + 5 efficiency learning
+  items kept; reversible `.bak`.
+
+**Process / the headline:** an INDEPENDENT pre-merge adversarial pass (6 surfaces)
+caught 1 real HIGH the green 5,079-suite AND the session's own two D-051 reviews
+missed: the entity-agnostic known-answers WRITE gate screened billing/auth/client-name
+PHI but NOT the clinical diagnosis/medication class (autism/ADHD/nonverbal/risperidone
+all ALLOWED -- the detectors lived only in `scrub_lex_phi`, never called on the write
+path). Fixed in `3931049`: `phi_guard.is_clinical_phi` wired into all 3 write gates,
+deliberately NARROW (no name redaction; EXCLUDES wellness-overlap anxiety/depression so
+F3 Mood positioning isn't over-refused); both directions verified (8/8 clinical caught,
+7/7 legit pass).
+
+**DOCTRINE:** (1) uncapped producers + a capped drain is structural starvation -- cap at
+the source and let the drain run daily; (2) a knowledge WRITE path must call the PHI
+detectors directly, never assume an upstream scrub covered it (the write gate and the
+scrub are different surfaces); (3) the write map and the read map for per-entity
+known-answers must be ONE canonical module or entities silently stop learning.
+
+
+## D-060 - WS17-C: System-2 FOLD + auto-approve RETIRED + "Cora's read" enrichment (2026-06-22)
+
+_Backfilled 2026-07-02 (hygiene session): shipped 2026-06-22 but never logged here.
+Condensed from the founder-canon record (TOM 0zz) + the WS17-C capture note._
+
+**Context:** Extends WS17-B (D-059). Executes the System-2 FOLD decision (Harrison
+2026-06-21, `_shared/projects/cora/2026-06-21_fndr_cora-system2-fold-decision.md`).
+Merged `main`=`origin/main`=`855b6eb` (the WS17-C commits + the pre-merge PHI-egress
+fix); bot restarted clean; suite ~5,113.
+
+**Decisions / what shipped:**
+- **FOLD:** team contributions (`note:` / correction / bookmark reaction) now flow into
+  the ONE Harrison-gated knowledge queue and write `known-answers/{entity}.md` via
+  `apply_contributed_note` on thumbs-up. Retired: the `#cora-kq` approver card, ~15
+  team_learning fns, the pending_contributions table, and the `team_note` KB write
+  (0 such chunks ever existed). KEPT: the author paraphrase-confirm loop.
+- **AUTO-APPROVE RETIRED:** every knowledge item (incl. HIGH machine-mined
+  `known_answer`) now needs Harrison's thumbs-up; nothing writes without a reaction
+  (D-011). Deliberately reverses the 2.4 HIGH-confidence auto-approve leg.
+- **"Cora's read":** every knowledge DM carries a corroborated / conflicts /
+  adds-context / net-new read + recommendation from Cora's own entity-scoped
+  retrieval -- PHI-scrubbed, source-opaque, fail-soft, decision-SUPPORT, never
+  persisted.
+- `cowork-cora-digest` recorded expected-disabled in `scheduled-task-state.yaml`
+  (kills the daily false WARN); `cowork-cora-gap-digest` KEPT as a retirement
+  candidate; boundary doc `design/knowledge-pipeline.md` updated.
+
+**Process / the headline (6th straight):** the independent pre-merge pass caught 1 real
+HIGH the green ~5,113-suite AND the session's own 7-reviewer + 2-verifier passes
+missed: WS17-C added a new LLM-EGRESS surface (Cora's read -> Anthropic; paraphrase ->
+Haiku) where `is_lex_billing_status_phi` was ENTITY-gated while the write gate was
+unconditional -- a folded note tagged with the AUTHOR's entity (e.g. Harrison=FNDR) but
+carrying named LEX billing PHI would have reached the LLM verbatim. Fixed (`855b6eb`):
+`is_lex_billing` made unconditional on the 4 LLM-egress screens; the 2 non-egress
+intake screens left entity-gated (avoids over-refusing legit non-LEX billing facts).
+
+**Validation:** WS17-B's first 7am fire came back clean the same morning -- no re-flood
+(~65 new vs the old ~17k dump), 10 knowledge DMs (6 known_answer + 4 efficiency) vs 5
+EVER pre-WS17-B, rotation archived 94 rows; owner-routing began at the next fire by
+design (its floor initialized that morning).
+
+**DOCTRINE:** (1) an LLM-EGRESS screen must be unconditional on the content class --
+entity-gating belongs only on non-egress intake surfaces (the D-066 doctrine-2 "3
+consecutive builds" count includes this instance); (2) the D-011 thumbs-up is the write
+gate for EVERY knowledge item, machine-mined or team-contributed -- auto-approve on
+canonical knowledge is retired; (3) fold parallel contribution queues into the one
+gated pipeline rather than maintaining a second approver surface.
+
+
 ## D-061 - Per-person involvement dossier (North Star pillar 4): cora_person_dossier + weekly refresh (2026-06-30)
 
 **Context:** Re-homes the per-person involvement / founder check-in capability from the
