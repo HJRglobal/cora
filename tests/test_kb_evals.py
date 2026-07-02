@@ -203,9 +203,14 @@ class TestIsolation:
                           "slack_sdk", "WebClient"):
             assert forbidden not in src, f"run_kb_evals.py must not use {forbidden}"
 
-    def test_runner_sets_eval_mode_before_cora_imports(self):
+    def test_runner_sets_eval_mode_after_dotenv_before_cora(self):
+        # Ordering contract: AFTER load_dotenv(override=True) so a stray .env
+        # line can't clobber the isolation flag, BEFORE the src path insert /
+        # any cora import so every call-time gate is armed.
         src = (Path(_SCRIPTS) / "run_kb_evals.py").read_text(encoding="utf-8")
-        assert src.index('os.environ["CORA_EVAL_MODE"]') < src.index("from dotenv")
+        set_at = src.index('os.environ["CORA_EVAL_MODE"]')
+        assert src.index("load_dotenv(_REPO_ROOT") < set_at
+        assert set_at < src.index('sys.path.insert(0, str(_REPO_ROOT / "src"))')
 
 
 # ── summary / newly-failing state ────────────────────────────────────────────
@@ -222,10 +227,49 @@ class TestSummary:
         assert s["passed"] == 1 and s["failed"] == 2
         assert s["skipped_l2_only"] == 1
 
+    def test_skipped_l2_case_keeps_failing_status(self):
+        # Adversarial review LOW: a previously-failing L2-only case skipped by
+        # a scheduled non---answers run must NOT be announced as "fixed".
+        results = [{"id": "a", "ok": True}, {"id": "l2case", "ok": None}]
+        s = rke.summarize(results, prev_failing={"l2case"})
+        assert s["fixed_since_last"] == []
+        assert "l2case" in s["failing_ids"]
+        assert s["still_failing_unevaluated"] == ["l2case"]
+        assert s["newly_failing"] == []
+
+    def test_corpus_load_error_goes_red(self):
+        s = rke.summarize([{"id": "a", "ok": True}], prev_failing=set(),
+                          load_errors=["golden-set.yaml failed to parse: boom"])
+        msg = rke.format_slack_summary(s)
+        assert "corpus load ERROR" in msg
+        assert "white_check_mark" not in msg
+
     def test_slack_summary_renders(self):
         s = rke.summarize([{"id": "a", "ok": True}], prev_failing=set())
         msg = rke.format_slack_summary(s)
         assert "KB evals" in msg and "1/1 passed" in msg
+
+    def test_load_errors_surface_for_broken_hand_file(self, tmp_path, monkeypatch):
+        # A broken HAND corpus is a harness error, never a silent shrink
+        # (adversarial review MEDIUM).
+        evals = tmp_path / "evals"
+        evals.mkdir()
+        (evals / "golden-set.yaml").write_text("cases: [unclosed",
+                                               encoding="utf-8")
+        monkeypatch.setattr(rke, "_EVALS_DIR", evals)
+        errors: list[str] = []
+        cases = rke.load_cases(load_errors=errors)
+        assert cases == []
+        assert errors and "failed to parse" in errors[0]
+
+    def test_numeric_expect_substring_does_not_crash(self):
+        with patch("cora.context_loader.load_context_parts",
+                   return_value=("size is 2880 wide", "")):
+            ok, detail = rke.run_l1_case({
+                "id": "x", "entity": "F3E", "question": "size?",
+                "expect_substring": 2880,   # unquoted YAML numeric scalar
+            })
+        assert ok is True
 
 
 # ── golden-set auto-growth ───────────────────────────────────────────────────

@@ -475,14 +475,40 @@ def should_escalate(gap: dict[str, Any]) -> bool:
     question text to a domain owner, and a question asked in a private DM must
     not be re-broadcast to a third party. Mining stays allowed (its output is
     Harrison-gated, D-011).
+
+    WS-1 review (R1b): company-finance gaps never escalate either. The
+    unknown_response detector now reliably logs finance-tool misses (the
+    locked UNKNOWN_RESPONSE) from TIER_1 channels, and an escalation DM would
+    quote that restricted-finance question to a domain owner who may be
+    financials-blocked (D-064). The D-064 canon matcher decides; the finance
+    unknown already has its own #hjrg-finance notification loop, and mining
+    stays allowed (Harrison-gated).
     """
     entity = (gap.get("entity") or "").strip().upper()
     if entity.startswith("LEX"):
         return False
     if gap.get("private_source") or (gap.get("channel") or "").strip().lower() == "dm":
         return False
+    # kb_miss gaps are mining-only telemetry, never an owner ask: the detector
+    # is retrieval-side and can fire on a question Cora answered correctly
+    # from static context -- DMing an owner to supply an answer Cora already
+    # gave is pure noise (adversarial review MEDIUM). unknown_response and
+    # llm_sentinel gaps reflect an actual failed answer and stay eligible.
+    if gap.get("detector") == "kb_miss":
+        return False
     text = f"{gap.get('question', '')} {gap.get('gap', '')}"
-    if is_phi_risk(text):
+    # Same 3-predicate PHI union as the write gates (adversarial review HIGH:
+    # is_phi_risk alone misses bare clinical terms + named-person admin-PHI,
+    # and escalation quotes this text verbatim to a possibly-non-custodian).
+    if is_phi_risk(text) or is_clinical_phi(text) or is_lex_billing_status_phi(text):
+        return False
+    try:
+        from .user_access import _financials_is_blocked
+        if _financials_is_blocked(text.lower()):
+            return False
+    except Exception:  # noqa: BLE001 -- fail CLOSED on a guard error
+        log.warning("gap_autofill: finance screen errored -- not escalating",
+                    exc_info=True)
         return False
     return gap_age_hours(gap) >= ESCALATE_AFTER_HOURS
 

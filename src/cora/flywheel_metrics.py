@@ -90,7 +90,10 @@ def _paths(repo_root: Path | None = None) -> dict[str, Path]:
 
 
 def _iter_jsonl(path: Path):
-    """Yield parsed records from a JSONL file; malformed lines are skipped."""
+    """Yield parsed dict records from a JSONL file; malformed lines and
+    valid-JSON-but-non-dict lines (a bare 'null'/'[]' from a partial write) are
+    skipped -- one bad line must never abort a whole gauge scan (adversarial
+    review LOW)."""
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -98,9 +101,11 @@ def _iter_jsonl(path: Path):
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(rec, dict):
+                    yield rec
     except OSError:
         return
 
@@ -143,8 +148,18 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     expired_unrouted_7d = 0
     routed_7d = 0
     try:
+        # A rotation crash window can leave the same row in BOTH files (archive
+        # is appended first, live rewritten second) -- dedup by update_id so
+        # the 7d gauges never double-count (adversarial review LOW). First
+        # occurrence (live file) wins.
+        counted_ids: set[str] = set()
         for path in (p["ledger_live"], p["ledger_archive"]):
             for rec in _iter_jsonl(path):
+                uid = rec.get("update_id") or ""
+                if uid:
+                    if uid in counted_ids:
+                        continue
+                    counted_ids.add(uid)
                 if path is p["ledger_live"] and rec.get("state") == "PENDING":
                     pending_total += 1
                 proposed_at = _parse_iso(rec.get("proposed_at") or "")

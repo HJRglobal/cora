@@ -661,6 +661,18 @@ def check_flywheel() -> list[CheckResult]:
         results = [
             CheckResult("Flywheel", "warn", msg) for _sev, msg in alarms
         ]
+        # WS-3 guard: this script loads .env (override=True), so if
+        # CORA_EVAL_MODE ever lands in .env (the HEALTH_PING_URL
+        # template-append precedent), it is visible here -- and the BOT would
+        # silently offer ZERO tools on its next restart. Catch it within 24h.
+        if os.environ.get("CORA_EVAL_MODE"):
+            results.append(CheckResult(
+                "Flywheel", "critical",
+                "CORA_EVAL_MODE is set in this environment -- if it is in "
+                ".env, the bot offers NO tools after its next restart. "
+                "Remove the line (only scripts/run_kb_evals.py may set it, "
+                "in-process).",
+            ))
         # One info-level OK line carrying the gauge numbers either way.
         summary = "; ".join(fm.format_lines(metrics)[:3])
         results.append(CheckResult(

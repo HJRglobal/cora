@@ -601,7 +601,11 @@ def _dispatch_qa(
         response_text = _extract_and_log_gap(
             response_text, entity, channel_name, user_id, user_message, latency_ms,
             kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
-            thread_key=f"{channel_id}:{register_ts}",
+            # No thread root (e.g. /cora-ask) -> no thread key; "C123:None"
+            # would collapse every slash-command ask in a channel into one
+            # 48h dedup bucket (adversarial review LOW).
+            thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+            thread_context=bool(prior_messages),
         )
         # D-032 / Phase 2.1: conversational replies pass through the deterministic
         # voice formatter; only genuine verbatim-table tools bypass it. The old
@@ -687,7 +691,8 @@ def _dispatch_qa(
     response_text = _extract_and_log_gap(
         response_text, entity, channel_name, user_id, user_message, latency_ms,
         kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
-        thread_key=f"{channel_id}:{register_ts}",
+        thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+        thread_context=bool(prior_messages),
     )
     # D-032 / Phase 2.1: conversational replies pass through the deterministic
     # voice formatter; only genuine verbatim-table tools bypass it (used_verbatim_tool,
@@ -996,6 +1001,7 @@ def _extract_and_log_gap(
     gen_meta: dict | None = None,
     is_dm: bool = False,
     thread_key: str = "",
+    thread_context: bool = False,
 ) -> str:
     """Pull the [CORA_KNOWLEDGE_GAP: ...] sentinel out of the response (if
     present), log the gap, and return the cleaned response text.
@@ -1022,6 +1028,7 @@ def _extract_and_log_gap(
             gen_meta=gen_meta,
             is_dm=is_dm,
             thread_key=thread_key,
+            thread_context=thread_context,
         )
         return response_text
     gap_desc = match.group(1).strip()

@@ -174,6 +174,17 @@ class TestDeflectionVeto:
                        response="That’s a legal matter. Reach Emily Stubbs.",
                        kb_meta=_kb_miss_meta()) is None
 
+    def test_interior_bold_deflection_vetoed(self, _isolated_state):
+        # The prompt contract sanctions interior *bold*; markers must not
+        # split the veto patterns (adversarial review MEDIUM).
+        for reply in (
+            "That's *company financials* - take it to the finance channel.",
+            "That's a *legal matter*. Reach Emily Stubbs.",
+            "I'm *not able* to discuss that.",
+        ):
+            assert _detect(_isolated_state, response=reply,
+                           kb_meta=_kb_miss_meta()) is None, reply
+
     def test_long_answer_containing_channel_hint_not_vetoed(self, _isolated_state):
         # The deflection veto only applies to short replies; a substantive
         # answer that happens to reference a channel is not a deflection.
@@ -194,6 +205,45 @@ class TestScopeVetoes:
     def test_phi_question_never_logged(self, _isolated_state, monkeypatch):
         monkeypatch.setattr(gd, "is_phi_risk", lambda text: True)
         assert _detect(_isolated_state, kb_meta=_kb_miss_meta()) is None
+
+    def test_clinical_phi_question_never_logged(self, _isolated_state, monkeypatch):
+        # Adversarial review HIGH: is_phi_risk alone misses bare clinical
+        # terms; all THREE predicates must screen the question.
+        monkeypatch.setattr(gd, "is_clinical_phi", lambda text: True)
+        assert _detect(_isolated_state, kb_meta=_kb_miss_meta()) is None
+
+    def test_admin_phi_question_never_logged(self, _isolated_state, monkeypatch):
+        monkeypatch.setattr(gd, "is_lex_billing_status_phi", lambda text: True)
+        assert _detect(_isolated_state, kb_meta=_kb_miss_meta()) is None
+
+    def test_real_clinical_text_screened(self, _isolated_state):
+        # End-to-end with the real detector: a clinical question in a NON-LEX
+        # channel must not enter the gap log.
+        det = _detect(_isolated_state, entity="HJRG",
+                      question="our client was diagnosed with autism and takes risperidone",
+                      kb_meta=_kb_miss_meta())
+        assert det is None
+        assert not _read_gaps(_isolated_state)
+
+    def test_thread_context_skips_kb_miss(self, _isolated_state):
+        # The answer source was the thread itself (prior_messages), invisible
+        # to kb_relevant_hits (adversarial review MEDIUM).
+        det = gd.maybe_log_gap(
+            entity="F3E", channel="f3e-leadership", user="U1",
+            question=QUESTION, response_text="answered from the thread above, in detail",
+            latency_ms=10, kb_meta=_kb_miss_meta(), gen_meta={},
+            is_dm=False, thread_key="", thread_context=True,
+        )
+        assert det is None
+
+    def test_thread_context_does_not_block_unknown_response(self, _isolated_state):
+        det = gd.maybe_log_gap(
+            entity="F3E", channel="f3e-leadership", user="U1",
+            question=QUESTION, response_text=gd.UNKNOWN_RESPONSE_TEXT,
+            latency_ms=10, kb_meta={}, gen_meta={},
+            is_dm=False, thread_key="", thread_context=True,
+        )
+        assert det == "unknown_response"
 
     @pytest.mark.parametrize("msg", [
         "thanks!", "ok", "hello", "good morning", "got it", "ping",
@@ -243,6 +293,22 @@ class TestDedupAndCap:
             (_isolated_state / "gap_detection_state.json").read_text(encoding="utf-8"))
         assert state["count"] == 3
         assert state["overflow"] == 2
+
+    def test_capped_question_can_log_tomorrow(self, _isolated_state, monkeypatch):
+        # Adversarial review MEDIUM: a cap hit must NOT record the dedup key,
+        # or the capped question is silently suppressed for the 7d window.
+        monkeypatch.setenv("CORA_GAP_DETECT_DAILY_CAP", "1")
+        assert _detect(_isolated_state, kb_meta=_kb_miss_meta()) == "kb_miss"
+        capped_q = "a second distinct substantive question about vendors"
+        assert _detect(_isolated_state, question=capped_q,
+                       kb_meta=_kb_miss_meta()) is None  # capped
+        # New day: the previously-capped question logs.
+        path = _isolated_state / "gap_detection_state.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["day"] = "2000-01-01"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        assert _detect(_isolated_state, question=capped_q,
+                       kb_meta=_kb_miss_meta()) == "kb_miss"
 
     def test_cap_resets_on_new_day(self, _isolated_state, monkeypatch):
         monkeypatch.setenv("CORA_GAP_DETECT_DAILY_CAP", "1")
@@ -300,6 +366,50 @@ class TestDmPrivacy:
         gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "F3E",
                "channel": "f3e-leadership", "question": "q", "gap": "g"}
         assert ga.should_escalate(gap) is True
+
+    def test_company_finance_gap_never_escalates(self):
+        # Adversarial review MEDIUM (R1b): the unknown_response detector now
+        # reliably logs finance-tool misses from TIER_1 channels; escalation
+        # must never quote a company-finance question to a domain owner
+        # (D-064 canon decides).
+        gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "F3E",
+               "channel": "f3e-finance",
+               "question": "what was our net cash burn last week?", "gap": "g"}
+        assert ga.should_escalate(gap) is False
+
+    def test_commercial_money_gap_still_escalates(self):
+        # D-064 precision: deal-level money talk is NOT company finance.
+        gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "F3E",
+               "channel": "f3e-sales",
+               "question": "did SJ Food Brokers pay invoice 8562 yet?", "gap": "g"}
+        assert ga.should_escalate(gap) is True
+
+    def test_finance_screen_error_fails_closed(self, monkeypatch):
+        import cora.user_access as ua
+        monkeypatch.setattr(ua, "_financials_is_blocked",
+                            lambda t: (_ for _ in ()).throw(RuntimeError("boom")))
+        gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "F3E",
+               "channel": "f3e-leadership", "question": "q", "gap": "g"}
+        assert ga.should_escalate(gap) is False
+
+    def test_kb_miss_gaps_never_escalate(self):
+        # kb_miss = mining-only telemetry (can fire on a correctly-answered
+        # question); only unknown_response / llm_sentinel gaps reach owners.
+        gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "F3E",
+               "channel": "f3e-leadership", "question": "q", "gap": "g",
+               "detector": "kb_miss"}
+        assert ga.should_escalate(gap) is False
+        gap["detector"] = "unknown_response"
+        assert ga.should_escalate(gap) is True
+
+    def test_clinical_phi_gap_never_escalates(self):
+        # Adversarial review HIGH (second half): the escalation screen uses
+        # the same 3-predicate union as the write gates.
+        gap = {"ts": "2026-06-01T00:00:00+00:00", "entity": "HJRG",
+               "channel": "hjrg-leadership",
+               "question": "was Jalen diagnosed with autism and given risperidone?",
+               "gap": "g"}
+        assert ga.should_escalate(gap) is False
 
 
 # ── gap TTL ──────────────────────────────────────────────────────────────────

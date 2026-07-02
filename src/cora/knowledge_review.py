@@ -55,6 +55,12 @@ _ARCHIVE_IDS_KEY: tuple[str, float] | None = None  # (archive path, mtime)
 
 
 def _ids_in_file(path: Path) -> set[str]:
+    """update_ids in one ledger file. A MISSING file is an empty set (normal
+    for a fresh repo); any OTHER read error RAISES -- after the WS-4 expiry +
+    rotation, the archive is the SOLE idempotency barrier for thousands of
+    drive-fact ids, and failing open (empty set) on a transient read error
+    would let a producer silently re-propose the whole population. A loud
+    failure aborts that propose and retries next run (watermark held)."""
     ids: set[str] = set()
     try:
         with path.open(encoding="utf-8") as fh:
@@ -66,10 +72,12 @@ def _ids_in_file(path: Path) -> set[str]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 uid = rec.get("update_id")
                 if uid:
                     ids.add(uid)
-    except OSError:
+    except FileNotFoundError:
         pass
     return ids
 

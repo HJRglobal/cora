@@ -60,7 +60,7 @@ from pathlib import Path
 from threading import Lock
 
 from . import knowledge_gaps
-from .phi_guard import is_phi_risk
+from .phi_guard import is_phi_risk, is_clinical_phi, is_lex_billing_status_phi
 
 log = logging.getLogger(__name__)
 
@@ -97,9 +97,11 @@ def _daily_cap() -> int:
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _SMALLTALK_RE = re.compile(
     r"^(hi|hiya|hello|hey|yo|sup|thanks?|thank you|thx|ty|ok(ay)?|k|cool|nice|"
-    r"great|perfect|awesome|good (morning|afternoon|evening|night)|gm|"
-    r"got it|sounds good|will do|no problem|np|lol|haha+|yes|no|yep|nope|"
-    r"sure|done|test(ing)?|ping)[\s!.,;:)?]*$",
+    r"great|perfect|awesome|good (morning|afternoon|evening|night)( (team|all|everyone))?|gm|"
+    r"got it|sounds good|will do|no problem|np|lol|haha+( that'?s \w+)?|yes|no|yep|nope|"
+    r"sure|done|test(ing)?|ping|"
+    r"can you help( me)?( real quick| out)?|what do you think|"
+    r"thanks so much( for the help)?|appreciate (it|you))[\s!.,;:)?]*$",
     re.IGNORECASE,
 )
 
@@ -194,8 +196,14 @@ _DEFLECTION_RES = [
 
 
 def _normalize_reply(text: str) -> str:
-    """Fold typographic quotes so shape regexes match either form."""
-    return (text or "").replace("’", "'").replace("‘", "'").strip()
+    """Fold typographic quotes AND strip emphasis markers so shape regexes match
+    either form. Detection runs on RAW pre-format_reply LLM output, and the
+    prompt contract sanctions interior *bold* -- "That's *company financials*"
+    must still match the deflection veto (adversarial review MEDIUM: bold
+    markers split every verbatim-anchored pattern)."""
+    t = (text or "").replace("’", "'").replace("‘", "'")
+    t = t.replace("*", "").replace("_", "").replace("`", "")
+    return t.strip()
 
 
 def is_deflection(response_text: str) -> bool:
@@ -274,8 +282,10 @@ def register_detection(entity: str, question: str) -> bool:
             state["recent"] = recent
             _save_state(state)
             return False
-        recent[key] = now.isoformat()
         state["recent"] = recent
+        # Cap check BEFORE recording the dedup key (adversarial review MEDIUM:
+        # recording it on a cap hit silently suppressed a capped question for
+        # the whole 7-day window instead of letting it log tomorrow).
         if int(state.get("count") or 0) >= _daily_cap():
             state["overflow"] = int(state.get("overflow") or 0) + 1
             _save_state(state)
@@ -284,6 +294,8 @@ def register_detection(entity: str, question: str) -> bool:
                 _daily_cap(), state["overflow"],
             )
             return False
+        recent[key] = now.isoformat()
+        state["recent"] = recent
         state["count"] = int(state.get("count") or 0) + 1
         _save_state(state)
         return True
@@ -323,8 +335,13 @@ def maybe_log_gap(
     gen_meta: dict | None = None,
     is_dm: bool = False,
     thread_key: str = "",
+    thread_context: bool = False,
 ) -> str | None:
     """Run the deterministic detectors; log at most one gap. Never raises.
+
+    thread_context=True means prior thread messages were in the LLM context --
+    kb_miss is skipped there (the answer source is the thread itself, invisible
+    to kb_relevant_hits; adversarial review MEDIUM).
 
     Returns the detector name when a gap was logged, else None.
     """
@@ -333,7 +350,7 @@ def maybe_log_gap(
             entity=entity, channel=channel, user=user, question=question,
             response_text=response_text, latency_ms=latency_ms,
             kb_meta=kb_meta or {}, gen_meta=gen_meta or {},
-            is_dm=is_dm, thread_key=thread_key,
+            is_dm=is_dm, thread_key=thread_key, thread_context=thread_context,
         )
     except Exception:  # noqa: BLE001 -- instrumentation must never break Q&A
         log.warning("gap_detection: detector error (non-fatal)", exc_info=True)
@@ -352,6 +369,7 @@ def _maybe_log_gap_inner(
     gen_meta: dict,
     is_dm: bool,
     thread_key: str,
+    thread_context: bool = False,
 ) -> str | None:
     # Eval harness traffic never logs gaps (WS-3 isolation, lens R3).
     if os.environ.get("CORA_EVAL_MODE") == "1":
@@ -369,7 +387,15 @@ def _maybe_log_gap_inner(
         return None
 
     # Belt-and-braces: PHI-flagged question text never enters the gap log.
-    if is_phi_risk(question):
+    # ALL THREE predicates, entity-agnostic (adversarial review HIGH:
+    # is_phi_risk alone misses bare clinical terms -- autism/risperidone/ADHD
+    # -- and named-person billing/authorization admin-PHI; that is exactly why
+    # is_clinical_phi and is_lex_billing_status_phi exist, and this log flows
+    # to Haiku + owner DMs + eval seeds. A missed legit gap is a far cheaper
+    # error than PHI in an egress-bound file -- same posture as
+    # apply_contributed_note's 3-predicate write gate).
+    if (is_phi_risk(question) or is_clinical_phi(question)
+            or is_lex_billing_status_phi(question)):
         log.debug("gap_detection: question flagged PHI -- skipped")
         return None
 
@@ -389,8 +415,10 @@ def _maybe_log_gap_inner(
         and not kb_meta.get("kb_notes_hit")
         and not kb_meta.get("cross_entity_fallback")
         and not gen_meta.get("used_tools")
+        and not thread_context
     ):
-        # Retrieval genuinely missed and no tool supplied the answer.
+        # Retrieval genuinely missed and no other answer source (tool, note,
+        # fallback, prior thread messages) was in play.
         detector = "kb_miss"
         gap_desc = ("KB retrieval returned no relevant content "
                     "(0 chunks passed the distance gate)")

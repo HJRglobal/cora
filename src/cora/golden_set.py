@@ -127,7 +127,10 @@ def append_case_from_known_answer(payload: dict[str, Any]) -> bool:
             log.info("golden_set: known_answer case skipped -- %s", reason)
             return False
         gap_ts = (payload.get("gap_ts") or "").strip()
-        suffix = (re.sub(r"[^0-9]", "", gap_ts)[:14]
+        # Full digit string (incl. microseconds) -- truncating to seconds made
+        # two same-second approvals collide and silently drop the second case
+        # (adversarial review LOW).
+        suffix = (re.sub(r"[^0-9]", "", gap_ts)[:20]
                   or hashlib.md5(f"{question}|{answer}".encode()).hexdigest()[:12])
         return _append_case({
             "id": f"auto-ka-{suffix}",

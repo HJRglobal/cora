@@ -388,6 +388,11 @@ def normalize_slack_bold(text: str) -> str:
     work = _SLACK_TOKEN_RE.sub(_protect, work)
     work = _BOLD_STAR_RE.sub(r"*\1*", work)
     work = _BOLD_UNDER_RE.sub(r"*\1*", work)
-    for i, tok in enumerate(tokens):
-        work = work.replace(_PLACEHOLDER.format(i), tok)
+    # Restore in REVERSE creation order: a later protection pass can capture an
+    # earlier placeholder inside its span (unbalanced backticks around a fence),
+    # so the outermost token must be re-expanded first or the inner placeholder
+    # literal leaks into the output and its content is lost (adversarial
+    # review LOW).
+    for i in range(len(tokens) - 1, -1, -1):
+        work = work.replace(_PLACEHOLDER.format(i), tokens[i])
     return work

@@ -66,6 +66,17 @@ class TestNormalizeSlackBold:
         # conservative reading: an unterminated fence is not a real block).
         assert "*inside unterminated*" in out
 
+    def test_nested_placeholder_restores_cleanly(self):
+        # Adversarial review LOW: unbalanced backticks around a fence let the
+        # inline-code pass capture the fence's placeholder inside its own
+        # span; restoration must run in reverse order or a literal NUL
+        # placeholder leaks and the fence content is lost.
+        text = "price 5` ```revenue table``` `discount **b**"
+        out = normalize_slack_bold(text)
+        assert "\x00" not in out
+        assert "revenue table" in out
+        assert "*b*" in out
+
 
 class TestWiring:
     def test_briefing_synthesize_normalizes(self, monkeypatch):

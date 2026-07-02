@@ -153,6 +153,30 @@ class TestCollect:
         m = fm.collect(now=NOW, repo_root=repo)
         assert m["pending_growth_7d"] == 3  # 4 pending now vs 1 a week ago
 
+    def test_non_dict_ledger_line_does_not_kill_gauges(self, repo):
+        # Adversarial review LOW: a valid-JSON non-dict line ('null', '[]')
+        # must be skipped, not abort the whole ledger scan.
+        ledger = repo / "data" / "cora-proposed-memory-updates.jsonl"
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write("null\n[]\n\"stray\"\n")
+        m = fm.collect(now=NOW, repo_root=repo)
+        assert "ledger_error" not in m
+        assert m["knowledge_dms_7d"] == 3
+
+    def test_rotation_crash_duplicate_not_double_counted(self, repo):
+        # Adversarial review LOW: the same row in live AND archive (rotation
+        # crash window) must count once.
+        recent = NOW - timedelta(days=2)
+        dup = {"update_id": "gapfill-1", "update_type": "known_answer",
+               "state": "DISMISSED", "proposed_at": recent.isoformat(),
+               "resolved_at": recent.isoformat(),
+               "dm_message_ts": _slack_ts(recent)}
+        with (repo / "data" / "cora-proposed-memory-updates.archive.jsonl").open(
+                "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dup) + "\n")
+        m = fm.collect(now=NOW, repo_root=repo)
+        assert m["knowledge_dms_7d"] == 3  # unchanged despite the dup row
+
     def test_missing_everything_degrades(self, tmp_path, monkeypatch):
         monkeypatch.delenv("KNOWLEDGE_GAPS_LOG_PATH", raising=False)
         monkeypatch.delenv("GAP_DETECTION_STATE_PATH", raising=False)

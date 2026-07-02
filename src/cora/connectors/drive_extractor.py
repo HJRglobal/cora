@@ -571,6 +571,11 @@ def run_proposal_loop(
                 fact_id[:12], fact_type, confidence,
             )
             stats["proposed"] += 1
+            # Count toward the cap in dry-run too, so the preview matches what
+            # a real run would actually do (adversarial review LOW; dry-run
+            # cannot see idempotency dedup, so it still over-reports when many
+            # candidates were already proposed -- logged, accepted).
+            newly_proposed += 1
             continue
 
         try:
