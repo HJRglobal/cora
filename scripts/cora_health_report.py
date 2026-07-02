@@ -350,6 +350,21 @@ def scheduled_tasks() -> dict:
     }
 
 
+def flywheel_metrics_section() -> dict:
+    """Knowledge-flywheel throughput (WS-2) -- computed by cora.flywheel_metrics
+    so this report and the nightly health check share ONE set of numbers and
+    thresholds. Read-only here (update_baseline=False; the nightly check owns
+    the daily pending-size baseline write)."""
+    try:
+        from cora import flywheel_metrics as fm
+        metrics = fm.collect(update_baseline=False)
+        metrics["alarm_lines"] = [msg for _sev, msg in fm.evaluate(metrics)]
+        metrics["display_lines"] = fm.format_lines(metrics)
+        return metrics
+    except Exception as exc:  # noqa: BLE001 -- fail-soft convention (see kb_corpus)
+        return {"available": False, "reason": str(exc)}
+
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -395,6 +410,11 @@ def threshold_alarms(report: dict) -> list[str]:
             f"up to {sch['max_concurrent_in_window']} tasks share a clock time in "
             f"the 03:00-09:00 window; collisions at {times} -- stagger them."
         )
+    # Flywheel alarms come pre-evaluated by cora.flywheel_metrics (WS-2) so the
+    # thresholds are single-sourced with the nightly health check.
+    fw = report.get("flywheel", {})
+    if fw.get("available"):
+        alarms.extend(f"FLYWHEEL: {msg}" for msg in fw.get("alarm_lines", []))
     return alarms
 
 
@@ -445,6 +465,17 @@ def format_slack(report: dict) -> str:
             f"*Tasks:* {sch['cora_task_count']} cora | "
             f"{len(sch.get('early_window_0300_0900', []))} in 03:00-09:00 | "
             f"peak {sch.get('max_concurrent_in_window', 0)} at one clock time"
+        )
+    fw = report.get("flywheel", {})
+    if fw.get("available"):
+        lines.append(
+            f"*Flywheel:* knowledge DMs 7d {fw.get('knowledge_dms_7d', '?')} | "
+            f"gaps newest "
+            + (f"{fw['gaps_last_entry_age_days']:.0f}d"
+               if fw.get("gaps_last_entry_age_days") is not None else "n/a")
+            + f" | mined 7d {fw.get('gap_autofill_proposed_7d', '?')} | "
+            f"shadow {fw.get('shadow_records', 0)}rec/{fw.get('shadow_days', 0)}d | "
+            f"PENDING {fw.get('pending_total', '?')}"
         )
     lines.append(f"_token method: {report.get('token_method')}_")
     return "\n".join(lines)
@@ -560,6 +591,15 @@ def render(report: dict) -> None:
         for t in st["early_window_0300_0900"]:
             print(f"      {t['name']:<40} {t['next_run']}")
 
+    # 7. flywheel
+    fw = report.get("flywheel", {})
+    print("\n[7] FLYWHEEL (knowledge-loop throughput)")
+    if not fw.get("available"):
+        print(f"    unavailable: {fw.get('reason')}")
+    else:
+        for line in fw.get("display_lines", []):
+            print(f"    {line}")
+
     print("\n" + "=" * 72)
 
 
@@ -573,6 +613,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "billing": recent_billing(log_days),
         "state": state_sizes(),
         "scheduled_tasks": scheduled_tasks(),
+        "flywheel": flywheel_metrics_section(),
     }
     report["alarms"] = threshold_alarms(report)
     return report
