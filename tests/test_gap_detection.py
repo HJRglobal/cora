@@ -136,6 +136,221 @@ class TestUnknownResponse:
         assert gd.UNKNOWN_RESPONSE_TEXT == UNKNOWN_RESPONSE
 
 
+# ── unknown_response length-INDEPENDENCE (D-066 follow-up calibration hotfix) ──
+#
+# The 2026-07-02 #cora-build smokes proved the blanket _UNKNOWN_MAX_CHARS gate
+# skipped the archetypal miss: Cora's answer-first house style pads a genuine
+# "I don't have that" reply to 550-700 chars, so a 566-char locked-phrase reply
+# and a 657-char "I don't have that context." reply BOTH went undetected. The
+# fix runs the prefix-anchored openers regardless of length; the anywhere-in
+# containment path keeps the short-reply guard.
+
+# Rebuilt from the two live smokes (both >_UNKNOWN_MAX_CHARS, both real misses).
+_SMOKE_LOCKED_OPENER = (
+    gd.UNKNOWN_RESPONSE_TEXT
+    + " In the meantime, here are a few pointers you can chase: the office "
+      "facilities log, the standing ops SOP folder, and whoever currently owns "
+      "vendor onboarding. I've also flagged this so the right owner can add a "
+      "canonical answer, and once that lands I'll be able to answer it directly "
+      "the next time anyone asks in this channel or by DM."
+)  # opens with the exact locked phrase -> startswith(locked) path
+_SMOKE_THAT_CONTEXT = (
+    "I don't have that context. There's nothing in what I can see that covers "
+    "an official SOP for that, and I don't want to guess at something that "
+    "reads like a policy. Your best bets are the ops SOP folder in Drive, the "
+    "facilities/office-management owner, and the leadership channel for the "
+    "team that would own it -- any of those is more likely to have a definitive "
+    "answer, and I've noted the gap so it can be filled going forward."
+)  # opens with a prefix-anchored _UNKNOWN_RES shape -> regex path
+
+
+class TestUnknownResponseLengthIndependence:
+    def test_smoke_replies_are_long(self):
+        # Guard the fixtures themselves: both MUST exceed the old gate, or the
+        # test would pass trivially under the buggy code.
+        assert len(_SMOKE_LOCKED_OPENER) > gd._UNKNOWN_MAX_CHARS
+        assert len(_SMOKE_THAT_CONTEXT) > gd._UNKNOWN_MAX_CHARS
+
+    def test_long_locked_phrase_opener_fires(self, _isolated_state):
+        assert gd.is_unknown_response(_SMOKE_LOCKED_OPENER) is True
+        assert _detect(_isolated_state, response=_SMOKE_LOCKED_OPENER) == "unknown_response"
+
+    def test_long_that_context_opener_fires(self, _isolated_state):
+        # The exact 657-char smoke shape ("I don't have that context. ...").
+        assert gd.is_unknown_response(_SMOKE_THAT_CONTEXT) is True
+        assert _detect(_isolated_state, response=_SMOKE_THAT_CONTEXT) == "unknown_response"
+
+    def test_long_couldnt_find_opener_fires(self, _isolated_state):
+        reply = ("I couldn't find any record of that in what I can see. " +
+                 "Here is where to look instead: " + "the ops folder, " * 40)
+        assert len(reply) > gd._UNKNOWN_MAX_CHARS
+        assert gd.is_unknown_response(reply) is True
+
+    def test_long_reply_quoting_locked_phrase_midtext_not_unknown(self, _isolated_state):
+        # FALSE-POSITIVE GUARD: a long reply that EMBEDS the locked phrase as a
+        # quote (not the reply's own verdict) must NOT fire -- the containment
+        # path is length-capped, and the openers are prefix-anchored.
+        reply = ("Here is the full vendor picture for the Tucson site. " +
+                 "background " * 40 +
+                 " During the call Larry said, \"" + gd.UNKNOWN_RESPONSE_TEXT +
+                 "\" but the signed PO from Nimbl already confirms the order.")
+        assert len(reply) > gd._UNKNOWN_MAX_CHARS
+        assert gd.is_unknown_response(reply) is False
+        assert _detect(_isolated_state, response=reply) is None
+
+    def test_long_helpful_answer_with_the_determiner_still_not_unknown(self, _isolated_state):
+        # Regression companion to the existing short case: "I don't have THE
+        # exact figure, but here's the answer" opens with a determiner OUTSIDE
+        # the matched set (that/this/any/it), so a long helpful answer that
+        # merely notes a lack must still NOT fire even without the length gate.
+        reply = ("I don't have the exact figure at hand, but here is the full "
+                 "breakdown you need: " + "line item " * 60)
+        assert len(reply) > gd._UNKNOWN_MAX_CHARS
+        assert gd.is_unknown_response(reply) is False
+
+    def test_short_containment_still_fires(self):
+        # Behavior-preserving: a SHORT reply containing the locked phrase still
+        # fires via the length-capped containment path (unchanged pre/post-fix).
+        reply = "Per policy: " + gd.UNKNOWN_RESPONSE_TEXT
+        assert len(reply) <= gd._UNKNOWN_MAX_CHARS
+        assert gd.is_unknown_response(reply) is True
+
+
+class TestDeflectionCollisionAfterWidening:
+    """The widened unknown matcher must not swallow deflections. Deflection
+    openers ('That's...', 'I'm not able...', 'I don't speculate') are DISJOINT
+    from unknown openers ('I don't have that/this/any/it', 'I couldn't find',
+    'I have no record'), and the deflection veto still runs BEFORE the unknown
+    check."""
+
+    def test_long_deflection_opener_not_caught_by_widened_unknown(self):
+        # A long refusal opening with a deflection phrase must not read as an
+        # unknown_response (the openers do not overlap).
+        for opener in (
+            "That's company financials",
+            "That's a legal matter",
+            "I'm not able to discuss that",
+            "I don't speculate",
+        ):
+            reply = opener + ". " + "context " * 80  # > any length gate
+            assert len(reply) > gd._UNKNOWN_MAX_CHARS
+            assert gd.is_unknown_response(reply) is False, opener
+
+    def test_deflection_still_vetoes_when_it_opens_unknown_shaped(self, _isolated_state):
+        # A short reply that OPENS unknown-shaped but is really a deflection
+        # (contains a deflection phrase) is vetoed first -- deflection wins.
+        reply = ("I don't have that here. That's company financials -- ask in "
+                 "#f3e-finance.")
+        assert len(reply) <= gd._DEFLECTION_MAX_CHARS
+        assert _detect(_isolated_state, response=reply,
+                       kb_meta=_kb_miss_meta()) is None
+        assert not _read_gaps(_isolated_state)
+
+    def test_long_deflection_opening_unknown_shaped_not_unknown(self, _isolated_state):
+        # Adversarial review MED (Finding 2): is_deflection caps at 400 chars,
+        # but the widened unknown prefix path is length-independent. A >400-char
+        # blocked-topic reply that OPENS unknown-shaped AND carries a deflection
+        # phrase must NOT read as unknown_response (the in-predicate deflection
+        # re-check catches it where is_deflection's 400 cap misses).
+        reply = ("I don't have visibility into that here. That's company "
+                 "financials -- ask in #f3e-finance or bring it to Harrison. " +
+                 "background " * 45)
+        assert len(reply) > gd._DEFLECTION_MAX_CHARS
+        assert gd.is_unknown_response(reply) is False
+        # No kb_meta -> kb_miss can't fire either; the reply must not log at all.
+        assert _detect(_isolated_state, response=reply) is None
+
+
+class TestToolRefusalNotLogged:
+    """Adversarial review MED (Finding 1): the widened matcher would otherwise
+    log a tool's own "not found" relay as an unknown_response gap. Those are
+    tool RESULTS, not knowledge gaps, and the person_dossier relay carries a
+    person name into the egress-bound log. The unknown_response branch is gated
+    on used_tools (mirroring kb_miss), with an exception for the locked finance
+    phrase."""
+
+    def test_meeting_picklist_relay_with_tools_not_logged(self, _isolated_state):
+        # Mirrors meeting_actions.py:1376 ("I couldn't find a meeting matching
+        # ...") -- matches _UNKNOWN_RES[2], >350 chars, tool path.
+        reply = ("I couldn't find a meeting matching \"Q3 planning\" that you "
+                 "attended in the last 14 days. Here are the recent meetings you "
+                 "did attend -- reply with a number and I'll pull its action "
+                 "items: 1) F3 Weekly, 2) OSN Ops sync, 3) BDM leadership, "
+                 "4) Founder review, 5) HJRG finance weekly. If none of these is "
+                 "the one you meant, tell me the meeting name or date and I'll "
+                 "look again.")
+        assert len(reply) > gd._UNKNOWN_MAX_CHARS  # also the newly-exposed >350 case
+        assert _detect(_isolated_state, response=reply,
+                       gen_meta={"used_tools": True}) is None
+        assert not _read_gaps(_isolated_state)
+
+    def test_dossier_no_signals_relay_with_tools_not_logged(self, _isolated_state):
+        # Mirrors person_dossier.py:686 ("I don't have any reachable
+        # work-involvement signals for {name} ...") -- matches _UNKNOWN_RES[0]
+        # via "any" and carries a person name; must NOT enter the gap log.
+        reply = ("I don't have any reachable work-involvement signals for Jane "
+                 "Contractor in the last 90 days across what I can see. Nothing "
+                 "surfaced in email, calendar, or shared docs for that person.")
+        assert _detect(_isolated_state,
+                       question="what is jane contractor working on?",
+                       response=reply, gen_meta={"used_tools": True}) is None
+        assert not _read_gaps(_isolated_state)
+
+    def test_locked_finance_phrase_still_logs_even_with_tools(self, _isolated_state):
+        # The exception: the finance connector returning the exact locked
+        # UNKNOWN phrase IS the data-gap signal, even though a tool ran.
+        det = _detect(_isolated_state, response=gd.UNKNOWN_RESPONSE_TEXT,
+                      gen_meta={"used_tools": True})
+        assert det == "unknown_response"
+
+    def test_kb_miss_reply_no_tools_still_logs(self, _isolated_state):
+        # Guard against over-correction: a genuine KB-miss unknown reply with
+        # NO tool involved must still log (the main smoke path).
+        det = _detect(_isolated_state, response=_SMOKE_THAT_CONTEXT,
+                      gen_meta={})
+        assert det == "unknown_response"
+
+
+# ── kb_miss calibration fields (best_distance + chunks_returned) ─────────────
+
+def _kb_miss_meta_with_distance(best=1.057, returned=12):
+    m = _kb_miss_meta()
+    m["kb_best_distance"] = best
+    m["kb_chunks_returned"] = returned
+    return m
+
+
+class TestCalibrationFields:
+    def test_kb_miss_record_carries_distance_and_count(self, _isolated_state):
+        det = _detect(_isolated_state, kb_meta=_kb_miss_meta_with_distance())
+        assert det == "kb_miss"
+        rec = _read_gaps(_isolated_state)[0]
+        assert rec["best_distance"] == 1.057
+        assert rec["chunks_returned"] == 12
+
+    def test_unknown_response_record_carries_distance_when_search_ran(self, _isolated_state):
+        # The smoke case: retrieval DID run (12 chunks < gate) yet the reply was
+        # an unknown_response -- exactly the data that shows kb_miss's gate is
+        # unreachable. best_distance must ride along.
+        meta = {"kb_search_ran": True, "kb_relevant_hits": 12,
+                "kb_best_distance": 1.074, "kb_chunks_returned": 12}
+        det = _detect(_isolated_state, response=_SMOKE_THAT_CONTEXT, kb_meta=meta)
+        assert det == "unknown_response"
+        rec = _read_gaps(_isolated_state)[0]
+        assert rec["best_distance"] == 1.074
+        assert rec["chunks_returned"] == 12
+
+    def test_record_omits_fields_when_absent(self, _isolated_state):
+        # A tool-only / no-search path leaves the fields off the record entirely
+        # (pre-existing records + non-KB records stay clean).
+        det = _detect(_isolated_state, response=gd.UNKNOWN_RESPONSE_TEXT,
+                      kb_meta={}, gen_meta={"used_tools": True})
+        assert det == "unknown_response"
+        rec = _read_gaps(_isolated_state)[0]
+        assert "best_distance" not in rec
+        assert "chunks_returned" not in rec
+
+
 # ── deflection veto (guard refusals working as designed are NOT gaps) ───────
 
 _DEFLECTION_SAMPLES = [

@@ -1033,6 +1033,7 @@ def _extract_and_log_gap(
         return response_text
     gap_desc = match.group(1).strip()
     cleaned = _GAP_RE.sub("", response_text).rstrip()
+    _km = kb_meta or {}
     knowledge_gaps.log_gap(
         entity=entity,
         channel=channel_name,
@@ -1043,6 +1044,10 @@ def _extract_and_log_gap(
         latency_ms=latency_ms,
         detector="llm_sentinel",
         private_source=is_dm,
+        # kb_miss calibration (D-066 follow-up): same best-distance/count fields
+        # the detector path records, when retrieval ran on this sentinel reply.
+        best_distance=_km.get("kb_best_distance"),
+        chunks_returned=_km.get("kb_chunks_returned"),
     )
     # Per-user feedback attribution — enriches gap event with display name.
     # channel_id not available in this helper scope; best-effort with channel_name.

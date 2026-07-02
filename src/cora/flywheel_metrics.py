@@ -194,6 +194,12 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
         last_ts: datetime | None = None
         total = 0
         by_detector: dict[str, int] = {}
+        # NOTE (D-066 follow-up): kb_miss=0 here is EXPECTED for now, not a
+        # defect -- the kb_miss detector requires 0 chunks under the 1.30 gate,
+        # empirically unreachable at ~560K chunks. unknown_response carries the
+        # deterministic intake; kb_miss stays a dead backstop until it is
+        # recalibrated to a distance FLOOR from the best_distance data now on
+        # each gap record. Do not "fix" a kb_miss=0 breakdown.
         for rec in _iter_jsonl(p["gaps_log"]):
             total += 1
             det = rec.get("detector") or "llm_sentinel"

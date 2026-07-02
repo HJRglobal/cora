@@ -526,6 +526,18 @@ def _try_kb_retrieve(
         kb_meta["kb_search_ran"] = True
         kb_meta["kb_relevant_hits"] = len(relevant)
         kb_meta["kb_notes_hit"] = bool(notes_block)
+        # WS-1 kb_miss calibration (D-066 follow-up): the closest returned
+        # chunk's distance and the raw returned count, BOTH regardless of the
+        # _KB_MAX_DISTANCE gate. kb_miss requires 0 relevant hits, which is
+        # empirically unreachable at ~560K chunks (even orthogonal vocabulary
+        # retrieves ~12 chunks well under 1.08). These are instrumentation only
+        # -- NOT a gate change -- so a week of real best-distance data can
+        # calibrate kb_miss to a distance FLOOR with Harrison rather than a
+        # guess. Zero added retrieval work; distances are already computed.
+        kb_meta["kb_chunks_returned"] = len(results)
+        kb_meta["kb_best_distance"] = (
+            round(min(r.distance for r in results), 4) if results else None
+        )
     if not relevant and not notes_block:
         log.info("KB returned %d chunks but none passed distance threshold %.2f",
                  len(results), _KB_MAX_DISTANCE)

@@ -29,6 +29,8 @@ def log_gap(
     latency_ms: int,
     detector: str = "llm_sentinel",
     private_source: bool = False,
+    best_distance: float | None = None,
+    chunks_returned: int | None = None,
 ) -> None:
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -49,6 +51,16 @@ def log_gap(
         # DM-originated: gap_autofill must never quote this question to a
         # domain owner (mining stays allowed -- output is Harrison-gated).
         record["private_source"] = True
+    # WS-1 kb_miss calibration (D-066 follow-up): the closest returned chunk's
+    # distance + the raw returned count when a KB search ran. Recorded only when
+    # present (KB search ran) so pre-existing and non-KB records stay clean.
+    # kb_miss is currently unreachable (0 relevant hits never happens at ~560K
+    # chunks); a week of these best_distance values lets kb_miss be recalibrated
+    # to a distance FLOOR with Harrison. Neither field is PHI-bearing.
+    if best_distance is not None:
+        record["best_distance"] = best_distance
+    if chunks_returned is not None:
+        record["chunks_returned"] = chunks_returned
     path = _log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _LOCK:

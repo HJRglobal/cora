@@ -11,8 +11,12 @@ Two deterministic detectors run on every LLM-generated Q&A response, in code:
   kb_miss          -- KB retrieval ran and returned 0 chunks under the live
                       distance gate (no personal-note hit, no cross-entity
                       fallback, no tool involvement) for a substantive question.
-  unknown_response -- the whole reply is the locked UNKNOWN_RESPONSE phrase or
-                      a clear short "I don't have that" shape.
+  unknown_response -- the reply OPENS with the locked UNKNOWN_RESPONSE phrase
+                      or a prefix-anchored "I don't have that / I couldn't
+                      find / I have no record" shape (length-INDEPENDENT: Cora's
+                      answer-first house style, the 2026-06-30 format standard,
+                      pads a genuine miss reply to 550-700 chars), OR a short
+                      reply that merely contains the locked finance phrase.
 
 The existing sentinel path is KEPT as belt-and-braces; its records now carry
 detector="llm_sentinel".
@@ -143,8 +147,12 @@ UNKNOWN_RESPONSE_TEXT = (
     "updated answer when you ask again."
 )
 
-# A genuine unknown/no-data reply is one short statement, per the prompt
-# contract ("respond with this exact text and nothing else").
+# Short-reply guard for the ANYWHERE-in-reply containment path ONLY (a long
+# reply may quote/embed the locked phrase mid-text rather than assert it). The
+# prefix-anchored openers below run length-INDEPENDENTLY: an answer-first miss
+# reply that OPENS with the shape but runs 550-700 chars (Cora's 2026-06-30
+# format standard) was being silently skipped by a blanket length gate here --
+# the exact 2026-07-02 #cora-build smoke miss (D-066 follow-up).
 _UNKNOWN_MAX_CHARS = 350
 _UNKNOWN_RES = [
     re.compile(r"^i don'?t have (that|this|any|it)\b", re.IGNORECASE),
@@ -215,11 +223,33 @@ def is_deflection(response_text: str) -> bool:
 
 def is_unknown_response(response_text: str) -> bool:
     reply = _normalize_reply(response_text)
-    if not reply or len(reply) > _UNKNOWN_MAX_CHARS:
+    if not reply:
         return False
-    if _normalize_reply(UNKNOWN_RESPONSE_TEXT) in reply:
+    locked = _normalize_reply(UNKNOWN_RESPONSE_TEXT)
+    # (1) Length-INDEPENDENT: the reply OPENS with an unknown/no-data shape.
+    # The locked-phrase startswith and the _UNKNOWN_RES regexes are all anchored
+    # to the START of the reply, so they fire ONLY when the reply BEGINS with
+    # the shape -- never on a mid-text quote. A genuine miss reply that opens
+    # "I don't have that ..." then adds house-style pointers (550-700 chars)
+    # MUST detect; the old blanket length gate hid it (D-066 follow-up smoke).
+    if reply.startswith(locked) or any(rx.match(reply) for rx in _UNKNOWN_RES):
+        # A padded refusal that OPENS unknown-shaped but ALSO carries a
+        # deflection phrase is a guard working as designed, not a gap.
+        # is_deflection() caps at _DEFLECTION_MAX_CHARS (400); re-assert the
+        # veto here length-INDEPENDENTLY so a >400-char deflection can't slip
+        # past it now that the unknown length gate is gone (adversarial review
+        # MED). Safe: no _DEFLECTION_RES redirect phrase legitimately BEGINS
+        # with an unknown shape, so a genuine miss opener is never suppressed.
+        if any(rx.search(reply) for rx in _DEFLECTION_RES):
+            return False
         return True
-    return any(rx.match(reply) for rx in _UNKNOWN_RES)
+    # (2) ANYWHERE-in-reply containment KEEPS the short-reply guard: in a long
+    # reply the locked phrase may be quoted/embedded ("...she said 'I don't
+    # have that right now...' but the PO confirms it"), which is NOT the reply's
+    # own verdict, so a length cap prevents that false positive.
+    if len(reply) <= _UNKNOWN_MAX_CHARS and locked in reply:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +436,17 @@ def _maybe_log_gap_inner(
 
     detector: str | None = None
     gap_desc = ""
-    if is_unknown_response(response_text):
+    if is_unknown_response(response_text) and (
+            not gen_meta.get("used_tools")
+            or _normalize_reply(response_text).startswith(
+                _normalize_reply(UNKNOWN_RESPONSE_TEXT))):
+        # A tool-path reply counts as an unknown-gap ONLY when it is the LOCKED
+        # finance UNKNOWN phrase (the finance connector's genuine data-gap
+        # signal -- test_unknown_wins_even_with_tools pins this). A tool's own
+        # "no meeting found" / "no signals for {person}" relay is a tool RESULT,
+        # not a knowledge gap -- and a dossier relay carries a person name into
+        # this egress-bound log. Mirrors kb_miss's used_tools exclusion below
+        # (adversarial review MED: meeting_actions/person_dossier refusals).
         detector = "unknown_response"
         gap_desc = "Reply was an unknown/no-data response"
     elif (
@@ -430,6 +470,13 @@ def _maybe_log_gap_inner(
     if not register_detection(ent, question):
         return None
 
+    # kb_miss calibration data (D-066 follow-up): the closest returned chunk's
+    # distance + raw count when a KB search ran (set by context_loader). Present
+    # for kb_miss AND for unknown_response replies that also ran retrieval; None
+    # when no search ran (tool-only path). Instrumentation only -- no gating.
+    best_distance = kb_meta.get("kb_best_distance")
+    chunks_returned = kb_meta.get("kb_chunks_returned")
+
     knowledge_gaps.log_gap(
         entity=ent,
         channel=channel,
@@ -440,8 +487,11 @@ def _maybe_log_gap_inner(
         latency_ms=latency_ms,
         detector=detector,
         private_source=is_dm,
+        best_distance=best_distance,
+        chunks_returned=chunks_returned,
     )
     _mark_thread_logged(thread_key)
-    log.info("gap_detection: gap logged detector=%s entity=%s channel=#%s",
-             detector, ent, channel)
+    log.info("gap_detection: gap logged detector=%s entity=%s channel=#%s "
+             "best_distance=%s chunks_returned=%s",
+             detector, ent, channel, best_distance, chunks_returned)
     return detector
