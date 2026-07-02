@@ -354,6 +354,12 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "GOLDEN_SET_AUTO_PATH", str(tmp_path / "golden-set-auto.yaml")
     )
+    # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
+    # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
+    # it into the test process, short-circuiting run_proposal_loop and reddening
+    # every proposal-path test. Clear it so tests run against the CODE default
+    # (enabled); the pause-gate tests set/clear the var explicitly themselves.
+    monkeypatch.delenv("DRIVE_EXTRACTOR_PROPOSALS_ENABLED", raising=False)
     try:
         import cora.gap_detection as _gd
         _gd._THREAD_LOGGED.clear()
