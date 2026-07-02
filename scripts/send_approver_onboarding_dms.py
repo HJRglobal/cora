@@ -1,4 +1,12 @@
+# ── RETIRED by WS17-C (D-060, 2026-06-22) -- do not run ──────────────────────
+# The #cora-kq approver-card flow (✅/❌ per-entity approval) this script
+# onboarded the 9 approvers to was retired: team contributions now fold into
+# the ONE Harrison-gated knowledge queue (design/knowledge-pipeline.md).
+# Unregistered (no deployment/*.ps1) and no callers; kept for history.
+# Header added 2026-07-02 (hygiene session).
 """Send personalized knowledge-approver onboarding DMs to the 9 designated approvers.
+
+RETIRED by WS17-C (D-060) -- see the header comment above; do not run.
 
 Run once after the KQ channels and approval routing are deployed:
 

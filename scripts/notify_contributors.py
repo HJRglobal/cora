@@ -1,4 +1,11 @@
+# ── RETIRED by WS17-C (D-060, 2026-06-22) -- do not run ──────────────────────
+# The #cora-kq approver/contributor flow this script onboarded people to was
+# retired: team contributions now fold into the ONE Harrison-gated knowledge
+# queue (design/knowledge-pipeline.md). Unregistered (no deployment/*.ps1) and
+# no callers; kept for history. Header added 2026-07-02 (hygiene session).
 """One-shot script: DM every knowledge contributor their capabilities + tutorial.
+
+RETIRED by WS17-C (D-060) -- see the header comment above; do not run.
 
 Run once after #cora-kq-* channels are created and contributors.yaml is finalized:
 
