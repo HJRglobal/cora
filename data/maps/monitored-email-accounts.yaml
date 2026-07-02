@@ -21,6 +21,12 @@
 #
 # thread_sweep: true -- include in gmail_threaded_sweep.py nightly KB run
 # attachment_filer: true -- include in run_attachment_filer.py 4h run
+# fireflies_seat: true -- current Fireflies Enterprise seat-holder (10 as of the
+#   2026-07-01 right-size; decision doc 00-Founder/2026-07-01_fndr_fireflies-
+#   enterprise-maximization-plan.md). Scopes the weekly coverage monitor
+#   (run_fireflies_coverage.py): unflagged people stay in Gmail/Drive ingestion
+#   but are never Fireflies-nudged. Flag ONE entry per human -- the loader
+#   evaluates the flag across all of a person's collapsed alias entries.
 
 accounts:
 
@@ -36,6 +42,7 @@ accounts:
     entity_default: FNDR
     asana_gid: "1204525779609669"
     slack_user_id: U0B2RM2JYJ1
+    fireflies_seat: true
 
   - email: hannah@hjrglobal.com
     name: Hannah Grant
@@ -47,6 +54,7 @@ accounts:
     entity_default: FNDR
     asana_gid: "1209060959783860"
     slack_user_id: U0B3AEQS0NB
+    fireflies_seat: true
 
   - email: justin@hjrglobal.com
     name: Justin Moran
@@ -58,6 +66,7 @@ accounts:
     entity_default: FNDR
     asana_gid: "1209093537787112"
     slack_user_id: U0B3AEJCYGP
+    fireflies_seat: true
 
   - email: jeff@hjrglobal.com
     name: Jeff Montgomery
@@ -80,6 +89,7 @@ accounts:
     entity_default: FNDR
     asana_gid: "1211363033856346"
     slack_user_id: U0B3TPD2MEV
+    fireflies_seat: true
 
   # Larry Stone: primary @hjrglobal.com; BDM work also runs through larry@bigd.media
   - email: larry@hjrglobal.com
@@ -109,6 +119,7 @@ accounts:
       - larry@hjrglobal.com
     asana_gid: "1211265856484421"
     slack_user_id: U0B3NGR1Y85
+    fireflies_seat: true
 
   - email: matt@hjrglobal.com
     name: Matt Petrovich
@@ -150,6 +161,7 @@ accounts:
     entity_default: BDM
     asana_gid: "1213560435702029"
     slack_user_id: U0B3PS63F1C
+    fireflies_seat: true
 
   - email: jake@hjrglobal.com
     name: Jake Lichtman
@@ -233,6 +245,7 @@ accounts:
     entity_default: F3E
     asana_gid: "1213638047870465"
     slack_user_id: U0B3RU5Q55G
+    fireflies_seat: true
 
   - email: alex@f3energy.com
     name: Alex Cordova
@@ -244,6 +257,7 @@ accounts:
     entity_default: F3E
     asana_gid: "1210991768665805"
     slack_user_id: U0B3VGWJTMJ
+    fireflies_seat: true
 
   # Jason@f3energy.com -- identity TBD (flagged as open question in TOM 2026-05-14)
   - email: jason@f3energy.com
@@ -365,6 +379,7 @@ accounts:
     entity_default: LEX
     asana_gid: "1209093544422692"
     slack_user_id: U0B3PS82G30
+    fireflies_seat: true
 
   - email: jen@lexingtonservices.com
     name: Jennifer Mortensen
@@ -376,6 +391,7 @@ accounts:
     entity_default: LEX
     asana_gid: "1212929353819846"
     slack_user_id: U0B3VGT8RE0
+    fireflies_seat: true
 
   # ── @unitedfightleague.com -- DWD confirmed active 2026-05-27 ───────────
 

@@ -3,6 +3,11 @@
 Goal: verify that every DWD user's meetings are actually being captured by Fireflies,
 not just Harrison's (founder TOM: 16 invites pending since 2026-06-03).
 
+Seat scope (2026-07-01): after the 6/22 Enterprise right-size the monitored
+population is the 10 Fireflies seat-holders, marked `fireflies_seat: true` in
+monitored-email-accounts.yaml — NOT the full DWD roster (removed employees stay
+in that file for Gmail/Drive ingestion and must never be Fireflies-nudged).
+
 Three statuses (MEMBER_NO_CALENDAR was dropped at CP-1: `integrations` provably does
 NOT carry calendar state — Harrison has 566 transcripts yet no calendar in his
 integrations list — so it would be undetectable / dead code):
@@ -160,10 +165,22 @@ def load_dwd_humans(path: Path | str | None = None) -> list[DwdHuman]:
     - Collapses cross-domain aliases into one human via union-find over three edge
       types: shared slack_user_id, shared email (primary or alias), shared normalized
       name. Faithful to the spec ("collapse by slack_user_id, fall back to name").
+    - Seat scope (2026-07-01 right-size): if ANY account in the file carries
+      fireflies_seat: true, only humans with at least one flagged account in their
+      collapsed component are returned — people removed from Fireflies stay in this
+      file for Gmail/Drive ingestion but fall out of the coverage monitor's scope.
+      A file with no flags keeps the full roster (backward-compatible).
     """
     yaml_path = Path(path) if path else _ACCOUNTS_YAML
     data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8")) or {}
     raw_accounts = data.get("accounts") or []
+
+    # Seat-scope mode is detected across the whole file (not just eligible entries);
+    # the flag itself is evaluated per collapsed component below, because it may sit
+    # on any one of a human's alias entries.
+    seat_scope = any(
+        isinstance(a, dict) and bool(a.get("fireflies_seat")) for a in raw_accounts
+    )
 
     accounts = [
         a
@@ -209,6 +226,8 @@ def load_dwd_humans(path: Path | str | None = None) -> list[DwdHuman]:
     humans: list[DwdHuman] = []
     for member_idxs in components.values():
         members = [accounts[i] for i in member_idxs]
+        if seat_scope and not any(m.get("fireflies_seat") for m in members):
+            continue
         all_emails: set[str] = set()
         for m in members:
             all_emails |= _account_emails(m)
