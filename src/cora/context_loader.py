@@ -517,6 +517,15 @@ def _try_kb_retrieve(
 
     # Filter by relevance threshold
     relevant = [r for r in results if r.distance <= _KB_MAX_DISTANCE]
+    # WS-1 gap detection: expose the retrieval outcome to the caller. Set ONLY
+    # when the search actually ran (the early returns above -- missing db,
+    # kb None, search exception -- leave these unset so an infra failure never
+    # reads as a knowledge miss). Zero added work: the values are already
+    # computed on this path.
+    if kb_meta is not None:
+        kb_meta["kb_search_ran"] = True
+        kb_meta["kb_relevant_hits"] = len(relevant)
+        kb_meta["kb_notes_hit"] = bool(notes_block)
     if not relevant and not notes_block:
         log.info("KB returned %d chunks but none passed distance threshold %.2f",
                  len(results), _KB_MAX_DISTANCE)

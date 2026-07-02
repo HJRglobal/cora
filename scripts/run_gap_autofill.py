@@ -81,6 +81,14 @@ def main() -> int:
     log.info("=" * 60)
     log.info("Gap autofill run starting (dry_run=%s)", args.dry_run)
 
+    # WS-1 gap TTL: close gaps open >GAP_TTL_DAYS as expired BEFORE loading the
+    # open set, so Haiku spend targets live gaps only.
+    n_expired = ga.expire_stale_gaps(dry_run=args.dry_run)
+    if n_expired:
+        log.info("%s %d stale gap(s) older than %dd",
+                 "[DRY] would expire" if args.dry_run else "Expired",
+                 n_expired, ga.GAP_TTL_DAYS)
+
     gaps = ga.load_open_gaps()
     log.info("Open gaps: %d (processing up to %d)", len(gaps), args.max_gaps)
     if not gaps:

@@ -12,7 +12,7 @@ from cora.knowledge_gaps import log_gap
 @pytest.fixture(autouse=True)
 def tmp_log_path(tmp_path, monkeypatch):
     log_file = tmp_path / "knowledge-gaps.jsonl"
-    monkeypatch.setattr(kg_module, "_LOG_PATH", log_file)
+    monkeypatch.setenv("KNOWLEDGE_GAPS_LOG_PATH", str(log_file))
     return log_file
 
 
