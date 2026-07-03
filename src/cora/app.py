@@ -1763,6 +1763,28 @@ def handle_message_event(event: dict, client) -> None:
     channel_name = _resolve_channel_name(client, channel_id)
     entity = route(channel_name)
 
+    # User access check pre-LLM (mirrors handle_mention + /cora-ask; same params,
+    # same ordering: check_access -> sibling -> cross). Closes the 6/18 gap: an
+    # in-thread follow-up previously skipped check_access, so the entity-auth /
+    # finance-topic (D-064) / PHI blocks enforced at the @mention did not hold
+    # in-thread. user_id is non-empty here (guarded at the top of the handler);
+    # Path 2 is channel threads, so is_dm is computed for parity only.
+    is_dm = str(channel_id).startswith("D")
+    phi_custodian = lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm)
+    tier = channel_classifier.tier_label(
+        entity, channel_classifier.classify_function(channel_name)
+    )
+    access_block = user_access.check_access(
+        user_id, entity, text, phi_custodian=phi_custodian, tier=tier
+    )
+    if access_block:
+        log.info(
+            "thread_followup: user_access blocked user=%s entity=%s reason=%s",
+            user_id, entity, access_block[:80],
+        )
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=access_block)
+        return
+
     # Apply sibling-entity guard pre-LLM (mirrors handle_mention Path 1).
     sibling_redirect = sibling_guard.check_redirect(entity, text)
     if sibling_redirect:
