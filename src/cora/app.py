@@ -1778,11 +1778,18 @@ def handle_message_event(event: dict, client) -> None:
         user_id, entity, text, phi_custodian=phi_custodian, tier=tier
     )
     if access_block:
+        # By design this also blocks a staged-write CONFIRM reply that echoes a
+        # blocked-topic phrase from the preview ("yes, the DDD revalidation one")
+        # -- exempting confirmation-shaped text would be a smuggling hole. A bare
+        # "yes"/"confirm" passes and completes the staged write.
         log.info(
             "thread_followup: user_access blocked user=%s entity=%s reason=%s",
             user_id, entity, access_block[:80],
         )
-        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=access_block)
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=access_block,
+            unfurl_links=False, unfurl_media=False,
+        )
         return
 
     # Apply sibling-entity guard pre-LLM (mirrors handle_mention Path 1).

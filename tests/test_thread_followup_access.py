@@ -17,8 +17,7 @@ import pytest
 import cora.app as app_module
 
 
-TOMMY = "U0B3RU5Q55G"  # real roster: F3E sales role, 'financials' blocked
-ALEX = "U0B3VGWJTMJ"   # real roster: F3E/UFL/HJRG, 'financials' blocked
+TOMMY = "U0B3RU5Q55G"  # real roster: F3E sales role, 'financials' + 'hr' blocked
 
 
 def _thread_event(user=TOMMY, text="what about the pricing?", channel="C123CHAN",
@@ -56,6 +55,7 @@ class TestFollowupAccessCheck:
         client.chat_postMessage.assert_called_once_with(
             channel="C123CHAN", thread_ts="200.1",
             text="You're not authorized for that topic.",
+            unfurl_links=False, unfurl_media=False,
         )
         path2_mocks.dispatch.assert_not_called()
         # check_access fires BEFORE sibling/cross (mention + /cora-ask parity),
@@ -132,3 +132,27 @@ class TestFollowupD064Integration:
         path2_real_access.assert_not_called()
         client.chat_postMessage.assert_called_once()
         assert client.chat_postMessage.call_args.kwargs["text"]
+
+    # ── Documented residual (adversarial-review MED, accepted by design) ──────
+    # A staged-write CONFIRM reply that echoes a blocked-topic phrase from the
+    # preview is refused like any other follow-up — exempting confirmation-shaped
+    # text would let a blocked user smuggle questions as "confirmations". The
+    # recovery path (a bare "yes"/"confirm") must keep passing. Re-closing this
+    # residual is a conscious choice, never accidental (D-064 doctrine).
+
+    def test_confirm_echoing_blocked_topic_is_refused_residual(self, path2_real_access):
+        client = MagicMock()
+        app_module.handle_message_event(
+            _thread_event(user=TOMMY, text="yes, create the task to hire the merchandiser"),
+            client)
+        path2_real_access.assert_not_called()   # 'hire' -> hr block, by design
+        client.chat_postMessage.assert_called_once()
+
+    def test_bare_confirmation_passes(self, path2_real_access):
+        client = MagicMock()
+        for word in ("yes", "confirm"):
+            client.reset_mock()
+            path2_real_access.reset_mock()
+            app_module.handle_message_event(_thread_event(user=TOMMY, text=word), client)
+            path2_real_access.assert_called_once()
+            client.chat_postMessage.assert_not_called()

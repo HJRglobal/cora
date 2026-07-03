@@ -11,7 +11,9 @@
 # PHI rails enforced by the capture pipeline regardless of this config:
 #   1. LEX-derived tasks route ONLY into LEX-scoped Asana projects
 #      (data/maps/meeting-capture-projects.yaml + asana-project-map.yaml LEX*).
-#   2. LEX digests post ONLY to LEX channels (data/maps/entity-channels.yaml).
+#   2. LEX digests post ONLY to LEX channels (the hardcoded _ENTITY_CHANNEL map
+#      + _LEX_CHANNEL_ALLOWLIST in fireflies_action_extractor.py; the channel
+#      IDs are documented in data/maps/entity-channels.yaml, reference-only).
 #   3. Task title/notes are PHI-scrubbed (phi_guard.scrub_lex_phi) -- the task
 #      carries the operational action, not transcribed clinical detail
 #      (minimum-necessary).
