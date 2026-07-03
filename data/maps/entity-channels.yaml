@@ -1,6 +1,9 @@
-# Entity → Slack channel ID mapping for Cora features.
-# Used by: pin_decisions (Feature 3), channel_bookmarks (Feature 4), and any
-# future feature that needs to post to entity-specific channels.
+# Entity → Slack channel ID mapping — REFERENCE DATA ONLY as of 2026-07-02.
+# No code reads this file at runtime: the dead app.py accessor cluster
+# (_load_entity_channels / _entity_leadership_channel / _entity_finance_channel)
+# was removed in hygiene Session 2, and fireflies_action_extractor keeps its own
+# hardcoded _ENTITY_CHANNEL map (sourced from these IDs). Kept as the canonical
+# leadership/finance channel-ID reference for humans + future features.
 #
 # Leadership channels: where decisions get pinned, questions get asked.
 # Finance channels: where financial data goes. Source-opacity rules enforced.
