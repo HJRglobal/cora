@@ -28,6 +28,46 @@ def test_map_references_only_real_tools():
     assert not unknown, f"map references non-existent tools: {unknown}"
 
 
+# --------------------------------------------------------------------------- #
+# global dispatch-registry parity (W3-03)
+#
+# TOOL_DEFINITIONS (the JSON schemas the LLM sees) and _TOOL_FUNCTIONS (the
+# dispatch map) must stay in lock-step: a tool defined but not wired (or wired
+# but not defined) is the drift class this audit had to verify by hand. Timeouts
+# must reference only real tools. These assert the whole set, not per-tool.
+# --------------------------------------------------------------------------- #
+
+def test_definitions_and_functions_are_in_lockstep():
+    defined = {t["name"] for t in td.TOOL_DEFINITIONS}
+    dispatched = set(td._TOOL_FUNCTIONS)
+    assert defined == dispatched, (
+        "TOOL_DEFINITIONS and _TOOL_FUNCTIONS diverged. "
+        f"defined-but-not-dispatched={defined - dispatched}; "
+        f"dispatched-but-not-defined={dispatched - defined}"
+    )
+
+
+def test_every_dispatch_target_is_callable():
+    non_callable = {name for name, fn in td._TOOL_FUNCTIONS.items() if not callable(fn)}
+    assert not non_callable, f"_TOOL_FUNCTIONS has non-callable targets: {non_callable}"
+
+
+def test_tool_definitions_have_no_duplicate_names():
+    names = [t["name"] for t in td.TOOL_DEFINITIONS]
+    dupes = {n for n in names if names.count(n) > 1}
+    assert not dupes, f"duplicate tool names in TOOL_DEFINITIONS: {dupes}"
+
+
+def test_timeouts_reference_only_real_tools():
+    # A per-tool timeout for a tool that no longer exists is dead config; every
+    # timeout key must be a registered tool. (Not every tool needs an explicit
+    # timeout — many deliberately fall back to _DEFAULT_TOOL_TIMEOUT.)
+    orphan_timeouts = set(td._TOOL_TIMEOUTS) - set(td._TOOL_FUNCTIONS)
+    assert not orphan_timeouts, (
+        f"_TOOL_TIMEOUTS references tools not in _TOOL_FUNCTIONS: {orphan_timeouts}"
+    )
+
+
 def test_every_tool_reachable_via_aggregator():
     # FNDR is the catch-all; it must expose every tool so nothing is orphaned.
     assert _names("FNDR") == ALL_NAMES

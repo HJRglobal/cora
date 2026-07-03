@@ -168,13 +168,30 @@ def test_async_guard_is_idempotent():
     assert slack_egress.install_egress_sanitizer() is True
 
 
-def test_async_webclient_construction_is_forbidden():
-    # Positive guard: if the async client IS importable (aiohttp installed), the
-    # guard must make construction raise. Skipped in the current venv (no aiohttp).
-    try:
-        from slack_sdk.web.async_client import AsyncWebClient
-    except Exception:  # pragma: no cover -- aiohttp not installed in this env
-        pytest.skip("AsyncWebClient unavailable (aiohttp not installed)")
+def test_async_webclient_construction_is_forbidden(monkeypatch):
+    # Positive guard, stub-based (W7-03): the previous version skipped whenever
+    # aiohttp was absent (i.e. always, in this venv), leaving the guard's core
+    # assertion — that AsyncWebClient construction RAISES — permanently unverified.
+    # Inject a fake slack_sdk.web.async_client.AsyncWebClient into sys.modules
+    # (mirroring conftest's _install_fake_tiktoken pattern) so the guard's
+    # `from ... import AsyncWebClient` resolves WITHOUT aiohttp, then assert the
+    # guard makes construction raise. Runs unconditionally now.
+    import sys
+    import types
+
+    import slack_sdk.web  # importable without aiohttp (only async_client needs it)
+
+    fake_mod = types.ModuleType("slack_sdk.web.async_client")
+
+    class AsyncWebClient:  # fresh + unguarded on every run
+        def __init__(self, *args, **kwargs):
+            pass
+
+    fake_mod.AsyncWebClient = AsyncWebClient
+    monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", fake_mod)
+    monkeypatch.setattr(slack_sdk.web, "async_client", fake_mod, raising=False)
+
     slack_egress._guard_async_webclient()
+    assert getattr(AsyncWebClient, "_cora_async_guarded", False) is True
     with pytest.raises(RuntimeError, match="sync-only"):
         AsyncWebClient(token="xoxb-test")

@@ -40,7 +40,7 @@ try:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
     from cora.connectors.notion_connector import (  # noqa: E402
         NotionConnectorError,
-        _DB_ID,
+        _CONTRACTS_DB_ID,
         _ENTITY_MAP,
         _SUB_ENTITY_MAP,
         _entity_and_sub,
@@ -58,12 +58,18 @@ try:
         sync_delta,
     )
     _CONNECTOR_AVAILABLE = True
-except (ImportError, SyntaxError):
+except ModuleNotFoundError:
+    # Skip Layer B ONLY on a genuine missing-dependency / unresolvable-module
+    # error. A symbol-drift ImportError ("cannot import name X") or a SyntaxError
+    # is deliberately NOT swallowed here — it propagates and hard-fails collection
+    # so a real code/test divergence can never masquerade as an "environment" skip
+    # again (W7-02: the tuple used to import a non-existent `_DB_ID`, and all 41
+    # Layer B tests silently skipped with a misleading mount-failure reason).
     pass
 
 _skip_if_no_connector = pytest.mark.skipif(
     not _CONNECTOR_AVAILABLE,
-    reason="notion_connector import unavailable (stale bash mount or missing deps)",
+    reason="notion_connector dependency unavailable (ModuleNotFoundError)",
 )
 
 
@@ -622,4 +628,4 @@ class TestPageToDocument:
 
     @_skip_if_no_connector
     def test_db_id_constant_matches_known_value(self):
-        assert _DB_ID == "7820cd3689ae4596bd8f965f2bf96d5d"
+        assert _CONTRACTS_DB_ID == "7820cd3689ae4596bd8f965f2bf96d5d"
