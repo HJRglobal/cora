@@ -1,4 +1,7 @@
-"""Tests for LEX Cora tools -- lex_revalidation_status and lex_staff_pulse.
+"""Tests for LEX Cora tools -- lex_revalidation_status.
+
+(lex_staff_pulse was removed from dispatch in D-058; its orphaned stub coverage
+was dropped per W7-04.)
 
 Tests are structured as three layers:
   Layer A: pure unit tests (no network, all mocked)
@@ -278,26 +281,6 @@ class TestGetRevalidationStatusOutput:
             today=date(2026, 5, 26),
         )
         assert "No sub-task" in result
-
-
-# ---------------------------------------------------------------------------
-# Layer B: staff_pulse stub output
-# ---------------------------------------------------------------------------
-
-
-class TestGetStaffPulse:
-    """Verify staff pulse returns a non-empty string."""
-
-    def test_returns_stub_message(self):
-        result = lex_client.get_staff_pulse()
-        assert isinstance(result, str)
-        assert len(result) > 10
-
-    def test_does_not_raise(self):
-        """Tool should never raise -- it's a stub."""
-        result = lex_client.get_staff_pulse()
-        assert isinstance(result, str)
-        assert len(result) > 10
 
 
 # ---------------------------------------------------------------------------
