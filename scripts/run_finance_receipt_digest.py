@@ -74,6 +74,18 @@ def main() -> int:
     else:
         posted = finance_receipts.post_digest_to_slack(digest)
         if not posted:
+            # W4-02: never silently succeed-then-drop. The digest work is done
+            # (docs filed) but the summary didn't reach the finance channel
+            # (e.g. it was archived). Raise a loud metadata-only alert to a
+            # live ops channel AND exit nonzero so the nightly health check's
+            # LastResult probe (W4-07) also flags it.
+            log.error(
+                "digest post FAILED — raising delivery-failure alert "
+                "(%d docs filed but summary not delivered)", len(result["rows"]),
+            )
+            finance_receipts.alert_delivery_failure(
+                len(result["rows"]), result["accounts_scanned"],
+            )
             print(digest)
             return 1
     return 0 if result["errors"] == 0 else 2

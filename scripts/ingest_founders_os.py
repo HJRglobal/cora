@@ -144,6 +144,13 @@ def main() -> int:
         help="Days to look back on first run (default: 730 = 2 years). "
              "--backfill sets this to 3650.",
     )
+    parser.add_argument(
+        "--time-budget-min", type=int, default=105,
+        help="Wall-clock self-budget in minutes (W4-01). The scheduled task's "
+             "ExecutionTimeLimit is PT2H; a value < that lets the sweep stop "
+             "CLEANLY and checkpoint instead of being SIGKILLed mid-commit. "
+             "0 or negative = unlimited. --backfill defaults this to unlimited.",
+    )
     args = parser.parse_args()
 
     # ── Resolve config ─────────────────────────────────────────────────────────
@@ -171,6 +178,15 @@ def main() -> int:
 
     freshness_days = 3650 if args.backfill else args.freshness_days
 
+    # A manual backfill runs at the console (no ExecutionTimeLimit), so it should
+    # run to completion; only cut off the scheduled incremental sweep. If the
+    # operator passes an explicit --time-budget-min they still win.
+    time_budget_min: int | None = args.time_budget_min
+    if args.backfill and args.time_budget_min == 105:  # untouched default
+        time_budget_min = 0  # unlimited
+    if time_budget_min is not None and time_budget_min <= 0:
+        time_budget_min = None
+
     if args.dry_run:
         log.info("DRY RUN — no KB writes will occur")
     if args.backfill:
@@ -190,6 +206,7 @@ def main() -> int:
         entity_filter=entity_filter,
         freshness_days=freshness_days,
         dry_run=args.dry_run,
+        time_budget_min=time_budget_min,
     )
     elapsed = time.time() - start
 
@@ -202,7 +219,7 @@ def main() -> int:
     log.info(
         "[%s] Complete in %.1fs — entities=%d files_enumerated=%d "
         "extracted=%d chunks_ingested=%d phi_skipped=%d "
-        "noise_filtered=%d dedup_skipped=%d",
+        "noise_filtered=%d dedup_skipped=%d deferred=%d%s",
         mode, elapsed,
         result.get("entities_swept", 0),
         result.get("files_enumerated", 0),
@@ -211,6 +228,8 @@ def main() -> int:
         result.get("phi_skipped", 0),
         result.get("noise_filtered", 0),
         result.get("dedup_skipped", 0),
+        result.get("entities_deferred", 0),
+        " [budget-interrupted — resumes next run]" if result.get("budget_interrupted") else "",
     )
     return 0
 

@@ -719,3 +719,490 @@ class TestRunSweep:
         assert captured_sets[0] is captured_sets[1]
         # Second call should see the file_id added by first call
         assert any("harrison@hjrglobal.com" in fid for fid in captured_sets[1])
+
+
+# ── W4-01: founders_os self-budget + resumable checkpoint ──────────────────────
+
+import itertools  # noqa: E402
+import time as _time  # noqa: E402
+
+from cora.connectors import drive_sweep as _ds  # noqa: E402
+
+
+class _FakeKB:
+    """Dict-backed KB with the real checkpoint/sync_state contract."""
+
+    def __init__(self, sync: dict | None = None):
+        self.checkpoints: dict[str, dict] = {}
+        self.sync: dict[str, int] = dict(sync or {})
+        self.upserts: list = []
+        self.sync_writes: list[tuple[str, int]] = []
+        self.deleted_checkpoints: list[str] = []
+
+    def upsert_documents(self, docs):
+        docs = list(docs)
+        self.upserts.extend(docs)
+        return len(docs)
+
+    def get_checkpoint(self, key):
+        return self.checkpoints.get(key)
+
+    def set_checkpoint(self, key, data):
+        self.checkpoints[key] = data
+
+    def delete_checkpoint(self, key):
+        self.deleted_checkpoints.append(key)
+        self.checkpoints.pop(key, None)
+
+    def get_sync_state(self, key):
+        v = self.sync.get(key)
+        return (v, None) if v is not None else None
+
+    def set_sync_state(self, key, last_sync_at, last_source_modified=None):
+        self.sync[key] = last_sync_at
+        self.sync_writes.append((key, last_sync_at))
+
+
+class _FakeTreeService:
+    """Drive service that serves an in-memory folder tree with (optionally
+    empty) file lists. Subfolder queries return children; file queries return
+    that folder's files. Empty file lists mean _process_single_folder_files
+    drains in one page without needing extraction/classification fakes."""
+
+    def __init__(self, subfolders: dict[str, list[dict]],
+                 files: dict[str, list[dict]] | None = None):
+        self._subfolders = subfolders
+        self._files = files or {}
+
+    def files(self):  # noqa: A003 — mimics googleapiclient surface
+        return self
+
+    def list(self, **kwargs):
+        import re
+        q = kwargs.get("q", "")
+        m = re.search(r"'([^']+)' in parents", q)
+        parent = m.group(1) if m else None
+        is_folder_q = "mimeType='application/vnd.google-apps.folder'" in q
+        outer = self
+
+        class _Req:
+            def execute(_self):
+                if is_folder_q:
+                    return {"files": outer._subfolders.get(parent, []),
+                            "nextPageToken": None}
+                return {"files": outer._files.get(parent, []),
+                        "nextPageToken": None}
+
+        return _Req()
+
+
+class TestFoundersOsEntityFor:
+    def test_exact_match(self):
+        assert _ds._founders_os_entity_for("08-Lexington-Services") == "LEX"
+
+    def test_prefix_match(self):
+        assert _ds._founders_os_entity_for("02-F3-Energy-extra") == "F3E"
+
+    def test_shared_maps_fndr(self):
+        assert _ds._founders_os_entity_for("_shared") == "FNDR"
+
+    def test_skip_folder_returns_none(self):
+        assert _ds._founders_os_entity_for("_archive") is None
+
+    def test_unmapped_returns_none(self):
+        assert _ds._founders_os_entity_for("random-folder") is None
+
+
+class TestSweepFolderTreeCheckpoint:
+    """Real _sweep_folder_tree BFS with a fake service (empty folders)."""
+
+    def test_full_walk_marks_tree_done_and_returns_true(self):
+        # root -> [a, b]; a -> [c]
+        svc = _FakeTreeService(subfolders={
+            "root": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"}],
+            "a": [{"id": "c", "name": "c"}],
+            "b": [], "c": [],
+        })
+        kb = _FakeKB()
+        done = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="FNDR", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+        )
+        assert done is True
+        ck = kb.checkpoints["ck"]
+        assert ck["tree_done"] is True
+        assert set(ck["completed_folder_ids"]) == {"root", "a", "b", "c"}
+
+    def test_tree_done_checkpoint_short_circuits(self):
+        # A tree_done checkpoint means the whole subtree is already ingested.
+        svc = _FakeTreeService(subfolders={"root": [{"id": "a", "name": "a"}]})
+        kb = _FakeKB()
+        kb.checkpoints["ck"] = {"completed_folder_ids": ["root", "a"], "tree_done": True}
+        # If it tried to walk, it would hit the service; make list() explode.
+        svc.list = MagicMock(side_effect=AssertionError("should not walk"))
+        done = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="FNDR", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={}, checkpoint_key="ck",
+        )
+        assert done is True
+
+    def test_budget_cut_persists_partial_and_returns_false(self):
+        svc = _FakeTreeService(subfolders={
+            "root": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"}],
+            "a": [], "b": [],
+        })
+        kb = _FakeKB()
+        # Deadline already in the past -> after processing the first folder
+        # (root) the loop's between-folder check trips and returns False.
+        done = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="FNDR", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+            deadline_monotonic=_time.monotonic() - 1,
+        )
+        assert done is False
+        ck = kb.checkpoints["ck"]
+        assert ck["tree_done"] is False
+        assert "root" in ck["completed_folder_ids"]  # progress recorded
+        assert set(ck["completed_folder_ids"]) != {"root", "a", "b"}  # not all
+
+    def test_resume_completes_over_two_runs(self):
+        # Run 1: past deadline -> stops after root, checkpoints. Run 2: no
+        # deadline -> resumes, skips root, finishes a & b -> tree_done.
+        svc = _FakeTreeService(subfolders={
+            "root": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"}],
+            "a": [], "b": [],
+        })
+        kb = _FakeKB()
+        r1 = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="LEX", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+            deadline_monotonic=_time.monotonic() - 1,
+        )
+        assert r1 is False and kb.checkpoints["ck"]["tree_done"] is False
+        r2 = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="LEX", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+            deadline_monotonic=None,
+        )
+        assert r2 is True
+        assert kb.checkpoints["ck"]["tree_done"] is True
+        assert set(kb.checkpoints["ck"]["completed_folder_ids"]) == {"root", "a", "b"}
+
+    def test_skip_folder_ids_not_walked(self):
+        # The root tree must not descend into a sub-entity folder ('llc').
+        svc = _FakeTreeService(subfolders={
+            "root": [{"id": "llc", "name": "llc"}, {"id": "misc", "name": "misc"}],
+            "llc": [{"id": "llc-child", "name": "x"}], "misc": [],
+        })
+        kb = _FakeKB()
+        done = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="LEX", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=True, score_threshold=6,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+            skip_folder_ids=frozenset({"llc"}),
+        )
+        assert done is True
+        completed = set(kb.checkpoints["ck"]["completed_folder_ids"])
+        assert "llc" not in completed and "llc-child" not in completed
+        assert completed == {"root", "misc"}
+
+    def test_dry_run_writes_no_checkpoint(self):
+        svc = _FakeTreeService(subfolders={"root": []})
+        kb = _FakeKB()
+        _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="FNDR", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=True, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0}, checkpoint_key="ck",
+        )
+        assert kb.checkpoints == {}
+
+    def test_folder_budget_cut_midpages_not_marked_complete(self):
+        # A folder whose files span >1 page and gets budget-cut mid-folder must
+        # NOT be recorded as completed (so it re-processes from page 1 next run).
+        class _MultiPageService:
+            def files(self):  # noqa: A003
+                return self
+
+            def list(self, **kwargs):
+                import re
+                q = kwargs.get("q", "")
+                is_folder_q = "mimeType='application/vnd.google-apps.folder'" in q
+                has_token = "pageToken" in kwargs
+                outer_folder_q = is_folder_q
+
+                class _Req:
+                    def execute(_self):
+                        if outer_folder_q:
+                            return {"files": [], "nextPageToken": None}  # no subfolders
+                        # File query: page 1 has a token (empty files), page 2 ends it.
+                        if not has_token:
+                            return {"files": [], "nextPageToken": "p2"}
+                        return {"files": [], "nextPageToken": None}
+
+                return _Req()
+
+        kb = _FakeKB()
+        done = _ds._sweep_folder_tree(
+            service=_MultiPageService(), folder_id="root", entity="LEX",
+            sub_entity=None, kb=kb, anthropic_client=None,
+            cutoff_str="2020-01-01T00:00:00Z", dry_run=False, is_lex=False,
+            score_threshold=4, seen_file_ids=set(), stats={"files_enumerated": 0},
+            checkpoint_key="ck", deadline_monotonic=_time.monotonic() - 1,
+        )
+        assert done is False
+        ck = kb.checkpoints["ck"]
+        assert ck["tree_done"] is False
+        assert "root" not in ck["completed_folder_ids"]  # mid-folder cut -> not done
+
+
+class TestProcessSingleFolderBudget:
+    def test_multi_page_stops_on_deadline_returns_false(self):
+        # Two pages; deadline in the past -> after page 1 (has token) -> False.
+        svc = MagicMock()
+        page1 = {"files": [], "nextPageToken": "p2"}
+        page2 = {"files": [], "nextPageToken": None}
+        svc.files().list().execute.side_effect = [page1, page2]
+        done = _ds._process_single_folder_files(
+            service=svc, folder_id="F", label="LEX", effective_entity="LEX",
+            kb=_FakeKB(), anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0},
+            deadline_monotonic=_time.monotonic() - 1,
+        )
+        assert done is False
+
+    def test_single_page_returns_true(self):
+        svc = _FakeTreeService(subfolders={}, files={"F": []})
+        done = _ds._process_single_folder_files(
+            service=svc, folder_id="F", label="FNDR", effective_entity="FNDR",
+            kb=_FakeKB(), anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats={"files_enumerated": 0},
+            deadline_monotonic=_time.monotonic() - 1,  # ignored — single page
+        )
+        assert done is True
+
+
+class TestSweepFoundersOsOrchestration:
+    """sweep_founders_os ordering + watermark atomicity (patched _sweep_folder_tree)."""
+
+    def _patch_build(self):
+        # Neutralise the Drive/Sheets service builders.
+        return patch.multiple(
+            "cora.connectors.drive_sweep",
+            _build_sa_drive_service_direct=MagicMock(return_value="svc"),
+            _build_sa_sheets_service_direct=MagicMock(return_value=None),
+        )
+
+    def test_neediest_first_ordering(self):
+        # FNDR has no watermark; F3E stale (1000); OSN fresh (2000).
+        top = [
+            {"id": "f_osn", "name": "09-One-Stop-Nutrition"},
+            {"id": "f_f3e", "name": "02-F3-Energy"},
+            {"id": "f_fndr", "name": "00-Founder"},
+        ]
+        kb = _FakeKB(sync={
+            "founders_os_F3E_f_f3e": 1000,
+            "founders_os_OSN_f_osn": 2000,
+        })
+        order: list[str] = []
+
+        def fake_tree(**kw):
+            order.append(kw["entity"])
+            return True
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders", return_value=top), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        assert order == ["FNDR", "F3E", "OSN"]  # no-wm, then stalest, then fresh
+        # every entity completed -> all watermarks advanced
+        assert {k for k, _ in kb.sync_writes} == {
+            "founders_os_FNDR_f_fndr", "founders_os_F3E_f_f3e", "founders_os_OSN_f_osn"}
+
+    def test_interrupted_entity_does_not_advance_watermark(self):
+        top = [{"id": "f_fndr", "name": "00-Founder"},
+               {"id": "f_lex", "name": "08-Lexington-Services"}]
+        kb = _FakeKB()
+
+        def fake_tree(**kw):
+            # FNDR completes, LEX's tree is budget-cut (returns False).
+            return kw["entity"] != "LEX"
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree):
+            agg = _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        wm_keys = {k for k, _ in kb.sync_writes}
+        assert "founders_os_FNDR_f_fndr" in wm_keys       # completed -> advanced
+        assert "founders_os_LEX_f_lex" not in wm_keys      # interrupted -> NOT advanced
+        assert agg["budget_interrupted"] is True
+        # LEX's checkpoints must NOT be cleared on interrupt.
+        assert not any("f_lex" in k for k in kb.deleted_checkpoints)
+
+    def test_root_tree_receives_sub_entity_skip_ids(self):
+        top = [{"id": "f_lex", "name": "08-Lexington-Services"}]
+        lex_children = [{"id": "llc", "name": "llc"}, {"id": "misc", "name": "misc"}]
+        kb = _FakeKB()
+        calls: list[dict] = []
+
+        def fake_tree(**kw):
+            calls.append(kw)
+            return True
+
+        def fake_list(svc, fid):
+            if fid == _ds.FOUNDERS_OS_ROOT_ID:
+                return top
+            if fid == "f_lex":
+                return lex_children
+            return []
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders", side_effect=fake_list), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        root_calls = [c for c in calls if c["sub_entity"] is None]
+        assert len(root_calls) == 1
+        assert "llc" in (root_calls[0].get("skip_folder_ids") or set())
+        # LEX watermark advanced (all subtrees returned True)
+        assert any(k == "founders_os_LEX_f_lex" for k, _ in kb.sync_writes)
+
+    def test_multi_subtree_interrupt_leaves_watermark_untouched(self):
+        # LEX: sub-entity 'llc' completes, then the root tree is budget-cut.
+        top = [{"id": "f_lex", "name": "08-Lexington-Services"}]
+        lex_children = [{"id": "llc", "name": "llc"}]
+        kb = _FakeKB()
+
+        def fake_tree(**kw):
+            return kw["sub_entity"] is not None  # sub-entity True, root False
+
+        def fake_list(svc, fid):
+            if fid == _ds.FOUNDERS_OS_ROOT_ID:
+                return top
+            if fid == "f_lex":
+                return lex_children
+            return []
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders", side_effect=fake_list), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        assert not any(k == "founders_os_LEX_f_lex" for k, _ in kb.sync_writes)
+        assert kb.deleted_checkpoints == []  # nothing cleared on interrupt
+
+    def test_between_entity_budget_defers_remaining(self):
+        top = [{"id": "f_fndr", "name": "00-Founder"},
+               {"id": "f_hjrg", "name": "01-HJR-Global"}]
+        kb = _FakeKB()
+
+        def fake_tree(**kw):
+            return True
+
+        # monotonic: deadline base=0 (budget 1min -> deadline 60); entity1
+        # check=1 (<60, proceed); entity2 check=1e9 (>=60 -> defer).
+        clock = itertools.chain([0.0, 1.0], itertools.repeat(1e9))
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree), \
+             patch("cora.connectors.drive_sweep.time.monotonic", side_effect=lambda: next(clock)):
+            agg = _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=1)
+
+        assert agg["budget_interrupted"] is True
+        assert agg["entities_deferred"] == 1
+        assert [k for k, _ in kb.sync_writes] == ["founders_os_FNDR_f_fndr"]
+
+    def test_deadline_threaded_into_all_tree_calls(self):
+        # D-051 CONFIRMED #2: the within-tree budget cut only works if
+        # sweep_founders_os passes deadline_monotonic into EVERY _sweep_folder_tree
+        # call (sub-entity, root-after-sub, and no-sub). Dropping it silently
+        # reinstates the PT2H SIGKILL (the W4-01 bug). Pin the threading.
+        top = [{"id": "f_lex", "name": "08-Lexington-Services"},
+               {"id": "f_fndr", "name": "00-Founder"}]
+        kb = _FakeKB()
+        calls: list[dict] = []
+
+        def fake_tree(**kw):
+            calls.append(kw)
+            return True
+
+        def fake_list(svc, fid):
+            if fid == _ds.FOUNDERS_OS_ROOT_ID:
+                return top
+            if fid == "f_lex":
+                return [{"id": "llc", "name": "llc"}]
+            return []
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders", side_effect=fake_list), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=120)
+
+        # LEX -> sub-entity tree + root tree (2), FNDR -> 1 = 3 tree calls.
+        assert len(calls) == 3
+        assert all(c.get("deadline_monotonic") is not None for c in calls)
+
+    def test_resume_watermark_uses_original_sweep_start(self):
+        # D-051 CONFIRMED #1: on a resumed completion the watermark advances to
+        # the ORIGINAL sweep start (the start marker), NOT the completing run's
+        # clock — else a file dropped into an already-completed subtree between
+        # runs falls permanently below the incremental cutoff and is lost.
+        top = [{"id": "f_fndr", "name": "00-Founder"}]
+        kb = _FakeKB()
+        # A start marker from a prior (interrupted) run, pinned to an OLD time.
+        kb.checkpoints["founders_os_startmark_founders_os_FNDR_f_fndr"] = {"started_at": 1000}
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", return_value=True):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        # Watermark == the ORIGINAL start (1000), NOT ~now.
+        assert kb.sync["founders_os_FNDR_f_fndr"] == 1000
+        # Marker cleared on completion.
+        assert "founders_os_startmark_founders_os_FNDR_f_fndr" not in kb.checkpoints
+
+    def test_fresh_entity_watermark_recent_and_marker_cleared(self):
+        # Single-run (no pre-existing marker): watermark ~= now, marker written
+        # then cleared on completion.
+        top = [{"id": "f_fndr", "name": "00-Founder"}]
+        kb = _FakeKB()
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", return_value=True):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        assert kb.sync["founders_os_FNDR_f_fndr"] > 1_700_000_000  # a recent epoch
+        assert "founders_os_startmark_founders_os_FNDR_f_fndr" not in kb.checkpoints
+
+    def test_interrupt_persists_start_marker_and_no_watermark(self):
+        top = [{"id": "f_lex", "name": "08-Lexington-Services"}]
+        kb = _FakeKB()
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", return_value=False):
+            _ds.sweep_founders_os("/sa.json", kb, None, time_budget_min=None)
+
+        mk = kb.checkpoints.get("founders_os_startmark_founders_os_LEX_f_lex")
+        assert mk and isinstance(mk["started_at"], int)  # persisted for resume
+        assert not any(k == "founders_os_LEX_f_lex" for k, _ in kb.sync_writes)

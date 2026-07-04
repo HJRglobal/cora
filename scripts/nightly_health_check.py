@@ -322,6 +322,143 @@ def check_scheduled_tasks() -> list[CheckResult]:
     return results
 
 
+# ── W4-07: LastTaskResult probe ───────────────────────────────────────────────
+# check_scheduled_tasks (above) classifies task STATE only (Ready/Running/
+# Disabled) — so a task that is "Ready" but SIGKILLed or failing on every run
+# (founders-os-sweep LastResult=267014; finance-receipt-digest LastResult=1)
+# stayed green and nothing alarmed for weeks. This probe reads LastTaskResult and
+# WARNs (never critical — a failing periodic job is not an outage) on a nonzero,
+# non-benign result for any ENABLED task.
+
+# Task Scheduler status codes that are NOT a failed run (the LastTaskResult holds
+# a benign status, not an exit code).
+_BENIGN_LAST_RESULTS: frozenset[int] = frozenset({
+    0,        # success
+    267008,   # 0x00041300 SCHED_S_TASK_READY
+    267009,   # 0x00041301 SCHED_S_TASK_RUNNING (e.g. the always-on service)
+    267011,   # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN (freshly-registered weeklies)
+})
+
+# Tasks documented to exit NONZERO as a legitimate SIGNAL (not a fault). Each is
+# covered by its own dedicated check, so gating LastResult here would only
+# double-report a non-fault:
+#   • "Cora - QBO Token Monitor" — exit 1 = a real token finding it already DM'd
+#     (scripts/qbo_token_status.py: `return 1 if has_failure else 0`); its
+#     liveness is freshness-monitored by check_qbo_monitor.
+#   • "cowork-cora-health-check" — THIS check. Self-referential: yesterday's
+#     exit 1 (from a real critical) would re-warn today; it monitors itself via
+#     the criticals path, not its own LastResult.
+_LASTRESULT_SIGNAL_OK: frozenset[str] = frozenset({
+    "Cora - QBO Token Monitor",
+    "cowork-cora-health-check",
+})
+
+_LAST_RESULT_HINTS: dict[int, str] = {
+    267014: "TASK_TERMINATED - likely hit its ExecutionTimeLimit",
+    1: "generic failure exit",
+    2: "partial failure exit",
+    267012: "NO_MORE_RUNS",
+    267013: "NOT_SCHEDULED",
+    267015: "NO_VALID_TRIGGERS",
+}
+
+
+def _classify_task_last_results(
+    task_results: dict[str, tuple[str, int | None]],
+    benign_codes: frozenset[int],
+    signal_ok_names: frozenset[str],
+) -> tuple[list[str], int]:
+    """Pure classifier (W4-07). Returns (warn_messages, ok_count).
+
+    Only ENABLED tasks are judged — a Disabled task is idle by design and its
+    stale LastResult is meaningless (this is what keeps the probe from
+    false-alarming on the legitimately-disabled fleet). A result we could not
+    read (None) never fabricates a warning. Signal-OK tasks are allow-listed.
+    Everything else nonzero-and-non-benign on an enabled task -> WARN."""
+    warn: list[str] = []
+    ok = 0
+    for name in sorted(task_results):
+        state, result = task_results[name]
+        if "Disabled" in state:
+            continue  # idle by design — stale LastResult is meaningless
+        if result is None:
+            continue  # unreadable — never invent a warning
+        if name in signal_ok_names:
+            ok += 1
+            continue
+        if result in benign_codes:
+            ok += 1
+            continue
+        hexr = f"0x{result & 0xFFFFFFFF:08X}"
+        hint = _LAST_RESULT_HINTS.get(result, "")
+        warn.append(
+            f"{name}: last run exited {result} ({hexr}"
+            f"{' - ' + hint if hint else ''}) - this repeats silently every run"
+        )
+    return warn, ok
+
+
+def _get_task_last_results() -> dict[str, tuple[str, int | None]]:
+    """State + LastTaskResult for every Cora task in one PowerShell call.
+
+    Returns {task_name: (state_str, last_result_int_or_None)}. Empty on failure
+    (the probe then reports a soft warn rather than crashing the health run)."""
+    ps = (
+        "Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora*' "
+        "-or $_.TaskName -like 'Cora*' } | ForEach-Object { $i = $_ | "
+        "Get-ScheduledTaskInfo; Write-Output ($_.TaskName + '|' + $_.State + "
+        "'|' + $i.LastTaskResult) }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001
+        log.warning("check_task_last_results: query failed: %s", exc)
+        return {}
+
+    results: dict[str, tuple[str, int | None]] = {}
+    for line in out.splitlines():
+        line = line.rstrip("\r").strip()
+        if not line or "|" not in line:
+            continue
+        # Task names never contain '|'; the last two fields are state + result.
+        name, _, rest = line.partition("|")
+        state, _, res = rest.partition("|")
+        name, state, res = name.strip(), state.strip(), res.strip()
+        try:
+            res_int: int | None = int(res)
+        except ValueError:
+            res_int = None
+        results[name] = (state, res_int)
+    return results
+
+
+def check_task_last_results() -> list[CheckResult]:
+    """W4-07: WARN on any ENABLED Cora task whose LAST run exited nonzero."""
+    task_results = _get_task_last_results()
+    if not task_results:
+        return [CheckResult(
+            "Task last-results", "warn",
+            "Could not read task LastTaskResult (PowerShell query returned "
+            "nothing) — silently-failing tasks may go undetected this run.",
+        )]
+    warn, ok_count = _classify_task_last_results(
+        task_results, _BENIGN_LAST_RESULTS, _LASTRESULT_SIGNAL_OK,
+    )
+    if warn:
+        return [CheckResult(
+            "Task last-results", "warn",
+            f"{len(warn)} enabled task(s) exited nonzero on their last run:\n" +
+            "\n".join(f"  - {w}" for w in warn),
+        )]
+    return [CheckResult(
+        "Task last-results", "ok",
+        f"All {ok_count} enabled task(s) last exited clean.",
+    )]
+
+
 _QBO_MONITOR_TASK = "Cora - QBO Token Monitor"
 
 
@@ -789,6 +926,9 @@ def main() -> int:
 
     log.info("Checking scheduled tasks...")
     all_results.extend(check_scheduled_tasks())
+
+    log.info("Checking scheduled-task last results (W4-07)...")
+    all_results.extend(check_task_last_results())
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())

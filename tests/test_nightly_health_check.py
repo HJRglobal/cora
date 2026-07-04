@@ -129,3 +129,102 @@ def test_qbo_monitor_never_run_is_warn(monkeypatch):
     _mock_schtasks(monkeypatch, 0, last_run="N/A")
     r = hc.check_qbo_monitor()
     assert r.status == "warn" and "never run" in r.detail
+
+
+# ── W4-07: LastTaskResult classifier ──────────────────────────────────────────
+
+_BENIGN = hc._BENIGN_LAST_RESULTS
+_SIGNAL_OK = hc._LASTRESULT_SIGNAL_OK
+
+
+def _classify(results):
+    return hc._classify_task_last_results(results, _BENIGN, _SIGNAL_OK)
+
+
+def test_lastresult_success_and_status_codes_are_ok():
+    warn, ok = _classify({
+        "cowork-cora-kb-sync-slack": ("Ready", 0),          # success
+        "cowork-cora-service": ("Running", 267009),          # RUNNING
+        "cowork-cora-kb-evals": ("Ready", 267011),           # HAS_NOT_RUN
+        "cowork-cora-x": ("Ready", 267008),                  # READY
+    })
+    assert warn == [] and ok == 4
+
+
+def test_lastresult_task_terminated_warns():
+    # W4-01 founders-os-sweep: 267014 TASK_TERMINATED on an enabled task.
+    warn, ok = _classify({"cowork-cora-founders-os-sweep": ("Ready", 267014)})
+    assert ok == 0 and len(warn) == 1
+    assert "founders-os-sweep" in warn[0] and "267014" in warn[0]
+
+
+def test_lastresult_generic_failure_warns():
+    # W4-02 finance-receipt-digest: exit 1 on an enabled task.
+    warn, ok = _classify({"cowork-cora-finance-receipt-digest": ("Ready", 1)})
+    assert ok == 0 and len(warn) == 1 and "finance-receipt-digest" in warn[0]
+
+
+def test_lastresult_disabled_task_skipped_even_if_nonzero():
+    # The adversarial concern: a legitimately-DISABLED task with a stale nonzero
+    # result must NOT false-alarm.
+    warn, ok = _classify({"cowork-cora-clover-daily-pull": ("Disabled", 267014)})
+    assert warn == [] and ok == 0
+
+
+def test_lastresult_qbo_monitor_signal_exit_allowlisted():
+    # Documented nonzero-as-signal (covered by check_qbo_monitor).
+    warn, ok = _classify({"Cora - QBO Token Monitor": ("Ready", 1)})
+    assert warn == [] and ok == 1
+
+
+def test_lastresult_health_check_self_excluded():
+    warn, ok = _classify({"cowork-cora-health-check": ("Ready", 1)})
+    assert warn == [] and ok == 1
+
+
+def test_lastresult_unreadable_none_never_warns():
+    warn, ok = _classify({"cowork-cora-x": ("Ready", None)})
+    assert warn == [] and ok == 0
+
+
+def test_lastresult_mixed_fleet_flags_only_real_failures():
+    warn, ok = _classify({
+        "cowork-cora-founders-os-sweep": ("Ready", 267014),        # WARN
+        "cowork-cora-finance-receipt-digest": ("Ready", 1),        # WARN
+        "cowork-cora-kb-sync-slack": ("Ready", 0),                 # ok
+        "cowork-cora-clover-daily-pull": ("Disabled", 267014),     # skipped
+        "Cora - QBO Token Monitor": ("Ready", 1),                  # allow-listed
+    })
+    assert ok == 2
+    assert len(warn) == 2
+    names = " ".join(warn)
+    assert "founders-os-sweep" in names and "finance-receipt-digest" in names
+
+
+def test_get_task_last_results_parses_pipe_output(monkeypatch):
+    fake = (
+        "cowork-cora-service|Running|267009\r\n"
+        "cowork-cora-founders-os-sweep|Ready|267014\r\n"
+        "Cora - QBO Token Monitor|Ready|1\r\n"
+        "cowork-cora-clover-daily-pull|Disabled|267014\r\n"
+    )
+    from types import SimpleNamespace
+    monkeypatch.setattr(hc.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(stdout=fake, returncode=0))
+    parsed = hc._get_task_last_results()
+    assert parsed["cowork-cora-founders-os-sweep"] == ("Ready", 267014)
+    assert parsed["Cora - QBO Token Monitor"] == ("Ready", 1)
+    assert parsed["cowork-cora-service"] == ("Running", 267009)
+
+
+def test_check_task_last_results_empty_query_is_soft_warn(monkeypatch):
+    monkeypatch.setattr(hc, "_get_task_last_results", lambda: {})
+    results = hc.check_task_last_results()
+    assert len(results) == 1 and results[0].status == "warn"
+
+
+def test_check_task_last_results_all_clean_is_ok(monkeypatch):
+    monkeypatch.setattr(hc, "_get_task_last_results",
+                        lambda: {"cowork-cora-x": ("Ready", 0)})
+    results = hc.check_task_last_results()
+    assert len(results) == 1 and results[0].status == "ok"

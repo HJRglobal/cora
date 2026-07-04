@@ -935,8 +935,15 @@ def _process_single_folder_files(
     seen_file_ids: set,
     stats: dict,
     sheets_service: Any | None = None,
-) -> None:
-    """Process files directly inside one folder (non-recursive, 'in parents' only)."""
+    deadline_monotonic: float | None = None,
+) -> bool:
+    """Process files directly inside one folder (non-recursive, 'in parents' only).
+
+    Returns True if the folder was fully drained (all pages processed), False if
+    it stopped early because the wall-clock budget (deadline_monotonic) elapsed.
+    W4-01: the caller must only mark a folder "done" in its checkpoint when this
+    returns True, so a budget-interrupted folder is re-processed next run (an
+    idempotent upsert on source_id=file_id — re-work, never data loss)."""
     q = (
         f"'{folder_id}' in parents"
         f" and ({_SUPPORTED_MIME_QUERY})"
@@ -1035,6 +1042,16 @@ def _process_single_folder_files(
         if not page_token:
             break
 
+        # W4-01: yield between pages if the wall-clock budget elapsed, so a folder
+        # with thousands of files can't blow past the task's ExecutionTimeLimit
+        # (which SIGKILLs mid-commit). Returning False signals "not fully drained"
+        # -> the caller leaves this folder OUT of its completed set, so next run
+        # re-processes it from page 1 (idempotent upsert; bounded to one folder).
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return False
+
+    return True
+
 
 def _sweep_folder_tree(
     *,
@@ -1052,7 +1069,9 @@ def _sweep_folder_tree(
     stats: dict,
     checkpoint_key: str,
     sheets_service: Any | None = None,
-) -> None:
+    deadline_monotonic: float | None = None,
+    skip_folder_ids: frozenset[str] | None = None,
+) -> bool:
     """BFS walk of a folder subtree using 'in parents' queries at each depth.
 
     The Drive API 'in ancestors' operator only works for Shared Drives, not
@@ -1062,9 +1081,50 @@ def _sweep_folder_tree(
     Entity is pre-determined from folder context; Haiku only scores relevance.
     PHI guard fires for all LEX content before classification.
     Dedup via seen_file_ids prevents double-ingesting files in overlapping sweeps.
+
+    W4-01 resumable sweep: ``checkpoint_key`` is now consumed. Each folder whose
+    files are fully processed is recorded in a per-subtree checkpoint
+    (``completed_folder_ids``); a subtree that finishes all folders records
+    ``tree_done: True``. On a resumed run the checkpoint lets the walk skip the
+    file-processing of already-completed folders (it still re-lists them to
+    rebuild the frontier — cheap) so a subtree bigger than one budget window
+    (LEX) chips away across runs instead of restarting each day. Returns True if
+    the whole subtree completed, False if the wall-clock budget elapsed first;
+    the caller advances the entity watermark ONLY when every subtree returns True,
+    so a budget interruption can never half-advance a watermark.
     """
     effective_entity = sub_entity or entity
     label = f"{entity}/{sub_entity}" if sub_entity else entity
+    skip_folder_ids = skip_folder_ids or frozenset()
+
+    # Resume state: load which folders in this subtree are already done.
+    completed: set[str] = set()
+    if not dry_run:
+        try:
+            ckpt = kb.get_checkpoint(checkpoint_key)
+            if ckpt:
+                if ckpt.get("tree_done"):
+                    # Whole subtree finished in a prior run — nothing to redo.
+                    return True
+                completed = {str(x) for x in ckpt.get("completed_folder_ids", [])}
+                if completed:
+                    log.info(
+                        "founders_os: resuming %s subtree from checkpoint "
+                        "(%d folders already done)", label, len(completed),
+                    )
+        except Exception as exc:  # noqa: BLE001 — a bad checkpoint never blocks a sweep
+            log.warning("founders_os: checkpoint read failed for %s: %s", label, exc)
+
+    def _persist(tree_done: bool) -> None:
+        if dry_run:
+            return
+        try:
+            kb.set_checkpoint(checkpoint_key, {
+                "completed_folder_ids": sorted(completed),
+                "tree_done": tree_done,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("founders_os: checkpoint save failed for %s: %s", label, exc)
 
     # BFS queue: process one folder at a time, recurse into subfolders
     queue: list[str] = [folder_id]
@@ -1072,33 +1132,67 @@ def _sweep_folder_tree(
 
     while queue:
         current_id = queue.pop(0)
-        if current_id in visited:
+        if current_id in visited or current_id in skip_folder_ids:
             continue
         visited.add(current_id)
 
-        # Process files directly inside this folder
-        _process_single_folder_files(
-            service=service,
-            folder_id=current_id,
-            label=label,
-            effective_entity=effective_entity,
-            kb=kb,
-            anthropic_client=anthropic_client,
-            cutoff_str=cutoff_str,
-            dry_run=dry_run,
-            is_lex=is_lex,
-            score_threshold=score_threshold,
-            seen_file_ids=seen_file_ids,
-            stats=stats,
-            sheets_service=sheets_service,
-        )
+        # Skip file-processing of folders already completed in a prior run, but
+        # still discover their subfolders below so the frontier is rebuilt.
+        if current_id not in completed:
+            folder_done = _process_single_folder_files(
+                service=service,
+                folder_id=current_id,
+                label=label,
+                effective_entity=effective_entity,
+                kb=kb,
+                anthropic_client=anthropic_client,
+                cutoff_str=cutoff_str,
+                dry_run=dry_run,
+                is_lex=is_lex,
+                score_threshold=score_threshold,
+                seen_file_ids=seen_file_ids,
+                stats=stats,
+                sheets_service=sheets_service,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if not folder_done:
+                # Budget elapsed mid-folder: do NOT mark this folder done.
+                _persist(tree_done=False)
+                return False
+            completed.add(current_id)
+            _persist(tree_done=False)
 
         # Discover subfolders and add to BFS queue
         subfolders = _list_subfolders(service, current_id)
         for subfolder in subfolders:
             sub_name = subfolder["name"].lower()
-            if sub_name not in _FOUNDERS_OS_SKIP_FOLDERS and subfolder["id"] not in visited:
+            if (sub_name not in _FOUNDERS_OS_SKIP_FOLDERS
+                    and subfolder["id"] not in visited
+                    and subfolder["id"] not in skip_folder_ids):
                 queue.append(subfolder["id"])
+
+        # Budget check between folders — stop cleanly so the checkpoint above is
+        # the resume point next run (never a SIGKILL mid-commit).
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            _persist(tree_done=False)
+            return False
+
+    # Whole subtree walked — record it so a resumed run skips it instantly.
+    _persist(tree_done=True)
+    return True
+
+
+def _founders_os_entity_for(folder_name: str) -> str | None:
+    """Map a top-level folder name to its entity code (exact, then prefix)."""
+    folder_key = folder_name.lower()
+    if folder_key in _FOUNDERS_OS_SKIP_FOLDERS:
+        return None
+    entity = _FOUNDERS_OS_ENTITY_MAP.get(folder_key)
+    if entity is None:
+        for key, ent in _FOUNDERS_OS_ENTITY_MAP.items():
+            if folder_key.startswith(key):
+                return ent
+    return entity
 
 
 def sweep_founders_os(
@@ -1109,6 +1203,7 @@ def sweep_founders_os(
     entity_filter: str | None = None,
     freshness_days: int = 730,
     dry_run: bool = False,
+    time_budget_min: int | None = None,
 ) -> dict:
     """Sweep the HJR-Founder-OS shared Drive folder into Cora's KB.
 
@@ -1116,12 +1211,24 @@ def sweep_founders_os(
     Haiku only scores relevance (0-10); files below threshold are discarded.
     PHI guard enforced on all LEX content. LEX threshold = 6, others = 4.
 
+    W4-01 reliability: ``time_budget_min`` bounds the wall clock. Before this
+    fix the scheduled task (PT2H ExecutionTimeLimit) SIGKILLed the process
+    mid-LEX-ingest EVERY run — so 7 of 10 entities never completed a sweep and
+    LEX re-scanned from scratch daily. Now the sweep (1) processes the neediest
+    entities first (never-completed, then stalest-watermark), (2) resumes big
+    subtrees from a checkpoint instead of restarting, and (3) stops CLEANLY a
+    few minutes before the task limit, persisting progress, so a subtree larger
+    than one window converges over ≤ a couple of runs. A watermark advances only
+    when EVERY subtree of an entity completed, so a budget cut can never
+    half-advance one. ``time_budget_min`` None/<=0 = unlimited (manual backfill).
+
     One-time Harrison action required: share HJR-Founder-OS folder with
     cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com as Viewer.
     """
     log.info(
-        "founders_os: starting sweep root=%s filter=%s freshness=%dd dry_run=%s",
+        "founders_os: starting sweep root=%s filter=%s freshness=%dd dry_run=%s budget=%s",
         root_folder_id, entity_filter or "ALL", freshness_days, dry_run,
+        f"{time_budget_min}min" if time_budget_min and time_budget_min > 0 else "none",
     )
 
     try:
@@ -1137,51 +1244,99 @@ def sweep_founders_os(
     if entity_filter:
         allowed_entities = {e.strip().upper() for e in entity_filter.split(",")}
 
+    # Wall-clock budget: honoured only on live runs (a dry-run preview should
+    # never be cut off, and it writes no checkpoint to resume from anyway).
+    deadline: float | None = None
+    if not dry_run and time_budget_min and time_budget_min > 0:
+        deadline = time.monotonic() + time_budget_min * 60
+
     top_folders = _list_subfolders(service, root_folder_id)
     log.info("founders_os: found %d top-level folders", len(top_folders))
+
+    # ── Build + order the entity work-list (W4-01 neediest-first) ───────────────
+    # Never-completed entities (no watermark row) sort first, then stalest
+    # watermark first; fresh incremental entities go last. This keeps the entity
+    # the SIGKILL used to starve (LEX / anything after it in Drive's arbitrary
+    # folder order) from being perpetually skipped, and lets it resume + finish
+    # before the cheap incremental entities consume any remaining budget.
+    work: list[dict] = []
+    for folder in top_folders:
+        entity = _founders_os_entity_for(folder["name"])
+        if entity is None:
+            log.info("founders_os: no mapping for %r — skipping", folder["name"])
+            continue
+        if allowed_entities and entity not in allowed_entities:
+            continue
+        watermark_key = f"founders_os_{entity}_{folder['id']}"
+        watermark_ts: int | None = None
+        try:
+            state = kb.get_sync_state(watermark_key)
+            if state and isinstance(state[0], int):
+                watermark_ts = state[0]
+        except Exception:
+            pass
+        work.append({
+            "folder_id": folder["id"], "folder_name": folder["name"],
+            "entity": entity, "watermark_key": watermark_key,
+            "watermark_ts": watermark_ts,
+        })
+    work.sort(key=lambda w: (w["watermark_ts"] is not None, w["watermark_ts"] or 0))
 
     aggregate: dict = {
         "entities_swept": 0, "files_enumerated": 0, "files_extracted": 0,
         "chunks_ingested": 0, "phi_skipped": 0, "noise_filtered": 0,
-        "dedup_skipped": 0,
+        "dedup_skipped": 0, "entities_deferred": 0, "budget_interrupted": False,
     }
     seen_file_ids: set[str] = set()
     run_start = datetime.now(timezone.utc)
 
-    for folder in top_folders:
-        folder_id   = folder["id"]
-        folder_name = folder["name"]
-        folder_key  = folder_name.lower()
+    for i, item in enumerate(work):
+        folder_id   = item["folder_id"]
+        folder_name = item["folder_name"]
+        entity      = item["entity"]
+        watermark_key = item["watermark_key"]
 
-        if folder_key in _FOUNDERS_OS_SKIP_FOLDERS:
-            continue
-
-        entity = _FOUNDERS_OS_ENTITY_MAP.get(folder_key)
-        if entity is None:
-            for key, ent in _FOUNDERS_OS_ENTITY_MAP.items():
-                if folder_key.startswith(key):
-                    entity = ent
-                    break
-        if entity is None:
-            log.info("founders_os: no mapping for %r — skipping", folder_name)
-            continue
-
-        if allowed_entities and entity not in allowed_entities:
-            continue
+        # Between-entity budget boundary: stop cleanly, defer the rest.
+        if deadline is not None and time.monotonic() >= deadline:
+            aggregate["budget_interrupted"] = True
+            aggregate["entities_deferred"] = len(work) - i
+            log.info(
+                "founders_os: budget reached before %s — deferring %d entity/ies "
+                "to next run", entity, aggregate["entities_deferred"],
+            )
+            break
 
         log.info("founders_os: sweeping %s -> entity=%s", folder_name, entity)
 
-        watermark_key = f"founders_os_{entity}_{folder_id}"
         cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
+        if item["watermark_ts"] is not None:
+            wm_dt = datetime.fromtimestamp(item["watermark_ts"], tz=timezone.utc)
+            cutoff = max(cutoff, wm_dt)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # D-051 review fix: on COMPLETION the watermark must advance to the time
+        # this multi-run sweep BEGAN, not the completing run's start. A resumed
+        # run skips the file-processing of already-`completed` folders (perf), so
+        # a file dropped into such a folder AFTER it was checkpointed but BEFORE
+        # the sweep finished is never re-enumerated on the completing run; if the
+        # watermark then jumped to the (later) completing-run start, that file
+        # would fall permanently below every future incremental cutoff and be
+        # silently lost. Pinning the watermark to the ORIGINAL sweep start keeps
+        # such files above the next cutoff (re-enumerated, idempotent upsert).
+        # The marker is written EAGERLY (before any tree work) so it survives even
+        # a hard SIGKILL that outran the self-budget. Single-run entities pay one
+        # extra checkpoint write+delete — negligible.
+        start_key = f"founders_os_startmark_{watermark_key}"
+        effective_start = int(run_start.timestamp())
         if not dry_run:
             try:
-                state = kb.get_sync_state(watermark_key)
-                if state and isinstance(state[0], int):
-                    wm_dt = datetime.fromtimestamp(state[0], tz=timezone.utc)
-                    cutoff = max(cutoff, wm_dt)
-            except Exception:
-                pass
-        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+                sm = kb.get_checkpoint(start_key)
+                if sm and isinstance(sm.get("started_at"), int):
+                    effective_start = sm["started_at"]   # resuming — keep original
+                else:
+                    kb.set_checkpoint(start_key, {"started_at": effective_start})
+            except Exception as exc:  # noqa: BLE001 — never block a sweep on this
+                log.warning("founders_os: start-mark failed for %s: %s", entity, exc)
 
         is_lex         = entity == "LEX"
         score_threshold = _LEX_SCORE_THRESHOLD if is_lex else _DEFAULT_SCORE_THRESHOLD
@@ -1190,71 +1345,118 @@ def sweep_founders_os(
             "phi_skipped": 0, "noise_filtered": 0, "dedup_skipped": 0,
         }
 
+        # Track every checkpoint key this entity touches, and whether the whole
+        # entity completed. The watermark advances (and checkpoints clear) ONLY
+        # when entity_completed stays True across every subtree.
+        entity_completed = True
+        ckpt_keys: list[str] = []
+
         sub_entity_map = _ENTITY_SUB_MAP.get(entity)
         if sub_entity_map:
             subfolders = _list_subfolders(service, folder_id)
-            for subfolder in subfolders:
-                sub_entity = sub_entity_map.get(subfolder["name"].lower())
-                if not sub_entity:
-                    continue
+            matched = [
+                (sf, sub_entity_map[sf["name"].lower()])
+                for sf in subfolders if sf["name"].lower() in sub_entity_map
+            ]
+            # The root tree must NOT re-walk the sub-entity folders (they're each
+            # swept as their own sub-entity). This was harmless before only because
+            # in-run seen_file_ids dedup skipped them; under resume (fresh
+            # seen_file_ids) the root tree would otherwise re-tag sub-entity files
+            # with the PARENT entity — a firewall regression. Skip them explicitly.
+            sub_skip = frozenset(sf["id"] for sf, _ in matched)
+            for sf, sub_entity in matched:
                 log.info("founders_os: sweeping sub-entity %s", sub_entity)
-                _sweep_folder_tree(
-                    service=service, folder_id=subfolder["id"],
+                key = f"founders_os_ckpt_{sf['id']}"
+                ckpt_keys.append(key)
+                done = _sweep_folder_tree(
+                    service=service, folder_id=sf["id"],
                     entity=entity, sub_entity=sub_entity,
                     kb=kb, anthropic_client=anthropic_client,
                     cutoff_str=cutoff_str, dry_run=dry_run,
                     is_lex=is_lex, score_threshold=score_threshold,
                     seen_file_ids=seen_file_ids, stats=stats,
-                    checkpoint_key=f"founders_os_ckpt_{subfolder['id']}",
+                    checkpoint_key=key,
                     sheets_service=sheets_service,
+                    deadline_monotonic=deadline,
                 )
-            _sweep_folder_tree(
-                service=service, folder_id=folder_id,
-                entity=entity, sub_entity=None,
-                kb=kb, anthropic_client=anthropic_client,
-                cutoff_str=cutoff_str, dry_run=dry_run,
-                is_lex=is_lex, score_threshold=score_threshold,
-                seen_file_ids=seen_file_ids, stats=stats,
-                checkpoint_key=f"founders_os_ckpt_{folder_id}_root",
-                sheets_service=sheets_service,
-            )
+                if not done:
+                    entity_completed = False
+                    break
+            if entity_completed:
+                key = f"founders_os_ckpt_{folder_id}_root"
+                ckpt_keys.append(key)
+                entity_completed = _sweep_folder_tree(
+                    service=service, folder_id=folder_id,
+                    entity=entity, sub_entity=None,
+                    kb=kb, anthropic_client=anthropic_client,
+                    cutoff_str=cutoff_str, dry_run=dry_run,
+                    is_lex=is_lex, score_threshold=score_threshold,
+                    seen_file_ids=seen_file_ids, stats=stats,
+                    checkpoint_key=key,
+                    sheets_service=sheets_service,
+                    deadline_monotonic=deadline,
+                    skip_folder_ids=sub_skip,
+                )
         else:
-            _sweep_folder_tree(
+            key = f"founders_os_ckpt_{folder_id}"
+            ckpt_keys.append(key)
+            entity_completed = _sweep_folder_tree(
                 service=service, folder_id=folder_id,
                 entity=entity, sub_entity=None,
                 kb=kb, anthropic_client=anthropic_client,
                 cutoff_str=cutoff_str, dry_run=dry_run,
                 is_lex=is_lex, score_threshold=score_threshold,
                 seen_file_ids=seen_file_ids, stats=stats,
-                checkpoint_key=f"founders_os_ckpt_{folder_id}",
+                checkpoint_key=key,
                 sheets_service=sheets_service,
+                deadline_monotonic=deadline,
             )
-
-        if not dry_run:
-            try:
-                kb.set_sync_state(watermark_key, int(run_start.timestamp()))
-            except Exception as exc:
-                log.warning("founders_os: watermark advance failed for %s: %s", entity, exc)
-
-        log.info(
-            "founders_os: %s done -- enumerated=%d extracted=%d ingested=%d "
-            "phi=%d noise=%d dedup=%d",
-            entity, stats["files_enumerated"], stats["files_extracted"],
-            stats["chunks_ingested"], stats["phi_skipped"],
-            stats["noise_filtered"], stats["dedup_skipped"],
-        )
 
         aggregate["entities_swept"] += 1
         for k in ("files_enumerated", "files_extracted", "chunks_ingested",
                   "phi_skipped", "noise_filtered", "dedup_skipped"):
             aggregate[k] += stats.get(k, 0)
 
+        if entity_completed:
+            if not dry_run:
+                try:
+                    # effective_start = the ORIGINAL sweep start (see start-mark
+                    # note above), so mid-sweep file drops are not skipped past.
+                    kb.set_sync_state(watermark_key, effective_start)
+                except Exception as exc:
+                    log.warning("founders_os: watermark advance failed for %s: %s", entity, exc)
+                # Entity fully swept — clear its resume checkpoints + start marker.
+                for key in (*ckpt_keys, start_key):
+                    try:
+                        kb.delete_checkpoint(key)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("founders_os: checkpoint clear failed for %s: %s", key, exc)
+            log.info(
+                "founders_os: %s done -- enumerated=%d extracted=%d ingested=%d "
+                "phi=%d noise=%d dedup=%d",
+                entity, stats["files_enumerated"], stats["files_extracted"],
+                stats["chunks_ingested"], stats["phi_skipped"],
+                stats["noise_filtered"], stats["dedup_skipped"],
+            )
+        else:
+            # Budget cut mid-entity: watermark stays put, checkpoints persisted
+            # for resume next run. Stop here — the budget is spent.
+            aggregate["budget_interrupted"] = True
+            aggregate["entities_deferred"] = len(work) - i - 1
+            log.info(
+                "founders_os: %s INTERRUPTED by budget (checkpointed for resume) "
+                "-- ingested=%d so far; %d later entity/ies deferred",
+                entity, stats["chunks_ingested"], aggregate["entities_deferred"],
+            )
+            break
+
     log.info(
         "founders_os: COMPLETE -- entities=%d enumerated=%d extracted=%d "
-        "ingested=%d phi=%d noise=%d dedup=%d",
+        "ingested=%d phi=%d noise=%d dedup=%d deferred=%d%s",
         aggregate["entities_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
-        aggregate["dedup_skipped"],
+        aggregate["dedup_skipped"], aggregate["entities_deferred"],
+        " [budget-interrupted]" if aggregate["budget_interrupted"] else "",
     )
     return aggregate

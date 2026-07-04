@@ -373,3 +373,64 @@ def test_format_finance_chunks_includes_filed_links():
 def test_format_finance_chunks_empty():
     text = fr.format_finance_chunks([], "all monitored mailboxes", {})
     assert "No matching financial documents" in text
+
+
+# ── W4-02: delivery-failure fail-loud alert ────────────────────────────────────
+
+def _capture_slack(monkeypatch):
+    sent = {}
+
+    class _Client:
+        def __init__(self, token=None):
+            pass
+
+        def chat_postMessage(self, channel, text, **kw):
+            sent["channel"] = channel
+            sent["text"] = text
+            return {"ok": True}
+
+    import slack_sdk
+    monkeypatch.setattr(slack_sdk, "WebClient", _Client)
+    return sent
+
+
+def test_alert_delivery_failure_posts_metadata_only(monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.delenv("FINANCE_DIGEST_FALLBACK_CHANNEL", raising=False)
+    monkeypatch.delenv("HEALTH_REPORT_CHANNEL", raising=False)
+    sent = _capture_slack(monkeypatch)
+
+    ok = fr.alert_delivery_failure(164, 28)
+    assert ok is True
+    assert sent["channel"] == "hjrg-leadership"        # default ops fallback
+    txt = sent["text"]
+    # Metadata only — count + reason + fix, NO financial CONTENT leaked.
+    assert "164 financial document" in txt
+    assert "could not be delivered" in txt
+    assert "$" not in txt              # no amounts
+    assert "filed copy" not in txt     # no per-doc vendor lines
+    assert "un-archive" in txt and "finance-receipt-allowlist.yaml" in txt
+
+
+def test_alert_delivery_failure_honors_fallback_env(monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("FINANCE_DIGEST_FALLBACK_CHANNEL", "cora-health")
+    sent = _capture_slack(monkeypatch)
+    fr.alert_delivery_failure(1, 1)
+    assert sent["channel"] == "cora-health"
+
+
+def test_alert_delivery_failure_no_token_returns_false(monkeypatch):
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    # Should not raise, should not post, returns False.
+    assert fr.alert_delivery_failure(5, 3) is False
+
+
+def test_fallback_channel_precedence(monkeypatch):
+    monkeypatch.delenv("FINANCE_DIGEST_FALLBACK_CHANNEL", raising=False)
+    monkeypatch.delenv("HEALTH_REPORT_CHANNEL", raising=False)
+    assert fr._fallback_alert_channel() == "hjrg-leadership"
+    monkeypatch.setenv("HEALTH_REPORT_CHANNEL", "cora-health")
+    assert fr._fallback_alert_channel() == "cora-health"
+    monkeypatch.setenv("FINANCE_DIGEST_FALLBACK_CHANNEL", "explicit-chan")
+    assert fr._fallback_alert_channel() == "explicit-chan"

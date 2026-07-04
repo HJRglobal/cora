@@ -543,3 +543,54 @@ def post_digest_to_slack(text: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.error("finance_receipts: digest post failed: %s", exc)
         return False
+
+
+# Where a DELIVERY-FAILURE notice goes when the pinned finance channel can't be
+# posted to (e.g. it was archived — W4-02). Reuses the ops channel the nightly
+# health check already posts to. This channel must NOT be a finance-tier
+# surface: the notice is deliberately METADATA-ONLY (count + reason + fix, never
+# vendor/amount/subject lines) so no financial CONTENT leaks off the finance
+# channel while we make the failure loud.
+def _fallback_alert_channel() -> str:
+    return (
+        os.environ.get("FINANCE_DIGEST_FALLBACK_CHANNEL", "").strip()
+        or os.environ.get("HEALTH_REPORT_CHANNEL", "").strip()
+        or "hjrg-leadership"
+    )
+
+
+def alert_delivery_failure(n_docs: int, accounts_scanned: int) -> bool:
+    """W4-02: make a digest DELIVERY break loud instead of silent.
+
+    The digest itself does its work (files docs) but the summary post can fail —
+    e.g. the pinned #hjr-finance channel is archived. Before this, the only
+    signals were a disk log line + a nonzero exit code that nothing watched, so
+    the weekly summary silently reached no one. This posts a metadata-only notice
+    (NO vendor/amount lines — the finance firewall keeps digest CONTENT off
+    non-finance channels) to a known-live ops channel. Returns True if posted."""
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    channel = _fallback_alert_channel()
+    target_label = "#" + (_load_config().get("channel_name") or "hjr-finance")
+    if not token:
+        log.error("finance_receipts: no SLACK_BOT_TOKEN — cannot raise delivery-failure alert")
+        return False
+    notice = (
+        ":warning: *Weekly finance receipt digest could not be delivered.* "
+        f"{n_docs} financial document(s) across {accounts_scanned} monitored "
+        "inbox(es) were filed to the Receipts & Invoices Inbox, but the summary "
+        f"post to the finance channel (`{target_label}`) failed — it is most "
+        "likely archived. *Fix:* un-archive that channel, or repoint `channel_id` "
+        "in `data/maps/finance-receipt-allowlist.yaml` to a live finance channel "
+        "(note: that also moves the cross-mailbox receipt-retrieval permission, "
+        "so it is a deliberate security-boundary decision)."
+    )
+    try:
+        from slack_sdk import WebClient  # lazy
+        WebClient(token=token).chat_postMessage(
+            channel=channel, text=notice, unfurl_links=False, unfurl_media=False,
+        )
+        log.info("finance_receipts: delivery-failure alert posted to #%s", channel)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.error("finance_receipts: delivery-failure alert ALSO failed to #%s: %s", channel, exc)
+        return False
