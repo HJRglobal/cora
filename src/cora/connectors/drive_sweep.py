@@ -43,9 +43,14 @@ from typing import Any
 import yaml
 
 from cora.connectors.drive_entity_detect import detect_entity_from_filename
+from cora.drive_materializer import ENTITY_CODES as _MATERIALIZER_ENTITY_CODES
 from cora.kb_exclusions import is_cora_internal_title
 from cora.knowledge_base.store import Document
 from cora.phi_guard import _PHI_PATTERNS
+
+# Canonical parent entity codes (post sub-entity split), reused from the
+# materializer so the two can't drift. O(1) membership for the W6-05 guard.
+_CANONICAL_ENTITIES: frozenset[str] = frozenset(_MATERIALIZER_ENTITY_CODES)
 
 log = logging.getLogger("cora.drive_sweep")
 
@@ -384,6 +389,23 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
         if prefix in ("LEX", "HJRP", "HJRPROD"):
             sub_entity = entity
             entity = prefix
+
+    # Entity-firewall guard (audit W6-05): Haiku can hallucinate an off-menu code
+    # (e.g. the filename token "F3" minted entity='F3' from an OSN receipt) that
+    # no channel routes to. Reject any non-canonical post-split parent code and
+    # fall back to the file owner's canonical default rather than minting a novel
+    # entity. _CANONICAL_ENTITIES is drive_materializer.ENTITY_CODES (the 10 parent
+    # codes; the classifier prompt's allowed set collapses to exactly these after
+    # the sub-entity split above). Mirrors session_capture's VALID_ENTITIES guard.
+    if entity not in _CANONICAL_ENTITIES:
+        default = user.get("entity_default", "FNDR")
+        fallback = default if default in _CANONICAL_ENTITIES else "FNDR"
+        log.warning(
+            "drive_sweep: non-canonical entity %r for %r -> falling back to %s",
+            entity, file_meta.get("name"), fallback,
+        )
+        entity = fallback
+        sub_entity = None
 
     summary = classification.get("summary", file_meta["name"])
     file_id = file_meta["id"]

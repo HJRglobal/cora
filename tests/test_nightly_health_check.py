@@ -24,7 +24,10 @@ import nightly_health_check as hc  # noqa: E402
 def test_state_config_loads():
     disabled, running = hc._load_task_state_config()
     assert "cowork-cora-service" in running
-    assert "Cora - Clover Daily Summary" in disabled
+    # "Cora - Clover Daily Summary" was REMOVED from the host (audit W4-03/W8-03,
+    # 2026-07-03); a removed task is not an expected-disabled task, so it must NOT
+    # be listed. cowork-clover-daily-pull is still present-but-Disabled, so it stays.
+    assert "Cora - Clover Daily Summary" not in disabled
     assert "cowork-clover-daily-pull" in disabled  # was missing -> false CRITICAL
     assert "cowork-cora-digest" in disabled  # WS17-C: silences the daily false WARN
     assert "cowork-cora-gap-digest" in disabled  # retired 2026-07-02 (hygiene S1)

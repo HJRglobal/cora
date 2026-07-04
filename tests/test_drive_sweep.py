@@ -326,6 +326,90 @@ class TestIngestFile:
         assert "drive.google.com/file/d/abc123" in docs[0].deep_link
 
 
+# ── non-canonical entity guard (audit W6-05, entity-firewall strengthening) ─────
+
+class TestNonCanonicalEntityGuard:
+    """A Haiku mis-classification that returns an off-menu code (e.g. 'F3' from a
+    filename token) must NOT mint a non-canonical entity that no channel routes to;
+    it falls back to the file owner's canonical default. Reproduces the audited
+    OSN Val Vista receipt that was tagged entity='F3'.
+    """
+
+    def _make_kb(self):
+        kb = MagicMock()
+        kb.upsert_documents = MagicMock(return_value=1)
+        return kb
+
+    def test_non_canonical_entity_falls_back_to_owner_default(self):
+        kb = self._make_kb()
+        file_meta = {"id": "f3receipt", "name": "376.2 F3.pdf", "mimeType": "application/pdf", "modifiedTime": "2024-11-06T00:00:00Z"}
+        classification = {"score": 8, "entity": "F3", "summary": "Val Vista receipt", "discard_reason": ""}
+        user = {"email": "matt@onestopnutrition.com", "name": "Matt", "entity_default": "OSN"}
+        _ingest_file(kb, file_meta, "425 SOUTH VAL VISTA DRIVE ...", classification, user)
+        doc = kb.upsert_documents.call_args[0][0][0]
+        assert doc.entity == "OSN"          # not the bogus 'F3'
+        assert doc.sub_entity is None
+
+    def test_non_canonical_entity_and_non_canonical_default_falls_to_fndr(self):
+        kb = self._make_kb()
+        file_meta = {"id": "x", "name": "weird.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-01-01T00:00:00Z"}
+        classification = {"score": 6, "entity": "F3", "summary": "?", "discard_reason": ""}
+        user = {"email": "someone@hjrglobal.com", "name": "Someone", "entity_default": "BOGUS"}
+        _ingest_file(kb, file_meta, "content", classification, user)
+        assert kb.upsert_documents.call_args[0][0][0].entity == "FNDR"
+
+    def test_canonical_parent_preserved(self):
+        kb = self._make_kb()
+        file_meta = {"id": "o1", "name": "osn.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-01-01T00:00:00Z"}
+        classification = {"score": 8, "entity": "OSN", "summary": "OSN doc", "discard_reason": ""}
+        user = {"email": "matt@onestopnutrition.com", "name": "Matt", "entity_default": "OSN"}
+        _ingest_file(kb, file_meta, "content", classification, user)
+        assert kb.upsert_documents.call_args[0][0][0].entity == "OSN"
+
+    def test_canonical_sub_entity_preserved_through_guard(self):
+        kb = self._make_kb()
+        file_meta = {"id": "cl1", "name": "hjrp-cl-lease.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-01-01T00:00:00Z"}
+        classification = {"score": 8, "entity": "HJRP-CL", "summary": "Cinema Lanes lease", "discard_reason": ""}
+        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR"}
+        _ingest_file(kb, file_meta, "content", classification, user)
+        doc = kb.upsert_documents.call_args[0][0][0]
+        assert doc.entity == "HJRP"           # parent kept (guard sees canonical HJRP post-split)
+        assert doc.sub_entity == "HJRP-CL"    # sub-entity preserved
+
+    def test_canonical_set_is_materializer_codes(self):
+        # Cheap guard: _CANONICAL_ENTITIES must remain a view of the materializer's
+        # ENTITY_CODES (catches someone re-hardcoding it to a divergent literal).
+        from cora import drive_materializer
+        from cora.connectors import drive_sweep
+        assert drive_sweep._CANONICAL_ENTITIES == frozenset(drive_materializer.ENTITY_CODES)
+
+    def test_classifier_prompt_codes_collapse_to_canonical_set(self):
+        # The REAL drift risk (per the Slice A D-051 review): the guard rejects any
+        # code Haiku returns that is not canonical-after-split. If the classifier
+        # prompt's allowed entity list drifts from _CANONICAL_ENTITIES, the guard
+        # would start downgrading a legit code (prompt adds one) or accept a code
+        # Haiku can never emit (ENTITY_CODES adds one). Assert the prompt's allowed
+        # codes, collapsed by the SAME sub-entity split _ingest_file uses, == the
+        # guard set. Extracted from the prompt text so it can't silently drift.
+        import re as _re
+        from cora.connectors import drive_sweep
+        prompt = drive_sweep._CLASSIFY_PROMPT
+        block = prompt.split("entity from:", 1)[1].split("Respond with JSON", 1)[0]
+        # Codes may contain digits (F3E, F3C) and hyphens (LEX-LLC, HJRP-CL).
+        codes = set(_re.findall(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)*\b", block))
+        assert codes, "could not parse the classifier prompt's allowed entity codes"
+        collapsed = set()
+        for c in codes:
+            if "-" in c and c.split("-")[0] in ("LEX", "HJRP", "HJRPROD"):
+                collapsed.add(c.split("-")[0])
+            else:
+                collapsed.add(c)
+        assert collapsed == set(drive_sweep._CANONICAL_ENTITIES), (
+            "classifier prompt entity codes (collapsed to parents) diverged from the "
+            f"guard's canonical set. prompt->{sorted(collapsed)} guard->{sorted(drive_sweep._CANONICAL_ENTITIES)}"
+        )
+
+
 # ── sweep_user ────────────────────────────────────────────────────────────────
 
 class TestSweepUser:

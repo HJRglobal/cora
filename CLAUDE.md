@@ -1928,6 +1928,6 @@ deployment/
 | D-025 | Credit requires @f3energy media tag -- hashtag-only posts do not qualify |
 | D-026 | QBO is primary financial source for all accounting questions (P&L, balance sheet, AR/AP, transactions). GSheets = supplemental only (weekly cash flow forecast + filed close packs). |
 | D-027 | Clover retired permanently from OSN stack (2026-06-05). OSN uses QBO as sole financial source. Do NOT rebuild Clover integration. |
-| D-028 | Per-tool timeout tiers: 8s fast (local DB), 15s default (single API), 25s heavy (multi-step/image/meeting). |
+| D-028 | Per-tool timeout tiers (6-tier as of 2026-07-03, audit W3-07): 8s fast (local DB) / 12s normal (single API) / 15s default (finance+QBO) / 20s heavy (uploads/DM/drafts) / 25s heaviest (image/deck/meeting/composite) + per-tool overrides (cora_person_dossier=60s). SOURCE OF TRUTH = `_TOOL_TIMEOUTS` in tool_dispatch.py; unlisted default = 15s. |
 | D-029 | Cora = intelligence + conversation. Make.com = mechanical automation. Rule-based, threshold-based, or straight data-push tasks belong in Make.com. Cora only where natural language or context is needed. |
 | D-030 | Meeting Action Capture watermark must track transcript IDs, not just timestamps. Timestamp-only watermarks fail when meeting_ts equals the watermark value. ID-set dedup is required. Watermark format: `{"last_processed_ts": N, "processed_ids": [...]}`. |

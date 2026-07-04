@@ -5581,9 +5581,13 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
 }
 
 
-# Per-tool timeout overrides (seconds). Default = 15s.
-# Fast tools (local DB / simple API): 8s
-# Heavy tools (multi-step, slow external APIs): 25s
+# Per-tool timeout overrides (seconds). THIS DICT IS THE SOURCE OF TRUTH for tool
+# timeouts — any doctrine text (decisions.md D-014, repo CLAUDE.md) is a pointer here.
+# Six tiers in use (superseding the older 8/15/25 three-tier note): 8s fast (local
+# DB / single quick call) · 12s normal (single external API) · 15s default (finance
+# / QBO reads) · 20s heavy (uploads, DM, drafts) · 25s heaviest (image/deck/meeting
+# parse / multi-source composite) · plus per-tool overrides (e.g. cora_person_dossier
+# = 60s for its Sonnet-dominated tail). Default when unlisted = _DEFAULT_TOOL_TIMEOUT (15s).
 _TOOL_TIMEOUTS: dict[str, int] = {
     # Fast — local DB or single quick API call
     "asana_get_my_tasks": 8,

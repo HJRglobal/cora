@@ -222,6 +222,13 @@ COMPLEX k bumped from default-8 to 12.
 remain responsive. Long-running tool calls (slow HubSpot API, Drive timeouts)
 were silently blocking the event loop.
 
+**SUPERSEDED (2026-07-03, audit W3-07):** the single 25s wrap became a per-tool
+tier scheme. The current scheme is SIX tiers — 8 / 12 / 15 / 20 / 25 seconds plus
+per-tool overrides (e.g. `cora_person_dossier` = 60s) — and the SOURCE OF TRUTH is
+`_TOOL_TIMEOUTS` in `tool_dispatch.py` (default when unlisted = `_DEFAULT_TOOL_TIMEOUT`
+= 15s). The older "8s fast / 15s default / 25s heavy" three-tier note (D-028 doctrine
+row in the repo CLAUDE.md) is stale; read `_TOOL_TIMEOUTS` directly when tuning.
+
 ---
 
 ## D-015 · Rate limiter persisted to SQLite across restarts (2026-05-31)
@@ -2359,3 +2366,31 @@ but a business entity name in a holdco digest - gate it entity-aware or it false
 5. Before deleting test infra, prove it inert on the real host (the shipped module already provides what the fork injected) AND that nothing imports it -- a stale conftest fork of production logic is a false-green hazard, not a safety net.
 
 **Open (Harrison / Cowork cascade):** branch `claude/audit-slice-03-test-coverage` committed (fix `39a409f` + this docs commit), NOT pushed/merged pending Harrison. Merge to `main` (test-only, no restart). Remaining audit slices are separate: W1/W9 god-file splits (app.py / tool_dispatch.py), W2-01/W6-01/W6-06 PHI backstops, W3-01/W3-02/W3-04 tool-timeout + gate fixes, MK-01 deal-sync drop-both, .env.example regen (W9-01), doc-sprawl archives (W11-02/W8-02).
+
+---
+
+## D-070 - Audit Slice A: config/DR + hygiene sweep (16 findings) (2026-07-03)
+
+Branch `claude/audit-slice-01-config-dr-hygiene` off local main `c9d13cc` (D-069 merged; note origin/main was still `aa82136` = D-068, i.e. the D-069 merge was local-only/unpushed when this slice branched). NOT pushed/merged pending Harrison. Suite 5,740 green. NO restart (doc/config + one bot-loaded but behavior-neutral guard). VERIFY-FIRST corrected the audit in several places.
+
+**SHIPPED in-repo:**
+- **W9-01 (HIGH)** `.env.example` regenerated from the actual env-read set (39 -> 108 documented keys), grouped by domain, each with code-default + one-line purpose. The RESERVED drive-extractor pause is pinned **`DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0` ACTIVE** (code default is `"1"`=ENABLED) so a rebuild-from-example reproduces the paused state -- the silent-reversal fix. Durable guard: new `tests/test_env_example_coverage.py` fails if any `os.environ`/`getenv`/config-wrapper key read under `src/` is undocumented (3 extraction patterns: direct call, `*_ENV="KEY"` constant indirection, config.py `get("KEY")` wrapper; full-text scan so multi-line reads are caught; commented `# KEY=` counts as documented). Pins the pause + the dead-key removal. **DID NOT** flip the code default of the pause flag (RESERVED -- documenting the value in .env.example is sufficient and honors "do not change it").
+- **W9-04** removed the dead `LINKEDIN_SPY_CHANNEL` (Apollo->Make; read nowhere). APOLLO_API_KEY + META_APP_* kept under a labeled "legacy/not-read-by-current-code" section (flagged, not deleted -- out of slice scope).
+- **W3-07** the stale D-028 3-tier timeout doctrine (8/15/25) updated to the real 6-tier scheme (8/12/15/20/25 + 60s dossier; default 15) in three places: the `_TOOL_TIMEOUTS` header comment (declared source of truth), repo `CLAUDE.md` D-028 row, and a SUPERSEDED note on D-014. No code change.
+- **W4-03 / W8-03** removed the stale `Cora - Clover Daily Summary` from `scheduled-task-state.yaml` disabled: block (task removed from host, like LinkedIn Spy); kept `cowork-clover-daily-pull` (still present-but-Disabled). Updated the pinning test (`test_nightly_health_check.py`) to assert-absent.
+- **W4-04** `setup-drive-extractor-task.ps1` trigger `04:00`->`04:05` (matches the B1 de-collision map) + a warning header (re-registering must keep 04:05; the pause lives in .env, not the task). ASCII-only.
+- **W11-01** `cora-constitution.md` refreshed: bullet threshold 4+ -> 3+ (matches `_UNIVERSAL_RULES`); added D-032 Slack-native format, D-064 finance-precision, D-068 thread parity; declared the machine files the source of truth; changelog rows.
+- **W11-03** created the 3 missing repo `design/known-answers/{f3c,hjrprod,ufl}.md` stubs the entity map references (fallback store completeness).
+- **W6-05 (entity-firewall strengthening)** `drive_sweep._ingest_file` now rejects a non-canonical post-split entity (a Haiku-hallucinated off-menu code like the audited `F3`) and falls back to the file owner's canonical `entity_default` instead of minting a novel entity; `_CANONICAL_ENTITIES = frozenset(drive_materializer.ENTITY_CODES)` (single source of truth). Tests + a prompt-vs-canon anti-drift test.
+- **W6-04 / W6-05 (KB writes -- GATED, NOT run)** `scripts/fix_kb_hygiene.py` (`--dry-run` DEFAULT, read-only; `--apply` Harrison-gated): re-tag the single `entity='F3'` chunk (`04061ff8-...`, an OSN Val Vista receipt) -> `OSN` (aborts unless exactly 1 F3 chunk + content marker); refresh the cosmetic `checkpoint_state kb_bin_index_ready` count 262441 -> live 605,982 (only `ready` is load-bearing; count is unread). Dry-run verified.
+
+**FLAGGED (Cowork / Harrison actions, NOT forced in-repo):** W11-02/W8-02 Drive doc-sprawl archive (the executed 2026-06-16 rebuild set + 2026-06-17 phase-3 prompts -> `_shared/projects/cora/_archive/`; cross-ref grep done -- moving requires updating live references, see the cascade report); W6-02 the 3.44 GB `backups/2026-06-07/cora_kb.db.bak` disk-delete (`.gitignore` already covers `/backups/` -- so only the host delete remains); W4-05 the 4 off-window same-minute task collisions (02:00/14:00/16:00/22:00 AZ; document-as-accepted, the 02:00 kb-sync-slack+qbo-token-refresh double is the one worth restaggering); W4-04 broader sweep (~6 setup-*.ps1 `-At` times still pre-B1; exact B1 map in the cascade report); W11-04 the 140 KB repo-root `CLAUDE.md` build-log trim (note-only).
+
+**Adversarial review (D-051 -- streak holds):** 5-agent fleet (security/preserve-list, W9-01 env coverage, drive_sweep guard, KB script/registry/setup, doc accuracy). 0 findings against PRODUCTION behavior; every real finding was TEST/DOC-quality -- exactly the "green suite misses it" pattern. Fixed pre-push: (1) the drive_sweep reconciliation test was TAUTOLOGICAL (`_CANONICAL_ENTITIES` IS `frozenset(ENTITY_CODES)`) -> added a real test that the classifier PROMPT's allowed codes collapse to the guard set (which itself fired on my own regex bug -- `[A-Z]{2,}` dropped the digit codes F3E/F3C -- proving it bites); (2) the env-coverage extractor was line-by-line so multi-line reads (config.py `get(\n "QBO_REDIRECT_URI")`) slipped -> switched to full-text scan; (3) `OSN_SCHEDULER_ADMIN_USER_IDS` mislabeled `# default` when the code default is `""` -> relabeled operational; (4) W6-04 count-semantics clarifying comment.
+
+**DOCTRINE:**
+1. A one-time regen is not a fix -- pair every "regenerate X from the code" cleanup with a guardrail TEST that fails on future drift (here: src env-reads must be a subset of `.env.example`). The extractor must model how the code ACTUALLY reads env (direct call + `*_ENV` constant indirection + the config.py wrapper) and scan full-text, or it silently under-covers.
+2. A RESERVED pause is safest fixed by pinning its ratified value in the template that a rebuild copies (`=0`), NOT by relying on the live `.env` alone -- but do NOT change the code default when told the flag is RESERVED; the template pin closes the DR hazard without touching runtime.
+3. Verify a "cosmetic" claim before writing to a live store: confirm the field is unread (grep every consumer) -- `kb_bin_index_ready.count` is written by the migration but read by nobody; only `ready` gates the fast path.
+4. An anti-drift reconciliation test must compare the two things that can ACTUALLY diverge (the classifier prompt's allowed codes vs the guard set), not a tautology (`X == X` where both are the same import).
+5. A config-hygiene fix to a scheduled-task registry can require a test edit -- `test_nightly_health_check.py` pinned the stale Clover entry; removing the yaml line without the test would have gone RED. Grep tests before editing a data/config file.

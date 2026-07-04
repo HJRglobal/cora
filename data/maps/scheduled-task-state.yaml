@@ -27,8 +27,10 @@ disabled:
   - Cora - Shopify DTC Summary
   - Cora - Deal Aging Alerts
   - Cora - Weekly Pipeline Digest
-  # Clover retired 2026-06-05/06 (D-027 / D-032)
-  - Cora - Clover Daily Summary
+  # Clover retired 2026-06-05/06 (D-027 / D-032). "Cora - Clover Daily Summary"
+  # was REMOVED from the host (2026-07-03, audit W4-03/W8-03) -- a removed task is
+  # not an "expected disabled" task, same as the delisted "Cora - LinkedIn Spy".
+  # cowork-clover-daily-pull remains present-but-Disabled on the host, so it stays.
   - cowork-clover-daily-pull
   # Cash Pulse disabled 2026-06-16 (gate G-E / audit N1)
   - Cora - Cash Flow Pulse
