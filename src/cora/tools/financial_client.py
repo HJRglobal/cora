@@ -446,6 +446,20 @@ def upload_report_as_file(
         log.warning("upload_report_as_file: SLACK_BOT_TOKEN not set")
         return False
 
+    # W3-05: this is the last raw-HTTP finance egress path -- the report bytes are
+    # PUT straight to Slack's upload URL via httpx, bypassing the slack_egress
+    # WebClient patch (which only wraps chat_* sends). Route the content (and the
+    # file title, shared via files_completeUploadExternal) through the same SAFETY
+    # sanitizer every chat send gets: mojibake repair + bare-URL/GID/long-ID
+    # redaction. Local import mirrors the httpx import above and avoids any
+    # import-time cycle. Fail-soft -- a sanitizer error must not drop the upload.
+    try:
+        from ..slack_egress import sanitize_text
+        content = sanitize_text(content)
+        title = sanitize_text(title)
+    except Exception:  # noqa: BLE001 -- never let sanitization block the upload
+        log.exception("upload_report_as_file: egress sanitize failed; uploading raw")
+
     content_bytes = content.encode("utf-8")
     filename = f"financial-report-{int(time.time())}.txt"
 

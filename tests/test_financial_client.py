@@ -294,3 +294,57 @@ class TestNotifyGap:
         # Should not raise — just logs warning
         result = notify_gap("cashflow topic for slack error test")
         assert result == UNKNOWN_RESPONSE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# W3-05: the financial-report file-upload PUTs bytes straight to Slack via httpx,
+# bypassing the slack_egress WebClient patch. Pin that the content is now routed
+# through slack_egress.sanitize_text before the PUT (bare URLs / long IDs stripped).
+# ─────────────────────────────────────────────────────────────────────────────
+class TestUploadReportEgress:
+    def _run_upload(self, monkeypatch, content, title="Report"):
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        slack_client = MagicMock()
+        slack_client.files_getUploadURLExternal.return_value = {
+            "ok": True, "upload_url": "https://files.slack.test/up", "file_id": "F1",
+        }
+        slack_client.files_completeUploadExternal.return_value = {"ok": True}
+        captured = {}
+
+        def _fake_put(url, content=None, headers=None, timeout=None):
+            captured["bytes"] = content
+            resp = MagicMock()
+            resp.status_code = 200
+            return resp
+
+        with patch("httpx.put", side_effect=_fake_put):
+            ok = financial_client.upload_report_as_file(
+                slack_client=slack_client, channel_id="C_FIN",
+                title=title, content=content,
+            )
+        return ok, captured
+
+    def test_bare_drive_url_stripped_from_uploaded_bytes(self, monkeypatch):
+        content = "Q1 revenue was strong. Source: https://drive.google.com/file/d/abc123XYZ/view here."
+        ok, captured = self._run_upload(monkeypatch, content)
+        assert ok is True
+        put_text = captured["bytes"].decode("utf-8")
+        assert "drive.google.com" not in put_text          # bare doc URL redacted
+        assert "Q1 revenue was strong" in put_text          # body survives
+        assert "here." in put_text
+
+    def test_naked_long_id_stripped_from_uploaded_bytes(self, monkeypatch):
+        content = "Invoice reference 1234567890123456789 for the period."
+        ok, captured = self._run_upload(monkeypatch, content)
+        assert ok is True
+        put_text = captured["bytes"].decode("utf-8")
+        assert "1234567890123456789" not in put_text        # 16+ digit naked ID redacted
+        assert "Invoice reference" in put_text
+
+    def test_sanctioned_link_preserved(self, monkeypatch):
+        # A sanctioned <url|label> Slack link is NOT stripped by the SAFETY subset.
+        content = "See the <https://drive.google.com/file/d/keep/view|filed report>."
+        ok, captured = self._run_upload(monkeypatch, content)
+        assert ok is True
+        put_text = captured["bytes"].decode("utf-8")
+        assert "<https://drive.google.com/file/d/keep/view|filed report>" in put_text

@@ -321,6 +321,24 @@ def test_tier2_no_user_id_fails_closed():
     assert d.action == "respond"
 
 
+def test_w2_04_guard_trio_exemption_contract():
+    # W2-04 pin: the DM Tier-2 retrieval branch (app.handle_message_event)
+    # dispatches WITHOUT re-running check_access / sibling / cross-entity guards.
+    # That is safe because check_tier2 is fail-closed AND owner-scoped, so a
+    # cross-entity / non-owner leak is structurally impossible on the grant path.
+    # These two properties (not the guard trio) are what makes the exemption safe;
+    # pin them together so the exemption can't silently rot.
+    # (1) fail-closed: unmapped identity => no grant.
+    assert ha.check_tier2("UNOBODY", True, "pull up my emails").action == "respond"
+    # (2) owner-scope: a mapped user's own-mailbox request grants ONLY their mailbox.
+    own = ha.check_tier2("UHANNAH", True, "pull up my emails about UFL")
+    assert own.action == "grant"
+    assert own.owner_emails == ha.owned_emails("UHANNAH")
+    # (3) owner-scope: a non-owner asking for a teammate's mail is refused, no grant.
+    other = ha.check_tier2("UTOMMY", True, "show me Hannah's emails")
+    assert other.action == "respond"
+
+
 # ── PHI exclusion on grants ───────────────────────────────────────────────────
 
 def test_drop_phi_removes_client_record_chunks():

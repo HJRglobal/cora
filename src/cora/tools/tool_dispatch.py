@@ -1813,10 +1813,6 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
 
 # --- Finance channel enforcement ---
 
-def _is_finance_channel(channel_name: str) -> bool:
-    """Return True only if channel_name ends with '-finance' (e.g. osn-finance)."""
-    return bool(channel_name) and channel_name.lower().endswith("-finance")
-
 
 def _is_hr_channel(channel_name: str) -> bool:
     """Return True only if channel_name ends with '-hr' (e.g. lex-hr)."""
@@ -1858,8 +1854,21 @@ def _qbo_error_message(entity: str, exc: Exception) -> str:
 
 
 def _is_tier1_channel(entity: str, channel_name: str) -> bool:
-    """Return True if the channel + entity combination grants TIER_1 access."""
+    """Return True if the channel + entity combination grants TIER_1 access.
+
+    A DM is structurally TIER_3 (W2-02). In a DM the ``entity`` passed to the
+    finance tools is the asker's org-roles PRIMARY, and channel_classifier.is_tier_1
+    short-circuits True for any HJRG-primary asker -- so an HJRG-primary user could
+    pull live finance DATA in a DM even though user_access.check_access already pins
+    DMs to TIER_3 (see app._handle_dm_qa). Refusing DMs here makes the tool-level
+    finance gate roster-independent and consistent with that pinned tier. The DM
+    signal at the tool layer is channel_name=="dm" -- claude_client does NOT thread
+    the "D..."-prefixed channel_id into dispatch, so _channel_id is empty on the
+    Q&A tool path; an empty/unknown channel_name is already non-TIER_1 below.
+    """
     if not channel_name:
+        return False
+    if channel_name.strip().lower() == "dm":
         return False
     func = _classify_channel_function(channel_name)
     return _channel_is_tier1(entity, func)
@@ -1934,7 +1943,12 @@ def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> 
 def _tool_financial_get_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
     """Read the weekly financial pulse .md file for the entity from Drive."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
+    # W3-04: gate on the same _is_tier1_channel as every sibling financial tool
+    # (cashflow / QBO / osn_pulse). The pulse .md summarizes finance data those
+    # tools already serve in any TIER_1 channel, so the old _is_finance_channel
+    # (-finance suffix only) gate was a narrower-than-D-064 divergence; aligning
+    # is a within-firewall tightening (no TIER_3 channel gains access).
+    if not _is_tier1_channel(entity, channel_name):
         return _FINANCE_CHANNEL_REQUIRED
     log.info("financial_get_pulse user=%s entity=%s", slack_user_id, entity)
     return financial_client.get_entity_pulse_text(
@@ -1947,7 +1961,8 @@ def _tool_financial_get_pulse(slack_user_id: str, entity: str, _input: dict) -> 
 def _tool_financial_get_close_pack(slack_user_id: str, entity: str, _input: dict) -> str:
     """Read a monthly close pack xlsx (P&L, balance sheet, cash flow, AR, or AP) from Drive."""
     channel_name = (_input or {}).get("_channel_name", "")
-    if not _is_finance_channel(channel_name):
+    # W3-04: align to the sibling _is_tier1_channel gate (see financial_get_pulse).
+    if not _is_tier1_channel(entity, channel_name):
         return _FINANCE_CHANNEL_REQUIRED
     inp = _input or {}
     period = (inp.get("period") or "").strip()
@@ -5681,13 +5696,26 @@ def dispatch(
         injected["_thread_ts"] = thread_ts
     try:
         timeout = _TOOL_TIMEOUTS.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        # W3-01: do NOT use the ThreadPoolExecutor context manager -- its __exit__
+        # runs shutdown(wait=True), which BLOCKS until the worker finishes, so a
+        # hung tool defeats its own future.result(timeout=...) and the dispatch
+        # wall-clock becomes unbounded. Manage the executor manually and shut it
+        # down non-blocking in a finally: wait=False abandons a still-running
+        # worker (Python cannot force-kill a thread), cancel_futures cancels any
+        # not-yet-started work. The success path is unchanged -- the worker is
+        # already done, so there is nothing to wait for. Tradeoff: a genuinely
+        # hung tool leaks one worker thread until it returns on its own, which is
+        # far better than blocking every request and is cleared on the next
+        # supervisor restart.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(fn, slack_user_id, entity, injected)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                log.warning("Tool %s timed out after %ds for user=%s entity=%s", tool_name, timeout, slack_user_id, entity)
-                return "Tool timed out — please try again."
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            log.warning("Tool %s timed out after %ds for user=%s entity=%s", tool_name, timeout, slack_user_id, entity)
+            return "Tool timed out — please try again."
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
         return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."

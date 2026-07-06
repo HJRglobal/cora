@@ -465,6 +465,9 @@ def _dispatch_qa(
         # retrieval, and the static portfolio context is withheld — explicit
         # mailbox retrieval doesn't need it, and a DM asker may not be
         # entity-authorized for the founder brief it contains.
+        # W2-04: this grant is owner-scoped + PHI-dropped (see _build_grant_context
+        # and historical_access.py L31-34); the DM-retrieval entry above dispatches
+        # here without re-running the guard trio, which is safe by that scoping.
         static_text = ""
         kb_text = _build_grant_context(
             retrieval_grant, user_message, user_id or "", channel_name,
@@ -1444,6 +1447,21 @@ def handle_message_event(event: dict, client) -> None:
             # top of _dispatch_qa issues the owner-scoped grant (or refuses,
             # fail-closed). The grant path withholds the static portfolio
             # context, so this adds no entity exposure for non-FNDR users.
+            #
+            # W2-04 — guard-trio exemption (documented, deliberate): unlike
+            # _handle_dm_qa below, this branch dispatches WITHOUT re-running
+            # user_access.check_access / sibling_guard / cross_entity_guard.
+            # That is safe by construction, NOT by omission:
+            #   * check_tier2 is FAIL-CLOSED — an unmapped identity gets no grant.
+            #   * the grant is scoped to the asker's OWN mailbox (owned_kb_search),
+            #     which they may always see (Harrison directive; the topic-block
+            #     exemption is documented at historical_access.py L31-34), so a
+            #     cross-entity / sibling leak is structurally impossible here.
+            #   * _build_grant_context applies historical_access.drop_phi before
+            #     the content ever reaches the model.
+            # Do NOT "restore" the guard trio here without re-reading that
+            # contract: the trio's job (entity/topic scoping) is already
+            # subsumed by the owner-scope + fail-closed grant.
             if historical_access.detect_retrieval_intent(text):
                 dm_channel = event.get("channel", user_id)
                 allowed, _cap = rate_limiter.check(user_id, dm_channel)
