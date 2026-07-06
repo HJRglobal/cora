@@ -119,19 +119,60 @@ def detect_sub_entity(title: str, content: str) -> str | None:
 #     — dropping all of those would be broad over-refusal beyond scope. The clinical
 #     residue among the untagged is caught at EGRESS (context_loader._withhold_non_lex_phi,
 #     W2-01) and monitored at rest (W6-06).
+#
+# W6-01 Fix-A (D-073, 2026-07-06): the tag+source is now only the SCOPE gate — it decides
+# WHICH docs to PHI-check, not which to drop. Harrison directed that LBHS/LTS *business*
+# (payroll / fees / PTO / aggregate "client billing" — NOT patient records, NOT 42-CFR-Part-2)
+# be KEPT + retrievable, while only actual PHI is dropped. Verified against the live corpus:
+# of 1,135 LBHS + 665 LTS tagged chunks, only ~42 carry PHI content; ~1,758 are business.
+# So the DROP decision moved to the PHI-content predicate below.
 RESTRICTED_INGEST_SUB_ENTITIES: tuple[str, ...] = ("LEX-LBHS", "LEX-LTS")
 RESTRICTED_INGEST_SOURCES: tuple[str, ...] = ("gmail", "drive_sweep")
 
 
 def is_restricted_lex_ingest(source: str | None, sub_entity: str | None) -> bool:
-    """True if a doc/chunk from a non-Slack sweep source (gmail/drive_sweep) resolves to
-    a restricted LEX sub-entity (LBHS/LTS) and must be dropped at ingest / purged (W6-01).
-
-    Single source of truth shared by KnowledgeBase.upsert_documents (drop new docs) and
-    scripts/purge_lex_restricted_kb.py (purge existing chunks), so the drop rule and the
-    purge scope can never diverge.
+    """SCOPE gate (W6-01): is this a non-Slack sweep (gmail/drive_sweep) doc/chunk resolved
+    to a restricted LEX sub-entity (LBHS/LTS)? True = it is a candidate for the PHI-content
+    drop below (NOT, by itself, a drop — see restricted_lex_phi_content_drop). Slack
+    lbhs*/lts* channels are denied upstream; GM-level / LLC / LLA / other sources are out of
+    scope. Shared by upsert_documents + purge_lex_restricted_kb.py so scope can't diverge.
     """
     return (
         source in RESTRICTED_INGEST_SOURCES
         and sub_entity in RESTRICTED_INGEST_SUB_ENTITIES
     )
+
+
+def restricted_lex_phi_content_drop(
+    source: str | None,
+    sub_entity: str | None,
+    title: str | None,
+    content: str | None,
+    allowed_names: set[str] | None = None,
+) -> bool:
+    """W6-01 Fix-A (D-073): DROP a gmail/drive_sweep LBHS/LTS doc ONLY when its content
+    actually carries PHI — NOT on the bare entity tag.
+
+    True iff the doc is in scope (is_restricted_lex_ingest) AND its title+content trips the
+    TAG-SCOPED PHI predicate phi_guard.non_lex_phi_backstop_trips_individual: clinical FRAMING
+    (DOB / ICD-10 / "diagnosed with X"), or a bare dx/med term WITH a specific named individual,
+    or named-individual program billing. NOT the LIVE variant's program-cue leg — on content
+    already tagged LBHS/LTS the program cue is present by construction (the tag keyword IS the
+    cue), so that leg would over-drop business docs mentioning a dx/med term with no patient
+    (a school name / job title / fee schedule) [D-051 re-gate, D-073].
+
+    LBHS/LTS BUSINESS (payroll / fees / PTO / aggregate "client billing" with no named individual,
+    and business docs that merely mention a dx/med descriptor) is KEPT + retrievable. Deterministic,
+    reuses an existing predicate composition — NO new detector.
+
+    Single source of truth shared by KnowledgeBase.upsert_documents (drop new docs) and
+    scripts/purge_lex_restricted_kb.py (purge existing PHI chunks). Pass the org-roles staff
+    roster as *allowed_names* so a staff possessive ("Harrison Rogers's ...") is not mistaken
+    for a care recipient. The W2-01 retrieval backstop remains the second layer for the
+    documented residual (a bare name+med/dx with no cue) and for mis-tagged/GM-level content.
+    """
+    if not is_restricted_lex_ingest(source, sub_entity):
+        return False
+    from .. import phi_guard  # lazy: keep knowledge_base import-time free of cora.phi_guard
+    text = (title or "") + " " + (content or "")
+    return phi_guard.non_lex_phi_backstop_trips_individual(text, allowed_names=allowed_names)

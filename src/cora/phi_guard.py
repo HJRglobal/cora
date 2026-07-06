@@ -281,6 +281,35 @@ def _reveals_individual_care_recipient(
     return False
 
 
+def _names_governed_care_recipient(
+    text: str, allowed_names: set[str] | None = None
+) -> bool:
+    """A care-recipient NOUN governing a Title-case name ("client John Smith"), excluding an
+    exact staff full-name. Used ONLY by the tag-scoped BILLING leg (below).
+
+    Unlike _reveals_individual_care_recipient, a BARE possessive ("Rita Hill's", "Lowe's",
+    "Employee's", "Kuska's") does NOT count: on LBHS/LTS-tagged FINANCIAL business content a
+    possessive is overwhelmingly a bookkeeper / vendor / employee, and "billing"/"invoice"/
+    "claims" are ordinary business vocab, so possessive + billing + the tag-implied program cue
+    over-dropped 19 real business chunks (D-051 re-gate 2026-07-06: bookkeeper AR sheets,
+    vendor P&Ls, CFO invoices, Chase wires). A possessive next to a MEDICATION is still PHI —
+    that stays on the dx/med leg via _reveals_individual_care_recipient (unchanged).
+    """
+    if not text:
+        return False
+    full, first = _staff_name_index(allowed_names)
+    for m in _CARE_RECIPIENT_NAME_RE.finditer(text):
+        # "recipient <Name>" on a FINANCIAL doc is the banking payee ("recipient Custodian" on a
+        # Chase wire), not a care recipient -- exclude it from the billing leg (the clinical
+        # dx/med + scrub paths keep the full noun set). D-051 re-gate: this was the last
+        # business over-drop (an EBITDA wire-activity PDF).
+        if m.group(1).lower() == "recipient":
+            continue
+        if not _is_staff_name(m.group(2), full, first):
+            return True
+    return False
+
+
 def non_lex_phi_backstop_trips_live(
     text: str, allowed_names: set[str] | None = None
 ) -> bool:
@@ -323,6 +352,47 @@ def non_lex_phi_backstop_trips_live(
         is_lex_billing_status_phi(text)
         and is_lex_program_context(text)
         and _reveals_individual_care_recipient(text, allowed_names)
+    )
+
+
+def non_lex_phi_backstop_trips_individual(
+    text: str, allowed_names: set[str] | None = None
+) -> bool:
+    """TAG-SCOPED variant of non_lex_phi_backstop_trips_live for paths that run on content
+    ALREADY tagged to a regulated LEX sub-entity (W6-01 Fix-A / D-073: the ingest drop + the
+    purge, both scoped to LBHS/LTS-tagged gmail/drive content).
+
+    On tag-scoped content a Lexington/behavioral-health PROGRAM cue is present BY CONSTRUCTION
+    (LBHS / BHRF / "behavioral health" are the very keywords detect_sub_entity uses to assign
+    the tag — ~66% of tagged chunks carry one), so the LIVE variant's "bare dx/med term + program
+    cue" leg degenerates to "bare dx/med term" and OVER-DROPS business docs that merely mention a
+    diagnosis/med as a descriptor (a school name "ACHIEVE School for Autism", a job title "Autism
+    Behavioral Support Rep", a fee schedule / formulary). So here the bare dx/med leg requires a
+    SPECIFIC INDIVIDUAL (a possessive or care-noun-governed non-staff name), NOT the program cue.
+
+    Clinical FRAMING (DOB / ICD-10 / "diagnosed with X") stays UNCONDITIONAL, and named
+    billing/status still requires program cue + individual — identical to the LIVE variant. Only
+    the bare dx/med leg differs. Business docs with an incidental dx/med term and no named
+    individual are KEPT (Harrison's keep-business intent); "client Marcus is autistic" /
+    "Jalen's risperidone" / "diagnosed with autism" still trip.
+
+    Do NOT use this on the general (non-tag-scoped) retrieval path — there the program cue is
+    RARE and meaningful, and dropping it would weaken the W2-01 backstop.
+    """
+    if not text:
+        return False
+    if _DOB_RE.search(text) or _ICD10_RE.search(text) or _DIAGNOSED_WITH_RE.search(text):
+        return True
+    if (_CLINICAL_DX_RE.search(text) or _MED_NAME_RE.search(text)) and \
+            _reveals_individual_care_recipient(text, allowed_names):
+        return True
+    # Billing/status leg: on tag-scoped financial content the individual MUST be a
+    # care-recipient-noun-GOVERNED name ("client John"), NOT a bare possessive (a bookkeeper/
+    # vendor/employee possessive + billing vocab is business, not PHI) -- D-051 re-gate.
+    return (
+        is_lex_billing_status_phi(text)
+        and is_lex_program_context(text)
+        and _names_governed_care_recipient(text, allowed_names)
     )
 
 

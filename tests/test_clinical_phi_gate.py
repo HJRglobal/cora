@@ -18,6 +18,7 @@ from cora.phi_guard import (
     is_lex_program_context,
     non_lex_phi_backstop_trips,
     non_lex_phi_backstop_trips_live,
+    non_lex_phi_backstop_trips_individual,
 )
 from cora import gap_autofill as ga
 
@@ -205,6 +206,66 @@ def test_live_backstop_catches_named_med_without_program_cue(text):
     """D-051 re-gate: a med/dx term next to a possessive or care-noun-governed name is PHI
     even with no Lexington/Medicaid program cue."""
     assert non_lex_phi_backstop_trips_live(text) is True
+
+
+# -- non_lex_phi_backstop_trips_INDIVIDUAL: the TAG-SCOPED ingest/purge predicate (D-073) ----
+# On content already tagged LBHS/LTS the program cue is present by construction, so the bare
+# dx/med leg must require a specific INDIVIDUAL (not the program cue) to avoid over-dropping
+# business docs that mention a diagnosis/med as a descriptor.
+
+@pytest.mark.parametrize("text", [
+    # clinical FRAMING trips unconditionally (roster-independent, any case)
+    "New intake was diagnosed with autism last week",
+    "coded ICD-10 F84.0 in the chart",
+    "Client Marcus was diagnosed with autism",   # capitalized care-noun but FRAMING catches it
+    # bare dx/med + a specific individual (care-noun-governed name / possessive) trips
+    "the client Marcus is autistic",
+    "Jalen's risperidone dose was increased",
+    # named billing + program cue + care-noun-GOVERNED individual trips
+    "the client John Smith's BHRF service authorization is pending",
+])
+def test_individual_variant_catches_phi(text):
+    assert non_lex_phi_backstop_trips_individual(text) is True
+
+
+def test_individual_variant_bare_dx_capitalized_carenoun_is_retrieval_residual():
+    """Layering note: a BARE dx term after a sentence-capitalized care-noun with NO framing
+    ('Client Marcus is autistic') is NOT caught by the ingest individual-variant (the care-noun
+    name matcher is case-sensitive on purpose, so it won't read 'Member Services' as a person),
+    but IS caught at retrieval by the case-insensitive LIVE variant + the STRICT Drive egress.
+    Same accepted-residual class as D-072; the two-Cora/BAA split is the durable fix."""
+    text = "Client Marcus is autistic"
+    assert non_lex_phi_backstop_trips_individual(text) is False   # ingest residual
+    assert non_lex_phi_backstop_trips_live(text) is True          # retrieval catches it
+    assert non_lex_phi_backstop_trips(text) is True               # Drive egress catches it
+
+
+@pytest.mark.parametrize("text", [
+    # incidental dx term with an LBHS/behavioral-health program cue but NO named individual:
+    # exactly the business docs Fix-A must KEEP (the D-051 finding-1 rescue).
+    "ACHIEVE School for Autism — candidate work history (LBHS careers form submission)",
+    "Job posting: Autism Behavioral Support Representative at our BHRF program",
+    "LBHS behavioral health ABA services fee schedule for autism and ADHD programs",
+    # aggregate program billing with no individual
+    "BHRF client billing volume rose 12% this quarter",
+    "LBHS staff payroll and PTO balances for June",
+    # D-051 re-gate F4: a BARE bookkeeper/vendor/employee possessive + billing vocab + the
+    # tag-implied program cue is BUSINESS, not a care recipient -> KEPT.
+    "Rita Hill's Lexington Medicaid billing reconciliation sheet",
+    "Lowe's invoice line items for the BHRF facility this quarter",
+    "Employee's travel reimbursement under the Lexington M&A retainer",
+])
+def test_individual_variant_keeps_business_with_incidental_terms(text):
+    assert non_lex_phi_backstop_trips_individual(text) is False
+
+
+def test_individual_variant_differs_from_live_on_tag_scoped_content():
+    """The whole point of the tag-scoped variant: a bare dx term + a program cue but NO
+    individual trips the LIVE variant (over-drop on tag-scoped content) but NOT the individual
+    variant (business kept)."""
+    text = "LBHS ABA services fee schedule covering autism programs"
+    assert non_lex_phi_backstop_trips_live(text) is True     # program cue satisfies the live leg
+    assert non_lex_phi_backstop_trips_individual(text) is False  # no individual -> kept
 
 
 @pytest.mark.parametrize("text", [

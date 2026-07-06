@@ -21,10 +21,33 @@ from typing import Any, Iterable
 
 from . import embeddings, schema
 from .chunker import chunk_text
-from .lex_sub_entity import detect_sub_entity, is_restricted_lex_ingest
+from .lex_sub_entity import (
+    detect_sub_entity,
+    is_restricted_lex_ingest,
+    restricted_lex_phi_content_drop,
+)
 from ..finance_doc_classifier import is_financial_document
 
 log = logging.getLogger(__name__)
+
+
+def _lex_staff_names() -> set[str]:
+    """Staff roster to PRESERVE when deciding the W6-01 PHI-content drop (so a staff
+    possessive like 'Harrison Rogers's billing ...' is not read as a care recipient). Fail-soft
+    to empty on any org_roles error.
+
+    IMPORTANT (D-073 re-gate): here an EMPTY roster is NOT "the safe direction" — unlike the
+    egress redactors (drive_materializer / person_dossier) where over-redact is safe, this is a
+    permanent, un-backed ingest DROP whose intent is to KEEP business. With an empty roster,
+    _reveals_individual_care_recipient reads every staff possessive as a care recipient and the
+    drop OVER-removes staff-attributed business. So the caller SKIPS the drop for a batch when
+    this returns empty (see upsert_documents Step 0a); the docs stay + are guarded at retrieval
+    by W2-01."""
+    try:
+        from .. import org_roles
+        return {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+    except Exception:  # noqa: BLE001
+        return set()
 
 # Binary-index fast-path tuning.
 # Coarse hamming scan over-fetches generously so binary-quantization loss is
@@ -192,40 +215,12 @@ class KnowledgeBase:
                 if detected:
                     doc.sub_entity = detected
 
-        # Step 0a: W6-01 (2026-07-05) restricted-LEX ingest deny-list. The Slack sweeps
-        # deny lbhs*/lts* CHANNELS; gmail + drive_sweep have no channel, so LBHS
-        # (42 CFR Part 2) / LTS (Provider-Type-15) PHI reached the KB via those sources.
-        # Drop any gmail/drive_sweep doc whose RESOLVED sub_entity is restricted (checked
-        # after Step 0 so both connector-set and content-detected tags are covered). GM-level
-        # LEX, LLC/LLA, and every non-gmail/drive source are untouched. Mirrors the Slack
-        # deny-list for the non-Slack sources; shared predicate = is_restricted_lex_ingest.
-        pre_drop_keys = {(d.source, d.source_id) for d in docs_list}
-        kept_docs = [
-            d for d in docs_list
-            if not is_restricted_lex_ingest(d.source, d.sub_entity)
-        ]
-        # (source, source_id) of the dropped docs whose STALE chunks must also be purged.
-        # A doc that was stored on a prior run (as NULL/LLC/etc.) but now resolves restricted
-        # must have its OLD chunks removed too -- else they survive forever, unreachable by
-        # the purge script (which selects on sub_entity IN (LBHS,LTS) and can never see a
-        # NULL-tagged survivor). This runs even when EVERY doc is dropped (D-051 finding 5).
-        dropped_keys = pre_drop_keys - {(d.source, d.source_id) for d in kept_docs}
-        if dropped_keys:
-            # Per-doc audit so the drop is reviewable, not a bare count (D-051 finding 2B).
-            for d in docs_list:
-                if is_restricted_lex_ingest(d.source, d.sub_entity):
-                    log.warning(
-                        "W6-01: dropped restricted-LEX doc source=%s source_id=%s "
-                        "sub_entity=%s title=%r",
-                        d.source, d.source_id, d.sub_entity, (d.title or "")[:80],
-                    )
-            docs_list = kept_docs
-            if not docs_list:
-                # All docs dropped: still purge any stale chunks for the dropped keys, then
-                # commit + return (the normal delete pass below never runs).
-                self._delete_chunks_for_keys(self._conn.cursor(), dropped_keys)
-                self._conn.commit()
-                return 0
+        # W6-01 restricted-LEX PHI-content drop is applied PER-CHUNK in Step 1a below (after
+        # chunking), NOT here on the whole doc. (Fix-A / D-073 + D-051 re-gate 2026-07-06:
+        # a whole-doc decision over a large mixed LBHS/LTS-tagged business doc -- a cash-flow
+        # spreadsheet, a P&L, a tracking sheet -- trips the billing leg on billing-words +
+        # "Lexington" + SOME name spread across the doc, over-dropping critical BUSINESS.
+        # Per-chunk keeps a business chunk unless a client name + billing/dx co-occur LOCALLY.)
 
         # Step 0b: ingest-time financial-document tagging (Tier 2-Finance).
         # Personal-source docs (gmail/drive_sweep) that look like receipts/
@@ -243,12 +238,65 @@ class KnowledgeBase:
         # Step 1: chunk each doc, build flat list of (doc, chunk_text, chunk_id)
         chunk_tuples: list[tuple[Document, str, str]] = []
         for doc in docs_list:
-            chunks = chunk_text(doc.content)
-            for chunk_str in chunks:
+            for chunk_str in chunk_text(doc.content):
                 chunk_tuples.append((doc, chunk_str, str(uuid.uuid4())))
 
+        # Step 1a: W6-01 restricted-LEX PHI-content drop, PER-CHUNK (Fix-A / D-073).
+        # Drop a gmail/drive_sweep LBHS/LTS chunk ONLY when THAT chunk's text carries PHI
+        # (restricted_lex_phi_content_drop -> phi_guard.non_lex_phi_backstop_trips_individual):
+        # clinical framing, or a bare dx/med term WITH a specific named individual, or
+        # named-individual program billing. Business chunks (payroll / fees / PTO / aggregate
+        # billing, rows that merely mention a dx/med descriptor) are KEPT + retrievable. Per
+        # CHUNK (not whole-doc) so a large mixed LBHS/LTS business doc keeps its business
+        # chunks; the W2-01 retrieval backstop is the second layer. GM-level LEX / LLC / LLA /
+        # non-gmail-drive chunks are out of scope (restricted_lex_phi_content_drop scope gate).
+        _phi_filtered_keys: set[tuple[str, str]] = set()
+        _has_candidate = any(
+            is_restricted_lex_ingest(d.source, d.sub_entity) for d in docs_list
+        )
+        if _has_candidate and chunk_tuples:
+            _staff = _lex_staff_names()
+            if not _staff:
+                # Roster unavailable/empty -> the PHI decision can't exclude staff possessives,
+                # so it would OVER-DROP staff-billing business. Defer for this batch; chunks
+                # stay + are guarded at retrieval by W2-01 (D-051 re-gate finding 2).
+                log.warning(
+                    "W6-01: LEX staff roster unavailable/empty -- deferring restricted-LEX PHI "
+                    "chunk drop for this batch (business kept; W2-01 guards at retrieval)"
+                )
+            else:
+                from collections import Counter
+                kept_tuples: list[tuple[Document, str, str]] = []
+                dropped_counts: Counter = Counter()
+                for doc, chunk_str, cid in chunk_tuples:
+                    if restricted_lex_phi_content_drop(
+                        doc.source, doc.sub_entity, doc.title, chunk_str, _staff
+                    ):
+                        dropped_counts[(doc.source, doc.source_id, doc.sub_entity, doc.title)] += 1
+                        continue
+                    kept_tuples.append((doc, chunk_str, cid))
+                if dropped_counts:
+                    # Per-doc audit (D-051 finding 2B) + record keys so a doc whose chunks were
+                    # (partly or wholly) dropped still has its STALE prior chunks replaced (F5).
+                    for (src, sid, sub, title), n in dropped_counts.items():
+                        _phi_filtered_keys.add((src, sid))
+                        log.warning(
+                            "W6-01: dropped %d restricted-LEX PHI chunk(s) source=%s "
+                            "source_id=%s sub_entity=%s title=%r",
+                            n, src, sid, sub, (title or "")[:80],
+                        )
+                    chunk_tuples = kept_tuples
+
         if not chunk_tuples:
-            log.info("No non-empty chunks generated from %d docs", len(docs_list))
+            # Nothing to insert (empty content, or every restricted chunk PHI-filtered). If a
+            # restricted doc had all its chunks dropped, still purge its stale prior chunks
+            # (F5); otherwise preserve the original empty-content no-op.
+            if _phi_filtered_keys:
+                cur = self._conn.cursor()
+                self._delete_chunks_for_keys(cur, _phi_filtered_keys)
+                self._conn.commit()
+            log.info("No chunks to store from %d docs (%d PHI-filtered key(s) purged)",
+                     len(docs_list), len(_phi_filtered_keys))
             return 0
 
         # Step 2: embed all chunks in batch (OpenAI handles internal batching)
@@ -267,10 +315,9 @@ class KnowledgeBase:
         now = int(time.time())
         cur = self._conn.cursor()
 
-        # Collect distinct (source, source_id) for replace-on-conflict. Seed with the
-        # dropped-doc keys (W6-01 finding 5) so a now-restricted re-ingest also purges the
-        # doc's stale chunks (incl. old sub_entity=NULL rows the purge script can't reach).
-        seen_keys: set[tuple[str, str]] = set(dropped_keys)
+        # Replace-on-conflict keys: every doc that still has chunks, PLUS any doc whose chunks
+        # were PHI-filtered (so a now-PHI re-ingest replaces its stale prior chunks -- F5).
+        seen_keys: set[tuple[str, str]] = set(_phi_filtered_keys)
         for doc, _, _ in chunk_tuples:
             seen_keys.add((doc.source, doc.source_id))
 
