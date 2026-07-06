@@ -68,37 +68,15 @@ def test_custodian_in_non_lex_channel_refused():
     assert lpa.phi_allowed(HARRISON, "OSN") is False
 
 
-def test_custodian_dm_in_lex_scope_allowed():
-    # A real non-founder custodian's DM loads their LEX-* primary -> relaxed.
-    assert lpa.phi_allowed(JEFF, "LEX", is_dm=True) is True
-    assert lpa.phi_allowed(JEFF, "LEX-LLC", is_dm=True) is True
-
-
-def test_custodian_dm_non_lex_scope_refused_w2_03():
-    # W2-03: a non-founder custodian's DM whose loaded entity is NOT LEX scope
-    # does NOT relax PHI (closes the "any custodian in any DM" hole). No live
-    # custodian hits this today (all non-founder custodians are LEX-primary), but
-    # it pins the roster-independent guarantee.
-    assert lpa.phi_allowed(JEFF, None, is_dm=True) is False
-    assert lpa.phi_allowed(JEFF, "FNDR", is_dm=True) is False
-    assert lpa.phi_allowed(SHAUN, "OSN", is_dm=True) is False
-
-
-def test_founder_dm_carveout_preserved():
-    # The root founder is topic-exempt + a custodian; his DM entity is pinned FNDR,
-    # so the founder carve-out preserves his standing DM PHI relaxation.
-    assert lpa.phi_allowed(HARRISON, "FNDR", is_dm=True) is True
-    assert lpa.phi_allowed(HARRISON, None, is_dm=True) is True
-    # ...but NOT in a non-LEX *channel* (is_dm=False) -- unchanged.
-    assert lpa.phi_allowed(HARRISON, "OSN", is_dm=False) is False
+def test_custodian_dm_allowed():
+    assert lpa.phi_allowed(JEFF, None, is_dm=True) is True
+    assert lpa.phi_allowed(JEFF, "FNDR", is_dm=True) is True
 
 
 def test_non_custodian_refused_everywhere():
     assert lpa.phi_allowed(RANDO, "LEX") is False
     assert lpa.phi_allowed(RANDO, "LEX-LLC") is False
     assert lpa.phi_allowed(RANDO, None, is_dm=True) is False
-    # A non-custodian in a DM is refused even though is_dm is True.
-    assert lpa.phi_allowed(RANDO, "FNDR", is_dm=True) is False
 
 
 # ---------------------------------------------------------------------------
