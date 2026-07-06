@@ -29,6 +29,7 @@ from cora.org_roles import RoleRecord
 HARRISON = "U0B2RM2JYJ1"
 TOMMY = "U_TOMMY_TEST"
 SHAUN = "U0B3PS82G30"  # real LEX-LLC PHI custodian (lex-phi-custodians.yaml)
+ERIC = "U0B3PRZMBCN"   # real allowed_entities: all (cross-entity finance), org-role entity F3E
 
 
 def _role(entity: str, slack_id: str = TOMMY, name: str = "Test User") -> RoleRecord:
@@ -143,6 +144,25 @@ class TestHandleDmQa:
         qa_mocks.get_role.return_value = _role("LEX-LLC", slack_id=SHAUN, name="Shaun")
         app_module._handle_dm_qa(_event(user=SHAUN), MagicMock(), SHAUN, "remember X")
         assert qa_mocks.dispatch.call_args.kwargs["entity"] == "LEX-LLC"
+
+    def test_portfolio_wide_user_dm_resolves_hjrg(self, qa_mocks):
+        # A portfolio-wide user (allowed_entities: all, real roster) must NOT be
+        # narrowed to their home entity in a DM, or cross_entity_guard would redirect
+        # cross-entity questions they're authorized to ask. has_unrestricted_entity_access
+        # runs REAL against user-permissions.yaml here (not mocked).
+        qa_mocks.get_role.return_value = _role("F3E", slack_id=ERIC, name="Eric")
+        app_module._handle_dm_qa(_event(user=ERIC), MagicMock(), ERIC, "how is OSN AP aging?")
+        assert qa_mocks.dispatch.call_args.kwargs["entity"] == "HJRG"
+
+    def test_has_unrestricted_entity_access_is_fail_closed(self):
+        from cora import user_access, cross_entity_guard
+        assert user_access.has_unrestricted_entity_access(ERIC) is True       # allowed: all
+        assert user_access.has_unrestricted_entity_access(HARRISON) is True   # root
+        assert user_access.has_unrestricted_entity_access(SHAUN) is False     # scoped (LEX)
+        assert user_access.has_unrestricted_entity_access("U_UNLISTED") is False
+        # And HJRG is a cross_entity_guard pass-through, so the resolved DM scope
+        # does not redirect a cross-entity question for such a user.
+        assert cross_entity_guard.check_cross_entity("how is OSN AP aging?", "HJRG") is None
 
     def test_unknown_user_falls_back_to_fndr(self, qa_mocks):
         qa_mocks.get_role.return_value = None

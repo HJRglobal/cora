@@ -1225,6 +1225,14 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
     # pick of WHICH context to load (D-044); user_access still enforces authorization.
     # Unknown/unmapped users -> "" -> "FNDR" (the catch-all posture, unchanged).
     entity = (getattr(role, "entity", "") or "").strip() or "FNDR"
+    # A portfolio-wide user (allowed_entities: all — e.g. cross-entity finance/HR)
+    # works across every entity, so scoping their DM to a single home entity would
+    # let cross_entity_guard redirect cross-entity questions they're authorized to
+    # ask. Resolve them to the HJRG aggregator (pass-through in cross_entity_guard,
+    # is_authorized True), matching the existing HJRG-primary allowed=all user. Only
+    # allowed=all users qualify, so this never broadens a narrow-scope user.
+    if user_access.has_unrestricted_entity_access(user_id):
+        entity = "HJRG"
     if user_id == _FOUNDER_ID:
         entity = "FNDR"
 

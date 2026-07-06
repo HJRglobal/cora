@@ -279,6 +279,21 @@ def is_authorized(user_id: str, entity: str) -> bool:
     return False
 
 
+def has_unrestricted_entity_access(user_id: str) -> bool:
+    """True if the user is authorized for ALL entities (allowed_entities: 'all').
+
+    Such a user works portfolio-wide (e.g. cross-entity finance or HR). Used by the
+    DM path to resolve their DM to an aggregator scope (HJRG) rather than their
+    narrow org-roles home entity — otherwise cross_entity_guard would redirect
+    cross-entity questions they're fully authorized to ask. Fail-closed: unknown /
+    unlisted users are NOT unrestricted.
+    """
+    if user_id == _HARRISON_ID:
+        return True
+    entry = _load_permissions().get(user_id)
+    return bool(entry) and entry.get("allowed_entities") == "all"
+
+
 def blocked_topics(user_id: str) -> list[str]:
     """Return the list of sensitive topics blocked for this user."""
     if user_id == _HARRISON_ID:
