@@ -56,6 +56,7 @@ import pytest
 
 import cora.app as app_module
 import cora.entity_router as entity_router
+from cora.org_roles import RoleRecord
 
 
 # Real roster: F3E sales role, 'financials' + 'hr' blocked, authorized for F3E.
@@ -114,9 +115,13 @@ def surface_ctx(surface, mode):
             p(patch.object(app_module.active_thread_store, "is_active", return_value=True))
             p(patch.object(app_module.active_thread_store, "touch"))
         elif surface == "_handle_dm_qa":
+            # Production-shaped RoleRecord (field is `.entity`). A
+            # SimpleNamespace(primary_entity=...) here silently resolved the DM to
+            # FNDR and hid the entity-resolution bug — use the real dataclass.
             def _role(uid):
                 if uid == TOMMY:
-                    return SimpleNamespace(primary_entity=ENTITY, name="Tommy Anderson")
+                    return RoleRecord(slack_id=uid, name="Tommy Anderson",
+                                      role="F3E Sales", entity=ENTITY)
                 return None  # unknown -> entity falls back to FNDR
             p(patch.object(app_module.org_roles, "get_role", side_effect=_role))
 

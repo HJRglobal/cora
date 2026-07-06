@@ -10,8 +10,11 @@ The contract under test:
   - everything else runs the guarded Q&A pipeline (_handle_dm_qa)
   - _handle_dm_qa mirrors handle_mention's guards: rate limit, user_access
     (incl. PHI custodian), help intent, sibling + cross-entity
-  - entity = asker's org-roles primary entity (advisory pick, not access);
-    unknown users fall back to FNDR; Harrison is FNDR
+  - entity = asker's org-roles entity (org_roles.RoleRecord.entity — an advisory
+    pick of WHICH context to load, not access); unknown users fall back to FNDR;
+    Harrison is FNDR. NOTE: these tests use a REAL org_roles.RoleRecord (not a
+    SimpleNamespace) so a field-name regression like the `primary_entity` bug
+    (every DM silently resolved to FNDR) can never be hidden by a stand-in shape.
 """
 
 from types import SimpleNamespace
@@ -20,10 +23,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import cora.app as app_module
+from cora.org_roles import RoleRecord
 
 
 HARRISON = "U0B2RM2JYJ1"
 TOMMY = "U_TOMMY_TEST"
+SHAUN = "U0B3PS82G30"  # real LEX-LLC PHI custodian (lex-phi-custodians.yaml)
+
+
+def _role(entity: str, slack_id: str = TOMMY, name: str = "Test User") -> RoleRecord:
+    """A production-shaped RoleRecord (field is `.entity`, NOT `primary_entity`)."""
+    return RoleRecord(slack_id=slack_id, name=name, role="Tester", entity=entity)
 
 
 # ── _dm_is_shift_message ──────────────────────────────────────────────────────
@@ -116,8 +126,10 @@ def qa_mocks():
 
 
 class TestHandleDmQa:
-    def test_dispatches_with_org_roles_primary_entity(self, qa_mocks):
-        qa_mocks.get_role.return_value = SimpleNamespace(primary_entity="F3E")
+    def test_dispatches_with_org_roles_entity(self, qa_mocks):
+        # Reads RoleRecord.entity (the real field). A SimpleNamespace(primary_entity=...)
+        # here would have hidden the bug where every DM resolved to FNDR.
+        qa_mocks.get_role.return_value = _role("F3E")
         app_module._handle_dm_qa(_event(), MagicMock(), TOMMY, "remember the vendor is Apex")
         assert qa_mocks.dispatch.call_count == 1
         kwargs = qa_mocks.dispatch.call_args.kwargs
@@ -125,13 +137,20 @@ class TestHandleDmQa:
         assert kwargs["channel_name"] == "dm"
         assert kwargs["reply_thread_ts"] is None
 
+    def test_lex_custodian_dm_resolves_lex_scope(self, qa_mocks):
+        # The core fix: a LEX custodian's DM must load LEX scope (LEX-LLC), not FNDR,
+        # so the LEX-scope PHI relaxation (W2-03) can fire. Pins the exact bug.
+        qa_mocks.get_role.return_value = _role("LEX-LLC", slack_id=SHAUN, name="Shaun")
+        app_module._handle_dm_qa(_event(user=SHAUN), MagicMock(), SHAUN, "remember X")
+        assert qa_mocks.dispatch.call_args.kwargs["entity"] == "LEX-LLC"
+
     def test_unknown_user_falls_back_to_fndr(self, qa_mocks):
         qa_mocks.get_role.return_value = None
         app_module._handle_dm_qa(_event(user="U_STRANGER"), MagicMock(), "U_STRANGER", "hello")
         assert qa_mocks.dispatch.call_args.kwargs["entity"] == "FNDR"
 
     def test_harrison_is_fndr_regardless_of_registry(self, qa_mocks):
-        qa_mocks.get_role.return_value = SimpleNamespace(primary_entity="HJRG")
+        qa_mocks.get_role.return_value = _role("HJRG", slack_id=HARRISON, name="Harrison")
         app_module._handle_dm_qa(_event(user=HARRISON), MagicMock(), HARRISON, "remember X")
         assert qa_mocks.dispatch.call_args.kwargs["entity"] == "FNDR"
 
@@ -158,7 +177,7 @@ class TestHandleDmQa:
         # from the asker's org-roles entity (an HJRG-primary user would otherwise
         # get TIER_1 in a DM and have the company-financials block suppressed). This
         # guards against a revert to entity-derived DM tier.
-        qa_mocks.get_role.return_value = SimpleNamespace(primary_entity="HJRG")
+        qa_mocks.get_role.return_value = _role("HJRG")  # genuinely HJRG-primary now
         app_module._handle_dm_qa(_event(), MagicMock(), TOMMY,
                                  "what is our company cash position")
         assert qa_mocks.access.call_args.kwargs["tier"] == "TIER_3"
@@ -190,6 +209,45 @@ class TestHandleDmQa:
         # The say wrapper strips any thread_ts a caller passes.
         kwargs["say"](text="hi", thread_ts="should-be-dropped")
         assert "thread_ts" not in client.chat_postMessage.call_args.kwargs
+
+
+class TestDmCustodianPhiIntegration:
+    """End-to-end pin the slice-05 D-051 review asked for: drive _handle_dm_qa with
+    a REAL RoleRecord AND the REAL lex_phi_access gate (real custodian file), so the
+    entity-resolution + PHI-relaxation chain is validated together — not through a
+    SimpleNamespace stand-in that hid the primary_entity bug."""
+
+    def _run(self, uid, entity, message="remember a note"):
+        # Force lex_phi_access to reload the real custodian allowlist.
+        app_module.lex_phi_access._cache = frozenset()
+        app_module.lex_phi_access._loaded_at = 0.0
+        with patch.object(app_module.rate_limiter, "check", return_value=(True, None)), \
+             patch.object(app_module, "_resolve_bot_user_id"), \
+             patch.object(app_module.org_roles, "get_role",
+                          return_value=_role(entity, slack_id=uid)), \
+             patch.object(app_module.user_access, "check_access", return_value=None) as access, \
+             patch.object(app_module.help_responder, "is_help_intent", return_value=False), \
+             patch.object(app_module.sibling_guard, "check_redirect", return_value=None), \
+             patch.object(app_module.cross_entity_guard, "check_cross_entity", return_value=None), \
+             patch.object(app_module, "_fetch_dm_history", return_value=[]), \
+             patch.object(app_module, "_dispatch_qa") as dispatch:
+            # phi_allowed is DELIBERATELY not mocked — it runs against the real
+            # data/maps/lex-phi-custodians.yaml.
+            app_module._handle_dm_qa(_event(user=uid), MagicMock(), uid, message)
+        return access, dispatch
+
+    def test_custodian_dm_flows_phi_custodian_true(self):
+        access, dispatch = self._run(SHAUN, "LEX-LLC")
+        # entity resolved to real LEX scope (the fix) ...
+        assert dispatch.call_args.kwargs["entity"] == "LEX-LLC"
+        # ... and the REAL W2-03 gate relaxed PHI for the custodian in-DM.
+        assert access.call_args.kwargs["phi_custodian"] is True
+        assert access.call_args.kwargs["tier"] == "TIER_3"
+
+    def test_non_custodian_dm_does_not_relax_phi(self):
+        access, dispatch = self._run("U_NOT_A_CUSTODIAN", "F3E")
+        assert dispatch.call_args.kwargs["entity"] == "F3E"
+        assert access.call_args.kwargs["phi_custodian"] is False
 
 
 # ── handle_message_event DM branch routing ────────────────────────────────────

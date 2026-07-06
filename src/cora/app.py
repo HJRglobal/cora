@@ -1216,7 +1216,15 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
     _resolve_bot_user_id(client)
 
     role = org_roles.get_role(user_id)
-    entity = (getattr(role, "primary_entity", "") or "").strip() or "FNDR"
+    # org_roles.RoleRecord's field is `entity` (NOT `primary_entity`). Reading the
+    # wrong attribute silently resolved EVERY DM to "FNDR" (the unknown-user
+    # fallback), which (a) REFUSED DM Q&A for every teammate whose allowed_entities
+    # excludes FNDR (user_access.check_access blocked them) and (b) blocked the
+    # LEX-scope PHI relaxation for custodians (their DM never carried LEX scope).
+    # Read the real field so a DM loads the asker's org-roles entity — an ADVISORY
+    # pick of WHICH context to load (D-044); user_access still enforces authorization.
+    # Unknown/unmapped users -> "" -> "FNDR" (the catch-all posture, unchanged).
+    entity = (getattr(role, "entity", "") or "").strip() or "FNDR"
     if user_id == _FOUNDER_ID:
         entity = "FNDR"
 
