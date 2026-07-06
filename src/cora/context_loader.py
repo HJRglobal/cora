@@ -571,16 +571,22 @@ def _try_kb_retrieve(
         # Content-level PHI scrub (F-2 / 2.3): a LEX-authorized NON-custodian whose
         # question misses the `phi` keyword gate could otherwise surface raw PHI
         # from a LEX chunk. Scrub retrieved LEX chunk text for non-custodians;
-        # custodians (phi_custodian=True) and non-LEX retrievals are untouched.
+        # custodians (phi_custodian=True) are untouched.
         if kb_entity == "LEX" and not phi_custodian:
             relevant = _apply_lex_phi_scrub(relevant)
+        elif not phi_custodian:
+            # W2-01: content-level PHI backstop for a LEX-PHI chunk MIS-TAGGED under a
+            # non-LEX entity (the LEX scrub above never fires for it). Withhold it —
+            # deterministic net mirroring drive_materializer._phi_wall's non-LEX branch.
+            relevant = _withhold_non_lex_phi(relevant)
 
-        log.info(
-            "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
-            len(relevant), len(results), entity,
-            relevant[0].distance if relevant else 0,
-        )
-        main_block = _format_kb_chunks(relevant)
+        if relevant:
+            log.info(
+                "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
+                len(relevant), len(results), entity,
+                relevant[0].distance,
+            )
+            main_block = _format_kb_chunks(relevant)
 
     if notes_block:
         return f"{main_block}\n\n{notes_block}" if main_block else notes_block
@@ -637,6 +643,95 @@ def _apply_lex_phi_scrub(results: list) -> list:
         except Exception:  # noqa: BLE001
             pass
     return results
+
+
+def _citation_carries_phi(r, staff: set) -> bool:
+    """Should a KEPT non-LEX chunk's citation (title + deep_link LABEL) be neutralized?
+
+    The title + deep_link label are a distinct citation surface the body predicate never
+    vetted — apply_tier1 strips them ONLY for gmail/drive_sweep, so a fireflies/slack/asana/
+    notion chunk keeps its raw title, and a LEX client name is frequently a BARE meeting
+    TITLE that no body cue reveals (the exact reason _apply_lex_phi_scrub neutralizes the LEX
+    citation). Neutralize when the citation:
+      - is a fireflies MEETING title (the per-client-name surface apply_tier1 does not strip;
+        meeting-title citations are low value, so blanking here cheaply closes the dominant
+        bare-client-name case, D-051 finding 1), OR
+      - trips the live PHI predicate (a clinical / program-billing title), OR
+      - carries a cue-adjacent client name (redact_cue_adjacent_names alters it).
+    Accepted residual: a bare client name with NO cue in a slack/asana/notion title — the
+    same class _apply_lex_phi_scrub's body redactor documents; the custodian gate + entity
+    siloing + fireflies-first classify_lex_meeting remain the primary net.
+    """
+    title = getattr(r, "title", "") or ""
+    dl = getattr(r, "deep_link", "") or ""
+    label = dl.split("|", 1)[1].rstrip(">") if dl.startswith("<") and "|" in dl else ""
+    citation = f"{title} {label}".strip()
+    if getattr(r, "source", "") == "fireflies":
+        return True
+    if not citation:
+        return False
+    if phi_guard.non_lex_phi_backstop_trips_live(citation, allowed_names=staff):
+        return True
+    return phi_guard.redact_cue_adjacent_names(citation, allowed_names=staff) != citation
+
+
+def _withhold_non_lex_phi(results: list) -> list:
+    """Content-level PHI backstop for a NON-custodian's NON-LEX retrieval (W2-01, 2026-07-05).
+
+    The LEX scrub (_apply_lex_phi_scrub) fires only when the resolved channel entity is
+    LEX. A LEX-PHI chunk mis-tagged under a NON-LEX entity (e.g. entity=FNDR/F3E via a
+    tagging miss) is retrievable on a non-LEX query — include_fndr pulls FNDR chunks into
+    every non-LEX channel — and, without this, is served UNSCRUBBED. That residual was
+    backstopped only by the prompt-only FNDR guardrail (violating D-034: deterministic
+    code over prompt). This is the deterministic net.
+
+    Uses phi_guard.non_lex_phi_backstop_trips_LIVE (D-051 findings 3/4/8): the high-volume
+    per-query path must not over-refuse legitimate OSN/F3E product copy (bare melatonin/ADHD
+    mentions) or aggregate holdco finance — so bare dx-term/med-name need a care/program cue
+    and the billing/status leg needs a non-staff individual. The Drive/dossier egress keeps
+    the stricter unconditional non_lex_phi_backstop_trips.
+
+    Two actions per chunk: (1) WITHHOLD the chunk when its BODY trips (drop it, never the
+    whole answer). (2) For a kept chunk, NEUTRALIZE its citation (title + deep_link) when the
+    citation surface carries a client name the body predicate never saw (finding 1).
+
+    FAIL-CLOSED: a predicate error withholds the chunk (never surface un-vetted content).
+    Custodians never reach this path (callers gate on phi_custodian); LEX retrievals take
+    _apply_lex_phi_scrub instead.
+    """
+    try:
+        staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+    except Exception:  # noqa: BLE001
+        staff = set()
+    kept: list = []
+    for r in results:
+        try:
+            if phi_guard.non_lex_phi_backstop_trips_live(
+                getattr(r, "content", "") or "", allowed_names=staff
+            ):
+                log.warning(
+                    "W2-01: withholding non-LEX chunk %s (entity=%s) — carries LEX-client "
+                    "PHI (mis-tagged?)",
+                    getattr(r, "chunk_id", "?"), getattr(r, "entity", "?"),
+                )
+                continue
+        except Exception:  # noqa: BLE001 — fail CLOSED: withhold on predicate error
+            log.warning(
+                "W2-01: PHI backstop error on chunk %s; WITHHOLDING (fail-closed)",
+                getattr(r, "chunk_id", "?"),
+            )
+            continue
+        # Kept: the body was vetted, but title/deep-link were not — neutralize a
+        # client-name-bearing citation (fail-closed on error).
+        try:
+            if _citation_carries_phi(r, staff):
+                r.title = "knowledge base entry"
+                r.deep_link = ""
+        except Exception:  # noqa: BLE001 — fail CLOSED
+            r.title = "knowledge base entry"
+            r.deep_link = ""
+        kept.append(r)
+    return kept
 
 
 # Business entities searched in the cross-entity fallback (WS4). LEX is added
@@ -704,6 +799,12 @@ def _try_cross_entity_fallback(
     merged, _ = historical_access.apply_tier1(
         merged, asker_emails or frozenset(), asker_unrestricted,
     )
+    # W2-01: the fallback spans every business entity, so a LEX-PHI chunk mis-tagged
+    # under a non-LEX entity can ride in here even though the entity==LEX filter above
+    # already dropped correctly-tagged LEX rows for a non-custodian. Apply the same
+    # content-level backstop as the main path.
+    if not phi_custodian:
+        merged = _withhold_non_lex_phi(merged)
     if not merged:
         return None
 

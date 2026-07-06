@@ -21,7 +21,7 @@ from typing import Any, Iterable
 
 from . import embeddings, schema
 from .chunker import chunk_text
-from .lex_sub_entity import detect_sub_entity
+from .lex_sub_entity import detect_sub_entity, is_restricted_lex_ingest
 from ..finance_doc_classifier import is_financial_document
 
 log = logging.getLogger(__name__)
@@ -141,6 +141,25 @@ class KnowledgeBase:
 
     # --- Ingest ---
 
+    def _delete_chunks_for_keys(self, cur, keys: set[tuple[str, str]]) -> None:
+        """Delete every chunk (from knowledge_chunks + both vec tables) for the given
+        (source, source_id) keys. Does NOT commit — the caller owns the transaction.
+        Used by upsert_documents for replace-on-conflict AND to purge the stale chunks of a
+        now-restricted (W6-01-dropped) doc (deletes by key regardless of stored sub_entity)."""
+        for source, source_id in keys:
+            cur.execute(
+                "SELECT chunk_id FROM knowledge_chunks WHERE source = ? AND source_id = ?",
+                (source, source_id),
+            )
+            old_ids = [row[0] for row in cur.fetchall()]
+            if not old_ids:
+                continue
+            placeholders = ",".join("?" * len(old_ids))
+            for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
+                cur.execute(
+                    f"DELETE FROM {tbl} WHERE chunk_id IN ({placeholders})", old_ids
+                )
+
     def upsert_documents(self, docs: Iterable[Document]) -> int:
         """Chunk + embed + store a batch of Documents. Returns count of chunks written.
 
@@ -172,6 +191,41 @@ class KnowledgeBase:
                 detected = detect_sub_entity(doc.title, doc.content)
                 if detected:
                     doc.sub_entity = detected
+
+        # Step 0a: W6-01 (2026-07-05) restricted-LEX ingest deny-list. The Slack sweeps
+        # deny lbhs*/lts* CHANNELS; gmail + drive_sweep have no channel, so LBHS
+        # (42 CFR Part 2) / LTS (Provider-Type-15) PHI reached the KB via those sources.
+        # Drop any gmail/drive_sweep doc whose RESOLVED sub_entity is restricted (checked
+        # after Step 0 so both connector-set and content-detected tags are covered). GM-level
+        # LEX, LLC/LLA, and every non-gmail/drive source are untouched. Mirrors the Slack
+        # deny-list for the non-Slack sources; shared predicate = is_restricted_lex_ingest.
+        pre_drop_keys = {(d.source, d.source_id) for d in docs_list}
+        kept_docs = [
+            d for d in docs_list
+            if not is_restricted_lex_ingest(d.source, d.sub_entity)
+        ]
+        # (source, source_id) of the dropped docs whose STALE chunks must also be purged.
+        # A doc that was stored on a prior run (as NULL/LLC/etc.) but now resolves restricted
+        # must have its OLD chunks removed too -- else they survive forever, unreachable by
+        # the purge script (which selects on sub_entity IN (LBHS,LTS) and can never see a
+        # NULL-tagged survivor). This runs even when EVERY doc is dropped (D-051 finding 5).
+        dropped_keys = pre_drop_keys - {(d.source, d.source_id) for d in kept_docs}
+        if dropped_keys:
+            # Per-doc audit so the drop is reviewable, not a bare count (D-051 finding 2B).
+            for d in docs_list:
+                if is_restricted_lex_ingest(d.source, d.sub_entity):
+                    log.warning(
+                        "W6-01: dropped restricted-LEX doc source=%s source_id=%s "
+                        "sub_entity=%s title=%r",
+                        d.source, d.source_id, d.sub_entity, (d.title or "")[:80],
+                    )
+            docs_list = kept_docs
+            if not docs_list:
+                # All docs dropped: still purge any stale chunks for the dropped keys, then
+                # commit + return (the normal delete pass below never runs).
+                self._delete_chunks_for_keys(self._conn.cursor(), dropped_keys)
+                self._conn.commit()
+                return 0
 
         # Step 0b: ingest-time financial-document tagging (Tier 2-Finance).
         # Personal-source docs (gmail/drive_sweep) that look like receipts/
@@ -213,32 +267,14 @@ class KnowledgeBase:
         now = int(time.time())
         cur = self._conn.cursor()
 
-        # Collect distinct (source, source_id) for replace-on-conflict
-        seen_keys: set[tuple[str, str]] = set()
+        # Collect distinct (source, source_id) for replace-on-conflict. Seed with the
+        # dropped-doc keys (W6-01 finding 5) so a now-restricted re-ingest also purges the
+        # doc's stale chunks (incl. old sub_entity=NULL rows the purge script can't reach).
+        seen_keys: set[tuple[str, str]] = set(dropped_keys)
         for doc, _, _ in chunk_tuples:
             seen_keys.add((doc.source, doc.source_id))
 
-        for source, source_id in seen_keys:
-            # Find existing chunk_ids to delete from vec table too
-            cur.execute(
-                "SELECT chunk_id FROM knowledge_chunks WHERE source = ? AND source_id = ?",
-                (source, source_id),
-            )
-            old_ids = [row[0] for row in cur.fetchall()]
-            if old_ids:
-                placeholders = ",".join("?" * len(old_ids))
-                cur.execute(
-                    f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({placeholders})",
-                    old_ids,
-                )
-                cur.execute(
-                    f"DELETE FROM knowledge_vec_f32 WHERE chunk_id IN ({placeholders})",
-                    old_ids,
-                )
-                cur.execute(
-                    f"DELETE FROM knowledge_chunks WHERE chunk_id IN ({placeholders})",
-                    old_ids,
-                )
+        self._delete_chunks_for_keys(cur, seen_keys)
 
         # Insert new chunks
         for (doc, chunk_str, chunk_id), vec in zip(chunk_tuples, vectors):

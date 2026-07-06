@@ -164,6 +164,169 @@ def is_lex_billing_status_phi(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Non-LEX PHI backstop — shared by the LIVE retrieval path and the Drive egress
+# ---------------------------------------------------------------------------
+# Single source of truth for the "a chunk mis-tagged under a NON-LEX entity still
+# carries LEX-client PHI" decision. Used by:
+#   - context_loader._withhold_non_lex_phi (W2-01, 2026-07-05): the live Slack/DM
+#     retrieval backstop for a non-custodian, mirroring the Drive egress below.
+#   - drive_materializer._phi_wall non-LEX branch (2026-06-29): the nightly
+#     _brain/swept digest backstop on the org-wide-readable Drive store.
+#
+# _LEX_PROGRAM_CONTEXT_RE was drive_materializer's private _LEX_CONTEXT_RE; it lives
+# here now so both egress paths share ONE regex and can never drift.
+#
+# WHY the billing/status leg needs a program cue (and clinical does not): is_clinical_phi
+# is already NARROW (excludes wellness-overlap anxiety/depression so F3 Mood copy passes;
+# no dose/name cue). But is_lex_billing_status_phi is by design a LEX-SCOPE-ONLY detector
+# — "client" / "member" / "billing" / "invoice" are ordinary commercial words, so firing
+# it unconditionally on a BDM/F3E/OSN chunk over-refuses every run. A name+invoice reveals
+# care-recipient PHI ONLY when tied to a care program; the cue is that tie.
+#
+# DELIBERATELY does NOT include is_phi_risk: that base set keys on generic clinical/
+# identifier words (assessment / patient / member id / prior auth / medicaid) that appear
+# in ordinary non-LEX business content, so applying it to ALL non-LEX chunks would be
+# broad over-refusal — the opposite of the NARROW intent. This mirrors _phi_wall's
+# non-LEX branch exactly (verify-first, 2026-07-05).
+_LEX_PROGRAM_CONTEXT_RE = re.compile(
+    r"\b(AHCCCS|DDD|Medicaid|HCBS|Lexington|LBHS|BHRF|behavioral health)\b", re.IGNORECASE
+)
+
+
+def is_lex_program_context(text: str) -> bool:
+    """True if *text* carries an explicit Lexington / Medicaid care-PROGRAM cue.
+
+    The gate for the billing/status leg of non_lex_phi_backstop_trips. See the module
+    section above for why the billing/status detector needs this tie on a non-LEX chunk.
+    """
+    return bool(text and _LEX_PROGRAM_CONTEXT_RE.search(text))
+
+
+def non_lex_phi_backstop_trips(text: str) -> bool:
+    """Content-level PHI backstop for a chunk/body carried under a NON-LEX entity tag.
+
+    True when a mis-tagged non-LEX chunk still carries LEX-client PHI:
+      - clinical PHI (is_clinical_phi) — ALWAYS, OR
+      - named billing / authorization / eligibility / client-status PHI
+        (is_lex_billing_status_phi) tied to a Lexington/Medicaid program cue.
+
+    Reuses the existing phi_guard predicates only — NO new detector — and is deliberately
+    NARROW so legitimate non-LEX content is not over-refused (F3 Mood wellness copy passes;
+    ordinary commercial 'client billing / invoice' vocab without a care-program cue passes).
+    Shared by the live retrieval backstop and the Drive egress so the two stay in lockstep.
+    """
+    if not text:
+        return False
+    if is_clinical_phi(text):
+        return True
+    return is_lex_billing_status_phi(text) and is_lex_program_context(text)
+
+
+# ---------------------------------------------------------------------------
+# LIVE-retrieval variant of the non-LEX backstop (D-051 remediation, 2026-07-05)
+# ---------------------------------------------------------------------------
+# non_lex_phi_backstop_trips (above) is RECALL-biased: is_clinical_phi trips on a BARE
+# medication NAME or diagnosis TERM with no identifier. That is correct for the WRITE gate
+# (a durable, always-loaded note) and the once-daily Drive/dossier egress (over-drop a whole
+# file, retry next run). But context_loader._withhold_non_lex_phi runs on the HIGH-VOLUME
+# per-query retrieval path for EVERY non-custodian non-LEX ask, where that recall bias
+# SILENTLY WITHHOLDS legitimate OSN/F3E product copy — "sleep gummy contains 3mg melatonin"
+# (melatonin is a sold OSN SKU AND a psych-med name), "Focus stack supports ADHD-style
+# concentration", "lithium battery pack for the display fridge" — the exact over-refusal the
+# slice charter forbids (D-051 findings 3/8). And the billing/status leg fires on a BARE
+# aggregate "Lexington member billing volume" with no individual, withholding real holdco
+# finance co-scanned from FNDR/HJRG (finding 4).
+#
+# This variant keeps the SAME PHI catches but tuned for the live path:
+#   - HIGH-SPECIFICITY clinical FRAMING trips unconditionally: DOB, ICD-10, "diagnosed with
+#     X", medication-CONTEXT ("prescribed X" / "dose"). These are the "clinical framing" the
+#     charter says to catch, and are not ordinary product copy.
+#   - BARE dx-term / BARE med-NAME trip ONLY with a co-present care-recipient/program cue
+#     (a bare product mention is not identifiable PHI).
+#   - billing/status trips ONLY with a program cue AND a non-staff INDIVIDUAL (aggregate
+#     finance reveals no care recipient).
+# is_clinical_phi + is_lex_billing_status_phi + non_lex_phi_backstop_trips are UNCHANGED,
+# so the write gate and the Drive/dossier egress keep their stricter (recall-biased) posture.
+
+# Care-recipient noun OR Lexington/Medicaid program cue — the identifier a bare clinical term
+# needs before it is treated as PHI on the live path.
+_LIVE_CARE_CUE_RE = re.compile(
+    r"\b(client|patient|member|individual|participant|recipient|consumer|guardian"
+    r"|caregiver|resident"
+    r"|AHCCCS|DDD|Medicaid|HCBS|Lexington|LBHS|BHRF|behavioral health)\b",
+    re.IGNORECASE,
+)
+
+
+def _reveals_individual_care_recipient(
+    text: str, allowed_names: set[str] | None = None
+) -> bool:
+    """True if *text* ties billing/status to a SPECIFIC individual (not an aggregate).
+
+    A care-recipient noun governing a Title-case name ("client John") OR a possessive
+    proper name that is NOT on the staff roster ("Bob Smith's"). Aggregate phrasing
+    ("Lexington member billing volume", "client enrollment mix") reveals no individual and
+    returns False. Staff possessives (Harrison Rogers's, Justin Moran's — pervasive in the
+    holdco finance corpus) are excluded so they do not read as care recipients.
+    """
+    if not text:
+        return False
+    if _CARE_RECIPIENT_NAME_RE.search(text):
+        return True
+    full, first = _staff_name_index(allowed_names)
+    for m in _NAME_POSSESSIVE_RE.finditer(text):
+        name = re.sub(r"['’]s$", "", m.group(0))
+        if not _is_staff_name(name, full, first):
+            return True
+    return False
+
+
+def non_lex_phi_backstop_trips_live(
+    text: str, allowed_names: set[str] | None = None
+) -> bool:
+    """Live-retrieval variant of non_lex_phi_backstop_trips (see module section above).
+
+    Same PHI catches, tuned so the high-volume per-query non-LEX path does not over-refuse
+    legitimate product copy or aggregate finance. Pass the staff roster as *allowed_names*
+    so staff possessives are not mistaken for care recipients.
+    """
+    if not text:
+        return False
+    # High-specificity clinical framing — unconditional (not ordinary product copy).
+    # NOTE: deliberately does NOT include _DOSE_RE / _MED_CONTEXT_RE — is_clinical_phi
+    # itself excludes them, and a supplement dose ("200mg caffeine", "3mg melatonin") is
+    # exactly the OSN/F3E product copy this variant must let through.
+    if _DOB_RE.search(text) or _ICD10_RE.search(text) or _DIAGNOSED_WITH_RE.search(text):
+        return True
+    # Bare dx-term / bare med-NAME: PHI when a care/program cue OR a specific INDIVIDUAL is
+    # co-present (D-051 re-gate). A bare product mention with NEITHER ("3mg melatonin",
+    # "ADHD-style focus", "lithium battery") is not identifiable PHI and passes; a possessive
+    # or care-noun-governed client name adjacent to a med/dx ("Jalen's risperidone", "client
+    # Marcus is autistic") IS caught.
+    #   ACCEPTED RESIDUAL (documented; NOT a regression — the live non-LEX path had NO backstop
+    #   before this slice): a BARE full-name-subject or first name next to a med/dx TERM with
+    #   no possessive/care-noun/program/DOB/ICD/diagnosed-with ("Marcus Johnson is autistic",
+    #   "Kayla started clonidine"). Closing it needs person-name detection that over-refuses
+    #   legit OSN/F3E copy where med/dx terms co-occur with named stores/brands ("Sprouts
+    #   carries melatonin", "natural Prozac alternative", "ADHD-style Focus stack") — the
+    #   co-equal don't-over-refuse mandate. The STRICT predicate (Drive/dossier egress) still
+    #   catches all of these; the LEX-channel scrub + custodian gate + entity siloing +
+    #   fireflies-first classify_lex_meeting remain the primary net; the BAA/two-Cora split
+    #   (Track B) is the durable fix. Flagged for Harrison.
+    if (_CLINICAL_DX_RE.search(text) or _MED_NAME_RE.search(text)) and (
+        _LIVE_CARE_CUE_RE.search(text)
+        or _reveals_individual_care_recipient(text, allowed_names)
+    ):
+        return True
+    # Named billing/status tied to a Lexington/Medicaid program AND a specific individual.
+    return (
+        is_lex_billing_status_phi(text)
+        and is_lex_program_context(text)
+        and _reveals_individual_care_recipient(text, allowed_names)
+    )
+
+
+# ---------------------------------------------------------------------------
 # LEX action-item PHI scrubber (Meeting Action Capture, 2026-06-14)
 # ---------------------------------------------------------------------------
 # Used by the Fireflies meeting-action-capture pipeline when LEX OPERATIONAL

@@ -134,10 +134,23 @@ def run_guard_case(case: dict) -> tuple[bool, str]:
         blocked = redirect is not None
         want = expect == "blocked"
         return blocked == want, f"cross_entity blocked={blocked} expected={expect}"
-    if kind in ("phi", "clinical_phi"):
-        from cora.phi_guard import is_phi_risk, is_clinical_phi
-        flagged = (is_clinical_phi(question) if kind == "clinical_phi"
-                   else is_phi_risk(question))
+    if kind in ("phi", "clinical_phi", "lex_billing_status",
+                "non_lex_phi_backstop", "non_lex_phi_backstop_live"):
+        from cora import phi_guard
+        # non_lex_phi_backstop pins the STRICT store-defense predicate (drive/dossier egress);
+        # non_lex_phi_backstop_live pins the LIVE-retrieval variant (context_loader) that is
+        # tuned NOT to over-refuse OSN/F3E product copy or aggregate finance. Both guard the
+        # D-059-class regression the green suite has repeatedly missed.
+        if kind == "clinical_phi":
+            flagged = phi_guard.is_clinical_phi(question)
+        elif kind == "lex_billing_status":
+            flagged = phi_guard.is_lex_billing_status_phi(question)
+        elif kind == "non_lex_phi_backstop":
+            flagged = phi_guard.non_lex_phi_backstop_trips(question)
+        elif kind == "non_lex_phi_backstop_live":
+            flagged = phi_guard.non_lex_phi_backstop_trips_live(question)
+        else:
+            flagged = phi_guard.is_phi_risk(question)
         want = expect == "flagged"
         return flagged == want, f"{kind} flagged={flagged} expected={expect}"
     return False, f"unknown guard kind: {kind!r}"

@@ -10,7 +10,8 @@ check doesn't.
 
 NO DRIFT: the detectors are IMPORTED from `phi_guard` + `drive_materializer` — the same
 functions/regexes the wall uses (`is_clinical_phi`, `is_lex_billing_status_phi`,
-`_LBHS_SIGNAL_RE`, `_LEX_CONTEXT_RE`, `_lex_staff_names`, and phi_guard's name regexes via
+`is_lex_program_context` (phi_guard; the wall's former `_LEX_CONTEXT_RE`), `_LBHS_SIGNAL_RE`,
+`_lex_staff_names`, and phi_guard's name regexes via
 `_has_unredacted_client_name`). `scan_body` runs them on the body AS-IS — NOT on a
 re-scrubbed copy — because (a) a written swept file is already the wall's output (a regression
 file is raw), so the detectors-on-body are a strict SUPERSET of the wall's checks-on-scrubbed
@@ -169,8 +170,8 @@ def scan_body(entity: str, body: str) -> ScanResult:
         # (M&A / financials) with zero PHI, and the wall writes such digests (review 2026-06-30:
         # an unconditional LBHS flag false-quarantined the holdco's "LBHS Voyager/Copa BHRF
         # financial model" digest daily). An LBHS mention that actually carries PHI still
-        # trips clinical (above) or named-billing (below -- LBHS satisfies _LEX_CONTEXT_RE).
-        if phi_guard.is_lex_billing_status_phi(body) and dm._LEX_CONTEXT_RE.search(body):
+        # trips clinical (above) or named-billing (below -- LBHS satisfies is_lex_program_context).
+        if phi_guard.is_lex_billing_status_phi(body) and phi_guard.is_lex_program_context(body):
             detectors.append("named_billing_status_phi_lex_context")
 
     return ScanResult(bool(detectors), detectors)

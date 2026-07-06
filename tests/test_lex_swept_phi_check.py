@@ -156,7 +156,9 @@ def test_drift_guard_same_detector_objects():
     assert mod.phi_guard is phi_guard
     assert mod.dm is dm
     assert mod.dm._LBHS_SIGNAL_RE is dm._LBHS_SIGNAL_RE
-    assert mod.dm._LEX_CONTEXT_RE is dm._LEX_CONTEXT_RE
+    # The Lexington/Medicaid program cue is centralized in phi_guard (2026-07-05, W2-01);
+    # was drive_materializer._LEX_CONTEXT_RE. Assert the shared object, no drift.
+    assert mod.phi_guard._LEX_PROGRAM_CONTEXT_RE is phi_guard._LEX_PROGRAM_CONTEXT_RE
     # the bare-client-name net reuses phi_guard's SAME name regexes (no reimplementation)
     assert mod.phi_guard._CARE_RECIPIENT_NAME_RE is phi_guard._CARE_RECIPIENT_NAME_RE
     assert mod.phi_guard._NAME_POSSESSIVE_RE is phi_guard._NAME_POSSESSIVE_RE

@@ -96,3 +96,42 @@ def detect_sub_entity(title: str, content: str) -> str | None:
     if len(matched) == 1:
         return matched.pop()
     return None
+
+
+# ---------------------------------------------------------------------------
+# W6-01 (2026-07-05) — restricted-LEX ingest deny-list for NON-Slack sweep sources
+# ---------------------------------------------------------------------------
+# The Slack sweeps deny the lbhs*/lts* CHANNELS at the source (slack_sweep_policy +
+# slack-sweep-policy.yaml). But gmail_reader + drive_sweep have no channel, so LBHS
+# (42 CFR Part 2) and LTS (Provider-Type-15 therapy) content still reached the KB via
+# those paths (audit: 585 drive_sweep + 536 gmail LBHS; 427 gmail + 237 drive_sweep LTS).
+# A BAA does NOT waive 42 CFR Part 2, so this mirrors the Slack deny-list for non-Slack
+# sources: any gmail/drive_sweep doc whose CONTENT resolves (detect_sub_entity) to a
+# restricted sub-entity is dropped at the ingest choke point rather than stored.
+#
+# SCOPE (deliberately narrow — verify-first 2026-07-05):
+#   - gmail + drive_sweep ONLY. Slack lbhs*/lts* channels are already denied upstream;
+#     a content-tagged LBHS/LTS chunk arriving via a GM channel (#lex-leadership) is
+#     GM-level leadership context and stays (subject to the retrieval scrub).
+#   - Keys on the RESOLVED sub_entity tag (content-based detect_sub_entity), NOT a raw
+#     domain-substring drop: 3,101 gmail/drive chunks merely MENTION a lbhs/lts domain,
+#     mostly LBHS/LTS *business* (loans, management fees, PTO) that is NOT Part-2 clinical
+#     — dropping all of those would be broad over-refusal beyond scope. The clinical
+#     residue among the untagged is caught at EGRESS (context_loader._withhold_non_lex_phi,
+#     W2-01) and monitored at rest (W6-06).
+RESTRICTED_INGEST_SUB_ENTITIES: tuple[str, ...] = ("LEX-LBHS", "LEX-LTS")
+RESTRICTED_INGEST_SOURCES: tuple[str, ...] = ("gmail", "drive_sweep")
+
+
+def is_restricted_lex_ingest(source: str | None, sub_entity: str | None) -> bool:
+    """True if a doc/chunk from a non-Slack sweep source (gmail/drive_sweep) resolves to
+    a restricted LEX sub-entity (LBHS/LTS) and must be dropped at ingest / purged (W6-01).
+
+    Single source of truth shared by KnowledgeBase.upsert_documents (drop new docs) and
+    scripts/purge_lex_restricted_kb.py (purge existing chunks), so the drop rule and the
+    purge scope can never diverge.
+    """
+    return (
+        source in RESTRICTED_INGEST_SOURCES
+        and sub_entity in RESTRICTED_INGEST_SUB_ENTITIES
+    )

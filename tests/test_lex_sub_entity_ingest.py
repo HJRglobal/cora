@@ -82,7 +82,10 @@ class TestIngestTimeTagging:
         assert _stored_sub_entities(kb, "msg-llc") == {"LEX-LLC"}
 
     def test_unambiguous_lts_doc_tagged(self, kb):
+        # source=asana isolates the TAGGING behavior — a gmail/drive_sweep LTS doc is
+        # dropped at ingest by the W6-01 deny-list (see TestW601RestrictedIngestDrop).
         kb.upsert_documents([_doc(
+            source="asana",
             source_id="msg-lts",
             title="Provider Type 15 deadline",
             content="DDD Therapy Revalidation paperwork is due June 30.",
@@ -90,7 +93,10 @@ class TestIngestTimeTagging:
         assert _stored_sub_entities(kb, "msg-lts") == {"LEX-LTS"}
 
     def test_unambiguous_lbhs_doc_tagged(self, kb):
+        # source=asana: gmail/drive_sweep LBHS docs are dropped by W6-01 (tested below);
+        # this asserts the tagging chokepoint independent of the ingest deny-list.
         kb.upsert_documents([_doc(
+            source="asana",
             source_id="msg-lbhs",
             title="LBHS Q2 census numbers",
             content="Census report attached.",
@@ -123,7 +129,9 @@ class TestIngestTimeTagging:
 
     def test_explicit_sub_entity_never_overridden(self, kb):
         # Content looks like LLC, but the connector explicitly tagged LBHS.
+        # source=asana so the W6-01 gmail/drive drop doesn't remove it.
         kb.upsert_documents([_doc(
+            source="asana",
             source_id="msg-explicit",
             sub_entity="LEX-LBHS",
             title="HCBS billing report",
@@ -179,3 +187,118 @@ class TestSharedModuleParity:
         assert detect_sub_entity("Sandy Patel membership repurchase 2023", "") == "LEX-LLA"
         assert detect_sub_entity("Lexington payroll report May 2026", "") is None
         assert detect_sub_entity("[LEX-LLC] LBHS billing overlap", "") is None
+
+
+class TestW601RestrictedIngestDrop:
+    """W6-01 (2026-07-05): a gmail/drive_sweep doc resolving to a restricted LEX
+    sub-entity (LBHS/LTS) is DROPPED at ingest — no LBHS (42 CFR Part 2) / LTS
+    (Provider-Type-15) PHI enters the KB via the non-Slack sweeps. GM-level LEX,
+    LLC/LLA, and all non-gmail/drive sources are untouched."""
+
+    def test_gmail_lbhs_doc_dropped(self, kb):
+        kb.upsert_documents([_doc(
+            source="gmail", source_id="g-lbhs",
+            title="LBHS Q2 census numbers", content="Census report attached.",
+        )])
+        assert _stored_sub_entities(kb, "g-lbhs") == set()  # nothing stored
+
+    def test_drive_sweep_lts_doc_dropped(self, kb):
+        kb.upsert_documents([_doc(
+            source="drive_sweep", source_id="d-lts",
+            title="Provider Type 15 deadline",
+            content="DDD Therapy Revalidation paperwork is due June 30.",
+        )])
+        assert _stored_sub_entities(kb, "d-lts") == set()
+
+    def test_gmail_explicit_lbhs_tag_dropped(self, kb):
+        # Connector-set LBHS tag (not content-detected) is also dropped on gmail/drive.
+        kb.upsert_documents([_doc(
+            source="gmail", source_id="g-lbhs-explicit", sub_entity="LEX-LBHS",
+            title="Payroll", content="Nothing obviously LBHS in the text.",
+        )])
+        assert _stored_sub_entities(kb, "g-lbhs-explicit") == set()
+
+    def test_gmail_llc_doc_kept(self, kb):
+        # LLC is NOT restricted — a gmail LLC doc still ingests + tags normally.
+        kb.upsert_documents([_doc(
+            source="gmail", source_id="g-llc",
+            title="HCBS billing report Q1",
+            content="Supported Living placements and HCBS claims.",
+        )])
+        assert _stored_sub_entities(kb, "g-llc") == {"LEX-LLC"}
+
+    def test_gmail_general_lex_doc_kept(self, kb):
+        # GM-level (NULL) LEX content is kept — the drop is LBHS/LTS-scoped only.
+        kb.upsert_documents([_doc(
+            source="gmail", source_id="g-general",
+            title="Staff training slides Q2",
+            content="Training material for all Lexington staff.",
+        )])
+        assert _stored_sub_entities(kb, "g-general") == {None}
+
+    def test_slack_lbhs_doc_kept(self, kb):
+        # A content-tagged LBHS chunk arriving via a NON-gmail/drive source (e.g. a
+        # GM #lex-leadership slack thread) is GM-level context and is NOT dropped.
+        kb.upsert_documents([_doc(
+            source="slack", source_id="s-lbhs",
+            title="LBHS Q2 census numbers", content="Census report attached.",
+        )])
+        assert _stored_sub_entities(kb, "s-lbhs") == {"LEX-LBHS"}
+
+    def test_mixed_batch_drops_only_restricted_gmail(self, kb):
+        # A batch with a gmail LBHS doc + a gmail LLC doc + a gmail general doc:
+        # only the LBHS doc is dropped; the rest ingest.
+        kb.upsert_documents([
+            _doc(source="gmail", source_id="mix-lbhs",
+                 title="LBHS census", content="report"),
+            _doc(source="gmail", source_id="mix-llc",
+                 title="HCBS billing", content="Supported Living HCBS claims"),
+            _doc(source="gmail", source_id="mix-gen",
+                 title="Lexington all-staff memo", content="general note"),
+        ])
+        assert _stored_sub_entities(kb, "mix-lbhs") == set()
+        assert _stored_sub_entities(kb, "mix-llc") == {"LEX-LLC"}
+        assert _stored_sub_entities(kb, "mix-gen") == {None}
+
+    # ── D-051 finding 5: a now-restricted RE-INGEST must purge the doc's STALE chunks ──
+    def test_reingest_now_restricted_purges_stale_all_dropped(self, kb):
+        # First ingest resolves NULL (GM-level) -> stored. It is later edited to add an LBHS
+        # cue; on re-ingest the doc is dropped AND its old NULL chunk must be purged (else it
+        # survives forever, unreachable by the sub_entity-keyed purge). All-dropped path.
+        kb.upsert_documents([_doc(source="drive_sweep", source_id="reY",
+                                  title="Staff memo", content="Lexington all-staff memo")])
+        assert _stored_sub_entities(kb, "reY") == {None}
+        kb.upsert_documents([_doc(source="drive_sweep", source_id="reY",
+                                  title="LBHS census", content="BHRF census report")])
+        assert _stored_sub_entities(kb, "reY") == set()  # stale NULL chunk purged
+
+    def test_reingest_now_restricted_purges_stale_mixed_batch(self, kb):
+        # Same, but the re-ingest batch ALSO carries a kept doc, so the NORMAL delete pass
+        # runs (not the all-dropped early return) — exercises the seen_keys seeding.
+        kb.upsert_documents([_doc(source="drive_sweep", source_id="reZ",
+                                  title="LLC report",
+                                  content="Supported Living HCBS claims Q1")])
+        assert _stored_sub_entities(kb, "reZ") == {"LEX-LLC"}
+        kb.upsert_documents([
+            _doc(source="drive_sweep", source_id="reZ",
+                 title="LBHS", content="BHRF behavioral health census"),   # now restricted -> dropped
+            _doc(source="drive_sweep", source_id="keptW",
+                 title="ops", content="Lexington general ops note"),        # kept
+        ])
+        assert _stored_sub_entities(kb, "reZ") == set()        # stale LLC chunk purged
+        assert _stored_sub_entities(kb, "keptW") == {None}     # co-batch kept doc ingested
+
+
+class TestW601Predicate:
+    """The shared is_restricted_lex_ingest predicate (single source of truth for the
+    ingest drop + the purge script)."""
+
+    def test_predicate_matrix(self):
+        from cora.knowledge_base.lex_sub_entity import is_restricted_lex_ingest
+        assert is_restricted_lex_ingest("gmail", "LEX-LBHS") is True
+        assert is_restricted_lex_ingest("drive_sweep", "LEX-LTS") is True
+        assert is_restricted_lex_ingest("gmail", "LEX-LLC") is False   # LLC not restricted
+        assert is_restricted_lex_ingest("gmail", None) is False        # GM-level
+        assert is_restricted_lex_ingest("slack", "LEX-LBHS") is False  # slack denied upstream
+        assert is_restricted_lex_ingest("asana", "LEX-LTS") is False
+        assert is_restricted_lex_ingest("static_md", "LEX-LBHS") is False

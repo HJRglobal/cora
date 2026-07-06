@@ -66,12 +66,10 @@ _LEX_MAIL_DOMAINS: tuple[str, ...] = (
 _MARICOPA_DOMAIN_RE = re.compile(r"@([\w.-]+\.)?maricopa\.gov$", re.IGNORECASE)
 _MARICOPA_TITLE_RE = re.compile(r"\b(maricopa|probation|budget\s+class)\b", re.IGNORECASE)
 
-# Lexington/Medicaid PROGRAM cue for the NON-LEX named-billing backstop -- mirrors
-# drive_materializer._LEX_CONTEXT_RE: ordinary commercial "client billing/invoice"
-# is not PHI, so the non-LEX drop only fires when a care-program cue is ALSO present.
-_LEX_CONTEXT_RE = re.compile(
-    r"\b(AHCCCS|DDD|Medicaid|HCBS|Lexington|LBHS|BHRF|behavioral health)\b", re.IGNORECASE
-)
+# Lexington/Medicaid PROGRAM cue for the NON-LEX named-billing backstop now lives in
+# phi_guard (is_lex_program_context; centralized 2026-07-05, W2-01). Ordinary commercial
+# "client billing/invoice" is not PHI, so the non-LEX drop only fires when a care-program
+# cue is ALSO present. One shared regex across all four PHI-wall consumers -> no drift.
 # LBHS / 42-CFR-Part-2 hard signal -- if it survives into a LEX target's synthesis, drop.
 _LBHS_SIGNAL_RE = re.compile(
     r"\b(LBHS|BHRF|COPA|Behavioral Health Services|Jared Harker)\b", re.IGNORECASE
@@ -159,7 +157,7 @@ def _phi_wall(p: PersonIdentity, body: str) -> Optional[str]:
     if phi_guard.is_clinical_phi(body):
         log.warning("person_dossier: %s dossier contains clinical PHI (mis-tag?) -- DROPPED", p.slug)
         return None
-    if phi_guard.is_lex_billing_status_phi(body) and _LEX_CONTEXT_RE.search(body):
+    if phi_guard.is_lex_billing_status_phi(body) and phi_guard.is_lex_program_context(body):
         log.warning("person_dossier: %s dossier ties care-recipient billing to a LEX context -- DROPPED", p.slug)
         return None
     return body

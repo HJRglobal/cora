@@ -66,15 +66,11 @@ _LBHS_SIGNAL_RE = re.compile(
     r"\b(LBHS|BHRF|COPA|Behavioral Health Services|Jared Harker)\b", re.IGNORECASE
 )
 
-# Lexington/Medicaid PROGRAM cue. Used ONLY by the non-LEX backstop: is_lex_billing_status_phi
-# is by design a LEX-scope-only detector (phi_guard note) — "client"/"member"/"billing"/
-# "invoice" are ordinary commercial words, so firing it unconditionally on BDM/F3E/OSN
-# digests over-drops legit content. A name+invoice reveals care-recipient PHI ONLY when tied
-# to a care program; this cue is that tie. (The LEX branch does not use this — it scrubs +
-# drops on any billing-status PHI regardless, which is correct in LEX scope.)
-_LEX_CONTEXT_RE = re.compile(
-    r"\b(AHCCCS|DDD|Medicaid|HCBS|Lexington|LBHS|BHRF|behavioral health)\b", re.IGNORECASE
-)
+# Lexington/Medicaid PROGRAM cue for the non-LEX backstop now lives in phi_guard
+# (is_lex_program_context; was this module's private _LEX_CONTEXT_RE). Centralized
+# 2026-07-05 (audit W2-01) so this Drive egress and the live-retrieval backstop in
+# context_loader share ONE regex + ONE decision (phi_guard.non_lex_phi_backstop_trips)
+# and can never drift. See phi_guard for why the billing/status leg needs the cue.
 
 _DEFAULT_LOOKBACK_HOURS = 26        # first run / missing-watermark seed (daily + overlap)
 _MAX_CHUNKS_PER_SOURCE = 2000       # bound a catch-up run after downtime
@@ -318,7 +314,7 @@ def _phi_wall(entity: str, body: str) -> str | None:
     if phi_guard.is_clinical_phi(body):
         log.warning("drive_materializer: %s digest contains clinical PHI (mis-tagged LEX?) — DROPPED", entity)
         return None
-    if phi_guard.is_lex_billing_status_phi(body) and _LEX_CONTEXT_RE.search(body):
+    if phi_guard.is_lex_billing_status_phi(body) and phi_guard.is_lex_program_context(body):
         log.warning("drive_materializer: %s digest ties a care-recipient billing/status to a Lexington context — DROPPED", entity)
         return None
     return body
