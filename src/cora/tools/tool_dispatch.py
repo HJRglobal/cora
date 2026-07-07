@@ -5639,7 +5639,20 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "gmail_create_draft": 20,
     "calendar_create_event": 20,
     "calendar_schedule_meeting": 25,
-    "f3_create_image": 25,
+    # Image generation (W3-02): the dispatch timeout MUST exceed the tool's
+    # internal httpx budgets, else a real generation is abandoned mid-flight and
+    # the user gets a spurious "Tool timed out" (W3-01 made this timeout a true
+    # wall-clock bound). photoroom_client budgets are additive within one spec:
+    # main-image download 30s (:177) + optional reference-image download 30s +
+    # generation POST 60s (:254) -> a single spec runs up to ~90s in the common
+    # path (fast downloads + the 60s generation ceiling).
+    "f3_generate_image": 90,    # PhotoRoom download(s) + 60s generation ceiling
+    "f3_create_image": 100,     # + Haiku brief->spec (spec_generator) before PhotoRoom
+    "f3_batch_image_run": 180,  # N specs in SERIES; a large batch exceeds this and
+                                # finishes in the background (W3-01 abandons the worker
+                                # on timeout, but images still land in Drive) -- the
+                                # true fix for large batches is async fire-and-report
+                                # (tracked, out of this slice's scope).
     "f3_create_sales_deck": 25,
     "influencer_log_deliverable": 20,
     "hubspot_update_deal_stage": 20,

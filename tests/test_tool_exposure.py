@@ -68,6 +68,26 @@ def test_timeouts_reference_only_real_tools():
     )
 
 
+def test_image_gen_timeouts_exceed_internal_photoroom_budget():
+    # W3-02: the dispatch timeout MUST exceed photoroom_client's internal httpx
+    # budgets, else a real generation is abandoned mid-flight and the user gets
+    # a spurious "Tool timed out" (W3-01 made this a true wall-clock bound). The
+    # single-generation POST budget is 60s (photoroom_client.py:254); a spec can
+    # also spend up to 30s each on the main + reference image downloads (:177).
+    _PHOTOROOM_GENERATION_BUDGET = 60  # httpx.post(..., timeout=60.0)
+    for tool in ("f3_generate_image", "f3_create_image", "f3_batch_image_run"):
+        assert tool in td._TOOL_TIMEOUTS, f"{tool} must have an explicit timeout (W3-02)"
+        assert td._TOOL_TIMEOUTS[tool] > _PHOTOROOM_GENERATION_BUDGET, (
+            f"{tool} dispatch timeout {td._TOOL_TIMEOUTS[tool]}s <= the 60s PhotoRoom "
+            "generation budget -> a real generation would spuriously time out"
+        )
+    # f3_create_image adds a Haiku brief->spec step before the same PhotoRoom
+    # path, so it must be at least as generous as the plain generator.
+    assert td._TOOL_TIMEOUTS["f3_create_image"] >= td._TOOL_TIMEOUTS["f3_generate_image"]
+    # batch runs specs in series -> it must be the most generous of the three.
+    assert td._TOOL_TIMEOUTS["f3_batch_image_run"] >= td._TOOL_TIMEOUTS["f3_create_image"]
+
+
 def test_every_tool_reachable_via_aggregator():
     # FNDR is the catch-all; it must expose every tool so nothing is orphaned.
     assert _names("FNDR") == ALL_NAMES
