@@ -606,10 +606,26 @@ def is_shift_keyword(text: str) -> bool:
     return any(kw in t for kw in _SHIFT_KEYWORDS) and len(t.split()) <= 6
 
 
-_QUESTION_LEAD_RE = re.compile(
-    r"^\s*(what|whats|where|when|who|whom|whose|why|how|which|"
-    r"is|are|am|was|were|do|does|did|can|could|should|would|will|"
-    r"has|have|had|may|might|shall)\b",
+# Leading wh-interrogatives are unconditional question openers -- a declarative
+# gap ANSWER essentially never starts with one.
+_QUESTION_WH_RE = re.compile(
+    r"^\s*(what|whats|where|when|who|whom|whose|why|how|which)\b",
+    re.IGNORECASE,
+)
+# An auxiliary verb opens a question only when a question SUBJECT follows it
+# ("do WE have...", "is THE launch...", "can YOU pull..."). It deliberately does
+# NOT fire on auxiliary-led DECLARATIVE answers -- "Has to go through Hannah",
+# "Should be the Tucson location", "Can be found in the shared drive", "Will
+# check with Justin" -- nor on a proper-noun subject that collides with an
+# auxiliary ("Will Rogers handles that", "May Chen owns it"). Those are real gap
+# answers and must still be captured (D-051 review of W-DMQ). Auxiliary-led
+# questions WITHOUT a following subject pronoun ("can Harrison approve this")
+# are still caught when they end with '?'.
+_QUESTION_AUX_RE = re.compile(
+    r"^\s*(is|are|am|was|were|do|does|did|can|could|should|would|will|"
+    r"has|have|had|may|might|shall)\s+"
+    r"(i|we|you|he|she|it|they|the|there|that|this|these|those|"
+    r"your|our|my|his|her|their|any|anyone|someone|somebody)\b",
     re.IGNORECASE,
 )
 
@@ -622,21 +638,41 @@ def looks_like_question(text: str) -> bool:
     unrelated question a teammate happened to DM while one ask was live (e.g.
     "what's our cash position across the entities?"), proposing it to Harrison
     as a bogus known-answer. Gap answers are declarative facts, so a trailing
-    '?' or a leading interrogative/auxiliary word is a strong "this is a new
-    question" signal -> route those to Q&A instead of capturing them.
+    '?', a leading wh-interrogative, or an auxiliary-verb-plus-question-subject
+    opener is a strong "this is a new question" signal -> route those to Q&A
+    instead of capturing them.
+
+    The auxiliary arm requires a following question subject (do WE / is THE /
+    can YOU) so an auxiliary-LED declarative answer is not misread as a question
+    and lost -- see the D-051 review notes on _QUESTION_AUX_RE above.
 
     Deliberately applied ONLY to the ambiguous top-level path (see the caller in
     app.handle_message_event): a reply typed in the ask's OWN thread is
     unambiguous intent to answer and always matches, question-shaped or not.
     Declines ("no idea", "not my area", "don't know") are declarative, so they
     still match here and are handled downstream by record_ask_answer.
+
+    ACCEPTED RESIDUALS (a lexical classifier over free prose cannot perfectly
+    separate a fresh question from an answer -- both directions are recoverable
+    here, so we keep the rule simple rather than chase them):
+      * false-positive: an ANSWER that ends in a confirmation tag ("... , right?")
+        or leads with "aux + the/that" reads as a question and is routed to Q&A
+        instead of captured -- the ask stays PENDING (re-escalated / digest picks
+        it up; a threaded reply always captures).
+      * false-negative: an aux-led question about a NAMED person ("did Justin
+        send it") or an imperative ("pull up the Q1 P&L") without a trailing '?'
+        is captured as a gap answer -> a Harrison-gated bogus proposal he -1's at
+        the 7am review (annoyance, never a write).
+    The robust disambiguation (drop top-level auto-capture; require a threaded
+    reply to the ask) is a product/UX change, not this cleanup -- left as a
+    follow-up option for Harrison.
     """
     t = (text or "").strip()
     if not t:
         return False
     if t.endswith("?"):
         return True
-    return bool(_QUESTION_LEAD_RE.match(t))
+    return bool(_QUESTION_WH_RE.match(t) or _QUESTION_AUX_RE.match(t))
 
 
 _DECLINE_RE = re.compile(

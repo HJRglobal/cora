@@ -354,3 +354,12 @@ class TestGapAskDoesNotSwallowFreshQuestion:
         assert r.captured["allow_toplevel"] is True
         r.rec.assert_called_once()                     # captured as a gap answer
         r.qa.assert_not_called()
+
+    def test_auxiliary_led_answer_still_captures(self):
+        # D-051 review (W-DMQ): a real answer that begins with an auxiliary verb
+        # ("Has to go through Hannah") must NOT be misread as a question -- it is
+        # still captured as the gap answer end-to-end.
+        r = self._drive("Has to go through Hannah in accounting.")
+        assert r.captured["allow_toplevel"] is True
+        r.rec.assert_called_once()
+        r.qa.assert_not_called()

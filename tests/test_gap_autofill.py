@@ -409,6 +409,28 @@ class TestLooksLikeQuestion:
                   "Tommy owns that account now."):
             assert ga.looks_like_question(a) is False, a
 
+    def test_auxiliary_led_declarative_answers_are_not_questions(self):
+        # D-051 review (W-DMQ): a real gap ANSWER often begins with an auxiliary
+        # verb but is NOT a question ("Has to go through Hannah"). It must fall
+        # through so match_pending_ask still captures it -- the auxiliary arm
+        # requires a following question SUBJECT (do WE / is THE / can YOU).
+        for a in ("Has to go through Hannah",
+                  "Should be the Tucson location",
+                  "Can be found in the shared drive under Ops",
+                  "Will check with Justin and get back",
+                  "Will Rogers handles that account now.",  # proper-noun collision
+                  "May Chen owns it",
+                  "Do not have that yet, sorry"):
+            assert ga.looks_like_question(a) is False, a
+
+    def test_auxiliary_question_requires_a_subject(self):
+        # Auxiliary-led *questions* (subject follows the auxiliary) are still
+        # flagged even without a trailing '?'.
+        for q in ("do we have the address", "should we ship it",
+                  "can you pull the numbers", "is the launch confirmed",
+                  "will they approve it", "did the order ship"):
+            assert ga.looks_like_question(q) is True, q
+
     def test_declines_are_not_flagged_as_questions(self):
         # Declines are declarative and must still reach record_ask_answer's
         # decline branch, so looks_like_question must not flag them.
