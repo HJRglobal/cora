@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -150,6 +151,119 @@ def _resume_target(fresh: bool) -> tuple[int | None, set[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Concurrent fan-out (bounded in-flight window)
+# ---------------------------------------------------------------------------
+def _run_units(units, args, basket, scan_id, done, state_started, *,
+               query_fn, classify_fn, resolve_fn):
+    """Run query->classify->verify for each unit concurrently, storing results
+    in the main thread. Bounded window of `workers` in-flight calls; per-provider
+    caps are enforced by ai_search's semaphores.
+
+    Cost cap: exact hard stop at --workers 1; with concurrency it may overshoot
+    by up to ~(workers x per-call cost) -- negligible since real cost ~= estimate.
+    Time budget self-bounds mid-run (the real control; task limit is the backstop).
+    """
+    deadline = time.monotonic() + args.time_budget_min * 60.0
+    workers = max(1, getattr(args, "workers", 16))
+    total_cost = 0.0
+    total_calls = 0
+    partial = False
+    skipped_models: set[str] = set()
+    units_iter = iter(units)
+
+    def work(unit):
+        bkey, prompt, model, _ri = unit
+        res = query_fn(model, prompt.text)
+        if res.skipped or res.error:
+            return unit, res, None, None
+        brand = basket.brand(bkey)
+        cls = classify_fn(brand, prompt, res.text, res.citations)
+        verified = resolve_fn(cls.cited_sources, competitor_names=brand.competitor_set,
+                              verify=not args.no_verify_citations)
+        return unit, res, cls, verified
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        inflight: dict = {}
+        stop = False
+
+        def try_submit() -> bool:
+            nonlocal stop, partial
+            while not stop:
+                if time.monotonic() > deadline:
+                    log.warning("time budget %.0fmin exhausted; stopping (partial)",
+                                args.time_budget_min)
+                    partial = True
+                    stop = True
+                    return False
+                unit = next(units_iter, None)
+                if unit is None:
+                    return False
+                if unit[2] in skipped_models:
+                    continue  # model has no key / errored-out; skip its remaining units
+                if args.max_cost_usd and total_cost + ai_search.estimate_call_cost(unit[2]) > args.max_cost_usd:
+                    log.warning("cost cap $%.2f reached (spent $%.4f); stopping (partial)",
+                                args.max_cost_usd, total_cost)
+                    partial = True
+                    stop = True
+                    return False
+                inflight[pool.submit(work, unit)] = unit
+                return True
+            return False
+
+        for _ in range(workers):
+            if not try_submit():
+                break
+
+        while inflight:
+            completed, _pending = wait(list(inflight), return_when=FIRST_COMPLETED)
+            for fut in completed:
+                unit = inflight.pop(fut)
+                bkey, prompt, model, ri = unit
+                key = _work_key(bkey, prompt.id, model, ri)
+                total_calls += 1
+                try:
+                    _u, res, cls, verified = fut.result()
+                except Exception as exc:  # noqa: BLE001 -- a crashed unit must not abort the scan
+                    log.warning("work unit %s crashed: %s", key, exc)
+                    continue
+                if res.skipped:
+                    log.warning("model %s skipped (%s); dropping its remaining units",
+                                model, res.error)
+                    skipped_models.add(model)
+                    continue
+                total_cost += res.cost_usd
+                if res.error:
+                    store.insert_answer(scan_id=scan_id, brand=bkey, prompt_id=prompt.id,
+                                        intent=prompt.intent, aided=prompt.aided, model=model,
+                                        run_index=ri, raw_text="",
+                                        classification=clf.Classification(),
+                                        cost_usd=res.cost_usd, error=res.error)
+                else:
+                    answer_id = store.insert_answer(
+                        scan_id=scan_id, brand=bkey, prompt_id=prompt.id, intent=prompt.intent,
+                        aided=prompt.aided, model=model, run_index=ri, raw_text=res.text,
+                        classification=cls, cost_usd=res.cost_usd, error=cls.error)
+                    store.record_answer_mentions(scan_id=scan_id, answer_id=answer_id, brand=bkey,
+                                                 brand_name=basket.brand(bkey).brand_name,
+                                                 model=model, classification=cls)
+                    store.insert_citations(scan_id=scan_id, answer_id=answer_id, brand=bkey,
+                                           model=model, citations=verified)
+                done.add(key)
+                _save_state({"scan_id": scan_id, "started_at": state_started,
+                             "done_keys": sorted(done)})
+                if args.max_cost_usd and total_cost >= args.max_cost_usd:
+                    partial = True
+                    stop = True
+                if time.monotonic() > deadline:
+                    partial = True
+                    stop = True
+            for _ in range(len(completed)):
+                if not try_submit():
+                    break
+    return total_calls, total_cost, partial
+
+
+# ---------------------------------------------------------------------------
 # Core scan
 # ---------------------------------------------------------------------------
 def execute_scan(args, *, query_fn=None, classify_fn=None, resolve_fn=None, aio_fn=None) -> int:
@@ -195,70 +309,21 @@ def execute_scan(args, *, query_fn=None, classify_fn=None, resolve_fn=None, aio_
     else:
         scan_id = store.create_scan(basket_version=basket.version, models=models,
                                     runs_per_prompt=runs, brands=brands)
-    _save_state({"scan_id": scan_id, "started_at": datetime.now(timezone.utc).isoformat(),
-                 "done_keys": sorted(done)})
+    state_started = datetime.now(timezone.utc).isoformat()
+    _save_state({"scan_id": scan_id, "started_at": state_started, "done_keys": sorted(done)})
 
-    deadline = time.monotonic() + args.time_budget_min * 60.0
-    total_cost = 0.0
-    total_calls = 0
-    skipped_models: set[str] = set()
-    partial = False
+    # Work units = every (brand, prompt, model, run) not already done. The
+    # per-provider concurrency caps live in ai_search's semaphores; the runner
+    # fans these out concurrently (bounded window) so a full weekly scan fits
+    # its time budget instead of running ~1780 calls serially.
+    units = [(bkey, prompt, model, ri)
+             for (bkey, prompt, model) in items
+             for ri in range(runs)
+             if _work_key(bkey, prompt.id, model, ri) not in done]
 
-    for bkey, prompt, model in items:
-        if model in skipped_models:
-            continue
-        brand = basket.brand(bkey)
-        for run_index in range(runs):
-            key = _work_key(bkey, prompt.id, model, run_index)
-            if key in done:
-                continue
-            if time.monotonic() > deadline:
-                log.warning("time budget %.0fmin exhausted; stopping (scan partial)",
-                            args.time_budget_min)
-                partial = True
-                break
-            if args.max_cost_usd and total_cost + ai_search.estimate_call_cost(model) > args.max_cost_usd:
-                log.warning("cost cap $%.2f would be exceeded (spent $%.4f); stopping",
-                            args.max_cost_usd, total_cost)
-                partial = True
-                break
-
-            result = query_fn(model, prompt.text)
-            total_calls += 1
-            if result.skipped:
-                log.warning("model %s skipped (%s); dropping it from this scan",
-                            model, result.error)
-                skipped_models.add(model)
-                break  # stop iterating runs for this model/prompt
-            total_cost += result.cost_usd
-
-            if result.error:
-                store.insert_answer(scan_id=scan_id, brand=bkey, prompt_id=prompt.id,
-                                    intent=prompt.intent, aided=prompt.aided, model=model,
-                                    run_index=run_index, raw_text="",
-                                    classification=clf.Classification(),
-                                    cost_usd=result.cost_usd, error=result.error)
-            else:
-                classification = classify_fn(brand, prompt, result.text, result.citations)
-                answer_id = store.insert_answer(
-                    scan_id=scan_id, brand=bkey, prompt_id=prompt.id, intent=prompt.intent,
-                    aided=prompt.aided, model=model, run_index=run_index,
-                    raw_text=result.text, classification=classification,
-                    cost_usd=result.cost_usd, error=classification.error)
-                store.record_answer_mentions(scan_id=scan_id, answer_id=answer_id, brand=bkey,
-                                             brand_name=brand.brand_name, model=model,
-                                             classification=classification)
-                verified = resolve_fn(classification.cited_sources,
-                                      competitor_names=brand.competitor_set,
-                                      verify=not args.no_verify_citations)
-                store.insert_citations(scan_id=scan_id, answer_id=answer_id, brand=bkey,
-                                       model=model, citations=verified)
-
-            done.add(key)
-            _save_state({"scan_id": scan_id, "started_at": datetime.now(timezone.utc).isoformat(),
-                         "done_keys": sorted(done)})
-        if partial:
-            break
+    total_calls, total_cost, partial = _run_units(
+        units, args, basket, scan_id, done, state_started,
+        query_fn=query_fn, classify_fn=classify_fn, resolve_fn=resolve_fn)
 
     # ---- AIO pull (Otterly) + scoring ----
     aio_by_brand = _pull_aio(brands, basket, args, aio_fn, scan_id) if not partial else {}
@@ -362,6 +427,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--max-cost-usd", type=float, default=200.0, help="hard grounded-search spend cap")
     ap.add_argument("--time-budget-min", type=float, default=100.0,
                     help="script-side wall-clock budget (real control; task limit is the backstop)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="concurrent in-flight calls (per-provider caps still apply); 1 = serial")
     ap.add_argument("--country", default="us", help="Otterly AIO country code (default us)")
     ap.add_argument("--no-aio", action="store_true", help="skip the Otterly AIO pull")
     ap.add_argument("--no-verify-citations", action="store_true")

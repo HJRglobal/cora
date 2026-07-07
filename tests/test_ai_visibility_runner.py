@@ -40,6 +40,11 @@ def _args(m, **over):
     return a
 
 
+def _args_serial(m, **over):
+    over.setdefault("workers", 1)
+    return _args(m, **over)
+
+
 # --- dry run ---
 def test_dry_run_makes_zero_calls(monkeypatch, capsys):
     m = _load_runner()
@@ -104,7 +109,7 @@ def test_cost_cap_stops_and_marks_partial(monkeypatch):
         return QueryResult(model=model, prompt=prompt, text="x", citations=[],
                            cost_usd=0.5)
 
-    rc = m.execute_scan(_args(m, max_cost_usd=1.0),
+    rc = m.execute_scan(_args_serial(m, max_cost_usd=1.0),  # workers=1 -> exact hard cap
                         query_fn=dear_query,
                         classify_fn=lambda *a, **k: Classification(),
                         resolve_fn=lambda urls, **k: [])
@@ -173,3 +178,26 @@ def test_unknown_brand_raises_systemexit():
     m = _load_runner()
     with pytest.raises(SystemExit):
         m.execute_scan(m.parse_args(["--brand", "nope", "--dry-run"]))
+
+
+def test_concurrent_scan_stores_all_units(monkeypatch):
+    """With workers>1 (default), every unit is still processed + stored exactly once."""
+    m = _load_runner()
+    seen = []
+
+    def fake_query(model, prompt):
+        seen.append(prompt)
+        return QueryResult(model=model, prompt=prompt, text="F3 Energy.",
+                           citations=[], cost_usd=0.001)
+
+    rc = m.execute_scan(_args(m, workers=8, runs=2),  # 33 prompts x 2 runs = 66 units
+                        query_fn=fake_query,
+                        classify_fn=lambda b, p, t, c: Classification(
+                            mentioned=True, is_correct_brand=True, position=1,
+                            sentiment="positive"),
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 0
+    latest = st.latest_scores()
+    rows = st.answers_for_scan(latest["energy"]["scan"]["id"], "energy")
+    assert len(rows) == 66  # every unit stored once, no dupes despite concurrency
+    assert len(seen) == 66

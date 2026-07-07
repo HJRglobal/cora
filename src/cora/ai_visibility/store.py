@@ -422,6 +422,39 @@ def latest_scores() -> dict[str, dict]:
         conn.close()
 
 
+def scores_for_scan(scan_id: int) -> dict[str, dict]:
+    """Per-brand scores for a specific scan (with scan meta attached)."""
+    conn = _get_conn()
+    try:
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan:
+            return {}
+        rows = conn.execute("SELECT * FROM scores WHERE scan_id=?", (scan_id,)).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            d = dict(r)
+            d["scan"] = dict(scan)
+            out[d["brand"]] = d
+        return out
+    finally:
+        conn.close()
+
+
+def top_competitors(scan_id: int, brand: str, limit: int = 3) -> list[tuple[str, int]]:
+    """Top competitors by total mentions this scan (all engines incl. AIO)."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT name, SUM(mentions_count) AS n FROM mentions
+               WHERE scan_id=? AND brand=? AND is_target=0
+               GROUP BY name ORDER BY n DESC LIMIT ?""",
+            (scan_id, brand, limit),
+        ).fetchall()
+        return [(r["name"], int(r["n"] or 0)) for r in rows]
+    finally:
+        conn.close()
+
+
 def top_competitor_gaps(scan_id: int, brand: str, limit: int = 3) -> list[dict]:
     """Prompts where a competitor is named but the brand is NOT a hit -- the
     'competitor beats us' gaps for the card."""
