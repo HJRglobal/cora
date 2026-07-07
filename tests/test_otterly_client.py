@@ -128,6 +128,81 @@ def test_fetch_aio_slice_happy_path(monkeypatch):
     assert s.engine == "aio_otterly"
 
 
+def test_get_citations_sends_date_window_and_engine(monkeypatch):
+    """Regression for the 2026-07-07 live 400: the citations call MUST include
+    startDate + endDate (same window as /stats) + the engines filter + country +
+    pagination -- omitting the date range 400s."""
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    captured: dict = {}
+
+    def _cap(path, params=None):
+        captured["path"] = path
+        captured["params"] = params or {}
+        return {"items": []}
+
+    monkeypatch.setattr(oc, "_get", _cap)
+    oc.get_brand_report_citations("r2", "2026-06-30", "2026-07-07", "us", "google")
+    assert captured["path"].endswith("/reports/brand/r2/citations")
+    p = captured["params"]
+    assert p["startDate"] == "2026-06-30"
+    assert p["endDate"] == "2026-07-07"
+    assert p["engines"] == "google"
+    assert p["country"] == "us"
+    assert "limit" in p and "offset" in p
+
+
+def test_fetch_aio_slice_passes_window_to_citations(monkeypatch):
+    """End-to-end: fetch_aio_slice threads its date window + resolved engine into
+    the citations call (so it no longer 400s)."""
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    monkeypatch.delenv("OTTERLY_AIO_ENGINE", raising=False)
+    seen: dict = {}
+
+    def _get(path, params=None):
+        if path.endswith("/engines"):
+            return {"items": [{"country": "us", "baseEngines": ["google"], "addonEngines": []}]}
+        if path.endswith("/stats"):
+            return {"summary": {"brandCoverage": 0.2, "shareOfVoice": 0.1,
+                                "averageRank": 2, "totalMentions": 3}}
+        if path.endswith("/citations"):
+            seen["citations_params"] = params
+            return {"items": [{"url": "https://reddit.com/r/energy",
+                               "domainCategory": "Social Media"}]}
+        if path.endswith("/reports/brand"):
+            return {"items": [{"id": "r2", "brand": "F3 Energy", "brandVariations": ["F3Energy"]}]}
+        raise oc.OtterlyError(f"unrouted {path}")
+
+    monkeypatch.setattr(oc, "_get", _get)
+    s = oc.fetch_aio_slice("energy", ENERGY_ALIASES, start_date="2026-06-30",
+                           end_date="2026-07-07")
+    assert s.available is True
+    assert len(s.citations) == 1
+    cp = seen["citations_params"]
+    assert cp["startDate"] == "2026-06-30" and cp["endDate"] == "2026-07-07"
+    assert cp["engines"] == "google"
+
+
+def test_fetch_aio_slice_citations_400_is_failsoft(monkeypatch):
+    """A citations 400 (or any error) is skipped: the slice stays available with
+    citations=[] and the stats-derived metrics intact -- never raises."""
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    monkeypatch.delenv("OTTERLY_AIO_ENGINE", raising=False)
+    routes = {
+        "/engines": {"items": [{"country": "us", "baseEngines": ["google"], "addonEngines": []}]},
+        "/reports/brand/r2/stats": {"summary": {"brandCoverage": 0.2, "shareOfVoice": 0.1,
+                                                 "averageRank": 2, "totalMentions": 3}},
+        "/reports/brand/r2/citations": RuntimeError("400 Bad Request"),
+        "/reports/brand": {"items": [{"id": "r2", "brand": "F3 Energy",
+                                      "brandVariations": ["F3Energy"]}]},
+    }
+    monkeypatch.setattr(oc, "_get", _fake_get(routes))
+    s = oc.fetch_aio_slice("energy", ENERGY_ALIASES, start_date="2026-06-30",
+                           end_date="2026-07-07")
+    assert s.available is True     # stats succeeded -> slice usable
+    assert s.citations == []       # citations 400 skipped, no raise
+    assert s.presence == 20.0      # stats metrics still captured
+
+
 def test_fetch_aio_slice_no_matching_report(monkeypatch):
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
     routes = {

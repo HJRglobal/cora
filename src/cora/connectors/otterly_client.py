@@ -279,8 +279,9 @@ def fetch_aio_slice(brand_key: str, aliases, *, start_date: str, end_date: str,
         metrics = _extract_brand_metrics(stats, aliases)
         comp = _extract_competitor_mentions(stats, aliases)
         try:
-            cites = _extract_citations(get_brand_report_citations(report_id, country))
-        except Exception as exc:  # noqa: BLE001 -- citations are optional
+            cites = _extract_citations(get_brand_report_citations(
+                report_id, start_date, end_date, country, eng))
+        except Exception as exc:  # noqa: BLE001 -- citations are optional; fail-soft
             log.warning("otterly: citations fetch failed for %s (%s)", report_id, exc)
             cites = []
         return AioBrandSlice(
@@ -309,8 +310,14 @@ def get_brand_report_stats(report_id: str, start_date: str, end_date: str,
     )
 
 
-def get_brand_report_citations(report_id: str, country: str = "us", limit: int = 100) -> dict:
-    return _get(
-        f"/reports/brand/{report_id}/citations",
-        params={"country": country, "limit": limit, "offset": 0},
-    )
+def get_brand_report_citations(report_id: str, start_date: str, end_date: str,
+                               country: str = "us", engine: str | None = None,
+                               limit: int = 100, offset: int = 0) -> dict:
+    # The citations endpoint requires the same date window as /stats -- omitting
+    # startDate/endDate 400s (2026-07-07 live smoke). The engines filter scopes
+    # citations to the AIO engine so they match the stats slice.
+    params: dict = {"startDate": start_date, "endDate": end_date,
+                    "country": country, "limit": limit, "offset": offset}
+    if engine:
+        params["engines"] = engine
+    return _get(f"/reports/brand/{report_id}/citations", params=params)
