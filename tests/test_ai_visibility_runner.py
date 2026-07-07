@@ -134,11 +134,17 @@ def test_missing_key_model_skipped(monkeypatch):
     rc = m.execute_scan(_args(m), query_fn=skip_query,
                         classify_fn=lambda *a, **k: Classification(),
                         resolve_fn=lambda urls, **k: [])
-    assert rc == 0
-    latest = st.latest_scores()
-    # no answers stored (model skipped) -> composite 0, scan completed
-    assert latest["energy"]["composite"] == 0.0
-    assert st.answers_for_scan(latest["energy"]["scan"]["id"], "energy") == []
+    assert rc == 0  # scan still completes
+    # all models skipped -> no successful answers -> brand OMITTED (no false 0/100)
+    assert st.latest_scores() == {}
+    conn = sqlite3.connect(str(st._db_path()))
+    try:
+        scan = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+        n_ans = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+    finally:
+        conn.close()
+    assert scan[7] == "completed"
+    assert n_ans == 0  # nothing stored for a fully-skipped model
 
 
 # --- resume state helpers ---
@@ -178,6 +184,82 @@ def test_unknown_brand_raises_systemexit():
     m = _load_runner()
     with pytest.raises(SystemExit):
         m.execute_scan(m.parse_args(["--brand", "nope", "--dry-run"]))
+
+
+def test_aio_path_merges_fifth_engine(monkeypatch):
+    """End-to-end AIO path: _pull_aio -> scoring.aio_metrics -> merged composite."""
+    m = _load_runner()
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")  # else _pull_aio short-circuits
+
+    def fake_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="F3 Energy.", citations=[],
+                           cost_usd=0.001)
+
+    def fake_classify(brand, prompt, text, citations):
+        return Classification(mentioned=True, is_correct_brand=True, position=1,
+                              sentiment="positive")
+
+    def fake_aio(bkey, aliases, *, start_date, end_date, country="us", workspace_id=None,
+                 engine=None):
+        return AioBrandSlice(brand_key=bkey, report_id="r", report_title="t", available=True,
+                             presence=40.0, share_of_voice=30.0, average_rank=2.0,
+                             sentiment={"positive": 3, "neutral": 1, "negative": 0},
+                             competitor_mentions={"Celsius": 10}, citations=[])
+
+    args = m.parse_args(["--brand", "energy", "--models", "perplexity_sonar", "--runs", "1",
+                         "--no-verify-citations", "--no-post"])  # NOTE: AIO left ON
+    rc = m.execute_scan(args, query_fn=fake_query, classify_fn=fake_classify,
+                        resolve_fn=lambda urls, **k: [], aio_fn=fake_aio)
+    assert rc == 0
+    latest = st.latest_scores()["energy"]
+    assert latest["aio_composite"] is not None          # AIO merged in
+    assert latest["composite"] != latest["composite_direct_only"]  # 5th engine shifted it
+    assert latest["scan"]["aio_included"] == 1
+
+
+def test_disambiguation_not_counted_at_integration(monkeypatch):
+    """A namesake (mentioned=True, is_correct_brand=False) reaches the DB but
+    _score_and_save's is_hit derivation keeps presence at 0."""
+    m = _load_runner()
+
+    def fake_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="F3 Nation is a workout group.",
+                           citations=[], cost_usd=0.001)
+
+    def namesake_classify(brand, prompt, text, citations):
+        return Classification(mentioned=True, is_correct_brand=False, position=None,
+                              sentiment="neutral")
+
+    rc = m.execute_scan(_args(m), query_fn=fake_query, classify_fn=namesake_classify,
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 0
+    latest = st.latest_scores()["energy"]
+    assert latest["presence"] == 0.0   # namesake NOT counted as presence
+    assert latest["composite"] == 0.0
+    # ... but the rows were genuinely stored with mentioned=1
+    rows = st.answers_for_scan(latest["scan"]["id"], "energy")
+    assert all(r["mentioned"] == 1 and r["is_correct_brand"] == 0 for r in rows)
+
+
+def test_cost_cap_presubmit_guard_stops(monkeypatch):
+    """Exercises the pre-submit estimate guard (not the post-completion >=): a cap
+    just above one call's spend stops before the 2nd call is submitted."""
+    m = _load_runner()
+
+    def q(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="x", citations=[], cost_usd=0.5)
+
+    rc = m.execute_scan(_args_serial(m, max_cost_usd=0.505), query_fn=q,
+                        classify_fn=lambda *a, **k: Classification(),
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 2
+    conn = sqlite3.connect(str(st._db_path()))
+    try:
+        scan = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert scan[8] == 1  # only 1 call: pre-submit guard blocked the 2nd (0.5 + est > 0.505)
+    assert scan[7] == "partial"
 
 
 def test_concurrent_scan_stores_all_units(monkeypatch):

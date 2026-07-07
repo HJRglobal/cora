@@ -109,9 +109,27 @@ def test_aio_metrics_from_primitives():
     assert m is not None
     assert m.presence == 25.0
     assert m.share_of_voice == 10.0
-    assert m.position == 33.0                # ladder(round(3))
+    # position is presence-scaled to match the direct engines' basis: ladder(3)=33 * 0.25
+    assert m.position == 8.25
     assert m.sentiment == 72.5               # (4*100+3*60+1*0)/8
-    assert m.composite == pytest.approx(29.98, abs=0.05)
+    # composite = .4*25 + .25*10 + .2*8.25 + .15*72.5
+    assert m.composite == pytest.approx(25.03, abs=0.05)
+
+
+def test_cross_engine_sentiment_excludes_no_hit_engines():
+    # brand hit on engine 'a' (all positive), absent on 'b'. Sentiment must be
+    # 100 (a's hits only), NOT (100 + 0)/2 = 50 (b contributes no sentiment vote).
+    runs = [_rv("a", hit=True, pos=1, sent="positive"),
+            _rv("b", hit=False)]
+    s = sc.score_brand(runs)
+    assert s.sentiment == 100.0
+    # sanity: presence still reflects b's absence (per-engine mean of 100 and 0)
+    assert s.presence == 50.0
+
+
+def test_cross_engine_sentiment_zero_when_no_hits_anywhere():
+    s = sc.score_brand([_rv("a", hit=False), _rv("b", hit=False)])
+    assert s.sentiment == 0.0
 
 
 def test_aio_metrics_none_when_no_presence():

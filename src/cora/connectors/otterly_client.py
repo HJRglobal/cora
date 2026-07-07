@@ -32,9 +32,11 @@ log = logging.getLogger(__name__)
 
 _BASE_URL = os.environ.get("OTTERLY_BASE_URL", "https://data.otterly.ai/v1")
 _HTTP_TIMEOUT = float(os.environ.get("OTTERLY_HTTP_TIMEOUT", "30"))
-# Fallback AIO engine id if /engines discovery fails. Discovery (by matching a
-# name containing "overview") is preferred and overrides this.
-_AIO_ENGINE_FALLBACK = os.environ.get("OTTERLY_AIO_ENGINE", "google_ai_overviews")
+# The Otterly engine id for Google AI Overviews. Otterly's documented engine
+# enum is {chatgpt, google, perplexity, copilot, google_ai_mode, gemini, claude};
+# "google" is the Google AI Overviews engine ("google_ai_mode" is the separate
+# AI Mode). Config-driven so it can be corrected without a code change.
+_AIO_ENGINE_DEFAULT = os.environ.get("OTTERLY_AIO_ENGINE", "google")
 
 ENGINE_TAG = "aio_otterly"
 
@@ -92,25 +94,37 @@ def _get(path: str, params: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
-def list_engines() -> list[dict]:
+def list_engine_ids() -> set[str]:
+    """Flatten the country-grouped /engines response
+    ({items:[{country, baseEngines:[str], addonEngines:[str]}]}) to the set of
+    engine id strings."""
     data = _get("/engines")
-    return data.get("items") or data.get("engines") or (data if isinstance(data, list) else [])
+    items = data.get("items") or (data if isinstance(data, list) else [])
+    ids: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for arr in (item.get("baseEngines"), item.get("addonEngines")):
+            for e in arr or []:
+                if isinstance(e, str) and e.strip():
+                    ids.add(e.strip())
+    return ids
 
 
 def resolve_aio_engine_id() -> str:
-    """Find the Google-AI-Overviews engine id. Prefer live discovery (match a
-    name/id containing 'overview'); fall back to the configured default."""
+    """Return the Otterly engine id for Google AI Overviews (config-driven,
+    default "google"). Best-effort validated against /engines: if the id isn't in
+    the live engine list we log a warning but still return it -- validation must
+    never block the AIO pull."""
+    target = _AIO_ENGINE_DEFAULT
     try:
-        for eng in list_engines():
-            if not isinstance(eng, dict):
-                continue
-            hay = " ".join(str(eng.get(k, "")) for k in ("id", "name", "slug", "key")).lower()
-            if "overview" in hay:
-                return str(eng.get("id") or eng.get("slug") or eng.get("key") or _AIO_ENGINE_FALLBACK)
-    except Exception as exc:  # noqa: BLE001 -- discovery is best-effort
-        log.warning("otterly: engine discovery failed (%s); using fallback %s",
-                    exc, _AIO_ENGINE_FALLBACK)
-    return _AIO_ENGINE_FALLBACK
+        ids = list_engine_ids()
+        if ids and target not in ids:
+            log.warning("otterly: AIO engine %r not in /engines %s; using it anyway",
+                        target, sorted(ids))
+    except Exception as exc:  # noqa: BLE001 -- validation is best-effort
+        log.warning("otterly: engine validation failed (%s); using %r", exc, target)
+    return target
 
 
 def list_brand_reports(workspace_id: str | None = None) -> list[dict]:

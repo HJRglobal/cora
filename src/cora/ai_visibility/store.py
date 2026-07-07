@@ -104,6 +104,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_av_answers_scan  ON answers(scan_id, brand, model);
         CREATE INDEX IF NOT EXISTS idx_av_answers_prompt ON answers(scan_id, prompt_id);
+        -- One row per work unit. Guards against a resume re-run (kill between the
+        -- answer commit and the done-state persist) creating a duplicate scored row.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_av_answers_unit
+            ON answers(scan_id, brand, prompt_id, model, run_index);
 
         CREATE TABLE IF NOT EXISTS mentions (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +243,14 @@ def insert_answer(*, scan_id: int, brand: str, prompt_id: str, intent: str, aide
                   error: str | None = None) -> int:
     conn = _get_conn()
     try:
+        # Idempotent per unit: a resume re-run must not double-count. Delete any
+        # prior row for this (scan,brand,prompt,model,run) -- CASCADE clears its
+        # mentions/citations -- then insert fresh.
+        conn.execute(
+            """DELETE FROM answers WHERE scan_id=? AND brand=? AND prompt_id=?
+               AND model=? AND run_index=?""",
+            (scan_id, brand, prompt_id, model, run_index),
+        )
         cur = conn.execute(
             """INSERT INTO answers (scan_id, brand, prompt_id, intent, aided, model, run_index,
                                     raw_text, classifier_json, mentioned, is_correct_brand,
@@ -360,9 +372,21 @@ def competitor_counts_by_answer(scan_id: int, brand: str) -> dict[int, int]:
 
 
 def save_score(scan_id: int, score: BrandScore) -> int:
-    """Persist a BrandScore, computing WoW delta vs the previous completed scan."""
-    prev = previous_composite(score.brand, scan_id)
-    wow = round(score.composite - prev, 2) if prev is not None else None
+    """Persist a BrandScore, computing WoW delta vs the previous completed scan.
+
+    WoW is only computed when the previous completed scan's AIO availability
+    MATCHES this one (both include Google AI Overviews, or both don't). Otherwise
+    the two composites are on different bases (merged 5-engine vs direct 4-engine)
+    and the delta would be a spurious artifact of AIO availability flipping, so
+    wow_delta is left None ("no comparable baseline")."""
+    prev_row = previous_score(score.brand, scan_id)
+    prev = prev_row["composite"] if prev_row else None
+    if prev_row is None or prev is None:
+        wow = None
+    else:
+        prev_had_aio = prev_row.get("aio_composite") is not None
+        cur_had_aio = score.aio_composite is not None
+        wow = round(score.composite - prev, 2) if prev_had_aio == cur_had_aio else None
     conn = _get_conn()
     try:
         cur = conn.execute(
@@ -385,21 +409,28 @@ def save_score(scan_id: int, score: BrandScore) -> int:
         conn.close()
 
 
-def previous_composite(brand: str, before_scan_id: int) -> float | None:
-    """Composite from the most recent completed scan's score for this brand,
-    before the given scan."""
+def previous_score(brand: str, before_scan_id: int) -> dict | None:
+    """The most recent COMPLETED scan's score row for this brand, before the given
+    scan (used for WoW). Non-completed (running/partial) scans are excluded so a
+    truncated scan never becomes a WoW baseline."""
     conn = _get_conn()
     try:
         row = conn.execute(
-            """SELECT s.composite AS composite FROM scores s
+            """SELECT s.* FROM scores s
                JOIN scans sc ON sc.id = s.scan_id
                WHERE s.brand=? AND s.scan_id < ? AND sc.status='completed'
                ORDER BY s.scan_id DESC LIMIT 1""",
             (brand, before_scan_id),
         ).fetchone()
-        return float(row["composite"]) if row and row["composite"] is not None else None
+        return dict(row) if row else None
     finally:
         conn.close()
+
+
+def previous_composite(brand: str, before_scan_id: int) -> float | None:
+    """Back-compat: previous completed composite for this brand (or None)."""
+    row = previous_score(brand, before_scan_id)
+    return float(row["composite"]) if row and row.get("composite") is not None else None
 
 
 def latest_scores() -> dict[str, dict]:

@@ -147,3 +147,71 @@ def test_latest_scores_empty_when_no_completed_scan():
     st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
                    brands=["energy"])  # running, not completed
     assert st.latest_scores() == {}
+
+
+def test_insert_answer_is_idempotent_per_unit():
+    """A resume re-run of the same unit must not create a duplicate scored row
+    (delete-by-unit + UNIQUE index)."""
+    sid = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                         brands=["energy"])
+    for _ in range(2):  # simulate a re-run of the same (scan,brand,prompt,model,run)
+        aid = st.insert_answer(scan_id=sid, brand="energy", prompt_id="ENG-D01",
+                               intent="discovery", aided=False, model="perplexity_sonar",
+                               run_index=0, raw_text="x", classification=_hit_classification(),
+                               cost_usd=0.01)
+        st.record_answer_mentions(scan_id=sid, answer_id=aid, brand="energy",
+                                  brand_name="F3 Energy", model="perplexity_sonar",
+                                  classification=_hit_classification())
+        st.insert_citations(scan_id=sid, answer_id=aid, brand="energy", model="perplexity_sonar",
+                            citations=[Citation("https://f3energy.com", "f3energy.com", True, "own_site")])
+    rows = st.answers_for_scan(sid, "energy")
+    assert len(rows) == 1  # exactly one answer row despite two inserts
+    counts = st.competitor_counts_by_answer(sid, "energy")
+    assert counts[rows[0]["id"]] == 2  # mentions not doubled (old cascade-deleted)
+    import sqlite3
+    conn = sqlite3.connect(str(st._db_path()))
+    try:
+        n_cit = conn.execute("SELECT COUNT(*) FROM citations WHERE scan_id=?", (sid,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert n_cit == 1  # citation not doubled either
+
+
+def test_partial_scan_is_not_a_wow_baseline():
+    """A partial (non-completed) scan with a saved score must NOT become the WoW
+    baseline for the next completed scan."""
+    s1 = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                        brands=["energy"])
+    st.save_score(s1, BrandScore(brand="energy", composite=50.0, composite_direct_only=50.0))
+    st.finish_scan(s1, status="completed", total_calls=1, total_cost_usd=0.0, aio_included=False)
+    # an intermediate PARTIAL scan with a (misleading) high score
+    s2 = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                        brands=["energy"])
+    st.save_score(s2, BrandScore(brand="energy", composite=90.0, composite_direct_only=90.0))
+    st.finish_scan(s2, status="partial", total_calls=1, total_cost_usd=0.0, aio_included=False)
+    # new completed scan -> WoW must baseline off the COMPLETED 50, not the partial 90
+    s3 = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                        brands=["energy"])
+    st.save_score(s3, BrandScore(brand="energy", composite=55.0, composite_direct_only=55.0))
+    st.finish_scan(s3, status="completed", total_calls=1, total_cost_usd=0.0, aio_included=False)
+    latest = st.latest_scores()["energy"]
+    assert latest["prev_composite"] == 50.0
+    assert latest["wow_delta"] == 5.0
+
+
+def test_wow_none_when_aio_availability_flips():
+    """WoW is left None across the AIO-availability boundary (merged vs direct-only
+    composites are not comparable)."""
+    s1 = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                        brands=["energy"])
+    st.save_score(s1, BrandScore(brand="energy", composite=55.0, composite_direct_only=60.0,
+                                 aio_composite=40.0))  # week 1 HAD aio
+    st.finish_scan(s1, status="completed", total_calls=1, total_cost_usd=0.0, aio_included=True)
+    s2 = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                        brands=["energy"])
+    st.save_score(s2, BrandScore(brand="energy", composite=62.0, composite_direct_only=62.0,
+                                 aio_composite=None))  # week 2 NO aio
+    st.finish_scan(s2, status="completed", total_calls=1, total_cost_usd=0.0, aio_included=False)
+    latest = st.latest_scores()["energy"]
+    assert latest["wow_delta"] is None  # not comparable -> no spurious delta
+    assert latest["prev_composite"] == 55.0

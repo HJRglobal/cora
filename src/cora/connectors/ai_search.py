@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,28 @@ from dataclasses import dataclass, field
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Secret-scrubbing for error strings that get logged AND persisted to the DB.
+# Defense-in-depth: even if a provider echoes a key (e.g. in a URL/header), it
+# never reaches logs/ai_visibility.db in plaintext.
+_SECRET_ENV_VARS = ("PERPLEXITY_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                    "ANTHROPIC_API_KEY", "OTTERLY_API_KEY", "SLACK_BOT_TOKEN")
+_KEY_QS_RE = re.compile(r"([?&](?:key|api_key|token)=)[^&\s'\"]+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}", re.IGNORECASE)
+
+
+def _redact(text: str) -> str:
+    """Redact known API-key values + key/token query params + Bearer tokens."""
+    if not text:
+        return text
+    out = str(text)
+    for var in _SECRET_ENV_VARS:
+        val = os.environ.get(var, "")
+        if val and len(val) >= 8 and val in out:
+            out = out.replace(val, "***REDACTED***")
+    out = _KEY_QS_RE.sub(r"\1***REDACTED***", out)
+    out = _BEARER_RE.sub(r"\1***REDACTED***", out)
+    return out
 
 # The four grounded surfaces this connector supports (mirrors
 # ai_visibility.prompts.KNOWN_MODELS).
@@ -307,10 +330,12 @@ def query_gemini_grounding(prompt: str) -> QueryResult:
         return QueryResult(model="gemini_grounding", prompt=prompt, skipped=True,
                            error="GEMINI_API_KEY not set")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    # Auth via the x-goog-api-key HEADER, never a ?key= query param -- an httpx
+    # HTTPStatusError echoes the request URL, and a key in the URL would leak into
+    # logs + the answers.error column (which DR backup bundles offsite).
     raw = _post_json(
         url,
-        headers={"Content-Type": "application/json"},
-        params={"key": key},
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
         body={"contents": [{"parts": [{"text": prompt}]}],
               "tools": [{"google_search": {}}]},
     )
@@ -393,15 +418,16 @@ def run_query(model: str, prompt: str) -> QueryResult:
             try:
                 r = _PROVIDERS[model](prompt)
             except Exception as exc:  # noqa: BLE001 -- fail-soft by design
+                safe = _redact(str(exc))
                 if _is_retryable(exc) and attempt < len(_RETRY_DELAYS):
                     delay = _RETRY_DELAYS[attempt]
                     log.warning("ai_search %s transient (attempt %d/%d), retry %ds: %s",
-                                model, attempt + 1, len(_RETRY_DELAYS) + 1, delay, exc)
+                                model, attempt + 1, len(_RETRY_DELAYS) + 1, delay, safe)
                     time.sleep(delay)
                     last_exc = exc
                     continue
-                log.warning("ai_search %s failed (attempt %d): %s", model, attempt + 1, exc)
-                return QueryResult(model=model, prompt=prompt, error=str(exc))
+                log.warning("ai_search %s failed (attempt %d): %s", model, attempt + 1, safe)
+                return QueryResult(model=model, prompt=prompt, error=safe)
             # Success path (includes the fail-soft skipped result).
             if r.skipped:
                 log.warning("ai_search %s skipped: %s", model, r.error)
@@ -417,7 +443,7 @@ def run_query(model: str, prompt: str) -> QueryResult:
             )
             return r
         return QueryResult(model=model, prompt=prompt,
-                           error=f"exhausted retries: {last_exc}")
+                           error=_redact(f"exhausted retries: {last_exc}"))
     finally:
         if sem is not None:
             sem.release()

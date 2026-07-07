@@ -385,6 +385,13 @@ def _tag_aio_citations(slc, brand) -> list:
 
 def _score_and_save(scan_id: int, bkey: str, basket: pb.Basket, aio) -> None:
     rows = store.answers_for_scan(scan_id, bkey)
+    if not rows:
+        # No successful answers for this brand this scan (partial cutoff before
+        # this brand, or every run errored). Do NOT save a 0 composite -- that
+        # would post a false "visibility collapsed to 0 (-N WoW)" card. Skip it
+        # so the card/tool simply omits the brand ("no data this week").
+        log.warning("no successful answers for brand %s; skipping score (no false 0)", bkey)
+        return
     comp_counts = store.competitor_counts_by_answer(scan_id, bkey)
     verdicts = [scoring.RunVerdict(
         model=r["model"], intent=r["intent"], aided=bool(r["aided"]),

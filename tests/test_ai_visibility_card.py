@@ -72,6 +72,15 @@ def test_build_scorecard_empty():
     assert "no completed scan" in rpt.build_scorecard({})
 
 
+@pytest.mark.parametrize("composite,expected", [
+    (0.0, rpt._RED), (34.9, rpt._RED),
+    (35.0, rpt._YELLOW), (59.9, rpt._YELLOW),
+    (60.0, rpt._GREEN), (100.0, rpt._GREEN),
+])
+def test_status_emoji_boundaries(composite, expected):
+    assert rpt._status_emoji(composite) == expected
+
+
 def test_resolve_channel_precedence(monkeypatch):
     monkeypatch.delenv("AI_VISIBILITY_CHANNEL", raising=False)
     assert rpt._resolve_channel(None) == rpt._DEFAULT_CHANNEL

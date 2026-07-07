@@ -205,6 +205,51 @@ def test_is_retryable_classification():
     assert ai._is_retryable(RuntimeError("Server overloaded, try again")) is True
 
 
+def test_redact_scrubs_keys_query_params_and_bearer(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyABCDEFGH_secretvalue123")
+    text = ("HTTP 400 for url 'https://x/v1beta/models/g:generateContent?"
+            "key=AIzaSyABCDEFGH_secretvalue123' Authorization: Bearer sk-ant-abcdef123456")
+    out = ai._redact(text)
+    assert "AIzaSyABCDEFGH_secretvalue123" not in out
+    assert "key=***REDACTED***" in out
+    assert "Bearer ***REDACTED***" in out
+
+
+def test_gemini_key_never_leaks_into_error(monkeypatch):
+    """A Gemini HTTP error must not carry the API key into the stored/logged error."""
+    secret = "AIzaSy_VERY_secret_key_0001"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.setattr(ai.time, "sleep", lambda *_a, **_k: None)
+
+    def _err(*a, **k):
+        # simulate httpx echoing the request URL (worst case) with the key in it
+        raise ValueError(f"Server error 400 for url 'https://g/generateContent?key={secret}'")
+
+    monkeypatch.setattr(ai, "_post_json", _err)
+    r = ai.run_query("gemini_grounding", "q")
+    assert r.ok is False
+    assert secret not in (r.error or "")
+    assert "***REDACTED***" in (r.error or "")
+
+
+def test_gemini_uses_header_not_query_param(monkeypatch):
+    """Regression: the Gemini key goes in the x-goog-api-key header, never ?key=."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gk-test")
+    captured = {}
+
+    def _capture(url, headers=None, body=None, *, params=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["params"] = params
+        return {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+
+    monkeypatch.setattr(ai, "_post_json", _capture)
+    ai.query_gemini_grounding("q")
+    assert captured["headers"].get("x-goog-api-key") == "gk-test"
+    assert "key=" not in captured["url"]
+    assert not captured.get("params")  # no key in query params
+
+
 def test_estimate_call_cost_positive_and_search_fee_dominates():
     c = ai.estimate_call_cost("gemini_grounding", output_tokens=800, input_tokens=200,
                               num_searches=1)

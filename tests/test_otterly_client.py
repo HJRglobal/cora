@@ -94,10 +94,12 @@ def test_fetch_aio_slice_missing_key(monkeypatch):
 
 def test_fetch_aio_slice_happy_path(monkeypatch):
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    monkeypatch.delenv("OTTERLY_AIO_ENGINE", raising=False)
     routes = {
+        # Real /engines shape: country-grouped, ids inside baseEngines/addonEngines
         "/engines": {"items": [
-            {"id": "chatgpt", "name": "ChatGPT"},
-            {"id": "google_ai_overviews", "name": "Google AI Overviews"},
+            {"country": "us", "baseEngines": ["chatgpt", "google", "perplexity"],
+             "addonEngines": ["google_ai_mode", "gemini"]},
         ]},
         "/reports/brand/r2/stats": {
             "summary": {"brandCoverage": 0.25, "shareOfVoice": 0.10, "averageRank": 3,
@@ -129,7 +131,7 @@ def test_fetch_aio_slice_happy_path(monkeypatch):
 def test_fetch_aio_slice_no_matching_report(monkeypatch):
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
     routes = {
-        "/engines": {"items": [{"id": "google_ai_overviews", "name": "Google AI Overviews"}]},
+        "/engines": {"items": [{"country": "us", "baseEngines": ["google"], "addonEngines": []}]},
         "/reports/brand": {"items": [{"id": "rX", "brand": "Unrelated"}]},
     }
     monkeypatch.setattr(oc, "_get", _fake_get(routes))
@@ -141,7 +143,7 @@ def test_fetch_aio_slice_no_matching_report(monkeypatch):
 def test_fetch_aio_slice_api_error_is_failsoft(monkeypatch):
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
     routes = {
-        "/engines": {"items": [{"id": "google_ai_overviews", "name": "Google AI Overviews"}]},
+        "/engines": {"items": [{"country": "us", "baseEngines": ["google"], "addonEngines": []}]},
         "/reports/brand": RuntimeError("otterly 500"),
     }
     monkeypatch.setattr(oc, "_get", _fake_get(routes))
@@ -150,15 +152,31 @@ def test_fetch_aio_slice_api_error_is_failsoft(monkeypatch):
     assert "otterly 500" in (s.error or "")
 
 
-def test_resolve_aio_engine_discovery_and_fallback(monkeypatch):
+def test_list_engine_ids_flattens_country_groups(monkeypatch):
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
-    monkeypatch.setattr(oc, "_get", _fake_get(
-        {"/engines": {"items": [{"id": "aio-x", "name": "The AI Overview engine"}]}}
-    ))
-    assert oc.resolve_aio_engine_id() == "aio-x"
+    monkeypatch.setattr(oc, "_get", _fake_get({"/engines": {"items": [
+        {"country": "us", "baseEngines": ["chatgpt", "google"], "addonEngines": ["gemini"]},
+        {"country": "uk", "baseEngines": ["google", "perplexity"], "addonEngines": []},
+    ]}}))
+    assert oc.list_engine_ids() == {"chatgpt", "google", "gemini", "perplexity"}
+
+
+def test_resolve_aio_engine_defaults_to_google(monkeypatch):
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    monkeypatch.delenv("OTTERLY_AIO_ENGINE", raising=False)
+    monkeypatch.setattr(oc, "_AIO_ENGINE_DEFAULT", "google")
+    monkeypatch.setattr(oc, "_get", _fake_get({"/engines": {"items": [
+        {"country": "us", "baseEngines": ["chatgpt", "google", "perplexity"], "addonEngines": []},
+    ]}}))
+    assert oc.resolve_aio_engine_id() == "google"  # validated present, returned
+
+
+def test_resolve_aio_engine_returns_configured_even_if_engines_errors(monkeypatch):
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+    monkeypatch.setattr(oc, "_AIO_ENGINE_DEFAULT", "google")
 
     def _boom(*a, **k):
         raise RuntimeError("engines down")
 
     monkeypatch.setattr(oc, "_get", _boom)
-    assert oc.resolve_aio_engine_id() == oc._AIO_ENGINE_FALLBACK
+    assert oc.resolve_aio_engine_id() == "google"  # validation failed -> still returns configured id

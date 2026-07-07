@@ -54,6 +54,7 @@ class EngineComponents:
     sentiment: float = 0.0
     composite: float = 0.0
     n_runs: int = 0
+    n_hits: int = 0
 
 
 @dataclass
@@ -138,6 +139,7 @@ def _engine_components(runs: list[RunVerdict]) -> EngineComponents:
         sentiment=round(sentiment, 2),
         composite=composite_of(presence, sov, position, sentiment),
         n_runs=total,
+        n_hits=brand_count,
     )
 
 
@@ -190,10 +192,15 @@ def aio_metrics(*, presence, share_of_voice=None, average_rank=None,
         return None
     pres = float(presence)
     sov = float(share_of_voice) if share_of_voice is not None else 0.0
+    # average_rank is prominence GIVEN the brand appeared; the direct engines'
+    # position is averaged over ALL runs (misses -> 0), i.e. presence-diluted.
+    # Scale the AIO prominence by presence so the merged 5th-engine position is
+    # on the same basis as the 4 direct engines.
     if average_rank is not None:
-        pos = _ladder(int(round(float(average_rank))))
+        pos = _ladder(int(round(float(average_rank)))) * (pres / 100.0)
     else:
-        pos = _UNRANKED_POSITION if pres > 0 else 0.0
+        pos = _UNRANKED_POSITION * (pres / 100.0) if pres > 0 else 0.0
+    pos = round(pos, 2)
     sent = _aio_sentiment_score(sentiment)
     if sent is None:
         sent = 60.0 if pres > 0 else 0.0  # neutral default when the brand is present
@@ -219,7 +226,12 @@ def score_brand(verdicts: list[RunVerdict], *, aio: AioMetrics | None = None) ->
     presence = round(_mean([per_engine[m].presence for m in engines]), 2)
     sov = round(_mean([per_engine[m].share_of_voice for m in engines]), 2)
     position = round(_mean([per_engine[m].position for m in engines]), 2)
-    sentiment = round(_mean([per_engine[m].sentiment for m in engines]), 2)
+    # Sentiment is a hits-only signal (per the module contract). Average it ONLY
+    # across engines that actually had >=1 hit -- a no-hit engine's 0.0 sentinel
+    # must not vote (absence is already penalized by presence; counting it here
+    # would double-penalize and understate a positively-mentioned brand).
+    sentiment = round(_mean([per_engine[m].sentiment for m in engines
+                             if per_engine[m].n_hits > 0]), 2)
     direct_composite = composite_of(presence, sov, position, sentiment)
 
     present_intents = sorted({v.intent for v in verdicts})
