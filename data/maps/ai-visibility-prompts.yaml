@@ -1,0 +1,189 @@
+# =============================================================================
+# F3 AI-Visibility Prompt Baskets  —  v1  (2026-07-02)
+# =============================================================================
+# Purpose: the fixed "instrument" for measuring whether AI answer engines
+# (ChatGPT / Gemini / Perplexity / Claude) recommend F3 Energy, Pure, and Mood.
+#
+# HARD RULE — THIS IS A FROZEN INSTRUMENT:
+#   * Never reword or delete an existing prompt id. Rewording silently breaks
+#     week-over-week trend comparability (see build brief, "non-determinism").
+#   * To evolve the basket: bump `version`, ADD new ids, leave old ones stable.
+#
+# THIS REPO COPY IS AUTHORITATIVE (per the build brief, 2026-07-07). The Drive
+# original at 02-F3-Energy/projects/ai-visibility/ is the historical source; make
+# every change HERE and keep the Drive copy pointed at this file. Prompt `text`
+# values are byte-identical to the frozen Drive v1 (em-dashes preserved) so the
+# instrument stays comparable week-over-week.
+#
+# Consumed by: the Cora AI-visibility engine (scripts/run_ai_visibility_scan.py).
+# Also usable manually: paste the `text` values into a cheap tracker (Otterly /
+# Peec) for the Phase-0 baseline.
+#
+# intent buckets:
+#   discovery  = category "best X" queries        (unaided; highest signal)
+#   problem    = use-case / "what should I drink"  (unaided; highest signal)
+#   comparison = "X vs Y" or "alternative to X"    (mixed aided/unaided)
+#   branded    = names F3 directly                 (aided; tests how we're described)
+#
+# aided:  false = F3 is NOT named in the prompt (did we surface on our own?)
+#         true  = F3 IS named (how does the model describe / rate us?)
+#
+# Per-prompt fields: id | text | intent | aided
+# Competitor sets are brand-level (below) — the classifier scores share-of-voice
+# against them. Sets mirror the F3 marketing blueprint (2026-06-21).
+# =============================================================================
+
+version: 1
+created: 2026-07-02
+owner: F3E
+
+sampling:
+  runs_per_prompt: 5                 # beat non-determinism; report a RATE not yes/no
+  models:                            # grounded/web-search variants ONLY (not base models)
+    - perplexity_sonar               # best single proxy for "AI search"; returns citations
+    - openai_web_search              # OpenAI Responses API, web_search tool
+    - gemini_grounding               # Gemini "Grounding with Google Search"
+    - claude_web                     # Anthropic w/ web search
+  cadence: weekly
+  # Google AI Overviews / AI Mode has NO direct model API. It IS covered by the
+  # engine via the Otterly public API (source-tag aio_otterly), merged as a 5th
+  # engine into the score. The 4 models above are queried directly by Cora and
+  # remain the authoritative/primary score for those engines.
+
+# -----------------------------------------------------------------------------
+brands:
+
+  energy:
+    brand_name: "F3 Energy"
+    # classifier must confirm the BEVERAGE brand, not "F3 Nation" (fitness) or other "F3"s
+    aliases: ["F3 Energy", "F3Energy", "F3 energy drink"]
+    disambiguation: "Beverage brand (functional energy drink). NOT F3 Nation fitness, NOT Formula 3."
+    positioning: "Premium functional energy — physical energy + mental clarity + nootropics; MMA/combat & athlete community."
+    competitor_set: ["Red Bull", "Monster", "Celsius", "Alani Nu", "Ghost", "C4", "Prime", "Reign", "Bang"]
+    prompts:
+      # --- discovery (unaided) ---
+      - {id: ENG-D01, text: "What's the best functional energy drink in 2026?", intent: discovery, aided: false}
+      - {id: ENG-D02, text: "What's the healthiest energy drink?", intent: discovery, aided: false}
+      - {id: ENG-D03, text: "Best energy drink for focus and mental clarity?", intent: discovery, aided: false}
+      - {id: ENG-D04, text: "Best energy drink for athletes?", intent: discovery, aided: false}
+      - {id: ENG-D05, text: "Best energy drink for MMA and combat sports training?", intent: discovery, aided: false}
+      - {id: ENG-D06, text: "Best natural energy drink with nootropics?", intent: discovery, aided: false}
+      - {id: ENG-D07, text: "Best energy drink that doesn't give you a crash?", intent: discovery, aided: false}
+      - {id: ENG-D08, text: "Best zero sugar energy drink?", intent: discovery, aided: false}
+      - {id: ENG-D09, text: "Top energy drink brands to try in 2026?", intent: discovery, aided: false}
+      - {id: ENG-D10, text: "Best energy drink to take before a workout?", intent: discovery, aided: false}
+      - {id: ENG-D11, text: "Which energy drink has the best ingredients?", intent: discovery, aided: false}
+      # --- problem / use-case (unaided) ---
+      - {id: ENG-P01, text: "What energy drink gives you energy without the jitters?", intent: problem, aided: false}
+      - {id: ENG-P02, text: "What can I drink for long-lasting energy and focus?", intent: problem, aided: false}
+      - {id: ENG-P03, text: "I want an energy drink that helps mental clarity, not just caffeine. Any recommendations?", intent: problem, aided: false}
+      - {id: ENG-P04, text: "What's a good energy drink that isn't Red Bull or Monster?", intent: problem, aided: false}
+      - {id: ENG-P05, text: "Energy drink with L-theanine and caffeine for clean focus?", intent: problem, aided: false}
+      - {id: ENG-P06, text: "What energy drink do fighters and athletes actually drink?", intent: problem, aided: false}
+      - {id: ENG-P07, text: "Best nootropic energy drink for productivity and focus at work?", intent: problem, aided: false}
+      - {id: ENG-P08, text: "What's a good energy drink for the gym and cardio?", intent: problem, aided: false}
+      # --- comparison ---
+      - {id: ENG-C01, text: "F3 Energy vs Celsius — which is better?", intent: comparison, aided: true}
+      - {id: ENG-C02, text: "F3 Energy vs Red Bull?", intent: comparison, aided: true}
+      - {id: ENG-C03, text: "F3 Energy vs Monster?", intent: comparison, aided: true}
+      - {id: ENG-C04, text: "F3 Energy vs Alani Nu?", intent: comparison, aided: true}
+      - {id: ENG-C05, text: "F3 Energy vs Ghost Energy?", intent: comparison, aided: true}
+      - {id: ENG-C06, text: "Celsius vs Alani Nu vs Ghost — which functional energy drink is best?", intent: comparison, aided: false}
+      - {id: ENG-C07, text: "What's the best alternative to Celsius?", intent: comparison, aided: false}
+      # --- branded (aided) ---
+      - {id: ENG-B01, text: "Is F3 Energy any good?", intent: branded, aided: true}
+      - {id: ENG-B02, text: "What is F3 Energy?", intent: branded, aided: true}
+      - {id: ENG-B03, text: "What are the ingredients in F3 Energy and is it healthy?", intent: branded, aided: true}
+      - {id: ENG-B04, text: "Where can I buy F3 Energy?", intent: branded, aided: true}
+      - {id: ENG-B05, text: "F3 Energy review — is it worth it?", intent: branded, aided: true}
+      - {id: ENG-B06, text: "Who makes F3 Energy and who founded it?", intent: branded, aided: true}
+      - {id: ENG-B07, text: "Does F3 Energy contain nootropics?", intent: branded, aided: true}
+
+  pure:
+    brand_name: "F3 Pure"
+    aliases: ["F3 Pure", "F3Pure"]
+    disambiguation: "Beverage brand (clean-sweetened functional energy). NOT a generic 'pure' product."
+    positioning: "Clean-sweetened functional energy (cane sugar/stevia/monk fruit); wellness / active-lifestyle; same functional stack, cleaner fuel."
+    competitor_set: ["Bloom", "Guayaki", "Mateina", "Celsius", "Alani Nu", "OLIPOP", "Poppi", "Zevia"]
+    prompts:
+      # --- discovery (unaided) ---
+      - {id: PUR-D01, text: "Best clean energy drink?", intent: discovery, aided: false}
+      - {id: PUR-D02, text: "Best natural energy drink?", intent: discovery, aided: false}
+      - {id: PUR-D03, text: "Best healthy energy drink for women?", intent: discovery, aided: false}
+      - {id: PUR-D04, text: "Best better-for-you energy drink in 2026?", intent: discovery, aided: false}
+      - {id: PUR-D05, text: "Best energy drink sweetened naturally with stevia or monk fruit?", intent: discovery, aided: false}
+      - {id: PUR-D06, text: "Best energy drink with no artificial sweeteners?", intent: discovery, aided: false}
+      - {id: PUR-D07, text: "Best low-sugar natural energy drink?", intent: discovery, aided: false}
+      - {id: PUR-D08, text: "Healthiest sparkling energy drink?", intent: discovery, aided: false}
+      - {id: PUR-D09, text: "Best clean-label energy drink for a wellness lifestyle?", intent: discovery, aided: false}
+      # --- problem / use-case (unaided) ---
+      - {id: PUR-P01, text: "I want an energy drink with no artificial ingredients — what should I get?", intent: problem, aided: false}
+      - {id: PUR-P02, text: "Energy drink without sucralose or artificial sweeteners?", intent: problem, aided: false}
+      - {id: PUR-P03, text: "Clean energy drink for an active lifestyle like Pilates or yoga?", intent: problem, aided: false}
+      - {id: PUR-P04, text: "What's an energy drink I can feel good about drinking every day?", intent: problem, aided: false}
+      - {id: PUR-P05, text: "Natural alternative to Celsius or Alani Nu?", intent: problem, aided: false}
+      - {id: PUR-P06, text: "Best clean energy drink you can buy at Sprouts or Whole Foods?", intent: problem, aided: false}
+      - {id: PUR-P07, text: "Healthy energy drink for busy moms?", intent: problem, aided: false}
+      # --- comparison ---
+      - {id: PUR-C01, text: "F3 Pure vs Bloom?", intent: comparison, aided: true}
+      - {id: PUR-C02, text: "F3 Pure vs Guayaki?", intent: comparison, aided: true}
+      - {id: PUR-C03, text: "F3 Pure vs Celsius for a cleaner option?", intent: comparison, aided: true}
+      - {id: PUR-C04, text: "Bloom vs Guayaki — best clean energy drink?", intent: comparison, aided: false}
+      - {id: PUR-C05, text: "Cleanest alternative to Celsius?", intent: comparison, aided: false}
+      # --- branded (aided) ---
+      - {id: PUR-B01, text: "Is F3 Pure good and healthy?", intent: branded, aided: true}
+      - {id: PUR-B02, text: "What is F3 Pure?", intent: branded, aided: true}
+      - {id: PUR-B03, text: "What are the ingredients in F3 Pure — does it have artificial sweeteners?", intent: branded, aided: true}
+      - {id: PUR-B04, text: "Where can I buy F3 Pure?", intent: branded, aided: true}
+      - {id: PUR-B05, text: "F3 Pure review?", intent: branded, aided: true}
+      - {id: PUR-B06, text: "Is F3 Pure a natural energy drink?", intent: branded, aided: true}
+
+  mood:
+    brand_name: "F3 Mood"
+    aliases: ["F3 Mood", "F3Mood"]
+    disambiguation: "Beverage brand (calm + focus functional drink). NOT a mood-tracking app or supplement pill."
+    positioning: "Calm the noise — focus + stress relief without sedation; NOT a sleep aid; chamomile/GABA/magnesium/valerian; execs, medical, first responders."
+    competitor_set: ["Recess", "Magic Mind", "Moment", "TruBrain", "Kin Euphorics", "De Soi"]
+    prompts:
+      # --- discovery (unaided) ---
+      - {id: MOO-D01, text: "Best drink for calm and focus?", intent: discovery, aided: false}
+      - {id: MOO-D02, text: "Best drink to reduce stress and anxiety?", intent: discovery, aided: false}
+      - {id: MOO-D03, text: "Best nootropic drink for focus?", intent: discovery, aided: false}
+      - {id: MOO-D04, text: "Best relaxation drink without alcohol?", intent: discovery, aided: false}
+      - {id: MOO-D05, text: "Best functional beverage for stress relief?", intent: discovery, aided: false}
+      - {id: MOO-D06, text: "Best drink for calm, steady energy?", intent: discovery, aided: false}
+      - {id: MOO-D07, text: "Best magnesium drink for calm and focus?", intent: discovery, aided: false}
+      - {id: MOO-D08, text: "Top calm and focus beverage brands in 2026?", intent: discovery, aided: false}
+      - {id: MOO-D09, text: "Best adaptogen drink for stress?", intent: discovery, aided: false}
+      # --- problem / use-case (unaided) ---
+      - {id: MOO-P01, text: "What can I drink to calm down and focus?", intent: problem, aided: false}
+      - {id: MOO-P02, text: "A drink for anxiety that isn't a sedative — any ideas?", intent: problem, aided: false}
+      - {id: MOO-P03, text: "What can I drink to focus under pressure at work?", intent: problem, aided: false}
+      - {id: MOO-P04, text: "A calming drink for after a stressful shift (nurse / first responder)?", intent: problem, aided: false}
+      - {id: MOO-P05, text: "Drink with GABA and magnesium for stress and focus?", intent: problem, aided: false}
+      - {id: MOO-P06, text: "Natural drink to relax without feeling sleepy?", intent: problem, aided: false}
+      - {id: MOO-P07, text: "Non-alcoholic drink to unwind and take the edge off?", intent: problem, aided: false}
+      - {id: MOO-P08, text: "What's a good alternative to Magic Mind or Recess?", intent: problem, aided: false}
+      # --- comparison ---
+      - {id: MOO-C01, text: "F3 Mood vs Recess?", intent: comparison, aided: true}
+      - {id: MOO-C02, text: "F3 Mood vs Magic Mind?", intent: comparison, aided: true}
+      - {id: MOO-C03, text: "F3 Mood vs Moment?", intent: comparison, aided: true}
+      - {id: MOO-C04, text: "Recess vs Magic Mind — best calm focus drink?", intent: comparison, aided: false}
+      - {id: MOO-C05, text: "Best alternative to Recess?", intent: comparison, aided: false}
+      # --- branded (aided) ---
+      - {id: MOO-B01, text: "Is F3 Mood any good?", intent: branded, aided: true}
+      - {id: MOO-B02, text: "What is F3 Mood?", intent: branded, aided: true}
+      - {id: MOO-B03, text: "What are the ingredients in F3 Mood?", intent: branded, aided: true}
+      - {id: MOO-B04, text: "Is F3 Mood a sleep aid — will it make me drowsy?", intent: branded, aided: true}
+      - {id: MOO-B05, text: "Where can I buy F3 Mood?", intent: branded, aided: true}
+      - {id: MOO-B06, text: "Does F3 Mood help with anxiety and focus?", intent: branded, aided: true}
+      - {id: MOO-B07, text: "F3 Mood review?", intent: branded, aided: true}
+
+# -----------------------------------------------------------------------------
+# COUNTS (v1, corrected 2026-07-07 from the actual data): energy 33 | pure 27 |
+# mood 29  =  89 prompts. (The original header said 86 -- an author miscount;
+# no prompts were added or removed, the count comment was simply wrong.)
+# At 5 runs x 4 models = 1,780 direct model calls per full weekly scan
+# (+ the Otterly AIO pull, which is a handful of report calls, not per-prompt).
+# See build brief for cost estimate (~$50-150/wk depending on model mix).
+# -----------------------------------------------------------------------------
