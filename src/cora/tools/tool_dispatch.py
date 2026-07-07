@@ -2616,6 +2616,25 @@ def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: 
         )
 
 
+def _tool_f3e_ai_visibility(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Return the latest F3 AI-visibility scores + WoW deltas + top competitor gaps.
+
+    Read-only. F3E + FNDR/HJRG only. PHI guard OFF (F3 marketing/visibility data,
+    no health data). No external writes.
+    """
+    entity_upper = (entity or "").upper()
+    if not (entity_upper.startswith("F3E") or entity_upper in ("FNDR", "HJRG")):
+        return "AI visibility metrics are scoped to F3 Energy channels."
+    log.info("f3e_ai_visibility user=%s entity=%s", slack_user_id, entity)
+    try:
+        from ..ai_visibility import report  # noqa: PLC0415 -- lazy read-only import
+        return report.get_tool_summary()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("f3e_ai_visibility error user=%s: %s", slack_user_id, exc)
+        return ("f3e_ai_visibility: I don't have the AI visibility scores right now -- "
+                f"{exc}. Apologize and suggest trying again shortly.")
+
+
 def _tool_fndr_contracts_dashboard(slack_user_id: str, entity: str, _input: dict) -> str:
     """Fetch the FNDR/HJRG contracts and renewals dashboard from Notion."""
     try:
@@ -4610,6 +4629,25 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "f3e_ai_visibility",
+        "description": (
+            "Fetch F3's AI-visibility scores -- how often ChatGPT / Perplexity / "
+            "Gemini / Claude (and Google AI Overviews) recommend F3 Energy, Pure, and "
+            "Mood when people ask buyer-style questions. Read-only. Use this for "
+            "'@Cora what's our AI visibility score', 'are we showing up in AI search', "
+            "'AI visibility', 'do the AI engines recommend us', 'where do competitors "
+            "beat us in AI answers'. Returns each brand's 0-100 score, week-over-week "
+            "delta, unaided presence, share-of-voice, and the top prompts where a "
+            "competitor is named but F3 isn't. Present the tool output as-is; do NOT "
+            "answer from KB memory. Call in any F3E or FNDR channel. No inputs required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     # ── OSN financial tools (OSN and FNDR channels) ──
     {
         "name": "osn_financial_pulse",
@@ -5469,6 +5507,7 @@ _ENTITY_TOOLS: dict[str, frozenset[str]] = {
         "f3e_inventory_by_location",
         "f3e_brand_voice_check",
         "f3e_hubspot_pipeline_summary",
+        "f3e_ai_visibility",
         "ads_get_performance_summary",
         "ads_get_channel_breakdown",
         "ads_get_subbrand_performance",
@@ -5559,6 +5598,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_inventory_by_location": _tool_f3e_inventory_by_location,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
+    "f3e_ai_visibility": _tool_f3e_ai_visibility,
     "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
     "fndr_press_pipeline_summary": _tool_fndr_press_pipeline_summary,
     "osn_financial_pulse": _tool_osn_financial_pulse,
@@ -5615,6 +5655,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "calendar_get_my_events": 8,
     "influencer_list_handles": 8,
     "influencer_get_status": 8,
+    "f3e_ai_visibility": 8,
     # Normal — single external API call
     "asana_create_task": 12,
     "asana_complete_task": 12,
