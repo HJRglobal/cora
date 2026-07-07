@@ -387,6 +387,41 @@ class TestShiftKeywordGuard:
             "carton artwork before the production run could stop") is False
 
 
+class TestLooksLikeQuestion:
+    """W-DMQ: a fresh interrogative DM must not be captured as a gap-ask answer."""
+
+    def test_trailing_question_mark_is_a_question(self):
+        assert ga.looks_like_question(
+            "what's our current cash position across the entities?") is True
+        assert ga.looks_like_question("123 Main St?") is True
+
+    def test_leading_interrogative_word_is_a_question(self):
+        for q in ("what's our cash position", "whats the plan", "where is the office",
+                  "how much did we spend", "which vendor won", "why did that slip",
+                  "is the launch confirmed", "can you pull the numbers",
+                  "do we have the address", "should we ship it"):
+            assert ga.looks_like_question(q) is True, q
+
+    def test_declarative_answer_is_not_a_question(self):
+        for a in ("The Anaheim address is 123 Main St.",
+                  "Launch is June 15, confirmed with BCB.",
+                  "June 15", "It's Apex Appliance in Tucson.",
+                  "Tommy owns that account now."):
+            assert ga.looks_like_question(a) is False, a
+
+    def test_declines_are_not_flagged_as_questions(self):
+        # Declines are declarative and must still reach record_ask_answer's
+        # decline branch, so looks_like_question must not flag them.
+        for d in ("no idea", "not my area", "don't know", "dunno", "not sure",
+                  "ask harrison"):
+            assert ga.looks_like_question(d) is False, d
+
+    def test_empty_is_not_a_question(self):
+        assert ga.looks_like_question("") is False
+        assert ga.looks_like_question("   ") is False
+        assert ga.looks_like_question(None) is False  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # Layer B -- executor (apply_known_answer)
 # ---------------------------------------------------------------------------

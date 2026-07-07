@@ -156,3 +156,58 @@ class TestFollowupD064Integration:
             app_module.handle_message_event(_thread_event(user=TOMMY, text=word), client)
             path2_real_access.assert_called_once()
             client.chat_postMessage.assert_not_called()
+
+
+class TestMentionInActiveThreadNoDoubleDispatch:
+    """W1-01: an @mention posted as a reply INSIDE an active thread is delivered
+    by Slack as BOTH an app_mention (-> handle_mention, a full answer) AND this
+    message event. Path 2 must SKIP such messages so Cora doesn't double-answer
+    (doubled LLM call + duplicate reply on mention-polluted text). Only Cora's
+    OWN bot id triggers the skip; a follow-up mentioning a teammate still routes.
+    """
+
+    CORA_BOT = "UCORABOT"
+
+    def test_leading_cora_mention_skips_path2(self, path2_mocks):
+        with patch.object(app_module, "_resolve_bot_user_id", return_value=self.CORA_BOT):
+            client = MagicMock()
+            app_module.handle_message_event(
+                _thread_event(text=f"<@{self.CORA_BOT}> what about the pricing?"), client)
+        # handle_mention (app_mention) owns it -> Path 2 must not double-answer.
+        path2_mocks.dispatch.assert_not_called()
+        # A clean skip, not a refusal: nothing is posted.
+        client.chat_postMessage.assert_not_called()
+
+    def test_non_leading_cora_mention_also_skips(self, path2_mocks):
+        # Slack fires app_mention for a mention ANYWHERE in the text, not just
+        # a leading one -> the substring check must skip those too.
+        with patch.object(app_module, "_resolve_bot_user_id", return_value=self.CORA_BOT):
+            client = MagicMock()
+            app_module.handle_message_event(
+                _thread_event(text=f"and what does <@{self.CORA_BOT}> think of this?"), client)
+        path2_mocks.dispatch.assert_not_called()
+
+    def test_teammate_mention_still_dispatches(self, path2_mocks):
+        # A follow-up mentioning a TEAMMATE is a legitimate Path-2 question and
+        # must NOT be skipped (adversarial probe: only Cora's id triggers skip).
+        with patch.object(app_module, "_resolve_bot_user_id", return_value=self.CORA_BOT):
+            client = MagicMock()
+            app_module.handle_message_event(
+                _thread_event(text="hey <@UTEAMMATE1> can you confirm the pricing?"), client)
+        path2_mocks.dispatch.assert_called_once()
+        client.chat_postMessage.assert_not_called()
+
+    def test_plain_followup_still_dispatches(self, path2_mocks):
+        with patch.object(app_module, "_resolve_bot_user_id", return_value=self.CORA_BOT):
+            client = MagicMock()
+            app_module.handle_message_event(_thread_event(text="what about the pricing?"), client)
+        path2_mocks.dispatch.assert_called_once()
+
+    def test_unresolved_bot_id_fails_open(self, path2_mocks):
+        # If the bot id can't be resolved we cannot classify the mention -> run
+        # Path 2 rather than drop a real follow-up (fail open, not closed).
+        with patch.object(app_module, "_resolve_bot_user_id", return_value=None):
+            client = MagicMock()
+            app_module.handle_message_event(
+                _thread_event(text=f"<@{self.CORA_BOT}> what about the pricing?"), client)
+        path2_mocks.dispatch.assert_called_once()

@@ -606,6 +606,39 @@ def is_shift_keyword(text: str) -> bool:
     return any(kw in t for kw in _SHIFT_KEYWORDS) and len(t.split()) <= 6
 
 
+_QUESTION_LEAD_RE = re.compile(
+    r"^\s*(what|whats|where|when|who|whom|whose|why|how|which|"
+    r"is|are|am|was|were|do|does|did|can|could|should|would|will|"
+    r"has|have|had|may|might|shall)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_question(text: str) -> bool:
+    """True when a DM reads as a FRESH question, not an answer to a gap ask.
+
+    W-DMQ: match_pending_ask's top-level branch greedily captures the next
+    non-shift DM as the answer to a lone outstanding ask. That swallowed an
+    unrelated question a teammate happened to DM while one ask was live (e.g.
+    "what's our cash position across the entities?"), proposing it to Harrison
+    as a bogus known-answer. Gap answers are declarative facts, so a trailing
+    '?' or a leading interrogative/auxiliary word is a strong "this is a new
+    question" signal -> route those to Q&A instead of capturing them.
+
+    Deliberately applied ONLY to the ambiguous top-level path (see the caller in
+    app.handle_message_event): a reply typed in the ask's OWN thread is
+    unambiguous intent to answer and always matches, question-shaped or not.
+    Declines ("no idea", "not my area", "don't know") are declarative, so they
+    still match here and are handled downstream by record_ask_answer.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    return bool(_QUESTION_LEAD_RE.match(t))
+
+
 _DECLINE_RE = re.compile(
     r"^\s*(no idea|not my area|don'?t know|dunno|no clue|not sure|ask (someone|harrison))\b",
     re.IGNORECASE,

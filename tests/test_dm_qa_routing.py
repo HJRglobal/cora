@@ -314,3 +314,43 @@ class TestDmBranchRouting:
         dispatch.assert_called_once()
         branch_mocks.qa.assert_not_called()
         branch_mocks.shift.assert_not_called()
+
+
+class TestGapAskDoesNotSwallowFreshQuestion:
+    """W-DMQ: with one live gap ask, a fresh interrogative top-level DM must
+    route to Q&A, not be captured as the ask's answer (a declarative answer
+    still captures). match_pending_ask's top-level branch is greedy; the fix
+    composes gap_autofill.looks_like_question into allow_toplevel at the caller.
+    These pin that the im-branch actually honors it end-to-end."""
+
+    def _drive(self, text):
+        captured = {}
+
+        def _spy_match(user_id, thread_ts, *, allow_toplevel=True):
+            # Mimic match_pending_ask with exactly one live top-level ask: it
+            # matches only when allow_toplevel is True.
+            captured["allow_toplevel"] = allow_toplevel
+            return {"ask_id": "a1"} if allow_toplevel else None
+
+        with patch.object(app_module.gap_autofill, "match_pending_ask",
+                          side_effect=_spy_match), \
+             patch.object(app_module.gap_autofill, "record_ask_answer",
+                          return_value="captured") as rec, \
+             patch.object(app_module.historical_access, "detect_retrieval_intent",
+                          return_value=False), \
+             patch.object(app_module, "_dm_is_shift_message", return_value=False), \
+             patch.object(app_module, "_handle_dm_qa") as qa:
+            app_module.handle_message_event(_event(text=text), MagicMock())
+        return SimpleNamespace(captured=captured, rec=rec, qa=qa)
+
+    def test_interrogative_dm_routes_to_qa_not_capture(self):
+        r = self._drive("what's our current cash position across the entities?")
+        assert r.captured["allow_toplevel"] is False  # excluded from top-level capture
+        r.rec.assert_not_called()                      # NOT captured as a gap answer
+        r.qa.assert_called_once()                      # reached the Q&A pipeline
+
+    def test_declarative_answer_still_captures(self):
+        r = self._drive("The Anaheim F3E address is 123 Main St.")
+        assert r.captured["allow_toplevel"] is True
+        r.rec.assert_called_once()                     # captured as a gap answer
+        r.qa.assert_not_called()

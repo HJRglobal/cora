@@ -1426,13 +1426,23 @@ def handle_message_event(event: dict, client) -> None:
         if user_id and text and not event.get("bot_id"):
             # Gap autofill Stage 2: if this user has a pending knowledge-gap
             # ask, treat the reply as the answer. Threaded replies to the ask
-            # message always match; top-level DMs match only when the text is
-            # not an OSN shift-scheduler command (those keep their old route).
+            # message always match. A top-level DM matches only when it is NOT
+            # an OSN shift-scheduler command AND does NOT read as a fresh
+            # question (W-DMQ): the lone-ask top-level match is greedy, so an
+            # unrelated question a teammate DMs while one ask is live (e.g.
+            # "what's our cash position?") would otherwise be swallowed and
+            # proposed to Harrison as a bogus known-answer. A clearly
+            # interrogative top-level DM falls through to the normal Q&A path
+            # instead; a genuine answer typed in the ask's OWN thread still
+            # always matches (looks_like_question only gates the top-level path).
             try:
                 ask = gap_autofill.match_pending_ask(
                     user_id,
                     event.get("thread_ts"),
-                    allow_toplevel=not gap_autofill.is_shift_keyword(text),
+                    allow_toplevel=(
+                        not gap_autofill.is_shift_keyword(text)
+                        and not gap_autofill.looks_like_question(text)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 — capture must never break DMs
                 log.warning("gap_autofill: match_pending_ask failed: %s", exc)
@@ -1780,6 +1790,28 @@ def handle_message_event(event: dict, client) -> None:
         )
         return
 
+    # ── W1-01: skip Path 2 when this reply @mentions Cora ────────────────────
+    # An @mention posted as a reply INSIDE an active thread is delivered by
+    # Slack as BOTH an app_mention event (-> handle_mention, a full answer) AND
+    # this message event. Without this guard Path 2 dispatches a SECOND full
+    # answer on the same message (doubled LLM call + duplicate reply, and on
+    # mention-polluted text since Path 2 never strips the leading <@Uxxx>).
+    # handle_mention already owns any message that mentions Cora, so bail here.
+    # Scope: only Cora's OWN bot id triggers the skip -- an in-thread follow-up
+    # that merely mentions a teammate (<@Usomeone>) is a legitimate Path-2
+    # question and must still route through. Fail OPEN when the bot id can't be
+    # resolved (never drop a real follow-up). This is deliberately placed AFTER
+    # Path 0 (note-confirm) and Path 1 (correction), which handle_mention does
+    # NOT own -- a "@Cora yes"/correction reply must still reach those paths.
+    _cora_bot_id = _resolve_bot_user_id(client)
+    if _cora_bot_id and f"<@{_cora_bot_id}>" in text:
+        log.info(
+            "thread_followup: skip Path 2 -- reply @mentions Cora "
+            "(handle_mention owns it) channel=%s user=%s",
+            channel_id, user_id,
+        )
+        return
+
     # ── Path 2: Active-thread follow-up (no @mention required) ───────────────
     # Only trigger if Cora is known to be active in this thread (within TTL).
     if not active_thread_store.is_active(channel_id, thread_ts):
@@ -2110,9 +2142,10 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
 
     # ── HubSpot email sync: 👍/👎 on an ambiguous-match DM ──────────────────────
     # When Cora DMs about an ambiguous email→HubSpot match, Harrison reacts
-    # 👍 to attach the thread or 👎 to skip. Runs before the bot_user_id gate
-    # because DM messages from Cora are item_user=bot but we want to catch this
-    # early for both DM channels (channel_type "im") and regular channels.
+    # 👍 to attach the thread or 👎 to skip. Runs AFTER the item_user==bot gate
+    # above: the pending-reaction DM is Cora-authored (item_user == bot), so it
+    # passes that gate cleanly, and get_pending_reaction is keyed on Cora's own
+    # DM ts -- so the post-gate position is functionally correct.
     if event_type == "reaction_added" and reaction in ("+1", "thumbsup", "-1", "thumbsdown"):
         try:
             from cora.connectors.hubspot_email_sync import (
@@ -2150,11 +2183,11 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     # (_handle_bookmark_reaction) returns first, so this never ran. Removed to keep
     # one bookmark path. _handle_bookmark_reaction is the live one.
 
-    item_user = event.get("item_user", "")
-    bot_user_id = _resolve_bot_user_id(client)
-    if not bot_user_id or item_user != bot_user_id:
-        # Remaining handlers only apply to reactions on Cora's own messages
-        return
+    # W1-02: a redundant re-fetch of item_user/bot_user_id + an identical
+    # `if not bot_user_id or item_user != bot_user_id: return` used to sit here.
+    # It was dead -- the gate above already guarantees item_user == bot_user_id
+    # (it returns otherwise) and neither value can change in between. Removed.
+    # Every handler below runs only on Cora-authored messages via that one gate.
 
     # ── OSN shift scheduler: ✅ on a schedule message approves + publishes it ──
     if event_type == "reaction_added" and reaction == "white_check_mark":
