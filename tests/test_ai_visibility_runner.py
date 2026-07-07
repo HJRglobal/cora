@@ -1,0 +1,175 @@
+"""Tests for scripts/run_ai_visibility_scan.py (all deps injected/mocked)."""
+
+from __future__ import annotations
+
+import sqlite3
+import sys
+from pathlib import Path
+
+import pytest
+
+
+def _load_runner():
+    sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+    try:
+        import run_ai_visibility_scan as m
+        return m
+    except ImportError:  # pragma: no cover
+        pytest.skip("run_ai_visibility_scan not importable")
+
+
+from cora.ai_visibility import store as st
+from cora.ai_visibility.classifier import Classification
+from cora.ai_visibility.citations import Citation
+from cora.connectors.ai_search import QueryResult
+from cora.connectors.otterly_client import AioBrandSlice
+
+
+@pytest.fixture(autouse=True)
+def _tmp_db(tmp_path):
+    st.set_db_path(tmp_path / "ai_visibility.db")
+    yield
+    st.set_db_path(None)
+
+
+def _args(m, **over):
+    a = m.parse_args(["--brand", "energy", "--models", "perplexity_sonar", "--runs", "1",
+                      "--no-aio", "--no-verify-citations", "--no-post"])
+    for k, v in over.items():
+        setattr(a, k, v)
+    return a
+
+
+# --- dry run ---
+def test_dry_run_makes_zero_calls(monkeypatch, capsys):
+    m = _load_runner()
+    monkeypatch.setattr(m.ai_search, "run_query",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no calls in dry-run")))
+    rc = m.execute_scan(m.parse_args(["--dry-run"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ZERO API calls" in out
+    assert "89 prompts" in out  # the real (corrected) count
+
+
+# --- planning ---
+def test_build_work_items_and_cost():
+    m = _load_runner()
+    import cora.ai_visibility.prompts as pb
+    basket = pb.load_basket()
+    items = m.build_work_items(basket, ["energy"], ["perplexity_sonar", "claude_web"])
+    assert len(items) == 33 * 2  # energy has 33 prompts x 2 models
+    total, per_model = m.estimate_total_cost(items, runs=5)
+    assert total > 0
+    assert set(per_model) == {"perplexity_sonar", "claude_web"}
+
+
+# --- full small scan (hit/miss) ---
+def test_full_scan_scores_and_completes(monkeypatch):
+    m = _load_runner()
+
+    def fake_query(model, prompt):
+        # F3 Energy hits on discovery, misses elsewhere -> nonzero composite
+        return QueryResult(model=model, prompt=prompt, text="F3 Energy is great.",
+                           citations=["https://f3energy.com"], input_tokens=10,
+                           output_tokens=40, num_searches=1, cost_usd=0.01)
+
+    def fake_classify(brand, prompt, text, citations):
+        hit = prompt.intent == "discovery"
+        return Classification(mentioned=hit, is_correct_brand=hit,
+                              position=1 if hit else None,
+                              sentiment="positive" if hit else "neutral",
+                              competitors_mentioned=["Celsius"], cited_sources=citations)
+
+    def fake_resolve(urls, **k):
+        return [Citation(u, "f3energy.com", True, "own_site") for u in urls]
+
+    rc = m.execute_scan(_args(m), query_fn=fake_query, classify_fn=fake_classify,
+                        resolve_fn=fake_resolve)
+    assert rc == 0
+    latest = st.latest_scores()
+    assert "energy" in latest
+    assert 0 < latest["energy"]["composite"] <= 100
+    assert latest["energy"]["scan"]["status"] == "completed"
+    # answers were stored for all 33 energy prompts
+    rows = st.answers_for_scan(latest["energy"]["scan"]["id"], "energy")
+    assert len(rows) == 33
+
+
+# --- cost cap hard stop ---
+def test_cost_cap_stops_and_marks_partial(monkeypatch):
+    m = _load_runner()
+
+    def dear_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="x", citations=[],
+                           cost_usd=0.5)
+
+    rc = m.execute_scan(_args(m, max_cost_usd=1.0),
+                        query_fn=dear_query,
+                        classify_fn=lambda *a, **k: Classification(),
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 2  # partial
+    # 2 calls at $0.5 -> the 3rd would exceed $1.0, so it stops at 2
+    conn = sqlite3.connect(str(st._db_path()))
+    try:
+        scan = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert scan[7] == "partial"  # status column
+    assert scan[8] == 2          # total_calls column
+
+
+# --- missing model key -> skipped, scan still completes ---
+def test_missing_key_model_skipped(monkeypatch):
+    m = _load_runner()
+
+    def skip_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, skipped=True, error="no key")
+
+    rc = m.execute_scan(_args(m), query_fn=skip_query,
+                        classify_fn=lambda *a, **k: Classification(),
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 0
+    latest = st.latest_scores()
+    # no answers stored (model skipped) -> composite 0, scan completed
+    assert latest["energy"]["composite"] == 0.0
+    assert st.answers_for_scan(latest["energy"]["scan"]["id"], "energy") == []
+
+
+# --- resume state helpers ---
+def test_state_roundtrip_and_resume(monkeypatch, tmp_path):
+    m = _load_runner()
+    monkeypatch.setattr(m, "_STATE_PATH", tmp_path / "state.json")
+    m._save_state({"scan_id": 1, "started_at": "x", "done_keys": ["a", "b"]})
+    assert m._load_state()["done_keys"] == ["a", "b"]
+    m._clear_state()
+    assert m._load_state() == {}
+
+
+def test_resume_target_running_scan(monkeypatch, tmp_path):
+    m = _load_runner()
+    monkeypatch.setattr(m, "_STATE_PATH", tmp_path / "state.json")
+    sid = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                         brands=["energy"])  # status running
+    m._save_state({"scan_id": sid, "started_at": "x", "done_keys": ["energy|ENG-D01|perplexity_sonar|0"]})
+    resume_sid, done = m._resume_target(fresh=False)
+    assert resume_sid == sid
+    assert "energy|ENG-D01|perplexity_sonar|0" in done
+    # fresh=True ignores the resumable scan
+    assert m._resume_target(fresh=True) == (None, set())
+
+
+def test_resume_skips_completed_scan(monkeypatch, tmp_path):
+    m = _load_runner()
+    monkeypatch.setattr(m, "_STATE_PATH", tmp_path / "state.json")
+    sid = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                         brands=["energy"])
+    st.finish_scan(sid, status="completed", total_calls=1, total_cost_usd=0.0, aio_included=False)
+    m._save_state({"scan_id": sid, "started_at": "x", "done_keys": []})
+    assert m._resume_target(fresh=False) == (None, set())
+
+
+def test_unknown_brand_raises_systemexit():
+    m = _load_runner()
+    with pytest.raises(SystemExit):
+        m.execute_scan(m.parse_args(["--brand", "nope", "--dry-run"]))
