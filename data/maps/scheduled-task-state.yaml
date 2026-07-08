@@ -44,6 +44,14 @@ disabled:
   # host task AFTER the hygiene-session merge; until then the daily check WARNs
   # "expected disabled but enabled" -- that WARN is the reminder, not a defect.
   - cowork-cora-gap-digest
+  # Deal Task Sync host-disabled 2026-07-08 (audit MK-01) -- Make.com 4768886 is
+  # the owner (mechanical proposal-stage -> Asana sync, D-029).
+  - Cora - Deal Task Sync
+  # F3E ecom brief + inventory alerts FOLDED into the F3E daily synthesis 2026-07-07
+  # (audit 2026-07-08). The daily synthesis now carries the DTC/subscriptions pulse +
+  # inventory flags, so the standalone tasks are host-disabled to avoid duplicate posts.
+  - Cora - F3E Daily Ecom Brief
+  - Cora - Inventory Alerts
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
