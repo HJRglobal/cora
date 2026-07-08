@@ -340,7 +340,7 @@ def _dispatch_qa(
 
     # ── Per-user historical email/Drive access gate (pre-LLM, D-034) ────────
     # Deterministic, runs before the semantic cache and before any Claude
-    # call. Finance gate first (it only acts inside #hjr-finance), then the
+    # call. Finance gate first (it only acts inside #founder-finance), then the
     # personal Tier-2 gate. "respond" decisions are COMPLETE replies (DM
     # redirect / refusal); "grant" switches the pipeline to owner-authorized
     # retrieval below. See historical_access.py / finance_receipts.py.

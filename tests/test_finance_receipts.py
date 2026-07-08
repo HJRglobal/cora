@@ -1,7 +1,7 @@
 """Tests for the Tier 2-Finance receipt/invoice retrieval path.
 
 Matrix from the 2026-06-09 spec: allowlist-only, channel-lock (only
-#hjr-finance), content-type filter + non-financial refusal, any-mailbox for
+#founder-finance), content-type filter + non-financial refusal, any-mailbox for
 allowlisted, PHI excluded, audit logging, proactive dedup/watermark,
 auto-file to the configured folder — plus classifier precision cases.
 """
@@ -23,7 +23,7 @@ users:
   - UERIC
   - UJERRY
 channel_id: {_FIN_CHANNEL}
-channel_name: hjr-finance
+channel_name: founder-finance
 drive_folder_id: "FOLDER123"
 """
 
@@ -154,7 +154,7 @@ def test_missing_allowlist_fails_closed(tmp_path, monkeypatch):
 
 def test_finance_retrieval_is_channel_scoped_both_directions():
     """2026-06-12 one-ship pin (task item a): the finance retrieval power is
-    REFUSED for an allowlisted user OUTSIDE #hjr-finance (no grant anywhere
+    REFUSED for an allowlisted user OUTSIDE #founder-finance (no grant anywhere
     else -- it falls back to normal Tier-2 'pass'), AND refused for a
     non-allowlisted user even INSIDE the channel."""
     # Allowlisted (Eric, Jerry) outside the pinned channel -> never a finance grant.
@@ -196,7 +196,7 @@ def test_audit_logs_every_cross_mailbox_pull(tmp_path, monkeypatch):
         date_modified=None, distance=0.3,
         metadata={"user_email": "hannah@hjrglobal.com"},
     )
-    fr.audit("UJUSTIN", "pull receipts from Hannah", None, [item], channel="hjr-finance")
+    fr.audit("UJUSTIN", "pull receipts from Hannah", None, [item], channel="founder-finance")
     entry = json.loads(path.read_text().strip())
     assert entry["requester"] == "UJUSTIN"
     assert entry["scope"] == "ANY"
@@ -409,7 +409,11 @@ def test_alert_delivery_failure_posts_metadata_only(monkeypatch):
     assert "could not be delivered" in txt
     assert "$" not in txt              # no amounts
     assert "filed copy" not in txt     # no per-doc vendor lines
-    assert "un-archive" in txt and "finance-receipt-allowlist.yaml" in txt
+    # Fix hint names the repointed channel + the config file to edit (no stale
+    # "un-archive" presumption -- #founder-finance is a live channel).
+    assert "founder-finance" in txt
+    assert "un-archive" not in txt
+    assert "finance-receipt-allowlist.yaml" in txt
 
 
 def test_alert_delivery_failure_honors_fallback_env(monkeypatch):

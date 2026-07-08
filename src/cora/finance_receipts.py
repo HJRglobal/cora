@@ -8,7 +8,7 @@ any inbox, never the private/business emails themselves.
 Hard rules (all enforced deterministically, pre-LLM, per D-034):
   - WHO:   exactly the Slack IDs in data/maps/finance-receipt-allowlist.yaml
            (Justin Moran, Eric Canku, Jerry Reick). Fail-closed.
-  - WHERE: the #hjr-finance channel ONLY (channel_id pinned in the same
+  - WHERE: the #founder-finance channel ONLY (channel_id pinned in the same
            config). Outside it, these users are normal Tier-2 users.
   - WHAT:  chunks tagged metadata.financial_document=true only. A
            non-financial retrieval request on this path is refused.
@@ -17,13 +17,13 @@ Hard rules (all enforced deterministically, pre-LLM, per D-034):
   - AUDIT: every cross-mailbox pull -> logs/finance-access-audit.jsonl.
 
 Workflow (PROACTIVE — all three, per Harrison):
-  1. On-demand retrieval in #hjr-finance (handled via app._dispatch_qa grant).
+  1. On-demand retrieval in #founder-finance (handled via app._dispatch_qa grant).
   2. Auto-file: retrieved + proactively-detected receipts/invoices are copied
      into the "Receipts & Invoices Inbox" Drive folder.
   3. Weekly digest (scripts/run_finance_receipt_digest.py, task
      `cowork-cora-finance-receipt-digest`): scan all monitored inboxes for
      newly-detected financial documents since the last watermark, file them,
-     and post a digest to #hjr-finance. Watermark + dedup ledger guarantee
+     and post a digest to #founder-finance. Watermark + dedup ledger guarantee
      each receipt surfaces once.
 
 Google/Slack imports are deliberately LAZY (inside functions) so the guard
@@ -104,7 +104,7 @@ def _load_config() -> dict:
         cfg = {
             "users": frozenset(str(u).strip() for u in (raw.get("users") or []) if u),
             "channel_id": str(raw.get("channel_id") or "").strip(),
-            "channel_name": str(raw.get("channel_name") or "hjr-finance").strip(),
+            "channel_name": str(raw.get("channel_name") or "founder-finance").strip(),
             "drive_folder_id": str(raw.get("drive_folder_id") or "").strip(),
         }
     except Exception as exc:  # noqa: BLE001
@@ -127,7 +127,7 @@ def invalidate_cache() -> None:
 
 
 def check_request(slack_user_id: str, channel_id: str, text: str) -> AccessDecision:
-    """Deterministic Tier 2-Finance gate. Only ever acts inside #hjr-finance.
+    """Deterministic Tier 2-Finance gate. Only ever acts inside #founder-finance.
 
     Returns PASS everywhere else — the normal Tier-2 rules then apply, so the
     finance power literally does not exist outside the pinned channel.
@@ -146,7 +146,7 @@ def check_request(slack_user_id: str, channel_id: str, text: str) -> AccessDecis
         and re.search(historical_access._RETRIEVE_VERBS, text or "", re.IGNORECASE)
     )
     if not (is_retrieval or verb_plus_fin):
-        return PASS  # general Q&A in #hjr-finance is untouched
+        return PASS  # general Q&A in #founder-finance is untouched
 
     if slack_user_id not in cfg.get("users", frozenset()):
         return AccessDecision(action="respond", message=_REFUSE_NOT_ALLOWLISTED)
@@ -502,7 +502,7 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
 
 
 def format_digest(rows: list[dict[str, str]], accounts_scanned: int) -> str:
-    """Slack mrkdwn digest for #hjr-finance."""
+    """Slack mrkdwn digest for #founder-finance."""
     if not rows:
         return (
             ":receipt: *Weekly receipts digest* — no new receipts or invoices "
@@ -563,14 +563,15 @@ def alert_delivery_failure(n_docs: int, accounts_scanned: int) -> bool:
     """W4-02: make a digest DELIVERY break loud instead of silent.
 
     The digest itself does its work (files docs) but the summary post can fail —
-    e.g. the pinned #hjr-finance channel is archived. Before this, the only
+    e.g. the pinned #founder-finance channel is archived or Cora is not a member.
+    Before this, the only
     signals were a disk log line + a nonzero exit code that nothing watched, so
     the weekly summary silently reached no one. This posts a metadata-only notice
     (NO vendor/amount lines — the finance firewall keeps digest CONTENT off
     non-finance channels) to a known-live ops channel. Returns True if posted."""
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     channel = _fallback_alert_channel()
-    target_label = "#" + (_load_config().get("channel_name") or "hjr-finance")
+    target_label = "#" + (_load_config().get("channel_name") or "founder-finance")
     if not token:
         log.error("finance_receipts: no SLACK_BOT_TOKEN — cannot raise delivery-failure alert")
         return False
@@ -578,9 +579,10 @@ def alert_delivery_failure(n_docs: int, accounts_scanned: int) -> bool:
         ":warning: *Weekly finance receipt digest could not be delivered.* "
         f"{n_docs} financial document(s) across {accounts_scanned} monitored "
         "inbox(es) were filed to the Receipts & Invoices Inbox, but the summary "
-        f"post to the finance channel (`{target_label}`) failed — it is most "
-        "likely archived. *Fix:* un-archive that channel, or repoint `channel_id` "
-        "in `data/maps/finance-receipt-allowlist.yaml` to a live finance channel "
+        f"post to the finance channel (`{target_label}`) failed — the channel may "
+        "be archived, or Cora may not be a member. *Fix:* confirm that channel is "
+        "live and Cora is in it, or repoint `channel_id` in "
+        "`data/maps/finance-receipt-allowlist.yaml` to a live finance channel "
         "(note: that also moves the cross-mailbox receipt-retrieval permission, "
         "so it is a deliberate security-boundary decision)."
     )

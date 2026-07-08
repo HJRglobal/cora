@@ -3,7 +3,7 @@
 Scans all monitored inboxes for newly-detected financial documents (receipts,
 invoices, statements, order confirmations) since the last per-account
 watermark, files their attachments into the "Receipts & Invoices Inbox"
-Drive folder, and posts a digest to #hjr-finance. Dedup-ledgered so each
+Drive folder, and posts a digest to #founder-finance. Dedup-ledgered so each
 receipt surfaces exactly once. See src/cora/finance_receipts.py.
 
 Usage:

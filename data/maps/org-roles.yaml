@@ -88,7 +88,7 @@ users:
     manager: U0B2RM2JYJ1
     notes: >-
       Defer accounting interpretation to Justin in finance channels. Finance
-      receipt retrieval allowlisted (#hjr-finance only).
+      receipt retrieval allowlisted (#founder-finance only).
 
   - slack_id: U0B3RU5Q55G
     name: Tommy Anderson
@@ -125,7 +125,7 @@ users:
     responsibilities:
       - F3E logistics and fulfillment coordination
     manager: U0B2RM2JYJ1
-    notes: Finance receipt retrieval allowlisted (#hjr-finance only).
+    notes: Finance receipt retrieval allowlisted (#founder-finance only).
 
   - slack_id: U0B3PS7RFJA
     name: Matt Petrovich
@@ -275,7 +275,7 @@ users:
       - Compliance filings support (e.g. F3C 990-N)
     manager: U0B3AEJCYGP
     notes: >-
-      Finance receipt retrieval allowlisted (#hjr-finance only). Title
+      Finance receipt retrieval allowlisted (#founder-finance only). Title
       confirmed by Harrison 2026-06-10.
 
   # Registry-only entry (no slack_id): Tessa has no active Slack/Asana access

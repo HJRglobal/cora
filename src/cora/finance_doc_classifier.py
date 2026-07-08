@@ -9,7 +9,7 @@ is the one-time catch-up for chunks ingested before this shipped.
 
 Design rule from the spec: ERR TOWARD PRECISION. Only high-confidence
 financial documents get the tag, so a misclassified personal email can never
-surface into #hjr-finance. Scoring requires two independent signals (or one
+surface into #founder-finance. Scoring requires two independent signals (or one
 very strong combination):
 
   +2  financial-document term in the SUBJECT/TITLE (invoice, receipt, ...)
