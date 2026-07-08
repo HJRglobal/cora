@@ -6,7 +6,7 @@ import cora.tools.tool_dispatch as td
 
 HARRISON = "U0B2RM2JYJ1"        # the founder -- gid path is exempt from the ownership check
 TOMMY = "U0B3RU5Q55G"           # a NON-founder mapped user (ownership check applies)
-SHAUN_GID = "1209093544422692"  # Shaun Hawkins, from the real slack-to-asana.yaml
+SHAUN_GID = "1215737571684638"  # Shaun Hawkins, from the real slack-to-asana.yaml
 
 
 class TestCompleteTask:
