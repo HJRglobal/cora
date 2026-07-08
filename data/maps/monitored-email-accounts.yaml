@@ -377,7 +377,7 @@ accounts:
     attachment_filer: true
     drive_sweep: true
     entity_default: LEX
-    asana_gid: "1209093544422692"
+    asana_gid: "1215737571684638"
     slack_user_id: U0B3PS82G30
     fireflies_seat: true
 
