@@ -825,6 +825,52 @@ class TestLexSynthesis:
         assert cs.synthesize_channel_lex("facts") is None
 
 
+class TestSetupScripts:
+    _SCOPES = {
+        "portfolio": ("run_portfolio_synthesis.py", None),
+        "f3e": ("run_entity_synthesis.py", "f3e"),
+        "hjrp": ("run_entity_synthesis.py", "hjrp"),
+        "osn": ("run_entity_synthesis.py", "osn"),
+        "lex": ("run_entity_synthesis.py", "lex"),
+        "bdm": ("run_entity_synthesis.py", "bdm"),
+        "ufl": ("run_entity_synthesis.py", "ufl"),
+        "hjrprod": ("run_entity_synthesis.py", "hjrprod"),
+        "f3c": ("run_entity_synthesis.py", "f3c"),
+    }
+
+    def _path(self, scope):
+        return _REPO_ROOT / "deployment" / f"setup-daily-synthesis-{scope}-task.ps1"
+
+    def test_all_nine_exist(self):
+        for scope in self._SCOPES:
+            assert self._path(scope).exists(), scope
+
+    def test_doctrine_compliance(self):
+        import re
+        for scope, (script, entity) in self._SCOPES.items():
+            src = self._path(scope).read_text(encoding="utf-8")
+            assert all(ord(c) < 128 for c in src), f"{scope}: non-ASCII (D-016)"
+            assert r".venv\Scripts\python.exe" in src, f"{scope}: venv python (D-005)"
+            assert "uv run" not in src, f"{scope}: uv (D-005)"
+            assert "-Daily" in src, f"{scope}: daily trigger"
+            assert script in src, f"{scope}: wrong runner"
+            if entity:
+                assert f"--entity {entity}" in src, f"{scope}: entity arg"
+
+    def test_times_unique_and_free(self):
+        import re
+        occupied = {"06:00", "06:10", "06:30", "06:40", "06:45", "06:50",
+                    "07:00", "07:06", "07:10", "07:15", "07:30"}
+        times = []
+        for scope in self._SCOPES:
+            src = self._path(scope).read_text(encoding="utf-8")
+            m = re.search(r'\$HourMin\s*=\s*"([\d:]+)"', src)
+            assert m, f"{scope}: no HourMin"
+            times.append(m.group(1))
+        assert len(times) == len(set(times)), f"duplicate times: {times}"
+        assert not (set(times) & occupied), "collision with a live task minute"
+
+
 class TestSourcePostSites:
     def test_channel_module_posts_to_channels_never_opens_dm(self):
         """channel_synthesis posts to channels (chat_postMessage) but NEVER opens
