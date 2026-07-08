@@ -144,7 +144,21 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Log to BOTH stdout and a dated file so a scheduled-task failure is
+    # diagnosable (Task Scheduler discards stdout). Mirrors run_portfolio_synthesis.py.
+    log_dir = _REPO_ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(
+                log_dir / f"cashflow-snapshot-{datetime.now().strftime('%Y-%m-%d')}.log",
+                encoding="utf-8",
+            ),
+        ],
+    )
     ap = argparse.ArgumentParser(description="Write the labeled cash-flow snapshot.")
     ap.add_argument("--out", default=None, help="Output JSON path (overrides env/default)")
     ap.add_argument("--weeks", type=int, default=4, help="Forecast weeks of ending-cash outlook")
