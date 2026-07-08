@@ -107,7 +107,7 @@ def test_create_task_resolves_assignee_via_aliases():
 
     call_kwargs = mock.call_args.kwargs
     # Shaun's Asana GID from the real slack-to-asana.yaml shipped in the repo
-    assert call_kwargs["assignee_gid"] == "1209093544422692"
+    assert call_kwargs["assignee_gid"] == "1215737571684638"
     assert "WRITE_CONFIRMED" in result
 
 
