@@ -5,9 +5,9 @@ One parameterized runner for every operating-entity daily synthesis. Each post i
 a Tag-style operational briefing (Moved / Needs you / Due soon / Watch), scoped
 strictly to the entity, source-opaque, cash included (all targets are TIER_1).
 
-Entities: f3e | osn | ufl | bdm | hjrp | hjrprod | f3c
-  (LEX has its own reviewed runner path -- see run_entity_synthesis's --entity lex
-   gate; it is aggregate/PHI-safe and posts only to #lex-leadership.)
+Entities: f3e | osn | ufl | bdm | hjrp | hjrprod | f3c | lex
+  (LEX is aggregate/PHI-safe: counts-only deadlines, no client detail, a layered
+   output PHI gate; posts only to #lex-leadership.)
 
 Standalone script (D-047): imports channel_synthesis / strategy_memo only -> no bot
 restart. Posts route through the egress boundary; the TIER_1 channel allowlist is
@@ -56,8 +56,7 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-# Non-LEX operating entities. LEX is added by its own reviewed slice.
-_ENTITY_CHOICES = ["f3e", "osn", "ufl", "bdm", "hjrp", "hjrprod", "f3c"]
+_ENTITY_CHOICES = ["f3e", "osn", "ufl", "bdm", "hjrp", "hjrprod", "f3c", "lex"]
 
 
 def main() -> int:

@@ -76,6 +76,25 @@ def _assert_tier1(channel_id: str) -> bool:
     return bool(channel_id) and channel_id in _TIER1_CHANNEL_IDS
 
 
+def _scrub_visibility_cpa(text: str) -> str:
+    """Neutralize Visibility-CPA individual names in any team-facing channel post.
+
+    The Visibility-CPA exclusion: external accounting (Hayden Greber / the Stubbs /
+    etc.) must never be named as an action owner or target in Cora's automated
+    output. A stalled-decision's free-text "owner of next nudge" can name one
+    (e.g. Harrison wrote "Andrew Stubbs or Justin to follow up"), and that owner
+    rides into BOTH the synthesis and the deterministic fallback. Applying the
+    neutralization at THIS single delivery chokepoint covers every scope and both
+    the synth and fallback paths. Fail-open (a broken pattern never blocks a send)."""
+    if not text:
+        return text
+    try:
+        from .phi_guard import _VIS_CPA_PATTERN
+        return _VIS_CPA_PATTERN.sub("external accounting", text)
+    except Exception:  # noqa: BLE001
+        return text
+
+
 # ---------------------------------------------------------------------------
 # Delivery -- channel post (sibling to strategy_memo.deliver_to_harrison)
 # ---------------------------------------------------------------------------
@@ -108,7 +127,8 @@ def deliver_to_channel(channel_id: str, body: str, *, today: date | None = None)
     from .reply_formatter import normalize_slack_bold
     from .slack_egress import sanitize_text
 
-    text = sanitize_text(normalize_slack_bold(body))[:_MAX_SLACK_CHARS]
+    text = sanitize_text(
+        normalize_slack_bold(_scrub_visibility_cpa(body)))[:_MAX_SLACK_CHARS]
     try:
         client = WebClient(token=token)
         client.chat_postMessage(channel=channel_id, text=text)
@@ -266,6 +286,10 @@ def run_synthesis(
     synthesized = body is not None
     if body is None:
         body = sm.fallback_memo(facts)
+    # Visibility-CPA neutralization on the FINAL body (synth or fallback) so the
+    # dry-run preview faithfully matches what posts; deliver_to_channel repeats it
+    # idempotently as a defense-in-depth chokepoint.
+    body = _scrub_visibility_cpa(body)
 
     delivered = False
     if not dry_run:
@@ -677,7 +701,10 @@ def gather_f3e_ecom(*, today: date | None = None) -> dict:
 
 def gather_all_for_entity(entity: str, *, today: date | None = None) -> dict:
     """Scoped fact base for one entity, each section fail-soft."""
+    entity = entity.upper()
     today = today or _today()
+    if entity == "LEX":
+        return _gather_all_for_lex(today=today)
     gathered = {
         "entity": entity,
         "date": today.isoformat(),
@@ -696,6 +723,30 @@ def gather_all_for_entity(entity: str, *, today: date | None = None) -> dict:
     if entity == "F3E":
         gathered["ecom"] = sm._safe_gather("ecom", lambda: gather_f3e_ecom(today=today))
     return gathered
+
+
+def _gather_all_for_lex(*, today: date) -> dict:
+    """LEX (Lexington Services) aggregate fact base -- the highest-stakes surface.
+
+    AGGREGATE POSTURE by construction: cash is the single LEX-corp consolidated tab
+    (no per-sub, no client detail); deadlines are COUNTS ONLY (itemize=False -> no
+    task names at all, since a LEX task name can carry a client name); decisions come
+    through gather_stalled_decisions which already PHI-filters; no pipeline, no ecom.
+    Client-level PHI never enters the facts -- that is the primary guarantee (the
+    synth prompt + output PHI gate are backstops, not the guarantee)."""
+    return {
+        "entity": "LEX",
+        "date": today.isoformat(),
+        "cash": sm._safe_gather("cash", lambda: gather_cash_for_entity("LEX")),
+        "pipeline": {"ok": False, "omitted": True},
+        "decisions": sm._safe_gather(
+            "decisions", lambda: gather_decisions_for_entity("LEX", today=today)),
+        "deadlines": sm._safe_gather(
+            "deadlines", lambda: gather_deadline_radar_for_entity(
+                "LEX", today=today, itemize=False)),
+        "kb_activity": sm._safe_gather("kb_activity", lambda: gather_kb_for_entity("LEX")),
+        "health": sm._safe_gather("health", sm.gather_health),
+    }
 
 
 def _change(value: float | None) -> str:
@@ -899,10 +950,100 @@ FACT BASE:
 """
 
 
+_LEX_PROMPT = """\
+You are writing the DAILY operational synthesis for the Lexington Services leadership
+channel (#lex-leadership). Lexington is a REGULATED Arizona DDD / behavioral-health
+services provider. This post is AGGREGATE, GM-level operations ONLY, and is the
+highest-stakes channel in the portfolio for privacy.
+
+ABSOLUTE PHI RULES (non-negotiable):
+- NEVER include any client / patient / member / participant / resident NAME, initials,
+  or any personal identifier.
+- NEVER include a diagnosis, medication, date of birth, clinical note, or any
+  client-level health information.
+- NEVER describe an individual person's status, authorization, billing, eligibility,
+  or placement.
+- Speak ONLY in aggregate: totals, counts, cash, deadline load by STAFF owner,
+  program-level status. If any fact looks client-specific, OMIT it entirely -- do
+  not paraphrase or summarize it.
+
+Below is today's verified, AGGREGATE fact base. Write a tight operational post
+(roughly 120-180 words) with bold headers (omit any empty section):
+*Moved* -- aggregate changes since the prior business day (cash, workload counts).
+*Needs you* -- stalled leadership decisions needing attention (no client detail).
+*Due soon* -- aggregate deadline counts and overdue load by staff owner.
+*Watch* -- aggregate program-level trends worth monitoring.
+
+Other rules:
+- Use ONLY facts in the fact base; never invent. A quiet day is fine to state plainly.
+- Advisory / operational only; nothing executes automatically.
+- Plain text, Slack-friendly. *single asterisks* for bold. No markdown tables.
+
+FACT BASE:
+{facts}
+"""
+
+
+def _lex_staff_names() -> set[str]:
+    """LEX-context staff roster (from the slack-to-asana map) passed to the name
+    scrubber as names to PRESERVE, so a staff owner in the overdue-by-owner line is
+    not mistaken for a client. A broader-than-LEX roster is fine (safe direction):
+    a client name simply will not be on it and so is redacted near a cue."""
+    try:
+        import yaml
+        raw = yaml.safe_load(sm._asana_map_path().read_text(encoding="utf-8")) or {}
+        return {str(u.get("display_name", "")).strip()
+                for u in (raw.get("users") or []) if u.get("display_name")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def synthesize_channel_lex(facts_text: str) -> str | None:
+    """LEX aggregate synthesis (Sonnet, FAIL-CLOSED) with a layered output PHI gate.
+
+    Defense-in-depth (the aggregate GATHER is the PRIMARY guarantee -- no client
+    detail is in the facts):
+      1. Hard drop-to-fallback on is_clinical_phi (DOB / ICD-10 / diagnosed-with /
+         bare dx term / med name). NARROW by design -- it does NOT trip on ordinary
+         aggregate program vocab (member / active / AHCCCS / Medicaid / assessment),
+         so it never false-blocks a legitimate aggregate post. is_phi_risk and
+         is_lex_billing_status_phi are DELIBERATELY excluded from the hard gate for
+         exactly that over-trip reason (D4).
+      2. scrub_lex_phi redacts client-identifying content -- diagnoses / meds / DOB
+         / care-recipient-noun-governed names ("client Maria" -> "client [name
+         redacted]") / non-staff possessive names -- WITHOUT the Title-case-near-cue
+         pass that would corrupt the "*Moved*"/"*Watch*" section headers. Recall-biased
+         (over-redacts a stray possessive), which is the correct LEX posture. Staff
+         names preserved via the roster. Wrapped fail-CLOSED (a pathological input
+         that makes the scrub raise drops the post rather than risk an unscrubbed one).
+      3. Re-check is_clinical_phi on the scrubbed text (belt).
+    Accepted residual (documented in phi_guard): a bare client name NOT governed by a
+    care-recipient noun and not possessive, produced against instructions -- not
+    closable by regex; the aggregate gather + prompt + custodian/channel containment
+    are the primary net."""
+    from .phi_guard import is_clinical_phi, scrub_lex_phi
+    text = _synthesize(_LEX_PROMPT.format(facts=facts_text), phi_check=is_clinical_phi)
+    if text is None:
+        return None
+    try:
+        scrubbed = scrub_lex_phi(text, allowed_names=_lex_staff_names())
+    except Exception:  # noqa: BLE001 -- cannot guarantee a scrub -> fail closed
+        log.exception("channel_synthesis: LEX scrub raised -- dropping to fallback")
+        return None
+    if is_clinical_phi(scrubbed):
+        log.warning("channel_synthesis: LEX output still tripped clinical PHI after "
+                    "scrub -- dropping to factual fallback")
+        return None
+    return scrubbed
+
+
 def synthesize_channel_entity(entity: str, facts_text: str, *, phi_check=None) -> str | None:
-    """Entity operational synthesis (Sonnet, FAIL-CLOSED). Applies a post-synthesis
-    cross-entity bleed assertion (drops to fallback if the output names a foreign
-    entity). phi_check overrides the default backstop (LEX passes a stricter gate)."""
+    """Entity operational synthesis (Sonnet, FAIL-CLOSED). LEX routes to the stricter
+    aggregate/PHI gate; all others get the source-opaque operational prompt with a
+    cross-entity observability check. phi_check overrides the default backstop."""
+    entity = entity.upper()
+    if entity == "LEX":
+        return synthesize_channel_lex(facts_text)
     label = _ENTITY_LABELS.get(entity, entity)
     prompt = _ENTITY_PROMPT.format(
         label=label, scope_note=_ENTITY_SCOPE_NOTE.get(entity, ""),

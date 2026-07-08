@@ -146,7 +146,8 @@ class TestDeliverToChannel:
                 "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz012345/view")
         ok = cs.deliver_to_channel(cs.SCOPE_CHANNELS["f3e"], body)
         assert ok is True
-        expected = sanitize_text(normalize_slack_bold(body))[:cs._MAX_SLACK_CHARS]
+        expected = sanitize_text(normalize_slack_bold(
+            cs._scrub_visibility_cpa(body)))[:cs._MAX_SLACK_CHARS]
         assert _FakeClient.last["text"] == expected
         # bold was normalized (** -> *) and the raw drive URL did not survive verbatim
         assert "**Cash**" not in _FakeClient.last["text"]
@@ -167,6 +168,18 @@ class TestDeliverToChannel:
         import slack_sdk
         monkeypatch.setattr(slack_sdk, "WebClient", _BoomClient)
         assert cs.deliver_to_channel(cs.SCOPE_CHANNELS["bdm"], "body") is False
+
+    def test_visibility_cpa_name_neutralized_at_delivery(self, monkeypatch):
+        # Covers synthesis AND fallback for every scope: a Visibility-CPA name in
+        # a decision owner must not reach a team-facing channel post.
+        import slack_sdk
+        monkeypatch.setattr(slack_sdk, "WebClient", _FakeClient)
+        _FakeClient.last = {}
+        cs.deliver_to_channel(cs.SCOPE_CHANNELS["lex"],
+                              "Needs you: Andrew Stubbs or Justin to follow up.")
+        assert "Andrew Stubbs" not in _FakeClient.last["text"]
+        assert "external accounting" in _FakeClient.last["text"]
+        assert "Justin" in _FakeClient.last["text"]     # the non-CPA owner survives
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +399,7 @@ class TestRunnerScript:
         assert "override=True" in src
         assert "cora.tool_dispatch" not in src   # D-047
         assert "cora.app" not in src
-        # LEX is NOT yet a choice in this runner (its own reviewed slice adds it).
-        assert '"lex"' not in src
+        assert '"lex"' in src                    # LEX now a supported entity
 
 
 def _install_fake_anthropic(monkeypatch, reply_text):
@@ -718,6 +730,99 @@ class TestRunEntityWiring:
         import pytest
         with pytest.raises(ValueError):
             cs.run_entity("nope", dry_run=True)
+
+    def test_run_entity_lex_posts_to_lex_channel(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "syn"))
+        monkeypatch.setattr(cs, "gather_all_for_entity",
+                            lambda entity, today=None: {"entity": "LEX",
+                                                        "date": "2026-07-07",
+                                                        "cash": {"ok": False}})
+        monkeypatch.setattr(cs, "compute_entity_deltas",
+                            lambda e, c, p: {"first_run": True})
+        monkeypatch.setattr(cs, "build_entity_facts_text", lambda e, g, d: "FACTS")
+        monkeypatch.setattr(cs, "synthesize_channel_entity",
+                            lambda e, facts: "LEX BODY")
+        import slack_sdk
+        monkeypatch.setattr(slack_sdk, "WebClient", _FakeClient)
+        _FakeClient.last = {}
+        cs.run_entity("lex", dry_run=False, today=date(2026, 7, 7))
+        assert _FakeClient.last["channel"] == cs.SCOPE_CHANNELS["lex"]
+
+
+class TestLexSynthesis:
+    def test_lex_gather_is_aggregate(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(cs, "gather_cash_for_entity",
+                            lambda e: {"ok": True, "closing_balance": 15_000.0,
+                                       "label": "Lexington Services"})
+
+        def fake_radar(entity, *, today=None, get_tasks_fn=None, itemize=True):
+            captured["itemize"] = itemize
+            captured["entity"] = entity
+            return {"ok": True, "due_14d": 3, "overdue": 1,
+                    "overdue_by_owner": {"Shaun Hawkins": 1}, "items": [],
+                    "redacted": 5}
+        monkeypatch.setattr(cs, "gather_deadline_radar_for_entity", fake_radar)
+        monkeypatch.setattr(cs, "gather_decisions_for_entity",
+                            lambda e, today=None: {"ok": True, "decisions": []})
+        monkeypatch.setattr(cs, "gather_kb_for_entity",
+                            lambda e: {"ok": True, "count": 10})
+        monkeypatch.setattr(sm, "gather_health",
+                            lambda: {"ok": True, "line": "healthy"})
+        g = cs.gather_all_for_entity("LEX", today=date(2026, 7, 7))
+        assert g["pipeline"] == {"ok": False, "omitted": True}
+        assert captured["itemize"] is False       # LEX deadlines never itemized
+        assert captured["entity"] == "LEX"
+        assert g["deadlines"]["items"] == []
+        assert "ecom" not in g
+
+    def test_clinical_dx_output_dropped(self, monkeypatch):
+        _install_fake_anthropic(
+            monkeypatch, "*Moved* A client was diagnosed with autism this week.")
+        assert cs.synthesize_channel_lex("facts") is None
+
+    def test_medication_output_dropped(self, monkeypatch):
+        _install_fake_anthropic(
+            monkeypatch, "*Watch* One client is now stable on risperidone.")
+        assert cs.synthesize_channel_lex("facts") is None
+
+    def test_governed_client_name_scrubbed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("STRATEGY_ASANA_MAP_PATH", str(tmp_path / "m.yaml"))
+        (tmp_path / "m.yaml").write_text(
+            "users:\n  - slack_user_id: U1\n    asana_user_gid: '1'\n"
+            "    display_name: Shaun Hawkins\n", encoding="utf-8")
+        _install_fake_anthropic(
+            monkeypatch,
+            "*Needs you* client Maria Gonzalez needs a service renewal.")
+        out = cs.synthesize_channel_lex("facts")
+        assert out is not None
+        assert "Maria Gonzalez" not in out
+        assert "[name redacted]" in out
+
+    def test_aggregate_vocab_not_false_blocked_headers_intact(self, tmp_path, monkeypatch):
+        """The tuned gate must NOT false-block a legit aggregate post, and must NOT
+        corrupt the *Moved*/*Watch* headers (why scrub_lex_phi, not the Title-case
+        cue scrub)."""
+        monkeypatch.setenv("STRATEGY_ASANA_MAP_PATH", str(tmp_path / "m.yaml"))
+        (tmp_path / "m.yaml").write_text("users: []\n", encoding="utf-8")
+        text = ("*Moved* 40 active members enrolled; cash steady. AHCCCS "
+                "revalidation on track; 12 assessments completed. *Watch* "
+                "intake volume up.")
+        _install_fake_anthropic(monkeypatch, text)
+        out = cs.synthesize_channel_lex("facts")
+        assert out == text                        # unchanged: no false-block, no corruption
+        assert "*Moved*" in out and "*Watch*" in out
+
+    def test_lex_prompt_carries_phi_rules(self):
+        p = cs._LEX_PROMPT
+        assert "NEVER include" in p
+        assert "diagnosis" in p
+        assert "AGGREGATE" in p
+        assert "highest-stakes" in p
+
+    def test_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert cs.synthesize_channel_lex("facts") is None
 
 
 class TestSourcePostSites:
