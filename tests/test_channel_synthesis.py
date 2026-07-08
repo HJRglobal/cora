@@ -378,6 +378,347 @@ class TestRunnerScript:
         assert "cora.tool_dispatch" not in src   # D-047
         assert "cora.app" not in src
 
+    def test_entity_runner_exists_and_wired(self):
+        src = (_REPO_ROOT / "scripts" / "run_entity_synthesis.py").read_text(
+            encoding="utf-8")
+        assert "--entity" in src
+        assert "run_entity" in src
+        assert "override=True" in src
+        assert "cora.tool_dispatch" not in src   # D-047
+        assert "cora.app" not in src
+        # LEX is NOT yet a choice in this runner (its own reviewed slice adds it).
+        assert '"lex"' not in src
+
+
+def _install_fake_anthropic(monkeypatch, reply_text):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    import anthropic
+
+    class _Resp:
+        content = [type("T", (), {"text": reply_text})()]
+
+    class _Client:
+        def __init__(self, api_key):
+            pass
+
+        class messages:  # noqa: N801
+            @staticmethod
+            def create(**kwargs):
+                return _Resp()
+    monkeypatch.setattr(anthropic, "Anthropic", _Client)
+
+
+def _hs_deal(name, stage_id, amount, idle_days, now):
+    import datetime as _dt
+    modified = now - idle_days * 86400
+    iso = _dt.datetime.fromtimestamp(modified, _dt.timezone.utc).isoformat()
+    return {"properties": {"dealname": name, "dealstage": stage_id,
+                           "amount": str(amount), "hs_lastmodifieddate": iso}}
+
+
+class TestEntityPipeline:
+    def test_omitted_for_non_pipeline_entities(self):
+        for e in ("HJRP", "HJRPROD", "F3C"):
+            out = cs.gather_pipeline_for_entity(e)
+            assert out == {"ok": False, "omitted": True}, e
+
+    def test_f3e_summary(self):
+        import time as _t
+        now = _t.time()
+        deals = [_hs_deal("Sprouts", "s1", 5000, 30, now),
+                 _hs_deal("GNC", "s1", 2000, 2, now)]
+        out = cs.gather_pipeline_for_entity(
+            "F3E", fetch_fn=lambda: deals,
+            stage_names={"s1": "Proposal"}, now=now)
+        assert out["ok"] is True
+        assert out["open_count"] == 2
+        assert out["open_amount"] == 7000.0
+        assert out["stages"]["Proposal"]["count"] == 2
+        assert len(out["aging"]) == 1
+        assert out["aging"][0]["name"] == "Sprouts"
+
+    def test_fetch_failure_degrades(self):
+        def boom():
+            raise RuntimeError("hubspot down")
+        out = cs.gather_pipeline_for_entity("OSN", fetch_fn=boom, stage_names={})
+        assert out["ok"] is False
+        assert out.get("error") is True
+
+
+class TestEntityCash:
+    def test_f3c_cash_omitted_no_fetch(self):
+        out = cs.gather_cash_for_entity("F3C")
+        assert out["ok"] is False and out["omitted"] is True
+        assert "F3 Energy" in out["note"]
+
+    def test_entity_cash_fetched(self, monkeypatch):
+        import cora.connectors.gsheets_financials as gf
+
+        class _S:
+            week_label = "Week of 7/6"
+            closing_balance = 62_427.0
+        monkeypatch.setattr(gf, "get_cashflow", lambda tab_name=None: _S())
+        out = cs.gather_cash_for_entity("OSN")
+        assert out["ok"] is True
+        assert out["closing_balance"] == 62_427.0
+
+    def test_entity_cash_failure_degrades(self, monkeypatch):
+        import cora.connectors.gsheets_financials as gf
+
+        def boom(tab_name=None):
+            raise gf.GsheetsConnectorError("missing tab")
+        monkeypatch.setattr(gf, "get_cashflow", boom)
+        out = cs.gather_cash_for_entity("BDM")
+        assert out["ok"] is False and out.get("error") is True
+
+
+class TestEntityDeadlineRadar:
+    def _map(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("STRATEGY_ASANA_MAP_PATH", str(tmp_path / "map.yaml"))
+        (tmp_path / "map.yaml").write_text(
+            "users:\n"
+            "  - slack_user_id: U1\n    asana_user_gid: '111'\n"
+            "    display_name: Alex Cordova\n"
+            "  - slack_user_id: U2\n    asana_user_gid: '222'\n"
+            "    display_name: Matt Petrovich\n", encoding="utf-8")
+
+    def test_filters_to_entity_only(self, tmp_path, monkeypatch):
+        self._map(tmp_path, monkeypatch)
+        tasks = {
+            "111": [
+                {"name": "F3E deck", "due_on": "2026-07-09", "completed": False,
+                 "projects": [{"name": "[F3E] Sales"}]},
+                {"name": "OSN thing", "due_on": "2026-07-09", "completed": False,
+                 "projects": [{"name": "[OSN] Ops"}]},  # foreign entity -> excluded
+            ],
+            "222": [
+                {"name": "F3E overdue", "due_on": "2026-07-01", "completed": False,
+                 "projects": [{"name": "[F3E] Retail"}]},
+            ],
+        }
+        out = cs.gather_deadline_radar_for_entity(
+            "F3E", today=date(2026, 7, 7),
+            get_tasks_fn=lambda gid: tasks[gid])
+        names = [i["name"] for i in out["items"]]
+        assert "F3E deck" in names
+        assert "F3E overdue" in names
+        assert "OSN thing" not in names       # cross-entity excluded
+        assert out["due_14d"] == 1
+        assert out["overdue"] == 1
+
+    def test_phi_name_counted_not_itemized(self, tmp_path, monkeypatch):
+        self._map(tmp_path, monkeypatch)
+        tasks = {"111": [
+            {"name": "Client patient intake form", "due_on": "2026-07-09",
+             "completed": False, "projects": [{"name": "[F3E] X"}]},
+        ], "222": []}
+        out = cs.gather_deadline_radar_for_entity(
+            "F3E", today=date(2026, 7, 7), get_tasks_fn=lambda gid: tasks[gid])
+        assert out["items"] == []            # PHI name never itemized
+        assert out["due_14d"] == 1           # still counted
+        assert out["redacted"] == 1
+
+    def test_itemize_false_counts_only(self, tmp_path, monkeypatch):
+        self._map(tmp_path, monkeypatch)
+        tasks = {"111": [
+            {"name": "[LEX] task name", "due_on": "2026-07-09", "completed": False,
+             "projects": [{"name": "[LEX-LLC] Ops"}]},
+        ], "222": []}
+        out = cs.gather_deadline_radar_for_entity(
+            "LEX", today=date(2026, 7, 7), itemize=False,
+            get_tasks_fn=lambda gid: tasks[gid])
+        assert out["items"] == []
+        assert out["due_14d"] == 1
+        assert out["redacted"] == 1
+
+
+class TestEntityDecisions:
+    def test_token_substring_filter(self, monkeypatch):
+        monkeypatch.setattr(sm, "gather_stalled_decisions", lambda today=None: {
+            "ok": True, "decisions": [
+                {"topic": "F3E expansion", "entity": "F3E, HJRPROD",
+                 "severity": "P0", "age_days": 5, "owner": "H"},
+                {"topic": "OSN cost", "entity": "OSN", "severity": "P0",
+                 "age_days": 5, "owner": "H"},
+                {"topic": "Podcast slot", "entity": "F3E / POD", "severity": "P1",
+                 "age_days": 5, "owner": "H"},
+            ]})
+        f3e = cs.gather_decisions_for_entity("F3E")
+        assert {d["topic"] for d in f3e["decisions"]} == {"F3E expansion", "Podcast slot"}
+        hjrprod = cs.gather_decisions_for_entity("HJRPROD")
+        # matches via alias token "POD" and the "HJRPROD" tag
+        assert {d["topic"] for d in hjrprod["decisions"]} == {"F3E expansion", "Podcast slot"}
+        osn = cs.gather_decisions_for_entity("OSN")
+        assert {d["topic"] for d in osn["decisions"]} == {"OSN cost"}
+
+
+class TestEntityKb:
+    def test_sums_entity_and_subentities_not_siblings(self, monkeypatch):
+        monkeypatch.setattr(sm, "gather_kb_activity", lambda: {
+            "ok": True, "by_entity": {"LEX": 100, "LEX-LLC": 40, "HJRP": 20,
+                                      "HJRPROD": 999, "F3E": 5}})
+        assert cs.gather_kb_for_entity("LEX")["count"] == 140      # LEX + LEX-LLC
+        assert cs.gather_kb_for_entity("HJRP")["count"] == 20      # NOT HJRPROD
+        assert cs.gather_kb_for_entity("HJRPROD")["count"] == 999
+
+
+class TestEntityDeltas:
+    def test_first_run(self):
+        assert cs.compute_entity_deltas("OSN", {"cash": {"ok": True,
+                "closing_balance": 1.0}}, []) == {"first_run": True}
+
+    def test_cash_delta_and_streak(self):
+        def snap(bal):
+            return {"cash": {"ok": True, "closing_balance": bal},
+                    "decisions": {"decisions": []}}
+        priors = [snap(60_000.0), snap(70_000.0)]  # newest first
+        cur = snap(50_000.0)
+        out = cs.compute_entity_deltas("OSN", cur, priors)
+        assert out["cash"]["delta"] == -10_000.0
+        assert out["cash"]["decline_streak"] == 2
+
+    def test_pipeline_delta(self):
+        cur = {"cash": {"ok": False}, "decisions": {"decisions": []},
+               "pipeline": {"ok": True, "open_count": 5, "open_amount": 20_000.0,
+                            "stages": {"Proposal": {"count": 3}}}}
+        prev = {"cash": {"ok": False}, "decisions": {"decisions": []},
+                "pipeline": {"ok": True, "open_count": 3, "open_amount": 12_000.0,
+                             "stages": {"Proposal": {"count": 1}}}}
+        out = cs.compute_entity_deltas("F3E", cur, [prev])
+        assert out["pipeline"]["open_count_delta"] == 2
+        assert out["pipeline"]["open_amount_delta"] == 8_000.0
+        assert out["pipeline"]["stage_moves"] == {"Proposal": 2}
+
+
+class TestEntityFacts:
+    def _g(self, entity, **over):
+        base = {"entity": entity, "date": "2026-07-07",
+                "cash": {"ok": True, "label": cs._ENTITY_LABELS[entity],
+                         "closing_balance": 62_427.0},
+                "pipeline": {"ok": False, "omitted": True},
+                "decisions": {"ok": True, "decisions": []},
+                "deadlines": {"ok": True, "due_14d": 2, "overdue": 1,
+                              "overdue_by_owner": {"Matt": 1},
+                              "items": [{"name": "X", "owner": "Matt",
+                                         "due_on": "2026-07-08", "overdue": False}]},
+                "kb_activity": {"ok": True, "count": 42},
+                "health": {"ok": True, "line": "Cora healthy (heartbeat 5s ago)"}}
+        base.update(over)
+        return base
+
+    def test_f3c_cash_omit_note(self):
+        g = self._g("F3C", cash={"ok": False, "omitted": True,
+                                 "note": "Cash is tracked under F3 Energy (shared entity ledger)."})
+        facts = cs.build_entity_facts_text("F3C", g, {"first_run": True})
+        assert "tracked under F3 Energy" in facts
+        assert "== PIPELINE" not in facts     # F3C omits pipeline
+
+    def test_hjrp_pipeline_section_absent(self):
+        facts = cs.build_entity_facts_text("HJRP", self._g("HJRP"), {"first_run": True})
+        assert "== PIPELINE" not in facts
+
+    def test_f3e_includes_ecom_and_pipeline(self):
+        g = self._g("F3E",
+                    pipeline={"ok": True, "open_count": 3, "open_amount": 30_000.0,
+                              "stages": {"Proposal": {"count": 3, "amount": 30_000.0}},
+                              "aging": []},
+                    ecom={"ok": True, "lines": ["- DTC: $10,000 net (7d)",
+                                                "- Subscriptions: 500 active"]})
+        facts = cs.build_entity_facts_text("F3E", g, {"first_run": True})
+        assert "== PIPELINE" in facts
+        assert "== ECOM" in facts
+        assert "DTC" in facts
+
+
+class TestEntitySynth:
+    def test_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert cs.synthesize_channel_entity("OSN", "facts") is None
+
+    def test_cross_entity_mention_logged_not_dropped(self, monkeypatch, caplog):
+        # A foreign-entity keyword is a legitimate-collaborator signal, not a data
+        # leak (the entity-scoped gather is the firewall). Keep the post, log it --
+        # dropping to fallback would keep the same mention and only lose quality.
+        import logging
+        text = "*Moved* Coordinating with Big D Media on the can graphic."
+        _install_fake_anthropic(monkeypatch, text)
+        with caplog.at_level(logging.INFO, logger="cora.channel_synthesis"):
+            out = cs.synthesize_channel_entity("F3E", "facts")
+        assert out == text
+        assert any("references another entity" in r.message for r in caplog.records)
+
+    def test_entity_scoped_gather_is_the_firewall(self, tmp_path, monkeypatch):
+        """The structural firewall: a FOREIGN entity's task never enters the
+        entity facts, so a foreign figure can never be synthesized."""
+        monkeypatch.setenv("STRATEGY_ASANA_MAP_PATH", str(tmp_path / "m.yaml"))
+        (tmp_path / "m.yaml").write_text(
+            "users:\n  - slack_user_id: U1\n    asana_user_gid: '111'\n"
+            "    display_name: X\n", encoding="utf-8")
+        tasks = {"111": [
+            {"name": "OSN secret deal $9M", "due_on": "2026-07-09",
+             "completed": False, "projects": [{"name": "[OSN] Ops"}]}]}
+        out = cs.gather_deadline_radar_for_entity(
+            "F3E", today=date(2026, 7, 7), get_tasks_fn=lambda gid: tasks["111"])
+        assert out["items"] == []            # OSN task never reaches F3E facts
+        assert out["due_14d"] == 0
+
+    def test_clean_entity_output_survives(self, monkeypatch):
+        text = "*Moved* DTC net up. *Watch* aging deal in retail pipeline."
+        _install_fake_anthropic(monkeypatch, text)
+        assert cs.synthesize_channel_entity("F3E", "facts") == text
+
+    def test_prompt_source_opaque_and_scope_note(self):
+        assert "SOURCE-OPAQUE" in cs._ENTITY_PROMPT
+        assert "STRICTLY within" in cs._ENTITY_PROMPT
+        assert "PAUSED" in cs._ENTITY_SCOPE_NOTE["UFL"]
+        assert "nonprofit" in cs._ENTITY_SCOPE_NOTE["F3C"]
+
+
+class TestEcomFold:
+    def test_fail_soft_all_sections(self, monkeypatch):
+        # Force every connector call to raise -> every line degrades, never raises.
+        import cora.connectors.shopify_client as shopify
+        import cora.connectors.polar_client as polar
+        import cora.tools.asana_client as asana
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+        monkeypatch.setattr(shopify, "get_sales_pulse", boom)
+        monkeypatch.setattr(shopify, "get_inventory_status", boom)
+        monkeypatch.setattr(polar, "generate_report", boom)
+        monkeypatch.setattr(asana, "get_project_tasks", boom)
+        out = cs.gather_f3e_ecom(today=date(2026, 7, 7))
+        assert out["ok"] is True
+        assert len(out["lines"]) == 5
+        assert any("not available" in ln or "not connected" in ln for ln in out["lines"])
+
+
+class TestRunEntityWiring:
+    def test_posts_to_entity_channel(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "syn"))
+        monkeypatch.setattr(cs, "gather_all_for_entity",
+                            lambda entity, today=None: {"entity": entity,
+                                                        "date": "2026-07-07",
+                                                        "cash": {"ok": False}})
+        monkeypatch.setattr(cs, "compute_entity_deltas",
+                            lambda e, c, p: {"first_run": True})
+        monkeypatch.setattr(cs, "build_entity_facts_text", lambda e, g, d: "FACTS")
+        monkeypatch.setattr(cs, "synthesize_channel_entity",
+                            lambda e, facts: "OSN BODY")
+        import slack_sdk
+        monkeypatch.setattr(slack_sdk, "WebClient", _FakeClient)
+        _FakeClient.last = {}
+        out = cs.run_entity("osn", dry_run=False, today=date(2026, 7, 7))
+        assert out["delivered"] is True
+        assert _FakeClient.last["channel"] == cs.SCOPE_CHANNELS["osn"]
+        assert "OSN BODY" in _FakeClient.last["text"]
+        assert (tmp_path / "syn" / "osn" / "2026-07-07.json").exists()
+
+    def test_unknown_entity_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            cs.run_entity("nope", dry_run=True)
+
 
 class TestSourcePostSites:
     def test_channel_module_posts_to_channels_never_opens_dm(self):

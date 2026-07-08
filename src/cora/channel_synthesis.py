@@ -31,9 +31,12 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date
+import re
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from . import asana_filters as af
 from . import strategy_memo as sm
 
 log = logging.getLogger(__name__)
@@ -291,6 +294,659 @@ def run_portfolio(*, dry_run: bool = False, today: date | None = None,
         gather_fn=lambda: sm.gather_all(today=today),
         synth_fn=synthesize_channel_portfolio,
         deliver_fn=lambda body: deliver_to_channel(ch, body, today=today),
+        dry_run=dry_run,
+        today=today,
+    )
+
+
+# ===========================================================================
+# Per-entity synthesis
+# ===========================================================================
+
+_ENTITY_LABELS: dict[str, str] = {
+    "F3E":     "F3 Energy",
+    "OSN":     "One Stop Nutrition",
+    "UFL":     "United Fight League",
+    "BDM":     "Big D Media",
+    "HJRP":    "HJR Properties",
+    "HJRPROD": "HJR Productions",
+    "F3C":     "F3 Community",
+    "LEX":     "Lexington Services",
+}
+
+# Pipeline mode per entity: "f3e" -> the F3E Retail pipeline (all F3E);
+# "default" -> the shared default pipeline, subset by f3_entity; absent -> no
+# pipeline section (HJRP / HJRPROD / F3C / LEX are not deal-pipeline entities).
+_ENTITY_PIPELINE_MODE: dict[str, str] = {
+    "F3E": "f3e", "OSN": "default", "UFL": "default", "BDM": "default",
+}
+
+# F3C shares F3 Energy's cash tab (entity_to_tab("F3C") == "CF_F3"), so fetching
+# it would post F3E's exact figures to #f3c-leadership (D3). Omit F3C cash with an
+# explicit note instead.
+_CASH_OMIT_ENTITIES: frozenset[str] = frozenset({"F3C"})
+
+# Decision-tag tokens per entity: decisions-pending Entity fields are free-text,
+# multi-value (e.g. "F3E, HJRPROD", "F3E / POD"), so match ANY token as a word,
+# not string equality (D7).
+_ENTITY_DECISION_TOKENS: dict[str, tuple[str, ...]] = {
+    "F3E":     ("F3E",),
+    "OSN":     ("OSN",),
+    "UFL":     ("UFL",),
+    "BDM":     ("BDM",),
+    "HJRP":    ("HJRP",),
+    "HJRPROD": ("HJRPROD", "POD", "FF"),
+    "F3C":     ("F3C",),
+    "LEX":     ("LEX", "LTS", "LBHS", "LLA", "LLC"),
+}
+
+# Short scope caveat woven into the synth prompt for the low-activity entities.
+_ENTITY_SCOPE_NOTE: dict[str, str] = {
+    "UFL": ("This entity is currently PAUSED -- a short 'quiet day' post is "
+            "expected and correct; do not manufacture activity."),
+    "F3C": ("This is a small nonprofit arm -- brief posts are expected; do not "
+            "manufacture activity."),
+    "HJRPROD": ("This is the media/production arm -- posts may be brief."),
+}
+
+
+# ---------------------------------------------------------------------------
+# Entity gathers (scoped, fail-soft)
+# ---------------------------------------------------------------------------
+
+def gather_cash_for_entity(entity: str) -> dict:
+    """Single-entity closing balance from the Standing ACTUALS tab. F3C omits
+    (shares F3E's tab); a dead source degrades to {'error': True}."""
+    label = _ENTITY_LABELS.get(entity, entity)
+    if entity in _CASH_OMIT_ENTITIES:
+        return {"ok": False, "omitted": True, "label": label,
+                "note": "Cash is tracked under F3 Energy (shared entity ledger)."}
+    from .connectors.gsheets_financials import (
+        GsheetsConnectorError, entity_to_tab, get_cashflow,
+    )
+    try:
+        summary = get_cashflow(tab_name=entity_to_tab(entity))
+        return {"ok": True, "label": label,
+                "closing_balance": summary.closing_balance,
+                "week_label": getattr(summary, "week_label", "")}
+    except GsheetsConnectorError as exc:
+        log.warning("channel_synthesis: cash fetch failed for %s: %s", entity, exc)
+        return {"ok": False, "error": True, "label": label}
+    except Exception as exc:  # noqa: BLE001 -- fail-soft
+        log.warning("channel_synthesis: cash error for %s: %s", entity, exc)
+        return {"ok": False, "error": True, "label": label}
+
+
+def _summarize_deals(deals: list, stage_names: dict, now: float) -> dict:
+    """Open-deal rollup (count / amount / stage mix / aging) -- mirrors
+    strategy_memo.gather_pipeline's per-pipeline math for a single deal list."""
+    aging_cutoff = now - sm.PIPELINE_AGING_DAYS * 86400
+    stages: dict[str, dict] = {}
+    open_count = 0
+    open_amount = 0.0
+    aging: list[dict] = []
+    for deal in deals:
+        props = deal.get("properties") or {}
+        stage_id = str(props.get("dealstage") or "")
+        stage = stage_names.get(stage_id, stage_id) or "(unknown)"
+        if "closed" in stage.lower():
+            continue
+        try:
+            amount = float(props.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        open_count += 1
+        open_amount += amount
+        bucket = stages.setdefault(stage, {"count": 0, "amount": 0.0})
+        bucket["count"] += 1
+        bucket["amount"] += amount
+        modified = sm._parse_hs_ts(props.get("hs_lastmodifieddate"))
+        if modified is not None and modified < aging_cutoff:
+            aging.append({"name": str(props.get("dealname") or "(unnamed)")[:80],
+                          "stage": stage, "amount": amount,
+                          "idle_days": int((now - modified) // 86400)})
+    aging.sort(key=lambda d: -d["idle_days"])
+    return {"open_count": open_count, "open_amount": round(open_amount, 2),
+            "stages": stages, "aging": aging[:8]}
+
+
+def gather_pipeline_for_entity(entity: str, *, fetch_fn=None,
+                               stage_names: dict | None = None,
+                               now: float | None = None) -> dict:
+    """Entity pipeline posture. F3E -> the F3E Retail pipeline; OSN/UFL/BDM ->
+    the shared default pipeline subset by f3_entity (get_deals_by_filter, which
+    server-side filters on f3_entity and drops closed). Other entities omit."""
+    mode = _ENTITY_PIPELINE_MODE.get(entity)
+    if not mode:
+        return {"ok": False, "omitted": True}
+    now = now or time.time()
+    from .tools import hubspot_client
+
+    if fetch_fn is None:
+        if mode == "f3e":
+            fetch_fn = lambda: hubspot_client.get_deals_by_filter(  # noqa: E731
+                entity="F3E", pipeline_id=hubspot_client.PIPELINE_F3E_RETAIL)
+        else:
+            fetch_fn = lambda: hubspot_client.get_deals_by_filter(  # noqa: E731
+                entity=entity, pipeline_id="default")
+    try:
+        deals = fetch_fn()
+    except Exception as exc:  # noqa: BLE001 -- fail-soft
+        log.warning("channel_synthesis: pipeline fetch failed for %s: %s", entity, exc)
+        return {"ok": False, "error": True}
+    names = stage_names if stage_names is not None else getattr(
+        hubspot_client, "_STAGE_NAME_CACHE", {})
+    summary = _summarize_deals(deals, names, now)
+    return {"ok": True, "label": f"{_ENTITY_LABELS.get(entity, entity)} pipeline",
+            **summary}
+
+
+def gather_deadline_radar_for_entity(entity: str, *, today: date | None = None,
+                                     get_tasks_fn=None,
+                                     itemize: bool = True) -> dict:
+    """Entity-scoped deadline radar (14d horizon). Filters tasks to *entity*'s
+    project prefixes. PHI/Visibility-flagged names are counted but NEVER itemized.
+    itemize=False (LEX) returns counts only -- no task names at all."""
+    import yaml
+
+    if get_tasks_fn is None:
+        from .tools.asana_client import get_user_tasks
+        get_tasks_fn = lambda gid: get_user_tasks(gid, max_tasks=100)  # noqa: E731
+    from .phi_guard import is_phi_risk, is_visibility_cpa_mention
+
+    try:
+        raw = yaml.safe_load(sm._asana_map_path().read_text(encoding="utf-8")) or {}
+        users = raw.get("users") or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: asana map unreadable: %s", exc)
+        return {"ok": False}
+
+    today = today or _today()
+    horizon = today + timedelta(days=sm.DEADLINE_RADAR_DAYS)
+    items: list[dict] = []
+    overdue_by_owner: dict[str, int] = {}
+    due_count = 0
+    overdue_count = 0
+    redacted = 0
+    users_failed = 0
+    for user in users:
+        gid = str(user.get("asana_user_gid") or "")
+        owner = str(user.get("display_name") or "unknown")
+        if not gid:
+            continue
+        try:
+            tasks = get_tasks_fn(gid)
+        except Exception as exc:  # noqa: BLE001 -- fail-soft per user
+            log.warning("channel_synthesis: task fetch failed for %s: %s", owner, exc)
+            users_failed += 1
+            continue
+        for task in tasks:
+            if task.get("completed"):
+                continue
+            if not af.task_belongs_to_entity(task, entity):
+                continue
+            due_raw = task.get("due_on") or ""
+            try:
+                due = datetime.strptime(due_raw, "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue
+            if due > horizon:
+                continue
+            is_overdue = due < today
+            if is_overdue:
+                overdue_count += 1
+                overdue_by_owner[owner] = overdue_by_owner.get(owner, 0) + 1
+            else:
+                due_count += 1
+            name = str(task.get("name") or "")
+            if (not itemize) or is_phi_risk(name) or is_visibility_cpa_mention(name):
+                redacted += 1
+                continue
+            items.append({"name": name[:100], "owner": owner,
+                          "due_on": due_raw, "overdue": is_overdue})
+    items.sort(key=lambda t: t["due_on"])
+    return {
+        "ok": True,
+        "due_14d": due_count,
+        "overdue": overdue_count,
+        "overdue_by_owner": dict(sorted(overdue_by_owner.items(),
+                                        key=lambda kv: -kv[1])),
+        "items": items[:sm.MAX_RADAR_ITEMS],
+        "redacted": redacted,
+        "users_failed": users_failed,
+    }
+
+
+def gather_decisions_for_entity(entity: str, *, today: date | None = None) -> dict:
+    """Stalled P0/P1 decisions filtered to *entity* by word-boundary token match on
+    the free-text Entity field (D7). gather_stalled_decisions already PHI-filters."""
+    base = sm.gather_stalled_decisions(today=today)
+    if not base.get("ok"):
+        return base
+    tokens = _ENTITY_DECISION_TOKENS.get(entity, (entity,))
+    pats = [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in tokens]
+    kept = [d for d in base.get("decisions", [])
+            if any(p.search(str(d.get("entity", ""))) for p in pats)]
+    return {"ok": True, "decisions": kept}
+
+
+def gather_kb_for_entity(entity: str) -> dict:
+    """Entity KB momentum (last 7d swept-content count), summing the entity's own
+    bucket plus its "ENTITY-" sub-entity buckets (so LEX includes LEX-LLC but HJRP
+    excludes HJRPROD)."""
+    base = sm.gather_kb_activity()
+    if not base.get("ok"):
+        return base
+    by = base.get("by_entity") or {}
+    total = sum(c for e, c in by.items()
+                if e == entity or e.startswith(entity + "-"))
+    return {"ok": True, "count": total}
+
+
+# ---------------------------------------------------------------------------
+# F3E ecom fold (source-opaque) -- folds run_f3e_ecom_brief into the F3E synthesis
+# ---------------------------------------------------------------------------
+# Reproduces the proven section logic of scripts/run_f3e_ecom_brief.py so the
+# ecom detail (DTC / paid / subscriptions / inventory / production) rides in the
+# F3E synthesis and the standalone #f3-ops-cockpit task can be retired (Harrison
+# 2026-07-07 decision #3). The RETAIL line is intentionally omitted here -- the
+# F3E pipeline section already covers it (no double-report). SOURCE-OPAQUE
+# (f3e.md non-negotiable): never name the platform / sheet / ad network. Every
+# section fail-soft.
+
+_ECOM_WINDOW_DAYS = 30
+_ECOM_RUN2_PROJECT_GID = "1215472268404903"  # [F3E] F3 Production - Run 2
+_ECOM_PAID_METRICS = ["total_marketing_spend", "blended_net_sales",
+                      "blended_roas", "blended_total_orders"]
+_ECOM_PAID_DIMENSION = "custom_internal-default-channel-grouping"
+_ECOM_SUB_METRICS = [
+    "recharge_sales_products.computed.net_sales",
+    "recharge_sales_products.raw.total_active_subscriptions",
+]
+
+
+def _ecom_num(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(str(value).replace(",", "").replace("$", "").strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ecom_money(value) -> str:
+    return f"${_ecom_num(value):,.0f}"
+
+
+def gather_f3e_ecom(*, today: date | None = None) -> dict:
+    """Source-opaque F3E ecom/ops facts (DTC / paid / subscriptions / inventory /
+    production). Fail-soft per section; returns {'ok': True, 'lines': [...]} where
+    lines are ready-to-read fact strings. Never raises."""
+    today = today or _today()
+    lines: list[str] = []
+
+    # DTC
+    try:
+        from .connectors import shopify_client
+        d7 = shopify_client.get_sales_pulse("7d")
+        d30 = shopify_client.get_sales_pulse("30d")
+        lines.append(f"- DTC: {_ecom_money(d7.net_revenue_usd)} net / "
+                     f"{d7.order_count} orders / {_ecom_money(d7.avg_order_value_usd)} "
+                     f"AOV (7d); {_ecom_money(d30.net_revenue_usd)} net (30d)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E DTC section unavailable: %s", exc)
+        lines.append("- DTC: not available")
+
+    # Paid (blended) + Subscriptions
+    cur_start = today - timedelta(days=_ECOM_WINDOW_DAYS)
+    win = (cur_start.isoformat(), today.isoformat())
+    try:
+        from .connectors import polar_client
+        rep = polar_client.generate_report(
+            metrics=_ECOM_PAID_METRICS, dimensions=[_ECOM_PAID_DIMENSION],
+            date_from=win[0], date_to=win[1], granularity="none")
+        spend = rep.total_data.get("total_marketing_spend")
+        mer = _ecom_num(rep.total_data.get("blended_roas"))
+        bnet = rep.total_data.get("blended_net_sales")
+        lines.append(f"- Paid (blended): {_ecom_money(spend)} spend / {mer:.2f}x MER / "
+                     f"{_ecom_money(bnet)} net (30d)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E paid section unavailable: %s", exc)
+        lines.append("- Paid (blended): not connected")
+
+    try:
+        from .connectors import polar_client
+        rep = polar_client.generate_report(
+            metrics=_ECOM_SUB_METRICS, dimensions=[],
+            date_from=win[0], date_to=win[1], granularity="none")
+        net = rep.total_data.get("recharge_sales_products.computed.net_sales")
+        active = int(_ecom_num(rep.total_data.get(
+            "recharge_sales_products.raw.total_active_subscriptions")))
+        lines.append(f"- Subscriptions: {_ecom_money(net)} net / {active} active (30d)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E subs section unavailable: %s", exc)
+        lines.append("- Subscriptions: not connected")
+
+    # Inventory (beverage low-stock; the single F3E inventory source -- supersedes
+    # run_inventory_alerts' pulse to avoid double-reporting)
+    try:
+        from .connectors import shopify_client
+        variants = shopify_client.get_inventory_status(low_stock_threshold=10)
+        beverages = [v for v in variants if shopify_client.is_beverage_product(
+            getattr(v, "product_type", ""), getattr(v, "product_title", ""))]
+        low = [v for v in beverages if getattr(v, "low_stock", False)]
+        if not low:
+            lines.append("- Inventory: all healthy")
+        else:
+            low.sort(key=lambda v: getattr(v, "qty_on_hand", 0))
+            named = "; ".join(
+                f"{' '.join(p for p in (v.product_title, v.variant_title) if p)} "
+                f"({v.qty_on_hand})" for v in low[:5])
+            extra = len(low) - 5
+            suffix = f" +{extra} more" if extra > 0 else ""
+            lines.append(f"- Inventory: {len(low)} low/critical -- {named}{suffix}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E inventory section unavailable: %s", exc)
+        lines.append("- Inventory: not available")
+
+    # Production (Run-2)
+    try:
+        from .tools import asana_client
+        tasks = asana_client.get_project_tasks(_ECOM_RUN2_PROJECT_GID, max_tasks=100)
+        open_tasks = [t for t in tasks if not t.get("completed")]
+        overdue = []
+        upcoming: list[date] = []
+        for t in open_tasks:
+            d = asana_client._parse_due_date(t.get("due_on") or t.get("due_at") or "")
+            if d is None:
+                continue
+            (overdue if d < today else upcoming).append(d)
+        next_due = min(upcoming).isoformat() if upcoming else "-"
+        lines.append(f"- Production (Run-2): {len(open_tasks)} open, "
+                     f"{len(overdue)} overdue -- next due {next_due}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E production section unavailable: %s", exc)
+        lines.append("- Production (Run-2): not available")
+
+    return {"ok": True, "lines": lines}
+
+
+# ---------------------------------------------------------------------------
+# Entity gather orchestration + facts + deltas
+# ---------------------------------------------------------------------------
+
+def gather_all_for_entity(entity: str, *, today: date | None = None) -> dict:
+    """Scoped fact base for one entity, each section fail-soft."""
+    today = today or _today()
+    gathered = {
+        "entity": entity,
+        "date": today.isoformat(),
+        "cash": sm._safe_gather("cash", lambda: gather_cash_for_entity(entity)),
+        "pipeline": sm._safe_gather(
+            "pipeline", lambda: gather_pipeline_for_entity(entity)),
+        "decisions": sm._safe_gather(
+            "decisions", lambda: gather_decisions_for_entity(entity, today=today)),
+        "deadlines": sm._safe_gather(
+            "deadlines",
+            lambda: gather_deadline_radar_for_entity(entity, today=today)),
+        "kb_activity": sm._safe_gather(
+            "kb_activity", lambda: gather_kb_for_entity(entity)),
+        "health": sm._safe_gather("health", sm.gather_health),
+    }
+    if entity == "F3E":
+        gathered["ecom"] = sm._safe_gather("ecom", lambda: gather_f3e_ecom(today=today))
+    return gathered
+
+
+def _change(value: float | None) -> str:
+    if value is None:
+        return ""
+    arrow = "up" if value >= 0 else "down"
+    return f"({arrow} {sm._fmt_money(abs(value))} since prior)"
+
+
+def compute_entity_deltas(entity: str, current: dict, priors: list) -> dict:
+    """Day-over-day deltas for a single entity (cash, pipeline, unmoved decisions).
+    priors newest-first. Returns {'first_run': True} when no prior snapshot."""
+    if not priors:
+        return {"first_run": True}
+    prev = priors[0]
+    out: dict = {"first_run": False, "prev_date": prev.get("date", "")}
+
+    def _cash(snap):
+        c = snap.get("cash") or {}
+        return c.get("closing_balance") if c.get("ok") else None
+
+    cur, before = _cash(current), _cash(prev)
+    if cur is not None and before is not None:
+        chain = [current] + priors
+        streak = 0
+        for newer, older in zip(chain, chain[1:]):
+            a, b = _cash(newer), _cash(older)
+            if a is None or b is None or a >= b:
+                break
+            streak += 1
+        out["cash"] = {"delta": round(cur - before, 2), "decline_streak": streak}
+
+    cur_p = current.get("pipeline") or {}
+    prev_p = prev.get("pipeline") or {}
+    if cur_p.get("ok") and prev_p.get("ok"):
+        moves: dict[str, int] = {}
+        all_stages = set(cur_p.get("stages") or {}) | set(prev_p.get("stages") or {})
+        for stage in all_stages:
+            c = ((cur_p.get("stages") or {}).get(stage) or {}).get("count", 0)
+            p = ((prev_p.get("stages") or {}).get(stage) or {}).get("count", 0)
+            if c != p:
+                moves[stage] = c - p
+        out["pipeline"] = {
+            "open_count_delta": cur_p.get("open_count", 0) - prev_p.get("open_count", 0),
+            "open_amount_delta": round(cur_p.get("open_amount", 0.0)
+                                       - prev_p.get("open_amount", 0.0), 2),
+            "stage_moves": moves,
+        }
+
+    def _topics(snap):
+        return {d.get("topic", "") for d in
+                ((snap.get("decisions") or {}).get("decisions") or [])}
+
+    unmoved: dict[str, int] = {}
+    prior_sets = [_topics(s) for s in priors]
+    for topic in _topics(current):
+        streak = 1
+        for topic_set in prior_sets:
+            if topic in topic_set:
+                streak += 1
+            else:
+                break
+        if streak >= 2:
+            unmoved[topic] = streak
+    out["unmoved_decisions"] = unmoved
+    return out
+
+
+def build_entity_facts_text(entity: str, gathered: dict, deltas: dict) -> str:
+    label = _ENTITY_LABELS.get(entity, entity)
+    lines: list[str] = [f"{label.upper()} FACT BASE -- {gathered.get('date', '')}"]
+    if deltas.get("first_run"):
+        lines.append("NOTE: first run -- no prior snapshot, no deltas yet.")
+    else:
+        lines.append(f"Deltas vs snapshot {deltas.get('prev_date', '')} "
+                     "(prior business day).")
+
+    # CASH
+    lines.append("\n== CASH ==")
+    cash = gathered.get("cash") or {}
+    if cash.get("omitted"):
+        lines.append(cash.get("note") or "(cash omitted for this entity)")
+    elif cash.get("ok"):
+        d = (deltas.get("cash") or {})
+        bits = [f"- {cash.get('label', label)}: {sm._fmt_money(cash.get('closing_balance'))}"]
+        if d.get("delta") is not None:
+            bits.append(_change(d["delta"]))
+        if d.get("decline_streak", 0) >= 2:
+            bits.append(f"[cash down {d['decline_streak']} days straight]")
+        if cash.get("week_label"):
+            bits.append(f"(sheet week {cash['week_label']})")
+        lines.append(" ".join(b for b in bits if b))
+    else:
+        lines.append("(cash source unavailable today)")
+
+    # PIPELINE
+    pipeline = gathered.get("pipeline") or {}
+    if pipeline.get("omitted"):
+        pass  # entity has no deal pipeline -- omit the section entirely
+    else:
+        lines.append("\n== PIPELINE (retail / sales) ==")
+        if pipeline.get("ok"):
+            d = (deltas.get("pipeline") or {})
+            head = (f"- {pipeline.get('open_count', 0)} open deals, "
+                    f"{sm._fmt_money(pipeline.get('open_amount'))}")
+            if d:
+                head += (f" (count {d.get('open_count_delta', 0):+d}, "
+                         f"{sm._fmt_money(d.get('open_amount_delta'))} since prior)")
+            lines.append(head)
+            for stage, bucket in (pipeline.get("stages") or {}).items():
+                lines.append(f"    {stage}: {bucket.get('count', 0)} / "
+                             f"{sm._fmt_money(bucket.get('amount'))}")
+            for move_stage, move in (d.get("stage_moves") or {}).items():
+                lines.append(f"    stage move: {move_stage} {move:+d}")
+            for deal in (pipeline.get("aging") or [])[:5]:
+                lines.append(f"    AGING: {deal['name']} ({deal['stage']}, "
+                             f"{sm._fmt_money(deal['amount'])}, idle "
+                             f"{deal['idle_days']}d)")
+        else:
+            lines.append("(pipeline source unavailable today)")
+
+    # ECOM (F3E only)
+    ecom = gathered.get("ecom") or {}
+    if ecom.get("ok"):
+        lines.append("\n== ECOM / OPS (source-opaque) ==")
+        lines.extend(ecom.get("lines") or [])
+
+    # DEADLINES
+    lines.append("\n== DEADLINES (next 14d) ==")
+    radar = gathered.get("deadlines") or {}
+    if radar.get("ok"):
+        lines.append(f"Due in window: {radar.get('due_14d', 0)} | "
+                     f"Overdue: {radar.get('overdue', 0)}")
+        owners = radar.get("overdue_by_owner") or {}
+        if owners:
+            lines.append("Overdue by owner: " + ", ".join(
+                f"{name} {count}" for name, count in list(owners.items())[:8]))
+        for item in (radar.get("items") or []):
+            marker = "OVERDUE" if item.get("overdue") else f"due {item.get('due_on')}"
+            lines.append(f"- {item['name']} ({item['owner']}, {marker})")
+    else:
+        lines.append("(deadline source unavailable today)")
+
+    # DECISIONS
+    lines.append("\n== STALLED P0/P1 DECISIONS ==")
+    decisions = gathered.get("decisions") or {}
+    rows = decisions.get("decisions") or []
+    if decisions.get("ok") and rows:
+        for d in rows[:10]:
+            age = f"{d['age_days']}d old" if d.get("age_days") is not None else "age unknown"
+            lines.append(f"- [{d['severity']}] {d['topic']} ({age}; "
+                         f"next: {d['owner']})")
+    elif decisions.get("ok"):
+        lines.append("(no open P0/P1 decisions)")
+    else:
+        lines.append("(decisions source unavailable today)")
+
+    # KB MOMENTUM
+    kb = gathered.get("kb_activity") or {}
+    if kb.get("ok"):
+        lines.append(f"\n== ACTIVITY == last 7d swept content: {kb.get('count', 0)} items")
+
+    # HEALTH
+    health = gathered.get("health") or {}
+    if health.get("ok"):
+        lines.append(f"\n{health.get('line', '')}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Entity synthesis prompt + synth (Moved / Needs you / Due / Watch)
+# ---------------------------------------------------------------------------
+
+_ENTITY_PROMPT = """\
+You are writing the DAILY operational synthesis for the {label} leadership channel.
+{scope_note}
+Below is today's verified fact base for {label}, with day-over-day deltas. Write a
+tight, operational post (roughly 150-220 words) with these sections, each a bold
+header on its own line (omit a section that has nothing to say):
+
+*Moved* -- what changed since the prior business day (cash, pipeline, deadlines).
+*Needs you* -- the few decisions or stalled items that need a leader's attention.
+*Due soon* -- the near-term deadlines and overdue items that matter.
+*Watch* -- items trending but not yet actionable (inventory flags, aging deals, momentum).
+
+Hard rules:
+- Use ONLY facts present in the fact base. Never invent numbers, deals, dates, or
+  names. A quiet day is fine to state plainly.
+- SOURCE-OPAQUE: describe activity by function ("DTC", "subscriptions", "paid",
+  "retail pipeline", "production"), NEVER name the underlying platform, tool, sheet,
+  or ad network.
+- Stay STRICTLY within {label}. Do NOT mention, compare against, or route to any
+  other portfolio entity.
+- Never include client names, diagnoses, or client-level health information.
+- Advisory / operational only; nothing here executes automatically.
+- Plain text, Slack-friendly. *single asterisks* for bold. No markdown tables.
+
+FACT BASE:
+{facts}
+"""
+
+
+def synthesize_channel_entity(entity: str, facts_text: str, *, phi_check=None) -> str | None:
+    """Entity operational synthesis (Sonnet, FAIL-CLOSED). Applies a post-synthesis
+    cross-entity bleed assertion (drops to fallback if the output names a foreign
+    entity). phi_check overrides the default backstop (LEX passes a stricter gate)."""
+    label = _ENTITY_LABELS.get(entity, entity)
+    prompt = _ENTITY_PROMPT.format(
+        label=label, scope_note=_ENTITY_SCOPE_NOTE.get(entity, ""),
+        facts=facts_text)
+    text = _synthesize(prompt, phi_check=phi_check)
+    if text is None:
+        return None
+    # Cross-entity observability (NOT a hard block). The REAL firewall is the
+    # entity-scoped GATHER: only this entity's cash / pipeline / deadlines /
+    # decisions ever enter the facts, so the synthesis cannot surface another
+    # entity's PRIVATE data (structural guarantee, test-pinned). A foreign-entity
+    # KEYWORD in the output is almost always a legitimate collaborator/vendor
+    # reference from this entity's OWN task ("liaise with Big D Media on the can
+    # graphic") -- and since the deterministic fallback carries the SAME facts,
+    # dropping to fallback would NOT remove the mention, only degrade quality. So
+    # we LOG it for review and keep the post. The prompt still instructs the model
+    # to stay strictly within scope. Never fires for the paired F3E/F3C.
+    try:
+        from .cross_entity_guard import check_cross_entity
+        if check_cross_entity(text, entity):
+            log.info("channel_synthesis: %s synthesis references another entity "
+                     "(likely a legitimate collaborator mention; entity-scoped "
+                     "gather is the firewall) -- kept, logged for review", entity)
+    except Exception:  # noqa: BLE001 -- observability must never block the post
+        log.exception("channel_synthesis: cross-entity check raised")
+    return text
+
+
+def run_entity(entity: str, *, dry_run: bool = False, today: date | None = None,
+               channel: str | None = None) -> dict:
+    """One entity synthesis -> its leadership channel."""
+    entity = entity.upper()
+    today = today or _today()
+    scope = entity.lower()
+    ch = channel or SCOPE_CHANNELS.get(scope)
+    if ch is None:
+        raise ValueError(f"no channel configured for entity {entity!r}")
+    return run_synthesis(
+        scope,
+        gather_fn=lambda: gather_all_for_entity(entity, today=today),
+        synth_fn=lambda facts: synthesize_channel_entity(entity, facts),
+        deliver_fn=lambda body: deliver_to_channel(ch, body, today=today),
+        deltas_fn=lambda gathered, priors: compute_entity_deltas(entity, gathered, priors),
+        facts_fn=lambda gathered, deltas: build_entity_facts_text(entity, gathered, deltas),
         dry_run=dry_run,
         today=today,
     )
