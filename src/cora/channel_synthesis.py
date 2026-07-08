@@ -118,3 +118,179 @@ def deliver_to_channel(channel_id: str, body: str, *, today: date | None = None)
 
 def _today() -> date:
     return sm._today()
+
+
+# ---------------------------------------------------------------------------
+# Per-scope snapshots (day-over-day deltas; separate from the weekly memo)
+# ---------------------------------------------------------------------------
+
+def _synthesis_snapshot_root() -> Path:
+    return Path(os.environ.get("SYNTHESIS_SNAPSHOT_DIR")
+                or sm._REPO_ROOT / "data" / "state" / "synthesis-snapshots")
+
+
+def _scope_snapshot_dir(scope: str) -> Path:
+    """A distinct snapshot dir per scope (portfolio / f3e / osn / ...), so daily
+    deltas never collide with the weekly memo's strategy-memo-snapshots."""
+    return _synthesis_snapshot_root() / scope
+
+
+# ---------------------------------------------------------------------------
+# Synthesis (Sonnet, FAIL-CLOSED, output PHI backstop)
+# ---------------------------------------------------------------------------
+
+def _default_phi_check(text: str) -> bool:
+    """Output backstop for the portfolio + non-LEX entity syntheses.
+
+    Uses the NARROW is_clinical_phi (DOB / ICD-10 / 'diagnosed with X' / bare
+    diagnosis terms / medication names). DELIBERATELY NOT the broad is_phi_risk:
+    that over-trips on ordinary aggregate program vocab (AHCCCS / Medicaid /
+    assessment / discharge / member id) that legitimately appears in a holdco
+    operational post's Lexington aggregate line, and would false-drop it to the
+    fallback every run. Clinical PHI (a leaked diagnosis / med) is the real
+    hazard the backstop must catch; the gather + prompt layers are the primary
+    guarantee that no client detail reaches the facts at all. LEX has its own
+    stricter output gate (see synthesize_channel_entity)."""
+    from .phi_guard import is_clinical_phi
+    return is_clinical_phi(text)
+
+
+def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
+    """One Sonnet synthesis call. FAIL-CLOSED: None on missing key / API error /
+    empty output / a positive PHI check -- the caller falls back to a deterministic
+    factual rollup, never a hallucinated or PHI-bearing post."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        log.warning("channel_synthesis: ANTHROPIC_API_KEY not set -- no synthesis")
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=sm.SONNET_MODEL,
+            max_tokens=sm._SYNTH_MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt_text}],
+        )
+        text = (response.content[0].text or "").strip()
+    except Exception as exc:  # noqa: BLE001 -- fail-closed by design
+        log.warning("channel_synthesis: synthesis failed: %s", exc)
+        return None
+    if not text:
+        return None
+    checker = phi_check or _default_phi_check
+    try:
+        if checker(text):
+            log.warning("channel_synthesis: synthesized output tripped PHI check "
+                        "-- dropping to factual fallback")
+            return None
+    except Exception:  # noqa: BLE001 -- a broken checker must fail CLOSED
+        log.exception("channel_synthesis: PHI check raised -- dropping to fallback")
+        return None
+    return text
+
+
+_PORTFOLIO_PROMPT = """\
+You are writing the DAILY portfolio operations briefing for the #founder-operations
+channel of a multi-entity holding company (HJR Global is the holdco / shared-services
+spine; the operating entities are F3 Energy, One Stop Nutrition, Lexington Services,
+HJR Properties, Big D Media, United Fight League, HJR Productions, F3 Community).
+
+Below is today's verified fact base, including day-over-day deltas. Write a concise,
+operational briefing (roughly 200-320 words) with these sections, each on its own
+line with a bold header:
+
+*Portfolio pulse* -- 2-3 lines: the overall cash position and the single most
+important movement of the day.
+*Cash* -- the notable per-entity closing balances and day-over-day changes, plus any
+multi-day decline streaks. Lexington is aggregate only.
+*Pipeline* -- open deal posture and any stage movement or aging deals worth attention.
+*Deadlines* -- what is due soon and what is overdue (counts plus the few that matter).
+*Needs Harrison* -- the stalled P0/P1 decisions: the shortest possible list of what
+needs a founder call. This is an operational status list, not strategic advice.
+
+Hard rules:
+- Use ONLY facts present in the fact base. Never invent numbers, deals, dates, or
+  names. If a section's source was unavailable, say so in one short line.
+- This is an OPERATIONAL status post for the team -- NOT founder strategy. Do NOT make
+  business-restructuring recommendations or blunt strategic calls; those live in the
+  private weekly memo. Report the state of the world and what needs a decision.
+- Never include any client name, diagnosis, or client-level health information --
+  Lexington data stays strictly aggregate.
+- Advisory / operational only; nothing here executes automatically.
+- Plain text, Slack-friendly. Use *single asterisks* for bold. No markdown tables.
+
+FACT BASE:
+{facts}
+"""
+
+
+def synthesize_channel_portfolio(facts_text: str) -> str | None:
+    """Operational holdco rollup for #founder-operations (Sonnet, FAIL-CLOSED)."""
+    return _synthesize(_PORTFOLIO_PROMPT.format(facts=facts_text))
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator (per-scope; channel_synthesis analog of strategy_memo.run_memo)
+# ---------------------------------------------------------------------------
+
+def run_synthesis(
+    scope: str,
+    *,
+    gather_fn,
+    synth_fn,
+    deliver_fn,
+    deltas_fn=None,
+    facts_fn=None,
+    dry_run: bool = False,
+    today: date | None = None,
+    snapshot_dir: Path | None = None,
+) -> dict:
+    """One synthesis run for *scope*. dry_run: gather + synthesize but write/send
+    NOTHING (no snapshot, no post) -- the rollout-gate review mode. Snapshots key
+    per-scope so day-over-day deltas never collide across scopes or with the
+    weekly memo. No Drive memo file is written (channel post + snapshot only)."""
+    today = today or _today()
+    deltas_fn = deltas_fn or sm.compute_deltas
+    facts_fn = facts_fn or sm.build_facts_text
+    snap_dir = snapshot_dir or _scope_snapshot_dir(scope)
+
+    gathered = gather_fn()
+    priors = sm.load_prior_snapshots(today=today, snapshot_dir=snap_dir)
+    deltas = deltas_fn(gathered, priors)
+    facts = facts_fn(gathered, deltas)
+
+    body = synth_fn(facts)
+    synthesized = body is not None
+    if body is None:
+        body = sm.fallback_memo(facts)
+
+    delivered = False
+    if not dry_run:
+        sm.save_snapshot(gathered, today=today, snapshot_dir=snap_dir)
+        delivered = deliver_fn(body)
+
+    return {
+        "scope": scope,
+        "dry_run": dry_run,
+        "date": today.isoformat(),
+        "first_run": bool(deltas.get("first_run")),
+        "synthesized": synthesized,
+        "delivered": delivered,
+        "facts": facts,
+        "body": body,
+    }
+
+
+def run_portfolio(*, dry_run: bool = False, today: date | None = None,
+                  channel: str | None = None) -> dict:
+    """Portfolio synthesis -> #founder-operations (holdco; covers HJRG)."""
+    today = today or _today()
+    ch = channel or SCOPE_CHANNELS["portfolio"]
+    return run_synthesis(
+        "portfolio",
+        gather_fn=lambda: sm.gather_all(today=today),
+        synth_fn=synthesize_channel_portfolio,
+        deliver_fn=lambda body: deliver_to_channel(ch, body, today=today),
+        dry_run=dry_run,
+        today=today,
+    )
