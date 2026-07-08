@@ -161,6 +161,17 @@ def _today() -> date:
     return sm._today()
 
 
+def _date_header(today: date) -> str:
+    """Authoritative dated header line: weekday + ISO date, bold for Slack.
+
+    Code-generated from `today` so the post date is DETERMINISTIC and can never
+    drift with the LLM's own rendering (a prior LEX post read "Wed Jul 9" on
+    2026-07-08, a Wednesday). The synthesis prompts instruct the model NOT to
+    emit its own date line -- this is the single authoritative date.
+    """
+    return f"*{today.strftime('%A')}, {today.isoformat()}*"
+
+
 # ---------------------------------------------------------------------------
 # Per-scope snapshots (day-over-day deltas; separate from the weekly memo)
 # ---------------------------------------------------------------------------
@@ -259,6 +270,8 @@ Hard rules:
   Lexington data stays strictly aggregate.
 - Advisory / operational only; nothing here executes automatically.
 - Plain text, Slack-friendly. Use *single asterisks* for bold. No markdown tables.
+- Do NOT write your own date, title, or greeting line -- a dated header is added
+  automatically; begin directly with the first *bold* section.
 
 FACT BASE:
 {facts}
@@ -308,6 +321,12 @@ def run_synthesis(
     # dry-run preview faithfully matches what posts; deliver_to_channel repeats it
     # idempotently as a defense-in-depth chokepoint.
     body = _scrub_visibility_cpa(body)
+
+    # Prepend the DETERMINISTIC dated header (code-generated from `today`). The LLM
+    # used to invent its own date line and drift it; the prompts now forbid that, and
+    # this single authoritative header applies uniformly to synth + fallback, every
+    # scope. Prepended before delivery so the dry-run `body` matches what posts.
+    body = f"{_date_header(today)}\n\n{body}"
 
     delivered = False
     if not dry_run:
@@ -1038,6 +1057,8 @@ Hard rules:
 - Never include client names, diagnoses, or client-level health information.
 - Advisory / operational only; nothing here executes automatically.
 - Plain text, Slack-friendly. *single asterisks* for bold. No markdown tables.
+- Do NOT write your own date, title, or greeting line -- a dated header is added
+  automatically; begin directly with the first *bold* section.
 
 FACT BASE:
 {facts}
@@ -1072,6 +1093,8 @@ Other rules:
 - Use ONLY facts in the fact base; never invent. A quiet day is fine to state plainly.
 - Advisory / operational only; nothing executes automatically.
 - Plain text, Slack-friendly. *single asterisks* for bold. No markdown tables.
+- Do NOT write your own date, title, or greeting line -- a dated header is added
+  automatically; begin directly with the first *bold* section.
 
 FACT BASE:
 {facts}

@@ -324,7 +324,8 @@ class TestRunSynthesis:
             "portfolio", gather_fn=_pgathered,
             synth_fn=lambda f: "BODY", deliver_fn=deliver,
             dry_run=True, today=date(2026, 7, 7))
-        assert out["body"] == "BODY"
+        # Body carries the deterministic dated header (2026-07-07 is a Tuesday).
+        assert out["body"] == "*Tuesday, 2026-07-07*\n\nBODY"
         assert out["delivered"] is False
         assert spy["called"] is False
         assert not (tmp_path / "syn").exists()
@@ -366,6 +367,41 @@ class TestRunSynthesis:
                          dry_run=False, today=date(2026, 7, 7))
         assert (tmp_path / "syn" / "portfolio" / "2026-07-07.json").exists()
         assert (tmp_path / "syn" / "f3e" / "2026-07-07.json").exists()
+
+    def test_date_header_format(self):
+        # Deterministic: weekday + ISO, bold. 2026-07-08 is a Wednesday.
+        assert cs._date_header(date(2026, 7, 8)) == "*Wednesday, 2026-07-08*"
+        assert cs._date_header(date(2026, 7, 7)) == "*Tuesday, 2026-07-07*"
+
+    def test_prepends_deterministic_date_header(self, tmp_path, monkeypatch):
+        """The post date is code-generated (weekday + ISO), never LLM-written, so it
+        cannot drift (prior bug: a LEX post read 'Wed Jul 9' on 2026-07-08)."""
+        self._env(tmp_path, monkeypatch)
+        out = cs.run_synthesis(
+            "portfolio", gather_fn=_pgathered,
+            synth_fn=lambda f: "MODEL BODY, NO DATE OF ITS OWN",
+            deliver_fn=lambda b: True,
+            dry_run=True, today=date(2026, 7, 8))  # a Wednesday
+        assert out["body"].startswith("*Wednesday, 2026-07-08*\n\n")
+        assert out["body"].endswith("MODEL BODY, NO DATE OF ITS OWN")
+        # Exactly one date line, at the very top -- no drift, no duplicate.
+        assert out["body"].count("2026-07-08") == 1
+
+    def test_date_header_applies_to_fallback(self, tmp_path, monkeypatch):
+        """The header is prepended to the deterministic fallback too, not only synth."""
+        self._env(tmp_path, monkeypatch)
+        out = cs.run_synthesis(
+            "portfolio", gather_fn=_pgathered,
+            synth_fn=lambda f: None, deliver_fn=lambda b: True,
+            dry_run=True, today=date(2026, 7, 8))
+        assert out["body"].startswith("*Wednesday, 2026-07-08*\n\n")
+        assert "SYNTHESIS UNAVAILABLE" in out["body"]
+
+    def test_prompts_forbid_model_date_line(self):
+        """All three synthesis prompts forbid the model from writing its own date
+        line -- the authoritative date is code-prepended."""
+        for p in (cs._PORTFOLIO_PROMPT, cs._ENTITY_PROMPT, cs._LEX_PROMPT):
+            assert "Do NOT write your own date" in p
 
 
 class TestRunPortfolioWiring:
