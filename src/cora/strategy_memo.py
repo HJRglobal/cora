@@ -494,9 +494,10 @@ def gather_health(*, now: float | None = None) -> dict[str, Any]:
 # Snapshots + deltas
 # ---------------------------------------------------------------------------
 
-def save_snapshot(gathered: dict[str, Any], *, today: date | None = None) -> Path:
+def save_snapshot(gathered: dict[str, Any], *, today: date | None = None,
+                  snapshot_dir: Path | None = None) -> Path:
     today = today or _today()
-    snap_dir = _snapshot_dir()
+    snap_dir = snapshot_dir or _snapshot_dir()
     snap_dir.mkdir(parents=True, exist_ok=True)
     path = snap_dir / f"{today.isoformat()}.json"
     path.write_text(json.dumps(gathered, ensure_ascii=False, indent=1),
@@ -512,10 +513,11 @@ def save_snapshot(gathered: dict[str, Any], *, today: date | None = None) -> Pat
 
 
 def load_prior_snapshots(*, today: date | None = None,
-                         limit: int = 8) -> list[dict[str, Any]]:
+                         limit: int = 8,
+                         snapshot_dir: Path | None = None) -> list[dict[str, Any]]:
     """Prior snapshots, newest first, excluding today's."""
     today = today or _today()
-    snap_dir = _snapshot_dir()
+    snap_dir = snapshot_dir or _snapshot_dir()
     if not snap_dir.exists():
         return []
     out: list[dict[str, Any]] = []
