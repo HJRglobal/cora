@@ -119,6 +119,18 @@ class TestTierAllowlist:
         assert not cs._assert_tier1("C0DEADBEEF")
         assert not cs._assert_tier1("")
 
+    def test_channel_ids_pinned_to_reference(self):
+        """D-051 #4/#12: pin the 9 ids to literal build-spec values (NOT derived
+        from SCOPE_CHANNELS) so a future typo/swap to a public channel fails here."""
+        expected = {
+            "portfolio": "C0BCUBUDHAR", "f3e": "C0B4KRQT3LY",
+            "hjrp": "C0B3A3W2A3H", "osn": "C0B3TCEF4KT", "lex": "C0B3A3U7WS3",
+            "bdm": "C0B3PF5QK9C", "ufl": "C0B3N5YG1SR", "hjrprod": "C0BFCM2TV55",
+            "f3c": "C0BFCMB2JFR",
+        }
+        assert cs.SCOPE_CHANNELS == expected
+        assert cs.SMOKE_CHANNEL == "C0B4B0URRQS"
+
 
 class TestDeliverToChannel:
     def test_refuses_non_tier1_and_posts_nothing(self, monkeypatch):
@@ -823,6 +835,182 @@ class TestLexSynthesis:
     def test_no_key_returns_none(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         assert cs.synthesize_channel_lex("facts") is None
+
+
+class TestD051Remediation:
+    """Regression tests for the confirmed D-051 adversarial-review findings."""
+
+    def _staff_map(self, tmp_path, monkeypatch, names=("Shaun Hawkins",)):
+        monkeypatch.setenv("STRATEGY_ASANA_MAP_PATH", str(tmp_path / "m.yaml"))
+        rows = "".join(
+            f"  - slack_user_id: U{i}\n    asana_user_gid: '{i}'\n    display_name: {n}\n"
+            for i, n in enumerate(names, 1))
+        (tmp_path / "m.yaml").write_text(f"users:\n{rows}", encoding="utf-8")
+
+    # ---- #1/#7: LEX decision topic scrubbed (covers synth AND fallback) ----
+    def test_lex_decision_topic_client_name_scrubbed(self, tmp_path, monkeypatch):
+        self._staff_map(tmp_path, monkeypatch)
+        monkeypatch.setattr(sm, "gather_stalled_decisions", lambda today=None: {
+            "ok": True, "decisions": [
+                {"topic": "Approve client Maria Gonzalez respite hours",
+                 "entity": "LEX", "severity": "P1", "age_days": 5, "owner": "Shaun"}]})
+        out = cs.gather_decisions_for_entity("LEX", today=date(2026, 7, 7))
+        topic = out["decisions"][0]["topic"]
+        assert "Maria Gonzalez" not in topic
+        assert "[name redacted]" in topic
+
+    def test_lex_fallback_body_scrubbed(self, tmp_path, monkeypatch):
+        """The LEX fallback (Sonnet unavailable) must not leak a client name."""
+        self._staff_map(tmp_path, monkeypatch)
+        monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "syn"))
+        monkeypatch.setattr(sm, "gather_stalled_decisions", lambda today=None: {
+            "ok": True, "decisions": [
+                {"topic": "client Maria Gonzalez placement decision", "entity": "LEX",
+                 "severity": "P0", "age_days": 9, "owner": "Shaun"}]})
+        # No cash/deadline/kb noise; synth returns None -> deterministic fallback.
+        monkeypatch.setattr(cs, "gather_cash_for_entity", lambda e: {"ok": False})
+        monkeypatch.setattr(cs, "gather_deadline_radar_for_entity",
+                            lambda *a, **k: {"ok": True, "due_14d": 0, "overdue": 0,
+                                             "overdue_by_owner": {}, "items": []})
+        monkeypatch.setattr(cs, "gather_kb_for_entity", lambda e: {"ok": False})
+        monkeypatch.setattr(sm, "gather_health", lambda: {"ok": False})
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)  # synth -> None
+        out = cs.run_entity("lex", dry_run=True, today=date(2026, 7, 7))
+        assert out["synthesized"] is False
+        assert "Maria Gonzalez" not in out["body"]
+
+    # ---- #2: LEX-cross-tagged decision excluded from a non-LEX post ----
+    def test_lex_cross_tagged_decision_excluded_from_nonlex(self, monkeypatch):
+        monkeypatch.setattr(sm, "gather_stalled_decisions", lambda today=None: {
+            "ok": True, "decisions": [
+                {"topic": "Approve Maria's respite billing", "entity": "F3E, LEX",
+                 "severity": "P1", "age_days": 5, "owner": "H"},
+                {"topic": "F3E retail expansion", "entity": "F3E",
+                 "severity": "P0", "age_days": 5, "owner": "H"}]})
+        out = cs.gather_decisions_for_entity("F3E", today=date(2026, 7, 7))
+        topics = {d["topic"] for d in out["decisions"]}
+        assert topics == {"F3E retail expansion"}   # LEX-cross-tagged dropped
+
+    # ---- #3: LEX-cross-listed task not itemized in a non-LEX radar ----
+    def test_lex_cross_listed_task_not_itemized_in_nonlex(self, tmp_path, monkeypatch):
+        self._staff_map(tmp_path, monkeypatch, names=("Alex Cordova",))
+        tasks = {"1": [
+            {"name": "client billing appeal for Robert", "due_on": "2026-07-09",
+             "completed": False,
+             "projects": [{"name": "[LEX-LLC] Ops"}, {"name": "[OSN] Vendor"}]}]}
+        out = cs.gather_deadline_radar_for_entity(
+            "OSN", today=date(2026, 7, 7), get_tasks_fn=lambda gid: tasks["1"])
+        assert out["items"] == []           # LEX-cross-listed task never itemized
+        assert out["due_14d"] == 1          # still counted
+        assert out["redacted"] == 1
+
+    # ---- #5: --channel cannot target a foreign entity's channel ----
+    def test_channel_override_to_foreign_entity_refused(self):
+        import pytest
+        with pytest.raises(ValueError):
+            cs.run_entity("f3e", dry_run=True,
+                          channel=cs.SCOPE_CHANNELS["ufl"])
+
+    def test_channel_override_to_own_or_smoke_allowed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "syn"))
+        monkeypatch.setattr(cs, "gather_all_for_entity",
+                            lambda entity, today=None: {"entity": entity,
+                                                        "date": "2026-07-07",
+                                                        "cash": {"ok": False}})
+        monkeypatch.setattr(cs, "compute_entity_deltas", lambda e, c, p: {"first_run": True})
+        monkeypatch.setattr(cs, "build_entity_facts_text", lambda e, g, d: "F")
+        monkeypatch.setattr(cs, "synthesize_channel_entity", lambda e, f: "B")
+        # own channel + smoke both fine (no raise)
+        cs.run_entity("f3e", dry_run=True, today=date(2026, 7, 7),
+                      channel=cs.SCOPE_CHANNELS["f3e"])
+        cs.run_entity("f3e", dry_run=True, today=date(2026, 7, 7),
+                      channel=cs.SMOKE_CHANNEL)
+
+    # ---- #6: source-opacity -- no "sheet" in the F3E cash line ----
+    def test_entity_cash_line_has_no_sheet_word(self):
+        g = {"entity": "F3E", "date": "2026-07-07",
+             "cash": {"ok": True, "label": "F3 Energy", "closing_balance": 1680.0,
+                      "week_label": "Week of 5/19/2026"},
+             "pipeline": {"ok": False, "omitted": True},
+             "decisions": {"ok": True, "decisions": []},
+             "deadlines": {"ok": True, "due_14d": 0, "overdue": 0,
+                           "overdue_by_owner": {}, "items": []},
+             "kb_activity": {"ok": False}, "health": {"ok": False}}
+        facts = cs.build_entity_facts_text("F3E", g, {"first_run": True})
+        assert "sheet" not in facts.lower()
+        assert "Week of 5/19/2026" in facts      # label still shown
+
+    # ---- #8/#13: F3E pipeline uses get_deals_by_pipeline (not entity filter) ----
+    def test_f3e_pipeline_uses_pipeline_fetch(self, monkeypatch):
+        from cora.tools import hubspot_client
+        calls = {"pipeline": 0, "filter": 0}
+        monkeypatch.setattr(hubspot_client, "get_deals_by_pipeline",
+                            lambda pid: (calls.__setitem__("pipeline", calls["pipeline"] + 1) or []))
+        monkeypatch.setattr(hubspot_client, "get_deals_by_filter",
+                            lambda **k: (calls.__setitem__("filter", calls["filter"] + 1) or []))
+        cs.gather_pipeline_for_entity("F3E", now=1_000_000.0)
+        assert calls["pipeline"] == 1 and calls["filter"] == 0
+        calls["pipeline"] = calls["filter"] = 0
+        cs.gather_pipeline_for_entity("OSN", now=1_000_000.0)
+        assert calls["filter"] == 1 and calls["pipeline"] == 0
+
+    # ---- #9: bare "LLC" no longer routes a non-LEX decision into LEX ----
+    def test_generic_llc_not_pulled_into_lex(self, monkeypatch):
+        monkeypatch.setattr(sm, "gather_stalled_decisions", lambda today=None: {
+            "ok": True, "decisions": [
+                {"topic": "HJR Global reorg", "entity": "HJR Global LLC",
+                 "severity": "P1", "age_days": 5, "owner": "H"}]})
+        out = cs.gather_decisions_for_entity("LEX", today=date(2026, 7, 7))
+        assert out["decisions"] == []       # generic LLC suffix not LEX
+
+    # ---- #10: LEX routes to the strict gate via the PUBLIC entry point ----
+    def test_synthesize_channel_entity_routes_lex_to_strict_gate(self, tmp_path, monkeypatch):
+        self._staff_map(tmp_path, monkeypatch)
+        _install_fake_anthropic(
+            monkeypatch, "*Needs you* client Maria Gonzalez needs a renewal.")
+        out = cs.synthesize_channel_entity("LEX", "facts")   # public entry, not _lex
+        assert out is not None
+        assert "Maria Gonzalez" not in out
+        assert "[name redacted]" in out
+
+    def test_synthesize_channel_entity_lex_drops_clinical(self, monkeypatch):
+        _install_fake_anthropic(monkeypatch, "*Watch* a client is on risperidone.")
+        assert cs.synthesize_channel_entity("LEX", "facts") is None
+
+    # ---- #14: positive source-opacity assertion on the ecom fold ----
+    def test_ecom_fold_source_opaque_when_healthy(self, monkeypatch):
+        import cora.connectors.shopify_client as shopify
+        import cora.connectors.polar_client as polar
+        import cora.tools.asana_client as asana
+
+        class _Pulse:
+            net_revenue_usd = 1000.0
+            order_count = 10
+            avg_order_value_usd = 100.0
+            top_products = []
+
+        class _Variant:
+            product_type = "beverage"
+            product_title = "Pure"
+            variant_title = "12pk"
+            low_stock = False
+            qty_on_hand = 50
+
+        class _Rep:
+            total_data = {"total_marketing_spend": 100, "blended_net_sales": 5000,
+                          "blended_roas": 3.0,
+                          "recharge_sales_products.computed.net_sales": 2000,
+                          "recharge_sales_products.raw.total_active_subscriptions": 300}
+        monkeypatch.setattr(shopify, "get_sales_pulse", lambda w: _Pulse())
+        monkeypatch.setattr(shopify, "get_inventory_status", lambda **k: [_Variant()])
+        monkeypatch.setattr(shopify, "is_beverage_product", lambda pt, t: True)
+        monkeypatch.setattr(polar, "generate_report", lambda **k: _Rep())
+        monkeypatch.setattr(asana, "get_project_tasks", lambda gid, max_tasks=100: [])
+        out = cs.gather_f3e_ecom(today=date(2026, 7, 7))
+        blob = " ".join(out["lines"]).lower()
+        for platform in ("shopify", "recharge", "polar", "meta", "tiktok",
+                         "klaviyo", "hubspot", "sheet"):
+            assert platform not in blob, f"source name leaked: {platform}"
 
 
 class TestSetupScripts:

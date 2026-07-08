@@ -9,6 +9,15 @@
 # The post routes through the egress boundary; the TIER_1 channel allowlist is the
 # financial-firewall gate.
 #
+# DEDUP / RETIRE AT GO-LIVE (D-029, build-spec section 5): the F3E synthesis FOLDS
+# the ecom brief (DTC/subs/paid/inventory/production) and the F3E inventory pulse.
+# During the ~1-week parallel-run these can coexist (different channels/times), but
+# when Cora's F3E synthesis is proven, Harrison should DISABLE the now-redundant
+# tasks so #f3e-leadership + #f3-ops-cockpit are not double-served (elevated PS):
+#     schtasks /Change /TN "Cora - F3E Daily Ecom Brief" /Disable
+#     schtasks /Change /TN "Cora - Inventory Alerts" /Disable
+# (Leave them enabled until then; this synthesis does not auto-disable anything.)
+#
 # Slot check (2026-07-07, verified against the live registry): 06:33 AZ is a free
 # clock minute in the 03:00-09:00 morning window (occupied minutes: 06:00 / 06:10 /
 # 06:30 / 06:40 / 06:45 / 06:50 / 07:00 / 07:06 / 07:10 / 07:15 / 07:30). The 9

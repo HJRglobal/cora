@@ -76,6 +76,24 @@ def _assert_tier1(channel_id: str) -> bool:
     return bool(channel_id) and channel_id in _TIER1_CHANNEL_IDS
 
 
+def _resolve_channel(scope: str, channel: str | None) -> str:
+    """Resolve the target channel for a scope, honoring a safe --channel override.
+
+    An override is accepted ONLY if it is the scope's own channel or the smoke
+    channel. Any other id is refused (raises) so a manual `--channel` cannot post
+    one entity's cash/pipeline into a DIFFERENT entity's leadership channel -- a
+    cross-entity confidentiality hole the bare TIER_1 gate would not catch since
+    all leadership channels are TIER_1 (D-051 #5)."""
+    default = SCOPE_CHANNELS.get(scope)
+    if channel is None:
+        return default
+    if channel == SMOKE_CHANNEL or channel == default:
+        return channel
+    raise ValueError(
+        f"--channel {channel!r} is not allowed for scope {scope!r}: target only its "
+        f"own channel ({default}) or the smoke channel ({SMOKE_CHANNEL}).")
+
+
 def _scrub_visibility_cpa(text: str) -> str:
     """Neutralize Visibility-CPA individual names in any team-facing channel post.
 
@@ -312,15 +330,32 @@ def run_portfolio(*, dry_run: bool = False, today: date | None = None,
                   channel: str | None = None) -> dict:
     """Portfolio synthesis -> #founder-operations (holdco; covers HJRG)."""
     today = today or _today()
-    ch = channel or SCOPE_CHANNELS["portfolio"]
+    ch = _resolve_channel("portfolio", channel)
     return run_synthesis(
         "portfolio",
-        gather_fn=lambda: sm.gather_all(today=today),
+        gather_fn=lambda: _portfolio_gather(today),
         synth_fn=synthesize_channel_portfolio,
         deliver_fn=lambda body: deliver_to_channel(ch, body, today=today),
         dry_run=dry_run,
         today=today,
     )
+
+
+def _portfolio_gather(today: date) -> dict:
+    """Portfolio fact base = gather_all, then SCRUB client PHI from any LEX-tagged
+    stalled-decision topic (D-051 #1/#2/#7). #founder-operations is a channel, so a
+    LEX client name in a decision topic must not reach it via the synth OR the
+    deterministic fallback; non-LEX decision topics (business names) are untouched."""
+    gathered = sm.gather_all(today=today)
+    dec = gathered.get("decisions") or {}
+    if dec.get("ok"):
+        scrubbed = [
+            ({**d, "topic": _scrub_client_phi(str(d.get("topic", "")))}
+             if _is_lex_tagged(str(d.get("entity", ""))) else d)
+            for d in dec.get("decisions", [])
+        ]
+        gathered = {**gathered, "decisions": {**dec, "decisions": scrubbed}}
+    return gathered
 
 
 # ===========================================================================
@@ -361,8 +396,36 @@ _ENTITY_DECISION_TOKENS: dict[str, tuple[str, ...]] = {
     "HJRP":    ("HJRP",),
     "HJRPROD": ("HJRPROD", "POD", "FF"),
     "F3C":     ("F3C",),
-    "LEX":     ("LEX", "LTS", "LBHS", "LLA", "LLC"),
+    # Bare "LLC" dropped (D-051 finding 9): it matched generic corporate suffixes
+    # ("HJR Global LLC") and mis-routed non-LEX decisions into #lex-leadership.
+    # "LEX" word-matches "LEX-LLC"/"LEX-LTS" etc., so LEX-LLC is still covered.
+    "LEX":     ("LEX", "LTS", "LBHS", "LLA"),
 }
+
+# A decision is "LEX-tagged" if its free-text Entity field carries any LEX token.
+# Used to (a) scrub client PHI from LEX decision topics and (b) EXCLUDE a
+# LEX-cross-tagged decision from a non-LEX entity's itemized post (D-051 #1/#2/#7).
+_LEX_DECISION_RE = re.compile(r"\b(?:LEX|LTS|LBHS|LLA)\b", re.IGNORECASE)
+
+
+def _is_lex_tagged(entity_field: str) -> bool:
+    return bool(_LEX_DECISION_RE.search(entity_field or ""))
+
+
+def _scrub_client_phi(text: str) -> str:
+    """Redact client-identifying PHI from a short free-text string (a LEX decision
+    topic). Uses scrub_lex_phi (staff-preserving) -- same recall-biased redactor as
+    the LEX synth output gate -- so client names in a LEX decision topic never reach
+    a channel post via EITHER the synthesis or the deterministic fallback (D-051
+    #1/#7). Fail-CLOSED: a pathological input that makes the scrub raise collapses to
+    a safe placeholder rather than leaking the raw topic."""
+    if not text:
+        return text
+    try:
+        from .phi_guard import scrub_lex_phi
+        return scrub_lex_phi(text, allowed_names=_lex_staff_names())
+    except Exception:  # noqa: BLE001
+        return "[LEX decision topic redacted for PHI]"
 
 # Short scope caveat woven into the synth prompt for the low-activity entities.
 _ENTITY_SCOPE_NOTE: dict[str, str] = {
@@ -448,9 +511,15 @@ def gather_pipeline_for_entity(entity: str, *, fetch_fn=None,
 
     if fetch_fn is None:
         if mode == "f3e":
-            fetch_fn = lambda: hubspot_client.get_deals_by_filter(  # noqa: E731
-                entity="F3E", pipeline_id=hubspot_client.PIPELINE_F3E_RETAIL)
+            # The F3E Retail pipeline is single-entity by construction, so fetch the
+            # WHOLE pipeline (no f3_entity AND-filter) -- matches strategy_memo's
+            # weekly memo and avoids dropping retail deals whose f3_entity tag is
+            # unset (D-051 #8/#13). _summarize_deals drops Closed Won/Lost by stage
+            # name, so including closed deals here is harmless.
+            fetch_fn = lambda: hubspot_client.get_deals_by_pipeline(  # noqa: E731
+                hubspot_client.PIPELINE_F3E_RETAIL)
         else:
+            # OSN/UFL/BDM genuinely share the default pipeline -> subset by f3_entity.
             fetch_fn = lambda: hubspot_client.get_deals_by_filter(  # noqa: E731
                 entity=entity, pipeline_id="default")
     try:
@@ -523,7 +592,12 @@ def gather_deadline_radar_for_entity(entity: str, *, today: date | None = None,
             else:
                 due_count += 1
             name = str(task.get("name") or "")
-            if (not itemize) or is_phi_risk(name) or is_visibility_cpa_mention(name):
+            # A task cross-listed in a LEX project must never be itemized in a
+            # NON-LEX post -- its name can carry a client name that is_phi_risk
+            # misses (D-051 #3; mirrors strategy_memo._is_lex_task's unconditional
+            # guard). Counted in the aggregate totals above, name never shown.
+            lex_cross = entity != "LEX" and af.task_belongs_to_entity(task, "LEX")
+            if (not itemize) or lex_cross or is_phi_risk(name) or is_visibility_cpa_mention(name):
                 redacted += 1
                 continue
             items.append({"name": name[:100], "owner": owner,
@@ -543,14 +617,31 @@ def gather_deadline_radar_for_entity(entity: str, *, today: date | None = None,
 
 def gather_decisions_for_entity(entity: str, *, today: date | None = None) -> dict:
     """Stalled P0/P1 decisions filtered to *entity* by word-boundary token match on
-    the free-text Entity field (D7). gather_stalled_decisions already PHI-filters."""
+    the free-text Entity field (D7). gather_stalled_decisions PHI-filters topic+entity
+    with the BROAD is_phi_risk, which misses bare/possessive client names -- so:
+      - a NON-LEX entity DROPS any LEX-cross-tagged decision (e.g. Entity "F3E, LEX"):
+        its topic can carry a LEX client name that would otherwise reach a non-LEX
+        leadership post unscrubbed (D-051 #2).
+      - the LEX entity SCRUBS each kept topic through scrub_lex_phi, so a client name
+        in a LEX decision topic never reaches #lex-leadership via the synth OR the
+        deterministic fallback (D-051 #1/#7)."""
     base = sm.gather_stalled_decisions(today=today)
     if not base.get("ok"):
         return base
+    entity = entity.upper()
     tokens = _ENTITY_DECISION_TOKENS.get(entity, (entity,))
     pats = [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in tokens]
-    kept = [d for d in base.get("decisions", [])
-            if any(p.search(str(d.get("entity", ""))) for p in pats)]
+    is_lex = entity == "LEX"
+    kept = []
+    for d in base.get("decisions", []):
+        ef = str(d.get("entity", ""))
+        if not any(p.search(ef) for p in pats):
+            continue
+        if not is_lex and _is_lex_tagged(ef):
+            continue  # LEX-cross-tagged decision excluded from a non-LEX post (PHI)
+        if is_lex:
+            d = {**d, "topic": _scrub_client_phi(str(d.get("topic", "")))}
+        kept.append(d)
     return {"ok": True, "decisions": kept}
 
 
@@ -836,8 +927,11 @@ def build_entity_facts_text(entity: str, gathered: dict, deltas: dict) -> str:
             bits.append(_change(d["delta"]))
         if d.get("decline_streak", 0) >= 2:
             bits.append(f"[cash down {d['decline_streak']} days straight]")
+        # Source-opaque (f3e.md): the label already reads "Week of ..."; do NOT
+        # prefix "sheet" -- naming the source is forbidden in the F3E post and a
+        # needless source hint elsewhere (D-051 #6).
         if cash.get("week_label"):
-            bits.append(f"(sheet week {cash['week_label']})")
+            bits.append(f"({cash['week_label']})")
         lines.append(" ".join(b for b in bits if b))
     else:
         lines.append("(cash source unavailable today)")
@@ -1078,9 +1172,9 @@ def run_entity(entity: str, *, dry_run: bool = False, today: date | None = None,
     entity = entity.upper()
     today = today or _today()
     scope = entity.lower()
-    ch = channel or SCOPE_CHANNELS.get(scope)
-    if ch is None:
+    if scope not in SCOPE_CHANNELS:
         raise ValueError(f"no channel configured for entity {entity!r}")
+    ch = _resolve_channel(scope, channel)
     return run_synthesis(
         scope,
         gather_fn=lambda: gather_all_for_entity(entity, today=today),
