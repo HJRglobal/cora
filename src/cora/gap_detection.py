@@ -172,10 +172,30 @@ _UNKNOWN_RES = [
 # guardrail. Matching is anywhere-in-reply but only for short replies (a real
 # deflection is one or two sentences).
 _DEFLECTION_MAX_CHARS = 400
-_DEFLECTION_RES = [
+
+# Two classes, because the veto must behave differently for a reply that OPENS
+# with a genuine-unknown shape vs a pure refusal:
+#
+#   POINTER  -- ambiguous "go ask over there" phrases. Cora's answer-first house
+#               style (2026-06-30 format standard) appends a channel pointer to
+#               GENUINE unknown replies as helpfulness -- "I don't have that.
+#               ...or ask in #hjrg." So a pointer must NOT veto a reply that
+#               OPENS unknown-shaped (2026-07-02 ROUND-2 addendum: the 351-char
+#               plant-watering miss was wrongly vetoed by exactly this trailing
+#               pointer). A pointer STILL vetoes a NON-unknown reply (a pure
+#               redirect that leads with it) via is_deflection() below.
+#   REASON   -- unambiguous refusal reasons. A genuine "I don't have that"
+#               opener never carries one of these as helpfulness, so they ALWAYS
+#               veto -- even when the reply is unknown-shaped and even past the
+#               400-char cap.
+_DEFLECTION_POINTER_RES = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"ask (me )?in (an? )?#\S+",
+    )
+]
+_DEFLECTION_REASON_RES = [
     re.compile(p, re.IGNORECASE) for p in (
         r"that'?s company financials",
-        r"ask (me )?in (an? )?#\S+",
         r"ask in the channel for the team",
         r"that'?s a legal matter",
         r"reach emily stubbs",
@@ -201,6 +221,10 @@ _DEFLECTION_RES = [
         r"go(es)? in a finance channel",
     )
 ]
+# Full set preserves the original anywhere-in-reply veto for is_deflection(),
+# which is applied to NON-unknown replies (pure redirects) -- both classes veto
+# a short pure refusal exactly as before.
+_DEFLECTION_RES = _DEFLECTION_POINTER_RES + _DEFLECTION_REASON_RES
 
 
 def _normalize_reply(text: str) -> str:
@@ -221,26 +245,40 @@ def is_deflection(response_text: str) -> bool:
     return any(rx.search(reply) for rx in _DEFLECTION_RES)
 
 
+def _opens_unknown(reply_norm: str) -> bool:
+    """True when an already-normalized reply BEGINS with an unknown/no-data shape
+    (the locked finance phrase or a prefix-anchored _UNKNOWN_RES opener). Shared
+    by is_unknown_response and the deflection-veto scoping in _maybe_log_gap_inner
+    so both agree on what counts as a genuine-miss opener. The regexes are all
+    START-anchored, so this fires only on the reply's OWN opening verdict, never
+    on a mid-text quote."""
+    if not reply_norm:
+        return False
+    locked = _normalize_reply(UNKNOWN_RESPONSE_TEXT)
+    return reply_norm.startswith(locked) or any(
+        rx.match(reply_norm) for rx in _UNKNOWN_RES)
+
+
 def is_unknown_response(response_text: str) -> bool:
     reply = _normalize_reply(response_text)
     if not reply:
         return False
     locked = _normalize_reply(UNKNOWN_RESPONSE_TEXT)
     # (1) Length-INDEPENDENT: the reply OPENS with an unknown/no-data shape.
-    # The locked-phrase startswith and the _UNKNOWN_RES regexes are all anchored
-    # to the START of the reply, so they fire ONLY when the reply BEGINS with
-    # the shape -- never on a mid-text quote. A genuine miss reply that opens
-    # "I don't have that ..." then adds house-style pointers (550-700 chars)
-    # MUST detect; the old blanket length gate hid it (D-066 follow-up smoke).
-    if reply.startswith(locked) or any(rx.match(reply) for rx in _UNKNOWN_RES):
-        # A padded refusal that OPENS unknown-shaped but ALSO carries a
-        # deflection phrase is a guard working as designed, not a gap.
-        # is_deflection() caps at _DEFLECTION_MAX_CHARS (400); re-assert the
-        # veto here length-INDEPENDENTLY so a >400-char deflection can't slip
-        # past it now that the unknown length gate is gone (adversarial review
-        # MED). Safe: no _DEFLECTION_RES redirect phrase legitimately BEGINS
-        # with an unknown shape, so a genuine miss opener is never suppressed.
-        if any(rx.search(reply) for rx in _DEFLECTION_RES):
+    # A genuine miss reply that opens "I don't have that ..." then adds
+    # house-style pointers (550-700 chars) MUST detect; the old blanket length
+    # gate hid it (D-066 follow-up smoke).
+    if _opens_unknown(reply):
+        # A padded refusal that OPENS unknown-shaped but ALSO carries an
+        # unambiguous refusal REASON is a guard working as designed, not a gap.
+        # Re-assert the REASON veto here length-INDEPENDENTLY so a >400-char
+        # deflection can't slip past it now that the unknown length gate is gone
+        # (adversarial review MED). A trailing channel POINTER is NOT re-checked
+        # here: on an unknown opener it is house-style helpfulness, not a
+        # refusal (2026-07-02 ROUND-2 addendum -- the 351-char plant-watering
+        # miss). Safe: no REASON phrase legitimately BEGINS an unknown-shaped
+        # genuine miss, so a real miss opener is never suppressed.
+        if any(rx.search(reply) for rx in _DEFLECTION_REASON_RES):
             return False
         return True
     # (2) ANYWHERE-in-reply containment KEEPS the short-reply guard: in a long
@@ -430,8 +468,19 @@ def _maybe_log_gap_inner(
         return None
 
     # A deflection is a guard working as designed, not a gap -- and its
-    # question is likely a blocked topic; drop entirely.
-    if is_deflection(response_text):
+    # question is likely a blocked topic; drop entirely. EXCEPTION: when the
+    # reply OPENS with a genuine-unknown shape, a bare trailing channel POINTER
+    # ("I don't have that. ...or ask in #hjrg.") is Cora's house-style
+    # helpfulness, NOT a refusal -- so for an unknown opener veto ONLY on an
+    # unambiguous refusal REASON (length-independent, mirroring the re-veto
+    # inside is_unknown_response). 2026-07-02 ROUND-2 addendum: the old
+    # anywhere-in-reply is_deflection() gate ate the 351-char plant-watering
+    # miss because it carried a trailing "ask in #hjrg" pointer.
+    reply_norm = _normalize_reply(response_text)
+    if _opens_unknown(reply_norm):
+        if any(rx.search(reply_norm) for rx in _DEFLECTION_REASON_RES):
+            return None
+    elif is_deflection(response_text):
         return None
 
     detector: str | None = None

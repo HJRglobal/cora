@@ -261,6 +261,76 @@ class TestDeflectionCollisionAfterWidening:
         assert _detect(_isolated_state, response=reply) is None
 
 
+class TestDeflectionPointerVsReason:
+    """2026-07-02 ROUND-2 addendum: Cora's answer-first house style appends
+    "...or ask in #channel" pointers to GENUINE unknown replies. The old
+    anywhere-in-reply deflection veto (<=400 chars) ate those short misses. Now a
+    channel POINTER never vetoes an unknown-shape OPENER; only an unambiguous
+    refusal REASON does. A pure redirect (non-unknown opener) is still vetoed."""
+
+    # Near-verbatim rebuild of the live 2026-07-02 miss ("who maintains the
+    # office plants?"): opens with the locked-ish unknown shape, ends with a
+    # channel pointer, no refusal reason, <= the 400-char deflection cap.
+    _PLANT_MISS = (
+        "I don't have that information. There's nothing in what I can see that "
+        "names who handles office plant care, and I don't want to guess -- your "
+        "best bet is whoever owns office/facilities, or ask in #hjrg or "
+        "#hjrg-operations and someone there can point you to the right person."
+    )
+
+    def test_plant_miss_fixture_shape(self):
+        # Guard the fixture: it must be <= the 400-char cap (so it exercises the
+        # OLD bug path) and carry a channel pointer with no refusal reason.
+        assert len(self._PLANT_MISS) <= gd._DEFLECTION_MAX_CHARS
+        assert any(rx.search(gd._normalize_reply(self._PLANT_MISS))
+                   for rx in gd._DEFLECTION_POINTER_RES)
+        assert not any(rx.search(gd._normalize_reply(self._PLANT_MISS))
+                       for rx in gd._DEFLECTION_REASON_RES)
+
+    def test_plant_miss_now_fires_unknown_response(self, _isolated_state):
+        assert gd.is_unknown_response(self._PLANT_MISS) is True
+        assert _detect(_isolated_state, question="who maintains the office plants?",
+                       response=self._PLANT_MISS) == "unknown_response"
+
+    def test_short_unknown_opener_plus_pointer_fires(self, _isolated_state):
+        # The core bug in miniature.
+        reply = "I don't have that. You could ask in #hjrg-operations."
+        assert gd.is_unknown_response(reply) is True
+        assert _detect(_isolated_state, response=reply) == "unknown_response"
+
+    def test_reason_led_redirect_with_channel_still_vetoed(self, _isolated_state):
+        # A true guard refusal states its REASON up front (non-unknown opener) --
+        # must stay vetoed even though it also names a channel.
+        reply = "That's company financials -- ask me in #f3e-finance."
+        assert _detect(_isolated_state, response=reply,
+                       kb_meta=_kb_miss_meta()) is None
+        assert not _read_gaps(_isolated_state)
+
+    def test_unknown_opener_carrying_a_reason_still_vetoed(self, _isolated_state):
+        # An unknown-shaped opener that ALSO carries an unambiguous refusal reason
+        # is a guard working as designed -> stays vetoed.
+        reply = ("I don't have that. That's a legal matter -- reach Emily Stubbs, "
+                 "or ask in #hjrg.")
+        assert gd.is_unknown_response(reply) is False
+        assert _detect(_isolated_state, response=reply,
+                       kb_meta=_kb_miss_meta()) is None
+
+    def test_long_unknown_opener_with_pointer_fires(self, _isolated_state):
+        # Length-independence AND pointer-exclusion together: a >400-char miss
+        # that opens unknown-shaped and ends with a channel pointer fires.
+        reply = ("I don't have that context. " + "background detail " * 30
+                 + " Your best route is to ask in #hjrg-operations.")
+        assert len(reply) > gd._DEFLECTION_MAX_CHARS
+        assert gd.is_unknown_response(reply) is True
+        assert _detect(_isolated_state, response=reply) == "unknown_response"
+
+    def test_is_deflection_public_api_unchanged(self):
+        # The generic is_deflection() predicate is UNCHANGED (pointer still
+        # matches anywhere, <=400): only the gap-logging path applies the
+        # opener-aware REASON-only scoping. Documents the deliberate split.
+        assert gd.is_deflection("I don't have that. Ask in #hjrg.") is True
+
+
 class TestToolRefusalNotLogged:
     """Adversarial review MED (Finding 1): the widened matcher would otherwise
     log a tool's own "not found" relay as an unknown_response gap. Those are
