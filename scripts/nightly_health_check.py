@@ -70,8 +70,8 @@ class CheckResult:
 
 # ── Tasks expected to be in each state ────────────────────────────────────────
 
-# Tasks intentionally Disabled (Harrison-directed). Keep in sync with
-# project_scheduled_tasks_registry.md "Disabled tasks" section.
+# Tasks intentionally Disabled (Harrison-directed). Single source of truth:
+# data/maps/scheduled-task-state.yaml (loaded by _load_task_state_config below).
 def _load_task_state_config() -> tuple[set[str], set[str]]:
     """Load intended (disabled, running) task-name sets from config (audit N8).
 
