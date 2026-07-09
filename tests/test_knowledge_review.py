@@ -726,3 +726,105 @@ class TestRotationCrashWindow:
         # archive still contains it (idempotency intact across the crash window)
         assert "dup-1" in {json.loads(l)["update_id"]
                            for l in arch.read_text(encoding="utf-8").splitlines() if l.strip()}
+
+
+@pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable")
+class TestOneTapApprove:
+    """2026-07-09 write-path: one-tap Block Kit approve/dismiss. Harrison-only
+    (D-011), writes+resolves on approve, idempotent, dismiss leaves no write, an
+    apply failure leaves the item PENDING for retry."""
+
+    HARRISON = "U0B2RM2JYJ1"
+    OTHER = "U_SOMEONE_ELSE"
+
+    def _seed(self, tmp_path, monkeypatch, *, update_id="ka-1", state="PENDING",
+              answer="F3 Energy ships DTC orders via ShipBob out of the Reno hub.",
+              utype="known_answer", entity="F3E",
+              gap_ts="2026-07-01T00:00:00+00:00"):
+        ledger = tmp_path / "updates.jsonl"
+        payload = {
+            "gap_ts": gap_ts, "entity": entity,
+            "question": "how does F3E ship DTC orders?",
+            "gap": "shipping method not in KB", "answer": answer,
+            "answer_source": "slack_kb",
+        }
+        entry = {
+            "update_id": update_id, "update_type": utype, "description": "d",
+            "payload": payload, "source_evidence": "", "confidence": "HIGH",
+            "state": state, "proposed_at": "2026-07-08T00:00:00+00:00",
+            "resolved_at": None, "dm_message_ts": "1780000000.0001",
+            "dm_channel_id": "D1",
+        }
+        ledger.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", ledger)
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
+        monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved.jsonl"))
+        return ledger, payload
+
+    def _state(self, ledger, update_id="ka-1"):
+        for l in ledger.read_text(encoding="utf-8").splitlines():
+            if l.strip():
+                rec = json.loads(l)
+                if rec.get("update_id") == update_id:
+                    return rec.get("state")
+        return None
+
+    def test_blocks_carry_update_id_and_actions(self):
+        text, blocks = kr.build_single_item_blocks(
+            {"update_id": "ka-9", "update_type": "known_answer",
+             "description": "Q/A", "confidence": "HIGH"})
+        assert isinstance(text, str) and text
+        actions = [b for b in blocks if b["type"] == "actions"][0]
+        ids = {e["action_id"]: e["value"] for e in actions["elements"]}
+        assert ids == {kr.ACTION_APPROVE: "ka-9", kr.ACTION_DISMISS: "ka-9"}
+
+    def test_non_harrison_cannot_approve(self, tmp_path, monkeypatch):
+        ledger, _ = self._seed(tmp_path, monkeypatch)
+        outcome, _msg = kr.process_one_tap_action("ka-1", self.OTHER, approve=True)
+        assert outcome == "not_authorized"
+        assert self._state(ledger) == "PENDING"            # untouched
+        assert not (tmp_path / "known-answers").exists()    # no write
+
+    def test_harrison_approve_writes_and_resolves(self, tmp_path, monkeypatch):
+        ledger, payload = self._seed(tmp_path, monkeypatch)
+        outcome, msg = kr.process_one_tap_action("ka-1", self.HARRISON, approve=True)
+        assert outcome == "approved" and "Saved" in msg
+        assert self._state(ledger) == "APPROVED"
+        md = (tmp_path / "known-answers" / "f3e.md").read_text(encoding="utf-8")
+        assert "ShipBob" in md
+        # gap marked resolved (keyed on gap_ts, not update_id).
+        assert payload["gap_ts"] in (tmp_path / "resolved.jsonl").read_text(encoding="utf-8")
+
+    def test_approve_is_idempotent_no_double_write(self, tmp_path, monkeypatch):
+        self._seed(tmp_path, monkeypatch)
+        kr.process_one_tap_action("ka-1", self.HARRISON, approve=True)
+        md_path = tmp_path / "known-answers" / "f3e.md"
+        first = md_path.read_text(encoding="utf-8")
+        outcome, _ = kr.process_one_tap_action("ka-1", self.HARRISON, approve=True)
+        assert outcome == "already_resolved"
+        assert md_path.read_text(encoding="utf-8") == first          # unchanged
+        assert first.count("A: F3 Energy ships") == 1                # single write
+
+    def test_dismiss_resolves_without_writing(self, tmp_path, monkeypatch):
+        ledger, _ = self._seed(tmp_path, monkeypatch)
+        outcome, _ = kr.process_one_tap_action("ka-1", self.HARRISON, approve=False)
+        assert outcome == "dismissed"
+        assert self._state(ledger) == "DISMISSED"
+        assert not (tmp_path / "known-answers").exists()
+
+    def test_not_found_item(self, tmp_path, monkeypatch):
+        self._seed(tmp_path, monkeypatch)
+        outcome, _ = kr.process_one_tap_action("nope", self.HARRISON, approve=True)
+        assert outcome == "not_found"
+
+    def test_apply_failure_leaves_pending(self, tmp_path, monkeypatch):
+        # Empty answer -> apply_known_answer returns (False, ...) -> retryable.
+        ledger, _ = self._seed(tmp_path, monkeypatch, answer="")
+        outcome, _ = kr.process_one_tap_action("ka-1", self.HARRISON, approve=True)
+        assert outcome == "apply_failed"
+        assert self._state(ledger) == "PENDING"
+
+    def test_apply_knowledge_update_refuses_non_knowledge_type(self):
+        ok, summary = kr.apply_knowledge_update(
+            {"update_type": "asana_task", "payload": {}})
+        assert ok is False and "not one-tap-approvable" in summary

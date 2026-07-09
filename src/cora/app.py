@@ -2250,6 +2250,83 @@ def handle_reaction_removed(event: dict, client) -> None:
     _handle_reaction(event, client, "reaction_removed")
 
 
+# ── One-tap knowledge-review approve/dismiss (2026-07-09 write-path) ──────────
+# Block Kit buttons on the knowledge-review DM. Harrison taps Approve and the
+# item is written + resolved IMMEDIATELY (keeping the Harrison-only human gate;
+# D-011 intact -- friction-removal, NOT auto-approve). The emoji 👍/👎 path is
+# unchanged as the belt-and-braces (processed at the next scheduled run), so
+# nothing regresses if Slack interactivity is disabled. All correctness
+# (Harrison gate, idempotency, apply-first-then-resolve) lives in
+# knowledge_review.process_one_tap_action; this wrapper is only Slack I/O.
+
+def _handle_knowledge_one_tap(body: dict, client, *, approve: bool) -> None:
+    try:
+        actions = body.get("actions") or []
+        update_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        outcome, msg = knowledge_review.process_one_tap_action(
+            update_id, actor_id, approve=approve,
+        )
+
+        # Audit trail. event_type="block_action" (NOT reaction_added) so the
+        # scheduled correlate_reactions_to_updates never re-processes this item.
+        try:
+            knowledge_review.log_reply_reaction(
+                reactor_id=actor_id,
+                reaction=("button_approve" if approve else "button_dismiss"),
+                message_ts=message_ts,
+                channel_id=channel_id,
+                channel_name="dm",
+                event_type="block_action",
+            )
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
+
+        if outcome == "not_authorized":
+            # A non-Harrison actor: refuse without rewriting Harrison's DM.
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # Update the DM in place: keep the item's original text, append the
+        # outcome, and drop the buttons so it can't be re-tapped.
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
+                ]
+            try:
+                client.chat_update(
+                    channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("knowledge one-tap: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("knowledge one-tap handler error (non-fatal)", exc_info=True)
+
+
+@app.action(knowledge_review.ACTION_APPROVE)
+def handle_knowledge_approve(ack, body, client) -> None:
+    ack()
+    _handle_knowledge_one_tap(body, client, approve=True)
+
+
+@app.action(knowledge_review.ACTION_DISMISS)
+def handle_knowledge_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_knowledge_one_tap(body, client, approve=False)
+
+
 @app.event("channel_created")
 def handle_channel_created(event: dict, client) -> None:
     """Auto-join every new public channel so the nightly sweep has full coverage."""

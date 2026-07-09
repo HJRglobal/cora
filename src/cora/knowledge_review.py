@@ -211,6 +211,15 @@ APPROVE_REACTIONS = {"+1", "thumbsup", "white_check_mark", "heavy_check_mark"}
 DISMISS_REACTIONS = {"-1", "thumbsdown", "x", "no_entry_sign"}
 COMMENT_REACTIONS = {"speech_balloon", "thinking_face", "eyes"}
 
+# ── One-tap approve (2026-07-09 write-path) ──────────────────────────────────
+# Block Kit action_ids on the knowledge-review DM. The bot's Socket-Mode
+# interactivity handler (app.py) processes a click IMMEDIATELY -- keeping the
+# Harrison-only human gate (D-011 intact; friction-removal, NOT auto-approve).
+# The emoji 👍/👎 path is unchanged as the belt-and-braces (still processed at
+# the next scheduled run), so nothing regresses if interactivity is disabled.
+ACTION_APPROVE = "knowledge_approve"
+ACTION_DISMISS = "knowledge_dismiss"
+
 # ── Update types ─────────────────────────────────────────────────────────────
 
 # These mirror the gap_type values used by reconciliation_engine.py
@@ -510,8 +519,43 @@ def format_single_item_dm(update: dict[str, Any]) -> str:
     if coras_read:
         from .reply_formatter import normalize_slack_bold
         lines.append(normalize_slack_bold(coras_read))
-    lines.append("\n👍 Approve · 👎 Dismiss")
+    lines.append("\n👍 Approve · 👎 Dismiss  (or tap a button below)")
     return "\n".join(lines)
+
+
+def build_single_item_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """(fallback_text, Block Kit blocks) for one knowledge-review DM.
+
+    The blocks carry ✅/👎 buttons whose `value` is the update_id, handled by the
+    bot's Socket-Mode interactivity for instant one-tap approve/dismiss. The text
+    is the same string format_single_item_dm produces, kept as the notification
+    fallback AND so the emoji 👍/👎 path still works if interactivity is off.
+    """
+    text = format_single_item_dm(update)
+    uid = str(update.get("update_id", ""))
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
+        {
+            "type": "actions",
+            "block_id": f"kr_actions_{uid}"[:255],
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": ACTION_APPROVE,
+                    "text": {"type": "plain_text", "text": "✅ Approve & save"},
+                    "style": "primary",
+                    "value": uid,
+                },
+                {
+                    "type": "button",
+                    "action_id": ACTION_DISMISS,
+                    "text": {"type": "plain_text", "text": "👎 Dismiss"},
+                    "value": uid,
+                },
+            ],
+        },
+    ]
+    return text, blocks
 
 
 def format_pending_dm(updates: list[dict[str, Any]]) -> str:
@@ -617,11 +661,12 @@ def send_individual_dms(
 
     results: dict[str, str] = {}
     for update in unsent:
-        text = format_single_item_dm(update)
+        text, blocks = build_single_item_blocks(update)
         try:
             resp = client.chat_postMessage(
                 channel=dm_channel,
                 text=text,
+                blocks=blocks,
                 unfurl_links=False,
                 unfurl_media=False,
             )
@@ -633,3 +678,98 @@ def send_individual_dms(
         _time.sleep(0.5)
 
     return results
+
+
+# ── One-tap approve: shared executor + processor (2026-07-09 write-path) ─────
+# The KNOWLEDGE types the review DM carries are ALL local file writes (no
+# connector writes): known_answer -> gap_autofill.apply_known_answer (writes the
+# live Drive _brain/known-answers store via env KNOWN_ANSWERS_DIR), efficiency ->
+# friction_mining.apply_efficiency, an #info-for-cora generic ->
+# gap_autofill.apply_contributed_note. This function is bot-loadable (function-
+# level imports avoid any import cycle) so the Socket-Mode button handler in
+# app.py can apply an item the instant Harrison taps Approve. The scheduled
+# run_knowledge_review executor is UNCHANGED and stays the belt-and-braces for
+# emoji reactions; an item is claimed by exactly one path (resolve_update flips
+# PENDING once), so there is no double-processing.
+
+def apply_knowledge_update(update: dict[str, Any]) -> tuple[bool, str]:
+    """Execute an approved KNOWLEDGE update (local writes only). Returns
+    (ok, summary). Never raises. Non-knowledge types are refused (the button is
+    knowledge-only; connector writes route to owners / stay Harrison-run)."""
+    utype = (update or {}).get("update_type", "")
+    payload = (update or {}).get("payload") or {}
+    try:
+        if utype == "known_answer":
+            from .gap_autofill import apply_known_answer
+            ok, summary = apply_known_answer(payload)
+            if ok:
+                try:  # WS-3 golden-set auto-growth (fail-soft; parity w/ scheduled run)
+                    from .golden_set import append_case_from_known_answer
+                    append_case_from_known_answer(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)", exc_info=True)
+            return ok, summary
+        if utype == "efficiency":
+            from .friction_mining import apply_efficiency
+            return apply_efficiency(payload)
+        if utype == "generic" and payload.get("source") == "info-for-cora":
+            from .gap_autofill import apply_contributed_note
+            ok, summary = apply_contributed_note(payload)
+            if ok:
+                try:
+                    from .golden_set import append_case_from_note
+                    append_case_from_note(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)", exc_info=True)
+            return ok, summary
+        return False, f"update type '{utype}' is not one-tap-approvable"
+    except Exception as exc:  # noqa: BLE001 -- handler must not crash the bot
+        log.error("knowledge_review: apply_knowledge_update failed: %s", exc, exc_info=True)
+        return False, f"apply failed: {exc}"
+
+
+def _find_update(update_id: str) -> dict[str, Any] | None:
+    for u in load_proposed_updates():
+        if u.get("update_id") == update_id:
+            return u
+    return None
+
+
+def process_one_tap_action(
+    update_id: str, actor_id: str, *, approve: bool,
+) -> tuple[str, str]:
+    """Handle a one-tap Approve/Dismiss on a knowledge-review DM.
+
+    Returns (outcome, user_message) where outcome is one of:
+      not_authorized | not_found | already_resolved | approved | apply_failed |
+      dismissed. Harrison-only (D-011). Idempotent + race-safe: apply-first (its
+      own resolved-ledger/line dedup makes a double-apply a single write), then
+      resolve_update flips PENDING->APPROVED atomically (a second click sees
+      non-PENDING and no-ops). apply-first (not resolve-first) so an apply
+      FAILURE leaves the item PENDING for retry -- never 'approved but unsaved'.
+    """
+    if actor_id != HARRISON_SLACK_USER_ID:
+        log.warning("knowledge_review: one-tap action by non-Harrison %s ignored", actor_id)
+        return "not_authorized", "Only Harrison can approve knowledge items."
+
+    update = _find_update(update_id)
+    if update is None:
+        return "not_found", "I can't find that item anymore (it may have expired)."
+    if update.get("state") != "PENDING":
+        return ("already_resolved",
+                f"Already handled ({str(update.get('state', '')).lower() or 'resolved'}).")
+
+    if not approve:
+        resolve_update(update_id, "DISMISSED", reason="one_tap_button")
+        log.info("knowledge_review: one-tap DISMISS %s", update_id[:8])
+        return "dismissed", "👎 Dismissed — I won't save this."
+
+    ok, summary = apply_knowledge_update(update)
+    if not ok:
+        log.warning("knowledge_review: one-tap approve apply failed %s: %s",
+                    update_id[:8], summary)
+        return ("apply_failed",
+                f"⚠️ Couldn't save: {summary}. Left pending — I'll retry at the next review.")
+    resolve_update(update_id, "APPROVED", reason="one_tap_button")
+    log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
+    return "approved", f"✅ Saved to Cora's known-answers. ({summary})"
