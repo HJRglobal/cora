@@ -288,6 +288,30 @@ class TestAnswerQualityGate:
     def test_durable_facts_kept(self, good):
         assert ga.answer_quality_ok(good)[0] is True
 
+    # D-051 regression: re.IGNORECASE was folding the [A-Z@#]/[A-Z] name-guard so
+    # a common NOUN usage of contact/email/message/reach/dm was wrongly rejected.
+    # These durable facts MUST be kept; the deflections below MUST still reject.
+    @pytest.mark.parametrize("good", [
+        "The primary contact is Jane Doe at 555-1234.",
+        "The support email is help@osn.com.",
+        "Contact information for the vendor is on file.",
+        "Email marketing runs through Klaviyo.",
+        "Message retention is 90 days.",
+        "Reach targets are set quarterly.",
+        "DM open rates average about twelve percent.",
+        "The main contact for the DDD contract is Shaun Hawkins.",
+    ])
+    def test_noun_usage_of_trigger_words_kept(self, good):
+        assert ga.answer_quality_ok(good)[0] is True
+
+    @pytest.mark.parametrize("bad", [
+        "contact Larry about it",
+        "email @alex to confirm",
+        "ask the finance team",
+    ])
+    def test_capitalized_target_still_rejected(self, bad):
+        assert ga.answer_quality_ok(bad)[0] is False
+
 
 # ---------------------------------------------------------------------------
 # Layer B -- escalation eligibility + owner resolution

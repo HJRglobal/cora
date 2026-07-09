@@ -40,6 +40,13 @@ _ARCHIVE_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.archive.json
 
 _REPLY_LOCK = Lock()
 _UPDATES_LOCK = Lock()
+# Serializes one-tap button actions within the bot process so two concurrent
+# taps (Socket Mode dispatches on a thread pool) cannot both pass the
+# state==PENDING check and both apply -- which would duplicate an append-only
+# efficiency finding or last-writer-wins clobber a same-entity known-answer .md
+# rewrite (D-051 finding). Lock ordering is always _ONE_TAP_LOCK -> _UPDATES_LOCK
+# (resolve_update takes the latter); nothing acquires them in the reverse order.
+_ONE_TAP_LOCK = Lock()
 
 # ── Append-time idempotency (WS17-B item 2) ──────────────────────────────────
 # propose_update is otherwise a blind append: a backfill / re-run that re-derives
@@ -742,34 +749,44 @@ def process_one_tap_action(
 
     Returns (outcome, user_message) where outcome is one of:
       not_authorized | not_found | already_resolved | approved | apply_failed |
-      dismissed. Harrison-only (D-011). Idempotent + race-safe: apply-first (its
-      own resolved-ledger/line dedup makes a double-apply a single write), then
-      resolve_update flips PENDING->APPROVED atomically (a second click sees
-      non-PENDING and no-ops). apply-first (not resolve-first) so an apply
-      FAILURE leaves the item PENDING for retry -- never 'approved but unsaved'.
+      dismissed. Harrison-only (D-011).
+
+    Concurrency: the whole load->state-check->apply->resolve critical section
+    runs under _ONE_TAP_LOCK so two concurrent taps (Socket Mode dispatches on a
+    thread pool) cannot both pass the PENDING check and both apply. The update is
+    re-read from disk INSIDE the lock, so the second tap sees the first's
+    APPROVED/DISMISSED state and no-ops. apply-first-then-resolve (not the
+    reverse) so an apply FAILURE leaves the item PENDING -- never 'approved but
+    unsaved'. Cross-process (button vs the scheduled run) is additionally guarded
+    by each applier's own dedup (known_answer resolved-ledger, contributed_note
+    line, efficiency same-day-title).
     """
     if actor_id != HARRISON_SLACK_USER_ID:
         log.warning("knowledge_review: one-tap action by non-Harrison %s ignored", actor_id)
         return "not_authorized", "Only Harrison can approve knowledge items."
 
-    update = _find_update(update_id)
-    if update is None:
-        return "not_found", "I can't find that item anymore (it may have expired)."
-    if update.get("state") != "PENDING":
-        return ("already_resolved",
-                f"Already handled ({str(update.get('state', '')).lower() or 'resolved'}).")
+    with _ONE_TAP_LOCK:
+        update = _find_update(update_id)
+        if update is None:
+            return "not_found", "I can't find that item anymore (it may have expired)."
+        if update.get("state") != "PENDING":
+            return ("already_resolved",
+                    f"Already handled ({str(update.get('state', '')).lower() or 'resolved'}).")
 
-    if not approve:
-        resolve_update(update_id, "DISMISSED", reason="one_tap_button")
-        log.info("knowledge_review: one-tap DISMISS %s", update_id[:8])
-        return "dismissed", "👎 Dismissed — I won't save this."
+        if not approve:
+            resolve_update(update_id, "DISMISSED", reason="one_tap_button")
+            log.info("knowledge_review: one-tap DISMISS %s", update_id[:8])
+            return "dismissed", "👎 Dismissed — I won't save this."
 
-    ok, summary = apply_knowledge_update(update)
-    if not ok:
-        log.warning("knowledge_review: one-tap approve apply failed %s: %s",
-                    update_id[:8], summary)
-        return ("apply_failed",
-                f"⚠️ Couldn't save: {summary}. Left pending — I'll retry at the next review.")
-    resolve_update(update_id, "APPROVED", reason="one_tap_button")
-    log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
-    return "approved", f"✅ Saved to Cora's known-answers. ({summary})"
+        ok, summary = apply_knowledge_update(update)
+        if not ok:
+            log.warning("knowledge_review: one-tap approve apply failed %s: %s",
+                        update_id[:8], summary)
+            # Left PENDING; apply failures here are ~always permanent (empty
+            # answer / looks-like-PHI), so no auto-retry is promised -- it will
+            # auto-expire at the next review if not otherwise resolved.
+            return ("apply_failed",
+                    f"⚠️ Couldn't save: {summary}. Not stored (it may be empty or look like PHI).")
+        resolve_update(update_id, "APPROVED", reason="one_tap_button")
+        log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
+        return "approved", f"✅ Saved to Cora's known-answers. ({summary})"

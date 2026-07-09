@@ -366,10 +366,18 @@ def _format_evidence(chunks: list[Any]) -> str:
 # recoverable (digest flow / re-ask); a bad durable write is not.
 
 # Answer punts to a person/doc/tool instead of stating the fact.
+# The (?-i:...) scopes the capital-initial classes to CASE-SENSITIVE even though
+# the pattern is IGNORECASE overall (D-051: a plain [A-Z@#] under re.IGNORECASE
+# matches lowercase too, so "the contact is Jane", "the email is help@x",
+# "message retention is 90d" were all wrongly rejected). The verb words stay
+# case-insensitive (match "Contact"/"Email" at a sentence start), but the token
+# AFTER them must be a genuinely capitalized proper name/handle -- that is what
+# distinguishes a deflection ("contact Larry", "email @x") from the same word
+# used as a NOUN in a real fact ("the contact is ...", "email marketing runs...").
 _VAGUE_DEFLECTION_RE = re.compile(
     r"\b(?:ping|reach out to|reach|contact|check with|talk to|follow up with|"
-    r"loop in|email|dm|message)\s+[A-Z@#]"          # "ping Larry", "email @x", "check with #y"
-    r"|\bask\s+(?:[A-Z]|@|#|the\s+\w+\s+(?:team|owner|lead))"  # "ask Larry" / "ask the finance team"
+    r"loop in|email|dm|message)\s+(?-i:[A-Z@#])"     # "ping Larry", "email @x", "check with #y"
+    r"|\bask\s+(?:(?-i:[A-Z])|@|#|the\s+\w+\s+(?:team|owner|lead))"  # "ask Larry" / "ask the finance team"
     r"|\b(?:find|see|refer to|look\s+(?:at|in|for))\s+(?:the|our|that|this|it\s+in)\b"
     r"|\b(?:lives|is|are|can be found|located|sits)\s+in\s+(?:polar|hubspot|asana|"
     r"drive|quickbooks|qbo|slack|notion)\b"

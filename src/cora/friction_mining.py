@@ -871,8 +871,17 @@ def apply_efficiency(payload: dict[str, Any]) -> tuple[bool, str]:
         evidence_bits = "; ".join(
             (ev.get("excerpt") or "")[:120] for ev in (payload.get("evidence") or [])[:2]
         )
+        header = f"## [{today}] {title}"
+        # Idempotency (D-051): apply_efficiency is now reachable concurrently (the
+        # one-tap button) AND could be re-approved; a bare append would duplicate
+        # the finding. Skip if the exact same-day header block is already present
+        # (mirrors apply_known_answer / apply_contributed_note dedup).
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if existing and any(line.rstrip() == header for line in existing.splitlines()):
+            log.info("friction_mining: backlog entry already present -- %s (skip)", title)
+            return True, f"already in {path.name} -- skipped duplicate"
         entry = (
-            f"\n## [{today}] {title}\n\n"
+            f"\n{header}\n\n"
             f"- Signal: {payload.get('signal_type', '?')} | "
             f"Entity: {payload.get('entity', '?')} | {payload.get('frequency', '')}\n"
             f"- Route: {payload.get('route', '?')}\n"

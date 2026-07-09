@@ -536,6 +536,17 @@ class TestApplyEfficiency:
         assert "First finding" in text and "Second finding" in text
         assert text.count("# Efficiency Backlog") == 1
 
+    def test_dedups_same_day_title(self, paths):
+        # D-051 concurrency fix: apply_efficiency is now reachable concurrently
+        # (the one-tap button) and could be re-approved -- a same-day/title block
+        # must not be duplicated.
+        ok1, _ = fm.apply_efficiency(self._payload("Automate the CSV export"))
+        ok2, summary2 = fm.apply_efficiency(self._payload("Automate the CSV export"))
+        assert ok1 and ok2 and "skipped duplicate" in summary2
+        text = (paths / "backlog.md").read_text(encoding="utf-8")
+        assert text.count("## [") == 1
+        assert text.count("Automate the CSV export") == 1
+
     def test_never_raises(self, paths, monkeypatch):
         # Point the backlog under an existing FILE so mkdir(parents=True)
         # raises -- platform-safe unwritable target.

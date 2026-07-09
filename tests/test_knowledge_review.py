@@ -828,3 +828,28 @@ class TestOneTapApprove:
         ok, summary = kr.apply_knowledge_update(
             {"update_type": "asana_task", "payload": {}})
         assert ok is False and "not one-tap-approvable" in summary
+
+    def test_concurrent_double_approve_writes_once(self, tmp_path, monkeypatch):
+        # D-051: _ONE_TAP_LOCK must serialize concurrent taps so exactly one
+        # applies (no duplicate / clobbered write).
+        import threading
+        self._seed(tmp_path, monkeypatch)
+        outcomes: list[str] = []
+        rlock = threading.Lock()
+        barrier = threading.Barrier(6)
+
+        def worker():
+            barrier.wait()
+            oc, _ = kr.process_one_tap_action("ka-1", self.HARRISON, approve=True)
+            with rlock:
+                outcomes.append(oc)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert outcomes.count("approved") == 1
+        assert outcomes.count("already_resolved") == 5
+        md = (tmp_path / "known-answers" / "f3e.md").read_text(encoding="utf-8")
+        assert md.count("A: F3 Energy ships") == 1
