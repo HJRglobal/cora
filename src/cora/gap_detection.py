@@ -77,8 +77,31 @@ _DEDUP_WINDOW_DAYS = 7
 # One detection per thread root; prune in-memory entries older than this.
 _THREAD_TTL_SECONDS = 48 * 3600
 
+# ── kb_miss SHADOW calibration floor (D-066 follow-up; 2026-07-09 slice) ──────
+# PROVISIONAL, NOT LOCKED. The real kb_miss detector is UNCHANGED (still fires
+# only when kb_relevant_hits == 0, empirically unreachable at ~570K chunks). To
+# escape the chicken-and-egg -- we can't pick a real floor without a distance
+# distribution, and we have no distribution because kb_miss never fires -- this
+# module now (a) logs best_distance for EVERY answerable retrieval to a decision
+# stream, and (b) computes a SHADOW kb_miss verdict against this provisional
+# floor, LOG-ONLY. The shadow verdict NEVER DMs, routes, writes, or feeds
+# knowledge_gaps.log_gap; it only annotates the decision-log line. Harrison
+# calibrates the REAL floor ~1 week out from the collected distribution -- do
+# NOT wire this number into any gating path. Env override for experimentation.
+_DEFAULT_SHADOW_KB_MISS_FLOOR = 1.10
+
+
+def _shadow_kb_miss_floor() -> float:
+    try:
+        return float(os.environ.get("CORA_KB_MISS_SHADOW_FLOOR",
+                                    _DEFAULT_SHADOW_KB_MISS_FLOOR))
+    except (TypeError, ValueError):
+        return _DEFAULT_SHADOW_KB_MISS_FLOOR
+
+
 _STATE_LOCK = Lock()
 _THREAD_LOCK = Lock()
+_DECISION_LOG_LOCK = Lock()
 _THREAD_LOGGED: dict[str, float] = {}
 
 
@@ -87,11 +110,76 @@ def _state_path() -> Path:
                 or _REPO_ROOT / "data" / "state" / "gap_detection_state.json")
 
 
+def _decision_log_path() -> Path:
+    """Per-query retrieval-decision stream (env-overridable for tests). Distinct
+    from the gap log: it records the retrieval OUTCOME (best_distance, counts,
+    shadow verdict) for EVERY answerable query -- including the ones that got a
+    good answer -- so the answerable distance distribution exists for the ~1-week
+    kb_miss floor calibration. Numeric + entity/channel only; never any question
+    or response text (PHI-safe by construction)."""
+    return Path(os.environ.get("KB_DECISION_LOG_PATH")
+                or _REPO_ROOT / "logs" / "kb-retrieval-decisions.jsonl")
+
+
 def _daily_cap() -> int:
     try:
         return int(os.environ.get("CORA_GAP_DETECT_DAILY_CAP", _DEFAULT_DAILY_CAP))
     except ValueError:
         return _DEFAULT_DAILY_CAP
+
+
+def _log_retrieval_decision(
+    *, entity: str, channel: str, kb_meta: dict, gen_meta: dict,
+    thread_context: bool,
+) -> bool:
+    """Append one retrieval-decision record; compute the SHADOW kb_miss verdict.
+
+    Fires for every answerable query where a KB search ran (kb_search_ran).
+    Returns the shadow_kb_miss verdict (for logging by the caller). NEVER raises
+    -- a decision-log I/O error must not affect gap logging or the Q&A reply.
+    Shadow verdict is LOG-ONLY: it does not gate, DM, route, or write.
+    """
+    try:
+        if not kb_meta.get("kb_search_ran"):
+            return False
+        best_distance = kb_meta.get("kb_best_distance")
+        chunks_returned = kb_meta.get("kb_chunks_returned")
+        floor = _shadow_kb_miss_floor()
+        # Shadow kb_miss: the closest chunk was weaker than the provisional floor
+        # AND no other answer source was in play (mirrors the real kb_miss
+        # "no other source" guards, but keyed on distance instead of the
+        # unreachable relevant_hits==0). LOG-ONLY.
+        shadow_kb_miss = bool(
+            best_distance is not None
+            and best_distance > floor
+            and not kb_meta.get("kb_notes_hit")
+            and not kb_meta.get("cross_entity_fallback")
+            and not gen_meta.get("used_tools")
+            and not thread_context
+        )
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "entity": entity,
+            "channel": channel,
+            "best_distance": best_distance,
+            "chunks_returned": chunks_returned,
+            "relevant_hits": kb_meta.get("kb_relevant_hits"),
+            "notes_hit": bool(kb_meta.get("kb_notes_hit")),
+            "cross_entity_fallback": bool(kb_meta.get("cross_entity_fallback")),
+            "used_tools": bool(gen_meta.get("used_tools")),
+            "thread_context": bool(thread_context),
+            "shadow_kb_miss": shadow_kb_miss,
+            "shadow_floor": floor,
+        }
+        path = _decision_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _DECISION_LOG_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return shadow_kb_miss
+    except Exception:  # noqa: BLE001 -- instrumentation must never break Q&A
+        log.warning("gap_detection: decision-log error (non-fatal)", exc_info=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +570,24 @@ def _maybe_log_gap_inner(
             return None
     elif is_deflection(response_text):
         return None
+
+    # Per-query retrieval-decision telemetry (2026-07-09 kb_miss calibration
+    # slice): record best_distance + the SHADOW kb_miss verdict for every
+    # answerable query where a KB search ran. LOG-ONLY -- the shadow verdict
+    # never gates, DMs, routes, or writes; it exists solely to build the
+    # answerable distance distribution Harrison calibrates the real floor from
+    # (~1 week out). Placed AFTER the deflection veto so refusals don't pollute
+    # the distribution, and BEFORE the dedup/cap/thread gates so EVERY answerable
+    # query is measured (not just the <=15/day that survive the gap cap).
+    # Fail-soft: _log_retrieval_decision never raises.
+    shadow_miss = _log_retrieval_decision(
+        entity=ent, channel=channel, kb_meta=kb_meta, gen_meta=gen_meta,
+        thread_context=thread_context,
+    )
+    if shadow_miss:
+        log.info("gap_detection: SHADOW kb_miss (log-only, NOT a gap) entity=%s "
+                 "channel=#%s best_distance=%s floor=%.2f", ent, channel,
+                 kb_meta.get("kb_best_distance"), _shadow_kb_miss_floor())
 
     detector: str | None = None
     gap_desc = ""

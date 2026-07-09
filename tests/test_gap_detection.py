@@ -29,9 +29,19 @@ def _isolated_state(tmp_path, monkeypatch):
                        str(tmp_path / ".resolved-gaps.jsonl"))
     monkeypatch.setenv("GAP_AUTOFILL_STATE_PATH",
                        str(tmp_path / "gap_autofill_state.json"))
+    monkeypatch.setenv("KB_DECISION_LOG_PATH",
+                       str(tmp_path / "kb-retrieval-decisions.jsonl"))
     monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    monkeypatch.delenv("CORA_KB_MISS_SHADOW_FLOOR", raising=False)
     gd._THREAD_LOGGED.clear()
     return tmp_path
+
+
+def _read_decisions(tmp_path):
+    path = tmp_path / "kb-retrieval-decisions.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l]
 
 
 def _read_gaps(tmp_path):
@@ -48,11 +58,13 @@ def _kb_miss_meta():
 def _detect(tmp_path, *, entity="F3E", channel="f3e-leadership", user="U1",
             question=QUESTION, response="Here is a long substantive answer "
             "about the vendor with plenty of details in it.",
-            kb_meta=None, gen_meta=None, is_dm=False, thread_key=""):
+            kb_meta=None, gen_meta=None, is_dm=False, thread_key="",
+            thread_context=False):
     return gd.maybe_log_gap(
         entity=entity, channel=channel, user=user, question=question,
         response_text=response, latency_ms=1200,
         kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm, thread_key=thread_key,
+        thread_context=thread_context,
     )
 
 
@@ -259,6 +271,100 @@ class TestDeflectionCollisionAfterWidening:
         assert gd.is_unknown_response(reply) is False
         # No kb_meta -> kb_miss can't fire either; the reply must not log at all.
         assert _detect(_isolated_state, response=reply) is None
+
+
+class TestRetrievalDecisionLog:
+    """2026-07-09 kb_miss calibration slice: a per-query decision stream +
+    a SHADOW kb_miss verdict. LOG-ONLY -- the shadow verdict must never create a
+    gap, DM, route, or write. Its purpose is to build the answerable distance
+    distribution Harrison locks the real floor from (~1 week out)."""
+
+    def _good(self, best):
+        # A good retrieval: chunks under the gate, distance = best.
+        return {"kb_search_ran": True, "kb_relevant_hits": 5,
+                "kb_notes_hit": False, "kb_chunks_returned": 12,
+                "kb_best_distance": best}
+
+    def test_good_answer_logs_decision_no_gap_no_shadow(self, _isolated_state):
+        det = _detect(_isolated_state, kb_meta=self._good(0.62),
+                      response="Here is a solid, well-sourced answer with detail.")
+        assert det is None                       # no gap on a good answer
+        assert not _read_gaps(_isolated_state)
+        rows = _read_decisions(_isolated_state)
+        assert len(rows) == 1
+        assert rows[0]["best_distance"] == 0.62
+        assert rows[0]["shadow_kb_miss"] is False
+        assert rows[0]["relevant_hits"] == 5
+
+    def test_weak_retrieval_flags_shadow_but_logs_no_gap(self, _isolated_state):
+        # best_distance ABOVE the provisional floor with no other source ->
+        # shadow_kb_miss True, but NO real gap (real kb_miss needs 0 hits).
+        det = _detect(_isolated_state, kb_meta=self._good(1.22),
+                      response="Here is a weakly-grounded but substantive answer.")
+        assert det is None
+        assert not _read_gaps(_isolated_state)     # real detector unchanged
+        rows = _read_decisions(_isolated_state)
+        assert len(rows) == 1 and rows[0]["shadow_kb_miss"] is True
+        assert rows[0]["shadow_floor"] == gd._DEFAULT_SHADOW_KB_MISS_FLOOR
+
+    def test_shadow_floor_env_override(self, _isolated_state, monkeypatch):
+        monkeypatch.setenv("CORA_KB_MISS_SHADOW_FLOOR", "0.90")
+        _detect(_isolated_state, kb_meta=self._good(0.95),
+                response="A substantive answer grounded just past a tight floor.")
+        rows = _read_decisions(_isolated_state)
+        assert rows[0]["shadow_floor"] == 0.90 and rows[0]["shadow_kb_miss"] is True
+
+    def test_shadow_excludes_tool_note_fallback_thread(self, _isolated_state):
+        # used_tools -> not a shadow miss even at high distance.
+        _detect(_isolated_state, kb_meta=self._good(1.4),
+                gen_meta={"used_tools": True},
+                response="A tool-answered reply with real content.")
+        # notes_hit -> not a shadow miss.
+        meta_notes = self._good(1.4); meta_notes["kb_notes_hit"] = True
+        _detect(_isolated_state, kb_meta=meta_notes,
+                response="An answer that came from the asker's own note.")
+        # thread_context -> not a shadow miss.
+        _detect(_isolated_state, kb_meta=self._good(1.4), thread_context=True,
+                response="An answer sourced from the prior thread messages.")
+        rows = _read_decisions(_isolated_state)
+        assert len(rows) == 3
+        assert all(r["shadow_kb_miss"] is False for r in rows)
+
+    def test_no_decision_line_when_search_never_ran(self, _isolated_state):
+        # Pure tool path (no KB search) -> no retrieval decision to record.
+        _detect(_isolated_state, kb_meta={"kb_search_ran": False},
+                gen_meta={"used_tools": True},
+                response="A calendar tool answer with no KB retrieval at all.")
+        assert _read_decisions(_isolated_state) == []
+
+    def test_deflection_does_not_pollute_the_distribution(self, _isolated_state):
+        # A guard refusal is vetoed BEFORE the decision log, so its weak
+        # retrieval never enters the answerable distribution.
+        _detect(_isolated_state, kb_meta=self._good(1.4),
+                response="That's company financials -- ask in #f3e-finance.")
+        assert _read_decisions(_isolated_state) == []
+
+    def test_decision_record_has_no_question_or_response_text(self, _isolated_state):
+        _detect(_isolated_state, question="what brand of coffee is in the kitchen?",
+                kb_meta=self._good(1.25),
+                response="I do have a detailed answer with sensitive wording here.")
+        row = _read_decisions(_isolated_state)[0]
+        blob = json.dumps(row).lower()
+        assert "coffee" not in blob and "sensitive wording" not in blob
+        # only numeric + entity/channel fields
+        assert set(row) == {"ts", "entity", "channel", "best_distance",
+                            "chunks_returned", "relevant_hits", "notes_hit",
+                            "cross_entity_fallback", "used_tools",
+                            "thread_context", "shadow_kb_miss", "shadow_floor"}
+
+    def test_unknown_response_gap_still_logs_and_decision_recorded(self, _isolated_state):
+        # A genuine unknown miss: the real unknown_response gap fires AND the
+        # decision line is recorded (both streams, no interference).
+        det = _detect(_isolated_state, response=_SMOKE_THAT_CONTEXT,
+                      kb_meta=self._good(1.074))
+        assert det == "unknown_response"
+        assert len(_read_gaps(_isolated_state)) == 1
+        assert len(_read_decisions(_isolated_state)) == 1
 
 
 class TestDeflectionPointerVsReason:
