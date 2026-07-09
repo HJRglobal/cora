@@ -354,6 +354,73 @@ def _format_evidence(chunks: list[Any]) -> str:
     return "\n\n".join(parts)
 
 
+# ── MINE answer-quality / durability gate (GL-11/12, 2026-07-09) ─────────────
+# The lifetime auto-approved MINE writes were low-value and are why the
+# approve-rate is 0: vague deflections ("F3 ad-spend ROI lives in Polar, ping
+# Larry"; "find the PDF Harrison presented"), in-progress statuses ("Harrison is
+# working with freelancers ... by end of week"), and point-in-time snapshots
+# ("cash crunched this week"; "what's on my plate") frozen as durable canon.
+# Bias to PRECISION: a low-quality proposal that Harrison must -1 (or, worse,
+# approves into a misleading canonical fact) is worse than proposing nothing, so
+# reject these BEFORE a MINE proposal is queued. An occasional false reject is
+# recoverable (digest flow / re-ask); a bad durable write is not.
+
+# Answer punts to a person/doc/tool instead of stating the fact.
+_VAGUE_DEFLECTION_RE = re.compile(
+    r"\b(?:ping|reach out to|reach|contact|check with|talk to|follow up with|"
+    r"loop in|email|dm|message)\s+[A-Z@#]"          # "ping Larry", "email @x", "check with #y"
+    r"|\bask\s+(?:[A-Z]|@|#|the\s+\w+\s+(?:team|owner|lead))"  # "ask Larry" / "ask the finance team"
+    r"|\b(?:find|see|refer to|look\s+(?:at|in|for))\s+(?:the|our|that|this|it\s+in)\b"
+    r"|\b(?:lives|is|are|can be found|located|sits)\s+in\s+(?:polar|hubspot|asana|"
+    r"drive|quickbooks|qbo|slack|notion)\b"
+    r"|\bin\s+the\s+(?:\w+\s+)?(?:sheet|deck|doc|document|drive|pdf|file|spreadsheet|"
+    r"folder|tracker)\b"                              # "in the sheet", "in the shared spreadsheet"
+    r"|\bthe\s+(?:pdf|deck|doc|document|file|spreadsheet|sheet)\s+(?:harrison|he|she|"
+    r"they|we|larry|justin|hannah|tommy|shaun|matt)\b",
+    re.IGNORECASE,
+)
+
+# Answer describes work-in-progress rather than a settled fact.
+_IN_PROGRESS_RE = re.compile(
+    r"\b(?:working on|in progress|being\s+(?:worked|built|finalized|decided|determined)|"
+    r"by\s+(?:the\s+)?end of|by eod|by\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"coming soon|not yet\s+(?:decided|determined|confirmed|finalized|set|available)|"
+    r"still\s+(?:being|working|figuring)|to be\s+(?:determined|decided|confirmed)|"
+    r"\btbd\b|\btbc\b)",
+    re.IGNORECASE,
+)
+
+# Answer is time-relative -> rots as canon (a durable fact is not "this week").
+_SNAPSHOT_RE = re.compile(
+    r"\b(?:this\s+(?:week|month|quarter)|last\s+(?:week|month|quarter)|today|yesterday|"
+    r"as of\s+(?:now|today|this|yesterday)|currently|right now|at the moment|"
+    r"so far this|this\s+(?:morning|afternoon)|(?:this|current)\s+pay\s?period)\b",
+    re.IGNORECASE,
+)
+
+_MIN_DURABLE_ANSWER_CHARS = 12
+
+
+def answer_quality_ok(answer: str) -> tuple[bool, str]:
+    """Reject vague-deflection / in-progress / point-in-time-snapshot drafts
+    before a MINE proposal is queued (GL-11/12). Returns (ok, reason).
+
+    Applied ONLY on the MINE (mined-draft) path -- NOT at the Harrison-approved
+    write, so a click-to-approve always results in a write (no confusing
+    "approved but nothing saved"). Bias to precision.
+    """
+    text = (answer or "").strip()
+    if len(text) < _MIN_DURABLE_ANSWER_CHARS:
+        return False, "answer too short to be a durable fact"
+    if _VAGUE_DEFLECTION_RE.search(text):
+        return False, "answer punts to a person/doc/tool instead of stating the fact"
+    if _IN_PROGRESS_RE.search(text):
+        return False, "answer describes in-progress work, not a settled fact"
+    if _SNAPSHOT_RE.search(text):
+        return False, "answer is a point-in-time snapshot, not durable canon"
+    return True, ""
+
+
 def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | None:
     """Haiku drafts an answer from evidence. Fail-CLOSED: any error -> None."""
     if len(evidence) < MIN_EVIDENCE_CHUNKS:
@@ -390,6 +457,13 @@ def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | N
         return None
     answer = str(verdict.get("answer") or "").strip()
     if not answer or is_phi_risk(answer) or is_clinical_phi(answer):
+        return None
+    # GL-11/12 durability gate: don't propose a vague deflection / in-progress
+    # status / point-in-time snapshot as canon (bias to precision).
+    ok, reason = answer_quality_ok(answer)
+    if not ok:
+        log.info("gap_autofill: draft rejected (quality) for gap %s: %s",
+                 gap.get("ts", "?"), reason)
         return None
     confidence = str(verdict.get("confidence") or "MED").upper()
     if confidence not in ("HIGH", "MED", "LOW"):

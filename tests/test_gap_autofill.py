@@ -217,11 +217,76 @@ class TestDraftAnswer:
         assert ga.draft_answer(_gap(), [_chunk(), _chunk()]) is None
 
     def test_bad_confidence_normalized(self, paths, monkeypatch):
+        # Answer must be a durable fact (the GL-11/12 gate rejects "Yes." as too
+        # short); this case exists to test confidence normalization.
         self._fake_anthropic(monkeypatch, json.dumps({
-            "answerable": True, "answer": "Yes.", "confidence": "VERY",
-            "citation": ""}))
+            "answerable": True, "answer": "The Q2 launch is confirmed for June 15.",
+            "confidence": "VERY", "citation": ""}))
         out = ga.draft_answer(_gap(), [_chunk(), _chunk()])
         assert out["confidence"] == "MED"
+
+    def test_vague_deflection_draft_rejected(self, paths, monkeypatch):
+        # GL-11: "ROI lives in Polar, ping Larry" is a pointer, not a fact.
+        self._fake_anthropic(monkeypatch, json.dumps({
+            "answerable": True,
+            "answer": "The F3 ad-spend ROI lives in Polar -- ping Larry for it.",
+            "confidence": "HIGH", "citation": "excerpt 1"}))
+        assert ga.draft_answer(_gap(), [_chunk(), _chunk()]) is None
+
+    def test_in_progress_draft_rejected(self, paths, monkeypatch):
+        # GL-11: "working with freelancers ... by end of week" is not settled.
+        self._fake_anthropic(monkeypatch, json.dumps({
+            "answerable": True,
+            "answer": "Harrison is working with freelancers and it'll be done by end of week.",
+            "confidence": "HIGH", "citation": "excerpt 2"}))
+        assert ga.draft_answer(_gap(), [_chunk(), _chunk()]) is None
+
+    def test_snapshot_draft_rejected(self, paths, monkeypatch):
+        # GL-12: a point-in-time cash snapshot must not freeze as canon.
+        self._fake_anthropic(monkeypatch, json.dumps({
+            "answerable": True,
+            "answer": "Cash crunched this week -- the balance is about 17,747 dollars.",
+            "confidence": "HIGH", "citation": "excerpt 1"}))
+        assert ga.draft_answer(_gap(), [_chunk(), _chunk()]) is None
+
+    def test_durable_fact_draft_kept(self, paths, monkeypatch):
+        # A genuine durable fact naming an owner is KEPT (not a deflection).
+        self._fake_anthropic(monkeypatch, json.dumps({
+            "answerable": True,
+            "answer": "Larry Kotch owns F3 Energy ad-spend and reports ROI monthly.",
+            "confidence": "HIGH", "citation": "excerpt 3"}))
+        out = ga.draft_answer(_gap(), [_chunk(), _chunk()])
+        assert out is not None and "Larry Kotch owns" in out["answer"]
+
+
+class TestAnswerQualityGate:
+    """GL-11/12 unit coverage: the durability classifier itself."""
+
+    @pytest.mark.parametrize("bad", [
+        "ping Larry for the numbers",
+        "The ROI lives in Polar -- ask Larry.",
+        "Find the PDF Harrison presented last month.",
+        "See the deck in the drive for details.",
+        "It's in the sheet the Justin team maintains.",
+        "Harrison is working on it, done by Friday.",
+        "That's TBD right now.",
+        "We closed 3 deals this week.",
+        "As of today the count is 42.",
+        "The pipeline currently sits at five deals.",
+        "ok",  # too short
+    ])
+    def test_low_quality_rejected(self, bad):
+        assert ga.answer_quality_ok(bad)[0] is False
+
+    @pytest.mark.parametrize("good", [
+        "The Anaheim warehouse is at 1234 S Anaheim Blvd, CA 92805.",
+        "Larry Kotch owns F3 Energy ad-spend reporting.",
+        "The DDD provider contract renews every October.",
+        "F3 Energy ships DTC orders via ShipBob out of the Reno hub.",
+        "Cora's knowledge review runs Mon-Fri at 7am Arizona time.",
+    ])
+    def test_durable_facts_kept(self, good):
+        assert ga.answer_quality_ok(good)[0] is True
 
 
 # ---------------------------------------------------------------------------
