@@ -71,3 +71,25 @@ def test_no_deal_task_sync_ps1_or_task_resurrected():
     assert not offenders, (
         "Deal Task Sync task/script resurrected in: " + ", ".join(sorted(offenders))
     )
+
+
+def test_no_ps1_reregisters_task_by_display_name():
+    """No deployment/scripts .ps1 may re-register the task by its display name.
+
+    Closes the resurrection vector the filename checks miss (D-051 review): a PS1
+    that does `Register-ScheduledTask -TaskName "Cora - Deal Task Sync"` pointed
+    at a differently-named script would evade the run_deal_task_sync/PS1-name
+    guards while silently reviving the retired task. The display name is allowed
+    ONLY in data/maps/scheduled-task-state.yaml (the delist reminder), which is
+    not scanned here.
+    """
+    offenders = []
+    for base in (_REPO / "deployment", _REPO / "scripts"):
+        if not base.exists():
+            continue
+        for path in base.rglob("*.ps1"):
+            if "Cora - Deal Task Sync" in path.read_text(encoding="utf-8", errors="ignore"):
+                offenders.append(str(path.relative_to(_REPO)))
+    assert not offenders, (
+        "Deal Task Sync re-registered by display name in: " + ", ".join(sorted(offenders))
+    )

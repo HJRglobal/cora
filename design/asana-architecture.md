@@ -1,7 +1,7 @@
 # Asana Architecture — how Cora maps work into Asana (Phase 1.10)
 
 **Purpose.** The canonical reference for how Cora's task creation (Fireflies
-meeting capture, `react-to-task`, deal-task sync, etc.) maps onto the HJR Global
+meeting capture, `react-to-task`, etc.) maps onto the HJR Global
 Asana workspace. Harrison #4 ("Asana is messy; I need a Goals / Portfolio /
 Project / Task framework"). This doc is the human-readable model; the machine
 sources of truth are the two YAML maps in `data/maps/` (below).

@@ -58,32 +58,47 @@ def test_every_entity_has_a_repo_seed_file():
 
 
 def test_every_seed_carries_authoritative_banner():
-    """The 'Drive is authoritative' banner must not be silently removed."""
+    """The 'Drive is authoritative' banner must be present on line 1.
+
+    Checked on the first NON-EMPTY line (not substring-anywhere) so a banner that
+    drifted off the top -- the position the README promises and context injection
+    surfaces first -- is caught, not silently tolerated lower in the file.
+    """
     offenders = []
     for name in _SEED_FILES:
         p = _KA_DIR / name
         if not p.is_file():
             continue  # covered by the existence test
-        if _BANNER_ANCHOR not in p.read_text(encoding="utf-8", errors="ignore"):
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        first = next((ln for ln in lines if ln.strip()), "")
+        if _BANNER_ANCHOR not in first:
             offenders.append(name)
     assert not offenders, (
-        "known-answers seed(s) missing the authoritative-store banner: "
+        "known-answers seed(s) missing the line-1 authoritative-store banner: "
         + ", ".join(sorted(offenders))
         + " -- restore the line-1 banner (see design/known-answers/README.md)."
     )
 
 
 def test_every_seed_still_parses_as_fallback():
-    """Each seed must remain a usable fallback: it has the append-target section."""
+    """Each seed must remain a usable fallback: the append-target section exists.
+
+    The marker is checked as a STANDALONE line, mirroring the write path exactly
+    (gap_autofill._append_to_section locates the section with un-stripped
+    `line == section_header`). A substring check would false-pass on an inline
+    mention while `_append_to_section` failed to find the header and silently
+    appended at EOF.
+    """
     offenders = []
     for name in _SEED_FILES:
         p = _KA_DIR / name
         if not p.is_file():
             continue
-        if _PARSE_MARKER not in p.read_text(encoding="utf-8", errors="ignore"):
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        if not any(line == _PARSE_MARKER for line in text.splitlines()):
             offenders.append(name)
     assert not offenders, (
-        f"known-answers seed(s) missing a '{_PARSE_MARKER}' section: "
+        f"known-answers seed(s) missing a standalone '{_PARSE_MARKER}' section line: "
         + ", ".join(sorted(offenders))
     )
 

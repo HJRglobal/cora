@@ -61,7 +61,7 @@ disabled:
 # listed here. A removed task is not an "expected disabled" task.
 
 # Expected-ENABLED tasks worth documenting as single-source-of-truth. The current
-# nightly_health_check._load_expected() reads only `disabled` + `running` (an
+# nightly_health_check._load_task_state_config() reads only `disabled` + `running` (an
 # enabled task simply must NOT be in `disabled`), so this section is documentary +
 # forward-compatible -- it will not false-WARN and is ready if the health check is
 # extended to assert expected-enabled tasks.
