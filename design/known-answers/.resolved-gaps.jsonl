@@ -1,2 +1,16 @@
 {"id": "2026-05-18T09:15:21.956663+00:00", "action": "answer", "timestamp": "2026-05-18T10:53:27.562536+00:00", "target_entity": "FNDR", "captured_entity": "FNDR"}
 {"id": "2026-05-18T09:50:10.784379+00:00", "action": "dynamic", "timestamp": "2026-05-18T22:30:38.865670+00:00", "target_entity": "OSN", "captured_entity": "OSN", "dynamic_answer_path": "design/known-answers/dynamic/OSN/monthly-financials.yaml", "snapshot_path": "data/snapshots/osn-monthly-financials/latest.yaml"}
+{"id": "2026-06-07T03:57:17.874649+00:00", "action": "answer", "timestamp": "2026-06-22T14:00:02.338128+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_autofill", "answer_source": "slack_kb"}
+{"id": "2026-06-11T07:47:14.971912+00:00", "action": "answer", "timestamp": "2026-06-22T14:00:04.080065+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_autofill", "answer_source": "slack_kb"}
+{"id": "2026-06-15T08:34:47.115134+00:00", "action": "answer", "timestamp": "2026-06-22T14:00:04.819952+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_autofill", "answer_source": "slack_kb"}
+{"id": "2026-05-26T18:40:19.876454+00:00", "action": "answer", "timestamp": "2026-06-23T14:00:06.487754+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
+{"id": "2026-05-21T21:59:36.403689+00:00", "action": "answer", "timestamp": "2026-06-23T14:00:06.831846+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_autofill", "answer_source": "teammate_dm"}
+{"id": "2026-05-21T21:39:58.791532+00:00", "action": "answer", "timestamp": "2026-06-23T14:00:07.187052+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_autofill", "answer_source": "teammate_dm"}
+{"id": "2026-05-18T20:08:40.448754+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.077279+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_ttl"}
+{"id": "2026-05-18T20:11:17.120133+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.077279+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_ttl"}
+{"id": "2026-05-18T20:38:30.741929+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_ttl"}
+{"id": "2026-05-22T15:50:02.997318+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_ttl"}
+{"id": "2026-05-24T20:14:15.639715+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_ttl"}
+{"id": "2026-05-24T23:18:59.572604+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_ttl"}
+{"id": "2026-05-26T09:04:43.198658+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_ttl"}
+{"id": "2026-05-28T18:49:14.574041+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_ttl"}

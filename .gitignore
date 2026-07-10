@@ -88,3 +88,6 @@ data/*.db.bak*
 /.git-corrupt-backup/
 /backups/
 data/health-kb-baseline.json
+data/health-flywheel-baseline.json
+data/cora-proposed-memory-updates.archive.jsonl
+data/*.jsonl.bak-*
