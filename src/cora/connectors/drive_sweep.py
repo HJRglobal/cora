@@ -44,7 +44,11 @@ import yaml
 
 from cora.connectors.drive_entity_detect import detect_entity_from_filename
 from cora.drive_materializer import ENTITY_CODES as _MATERIALIZER_ENTITY_CODES
-from cora.kb_exclusions import is_cora_internal_title
+from cora.kb_exclusions import (
+    KB_EXCLUDED_FOLDER_IDS,
+    folder_ids_excluded,
+    is_cora_internal_title,
+)
 from cora.knowledge_base.store import Document
 from cora.phi_guard import _PHI_PATTERNS
 
@@ -494,6 +498,42 @@ def _retry_execute(request: Any, max_retries: int = 3) -> Any:
             raise
 
 
+def _expanded_excluded_folder_ids(
+    service: Any, base_ids: frozenset[str] = KB_EXCLUDED_FOLDER_IDS, *, max_folders: int = 500
+) -> frozenset[str]:
+    """Expand the KB-excluded dashboard folders to include their descendant
+    subfolders, so a FLAT per-user sweep (which has no tree context) can skip
+    NESTED files, not just direct children.
+
+    Fail-safe: on any API error it returns whatever it has gathered (at least the
+    base roots), and it never over-excludes outside those subtrees. For users who
+    can't see the folders, each list returns empty (cheap no-op)."""
+    out: set[str] = set(base_ids)
+    queue: list[str] = list(base_ids)
+    try:
+        while queue and len(out) < max_folders:
+            fid = queue.pop()
+            resp = _retry_execute(
+                service.files().list(
+                    q=(
+                        f"'{fid}' in parents"
+                        f" and mimeType = 'application/vnd.google-apps.folder'"
+                        f" and trashed = false"
+                    ),
+                    spaces="drive",
+                    fields="files(id)",
+                    pageSize=100,
+                )
+            )
+            for f in resp.get("files", []):
+                if f["id"] not in out:
+                    out.add(f["id"])
+                    queue.append(f["id"])
+    except Exception as exc:  # noqa: BLE001 -- fail-safe, never crash the sweep
+        log.warning("drive_sweep: excluded-folder expansion partial (%s)", exc)
+    return frozenset(out)
+
+
 def _build_drive_service(sa_json_path: str, user_email: str):
     """Build a Drive v3 service impersonating user_email via DWD."""
     from google.oauth2 import service_account
@@ -600,6 +640,11 @@ def sweep_user(
     # missing -> we degrade to the Drive-export path without crashing).
     sheets_service = _build_sheets_service(sa_json_path, email)
 
+    # Dashboard read layer (2026-07-11): never ingest the personal / highly-
+    # confidential dashboard stores. This is a FLAT sweep, so expand the excluded
+    # roots to their descendant subfolders to catch nested files too.
+    excluded_folders = _expanded_excluded_folder_ids(service)
+
     # Build Drive files.list query
     q = (
         f"({_SUPPORTED_MIME_QUERY})"
@@ -649,6 +694,13 @@ def sweep_user(
             if is_cora_internal_title(filename, broad=True):
                 stats.setdefault("cora_internal_skipped", 0)
                 stats["cora_internal_skipped"] += 1
+                continue
+
+            # Dashboard read layer: never ingest personal/confidential dashboard
+            # stores (OneAmerica, capital-raise, travel-points) or their subtrees.
+            if folder_ids_excluded(file_meta.get("parents"), excluded_folders):
+                stats.setdefault("dashboard_excluded_skipped", 0)
+                stats["dashboard_excluded_skipped"] += 1
                 continue
 
             # Skip very small files (likely empty/template)
@@ -989,6 +1041,14 @@ def _process_single_folder_files(
             if is_cora_internal_title(filename, broad=True):
                 stats.setdefault("cora_internal_skipped", 0)
                 stats["cora_internal_skipped"] += 1
+                continue
+
+            # Dashboard read layer: skip personal/confidential dashboard stores
+            # (belt for direct children; nested files are pruned at the tree walk
+            # via skip_folder_ids).
+            if folder_ids_excluded(file_meta.get("parents")):
+                stats.setdefault("dashboard_excluded_skipped", 0)
+                stats["dashboard_excluded_skipped"] += 1
                 continue
 
             try:
@@ -1378,6 +1438,7 @@ def sweep_founders_os(
                     checkpoint_key=key,
                     sheets_service=sheets_service,
                     deadline_monotonic=deadline,
+                    skip_folder_ids=KB_EXCLUDED_FOLDER_IDS,
                 )
                 if not done:
                     entity_completed = False
@@ -1395,7 +1456,7 @@ def sweep_founders_os(
                     checkpoint_key=key,
                     sheets_service=sheets_service,
                     deadline_monotonic=deadline,
-                    skip_folder_ids=sub_skip,
+                    skip_folder_ids=sub_skip | KB_EXCLUDED_FOLDER_IDS,
                 )
         else:
             key = f"founders_os_ckpt_{folder_id}"
@@ -1410,6 +1471,7 @@ def sweep_founders_os(
                 checkpoint_key=key,
                 sheets_service=sheets_service,
                 deadline_monotonic=deadline,
+                skip_folder_ids=KB_EXCLUDED_FOLDER_IDS,
             )
 
         aggregate["entities_swept"] += 1

@@ -27,6 +27,7 @@ from .lex_sub_entity import (
     restricted_lex_phi_content_drop,
 )
 from ..finance_doc_classifier import is_financial_document
+from ..kb_exclusions import is_dashboard_store_path
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +193,27 @@ class KnowledgeBase:
         the prior chunks.
         """
         docs_list = list(docs)
+        if not docs_list:
+            return 0
+
+        # Step 0-guard: NEVER ingest personal / highly-confidential dashboard stores
+        # (capital-raise, oneamerica, travel-points). Universal chokepoint for every
+        # path-bearing source -- static_md (source_id IS the path) and drive_asset
+        # (metadata.path is the Drive path). drive_sweep carries no path (source_id =
+        # bare file id) and is excluded at enumeration instead (kb_exclusions
+        # KB_EXCLUDED_FOLDER_IDS wired into drive_sweep). Dashboard read layer,
+        # 2026-07-11; "capital-raise KB-exclusion" is a standing directive.
+        kept = []
+        dropped = 0
+        for doc in docs_list:
+            meta_path = str((doc.metadata or {}).get("path", ""))
+            if is_dashboard_store_path(doc.source_id) or is_dashboard_store_path(meta_path):
+                dropped += 1
+                continue
+            kept.append(doc)
+        if dropped:
+            log.info("upsert_documents: dropped %d dashboard-store doc(s) (KB-excluded)", dropped)
+        docs_list = kept
         if not docs_list:
             return 0
 

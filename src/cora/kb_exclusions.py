@@ -63,6 +63,66 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard read layer (2026-07-11): personal / highly-confidential dashboard
+# backing-store folders that must NEVER be KB-ingested.
+# ─────────────────────────────────────────────────────────────────────────────
+# The `.json` state files are already excluded by an accident of the sweep MIME
+# allow-list (application/json is not requested), but their `.md` / `.xlsx`
+# siblings (capital-raise deal docs, the OneAmerica tracker workbook) WOULD be
+# swept. Hardcoded here -- NOT read from dashboard-access.yaml -- so an ingest
+# sweep can never fail-open on a YAML parse error. Keep in sync with the
+# `kb_ingest: never` / `kb_excluded_folders` entries in
+# data/maps/dashboard-access.yaml.
+KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
+    {
+        "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # 00-Founder/insurance/oneamerica (PERSONAL)
+        "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP",  # 02-F3-Energy/projects/capital-raise (HIGHLY CONFIDENTIAL)
+        "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # 00-Founder/travel-points (PERSONAL)
+    }
+)
+
+
+# Distinctive folder-name segments of the excluded dashboard stores. A source_id
+# that is a PATH (static_md) or a Drive `metadata.path` (drive_asset) sitting under
+# one of these folders is dropped at the store chokepoint (upsert_documents Step 0).
+# drive_sweep stores no path (source_id = bare Drive file id) and is instead handled
+# by the folder-id exclusion above at enumeration time.
+_DASHBOARD_STORE_SEGMENTS: frozenset[str] = frozenset(
+    {"capital-raise", "oneamerica", "travel-points"}
+)
+
+
+def is_excluded_folder(folder_id: str) -> bool:
+    """True if a Drive folder id is a personal/confidential dashboard store that
+    must never be KB-ingested."""
+    return bool(folder_id) and folder_id in KB_EXCLUDED_FOLDER_IDS
+
+
+def is_dashboard_store_path(path_or_source_id: str) -> bool:
+    """True if a filesystem path, Drive path, or path-shaped source_id sits inside
+    a personal / highly-confidential dashboard store (capital-raise, oneamerica,
+    travel-points). Segment-based, case-insensitive, handles ``/`` and ``\\``.
+
+    Over-exclusion is bounded to those distinctive folder names and is the safe
+    direction here (these stores must never be KB-ingested)."""
+    segs = {s.lower() for s in _segments(str(path_or_source_id or ""))}
+    return bool(segs & _DASHBOARD_STORE_SEGMENTS)
+
+
+def folder_ids_excluded(
+    parents: list[str] | None, folder_set: frozenset[str] | set[str] | None = None
+) -> bool:
+    """True if ANY of a file's parent folder ids is KB-excluded.
+
+    ``folder_set`` lets a caller pass an EXPANDED set (excluded roots + their
+    descendant subfolders) so a flat per-user sweep also skips NESTED files; it
+    defaults to the direct roots. The founders_os tree walk instead prunes whole
+    subtrees via ``skip_folder_ids``.
+    """
+    check = folder_set if folder_set is not None else KB_EXCLUDED_FOLDER_IDS
+    return any(p in check for p in (parents or []))
+
 # The Cora build workspace. Any file under this folder sequence is build/ops
 # metadata, never org knowledge.
 _CORA_WORKSPACE_SEGMENTS: tuple[str, ...] = ("_shared", "projects", "cora")
