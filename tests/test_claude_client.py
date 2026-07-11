@@ -145,3 +145,40 @@ class TestShopifyNarrationNet:
                           return_value=[{"type": "tool_result", "tool_use_id": "tid1", "content": confirmed}]):
             out = cl.generate_response("sys", "ctx", "confirm")
         assert out == "DTC inventory updated -- Pure at the office: 202 -> 203 units."
+
+    def test_directed_text_not_triggered_for_crash_string(self):
+        crash = "Tool f3e_shopify_set_inventory crashed: KeyError. Apologize to the user and continue."
+        assert not cl._is_shopify_directive(crash)
+        assert cl._is_shopify_directive("WRITE_BLOCKED -- x\n\nNOT WRITTEN")
+        assert cl._is_shopify_directive("WRITE_CONFIRMED -- x\n\ndone")
+
+    def test_generate_response_does_not_override_crash_string(self):
+        """Review #1: a raw crash string (no WRITE_ sentinel) must NOT be posted
+        verbatim -- fall through to the model's source-opaque apology."""
+        crash = "Tool f3e_shopify_set_inventory crashed: KeyError('x'). Apologize to the user and continue."
+        tu = _tool_use_response("f3e_shopify_set_inventory", tool_input={"confirmed": True})
+        done = _mock_success("Sorry, I hit a snag and couldn't update that. Try again shortly.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[tu, done]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1", "content": crash}]):
+            out = cl.generate_response("sys", "ctx", "set pure to 203")
+        assert out == "Sorry, I hit a snag and couldn't update that. Try again shortly."
+        assert "shopify" not in out.lower() and "crashed" not in out.lower()
+
+    def test_last_result_prefers_confirmed_in_batch(self):
+        b1 = MagicMock(); b1.name = "f3e_shopify_set_inventory"
+        b2 = MagicMock(); b2.name = "f3e_shopify_set_inventory"
+        results = [
+            {"tool_use_id": "1", "content": "WRITE_CONFIRMED -- p\n\nDTC inventory updated -- x: 202 -> 203 units."},
+            {"tool_use_id": "2", "content": "WRITE_BLOCKED -- p\n\nNOT WRITTEN"},
+        ]
+        assert cl._last_shopify_write_result([b1, b2], results).startswith("WRITE_CONFIRMED")
+
+    def test_merge_confirmed_is_sticky(self):
+        conf = "WRITE_CONFIRMED -- p\n\ndone"
+        blk = "WRITE_BLOCKED -- p\n\nNOT WRITTEN"
+        assert cl._merge_shopify_result(blk, conf) == conf   # a write in this turn wins
+        assert cl._merge_shopify_result(conf, blk) == conf   # ...and sticks over a later re-preview
+        assert cl._merge_shopify_result(blk, "WRITE_BLOCKED -- q\n\nb").endswith("b")  # else last wins
+        assert cl._merge_shopify_result(conf, "") == conf    # empty batch keeps prev

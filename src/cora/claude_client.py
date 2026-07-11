@@ -372,36 +372,64 @@ def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
 # 2026-05-26 slack_send_dm silent-completion pattern, extended to repair a
 # NON-empty hallucination, and scoped to this one write tool by name.
 _SHOPIFY_WRITE_TOOL = "f3e_shopify_set_inventory"
+# The net ONLY overrides narration when the tool result carries one of these
+# contract sentinels. A result WITHOUT one (e.g. dispatch()'s "Tool ... crashed:"
+# string on an unhandled exception) must NOT be posted verbatim -- it would leak the
+# tool name / internal directives and bypass the model's source-opaque mediation
+# (D-051 hotfix review #1). Fall through to the model's text in that case.
+_SHOPIFY_SENTINELS = ("WRITE_CONFIRMED", "WRITE_BLOCKED")
+
+
+def _is_shopify_directive(raw: str) -> bool:
+    return bool(raw) and raw.startswith(_SHOPIFY_SENTINELS)
 
 
 def _shopify_directed_text(raw: str) -> str:
     """The user-facing text the write tool prescribes -- the part after the first
     blank line of a WRITE_CONFIRMED / WRITE_BLOCKED payload. Falls back to the raw
-    string if the sentinel/blank is absent."""
+    string if the blank is absent (callers gate on _is_shopify_directive first)."""
     if not raw:
         return raw
-    if raw.startswith("WRITE_CONFIRMED") or raw.startswith("WRITE_BLOCKED"):
+    if raw.startswith(_SHOPIFY_SENTINELS):
         parts = raw.split("\n\n", 1)
         return parts[1].strip() if len(parts) > 1 and parts[1].strip() else raw
     return raw
 
 
 def _last_shopify_write_result(tool_use_blocks: list, tool_results: list) -> str:
-    """The text content of the last f3e_shopify_set_inventory result in this turn's
-    batch, or '' if the write tool was not called. tool_results is same-order as
-    tool_use_blocks (see _dispatch_tools_parallel)."""
+    """The authoritative f3e_shopify_set_inventory result in this turn's batch, or
+    '' if the write tool was not called. A WRITE_CONFIRMED (a real write happened)
+    WINS over a later WRITE_BLOCKED in the same batch, so a double-confirm can never
+    narrate a completed write as 'NOT WRITTEN' (review #3). tool_results is
+    same-order as tool_use_blocks (see _dispatch_tools_parallel)."""
     found = ""
     for block, result in zip(tool_use_blocks, tool_results):
         if getattr(block, "name", None) != _SHOPIFY_WRITE_TOOL:
             continue
         content = result.get("content", "")
+        text = ""
         if isinstance(content, str):
-            found = content
+            text = content
         elif isinstance(content, list):
             for blk in content:
                 if isinstance(blk, dict) and blk.get("type") == "text":
-                    found = blk.get("text", "")
+                    text = blk.get("text", "")
+        if text.startswith("WRITE_CONFIRMED"):
+            return text  # a real write is authoritative for this turn
+        if text:
+            found = text
     return found
+
+
+def _merge_shopify_result(prev: str, batch: str) -> str:
+    """Fold a batch's shopify result into the running one across iterations. A
+    WRITE_CONFIRMED already seen STICKS (a write happened; a later re-preview must
+    not overwrite the narration, review #3)."""
+    if not batch:
+        return prev
+    if batch.startswith("WRITE_CONFIRMED") or not prev.startswith("WRITE_CONFIRMED"):
+        return batch
+    return prev
 
 
 def generate_response(
@@ -474,9 +502,12 @@ def generate_response(
         _log_usage(response, iteration)
 
         if response.stop_reason != "tool_use":
-            # Model is done. If the DTC write tool ran, POST ITS OWN outcome text --
+            # Model is done. If the DTC write tool returned a CONTRACT result
+            # (WRITE_CONFIRMED / WRITE_BLOCKED), POST ITS OWN outcome text --
             # overriding any success-claim the model produced on a non-write (HIGH-2).
-            if _last_shopify_result:
+            # A non-contract result (e.g. an unhandled crash string) is NOT posted
+            # verbatim -- fall through to the model's source-opaque mediation.
+            if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             return _extract_text(response) or "(Cora returned no text)"
 
@@ -488,7 +519,7 @@ def generate_response(
                 "Tool-use iteration cap (%d) hit — returning partial response",
                 _MAX_TOOL_ITERATIONS,
             )
-            if _last_shopify_result:
+            if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
             return _extract_text(response) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
@@ -508,7 +539,8 @@ def generate_response(
         )
 
         messages.append({"role": "user", "content": tool_results})
-        _last_shopify_result = _last_shopify_write_result(tool_use_blocks, tool_results) or _last_shopify_result
+        _last_shopify_result = _merge_shopify_result(
+            _last_shopify_result, _last_shopify_write_result(tool_use_blocks, tool_results))
 
     # Should not reach here given the iteration check above, but defensive fallback
     raise ClaudeClientError("Tool-use loop exited unexpectedly")
@@ -653,11 +685,13 @@ def generate_response_streaming(
                 # Stream missed some text — push the corrected final
                 accumulated_text = final_text
                 _maybe_push(accumulated_text)
-            if _last_shopify_result:
+            if _is_shopify_directive(_last_shopify_result):
                 # HIGH-2: the DTC write tool OWNS its outcome text. Post it verbatim,
                 # OVERRIDING any narration the model streamed -- so a mis-narrating
                 # model can never claim a write that did not happen (nor mis-state one
-                # that did). Fires whether or not the model emitted text.
+                # that did). Fires whether or not the model emitted text. Only a
+                # CONTRACT result (WRITE_CONFIRMED/WRITE_BLOCKED) overrides; a crash
+                # string falls through to the model's source-opaque mediation (#1).
                 directed = _shopify_directed_text(_last_shopify_result)
                 if directed and directed != accumulated_text:
                     accumulated_text = directed
@@ -687,7 +721,7 @@ def generate_response_streaming(
                 "Tool-use iteration cap (%d) hit during streaming — returning partial response",
                 _MAX_TOOL_ITERATIONS,
             )
-            if _last_shopify_result:
+            if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
             return accumulated_text or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
@@ -720,8 +754,9 @@ def generate_response_streaming(
                         t = block.get("text", "").strip()
                         if t:
                             _last_tool_result_text = t
-        # HIGH-2: remember the DTC write tool's result specifically (by tool name)
-        # so the stop handler can post its authoritative outcome text.
-        _last_shopify_result = _last_shopify_write_result(tool_use_blocks, tool_results) or _last_shopify_result
+        # HIGH-2: remember the DTC write tool's authoritative result (by tool name)
+        # so the stop handler can post its outcome text; a WRITE_CONFIRMED sticks.
+        _last_shopify_result = _merge_shopify_result(
+            _last_shopify_result, _last_shopify_write_result(tool_use_blocks, tool_results))
 
     raise ClaudeClientError("Tool-use loop exited unexpectedly during streaming")

@@ -328,6 +328,30 @@ class TestConfirmFlow:
             m_set.assert_called_once_with(52999599030592, 81567023424, 203)
             assert r2.startswith("WRITE_CONFIRMED")
 
+    def test_changed_quantity_re_previews_from_pending(self):
+        """'yes, but make it 210' re-previews the NEW target against the SAME
+        resolved ids -- then a follow-up confirm writes it (review #2/#7)."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[202, 202, 202], set_result=210)
+            _preview(product="pure original 12", location="office", quantity=203)
+            r1 = _confirm(product="pure original 12", location="office", quantity=210)
+            m_set.assert_not_called()
+            assert r1.startswith("WRITE_BLOCKED") and "210" in r1
+            r2 = _confirm()  # bare confirm of the re-previewed 210
+            m_set.assert_called_once_with(52999599030592, 81567023424, 210)
+            assert r2.startswith("WRITE_CONFIRMED") and "210" in r2
+
+    def test_changed_quantity_without_product_does_not_dead_end(self):
+        """The dead-end the review flagged: a changed-qty confirm that omits
+        product/location must reuse the pending's ids, not block on 'which product?'."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[202, 202])
+            _preview(product="pure original 12", location="office", quantity=203)
+            r = _confirm(quantity=210)  # no product/location
+            m_set.assert_not_called()
+            assert r.startswith("WRITE_BLOCKED") and "210" in r
+            assert "which product" not in r.lower() and "couldn't find" not in r.lower()
+
     def test_write_failure_is_blocked_not_confirmed(self):
         with ExitStack() as s:
             s.enter_context(patch.object(shopify_client, "get_active_locations", return_value=list(_LOCS)))
@@ -340,6 +364,23 @@ class TestConfirmFlow:
             r = _confirm()
             assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
             assert "WRITE_CONFIRMED" not in r
+
+
+# ── crash safety (review #1): a tool crash must be source-opaque + NOT WRITTEN ──
+
+class TestCrashSafety:
+    def test_unexpected_exception_returns_source_opaque_not_written(self):
+        # A non-Shopify error (e.g. a bad response shape) is NOT caught by the inner
+        # ShopifyConnectorError handlers -> must be caught by the top-level wrapper.
+        with ExitStack() as s:
+            s.enter_context(patch.object(shopify_client, "get_active_locations",
+                                         side_effect=ValueError("kaboom in resolve")))
+            s.enter_context(patch.object(tool_dispatch, "_load_shopify_write_config", return_value=_CONFIG))
+            r = _preview(product="pure original 12", location="office", quantity=203)
+        assert r.startswith("WRITE_BLOCKED")
+        assert "NOT WRITTEN" in r
+        assert "shopify" not in r.lower()
+        assert "kaboom" not in r.lower()  # raw exception text not surfaced
 
 
 # ── the WRITE_BLOCKED / WRITE_CONFIRMED contract (for the narration net) ─────────

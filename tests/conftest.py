@@ -230,10 +230,20 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
 @pytest.fixture(scope="session", autouse=True)
 def _guard_logs_untouched():
     """MED-3 repo guard: the test suite must NOT mutate the real DTC inventory
-    audit log. Snapshot its (size, mtime) at session start and assert unchanged at
-    session end -- if a test writes to logs/ instead of a tmp path, the run fails."""
+    audit log. Snapshot its (size, mtime) at session start and check it at session
+    end -- if a test writes to logs/ instead of a tmp path, fail.
+
+    Live-host safety (review #6): the always-on bot appends to this same file. If
+    the bot is running concurrently (heartbeat fresh), a change is almost certainly
+    a legitimate live write, NOT a test regression -- so downgrade to a warning
+    rather than false-failing the whole suite. On a quiet host (CI / dev, no live
+    bot) the redirect means tests can't touch it, so a change IS a regression -> fail.
+    """
+    import warnings
     from pathlib import Path as _Path
-    audit = _Path(__file__).resolve().parent.parent / "logs" / "shopify-inventory-writes.jsonl"
+    root = _Path(__file__).resolve().parent.parent
+    audit = root / "logs" / "shopify-inventory-writes.jsonl"
+    heartbeat = root / "data" / "health" / "heartbeat.txt"
 
     def _snap():
         try:
@@ -242,10 +252,22 @@ def _guard_logs_untouched():
         except FileNotFoundError:
             return None
 
+    def _bot_live():
+        try:
+            import time as _t
+            return (_t.time() - heartbeat.stat().st_mtime) < 180
+        except Exception:
+            return False
+
     before = _snap()
     yield
     after = _snap()
-    assert after == before, (
-        f"the test suite mutated the real audit log {audit} ({before} -> {after}) -- "
-        "a test wrote to logs/ instead of a tmp path"
-    )
+    if after == before:
+        return
+    msg = (f"the real audit log {audit} changed during the suite ({before} -> {after})")
+    if _bot_live():
+        warnings.warn(msg + " -- but the live bot is running (heartbeat fresh), so this "
+                      "is most likely a concurrent real write, not a test regression.")
+    else:
+        raise AssertionError(
+            msg + " -- a test wrote to logs/ instead of a tmp path (no live bot detected)")

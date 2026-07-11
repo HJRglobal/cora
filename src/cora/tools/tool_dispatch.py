@@ -2798,7 +2798,49 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     )
 
 
+def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dict, new_qty: int) -> str:
+    """The user changed the target on the confirm turn ('yes, but make it 210').
+    Re-preview the NEW target against the SAME server-resolved item/location from the
+    pending entry -- do NOT discard those ids and re-resolve from free text (which
+    dead-ends when the model omits product/location, review #2/#7). Re-stores a fresh
+    pending so the follow-up confirm works. NO write."""
+    item_id = pending["inventory_item_id"]
+    loc_id = pending["location_id"]
+    variant_label = pending["variant_label"]
+    loc_name = pending["location_label"]
+    try:
+        live = shopify_client.get_inventory_level(item_id, loc_id)
+    except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+        log.warning("f3e_shopify_set_inventory new-target level read error user=%s: %s", slack_user_id, exc)
+        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI can't read the current count right now -- try again in a moment.")
+    if live is None:
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
+    _store_pending_shopify_write(slack_user_id, channel, {
+        "inventory_item_id": item_id, "location_id": loc_id, "target_qty": new_qty,
+        "preview_qty": live, "variant_label": variant_label, "location_label": loc_name,
+        "ts": time.time(),
+    })
+    log.info("f3e_shopify_set_inventory RE-PREVIEW(new target) user=%s item=%s loc=%s cur=%s -> %s",
+             slack_user_id, item_id, loc_id, live, new_qty)
+    return _shopify_write_blocked(_shopify_preview_text(
+        variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty))
+
+
 def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Crash-safe wrapper (review #1): a WRITE tool must fail SOURCE-OPAQUE and say
+    NOT WRITTEN, never surface a raw crash string. Any unexpected exception becomes a
+    WRITE_BLOCKED NOT-WRITTEN reply (which the narration net then posts cleanly)."""
+    try:
+        return _shopify_set_inventory_impl(slack_user_id, entity, _input)
+    except Exception as exc:  # noqa: BLE001 -- fail closed + source-opaque, never a raw crash
+        log.exception("f3e_shopify_set_inventory crashed user=%s: %s", slack_user_id, exc)
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nSomething went wrong on my end -- the count was not changed. "
+            f"Try again in a moment.")
+
+
+def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -> str:
     """Set F3E DTC inventory for one variant at one location. Staged-write tool.
 
     Phase 1 (confirmed != true): resolve the product/variant + location, refuse
@@ -2807,9 +2849,9 @@ def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dic
     slack_user + channel, TTL 10 min), and return a NOT-WRITTEN preview.
     Phase 2 (confirmed=true): execute the caller's OWN pending entry -- identity is
     the tool's server-resolved ids, NOT an LLM echo (HIGH-1) -- after a FRESH live-qty
-    re-check (drift -> re-preview; match -> WRITE). A confirm with no fresh pending
-    (or a changed target quantity) safely falls back to a fresh preview -- never a
-    blind write.
+    re-check (drift -> re-preview; match -> WRITE). A changed target re-previews
+    against the same resolved ids; no fresh pending falls back to a fresh resolve.
+    Never a blind write.
 
     Every non-write return is WRITE_BLOCKED-wrapped and leads with a NOT-WRITTEN
     marker; the claude_client narration net posts the tool's own outcome text so a
@@ -2833,20 +2875,27 @@ def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dic
     # --- Phase 2: confirmed -> execute the caller's pending write ------------------
     if confirmed:
         pending = _take_pending_shopify_write(slack_user_id, channel)
-        # If the model passed a quantity that DIFFERS from what was previewed, the
-        # user changed their target -> re-preview the new target (never silently
-        # write the stale one). A matching or absent quantity executes the pending.
-        q_changed = False
-        q_raw = input_data.get("quantity")
-        if pending is not None and q_raw is not None and str(q_raw).strip() != "":
-            try:
-                q_changed = int(q_raw) != int(pending["target_qty"])
-            except (TypeError, ValueError):
-                q_changed = False
-        if pending is not None and not q_changed:
-            return _shopify_execute_pending(slack_user_id, channel, pending)
+        if pending is not None:
+            # Did the model pass a DIFFERENT target than was previewed?
+            new_qty = None
+            q_raw = input_data.get("quantity")
+            if q_raw is not None and str(q_raw).strip() != "":
+                try:
+                    new_qty = int(q_raw)
+                except (TypeError, ValueError):
+                    new_qty = None
+            if new_qty is None or new_qty == int(pending["target_qty"]):
+                return _shopify_execute_pending(slack_user_id, channel, pending)
+            if new_qty < 0:
+                # Keep the (unchanged) pending alive; just ask for a valid number.
+                _store_pending_shopify_write(slack_user_id, channel, {**pending, "ts": time.time()})
+                return _shopify_write_blocked(
+                    f"{_NOT_WRITTEN}\nThe count can't be negative -- give me zero or more.")
+            # User changed the number -> re-preview the NEW target against the SAME
+            # resolved item/location (reuse the pending's ids; never dead-end).
+            return _repreview_pending_new_target(slack_user_id, channel, pending, new_qty)
         # No fresh pending (expired / never previewed / a machine restart cleared it)
-        # or the target changed -> resolve fresh and re-preview.
+        # -> resolve fresh and re-preview.
         blocked, data = _shopify_resolve(slack_user_id, input_data)
         if blocked:
             return blocked
