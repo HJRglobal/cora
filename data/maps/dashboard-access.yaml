@@ -1,0 +1,104 @@
+# data/maps/dashboard-access.yaml
+# Dashboard -> Slack-surface allowlist for the Cora dashboard read layer.
+#
+# FAIL-CLOSED. An unlisted dashboard, an unknown/empty channel, or an unparseable
+# file => REFUSE with no existence leak (see dashboard_access.py).
+#
+# The operative match key at the tool layer is the RESOLVED channel NAME. The QA
+# tool loop threads _channel_name, NEVER _channel_id on the Q&A path
+# (D-052 / audit Slice-F doctrine), so the channel *ids* recorded here are audit /
+# documentation only -- the guard never reads them.
+#
+# Loader: 60s TTL, never-cache-empty (mirrors lex_phi_access / finance_receipts).
+#
+# Entity-class allowance (allow_entities) is gated on entity_router.is_mapped() so
+# an UNMAPPED channel can never fall through route()'s "FNDR" default into a
+# founder-scoped dashboard (a fail-open the naive `route() in allow_entities` check
+# would have). Founder channels that only match the catch-all "*" route
+# (e.g. #founder-operations) are therefore listed explicitly in allow_channels.
+#
+# DMs arrive as channel_name == "dm"; personal dashboards have empty channel lists
+# so DM-to-a-dm_user is the ONLY pass for them, by construction.
+dashboards:
+  oneamerica-whole-life-portfolio:
+    sensitivity: PERSONAL
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: []
+    allow_entities: []
+    store:
+      type: drive_json
+      folder: "1INi4fLXG23xao-d_yf56Wrbrah54pIBB"
+      files:
+        policies_current: "1K4IzhozVRpYsGpTCfYu31PCLgI3LzzOo"
+        transactions: "1Gz6aZPGRxlBrJGaScoEUqiPWRFxId5NY"
+        history: "1BoqtCBC1BVvA5AHvRTeDC-Sj7Nq45Pj9"
+    tools: [personal_oneamerica_portfolio]
+    no_cache: true
+    kb_ingest: never
+
+  f3-capital-program:
+    sensitivity: HIGHLY_CONFIDENTIAL
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: []
+    allow_entities: []
+    store:
+      type: drive_json_newest_by_title
+      folder: "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP"
+      title: "f3-capital-program-state.json"
+    tools: [personal_capital_program_state]
+    no_cache: true
+    kb_ingest: never
+
+  travel-points-optimizer:           # RESERVED -- artifact not built yet; store.files empty
+    sensitivity: PERSONAL
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: []
+    allow_entities: []
+    store: {type: drive_json, folder: "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752", files: {}}
+    tools: []
+    no_cache: true
+    kb_ingest: never
+
+  f3-creator-sponsorship-command-center:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    # ids: f3-athletes C0B6GT3117Y, f3e-leadership C0B4KRQT3LY, founder-operations C0BCUBUDHAR
+    # (founder-operations matches only the catch-all route -> listed explicitly, not via allow_entities)
+    allow_channels: [f3-athletes, f3e-leadership, founder-operations]
+    allow_entities: [FNDR, HJRG]
+    store:
+      type: airtable
+      base: "appwF6W6eVTvPFjct"
+      tables: {roster: tbl2WMoSoWmIuvQdw, content: tblnDplqlUhZ8kDuf, activity: tbldf9x3chG5DOMgm, cadence: tbl7E6EVfxuNH8dLH}
+    tools: [f3e_creator_crm]
+
+  f3-content-pipeline:
+    sensitivity: FOUNDER_OPS
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [founder-operations]   # id C0BCUBUDHAR; catch-all-only route -> explicit
+    allow_entities: [FNDR, HJRG]
+    store:
+      type: airtable
+      base: "appxbEBjIBf8Wwlbd"
+      tables: {deliverables: tblMTiDMRwhV8RxDw, calendar: tblZBR6ZAYDELjDxF, production: tblgZ1PiSb8HTSh05, campaigns: tblbmC1GyTgIncH0q, budget: tblkxSlFZcplh27wW, events: tblUFxhdXYoYsD3Vm, freelancers: tbl7gOmAw3kgrZi19}
+    tools: [fndr_content_pipeline]
+
+# --- Documentation-only: existing tools keep their OWN gates -- do NOT re-gate. ---
+covered_by_existing:
+  f3-ai-visibility-dashboard: {tool: f3e_ai_visibility, store: "data/ai_visibility.db", overlay_bridge: deferred}
+  f3-ecom: {tools: [f3e_shopify_sales_pulse, f3e_shopify_inventory, polar_tools]}
+  f3-productions-dashboard: {tools: [asana_tools, f3_production_kb]}
+  f3-retail-dashboard: {tool: f3e_hubspot_pipeline_summary}
+  press-pipeline-dashboard: {tool: fndr_press_pipeline_summary}
+
+# --- Folders that must NEVER be KB-ingested (personal / highly confidential). ---
+# Documentation mirror of the store.folder ids carrying kb_ingest: never above.
+# The OPERATIVE denylist enforced in drive_sweep is kb_exclusions.KB_EXCLUDED_FOLDER_IDS
+# (hardcoded there so an ingest sweep can never fail-open on a YAML parse error).
+kb_excluded_folders:
+  - "1INi4fLXG23xao-d_yf56Wrbrah54pIBB"   # 00-Founder/insurance/oneamerica
+  - "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP"   # 02-F3-Energy/projects/capital-raise
+  - "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752"   # 00-Founder/travel-points
+
+retired: [f3-ambassador-command-center, f3-pure-tiktok-cockpit]
