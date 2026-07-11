@@ -82,6 +82,24 @@ class LocationSKU:
     available: int
 
 
+@dataclass
+class VariantMatch:
+    """A product-variant candidate returned by resolve_variants() for the
+    staged inventory-write resolver. Carries the ids the write path needs."""
+    product_title: str
+    variant_title: str
+    sku: str
+    variant_id: int
+    inventory_item_id: int
+
+    @property
+    def label(self) -> str:
+        """Human display label -- 'Product (Variant)' or just 'Product'."""
+        if self.variant_title:
+            return f"{self.product_title} ({self.variant_title})"
+        return self.product_title
+
+
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
@@ -694,6 +712,192 @@ def format_location_inventory_for_llm(
 
     lines.append("_Live data. Units = individual cans._")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Inventory WRITES (staged; caller enforces location policy)
+#
+# These back the f3e_shopify_set_inventory staged-write tool. This connector is
+# a THIN, policy-free API wrapper: it will write to ANY location id passed. The
+# refuse-by-default location allowlist (Nimbl and the other externally-synced
+# 3PL/marketplace locations are NOT manually writable) lives in the TOOL layer
+# (tool_dispatch), not here -- keep this module a pure client so the policy stays
+# where the staged-write/scope logic is and is testable in isolation.
+# ---------------------------------------------------------------------------
+
+
+def get_active_locations() -> list[dict]:
+    """Return [{'id': int, 'name': str}] for every ACTIVE Shopify location,
+    preserving the original-case name (unlike _get_locations(), which lowercases
+    its keys for the read path). Cached for the standard TTL. Used by the write
+    tool for name<->id resolution, display, and allowlist matching.
+    """
+    cache_key = "active_locations"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    store, token = _store_config()
+    try:
+        resp = requests.get(
+            f"{_base_url(store)}/locations.json",
+            headers=_headers(token),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise ShopifyConnectorError(f"Network error fetching locations: {exc}") from exc
+    if resp.status_code == 401:
+        raise ShopifyConnectorError(
+            "Auth failed (HTTP 401) fetching locations. Check SHOPIFY_F3E_ACCESS_TOKEN."
+        )
+    if not resp.ok:
+        raise ShopifyConnectorError(
+            f"Shopify locations API error {resp.status_code}: {resp.text[:200]}"
+        )
+
+    result: list[dict] = []
+    for loc in resp.json().get("locations", []):
+        if loc.get("active") and loc.get("name") and loc.get("id"):
+            result.append({"id": int(loc["id"]), "name": str(loc["name"])})
+    _cache_set(cache_key, result)
+    log.info("shopify active_locations loaded: %d", len(result))
+    return result
+
+
+def resolve_variants(query: str, limit: int = 25) -> list[VariantMatch]:
+    """Resolve a free-text product/variant name (or SKU) to candidate variants.
+
+    Matching (case-insensitive):
+      - an exact SKU match returns just that variant (highest confidence);
+      - otherwise every variant whose "<product> <variant> <sku>" haystack
+        contains ALL whitespace-split query tokens (AND-of-tokens substring).
+
+    Returns ALL candidates (deduped by variant id). The CALLER decides:
+    0 matches -> ask the user; exactly 1 -> proceed; >1 -> ask to disambiguate.
+    This never collapses an ambiguous match to a single guess.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    store, token = _store_config()
+    products = _get_paginated(
+        f"{_base_url(store)}/products.json",
+        token,
+        params={"limit": _PAGE_SIZE, "fields": "id,title,variants"},
+    )
+    tokens = [t for t in q.split() if t]
+    exact_sku: dict[int, VariantMatch] = {}
+    fuzzy: dict[int, VariantMatch] = {}
+    for product in products:
+        product_title = (product.get("title") or "").strip() or "Unknown product"
+        for v in product.get("variants") or []:
+            iid = v.get("inventory_item_id")
+            vid = v.get("id")
+            if not iid or not vid:
+                continue
+            sku = (v.get("sku") or "").strip()
+            variant_title = (v.get("title") or "").strip()
+            if variant_title.lower() in ("default title", "default"):
+                variant_title = ""
+            match = VariantMatch(
+                product_title=product_title,
+                variant_title=variant_title,
+                sku=sku,
+                variant_id=int(vid),
+                inventory_item_id=int(iid),
+            )
+            if sku and q == sku.lower():
+                exact_sku[int(vid)] = match
+                continue
+            haystack = f"{product_title} {variant_title} {sku}".lower()
+            if tokens and all(tok in haystack for tok in tokens):
+                fuzzy[int(vid)] = match
+    # An exact SKU hit is authoritative -- ignore fuzzy noise when one exists.
+    chosen = exact_sku if exact_sku else fuzzy
+    return list(chosen.values())[:limit]
+
+
+def get_inventory_level(inventory_item_id: int, location_id: int) -> Optional[int]:
+    """Return the FRESH (uncached) available count for one inventory item at one
+    location, or None if the item is not stocked there (no inventory_level row).
+
+    Deliberately bypasses the 5-min cache: it is the staged-write concurrency
+    re-check, so it MUST see the live number. The value is returned UNCLAMPED
+    (Shopify can report a negative `available` on oversell) so the preview shows
+    the true current and the concurrency comparison is exact.
+    """
+    store, token = _store_config()
+    try:
+        resp = requests.get(
+            f"{_base_url(store)}/inventory_levels.json",
+            headers=_headers(token),
+            params={
+                "inventory_item_ids": str(int(inventory_item_id)),
+                "location_ids": str(int(location_id)),
+                "limit": 1,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise ShopifyConnectorError(f"Network error fetching inventory level: {exc}") from exc
+    if resp.status_code == 401:
+        raise ShopifyConnectorError(
+            "Auth failed (HTTP 401) fetching inventory level. Check SHOPIFY_F3E_ACCESS_TOKEN."
+        )
+    if not resp.ok:
+        raise ShopifyConnectorError(
+            f"Shopify inventory_levels API error {resp.status_code}: {resp.text[:200]}"
+        )
+    levels = resp.json().get("inventory_levels", [])
+    if not levels:
+        return None
+    return int(levels[0].get("available") or 0)
+
+
+def set_inventory_level(inventory_item_id: int, location_id: int, available: int) -> int:
+    """Set the available quantity for one inventory item at one location via
+    POST /inventory_levels/set.json. Returns the new available count.
+
+    NO location policy here -- the caller (f3e_shopify_set_inventory) enforces the
+    refuse-by-default allowlist. Invalidates the 5-min cache on success so the
+    next inventory read reflects the write. Raises ShopifyConnectorError on
+    failure (a 403 specifically means the token lacks the write_inventory scope).
+    """
+    store, token = _store_config()
+    try:
+        resp = requests.post(
+            f"{_base_url(store)}/inventory_levels/set.json",
+            headers=_headers(token),
+            json={
+                "location_id": int(location_id),
+                "inventory_item_id": int(inventory_item_id),
+                "available": int(available),
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise ShopifyConnectorError(f"Network error setting inventory level: {exc}") from exc
+    if resp.status_code == 401:
+        raise ShopifyConnectorError(
+            "Auth failed (HTTP 401) setting inventory. Check SHOPIFY_F3E_ACCESS_TOKEN."
+        )
+    if resp.status_code == 403:
+        raise ShopifyConnectorError(
+            "Inventory write denied (HTTP 403) -- the access token lacks the "
+            "write_inventory scope. Harrison must grant it in the Shopify custom-app config."
+        )
+    if not resp.ok:
+        raise ShopifyConnectorError(
+            f"Shopify inventory set API error {resp.status_code}: {resp.text[:200]}"
+        )
+    level = resp.json().get("inventory_level") or {}
+    new_available = int(level.get("available", available) or 0)
+    _cache_clear()  # a write invalidates every cached sales/inventory/location read
+    log.info(
+        "shopify set_inventory item=%s location=%s -> available=%s",
+        inventory_item_id, location_id, new_available,
+    )
+    return new_available
 
 
 # ---------------------------------------------------------------------------

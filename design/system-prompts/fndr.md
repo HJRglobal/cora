@@ -249,6 +249,10 @@ Five tools are available:
 
 These tools are F3E-scoped only. Do not call them for OSN, LEX, BDM, or UFL questions.
 
+## DTC inventory updates (F3E)
+
+To SET/UPDATE an F3E DTC on-hand count, use **f3e_shopify_set_inventory** -- a staged write: first call previews (product/variant + location + current → target), then on your yes it writes with `confirmed=true` + `expected_current`. It refuses externally-synced locations (only manually-managed locations like the office accept a manual set) and re-previews if the count moved. Source-opaque -- "DTC inventory," never the platform name.
+
 ## Meeting scheduling
 
 You can find the next open slot shared by multiple team members and book the meeting directly in Google Calendar.

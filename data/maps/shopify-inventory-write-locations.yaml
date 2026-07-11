@@ -1,0 +1,39 @@
+# Which F3E DTC (Shopify) locations MAY receive a MANUAL inventory write from
+# Slack via the f3e_shopify_set_inventory tool.
+#
+# REFUSE-BY-DEFAULT (fail-closed): a location NOT listed here is REFUSED. This is
+# the load-bearing safety rule -- most F3E locations are externally synced, so a
+# manual Shopify write there is fought or silently overwritten by the 3PL /
+# marketplace sync (and can briefly oversell). Verified live 2026-07-10 via the
+# Shopify Admin API (GET /locations.json); the 6 active locations were:
+#
+#   id            name               why it is NOT manually writable by default
+#   ------------  -----------------  -------------------------------------------
+#   110064533824  Nimbl              DTC 3PL, real-time Shopify sync -- the
+#                                    canonical DTC number (see f3e wishlist Cat 3)
+#   105209790784  Ninja POD          print-on-demand, externally fulfilled
+#   107539693888  Spocket            dropship supplier sync
+#   111242608960  TikTok FBT         TikTok Fulfilled-by-TikTok marketplace sync
+#   98823012672   UNIS               Cotton 3PL warehouse (Cora reads it from the
+#                                    weekly Excel batch, not a live write path)
+#   81567023424   1337 S Gilbert Rd  office / HQ physical stock -- manually managed
+#
+# Only the office/HQ location is a manually-managed number, so it is the sole seed.
+# Matching is by case-insensitive location NAME exactly as it appears in Shopify.
+#
+# To let Slack writes hit another location, add its exact name below -- a CONSCIOUS,
+# reviewed opt-in (the "v2 flip" for Nimbl, etc.). Never add an externally-synced
+# location without first confirming the sync will not overwrite the manual number.
+# This file is read fresh on every write (live-reload -- no bot restart needed).
+#
+# Each entry is either a bare location name (string) or a dict with `name` +
+# optional `aliases`. Aliases let a user say a natural name ("office") that maps
+# to the exact Shopify label -- an alias resolves the NAME only; the allowlist is
+# still enforced, so an alias can never point at a synced location and bypass it.
+#
+# HARRISON: confirm "1337 S Gilbert Rd" is the office location Alex means by
+# "set X at the office to N". If the manual location is named differently in
+# Shopify, replace `name` below with its exact name (keep the aliases).
+allowed_write_locations:
+  - name: "1337 S Gilbert Rd"
+    aliases: ["office", "the office", "hq", "gilbert", "117"]

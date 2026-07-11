@@ -17,6 +17,7 @@ from cora.connectors.shopify_client import (
     ShopifyConfigError,
     ShopifyConnectorError,
     TopProduct,
+    VariantMatch,
     _az_now,
     _base_url,
     _cache_clear,
@@ -30,11 +31,15 @@ from cora.connectors.shopify_client import (
     format_inventory_for_llm,
     format_location_inventory_for_llm,
     format_sales_for_llm,
+    get_active_locations,
     get_inventory_by_location,
+    get_inventory_level,
     get_inventory_status,
     get_sales_pulse,
     graphql,
     is_beverage_product,
+    resolve_variants,
+    set_inventory_level,
 )
 
 
@@ -956,3 +961,220 @@ def test_graphql_config_error(monkeypatch):
     monkeypatch.delenv("SHOPIFY_F3E_ACCESS_TOKEN", raising=False)
     with pytest.raises(ShopifyConfigError):
         graphql("query { shop { name } }", {})
+
+
+# ── get_active_locations (write path) ────────────────────────────────────────
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_active_locations_preserves_case_and_filters(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {"locations": [
+        {"id": 111, "name": "1337 S Gilbert Rd", "active": True},
+        {"id": 222, "name": "Nimbl", "active": True},
+        {"id": 333, "name": "Closed", "active": False},   # inactive -> dropped
+        {"id": 444, "name": "", "active": True},           # no name -> dropped
+        {"name": "No ID", "active": True},                 # no id -> dropped
+    ]})
+    result = get_active_locations()
+    assert result == [
+        {"id": 111, "name": "1337 S Gilbert Rd"},   # original case preserved
+        {"id": 222, "name": "Nimbl"},
+    ]
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_active_locations_cached(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {"locations": [
+        {"id": 1, "name": "Nimbl", "active": True},
+    ]})
+    get_active_locations()
+    get_active_locations()
+    assert mock_get.call_count == 1
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_active_locations_auth_error(mock_get, env_vars):
+    mock_get.return_value = _make_resp(401, text="unauthorized")
+    with pytest.raises(ShopifyConnectorError, match="401"):
+        get_active_locations()
+
+
+# ── resolve_variants ─────────────────────────────────────────────────────────
+
+_RESOLVE_PRODUCTS = [
+    {"id": 1, "title": "F3 Pure Original", "variants": [
+        {"id": 11, "inventory_item_id": 111, "sku": "PU-ORIG-12", "title": "12 Pack"},
+        {"id": 12, "inventory_item_id": 112, "sku": "PU-ORIG-6", "title": "6 Pack"},
+    ]},
+    {"id": 2, "title": "F3 Mood", "variants": [
+        {"id": 21, "inventory_item_id": 221, "sku": "MO-12", "title": "Default Title"},
+    ]},
+    {"id": 3, "title": "F3 Energy Koozie", "variants": [
+        {"id": 31, "inventory_item_id": 331, "sku": "KOOZIE", "title": "Default"},
+    ]},
+]
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_unique_fuzzy_match(mock_paginate, env_vars):
+    mock_paginate.return_value = _RESOLVE_PRODUCTS
+    matches = resolve_variants("pure original 12")
+    assert len(matches) == 1
+    assert matches[0].inventory_item_id == 111
+    assert matches[0].variant_title == "12 Pack"
+    assert matches[0].label == "F3 Pure Original (12 Pack)"
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_ambiguous_returns_all(mock_paginate, env_vars):
+    mock_paginate.return_value = _RESOLVE_PRODUCTS
+    matches = resolve_variants("pure original")  # matches both 12 + 6 pack
+    assert len(matches) == 2
+    assert {m.inventory_item_id for m in matches} == {111, 112}
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_exact_sku_wins(mock_paginate, env_vars):
+    mock_paginate.return_value = _RESOLVE_PRODUCTS
+    matches = resolve_variants("PU-ORIG-6")
+    assert len(matches) == 1
+    assert matches[0].inventory_item_id == 112
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_no_match(mock_paginate, env_vars):
+    mock_paginate.return_value = _RESOLVE_PRODUCTS
+    assert resolve_variants("nonexistent widget") == []
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_default_title_stripped(mock_paginate, env_vars):
+    mock_paginate.return_value = _RESOLVE_PRODUCTS
+    matches = resolve_variants("MO-12")
+    assert matches[0].variant_title == ""      # "Default Title" -> ""
+    assert matches[0].label == "F3 Mood"
+
+
+def test_resolve_variants_empty_query_returns_empty(env_vars):
+    assert resolve_variants("   ") == []
+
+
+@patch("cora.connectors.shopify_client._get_paginated")
+def test_resolve_variants_skips_variant_without_ids(mock_paginate, env_vars):
+    mock_paginate.return_value = [
+        {"id": 9, "title": "Broken", "variants": [
+            {"id": None, "inventory_item_id": None, "sku": "X", "title": "x"},
+        ]},
+    ]
+    assert resolve_variants("broken") == []
+
+
+# ── get_inventory_level (fresh, uncached) ─────────────────────────────────────
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_returns_available(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {"inventory_levels": [
+        {"inventory_item_id": 111, "location_id": 999, "available": 132},
+    ]})
+    assert get_inventory_level(111, 999) == 132
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_none_when_not_stocked(mock_get, env_vars):
+    mock_get.return_value = _make_resp(200, {"inventory_levels": []})
+    assert get_inventory_level(111, 999) is None
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_unclamped_negative(mock_get, env_vars):
+    """Oversell can report a negative available -- returned RAW for the exact
+    concurrency comparison (unlike the clamped read paths)."""
+    mock_get.return_value = _make_resp(200, {"inventory_levels": [
+        {"available": -3},
+    ]})
+    assert get_inventory_level(111, 999) == -3
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_bypasses_cache(mock_get, env_vars):
+    """Two calls hit the API twice -- the concurrency re-check must be fresh."""
+    mock_get.return_value = _make_resp(200, {"inventory_levels": [{"available": 5}]})
+    get_inventory_level(111, 999)
+    get_inventory_level(111, 999)
+    assert mock_get.call_count == 2
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_auth_error(mock_get, env_vars):
+    mock_get.return_value = _make_resp(401, text="unauthorized")
+    with pytest.raises(ShopifyConnectorError, match="401"):
+        get_inventory_level(111, 999)
+
+
+@patch("cora.connectors.shopify_client.requests.get")
+def test_get_inventory_level_network_error(mock_get, env_vars):
+    import requests
+    mock_get.side_effect = requests.exceptions.RequestException("timeout")
+    with pytest.raises(ShopifyConnectorError, match="Network error"):
+        get_inventory_level(111, 999)
+
+
+# ── set_inventory_level (write) ───────────────────────────────────────────────
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_returns_new_available(mock_post, env_vars):
+    mock_post.return_value = _make_resp(200, {"inventory_level": {"available": 240}})
+    assert set_inventory_level(111, 999, 240) == 240
+    # payload shape
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"] == {"location_id": 999, "inventory_item_id": 111, "available": 240}
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_invalidates_cache(mock_post, env_vars):
+    mock_post.return_value = _make_resp(200, {"inventory_level": {"available": 10}})
+    _cache_set("inventory:10", ["stale"])
+    assert _cache_get("inventory:10") == ["stale"]
+    set_inventory_level(111, 999, 10)
+    assert _cache_get("inventory:10") is None   # cache cleared after the write
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_403_flags_missing_scope(mock_post, env_vars):
+    mock_post.return_value = _make_resp(403, text="not authorized")
+    with pytest.raises(ShopifyConnectorError, match="write_inventory"):
+        set_inventory_level(111, 999, 240)
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_401_raises(mock_post, env_vars):
+    mock_post.return_value = _make_resp(401, text="unauthorized")
+    with pytest.raises(ShopifyConnectorError, match="401"):
+        set_inventory_level(111, 999, 240)
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_500_raises(mock_post, env_vars):
+    mock_post.return_value = _make_resp(500, text="server error")
+    with pytest.raises(ShopifyConnectorError, match="500"):
+        set_inventory_level(111, 999, 240)
+
+
+@patch("cora.connectors.shopify_client.requests.post")
+def test_set_inventory_level_network_error(mock_post, env_vars):
+    import requests
+    mock_post.side_effect = requests.exceptions.RequestException("timeout")
+    with pytest.raises(ShopifyConnectorError, match="Network error"):
+        set_inventory_level(111, 999, 240)
+
+
+def test_set_inventory_level_config_error(monkeypatch):
+    monkeypatch.delenv("SHOPIFY_F3E_STORE", raising=False)
+    monkeypatch.delenv("SHOPIFY_F3E_ACCESS_TOKEN", raising=False)
+    with pytest.raises(ShopifyConfigError):
+        set_inventory_level(111, 999, 240)
+
+
+def test_variant_match_label_no_variant_title():
+    m = VariantMatch(product_title="F3 Mood", variant_title="", sku="MO-12",
+                     variant_id=1, inventory_item_id=2)
+    assert m.label == "F3 Mood"

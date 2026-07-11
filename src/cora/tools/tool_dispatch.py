@@ -33,6 +33,12 @@ _MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 _HUBSPOT_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-hubspot.yaml"
 _ALIASES_PATH = _REPO_ROOT / "data" / "maps" / "user-aliases.yaml"
 _HIERARCHY_PATH = _REPO_ROOT / "data" / "maps" / "supervisor-hierarchy.yaml"
+# Refuse-by-default allowlist of Shopify locations that MAY receive a manual
+# inventory write from Slack (f3e_shopify_set_inventory). Read fresh per write
+# (live-reload). See the file header for the location-by-location rationale.
+_SHOPIFY_WRITE_LOC_PATH = _REPO_ROOT / "data" / "maps" / "shopify-inventory-write-locations.yaml"
+# Per-write audit trail for DTC inventory sets.
+_SHOPIFY_WRITE_AUDIT_PATH = _REPO_ROOT / "logs" / "shopify-inventory-writes.jsonl"
 
 # HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
 HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
@@ -2449,6 +2455,308 @@ def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dic
     return inventory_client.get_f3e_location_inventory_text(location, brand)
 
 
+# --- F3E DTC inventory WRITE (staged) ---
+
+
+def _load_shopify_write_config() -> tuple[frozenset[str], dict[str, str]]:
+    """Parse the write-locations map. Returns:
+        (allowed_names_lc, alias_lc -> canonical_name_lc)
+
+    `allowed_names_lc` is the refuse-by-default allowlist (which Shopify location
+    NAMES may be written, lowercased). `alias_lc` maps spoken names ("office") to
+    a canonical allowlisted location name so a user need not type the exact
+    Shopify label. Entries may be a bare string (name only) or a dict with
+    `name` + optional `aliases`. Read fresh from disk (live-reload). FAIL-CLOSED:
+    a missing or unparseable file returns (empty, empty) -> every write refused."""
+    try:
+        if not _SHOPIFY_WRITE_LOC_PATH.exists():
+            log.warning("shopify write-locations map not found at %s -- refusing all writes",
+                        _SHOPIFY_WRITE_LOC_PATH)
+            return frozenset(), {}
+        with open(_SHOPIFY_WRITE_LOC_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        entries = data.get("allowed_write_locations") or []
+        allowed: set[str] = set()
+        aliases: dict[str, str] = {}
+        for entry in entries:
+            if isinstance(entry, str):
+                nm = entry.strip().lower()
+                if nm:
+                    allowed.add(nm)
+            elif isinstance(entry, dict):
+                nm = str(entry.get("name") or "").strip().lower()
+                if not nm:
+                    continue
+                allowed.add(nm)
+                for alias in (entry.get("aliases") or []):
+                    al = str(alias).strip().lower()
+                    if al:
+                        aliases[al] = nm
+        return frozenset(allowed), aliases
+    except Exception as exc:  # noqa: BLE001 -- fail closed on any read/parse error
+        log.warning("shopify write-locations map load failed (%s) -- refusing all writes", exc)
+        return frozenset(), {}
+
+
+def _audit_shopify_write(
+    *, slack_user: str, channel: str, variant: str, location: str, old, new: int,
+) -> None:
+    """Append one line to logs/shopify-inventory-writes.jsonl. Audit failure must
+    never break the reply (mirrors historical_access.audit)."""
+    import json as _json
+    import time as _time
+    try:
+        _SHOPIFY_WRITE_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": int(_time.time()),
+            "slack_user": slack_user,
+            "channel": channel,
+            "variant": variant,
+            "location": location,
+            "old": old,
+            "new": new,
+        }
+        with _SHOPIFY_WRITE_AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(entry) + "\n")
+    except Exception as exc:  # noqa: BLE001 -- audit failure must not break the write reply
+        log.error("shopify inventory write audit failed: %s", exc)
+
+
+def _resolve_shopify_location(query: str) -> tuple[int | None, str, list[str]]:
+    """Resolve a spoken/typed location name to (location_id, canonical_name, all_names).
+
+    Resolution order:
+      1. a configured ALIAS ("office" -> "1337 S Gilbert Rd") -> that live location;
+      2. exact (case-insensitive) live-location name;
+      3. unique partial substring of a live-location name.
+    Returns (None, "", all_names) when zero or multiple candidates match -- the
+    caller asks the user rather than guessing. all_names is the full active-location
+    list (for a helpful 'known locations' message). NOTE: an alias only resolves the
+    NAME; the caller still enforces the allowlist, so an alias never bypasses it."""
+    locations = shopify_client.get_active_locations()  # [{'id','name'}]
+    all_names = [str(l["name"]) for l in locations]
+    needle = (query or "").strip().lower()
+    if not needle:
+        return None, "", all_names
+    _, aliases = _load_shopify_write_config()
+    target = aliases.get(needle)
+    if target:
+        for l in locations:
+            if str(l["name"]).strip().lower() == target:
+                return int(l["id"]), str(l["name"]), all_names
+        # Alias points at a name that is not a live active location -> no match.
+        return None, "", all_names
+    exact = [l for l in locations if str(l["name"]).strip().lower() == needle]
+    if len(exact) == 1:
+        return int(exact[0]["id"]), str(exact[0]["name"]), all_names
+    partial = [l for l in locations if needle in str(l["name"]).strip().lower()]
+    if len(partial) == 1:
+        return int(partial[0]["id"]), str(partial[0]["name"]), all_names
+    return None, "", all_names
+
+
+def _shopify_set_inventory_preview(
+    *, variant_label: str, location_name: str, current: int, quantity: int, changed: bool,
+) -> str:
+    """WRITE_PREVIEW text for the staged inventory set (source-opaque)."""
+    lead = (
+        "The count moved since I last checked, so here is a fresh preview "
+        if changed else ""
+    )
+    return (
+        f"WRITE_PREVIEW {lead}Set DTC inventory for {variant_label} at "
+        f"{location_name}: {current} -> {quantity}.\n"
+        f"Show the user only: \"{variant_label} at {location_name}: {current} -> "
+        f"{quantity} units. Confirm?\" -- then, on the user's yes, call this tool "
+        f"again with confirmed=true, the same product / location / quantity, AND "
+        f"expected_current={current}. Do NOT name the store or platform."
+    )
+
+
+def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Set F3E DTC inventory for one variant at one location. Staged-write tool.
+
+    Phase 1 (confirmed != true): resolve the product/variant by name (or SKU) and
+    the location by name, refuse externally-synced locations (Nimbl et al.) via the
+    refuse-by-default allowlist, fetch the CURRENT quantity, and return a preview.
+    Phase 2 (confirmed=true + expected_current): re-resolve, re-check the allowlist,
+    re-read the live current, and -- only if it still equals expected_current --
+    write; if it moved, re-preview instead of writing (optimistic concurrency).
+
+    Scope: F3E channels + Harrison/FNDR/HJRG cross-entity. Source-opaque output.
+    """
+    input_data = _input or {}
+    ent = (entity or "").upper()
+
+    # --- Scope guard (defense-in-depth; tools_for_entity already gates exposure) ---
+    is_founder = slack_user_id == _HARRISON_SLACK_ID or ent in ("FNDR", "HJRG")
+    if not (ent == "F3E" or is_founder):
+        return (
+            "f3e_shopify_set_inventory blocked: DTC inventory updates are only "
+            "available from F3E channels. Use an #f3e-* / #f3-* channel."
+        )
+
+    confirmed = input_data.get("confirmed", False) is True
+
+    # --- Validate quantity (required in both phases) ---
+    quantity_raw = input_data.get("quantity")
+    if quantity_raw is None or str(quantity_raw).strip() == "":
+        return ("f3e_shopify_set_inventory: missing `quantity`. Ask the user what "
+                "number to set the count to.")
+    try:
+        quantity = int(quantity_raw)
+    except (TypeError, ValueError):
+        return ("f3e_shopify_set_inventory: `quantity` must be a whole number. "
+                "Ask the user to restate the target count.")
+    if quantity < 0:
+        return ("f3e_shopify_set_inventory: `quantity` cannot be negative. Ask the "
+                "user for a count of zero or more.")
+
+    product_query = (input_data.get("product") or "").strip()
+    location_query = (input_data.get("location") or "").strip()
+    if not product_query:
+        return ("f3e_shopify_set_inventory: missing `product`. Ask the user which "
+                "product or variant to update (a name or SKU).")
+    if not location_query:
+        return ("f3e_shopify_set_inventory: missing `location`. Ask the user which "
+                "location to set (do not assume) -- e.g. the office.")
+
+    # --- Resolve location (both phases) ---
+    try:
+        loc_id, loc_name, all_loc_names = _resolve_shopify_location(location_query)
+    except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+        log.warning("f3e_shopify_set_inventory location resolve error user=%s: %s",
+                    slack_user_id, exc)
+        return "I don't have that right now."
+    if loc_id is None:
+        return (
+            f"I couldn't pin down a single location matching '{location_query}'. "
+            f"Ask the user to name the location exactly. Known locations: "
+            f"{', '.join(all_loc_names)}."
+        )
+
+    # --- Refuse-by-default location allowlist (the load-bearing safety rule) ---
+    allowed, _ = _load_shopify_write_config()
+    if loc_name.strip().lower() not in allowed:
+        allowed_display = ", ".join(sorted(n.title() for n in allowed)) or "none configured"
+        return (
+            f"I can't set inventory at {loc_name} from here. That location's number "
+            f"is kept in sync automatically (a fulfillment partner owns it), so a "
+            f"manual change would just be overwritten. Manual updates go to: "
+            f"{allowed_display}. If you really need to change {loc_name}, that's a "
+            f"call for Harrison. Do NOT name the store or platform to the user."
+        )
+
+    # --- Resolve the product/variant (both phases) ---
+    try:
+        matches = shopify_client.resolve_variants(product_query)
+    except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+        log.warning("f3e_shopify_set_inventory variant resolve error user=%s: %s",
+                    slack_user_id, exc)
+        return "I don't have that right now."
+    if not matches:
+        return (
+            f"I couldn't find a product or variant matching '{product_query}'. Ask "
+            f"the user to restate the name or give the SKU -- do not guess."
+        )
+    if len(matches) > 1:
+        listing = "; ".join(
+            f"{m.label}" + (f" [SKU {m.sku}]" if m.sku else "") for m in matches[:12]
+        )
+        return (
+            f"'{product_query}' matches {len(matches)} variants: {listing}. Ask the "
+            f"user which one they mean (never guess)."
+        )
+    match = matches[0]
+
+    # --- Read the live current at that location (both phases) ---
+    try:
+        current = shopify_client.get_inventory_level(match.inventory_item_id, loc_id)
+    except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+        log.warning("f3e_shopify_set_inventory level read error user=%s: %s",
+                    slack_user_id, exc)
+        return "I don't have that right now."
+    if current is None:
+        return (
+            f"{match.label} isn't stocked at {loc_name} yet, so I can't set a count "
+            f"there. The item has to be connected to that location first -- that's a "
+            f"call for Harrison."
+        )
+
+    # --- Phase 1: preview ---
+    if not confirmed:
+        log.info(
+            "f3e_shopify_set_inventory PREVIEW user=%s item=%s loc=%s cur=%s -> %s",
+            slack_user_id, match.inventory_item_id, loc_id, current, quantity,
+        )
+        return _shopify_set_inventory_preview(
+            variant_label=match.label, location_name=loc_name,
+            current=current, quantity=quantity, changed=False,
+        )
+
+    # --- Phase 2: confirmed write, with optimistic-concurrency guard ---
+    expected_raw = input_data.get("expected_current")
+    if expected_raw is None or str(expected_raw).strip() == "":
+        # Not properly staged -> fall back to a fresh preview (never a blind write).
+        return _shopify_set_inventory_preview(
+            variant_label=match.label, location_name=loc_name,
+            current=current, quantity=quantity, changed=False,
+        )
+    try:
+        expected_current = int(expected_raw)
+    except (TypeError, ValueError):
+        return _shopify_set_inventory_preview(
+            variant_label=match.label, location_name=loc_name,
+            current=current, quantity=quantity, changed=False,
+        )
+    if current != expected_current:
+        # The number moved between preview and confirm -> re-preview, do NOT write.
+        log.info(
+            "f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s "
+            "expected=%s live=%s", slack_user_id, match.inventory_item_id,
+            expected_current, current,
+        )
+        return _shopify_set_inventory_preview(
+            variant_label=match.label, location_name=loc_name,
+            current=current, quantity=quantity, changed=True,
+        )
+
+    # --- Execute the write ---
+    try:
+        new_available = shopify_client.set_inventory_level(
+            match.inventory_item_id, loc_id, quantity,
+        )
+    except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+        log.warning(
+            "f3e_shopify_set_inventory WRITE FAILED user=%s item=%s loc=%s: %s",
+            slack_user_id, match.inventory_item_id, loc_id, exc,
+        )
+        return (
+            "That DTC inventory update didn't go through -- the count was NOT changed. "
+            "Tell the user it failed and to try again shortly. Do not name the store "
+            "or platform."
+        )
+
+    _audit_shopify_write(
+        slack_user=slack_user_id,
+        channel=(input_data.get("_channel_name") or ""),
+        variant=match.label,
+        location=loc_name,
+        old=current,
+        new=new_available,
+    )
+    log.info(
+        "f3e_shopify_set_inventory WROTE user=%s item=%s loc=%s %s -> %s",
+        slack_user_id, match.inventory_item_id, loc_id, current, new_available,
+    )
+    return (
+        f"WRITE_CONFIRMED -- post the following line as your entire response "
+        f"(no preamble, no meta-commentary, do not name the store or platform):\n\n"
+        f"DTC inventory updated -- {match.label} at {loc_name}: {current} -> "
+        f"{new_available} units."
+    )
+
+
 # --- Calendar meeting scheduling ---
 
 
@@ -4460,6 +4768,70 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── F3E DTC inventory WRITE (staged) ──
+    {
+        "name": "f3e_shopify_set_inventory",
+        "description": (
+            "STAGED-WRITE tool. Set F3 Energy DTC inventory to an absolute number "
+            "for ONE product/variant at ONE location. Use when a user asks to set, "
+            "update, correct, or adjust the on-hand count -- phrases like 'set Pure "
+            "Original at the office to 240', 'update Mood 12-pack stock to 50', "
+            "'change the office count for Energy to 0'. This is a WRITE: two calls. "
+            "First call with confirmed=false (or omitted) resolves the product + "
+            "location, fetches the CURRENT count, and returns a WRITE_PREVIEW for "
+            "the user to approve; show that preview and ask for a yes. Only after "
+            "the user confirms, call again with confirmed=true, the SAME product / "
+            "location / quantity, AND expected_current (the current number from the "
+            "preview). "
+            "Refusals you must relay plainly (do not argue with them): synced "
+            "locations (e.g. the DTC fulfillment partner's location) cannot be set "
+            "manually -- only manually-managed locations like the office; an "
+            "ambiguous product or location means ask which one; an un-stocked "
+            "item can't be set. "
+            "Source-opaque: never name the store, platform, or a URL -- say 'DTC "
+            "inventory'/'online'. F3E channels only (or Harrison cross-entity)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product": {
+                    "type": "string",
+                    "description": (
+                        "Product/variant name or SKU to set, e.g. 'Pure Original 12-pack' "
+                        "or a SKU. If it matches more than one variant the tool asks you "
+                        "to disambiguate; pass the fuller name the user gives."
+                    ),
+                },
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "Location name to set at, e.g. 'office'. Ask the user which "
+                        "location -- do NOT assume one."
+                    ),
+                },
+                "quantity": {
+                    "type": "integer",
+                    "description": "The absolute on-hand count to set (0 or more).",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "false/omitted = preview only. true = execute, and ONLY after "
+                        "the user approved the preview. Requires expected_current."
+                    ),
+                },
+                "expected_current": {
+                    "type": "integer",
+                    "description": (
+                        "On a confirmed=true call, the current count shown in the "
+                        "preview. If the live count has changed since, the tool "
+                        "re-previews instead of writing (concurrency guard)."
+                    ),
+                },
+            },
+            "required": ["product", "location", "quantity", "confirmed"],
+        },
+    },
     # ── F3E warehouse inventory (batch report, not live DTC) ──
     {
         "name": "f3e_inventory_pulse",
@@ -5503,6 +5875,7 @@ _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
         "f3e_shopify_sales_pulse",
         "f3e_shopify_inventory",
+        "f3e_shopify_set_inventory",
         "f3e_inventory_pulse",
         "f3e_inventory_by_location",
         "f3e_brand_voice_check",
@@ -5594,6 +5967,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "fndr_open_decisions": _tool_fndr_open_decisions,
     "f3e_shopify_sales_pulse": _tool_f3e_shopify_sales_pulse,
     "f3e_shopify_inventory": _tool_f3e_shopify_inventory,
+    "f3e_shopify_set_inventory": _tool_f3e_shopify_set_inventory,
     "f3e_inventory_pulse": _tool_f3e_inventory_pulse,
     "f3e_inventory_by_location": _tool_f3e_inventory_by_location,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
@@ -5679,6 +6053,9 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # Heavy — multi-step, slow uploads, or long-running APIs
     "gmail_create_draft": 20,
     "calendar_create_event": 20,
+    # DTC inventory write: resolve products + locations + read + write (several
+    # sequential Shopify calls per phase).
+    "f3e_shopify_set_inventory": 20,
     "calendar_schedule_meeting": 25,
     # Image generation (W3-02): the dispatch timeout MUST exceed the tool's
     # internal httpx budgets, else a real generation is abandoned mid-flight and
