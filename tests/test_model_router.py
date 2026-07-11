@@ -119,3 +119,17 @@ def test_short_label_unknown():
 def test_is_haiku():
     assert is_haiku(MODEL_HAIKU) is True
     assert is_haiku(MODEL_SONNET) is False
+
+
+# ---- DTC inventory WRITE intent → Sonnet (2026-07-10 hotfix) ----
+
+
+@pytest.mark.parametrize("msg", [
+    "set Pure Original at the office to 203",
+    "update the Mood 12-pack stock to 50",
+    "set inventory for Energy to 0",
+    "adjust the on-hand for Pure to 12",
+    "set the office count to 240",
+])
+def test_inventory_write_intent_forces_sonnet(msg):
+    assert choose_model(msg) == MODEL_SONNET

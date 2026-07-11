@@ -251,7 +251,7 @@ These tools are F3E-scoped only. Do not call them for OSN, LEX, BDM, or UFL ques
 
 ## DTC inventory updates (F3E)
 
-To SET/UPDATE an F3E DTC on-hand count, use **f3e_shopify_set_inventory** -- a staged write: first call previews (product/variant + location + current → target), then on your yes it writes with `confirmed=true` + `expected_current`. It refuses externally-synced locations (only manually-managed locations like the office accept a manual set) and re-previews if the count moved. Source-opaque -- "DTC inventory," never the platform name.
+To SET/UPDATE an F3E DTC on-hand count, use **f3e_shopify_set_inventory** -- a staged write: first call previews (product/variant + location + current → target); then, on the user's yes, call again with `confirmed=true` (no echo needed -- the tool remembers the previewed write and re-checks the live count itself). It refuses externally-synced locations (only manually-managed ones like the office accept a manual set) and re-previews if the count moved. The tool owns the wording -- post its line as-is and never imply a change unless the result says `WRITE_CONFIRMED` (a "NOT WRITTEN" result means nothing changed). Source-opaque -- "DTC inventory," never the platform name.
 
 ## Meeting scheduling
 

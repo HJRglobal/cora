@@ -360,6 +360,50 @@ def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
             meta["used_verbatim_tool"] = True
 
 
+# ── Staged-WRITE narration safety net (2026-07-10, HIGH-2) ───────────────────
+# The DTC inventory WRITE tool OWNS its user-facing outcome text. On a WRITE it
+# returns a WRITE_CONFIRMED payload; on ANY non-write (preview / re-preview /
+# refusal / clarification / failure) it returns a WRITE_BLOCKED payload that leads
+# with "NOT WRITTEN". Live 2026-07-10 (on Haiku) the model narrated "203 units set"
+# after a re-preview that wrote NOTHING. So whenever this tool's LAST result is
+# present, the loop POSTS THE TOOL'S OWN TEXT (the part after the first blank line),
+# overriding whatever the model streamed -- a mis-narrating model can no longer
+# claim a write that did not happen (nor mis-state one that did). Mirrors the
+# 2026-05-26 slack_send_dm silent-completion pattern, extended to repair a
+# NON-empty hallucination, and scoped to this one write tool by name.
+_SHOPIFY_WRITE_TOOL = "f3e_shopify_set_inventory"
+
+
+def _shopify_directed_text(raw: str) -> str:
+    """The user-facing text the write tool prescribes -- the part after the first
+    blank line of a WRITE_CONFIRMED / WRITE_BLOCKED payload. Falls back to the raw
+    string if the sentinel/blank is absent."""
+    if not raw:
+        return raw
+    if raw.startswith("WRITE_CONFIRMED") or raw.startswith("WRITE_BLOCKED"):
+        parts = raw.split("\n\n", 1)
+        return parts[1].strip() if len(parts) > 1 and parts[1].strip() else raw
+    return raw
+
+
+def _last_shopify_write_result(tool_use_blocks: list, tool_results: list) -> str:
+    """The text content of the last f3e_shopify_set_inventory result in this turn's
+    batch, or '' if the write tool was not called. tool_results is same-order as
+    tool_use_blocks (see _dispatch_tools_parallel)."""
+    found = ""
+    for block, result in zip(tool_use_blocks, tool_results):
+        if getattr(block, "name", None) != _SHOPIFY_WRITE_TOOL:
+            continue
+        content = result.get("content", "")
+        if isinstance(content, str):
+            found = content
+        elif isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    found = blk.get("text", "")
+    return found
+
+
 def generate_response(
     system_prompt: str,
     context: str,
@@ -416,6 +460,8 @@ def generate_response(
         meta["used_verbatim_tool"] = False
         meta["tool_names"] = []
 
+    _last_shopify_result: str = ""  # HIGH-2: the write tool owns its outcome text
+
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         response = _create_with_retry(
             model=effective_model,
@@ -428,7 +474,10 @@ def generate_response(
         _log_usage(response, iteration)
 
         if response.stop_reason != "tool_use":
-            # Model is done — return whatever text it produced
+            # Model is done. If the DTC write tool ran, POST ITS OWN outcome text --
+            # overriding any success-claim the model produced on a non-write (HIGH-2).
+            if _last_shopify_result:
+                return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             return _extract_text(response) or "(Cora returned no text)"
 
         if meta is not None:
@@ -439,6 +488,8 @@ def generate_response(
                 "Tool-use iteration cap (%d) hit — returning partial response",
                 _MAX_TOOL_ITERATIONS,
             )
+            if _last_shopify_result:
+                return _shopify_directed_text(_last_shopify_result)
             return _extract_text(response) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
@@ -457,6 +508,7 @@ def generate_response(
         )
 
         messages.append({"role": "user", "content": tool_results})
+        _last_shopify_result = _last_shopify_write_result(tool_use_blocks, tool_results) or _last_shopify_result
 
     # Should not reach here given the iteration check above, but defensive fallback
     raise ClaudeClientError("Tool-use loop exited unexpectedly")
@@ -546,6 +598,7 @@ def generate_response_streaming(
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
     accumulated_text = ""
     _last_tool_result_text: str = ""  # safety net: fallback if Claude emits no text after a write
+    _last_shopify_result: str = ""    # HIGH-2: the DTC write tool owns its outcome text
 
     if meta is not None:
         meta["used_tools"] = False
@@ -600,7 +653,16 @@ def generate_response_streaming(
                 # Stream missed some text — push the corrected final
                 accumulated_text = final_text
                 _maybe_push(accumulated_text)
-            if not accumulated_text and _last_tool_result_text:
+            if _last_shopify_result:
+                # HIGH-2: the DTC write tool OWNS its outcome text. Post it verbatim,
+                # OVERRIDING any narration the model streamed -- so a mis-narrating
+                # model can never claim a write that did not happen (nor mis-state one
+                # that did). Fires whether or not the model emitted text.
+                directed = _shopify_directed_text(_last_shopify_result)
+                if directed and directed != accumulated_text:
+                    accumulated_text = directed
+                    _maybe_push(accumulated_text)
+            elif not accumulated_text and _last_tool_result_text:
                 # Claude produced no text after a tool call (silent-completion).
                 # Extract the WRITE_CONFIRMED payload if present, otherwise
                 # surface the raw tool result so the user sees something.
@@ -625,6 +687,8 @@ def generate_response_streaming(
                 "Tool-use iteration cap (%d) hit during streaming — returning partial response",
                 _MAX_TOOL_ITERATIONS,
             )
+            if _last_shopify_result:
+                return _shopify_directed_text(_last_shopify_result)
             return accumulated_text or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
@@ -656,5 +720,8 @@ def generate_response_streaming(
                         t = block.get("text", "").strip()
                         if t:
                             _last_tool_result_text = t
+        # HIGH-2: remember the DTC write tool's result specifically (by tool name)
+        # so the stop handler can post its authoritative outcome text.
+        _last_shopify_result = _last_shopify_write_result(tool_use_blocks, tool_results) or _last_shopify_result
 
     raise ClaudeClientError("Tool-use loop exited unexpectedly during streaming")

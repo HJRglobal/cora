@@ -199,6 +199,20 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         _gd._THREAD_LOGGED.clear()
     except Exception:
         pass
+    # MED-3 (2026-07-10): the DTC inventory write tool appends an audit line to
+    # logs/shopify-inventory-writes.jsonl. Redirect that path to a tmp file for
+    # EVERY test (a build-session suite run polluted the real file with 3 fixture
+    # rows), and clear the in-memory pending-confirmation store so it never leaks
+    # across tests. Belt: the session guard below fails the run if logs/ is touched.
+    try:
+        import cora.tools.tool_dispatch as _td
+        monkeypatch.setattr(
+            _td, "_SHOPIFY_WRITE_AUDIT_PATH",
+            tmp_path / "shopify-inventory-writes.jsonl", raising=False,
+        )
+        _td._PENDING_SHOPIFY_WRITES.clear()
+    except Exception:
+        pass
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:
@@ -206,3 +220,32 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         _hc._portal_verified = False
     except Exception:
         pass
+    try:
+        import cora.tools.tool_dispatch as _td
+        _td._PENDING_SHOPIFY_WRITES.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_logs_untouched():
+    """MED-3 repo guard: the test suite must NOT mutate the real DTC inventory
+    audit log. Snapshot its (size, mtime) at session start and assert unchanged at
+    session end -- if a test writes to logs/ instead of a tmp path, the run fails."""
+    from pathlib import Path as _Path
+    audit = _Path(__file__).resolve().parent.parent / "logs" / "shopify-inventory-writes.jsonl"
+
+    def _snap():
+        try:
+            st = audit.stat()
+            return (st.st_size, int(st.st_mtime))
+        except FileNotFoundError:
+            return None
+
+    before = _snap()
+    yield
+    after = _snap()
+    assert after == before, (
+        f"the test suite mutated the real audit log {audit} ({before} -> {after}) -- "
+        "a test wrote to logs/ instead of a tmp path"
+    )

@@ -69,6 +69,12 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\b(low|running low|out of) (on )?(stock|inventory)\b",
     r"\binventory (status|levels?|check|at)\b",
     r"\bwhat'?s? (low|running low|out)\b",
+    # DTC inventory WRITE intent (2026-07-10 hotfix) -- a write flow is not a Haiku
+    # job. Catches the "set X at the office to N" turn; the bare-"yes" confirm turn
+    # is escalated separately in app.py when a pending shopify write exists.
+    r"\b(set|update|change|adjust|correct|bump|lower|raise)\b[^?!.]{0,60}\b(inventory|stock|on.?hand|units?)\b",
+    r"\bset\b[^?!.]{0,60}\bto\s+\d+\b",
+    r"\b(inventory|stock)\b[^?!.]{0,30}\bto\s+\d+\b",
     r"\bfoot traffic\b",
     r"\bcustomer (count|traffic|trends?|numbers?|growth)\b",
     r"\bhow'?s? (gilbert|warner|mckellips|greenfield|val vista|pecos|GW|GM|GF|VVP)\b",
