@@ -499,39 +499,98 @@ def _retry_execute(request: Any, max_retries: int = 3) -> Any:
 
 
 def _expanded_excluded_folder_ids(
-    service: Any, base_ids: frozenset[str] = KB_EXCLUDED_FOLDER_IDS, *, max_folders: int = 500
-) -> frozenset[str]:
+    service: Any, base_ids: frozenset[str] = KB_EXCLUDED_FOLDER_IDS, *, max_folders: int = 2000
+) -> tuple[frozenset[str], bool]:
     """Expand the KB-excluded dashboard folders to include their descendant
-    subfolders, so a FLAT per-user sweep (which has no tree context) can skip
-    NESTED files, not just direct children.
+    subfolders, so a FLAT per-user sweep (no tree context) can skip NESTED files.
 
-    Fail-safe: on any API error it returns whatever it has gathered (at least the
-    base roots), and it never over-excludes outside those subtrees. For users who
-    can't see the folders, each list returns empty (cheap no-op)."""
+    Returns ``(folder_ids, complete)``. ``complete`` is False if ANY list call
+    failed (after retry) OR the ``max_folders`` cap was hit OR a page was dropped
+    -- the caller must then FALL BACK to per-file ancestor resolution rather than
+    silently proceed with a partial denylist (a confidential fail-open, D-051
+    2026-07-11). Paginates subfolders so a folder with >100 subfolders is not
+    silently truncated. For users who can't see the roots, each list is empty."""
     out: set[str] = set(base_ids)
     queue: list[str] = list(base_ids)
-    try:
-        while queue and len(out) < max_folders:
-            fid = queue.pop()
-            resp = _retry_execute(
-                service.files().list(
-                    q=(
-                        f"'{fid}' in parents"
-                        f" and mimeType = 'application/vnd.google-apps.folder'"
-                        f" and trashed = false"
-                    ),
-                    spaces="drive",
-                    fields="files(id)",
-                    pageSize=100,
+    complete = True
+    while queue:
+        if len(out) >= max_folders:
+            complete = False
+            break
+        fid = queue.pop()
+        page_token: str | None = None
+        while True:
+            try:
+                resp = _retry_execute(
+                    service.files().list(
+                        q=(
+                            f"'{fid}' in parents"
+                            f" and mimeType = 'application/vnd.google-apps.folder'"
+                            f" and trashed = false"
+                        ),
+                        spaces="drive",
+                        fields="nextPageToken, files(id)",
+                        pageSize=100,
+                        pageToken=page_token,
+                    )
                 )
-            )
+            except Exception as exc:  # noqa: BLE001 -- fail-CLOSED (signal incomplete)
+                log.warning(
+                    "drive_sweep: excluded-folder expansion error on %s (%s) -- "
+                    "falling back to per-file ancestor resolution", fid, exc,
+                )
+                complete = False
+                break
             for f in resp.get("files", []):
                 if f["id"] not in out:
                     out.add(f["id"])
                     queue.append(f["id"])
-    except Exception as exc:  # noqa: BLE001 -- fail-safe, never crash the sweep
-        log.warning("drive_sweep: excluded-folder expansion partial (%s)", exc)
-    return frozenset(out)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    return frozenset(out), complete
+
+
+def _any_ancestor_excluded(
+    service: Any, folder_ids: list[str] | None, cache: dict[str, list[str]], *, max_nodes: int = 400
+) -> bool:
+    """Walk a file's parent folders UPWARD; True if any ancestor is a KB-excluded
+    dashboard root. Used only as the fail-closed fallback when expansion did not
+    complete. Folder->parents lookups are cached per sweep run (bounded cost).
+    An unresolvable node is treated as non-excluded (logged) -- best effort."""
+    seen: set[str] = set()
+    stack: list[str] = list(folder_ids or [])
+    while stack and len(seen) < max_nodes:
+        fid = stack.pop()
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if fid in KB_EXCLUDED_FOLDER_IDS:
+            return True
+        if fid not in cache:
+            try:
+                meta = _retry_execute(service.files().get(fileId=fid, fields="parents"))
+                cache[fid] = meta.get("parents") or []
+            except Exception as exc:  # noqa: BLE001
+                log.warning("drive_sweep: ancestor resolve failed for %s (%s)", fid, exc)
+                cache[fid] = []
+        stack.extend(cache[fid])
+    return False
+
+
+def _file_under_excluded_folder(
+    service: Any, parents: list[str] | None, expanded: frozenset[str],
+    complete: bool, cache: dict[str, list[str]],
+) -> bool:
+    """True if a file (by its parent folder ids) sits in an excluded dashboard
+    store. Fast path uses the expanded folder-id set; if expansion was incomplete
+    it falls back to ancestor resolution (fail-closed)."""
+    parents = parents or []
+    if any(p in expanded for p in parents):
+        return True
+    if complete:
+        return False  # the expanded set is authoritative
+    return _any_ancestor_excluded(service, parents, cache)
 
 
 def _build_drive_service(sa_json_path: str, user_email: str):
@@ -642,8 +701,11 @@ def sweep_user(
 
     # Dashboard read layer (2026-07-11): never ingest the personal / highly-
     # confidential dashboard stores. This is a FLAT sweep, so expand the excluded
-    # roots to their descendant subfolders to catch nested files too.
-    excluded_folders = _expanded_excluded_folder_ids(service)
+    # roots to their descendant subfolders to catch nested files too; if the
+    # expansion did not complete, fall back to per-file ancestor resolution
+    # (fail-closed -- never ingest with a partial denylist).
+    excluded_folders, _excl_complete = _expanded_excluded_folder_ids(service)
+    _folder_parent_cache: dict[str, list[str]] = {}
 
     # Build Drive files.list query
     q = (
@@ -698,7 +760,10 @@ def sweep_user(
 
             # Dashboard read layer: never ingest personal/confidential dashboard
             # stores (OneAmerica, capital-raise, travel-points) or their subtrees.
-            if folder_ids_excluded(file_meta.get("parents"), excluded_folders):
+            if _file_under_excluded_folder(
+                service, file_meta.get("parents"), excluded_folders,
+                _excl_complete, _folder_parent_cache,
+            ):
                 stats.setdefault("dashboard_excluded_skipped", 0)
                 stats["dashboard_excluded_skipped"] += 1
                 continue

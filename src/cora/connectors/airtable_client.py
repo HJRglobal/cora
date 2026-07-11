@@ -52,6 +52,17 @@ class AirtableResult:
     error: str = ""
 
 
+class _UnknownFieldError(Exception):
+    """Internal: an Airtable 4xx caused by an unknown field name in fields[]."""
+
+
+def _looks_like_unknown_field(response) -> bool:
+    try:
+        return "UNKNOWN_FIELD_NAME" in (response.text or "").upper()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _key() -> str:
     return os.environ.get("AIRTABLE_API_KEY", "").strip()
 
@@ -87,25 +98,31 @@ def list_records(
 
     url = f"{_API_ROOT}/{base_id}/{table}"
     headers = {"Authorization": f"Bearer {key}"}
-    out: list[dict[str, Any]] = []
-    offset: str | None = None
-    try:
+
+    def _fetch(use_fields: bool) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        offset: str | None = None
         with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
             for _ in range(_MAX_PAGES):
                 params: dict[str, Any] = {"pageSize": _PAGE_SIZE}
-                if fields:
+                if use_fields and fields:
                     params["fields[]"] = fields
                 if offset:
                     params["offset"] = offset
                 resp = client.get(url, headers=headers, params=params)
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    r = exc.response
+                    if use_fields and fields and r is not None \
+                            and r.status_code in (400, 422) and _looks_like_unknown_field(r):
+                        raise _UnknownFieldError(str(exc)) from exc
+                    raise
                 data = resp.json()
                 for rec in data.get("records", []):
                     out.append(rec.get("fields", {}) or {})
                     if max_records and len(out) >= max_records:
-                        return AirtableResult(
-                            base_id=base_id, table=table, records=out[:max_records]
-                        )
+                        return out[:max_records]
                 offset = data.get("offset")
                 if not offset:
                     break
@@ -113,8 +130,25 @@ def list_records(
                 log.warning(
                     "airtable: hit page cap (%d) base=%s table=%s", _MAX_PAGES, base_id, table
                 )
+        return out
+
+    try:
+        records = _fetch(use_fields=True)
+    except _UnknownFieldError as exc:
+        # A field name drifted (rename / casing). Recover by fetching all columns
+        # and letting the formatter pick the keys it knows -- do NOT surface this
+        # recoverable schema drift as a misleading "not connected".
+        log.warning(
+            "airtable: unknown field in %s/%s (%s) -- retrying without field restriction",
+            base_id, table, exc,
+        )
+        try:
+            records = _fetch(use_fields=False)
+        except Exception as exc2:  # noqa: BLE001 -- fail-soft
+            log.warning("airtable: fieldless retry failed base=%s table=%s: %s", base_id, table, exc2)
+            return AirtableResult(base_id=base_id, table=table, available=False, error=str(exc2))
     except Exception as exc:  # noqa: BLE001 -- fail-soft, never raise
         log.warning("airtable: list failed base=%s table=%s: %s", base_id, table, exc)
         return AirtableResult(base_id=base_id, table=table, available=False, error=str(exc))
 
-    return AirtableResult(base_id=base_id, table=table, records=out)
+    return AirtableResult(base_id=base_id, table=table, records=records)

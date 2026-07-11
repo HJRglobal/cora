@@ -121,6 +121,50 @@ def test_airtable_http_error_failsoft(monkeypatch):
     assert res.error
 
 
+def test_airtable_retries_without_fields_on_unknown_field(monkeypatch):
+    import httpx
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload, status=200, text=""):
+            self._p = payload
+            self.status_code = status
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "err",
+                    request=httpx.Request("GET", "http://x"),
+                    response=httpx.Response(self.status_code, text=self.text),
+                )
+
+        def json(self):
+            return self._p
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, headers=None, params=None):
+            calls.append(params or {})
+            if "fields[]" in (params or {}):
+                return _Resp({}, 422, '{"error":{"type":"UNKNOWN_FIELD_NAME"}}')
+            return _Resp({"records": [{"fields": {"Name": "A"}}]})
+
+    monkeypatch.setattr(airtable_client.httpx, "Client", lambda *a, **k: _Client())
+    monkeypatch.setenv("AIRTABLE_API_KEY", "patTEST")
+    res = airtable_client.list_records(ALLOWED, "Roster", fields=["BadField"])
+    assert res.available is True  # NOT surfaced as "not connected"
+    assert [r["Name"] for r in res.records] == ["A"]
+    assert any("fields[]" in c for c in calls)      # first attempt used fields
+    assert any("fields[]" not in c for c in calls)  # then retried fieldless
+
+
 def test_airtable_allowed_bases_are_the_two_dashboards():
     assert airtable_client.ALLOWED_BASES == frozenset({ALLOWED, CONTENT})
 

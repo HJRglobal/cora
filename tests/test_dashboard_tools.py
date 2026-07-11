@@ -269,6 +269,53 @@ def test_format_content_pipeline_ordering_and_budget():
     _assert_opaque(out)
 
 
+def test_oneamerica_exact_85_not_counted():
+    # Exactly 85.0% borrowed must NOT be labelled ">85% borrowed".
+    at85 = {"meta": {"values_as_of": "2026-07-08"}, "policies": [
+        {"insured": "X", "total_db": 100, "guar_cv": 1, "pua_cv": 1,
+         "loan_balance": 8500, "avail_loan": 1500, "premium": 1, "paid_to_date": "2027-01-01", "flags": ""}]}
+    out = td._format_oneamerica(at85, today=date(2026, 7, 11))
+    assert ">85% borrowed" not in out
+    over = {"meta": {"values_as_of": "2026-07-08"}, "policies": [
+        {"insured": "X", "total_db": 100, "guar_cv": 1, "pua_cv": 1,
+         "loan_balance": 8600, "avail_loan": 1400, "premium": 1, "paid_to_date": "2027-01-01", "flags": ""}]}
+    out2 = td._format_oneamerica(over, today=date(2026, 7, 11))
+    assert "1 at >85% borrowed" in out2
+
+
+def test_oneamerica_non_dict_meta_no_crash():
+    out = td._format_oneamerica({"meta": 5, "policies": []}, today=date(2026, 7, 11))
+    assert "0 policies" in out
+
+
+def test_capital_non_dict_nested_no_crash():
+    weird = {"meta": "oops", "locked": {"raise_usd": 2000000, "post_money_valuation_usd": 25000000, "carta": "bad"},
+             "calc": None, "candidates": []}
+    out = td._format_capital_program(weird)  # must not raise
+    assert "$2,000,000" in out
+    assert "hasn't been synced" in out.lower()
+
+
+def test_creator_lookup_scrubs_urls_and_vendors():
+    roster = [{"Name": "Foo", "Handle": "https://instagram.com/foo",
+               "Next step": "sync via airtable.com/appX", "Stage": "Active"}]
+    out = td._creator_person_lookup(roster, "foo")
+    low = out.lower()
+    assert "http" not in low          # full URL neutralized
+    assert "airtable" not in low      # vendor token neutralized
+    assert "Foo" in out
+
+
+def test_content_pipeline_priority_bullets_ordered():
+    # Raw order puts Unassigned before Overdue; bullets must still lead with Overdue.
+    deliverables = [
+        {"Deliverable": "U1", "Action flag": "Unassigned"},
+        {"Deliverable": "O1", "Action flag": "Overdue", "Due date": "2026-07-01"},
+    ]
+    out = td._format_content_pipeline(deliverables, [], [], [], [], today=date(2026, 7, 11))
+    assert out.index("[Overdue] O1") < out.index("[Unassigned] U1")
+
+
 def test_format_creator_counts():
     roster = [
         {"Name": "A", "Stage": "Active", "Tier": "A", "Program": ["MMA"], "GMV": 100},

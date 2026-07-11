@@ -177,9 +177,57 @@ def test_drive_sweep_folder_expansion():
         def files(self):
             return _Files()
 
-    expanded = drive_sweep._expanded_excluded_folder_ids(_Service())
+    expanded, complete = drive_sweep._expanded_excluded_folder_ids(_Service())
+    assert complete is True
     assert CAPITAL_FOLDER in expanded
     assert "_notes" in expanded  # descendant folder captured
+
+
+def test_drive_sweep_expansion_incomplete_on_error():
+    from cora.connectors import drive_sweep
+
+    class _Files:
+        def list(self, **k):
+            raise RuntimeError("transient Drive 500")
+
+    class _Service:
+        def files(self):
+            return _Files()
+
+    expanded, complete = drive_sweep._expanded_excluded_folder_ids(_Service())
+    assert complete is False               # signalled -> caller must fall back
+    assert CAPITAL_FOLDER in expanded      # at least the base roots survive
+
+
+def test_file_under_excluded_ancestor_fallback():
+    from cora.connectors import drive_sweep
+
+    # parent chain: deckFolder -> notesFolder -> CAPITAL_FOLDER (excluded)
+    parents_of = {"deckFolder": ["notesFolder"], "notesFolder": [CAPITAL_FOLDER]}
+
+    class _GetReq:
+        def __init__(self, fid):
+            self._fid = fid
+
+        def execute(self):
+            return {"parents": parents_of.get(self._fid, [])}
+
+    class _Files:
+        def get(self, *, fileId, **k):
+            return _GetReq(fileId)
+
+    class _Service:
+        def files(self):
+            return _Files()
+
+    base = kb_exclusions.KB_EXCLUDED_FOLDER_IDS
+    cache: dict = {}
+    # Expansion incomplete (complete=False) -> ancestor resolution catches the nested file.
+    assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, False, cache) is True
+    # A file whose ancestry never reaches an excluded root is not excluded.
+    assert drive_sweep._file_under_excluded_folder(_Service(), ["unrelatedFolder"], base, False, cache) is False
+    # When expansion IS complete, the expanded set is authoritative (no ancestor walk).
+    assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, True, {}) is False
 
 
 # --------------------------------------------------------------------------- #

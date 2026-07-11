@@ -15,6 +15,7 @@ that entity. FNDR channels (founder-level + catch-all) see everything.
 import concurrent.futures
 import logging
 import os
+import re
 import time
 from collections import Counter
 from datetime import date, timedelta
@@ -3998,6 +3999,28 @@ _DASH_CREATOR = "f3-creator-sponsorship-command-center"
 _DASH_CONTENT = "f3-content-pipeline"
 
 
+# Source-opacity scrub for pass-through free-text field values. These tools are
+# VERBATIM_TABLE_TOOLS, so format_reply is bypassed and only the egress boundary
+# runs downstream -- and egress does NOT strip named systems or non-allowlisted
+# vendor URLs (airtable.com / instagram.com / a portal link pasted into a "Next
+# step" note). So a URL or platform token pasted into an Airtable/OneAmerica field
+# would leak verbatim. Neutralize both here before interpolation (D-051 2026-07-11).
+_DASH_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_DASH_VENDOR_RE = re.compile(
+    r"\b(airtable|quickbooks|shopify|oneamerica|one\s?america|notion)\b", re.IGNORECASE
+)
+
+
+def _dash_scrub(text: str) -> str:
+    """Strip URLs (all hosts) + explicit platform tokens from tool output so a
+    value pasted into a backing-store field can't leak the source/mechanics."""
+    if not isinstance(text, str) or not text:
+        return text
+    text = _DASH_URL_RE.sub("[link]", text)
+    text = _DASH_VENDOR_RE.sub("[source]", text)
+    return text
+
+
 def _dash_f(v: Any) -> float:
     try:
         return float(v)
@@ -4058,7 +4081,8 @@ def _dash_fmt_counts(counter: Counter) -> str:
 
 def _format_oneamerica(data: dict, *, detail: bool = False, today: date | None = None) -> str:
     today = today or date.today()
-    meta = data.get("meta") or {}
+    _m = data.get("meta")
+    meta = _m if isinstance(_m, dict) else {}
     policies = [p for p in (data.get("policies") or []) if isinstance(p, dict)]
     as_of = meta.get("values_as_of") or "recently"
     n = len(policies)
@@ -4079,7 +4103,7 @@ def _format_oneamerica(data: dict, *, detail: bool = False, today: date | None =
         else:
             denom = lb + _dash_f(av)
             pct = (lb / denom * 100.0) if denom > 0 else 0.0
-        if pct >= 85.0:
+        if pct > 85.0:
             high_borrow += 1
 
     overdue, upcoming, flagged = [], [], []
@@ -4128,7 +4152,7 @@ def _format_oneamerica(data: dict, *, detail: bool = False, today: date | None =
                 f"{_dash_money(p.get('total_db'))} DB, {_dash_money(cv)} CV, "
                 f"{_dash_money(p.get('loan_balance'))} loan, paid to {p.get('paid_to_date', '?')}"
             )
-    return "\n".join(lines)
+    return _dash_scrub("\n".join(lines))
 
 
 def _tool_personal_oneamerica_portfolio(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -4161,8 +4185,10 @@ def _dash_render_state(v: Any) -> str:
 
 
 def _format_capital_program(data: dict) -> str:
-    meta = data.get("meta") or {}
-    locked = data.get("locked") or {}
+    _m = data.get("meta")
+    meta = _m if isinstance(_m, dict) else {}
+    _l = data.get("locked")
+    locked = _l if isinstance(_l, dict) else {}
     synced = meta.get("synced_at") or "unknown"
 
     lines = ["*Capital program -- locked terms:*"]
@@ -4187,7 +4213,8 @@ def _format_capital_program(data: dict) -> str:
         )
     if locked.get("recap"):
         lines.append(f"- Recap: {locked.get('recap')}")
-    carta = locked.get("carta") or {}
+    _carta = locked.get("carta")
+    carta = _carta if isinstance(_carta, dict) else {}
     if carta:
         lines.append(
             f"- Cap table: {int(_dash_f(carta.get('fully_diluted'))):,} fully diluted; "
@@ -4206,7 +4233,7 @@ def _format_capital_program(data: dict) -> str:
         )
         if data.get("note"):
             lines.append(f"Note: {data.get('note')}")
-        return "\n".join(lines)
+        return _dash_scrub("\n".join(lines))
 
     lines.append("")
     lines.append(f"*Live state (synced {synced}):*")
@@ -4227,7 +4254,7 @@ def _format_capital_program(data: dict) -> str:
             lines.append(f"- {k.replace('_', ' ').title()}: {_dash_render_state(v)}")
     if data.get("note"):
         lines.append(f"- Note: {data.get('note')}")
-    return "\n".join(lines)
+    return _dash_scrub("\n".join(lines))
 
 
 def _tool_personal_capital_program_state(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -4287,7 +4314,7 @@ def _format_creator_crm(roster: list[dict], activity: list[dict], *, today: date
         for a in recent:
             typ = f" [{a.get('Type')}]" if a.get("Type") else ""
             lines.append(f"  - {a.get('Date')}: {a.get('Entry', '(entry)')}{typ}")
-    return "\n".join(lines)
+    return _dash_scrub("\n".join(lines))
 
 
 def _creator_person_lookup(roster: list[dict], person: str) -> str:
@@ -4316,7 +4343,7 @@ def _creator_person_lookup(roster: list[dict], person: str) -> str:
             detail.append(f"{label}: {v}")
         if detail:
             lines.append("  " + " | ".join(detail))
-    return "\n".join(lines)
+    return _dash_scrub("\n".join(lines))
 
 
 def _tool_f3e_creator_crm(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -4364,7 +4391,10 @@ def _format_content_pipeline(
             key=lambda kv: (order.index(kv[0]) if kv[0] in order else 99, -kv[1]),
         )
         lines.append("Deliverables: " + ", ".join(f"{k} {v}" for k, v in ordered))
-        prio = [d for d in deliverables if str(d.get("Action flag", "")) in ("Overdue", "Due this week", "Unassigned")]
+        prio = sorted(
+            [d for d in deliverables if str(d.get("Action flag", "")) in ("Overdue", "Due this week", "Unassigned")],
+            key=lambda d: order.index(str(d.get("Action flag", ""))) if str(d.get("Action flag", "")) in order else 99,
+        )
         for d in prio[:10]:
             due = d.get("Due date")
             lines.append(
@@ -4406,7 +4436,7 @@ def _format_content_pipeline(
 
     if len(lines) == 1:
         lines.append("Nothing in the pipeline right now.")
-    return "\n".join(lines)
+    return _dash_scrub("\n".join(lines))
 
 
 def _tool_fndr_content_pipeline(slack_user_id: str, entity: str, _input: dict) -> str:
