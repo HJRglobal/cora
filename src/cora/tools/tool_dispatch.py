@@ -2569,7 +2569,9 @@ def _shopify_set_inventory_preview(
         f"Show the user only: \"{variant_label} at {location_name}: {current} -> "
         f"{quantity} units. Confirm?\" -- then, on the user's yes, call this tool "
         f"again with confirmed=true, the same product / location / quantity, AND "
-        f"expected_current={current}. Do NOT name the store or platform."
+        f"these exact echo-back values so I can detect any drift: "
+        f"expected_current={current}, expected_item=\"{variant_label}\", "
+        f"expected_location=\"{location_name}\". Do NOT name the store or platform."
     )
 
 
@@ -2708,6 +2710,24 @@ def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dic
         return _shopify_set_inventory_preview(
             variant_label=match.label, location_name=loc_name,
             current=current, quantity=quantity, changed=False,
+        )
+    # IDENTITY guard (D-051): the concurrency check on expected_current alone binds
+    # only the QUANTITY. Phase 2 re-resolves product+location from free text, so a
+    # catalog mutation between preview and confirm could make the SAME query resolve
+    # to a DIFFERENT single variant/location whose count happens to equal
+    # expected_current -- writing the right number to the wrong item. Bind IDENTITY
+    # too, using the human-readable label + location name echoed from the preview
+    # (no raw ids -> source-opaque). Any mismatch re-previews, never writes.
+    exp_item = str(input_data.get("expected_item") or "").strip()
+    exp_loc = str(input_data.get("expected_location") or "").strip()
+    if (exp_item and exp_item != match.label) or (exp_loc and exp_loc != loc_name):
+        log.info(
+            "f3e_shopify_set_inventory IDENTITY re-preview user=%s exp_item=%r got=%r "
+            "exp_loc=%r got=%r", slack_user_id, exp_item, match.label, exp_loc, loc_name,
+        )
+        return _shopify_set_inventory_preview(
+            variant_label=match.label, location_name=loc_name,
+            current=current, quantity=quantity, changed=True,
         )
     if current != expected_current:
         # The number moved between preview and confirm -> re-preview, do NOT write.
@@ -4828,6 +4848,23 @@ TOOL_DEFINITIONS = [
                         "re-previews instead of writing (concurrency guard)."
                     ),
                 },
+                "expected_item": {
+                    "type": "string",
+                    "description": (
+                        "On confirmed=true, echo back the exact variant label from the "
+                        "preview (e.g. 'F3 Pure Original (12 Pack)'). If the product "
+                        "re-resolves to a different item, the tool re-previews (identity "
+                        "guard)."
+                    ),
+                },
+                "expected_location": {
+                    "type": "string",
+                    "description": (
+                        "On confirmed=true, echo back the exact location name from the "
+                        "preview. If the location re-resolves differently, the tool "
+                        "re-previews (identity guard)."
+                    ),
+                },
             },
             "required": ["product", "location", "quantity", "confirmed"],
         },
@@ -6053,9 +6090,16 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # Heavy — multi-step, slow uploads, or long-running APIs
     "gmail_create_draft": 20,
     "calendar_create_event": 20,
-    # DTC inventory write: resolve products + locations + read + write (several
-    # sequential Shopify calls per phase).
-    "f3e_shopify_set_inventory": 20,
+    # DTC inventory write (D-028 / D-051): the confirmed phase makes up to four
+    # SEQUENTIAL Shopify calls, each with its own 15s per-request budget --
+    # get_active_locations + resolve_variants (paginated products.json) +
+    # get_inventory_level + set_inventory_level. The dispatch timeout MUST exceed
+    # that worst-case sum, or a slow write is abandoned mid-flight and reported as
+    # "didn't go through" AFTER the POST actually landed (the f3_generate_image
+    # lesson). 15*4 + a pagination page = ~75s. Self-healing on retry (the
+    # optimistic-concurrency guard re-previews), but the false-failure message is
+    # the defect this closes.
+    "f3e_shopify_set_inventory": 75,
     "calendar_schedule_meeting": 25,
     # Image generation (W3-02): the dispatch timeout MUST exceed the tool's
     # internal httpx budgets, else a real generation is abandoned mid-flight and

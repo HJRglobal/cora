@@ -194,13 +194,17 @@ def main(argv: list[str] | None = None) -> int:
     now = _now()
     cutoff_dt = now - timedelta(days=args.cutoff_days)
 
-    records = _load_records(ledger)
-    total = len(records)
-    # Fingerprint at load so --apply can abort if the live bot appended since.
+    # Fingerprint BEFORE reading (D-051): if captured AFTER the read, an append
+    # that lands DURING the read is baked into the baseline, so the pre-rewrite
+    # re-check passes and that fresh row is silently dropped from the live ledger
+    # (it survives only in the .bak). Capturing before means any change during the
+    # read makes now_fp differ -> abort (fail-safe, no silent loss).
     try:
         load_fp = (ledger.stat().st_mtime, ledger.stat().st_size)
     except OSError:
         load_fp = None
+    records = _load_records(ledger)
+    total = len(records)
 
     # Census + the expiry set.
     pending_by_type: Counter = Counter()

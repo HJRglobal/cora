@@ -152,12 +152,15 @@ class TestApply:
             "{malformed json line",                                                     # preserved
         ]
         _write_ledger(ledger, rows)
+        before = ledger.read_bytes()  # the exact pre-expiry state
         rc = mod.main(["--ledger", str(ledger), "--manifest-dir", str(tmp_path),
                        "--cutoff-days", "14", "--apply"])
         assert rc == 0
-        # .bak created
+        # .bak created AND is a faithful pre-expiry snapshot (the revert artifact --
+        # copy2 must run BEFORE the rewrite; guards against a reorder regression).
         baks = list(tmp_path.glob("ledger.jsonl.bak-*"))
         assert len(baks) == 1
+        assert baks[0].read_bytes() == before
         # re-read the ledger
         lines = ledger.read_text(encoding="utf-8").splitlines()
         assert "{malformed json line" in lines  # preserved verbatim

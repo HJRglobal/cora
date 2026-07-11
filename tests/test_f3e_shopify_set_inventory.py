@@ -302,6 +302,44 @@ class TestConfirmedWrite:
             m_set.assert_not_called()
             assert "WRITE_PREVIEW" in r
 
+    def test_matching_identity_writes(self):
+        with ExitStack() as s:
+            m_set = _stub(s, current=132, set_result=240)
+            r = _call(product="pure original 12", location="office", quantity=240,
+                      confirmed=True, expected_current=132,
+                      expected_item="F3 Pure Original (12 Pack)",
+                      expected_location=_OFFICE)
+            m_set.assert_called_once()
+            assert "WRITE_CONFIRMED" in r
+
+    def test_variant_identity_drift_re_previews(self):
+        """expected_item from the preview != the re-resolved variant -> re-preview, no write."""
+        with ExitStack() as s:
+            m_set = _stub(s, current=132)
+            r = _call(product="pure original 12", location="office", quantity=240,
+                      confirmed=True, expected_current=132,
+                      expected_item="F3 Mood (6 Pack)",   # drifted
+                      expected_location=_OFFICE)
+            m_set.assert_not_called()
+            assert "WRITE_PREVIEW" in r
+
+    def test_location_identity_drift_re_previews(self):
+        with ExitStack() as s:
+            m_set = _stub(s, current=132)
+            r = _call(product="pure original 12", location="office", quantity=240,
+                      confirmed=True, expected_current=132,
+                      expected_item="F3 Pure Original (12 Pack)",
+                      expected_location="Nimbl")   # drifted
+            m_set.assert_not_called()
+            assert "WRITE_PREVIEW" in r
+
+    def test_preview_instructs_identity_echo(self):
+        with ExitStack() as s:
+            _stub(s, current=132)
+            r = _call(product="pure original 12", location="office", quantity=240)
+            assert 'expected_item="F3 Pure Original (12 Pack)"' in r
+            assert f'expected_location="{_OFFICE}"' in r
+
     def test_write_failure_is_graceful(self):
         with ExitStack() as s:
             s.enter_context(patch.object(
@@ -392,7 +430,10 @@ class TestWiring:
         assert "f3e_shopify_set_inventory" in _ENTITY_TOOLS["F3E"]
 
     def test_has_timeout(self):
-        assert _TOOL_TIMEOUTS.get("f3e_shopify_set_inventory") == 20
+        # Heavy write: dispatch budget MUST exceed the sum of the confirmed phase's
+        # sequential per-request budgets (D-028 / D-051), else a slow write is
+        # abandoned mid-flight and falsely reported as failed.
+        assert _TOOL_TIMEOUTS.get("f3e_shopify_set_inventory") == 75
 
     def test_offered_to_f3e_not_lex(self):
         f3e_names = {t["name"] for t in tools_for_entity("F3E")}
