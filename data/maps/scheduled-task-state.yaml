@@ -44,13 +44,11 @@ disabled:
   # host task AFTER the hygiene-session merge; until then the daily check WARNs
   # "expected disabled but enabled" -- that WARN is the reminder, not a defect.
   - cowork-cora-gap-digest
-  # Deal Task Sync host-disabled 2026-07-08 (audit MK-01) -- Make.com 4768886 is
-  # the owner (mechanical proposal-stage -> Asana sync, D-029). Code path RETIRED
-  # 2026-07-09 (Slice 07: run_deal_task_sync.py + setup PS1 deleted, guarded by
-  # tests/test_deal_task_sync_retired.py). Kept listed while the host task is
-  # still registered-Disabled; DELIST this line once Harrison unregisters it -- a
-  # removed task is not an "expected disabled" task (see the LinkedIn Spy note).
-  - Cora - Deal Task Sync
+  # "Cora - Deal Task Sync" was host-UNREGISTERED 2026-07-09 (audit MK-01; the code
+  # path was retired in Slice 07, guarded by tests/test_deal_task_sync_retired.py).
+  # DELISTED 2026-07-10 -- a removed task is not an "expected disabled" task, same
+  # as "Cora - Clover Daily Summary" and "Cora - LinkedIn Spy" below. Make.com
+  # 4768886 remains the sole owner of the mechanical proposal-stage -> Asana sync.
   # F3E ecom brief + inventory alerts FOLDED into the F3E daily synthesis 2026-07-07
   # (audit 2026-07-08). The daily synthesis now carries the DTC/subscriptions pulse +
   # inventory flags, so the standalone tasks are host-disabled to avoid duplicate posts.
