@@ -108,8 +108,25 @@ _PENDING_MAX_AGE_DAYS = 30
 # effective run time (the task ExecutionTimeLimit, currently 10 min; 18-min
 # self-budget once re-registered) yet clears well before the next weekday run.
 # Same atomic O_CREAT|O_EXCL idiom as the knowledge-review lock.
+#
+# VERIFY-FIRST NOTE (2026-07-10): the "3 simultaneous run_start lines in one
+# second" seen 7/9 in cora-daily-briefing.jsonl were NOT a production double-fire
+# and are NOT evidence of a missing lock -- this lock already exists and works.
+# Those clusters are dev/probe traffic (time_budget_min=9.0, alternating
+# dry_run true/false, ~13 ms apart): the real-mode probes return early on a
+# missing SLACK_BOT_TOKEN and RELEASE the lock in their finally, so a second probe
+# a few ms later legitimately re-acquires it. The real scheduled fire is the
+# time_budget_min=18.0 line. So Fold 2 adds crash VISIBILITY (dated log +
+# traceback), not another lock.
 _RUN_LOCK_PATH          = _REPO_ROOT / "data" / "state" / "daily-briefing.lock"
 _RUN_LOCK_STALE_SECONDS = 30 * 60
+
+# Dated human-readable log (Fold 2 / 2026-07-10): the 7/10 catch-up fire died with
+# host LastTaskResult 32212 and left NO trace -- run_start with no run_end and no
+# dated file, because the scheduled task's stderr vanishes with its window. Attach
+# a per-day FileHandler at the __main__ entrypoint so a crash (or an external
+# SIGKILL) leaves a durable, flushed trace on disk.
+_DATED_LOG_DIR = _REPO_ROOT / "logs"
 
 # ---- Logging -----------------------------------------------------------------
 
@@ -119,6 +136,34 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("run_daily_briefing")
+
+
+def _attach_dated_file_handler() -> "Path | None":
+    """Attach a per-day FileHandler to the ROOT logger so every INFO+ line from
+    this run (and the cora.* section builders) is captured to
+    logs/daily-briefing-YYYY-MM-DD.log. Called from the __main__ entrypoint ONLY
+    (not from main()) so the test suite, which calls main() directly, never
+    creates real log files. Idempotent; fail-soft (never breaks the run)."""
+    try:
+        _DATED_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = _DATED_LOG_DIR / f"daily-briefing-{datetime.now().strftime('%Y-%m-%d')}.log"
+        root = logging.getLogger()
+        for h in root.handlers:
+            if isinstance(h, logging.FileHandler) and \
+                    os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(str(path)):
+                return path  # already attached today
+        fh = logging.FileHandler(path, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        root.addHandler(fh)
+        log.info("dated briefing log attached: %s", path)
+        return path
+    except Exception as exc:  # noqa: BLE001 -- logging setup must not break the run
+        log.warning("could not attach dated briefing log handler: %s", exc)
+        return None
 
 
 # ---- Roster (org role registry, D-044) ----------------------------------------
@@ -613,6 +658,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return _run(args, mode)
+    except Exception:
+        # Visibility (Fold 2 / 2026-07-10): a run that starts but dies mid-flight
+        # must leave a durable trace. Log the full traceback (lands in the dated
+        # file attached at __main__) and drop a run_crash audit line -- a run_start
+        # with a matching run_crash instead of a run_end -- before exiting nonzero.
+        log.exception("daily-briefing run crashed (mode=%s)", mode)
+        _write_audit([{
+            "ts": time.time(), "event": "run_crash", "mode": mode,
+            "error": "unhandled exception -- see traceback in logs/daily-briefing-<date>.log",
+        }])
+        return 1
     finally:
         if take_lock:
             _release_run_lock()
@@ -793,4 +849,21 @@ def _run(args: argparse.Namespace, mode: str) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Fold 2: attach the dated log FIRST so main()'s traceback lands on disk, then
+    # run under a last-resort net for a crash OUTSIDE _run (arg parse, lock, an
+    # import-time failure) -- main() already catches crashes inside _run.
+    _attach_dated_file_handler()
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        log.exception("daily-briefing crashed before/around the run")
+        try:
+            _write_audit([{
+                "ts": time.time(), "event": "run_crash", "mode": "unknown",
+                "error": "unhandled exception at entrypoint",
+            }])
+        except Exception:  # noqa: BLE001
+            pass
+        sys.exit(1)
