@@ -95,6 +95,9 @@ def _load_access_map() -> dict[str, dict[str, Any]]:
                 "allow_entities": frozenset(
                     str(e).strip().upper() for e in (entry.get("allow_entities") or []) if e
                 ),
+                # Backing-store config (folder/files/base/tables/title) for the
+                # reader tools -- documentation-as-config, NOT part of the gate.
+                "store": entry.get("store") if isinstance(entry.get("store"), dict) else {},
             }
         if result:  # never cache an empty/failed load
             _cache = result
@@ -146,6 +149,14 @@ def check_dashboard_access(
     if entry["allow_entities"] and is_mapped(ch) and route(ch) in entry["allow_entities"]:
         return None
     return refusal
+
+
+def store_for(dashboard_id: str) -> dict[str, Any]:
+    """Return the raw backing-store config for a dashboard (folder / files / base
+    / tables / title), or {} if unknown. Read-only convenience for the reader
+    tools -- this is NOT an access check; callers gate with
+    ``check_dashboard_access`` first."""
+    return dict(_load_access_map().get(dashboard_id, {}).get("store", {}) or {})
 
 
 def invalidate_cache() -> None:

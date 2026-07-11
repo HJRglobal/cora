@@ -16,6 +16,8 @@ import concurrent.futures
 import logging
 import os
 import time
+from collections import Counter
+from datetime import date, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -23,8 +25,8 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
-from .. import org_roles
-from ..connectors import gmail_reader, photoroom_client, qbo_oauth, shopify_client
+from .. import dashboard_access, org_roles
+from ..connectors import airtable_client, dashboard_drive_reader, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
 log = logging.getLogger(__name__)
@@ -99,6 +101,12 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "ads_get_cm_waterfall",
     # Composite plate (role + tasks + calendar + pipeline, with sanctioned links)
     "whats_on_my_plate",
+    # Dashboard read layer -- personal/confidential dashboards MUST never cache
+    # (D-043 class); the two CRM readers are time-sensitive structured dashboards.
+    "personal_oneamerica_portfolio",
+    "personal_capital_program_state",
+    "f3e_creator_crm",
+    "fndr_content_pipeline",
 })
 
 
@@ -3972,6 +3980,464 @@ def _tool_cora_person_dossier(slack_user_id: str, entity: str, _input: dict) -> 
     return result.reply
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard read layer (2026-07-11)
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only tools that surface the live state of Cowork dashboards from their
+# backing stores. EVERY tool calls dashboard_access.check_dashboard_access FIRST
+# (deterministic, pre-answer, fail-closed, no existence leak) and is SOURCE-OPAQUE
+# by construction: replies say "your insurance portfolio" / "the capital program
+# tracker" / "the creator CRM" / "the content pipeline" -- never Airtable / Drive /
+# Notion / OneAmerica / the carrier / a portal URL. The egress boundary does NOT
+# redact named systems, so opacity is enforced here, not downstream. All four are
+# VERBATIM_TABLE_TOOLS (never cached; the two personal ones are the D-043 class).
+
+_DASH_ONEAMERICA = "oneamerica-whole-life-portfolio"
+_DASH_CAPITAL = "f3-capital-program"
+_DASH_CREATOR = "f3-creator-sponsorship-command-center"
+_DASH_CONTENT = "f3-content-pipeline"
+
+
+def _dash_f(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dash_money(v: Any) -> str:
+    return f"${_dash_f(v):,.0f}"
+
+
+def _dash_millions(v: Any) -> str:
+    return f"${_dash_f(v) / 1e6:,.2f}M"
+
+
+def _dash_parse_date(s: Any) -> date | None:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def _dash_count_single(records: list[dict], field_name: str) -> Counter:
+    """Count a single-select / formula string field across records."""
+    c: Counter = Counter()
+    for r in records:
+        v = r.get(field_name)
+        if isinstance(v, str) and v.strip():
+            c[v.strip()] += 1
+        elif isinstance(v, dict) and v.get("name"):  # defensive: nested {name} shape
+            c[str(v["name"])] += 1
+    return c
+
+
+def _dash_count_multi(records: list[dict], field_name: str) -> Counter:
+    """Count a multi-select field (list of names) across records."""
+    c: Counter = Counter()
+    for r in records:
+        v = r.get(field_name)
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str) and item.strip():
+                    c[item.strip()] += 1
+                elif isinstance(item, dict) and item.get("name"):
+                    c[str(item["name"])] += 1
+        elif isinstance(v, str) and v.strip():
+            c[v.strip()] += 1
+    return c
+
+
+def _dash_fmt_counts(counter: Counter) -> str:
+    return ", ".join(f"{k} {v}" for k, v in counter.most_common())
+
+
+# --- OneAmerica whole-life portfolio (Harrison DM only) ---
+
+def _format_oneamerica(data: dict, *, detail: bool = False, today: date | None = None) -> str:
+    today = today or date.today()
+    meta = data.get("meta") or {}
+    policies = [p for p in (data.get("policies") or []) if isinstance(p, dict)]
+    as_of = meta.get("values_as_of") or "recently"
+    n = len(policies)
+
+    total_db = sum(_dash_f(p.get("total_db")) for p in policies)
+    total_cv = sum(_dash_f(p.get("guar_cv")) + _dash_f(p.get("pua_cv")) for p in policies)
+    total_loan = sum(_dash_f(p.get("loan_balance")) for p in policies)
+    total_avail = sum(_dash_f(p.get("avail_loan")) for p in policies)
+    annual_prem = sum(_dash_f(p.get("premium")) for p in policies)
+    loans_count = sum(1 for p in policies if _dash_f(p.get("loan_balance")) > 0)
+
+    high_borrow = 0
+    for p in policies:
+        lb = _dash_f(p.get("loan_balance"))
+        av = p.get("avail_loan")
+        if av is None:
+            pct = 100.0 if lb > 0 else 0.0
+        else:
+            denom = lb + _dash_f(av)
+            pct = (lb / denom * 100.0) if denom > 0 else 0.0
+        if pct >= 85.0:
+            high_borrow += 1
+
+    overdue, upcoming, flagged = [], [], []
+    for p in policies:
+        insured = p.get("insured", "a policy")
+        ptd = _dash_parse_date(p.get("paid_to_date"))
+        if p.get("flags"):
+            flagged.append((insured, str(p.get("flags"))))
+        if ptd and ptd < today:
+            overdue.append((insured, p.get("paid_to_date")))
+        elif ptd and today <= ptd <= today + timedelta(days=30):
+            upcoming.append((insured, p.get("paid_to_date"), _dash_f(p.get("premium"))))
+
+    lines = [f"Your whole-life portfolio (values as of {as_of}) -- {n} policies:"]
+    lines.append(f"- Total death benefit: {_dash_millions(total_db)}")
+    lines.append(f"- Total cash value: {_dash_millions(total_cv)}")
+    loan_line = f"- Policy loans outstanding: {_dash_millions(total_loan)} across {loans_count} policies"
+    if high_borrow:
+        loan_line += f" ({high_borrow} at >85% borrowed)"
+    lines.append(loan_line)
+    lines.append(f"- Available to borrow: {_dash_money(total_avail)}")
+    lines.append(f"- Total annual premium: {_dash_money(annual_prem)}")
+
+    if overdue:
+        lines.append("")
+        lines.append("Premium paid-to date in the PAST (verify status):")
+        for insured, d in sorted(overdue, key=lambda x: str(x[1])):
+            lines.append(f"  - {insured}: paid to {d}")
+    if upcoming:
+        lines.append("")
+        lines.append("Premiums due in the next 30 days:")
+        for insured, d, prem in sorted(upcoming, key=lambda x: str(x[1])):
+            lines.append(f"  - {insured}: {d} ({_dash_money(prem)})")
+    if flagged:
+        lines.append("")
+        lines.append("Flags:")
+        for insured, fl in flagged:
+            lines.append(f"  - {insured}: {fl}")
+    if detail:
+        lines.append("")
+        lines.append("Per policy (insured / death benefit / cash value / loan / paid-to):")
+        for p in policies:
+            cv = _dash_f(p.get("guar_cv")) + _dash_f(p.get("pua_cv"))
+            lines.append(
+                f"  - {p.get('insured', '?')} ({p.get('product', '')}): "
+                f"{_dash_money(p.get('total_db'))} DB, {_dash_money(cv)} CV, "
+                f"{_dash_money(p.get('loan_balance'))} loan, paid to {p.get('paid_to_date', '?')}"
+            )
+    return "\n".join(lines)
+
+
+def _tool_personal_oneamerica_portfolio(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_ONEAMERICA, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_ONEAMERICA)
+    file_id = (store.get("files") or {}).get("policies_current", "")
+    data = dashboard_drive_reader.read_json_by_id(file_id)
+    if not isinstance(data, dict) or not isinstance(data.get("policies"), list):
+        return "I couldn't pull your insurance portfolio just now -- try again in a moment."
+    log.info("personal_oneamerica_portfolio user=%s", slack_user_id)
+    return _format_oneamerica(data, detail=bool(inp.get("detail")))
+
+
+# --- F3 capital program tracker (Harrison DM only, HIGHLY CONFIDENTIAL) ---
+
+def _dash_render_state(v: Any) -> str:
+    """Compact render of an unknown-shape edit-state value (dict/list/scalar)."""
+    if isinstance(v, dict):
+        return "; ".join(f"{k}: {_dash_render_state(val)}" for k, val in list(v.items())[:12])
+    if isinstance(v, list):
+        if all(not isinstance(x, (dict, list)) for x in v):
+            return ", ".join(str(x) for x in v[:12])
+        return f"{len(v)} items"
+    return str(v)
+
+
+def _format_capital_program(data: dict) -> str:
+    meta = data.get("meta") or {}
+    locked = data.get("locked") or {}
+    synced = meta.get("synced_at") or "unknown"
+
+    lines = ["*Capital program -- locked terms:*"]
+    if locked.get("raise_usd"):
+        lines.append(
+            f"- Raise: {_dash_money(locked.get('raise_usd'))} at "
+            f"{_dash_money(locked.get('post_money_valuation_usd'))} post-money"
+        )
+    if locked.get("price_per_share_usd"):
+        lines.append(f"- Price per share: ${_dash_f(locked.get('price_per_share_usd')):.4f}")
+    if locked.get("founder_conversion_usd"):
+        lines.append(f"- Founder conversion: {_dash_money(locked.get('founder_conversion_usd'))}")
+    if locked.get("ambassador_pool_usd"):
+        lines.append(
+            f"- Ambassador pool: {_dash_money(locked.get('ambassador_pool_usd'))} "
+            f"({_dash_f(locked.get('ambassador_pool_pct')):g}%)"
+        )
+    if locked.get("operator_seat_usd"):
+        lines.append(
+            f"- Operator seat: {_dash_money(locked.get('operator_seat_usd'))} "
+            f"({_dash_f(locked.get('operator_seat_pct')):g}%)"
+        )
+    if locked.get("recap"):
+        lines.append(f"- Recap: {locked.get('recap')}")
+    carta = locked.get("carta") or {}
+    if carta:
+        lines.append(
+            f"- Cap table: {int(_dash_f(carta.get('fully_diluted'))):,} fully diluted; "
+            f"Harrison {int(_dash_f(carta.get('harrison_shares'))):,} "
+            f"({_dash_f(carta.get('harrison_pct')):g}%)"
+        )
+
+    edit_keys = ("calc", "roster", "phases", "legal", "open_items", "tracker")
+    has_edit = any(data.get(k) for k in edit_keys) or data.get("candidates")
+    if not has_edit:
+        lines.append("")
+        lines.append(
+            f"The tracker hasn't been synced from the dashboard yet (last bridge write: "
+            f"{synced}), so I only have the locked terms above -- open the tracker and press "
+            f"Sync to Cora for the live candidate pipeline and status."
+        )
+        if data.get("note"):
+            lines.append(f"Note: {data.get('note')}")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(f"*Live state (synced {synced}):*")
+    candidates = data.get("candidates") or []
+    if candidates:
+        confirmed = [
+            c for c in candidates
+            if isinstance(c, dict) and str(c.get("status", "")).lower() in ("confirmed", "committed", "closed")
+        ]
+        cand_line = f"- Candidates: {len(candidates)} in pipeline"
+        if confirmed:
+            names = ", ".join(str(c.get("name", "?")) for c in confirmed[:12])
+            cand_line += f"; {len(confirmed)} confirmed ({names})"
+        lines.append(cand_line)
+    for k in ("calc", "phases", "legal", "tracker", "open_items"):
+        v = data.get(k)
+        if v:
+            lines.append(f"- {k.replace('_', ' ').title()}: {_dash_render_state(v)}")
+    if data.get("note"):
+        lines.append(f"- Note: {data.get('note')}")
+    return "\n".join(lines)
+
+
+def _tool_personal_capital_program_state(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_CAPITAL, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_CAPITAL)
+    data = dashboard_drive_reader.newest_json_by_title(
+        store.get("folder", ""), store.get("title", "")
+    )
+    if not isinstance(data, dict) or not data:
+        return "I couldn't pull the capital program tracker just now -- try again in a moment."
+    log.info("personal_capital_program_state user=%s", slack_user_id)
+    return _format_capital_program(data)
+
+
+# --- F3 creator & ambassador CRM (F3E creator/leadership + founder + DM) ---
+
+def _format_creator_crm(roster: list[dict], activity: list[dict], *, today: date | None = None) -> str:
+    today = today or date.today()
+    lines = [f"*Creator CRM* -- {len(roster)} people in the roster."]
+    stage = _dash_count_single(roster, "Stage")
+    tier = _dash_count_single(roster, "Tier")
+    prog = _dash_count_multi(roster, "Program")
+    if stage:
+        lines.append("By stage: " + _dash_fmt_counts(stage))
+    if tier:
+        lines.append("By tier: " + _dash_fmt_counts(tier))
+    if prog:
+        lines.append("By program: " + _dash_fmt_counts(prog))
+
+    due = []
+    for a in activity:
+        fu = _dash_parse_date(a.get("Follow-up date"))
+        if fu and fu <= today:
+            due.append((a.get("Entry", "(activity)"), a.get("Follow-up date")))
+    if due:
+        lines.append("")
+        lines.append(f"Follow-ups due ({len(due)}):")
+        for entry, d in sorted(due, key=lambda x: str(x[1]))[:10]:
+            lines.append(f"  - {entry} (due {d})")
+
+    top = [r for r in sorted(roster, key=lambda r: _dash_f(r.get("GMV")), reverse=True) if _dash_f(r.get("GMV")) > 0][:5]
+    if top:
+        lines.append("")
+        lines.append("Top creators by sales driven:")
+        for r in top:
+            lines.append(f"  - {r.get('Name', '?')}: {_dash_money(r.get('GMV'))}")
+
+    recent = sorted([a for a in activity if a.get("Date")], key=lambda a: str(a.get("Date")), reverse=True)[:5]
+    if recent:
+        lines.append("")
+        lines.append("Recent activity:")
+        for a in recent:
+            typ = f" [{a.get('Type')}]" if a.get("Type") else ""
+            lines.append(f"  - {a.get('Date')}: {a.get('Entry', '(entry)')}{typ}")
+    return "\n".join(lines)
+
+
+def _creator_person_lookup(roster: list[dict], person: str) -> str:
+    pl = person.strip().lower()
+    matches = [r for r in roster if pl in str(r.get("Name", "")).lower()]
+    if not matches:
+        return f'I don\'t have a creator named "{person}" in the roster.'
+    if len(matches) > 6:
+        return f'"{person}" matches {len(matches)} creators -- can you be more specific?'
+    lines = []
+    for r in matches:
+        header = f"*{r.get('Name', '?')}*"
+        if r.get("Handle"):
+            header += f" ({r.get('Handle')})"
+        lines.append(header)
+        detail = []
+        for label, key in (("Program", "Program"), ("Stage", "Stage"), ("Tier", "Tier"),
+                            ("GMV", "GMV"), ("Last touch", "Last touch"), ("Next step", "Next step")):
+            v = r.get(key)
+            if not v:
+                continue
+            if key == "GMV":
+                v = _dash_money(v)
+            elif isinstance(v, list):
+                v = ", ".join(str(x) for x in v)
+            detail.append(f"{label}: {v}")
+        if detail:
+            lines.append("  " + " | ".join(detail))
+    return "\n".join(lines)
+
+
+def _tool_f3e_creator_crm(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_CREATOR, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_CREATOR)
+    base = store.get("base", "")
+    tables = store.get("tables") or {}
+    roster = airtable_client.list_records(
+        base, tables.get("roster", ""),
+        fields=["Name", "Program", "Stage", "Tier", "GMV", "Handle", "Last touch", "Next step", "Owner", "Brand"],
+    )
+    if not roster.available:
+        return "The creator CRM isn't connected yet, so I can't pull that right now."
+    activity = airtable_client.list_records(
+        base, tables.get("activity", ""),
+        fields=["Entry", "Date", "Type", "Follow-up date"],
+    )
+    activity_records = activity.records if activity.available else []
+    person = (inp.get("person") or "").strip()
+    log.info("f3e_creator_crm user=%s person=%r", slack_user_id, person)
+    if person:
+        return _creator_person_lookup(roster.records, person)
+    return _format_creator_crm(roster.records, activity_records)
+
+
+# --- Founder content & freelancer pipeline (founder channels + DM) ---
+
+def _format_content_pipeline(
+    deliverables: list[dict], calendar: list[dict], campaigns: list[dict],
+    budget: list[dict], events: list[dict], *, today: date | None = None,
+) -> str:
+    today = today or date.today()
+    lines = ["*Content & freelancer pipeline:*"]
+
+    flags = _dash_count_single(deliverables, "Action flag")
+    if flags:
+        order = ["Overdue", "Due this week", "Unassigned", "In production", "On track", "Done"]
+        ordered = sorted(
+            flags.items(),
+            key=lambda kv: (order.index(kv[0]) if kv[0] in order else 99, -kv[1]),
+        )
+        lines.append("Deliverables: " + ", ".join(f"{k} {v}" for k, v in ordered))
+        prio = [d for d in deliverables if str(d.get("Action flag", "")) in ("Overdue", "Due this week", "Unassigned")]
+        for d in prio[:10]:
+            due = d.get("Due date")
+            lines.append(
+                f"  - [{d.get('Action flag')}] {d.get('Deliverable', '?')}"
+                + (f" (due {due})" if due else "")
+            )
+
+    week = [
+        c for c in calendar
+        if (dd := _dash_parse_date(c.get("Slot date"))) and today <= dd <= today + timedelta(days=7)
+    ]
+    if week:
+        lines.append("")
+        lines.append(f"Calendar slots this week ({len(week)}):")
+        for c in sorted(week, key=lambda c: str(c.get("Slot date"))):
+            lines.append(f"  - {c.get('Slot date')}: {c.get('Slot', '?')}")
+
+    camp = _dash_count_single(campaigns, "Status")
+    if camp:
+        lines.append("")
+        lines.append("Campaigns: " + _dash_fmt_counts(camp))
+
+    buckets: dict[str, list[float]] = {}
+    for b in budget:
+        bk = b.get("Bucket") or "Other"
+        pair = buckets.setdefault(str(bk), [0.0, 0.0])
+        pair[0] += _dash_f(b.get("Planned $"))
+        pair[1] += _dash_f(b.get("Actual $"))
+    if buckets:
+        lines.append("")
+        lines.append("Budget (actual of planned):")
+        for bk, (planned, actual) in buckets.items():
+            lines.append(f"  - {bk}: {_dash_money(actual)} of {_dash_money(planned)}")
+
+    ev = _dash_count_single(events, "Status")
+    if ev:
+        lines.append("")
+        lines.append("Events pipeline: " + _dash_fmt_counts(ev))
+
+    if len(lines) == 1:
+        lines.append("Nothing in the pipeline right now.")
+    return "\n".join(lines)
+
+
+def _tool_fndr_content_pipeline(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_CONTENT, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_CONTENT)
+    base = store.get("base", "")
+    tables = store.get("tables") or {}
+    deliverables = airtable_client.list_records(
+        base, tables.get("deliverables", ""),
+        fields=["Deliverable", "Action flag", "Due date", "Status", "Assigned freelancer"],
+    )
+    if not deliverables.available:
+        return "The content pipeline isn't connected yet, so I can't pull that right now."
+
+    def _rows(table_key: str, fields: list[str]) -> list[dict]:
+        res = airtable_client.list_records(base, tables.get(table_key, ""), fields=fields)
+        return res.records if res.available else []
+
+    calendar = _rows("calendar", ["Slot", "Slot date", "Status", "Platform"])
+    campaigns = _rows("campaigns", ["Campaign", "Status", "Launch month"])
+    budget = _rows("budget", ["Line", "Bucket", "Planned $", "Actual $", "Period"])
+    events = _rows("events", ["Event", "Status", "Date", "Fit score"])
+    log.info("fndr_content_pipeline user=%s", slack_user_id)
+    return _format_content_pipeline(deliverables.records, calendar, campaigns, budget, events)
+
+
 TOOL_DEFINITIONS = [
     {
         "name": "asana_get_my_tasks",
@@ -5960,6 +6426,75 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "personal_oneamerica_portfolio",
+        "description": (
+            "Harrison's personal whole-life insurance portfolio: total death benefit, "
+            "total cash value, outstanding policy loans (and how many are near their "
+            "borrowing limit), per-policy flags (e.g. a premium paid-to date in the "
+            "past), and premiums due in the next 30 days. Use when Harrison asks about "
+            "his whole-life policies, insurance portfolio, cash value, policy loans, or "
+            "premium schedule. Private -- only reachable in Harrison's DM (it refuses "
+            "everywhere else). Pass detail=true for a per-policy breakdown."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "boolean",
+                    "description": "Include a per-policy breakdown (default false: summary only).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "personal_capital_program_state",
+        "description": (
+            "The F3 capital program / raise tracker: locked deal terms (raise amount, "
+            "post-money valuation, price per share, ambassador/operator pools, recap, cap "
+            "table) plus -- once synced from the dashboard -- calc outputs, candidate "
+            "pipeline, and phase/legal/tracker status. Use when Harrison asks about the "
+            "capital program, the raise, the equity program, investor/candidate pipeline, "
+            "or deal terms. HIGHLY CONFIDENTIAL -- only reachable in Harrison's DM (it "
+            "refuses everywhere else)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "f3e_creator_crm",
+        "description": (
+            "F3's creator & ambassador CRM: roster counts by program / stage / tier, "
+            "follow-ups due, top creators by sales driven (GMV), and recent activity. Use "
+            "when someone asks about the creator roster, ambassadors, influencers, the "
+            "sponsorship pipeline, or a specific creator's status. Pass person=<name> to "
+            "look up one creator. Available in F3 creator/leadership channels, founder "
+            "channels, and Harrison's DM (it refuses elsewhere)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {
+                    "type": "string",
+                    "description": "Optional: a creator's name to look up their single record.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "fndr_content_pipeline",
+        "description": (
+            "The founder content & freelancer pipeline: deliverables by priority (overdue "
+            "/ due this week / unassigned), this week's content calendar slots, campaign "
+            "statuses, budget planned-vs-actual by bucket, and the events-sponsorship "
+            "pipeline by stage. Use when Harrison asks what's overdue or due in content, "
+            "the content pipeline, freelancer deliverables, the marketing calendar, "
+            "campaign or content-budget status, or the events pipeline. Founder-only "
+            "(refuses outside founder channels + Harrison's DM)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -6038,6 +6573,7 @@ _F3_IMAGE_TOOLS: frozenset[str] = frozenset({
 # Extra tools per entity, BEYOND _GLOBAL_CORE_TOOLS.
 _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
+        "f3e_creator_crm",
         "f3e_shopify_sales_pulse",
         "f3e_shopify_inventory",
         "f3e_shopify_set_inventory",
@@ -6172,6 +6708,11 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_person_dossier": _tool_cora_person_dossier,
     # Meeting action items -- PULL flow (replaces the retired auto-create push)
     "meeting_action_items": _tool_meeting_action_items,
+    # Dashboard read layer (2026-07-11): read-only, each gates on dashboard_access.
+    "personal_oneamerica_portfolio": _tool_personal_oneamerica_portfolio,
+    "personal_capital_program_state": _tool_personal_capital_program_state,
+    "f3e_creator_crm": _tool_f3e_creator_crm,
+    "fndr_content_pipeline": _tool_fndr_content_pipeline,
 }
 
 
@@ -6257,6 +6798,11 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_my_notes": 8,
     "cora_forget_note": 8,
     "cora_self_check": 8,
+    # Dashboard read layer: Drive/Airtable network reads.
+    "personal_oneamerica_portfolio": 20,   # Drive JSON download
+    "personal_capital_program_state": 15,  # folder list + newest JSON download
+    "f3e_creator_crm": 15,                 # 2 Airtable list calls
+    "fndr_content_pipeline": 20,           # 5 sequential Airtable list calls
 }
 _DEFAULT_TOOL_TIMEOUT = 15
 
