@@ -169,6 +169,20 @@ def _create_with_retry(**kwargs) -> anthropic.types.Message:
     raise ClaudeClientError(f"Claude API failed after 3 attempts: {last_exc}") from last_exc
 
 
+def _apply_forced_tool(
+    kwargs: dict, force_tool: str | None, iteration: int, cached_tools: list,
+) -> None:
+    """On the FIRST iteration only, force the model to call `force_tool` via tool_choice
+    (F-23 Slice 2). A destructive/create intent must yield a TOOL-generated preview +
+    server-side pending entry, never a haiku-fabricated preview with no pending. No-op
+    when the tool isn't in the offered set (eval mode -> no tools; an entity that doesn't
+    expose it) so a forced choice can never reference an absent tool and 400 the request."""
+    if not force_tool or iteration != 0 or not cached_tools:
+        return
+    if any((t.get("name") if isinstance(t, dict) else None) == force_tool for t in cached_tools):
+        kwargs["tool_choice"] = {"type": "tool", "name": force_tool}
+
+
 def _extract_text(response: anthropic.types.Message) -> str:
     """Pull text content from a response that may also have tool_use blocks."""
     parts = []
@@ -410,16 +424,42 @@ _DESTRUCTIVE_ASANA_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _PHANTOM_DESTRUCTIVE_CORRECTION = (
-    "I didn't actually change anything in Asana just now -- nothing was deleted or "
-    "completed. Tell me which task and I'll take care of it (I'll show you a preview "
+    "I didn't actually change anything in Asana just now -- nothing was created, deleted, "
+    "or completed. Tell me which task and I'll take care of it (I'll show you a preview "
     "and wait for your yes first)."
 )
 
+# F-23 Slice 3: broadened completion-claim guard, applied ONLY when the user's OWN turn
+# was a bare affirmative (assume_confirm) AND no write sentinel fired this turn. On a bare
+# "yes" with no tool call, ANY terse completed-action claim ("Confirmed -- task deleted",
+# "Done, deleted the task", "Created it") is a fabrication -- there is nothing legitimate
+# to confirm. Scoping on the USER turn (not just Cora's phrasing) is what lets this be
+# aggressive without clobbering a factual status answer on a NON-confirm turn (those keep
+# the narrower first-person guard above). Length-gated so a long read result that merely
+# mentions "completed" in a task list is never overridden (only terse confirmations are).
+# The bare "confirmed -- task deleted" residual observed live is 63 chars.
+_PHANTOM_CONFIRM_MAX_LEN = 240
+_PHANTOM_CONFIRM_CLAIM_RE = re.compile(
+    r"\b(?:deleted|removed|trashed|completed|created|booked|cancell?ed)\b"
+    r"|\bmarked\b[^.\n]{0,24}\b(?:done|complete|finished)\b"
+    r"|\b(?:it'?s|that'?s|task is|all set)\b[^.\n]{0,24}\b(?:deleted|removed|done|complete|created)\b",
+    re.IGNORECASE,
+)
 
-def _guard_phantom_destructive(text: str) -> str:
+
+def _guard_phantom_destructive(text: str, *, broaden: bool = False) -> str:
     """Override a fabricated destructive-Asana success (F-23). Applied ONLY when no
-    contract-write tool produced a sentinel this turn (a real write would have)."""
-    if text and _DESTRUCTIVE_ASANA_CLAIM_RE.search(text):
+    contract-write tool produced a sentinel this turn (a real write would have).
+
+    broaden=True (the user's turn was a bare affirmative): also catch terse impersonal
+    completion claims the narrower first-person regex misses (the live "Confirmed -- task
+    deleted" residual). Fail-safe: a false override says "I didn't change anything"
+    (non-harmful) rather than letting a phantom success stand."""
+    if not text:
+        return text
+    if _DESTRUCTIVE_ASANA_CLAIM_RE.search(text):
+        return _PHANTOM_DESTRUCTIVE_CORRECTION
+    if broaden and len(text) <= _PHANTOM_CONFIRM_MAX_LEN and _PHANTOM_CONFIRM_CLAIM_RE.search(text):
         return _PHANTOM_DESTRUCTIVE_CORRECTION
     return text
 
@@ -488,8 +528,19 @@ def generate_response(
     cached_context: str | None = None,
     cross_entity_tools: bool = False,
     meta: dict | None = None,
+    force_tool: str | None = None,
+    assume_confirm: bool = False,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
+
+    force_tool: when set, the FIRST model turn is forced (tool_choice) to call that
+    tool -- F-23 Slice 2, so a destructive/create intent produces a TOOL preview +
+    server-side pending entry instead of a fabricated one. No-op if the tool isn't
+    offered for this entity.
+
+    assume_confirm: the user's turn was a bare affirmative (F-23 Slice 3). Broadens the
+    phantom-write guard so a fabricated completed-action claim on a confirm turn (with no
+    write sentinel) is overridden with a truthful correction.
 
     meta: optional caller-owned dict for out-of-band response metadata. When
     provided, this function sets meta["used_tools"] (bool) so callers can tell
@@ -535,7 +586,7 @@ def generate_response(
     _last_shopify_result: str = ""  # HIGH-2: the write tool owns its outcome text
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
-        response = _create_with_retry(
+        create_kwargs = dict(
             model=effective_model,
             max_tokens=_MAX_TOKENS,
             system=system_blocks,
@@ -543,6 +594,8 @@ def generate_response(
             tools=cached_tools,
             timeout=_TIMEOUT,
         )
+        _apply_forced_tool(create_kwargs, force_tool, iteration, cached_tools)
+        response = _create_with_retry(**create_kwargs)
         _log_usage(response, iteration)
 
         if response.stop_reason != "tool_use":
@@ -554,7 +607,8 @@ def generate_response(
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             # No contract-write sentinel this turn -> phantom-destructive guard (F-23).
-            return _guard_phantom_destructive(_extract_text(response)) or "(Cora returned no text)"
+            return _guard_phantom_destructive(
+                _extract_text(response), broaden=assume_confirm) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True
@@ -566,7 +620,8 @@ def generate_response(
             )
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
-            return _guard_phantom_destructive(_extract_text(response)) or (
+            return _guard_phantom_destructive(
+                _extract_text(response), broaden=assume_confirm) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 
@@ -638,8 +693,12 @@ def generate_response_streaming(
     cached_context: str | None = None,
     cross_entity_tools: bool = False,
     meta: dict | None = None,
+    force_tool: str | None = None,
+    assume_confirm: bool = False,
 ) -> str:
     """Streaming variant of generate_response.
+
+    force_tool / assume_confirm: see generate_response (F-23 Slices 2 + 3).
 
     meta: optional caller-owned dict for out-of-band response metadata — sets
     meta["used_tools"] (bool) exactly like generate_response (D-032 bypass signal).
@@ -687,15 +746,17 @@ def generate_response_streaming(
             update_callback(text)
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
+        stream_kwargs = dict(
+            model=effective_model,
+            max_tokens=_MAX_TOKENS,
+            system=system_blocks,
+            messages=messages,
+            tools=cached_tools,
+            timeout=_TIMEOUT,
+        )
+        _apply_forced_tool(stream_kwargs, force_tool, iteration, cached_tools)
         try:
-            with _stream_with_retry(
-                model=effective_model,
-                max_tokens=_MAX_TOKENS,
-                system=system_blocks,
-                messages=messages,
-                tools=cached_tools,
-                timeout=_TIMEOUT,
-            ) as stream:
+            with _stream_with_retry(**stream_kwargs) as stream:
                 for event in stream:
                     # Two event shapes carry text:
                     #   content_block_delta with delta.type == text_delta
@@ -760,7 +821,7 @@ def generate_response_streaming(
             if not directive_fired:
                 # No contract-write sentinel this turn -> phantom-destructive guard
                 # (F-23): override a fabricated "task deleted" success with no tool call.
-                guarded = _guard_phantom_destructive(accumulated_text)
+                guarded = _guard_phantom_destructive(accumulated_text, broaden=assume_confirm)
                 if guarded != accumulated_text:
                     accumulated_text = guarded
                     _maybe_push(accumulated_text)
@@ -776,7 +837,7 @@ def generate_response_streaming(
             )
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
-            return _guard_phantom_destructive(accumulated_text) or (
+            return _guard_phantom_destructive(accumulated_text, broaden=assume_confirm) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 

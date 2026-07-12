@@ -255,3 +255,99 @@ class TestPhantomDestructiveGuard:
                           return_value=[{"type": "tool_result", "tool_use_id": "tid1", "content": confirmed}]):
             out = cl.generate_response("sys", "ctx", "yes")
         assert out == 'Deleted "Jerry task" from Asana.'
+
+
+class TestForcedTool:
+    """F-23 Slice 2: a destructive/create intent forces the tool via tool_choice."""
+
+    def test_apply_sets_tool_choice_iter0(self):
+        kw = {}
+        cl._apply_forced_tool(kw, "asana_delete_task", 0,
+                              [{"name": "asana_delete_task"}, {"name": "x"}])
+        assert kw["tool_choice"] == {"type": "tool", "name": "asana_delete_task"}
+
+    def test_apply_noop_when_tool_not_offered(self):
+        kw = {}
+        cl._apply_forced_tool(kw, "asana_delete_task", 0, [{"name": "other"}])
+        assert "tool_choice" not in kw
+
+    def test_apply_noop_after_first_iteration(self):
+        kw = {}
+        cl._apply_forced_tool(kw, "asana_delete_task", 1, [{"name": "asana_delete_task"}])
+        assert "tool_choice" not in kw
+
+    def test_apply_noop_no_tools(self):
+        kw = {}
+        cl._apply_forced_tool(kw, "asana_delete_task", 0, [])
+        assert "tool_choice" not in kw
+
+    def test_apply_noop_no_force(self):
+        kw = {}
+        cl._apply_forced_tool(kw, None, 0, [{"name": "asana_delete_task"}])
+        assert "tool_choice" not in kw
+
+    def test_generate_response_forces_only_first_call(self):
+        captured = []
+        tu = _tool_use_response("asana_delete_task", tool_input={})
+        done = _mock_success("model narration")
+
+        def _rec(**kwargs):
+            captured.append(kwargs.get("tool_choice"))
+            return tu if len(captured) == 1 else done
+
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=_rec), \
+             patch.object(cl, "_build_cached_tools", return_value=[{"name": "asana_delete_task"}]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1",
+                                         "content": "WRITE_BLOCKED -- x\n\nNot deleted yet -- confirm."}]):
+            out = cl.generate_response("sys", "ctx", "delete the Jerry task",
+                                       force_tool="asana_delete_task")
+        assert captured[0] == {"type": "tool", "name": "asana_delete_task"}  # forced turn 1
+        assert captured[1] is None                                           # not forced after
+        assert out == "Not deleted yet -- confirm."   # net posts the tool's WRITE_BLOCKED text
+
+
+class TestPhantomBroaden:
+    """F-23 Slice 3: on a bare-affirmative user turn, terse fabricated completion
+    claims (the live 'Confirmed -- task deleted' residual) are corrected."""
+
+    @pytest.mark.parametrize("claim", [
+        "Confirmed -- task deleted",
+        "Task deleted.",
+        "Done, deleted the task.",
+        "All set, it's deleted.",
+        "Created it in Asana.",
+        "Done -- completed.",
+    ])
+    def test_broaden_catches_terse_claims(self, claim):
+        assert cl._guard_phantom_destructive(claim, broaden=True) == cl._PHANTOM_DESTRUCTIVE_CORRECTION
+
+    def test_broaden_off_leaves_terse_residual(self):
+        # Without confirm context the terse third-person residual passes (accepted) --
+        # the tool-sentinel + interceptor paths are the primary controls.
+        assert cl._guard_phantom_destructive("Confirmed -- task deleted") == "Confirmed -- task deleted"
+
+    def test_broaden_ignores_long_read_result(self):
+        long_list = "Here are your open tasks: " + "; ".join(
+            f"Task {i} (completed)" for i in range(30))
+        assert len(long_list) > cl._PHANTOM_CONFIRM_MAX_LEN
+        assert cl._guard_phantom_destructive(long_list, broaden=True) == long_list
+
+    def test_generate_response_broaden_overrides_phantom_confirm(self):
+        # THE residual repro: bare "yes, delete it permanently", model fabricates a
+        # terse success with ZERO tool_use.
+        done = _mock_success("Confirmed -- task deleted.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[done]):
+            out = cl.generate_response("sys", "ctx", "yes, delete it permanently",
+                                       assume_confirm=True)
+        assert out == cl._PHANTOM_DESTRUCTIVE_CORRECTION
+
+    def test_generate_response_no_broaden_lets_terse_residual_through(self):
+        done = _mock_success("Confirmed -- task deleted.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[done]):
+            out = cl.generate_response("sys", "ctx", "yes, delete it permanently",
+                                       assume_confirm=False)
+        assert out == "Confirmed -- task deleted."

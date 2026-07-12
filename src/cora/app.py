@@ -306,6 +306,50 @@ def _build_grant_context(
     return historical_access.format_owned_chunks(results, label, recency_first=recency)
 
 
+# ── Asana task-action intent detector (F-23 Slice 2) ────────────────────────
+# A clear delete/complete/create-task request must produce a TOOL-generated preview
+# (+ server-side pending entry the confirm interceptor can later execute), never a
+# haiku-fabricated one. When this fires, _dispatch_qa forces Sonnet AND forces the
+# tool via tool_choice. Conservative: interrogatives are excluded, and every branch
+# requires an explicit task referent (delete/create verbs are also used for events,
+# drafts, reports, etc.). A miss is safe -- the interceptor + Slice 3 phantom guard
+# still prevent a fabricated success on the follow-up confirm turn.
+_ASANA_INTENT_INTERROGATIVE_RE = re.compile(
+    r"^\s*(?:who|what|which|whose|whom|did|do|does|is|are|was|were|has|have|had|"
+    r"can|could|would|should|when|where|why|how)\b|\?\s*$",
+    re.IGNORECASE,
+)
+_ASANA_TASK_REF_RE = re.compile(r"\btasks?\b|\bto-?dos?\b", re.IGNORECASE)
+_ASANA_DELETE_INTENT_RE = re.compile(
+    r"\b(?:delete|remove|trash)\b|\bget rid of\b", re.IGNORECASE)
+_ASANA_COMPLETE_INTENT_RE = re.compile(
+    r"\bmark(?:ed)?\b[^.\n]{0,30}\b(?:done|complete|completed|finished|off)\b"
+    r"|\b(?:complete|finish|close out|check off)\b",
+    re.IGNORECASE)
+_ASANA_CREATE_INTENT_RE = re.compile(
+    r"\b(?:create|make|set up|start)\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b"
+    r"|\b(?:new|another)\s+(?:asana\s+)?tasks?\b",
+    re.IGNORECASE)
+
+
+def _asana_destructive_intent(text: str) -> str | None:
+    """Return the Asana action tool to force ('asana_delete_task' /
+    'asana_complete_task' / 'asana_create_task') for a clear imperative task action,
+    else None. F-23 Slice 2."""
+    t = (text or "").strip()
+    if not t or _ASANA_INTENT_INTERROGATIVE_RE.search(t):
+        return None
+    if not _ASANA_TASK_REF_RE.search(t):
+        return None  # every branch requires an explicit task referent
+    if _ASANA_DELETE_INTENT_RE.search(t):
+        return "asana_delete_task"
+    if _ASANA_COMPLETE_INTENT_RE.search(t):
+        return "asana_complete_task"
+    if _ASANA_CREATE_INTENT_RE.search(t):
+        return "asana_create_task"
+    return None
+
+
 def _dispatch_qa(
     *,
     channel_id: str,
@@ -557,15 +601,26 @@ def _dispatch_qa(
     )
     prompt = load_prompt(entity)
     chosen_model = model_router.choose_model(user_message)
-    # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory confirm
-    # for this (user, channel) means the next turn is very likely the "yes" -- which
-    # is undetectable from message content -- so force Sonnet for the write turn. A
-    # write flow is not a Haiku job (both live confirm turns ran on Haiku).
-    if user_id and (
+    # F-23 Slice 2: a clear delete/complete/create-task request forces that tool (via
+    # tool_choice) on the first model turn, so a TOOL preview + server-side pending
+    # entry is produced instead of a haiku-fabricated one (the delete-intent turn ran
+    # on haiku live and fabricated the preview -- no tool_use, no pending).
+    force_tool = _asana_destructive_intent(user_message) if user_id else None
+    # F-23 Slice 3: a bare affirmative that REACHED the model (the confirm interceptor
+    # above didn't fire -> no pending existed) broadens the phantom-write guard so a
+    # fabricated "Confirmed -- task deleted" (with no write sentinel) is corrected.
+    assume_confirm = bool(user_id) and _tool_dispatch.is_bare_affirmative(user_message)
+    # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory/calendar/
+    # Asana confirm for this (user, channel) means the next turn is very likely the
+    # "yes" -- undetectable from message content -- so force Sonnet. A write flow is
+    # not a Haiku job (both live confirm turns ran on Haiku). Also force Sonnet when a
+    # destructive/create tool is being forced (Slice 2) -- forced tool use + a write
+    # is a Sonnet job.
+    if force_tool or (user_id and (
         _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
         or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
         or _tool_dispatch.has_pending_asana_write(user_id, channel_name)
-    ):
+    )):
         chosen_model = model_router.MODEL_SONNET
     log.info(
         "model_routing channel=#%s user=%s model=%s msg_chars=%d",
@@ -609,6 +664,8 @@ def _dispatch_qa(
                 cached_context=static_text,
                 cross_entity_tools=is_founder,
                 meta=gen_meta,
+                force_tool=force_tool,
+                assume_confirm=assume_confirm,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -690,6 +747,8 @@ def _dispatch_qa(
             cached_context=static_text,
             cross_entity_tools=is_founder,
             meta=gen_meta,
+            force_tool=force_tool,
+            assume_confirm=assume_confirm,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
