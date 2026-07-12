@@ -3198,6 +3198,197 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
     return _store_and_preview_shopify(slack_user_id, channel, data)
 
 
+# ── Deterministic staged-write confirm interceptor (F-23 follow-up, 2026-07-12) ──
+# D-078 made the confirm turn SERVER-SIDE, but it still relied on the MODEL calling the
+# tool with confirmed=true. The mega-smoke POST-MERGE log proved a haiku confirm turn can
+# skip the tool entirely -- fabricating "Confirmed -- task deleted" with ZERO tool_use, so
+# the delete never happened (a false success on a destructive op). This interceptor runs in
+# app._dispatch_qa BEFORE model routing: when a FRESH pending write for (user, channel)
+# exists AND the message is a clear bare affirmative, it executes the write IN CODE via the
+# tool's OWN confirm executor (so every store's confirm semantics survive -- Shopify's fresh
+# live-count re-check, the Asana execute-stashed-gid) and posts the tool's own outcome text.
+# The model is never consulted. A clear negative cancels. Anything ambiguous returns None ->
+# the model handles it with the pending intact (the Sonnet write-escalation still covers that
+# case). Runs downstream of the DM gap-ask + OSN-scheduler routing in app.handle_message_event,
+# so a "yes" meant for those never reaches here.
+#
+# Anchored on Asana (complete/delete/create) + Shopify -- the stores whose confirm executors
+# return CLEAN, verbatim-postable user text (WRITE_CONFIRMED / WRITE_BLOCKED sentinels).
+# Calendar is intentionally NOT here: its outcome text is model-facing ("Tell the user ...")
+# and would read wrong if posted verbatim, so calendar confirms stay on the Sonnet-forced
+# model path (a documented follow-up would give calendar clean sentinel text).
+
+# Pure affirmative tokens (no action verbs) -- always a "go" regardless of pending action.
+_CONFIRM_AFFIRM_WORDS = frozenset({
+    "yes", "y", "yep", "yeah", "yup", "ya", "yea", "ok", "okay", "k", "kk", "sure",
+    "confirm", "confirmed", "confirming", "approve", "approved", "proceed", "correct",
+    "affirmative", "go", "do", "yesplease",
+})
+# Stop tokens -- a lone stop (no go) is a cancel.
+_CONFIRM_STOP_WORDS = frozenset({
+    "no", "nope", "nah", "cancel", "canceled", "cancelled", "cancelling", "stop",
+    "dont", "abort", "skip", "forget", "hold", "wait", "not", "never", "nevermind",
+})
+# Filler tokens -- ignored (neither go nor stop nor content).
+_CONFIRM_FILLER_WORDS = frozenset({
+    "it", "that", "this", "the", "them", "task", "todo", "event", "please", "thanks",
+    "thank", "you", "ahead", "and", "just", "now", "for", "me", "permanently", "one",
+    "already", "really", "totally", "absolutely", "definitely", "then", "good", "great",
+    "perfect", "mind", "a", "of", "course", "sounds", "all", "set", "my", "its", "im",
+})
+# Action verbs -> the canonical pending action they confirm. A verb that CONTRADICTS the
+# freshest pending action makes the message ambiguous (fall through to the model), so a
+# "delete the task" typed while a *complete* is pending never triggers the complete.
+_CONFIRM_ACTION_VERBS = {
+    "delete": "delete", "deleting": "delete", "remove": "delete", "trash": "delete",
+    "complete": "complete", "completing": "complete", "finish": "complete",
+    "finished": "complete", "close": "complete", "done": "complete",
+    "create": "create", "creating": "create", "make": "create",
+}
+
+
+def _confirm_intent(message: str, pending_action: str | None) -> str | None:
+    """Classify a message as a bare confirm ("affirm") / cancel ("negate") of a staged
+    write, or None (not a clear bare confirm -> fall through to the model).
+
+    Conservative by construction: EVERY token must be an affirm / stop / filler / action
+    verb, so any content word (a fresh question, a name, a number) yields None. A mixed
+    go+stop message ("yes cancel it") is ambiguous -> None. An action verb that names a
+    DIFFERENT action than `pending_action` -> None. pending_action=None treats every action
+    verb as a plain go (used for the broaden signal, where the action is irrelevant)."""
+    if not message:
+        return None
+    toks = re.findall(r"[a-z0-9']+", message.lower())
+    if not toks or len(toks) > 10:
+        return None
+    go = stop = conflict = False
+    for raw in toks:
+        t = raw.replace("'", "")
+        if t in _CONFIRM_AFFIRM_WORDS:
+            go = True
+        elif t in _CONFIRM_STOP_WORDS:
+            stop = True
+        elif t in _CONFIRM_ACTION_VERBS:
+            canon = _CONFIRM_ACTION_VERBS[t]
+            if pending_action is not None and canon != pending_action:
+                conflict = True
+            else:
+                go = True
+        elif t in _CONFIRM_FILLER_WORDS:
+            continue
+        else:
+            return None  # a content word -> not a bare confirm
+    if conflict:
+        return None
+    if go and not stop:
+        return "affirm"
+    if stop and not go:
+        return "negate"
+    return None
+
+
+def is_bare_affirmative(message: str) -> bool:
+    """True when the message is a clear bare affirmative (any pending action). Used by
+    app.py to broaden the claude_client phantom-write guard on a confirm turn (F-23
+    Slice 3) -- on a bare 'yes' with no write sentinel, ANY completed-action claim is a
+    fabrication."""
+    return _confirm_intent(message, None) == "affirm"
+
+
+def _strip_write_sentinel(raw: str) -> str:
+    """Return the user-facing portion of a WRITE_CONFIRMED / WRITE_BLOCKED contract
+    payload (the text after the first blank line), or the raw string unchanged."""
+    if raw and raw.startswith(("WRITE_CONFIRMED", "WRITE_BLOCKED")):
+        parts = raw.split("\n\n", 1)
+        if len(parts) > 1 and parts[1].strip():
+            return parts[1].strip()
+    return raw
+
+
+def _peek_pending_asana(slack_user: str, channel: str) -> dict | None:
+    """Read-only fresh-pending peek (does NOT pop) for the Asana staged-write store."""
+    key = _asana_pending_key(slack_user, channel)
+    with _ASANA_PENDING_LOCK:
+        entry = _PENDING_ASANA_WRITES.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _ASANA_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _peek_pending_shopify(slack_user: str, channel: str) -> dict | None:
+    """Read-only fresh-pending peek (does NOT pop) for the Shopify staged-write store."""
+    key = _shopify_pending_key(slack_user, channel)
+    with _SHOPIFY_PENDING_LOCK:
+        entry = _PENDING_SHOPIFY_WRITES.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _SHOPIFY_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+_CONFIRM_CANCELLED_REPLY = (
+    "Okay -- I won't. Nothing was changed. Tell me if you'd like something else."
+)
+
+
+def try_confirm_pending_write(
+    *, slack_user_id: str, channel_name: str, entity: str, message: str,
+) -> str | None:
+    """Deterministic pre-model confirm/cancel of a staged write (F-23). Returns the
+    user-facing reply string to post, or None to fall through to the model.
+
+    See the section header above. Peeks the freshest pending write across the
+    verbatim-clean stores (Asana + Shopify); on a bare affirmative, executes it via the
+    tool's OWN confirmed=true handler (reusing all confirm semantics) and returns the
+    tool's own outcome text; on a bare negative, pops + cancels; otherwise None."""
+    if not slack_user_id:
+        return None
+    candidates: list[tuple[float, str, str | None]] = []
+    a = _peek_pending_asana(slack_user_id, channel_name)
+    if a:
+        candidates.append((float(a.get("ts", 0)), "asana", a.get("action")))
+    s = _peek_pending_shopify(slack_user_id, channel_name)
+    if s:
+        candidates.append((float(s.get("ts", 0)), "shopify", "set"))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)  # freshest first
+    _ts, kind, action = candidates[0]
+
+    intent = _confirm_intent(message, action)
+    if intent is None:
+        return None
+
+    if intent == "negate":
+        # Consume ONLY the freshest pending (the one the user is answering); leave any
+        # other store's entry alone.
+        if kind == "asana":
+            _take_pending_asana_write(slack_user_id, channel_name)
+        elif kind == "shopify":
+            _take_pending_shopify_write(slack_user_id, channel_name)
+        log.info("confirm_interceptor CANCEL user=%s kind=%s action=%s",
+                 slack_user_id, kind, action)
+        return _CONFIRM_CANCELLED_REPLY
+
+    # affirm -> execute via the tool's own confirm executor (pops its own pending).
+    inp = {"confirmed": True, "_channel_name": channel_name}
+    if kind == "asana":
+        if action == "delete":
+            raw = _tool_asana_delete_task(slack_user_id, entity, inp)
+        elif action == "complete":
+            raw = _tool_asana_complete_task(slack_user_id, entity, inp)
+        elif action == "create":
+            raw = _tool_asana_create_task(slack_user_id, entity, inp)
+        else:
+            return None
+    elif kind == "shopify":
+        raw = _tool_f3e_shopify_set_inventory(slack_user_id, entity, inp)
+    else:
+        return None
+    log.info("confirm_interceptor EXECUTE user=%s kind=%s action=%s",
+             slack_user_id, kind, action)
+    return _strip_write_sentinel(raw)
+
+
 # --- Calendar meeting scheduling ---
 
 

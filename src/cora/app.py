@@ -436,6 +436,30 @@ def _dispatch_qa(
         )
         return guarded
 
+    # ── Deterministic staged-write confirm interceptor (F-23, 2026-07-12) ──────
+    # A fresh pending Asana/Shopify write for this (user, channel) + a clear bare
+    # affirmative executes the write IN CODE via the tool's own confirm executor
+    # and posts the tool's own outcome text -- the model is never consulted, so a
+    # haiku that skips the tool (fabricating a phantom "deleted" success) can no
+    # longer lose the write. A clear negative cancels. Anything else returns None
+    # and falls through to the model with the pending intact (the Sonnet
+    # write-escalation below still covers the ambiguous case). Runs downstream of
+    # the DM gap-ask + OSN-scheduler routing in handle_message_event, so a "yes"
+    # meant for those never reaches here.
+    if user_id:
+        confirm_reply = _tool_dispatch.try_confirm_pending_write(
+            slack_user_id=user_id, channel_name=channel_name, entity=entity,
+            message=user_message,
+        )
+        if confirm_reply is not None:
+            log.info(
+                "confirm_interceptor served channel=#%s user=%s", channel_name, user_id,
+            )
+            say(text=_guard_content(confirm_reply), thread_ts=reply_thread_ts,
+                unfurl_links=False, unfurl_media=False)
+            active_thread_store.register(channel_id, register_ts)
+            return
+
     t0 = time.monotonic()
 
     # ── Intent classification + semantic cache ─────────────────────────────
