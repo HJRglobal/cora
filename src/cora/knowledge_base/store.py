@@ -605,6 +605,7 @@ class KnowledgeBase:
         k: int = 12,
         financial_only: bool = False,
         query_vec: list[float] | None = None,
+        recency_first: bool = False,
     ) -> list[SearchResult]:
         """Exact vector search restricted to specific mailbox owners.
 
@@ -660,6 +661,12 @@ class KnowledgeBase:
         if financial_only:
             where.append("json_extract(k.metadata, '$.financial_document') = 1")
 
+        # F-21: for a "latest / most recent email" ask, ordering purely by vector
+        # distance can rank a January email above a July one. Pull a WIDER relevant
+        # candidate set by distance (so a recent-but-less-similar message is not
+        # starved out), then re-order those by date_modified DESC and take k. General
+        # (non-recency) retrieval keeps the pure best-match ordering.
+        pull_k = max(int(k), 40) if recency_first else int(k)
         sql = f"""
             SELECT
                 k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
@@ -670,10 +677,14 @@ class KnowledgeBase:
             JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
             WHERE {" AND ".join(where)}
             ORDER BY distance
-            LIMIT {int(k)}
+            LIMIT {pull_k}
         """
         rows = self._conn.execute(sql, params).fetchall()
-        return self._rows_to_results(rows)
+        results = self._rows_to_results(rows)
+        if recency_first:
+            results.sort(key=lambda r: (r.date_modified or 0), reverse=True)
+            results = results[: int(k)]
+        return results
 
     # --- Personal user notes (Org Synthesis Phase 5, deliverable 1) ---
 

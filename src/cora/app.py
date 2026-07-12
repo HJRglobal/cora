@@ -265,6 +265,9 @@ def _build_grant_context(
     """
     from .context_loader import owned_kb_search
 
+    # F-21: a "latest / most recent email" ask (personal mode) is answered
+    # newest-first, not by pure vector similarity.
+    recency = grant.mode != "finance" and historical_access.is_recency_query(query)
     try:
         results = owned_kb_search(
             query,
@@ -272,6 +275,7 @@ def _build_grant_context(
             financial_only=(grant.mode == "finance"),
             k=12,
             query_vec=query_vec,
+            recency_first=recency,
         )
     except Exception as exc:  # noqa: BLE001 — retrieval failure = empty, not crash
         log.error("historical_access: owned_kb_search failed user=%s: %s", user_id, exc)
@@ -299,7 +303,7 @@ def _build_grant_context(
         items=[r.source_id for r in results], channel=channel_name,
     )
     label = "your" if grant.target_label == "your" else f"{grant.target_label}'s"
-    return historical_access.format_owned_chunks(results, label)
+    return historical_access.format_owned_chunks(results, label, recency_first=recency)
 
 
 def _dispatch_qa(

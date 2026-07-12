@@ -284,6 +284,26 @@ def detect_retrieval_intent(text: str) -> bool:
     return any(p.search(text) for p in _INTENT_RES)
 
 
+# F-21: a superlative-recency ask ("latest / most recent / newest / last email")
+# must be answered newest-first, not by pure vector similarity (which returned a
+# January email as "latest" when a July one existed). Keyed on the superlative +
+# a message/email/document noun so an ordinary "recent activity" phrase elsewhere
+# doesn't force the re-order.
+_RECENCY_INTENT_RE = re.compile(
+    r"\b(?:latest|most\s+recent|newest|last|the\s+recent|most\s+current)\b"
+    r"[^.?!\n]{0,40}\b(?:e-?mails?|messages?|notes?|docs?|documents?|files?|"
+    r"threads?|replies|correspondence|from)\b"
+    r"|\b(?:e-?mail|message|note|doc|document|thread)\b[^.?!\n]{0,20}"
+    r"\b(?:latest|most\s+recent|newest|last)\b",
+    re.IGNORECASE,
+)
+
+
+def is_recency_query(text: str) -> bool:
+    """True when the ask wants the NEWEST item (order granted chunks by date)."""
+    return bool(text and _RECENCY_INTENT_RE.search(text))
+
+
 def detect_target_person(
     text: str, asker_emails: frozenset[str] = frozenset(), include_from: bool = False
 ) -> tuple[str, frozenset[str]] | None:
@@ -489,21 +509,30 @@ def drop_phi(results: list) -> list:
     ]
 
 
-def format_owned_chunks(results: list, target_label: str) -> str:
-    """Render owner-authorized chunks (FULL headers/links) as LLM context."""
+def format_owned_chunks(results: list, target_label: str, recency_first: bool = False) -> str:
+    """Render owner-authorized chunks (FULL headers/links) as LLM context.
+
+    recency_first (F-21): the items are already sorted newest-first, so tell the
+    model item [1] is the MOST RECENT -- for a "latest email" ask it must lead with
+    [1] and not pick an older item just because it reads as a closer match."""
     if not results:
         return (
             "# Retrieved mailbox items\n\n"
             f"No matching items were found in {target_label} mailbox or Drive "
             "history for this request. Say so plainly — do not invent items."
         )
+    recency_note = (
+        " These are ordered NEWEST FIRST -- item [1] is the most recent; for a "
+        "'latest'/'most recent' ask, lead with [1]."
+        if recency_first else ""
+    )
     lines = [
         "# Retrieved mailbox items (explicit retrieval — owner-authorized)",
         "",
         f"(The asker is authorized to see these items from {target_label} "
         "mailbox/Drive history in full. Present the relevant ones as a short "
-        "list — sender, subject, date — quoting content where useful. Only "
-        "include links that appear below; never fabricate one.)",
+        f"list — sender, subject, date — quoting content where useful.{recency_note} "
+        "Only include links that appear below; never fabricate one.)",
         "",
     ]
     for i, r in enumerate(results, 1):

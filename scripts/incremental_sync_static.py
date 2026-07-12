@@ -14,6 +14,8 @@ Catches:
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import sys
 import time
@@ -50,6 +52,53 @@ ENTITY_FOLDERS: dict[str, str] = {
 }
 
 PHI_BLACKLIST_SEGMENTS = {"consumers", "clients", "phi", "clinical", "ehr"}
+
+# F-09: the mtime watermark alone MISSES a content change that does not advance
+# mtime past the watermark -- notably a REDACTION (content shrinks) synced by Drive
+# File Stream, which left stale figure chunks in the KB after the 7/11 redaction.
+# A per-source_id content sha256 sidecar makes the sync CONTENT-change-driven: a
+# file re-ingests when its content hash differs from the last ingested hash, even
+# if mtime didn't move. The store is shrink-safe (upsert purges prior chunks), so
+# this only fixes the TRIGGER, not the dedup.
+_HASH_STORE_PATH = CORA_REPO_ROOT / "data" / "state" / "static-md-content-hashes.json"
+
+
+def _rel_key(path: Path) -> str:
+    """The source_id key -- identical to file_to_document's rel_path."""
+    return (
+        str(path.relative_to(FOUNDER_OS_ROOT))
+        if path.is_relative_to(FOUNDER_OS_ROOT)
+        else str(path)
+    )
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _load_hash_store() -> dict[str, str]:
+    try:
+        with open(_HASH_STORE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_hash_store(store: dict[str, str]) -> None:
+    try:
+        _HASH_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _HASH_STORE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+        tmp.replace(_HASH_STORE_PATH)
+    except OSError as exc:
+        logging.getLogger("kb-sync-static").warning(
+            "could not persist static-md content-hash store: %s", exc
+        )
 
 
 def _setup_logging() -> None:
@@ -155,9 +204,14 @@ def main() -> int:
 
     sync_start = int(time.time())
 
-    # Walk + filter to modified-since-watermark files
+    # Walk + filter to changed files. A file re-ingests when its mtime is past the
+    # watermark OR its content hash differs from the last ingested hash (F-09: a
+    # redaction can change content without advancing mtime past the watermark).
+    hash_store = _load_hash_store()
+    pending_hashes: dict[str, str] = {}
     modified_files: list[Path] = []
     skipped_cora_internal = 0
+    hash_triggered = 0
     for path in FOUNDER_OS_ROOT.rglob("*.md"):
         if not path.is_file():
             continue
@@ -178,12 +232,24 @@ def main() -> int:
             mtime = path.stat().st_mtime
         except OSError:
             continue
-        if mtime > last_sync_ts:
+        key = _rel_key(path)
+        digest = _sha256_file(path)
+        mtime_changed = mtime > last_sync_ts
+        content_changed = digest is not None and hash_store.get(key) != digest
+        if mtime_changed or content_changed:
             modified_files.append(path)
+            if digest is not None:
+                pending_hashes[key] = digest
+            if content_changed and not mtime_changed:
+                hash_triggered += 1
 
     if skipped_cora_internal:
         log.info("Excluded %d Cora build/audit docs from ingest (cora-internal)", skipped_cora_internal)
-    log.info("Discovered %d modified-since-watermark files (out of full tree walk)", len(modified_files))
+    log.info(
+        "Discovered %d changed files (out of full tree walk); %d via content-hash "
+        "only (mtime unchanged -- e.g. a redaction)",
+        len(modified_files), hash_triggered,
+    )
 
     if not modified_files:
         log.info("No files modified — nothing to ingest")
@@ -201,6 +267,10 @@ def main() -> int:
     if not docs:
         log.warning("No valid documents from %d modified files", len(modified_files))
         kb.set_sync_state("static_md", sync_start)
+        # Record hashes so content-changed-but-empty files don't re-select forever.
+        if pending_hashes:
+            hash_store.update(pending_hashes)
+            _save_hash_store(hash_store)
         kb.close()
         return 0
 
@@ -229,6 +299,10 @@ def main() -> int:
     if exit_code == 0:
         kb.set_sync_state("static_md", sync_start, last_source_modified=sync_start)
         log.info("Watermark advanced")
+        if pending_hashes:
+            hash_store.update(pending_hashes)
+            _save_hash_store(hash_store)
+            log.info("Content-hash store updated for %d files", len(pending_hashes))
 
     kb.close()
     return exit_code

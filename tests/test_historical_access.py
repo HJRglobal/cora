@@ -519,3 +519,54 @@ def test_app_injects_tier1_synthesis_rule():
 def test_context_loader_applies_tier1():
     assert "historical_access.apply_tier1" in _CTX_SRC
     assert "unstripped_personal" in _CTX_SRC
+
+
+# ── F-21: recency-first retrieval for "latest email" asks ─────────────────────
+
+def test_search_owned_recency_first_sorts_newest(kb):
+    # Two similar emails; the OLDER may be the closer vector match, but a
+    # "latest email" ask must surface the NEWER one first.
+    kb.upsert_documents([
+        _gmail_doc("harrison@hjrglobal.com", "old", "note from Emily about the plan",
+                   date_modified=1737331200),   # ~2025-01-20
+        _gmail_doc("harrison@hjrglobal.com", "new", "note from Emily about the plan",
+                   date_modified=1752364800),   # ~2025-07-13
+    ])
+    res = kb.search_owned(
+        "latest email from Emily",
+        owner_emails=frozenset({"harrison@hjrglobal.com"}),
+        recency_first=True,
+    )
+    assert res and res[0].date_modified == 1752364800  # newest first
+
+
+def test_is_recency_query_positive():
+    for q in [
+        "pull up my latest email from Emily",
+        "what's the most recent message from Justin",
+        "show me the newest doc in my drive",
+        "find the last email from the vendor",
+    ]:
+        assert ha.is_recency_query(q), q
+
+
+def test_is_recency_query_negative():
+    for q in [
+        "pull up my emails from Emily",          # no superlative
+        "what did the team decide last quarter",  # 'last' but not email/message noun
+        "summarize recent activity",              # 'recent' generic, no noun
+    ]:
+        assert not ha.is_recency_query(q), q
+
+
+def test_format_owned_chunks_recency_note_present_only_when_flagged():
+    r = SearchResult(
+        chunk_id="c1", source="gmail", source_id="gmail:h:1", entity="FNDR",
+        title="Re: plan", content="body", distance=0.1, deep_link="",
+        date_modified=1752364800, author="emily@x.com",
+        metadata={"user_email": "harrison@hjrglobal.com"},
+    )
+    with_note = ha.format_owned_chunks([r], "your", recency_first=True)
+    without = ha.format_owned_chunks([r], "your", recency_first=False)
+    assert "NEWEST FIRST" in with_note and "most recent" in with_note
+    assert "NEWEST FIRST" not in without

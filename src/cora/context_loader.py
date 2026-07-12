@@ -373,12 +373,14 @@ def owned_kb_search(
     financial_only: bool = False,
     k: int = 12,
     query_vec: list[float] | None = None,
+    recency_first: bool = False,
 ) -> list:
     """Tier-2 owner-scoped KB search through the shared instance + lock.
 
     Thin wrapper over KnowledgeBase.search_owned so callers (app.py grant
     path) keep the shared-connection lock discipline. Returns [] when the KB
     is unavailable. PHI filtering is the caller's job (historical_access.drop_phi).
+    recency_first re-orders the relevant candidates newest-first (F-21).
     """
     kb = get_shared_kb()
     if kb is None:
@@ -390,6 +392,7 @@ def owned_kb_search(
             financial_only=financial_only,
             k=k,
             query_vec=query_vec,
+            recency_first=recency_first,
         )
 
 

@@ -789,17 +789,46 @@ class TestToolDispatchInventoryByLocation:
         mock_excel.assert_called_once_with("unis", None)
         assert result == "unis result"
 
-    def test_office_routes_to_excel(self):
+    def test_office_routes_to_live_shopify(self):
+        # F-17: office reads now hit the SAME live Shopify location the write tool
+        # writes ("1337 S Gilbert Rd"), so a pre-write "how many at the office"
+        # check agrees with the write preview (no stale-Excel mismatch).
         from cora.tools import tool_dispatch
+        from cora.connectors.shopify_client import LocationSKU
 
         handler = tool_dispatch._TOOL_FUNCTIONS["f3e_inventory_by_location"]
+        mock_skus = [LocationSKU(product_title="F3 Pure Original", sku="PURE", available=202)]
+        with patch.object(tool_dispatch, "_load_shopify_write_config",
+                          return_value=(frozenset({"1337 s gilbert rd"}),
+                                        {"office": "1337 s gilbert rd"})), \
+             patch("cora.connectors.shopify_client.get_inventory_by_location",
+                   return_value=mock_skus) as mock_get, \
+             patch("cora.connectors.shopify_client.format_location_inventory_for_llm",
+                   return_value="live office result"), \
+             patch("cora.tools.inventory_client.get_f3e_location_inventory_text") as mock_excel:
+            result = handler("U123", "F3E", {"location": "office"})
 
-        with patch("cora.tools.inventory_client.get_f3e_location_inventory_text",
-                   return_value="office result") as mock_excel:
+        mock_get.assert_called_once_with("1337 s gilbert rd", None)
+        mock_excel.assert_not_called()  # live path, NOT the stale Excel snapshot
+        assert result == "live office result"
+
+    def test_office_falls_back_to_excel_on_shopify_error(self):
+        # Live source is preferred, but a Shopify error degrades to the Excel snapshot.
+        from cora.tools import tool_dispatch
+        from cora.connectors.shopify_client import ShopifyConnectorError
+
+        handler = tool_dispatch._TOOL_FUNCTIONS["f3e_inventory_by_location"]
+        with patch.object(tool_dispatch, "_load_shopify_write_config",
+                          return_value=(frozenset({"1337 s gilbert rd"}),
+                                        {"office": "1337 s gilbert rd"})), \
+             patch("cora.connectors.shopify_client.get_inventory_by_location",
+                   side_effect=ShopifyConnectorError("timeout")), \
+             patch("cora.tools.inventory_client.get_f3e_location_inventory_text",
+                   return_value="excel fallback") as mock_excel:
             result = handler("U123", "F3E", {"location": "office"})
 
         mock_excel.assert_called_once_with("office", None)
-        assert result == "office result"
+        assert result == "excel fallback"
 
     def test_brand_passed_through_to_excel(self):
         from cora.tools import tool_dispatch

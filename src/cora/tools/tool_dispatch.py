@@ -2680,9 +2680,9 @@ def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dic
     """Return F3E inventory for a named location.
 
     Routes by location:
-      nimbl            -> live Shopify inventory_levels (real-time Nimbl sync)
-      unis/warehouse   -> weekly Excel batch report (Cotton 3PL snapshot)
-      office/117       -> weekly Excel batch report (117 office snapshot)
+      nimbl                -> live Shopify inventory_levels (real-time Nimbl sync)
+      office/117/hq/gilbert -> LIVE Shopify (same source the write tool uses -- F-17)
+      unis/warehouse       -> weekly Excel batch report (Cotton 3PL snapshot)
 
     Optional brand filter narrows to Pure / Mood / Energy.
     """
@@ -2714,7 +2714,29 @@ def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dic
         )
         return shopify_client.format_location_inventory_for_llm(skus, location, brand)
 
-    # UNIS / warehouse / cotton, office / 117 -> weekly Excel snapshot
+    # F-17: office / HQ reads must hit the SAME live Shopify location the write tool
+    # writes ("1337 S Gilbert Rd"), or a "how many at the office" pre-check reads the
+    # stale weekly Excel (0) while the write previews the live count (202). Resolve via
+    # the write-path alias map so read + write always agree; Excel is a labeled fallback
+    # only on a live error.
+    _, _write_aliases = _load_shopify_write_config()
+    canonical = _write_aliases.get(location)
+    if canonical:
+        try:
+            skus = shopify_client.get_inventory_by_location(canonical, brand)
+            log.info(
+                "f3e_inventory_by_location user=%s location=%s->%s brand=%s skus=%d (live Shopify)",
+                slack_user_id, location, canonical, brand or "ALL", len(skus),
+            )
+            return shopify_client.format_location_inventory_for_llm(skus, location, brand)
+        except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+            log.warning(
+                "f3e_inventory_by_location live office error user=%s: %s -- Excel fallback",
+                slack_user_id, exc,
+            )
+            # fall through to the Excel snapshot (source-labeled by the formatter)
+
+    # UNIS / warehouse / cotton (and office fallback) -> weekly Excel snapshot
     log.info(
         "f3e_inventory_by_location user=%s location=%s brand=%s (weekly Excel)",
         slack_user_id, location, brand or "ALL",
