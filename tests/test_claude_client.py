@@ -370,3 +370,24 @@ class TestPhantomBroaden:
                                          "content": "Calendar event CREATED; tell the user it's booked."}]):
             out = cl.generate_response("sys", "ctx", "yes", assume_confirm=True, meta={})
         assert out == "Done -- created it. Invites are on the way."
+
+    def test_should_broaden_read_does_not_disarm(self):
+        # re-verify MED: a READ tool must NOT disable the backstop; a non-sentinel WRITE does.
+        assert cl._should_broaden(True, {"tool_names": ["asana_get_my_tasks"]}) is True
+        assert cl._should_broaden(True, {"tool_names": ["calendar_create_event"]}) is False
+        assert cl._should_broaden(True, {"tool_names": []}) is True
+        assert cl._should_broaden(True, None) is True
+        assert cl._should_broaden(False, {"tool_names": []}) is False
+
+    def test_broaden_survives_a_spurious_read(self):
+        # re-verify MED: bare "yes", no pending, model makes a spurious READ then fabricates
+        # a terse destructive success -> the backstop must STILL correct it.
+        tu = _tool_use_response("asana_get_my_tasks", tool_input={})
+        done = _mock_success("Confirmed -- task deleted.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[tu, done]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1",
+                                         "content": "You have 3 open tasks: A, B, C."}]):
+            out = cl.generate_response("sys", "ctx", "yes", assume_confirm=True, meta={})
+        assert out == cl._PHANTOM_DESTRUCTIVE_CORRECTION

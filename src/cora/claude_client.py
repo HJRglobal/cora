@@ -455,6 +455,28 @@ _PHANTOM_CONFIRM_CLAIM_RE = re.compile(
 )
 
 
+# Write tools that reach the phantom guard WITHOUT a WRITE_CONFIRMED/WRITE_BLOCKED
+# sentinel (the _CONTRACT_WRITE_TOOLS members fire a sentinel and are handled before the
+# guard). If one of THESE ran this turn, a real non-sentinel write may have happened, so
+# the broadened guard must not clobber its success narration. A READ tool must NOT be in
+# this set -- a spurious read must never disarm the phantom backstop (re-verify MED).
+_NON_SENTINEL_WRITE_TOOLS = frozenset({
+    "calendar_create_event", "calendar_delete_event", "calendar_schedule_meeting",
+    "gmail_create_draft",
+})
+
+
+def _should_broaden(assume_confirm: bool, meta: dict | None) -> bool:
+    """Whether to apply the broadened phantom-confirm guard this turn. True on a bare-
+    affirmative turn UNLESS a non-sentinel WRITE tool ran (its real success must survive).
+    Reads do NOT disable it -- a fabricated destructive claim alongside a spurious read is
+    exactly what the backstop must still catch."""
+    if not assume_confirm:
+        return False
+    names = (meta or {}).get("tool_names") or []
+    return not any(n in _NON_SENTINEL_WRITE_TOOLS for n in names)
+
+
 def _guard_phantom_destructive(text: str, *, broaden: bool = False) -> str:
     """Override a fabricated destructive-Asana success (F-23). Applied ONLY when no
     contract-write tool produced a sentinel this turn (a real write would have).
@@ -616,7 +638,7 @@ def generate_response(
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             # No contract-write sentinel this turn -> phantom-destructive guard (F-23).
             return _guard_phantom_destructive(
-                _extract_text(response), broaden=(assume_confirm and not (meta or {}).get("used_tools", False))) or "(Cora returned no text)"
+                _extract_text(response), broaden=_should_broaden(assume_confirm, meta)) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True
@@ -629,7 +651,7 @@ def generate_response(
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
             return _guard_phantom_destructive(
-                _extract_text(response), broaden=(assume_confirm and not (meta or {}).get("used_tools", False))) or (
+                _extract_text(response), broaden=_should_broaden(assume_confirm, meta)) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 
@@ -829,7 +851,7 @@ def generate_response_streaming(
             if not directive_fired:
                 # No contract-write sentinel this turn -> phantom-destructive guard
                 # (F-23): override a fabricated "task deleted" success with no tool call.
-                guarded = _guard_phantom_destructive(accumulated_text, broaden=(assume_confirm and not (meta or {}).get("used_tools", False)))
+                guarded = _guard_phantom_destructive(accumulated_text, broaden=_should_broaden(assume_confirm, meta))
                 if guarded != accumulated_text:
                     accumulated_text = guarded
                     _maybe_push(accumulated_text)
@@ -845,7 +867,7 @@ def generate_response_streaming(
             )
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
-            return _guard_phantom_destructive(accumulated_text, broaden=(assume_confirm and not (meta or {}).get("used_tools", False))) or (
+            return _guard_phantom_destructive(accumulated_text, broaden=_should_broaden(assume_confirm, meta)) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 
