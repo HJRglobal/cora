@@ -748,6 +748,7 @@ def format_tasks_for_llm(
     tasks: list[dict[str, Any]],
     entity_scope: str | None = None,
     total_before_filter: int | None = None,
+    max_items: int | None = None,
 ) -> str:
     """Render task list as a string suitable for a tool_result content block.
 
@@ -757,6 +758,13 @@ def format_tasks_for_llm(
     list has been filtered to a specific entity. total_before_filter is the count before
     the entity filter ran — used to render "showing N of M" framing when filtering reduced
     the count.
+
+    max_items: if set, render only the first max_items tasks (soonest-due first) and
+    replace the "reproduce every line" instruction with a bounded-view note that points
+    the user at narrowing actions for the rest (F-03: an unbounded 25-line verbatim
+    reproduction overran the reply's output-token budget and truncated mid-line). None
+    (the default) preserves the historical unbounded behavior for callers that pre-slice
+    (whats_on_my_plate) or want the full list.
     """
     # Empty-list case
     if not tasks:
@@ -783,17 +791,30 @@ def format_tasks_for_llm(
     else:
         header = f"Found {len(tasks)} incomplete Asana task(s):"
 
+    total_tasks = len(tasks)
+    capped = bool(max_items) and total_tasks > max_items
+    render = tasks[:max_items] if capped else tasks
+
     lines = [header]
     lines.append(
         "(Task names below are Slack-formatted hyperlinks — preserve the `<url|name>` "
         "syntax verbatim in your reply so the user can click through to edit in Asana.)"
     )
-    if len(tasks) > 10:
+    if capped:
+        # F-03: a full verbatim reproduction of a long list overran the reply's
+        # output-token budget and truncated mid-line. Show only the soonest-due
+        # max_items and point the user at real narrowing actions for the rest.
+        lines.append(
+            f"(Showing the {max_items} soonest-due of {total_tasks} open tasks. "
+            f"Reproduce these {max_items} lines verbatim, then tell the user they can "
+            f"name a project or entity, or ask 'what's overdue', to see the rest.)"
+        )
+    elif total_tasks > 10:
         lines.append(
             "(Long list: reproduce each task line verbatim and add no extra "
             "commentary, so the full list fits in the reply.)"
         )
-    for t in tasks:
+    for t in render:
         name = t.get("name", "(no name)")
         due = t.get("due_on") or t.get("due_at") or "no due date"
         permalink = t.get("permalink_url") or ""

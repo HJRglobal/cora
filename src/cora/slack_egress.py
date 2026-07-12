@@ -9,17 +9,28 @@ listener `client`, and every script's own WebClient, all funnel through these, s
 the class patch covers all of them. Installed once from cora/__init__.py.
 
 DELIBERATELY NARROW (a hard-won lesson, 2026-06-17 adversarial review): the
-boundary applies ONLY redactions that are SAFE on arbitrary content and never
-mangle structure -- mojibake repair + bare-URL/GID/long-ID redaction. It does
-NOT voice-flatten (markdown/emoji/dashes/whitespace/code-fence/table collapse)
-and does NOT redact named systems. Those are CONVERSATIONAL concerns applied to
-interactive Q&A replies only, inline in app.py via reply_formatter.format_reply.
-Running the conversational formatter on EVERY send would corrupt proactive
-structured output -- code-fenced / fixed-width tables (cash pulse, metrics
-digests, the strategy memo), intentional SIGNAL emoji on cards (confidence dots,
-👍/👎 affordances), numbered rankings -- and would over-redact legitimate ops
-alerts that name a system ("the QuickBooks sync failed"). The safety layer here
-never breaks tables/emoji and never strips a system name from an ops alert.
+boundary applies ONLY transforms that are SAFE on arbitrary content and never
+mangle structure -- mojibake repair, bare-URL/GID/long-ID redaction, and
+markdown-bold normalization (**x** -> *x*, the ONE Slack-render fix that is
+code-fence-/table-/token-safe; see reply_formatter.normalize_slack_bold). It
+does NOT do the broader voice-flatten (emoji/dashes/whitespace/code-fence/table
+collapse, list-marker rewrite) and does NOT redact named systems. Those are
+CONVERSATIONAL concerns applied to interactive Q&A replies only, inline in
+app.py via reply_formatter.format_reply. Running the conversational formatter on
+EVERY send would corrupt proactive structured output -- code-fenced / fixed-width
+tables (cash pulse, metrics digests, the strategy memo), intentional SIGNAL emoji
+on cards (confidence dots, 👍/👎 affordances), numbered rankings -- and would
+over-redact legitimate ops alerts that name a system ("the QuickBooks sync
+failed"). The safety layer here never breaks tables/emoji and never strips a
+system name from an ops alert.
+
+Bold normalization was added to the boundary 2026-07-12 (F-04): the earlier
+"per-sender opt-in" stance left literal **bold** egressing on the two paths that
+skip format_reply -- VERBATIM_TABLE_TOOLS replies (tool prose presented as-is)
+and STREAMING mid-frames (chat_update posts raw cumulative text before the final
+formatted update). normalize_slack_bold is fence-/table-/Slack-token-safe and
+idempotent, so applying it universally fixes both without touching structure
+(format_reply already converts bold on the conversational path -> a no-op there).
 
 NOT covered (documented residual, Phase 3): a handful of scheduled senders that
 POST raw JSON to slack.com/api via httpx/requests bypass slack_sdk.WebClient and
@@ -34,7 +45,7 @@ from __future__ import annotations
 import functools
 import logging
 
-from .reply_formatter import redact_links_and_ids
+from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
 log = logging.getLogger(__name__)
 
@@ -85,17 +96,19 @@ def repair_mojibake(text: str) -> str:
 
 # ── The single sanitizer ──────────────────────────────────────────────────────
 def sanitize_text(text):
-    """Universal SAFETY redaction applied to EVERY outbound Slack message body.
+    """Universal SAFETY transforms applied to EVERY outbound Slack message body.
 
     Mojibake repair + bare-URL/GID/long-ID redaction (sanctioned <url|label>
-    links preserved). NO voice/markdown/emoji flattening and NO named-source
-    redaction -- those are conversational-only (see module docstring). Pure;
-    non-string / empty input passes through untouched; never raises (the wrapper
-    also guards)."""
+    links preserved) + markdown-bold normalization (**x** -> *x*, fence-/table-/
+    token-safe, idempotent -- F-04). NO broader voice/emoji/whitespace flattening
+    and NO named-source redaction -- those are conversational-only (see module
+    docstring). Pure; non-string / empty input passes through untouched; never
+    raises (the wrapper also guards)."""
     if not isinstance(text, str) or not text:
         return text
     text = repair_mojibake(text)
     text = redact_links_and_ids(text)
+    text = normalize_slack_bold(text)
     return text
 
 

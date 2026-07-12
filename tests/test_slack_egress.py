@@ -76,6 +76,35 @@ def test_sanitize_none_and_empty_passthrough():
     assert slack_egress.sanitize_text(123) == 123
 
 
+# ── sanitize_text: markdown-bold normalization (F-04, 2026-07-12) ────────────
+def test_sanitize_converts_double_asterisk_bold_to_slack():
+    # The two paths that skip format_reply (verbatim-tool prose + streaming
+    # mid-frames) previously egressed literal **bold**. The boundary now converts.
+    out = slack_egress.sanitize_text("The revenue was **$320,615** last month.")
+    assert "**" not in out
+    assert "*$320,615*" in out
+
+
+def test_sanitize_converts_underscore_bold_to_slack():
+    out = slack_egress.sanitize_text("__Heads up__: inventory low")
+    assert "__" not in out
+    assert "*Heads up*" in out
+
+
+def test_sanitize_bold_is_idempotent_on_single_asterisk():
+    # Already-Slack bold (single *) must be untouched (format_reply already ran
+    # on the conversational path; double-application must be a no-op).
+    card = "*[Known Answer]* fact"
+    assert slack_egress.sanitize_text(card) == card
+
+
+def test_sanitize_bold_leaves_fenced_block_literal():
+    # A fixed-width proactive table inside a code fence keeps its ** literal
+    # (normalize_slack_bold protects fenced blocks).
+    table = "```\nCol **A**   Col B\nx          y\n```"
+    assert slack_egress.sanitize_text(table) == table
+
+
 # ── repair_mojibake ──────────────────────────────────────────────────────────
 def test_repair_mojibake_em_dash():
     out = slack_egress.repair_mojibake("Week of 5-29 â€” steady")

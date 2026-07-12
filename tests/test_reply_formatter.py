@@ -77,6 +77,24 @@ class TestSheetNameRedaction:
         assert "CF_SUMMARY" not in out
         assert "the cash flow model" in out
 
+    def test_cf_summary_no_double_article(self):
+        # S3.4 (2026-07-12): the determiner was swallowed only on the Standing
+        # ACTUALS alternative, so "the CF_SUMMARY sheet" -> "the the cash flow
+        # model". The (?:the\s+)? now spans the whole alternation.
+        out = format_reply("It lives at the CF_SUMMARY sheet.")
+        assert "the the" not in out.lower()
+        assert "the cash flow model" in out
+        # And the CF SUMMARY (space, not underscore) tab variant.
+        out2 = format_reply("Check the CF SUMMARY tab.")
+        assert "the the" not in out2.lower()
+        assert "the cash flow model" in out2
+
+    def test_standing_actuals_no_double_article(self):
+        # The pre-existing alternative kept working after the restructure.
+        out = format_reply("Pull the Standing ACTUALS sheet.")
+        assert "the the" not in out.lower()
+        assert "the cash flow model" in out
+
     def test_sheet_name_with_interior_bold_still_redacted(self):
         # Step 2 converts **ACTUALS** -> *ACTUALS*; the inserted '*' must NOT let the
         # sheet identifier slip past the (no-egress-backstop) conversational lint.

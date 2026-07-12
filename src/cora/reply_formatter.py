@@ -143,9 +143,14 @@ _NAKED_ID_RE = re.compile(r"\b\d{16,}\b")
 # deleted) so the sentence stays grammatical. Conversational-only: this runs
 # inside format_reply, which the egress boundary does NOT apply to proactive
 # sends (an ops alert may legitimately reference a sheet).
+# The optional leading determiner spans the WHOLE alternation so BOTH sheet names
+# swallow a preceding "the" -- otherwise "the CF_SUMMARY sheet" -> "the <repl>" =
+# "the the cash flow model" (the S3.4 double-article artifact, 2026-07-12).
 _SHEET_IDENT_RE = re.compile(
-    r"\b(?:the\s+)?Standing\s+ACTUALS(?:\s+(?:sheet|spreadsheet|tab))?\b"
-    r"|\bCF[_\s]?SUMMARY(?:\s+(?:sheet|tab))?\b",
+    r"\b(?:the\s+)?(?:"
+    r"Standing\s+ACTUALS(?:\s+(?:sheet|spreadsheet|tab))?"
+    r"|CF[_\s]?SUMMARY(?:\s+(?:sheet|tab))?"
+    r")\b",
     re.IGNORECASE,
 )
 _SHEET_IDENT_REPLACEMENT = "the cash flow model"
@@ -371,9 +376,12 @@ def normalize_slack_bold(text: str) -> str:
     Idempotent (converting already-*bold* text is a no-op: ** is required to
     match). Pure function; returns the input on falsy/non-str.
 
-    Deliberately NOT hooked into slack_egress.sanitize_text: the boundary is
-    kept to universal SAFETY transforms (2026-06-17 review); bold conversion
-    is per-sender opt-in.
+    Hooked into slack_egress.sanitize_text as of 2026-07-12 (F-04): because it is
+    fence-/table-/token-safe and idempotent it qualifies as a universal SAFETY
+    transform, so the egress boundary now runs it on EVERY send. This closes the
+    two paths that skip format_reply -- VERBATIM_TABLE_TOOLS replies and STREAMING
+    mid-frames -- where literal **bold** was reaching Slack. It remains a no-op on
+    the conversational path (format_reply already converts bold upstream).
     """
     if not text or not isinstance(text, str):
         return text

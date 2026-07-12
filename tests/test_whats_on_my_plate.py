@@ -606,3 +606,35 @@ def test_short_list_has_no_terse_render_note():
     from cora.tools import asana_client
     out = asana_client.format_tasks_for_llm([{"name": "t", "projects": []}])
     assert "Long list" not in out
+
+
+# ── F-03: bounded render for asana_get_my_tasks (2026-07-12) ─────────────────
+def test_max_items_caps_rendered_lines_and_notes_total():
+    from cora.tools import asana_client
+    tasks = [{"name": f"t{i}", "projects": []} for i in range(25)]
+    out = asana_client.format_tasks_for_llm(tasks, max_items=10)
+    rendered = [ln for ln in out.splitlines() if ln.startswith("- [")]
+    assert len(rendered) == 10                       # only 10 task lines rendered
+    assert "Showing the 10 soonest-due of 25" in out  # honest bounded-view note
+    assert "Found 25 incomplete" in out               # header keeps the true count
+    assert "Long list" not in out                     # the old verbatim instruction is gone
+
+
+def test_max_items_no_cap_when_under_limit():
+    from cora.tools import asana_client
+    tasks = [{"name": f"t{i}", "projects": []} for i in range(6)]
+    out = asana_client.format_tasks_for_llm(tasks, max_items=10)
+    rendered = [ln for ln in out.splitlines() if ln.startswith("- [")]
+    assert len(rendered) == 6
+    assert "soonest-due of" not in out
+
+
+def test_max_items_none_preserves_full_render():
+    # The plate + peer-view callers pass max_items=None and must be unchanged.
+    from cora.tools import asana_client
+    tasks = [{"name": f"t{i}", "projects": []} for i in range(25)]
+    out = asana_client.format_tasks_for_llm(tasks)
+    rendered = [ln for ln in out.splitlines() if ln.startswith("- [")]
+    assert len(rendered) == 25
+    assert "Long list" in out
+    assert "soonest-due of" not in out

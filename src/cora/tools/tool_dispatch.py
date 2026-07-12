@@ -412,6 +412,12 @@ def is_authorized_to_query_user(
 
 # --- Tool implementations (bound to the requesting slack user + entity scope via dispatch) ---
 
+# F-03: cap the standalone asana_get_my_tasks render so a long verbatim
+# reproduction can't overrun the reply's output-token budget and truncate
+# mid-line (25 rich link-lines did, live 2026-07-11). Matches _PLATE_MAX_ITEMS;
+# the tool still renders richer per-task detail than the plate composite.
+_MY_TASKS_MAX_ITEMS = 10
+
 
 def _tool_get_my_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
     """Resolve user → Asana gid → fetch tasks → entity-filter → format."""
@@ -453,6 +459,7 @@ def _tool_get_my_tasks(slack_user_id: str, entity: str, _input: dict) -> str:
         filtered,
         entity_scope=entity if entity != "FNDR" else None,
         total_before_filter=total,
+        max_items=_MY_TASKS_MAX_ITEMS,
     )
 
 
@@ -3647,7 +3654,8 @@ _HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 
 # Cap per plate section: long composites (25 tasks + 23 deals seen live
 # 2026-06-11) push the narration into max-token truncation, ending the Slack
-# reply in a malformed half-link. The standalone tools remain the full view.
+# reply in a malformed half-link. asana_get_my_tasks caps separately at
+# _MY_TASKS_MAX_ITEMS (F-03); the deal/other sections here remain full.
 _PLATE_MAX_ITEMS = 10
 
 
@@ -3710,7 +3718,7 @@ def _plate_asana_section(
     if len(filtered) > _PLATE_MAX_ITEMS:
         text += (
             f"\n(Plate view shows the first {_PLATE_MAX_ITEMS} of {len(filtered)} open tasks -- "
-            f"say 'show me my tasks' for the full list.)"
+            f"say 'show me my tasks' for the full task view.)"
         )
     return text
 
