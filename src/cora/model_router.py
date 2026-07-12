@@ -120,9 +120,14 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\bwhat'?s? on my (calendar|schedule|agenda)\b",
     r"\bmy (calendar|schedule|agenda) (today|tomorrow|this week|look|for)\b",
     r"\bwhat'?s? my (schedule|calendar|agenda)\b",
+    r"\b(show|pull up|open) (me )?my (calendar|schedule|agenda)\b",   # D-051 #7
+    r"\b(when'?s?|what'?s?) my next (meeting|call|event)\b",          # D-051 #7
     r"\bam i free\b",
     r"\b(do i have|what) (any )?(meetings?|events?|calls?)\b",
-    r"\bfree (today|tomorrow|this (week|morning|afternoon)|on \w+day)\b",
+    # D-051 #8: explicit weekday alternation, not `on \w+day` (which matched
+    # "holiday"/"birthday" and forced Sonnet on unrelated queries).
+    r"\bfree (today|tomorrow|this (week|morning|afternoon)"
+    r"|on (mon|tues|wednes|thurs|fri|satur|sun)day)\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 

@@ -397,11 +397,16 @@ _SHOPIFY_SENTINELS = ("WRITE_CONFIRMED", "WRITE_BLOCKED")
 # task/Asana announcements so a factual task-status answer ("that task was
 # completed") is not caught. Fail-safe: a false override says "I didn't change
 # anything" (non-harmful) rather than letting a phantom destructive claim stand.
+# D-051 #4: scoped to FIRST-PERSON Cora announcements of a just-performed action +
+# the terse "permanently deleted" fabrication shape, so a FACTUAL third-person status
+# answer ("that task was deleted on 6/3 by Hannah", "the task is done") survives. The
+# bare third-person "task ... deleted" branch was dropped (it clobbered legit status
+# reports); a bare "Task deleted" with no "permanently"/first-person is an accepted
+# residual (the tool-sentinel path is the primary F-23 control; this guard is a backstop).
 _DESTRUCTIVE_ASANA_CLAIM_RE = re.compile(
-    r"\btask\b[^.\n]{0,25}\bdeleted\b"
-    r"|\bdeleted\b[^.\n]{0,25}\b(?:task|from asana)\b"
-    r"|\bpermanently deleted\b"
-    r"|\bi(?:'ve| have| just)?\s+(?:deleted|completed|marked)\b[^.\n]{0,30}\b(?:task|asana)\b",
+    r"\bi(?:'ve| have| just)?\s+(?:permanently\s+)?deleted\b[^.\n]{0,30}\b(?:task|from asana)\b"
+    r"|\bi(?:'ve| have| just)?\s+marked\b[^.\n]{0,30}\bcomplete\b"
+    r"|\b(?:permanently\s+deleted|deleted\s+permanently)\b",
     re.IGNORECASE,
 )
 _PHANTOM_DESTRUCTIVE_CORRECTION = (

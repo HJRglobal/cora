@@ -289,12 +289,18 @@ def detect_retrieval_intent(text: str) -> bool:
 # January email as "latest" when a July one existed). Keyed on the superlative +
 # a message/email/document noun so an ordinary "recent activity" phrase elsewhere
 # doesn't force the re-order.
+# D-051 #3: a trailing "last" that governs a TIME noun ("email from last week") is
+# NOT a recency-superlative -- the negative lookahead keeps it from forcing a
+# date-sort that would evict the actually-relevant email. "the last email from the
+# vendor" / "latest email" still match. Bare "from" dropped from the noun list.
 _RECENCY_INTENT_RE = re.compile(
-    r"\b(?:latest|most\s+recent|newest|last|the\s+recent|most\s+current)\b"
+    r"\b(?:latest|most\s+recent|newest|the\s+recent|most\s+current"
+    r"|last(?!\s+(?:week|weeks|month|months|year|years|night|quarter|quarters|time"
+    r"|mon|tues|wednes|thurs|fri|satur|sun)))\b"
     r"[^.?!\n]{0,40}\b(?:e-?mails?|messages?|notes?|docs?|documents?|files?|"
-    r"threads?|replies|correspondence|from)\b"
+    r"threads?|replies|correspondence)\b"
     r"|\b(?:e-?mail|message|note|doc|document|thread)\b[^.?!\n]{0,20}"
-    r"\b(?:latest|most\s+recent|newest|last)\b",
+    r"\b(?:latest|most\s+recent|newest)\b",
     re.IGNORECASE,
 )
 

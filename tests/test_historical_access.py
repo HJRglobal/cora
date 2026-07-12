@@ -555,6 +555,11 @@ def test_is_recency_query_negative():
         "pull up my emails from Emily",          # no superlative
         "what did the team decide last quarter",  # 'last' but not email/message noun
         "summarize recent activity",              # 'recent' generic, no noun
+        # D-051 #3: trailing "last" governing a TIME noun is date-scoping, NOT recency;
+        # forcing a date-sort here would evict the actually-relevant email.
+        "what does the email from last week about the pricing dispute say",
+        "pull up the message from last month about the vendor",
+        "find the doc from last Tuesday",
     ]:
         assert not ha.is_recency_query(q), q
 

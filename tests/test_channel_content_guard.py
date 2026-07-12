@@ -212,3 +212,42 @@ def test_guard_wired_into_dispatch_qa():
     assert "channel_content_guard.guard_outbound" in app_src
     # helper def + cache-hit + non-stream + stream-frame + stream-final = 5 refs.
     assert app_src.count("_guard_content(") >= 5
+
+
+# ── D-051 review regressions (2026-07-12) ─────────────────────────────────────
+
+def test_company_financials_refused_in_unmapped_channel():
+    # #1 HIGH: route() returns FNDR for ANY unmapped channel (catch-all), so keying
+    # the exemption on entity==FNDR fails OPEN. A revenue figure in an unmapped
+    # multi-member channel must still be refused.
+    out, cls = _g(_REVENUE, entity="FNDR", tier="TIER_3", channel="investor-updates")
+    assert cls == "company_financials"
+    assert "320,615" not in out
+
+
+def test_company_financials_still_allowed_in_founder_operations():
+    # #1 must not regress S2.10: the named founder-ops channel stays allowed.
+    out, cls = _g(_REVENUE, entity="FNDR", tier="TIER_3", channel="founder-operations")
+    assert cls is None
+
+
+def test_capital_raise_paraphrase_refused():
+    # #2: a paraphrase avoiding "capital program" + "seat" must still be caught.
+    text = "The F3 capital raise is targeting $25M with a $500K buy-in per ambassador."
+    out, cls = _g(text, entity="FNDR", tier="TIER_1", channel="cora-build")
+    assert cls == "capital_program"
+
+
+def test_a_list_creators_not_over_refused():
+    # #5: "A-list" is core F3E sponsorship vocabulary -- must NOT trip travel_points.
+    out, cls = _g("Our A-list creators this month are Alex and Riley.",
+                  entity="F3E", tier="TIER_1", channel="f3e-leadership")
+    assert cls is None
+
+
+def test_event_seats_percent_not_over_refused():
+    # #6: an ordinary event/sponsorship answer with seats + $ + % must NOT trip
+    # capital_program (bare `%` removed from the equity signal).
+    out, cls = _g("We sold 250 seats for the gala, grossing $45,000, up 15% from last year.",
+                  entity="F3E", tier="TIER_1", channel="f3e-leadership")
+    assert cls is None

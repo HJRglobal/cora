@@ -216,21 +216,25 @@ class TestPhantomDestructiveGuard:
         for claim in [
             "Task deleted permanently.",
             'Done -- I deleted the "Jerry" task from Asana.',
-            "The task has been deleted.",
             "I permanently deleted that task for you.",
+            'Done -- I marked "Send the deck" complete in Asana.',
         ]:
-            assert cl._guard_phantom_destructive(claim) == cl._PHANTOM_DESTRUCTIVE_CORRECTION
+            assert cl._guard_phantom_destructive(claim) == cl._PHANTOM_DESTRUCTIVE_CORRECTION, claim
 
     def test_guard_ignores_factual_status_answer(self):
-        # A factual task-status answer (not Cora claiming she just acted) must pass.
+        # A factual THIRD-PERSON status answer (not Cora claiming she just acted) must
+        # pass -- the correction would be an affirmatively FALSE statement (D-051 #4).
         for ok in [
             "That task was completed on 6/3.",
+            "That onboarding task was deleted last week by Hannah, so you're all set.",
+            "The Jimmy Bar task was deleted a year ago when it closed.",
             "Yes, it's marked done in the tracker.",
-            "I've completed the analysis of your pipeline.",
-            "I deleted the extra whitespace from the draft.",  # not task/asana
+            "I've completed the analysis of your pipeline.",   # first-person, not an Asana action
+            "I marked the onboarding notes as reviewed.",       # 'marked' but not 'complete'
+            "I deleted the extra whitespace from the draft.",   # not task/from-asana
             "Here are your 5 open tasks.",
         ]:
-            assert cl._guard_phantom_destructive(ok) == ok
+            assert cl._guard_phantom_destructive(ok) == ok, ok
 
     def test_generate_response_overrides_phantom_delete_no_tool_call(self):
         # THE F-23 repro: the model narrates a delete success with ZERO tool_use.

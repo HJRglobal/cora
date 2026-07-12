@@ -43,9 +43,20 @@ def test_composite_tool_families_route_to_sonnet(msg):
     "do I have any meetings today?",
     "what meetings do I have this week?",
     "am I free this afternoon?",
+    "show me my calendar",            # D-051 #7
+    "pull up my schedule",            # D-051 #7
+    "when's my next meeting?",        # D-051 #7
+    "what's my next call?",           # D-051 #7
 ])
 def test_calendar_read_routes_to_sonnet(msg):
     assert choose_model(msg) == MODEL_SONNET
+
+
+def test_holiday_birthday_do_not_force_sonnet_via_onday():
+    # D-051 #8: `on \w+day` no longer matches "holiday"/"birthday" (these have no
+    # other Sonnet indicator, so they must stay Haiku).
+    assert choose_model("is the office closed on the holiday") == MODEL_HAIKU
+    assert choose_model("the potluck is on the birthday") == MODEL_HAIKU
 
 
 @pytest.mark.parametrize("msg", [

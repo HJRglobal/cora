@@ -33,11 +33,12 @@ prompt-only, D-034):
     guard and the tool-layer gate can never drift. A class is "not permitted here"
     exactly when its dashboard would refuse here.
   * Company financials (no dashboard) key on the channel TIER: permitted in a
-    TIER_1 channel (leadership / finance / founder / build) OR a founder/aggregator
-    (FNDR/HJRG) channel OR a DM -- the post-LLM backstop for the pre-LLM
-    `user_access` financials deflection and the QBO tool tier gate, which a
-    KB-sourced figure can slip past. Refused only in a non-founder entity channel
-    below TIER_1 (e.g. #f3-athletes -- the F-12 surface).
+    TIER_1 channel (leadership / finance / founder / build), an explicitly-named
+    founder-ops channel (`_FOUNDER_FIN_CHANNELS`), or a DM -- the post-LLM backstop
+    for the pre-LLM `user_access` financials deflection and the QBO tool tier gate,
+    which a KB-sourced figure can slip past. Refused in any other channel below
+    TIER_1 (e.g. #f3-athletes -- the F-12 surface -- AND any UNMAPPED channel, which
+    route() would otherwise call "FNDR": keying on entity would fail open there).
   * On the FIRST class that trips, the ENTIRE answer is replaced with a leak-free,
     class-appropriate refusal (surgical figure-redaction is fragile -- a "93% LTV"
     survives even when the dollar amount is stripped). First-trip wins.
@@ -63,12 +64,19 @@ from . import dashboard_access
 
 log = logging.getLogger(__name__)
 
-# Founder / portfolio-aggregator entities. Their channels (e.g. #founder-operations,
-# which the function-namer misclassifies as TIER_3) are legitimate portfolio-oversight
-# surfaces where company financials belong -- so company_financials is permitted there
-# regardless of the computed tier (avoids regressing S2.10, the founder-ops portfolio
-# read that correctly PASSED). Entity channels (F3E/OSN/...) get the strict tier rule.
-_FOUNDER_ENTITIES: frozenset[str] = frozenset({"FNDR", "HJRG"})
+# Founder-ops channels that are legitimate portfolio-oversight surfaces for company
+# financials but are NOT TIER_1 by the function-namer (e.g. #founder-operations, which
+# routes to FNDR only via the catch-all and classifies TIER_3). Matched on the resolved
+# channel NAME -- NOT on `entity == FNDR`, because route() returns "FNDR" for EVERY
+# unmapped channel (the catch-all), so keying on the entity fails OPEN: a company
+# revenue figure would leak into any unmapped multi-member channel like #investor-updates
+# (D-051 #1 HIGH -- the exact F-12 leak class this module exists to close). TIER_1 founder
+# channels (fndr*/hjrg*/cora-build, and any HJRG channel) already pass on the tier check.
+_FOUNDER_FIN_CHANNELS: frozenset[str] = frozenset({"founder-operations"})
+
+
+def _norm_channel(channel_name: str) -> str:
+    return (channel_name or "").strip().lstrip("#").lower()
 
 
 # ── Money-figure primitive ────────────────────────────────────────────────────
@@ -114,23 +122,36 @@ def _trips_personal_insurance(text: str) -> bool:
 # "valuation" (would over-refuse a legit HJRPROD deal answer -- S2.8 correctly
 # withheld valuation) and NOT bare "ambassador" (that is the CREATOR program, a
 # different confidential class -- see cross-entity CRM below).
+# "capital raise" / "ambassador raise" is the dashboard's literal identity (the
+# folder is 02-F3-Energy/projects/capital-raise), so name it explicitly (D-051 #2).
 _CAPITAL_PROGRAM_RE = re.compile(
-    r"\bcapital\s+program\b|\bcap\s+table\b|\bcapitalization\s+table\b"
+    r"\bcapital\s+program\b|\bcapital[-\s]raise\b|\bambassador\s+raise\b"
+    r"|\bcap\s+table\b|\bcapitalization\s+table\b"
     r"|\bprice\s+per\s+share\b|\bper[\s-]share\b",
     re.IGNORECASE,
 )
 _CAPITAL_SEAT_RE = re.compile(r"\bseats?\b", re.IGNORECASE)
+# A raise/buy-in/investment signal -- the structural fallback fires on this OR a
+# seat (D-051 #2: a paraphrase avoiding "seat" was slipping through).
+_CAPITAL_RAISE_TERM_RE = re.compile(
+    r"\braise\b|\bbuy[\s-]?in\b|\binvest(?:ment|or)?\b", re.IGNORECASE
+)
+# Equity/ownership signal. NO bare "%" (D-051 #6: "$45,000, up 15%" over-refused an
+# ordinary event/sponsorship answer); a percentage counts only next to an equity term.
 _CAPITAL_EQUITY_RE = re.compile(
-    r"\bequity\b|\bstakes?\b|\bvaluation\b|%|\bownership\b", re.IGNORECASE
+    r"\bequity\b|\bstakes?\b|\bvaluation\b|\bownership\b"
+    r"|\d+(?:\.\d+)?%\s*(?:equity|ownership|stake)",
+    re.IGNORECASE,
 )
 
 
 def _trips_capital_program(text: str) -> bool:
     if _CAPITAL_PROGRAM_RE.search(text):
         return True
-    # $ investment SEAT priced with an equity/% signal = the ambassador-seat raise.
+    # $ investment structure (a seat OR a raise/buy-in) priced with an equity signal
+    # = the ambassador raise. (D-051 #2: no longer hard-requires the word "seat".)
     return bool(
-        _CAPITAL_SEAT_RE.search(text)
+        (_CAPITAL_SEAT_RE.search(text) or _CAPITAL_RAISE_TERM_RE.search(text))
         and _has_money_figure(text)
         and _CAPITAL_EQUITY_RE.search(text)
     )
@@ -139,8 +160,10 @@ def _trips_capital_program(text: str) -> bool:
 # ── Class: travel points ──────────────────────────────────────────────────────
 # Dashboard: travel-points-optimizer (PERSONAL, DM-to-Harrison only).
 # Highly specific loyalty-program terms -- negligible false-positive risk.
+# NO standalone "A-List" (D-051 #5: "our A-list creators" is core F3E sponsorship
+# vocabulary -- only the qualified Southwest tier "A-List Preferred" is a signal).
 _TRAVEL_POINTS_RE = re.compile(
-    r"\bCompanion\s+Pass\b|\bA-?List\s+Preferred\b|\bA-?List\b"
+    r"\bCompanion\s+Pass\b|\bA-?List\s+Preferred\b"
     r"|\brapid\s+rewards\b|\bairline\s+miles\b",
     re.IGNORECASE,
 )
@@ -281,9 +304,10 @@ def guard_outbound(
                 continue  # this channel is permitted for this class
         else:
             # company_financials: allowed in a DM (no other members; the pre-LLM
-            # W2-02 deflection owns the DM-financials policy), a TIER_1 channel, or
-            # a founder/aggregator (FNDR/HJRG) channel like #founder-operations.
-            if is_dm or tier == "TIER_1" or entity in _FOUNDER_ENTITIES:
+            # W2-02 deflection owns the DM-financials policy), a TIER_1 channel, or an
+            # explicitly-named founder-ops channel. Keyed on the channel NAME, never on
+            # entity==FNDR (which the catch-all route grants to EVERY unmapped channel).
+            if is_dm or tier == "TIER_1" or _norm_channel(channel_name) in _FOUNDER_FIN_CHANNELS:
                 continue
         log.warning(
             "channel_content_guard: REFUSED class=%s channel=#%s entity=%s tier=%s user=%s",
