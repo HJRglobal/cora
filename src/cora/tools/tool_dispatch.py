@@ -907,9 +907,92 @@ def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entit
     return str(t.get("gid") or ""), (t.get("name") or task_name), None
 
 
+# ── Asana destructive staged-write pending store + contract (F-23, 2026-07-12) ──
+# The mega-smoke caught the model fabricating a full staged-DELETE preview + "Task
+# deleted permanently" with ZERO asana_delete_task tool_use -- the task survived
+# (false-success on a destructive op). Two coupled fixes, mirroring the Shopify /
+# calendar pattern:
+#   (1) SERVER-SIDE pending store: preview RESOLVES + stashes the gid; the confirm
+#       turn executes the STASHED gid, never a confirm-turn-echoed name/gid (so a
+#       confirm can't act on a different task than previewed).
+#   (2) WRITE_CONFIRMED / WRITE_BLOCKED contract: the claude_client narration net
+#       (generalized to a tool SET) posts the tool's own outcome text and, when NO
+#       destructive-Asana WRITE_CONFIRMED fired, a phantom-claim guard rewrites a
+#       fabricated "deleted/completed" success. The tool owns the outcome text.
+_ASANA_PENDING_LOCK = Lock()
+_ASANA_PENDING_TTL_SECONDS = 600  # 10 min
+_PENDING_ASANA_WRITES: dict[tuple[str, str], dict] = {}
+
+
+def _asana_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_asana_write(slack_user: str, channel: str, entry: dict) -> None:
+    with _ASANA_PENDING_LOCK:
+        _PENDING_ASANA_WRITES[_asana_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_asana_write(slack_user: str, channel: str) -> dict | None:
+    key = _asana_pending_key(slack_user, channel)
+    with _ASANA_PENDING_LOCK:
+        entry = _PENDING_ASANA_WRITES.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _ASANA_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def has_pending_asana_write(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe -- app.py forces Sonnet on the destructive confirm
+    turn (a bare 'yes' is undetectable from content)."""
+    key = _asana_pending_key(slack_user, channel)
+    with _ASANA_PENDING_LOCK:
+        entry = _PENDING_ASANA_WRITES.get(key)
+    return bool(entry) and (time.time() - float(entry.get("ts", 0))) <= _ASANA_PENDING_TTL_SECONDS
+
+
+def _write_confirmed_contract(user_text: str) -> str:
+    """Sentinel-wrap a real write's user-facing text. The claude_client net posts
+    the part after the blank line verbatim, overriding the model."""
+    return f"WRITE_CONFIRMED\n\n{user_text}"
+
+
+def _write_blocked_contract(user_text: str) -> str:
+    """Sentinel-wrap a NON-write (preview / refusal / error). The net posts the part
+    after the blank verbatim; NOTHING was written, so a mis-narrating model can't
+    imply a change that did not happen."""
+    return (
+        "WRITE_BLOCKED -- post the lines after the blank as your reply verbatim; "
+        "NOTHING was written. If it is a preview, the user must reply to confirm and "
+        "you then call this tool again with confirmed=true.\n\n"
+        f"{user_text}"
+    )
+
+
 def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Mark one of the asker's tasks complete (staged-write, confirmed gate)."""
+    """Mark one of the asker's tasks complete (staged-write, server-side pending)."""
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    if confirmed:
+        pending = _take_pending_asana_write(slack_user_id, channel)
+        if pending and pending.get("action") == "complete":
+            try:
+                asana_client.complete_task(pending["gid"])
+            except asana_client.AsanaClientError as exc:
+                return _write_blocked_contract(
+                    f'NOT DONE -- couldn\'t complete "{pending["label"]}" ({exc}). '
+                    f"It was NOT marked done."
+                )
+            log.info("asana_complete_task actor=%s gid=%s", slack_user_id, pending["gid"])
+            return _write_confirmed_contract(
+                f'Done -- marked "{pending["label"]}" complete in Asana.'
+            )
+        # No fresh pending complete -> re-preview (never complete blind).
+
     gid, label, err = _resolve_asker_task(
         slack_user_id,
         (input_data.get("task_gid") or "").strip(),
@@ -917,25 +1000,38 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
         entity,
     )
     if err:
-        return err
+        return _write_blocked_contract(err)
     label = _lex_safe_label(label, entity)
-    if input_data.get("confirmed", False) is not True:
-        return (
-            f"asana_complete_task refused: show the user the preview "
-            f"'Mark complete: {label}' and get explicit approval, then call again "
-            f"with confirmed=true."
-        )
-    try:
-        asana_client.complete_task(gid)
-    except asana_client.AsanaClientError as exc:
-        return f"Couldn't complete that task ({exc}). Tell the user it was NOT marked done."
-    log.info("asana_complete_task actor=%s gid=%s", slack_user_id, gid)
-    return f'WRITE_CONFIRMED -- post exactly: Done -- marked "{label}" complete in Asana.'
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "complete", "gid": gid, "label": label, "ts": time.time(),
+    })
+    return _write_blocked_contract(
+        f'Not done yet -- reply to confirm and I\'ll mark "{label}" complete in Asana. '
+        f"Nothing changes until you confirm."
+    )
 
 
 def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> str:
-    """PERMANENTLY delete one of the asker's tasks (staged-write, confirmed gate)."""
+    """PERMANENTLY delete one of the asker's tasks (staged-write, server-side pending)."""
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    if confirmed:
+        pending = _take_pending_asana_write(slack_user_id, channel)
+        if pending and pending.get("action") == "delete":
+            try:
+                asana_client.delete_task(pending["gid"])
+            except asana_client.AsanaClientError as exc:
+                return _write_blocked_contract(
+                    f'NOT DELETED -- couldn\'t delete "{pending["label"]}" ({exc}). '
+                    f"It was NOT deleted."
+                )
+            log.info("asana_delete_task actor=%s gid=%s label=%r",
+                     slack_user_id, pending["gid"], pending["label"])
+            return _write_confirmed_contract(f'Deleted "{pending["label"]}" from Asana.')
+        # No fresh pending delete -> re-preview (NEVER delete blind).
+
     gid, label, err = _resolve_asker_task(
         slack_user_id,
         (input_data.get("task_gid") or "").strip(),
@@ -943,20 +1039,16 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
         entity,
     )
     if err:
-        return err
+        return _write_blocked_contract(err)
     label = _lex_safe_label(label, entity)
-    if input_data.get("confirmed", False) is not True:
-        return (
-            f"asana_delete_task refused: deleting a task is PERMANENT (completing is "
-            f"usually better). Show the user 'Permanently delete: {label}' and get "
-            f"explicit approval, then call again with confirmed=true."
-        )
-    try:
-        asana_client.delete_task(gid)
-    except asana_client.AsanaClientError as exc:
-        return f"Couldn't delete that task ({exc}). Tell the user it was NOT deleted."
-    log.info("asana_delete_task actor=%s gid=%s label=%r", slack_user_id, gid, label)
-    return f'WRITE_CONFIRMED -- post exactly: Deleted "{label}" from Asana.'
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "delete", "gid": gid, "label": label, "ts": time.time(),
+    })
+    return _write_blocked_contract(
+        f'Not deleted yet -- deleting is PERMANENT (completing is usually better). '
+        f'Reply to confirm and I\'ll permanently delete "{label}" from Asana. Nothing '
+        f"changes until you confirm."
+    )
 
 
 def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2813,7 +2905,10 @@ def _shopify_preview_text(
     return (
         f"{_NOT_WRITTEN}{moved}\n"
         f"{variant_label} at {location_name}: {current} -> {quantity} units. "
-        f"Reply \"confirm\" and I'll set it."
+        # F-18: a bare in-thread reply may not reach Cora (Path-2 delivery, F-19),
+        # so instruct the reliable path -- @mention + confirm -- which pops the
+        # (user, channel) pending entry regardless of thread.
+        f"@mention me and say \"confirm\" and I'll set it."
     )
 
 

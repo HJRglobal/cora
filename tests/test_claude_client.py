@@ -182,3 +182,72 @@ class TestShopifyNarrationNet:
         assert cl._merge_shopify_result(conf, blk) == conf   # ...and sticks over a later re-preview
         assert cl._merge_shopify_result(blk, "WRITE_BLOCKED -- q\n\nb").endswith("b")  # else last wins
         assert cl._merge_shopify_result(conf, "") == conf    # empty batch keeps prev
+
+
+class TestContractWriteNetGeneralized:
+    """F-23: the narration net covers the destructive Asana tools too."""
+
+    def test_net_matches_asana_delete_tool(self):
+        b1 = MagicMock(); b1.name = "asana_delete_task"
+        results = [{"tool_use_id": "1", "content": 'WRITE_CONFIRMED\n\nDeleted "Jerry task" from Asana.'}]
+        assert cl._last_shopify_write_result([b1], results).startswith("WRITE_CONFIRMED")
+
+    def test_net_matches_asana_complete_tool(self):
+        b1 = MagicMock(); b1.name = "asana_complete_task"
+        results = [{"tool_use_id": "1", "content": "WRITE_BLOCKED -- p\n\nNot done yet -- reply to confirm."}]
+        assert cl._last_shopify_write_result([b1], results).startswith("WRITE_BLOCKED")
+
+    def test_asana_delete_confirmed_posts_verbatim(self):
+        confirmed = 'WRITE_CONFIRMED\n\nDeleted "Jerry task" from Asana.'
+        tu = _tool_use_response("asana_delete_task", tool_input={"confirmed": True})
+        done = _mock_success("some model narration")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[tu, done]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1", "content": confirmed}]):
+            out = cl.generate_response("sys", "ctx", "yes")
+        assert out == 'Deleted "Jerry task" from Asana.'
+
+
+class TestPhantomDestructiveGuard:
+    """F-23: a fabricated destructive-Asana success with NO tool call is overridden."""
+
+    def test_guard_fires_on_fabricated_delete_claim(self):
+        for claim in [
+            "Task deleted permanently.",
+            'Done -- I deleted the "Jerry" task from Asana.',
+            "The task has been deleted.",
+            "I permanently deleted that task for you.",
+        ]:
+            assert cl._guard_phantom_destructive(claim) == cl._PHANTOM_DESTRUCTIVE_CORRECTION
+
+    def test_guard_ignores_factual_status_answer(self):
+        # A factual task-status answer (not Cora claiming she just acted) must pass.
+        for ok in [
+            "That task was completed on 6/3.",
+            "Yes, it's marked done in the tracker.",
+            "I've completed the analysis of your pipeline.",
+            "I deleted the extra whitespace from the draft.",  # not task/asana
+            "Here are your 5 open tasks.",
+        ]:
+            assert cl._guard_phantom_destructive(ok) == ok
+
+    def test_generate_response_overrides_phantom_delete_no_tool_call(self):
+        # THE F-23 repro: the model narrates a delete success with ZERO tool_use.
+        done = _mock_success("Task deleted permanently. It's gone from Asana.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[done]):
+            out = cl.generate_response("sys", "ctx", "yes, delete the Jerry task")
+        assert out == cl._PHANTOM_DESTRUCTIVE_CORRECTION
+
+    def test_generate_response_keeps_real_delete_confirmed(self):
+        # When the tool actually fired + CONFIRMED, the net posts its text (no phantom).
+        confirmed = 'WRITE_CONFIRMED\n\nDeleted "Jerry task" from Asana.'
+        tu = _tool_use_response("asana_delete_task", tool_input={"confirmed": True})
+        done = _mock_success("Task deleted permanently.")  # model also claims it
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[tu, done]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1", "content": confirmed}]):
+            out = cl.generate_response("sys", "ctx", "yes")
+        assert out == 'Deleted "Jerry task" from Asana.'

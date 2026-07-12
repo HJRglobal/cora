@@ -8,6 +8,7 @@ Two public entry points:
 """
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
@@ -372,12 +373,50 @@ def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
 # 2026-05-26 slack_send_dm silent-completion pattern, extended to repair a
 # NON-empty hallucination, and scoped to this one write tool by name.
 _SHOPIFY_WRITE_TOOL = "f3e_shopify_set_inventory"
+# F-23 (2026-07-12): the narration net now covers a SET of contract-write tools --
+# each returns a WRITE_CONFIRMED / WRITE_BLOCKED payload whose text the loop posts
+# verbatim, overriding whatever the model streamed. Extended from Shopify to the
+# destructive Asana tools (which fabricated a "deleted permanently" success with NO
+# tool call in the mega-smoke). asana_create_task / gmail_create_draft are NOT in
+# the set (they don't emit the sentinels; adding them later would require auditing
+# that their verbatim payload leaks nothing source-sensitive).
+_CONTRACT_WRITE_TOOLS = frozenset({
+    _SHOPIFY_WRITE_TOOL, "asana_complete_task", "asana_delete_task",
+})
 # The net ONLY overrides narration when the tool result carries one of these
 # contract sentinels. A result WITHOUT one (e.g. dispatch()'s "Tool ... crashed:"
 # string on an unhandled exception) must NOT be posted verbatim -- it would leak the
 # tool name / internal directives and bypass the model's source-opaque mediation
 # (D-051 hotfix review #1). Fall through to the model's text in that case.
 _SHOPIFY_SENTINELS = ("WRITE_CONFIRMED", "WRITE_BLOCKED")
+
+# F-23 phantom-destructive-claim guard: when NO contract-write tool produced a
+# sentinel this turn but the model's final text ANNOUNCES a destructive Asana
+# action anyway (the fabricated "Task deleted permanently" with zero tool_use),
+# override it with a truthful correction. Scoped to DELETE + first-person
+# task/Asana announcements so a factual task-status answer ("that task was
+# completed") is not caught. Fail-safe: a false override says "I didn't change
+# anything" (non-harmful) rather than letting a phantom destructive claim stand.
+_DESTRUCTIVE_ASANA_CLAIM_RE = re.compile(
+    r"\btask\b[^.\n]{0,25}\bdeleted\b"
+    r"|\bdeleted\b[^.\n]{0,25}\b(?:task|from asana)\b"
+    r"|\bpermanently deleted\b"
+    r"|\bi(?:'ve| have| just)?\s+(?:deleted|completed|marked)\b[^.\n]{0,30}\b(?:task|asana)\b",
+    re.IGNORECASE,
+)
+_PHANTOM_DESTRUCTIVE_CORRECTION = (
+    "I didn't actually change anything in Asana just now -- nothing was deleted or "
+    "completed. Tell me which task and I'll take care of it (I'll show you a preview "
+    "and wait for your yes first)."
+)
+
+
+def _guard_phantom_destructive(text: str) -> str:
+    """Override a fabricated destructive-Asana success (F-23). Applied ONLY when no
+    contract-write tool produced a sentinel this turn (a real write would have)."""
+    if text and _DESTRUCTIVE_ASANA_CLAIM_RE.search(text):
+        return _PHANTOM_DESTRUCTIVE_CORRECTION
+    return text
 
 
 def _is_shopify_directive(raw: str) -> bool:
@@ -397,14 +436,14 @@ def _shopify_directed_text(raw: str) -> str:
 
 
 def _last_shopify_write_result(tool_use_blocks: list, tool_results: list) -> str:
-    """The authoritative f3e_shopify_set_inventory result in this turn's batch, or
-    '' if the write tool was not called. A WRITE_CONFIRMED (a real write happened)
-    WINS over a later WRITE_BLOCKED in the same batch, so a double-confirm can never
-    narrate a completed write as 'NOT WRITTEN' (review #3). tool_results is
-    same-order as tool_use_blocks (see _dispatch_tools_parallel)."""
+    """The authoritative contract-write result in this turn's batch (Shopify or the
+    destructive Asana tools -- _CONTRACT_WRITE_TOOLS), or '' if none was called. A
+    WRITE_CONFIRMED (a real write happened) WINS over a later WRITE_BLOCKED in the
+    same batch, so a double-confirm can never narrate a completed write as 'NOT
+    WRITTEN' (review #3). tool_results is same-order as tool_use_blocks."""
     found = ""
     for block, result in zip(tool_use_blocks, tool_results):
-        if getattr(block, "name", None) != _SHOPIFY_WRITE_TOOL:
+        if getattr(block, "name", None) not in _CONTRACT_WRITE_TOOLS:
             continue
         content = result.get("content", "")
         text = ""
@@ -509,7 +548,8 @@ def generate_response(
             # verbatim -- fall through to the model's source-opaque mediation.
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
-            return _extract_text(response) or "(Cora returned no text)"
+            # No contract-write sentinel this turn -> phantom-destructive guard (F-23).
+            return _guard_phantom_destructive(_extract_text(response)) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True
@@ -521,7 +561,7 @@ def generate_response(
             )
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
-            return _extract_text(response) or (
+            return _guard_phantom_destructive(_extract_text(response)) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 
@@ -685,13 +725,14 @@ def generate_response_streaming(
                 # Stream missed some text — push the corrected final
                 accumulated_text = final_text
                 _maybe_push(accumulated_text)
-            if _is_shopify_directive(_last_shopify_result):
-                # HIGH-2: the DTC write tool OWNS its outcome text. Post it verbatim,
-                # OVERRIDING any narration the model streamed -- so a mis-narrating
-                # model can never claim a write that did not happen (nor mis-state one
-                # that did). Fires whether or not the model emitted text. Only a
-                # CONTRACT result (WRITE_CONFIRMED/WRITE_BLOCKED) overrides; a crash
-                # string falls through to the model's source-opaque mediation (#1).
+            directive_fired = _is_shopify_directive(_last_shopify_result)
+            if directive_fired:
+                # HIGH-2: the contract-write tool OWNS its outcome text. Post it
+                # verbatim, OVERRIDING any narration the model streamed -- so a
+                # mis-narrating model can never claim a write that did not happen (nor
+                # mis-state one that did). Fires whether or not the model emitted text.
+                # Only a CONTRACT result (WRITE_CONFIRMED/WRITE_BLOCKED) overrides; a
+                # crash string falls through to the model's source-opaque mediation (#1).
                 directed = _shopify_directed_text(_last_shopify_result)
                 if directed and directed != accumulated_text:
                     accumulated_text = directed
@@ -711,6 +752,13 @@ def generate_response_streaming(
                     "Silent-completion fallback triggered: extracted %d chars from last tool result",
                     len(accumulated_text),
                 )
+            if not directive_fired:
+                # No contract-write sentinel this turn -> phantom-destructive guard
+                # (F-23): override a fabricated "task deleted" success with no tool call.
+                guarded = _guard_phantom_destructive(accumulated_text)
+                if guarded != accumulated_text:
+                    accumulated_text = guarded
+                    _maybe_push(accumulated_text)
             return accumulated_text or "(Cora returned no text)"
 
         if meta is not None:
@@ -723,7 +771,7 @@ def generate_response_streaming(
             )
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
-            return accumulated_text or (
+            return _guard_phantom_destructive(accumulated_text) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 

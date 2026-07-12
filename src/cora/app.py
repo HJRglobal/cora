@@ -536,6 +536,7 @@ def _dispatch_qa(
     if user_id and (
         _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
         or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
+        or _tool_dispatch.has_pending_asana_write(user_id, channel_name)
     ):
         chosen_model = model_router.MODEL_SONNET
     log.info(
