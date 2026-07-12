@@ -79,6 +79,7 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # 00-Founder/insurance/oneamerica (PERSONAL)
         "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP",  # 02-F3-Energy/projects/capital-raise (HIGHLY CONFIDENTIAL)
         "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # 00-Founder/travel-points (PERSONAL)
+        "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # Downloads/OneAmerica-Handoff dup (PERSONAL, F-09 parked #2)
     }
 )
 

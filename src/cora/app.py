@@ -14,6 +14,7 @@ from .claude_client import (
 )
 from . import active_thread_store
 from . import channel_classifier
+from . import channel_content_guard
 from . import user_access
 from . import lex_phi_access
 from .config import config
@@ -410,6 +411,27 @@ def _dispatch_qa(
         f"---\n\n"
     )
 
+    # ── Outbound channel-scope content guard (F-08 family) ──────────────────
+    # Twin of the retrieval-side PHI scrub: evaluate the COMPOSED answer against
+    # THIS channel and refuse a confidential content class the channel doesn't
+    # permit (personal insurance / capital program / travel points / cross-entity
+    # CRM / company financials outside TIER_1). Keyed on CHANNEL, not asker, so it
+    # fires even for the founder. Applied at EVERY post site (cache-hit,
+    # non-streaming, streaming final, and each streaming frame) because the
+    # semantic cache is entity-keyed, not tier-keyed -- a TIER_1-generated answer
+    # can be cache-served into a TIER_3 channel of the same entity. The original
+    # (unguarded) answer is what gets CACHED; guarding happens at serve time.
+    # Skipped on the Tier-2 owner-mail GRANT path (1:1 DM, owner-scoped, already
+    # access-controlled + PHI-dropped).
+    def _guard_content(txt: str) -> str:
+        if retrieval_grant is not None or not txt:
+            return txt
+        guarded, tripped = channel_content_guard.guard_outbound(
+            txt, entity=entity, tier=tier, channel_name=channel_name,
+            user_id=user_id or "", is_dm=is_dm,
+        )
+        return guarded
+
     t0 = time.monotonic()
 
     # ── Intent classification + semantic cache ─────────────────────────────
@@ -436,7 +458,7 @@ def _dispatch_qa(
                     channel_name, user_id, entity, latency_ms,
                 )
                 say(
-                    text=cached_response,
+                    text=_guard_content(cached_response),
                     thread_ts=reply_thread_ts,
                     unfurl_links=False,
                     unfurl_media=False,
@@ -582,8 +604,10 @@ def _dispatch_qa(
         response_text = _fix_lex_channel_names(response_text)
         response_text = _validate_channel_links(response_text, client)
         # Verbatim tables are time-sensitive (financial figures), so never cache them.
+        # Cache the ORIGINAL (entity-keyed, channel-agnostic); guard at serve time.
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+        response_text = _guard_content(response_text)
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
@@ -610,7 +634,9 @@ def _dispatch_qa(
             client.chat_update(
                 channel=placeholder_channel,
                 ts=placeholder_ts,
-                text=cumulative_text,
+                # Guard every mid-stream frame so a confidential class streaming in
+                # is masked the instant it appears (not just on the final update).
+                text=_guard_content(cumulative_text),
             )
         except Exception as upd_exc:  # noqa: BLE001
             log.warning(
@@ -667,8 +693,10 @@ def _dispatch_qa(
     response_text = _fix_lex_channel_names(response_text)
     response_text = _validate_channel_links(response_text, client)
     # Verbatim tables are never cached (time-sensitive financial figures).
+    # Cache the ORIGINAL (entity-keyed, channel-agnostic); guard at serve time.
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
+    response_text = _guard_content(response_text)
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
     log.info(

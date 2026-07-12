@@ -100,5 +100,6 @@ kb_excluded_folders:
   - "1INi4fLXG23xao-d_yf56Wrbrah54pIBB"   # 00-Founder/insurance/oneamerica
   - "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP"   # 02-F3-Energy/projects/capital-raise
   - "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752"   # 00-Founder/travel-points
+  - "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-"   # Downloads/OneAmerica-Handoff dup (F-09 parked #2)
 
 retired: [f3-ambassador-command-center, f3-pure-tiktok-cockpit]
