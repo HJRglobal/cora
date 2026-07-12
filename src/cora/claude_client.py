@@ -391,11 +391,14 @@ _SHOPIFY_WRITE_TOOL = "f3e_shopify_set_inventory"
 # each returns a WRITE_CONFIRMED / WRITE_BLOCKED payload whose text the loop posts
 # verbatim, overriding whatever the model streamed. Extended from Shopify to the
 # destructive Asana tools (which fabricated a "deleted permanently" success with NO
-# tool call in the mega-smoke). asana_create_task / gmail_create_draft are NOT in
-# the set (they don't emit the sentinels; adding them later would require auditing
-# that their verbatim payload leaks nothing source-sensitive).
+# tool call in the mega-smoke) and, since Slice 4, asana_create_task (now on the server-
+# side pending pattern: WRITE_BLOCKED preview + WRITE_CONFIRMED create). Its verbatim
+# payload (format_created_task_for_llm: task name + the asker's OWN Asana permalink) is
+# source-opaque -- the user's own task in their own workspace, no cross-source leak -- so
+# posting it verbatim is safe. gmail_create_draft is NOT in the set (it doesn't emit the
+# sentinels; a follow-up would audit its verbatim payload).
 _CONTRACT_WRITE_TOOLS = frozenset({
-    _SHOPIFY_WRITE_TOOL, "asana_complete_task", "asana_delete_task",
+    _SHOPIFY_WRITE_TOOL, "asana_complete_task", "asana_delete_task", "asana_create_task",
 })
 # The net ONLY overrides narration when the tool result carries one of these
 # contract sentinels. A result WITHOUT one (e.g. dispatch()'s "Tool ... crashed:"

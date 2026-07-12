@@ -679,6 +679,44 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
       permalink.
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed", False) is True
+
+    # ── Phase 2a: confirm turn with a fresh pending create -> execute the STASHED
+    # payload (F-23 Slice 4). Identity = the server-resolved payload, not a confirm-turn
+    # echo, so the bare-"yes" confirm interceptor and a model confirm both create exactly
+    # what was previewed.
+    if confirmed:
+        pending = _take_pending_asana_write(slack_user_id, channel)
+        if pending and pending.get("action") == "create":
+            return _execute_asana_create(slack_user_id, pending)
+        # No fresh pending create -> fall through and resolve. A single-call
+        # confirmed=true (honor-system / backward-compat) still creates directly.
+
+    resolved = _resolve_asana_create(slack_user_id, entity, input_data)
+    if isinstance(resolved, str):
+        # Title / assignee / LEX-scrub / dedup refusal. Model-facing (NOT sentinel-wrapped),
+        # so the model mediates it source-opaquely -- unchanged from before Slice 4.
+        return resolved
+
+    if not confirmed:
+        # ── Phase 1: stash the resolved payload + return a WRITE_BLOCKED preview. The
+        # confirm interceptor executes it on a bare "yes"; the narration net posts the
+        # preview verbatim.
+        _store_pending_asana_write(slack_user_id, channel, {
+            "action": "create", **resolved, "ts": time.time(),
+        })
+        return _write_blocked_contract(_asana_create_preview_text(resolved))
+
+    # ── Phase 2b: confirmed=true with no pending (honor-system / backward-compat) -> create now.
+    return _execute_asana_create(slack_user_id, resolved)
+
+
+def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
+    """Validate + resolve an Asana create request. Returns a resolved payload dict, or a
+    model-facing error/refusal STRING (title / assignee / LEX-scrub / dedup). Shared by
+    the Phase-1 preview stash and the honor-system confirmed-direct path so both surface
+    the same routing/scrub/dedup outcome."""
     title = (input_data.get("title") or "").strip()
     if not title:
         return (
@@ -744,22 +782,6 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         )
     f_title, f_notes, f_project = plan["title"], plan["notes"], plan["project_gid"]
 
-    # The confirmation gate (defense in depth) -- surface routing/scrub in the preview.
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        preview = [
-            "asana_create_task refused: `confirmed` must be set to true ONLY after you "
-            "have shown the user this preview block AND received their explicit approval "
-            "('yes' / 'approve' / 'create it'):",
-            f"- Task: {f_title}",
-            f"- Assignee: {assignee_display}",
-            f"- Due: {due_on or '(none)'}",
-        ]
-        if plan["notices"]:
-            preview.append("- Note: " + "; ".join(plan["notices"]))
-        preview.append("If they approve, call again with confirmed=true.")
-        return "\n".join(preview)
-
     # Dedup gate: surface a likely duplicate instead of silently creating one.
     if f_project and not force_duplicate:
         dup = _find_open_dup(f_project, f_title)
@@ -770,18 +792,64 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
                 f"separate task, call again with force_duplicate=true."
             )
 
+    # Resolve followers up front so the confirm executor binds server-resolved gids
+    # (Asana allows ONE assignee but many followers).
+    follower_gids: list[str] = []
+    follower_displays: list[str] = []
+    for nm in (input_data.get("follower_names") or []):
+        rid, _info = resolve_name_to_slack_user_id(str(nm), channel_entity=entity)
+        if not rid:
+            continue
+        fu = _load_slack_asana_map().get(rid) or {}
+        g = str(fu.get("asana_user_gid", "") or "")
+        if g and "REPLACE" not in g and g != assignee_gid:
+            follower_gids.append(g)
+            follower_displays.append(fu.get("display_name", str(nm)))
+
+    return {
+        "title": f_title,
+        "assignee_gid": assignee_gid,
+        "assignee_display": assignee_display,
+        "project_gid": f_project,
+        "notes": f_notes,
+        "due_on": due_on,
+        "notices": list(plan["notices"]),
+        "follower_gids": follower_gids,
+        "follower_displays": follower_displays,
+    }
+
+
+def _asana_create_preview_text(r: dict) -> str:
+    """The NOT-CREATED-yet preview line the narration net posts verbatim (Slice 4)."""
+    lines = [
+        "Not created yet -- reply to confirm and I'll create this task in Asana. "
+        "Nothing is created until you confirm.",
+        f"- Task: {r['title']}",
+        f"- Assignee: {r['assignee_display']}",
+        f"- Due: {r['due_on'] or '(none)'}",
+    ]
+    if r["follower_displays"]:
+        lines.append("- Following: " + ", ".join(r["follower_displays"]))
+    if r["notices"]:
+        lines.append("- Note: " + "; ".join(r["notices"]))
+    return "\n".join(lines)
+
+
+def _execute_asana_create(slack_user_id: str, r: dict) -> str:
+    """Create the task from a resolved payload (Phase 2). Returns the WRITE_CONFIRMED
+    contract text (format_created_task_for_llm) or a model-facing create error."""
     try:
         created = asana_client.create_task(
-            name=f_title,
-            assignee_gid=assignee_gid,
-            project_gid=f_project,
-            notes=f_notes,
-            due_on=due_on,
+            name=r["title"],
+            assignee_gid=r["assignee_gid"],
+            project_gid=r["project_gid"],
+            notes=r["notes"],
+            due_on=r["due_on"],
         )
     except asana_client.AsanaClientError as exc:
         log.warning(
             "asana_create_task FAILED asker=%s title=%r assignee=%s exc=%s",
-            slack_user_id, f_title, assignee_gid, exc,
+            slack_user_id, r["title"], r["assignee_gid"], exc,
         )
         return (
             f"Asana create_task error: {exc}. Tell the user the task wasn't created. "
@@ -791,33 +859,21 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
 
     log.info(
         "asana_create_task CREATED asker=%s title=%r assignee=%s task_gid=%s project=%s notices=%s",
-        slack_user_id, f_title, assignee_display, created.get("gid", ""), f_project, plan["notices"],
+        slack_user_id, r["title"], r["assignee_display"], created.get("gid", ""),
+        r["project_gid"], r["notices"],
     )
 
-    # Optional followers so a task meant for >1 person surfaces for all of them
-    # (Asana allows ONE assignee but many followers).
     added_followers: list[str] = []
-    follower_names = input_data.get("follower_names") or []
-    if follower_names and created.get("gid"):
-        fgids: list[str] = []
-        for nm in follower_names:
-            rid, _info = resolve_name_to_slack_user_id(str(nm), channel_entity=entity)
-            if not rid:
-                continue
-            fu = _load_slack_asana_map().get(rid) or {}
-            g = str(fu.get("asana_user_gid", "") or "")
-            if g and "REPLACE" not in g and g != assignee_gid:
-                fgids.append(g)
-                added_followers.append(fu.get("display_name", str(nm)))
-        if fgids:
-            try:
-                asana_client.add_task_followers(str(created["gid"]), fgids)
-            except asana_client.AsanaClientError as exc:
-                log.warning("asana_create_task: add followers failed: %s", exc)
-                added_followers = []
+    if r.get("follower_gids") and created.get("gid"):
+        try:
+            asana_client.add_task_followers(str(created["gid"]), r["follower_gids"])
+            added_followers = list(r["follower_displays"])
+        except asana_client.AsanaClientError as exc:
+            log.warning("asana_create_task: add followers failed: %s", exc)
+            added_followers = []
 
     out = asana_client.format_created_task_for_llm(created)
-    extras = list(plan["notices"])
+    extras = list(r["notices"])
     if added_followers:
         extras.append("following: " + ", ".join(added_followers))
     if extras:
@@ -4994,29 +5050,24 @@ TOOL_DEFINITIONS = [
     {
         "name": "asana_create_task",
         "description": (
-            "Create a new Asana task in the HJR Global workspace. This is Cora's FIRST write "
-            "tool — use with care.\n"
+            "Create a new Asana task in the HJR Global workspace. Staged-write tool.\n"
             "\n"
-            "REQUIRED PATTERN (staged-write — never skip):\n"
-            "1. When the user asks to create a task, DRAFT it as a preview block in your "
-            "   reply. Show: title, assignee (default: the asker), due date if mentioned, "
-            "   notes if mentioned, project if mentioned. DO NOT call this tool on the first "
-            "   turn — just show the preview and ask the user to confirm.\n"
-            "2. Wait for the user's next message. If they say 'yes', 'approve', 'create it', "
-            "   'go ahead', or similar explicit affirmation, call this tool with confirmed=true.\n"
-            "3. If the user wants changes, re-show the preview with the changes and ask again. "
-            "   Do not call this tool until they explicitly approve.\n"
-            "4. If they reject ('no', 'cancel', 'don't'), don't call this tool at all.\n"
+            "REQUIRED PATTERN (server-side staged-write — never skip):\n"
+            "1. When the user asks to create a task, call this tool WITHOUT confirmed (or "
+            "   confirmed=false). The TOOL resolves the assignee/project (auto-routes to this "
+            "   channel's entity + PHI-scrubs Lexington titles), stashes the resolved task, and "
+            "   returns a NOT-CREATED-yet preview. Show that preview to the user verbatim — do "
+            "   NOT draft your own; the tool's preview reflects the real routing/scrub.\n"
+            "2. On the user's explicit approval ('yes', 'create it', 'go ahead'), call again "
+            "   with confirmed=true. Nothing is created until then.\n"
+            "3. If they want changes, call again (no confirmed) with the changes to re-preview.\n"
+            "4. If they reject, don't call again.\n"
             "\n"
             "Use this tool when the user asks Cora to create, add, or queue a task — phrases like "
-            "'create a task to...', 'add a task for Sean to...', 'remind me to...', 'set up a task '"
-            "to do X', 'queue a task for Hannah'. The default assignee is the @-mentioning user. "
-            "Cross-assignment is allowed (any teammate in slack-to-asana.yaml; aliases supported). "
-            "The tool returns a clickable Slack link to the created task — preserve the <url|name> "
-            "syntax verbatim in your reply.\n"
-            "\n"
-            "If you call without confirmed=true, the tool will refuse and remind you to confirm "
-            "first. That's the safety net."
+            "'create a task to...', 'add a task for Sean to...', 'set up a task to do X', 'queue a "
+            "task for Hannah'. Default assignee is the @-mentioning user; cross-assignment is "
+            "allowed (any teammate in slack-to-asana.yaml; aliases supported). On confirm the tool "
+            "returns a clickable Slack link to the created task."
         ),
         "input_schema": {
             "type": "object",
@@ -5052,10 +5103,10 @@ TOOL_DEFINITIONS = [
                 },
                 "confirmed": {
                     "type": "boolean",
-                    "description": "Required. Set to true ONLY after you have shown the user the tool's preview (it includes the resolved project + any Lexington PHI-scrub note) and received explicit approval. If false or omitted, the tool refuses and returns the preview for you to show.",
+                    "description": "Set to true ONLY after you have shown the user the tool's preview (it includes the resolved project + any Lexington PHI-scrub note) and received explicit approval. If false or omitted, the tool stashes the resolved task and returns a NOT-CREATED-yet preview for you to show; nothing is created until you call again with confirmed=true.",
                 },
             },
-            "required": ["title", "confirmed"],
+            "required": ["title"],
         },
     },
     {

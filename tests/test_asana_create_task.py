@@ -4,6 +4,8 @@ confirmation gate and assignee resolution. Real Asana API calls are stubbed.
 
 from unittest.mock import patch
 
+import pytest
+
 import cora.tools.tool_dispatch as td
 
 
@@ -12,27 +14,65 @@ HARRISON_SLACK = "U0B2RM2JYJ1"
 SHAUN_SLACK = "U0B3PS82G30"
 
 
-def test_create_task_refuses_without_confirmed_flag():
-    """The defense-in-depth refusal — even if Claude tries to skip the preview
-    step, the tool itself blocks the create until confirmed=true is set."""
-    result = td._tool_asana_create_task(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={"title": "Try to skip the preview"},
-    )
-    assert "refused" in result.lower()
-    assert "confirmed" in result.lower()
-    assert "preview" in result.lower()
+@pytest.fixture(autouse=True)
+def _clear_asana_pending():
+    # F-23 Slice 4: create now stashes a server-side pending on the unconfirmed
+    # (preview) path, so tests must not leak a stashed create into the next test.
+    td._PENDING_ASANA_WRITES.clear()
+    yield
+    td._PENDING_ASANA_WRITES.clear()
 
 
-def test_create_task_refuses_with_confirmed_false():
-    """Explicit false is treated the same as missing."""
-    result = td._tool_asana_create_task(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={"title": "Try false", "confirmed": False},
-    )
-    assert "refused" in result.lower()
+def test_create_task_unconfirmed_previews_and_stashes():
+    """F-23 Slice 4: the FIRST call (no confirmed) does NOT create -- it stashes a
+    server-side pending + returns a WRITE_BLOCKED preview the narration net posts."""
+    with patch.object(td.asana_client, "create_task") as mock:
+        result = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="FNDR",
+            _input={"title": "Try to skip the preview", "_channel_name": "dm"},
+        )
+    mock.assert_not_called()
+    assert "WRITE_BLOCKED" in result
+    assert "not created yet" in result.lower() and "confirm" in result.lower()
+    assert td.has_pending_asana_write(HARRISON_SLACK, "dm")
+
+
+def test_create_task_confirmed_false_previews_not_creates():
+    """Explicit confirmed=false previews too (does not create)."""
+    with patch.object(td.asana_client, "create_task") as mock:
+        result = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK,
+            entity="FNDR",
+            _input={"title": "Try false", "confirmed": False, "_channel_name": "dm"},
+        )
+    mock.assert_not_called()
+    assert "WRITE_BLOCKED" in result
+
+
+def test_create_task_two_call_flow_creates_stashed_payload():
+    """Preview stashes the resolved payload; a bare confirmed=true (no fields, as the
+    confirm interceptor sends) executes exactly what was previewed."""
+    created = {"gid": "T9", "name": "Coordinate launch",
+               "permalink_url": "http://x/T9", "assignee": {"name": "Harrison Rogers"},
+               "due_on": None, "projects": []}
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock:
+        # Phase 1: preview + stash.
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"title": "Coordinate launch", "_channel_name": "dm"},
+        )
+        mock.assert_not_called()
+        # Phase 2: bare confirm (no title) executes the STASHED payload.
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"confirmed": True, "_channel_name": "dm"},
+        )
+    mock.assert_called_once()
+    assert mock.call_args.kwargs["name"] == "Coordinate launch"
+    assert "WRITE_CONFIRMED" in out
+    assert not td.has_pending_asana_write(HARRISON_SLACK, "dm")  # consumed
 
 
 def test_create_task_refuses_without_title():
@@ -201,7 +241,7 @@ def test_unconfirmed_preview_surfaces_lex_scrub():
             entity="LEX-LLC",
             _input={"title": "Call John Doe"},
         )
-    assert "refused" in out.lower()
+    assert "WRITE_BLOCKED" in out      # unconfirmed preview (Slice 4 contract)
     assert "[client]" in out          # scrubbed title shown in preview
     assert "phi-scrubbed" in out.lower()
 
