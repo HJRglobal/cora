@@ -98,6 +98,20 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\bwhat have i been (working|up to|doing|involved)\b",
     r"\bwhat i'?ve been (working|up to|doing)\b",
     r"\b\w+'?s (recent )?involvement\b",
+    # Composite / dashboard tool families (F-01, 2026-07-12). Haiku under-calls
+    # these tools and answers from KB instead (F-16/F-22 -- meeting_action_items,
+    # personal_oneamerica_portfolio, personal_capital_program_state,
+    # fndr_content_pipeline, f3e_creator_crm). Force Sonnet so the tool is invoked;
+    # the prompt directives (F-16/F-22/parked-1) make it MANDATORY. Bias-to-Sonnet
+    # is safe (Haiku->Sonnet misroute = slower only). The channel_content_guard
+    # (F-08) still blocks any confidential figure that reaches a wrong channel.
+    r"\baction items?\b",
+    r"\bmy (to-?dos?|action items?|takeaways?) from\b",
+    r"\b(cash value|policy loans?|whole.?life|death benefit)\b",
+    r"\bOneAmerica\b",
+    r"\b(capital program|cap table|the raise|equity seats?)\b",
+    r"\b(content pipeline|content calendar|freelancer deliverables?)\b",
+    r"\b(creator crm|creator roster|sponsorship pipeline)\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 

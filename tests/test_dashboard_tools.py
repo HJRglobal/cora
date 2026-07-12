@@ -329,3 +329,47 @@ def test_format_creator_counts():
     # only GMV>0 creators listed as top, highest first
     assert out.index("B:") < out.index("A:")
     assert "C:" not in out.split("Top creators")[-1]
+
+
+# --------------------------------------------------------------------------- #
+# Prompt-coverage: mandatory-tool-call directives (F-16 / F-22 / parked-1)
+# --------------------------------------------------------------------------- #
+from pathlib import Path  # noqa: E402
+
+_PROMPTS = Path(__file__).resolve().parent.parent / "design" / "system-prompts"
+
+
+def _prompt(name: str) -> str:
+    return (_PROMPTS / name).read_text(encoding="utf-8")
+
+
+def test_fndr_prompt_has_personal_dashboards_section():
+    # parked-1 + F-16: fndr.md must direct the two DM-only personal dashboards.
+    txt = _prompt("fndr.md")
+    assert "## Personal dashboards" in txt
+    assert "personal_oneamerica_portfolio" in txt
+    assert "personal_capital_program_state" in txt
+
+
+def test_fndr_prompt_has_content_pipeline_section():
+    txt = _prompt("fndr.md")
+    assert "## Content pipeline" in txt
+    assert "fndr_content_pipeline" in txt
+
+
+def test_f3e_prompt_has_creator_crm_section():
+    # F-16: f3e.md must direct the creator CRM tool.
+    txt = _prompt("f3e.md")
+    assert "## Creator & ambassador CRM" in txt
+    assert "f3e_creator_crm" in txt
+
+
+def test_all_entity_prompts_carry_meeting_action_items_section():
+    # F-22: meeting_action_items is global-core -> every entity prompt directs it.
+    missing = [
+        f.name
+        for f in sorted(_PROMPTS.glob("*.md"))
+        if "## Meeting action items" not in f.read_text(encoding="utf-8")
+        or "meeting_action_items" not in f.read_text(encoding="utf-8")
+    ]
+    assert not missing, f"prompts missing the meeting-action-items section: {missing}"

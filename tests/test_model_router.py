@@ -15,6 +15,24 @@ from cora.model_router import (
 # ---- Short / simple queries → Haiku ----
 
 
+# ---- Composite / dashboard tool families -> Sonnet (F-01, 2026-07-12) ----
+# Haiku under-called these tools and answered from KB (F-16/F-22); force Sonnet.
+@pytest.mark.parametrize("msg", [
+    "what were my action items from the finance weekly?",
+    "recap my to-dos from yesterday's call",
+    "what's my OneAmerica cash value?",
+    "how much is left on the policy loan?",
+    "where does the capital program stand?",
+    "what's the cap table look like?",
+    "what's overdue in the content pipeline?",
+    "show me the content calendar",
+    "who's on our creator roster?",
+    "how many creators do we have in the creator CRM?",
+])
+def test_composite_tool_families_route_to_sonnet(msg):
+    assert choose_model(msg) == MODEL_SONNET
+
+
 @pytest.mark.parametrize("msg", [
     # "what's on my plate?" removed 2026-06-11: plate queries are Sonnet-forced
     # (multi-source composite tool; Haiku misnarrated a degraded result live).
