@@ -33,14 +33,29 @@ def test_composite_tool_families_route_to_sonnet(msg):
     assert choose_model(msg) == MODEL_SONNET
 
 
+# ---- Calendar-read intents -> Sonnet (F-02, 2026-07-12) ----
+# On Haiku the model fabricated a calendar outage instead of calling the tool.
+@pytest.mark.parametrize("msg", [
+    "what's on my calendar today and tomorrow?",
+    "what's on my calendar today?",
+    "what's my schedule tomorrow?",
+    "am I free Friday?",
+    "do I have any meetings today?",
+    "what meetings do I have this week?",
+    "am I free this afternoon?",
+])
+def test_calendar_read_routes_to_sonnet(msg):
+    assert choose_model(msg) == MODEL_SONNET
+
+
 @pytest.mark.parametrize("msg", [
     # "what's on my plate?" removed 2026-06-11: plate queries are Sonnet-forced
     # (multi-source composite tool; Haiku misnarrated a degraded result live).
     "show me my tasks",
     "what's Tommy's open work?",
     "list my deals",
-    "do I have any meetings today?",
-    "am I free Friday?",
+    # "do I have any meetings today?" / "am I free Friday?" moved to Sonnet
+    # (F-02, 2026-07-12): calendar-read intents are now Sonnet-forced.
     "what's Shaun working on",
     "get me the latest f3 pure brand guidelines",
     "find the contract with Tierra Brandt",

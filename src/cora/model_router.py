@@ -112,12 +112,25 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\b(capital program|cap table|the raise|equity seats?)\b",
     r"\b(content pipeline|content calendar|freelancer deliverables?)\b",
     r"\b(creator crm|creator roster|sponsorship pipeline)\b",
+    # Calendar-READ intents (F-02, 2026-07-12). On Haiku the model skipped
+    # calendar_get_my_events and FABRICATED an outage ("I don't have access to your
+    # calendar"); force Sonnet so the read tool is actually invoked. Anchored so
+    # ordinary "free" / "meeting" prose elsewhere doesn't over-match.
+    r"\bon my (calendar|schedule|agenda)\b",
+    r"\bwhat'?s? on my (calendar|schedule|agenda)\b",
+    r"\bmy (calendar|schedule|agenda) (today|tomorrow|this week|look|for)\b",
+    r"\bwhat'?s? my (schedule|calendar|agenda)\b",
+    r"\bam i free\b",
+    r"\b(do i have|what) (any )?(meetings?|events?|calls?)\b",
+    r"\bfree (today|tomorrow|this (week|morning|afternoon)|on \w+day)\b",
 ]
 _SONNET_INDICATOR_RE = re.compile("|".join(_SONNET_INDICATOR_PATTERNS), re.IGNORECASE)
 
 # Haiku-friendly query patterns -- direct factual lookups, single-tool dispatches.
 # NOTE: this list is advisory/dead (choose_model never consults it); "plate" was
-# removed 2026-06-11 because plate queries are Sonnet-forced above.
+# removed 2026-06-11 (Sonnet-forced) and calendar/schedule/agenda/"am i free"/
+# "do i have meetings" are ALSO Sonnet-forced now (F-02, 2026-07-12) despite still
+# appearing below -- the Sonnet indicators above win, this list changes nothing.
 _HAIKU_HINT_PATTERNS = [
     r"\bwhat'?s? (on my|my) (calendar|tasks?|schedule|deals?|pipeline)\b",
     r"\bshow me\b",

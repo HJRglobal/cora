@@ -353,6 +353,42 @@ def create_event(
     return event
 
 
+def delete_event(*, user_email: str, event_id: str) -> None:
+    """Delete an event from user_email's primary calendar (F-06, 2026-07-12).
+
+    Cancels via events().delete under the calendar.events DWD scope, impersonating
+    the asker, notifying attendees (sendUpdates='all'). Idempotent: a 404/410 (the
+    event is already gone) is treated as success. Raises CalendarClientError on a
+    real failure. Callers gate this behind a confirmed staged-write (a resolved
+    event_id from a preview turn) -- this function does no confirmation itself.
+    """
+    if not event_id or not event_id.strip():
+        raise CalendarClientError("delete_event requires an event_id.")
+    try:
+        service = _build_service(user_email, write=True)
+        service.events().delete(
+            calendarId="primary",
+            eventId=event_id.strip(),
+            sendUpdates="all",
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        if status in (404, 410):
+            # 404 = not found, 410 = already deleted -> idempotent success.
+            log.info("delete_event: event %s already gone (HTTP %s) -- no-op", event_id, status)
+            return
+        if status == 403:
+            raise CalendarClientError(
+                f"Calendar 403 for {user_email} -- service account lacks the "
+                f"calendar.events DWD scope needed to delete."
+            ) from exc
+        raise CalendarClientError(f"Calendar API HTTP {status}: {exc}") from exc
+    except CalendarClientError:
+        raise
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error deleting event: {exc}") from exc
+
+
 def _extract_meet_link(event: dict[str, Any]) -> str:
     """Pull the Google Meet join URL from the conferenceData response, or return ''."""
     conf = event.get("conferenceData") or {}

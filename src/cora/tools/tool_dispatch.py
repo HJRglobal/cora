@@ -1188,30 +1188,115 @@ def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
     return calendar_client.format_events_for_llm(events, window_label)
 
 
+# ── Calendar staged-write server-side pending store (F-05, 2026-07-12) ───────
+# Same server-side confirm pattern as the Shopify DTC write (below, ~2588): a
+# calendar write PREVIEWS on the first call, stashing the RESOLVED fields keyed by
+# (user, channel), and only EXECUTES on a later confirm turn from the STASHED
+# fields -- never from model-echoed fields on the confirm turn. Closes the
+# honor-system gate (F-05: a first-call confirmed=true booked an event + SENT
+# Google invites with NO preview). Shared by create + delete; each tool checks the
+# stashed `action` and re-previews on mismatch/no-pending (never a blind write).
+_CALENDAR_PENDING_LOCK = Lock()
+_CALENDAR_PENDING_TTL_SECONDS = 600  # 10 min
+_PENDING_CALENDAR_WRITES: dict[tuple[str, str], dict] = {}
+
+
+def _calendar_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_calendar_write(slack_user: str, channel: str, entry: dict) -> None:
+    with _CALENDAR_PENDING_LOCK:
+        _PENDING_CALENDAR_WRITES[_calendar_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_calendar_write(slack_user: str, channel: str) -> dict | None:
+    """Pop-and-return the caller's pending calendar write if present AND fresh."""
+    key = _calendar_pending_key(slack_user, channel)
+    with _CALENDAR_PENDING_LOCK:
+        entry = _PENDING_CALENDAR_WRITES.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _CALENDAR_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def has_pending_calendar_write(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe -- app.py forces Sonnet on the confirm turn (a
+    bare 'yes'/'confirm' is undetectable from message content)."""
+    key = _calendar_pending_key(slack_user, channel)
+    with _CALENDAR_PENDING_LOCK:
+        entry = _PENDING_CALENDAR_WRITES.get(key)
+    return bool(entry) and (time.time() - float(entry.get("ts", 0))) <= _CALENDAR_PENDING_TTL_SECONDS
+
+
+def _calendar_resolve_email(slack_user_id: str) -> tuple[str | None, str | None]:
+    """Resolve the caller's Google identity. Returns (user_email, error_str)."""
+    asker = _load_slack_asana_map().get(slack_user_id)
+    if not asker:
+        return None, (
+            f"Slack user {slack_user_id} is not mapped to a Google identity. Harrison "
+            f"can add a row to data/maps/slack-to-asana.yaml (asana_email doubles as the "
+            f"Google identity)."
+        )
+    user_email = (asker.get("asana_email") or "").strip()
+    if not user_email:
+        return None, (
+            f"User {asker.get('display_name', slack_user_id)} has no asana_email in the "
+            f"user map. Tell the user there's a configuration issue."
+        )
+    return user_email, None
+
+
 def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Create a Calendar event in the asker's own primary calendar.
+    """Create a Calendar event in the asker's own primary calendar (staged write).
 
-    Cora's third write tool. Same staged-write doctrine as asana_create_task
-    and gmail_create_draft: refuses without confirmed=True; tool description
-    instructs Claude to show a preview block and get explicit user approval first.
-
-    The event is created via DWD impersonation AS the asker, so it lands in
-    their own Google Calendar. Attendees receive Google invitations automatically
-    when sendUpdates='all' (the default).
+    F-05: server-side pending store, NOT the honor-system model `confirmed` flag.
+    The FIRST call previews + stashes the resolved fields; only a later confirm turn
+    (which pops the stashed entry) actually books. A first-call confirmed=true now
+    re-previews instead of booking, so an event/invite can never be sent unconfirmed.
+    The event is created via DWD impersonation AS the asker (lands in their own
+    calendar); attendees get Google invites (sendUpdates='all').
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
 
-    # Confirmation gate — same pattern as the other write tools
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "calendar_create_event refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a clear preview block (title, start, end, "
-            "attendees, description, location) AND received their explicit approval "
-            "('yes', 'create it', 'add it', 'looks good', or similar). "
-            "If you have NOT done that yet, format a preview NOW and wait for confirmation."
-        )
+    # ── Phase 2: confirm turn -- execute ONLY the caller's own stashed create ──
+    if confirmed:
+        pending = _take_pending_calendar_write(slack_user_id, channel)
+        if pending and pending.get("action") == "create":
+            try:
+                event = calendar_client.create_event(
+                    user_email=pending["user_email"],
+                    summary=pending["summary"],
+                    start=pending["start"],
+                    end=pending["end"],
+                    attendees=pending.get("attendees"),
+                    description=pending.get("description"),
+                    location=pending.get("location"),
+                    time_zone=pending.get("time_zone") or calendar_client._DEFAULT_TZ,
+                )
+            except calendar_client.CalendarClientError as exc:
+                log.warning("calendar_create_event BOOK FAILED asker=%s exc=%s", slack_user_id, exc)
+                return (
+                    f"Calendar event error: {exc}. Tell the user the event wasn't created. "
+                    f"If the error mentions a missing DWD scope, Harrison needs to update "
+                    f"Domain-wide Delegation in admin.google.com."
+                )
+            log.info(
+                "calendar_create_event CREATED asker=%s email=%s event_id=%s attendee_count=%d",
+                slack_user_id, pending["user_email"], event.get("id", ""),
+                len(pending.get("attendees") or []),
+            )
+            return calendar_client.format_created_event_for_llm(
+                event, user_email=pending["user_email"]
+            )
+        # No fresh pending create (first-call-confirmed, stale, or restart-cleared)
+        # -> fall through to Phase 1 and RE-PREVIEW. Never book blind.
 
+    # ── Phase 1: validate + resolve + stash + preview ─────────────────────────
     summary = (input_data.get("summary") or "").strip()
     start = (input_data.get("start") or "").strip()
     end = (input_data.get("end") or "").strip()
@@ -1227,20 +1312,9 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
     if not end:
         return "calendar_create_event: missing required field `end`. Ask the user for an end date/time."
 
-    # Resolve caller's Google identity from the Slack→Asana map
-    asker = _load_slack_asana_map().get(slack_user_id)
-    if not asker:
-        return (
-            f"calendar_create_event: Slack user {slack_user_id} is not mapped to a Google "
-            f"identity. Harrison can add a row to data/maps/slack-to-asana.yaml (the "
-            f"asana_email field doubles as the Google identity)."
-        )
-    user_email = (asker.get("asana_email") or "").strip()
-    if not user_email:
-        return (
-            f"calendar_create_event: user {asker.get('display_name', slack_user_id)} has "
-            f"no asana_email in the user map. Tell the user there's a configuration issue."
-        )
+    user_email, err = _calendar_resolve_email(slack_user_id)
+    if err:
+        return f"calendar_create_event: {err}"
 
     # Normalize attendees
     attendee_list: list[str] | None = None
@@ -1250,40 +1324,123 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
         elif isinstance(attendees, list):
             attendee_list = [str(a).strip() for a in attendees if str(a).strip()]
 
-    try:
-        event = calendar_client.create_event(
-            user_email=user_email,
-            summary=summary,
-            start=start,
-            end=end,
-            attendees=attendee_list,
-            description=description,
-            location=location,
-            time_zone=time_zone,
-        )
-    except calendar_client.CalendarClientError as exc:
-        log.warning(
-            "calendar_create_event FAILED asker=%s email=%s summary=%r exc=%s",
-            slack_user_id, user_email, summary, exc,
-        )
-        return (
-            f"Calendar event error: {exc}. Tell the user the event wasn't created. "
-            f"If the error mentions a missing DWD scope, Harrison needs to update "
-            f"Domain-wide Delegation in admin.google.com."
-        )
-
-    log.info(
-        "calendar_create_event CREATED asker=%s email=%s event_id=%s summary=%r "
-        "start=%s attendee_count=%d",
-        slack_user_id,
-        user_email,
-        event.get("id", ""),
-        summary,
-        start,
-        len(attendee_list) if attendee_list else 0,
+    _store_pending_calendar_write(slack_user_id, channel, {
+        "action": "create",
+        "user_email": user_email,
+        "summary": summary,
+        "start": start,
+        "end": end,
+        "attendees": attendee_list,
+        "description": description,
+        "location": location,
+        "time_zone": time_zone,
+        "ts": time.time(),
+    })
+    attendee_note = (
+        f" Google will send invites to {len(attendee_list)} attendee(s) on confirm."
+        if attendee_list else ""
+    )
+    return (
+        "NOT CREATED yet -- this is a preview. Show the user this event and ask them to "
+        "confirm; NOTHING is on the calendar until they say yes.\n"
+        f"- Title: {summary}\n"
+        f"- Start: {start}\n"
+        f"- End: {end}\n"
+        + (f"- Location: {location}\n" if location else "")
+        + (f"- Attendees: {', '.join(attendee_list)}\n" if attendee_list else "")
+        + f"\nReply to confirm and I'll book it (a Google Meet link is added "
+        f"automatically).{attendee_note}"
     )
 
-    return calendar_client.format_created_event_for_llm(event, user_email=user_email)
+
+def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Cancel/delete a Calendar event in the asker's own primary calendar (F-06).
+
+    Staged write on the SAME server-side pending store as create: PREVIEW resolves
+    the target event (by event_id, or by matching a title/keywords within a window)
+    and stashes its id; a later confirm turn pops the stash and deletes ONLY that
+    resolved id. Never deletes on the first call and never from a model-echoed id on
+    the confirm turn. Attendees are notified (sendUpdates='all')."""
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    user_email, err = _calendar_resolve_email(slack_user_id)
+    if err:
+        return f"calendar_delete_event: {err}"
+
+    # ── Phase 2: confirm turn -- delete ONLY the caller's own stashed target ──
+    if confirmed:
+        pending = _take_pending_calendar_write(slack_user_id, channel)
+        if pending and pending.get("action") == "delete":
+            try:
+                calendar_client.delete_event(
+                    user_email=pending["user_email"], event_id=pending["event_id"]
+                )
+            except calendar_client.CalendarClientError as exc:
+                log.warning("calendar_delete_event FAILED asker=%s exc=%s", slack_user_id, exc)
+                return (
+                    f"Calendar delete error: {exc}. Tell the user the event was NOT "
+                    f"cancelled."
+                )
+            log.info(
+                "calendar_delete_event DELETED asker=%s email=%s event_id=%s",
+                slack_user_id, pending["user_email"], pending["event_id"],
+            )
+            return (
+                f"Cancelled '{pending['summary']}'. Google notified any attendees. Tell "
+                f"the user it's off their calendar."
+            )
+        # No fresh pending delete -> fall through to Phase 1 and RE-PREVIEW.
+
+    # ── Phase 1: resolve the target + stash + preview ─────────────────────────
+    event_id = (input_data.get("event_id") or "").strip()
+    query = (input_data.get("query") or "").strip()
+    when = (input_data.get("when") or "this_week").strip()
+
+    if event_id:
+        summary = query or "(event)"
+        _store_pending_calendar_write(slack_user_id, channel, {
+            "action": "delete", "event_id": event_id, "summary": summary,
+            "user_email": user_email, "ts": time.time(),
+        })
+        return (
+            f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{summary}'. "
+            f"Attendees will be notified. Nothing changes until you confirm."
+        )
+
+    if not query:
+        return (
+            "calendar_delete_event: tell me which event to cancel -- a title or keywords "
+            "(and a date if it's not this week). I won't guess."
+        )
+    try:
+        events, label = calendar_client.get_user_events(user_email, when=when, max_events=50)
+    except calendar_client.CalendarClientError as exc:
+        return f"I couldn't pull your calendar to find that event: {exc}"
+    matches = [e for e in events if query.lower() in (e.get("summary") or "").lower()]
+    if not matches:
+        return (
+            f"I couldn't find an event matching '{query}' in {label}. Tell me the date "
+            f"(e.g. 'on 2026-07-13') and I'll look again -- I won't cancel anything I "
+            f"can't find."
+        )
+    if len(matches) > 1:
+        listing = "; ".join((e.get("summary") or "(no title)") for e in matches[:8])
+        return (
+            f"'{query}' matches {len(matches)} events in {label}: {listing}. Which one? "
+            f"(give the title and its date)"
+        )
+    ev = matches[0]
+    ev_summary = ev.get("summary") or "(event)"
+    _store_pending_calendar_write(slack_user_id, channel, {
+        "action": "delete", "event_id": ev.get("id", ""), "summary": ev_summary,
+        "user_email": user_email, "ts": time.time(),
+    })
+    return (
+        f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{ev_summary}' ({label}). "
+        f"Attendees will be notified. Nothing changes until you confirm."
+    )
 
 
 def _tool_influencer_add_handle(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -4767,10 +4924,11 @@ TOOL_DEFINITIONS = [
             "Use this when the user asks to schedule, book, add, or create a meeting or event — "
             "phrases like 'schedule a meeting with X', 'add a call to my calendar', "
             "'book time for Y', 'create a calendar event for Z'. "
-            "IMPORTANT: You MUST show the user a clear preview block (title, start time, "
-            "end time, attendees, description, location) and receive their EXPLICIT approval "
-            "before setting confirmed=true. Never set confirmed=true on the first call — "
-            "always preview first. "
+            "STAGED WRITE: the FIRST call returns a NOT-CREATED preview and does not book "
+            "anything; show that preview to the user and get their explicit yes; then call "
+            "AGAIN with confirmed=true to book. (A first-call confirmed=true just re-previews "
+            "-- the tool books from a server-side stash, never from the confirm-turn fields, "
+            "so an event/invite can never be sent unconfirmed.) "
             "The event is created in the asking user's own primary Google Calendar. "
             "If attendees are provided, Google sends them invitations automatically. "
             "The tool returns a clickable link to the created event — preserve the "
@@ -4826,13 +4984,66 @@ TOOL_DEFINITIONS = [
                 "confirmed": {
                     "type": "boolean",
                     "description": (
-                        "Required. Set to true ONLY after you have shown the user a preview "
-                        "block AND received their explicit approval. If false or omitted, "
-                        "the tool refuses and instructs you to show a preview first."
+                        "Set to true on the CONFIRM turn, after the user has seen the "
+                        "NOT-CREATED preview and said yes. The first call (confirmed false/"
+                        "omitted) previews + stashes; the tool books from that stash on the "
+                        "confirm turn, so a first-call confirmed=true only re-previews."
                     ),
                 },
             },
             "required": ["summary", "start", "end", "confirmed"],
+        },
+    },
+    {
+        "name": "calendar_delete_event",
+        "description": (
+            "Cancel / delete an event from the user's own Google Calendar. Use when the "
+            "user asks to cancel, delete, remove, or call off a meeting or hold they have "
+            "-- 'cancel the SMOKE TEST hold', 'delete my 2pm', 'remove the Friday sync'. "
+            "STAGED WRITE (same as create): the FIRST call returns a NOT-CANCELLED preview "
+            "identifying the event; show it and get the user's yes; then call AGAIN with "
+            "confirmed=true to cancel. The tool resolves the event server-side (by event_id "
+            "from a prior create/list, or by matching `query` within `when`) and deletes only "
+            "that resolved event on confirm -- it never deletes on the first call and never "
+            "from a confirm-turn-supplied id. Attendees are notified. If it can't pin down a "
+            "single event it asks which one -- relay that; do NOT guess."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The event title or keywords to cancel (e.g. 'SMOKE TEST HOLD', "
+                        "'marketing sync'). Matched case-insensitively against events in the "
+                        "`when` window. Omit only if you pass event_id."
+                    ),
+                },
+                "when": {
+                    "type": "string",
+                    "description": (
+                        "Search window for resolving `query`: 'today', 'tomorrow', "
+                        "'this_week' (default, next 7 days), 'next_week', or 'YYYY-MM-DD'. "
+                        "Pass the event's date when the user gives one."
+                    ),
+                },
+                "event_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional direct event id from a prior calendar_create_event result "
+                        "or event list, if you have it -- skips the query resolve."
+                    ),
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true on the CONFIRM turn, after the user has seen the "
+                        "NOT-CANCELLED preview and said yes. First call previews; the tool "
+                        "deletes the stashed event on the confirm turn."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -6571,6 +6782,7 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "gmail_inbox",
     "calendar_get_my_events",
     "calendar_create_event",
+    "calendar_delete_event",
     "calendar_schedule_meeting",
     "slack_send_dm",
     "financial_get_cashflow",
@@ -6687,6 +6899,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "gmail_inbox": _tool_gmail_inbox,
     "calendar_get_my_events": _tool_get_my_events,
     "calendar_create_event": _tool_calendar_create_event,
+    "calendar_delete_event": _tool_calendar_delete_event,
     "calendar_schedule_meeting": _tool_calendar_schedule_meeting,
     "fighter_compliance": _tool_fighter_compliance,
     "influencer_list_handles": _tool_influencer_list_handles,
@@ -6797,6 +7010,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # Heavy — multi-step, slow uploads, or long-running APIs
     "gmail_create_draft": 20,
     "calendar_create_event": 20,
+    "calendar_delete_event": 20,
     # DTC inventory write (D-028 / D-051): the confirmed phase makes up to four
     # SEQUENTIAL Shopify calls, each with its own 15s per-request budget --
     # get_active_locations + resolve_variants (paginated products.json) +

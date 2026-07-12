@@ -533,7 +533,10 @@ def _dispatch_qa(
     # for this (user, channel) means the next turn is very likely the "yes" -- which
     # is undetectable from message content -- so force Sonnet for the write turn. A
     # write flow is not a Haiku job (both live confirm turns ran on Haiku).
-    if user_id and _tool_dispatch.has_pending_shopify_write(user_id, channel_name):
+    if user_id and (
+        _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
+        or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
+    ):
         chosen_model = model_router.MODEL_SONNET
     log.info(
         "model_routing channel=#%s user=%s model=%s msg_chars=%d",
