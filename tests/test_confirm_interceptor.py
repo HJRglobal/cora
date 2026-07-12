@@ -22,9 +22,11 @@ _CH = "hjrg-leadership"
 def _clear_stores():
     td._PENDING_ASANA_WRITES.clear()
     td._PENDING_SHOPIFY_WRITES.clear()
+    td._PENDING_CALENDAR_WRITES.clear()
     yield
     td._PENDING_ASANA_WRITES.clear()
     td._PENDING_SHOPIFY_WRITES.clear()
+    td._PENDING_CALENDAR_WRITES.clear()
 
 
 # ── _confirm_intent classifier ──────────────────────────────────────────────
@@ -142,16 +144,36 @@ class TestInterceptorAsana:
         assert out is None
         mock.assert_not_called()
 
-    def test_ambiguous_message_leaves_pending_intact(self):
+    def test_content_message_abandons_destructive_pending(self):
+        # F-23 review HIGH #1: a destructive Asana pending is IMMEDIATE-CONFIRM-ONLY. A
+        # content message (not a confirm) ABANDONS it so a later stray "yes"/"ok thanks"
+        # cannot fire a stale permanent delete.
         self._stash_delete()
         with patch.object(td.asana_client, "delete_task") as mock:
             out = td.try_confirm_pending_write(
                 slack_user_id=HARRISON, channel_name=_CH, entity="FNDR",
-                message="what's my cash position?",
+                message="actually, when is it due?",
             )
         assert out is None
         mock.assert_not_called()
-        assert td.has_pending_asana_write(HARRISON, _CH)  # NOT consumed
+        assert not td.has_pending_asana_write(HARRISON, _CH)  # abandoned
+
+    def test_stale_pending_then_ack_does_not_fire(self):
+        # The live scenario: delete preview -> clarifying question -> "ok thanks".
+        self._stash_delete()
+        with patch.object(td.asana_client, "delete_task") as mock:
+            # 1) clarifying question abandons the pending
+            td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR",
+                message="when is it due?",
+            )
+            # 2) later acknowledgment finds no pending -> no delete
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR",
+                message="ok thanks",
+            )
+        assert out is None
+        mock.assert_not_called()
 
     def test_ttl_expired_pending_returns_none(self):
         td._store_pending_asana_write(HARRISON, _CH, {
@@ -186,6 +208,69 @@ class TestInterceptorAsana:
             slack_user_id="", channel_name=_CH, entity="FNDR", message="yes",
         )
         assert out is None
+
+    def test_interrogative_does_not_fire(self):
+        # review MED #6: "done?" is a question, not a confirm.
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "complete", "gid": "g2", "label": "X", "ts": time.time(),
+        })
+        with patch.object(td.asana_client, "complete_task") as mock:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="done?",
+            )
+        assert out is None
+        mock.assert_not_called()
+        assert not td.has_pending_asana_write(HARRISON, _CH)  # question abandons the destructive pending
+
+    def test_create_pending_executes_on_affirm(self):
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "create", "title": "Coordinate launch", "assignee_gid": "g",
+            "assignee_display": "Harrison", "project_gid": None, "notes": None,
+            "due_on": None, "notices": [], "follower_gids": [], "follower_displays": [],
+            "ts": time.time(),
+        })
+        created = {"gid": "T1", "name": "Coordinate launch", "permalink_url": "http://x/T1",
+                   "assignee": {"name": "Harrison"}, "due_on": None, "projects": []}
+        with patch.object(td.asana_client, "create_task", return_value=created) as mock:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="yes",
+            )
+        mock.assert_called_once()
+        assert "Coordinate launch" in out
+        assert "WRITE_CONFIRMED" not in out
+
+    def test_execute_crash_returns_safe_message(self):
+        # review general-correctness: a non-AsanaClientError must not escape the interceptor.
+        self._stash_delete()
+        with patch.object(td.asana_client, "delete_task", side_effect=RuntimeError("boom")):
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="yes",
+            )
+        assert out and "went wrong" in out.lower() and "nothing was changed" in out.lower()
+
+
+class TestInterceptorCalendarFreshness:
+    def _stash_cal(self, ts):
+        td._store_pending_calendar_write("U0B2RM2JYJ1", _CH, {
+            "action": "create", "user_email": "h@x", "summary": "Sync",
+            "start": "s", "end": "e", "ts": ts,
+        })
+
+    def test_fresher_calendar_defers_and_abandons_stale_delete(self):
+        # review HIGH #2: a bare "yes" meant for a FRESHER calendar pending must NOT fire
+        # a staler Asana delete; the stale delete is abandoned and calendar defers to model.
+        HARRISON = "U0B2RM2JYJ1"
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "g1", "label": "X", "ts": time.time() - 60,
+        })
+        self._stash_cal(time.time())
+        with patch.object(td.asana_client, "delete_task") as mock:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="yes",
+            )
+        assert out is None                              # calendar deferred to the model
+        mock.assert_not_called()                        # the staler delete did NOT fire
+        assert not td.has_pending_asana_write(HARRISON, _CH)  # stale delete abandoned
 
 
 class TestInterceptorShopify:

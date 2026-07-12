@@ -11,9 +11,9 @@ class TestAsanaDestructiveIntent:
     @pytest.mark.parametrize("msg", [
         "delete the SMOKE F23 CLEAN task",
         "please delete that task",
-        "remove the onboarding task",
         "trash this task",
         "get rid of the duplicate task",
+        "delete this to-do",
     ])
     def test_delete(self, msg):
         assert app._asana_destructive_intent(msg) == "asana_delete_task"
@@ -27,6 +27,16 @@ class TestAsanaDestructiveIntent:
     ])
     def test_complete(self, msg):
         assert app._asana_destructive_intent(msg) == "asana_complete_task"
+
+    @pytest.mark.parametrize("msg", [
+        # review MED #7: verb-governance false positives that must NOT force a tool.
+        "give me the complete list of tasks",       # 'complete' adjective
+        "send me a complete rundown of my open tasks",
+        "remove Bob as a follower on the launch task",  # 'remove' dropped -> not a delete
+        "remove me from the task followers",
+    ])
+    def test_governance_false_positives_excluded(self, msg):
+        assert app._asana_destructive_intent(msg) is None
 
     @pytest.mark.parametrize("msg", [
         "create a task to follow up with Bob",

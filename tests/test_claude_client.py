@@ -351,3 +351,22 @@ class TestPhantomBroaden:
             out = cl.generate_response("sys", "ctx", "yes, delete it permanently",
                                        assume_confirm=False)
         assert out == "Confirmed -- task deleted."
+
+    def test_broaden_ignores_factual_non_task_completion(self):
+        # review MED #5: a factual completion about something OTHER than a task must survive
+        # even under broaden (no task/asana referent, not a terse leading confirmation).
+        txt = "The Q1 close was completed March 31; revenue was $1.2M."
+        assert cl._guard_phantom_destructive(txt, broaden=True) == txt
+
+    def test_broaden_gated_off_when_a_tool_ran(self):
+        # review HIGH #3/#4: a real write happened via a (non-contract) tool this turn, so
+        # even a terse "Done -- created it" success must NOT be clobbered.
+        tu = _tool_use_response("calendar_create_event", tool_input={"confirmed": True})
+        done = _mock_success("Done -- created it. Invites are on the way.")
+        with patch.object(cl, "_log_usage"), \
+             patch.object(cl, "_create_with_retry", side_effect=[tu, done]), \
+             patch.object(cl, "_dispatch_tools_parallel",
+                          return_value=[{"type": "tool_result", "tool_use_id": "tid1",
+                                         "content": "Calendar event CREATED; tell the user it's booked."}]):
+            out = cl.generate_response("sys", "ctx", "yes", assume_confirm=True, meta={})
+        assert out == "Done -- created it. Invites are on the way."

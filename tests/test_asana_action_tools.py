@@ -129,6 +129,37 @@ class TestDeleteTaskStaged:
         assert "isn't one of your open tasks" in out.lower()
 
 
+class TestCrossActionPendingProtection:
+    """F-23 review #8: a confirm for one action must NOT destroy a pending for another
+    (the three Asana action tools share one single-slot pending store)."""
+
+    def test_complete_confirm_does_not_destroy_pending_delete(self):
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "g1", "label": "X", "ts": __import__("time").time(),
+        })
+        with patch.object(td.asana_client, "complete_task") as mc, \
+             patch.object(td.asana_client, "get_user_tasks", return_value=[]):
+            # a stray complete-confirm arrives (no complete pending) -> must re-preview,
+            # NOT pop/destroy the delete pending.
+            _complete({"confirmed": True})
+        mc.assert_not_called()
+        # the delete pending survives for the real "yes"
+        assert td.has_pending_asana_write(HARRISON, _CH)
+        pend = td._peek_pending_asana(HARRISON, _CH)
+        assert pend and pend["action"] == "delete"
+
+    def test_create_confirm_does_not_destroy_pending_delete(self):
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "g1", "label": "X", "ts": __import__("time").time(),
+        })
+        with patch.object(td.asana_client, "create_task") as mc:
+            td._tool_asana_create_task(HARRISON, "FNDR", {"confirmed": True, "_channel_name": _CH})
+        mc.assert_not_called()
+        assert td.has_pending_asana_write(HARRISON, _CH)
+        pend = td._peek_pending_asana(HARRISON, _CH)
+        assert pend and pend["action"] == "delete"
+
+
 class TestCreateWithFollowers:
     def test_followers_added_and_surfaced(self):
         created = {"gid": "T1", "permalink_url": "http://x", "projects": []}

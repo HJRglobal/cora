@@ -687,11 +687,12 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     # echo, so the bare-"yes" confirm interceptor and a model confirm both create exactly
     # what was previewed.
     if confirmed:
-        pending = _take_pending_asana_write(slack_user_id, channel)
-        if pending and pending.get("action") == "create":
+        pending = _claim_pending_asana(slack_user_id, channel, "create")
+        if pending:
             return _execute_asana_create(slack_user_id, pending)
         # No fresh pending create -> fall through and resolve. A single-call
-        # confirmed=true (honor-system / backward-compat) still creates directly.
+        # confirmed=true (honor-system / backward-compat) still creates directly. A
+        # pending delete/complete is left intact by _claim_pending_asana (review #8).
 
     resolved = _resolve_asana_create(slack_user_id, entity, input_data)
     if isinstance(resolved, str):
@@ -1000,6 +1001,25 @@ def _take_pending_asana_write(slack_user: str, channel: str) -> dict | None:
     return entry
 
 
+def _claim_pending_asana(slack_user: str, channel: str, action: str) -> dict | None:
+    """Atomically pop-and-return the caller's pending Asana write ONLY if it is fresh AND
+    its action matches `action`. A pending of a DIFFERENT action is LEFT INTACT -- so a
+    stray complete-confirm never destroys a pending delete (or a create-confirm a pending
+    delete/complete), which the shared single-slot store otherwise allowed (review #8).
+    The peek + action-check + pop happen under one lock (concurrency-safe)."""
+    key = _asana_pending_key(slack_user, channel)
+    with _ASANA_PENDING_LOCK:
+        entry = _PENDING_ASANA_WRITES.get(key)
+        if not entry:
+            return None
+        if (time.time() - float(entry.get("ts", 0))) > _ASANA_PENDING_TTL_SECONDS:
+            return None
+        if entry.get("action") != action:
+            return None
+        _PENDING_ASANA_WRITES.pop(key, None)
+        return entry
+
+
 def has_pending_asana_write(slack_user: str, channel: str) -> bool:
     """Read-only freshness probe -- app.py forces Sonnet on the destructive confirm
     turn (a bare 'yes' is undetectable from content)."""
@@ -1034,8 +1054,8 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
     confirmed = input_data.get("confirmed") is True
 
     if confirmed:
-        pending = _take_pending_asana_write(slack_user_id, channel)
-        if pending and pending.get("action") == "complete":
+        pending = _claim_pending_asana(slack_user_id, channel, "complete")
+        if pending:
             try:
                 asana_client.complete_task(pending["gid"])
             except asana_client.AsanaClientError as exc:
@@ -1074,8 +1094,8 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     confirmed = input_data.get("confirmed") is True
 
     if confirmed:
-        pending = _take_pending_asana_write(slack_user_id, channel)
-        if pending and pending.get("action") == "delete":
+        pending = _claim_pending_asana(slack_user_id, channel, "delete")
+        if pending:
             try:
                 asana_client.delete_task(pending["gid"])
             except asana_client.AsanaClientError as exc:
@@ -3314,6 +3334,10 @@ def _confirm_intent(message: str, pending_action: str | None) -> str | None:
     verb as a plain go (used for the broaden signal, where the action is irrelevant)."""
     if not message:
         return None
+    # A question is never a bare confirm. Guard BEFORE tokenizing (the tokenizer drops
+    # '?', so "done?" / "delete it?" would otherwise read as an affirm -- review MED #6).
+    if "?" in message:
+        return None
     toks = re.findall(r"[a-z0-9']+", message.lower())
     if not toks or len(toks) > 10:
         return None
@@ -3381,9 +3405,54 @@ def _peek_pending_shopify(slack_user: str, channel: str) -> dict | None:
     return None
 
 
+def _peek_pending_calendar(slack_user: str, channel: str) -> dict | None:
+    """Read-only fresh-pending peek (does NOT pop) for the Calendar staged-write store.
+    The interceptor peeks calendar for FRESHNESS ONLY -- it never executes a calendar
+    confirm (calendar's outcome text is model-facing, not verbatim-postable) -- so that a
+    fresher calendar pending is never overridden by a staler Asana/Shopify write (review
+    HIGH #2)."""
+    key = _calendar_pending_key(slack_user, channel)
+    with _CALENDAR_PENDING_LOCK:
+        entry = _PENDING_CALENDAR_WRITES.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _CALENDAR_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
 _CONFIRM_CANCELLED_REPLY = (
     "Okay -- I won't. Nothing was changed. Tell me if you'd like something else."
 )
+
+
+def _run_confirm_execute(
+    kind: str, action: str | None, slack_user_id: str, entity: str, channel: str,
+) -> str | None:
+    """Execute a confirmed staged write via the tool's OWN confirmed=true handler and
+    return its (sentinel-stripped) outcome text. Wrapped so an unexpected exception can
+    never escape the interceptor into the Slack handler -- the tool handlers catch only
+    their client errors (review MED, general-correctness)."""
+    inp = {"confirmed": True, "_channel_name": channel}
+    try:
+        if kind == "asana":
+            if action == "delete":
+                raw = _tool_asana_delete_task(slack_user_id, entity, inp)
+            elif action == "complete":
+                raw = _tool_asana_complete_task(slack_user_id, entity, inp)
+            elif action == "create":
+                raw = _tool_asana_create_task(slack_user_id, entity, inp)
+            else:
+                return None
+        elif kind == "shopify":
+            raw = _tool_f3e_shopify_set_inventory(slack_user_id, entity, inp)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 -- never crash the serve path; the write is not lost silently
+        log.exception("confirm_interceptor execute crashed user=%s kind=%s action=%s",
+                      slack_user_id, kind, action)
+        return "Something went wrong on my end -- nothing was changed. Try again in a moment."
+    log.info("confirm_interceptor EXECUTE user=%s kind=%s action=%s",
+             slack_user_id, kind, action)
+    return _strip_write_sentinel(raw)
 
 
 def try_confirm_pending_write(
@@ -3392,31 +3461,72 @@ def try_confirm_pending_write(
     """Deterministic pre-model confirm/cancel of a staged write (F-23). Returns the
     user-facing reply string to post, or None to fall through to the model.
 
-    See the section header above. Peeks the freshest pending write across the
-    verbatim-clean stores (Asana + Shopify); on a bare affirmative, executes it via the
-    tool's OWN confirmed=true handler (reusing all confirm semantics) and returns the
-    tool's own outcome text; on a bare negative, pops + cancels; otherwise None."""
+    Peeks the freshest pending across Asana + Shopify + Calendar. Executes only Asana +
+    Shopify confirms (verbatim-clean outcome text); calendar defers to the model.
+
+    Safety invariants from the D-051 review:
+    - A DESTRUCTIVE Asana pending (delete/complete) is IMMEDIATE-CONFIRM-ONLY: it fires
+      only when it is the freshest pending AND this message is a clear affirmative for it.
+      In every other case (a content message, a negative, or a fresher write superseding
+      it) it is ABANDONED, so a later stray "yes"/"ok thanks" can never fire a stale
+      permanent delete (review HIGH #1).
+    - If the freshest pending is CALENDAR, return None (defer to the model) so a staler
+      Asana/Shopify write is never fired on a calendar-meant affirmative (review HIGH #2).
+
+    Residual (documented): a channel user with two simultaneous active Cora threads who
+    types a bare affirmative in thread B as their very next message could still confirm a
+    thread-A pending -- the pending key is (user, channel), not per-thread. Mitigated by
+    F-19 (a bare in-thread channel reply may not even reach the app); the exercisable
+    surfaces today are DMs + @mention confirms. Thread anchoring is a follow-up."""
     if not slack_user_id:
         return None
-    candidates: list[tuple[float, str, str | None]] = []
-    a = _peek_pending_asana(slack_user_id, channel_name)
-    if a:
-        candidates.append((float(a.get("ts", 0)), "asana", a.get("action")))
-    s = _peek_pending_shopify(slack_user_id, channel_name)
-    if s:
-        candidates.append((float(s.get("ts", 0)), "shopify", "set"))
-    if not candidates:
+    asana = _peek_pending_asana(slack_user_id, channel_name)
+    shopify = _peek_pending_shopify(slack_user_id, channel_name)
+    calendar = _peek_pending_calendar(slack_user_id, channel_name)
+
+    entries: list[tuple[float, str, str | None]] = []
+    if asana:
+        entries.append((float(asana.get("ts", 0)), "asana", asana.get("action")))
+    if shopify:
+        entries.append((float(shopify.get("ts", 0)), "shopify", "set"))
+    if calendar:
+        entries.append((float(calendar.get("ts", 0)), "calendar", calendar.get("action")))
+    if not entries:
         return None
-    candidates.sort(reverse=True)  # freshest first
-    _ts, kind, action = candidates[0]
+    entries.sort(reverse=True)  # freshest first
+    _ts, kind, action = entries[0]
+
+    # ── Case 1: the freshest pending IS a destructive Asana write (delete/complete) ──
+    if kind == "asana" and action in ("delete", "complete"):
+        intent = _confirm_intent(message, action)
+        if intent == "affirm":
+            return _run_confirm_execute("asana", action, slack_user_id, entity, channel_name)
+        # Negative OR content: abandon it (immediate-confirm-only). A negative also gets
+        # the explicit cancel reply; a content message silently defers to the model.
+        _take_pending_asana_write(slack_user_id, channel_name)
+        if intent == "negate":
+            log.info("confirm_interceptor CANCEL user=%s kind=asana action=%s",
+                     slack_user_id, action)
+            return _CONFIRM_CANCELLED_REPLY
+        log.info("confirm_interceptor ABANDON destructive asana user=%s action=%s (non-confirm msg)",
+                 slack_user_id, action)
+        return None
+
+    # ── Case 2: freshest is Shopify / Calendar / an Asana CREATE ────────────────────
+    # A staler destructive Asana pending is now superseded (a fresher write took its
+    # place, or the user did not confirm it) -> abandon it so it cannot fire later.
+    if asana and asana.get("action") in ("delete", "complete"):
+        _take_pending_asana_write(slack_user_id, channel_name)
+        log.info("confirm_interceptor ABANDON stale destructive asana user=%s action=%s (superseded)",
+                 slack_user_id, asana.get("action"))
+
+    if kind == "calendar":
+        return None  # deferred to the model; never fire a staler write on a calendar confirm
 
     intent = _confirm_intent(message, action)
     if intent is None:
         return None
-
     if intent == "negate":
-        # Consume ONLY the freshest pending (the one the user is answering); leave any
-        # other store's entry alone.
         if kind == "asana":
             _take_pending_asana_write(slack_user_id, channel_name)
         elif kind == "shopify":
@@ -3424,25 +3534,7 @@ def try_confirm_pending_write(
         log.info("confirm_interceptor CANCEL user=%s kind=%s action=%s",
                  slack_user_id, kind, action)
         return _CONFIRM_CANCELLED_REPLY
-
-    # affirm -> execute via the tool's own confirm executor (pops its own pending).
-    inp = {"confirmed": True, "_channel_name": channel_name}
-    if kind == "asana":
-        if action == "delete":
-            raw = _tool_asana_delete_task(slack_user_id, entity, inp)
-        elif action == "complete":
-            raw = _tool_asana_complete_task(slack_user_id, entity, inp)
-        elif action == "create":
-            raw = _tool_asana_create_task(slack_user_id, entity, inp)
-        else:
-            return None
-    elif kind == "shopify":
-        raw = _tool_f3e_shopify_set_inventory(slack_user_id, entity, inp)
-    else:
-        return None
-    log.info("confirm_interceptor EXECUTE user=%s kind=%s action=%s",
-             slack_user_id, kind, action)
-    return _strip_write_sentinel(raw)
+    return _run_confirm_execute(kind, action, slack_user_id, entity, channel_name)
 
 
 # --- Calendar meeting scheduling ---

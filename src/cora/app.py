@@ -320,11 +320,19 @@ _ASANA_INTENT_INTERROGATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _ASANA_TASK_REF_RE = re.compile(r"\btasks?\b|\bto-?dos?\b", re.IGNORECASE)
+# GOVERNANCE-REQUIRED (review MED #7): the verb must govern a task, not appear as an
+# adjective ("the complete list of tasks") or an overloaded object ("remove Bob as a
+# follower on the task"). "remove" is dropped entirely -- too overloaded (remove follower
+# / from a list) and firing a PERMANENT delete on it is the dangerous case.
 _ASANA_DELETE_INTENT_RE = re.compile(
-    r"\b(?:delete|remove|trash)\b|\bget rid of\b", re.IGNORECASE)
+    r"\b(?:delete|trash)\b[^.\n]{0,40}\b(?:tasks?|to-?dos?)\b"
+    r"|\b(?:tasks?|to-?dos?)\b[^.\n]{0,25}\b(?:delete[d]?|trashed?)\b"
+    r"|\bget rid of\b[^.\n]{0,40}\b(?:tasks?|to-?dos?)\b",
+    re.IGNORECASE)
 _ASANA_COMPLETE_INTENT_RE = re.compile(
-    r"\bmark(?:ed)?\b[^.\n]{0,30}\b(?:done|complete|completed|finished|off)\b"
-    r"|\b(?:complete|finish|close out|check off)\b",
+    r"\bmark(?:ed|ing)?\b[^.\n]{0,30}\b(?:done|complete[d]?|finished|off)\b"
+    r"|\b(?:complete|finish|close out|check off)\s+(?:the|my|this|that|our)\b[^.\n]{0,30}\b(?:tasks?|to-?dos?)\b"
+    r"|\b(?:complete|finish|close out|check off)\s+(?:it|that|this)\b",
     re.IGNORECASE)
 _ASANA_CREATE_INTENT_RE = re.compile(
     r"\b(?:create|make|set up|start)\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b"
@@ -335,7 +343,9 @@ _ASANA_CREATE_INTENT_RE = re.compile(
 def _asana_destructive_intent(text: str) -> str | None:
     """Return the Asana action tool to force ('asana_delete_task' /
     'asana_complete_task' / 'asana_create_task') for a clear imperative task action,
-    else None. F-23 Slice 2."""
+    else None. F-23 Slice 2. Conservative: interrogatives excluded, an explicit task
+    referent required, and the action verb must GOVERN the task (review MED #7). A miss
+    is safe -- the confirm interceptor + phantom guard still prevent a fabricated success."""
     t = (text or "").strip()
     if not t or _ASANA_INTENT_INTERROGATIVE_RE.search(t):
         return None
@@ -606,10 +616,23 @@ def _dispatch_qa(
     # entry is produced instead of a haiku-fabricated one (the delete-intent turn ran
     # on haiku live and fabricated the preview -- no tool_use, no pending).
     force_tool = _asana_destructive_intent(user_message) if user_id else None
-    # F-23 Slice 3: a bare affirmative that REACHED the model (the confirm interceptor
-    # above didn't fire -> no pending existed) broadens the phantom-write guard so a
-    # fabricated "Confirmed -- task deleted" (with no write sentinel) is corrected.
-    assume_confirm = bool(user_id) and _tool_dispatch.is_bare_affirmative(user_message)
+    # F-23 Slice 3: a bare affirmative broadens the phantom-write guard so a fabricated
+    # "Confirmed -- task deleted" (with no write sentinel) is corrected. Gated on NO
+    # pending write existing (review HIGH #3/#4, MED #5): if a pending exists and a bare
+    # affirmative still reached the model, it is a CALENDAR confirm (Asana/Shopify would
+    # have fired the interceptor) -- a real calendar write is coming, so broadening would
+    # clobber its legitimate success narration. With no pending, a bare affirmative that
+    # reached the model has nothing legitimate to confirm -> broaden is safe. (claude_client
+    # further gates broaden on "no tool ran this turn".)
+    assume_confirm = (
+        bool(user_id)
+        and _tool_dispatch.is_bare_affirmative(user_message)
+        and not (
+            _tool_dispatch.has_pending_asana_write(user_id, channel_name)
+            or _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
+            or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
+        )
+    )
     # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory/calendar/
     # Asana confirm for this (user, channel) means the next turn is very likely the
     # "yes" -- undetectable from message content -- so force Sonnet. A write flow is
