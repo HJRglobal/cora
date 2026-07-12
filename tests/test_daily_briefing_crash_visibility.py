@@ -103,3 +103,39 @@ def test_normal_return_code_not_masked(monkeypatch):
     monkeypatch.setattr(rdb, "_write_audit", lambda entries: None)
     monkeypatch.setattr(rdb, "_run", lambda args, mode: 2)
     assert rdb.main(["--dry-run"]) == 2
+
+
+# ── F-14a (2026-07-12): the per-user synthesis call is BOUNDED ────────────────
+def test_synthesize_bounds_the_anthropic_call(monkeypatch):
+    """0xC000013A was an external SIGKILL because a stalled, UNTIMED messages.create
+    ran past the task limit. The call must now carry a hard timeout so a stall fails
+    fast (the per-user try/except then fails soft + the budget check binds)."""
+    import types
+
+    captured = {}
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            captured["create_timeout"] = kwargs.get("timeout")
+            msg = types.SimpleNamespace()
+            block = types.SimpleNamespace(text="ok briefing")
+            msg.content = [block]
+            return msg
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_timeout"] = kwargs.get("timeout")
+            self.messages = _FakeMessages()
+
+    fake_anthropic = types.ModuleType("anthropic")
+    fake_anthropic.Anthropic = _FakeClient
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    rec = rdb.RoleRecord(slack_id="U1", name="Test User", role="ops", entity="FNDR")
+    monkeypatch.setattr(rdb, "_compose_sections", lambda r: "sections")
+    monkeypatch.setattr(rdb, "_query_user_chunks", lambda name, first: [])
+
+    out = rdb.build_user_briefing(rec, api_key="sk-test", today_str="2026-07-12")
+    assert out == "ok briefing"
+    assert captured["client_timeout"] == rdb._ANTHROPIC_TIMEOUT_S
+    assert captured["create_timeout"] == rdb._ANTHROPIC_TIMEOUT_S

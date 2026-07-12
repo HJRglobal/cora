@@ -88,6 +88,13 @@ _LOOKBACK_SECONDS  = 25 * 3600
 _MAX_CHUNKS        = 20    # per-user cap before sending to Haiku
 _MAX_CHUNK_CHARS   = 500   # truncate long chunks
 _HAIKU_MODEL       = "claude-haiku-4-5-20251001"
+# F-14a: the per-user synthesis call was UNTIMED, so a single stalled Anthropic
+# request ran to the task's 20-min ExecutionTimeLimit SIGKILL (LastRunResult
+# 0xC000013A) -- the between-user 18-min self-budget is only checked BETWEEN users,
+# so it never bound. A hard per-call timeout (well under the budget, above p99 for a
+# 600-token Haiku call) makes a stall fail fast; the per-user try/except then fails
+# that briefing soft and the loop continues + the budget check fires.
+_ANTHROPIC_TIMEOUT_S = 90.0
 
 # Drop tasks overdue by more than this many days from the brief's task feed
 # (N7 / Harrison #1): abandoned goal-tracking tasks ("Sales & Revenue Goals
@@ -449,11 +456,13 @@ def _synthesize(
     prompt = _build_briefing_prompt(rec, sections_text, context_text, today_str)
 
     import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
+    # F-14a: bound the call so a stall can't run to the task SIGKILL (see constant).
+    client = anthropic.Anthropic(api_key=api_key, timeout=_ANTHROPIC_TIMEOUT_S)
     resp = client.messages.create(
         model=_HAIKU_MODEL,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
+        timeout=_ANTHROPIC_TIMEOUT_S,
     )
     # WS-5: Haiku emits literal **bold** despite the prompt; this composer
     # egresses outside format_reply's conversational path, so normalize here --
