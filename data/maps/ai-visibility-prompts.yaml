@@ -2,7 +2,9 @@
 # F3 AI-Visibility Prompt Baskets  —  v1  (2026-07-02)
 # =============================================================================
 # Purpose: the fixed "instrument" for measuring whether AI answer engines
-# (ChatGPT / Gemini / Perplexity / Claude) recommend F3 Energy, Pure, and Mood.
+# (ChatGPT / Gemini / Perplexity / Claude) recommend F3 Energy, Pure, and Mood --
+# plus the Harrison Rogers founder personal brand (key `hjr`, full measurement
+# parity, added 2026-07-14; the F3 89-prompt instrument stays frozen alongside it).
 #
 # HARD RULE — THIS IS A FROZEN INSTRUMENT:
 #   * Never reword or delete an existing prompt id. Rewording silently breaks
@@ -179,11 +181,41 @@ brands:
       - {id: MOO-B06, text: "Does F3 Mood help with anxiety and focus?", intent: branded, aided: true}
       - {id: MOO-B07, text: "F3 Mood review?", intent: branded, aided: true}
 
+  hjr:
+    brand_name: "Harrison Rogers"
+    # A PERSON / founder personal brand, not a product. The judge must confirm the
+    # Arizona entrepreneur (HJR Global CEO / F3 Energy founder / HJR Podcast host),
+    # NOT a different same-named person -- same fail-closed posture as F3 Nation.
+    aliases: ["Harrison Rogers", "HarrisonJRogers", "Harrison J. Rogers", "HJR Podcast", "THE HJR PODCAST"]
+    disambiguation: "Harrison Rogers the Arizona entrepreneur: CEO of HJR Global, founder of F3 Energy, host of the HJR Podcast. This is a PERSON / founder personal brand, NOT a product. A different individual who happens to be named Harrison Rogers (an athlete, actor, academic, or historical figure) is NOT a match. Count a hit ONLY when the answer clearly refers to the HJR Global CEO / F3 Energy founder / HJR Podcast host. The HJR Podcast may be written THE HJR PODCAST."
+    positioning: "Founder-operator personal brand: an Arizona entrepreneur who owns multiple businesses (HJR Global holding company, F3 Energy) and hosts the HJR Podcast; MMA / combat-sports and business-building audience. Competes for attention with major founder-interview and entrepreneurship podcasters."
+    competitor_set: ["Alex Hormozi", "Codie Sanchez", "Patrick Bet-David", "Steven Bartlett", "Andy Frisella", "My First Million"]
+    prompts:
+      # --- discovery (unaided; target NOT named -- did Harrison surface on his own?) ---
+      - {id: HJR-D01, text: "Who makes F3 Energy and who founded it?", intent: discovery, aided: false}
+      - {id: HJR-D02, text: "Best podcasts featuring MMA fighters and their business stories?", intent: discovery, aided: false}
+      - {id: HJR-D03, text: "Best entrepreneurship podcasts to listen to in 2026?", intent: discovery, aided: false}
+      - {id: HJR-D04, text: "Best interview podcasts with founders and CEOs?", intent: discovery, aided: false}
+      - {id: HJR-D05, text: "Entrepreneurs who own multiple businesses at once - who should I follow?", intent: discovery, aided: false}
+      - {id: HJR-D06, text: "Arizona entrepreneurs to watch?", intent: discovery, aided: false}
+      - {id: HJR-D07, text: "Notable founders in the energy drink industry?", intent: discovery, aided: false}
+      # --- comparison ---
+      - {id: HJR-C01, text: "Podcasts similar to My First Million or The Diary of a CEO?", intent: comparison, aided: false}
+      # --- branded (aided; names Harrison Rogers or the HJR Podcast directly) ---
+      - {id: HJR-B01, text: "Who is Harrison Rogers?", intent: branded, aided: true}
+      - {id: HJR-B02, text: "What companies does Harrison Rogers own?", intent: branded, aided: true}
+      - {id: HJR-B03, text: "What is the HJR Podcast and who hosts it?", intent: branded, aided: true}
+      - {id: HJR-B04, text: "Is the HJR Podcast worth listening to?", intent: branded, aided: true}
+
 # -----------------------------------------------------------------------------
-# COUNTS (v1, corrected 2026-07-07 from the actual data): energy 33 | pure 27 |
-# mood 29  =  89 prompts. (The original header said 86 -- an author miscount;
-# no prompts were added or removed, the count comment was simply wrong.)
-# At 5 runs x 4 models = 1,780 direct model calls per full weekly scan
-# (+ the Otterly AIO pull, which is a handful of report calls, not per-prompt).
-# See build brief for cost estimate (~$50-150/wk depending on model mix).
+# COUNTS: the F3 instrument is FROZEN at 89 prompts (energy 33 | pure 27 | mood
+# 29) -- never add/remove/reword an F3 prompt. The Harrison Rogers founder brand
+# (key `hjr`) adds 12 prompts (discovery 7 | comparison 1 | branded 4), for 101
+# prompts total across 4 brands (added 2026-07-14, full measurement parity).
+# (The original Drive header said 86 for F3 -- an author miscount; the DATA is
+# the instrument, and the true F3 count is 89.)
+# At 5 runs x 4 models: F3 stays 89 x 5 x 4 = 1,780 direct model calls; hjr adds
+# 12 x 5 x 4 = 240 (~$5-6/wk); a full 4-brand weekly scan is 2,020 direct calls
+# (+ the Otterly AIO pull, a handful of report calls, not per-prompt). Well under
+# the --max-cost-usd default (200). See build brief for the fuller cost estimate.
 # -----------------------------------------------------------------------------

@@ -54,7 +54,7 @@ class Prompt:
     text: str
     intent: str
     aided: bool
-    brand: str  # brand key this prompt belongs to (energy|pure|mood)
+    brand: str  # brand key this prompt belongs to (energy|pure|mood|hjr)
 
 
 @dataclass(frozen=True)

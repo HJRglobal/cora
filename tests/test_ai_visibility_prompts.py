@@ -27,20 +27,22 @@ def test_real_basket_loads_and_counts():
         "claude_web",
     )
     assert b.cadence == "weekly"
-    assert b.brand_keys() == ("energy", "pure", "mood")
-    # NOTE: the frozen instrument actually holds 89 prompts (energy 33 / pure 27
-    # / mood 29). The Drive header's "86" was an author miscount; the DATA is the
-    # instrument, so we pin the true counts here.
-    assert b.total_prompts() == 89
+    assert b.brand_keys() == ("energy", "pure", "mood", "hjr")
+    # NOTE: the frozen F3 instrument holds 89 prompts (energy 33 / pure 27 / mood
+    # 29). The Drive header's "86" was an author miscount; the DATA is the
+    # instrument, so we pin the true counts here. The Harrison Rogers founder brand
+    # (key hjr) adds 12 (2026-07-14 full parity) -> 101 total across 4 brands.
+    assert b.total_prompts() == 101
     assert len(b.brand("energy").prompts) == 33
     assert len(b.brand("pure").prompts) == 27
     assert len(b.brand("mood").prompts) == 29
+    assert len(b.brand("hjr").prompts) == 12
 
 
 def test_real_basket_ids_globally_unique():
     b = pb.load_basket()
     ids = b.all_prompt_ids()
-    assert len(ids) == len(set(ids)) == 89
+    assert len(ids) == len(set(ids)) == 101
 
 
 def test_real_basket_every_prompt_has_valid_fields():
@@ -50,7 +52,7 @@ def test_real_basket_every_prompt_has_valid_fields():
         assert p.text and isinstance(p.text, str)
         assert p.intent in pb.KNOWN_INTENTS
         assert isinstance(p.aided, bool)
-        assert p.brand in ("energy", "pure", "mood")
+        assert p.brand in ("energy", "pure", "mood", "hjr")
 
 
 def test_real_basket_frozen_text_fidelity_em_dash_preserved():
@@ -74,6 +76,47 @@ def test_real_basket_brand_config():
     mood = b.brand("mood")
     assert "Recess" in mood.competitor_set
     assert "Magic Mind" in mood.competitor_set
+
+
+def test_real_basket_hjr_founder_brand_config():
+    """The Harrison Rogers founder personal brand (key hjr) -- full parity."""
+    b = pb.load_basket()
+    hjr = b.brand("hjr")
+    assert hjr.brand_name == "Harrison Rogers"
+    # aliases the classifier + Otterly report-matcher use
+    assert "Harrison Rogers" in hjr.aliases          # required for the Otterly report match
+    assert "HarrisonJRogers" in hjr.aliases
+    assert "Harrison J. Rogers" in hjr.aliases
+    assert "THE HJR PODCAST" in hjr.aliases
+    # fail-closed PERSON disambiguation (namesake must be excluded)
+    assert "NOT a match" in hjr.disambiguation
+    assert "PERSON" in hjr.disambiguation
+    # competitor set mirrors the Otterly report
+    for rival in ("Alex Hormozi", "Codie Sanchez", "Patrick Bet-David",
+                  "Steven Bartlett", "Andy Frisella", "My First Million"):
+        assert rival in hjr.competitor_set, rival
+    # 12 prompts; the shared founder question is a NEW HJR- id (ENG-B06 untouched)
+    assert len(hjr.prompts) == 12
+    by_id = {p.id: p for p in hjr.prompts}
+    assert "HJR-D01" in by_id
+    assert by_id["HJR-D01"].text == "Who makes F3 Energy and who founded it?"
+    assert by_id["HJR-D01"].aided is False   # target (Harrison) NOT named -> unaided
+    assert by_id["HJR-B01"].text == "Who is Harrison Rogers?"
+    assert by_id["HJR-B01"].aided is True
+
+
+def test_f3_instrument_untouched_by_hjr_addition():
+    """Adding hjr must not perturb the frozen F3 89-prompt instrument."""
+    b = pb.load_basket()
+    by_id = {p.id: p for p in b.all_prompts()}
+    # the shared founder prompt still lives in energy as ENG-B06, aided (F3 named)
+    assert by_id["ENG-B06"].text == "Who makes F3 Energy and who founded it?"
+    assert by_id["ENG-B06"].brand == "energy"
+    assert by_id["ENG-B06"].aided is True
+    # F3 counts unchanged
+    assert len(b.brand("energy").prompts) == 33
+    assert len(b.brand("pure").prompts) == 27
+    assert len(b.brand("mood").prompts) == 29
 
 
 def test_real_basket_aided_split_makes_sense():

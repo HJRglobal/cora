@@ -54,7 +54,7 @@ def test_dry_run_makes_zero_calls(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "ZERO API calls" in out
-    assert "89 prompts" in out  # the real (corrected) count
+    assert "101 prompts" in out  # 89 frozen F3 + 12 hjr (4-brand total)
 
 
 # --- planning ---
@@ -99,6 +99,39 @@ def test_full_scan_scores_and_completes(monkeypatch):
     # answers were stored for all 33 energy prompts
     rows = st.answers_for_scan(latest["energy"]["scan"]["id"], "energy")
     assert len(rows) == 33
+
+
+# --- 4th brand (Harrison Rogers) flows through identically ---
+def test_hjr_brand_scores_and_completes(monkeypatch):
+    m = _load_runner()
+
+    def fake_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt,
+                           text="Harrison Rogers, the HJR Global CEO and F3 Energy founder.",
+                           citations=["https://hjrglobal.com"], input_tokens=10,
+                           output_tokens=40, num_searches=1, cost_usd=0.01)
+
+    def fake_classify(brand, prompt, text, citations):
+        # correct-brand hit on branded prompts, miss elsewhere -> nonzero composite
+        hit = prompt.intent == "branded"
+        return Classification(mentioned=hit, is_correct_brand=hit,
+                              position=1 if hit else None,
+                              sentiment="positive" if hit else "neutral",
+                              competitors_mentioned=["Alex Hormozi"], cited_sources=citations)
+
+    args = m.parse_args(["--brand", "hjr", "--models", "perplexity_sonar", "--runs", "1",
+                         "--no-aio", "--no-verify-citations", "--no-post"])
+    rc = m.execute_scan(args, query_fn=fake_query, classify_fn=fake_classify,
+                        resolve_fn=lambda urls, **k: [])
+    assert rc == 0
+    latest = st.latest_scores()
+    assert "hjr" in latest
+    assert 0 < latest["hjr"]["composite"] <= 100
+    assert latest["hjr"]["scan"]["status"] == "completed"
+    # all 12 hjr prompts stored under brand='hjr'
+    rows = st.answers_for_scan(latest["hjr"]["scan"]["id"], "hjr")
+    assert len(rows) == 12
+    assert all(r["brand"] == "hjr" for r in rows)
 
 
 # --- cost cap hard stop ---
