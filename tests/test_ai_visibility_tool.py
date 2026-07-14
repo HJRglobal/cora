@@ -26,6 +26,8 @@ def test_tool_definition_shape():
     entry = next(t for t in td.TOOL_DEFINITIONS if t["name"] == "f3e_ai_visibility")
     assert entry["input_schema"]["properties"] == {}
     assert "AI visibility" in entry["description"] or "AI-visibility" in entry["description"]
+    # 4th brand parity: the founder personal brand is named so the model triggers on it
+    assert "Harrison Rogers" in entry["description"]
 
 
 def test_timeout_is_fast_tier():

@@ -72,6 +72,48 @@ def test_build_scorecard_empty():
     assert "no completed scan" in rpt.build_scorecard({})
 
 
+def _seed_hjr_scan():
+    """Seed a scan carrying a Harrison Rogers (hjr) score + a competitor gap."""
+    from cora.ai_visibility.classifier import Classification
+    sid = st.create_scan(basket_version=1, models=["perplexity_sonar"], runs_per_prompt=1,
+                         brands=["hjr"])
+    st.save_score(sid, BrandScore(
+        brand="hjr", composite=41.0, composite_direct_only=41.0,
+        presence=40, share_of_voice=28, position=33, sentiment=60,
+        unaided_presence=30.0))
+    # a competitor-only answer on a real hjr prompt -> a gap + a top rival
+    a = st.insert_answer(scan_id=sid, brand="hjr", prompt_id="HJR-D07", intent="discovery",
+                         aided=False, model="perplexity_sonar", run_index=0, raw_text="x",
+                         classification=Classification(mentioned=False, is_correct_brand=False,
+                                                       competitors_mentioned=["Alex Hormozi"]),
+                         cost_usd=0.0)
+    st.record_answer_mentions(scan_id=sid, answer_id=a, brand="hjr", brand_name="Harrison Rogers",
+                              model="perplexity_sonar",
+                              classification=Classification(mentioned=False,
+                                                            competitors_mentioned=["Alex Hormozi"]))
+    st.finish_scan(sid, status="completed", total_calls=1, total_cost_usd=0.1, aio_included=False)
+    return sid
+
+
+def test_scorecard_renders_hjr_fourth_brand():
+    sid = _seed_hjr_scan()
+    card = rpt.build_scorecard(st.scores_for_scan(sid))
+    assert "*Harrison Rogers* - 41/100" in card       # 4th brand block present
+    assert "top rivals:" in card and "Alex Hormozi" in card
+    assert "Competitors beat us on:" in card           # brand-neutral gap line unchanged
+    # the F3 card title is retained by Harrison's choice (personal brand rides the F3 lane)
+    assert "*F3 AI Visibility - weekly scan" in card
+
+
+def test_tool_summary_hjr_gap_wording_is_brand_aware():
+    sid = _seed_hjr_scan()
+    summary = rpt.get_tool_summary()
+    assert "Harrison Rogers: 41/100" in summary
+    # the gap line uses the founder brand's name, NOT "F3"
+    assert "but Harrison Rogers isn't" in summary
+    assert "but F3 isn't" not in summary
+
+
 @pytest.mark.parametrize("composite,expected", [
     (0.0, rpt._RED), (34.9, rpt._RED),
     (35.0, rpt._YELLOW), (59.9, rpt._YELLOW),

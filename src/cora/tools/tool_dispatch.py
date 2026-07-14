@@ -6337,13 +6337,15 @@ TOOL_DEFINITIONS = [
         "description": (
             "Fetch F3's AI-visibility scores -- how often ChatGPT / Perplexity / "
             "Gemini / Claude (and Google AI Overviews) recommend F3 Energy, Pure, and "
-            "Mood when people ask buyer-style questions. Read-only. Use this for "
-            "'@Cora what's our AI visibility score', 'are we showing up in AI search', "
-            "'AI visibility', 'do the AI engines recommend us', 'where do competitors "
-            "beat us in AI answers'. Returns each brand's 0-100 score, week-over-week "
-            "delta, unaided presence, share-of-voice, and the top prompts where a "
-            "competitor is named but F3 isn't. Present the tool output as-is; do NOT "
-            "answer from KB memory. Call in any F3E or FNDR channel. No inputs required."
+            "Mood (plus the Harrison Rogers founder personal brand) when people ask "
+            "buyer-style questions. Read-only. Use this for '@Cora what's our AI "
+            "visibility score', 'are we showing up in AI search', 'AI visibility', "
+            "'do the AI engines recommend us', 'where do competitors beat us in AI "
+            "answers', 'how does Harrison Rogers show up in AI answers'. Returns each "
+            "brand's 0-100 score, week-over-week delta, unaided presence, "
+            "share-of-voice, and the top prompts where a competitor is named but the "
+            "brand isn't. Present the tool output as-is; do NOT answer from KB memory. "
+            "Call in any F3E or FNDR channel. No inputs required."
         ),
         "input_schema": {
             "type": "object",

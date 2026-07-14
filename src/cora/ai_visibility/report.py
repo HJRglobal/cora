@@ -19,8 +19,13 @@ from .prompts import PromptBasketError, load_basket
 
 log = logging.getLogger(__name__)
 
-_BRAND_ORDER = ["energy", "pure", "mood"]
-_BRAND_LABEL = {"energy": "F3 Energy", "pure": "F3 Pure", "mood": "F3 Mood"}
+_BRAND_ORDER = ["energy", "pure", "mood", "hjr"]
+_BRAND_LABEL = {"energy": "F3 Energy", "pure": "F3 Pure", "mood": "F3 Mood",
+                "hjr": "Harrison Rogers"}
+# Short label used in the "competitor named but <X> isn't" gap line. The F3
+# beverage brands share "F3" (output byte-identical to pre-hjr); the founder
+# personal brand uses its own name. Unknown keys fall back to "F3".
+_BRAND_SHORT = {"energy": "F3", "pure": "F3", "mood": "F3", "hjr": "Harrison Rogers"}
 
 # Score card Slack channel: config value, never hardcoded at the call site.
 # Default = #f3-ai-visibility (C0BFXEJ1UJU). Override with AI_VISIBILITY_CHANNEL
@@ -89,7 +94,8 @@ def get_tool_summary() -> str:
         lines.append(line)
         gaps = top_gaps_text(s["scan"]["id"], bkey, pmap)
         if gaps:
-            lines.append("    where a competitor is named but F3 isn't: "
+            short = _BRAND_SHORT.get(bkey, "F3")
+            lines.append(f"    where a competitor is named but {short} isn't: "
                          + "; ".join(f'"{g}"' for g in gaps))
     if not aio_any:
         lines.append("(Google AI Overviews coverage was not available for this scan.)")
