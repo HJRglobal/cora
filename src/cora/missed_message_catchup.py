@@ -724,10 +724,11 @@ def _run_dispatch_capture(client, cand: Candidate, entity: str, is_founder: bool
 
     READ-ONLY reconstruction (D-051 remediation). For the duration of the _dispatch_qa
     call, in THIS process only:
-      * CORA_EVAL_MODE=1 -> tools_for_entity returns [] and dispatch() refuses, so NO
-        tool (read or write) executes. This is the critical guard: without it a
-        reconstructed confirm-shaped message ("yes") after a pre-outage proposal would
-        drive a real calendar invite / gmail draft / tracker write. Trade-off: drafts
+      * CORA_EVAL_MODE=1 -> tools_for_entity returns [], dispatch() refuses, AND the
+        F-23 confirm interceptor (try_confirm_pending_write) short-circuits, so NO tool
+        or staged-write executes. This is the critical guard: without it a reconstructed
+        confirm-shaped message ("yes") after a pre-outage proposal would drive a real
+        calendar invite / gmail draft / tracker write. Trade-off: drafts
         are KB/context-only -- a tool-backed answer (live finance, plate, calendar read)
         drafts as "couldn't access that", which Harrison sees on the card and can Skip.
       * active_thread_store.register + _try_cache_store -> no-ops (never register a stale

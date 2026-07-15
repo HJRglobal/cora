@@ -174,13 +174,11 @@ def main() -> int:
                   "connectivity is restored.")
         return 1
 
-    # Age-prune the (host-local) ledger so drafted-answer text at rest stays bounded.
-    try:
-        dropped_rows = mmc.prune_ledger()
-        if dropped_rows:
-            log.info("Pruned %d ledger rows older than 90d.", dropped_rows)
-    except Exception:  # noqa: BLE001
-        pass
+    # NOTE: the ledger is NOT auto-pruned here. mmc.prune_ledger() exists as a manual
+    # utility, but running it while the bot may concurrently append a terminal row could
+    # clobber that row and defeat the double-post guard (D-051 re-gate). The ledger is
+    # host-local and grows only a few rows per (rare) outage, so unbounded growth is not
+    # a practical concern; prune manually if it ever matters.
 
     # ── Enumerate + filter channels ───────────────────────────────────────────
     channels = mmc.list_catchup_channels(client)
@@ -242,6 +240,15 @@ def main() -> int:
                 )
                 if cand.status == "draft":
                     mmc.record_pending(cand, run_id)
+                else:
+                    # Non-actionable (decline/redirect/help/error/stale/would_draft):
+                    # record a non-terminal 'surfaced' marker so a re-run's already-seen
+                    # dedupe doesn't re-post a duplicate context-only card.
+                    mmc.record_row(cand.catchup_id, "surfaced", run_id=run_id,
+                                   channel_id=cand.channel_id, channel_name=cand.channel_name,
+                                   entity=cand.entity, tier=cand.tier, asker=cand.user_id,
+                                   event_ts=cand.event_ts, detection_tier=cand.detection_tier,
+                                   is_dm=cand.is_dm, note=cand.status)
                 posted += 1
             except Exception as exc:  # noqa: BLE001
                 log.warning("card post failed for %s: %s", cand.catchup_id, exc)

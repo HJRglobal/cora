@@ -689,6 +689,34 @@ def test_prune_ledger_drops_old_keeps_recent():
     assert remaining == {cid_new}
 
 
+def test_confirm_interceptor_short_circuits_in_eval_mode(monkeypatch):
+    # D-051 re-gate: the F-23 confirm interceptor is a real-write path that must be
+    # disabled under CORA_EVAL_MODE (the read-only capture guarantee). The gate is the
+    # first line, so it returns None WITHOUT even peeking the pending stores.
+    from cora.tools import tool_dispatch as td
+    monkeypatch.setenv("CORA_EVAL_MODE", "1")
+
+    def _boom(*a, **k):
+        raise AssertionError("pending stores must not be consulted in eval mode")
+
+    monkeypatch.setattr(td, "_peek_pending_asana", _boom)
+    monkeypatch.setattr(td, "_peek_pending_shopify", _boom)
+    monkeypatch.setattr(td, "_peek_pending_calendar", _boom)
+    out = td.try_confirm_pending_write(
+        slack_user_id="U1", channel_name="dm", entity="FNDR", message="yes",
+    )
+    assert out is None
+
+
+def test_surfaced_row_dedupes_but_is_not_terminal():
+    # Fix C: a non-draft 'surfaced' marker suppresses re-surfacing (already_seen) but is
+    # NOT terminal (nothing was posted to a channel).
+    cid = mmc.catchup_id("C1", "500.0")
+    mmc.record_row(cid, "surfaced", channel_id="C1", note="decline")
+    assert mmc.is_terminal(cid) is False
+    assert mmc.latest_disposition(cid) is not None  # already_seen would skip it
+
+
 def test_fetch_window_cap_hit_warns(monkeypatch, caplog):
     # F9: silent truncation of the oldest asks must surface a warning.
     monkeypatch.setattr(mmc.time, "sleep", lambda *a, **k: None)

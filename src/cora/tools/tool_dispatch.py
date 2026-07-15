@@ -3478,6 +3478,12 @@ def try_confirm_pending_write(
     thread-A pending -- the pending key is (user, channel), not per-thread. Mitigated by
     F-19 (a bare in-thread channel reply may not even reach the app); the exercisable
     surfaces today are DMs + @mention confirms. Thread anchoring is a follow-up."""
+    # Read-only harness / catch-up reconstruction (CORA_EVAL_MODE=1) must never fire a
+    # staged write. This matches the belt-and-braces gate in dispatch(): the confirm
+    # interceptor is a real-write path that does NOT route through dispatch(), so it
+    # needs its own gate (D-051 re-gate LOW). Harmless in the bot (never eval mode).
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return None
     if not slack_user_id:
         return None
     asana = _peek_pending_asana(slack_user_id, channel_name)
