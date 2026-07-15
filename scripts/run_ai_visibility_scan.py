@@ -56,13 +56,15 @@ _RESUME_STALE_HOURS = 24
 
 # PERSON brands: the Otterly Google-AI-Overviews slice counts brand-name mentions
 # with NO wrong-person disambiguation, unlike the 4 direct engines (each Haiku-judged
-# with fail-closed is_correct_brand). For a PERSON brand a namesake would silently
-# inflate the merged headline composite, so we do NOT merge the un-disambiguatable
-# AIO leg for these brands -- they are scored on the 4 disambiguated direct engines
-# only (D-051 review, 2026-07-14). The composite FORMULA is identical to the F3
-# brands; only the AIO 5th-engine merge is gated. Reversible: drop a key here once
-# the corresponding Otterly report's brand-variation config excludes namesakes.
-_PERSON_BRANDS: frozenset[str] = frozenset({"hjr"})
+# with fail-closed is_correct_brand). A brand listed here is scored on the 4
+# disambiguated direct engines ONLY (its AIO 5th-engine merge is gated) so a namesake
+# cannot inflate its headline composite. The composite FORMULA is identical either way.
+#
+# EMPTY as of 2026-07-14: Harrison ACCEPTED the namesake-inflation risk for `hjr` and
+# chose full 5-engine parity with the F3 brands (AIO merged, D-080). The mechanism is
+# kept in place for any FUTURE person brand. Revisit if a brand's AIO presence ever
+# looks implausible vs its judged direct-engine presence -- add its key back here.
+_PERSON_BRANDS: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------

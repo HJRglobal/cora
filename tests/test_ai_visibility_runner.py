@@ -250,9 +250,11 @@ def test_aio_path_merges_fifth_engine(monkeypatch):
     assert latest["scan"]["aio_included"] == 1
 
 
-def test_person_brand_excludes_aio_from_headline(monkeypatch):
-    """hjr (person brand): the un-disambiguatable Otterly AIO leg must NOT be merged
-    into the headline; hjr is scored on the 4 direct (Haiku-judged) engines only."""
+def test_person_brand_hjr_includes_aio_merge(monkeypatch):
+    """hjr scores on all 5 engines (Harrison accepted the namesake risk 2026-07-14,
+    D-080): the Otterly AIO slice IS fetched + merged into the headline, at full
+    parity with the F3 brands. `_PERSON_BRANDS` is now empty; the gate mechanism
+    remains for any future person brand."""
     m = _load_runner()
     monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")  # else _pull_aio short-circuits entirely
     aio_calls = []
@@ -267,11 +269,11 @@ def test_person_brand_excludes_aio_from_headline(monkeypatch):
 
     def fake_aio(bkey, aliases, *, start_date, end_date, country="us", workspace_id=None,
                  engine=None):
-        aio_calls.append(bkey)  # MUST NOT be called for a person brand
+        aio_calls.append(bkey)  # now SHOULD be called for hjr (gate off)
         return AioBrandSlice(brand_key=bkey, report_id="r", report_title="t", available=True,
-                             presence=90.0, share_of_voice=90.0, average_rank=1.0,
-                             sentiment={"positive": 5, "neutral": 0, "negative": 0},
-                             competitor_mentions={}, citations=[])
+                             presence=40.0, share_of_voice=30.0, average_rank=2.0,
+                             sentiment={"positive": 3, "neutral": 1, "negative": 0},
+                             competitor_mentions={"Alex Hormozi": 10}, citations=[])
 
     args = m.parse_args(["--brand", "hjr", "--models", "perplexity_sonar", "--runs", "1",
                          "--no-verify-citations", "--no-post"])  # AIO left ON
@@ -279,9 +281,45 @@ def test_person_brand_excludes_aio_from_headline(monkeypatch):
                         resolve_fn=lambda urls, **k: [], aio_fn=fake_aio)
     assert rc == 0
     latest = st.latest_scores()["hjr"]
-    assert latest["aio_composite"] is None                      # AIO NOT merged for the person
-    assert latest["composite"] == latest["composite_direct_only"]  # direct engines only
-    assert aio_calls == []                                       # Otterly not even fetched for hjr
+    assert latest["aio_composite"] is not None                     # AIO merged for hjr
+    assert latest["composite"] != latest["composite_direct_only"]  # 5th engine shifted it
+    assert aio_calls == ["hjr"]                                    # Otterly fetched for hjr
+    assert latest["scan"]["aio_included"] == 1
+
+
+def test_hjr_aio_failsoft_thin_slice_does_not_zero_or_crash(monkeypatch):
+    """The Otterly 'Harrison Rogers' report was created 7/13 and may be thin at
+    first. A missing/unavailable AIO slice must fail SOFT: hjr still completes and
+    scores on the direct engines (no crash, no false 0, aio_composite None)."""
+    m = _load_runner()
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")
+
+    def fake_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="Harrison Rogers.", citations=[],
+                           cost_usd=0.001)
+
+    def fake_classify(brand, prompt, text, citations):
+        # hits on branded prompts -> a nonzero direct composite
+        hit = prompt.intent == "branded"
+        return Classification(mentioned=hit, is_correct_brand=hit,
+                              position=1 if hit else None,
+                              sentiment="positive" if hit else "neutral")
+
+    def thin_aio(bkey, aliases, *, start_date, end_date, country="us", workspace_id=None,
+                 engine=None):
+        # report exists but has no data yet -> unavailable slice (fail-soft path)
+        return AioBrandSlice(brand_key=bkey, available=False, error="no AIO data yet")
+
+    args = m.parse_args(["--brand", "hjr", "--models", "perplexity_sonar", "--runs", "1",
+                         "--no-verify-citations", "--no-post"])  # AIO on
+    rc = m.execute_scan(args, query_fn=fake_query, classify_fn=fake_classify,
+                        resolve_fn=lambda urls, **k: [], aio_fn=thin_aio)
+    assert rc == 0
+    latest = st.latest_scores()["hjr"]
+    assert latest["scan"]["status"] == "completed"
+    assert latest["composite"] > 0                                 # NOT falsely zeroed
+    assert latest["aio_composite"] is None                         # thin AIO simply not merged
+    assert latest["composite"] == latest["composite_direct_only"]  # direct engines carry it
     assert latest["scan"]["aio_included"] == 0
 
 
