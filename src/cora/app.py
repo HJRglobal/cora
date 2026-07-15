@@ -1,5 +1,6 @@
 """Bolt app and event handlers."""
 
+import json
 import logging
 import re
 import time
@@ -23,6 +24,7 @@ from .entity_router import route
 from . import feedback_log
 from . import help_responder
 from . import knowledge_review
+from . import missed_message_catchup as missed_catchup
 from . import intent_classifier as ic
 from . import knowledge_gaps
 from . import gap_detection
@@ -2474,6 +2476,137 @@ def handle_knowledge_approve(ack, body, client) -> None:
 def handle_knowledge_dismiss(ack, body, client) -> None:
     ack()
     _handle_knowledge_one_tap(body, client, approve=False)
+
+
+# ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
+# Mirrors the knowledge one-tap contract: ack() immediately, then delegate; ALL
+# correctness (Harrison gate, idempotency, apply-then-record, re-guard-at-post)
+# lives in missed_message_catchup.process_catchup_action. The emoji fallback does
+# NOT apply here (there is no scheduled correlator for catch-up), so these buttons
+# require Slack Interactivity to be ON; a card with no working buttons is harmless
+# (it just cannot be actioned) -- nothing auto-posts either way.
+
+def _handle_catchup_one_tap(body: dict, client, *, action: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        cid = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        outcome, msg = missed_catchup.process_catchup_action(
+            cid, actor_id, client, action=action,
+        )
+
+        if outcome == "not_authorized":
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # Update the DM card in place: keep the item text, append the outcome, drop
+        # the buttons so it can't be re-tapped.
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("catchup one-tap: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("catchup one-tap handler error (non-fatal)", exc_info=True)
+
+
+@app.action(missed_catchup.ACTION_SEND)
+def handle_catchup_send(ack, body, client) -> None:
+    ack()
+    _handle_catchup_one_tap(body, client, action="send")
+
+
+@app.action(missed_catchup.ACTION_SKIP)
+def handle_catchup_skip(ack, body, client) -> None:
+    ack()
+    _handle_catchup_one_tap(body, client, action="skip")
+
+
+@app.action(missed_catchup.ACTION_EDIT)
+def handle_catchup_edit(ack, body, client) -> None:
+    """Open a modal prefilled with the draft so Harrison can edit before sending."""
+    ack()
+    try:
+        actions = body.get("actions") or []
+        cid = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+        trigger_id = body.get("trigger_id", "")
+
+        if actor_id != missed_catchup.HARRISON_ID:
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=actor_id,
+                    text="Only Harrison can edit catch-up replies.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        row = missed_catchup.latest_disposition(cid)
+        if not row or row.get("disposition") != "pending":
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=actor_id,
+                    text="That catch-up item is no longer editable.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        view = missed_catchup.edit_modal_view(
+            cid, channel_id, message_ts, row.get("draft_text", ""),
+        )
+        client.views_open(trigger_id=trigger_id, view=view)
+    except Exception:  # noqa: BLE001
+        log.warning("catchup edit-modal open failed (non-fatal)", exc_info=True)
+
+
+@app.view(missed_catchup.VIEW_EDIT_SUBMIT)
+def handle_catchup_edit_submit(ack, body, client, view) -> None:
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        cid = meta.get("catchup_id", "")
+        dm_channel = meta.get("dm_channel", "")
+        dm_ts = meta.get("dm_ts", "")
+        actor_id = (body.get("user") or {}).get("id", "")
+        state = (view.get("state") or {}).get("values") or {}
+        edited = (
+            (state.get("catchup_edit_block") or {})
+            .get("catchup_edit_input", {})
+            .get("value", "")
+        ) or ""
+
+        outcome, msg = missed_catchup.process_catchup_action(
+            cid, actor_id, client, action="send", edited_text=edited,
+        )
+
+        # Rewrite the original DM card to reflect the outcome (best-effort).
+        if dm_channel and dm_ts and outcome != "not_authorized":
+            try:
+                client.chat_update(
+                    channel=dm_channel, ts=dm_ts, text=msg,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        log.warning("catchup edit-submit handler error (non-fatal)", exc_info=True)
 
 
 @app.event("channel_created")
