@@ -54,6 +54,16 @@ log = logging.getLogger("ai_visibility_scan")
 _STATE_PATH = _REPO_ROOT / "data" / "state" / "ai-visibility-scan-state.json"
 _RESUME_STALE_HOURS = 24
 
+# PERSON brands: the Otterly Google-AI-Overviews slice counts brand-name mentions
+# with NO wrong-person disambiguation, unlike the 4 direct engines (each Haiku-judged
+# with fail-closed is_correct_brand). For a PERSON brand a namesake would silently
+# inflate the merged headline composite, so we do NOT merge the un-disambiguatable
+# AIO leg for these brands -- they are scored on the 4 disambiguated direct engines
+# only (D-051 review, 2026-07-14). The composite FORMULA is identical to the F3
+# brands; only the AIO 5th-engine merge is gated. Reversible: drop a key here once
+# the corresponding Otterly report's brand-variation config excludes namesakes.
+_PERSON_BRANDS: frozenset[str] = frozenset({"hjr"})
+
 
 # ---------------------------------------------------------------------------
 # Planning
@@ -315,7 +325,7 @@ def execute_scan(args, *, query_fn=None, classify_fn=None, resolve_fn=None, aio_
     # Work units = every (brand, prompt, model, run) not already done. The
     # per-provider concurrency caps live in ai_search's semaphores; the runner
     # fans these out concurrently (bounded window) so a full weekly scan fits
-    # its time budget instead of running ~1780 calls serially.
+    # its time budget instead of running ~2020 calls serially (full 4-brand scan).
     units = [(bkey, prompt, model, ri)
              for (bkey, prompt, model) in items
              for ri in range(runs)
@@ -360,6 +370,14 @@ def _pull_aio(brands, basket, args, aio_fn, scan_id) -> dict:
     start = end - timedelta(days=7)
     out: dict = {}
     for bkey in brands:
+        if bkey in _PERSON_BRANDS:
+            # Otterly's aggregate brand-coverage cannot namesake-disambiguate a
+            # person; scoring a person brand on the un-disambiguated AIO leg would
+            # let a same-named individual inflate the headline. Score on the 4
+            # disambiguated direct engines only (see _PERSON_BRANDS).
+            log.info("AIO skipped for person brand %s (Otterly cannot namesake-disambiguate "
+                     "a person; scored on the 4 disambiguated direct engines only)", bkey)
+            continue
         brand = basket.brand(bkey)
         slc = aio_fn(bkey, brand.aliases, start_date=start.isoformat(),
                      end_date=end.isoformat(), country=args.country)
@@ -428,7 +446,8 @@ def _maybe_post_card(scan_id: int, args) -> None:
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--brand", default="", help="comma-separated brand keys (energy,pure,mood)")
+    ap.add_argument("--brand", default="",
+                    help="comma-separated brand keys (energy,pure,mood,hjr); default = all configured brands")
     ap.add_argument("--models", default="", help="comma-separated model ids")
     ap.add_argument("--runs", type=int, default=0, help="override runs_per_prompt")
     ap.add_argument("--max-cost-usd", type=float, default=200.0, help="hard grounded-search spend cap")

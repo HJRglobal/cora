@@ -164,3 +164,18 @@ def test_build_prompt_includes_disambiguation_and_competitors():
     assert "F3 Nation" in p  # disambiguation carried in
     assert "Celsius" in p
     assert "best functional energy drink" in p
+
+
+def test_judge_scaffolding_is_brand_or_person_agnostic():
+    """The person brand hjr must render a coherent judge prompt (no beverage lock)."""
+    from cora.ai_visibility.prompts import load_basket
+    hjr = load_basket().brand("hjr")
+    prompt = clf.build_prompt(hjr, PROMPT, "Harrison Rogers founded F3 Energy.")
+    # scaffolding is target-agnostic, not beverage-locked
+    assert "a brand or a person" in prompt
+    assert "beverage brand described" not in prompt  # old beverage-locked wording gone
+    # the person disambiguation (namesake exclusion) is carried into the judge prompt
+    assert "PERSON" in prompt
+    assert "NOT a match" in prompt
+    # system prompt is likewise target-agnostic
+    assert "brand OR a person" in clf._SYSTEM

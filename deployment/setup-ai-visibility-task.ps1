@@ -1,8 +1,9 @@
 # Setup Windows Scheduled Task: Cora AI-Visibility weekly scan, Monday 10:15am AZ.
 #
 # Runs the frozen prompt basket across the grounded AI-search engines + the
-# Otterly Google-AI-Overviews slice, scores F3 Energy / Pure / Mood 0-100, and
-# posts the weekly score card to #f3-ai-visibility. Mon 10:15 AZ is outside the
+# Otterly Google-AI-Overviews slice, scores all configured brands 0-100 (F3
+# Energy / Pure / Mood + the Harrison Rogers founder brand), and posts the weekly
+# score card to #f3-ai-visibility. Mon 10:15 AZ is outside the
 # crowded 03:00-09:00 sync window and does not collide with the Mon 10:30 finance
 # receipt digest. The script self-bounds on wall-clock (--time-budget-min, default
 # 100); the task ExecutionTimeLimit (2h) is only the backstop.
@@ -63,7 +64,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask `
     -TaskName $TaskName `
-    -Description "Cora AI-Visibility weekly scan: score F3 Energy/Pure/Mood 0-100 across AI search engines + Google AI Overviews, post the card to #f3-ai-visibility" `
+    -Description "Cora AI-Visibility weekly scan: score all configured brands 0-100 across AI search engines + Google AI Overviews, post the card to #f3-ai-visibility" `
     -Action $action `
     -Trigger $trigger `
     -Principal $principal `

@@ -250,6 +250,41 @@ def test_aio_path_merges_fifth_engine(monkeypatch):
     assert latest["scan"]["aio_included"] == 1
 
 
+def test_person_brand_excludes_aio_from_headline(monkeypatch):
+    """hjr (person brand): the un-disambiguatable Otterly AIO leg must NOT be merged
+    into the headline; hjr is scored on the 4 direct (Haiku-judged) engines only."""
+    m = _load_runner()
+    monkeypatch.setenv("OTTERLY_API_KEY", "otk-test")  # else _pull_aio short-circuits entirely
+    aio_calls = []
+
+    def fake_query(model, prompt):
+        return QueryResult(model=model, prompt=prompt, text="Harrison Rogers.", citations=[],
+                           cost_usd=0.001)
+
+    def fake_classify(brand, prompt, text, citations):
+        return Classification(mentioned=True, is_correct_brand=True, position=1,
+                              sentiment="positive")
+
+    def fake_aio(bkey, aliases, *, start_date, end_date, country="us", workspace_id=None,
+                 engine=None):
+        aio_calls.append(bkey)  # MUST NOT be called for a person brand
+        return AioBrandSlice(brand_key=bkey, report_id="r", report_title="t", available=True,
+                             presence=90.0, share_of_voice=90.0, average_rank=1.0,
+                             sentiment={"positive": 5, "neutral": 0, "negative": 0},
+                             competitor_mentions={}, citations=[])
+
+    args = m.parse_args(["--brand", "hjr", "--models", "perplexity_sonar", "--runs", "1",
+                         "--no-verify-citations", "--no-post"])  # AIO left ON
+    rc = m.execute_scan(args, query_fn=fake_query, classify_fn=fake_classify,
+                        resolve_fn=lambda urls, **k: [], aio_fn=fake_aio)
+    assert rc == 0
+    latest = st.latest_scores()["hjr"]
+    assert latest["aio_composite"] is None                      # AIO NOT merged for the person
+    assert latest["composite"] == latest["composite_direct_only"]  # direct engines only
+    assert aio_calls == []                                       # Otterly not even fetched for hjr
+    assert latest["scan"]["aio_included"] == 0
+
+
 def test_disambiguation_not_counted_at_integration(monkeypatch):
     """A namesake (mentioned=True, is_correct_brand=False) reaches the DB but
     _score_and_save's is_hit derivation keeps presence at 0."""

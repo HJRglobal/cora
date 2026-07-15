@@ -114,6 +114,26 @@ def test_tool_summary_hjr_gap_wording_is_brand_aware():
     assert "but F3 isn't" not in summary
 
 
+def test_tool_summary_f3_gap_wording_unchanged():
+    """The F3 brands keep the pre-hjr 'but F3 isn't' gap wording (byte-identical)."""
+    _seed_scan()  # energy scan with an ENG-D02 competitor gap
+    summary = rpt.get_tool_summary()
+    assert "F3 Energy: 62/100" in summary
+    assert "where a competitor is named but F3 isn't:" in summary
+
+
+def test_brand_dicts_cover_every_basket_brand():
+    """Guard against a future basket brand being silently omitted (order) or
+    KeyError'd (label): the three hand-maintained report dicts must cover every
+    brand key the basket declares."""
+    from cora.ai_visibility.prompts import load_basket
+    keys = set(load_basket().brand_keys())
+    assert set(rpt._BRAND_ORDER) == keys
+    for k in keys:
+        assert k in rpt._BRAND_LABEL, k       # direct-indexed in build_scorecard/get_tool_summary
+        assert k in rpt._BRAND_SHORT, k       # gap-line short label
+
+
 @pytest.mark.parametrize("composite,expected", [
     (0.0, rpt._RED), (34.9, rpt._RED),
     (35.0, rpt._YELLOW), (59.9, rpt._YELLOW),

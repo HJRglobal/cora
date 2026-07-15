@@ -40,17 +40,18 @@ _HAIKU_MODEL = "claude-haiku-4-5-20251001"  # pinned snapshot (deterministic jud
 _VALID_SENTIMENT = frozenset({"positive", "neutral", "negative", "mixed"})
 
 _SYSTEM = (
-    "You are a precise brand-mention classifier for AI answer engines. You judge "
-    "whether a specific beverage brand was recommended in an AI-generated answer. "
-    "You never confuse the brand with same-named entities (namesakes). You reply "
-    "with ONLY a single JSON object, no prose, no code fence."
+    "You are a precise mention classifier for AI answer engines. You judge whether "
+    "a specific target (a brand OR a person) was recommended or referenced in an "
+    "AI-generated answer. You never confuse the target with same-named entities "
+    "(namesakes) -- including a different person who happens to share the name. You "
+    "reply with ONLY a single JSON object, no prose, no code fence."
 )
 
-_PROMPT_TEMPLATE = """Judge whether the TARGET BRAND is recommended in the AI ANSWER below.
+_PROMPT_TEMPLATE = """Judge whether the TARGET (a brand or a person) is recommended in the AI ANSWER below.
 
-TARGET BRAND: {brand_name}
+TARGET: {brand_name}
 Known aliases (how it may be written): {aliases}
-Disambiguation (what it IS and is NOT): {disambiguation}
+Disambiguation (what/who it IS and is NOT): {disambiguation}
 Its competitor set (only these count as competitors): {competitors}
 
 THE QUESTION THAT WAS ASKED:
@@ -63,12 +64,15 @@ THE AI ANSWER TO JUDGE:
 
 Return ONLY this JSON object (no code fence, no commentary):
 {{
-  "mentioned": <true if the target brand -- by any alias, or unambiguously the same
-    beverage -- is referenced at all in the answer; false otherwise. A bare "F3"
-    that clearly refers to something else is NOT a mention>,
-  "is_correct_brand": <true ONLY if the reference is the F3 beverage brand described
-    in the disambiguation. If it refers to a namesake (e.g. F3 Nation fitness, Formula
-    3 racing, a generic 'pure' product, a mood-tracking app), set false>,
+  "mentioned": <true if the target -- by any alias, or unambiguously the same
+    brand/person -- is referenced at all in the answer; false otherwise. A bare "F3"
+    (or a bare first/last name) that clearly refers to something/someone else is NOT
+    a mention>,
+  "is_correct_brand": <true ONLY if the reference is the specific target described in
+    the Disambiguation above (the target brand or person). If it refers to a namesake
+    or a different same-named entity (e.g. F3 Nation fitness, Formula 3 racing, a
+    generic 'pure' product, a mood-tracking app, or a different person who shares the
+    name), set false>,
   "position": <1 if the target brand is the first / most prominently recommended item,
     2 if second, 3 if third, a higher integer if lower, or null if not mentioned>,
   "sentiment": "<positive|neutral|negative|mixed toward the target brand; neutral if merely listed; neutral if not mentioned>",
