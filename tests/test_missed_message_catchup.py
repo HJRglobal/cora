@@ -12,6 +12,7 @@ Harrison-gated one-tap processor (skip/send/edit + idempotency + non-Harrison re
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -548,3 +549,161 @@ def test_preface_only_on_nontrivial():
 def _epoch(iso: str) -> float:
     from datetime import datetime as _dt
     return _dt.strptime(iso, "%Y-%m-%dT%H:%M:%S").astimezone().timestamp()
+
+
+# ── D-051 remediation regressions ────────────────────────────────────────────────
+
+def test_is_cora_only_matches_own_bot_user_id():
+    # F6: a FOREIGN bot (bot_id present, different user) must NOT read as Cora.
+    assert mmc._is_cora({"bot_id": "B1", "user": "UOTHERBOT"}, BOT) is False
+    assert mmc._is_cora({"bot_id": "B1", "user": BOT}, BOT) is True
+    assert mmc._is_cora({"user": BOT}, BOT) is True
+    assert mmc._is_cora({"bot_id": "B1"}, BOT) is False
+
+
+def test_foreign_bot_reply_does_not_suppress_a_real_miss(monkeypatch):
+    # F6: a Make.com/Tag reply after the ask must not count as "Cora answered".
+    monkeypatch.setattr(mmc.time, "sleep", lambda *a, **k: None)
+    msgs = [{"user": ALICE, "text": f"<@{BOT}> status?", "ts": "500.0"}]
+    replies = msgs + [{"bot_id": "BMAKE", "user": "UMAKEBOT", "text": "feed post", "ts": "700.0"}]
+    client = _client_for(msgs, replies=replies)
+    chans = [{"id": "C1", "name": "f3e-sales", "is_dm": False}]
+    cands = mmc.find_missed_messages(client, chans, 100.0, 1000.0, bot_id=BOT, now=800.0)
+    assert len(cands) == 1  # NOT dropped -- the foreign bot is not Cora
+
+
+def test_capture_is_read_only_eval_mode_and_writers_suppressed(monkeypatch):
+    # F1 + F12: during capture, tools are disabled (CORA_EVAL_MODE=1) and the shared
+    # gap/cache/thread writers are no-ops; all restored afterward.
+    _pass_all_guards(monkeypatch)
+    import cora.app as app_mod
+    seen = {}
+
+    def fake_dispatch(**kw):
+        seen["eval"] = os.environ.get("CORA_EVAL_MODE")
+        seen["register_is_noop"] = app_mod.active_thread_store.register("c", "t") is None
+        seen["gap_is_noop"] = app_mod.gap_detection.maybe_log_gap() is None
+        seen["klog_is_noop"] = app_mod.knowledge_gaps.log_gap() is None
+        seen["uft_is_noop"] = app_mod.uft.log_knowledge_gap() is None
+        kw["say"](text="answer from KB", thread_ts=kw["reply_thread_ts"])
+
+    monkeypatch.setattr(app_mod, "_dispatch_qa", fake_dispatch)
+    monkeypatch.setattr(app_mod, "_fetch_thread_history", lambda *a, **k: [])
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+
+    cand = mmc.generate_draft(MagicMock(), _channel_cand())
+    assert cand.status == "draft" and cand.draft_text == "answer from KB"
+    assert seen["eval"] == "1"                       # tools disabled during capture
+    assert seen["register_is_noop"] and seen["gap_is_noop"]
+    assert seen["klog_is_noop"] and seen["uft_is_noop"]
+    assert os.environ.get("CORA_EVAL_MODE") is None   # restored (was unset)
+
+
+def test_pipeline_error_becomes_error_status_not_a_sendable_draft(monkeypatch):
+    # F8: a swallowed ClaudeClientError apology must NOT become a status=draft card.
+    _pass_all_guards(monkeypatch)
+    import cora.app as app_mod
+
+    def fake_dispatch(**kw):
+        # Emulate _dispatch_qa's ClaudeClientError branch: it posts user_facing_message.
+        msg = app_mod.user_facing_message(RuntimeError("boom"))
+        kw["say"](text=msg, thread_ts=kw["reply_thread_ts"])
+
+    monkeypatch.setattr(app_mod, "_dispatch_qa", fake_dispatch)
+    monkeypatch.setattr(app_mod, "_fetch_thread_history", lambda *a, **k: [])
+    cand = mmc.generate_draft(MagicMock(), _channel_cand())
+    assert cand.status == "error"
+    assert cand.draft_text == ""
+
+
+def test_is_terminal_is_sticky_and_record_pending_refuses(monkeypatch):
+    # F4: a pending row appended AFTER a terminal row must not re-arm the item.
+    cid = mmc.catchup_id("C1", "500.0")
+    mmc.record_row(cid, "pending", channel_id="C1", draft_text="d")
+    mmc.record_row(cid, "sent", posted_ts="9.9")
+    mmc.record_row(cid, "pending", channel_id="C1", draft_text="d2")  # stray re-arm
+    assert mmc.is_terminal(cid) is True  # sticky: any terminal row wins
+    cand = _channel_cand()
+    cand.status = "draft"
+    cand.draft_text = "x"
+    assert mmc.record_pending(cand, "run-2") is False  # refuses to re-arm
+
+
+def test_detect_skips_already_pending(monkeypatch):
+    # F5: re-running before actioning must not re-surface a still-pending card.
+    monkeypatch.setattr(mmc.time, "sleep", lambda *a, **k: None)
+    msgs = [{"user": ALICE, "text": f"<@{BOT}> q?", "ts": "500.0"}]
+    client = _client_for(msgs, replies=msgs)
+    chans = [{"id": "C1", "name": "f3e-sales", "is_dm": False}]
+    mmc.record_row(mmc.catchup_id("C1", "500.0"), "pending", channel_id="C1", draft_text="d")
+    cands = mmc.find_missed_messages(client, chans, 100.0, 1000.0, bot_id=BOT, now=600.0)
+    assert cands == []
+
+
+def test_silent_channel_is_skipped(monkeypatch):
+    # F2: a reconstructed ask in a silent feed channel is never a postable candidate.
+    monkeypatch.setattr(mmc.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(mmc.entity_router, "is_silent_channel", lambda name: name == "asana-feed")
+    msgs = [{"user": ALICE, "text": f"<@{BOT}> hi", "ts": "500.0"}]
+    client = _client_for(msgs, replies=msgs)
+    chans = [{"id": "C9", "name": "asana-feed", "is_dm": False}]
+    assert mmc.find_missed_messages(client, chans, 100.0, 1000.0, bot_id=BOT, now=600.0) == []
+
+
+def test_derive_window_prefers_most_recent_gap(tmp_path):
+    # F10: an older, larger gap must not outrank the recent outage.
+    lines = [
+        "2026-07-15T10:00:00 INFO [T] cora.main: heartbeat alive uptime_s=60",
+        "2026-07-15T10:01:00 INFO [T] cora.main: heartbeat alive uptime_s=120",
+        # OLD big gap (3h) ...
+        "2026-07-15T13:01:00 INFO [T] cora.main: heartbeat alive uptime_s=60",
+        "2026-07-15T20:00:00 INFO [T] cora.main: heartbeat alive uptime_s=60",
+        # RECENT smaller-but-qualifying gap (24 min) ...
+        "2026-07-15T20:24:00 INFO [MainThread] cora.main: Cora starting up",
+        "2026-07-15T20:25:00 INFO [T] cora.main: heartbeat alive uptime_s=60",
+    ]
+    _mk_log(tmp_path, "cora-2026-07-15.log", lines)
+    win = mmc.derive_window(logs_dir=tmp_path, now=_epoch("2026-07-15T20:30:00"), min_gap_minutes=6.0)
+    assert win is not None
+    oldest, latest = win
+    assert abs(oldest - _epoch("2026-07-15T20:00:00")) < 2   # recent gap, not the 3h one
+    assert abs(latest - _epoch("2026-07-15T20:24:00")) < 2
+
+
+def test_prune_ledger_drops_old_keeps_recent():
+    cid_old = "C1:100.0"
+    cid_new = "C1:200.0"
+    now = 1_000_000_000.0
+    # record_row stamps ts=time.time(); write explicit rows instead for determinism.
+    path = mmc._ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    rows = [
+        {"catchup_id": cid_old, "disposition": "sent", "ts": now - 200 * 86400},
+        {"catchup_id": cid_new, "disposition": "pending", "ts": now - 1 * 86400},
+    ]
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    dropped = mmc.prune_ledger(max_age_days=90.0, now=now)
+    assert dropped == 1
+    remaining = {r["catchup_id"] for r in mmc._iter_ledger_rows(path)}
+    assert remaining == {cid_new}
+
+
+def test_fetch_window_cap_hit_warns(monkeypatch, caplog):
+    # F9: silent truncation of the oldest asks must surface a warning.
+    monkeypatch.setattr(mmc.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(mmc, "_MAX_MESSAGES_PER_CHANNEL", 2)
+    client = MagicMock()
+    client.conversations_history.return_value = {
+        "messages": [
+            {"user": "U1", "text": "a", "ts": "1"},
+            {"user": "U1", "text": "b", "ts": "2"},
+            {"user": "U1", "text": "c", "ts": "3"},
+        ],
+        "has_more": True, "response_metadata": {"next_cursor": "cur"},
+    }
+    import logging as _log
+    with caplog.at_level(_log.WARNING):
+        msgs = mmc.fetch_window_messages(client, "C1", 0.0, 10.0, max_messages=2)
+    assert len(msgs) >= 2
+    assert any("window cap" in r.message for r in caplog.records)

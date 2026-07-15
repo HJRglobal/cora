@@ -18,11 +18,14 @@ Architecture notes (VERIFY-FIRST reconciled against live main, 2026-07-15):
     _dispatch_qa. So a wrapper MUST replicate the handler guard sequence
     (user_access -> sibling_guard -> cross_entity_guard, plus help intent) BEFORE
     calling _dispatch_qa, or those firewalls are bypassed. We do exactly that.
-  * active_thread_store (data/active_threads.db) and the semantic cache
-    (data/cora_kb.db) are SHARED persisted stores. Draft generation SUPPRESSES
-    active_thread_store.register + _try_cache_store (in-process, script side only)
-    so a reconstruction never mutates live serving state. The thread is registered
-    for real only when an approved reply is actually posted.
+  * Draft generation is READ-ONLY (D-051): during the wrapped _dispatch_qa call it
+    sets CORA_EVAL_MODE=1 (so NO tool executes -- a reconstructed "yes" can never fire
+    a real calendar invite / gmail draft / tracker write) and no-ops the shared-state
+    writers active_thread_store.register + _try_cache_store + the gap/feedback loggers.
+    Consequence: drafts are KB/context-only; a tool-backed answer drafts as "couldn't
+    access that" (Harrison sees it and can Skip). The thread is registered, and a reply
+    posted, ONLY on Harrison's approval tap. Answer generation still makes real Claude
+    (and, for the still-open classifier, Haiku) calls even in dry-run.
 
 NOT a D-047 standalone module: it deliberately (lazy-)imports app.py to reuse the
 live pipeline. The RUNNER (scripts/run_missed_message_catchup.py) is a fresh
@@ -75,6 +78,11 @@ VIEW_EDIT_SUBMIT = "catchup_edit_submit"
 # recognise it so the capturing say never mistakes it for the answer.
 _STREAM_PLACEHOLDER = ":thought_balloon: thinking…"
 
+# Injected as user_facing_message() during capture so a Claude/pipeline error (which
+# _dispatch_qa swallows and posts as an apology) is DETECTABLE as an error rather than
+# captured as a valid draft with a Send button (D-051 wrap-fidelity fix).
+_PIPELINE_ERROR_SENTINEL = "\x00catchup-pipeline-error\x00"
+
 # Configurable delay preface (Harrison: yes, configurable). Prepended only to
 # non-trivial approved answers (see _PREFACE_MIN_CHARS).
 CATCHUP_PREFACE = os.environ.get(
@@ -97,7 +105,7 @@ _TERMINAL = frozenset({"sent", "edited_sent", "skipped"})
 _ONE_TAP_LOCK = threading.Lock()
 
 # History fetch guardrails.
-_MAX_MESSAGES_PER_CHANNEL = 800
+_MAX_MESSAGES_PER_CHANNEL = 1200
 _PAGE_SLEEP = 0.2
 _CHANNEL_SLEEP = 1.2  # Slack Tier-3 pacing between channels (matches channel_sweep)
 
@@ -154,21 +162,14 @@ def derive_window(
         return None
 
     alive: list[float] = []
-    startups: list[float] = []
     for path in files:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    if _STARTUP_MARKER in line:
+                    if _STARTUP_MARKER in line or any(mk in line for mk in _ALIVE_MARKERS):
                         ts = _parse_log_ts(line)
                         if ts is not None:
-                            startups.append(ts)
                             alive.append(ts)  # a startup is also an "alive" instant
-                        continue
-                    if any(mk in line for mk in _ALIVE_MARKERS):
-                        ts = _parse_log_ts(line)
-                        if ts is not None:
-                            alive.append(ts)
         except Exception:
             continue
 
@@ -176,17 +177,17 @@ def derive_window(
     if len(alive) < 2:
         return None
 
-    # Largest consecutive gap in the alive timeline.
-    gap_start = gap_end = None
-    biggest = 0.0
+    # Prefer the MOST-RECENT qualifying gap (the outage the operator just recovered
+    # from) rather than the globally largest -- a prior/longer incident or an overnight
+    # host sleep must not outrank today's outage (D-051). Among consecutive gaps that
+    # exceed the floor, take the one whose end is closest to now.
+    min_gap = min_gap_minutes * 60.0
+    chosen = None
     for a, b in zip(alive, alive[1:]):
-        if (b - a) > biggest:
-            biggest = b - a
-            gap_start, gap_end = a, b
-
-    if gap_start is None or biggest < min_gap_minutes * 60.0:
-        return None
-    return (gap_start, gap_end)
+        if (b - a) >= min_gap:
+            if chosen is None or b > chosen[1]:
+                chosen = (a, b)
+    return chosen
 
 
 def parse_ts_arg(value: str) -> float:
@@ -265,6 +266,7 @@ def fetch_window_messages(
     cursor = None
     oldest_s = f"{oldest:.6f}"
     latest_s = f"{latest:.6f}"
+    more_remaining = False
     while len(msgs) < max_messages:
         kwargs: dict = {
             "channel": channel_id,
@@ -289,7 +291,18 @@ def fetch_window_messages(
         cursor = (resp.get("response_metadata") or {}).get("next_cursor")
         if not resp.get("has_more") or not cursor:
             break
+        if len(msgs) >= max_messages:
+            more_remaining = True  # stopped by the cap, not by end-of-window
+            break
         time.sleep(_PAGE_SLEEP)
+    if more_remaining:
+        # Slack returns newest-first, so the DROPPED messages are the OLDEST in the
+        # window -- exactly the earliest post-outage asks most likely still unanswered.
+        log.warning(
+            "catchup: channel %s hit the %d-message window cap -- the OLDEST asks in "
+            "the window were NOT fetched. Narrow --since/--until or --channels for full "
+            "coverage of this channel.", channel_id, max_messages,
+        )
     msgs.sort(key=lambda m: float(m.get("ts", "0") or 0))
     return msgs
 
@@ -319,9 +332,14 @@ def _thread_replies(client, channel_id: str, root_ts: str, cache: dict) -> list[
 
 
 def _is_cora(msg: dict, bot_id: Optional[str]) -> bool:
-    """True if a Slack message was authored by Cora (bot post or the bot user)."""
-    if msg.get("bot_id"):
-        return True
+    """True ONLY if a Slack message was authored by Cora herself.
+
+    D-051 fix: a bare `if msg.get("bot_id")` counted EVERY app (Make.com, Tag, the
+    fighter trackers) as Cora -- which both suppressed genuine misses (a foreign bot
+    replying after the ask read as "Cora already answered") and false-promoted threads
+    to TIER_THREAD. Cora's own bolt-posted messages carry user == her bot USER id, so
+    match strictly on that.
+    """
     return bool(bot_id) and msg.get("user") == bot_id
 
 
@@ -405,7 +423,7 @@ def find_missed_messages(
     staleness_hours: float = 24.0,
     include_fuzzy: bool = False,
     now: Optional[float] = None,
-    is_terminal_fn: Optional[Callable[[str], bool]] = None,
+    already_seen_fn: Optional[Callable[[str], bool]] = None,
     still_open_fn: Optional[Callable[[str, list[str]], bool]] = None,
 ) -> list[Candidate]:
     """Reconstruct the set of asks Cora missed in [oldest, latest].
@@ -414,13 +432,16 @@ def find_missed_messages(
     an in-thread reply in a thread Cora already participated in. Fuzzy (bare-"cora"
     directed asks) only when include_fuzzy=True, tagged lower-confidence.
 
-    A candidate is dropped when: Cora already replied after it (answered), the ledger
-    already holds a terminal disposition for it (idempotency), or a still-open
-    classifier says it was self-resolved. Older-than-staleness asks are surfaced with
-    status="stale" (not drafted). Answered/terminal/resolved are dropped silently.
+    A candidate is dropped when: Cora already replied after it (answered); the ledger
+    already holds ANY row for it (idempotency -- so a re-run before Harrison actions the
+    first batch does NOT re-surface still-pending cards, D-051); or a still-open
+    classifier says it was self-resolved. Silent "do-not-respond" channels are skipped
+    entirely (mirrors handle_mention's is_silent_channel early-return). Older-than-
+    staleness asks are surfaced with status="stale" (not drafted). Answered/seen/resolved
+    are dropped silently.
     """
     now = now if now is not None else time.time()
-    is_terminal_fn = is_terminal_fn or is_terminal
+    already_seen_fn = already_seen_fn or (lambda cid: latest_disposition(cid) is not None)
     stale_cutoff = now - staleness_hours * 3600.0
     out: list[Candidate] = []
     replies_cache: dict = {}
@@ -429,6 +450,11 @@ def find_missed_messages(
         cid = ch["id"]
         is_dm = ch.get("is_dm", False)
         name = "dm" if is_dm else ch.get("name", "")
+        # Silent feed channels: the live handlers never speak here (is_silent_channel
+        # early-returns), so a reconstructed ask must never become a postable draft.
+        if not is_dm and entity_router.is_silent_channel(name):
+            log.info("catchup: channel #%s is silent -- skipped", name)
+            continue
         try:
             window_msgs = fetch_window_messages(client, cid, oldest, latest)
         except Exception as exc:  # noqa: BLE001
@@ -481,7 +507,7 @@ def find_missed_messages(
                 continue
 
             cid_key = catchup_id(cid, mts)
-            if is_terminal_fn(cid_key):
+            if already_seen_fn(cid_key):
                 continue
 
             # Already answered? (look forward to NOW, not just window end)
@@ -696,9 +722,24 @@ def generate_draft(client, cand: Candidate, *, draft_answer: bool = True) -> Can
 def _run_dispatch_capture(client, cand: Candidate, entity: str, is_founder: bool) -> str:
     """Call app._dispatch_qa with a capturing say + client proxy; return captured text.
 
-    Suppresses active_thread_store.register + _try_cache_store for the duration
-    (in this process only) so a reconstruction never registers a stale active thread
-    or poisons the shared semantic cache. Runs in the RUNNER process, never the bot.
+    READ-ONLY reconstruction (D-051 remediation). For the duration of the _dispatch_qa
+    call, in THIS process only:
+      * CORA_EVAL_MODE=1 -> tools_for_entity returns [] and dispatch() refuses, so NO
+        tool (read or write) executes. This is the critical guard: without it a
+        reconstructed confirm-shaped message ("yes") after a pre-outage proposal would
+        drive a real calendar invite / gmail draft / tracker write. Trade-off: drafts
+        are KB/context-only -- a tool-backed answer (live finance, plate, calendar read)
+        drafts as "couldn't access that", which Harrison sees on the card and can Skip.
+      * active_thread_store.register + _try_cache_store -> no-ops (never register a stale
+        active thread; never poison the shared semantic cache).
+      * gap_detection.maybe_log_gap + knowledge_gaps.log_gap + uft.log_knowledge_gap ->
+        no-ops (a reconstruction must not seed knowledge-gap rows that later escalate a
+        DM to a domain owner; CORA_EVAL_MODE covers the no-sentinel path, these cover the
+        sentinel path too).
+      * user_facing_message -> a sentinel, so a swallowed ClaudeClientError is detected
+        as an error (returns "") instead of captured as a valid draft.
+    Returns "" on empty/error (generate_draft maps that to status="error"). Runs in the
+    RUNNER process, never the bot.
     """
     from cora import app as _app  # lazy: breaks the app<->module import cycle
 
@@ -735,10 +776,22 @@ def _run_dispatch_capture(client, cand: Candidate, entity: str, is_founder: bool
     except Exception as exc:  # noqa: BLE001
         log.warning("catchup: history assembly failed for %s: %s", cand.catchup_id, exc)
 
-    _orig_register = _app.active_thread_store.register
-    _orig_cache = _app._try_cache_store
+    _prev_eval = os.environ.get("CORA_EVAL_MODE")
+    _orig = {
+        "register": _app.active_thread_store.register,
+        "cache": _app._try_cache_store,
+        "gap": _app.gap_detection.maybe_log_gap,
+        "klog": _app.knowledge_gaps.log_gap,
+        "uft": _app.uft.log_knowledge_gap,
+        "ufm": _app.user_facing_message,
+    }
+    os.environ["CORA_EVAL_MODE"] = "1"
     _app.active_thread_store.register = lambda *a, **k: None
     _app._try_cache_store = lambda *a, **k: None
+    _app.gap_detection.maybe_log_gap = lambda *a, **k: None
+    _app.knowledge_gaps.log_gap = lambda *a, **k: None
+    _app.uft.log_knowledge_gap = lambda *a, **k: None
+    _app.user_facing_message = lambda exc: _PIPELINE_ERROR_SENTINEL
     try:
         _app._dispatch_qa(
             channel_id=cand.channel_id,
@@ -755,10 +808,21 @@ def _run_dispatch_capture(client, cand: Candidate, entity: str, is_founder: bool
     except Exception as exc:  # noqa: BLE001
         log.warning("catchup: _dispatch_qa capture failed for %s: %s", cand.catchup_id, exc)
     finally:
-        _app.active_thread_store.register = _orig_register
-        _app._try_cache_store = _orig_cache
+        if _prev_eval is None:
+            os.environ.pop("CORA_EVAL_MODE", None)
+        else:
+            os.environ["CORA_EVAL_MODE"] = _prev_eval
+        _app.active_thread_store.register = _orig["register"]
+        _app._try_cache_store = _orig["cache"]
+        _app.gap_detection.maybe_log_gap = _orig["gap"]
+        _app.knowledge_gaps.log_gap = _orig["klog"]
+        _app.uft.log_knowledge_gap = _orig["uft"]
+        _app.user_facing_message = _orig["ufm"]
 
-    return holder.get("text") or ""
+    text = holder.get("text") or ""
+    if text == _PIPELINE_ERROR_SENTINEL:
+        return ""  # swallowed ClaudeClientError -> status="error", no Send button
+    return text
 
 
 # ── Review card (Harrison DM) ─────────────────────────────────────────────────────
@@ -905,8 +969,17 @@ def latest_disposition(cid: str) -> Optional[dict]:
 
 
 def is_terminal(cid: str) -> bool:
-    row = latest_disposition(cid)
-    return bool(row) and row.get("disposition") in _TERMINAL
+    """STICKY: True if ANY ledger row for this id is terminal.
+
+    D-051 fix: latest-row-wins alone let a re-run append a 'pending' row AFTER a
+    terminal 'sent' row (two overlapping --send-cards runs), re-arming an already-posted
+    item for a double-post. Scanning for any terminal row makes a sent/skipped item
+    permanently closed regardless of later appends.
+    """
+    for row in _iter_ledger_rows(_ledger_path()):
+        if row.get("catchup_id") == cid and row.get("disposition") in _TERMINAL:
+            return True
+    return False
 
 
 def record_row(
@@ -930,6 +1003,7 @@ def record_row(
     """Append one ledger row (best-effort, never raises)."""
     path = _ledger_path()
     try:
+        now = time.time()
         row = {
             "catchup_id": cid,
             "disposition": disposition,
@@ -946,6 +1020,7 @@ def record_row(
             "is_dm": is_dm,
             "posted_ts": posted_ts,
             "note": note,
+            "ts": now,  # epoch, for age-pruning
             "decided_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -957,9 +1032,50 @@ def record_row(
         return False
 
 
+def prune_ledger(max_age_days: float = 90.0, *, now: Optional[float] = None) -> int:
+    """Rewrite the ledger dropping rows older than max_age_days (best-effort).
+
+    Keeps the at-rest store bounded -- the pending rows carry drafted answer text
+    (host-local, encrypted disk, Harrison-review-only), so age-cap it. Rows missing a
+    parseable ts are kept (fail-safe). Returns the number of rows dropped.
+    """
+    path = _ledger_path()
+    if not path.exists():
+        return 0
+    now = now if now is not None else time.time()
+    cutoff = now - max_age_days * 86400.0
+    kept: list[str] = []
+    dropped = 0
+    try:
+        for row in _iter_ledger_rows(path):
+            ts = row.get("ts")
+            try:
+                if ts is not None and float(ts) < cutoff:
+                    dropped += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+            kept.append(json.dumps(row))
+        if dropped:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            tmp.replace(path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("catchup ledger prune failed: %s", exc)
+        return 0
+    return dropped
+
+
 def record_pending(cand: Candidate, run_id: str, posted_ts: str = "") -> bool:
     """Persist a drafted candidate as PENDING so the (separate-process) bot button
-    handler can post it later. Carries everything the handler needs."""
+    handler can post it later. Carries everything the handler needs.
+
+    Refuses to re-arm an already-terminal item (D-051 double-post guard): if a
+    concurrent run already got it sent/skipped, do not append a fresh 'pending' row.
+    """
+    if is_terminal(cand.catchup_id):
+        log.info("catchup: %s already terminal -- not re-arming pending", cand.catchup_id)
+        return False
     return record_row(
         cand.catchup_id,
         "pending",

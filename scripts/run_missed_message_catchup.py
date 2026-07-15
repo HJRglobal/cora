@@ -8,8 +8,12 @@ drafts an answer for each by WRAPPING the live answer pipeline (all guards inher
 and -- only in live mode -- DMs Harrison one review card per message with Send/Edit/Skip
 buttons. Nothing posts to any channel without Harrison's per-message tap.
 
-DEFAULT IS DRY-RUN: it surfaces the review list and posts NOTHING (no cards, no ledger
-writes). Pass --send-cards to actually DM the review cards to Harrison.
+DEFAULT IS DRY-RUN: it surfaces the review list and posts NOTHING to any channel (no
+cards, no ledger rows, no live-state mutation). Pass --send-cards to actually DM the
+review cards to Harrison. NOTE: draft generation itself makes real Claude calls (and
+Haiku calls for the still-open classifier) even in dry-run -- but with tools DISABLED
+(CORA_EVAL_MODE), so drafts are KB/context-only and no tool side effect can fire; use
+--no-draft for a zero-cost detection-only pass.
 
 Run (from repo root):
     .venv\\Scripts\\python.exe scripts\\run_missed_message_catchup.py --auto-window
@@ -26,6 +30,7 @@ Exit codes: 0 = ok, 1 = error / bad args, 2 = no outage window found (needs --si
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import os
 import sys
@@ -48,6 +53,43 @@ log = logging.getLogger("missed_catchup")
 
 # Highest-confidence detection tiers first when applying the surface cap.
 _TIER_RANK = {"mention": 0, "dm": 1, "thread_participation": 2, "fuzzy": 3}
+
+_LOCK_PATH = _REPO_ROOT / "data" / "state" / "missed-catchup.lock"
+_LOCK_STALE_SECS = 30 * 60
+
+
+def _acquire_run_lock():
+    """Best-effort single-run lock (O_EXCL). Returns an fd on success, None if held.
+
+    A stale lock (>30 min, e.g. a crashed prior run) is reclaimed. Released on exit.
+    """
+    try:
+        _LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _LOCK_PATH.exists():
+            try:
+                age = time.time() - _LOCK_PATH.stat().st_mtime
+                if age > _LOCK_STALE_SECS:
+                    _LOCK_PATH.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        fd = os.open(str(_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    except Exception:  # noqa: BLE001 -- never let lock IO break the run
+        return object()  # sentinel: proceed without a lock rather than fail hard
+
+    def _release():
+        try:
+            os.close(fd)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _LOCK_PATH.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+    atexit.register(_release)
+    return fd
 
 
 def main() -> int:
@@ -114,9 +156,31 @@ def main() -> int:
     run_id = f"catchup-{int(now)}"
     deadline = time.monotonic() + args.time_budget_min * 60.0
 
-    # Resolve Cora's own user id (for role-tagging + bot-authored detection).
+    # Single-run lock -- prevents two overlapping runs from racing the ledger (the
+    # double-post window closed by sticky is_terminal, belt-and-suspenders).
+    lock = _acquire_run_lock()
+    if lock is None:
+        log.error("Another catch-up run is in progress (lock held). Exiting.")
+        return 1
+
+    # Resolve Cora's own user id (for role-tagging + bot-authored detection). If
+    # auth.test fails, @mention detection is inoperable -- abort loudly rather than
+    # report a false 'nothing missed'.
     from cora import app as _app
     bot_id = _app._resolve_bot_user_id(client)
+    if not bot_id:
+        log.error("Could not resolve Cora's bot user id (auth.test failed). @mention "
+                  "detection is DISABLED without it -- aborting. Re-run once Slack "
+                  "connectivity is restored.")
+        return 1
+
+    # Age-prune the (host-local) ledger so drafted-answer text at rest stays bounded.
+    try:
+        dropped_rows = mmc.prune_ledger()
+        if dropped_rows:
+            log.info("Pruned %d ledger rows older than 90d.", dropped_rows)
+    except Exception:  # noqa: BLE001
+        pass
 
     # ── Enumerate + filter channels ───────────────────────────────────────────
     channels = mmc.list_catchup_channels(client)
@@ -147,10 +211,10 @@ def main() -> int:
     # ── Draft + report + (live) card ──────────────────────────────────────────
     posted = 0
     counts: dict = {}
-    for cand in surfaced:
+    for i, cand in enumerate(surfaced):
         if time.monotonic() > deadline:
             log.warning("Time budget exhausted -- stopping. %d asks not processed.",
-                        len(surfaced) - posted)
+                        len(surfaced) - i)
             break
         if cand.status != "stale":
             try:
@@ -160,11 +224,14 @@ def main() -> int:
                 cand.note = f"draft error: {exc}"
         counts[cand.status] = counts.get(cand.status, 0) + 1
 
+        # Never log draft answer CONTENT (may carry KB PHI/finance for a custodian
+        # asker) -- length only for drafts; the guard note is safe to show for the rest.
         where = "DM" if cand.is_dm else f"#{cand.channel_name}"
-        preview = cand.draft_text[:160].replace("\n", " ") if cand.draft_text else cand.note[:160]
+        detail = (f"chars={len(cand.draft_text)}" if cand.status == "draft"
+                  else (cand.note[:120] if cand.note else ""))
         log.info("[%s] %s | %s | %s | %s",
                  cand.status.upper(), where, cand.detection_tier,
-                 _fmt(_f(cand.event_ts)), preview)
+                 _fmt(_f(cand.event_ts)), detail)
 
         if not dry_run:
             fallback, blocks = mmc.build_review_card(cand)
