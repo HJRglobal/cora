@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from cora import historical_access, user_notes, phi_guard, org_roles
+from cora import historical_access, user_notes, phi_guard, org_roles, drive_io
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 
 log = logging.getLogger(__name__)
@@ -194,6 +194,27 @@ _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
     if not entity.startswith("LEX-")
 }
 
+# ── G: mount resilience (2026-07-16) ─────────────────────────────────────────
+# The static context (entity/founder CLAUDE.md + known-answers) lives on the local
+# Google Drive (G:) mount. A transient unmount/remount must NOT freeze a request or
+# the bot loop, so every G: touch here goes through drive_io. Because this is the
+# interactive request path AND it has a TTL cache to fall back on, we fail FAST to
+# cached context on a hiccup rather than make a user wait: the per-request mtime check
+# does a single bounded attempt (retry_seconds=0), and a cache-miss build gets only a
+# short ride-over window. KB retrieval (cora_kb.db, on C:) is UNAFFECTED by a G: outage,
+# so Cora keeps answering from the KB even while the static brief is degraded.
+_CTX_TIMEOUT_SECONDS = 5.0
+_CTX_RETRY_SECONDS = 3.0
+
+# Served as the static block when the mount is gone AND there is no cached context to
+# fall back to (e.g. a G: outage spanning a restart). Deliberately minimal + honest;
+# the KB retrieval block still rides alongside it in the request.
+_DEGRADED_STATIC_CONTEXT = (
+    "_Portfolio context is briefly unavailable (Cora's document store is "
+    "reconnecting). Ground your answer in the retrieved knowledge below and general "
+    "context; if that isn't enough to answer confidently, say so rather than guessing._"
+)
+
 _TTL = 300  # seconds
 
 # LEX sub-entity channels route to e.g. "LEX-LLC"; the KB stores documents under "LEX".
@@ -210,10 +231,14 @@ _cache: dict[str, tuple[str, float, float | None]] = {}
 
 
 def _known_answers_mtime(entity: str) -> float | None:
+    """mtime of the entity's known-answers file, or None when it has none / the file
+    is absent (mount UP). Raises drive_io.DriveUnavailable if the G: mount is gone, so
+    the cache-validity check can serve cached context instead of touching a dead mount.
+    Single bounded attempt (retry_seconds=0) — this runs on EVERY request."""
     path = _KNOWN_ANSWERS_PATHS.get(entity)
-    if path is None or not path.exists():
+    if path is None:
         return None
-    return path.stat().st_mtime
+    return drive_io.stat_mtime(path, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=0)
 
 
 def load_context_parts(
@@ -310,21 +335,61 @@ def load_context(
 
 
 def _load_static_context(entity: str) -> str:
-    """Existing static-context logic with the TTL cache. Extracted for clarity."""
+    """Static-context logic with the TTL cache, hardened against a G: mount outage.
+
+    A transient Google-Drive unmount must never freeze a request or crash the loop.
+    Every G: read here goes through drive_io; on drive_io.DriveUnavailable we serve
+    the last cached value (even if stale) or, if this entity was never cached, a
+    minimal degraded block. This function therefore NEVER raises on a G: outage.
+    """
     now = time.monotonic()
     cached = _cache.get(entity)
     if cached is not None:
         text, cached_at, ka_mtime = cached
-        if now - cached_at < _TTL and _known_answers_mtime(entity) == ka_mtime:
+        # The cache-validity check touches G: (known-answers mtime). If the mount is
+        # briefly gone, serve the cached value rather than attempt any further G: read.
+        try:
+            fresh_mtime = _known_answers_mtime(entity)
+        except drive_io.DriveUnavailable:
+            log.warning(
+                "context: G: mount unavailable checking %s known-answers mtime — "
+                "serving cached static context", entity,
+            )
+            return text
+        if now - cached_at < _TTL and fresh_mtime == ka_mtime:
             return text
 
+    try:
+        return _build_static_context(entity, now)
+    except drive_io.DriveUnavailable:
+        if cached is not None:
+            log.warning(
+                "context: G: mount unavailable building %s — serving last cached "
+                "static context (may be stale); KB retrieval unaffected", entity,
+            )
+            return cached[0]
+        log.warning(
+            "context: G: mount unavailable and no cached context for %s — serving "
+            "minimal degraded context; KB retrieval unaffected", entity,
+        )
+        return _DEGRADED_STATIC_CONTEXT
+
+
+def _build_static_context(entity: str, now: float) -> str:
+    """Build (and cache) the entity's static context from G:. Raises
+    drive_io.DriveUnavailable if the mount is gone mid-build; a genuine missing file
+    with the mount UP keeps its prior behavior (exists()->False branch, or a
+    FileNotFoundError from the founder read, exactly as before)."""
     parts: list[str] = []
 
     if entity != "FNDR":
         entity_path = _ENTITY_PATHS.get(entity)
         if entity_path is not None:
-            if entity_path.exists():
-                parts.append(entity_path.read_text(encoding="utf-8"))
+            if drive_io.exists(entity_path, timeout=_CTX_TIMEOUT_SECONDS,
+                               retry_seconds=_CTX_RETRY_SECONDS):
+                parts.append(drive_io.read_text(
+                    entity_path, timeout=_CTX_TIMEOUT_SECONDS,
+                    retry_seconds=_CTX_RETRY_SECONDS))
             else:
                 log.warning(
                     "No CLAUDE.md for entity %s at %s -- falling back to founder-level only",
@@ -338,7 +403,8 @@ def _load_static_context(entity: str) -> str:
     # Sub-entity channels must not receive that data — their own stub CLAUDE.md
     # is the only entity context they get.
     if entity not in _NO_FOUNDER_CONTEXT:
-        founder_text = _FOUNDER_PATH.read_text(encoding="utf-8")
+        founder_text = drive_io.read_text(
+            _FOUNDER_PATH, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=_CTX_RETRY_SECONDS)
         # Aggregators (FNDR/HJRG) keep the full brief; every other entity gets the
         # static head only and relies on KB retrieval for the dynamic current-state.
         if entity not in _FOUNDER_FULL_ENTITIES:
@@ -347,8 +413,12 @@ def _load_static_context(entity: str) -> str:
 
     # Append static known-answers if available
     ka_path = _KNOWN_ANSWERS_PATHS.get(entity)
-    if ka_path is not None and ka_path.exists():
-        ka_content = ka_path.read_text(encoding="utf-8").strip()
+    if ka_path is not None and drive_io.exists(
+        ka_path, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=_CTX_RETRY_SECONDS
+    ):
+        ka_content = drive_io.read_text(
+            ka_path, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=_CTX_RETRY_SECONDS
+        ).strip()
         if ka_content:
             parts.append("# Known Answers (from prior gap reviews)\n\n" + ka_content)
     else:
@@ -356,7 +426,8 @@ def _load_static_context(entity: str) -> str:
 
     # Append dynamic answers interpolated from snapshots — entity-scoped so a
     # sibling entity's snapshot (e.g. F3E cash position) can never leak into
-    # this context. FNDR is the only entity that aggregates across all.
+    # this context. FNDR is the only entity that aggregates across all. These are
+    # LOCAL (repo) reads, unaffected by a G: outage.
     dynamic = _load_scoped_dynamic_answers(entity)
     if dynamic:
         parts.append("# Dynamic Known Answers (refreshed from snapshots)\n\n" + dynamic)

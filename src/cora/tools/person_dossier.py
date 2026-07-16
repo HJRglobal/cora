@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from .. import model_router, org_roles, phi_guard, slack_egress
+from .. import drive_io, model_router, org_roles, phi_guard, slack_egress
 from ..connectors import gmail_reader
 from ..person_identity import PersonIdentity
 from ..person_identity import resolve as _resolve_identity
@@ -580,12 +580,24 @@ def write_back(p: PersonIdentity, body: str, *, as_of: str | None = None) -> boo
     if not body or not body.strip():
         return False
     path = _people_dir() / p.dossier_filename
-    if not path.exists():
+    # The dossier files live on the G: mount. A transient unmount must never hang this
+    # tool (it runs in the request path); route every G: touch through drive_io and
+    # skip the write-back (returning the synthesized reply anyway) if the mount is gone.
+    # Short retry so the tool never blocks the user on a flaky mount.
+    try:
+        present = drive_io.exists(path, timeout=5.0, retry_seconds=2.0)
+    except drive_io.DriveUnavailable:
+        log.warning("person_dossier: G: mount unavailable -- skipping dossier write-back for %s", p.slug)
+        return False
+    if not present:
         log.warning("person_dossier: no dossier file at %s -- skipping write-back", path)
         return False
     as_of = as_of or datetime.now().date().isoformat()
     try:
-        original = path.read_text(encoding="utf-8")
+        original = drive_io.read_text(path, timeout=5.0, retry_seconds=2.0)
+    except drive_io.DriveUnavailable:
+        log.warning("person_dossier: G: mount unavailable reading %s -- skipping write-back", path)
+        return False
     except Exception as exc:  # noqa: BLE001
         log.warning("person_dossier: could not read %s: %s", path, exc)
         return False
@@ -608,9 +620,10 @@ def write_back(p: PersonIdentity, body: str, *, as_of: str | None = None) -> boo
     new_doc = new_doc.replace("auto-refreshed by Tag", "auto-refreshed by Cora")
 
     try:
-        tmp = path.with_suffix(".md.tmp")
-        tmp.write_text(new_doc, encoding="utf-8")
-        tmp.replace(path)
+        drive_io.write_text_atomic(path, new_doc, timeout=5.0, retry_seconds=2.0)
+    except drive_io.DriveUnavailable:
+        log.warning("person_dossier: G: mount unavailable writing %s -- write-back skipped", path)
+        return False
     except Exception as exc:  # noqa: BLE001
         log.warning("person_dossier: write-back failed for %s: %s", path, exc)
         return False

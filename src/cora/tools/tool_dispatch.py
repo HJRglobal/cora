@@ -2713,8 +2713,18 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
     _DRIVE_ROOT = Path("G:/My Drive/HJR-Founder-OS")
     decisions_path = _DRIVE_ROOT / "memory" / "decisions-pending.md"
 
+    from cora import drive_io
     try:
-        content = decisions_path.read_text(encoding="utf-8")
+        # decisions-pending.md lives on the G: mount; drive_io makes a transient
+        # unmount a catchable DriveUnavailable instead of a hang. Short retry so the
+        # tool never blocks the user on a flaky mount.
+        content = drive_io.read_text(decisions_path, timeout=5.0, retry_seconds=2.0)
+    except drive_io.DriveUnavailable:
+        log.warning("fndr_open_decisions: G: mount unavailable reading decisions-pending.md")
+        return (
+            "My decisions log is briefly unavailable (document store reconnecting) — "
+            "try again in a moment."
+        )
     except FileNotFoundError:
         log.warning("fndr_open_decisions: decisions-pending.md not found at %s", decisions_path)
         return "I don't have that right now."

@@ -18,7 +18,10 @@ import time
 
 import pytest
 
-from src.cora import drive_io
+# Import from `cora` (not `src.cora`) so this test exercises the SAME module object
+# the production code imports (`from cora import drive_io`); the two import paths are
+# distinct module trees with distinct DriveUnavailable classes.
+from cora import drive_io
 
 
 @pytest.fixture(autouse=True)
