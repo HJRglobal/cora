@@ -43,23 +43,33 @@ class TestLogAction:
         lines = pm_metrics._ACTION_LOG.read_text(encoding="utf-8").strip().split("\n")
         e = json.loads(lines[0])
         assert e["action"] == "create" and e["actor"] == "U1"
-        assert e["entity"] == "F3E" and e["gid"] == "G1" and e["title"] == "Ship the deck"
+        assert e["entity"] == "F3E" and e["gid"] == "G1"
 
-    def test_lex_drops_title(self):
-        pm_metrics.log_pm_action("complete", "U1", "LEX", "G2", title="Call John Doe's guardian")
-        e = json.loads(pm_metrics._ACTION_LOG.read_text(encoding="utf-8").strip())
-        assert "title" not in e  # invariant #2: LEX = gid + entity only
-        assert e["entity"] == "LEX" and e["gid"] == "G2"
-
-    def test_lex_subentity_drops_title(self):
-        pm_metrics.log_pm_action("update", "U1", "LEX-LLC", "G3", title="secret")
+    def test_title_never_persisted_non_lex(self):
+        # D-051: titles are omitted UNCONDITIONALLY (these tools act cross-entity, so the
+        # channel entity can't gate a LEX title). Even a non-LEX title is not stored.
+        pm_metrics.log_pm_action("create", "U1", "F3E", "G1", title="Ship the deck")
         e = json.loads(pm_metrics._ACTION_LOG.read_text(encoding="utf-8").strip())
         assert "title" not in e
 
-    def test_title_truncated(self):
-        pm_metrics.log_pm_action("create", "U1", "F3E", "G1", title="x" * 500)
+    def test_lex_context_never_persists_title(self):
+        pm_metrics.log_pm_action("complete", "U1", "LEX", "G2", title="Call John Doe's guardian")
         e = json.loads(pm_metrics._ACTION_LOG.read_text(encoding="utf-8").strip())
-        assert len(e["title"]) == pm_metrics._TITLE_CAP
+        assert "title" not in e and "John Doe" not in json.dumps(e)
+        assert e["entity"] == "LEX" and e["gid"] == "G2"
+
+    def test_cross_entity_lex_title_never_leaks(self):
+        # The D-051 finding: a LEX task acted on from a FNDR/HJRG channel (entity='FNDR')
+        # must NOT write the client-named title -- the previous channel-entity gate missed it.
+        pm_metrics.log_pm_action("complete", "U0B2RM2JYJ1", "FNDR", "G9",
+                                 title="Follow up on Jane Doe intake authorization")
+        blob = pm_metrics._ACTION_LOG.read_text(encoding="utf-8")
+        assert "Jane Doe" not in blob and '"title"' not in blob
+
+    def test_extra_still_recorded(self):
+        pm_metrics.log_pm_action("subtask", "U1", "F3E", "G1", extra={"parent": "P1"})
+        e = json.loads(pm_metrics._ACTION_LOG.read_text(encoding="utf-8").strip())
+        assert e["extra"] == {"parent": "P1"}
 
     def test_never_raises_on_write_error(self, monkeypatch):
         # point the log at an unwritable path shape; must swallow the error

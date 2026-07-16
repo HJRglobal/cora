@@ -339,6 +339,11 @@ class TestIntentDetector:
         "move the meeting to Friday",          # calendar, no task referent
         "reassign this to me later maybe",     # no task referent -> gated out
         "can you change the priority?",         # interrogative
+        # D-051: declarative status/read phrasings must NOT force the write tool.
+        "update me on the status of the deck task",
+        "give me an update on the marketing task status",
+        "any update on the deadline for the report task",
+        "set up a status meeting about the marketing task",
     ])
     def test_true_negatives(self, msg):
         assert cora_app._asana_destructive_intent(msg) is None

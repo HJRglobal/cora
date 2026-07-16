@@ -350,10 +350,14 @@ _ASANA_COMMENT_INTENT_RE = re.compile(
     r"\b(?:comment|leave a comment|add a comment|add a note|leave a note)\b"
     r"[^.\n]{0,24}\b(?:on|to|under)\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b",
     re.IGNORECASE)
+# D-051 (2026-07-15): the field-change verb must GOVERN the field noun (an optional
+# article between them), not merely co-occur within 24 chars -- otherwise overloaded
+# reads like "update me on the status of the deck task" / "any update on the deadline"
+# were forced into the WRITE tool. Mirrors the delete/complete governance requirement.
 _ASANA_UPDATE_INTENT_RE = re.compile(
     r"\bre-?assign\b"
-    r"|\b(?:change|update|move|push|bump|extend|set|reset)\b[^.\n]{0,24}"
-    r"\b(?:due date|due-date|deadline|due on|priority|status)\b"
+    r"|\b(?:change|update|move|push|bump|extend|set|reset)\s+(?:the|its|this|that|my|our)?\s*"
+    r"(?:due date|due-date|deadline|due on|priority|status)\b"
     r"|\brename\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b",
     re.IGNORECASE)
 

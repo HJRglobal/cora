@@ -7,7 +7,11 @@ Two responsibilities:
      subtask / meeting-capture). This is the authoritative, per-person Cora-attributed
      record: the single-PAT Asana model attributes every Cora write to Harrison, so
      `created_by` can't distinguish Cora-vs-UI -- the log is the ground truth for the
-     Cora side. LEX tasks are logged in AGGREGATE ONLY (gid + entity, NEVER a title).
+     Cora side. NO task TITLE is ever persisted (gid + entity + action only): these
+     edit tools act CROSS-ENTITY (a founder / FNDR / HJRG asker can act on their own
+     LEX task, so the channel entity can't reliably gate a LEX title), so titles are
+     omitted UNCONDITIONALLY -- that closes invariant #2 (LEX aggregate-only) with no
+     dependence on the recorded entity, and the digest never needs a title anyway.
 
   2. run() / format_digest() -- the weekly PM-adoption digest (scheduled, script-side):
      Cora-vs-UI created/completed, overdue WoW trend, staleness, per-person engagement.
@@ -36,7 +40,6 @@ _SNAPSHOT_DIR = _REPO_ROOT / "data" / "state" / "pm-adoption-snapshots"
 _ROSTER = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
 
 _STALE_DAYS = 14
-_TITLE_CAP = 120
 _SNAPSHOTS_KEPT = 26
 HARRISON_DM = "U0B2RM2JYJ1"
 FOUNDER_OPS_CHANNEL = "C0BCUBUDHAR"  # #founder-operations
@@ -46,15 +49,19 @@ _CREATE_ACTIONS = frozenset({"create", "subtask"})
 _COMPLETE_ACTIONS = frozenset({"complete"})
 
 
-def _is_lex(entity: str) -> bool:
-    return (entity or "").upper().startswith("LEX")
-
-
 def log_pm_action(action: str, actor: str, entity: str, gid: str,
                   *, title: str | None = None, extra: dict | None = None) -> None:
     """Append one PM-action record. NEVER raises (a logging failure must not break a task
-    write). LEX entities are logged WITHOUT a title -- invariant: gid + entity only, so no
-    client name can leak into the metrics/log sink."""
+    write).
+
+    The `title` argument is accepted (call sites pass it) but is DELIBERATELY NOT
+    persisted: these edit tools act cross-entity, so the channel `entity` cannot reliably
+    tell whether the resolved task is LEX -- persisting a title would leak a LEX client
+    name into this at-rest sink whenever a LEX task is acted on from a FNDR/HJRG/founder
+    context (D-051 2026-07-15). Omitting titles unconditionally closes invariant #2; the
+    adoption metric + digest only ever need gid + entity + action. `extra` must carry NO
+    task content -- only structural metadata (field names, parent gid, via-source).
+    """
     try:
         _ACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
         entry: dict[str, Any] = {
@@ -64,8 +71,6 @@ def log_pm_action(action: str, actor: str, entity: str, gid: str,
             "entity": (entity or "").upper(),
             "gid": str(gid or ""),
         }
-        if title and not _is_lex(entity):
-            entry["title"] = str(title)[:_TITLE_CAP]
         if extra:
             entry["extra"] = extra
         with _ACTION_LOG.open("a", encoding="utf-8") as fh:
