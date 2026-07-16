@@ -26,7 +26,7 @@ from typing import Any, Callable
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
-from .. import dashboard_access, org_roles
+from .. import dashboard_access, org_roles, pm_metrics
 from ..connectors import airtable_client, dashboard_drive_reader, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
@@ -689,7 +689,7 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "create")
         if pending:
-            return _execute_asana_create(slack_user_id, pending)
+            return _execute_asana_create(slack_user_id, pending, entity)
         # No fresh pending create -> fall through and resolve. A single-call
         # confirmed=true (honor-system / backward-compat) still creates directly. A
         # pending delete/complete is left intact by _claim_pending_asana (review #8).
@@ -710,7 +710,7 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         return _write_blocked_contract(_asana_create_preview_text(resolved))
 
     # ── Phase 2b: confirmed=true with no pending (honor-system / backward-compat) -> create now.
-    return _execute_asana_create(slack_user_id, resolved)
+    return _execute_asana_create(slack_user_id, resolved, entity)
 
 
 def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
@@ -836,7 +836,7 @@ def _asana_create_preview_text(r: dict) -> str:
     return "\n".join(lines)
 
 
-def _execute_asana_create(slack_user_id: str, r: dict) -> str:
+def _execute_asana_create(slack_user_id: str, r: dict, entity: str = "") -> str:
     """Create the task from a resolved payload (Phase 2). Returns the WRITE_CONFIRMED
     contract text (format_created_task_for_llm) or a model-facing create error."""
     try:
@@ -863,6 +863,8 @@ def _execute_asana_create(slack_user_id: str, r: dict) -> str:
         slack_user_id, r["title"], r["assignee_display"], created.get("gid", ""),
         r["project_gid"], r["notices"],
     )
+    pm_metrics.log_pm_action("create", slack_user_id, entity, created.get("gid", ""),
+                             title=r.get("title"))
 
     added_followers: list[str] = []
     if r.get("follower_gids") and created.get("gid"):
@@ -1064,6 +1066,8 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
                     f"It was NOT marked done."
                 )
             log.info("asana_complete_task actor=%s gid=%s", slack_user_id, pending["gid"])
+            pm_metrics.log_pm_action("complete", slack_user_id, entity, pending["gid"],
+                                     title=pending.get("label"))
             return _write_confirmed_contract(
                 f'Done -- marked "{pending["label"]}" complete in Asana.'
             )
@@ -1105,6 +1109,8 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
                 )
             log.info("asana_delete_task actor=%s gid=%s label=%r",
                      slack_user_id, pending["gid"], pending["label"])
+            pm_metrics.log_pm_action("delete", slack_user_id, entity, pending["gid"],
+                                     title=pending.get("label"))
             return _write_confirmed_contract(f'Deleted "{pending["label"]}" from Asana.')
         # No fresh pending delete -> re-preview (NEVER delete blind).
 
@@ -1204,6 +1210,10 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
                     failed = list(pending.get("custom_desc") or ["status/priority"])
             log.info("asana_update_task actor=%s gid=%s fields=%s custom=%s custom_ok=%s",
                      slack_user_id, gid, sorted(fields.keys()), sorted(custom.keys()), not failed)
+            pm_metrics.log_pm_action(
+                "update", slack_user_id, entity, gid, title=pending.get("label"),
+                extra={"fields": sorted(fields.keys()) + list(pending.get("custom_desc") or [])},
+            )
             msg = f'Updated "{pending["label"]}" in Asana'
             if change_desc:
                 msg += " -- " + "; ".join(change_desc)
@@ -1348,6 +1358,8 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
                     f"No comment was posted."
                 )
             log.info("asana_add_comment actor=%s gid=%s", slack_user_id, pending["gid"])
+            pm_metrics.log_pm_action("comment", slack_user_id, entity, pending["gid"],
+                                     title=pending.get("label"))
             return _write_confirmed_contract(f'Comment added to "{pending["label"]}" in Asana.')
         # No fresh pending comment -> re-preview.
 
@@ -1404,6 +1416,10 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
                 )
             log.info("asana_add_subtask actor=%s parent=%s sub=%s",
                      slack_user_id, pending["parent_gid"], created.get("gid", ""))
+            pm_metrics.log_pm_action(
+                "subtask", slack_user_id, entity, created.get("gid", "") or pending["parent_gid"],
+                title=pending.get("name"), extra={"parent": pending["parent_gid"]},
+            )
             link = created.get("permalink_url") or ""
             name_disp = f'<{link}|{pending["name"]}>' if link else f'"{pending["name"]}"'
             return _write_confirmed_contract(

@@ -59,7 +59,7 @@ from typing import Any
 
 import yaml
 
-from cora import org_roles
+from cora import org_roles, pm_metrics
 from cora.connectors import fireflies_action_extractor as fae
 from cora.connectors.fireflies_connector import (
     FirefliesConnectorError,
@@ -1195,10 +1195,16 @@ def _create_selected(
                 log.debug("meeting_actions custom-field tagging skipped: %s", exc)
         created_keys.add(key)
         created.append({"task_name": task_name, "permalink_url": task.get("permalink_url", ""), "gid": gid})
+        # PM-adoption metric: a meeting-capture create is a Cora-attributed task action.
+        # route_entity gates the title (LEX -> dropped by log_pm_action).
+        pm_metrics.log_pm_action("create", slack_user_id, route_entity, gid,
+                                 title=task_name, extra={"via": "meeting_capture"})
 
+    # PHI: log the SCRUBBED display_title, never the raw meeting title (a LEX meeting
+    # title can carry a client name -- 2026-07-15 fix, PM-hub invariant #2).
     log.info(
         "meeting_action_items CREATE asker=%s meeting=%r entity=%s created=%d already_open=%d skipped=%d not_in_meeting=%d create_failed=%d budget_hit=%s",
-        slack_user_id, title, route_entity, len(created), len(already_open), len(skipped), len(not_in_meeting), len(create_failed), budget_hit,
+        slack_user_id, display_title, route_entity, len(created), len(already_open), len(skipped), len(not_in_meeting), len(create_failed), budget_hit,
     )
 
     if not created:
@@ -1414,6 +1420,6 @@ def run_meeting_action_items(
 
     log.info(
         "meeting_action_items PREVIEW asker=%s meeting=%r entity=%s is_lex=%s mine=%d unclear=%d",
-        slack_user_id, title, meeting_entity, is_lex, len(mine), len(unclear),
+        slack_user_id, _scrub_for_lex(title, is_lex), meeting_entity, is_lex, len(mine), len(unclear),
     )
     return _format_preview(transcript, resolved_id, is_lex, mine, unclear)

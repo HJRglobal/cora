@@ -86,8 +86,15 @@ def get_user_tasks(
     user_gid: str,
     max_tasks: int = _DEFAULT_MAX_TASKS,
     opt_fields: list[str] | None = None,
+    completed_since: str = "now",
 ) -> list[dict[str, Any]]:
-    """Fetch incomplete tasks assigned to a user.
+    """Fetch tasks assigned to a user.
+
+    completed_since (default "now") is the Asana incomplete-only filter: "now"
+    returns ONLY incomplete tasks; an ISO8601 timestamp additionally returns tasks
+    completed after it (used by the weekly PM-adoption digest to count
+    completed/created-this-week in one call per user). Every existing caller keeps
+    the incomplete-only default -- backward-compatible.
 
     Paginates when max_tasks > 100 (Asana 400s on limit > 100 — the 5/31
     reconciliation "scale increase" to max_tasks=200 silently broke every
@@ -119,7 +126,7 @@ def get_user_tasks(
         params = {
             "assignee": user_gid,
             "workspace": _WORKSPACE_GID,
-            "completed_since": "now",  # incomplete-only filter
+            "completed_since": completed_since,  # "now"=incomplete-only; ISO ts=+completed-since
             "limit": min(_API_MAX_LIMIT, max_tasks - len(tasks)),
             "opt_fields": ",".join(fields),
         }
