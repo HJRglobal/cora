@@ -29,7 +29,21 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import drive_io
+
 log = logging.getLogger(__name__)
+
+
+def _safe_exists(path: Path) -> bool:
+    """Bounded, fail-open existence check. The ledger lives on the G: mount; a
+    transient unmount returns False ("not present" -> the callers treat this as
+    "not recently nudged" / "start a fresh count"), matching the module's fail-open
+    doctrine, and can never hang the daily nudge job."""
+    try:
+        return drive_io.exists(path)
+    except drive_io.DriveUnavailable:
+        log.warning("nudge_ledger: G: mount unavailable checking %s -- failing open", path)
+        return False
 
 _DEFAULT_LOG_PATH = (
     r"G:\My Drive\HJR-Founder-OS\_shared\projects\cora\closure-nudges-throttle.jsonl"
@@ -62,7 +76,9 @@ def _parse_iso(value: str | None) -> datetime | None:
 def _iter_rows(path: Path):
     """Yield parsed data rows (skipping the schema header + blank/bad lines)."""
     try:
-        text = path.read_text(encoding="utf-8")
+        # G: mount: drive_io makes a transient unmount a bounded DriveUnavailable
+        # (an OSError, caught here -> fail-open empty iteration) instead of a hang.
+        text = drive_io.read_text(path, encoding="utf-8")
     except Exception:
         return
     for line in text.splitlines():
@@ -86,7 +102,7 @@ def recently_nudged(task_gid: str, within_days: int = 14) -> bool:
     if not task_gid:
         return False
     path = _log_path()
-    if not path.exists():
+    if not _safe_exists(path):
         return False
 
     now = datetime.now(timezone.utc)
@@ -115,7 +131,7 @@ def permanently_excluded(task_gid: str) -> bool:
     if not task_gid:
         return False
     path = _log_path()
-    if not path.exists():
+    if not _safe_exists(path):
         return False
     try:
         for row in _iter_rows(path):
@@ -156,7 +172,7 @@ def record_closed_skip(
             "task_gid": str(task_gid),
             "task_name": task_name,
             "last_nudged_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "nudge_count": _prior_nudge_count(path, task_gid) if path.exists() else 0,
+            "nudge_count": _prior_nudge_count(path, task_gid) if _safe_exists(path) else 0,
             "reason": _CLOSED_REASON,
             "permanent": bool(permanent),
             "completed_at": completed_at or "",
@@ -164,9 +180,9 @@ def record_closed_skip(
             "signal_summary": "Task already completed at fire time -- nudge skipped.",
             "run_id": run_id,
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        # G: append, timeout-bounded (single attempt, no retry -> no double-append).
+        # A gone mount raises DriveUnavailable (caught below -> fail-open, skip record).
+        drive_io.append_text(path, json.dumps(row) + "\n")
         return True
     except Exception as exc:
         log.warning("nudge_ledger closed-skip append failed for task %s: %s", task_gid, exc)
@@ -259,7 +275,7 @@ def record_nudge(
         return False
     path = _log_path()
     try:
-        count = _prior_nudge_count(path, task_gid) + 1 if path.exists() else 1
+        count = _prior_nudge_count(path, task_gid) + 1 if _safe_exists(path) else 1
         row = {
             "task_gid": str(task_gid),
             "task_name": task_name,
@@ -273,9 +289,9 @@ def record_nudge(
             "signal_summary": signal_summary,
             "run_id": run_id,
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        # G: append, timeout-bounded (single attempt, no retry -> no double-append).
+        # A gone mount raises DriveUnavailable (caught below -> fail-open, skip record).
+        drive_io.append_text(path, json.dumps(row) + "\n")
         return True
     except Exception as exc:
         log.warning("nudge_ledger append failed for task %s: %s", task_gid, exc)

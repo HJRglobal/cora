@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import phi_guard, org_roles
+from . import drive_io, phi_guard, org_roles
 
 log = logging.getLogger(__name__)
 
@@ -145,21 +145,18 @@ def mirror_flywheel_ledgers(repo_root: Path | None = None) -> list[str]:
     root = repo_root or _REPO_ROOT
     dest = _flywheel_dir()
     mirrored: list[str] = []
-    try:
-        dest.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:  # noqa: BLE001 — DR mirror must never break the run
-        log.warning("drive_materializer: flywheel mirror dir unavailable: %s", exc)
-        return mirrored
     for sub, name in _FLYWHEEL_LEDGERS:
         src = root / sub / name
         try:
-            if not src.exists():
+            if not src.exists():  # LOCAL ledger
                 continue
-            tmp = dest / (name + ".tmp")
-            tmp.write_bytes(src.read_bytes())
-            tmp.replace(dest / name)
+            # G: write, timeout-bounded (make_parents creates _flywheel/). A gone mount
+            # raises DriveUnavailable (caught below -> skip that file); the short retry +
+            # circuit breaker keep the whole mirror bounded during an outage. DR insurance,
+            # never fails the run.
+            drive_io.write_bytes_atomic(dest / name, src.read_bytes(), retry_seconds=5.0)
             mirrored.append(name)
-        except Exception as exc:  # noqa: BLE001 — one bad file must not abort the mirror
+        except Exception as exc:  # noqa: BLE001 — one bad file (incl. DriveUnavailable) must not abort
             log.warning("drive_materializer: flywheel mirror failed for %s: %s", name, exc)
     return mirrored
 
@@ -333,12 +330,11 @@ def _render_file(entity: str, today_str: str, body: str, source_chunks: dict[str
 
 
 def _write_swept_file(entity: str, today_str: str, doc: str) -> Path:
-    out_dir = _swept_root() / entity
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{today_str}.md"
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(doc, encoding="utf-8")
-    tmp.replace(path)
+    path = _swept_root() / entity / f"{today_str}.md"
+    # G: write, atomic + timeout-bounded (make_parents creates {ENTITY}/). A gone mount
+    # raises drive_io.DriveUnavailable, which run() catches per-entity (watermark not
+    # advanced -> retries next run) instead of hanging the nightly process.
+    drive_io.write_text_atomic(path, doc, encoding="utf-8")
     return path
 
 
@@ -436,7 +432,19 @@ def run(
 
             doc = _render_file(entity, today_str, safe, source_chunks)
             if not dry_run:
-                path = _write_swept_file(entity, today_str, doc)
+                try:
+                    path = _write_swept_file(entity, today_str, doc)
+                except drive_io.DriveUnavailable:
+                    # A transient G: unmount: skip this entity WITHOUT advancing its
+                    # watermark, so the digest retries next run. The circuit breaker
+                    # then fast-fails the remaining entities' writes (no per-entity
+                    # 90s wait), and the run still exits cleanly.
+                    log.warning(
+                        "drive_materializer: G: mount unavailable writing %s digest — "
+                        "skipping (watermark not advanced, retries next run)", entity,
+                    )
+                    stats["entities_skipped"] += 1
+                    continue
                 stats["files"].append(str(path))
                 for source, adv in source_adv.items():
                     wm[_wm_key(entity, source)] = adv

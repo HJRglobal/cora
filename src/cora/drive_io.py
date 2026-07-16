@@ -387,6 +387,33 @@ def write_bytes_atomic(
     )
 
 
+def append_text(
+    path: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    make_parents: bool = True,
+    timeout: float = TIMEOUT_SECONDS,
+    retry_seconds: float = 0.0,
+) -> None:
+    """Resilient APPEND (``open('a')`` + write) for append-only ledgers.
+
+    Defaults to ``retry_seconds=0`` (a single bounded attempt, NO retry): a retry
+    after a slow-but-eventually-successful first write would double-append a line,
+    which -- unlike an atomic replace -- is not idempotent. Callers that must record
+    accept "skip on outage" (fail-open) over a possible duplicate row. Raises
+    :class:`DriveUnavailable` when the mount is gone."""
+    p = Path(path)
+
+    def _op() -> None:
+        if make_parents:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding=encoding) as fh:
+            fh.write(text)
+
+    _guarded(_op, what=f"appending {p}", timeout=timeout, retry_seconds=retry_seconds)
+
+
 def _write_atomic(
     path: str | os.PathLike[str],
     data: bytes,

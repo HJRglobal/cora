@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import phi_guard
+from . import drive_io, phi_guard
 
 log = logging.getLogger(__name__)
 
@@ -545,8 +545,11 @@ def harvest(
             continue
 
         try:
-            npath.parent.mkdir(parents=True, exist_ok=True)
-            npath.write_text(note, encoding="utf-8")
+            # G: write, atomic + timeout-bounded (make_parents creates the YYYY-MM dir).
+            # A transient unmount raises drive_io.DriveUnavailable (an OSError, caught
+            # here -> this session is skipped + retries next run) instead of hanging the
+            # nightly capture process.
+            drive_io.write_text_atomic(npath, note, encoding="utf-8")
         except OSError as exc:
             log.error("session_capture: failed writing %s: %s", npath, exc)
             result.skipped_reason = "write_failed"

@@ -54,6 +54,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import drive_io
 from .phi_guard import is_phi_risk, is_visibility_cpa_mention
 
 log = logging.getLogger(__name__)
@@ -256,7 +257,9 @@ def gather_pipeline(
 def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
     path = _decisions_pending_path()
     try:
-        content = path.read_text(encoding="utf-8")
+        # G: mount: drive_io makes a transient unmount a bounded DriveUnavailable
+        # (an OSError -> caught here) instead of a hang that wedges this weekly job.
+        content = drive_io.read_text(path, encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
         log.warning("strategy_memo: decisions-pending unreadable: %s", exc)
         return {"ok": False, "decisions": []}
@@ -849,9 +852,11 @@ def build_memo_document(memo_body: str, *, today: date | None = None) -> str:
 def write_memo_file(document: str, *, today: date | None = None) -> Path:
     today = today or _today()
     month_dir = _memo_root() / today.strftime("%Y-%m")
-    month_dir.mkdir(parents=True, exist_ok=True)
     path = month_dir / f"{today.isoformat()}_fndr_weekly-strategy-memo.md"
-    path.write_text(document, encoding="utf-8")
+    # G: mount: atomic + timeout-bounded. A gone mount raises DriveUnavailable, which
+    # run_memo already catches so the memo still DMs to Harrison (file write is
+    # best-effort). make_parents creates the YYYY-MM dir.
+    drive_io.write_text_atomic(path, document, encoding="utf-8")
     return path
 
 
