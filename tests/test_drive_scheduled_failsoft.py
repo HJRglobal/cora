@@ -70,6 +70,28 @@ def test_flywheel_mirror_failsoft_on_outage(monkeypatch, tmp_path):
     assert mirrored == []
 
 
+def test_flywheel_mirror_continues_after_one_bad_file(monkeypatch, tmp_path):
+    """One file's outage must not abort the rest: the good ledger still mirrors
+    (per-file fail-soft, D-051 GAP7)."""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "cora-reply-log.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "knowledge-gaps.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel"))
+
+    real = drive_io.write_bytes_atomic
+
+    def _selective(path, data, **kwargs):
+        if "cora-reply-log" in str(path):
+            raise drive_io.DriveUnavailable("outage on this one file")
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(drive_materializer.drive_io, "write_bytes_atomic", _selective)
+    mirrored = drive_materializer.mirror_flywheel_ledgers(repo_root=tmp_path)
+    assert "knowledge-gaps.jsonl" in mirrored           # the good file mirrored
+    assert "cora-reply-log.jsonl" not in mirrored        # the bad file skipped, not fatal
+
+
 # ── nudge_ledger (daily) ─────────────────────────────────────────────────────
 
 def test_recently_nudged_failopen_on_outage(monkeypatch):

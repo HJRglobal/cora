@@ -140,6 +140,34 @@ class TestFailSoft:
         assert result["memo"]
         assert result["synthesized"] is False
 
+    def test_run_memo_delivers_even_when_memo_write_hits_outage(self, paths, monkeypatch):
+        """A G: unmount during the memo-file write must NOT block Harrison's DM -- the
+        file write is best-effort, so memo_path is empty but delivered stays True
+        (D-051 GAP6)."""
+        def _boom_write(*_a, **_k):
+            raise sm.drive_io.DriveUnavailable("simulated G: unmount")
+
+        monkeypatch.setattr(sm.drive_io, "write_text_atomic", _boom_write)
+        delivered = {"n": 0}
+
+        def _deliver(_body):
+            delivered["n"] += 1
+            return True
+
+        result = sm.run_memo(
+            dry_run=False, today=TODAY,
+            gather_fn=lambda: {"date": TODAY.isoformat(),
+                               "cash": {"ok": False}, "pipeline": {"ok": False},
+                               "decisions": {"ok": False}, "deadlines": {"ok": False},
+                               "efficiency": {"ok": False}, "kb_activity": {"ok": False},
+                               "health": {"ok": False}},
+            synth_fn=lambda facts: "MEMO BODY",
+            deliver_fn=_deliver,
+        )
+        assert result["memo_path"] == ""     # the memo file write was skipped
+        assert result["delivered"] is True   # but the DM still fired
+        assert delivered["n"] == 1
+
     def test_gather_cash_marks_failed_entity_and_keeps_rest(self, monkeypatch):
         import cora.connectors.gsheets_financials as gf
 

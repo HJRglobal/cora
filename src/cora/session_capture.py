@@ -558,7 +558,8 @@ def harvest(
             continue
 
         if with_kb and kb is not None:
-            _ingest_note(kb, npath, entity, distilled, session, founder_os_root)
+            _ingest_note(kb, npath, entity, distilled, session, founder_os_root,
+                         content=note, when=when)
 
         append_ledger({
             "session_id": session.session_id,
@@ -576,25 +577,31 @@ def harvest(
 
 
 def _ingest_note(kb: Any, npath: Path, entity: str, distilled: dict[str, Any],
-                 session: ParsedSession, root: Path) -> None:
+                 session: ParsedSession, root: Path, *, content: str, when: datetime) -> None:
     """Upsert a freshly-written note into the KB immediately (idempotent).
 
     Uses source="static_md" + source_id=<relative path> so it shares identity
     with the nightly static_md sync (replace-on-conflict => no duplicate).
     sub_entity tagging for LEX is applied by the store's upsert Step 0.
+
+    Takes the note CONTENT + capture time directly (the note was JUST written a few
+    lines up), so the immediate ingest never RE-READS the file off the G: mount --
+    a naked read-back there could hang in the ~30s unmount/remount window this branch
+    was built to survive (D-051, 2026-07-16). The nightly static_md sync reconciles
+    date_created/date_modified from the real file stat on its next pass (idempotent).
     """
     try:
         from .knowledge_base.store import Document
         rel = str(npath.relative_to(root)) if npath.is_relative_to(root) else str(npath)
-        stat = npath.stat()
+        ts = int(when.timestamp())
         kb.upsert_documents([Document(
             source="static_md",
             source_id=rel,
             entity="LEX" if entity.startswith("LEX-") else entity,
             sub_entity=entity if entity.startswith("LEX-") else None,
-            content=npath.read_text(encoding="utf-8", errors="replace"),
-            date_created=int(stat.st_ctime),
-            date_modified=int(stat.st_mtime),
+            content=content,
+            date_created=ts,
+            date_modified=ts,
             title=f"Session capture — {distilled['topic']}",
             deep_link=f"computer://{npath}",
             metadata={"path": rel, "session_id": session.session_id, "kind": "session_capture"},

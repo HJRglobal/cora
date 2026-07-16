@@ -151,6 +151,23 @@ class TestRun:
         assert not (Path(env) / "swept" / "F3E" / "2026-06-29.md").exists()
         assert dm._load_watermarks().get(dm._wm_key("F3E", "gmail")) is None  # not advanced
 
+    def test_driveunavailable_write_skips_without_advancing_watermark(self, kb, env, monkeypatch):
+        """A G: unmount DURING the swept-file write skips that entity WITHOUT advancing
+        its watermark (retries next run) -- the DR invariant a watermark-advance-on-skip
+        regression would silently break, dropping a day's digest (D-051 GAP2)."""
+        _insert(kb, source="gmail", entity="F3E", ingested_at=NOW, cid="x")
+        fc = FakeClient()
+
+        def _raise_du(*_a, **_k):
+            raise dm.drive_io.DriveUnavailable("simulated G: unmount")
+
+        monkeypatch.setattr(dm.drive_io, "write_text_atomic", _raise_du)
+        stats = dm.run(today=date(2026, 6, 29), client=fc, kb=kb, lookback_hours=24 * 3650)
+        assert stats["entities_written"] == 0
+        assert stats["entities_skipped"] >= 1
+        assert not (Path(env) / "swept" / "F3E" / "2026-06-29.md").exists()
+        assert dm._load_watermarks().get(dm._wm_key("F3E", "gmail")) is None  # NOT advanced
+
     def test_dry_run_writes_nothing_and_no_watermark(self, kb, env):
         _insert(kb, source="gmail", entity="F3E", ingested_at=NOW, cid="x")
         fc = FakeClient()

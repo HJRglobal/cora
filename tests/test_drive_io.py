@@ -183,7 +183,13 @@ def test_hung_op_returns_control_within_timeout(mount_gone, monkeypatch):
 
 def test_hung_op_does_not_freeze_other_threads(mount_gone, monkeypatch):
     """While one thread is stuck in a hung G: read, an independent thread (proxy for
-    the heartbeat) keeps making progress -- the interpreter is not frozen."""
+    the heartbeat) keeps making progress -- the interpreter is not frozen.
+
+    NOTE: this demonstrates the GIL-RELEASING blocking case (Event.wait releases the
+    GIL, as a real kernel FS read does), which is the case the wrapper actually
+    recovers. The pathological GIL-NON-releasing hang is acknowledged as
+    in-process-unrecoverable (see the drive_io module docstring) and is covered by the
+    external cora-watchdog -- it is not what this test proves."""
     monkeypatch.setattr(drive_io, "BACKOFF_SECONDS", 0.01)
     release = threading.Event()
     beats = []
@@ -238,18 +244,72 @@ def test_breaker_fast_fails_after_outage(mount_gone, monkeypatch):
 
 
 def test_breaker_resets_on_success(mount_up):
-    """A successful read resets the breaker so later reads proceed normally."""
-    drive_io._breaker_trip()
-    assert drive_io._breaker_is_open()
+    """A successful read ACTIVELY resets the breaker (not merely lets it time out).
+    Set the window to a PAST monotonic value (expired, but the stored value is
+    non-zero); a successful read must ZERO it via the success-path _breaker_reset().
+    Teeth: deleting that reset would leave the stale negative value, not 0.0."""
     f = mount_up / "ok.md"
     f.write_text("ok", encoding="utf-8")
-    # Breaker open -> this first call fast-fails...
-    with pytest.raises(drive_io.DriveUnavailable):
-        drive_io.read_text(f, retry_seconds=0)
-    # ...but after the breaker window we succeed and reset. Simulate expiry:
-    drive_io.reset_state_for_tests()
-    assert drive_io.read_text(f, retry_seconds=0) == "ok"
+    drive_io._breaker_open_until = time.monotonic() - 1.0  # expired but non-zero
     assert not drive_io._breaker_is_open()
+    assert drive_io.read_text(f, retry_seconds=0) == "ok"
+    assert drive_io._breaker_open_until == 0.0
+
+
+def test_breaker_trip_honors_hold_seconds(monkeypatch):
+    """_breaker_trip holds the breaker open for max(BREAKER_SECONDS, hold_seconds), so
+    a long-retry-window (scheduled) call keeps it open at least that long (D-051 Q5)."""
+    monkeypatch.setattr(drive_io, "BREAKER_SECONDS", 5.0)
+    drive_io._breaker_trip(hold_seconds=50.0)
+    assert drive_io._breaker_open_until - time.monotonic() > 5.0  # held for the larger hold
+    drive_io.reset_state_for_tests()
+    drive_io._breaker_trip(hold_seconds=1.0)
+    remaining = drive_io._breaker_open_until - time.monotonic()
+    assert 3.5 < remaining <= 5.0  # held for BREAKER_SECONDS (the larger of the two)
+
+
+def test_retry_then_recover(monkeypatch):
+    """An op that fails mount-gone once then succeeds within the window returns the
+    value and leaves the breaker CLOSED -- the 'ride over a ~30s remount' guarantee
+    (D-051 GAP1). Neither always-succeed nor always-fail exercises this loop."""
+    monkeypatch.setattr(drive_io, "BACKOFF_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    def _op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = OSError("device not ready")
+            err.winerror = 21  # short-circuits classification -> mount-gone -> retry
+            raise err
+        return "recovered"
+
+    val = drive_io._guarded(_op, what="test", timeout=1.0, retry_seconds=1.0)
+    assert val == "recovered"
+    assert calls["n"] == 2                       # failed once, then succeeded
+    assert not drive_io._breaker_is_open()        # success reset the breaker
+
+
+def test_guarded_retry_zero_is_single_attempt(mount_gone, monkeypatch):
+    """retry_seconds=0 makes exactly ONE attempt (no retry). This is the invariant
+    append_text relies on to guarantee no double-append (D-051 GAP3)."""
+    monkeypatch.setattr(drive_io, "BACKOFF_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    def _op():
+        calls["n"] += 1
+        raise FileNotFoundError(2, "gone")
+
+    with pytest.raises(drive_io.DriveUnavailable):
+        drive_io._guarded(_op, what="append", timeout=1.0, retry_seconds=0)
+    assert calls["n"] == 1
+
+
+def test_append_text_happy_path(mount_up):
+    """append_text APPENDS (does not overwrite) and creates parents (D-051 GAP3)."""
+    dest = mount_up / "sub" / "ledger.jsonl"
+    drive_io.append_text(dest, '{"a": 1}\n')
+    drive_io.append_text(dest, '{"b": 2}\n')
+    assert dest.read_text(encoding="utf-8") == '{"a": 1}\n{"b": 2}\n'
 
 
 # ── is_mount_available ───────────────────────────────────────────────────────

@@ -130,10 +130,16 @@ def _breaker_is_open() -> bool:
         return time.monotonic() < _breaker_open_until
 
 
-def _breaker_trip() -> None:
+def _breaker_trip(hold_seconds: float = 0.0) -> None:
+    """Open the breaker for at least BREAKER_SECONDS, and at least ``hold_seconds``
+    (the retry window of the call that just confirmed the outage). Holding it at least
+    as long as the tripping call's window stops a sustained hang-mode outage from
+    starting a fresh full-length retry window on every breaker cycle -- which, on the
+    scheduled path (retry=90 >> breaker=30), would otherwise leave the breaker open
+    only ~25% of the time and undercut its worker-spawn-limiting purpose (D-051 Q5)."""
     global _breaker_open_until
     with _breaker_lock:
-        _breaker_open_until = time.monotonic() + BREAKER_SECONDS
+        _breaker_open_until = time.monotonic() + max(BREAKER_SECONDS, hold_seconds)
 
 
 def _breaker_reset() -> None:
@@ -175,14 +181,16 @@ def _run_bounded(op: Callable[[], _T], timeout: float) -> _T:
     return box["value"]  # type: ignore[return-value]
 
 
-def _mount_reachable() -> bool:
+def _mount_reachable(timeout: float = TIMEOUT_SECONDS) -> bool:
     """Bounded probe of the mount anchor. True only if the anchor is reachable.
 
     A timeout or any error is treated as NOT reachable (fail toward "mount gone").
-    Never raises. Does NOT consult or modify the breaker.
+    Never raises. Does NOT consult or modify the breaker. ``timeout`` is threaded from
+    the caller so a short request-path op's classification probe is bounded by that
+    same short budget, not the longer module default (D-051 Q6).
     """
     try:
-        return bool(_run_bounded(lambda: os.path.exists(MOUNT_ANCHOR), TIMEOUT_SECONDS))
+        return bool(_run_bounded(lambda: os.path.exists(MOUNT_ANCHOR), timeout))
     except _WorkerTimeout:
         return False
     except Exception:  # noqa: BLE001 -- any probe error => treat as unreachable
@@ -199,13 +207,14 @@ def is_mount_available() -> bool:
     return _mount_reachable()
 
 
-def _classify_mount_gone(exc: BaseException) -> bool:
+def _classify_mount_gone(exc: BaseException, timeout: float = TIMEOUT_SECONDS) -> bool:
     """Decide whether ``exc`` means the mount is gone (vs a genuine file-level error).
 
     - A worker timeout is always mount-gone (a healthy read never hangs).
     - A known device/network WinError code is always mount-gone.
     - A ``FileNotFoundError`` / other ``OSError`` is ambiguous (the file may simply
-      not exist while the mount is UP) -- disambiguate by probing the mount anchor.
+      not exist while the mount is UP) -- disambiguate by probing the mount anchor
+      (bounded by the caller's ``timeout``).
       Mount reachable => genuine error (NOT mount-gone). Mount unreachable => mount-gone.
     - Anything else (e.g. a ``UnicodeDecodeError``) is NOT mount-gone.
     """
@@ -215,7 +224,7 @@ def _classify_mount_gone(exc: BaseException) -> bool:
     if winerror in _MOUNT_GONE_WINERRORS:
         return True
     if isinstance(exc, OSError):
-        return not _mount_reachable()
+        return not _mount_reachable(timeout)
     return False
 
 
@@ -245,7 +254,7 @@ def _guarded(
         try:
             value = _run_bounded(op, timeout)
         except (_WorkerTimeout, OSError) as exc:
-            if not _classify_mount_gone(exc):
+            if not _classify_mount_gone(exc, timeout):
                 raise  # genuine file-level error with the mount up -- preserve behavior
             last_exc = exc
         else:
@@ -254,9 +263,12 @@ def _guarded(
 
         if time.monotonic() >= deadline:
             break
-        time.sleep(BACKOFF_SECONDS)
+        # Floor the backoff so a misconfigured 0/negative DRIVE_IO_BACKOFF_SECONDS can
+        # neither raise (negative -> ValueError) nor hot-spin a worker-spawn storm (0).
+        time.sleep(max(0.05, BACKOFF_SECONDS))
 
-    _breaker_trip()
+    # Hold the breaker at least as long as this call's retry window (D-051 Q5).
+    _breaker_trip(retry_seconds)
     raise DriveUnavailable(f"G: mount unreachable while {what}") from last_exc
 
 
@@ -271,7 +283,14 @@ def read_text(
 ) -> str:
     """Resilient ``Path.read_text``. Raises :class:`DriveUnavailable` if the mount
     is gone; re-raises ``FileNotFoundError`` when the mount is UP but the file is
-    genuinely absent."""
+    genuinely absent.
+
+    Classification edge: if the mount ANCHOR itself is unreachable (e.g. a box with no
+    G: at all), a missing file cannot be distinguished from a gone mount and so
+    reclassifies to :class:`DriveUnavailable`. On the production host G: is always
+    present, so absence surfaces as ``FileNotFoundError`` as expected -- but a future
+    caller that branches specifically on ``FileNotFoundError`` should ALSO handle
+    ``DriveUnavailable`` (both are ``OSError``)."""
     p = Path(path)
     return _guarded(
         lambda: p.read_text(encoding=encoding),
