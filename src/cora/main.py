@@ -10,6 +10,7 @@ from pathlib import Path
 
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+from . import drive_io
 from .app import app
 from .config import config
 from .context_loader import _load_static_context
@@ -17,6 +18,15 @@ from .health_endpoint import start_health_server, start_ping_thread
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEARTBEAT_FILE = _REPO_ROOT / "data" / "health" / "heartbeat.txt"
+
+# Slice 4 (2026-07-16): how often the G: reachability breadcrumb probes the mount.
+# Pure observability -- it NEVER gates the bot (drive_io already makes real reads
+# fail-soft); this only logs available<->unavailable transitions for correlating
+# future Drive blips against the heartbeat/watchdog timeline.
+try:
+    _DRIVE_MONITOR_INTERVAL_SECS = int(os.environ.get("DRIVE_IO_MONITOR_INTERVAL_SECS") or "300")
+except ValueError:
+    _DRIVE_MONITOR_INTERVAL_SECS = 300
 
 # Seconds to wait before each successive restart attempt (capped at last value).
 _BACKOFF = (1, 2, 5, 10, 30)
@@ -118,6 +128,50 @@ def _prewarm_kb(log: logging.Logger) -> None:
         log.warning("kb-prewarm: failed (non-fatal): %s", exc)
 
 
+def _log_drive_transition(prev: bool | None, available: bool, log: logging.Logger) -> bool:
+    """Log a G: mount reachability transition and return the new state.
+
+    Startup (prev is None) logs the initial state; a later flip logs a transition.
+    Pure apart from the log call, so it can be tested in isolation. NEVER gates
+    anything -- the drive_io wrapper already makes real G: reads fail-soft.
+    """
+    if available == prev:
+        return available
+    if prev is None:
+        if available:
+            log.info("drive-monitor: G: mount AVAILABLE at startup")
+        else:
+            log.warning("drive-monitor: G: mount UNAVAILABLE at startup "
+                        "(context serves from cache until it returns)")
+    elif available:
+        log.warning("drive-monitor: G: mount RECOVERED (unavailable -> available)")
+    else:
+        log.warning("drive-monitor: G: mount LOST (available -> unavailable); "
+                    "context serves from cache, heartbeat unaffected")
+    return available
+
+
+def _drive_reachability_monitor(log, stop, *, probe=None, interval=None) -> None:
+    """Process-lifetime daemon: probe G: reachability and log transitions.
+
+    Observability ONLY -- it never gates the bot. `probe` (default
+    drive_io.is_mount_available) is bounded so this loop can never hang, and a probe
+    error is swallowed (a breadcrumb must never crash the process).
+    """
+    probe = probe or drive_io.is_mount_available
+    step = interval if interval is not None else _DRIVE_MONITOR_INTERVAL_SECS
+    prev: bool | None = None
+    while True:
+        try:
+            available = bool(probe())
+        except Exception as exc:  # noqa: BLE001 -- a breadcrumb must never crash
+            log.warning("drive-monitor: probe error (ignored): %s", exc)
+            available = False
+        prev = _log_drive_transition(prev, available, log)
+        if stop.wait(step):
+            return
+
+
 def main() -> None:
     _setup_logging()
     log = logging.getLogger(__name__)
@@ -146,6 +200,16 @@ def main() -> None:
     # heartbeat sentinel file, so they track liveness across reconnect cycles).
     start_health_server()
     start_ping_thread()
+
+    # G: mount reachability breadcrumb (Slice 4) — process-lifetime daemon, observability
+    # only. Its stop Event is never set (dies with the process); it logs when G: flips
+    # available<->unavailable so a future Drive blip is correlatable in the log timeline.
+    threading.Thread(
+        target=_drive_reachability_monitor,
+        args=(log, threading.Event()),
+        name="DriveMonitor",
+        daemon=True,
+    ).start()
 
     attempt = 0
     last_error = ""
