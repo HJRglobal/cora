@@ -19,10 +19,17 @@ Write doctrine (LOCKED 2026-05-21):
 - Workspace is fixed to HJR Global; cross-workspace writes are not
   supported in v1.
 
+Edit path (added 2026-07-15, PM-hub Phase 1):
+- update_task (native fields: name / assignee / due_on / notes) — PUT /tasks/{gid}
+- create_subtask — POST /tasks/{parent}/subtasks
+- list_custom_field_enum_options — resolve a Status/Priority value name to its
+  enum-option GID for set_task_custom_fields
+All still staged-write at the tool layer (preview + confirmed=true gate).
+
 Phase 3+ paths (deferred):
 - OAuth per-user (replaces single PAT — writes attributed to the asker
   not Harrison)
-- search_tasks, update_task, complete_task
+- search_tasks
 - Project resolution by name (today: optional project_gid passed in,
   no name-to-gid resolver)
 """
@@ -287,6 +294,71 @@ def create_task(
     return r.json().get("data") or {}
 
 
+def create_subtask(
+    parent_gid: str,
+    *,
+    name: str,
+    assignee_gid: str | None = None,
+    notes: str | None = None,
+    due_on: str | None = None,
+) -> dict[str, Any]:
+    """Create a subtask under an existing task (POST /tasks/{parent}/subtasks).
+
+    A subtask inherits its parent's project/workspace, so we do NOT set
+    workspace/projects here (the parent implies them). Returns the created
+    subtask dict (gid + permalink_url). Raises AsanaClientError on failure.
+    """
+    if not parent_gid or not parent_gid.strip():
+        raise AsanaClientError("create_subtask requires a non-empty parent_gid")
+    if not name or not name.strip():
+        raise AsanaClientError("create_subtask requires a non-empty `name`")
+
+    data: dict[str, Any] = {"name": name.strip()}
+    if assignee_gid:
+        data["assignee"] = str(assignee_gid)
+    if notes:
+        data["notes"] = notes
+    if due_on:
+        if len(due_on) != 10 or due_on[4] != "-" or due_on[7] != "-":
+            raise AsanaClientError(
+                f"create_subtask: due_on must be YYYY-MM-DD format, got {due_on!r}"
+            )
+        data["due_on"] = due_on
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    opt_fields = ",".join([
+        "name", "assignee.name", "due_on", "notes", "permalink_url", "parent.name",
+    ])
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/tasks/{parent_gid}/subtasks",
+                params={"opt_fields": opt_fields},
+                json={"data": data},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot add a subtask to task {parent_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — parent task {parent_gid} not found")
+    if r.status_code == 400:
+        raise AsanaClientError(f"Asana 400 — bad request: {r.text[:400]}")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
 def complete_task(task_gid: str) -> dict[str, Any]:
     """Mark an Asana task as complete.
 
@@ -315,6 +387,67 @@ def complete_task(task_gid: str) -> dict[str, Any]:
         raise AsanaClientError(f"Asana 403 — cannot complete task {task_gid}")
     if r.status_code == 404:
         raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code >= 500:
+        raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
+    if r.status_code not in (200, 201):
+        raise AsanaClientError(f"Asana {r.status_code}: {r.text[:200]}")
+
+    return r.json().get("data") or {}
+
+
+def update_task(task_gid: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Update native fields on an existing task (PUT /tasks/{gid}).
+
+    `fields` carries any subset of Asana native task fields to change:
+      - "name":     str
+      - "assignee": user_gid str, or None to UNASSIGN
+      - "due_on":   "YYYY-MM-DD", or None to CLEAR the due date
+      - "notes":    str
+    Only the keys present are changed. Custom fields (Status/Priority) go through
+    set_task_custom_fields, NOT here. Returns the updated task dict. Raises
+    AsanaClientError on failure.
+    """
+    if not task_gid or not task_gid.strip():
+        raise AsanaClientError("update_task requires a non-empty task_gid")
+    if not fields:
+        raise AsanaClientError("update_task requires at least one field to change")
+
+    # A present-but-None due_on/assignee is a deliberate CLEAR/UNASSIGN (Asana
+    # accepts null); only validate the date shape when a non-null value is given.
+    due = fields.get("due_on", "__ABSENT__")
+    if due not in ("__ABSENT__", None) and (
+        len(str(due)) != 10 or str(due)[4] != "-" or str(due)[7] != "-"
+    ):
+        raise AsanaClientError(
+            f"update_task: due_on must be YYYY-MM-DD format, got {due!r}"
+        )
+
+    headers = {
+        "Authorization": f"Bearer {_pat()}",
+        "Content-Type": "application/json",
+    }
+    opt_fields = ",".join([
+        "name", "assignee.name", "due_on", "notes", "projects.name", "permalink_url",
+    ])
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.put(
+                f"{_BASE}/tasks/{task_gid}",
+                params={"opt_fields": opt_fields},
+                json={"data": fields},
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise AsanaClientError(f"Asana network error: {exc}") from exc
+
+    if r.status_code == 401:
+        raise AsanaClientError("Asana 401 — PAT invalid or revoked")
+    if r.status_code == 403:
+        raise AsanaClientError(f"Asana 403 — cannot update task {task_gid}")
+    if r.status_code == 404:
+        raise AsanaClientError(f"Asana 404 — task {task_gid} not found")
+    if r.status_code == 400:
+        raise AsanaClientError(f"Asana 400 — bad request: {r.text[:400]}")
     if r.status_code >= 500:
         raise AsanaClientError(f"Asana {r.status_code} — upstream error: {r.text[:200]}")
     if r.status_code not in (200, 201):
@@ -578,6 +711,39 @@ def set_task_custom_fields(task_gid: str, custom_fields: dict[str, str]) -> bool
     except httpx.RequestError as exc:
         log.warning("set_task_custom_fields network error for %s: %s", task_gid, exc)
         return False
+
+
+def list_custom_field_enum_options(field_gid: str) -> list[dict[str, str]]:
+    """Return an enum custom field's options as [{"gid","name","enabled"}, ...].
+
+    Used to resolve a human value name ("In Progress", "High") to its enum-option
+    GID for set_task_custom_fields, WITHOUT hard-coding every option GID. Returns
+    [] on any failure (best-effort — the caller degrades to "couldn't set that
+    field" rather than aborting). Never raises.
+    """
+    if not field_gid or not str(field_gid).strip():
+        return []
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/custom_fields/{field_gid}",
+                params={"opt_fields": "enum_options.name,enum_options.gid,enum_options.enabled"},
+                headers=headers,
+            )
+        if r.status_code != 200:
+            log.warning("list_custom_field_enum_options %s for %s: %s",
+                        r.status_code, field_gid, r.text[:200])
+            return []
+        opts = (r.json().get("data") or {}).get("enum_options") or []
+        return [
+            {"gid": str(o.get("gid", "")), "name": str(o.get("name", "")),
+             "enabled": bool(o.get("enabled", True))}
+            for o in opts if o.get("gid")
+        ]
+    except Exception as exc:  # noqa: BLE001 -- best-effort resolution, never raises
+        log.warning("list_custom_field_enum_options network error for %s: %s", field_gid, exc)
+        return []
 
 
 def list_project_custom_field_gids(project_gid: str) -> set[str]:
