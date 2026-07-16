@@ -1127,6 +1127,349 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     )
 
 
+# ── PM-hub Phase 1 (2026-07-15): conversational task-EDIT tools ────────────────
+# Complete the conversational loop -- change due/assignee/title/notes/status/priority,
+# comment, and add subtasks on EXISTING tasks. All three reuse the F-23 server-side
+# pending store (_PENDING_ASANA_WRITES, new action values) + _resolve_asker_task WS5
+# ownership gate + _lex_safe_label / scrub_lex_phi PHI rails. No new autonomy: every
+# one is preview -> explicit confirm; the confirm turn executes the STASHED payload.
+_ASANA_STATUS_FIELD_GID = "1214566926973275"    # workspace "Status" custom field (D-031)
+_ASANA_PRIORITY_FIELD_GID = "1204547177535963"  # workspace "Priority" custom field (D-031)
+
+
+def _scrub_lex_write_content(text, entity: str):
+    """PHI-scrub content destined for an Asana WRITE when the channel is LEX. Returns
+    (scrubbed, ok); ok=False on a scrub error -> the caller must REFUSE (fail closed,
+    never write raw PHI to Asana). Non-LEX / empty passes through ok=True."""
+    if not text or not (entity or "").upper().startswith("LEX"):
+        return text, True
+    try:
+        from .. import phi_guard
+        staff = {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+        return phi_guard.scrub_lex_phi(text, allowed_names=staff), True
+    except Exception as exc:  # noqa: BLE001 -- fail CLOSED on PHI
+        log.warning("asana edit: LEX PHI scrub failed (%s)", exc)
+        return None, False
+
+
+def _resolve_enum_option(field_gid: str, value: str):
+    """Resolve a human value name -> its enum-option GID (case-insensitive). Returns
+    (option_gid or None, [enabled option names]). Best-effort -- (None, []) on lookup
+    failure, so a status/priority we can't resolve is surfaced, never silently wrong."""
+    opts = asana_client.list_custom_field_enum_options(field_gid)
+    names = [o["name"] for o in opts if o.get("enabled", True) and o.get("name")]
+    want = " ".join((value or "").split()).lower()
+    for o in opts:
+        if o.get("enabled", True) and o.get("name", "").strip().lower() == want:
+            return o["gid"], names
+    return None, names
+
+
+def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Change fields (due/assignee/title/notes/status/priority) on one of the asker's OWN
+    open tasks (staged-write, server-side pending). Reassigning your OWN task to a teammate
+    is allowed (a hand-off); the founder + FNDR/HJRG channels are cross-entity-exempt for
+    the ownership check, same as complete/delete (WS5)."""
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    # ── Phase 2: confirm -> apply the STASHED change-set (native PUT + custom fields).
+    if confirmed:
+        pending = _claim_pending_asana(slack_user_id, channel, "update")
+        if pending:
+            gid = pending["gid"]
+            fields = pending.get("fields") or {}
+            custom = pending.get("custom_fields") or {}
+            change_desc = list(pending.get("change_desc") or [])
+            failed: list[str] = []
+            if fields:
+                try:
+                    asana_client.update_task(gid, fields)
+                except asana_client.AsanaClientError as exc:
+                    return _write_blocked_contract(
+                        f'NOT UPDATED -- couldn\'t update "{pending["label"]}" ({exc}). '
+                        f"No change was made."
+                    )
+            if custom:
+                ok = asana_client.set_task_custom_fields(gid, custom)
+                if not ok:
+                    cdesc = " and ".join(pending.get("custom_desc") or ["status/priority"])
+                    if not fields:
+                        # nothing else changed -> nothing was written; do NOT claim success.
+                        return _write_blocked_contract(
+                            f'NOT UPDATED -- couldn\'t set {cdesc} on "{pending["label"]}" '
+                            f"(that field may not be enabled on its project). No change was made."
+                        )
+                    failed = list(pending.get("custom_desc") or ["status/priority"])
+            log.info("asana_update_task actor=%s gid=%s fields=%s custom=%s custom_ok=%s",
+                     slack_user_id, gid, sorted(fields.keys()), sorted(custom.keys()), not failed)
+            msg = f'Updated "{pending["label"]}" in Asana'
+            if change_desc:
+                msg += " -- " + "; ".join(change_desc)
+            msg += "."
+            if failed:
+                msg += (" (Couldn't set " + " and ".join(failed) +
+                        " -- that field may not be enabled on this task's project; set it "
+                        "directly in Asana.)")
+            return _write_confirmed_contract(msg)
+        # No fresh pending update -> re-preview (never write blind).
+
+    # ── Phase 1: resolve target + change-set SERVER-SIDE, stash, WRITE_BLOCKED preview.
+    gid, label, err = _resolve_asker_task(
+        slack_user_id,
+        (input_data.get("task_gid") or "").strip(),
+        (input_data.get("task_name") or "").strip(),
+        entity,
+    )
+    if err:
+        return _write_blocked_contract(err)
+    label = _lex_safe_label(label, entity)
+
+    fields: dict = {}
+    custom: dict = {}
+    change_desc: list[str] = []
+    custom_desc: list[str] = []
+    skipped: list[str] = []
+    _lex_refusal = (
+        "I couldn't safely prepare that Lexington task change for confidentiality. "
+        "Tell the user to edit it directly in Asana."
+    )
+
+    new_title = (input_data.get("new_title") or "").strip()
+    if new_title:
+        scrubbed, ok = _scrub_lex_write_content(new_title, entity)
+        if not ok:
+            return _write_blocked_contract(_lex_refusal)
+        fields["name"] = scrubbed
+        change_desc.append(f'rename to "{scrubbed}"')
+
+    if input_data.get("clear_due") is True:
+        fields["due_on"] = None
+        change_desc.append("clear the due date")
+    else:
+        new_due = (input_data.get("new_due_on") or "").strip()
+        if new_due:
+            if len(new_due) != 10 or new_due[4] != "-" or new_due[7] != "-":
+                return _write_blocked_contract(
+                    f"That due date ({new_due}) isn't in YYYY-MM-DD form -- give me a real date."
+                )
+            fields["due_on"] = new_due
+            change_desc.append(f"set due {new_due}")
+
+    new_notes = input_data.get("new_notes")
+    if new_notes is not None and str(new_notes).strip():
+        scrubbed, ok = _scrub_lex_write_content(str(new_notes), entity)
+        if not ok:
+            return _write_blocked_contract(_lex_refusal)
+        fields["notes"] = scrubbed
+        change_desc.append("update the description")
+
+    if input_data.get("unassign") is True:
+        fields["assignee"] = None
+        change_desc.append("unassign it")
+    else:
+        new_assignee = (input_data.get("new_assignee_name") or "").strip()
+        if new_assignee:
+            rid, info = resolve_name_to_slack_user_id(new_assignee, channel_entity=entity)
+            if not rid:
+                return _write_blocked_contract(
+                    info or f"I couldn't match '{new_assignee}' to anyone in the roster. "
+                    "Use a full name or common alias."
+                )
+            tu = _load_slack_asana_map().get(rid) or {}
+            agid = str(tu.get("asana_user_gid", "") or "")
+            if not agid or "REPLACE" in agid:
+                return _write_blocked_contract(
+                    f"{tu.get('display_name', new_assignee)} isn't fully set up in Asana yet, "
+                    "so I can't reassign to them."
+                )
+            fields["assignee"] = agid
+            change_desc.append(f"reassign to {tu.get('display_name', new_assignee)}")
+
+    new_status = (input_data.get("new_status") or "").strip()
+    if new_status:
+        opt, names = _resolve_enum_option(_ASANA_STATUS_FIELD_GID, new_status)
+        if opt:
+            custom[_ASANA_STATUS_FIELD_GID] = opt
+            custom_desc.append("status")
+            change_desc.append(f"set status to {new_status}")
+        else:
+            avail = (" Valid: " + ", ".join(names) + ".") if names else ""
+            skipped.append(f"status '{new_status}' isn't a recognized option;{avail}")
+
+    new_priority = (input_data.get("new_priority") or "").strip()
+    if new_priority:
+        opt, names = _resolve_enum_option(_ASANA_PRIORITY_FIELD_GID, new_priority)
+        if opt:
+            custom[_ASANA_PRIORITY_FIELD_GID] = opt
+            custom_desc.append("priority")
+            change_desc.append(f"set priority to {new_priority}")
+        else:
+            avail = (" Valid: " + ", ".join(names) + ".") if names else ""
+            skipped.append(f"priority '{new_priority}' isn't a recognized option;{avail}")
+
+    if not fields and not custom:
+        note = (" (" + " ".join(skipped) + ")") if skipped else ""
+        return _write_blocked_contract(
+            "Tell me what to change on that task -- a new due date, assignee, title, "
+            "notes, status, or priority." + note
+        )
+
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "update", "gid": gid, "label": label,
+        "fields": fields, "custom_fields": custom,
+        "change_desc": change_desc, "custom_desc": custom_desc, "ts": time.time(),
+    })
+    preview = (
+        f'Not updated yet -- reply to confirm and I\'ll update "{label}": '
+        + "; ".join(change_desc) + ". Nothing changes until you confirm."
+    )
+    if skipped:
+        preview += " (Note: " + " ".join(skipped) + ")"
+    return _write_blocked_contract(preview)
+
+
+def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Post a comment on one of the asker's OWN open tasks (staged-write, server-side
+    pending). Founder + FNDR/HJRG cross-entity-exempt (WS5)."""
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    if confirmed:
+        pending = _claim_pending_asana(slack_user_id, channel, "comment")
+        if pending:
+            try:
+                asana_client.create_task_comment(pending["gid"], pending["text"])
+            except asana_client.AsanaClientError as exc:
+                return _write_blocked_contract(
+                    f'NOT ADDED -- couldn\'t comment on "{pending["label"]}" ({exc}). '
+                    f"No comment was posted."
+                )
+            log.info("asana_add_comment actor=%s gid=%s", slack_user_id, pending["gid"])
+            return _write_confirmed_contract(f'Comment added to "{pending["label"]}" in Asana.')
+        # No fresh pending comment -> re-preview.
+
+    text = (input_data.get("text") or "").strip()
+    gid, label, err = _resolve_asker_task(
+        slack_user_id,
+        (input_data.get("task_gid") or "").strip(),
+        (input_data.get("task_name") or "").strip(),
+        entity,
+    )
+    if err:
+        return _write_blocked_contract(err)
+    if not text:
+        return _write_blocked_contract("Tell me what the comment should say.")
+    label = _lex_safe_label(label, entity)
+    scrubbed, ok = _scrub_lex_write_content(text, entity)
+    if not ok:
+        return _write_blocked_contract(
+            "I couldn't safely prepare that Lexington comment for confidentiality. "
+            "Tell the user to add it directly in Asana."
+        )
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "comment", "gid": gid, "label": label, "text": scrubbed, "ts": time.time(),
+    })
+    return _write_blocked_contract(
+        f'Not added yet -- reply to confirm and I\'ll post this comment on "{label}": '
+        f'"{scrubbed}". Nothing is posted until you confirm.'
+    )
+
+
+def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Add a subtask under one of the asker's OWN open tasks (staged-write, server-side
+    pending). The subtask inherits the parent's project; assignee defaults to the asker.
+    Founder + FNDR/HJRG cross-entity-exempt for the PARENT-ownership check (WS5)."""
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    confirmed = input_data.get("confirmed") is True
+
+    if confirmed:
+        pending = _claim_pending_asana(slack_user_id, channel, "subtask")
+        if pending:
+            try:
+                created = asana_client.create_subtask(
+                    pending["parent_gid"],
+                    name=pending["name"],
+                    assignee_gid=pending.get("assignee_gid") or None,
+                    notes=pending.get("notes") or None,
+                    due_on=pending.get("due_on") or None,
+                )
+            except asana_client.AsanaClientError as exc:
+                return _write_blocked_contract(
+                    f'NOT ADDED -- couldn\'t add the subtask under "{pending["parent_label"]}" '
+                    f"({exc}). Nothing was created."
+                )
+            log.info("asana_add_subtask actor=%s parent=%s sub=%s",
+                     slack_user_id, pending["parent_gid"], created.get("gid", ""))
+            link = created.get("permalink_url") or ""
+            name_disp = f'<{link}|{pending["name"]}>' if link else f'"{pending["name"]}"'
+            return _write_confirmed_contract(
+                f'Added subtask {name_disp} under "{pending["parent_label"]}" '
+                f'(assignee: {pending.get("assignee_display", "you")}).'
+            )
+        # No fresh pending subtask -> re-preview.
+
+    name = (input_data.get("title") or "").strip()
+    gid, label, err = _resolve_asker_task(
+        slack_user_id,
+        (input_data.get("parent_task_gid") or "").strip(),
+        (input_data.get("parent_task_name") or "").strip(),
+        entity,
+    )
+    if err:
+        return _write_blocked_contract(err)
+    if not name:
+        return _write_blocked_contract("Tell me what the subtask should be called.")
+    parent_label = _lex_safe_label(label, entity)
+
+    name_scrubbed, ok1 = _scrub_lex_write_content(name, entity)
+    notes_raw = input_data.get("notes")
+    notes_scrubbed, ok2 = _scrub_lex_write_content(str(notes_raw) if notes_raw else None, entity)
+    if not ok1 or not ok2:
+        return _write_blocked_contract(
+            "I couldn't safely prepare that Lexington subtask for confidentiality. "
+            "Tell the user to add it directly in Asana."
+        )
+
+    assignee_name = (input_data.get("assignee_name") or "").strip()
+    if assignee_name:
+        rid, info = resolve_name_to_slack_user_id(assignee_name, channel_entity=entity)
+        if not rid:
+            return _write_blocked_contract(
+                info or f"I couldn't match '{assignee_name}' to anyone in the roster."
+            )
+        au = _load_slack_asana_map().get(rid) or {}
+        assignee_gid = str(au.get("asana_user_gid", "") or "")
+        assignee_display = au.get("display_name", assignee_name)
+    else:
+        asker = _load_slack_asana_map().get(slack_user_id) or {}
+        assignee_gid = str(asker.get("asana_user_gid", "") or "")
+        assignee_display = "you"
+    if not assignee_gid or "REPLACE" in assignee_gid:
+        assignee_gid = ""
+        assignee_display = "unassigned"
+
+    due_on = (input_data.get("due_on") or "").strip() or None
+    if due_on and (len(due_on) != 10 or due_on[4] != "-" or due_on[7] != "-"):
+        return _write_blocked_contract(
+            f"That due date ({due_on}) isn't in YYYY-MM-DD form -- give me a real date."
+        )
+
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "subtask", "parent_gid": gid, "parent_label": parent_label,
+        "name": name_scrubbed, "notes": notes_scrubbed, "due_on": due_on,
+        "assignee_gid": assignee_gid, "assignee_display": assignee_display, "ts": time.time(),
+    })
+    return _write_blocked_contract(
+        f'Not added yet -- reply to confirm and I\'ll add subtask "{name_scrubbed}" '
+        f'(assignee: {assignee_display}) under "{parent_label}". '
+        f"Nothing is created until you confirm."
+    )
+
+
 def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
     """Create a Gmail draft in the asker's own Drafts folder.
 
@@ -3440,6 +3783,12 @@ def _run_confirm_execute(
                 raw = _tool_asana_complete_task(slack_user_id, entity, inp)
             elif action == "create":
                 raw = _tool_asana_create_task(slack_user_id, entity, inp)
+            elif action == "update":
+                raw = _tool_asana_update_task(slack_user_id, entity, inp)
+            elif action == "comment":
+                raw = _tool_asana_add_comment(slack_user_id, entity, inp)
+            elif action == "subtask":
+                raw = _tool_asana_add_subtask(slack_user_id, entity, inp)
             else:
                 return None
         elif kind == "shopify":
@@ -5244,6 +5593,93 @@ TOOL_DEFINITIONS = [
                 "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to delete."},
                 "task_gid": {"type": "string", "description": "Optional Asana task gid (skips name matching, but the task is still verified to be one of YOUR open tasks unless you are the founder/an aggregator channel)."},
                 "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the matched task and getting explicit approval to PERMANENTLY delete it."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "asana_update_task",
+        "description": (
+            "Change fields on one of the ASKING USER's existing open Asana tasks: due "
+            "date, assignee (reassign), title, notes/description, status, or priority. Use "
+            "for 'change the due date of X to Friday', 'reassign the X task to Hannah', "
+            "'rename the X task', 'move X's deadline', 'mark X in progress', 'set X to high "
+            "priority', 'add a description to X'. NOT for marking done (asana_complete_task) "
+            "or deleting (asana_delete_task).\n"
+            "REQUIRED PATTERN (staged-write): on the first turn call with task_name (or "
+            "task_gid) + the change fields WITHOUT confirmed -- the tool resolves the task, "
+            "PHI-scrubs any Lexington content, and returns a NOT-CHANGED-yet preview naming "
+            "the match and the exact changes; show that preview verbatim, get explicit "
+            "approval, THEN call again with confirmed=true. Only the asker's OWN open tasks "
+            "(reassigning your own task to a teammate is allowed); if it reports zero or "
+            "multiple matches, relay that. The tool owns the wording -- never say a field "
+            "changed unless the result says WRITE_CONFIRMED."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task to change."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid (still verified to be one of YOUR open tasks unless founder/aggregator channel)."},
+                "new_due_on": {"type": "string", "description": "New due date, YYYY-MM-DD."},
+                "clear_due": {"type": "boolean", "description": "Set true to REMOVE the due date entirely."},
+                "new_assignee_name": {"type": "string", "description": "Reassign to this teammate (first name / full name / alias). You must OWN the task to reassign it."},
+                "unassign": {"type": "boolean", "description": "Set true to remove the assignee entirely."},
+                "new_title": {"type": "string", "description": "Rename the task."},
+                "new_notes": {"type": "string", "description": "Replace the task description / notes."},
+                "new_status": {"type": "string", "description": "Set the Status custom field to this value name (e.g. 'In Progress'). Best-effort -- surfaced if the field or option isn't available on the task's project."},
+                "new_priority": {"type": "string", "description": "Set the Priority custom field to this value name (e.g. 'High'). Best-effort."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the tool's preview and getting explicit approval."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "asana_add_comment",
+        "description": (
+            "Post a comment on one of the ASKING USER's open Asana tasks. Use for 'comment "
+            "on the X task that ...', 'add a note to X saying ...', 'leave a comment on X'.\n"
+            "REQUIRED PATTERN (staged-write): on the first turn call with task_name (or "
+            "task_gid) + text WITHOUT confirmed -- the tool resolves the task, PHI-scrubs "
+            "Lexington content, and returns a NOT-POSTED-yet preview; show it verbatim, get "
+            "explicit approval, THEN call again with confirmed=true. Only the asker's OWN "
+            "open tasks. The tool owns the wording -- never say a comment posted unless the "
+            "result says WRITE_CONFIRMED."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open task."},
+                "task_gid": {"type": "string", "description": "Optional Asana task gid (still ownership-verified unless founder/aggregator)."},
+                "text": {"type": "string", "description": "The comment body to post."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the preview and getting explicit approval."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "asana_add_subtask",
+        "description": (
+            "Add a subtask under one of the ASKING USER's open Asana tasks. Use for 'add a "
+            "subtask to X: ...', 'break X into steps', 'under the X task add ...'. The "
+            "subtask inherits X's project; it is assigned to the asker unless assignee_name "
+            "is given.\n"
+            "REQUIRED PATTERN (staged-write): on the first turn call with parent_task_name "
+            "(or parent_task_gid) + title WITHOUT confirmed -- the tool resolves the parent, "
+            "PHI-scrubs Lexington content, and returns a NOT-CREATED-yet preview; show it "
+            "verbatim, get explicit approval, THEN call again with confirmed=true. The "
+            "parent must be one of the asker's OWN open tasks. The tool owns the wording -- "
+            "never say a subtask was created unless the result says WRITE_CONFIRMED."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "parent_task_name": {"type": "string", "description": "Name (or close fragment) of the asker's open PARENT task."},
+                "parent_task_gid": {"type": "string", "description": "Optional parent task gid (still ownership-verified unless founder/aggregator)."},
+                "title": {"type": "string", "description": "The subtask title (action-oriented, start with a verb)."},
+                "assignee_name": {"type": "string", "description": "Optional. Assign the subtask to this teammate; defaults to the asking user."},
+                "due_on": {"type": "string", "description": "Optional. Subtask due date, YYYY-MM-DD."},
+                "notes": {"type": "string", "description": "Optional. Subtask description."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after showing the preview and getting explicit approval."},
             },
             "required": [],
         },
@@ -7237,6 +7673,9 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "asana_create_task",
     "asana_complete_task",
     "asana_delete_task",
+    "asana_update_task",
+    "asana_add_comment",
+    "asana_add_subtask",
     "gmail_create_draft",
     "gmail_inbox",
     "calendar_get_my_events",
@@ -7354,6 +7793,9 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "asana_create_task": _tool_asana_create_task,
     "asana_complete_task": _tool_asana_complete_task,
     "asana_delete_task": _tool_asana_delete_task,
+    "asana_update_task": _tool_asana_update_task,
+    "asana_add_comment": _tool_asana_add_comment,
+    "asana_add_subtask": _tool_asana_add_subtask,
     "gmail_create_draft": _tool_gmail_create_draft,
     "gmail_inbox": _tool_gmail_inbox,
     "calendar_get_my_events": _tool_get_my_events,
@@ -7450,6 +7892,12 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "asana_create_task": 12,
     "asana_complete_task": 12,
     "asana_delete_task": 12,
+    "asana_add_comment": 12,
+    "asana_add_subtask": 12,
+    # Update can chain up to ~4 sequential Asana calls in one invocation (preview:
+    # get_user_tasks + 1-2 enum lookups; confirm: update PUT + custom-field PUT) --
+    # give it the heavy tier so a status/priority change is never abandoned mid-flight.
+    "asana_update_task": 20,
     "f3e_hubspot_pipeline_summary": 12,
     "fndr_contracts_dashboard": 12,
     "fndr_press_pipeline_summary": 12,

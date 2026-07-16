@@ -399,6 +399,10 @@ _SHOPIFY_WRITE_TOOL = "f3e_shopify_set_inventory"
 # sentinels; a follow-up would audit its verbatim payload).
 _CONTRACT_WRITE_TOOLS = frozenset({
     _SHOPIFY_WRITE_TOOL, "asana_complete_task", "asana_delete_task", "asana_create_task",
+    # PM-hub Phase 1 (2026-07-15): the conversational edit tools emit the same
+    # WRITE_CONFIRMED / WRITE_BLOCKED contract; their verbatim payload is source-opaque
+    # (the asker's own task name + own workspace permalink), safe to post verbatim.
+    "asana_update_task", "asana_add_comment", "asana_add_subtask",
 })
 # The net ONLY overrides narration when the tool result carries one of these
 # contract sentinels. A result WITHOUT one (e.g. dispatch()'s "Tool ... crashed:"

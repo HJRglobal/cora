@@ -340,25 +340,50 @@ _ASANA_CREATE_INTENT_RE = re.compile(
     r"\b(?:create|make|set up|start)\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b"
     r"|\b(?:new|another)\s+(?:asana\s+)?tasks?\b",
     re.IGNORECASE)
+# PM-hub Phase 1 (2026-07-15): edit-tool intents. Each requires a task referent (the
+# shared gate) EXCEPT subtask, which is self-referential ("subtask" has no standalone
+# "task" word boundary) and carries its own verb, so it is checked before the gate.
+_ASANA_SUBTASK_INTENT_RE = re.compile(
+    r"\b(?:add|create|make|new|break|split|divide)\b[^.\n]{0,24}\bsub-?tasks?\b",
+    re.IGNORECASE)
+_ASANA_COMMENT_INTENT_RE = re.compile(
+    r"\b(?:comment|leave a comment|add a comment|add a note|leave a note)\b"
+    r"[^.\n]{0,24}\b(?:on|to|under)\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b",
+    re.IGNORECASE)
+_ASANA_UPDATE_INTENT_RE = re.compile(
+    r"\bre-?assign\b"
+    r"|\b(?:change|update|move|push|bump|extend|set|reset)\b[^.\n]{0,24}"
+    r"\b(?:due date|due-date|deadline|due on|priority|status)\b"
+    r"|\brename\b[^.\n]{0,24}\b(?:tasks?|to-?dos?)\b",
+    re.IGNORECASE)
 
 
 def _asana_destructive_intent(text: str) -> str | None:
-    """Return the Asana action tool to force ('asana_delete_task' /
-    'asana_complete_task' / 'asana_create_task') for a clear imperative task action,
-    else None. F-23 Slice 2. Conservative: interrogatives excluded, an explicit task
-    referent required, and the action verb must GOVERN the task (review MED #7). A miss
-    is safe -- the confirm interceptor + phantom guard still prevent a fabricated success."""
+    """Return the Asana WRITE tool to force (delete/complete/create/update/comment/
+    subtask) for a clear imperative task action, else None. F-23 Slice 2 + PM-hub
+    Phase 1. Conservative: interrogatives excluded, an explicit task referent required
+    (except subtask, which is self-referential + verb-anchored), and destructive/create
+    verbs must GOVERN the task (review MED #7). A miss is safe -- the confirm interceptor
+    + phantom guard still prevent a fabricated success on the follow-up confirm turn."""
     t = (text or "").strip()
     if not t or _ASANA_INTENT_INTERROGATIVE_RE.search(t):
         return None
+    # Subtask first: "subtask" contains no standalone "task" boundary, so the generic
+    # task-ref gate would drop it; the verb-anchored regex is its own referent.
+    if _ASANA_SUBTASK_INTENT_RE.search(t):
+        return "asana_add_subtask"
     if not _ASANA_TASK_REF_RE.search(t):
-        return None  # every branch requires an explicit task referent
+        return None  # remaining branches require an explicit task referent
     if _ASANA_DELETE_INTENT_RE.search(t):
         return "asana_delete_task"
     if _ASANA_COMPLETE_INTENT_RE.search(t):
         return "asana_complete_task"
     if _ASANA_CREATE_INTENT_RE.search(t):
         return "asana_create_task"
+    if _ASANA_COMMENT_INTENT_RE.search(t):
+        return "asana_add_comment"
+    if _ASANA_UPDATE_INTENT_RE.search(t):
+        return "asana_update_task"
     return None
 
 

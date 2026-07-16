@@ -61,11 +61,23 @@ class TestAsanaDestructiveIntent:
         "delete the old draft",           # not a task
         "create a report",                # not a task
         "cancel the meeting",             # cancel is not a task-delete verb
-        "add a comment to the task",      # 'add' near 'task' but not a create-a-task
+        "add me to the task followers",   # 'add' near 'task' but not create/comment/subtask
         "remove Bob from the channel",    # not a task
     ])
     def test_non_task_or_unrelated_excluded(self, msg):
         assert app._asana_destructive_intent(msg) is None
+
+    @pytest.mark.parametrize("msg,expect", [
+        # PM-hub Phase 1: the edit-tool intents (update / comment / subtask).
+        ("reassign the deck task to Hannah", "asana_update_task"),
+        ("change the due date of the vendor task to Friday", "asana_update_task"),
+        ("rename the onboarding task", "asana_update_task"),
+        ("comment on the deck task that it's blocked", "asana_add_comment"),
+        ("add a comment to the launch task", "asana_add_comment"),
+        ("add a subtask to the launch task", "asana_add_subtask"),
+    ])
+    def test_edit_intents(self, msg, expect):
+        assert app._asana_destructive_intent(msg) == expect
 
     @pytest.mark.parametrize("msg", [
         "yes, delete it permanently",     # confirm turn -> interceptor / Slice 3, not force
