@@ -6,12 +6,15 @@ PHI-scrubbed, wired into the deterministic confirm interceptor. No new autonomy:
 every one is preview -> explicit confirm; the confirm executes the STASHED payload.
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 import cora.tools.tool_dispatch as td
 from cora import app as cora_app
+
+_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "design" / "system-prompts"
 
 HARRISON = "U0B2RM2JYJ1"        # founder -- gid path exempt from the ownership check
 TOMMY = "U0B3RU5Q55G"           # NON-founder mapped user (ownership applies)
@@ -339,3 +342,25 @@ class TestIntentDetector:
     ])
     def test_true_negatives(self, msg):
         assert cora_app._asana_destructive_intent(msg) is None
+
+
+# ─────────────────────── prompt coverage (drift guard) ───────────────────────
+class TestPromptCoverage:
+    """Every entity prompt must carry the 'Managing tasks' mandatory-tool-call section
+    (the tools are global-core, so every channel needs the instruction)."""
+
+    def _prompts(self):
+        files = sorted(_PROMPTS_DIR.glob("*.md"))
+        assert len(files) == 17, f"expected 17 entity prompts, found {len(files)}"
+        return files
+
+    def test_all_prompts_have_managing_tasks_section(self):
+        for f in self._prompts():
+            text = f.read_text(encoding="utf-8")
+            assert "## Managing tasks (mandatory tool call, staged write)" in text, f.name
+
+    def test_all_prompts_name_the_three_edit_tools(self):
+        for f in self._prompts():
+            text = f.read_text(encoding="utf-8")
+            for tool in ("asana_update_task", "asana_add_comment", "asana_add_subtask"):
+                assert tool in text, f"{tool} missing from {f.name}"
