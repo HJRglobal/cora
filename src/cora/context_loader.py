@@ -66,13 +66,20 @@ _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 #
 # 2026-07-17 (D-084): FNDR/HJRG were removed from the full-inject set. Keeping the
 # full ~157K-token "Current State of the World" tail inlined pushed an FNDR mention
-# past Anthropic's 200,000-token input ceiling (a live 400). The founder doc is
-# freshly, fully KB-indexed under FNDR (source=static_md), so a portfolio-status
-# question retrieves the relevant current-state chunks — FNDR loses no answerable
-# fact, and its cached context block stops being invalidated by daily TOM edits.
-# _FOUNDER_FULL_ENTITIES is retained (empty) so the full-inject lever can be
-# re-enabled per entity if a future need arises; the claude_client token-budget
-# guard (D-084) is the backstop if it ever is.
+# past Anthropic's 200,000-token input ceiling (a live 400). The founder doc IS
+# fully KB-indexed under FNDR (source=static_md, source_id='CLAUDE.md') and co-scanned
+# on every FNDR query, so FNDR/HJRG now rely on KB RETRIEVAL for current-state instead
+# of the always-present tail. HONEST tradeoff (D-051): current-state edits newer than
+# the last founder-doc static_md sync, and any single fact outside the top-K retrieval
+# for a broad-portfolio query, are NOT inlined -- the _slim_founder honesty note keeps
+# this transparent (Cora says it lacks current state rather than guessing), and the
+# nightly health check monitors that the founder doc stays freshly indexed (its now-sole
+# current-state path). The load-bearing static HEAD (portfolio table, operating
+# principles, folder map, source-of-truth rules) is still always present. A win too: the
+# cached context block stops being invalidated by daily TOM edits.
+# _FOUNDER_FULL_ENTITIES is retained (empty) so the full-inject lever can be re-enabled
+# per entity if a future need arises; the claude_client token-budget guard (D-084) is
+# the backstop if it ever is.
 _FOUNDER_DYNAMIC_MARKER = "# Current State of the World"
 _FOUNDER_FULL_ENTITIES: frozenset[str] = frozenset()
 

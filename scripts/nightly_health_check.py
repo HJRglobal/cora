@@ -525,26 +525,32 @@ def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
         return CheckResult("Dynamic snapshots", "warn", f"yaml import failed: {exc}")
     stale: list[str] = []
     checked = 0
+    # D-051: the per-file body is fully fail-soft -- a malformed yaml (non-dict source,
+    # non-numeric threshold, stat race) must never propagate and abort the WHOLE nightly
+    # report before it posts to Slack.
     for yaml_path in sorted(_DYNAMIC_ANSWERS_DIR.glob("*/*.yaml")):
+        label = f"{yaml_path.parent.name}/{yaml_path.stem}"
         try:
             raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-        except Exception:  # noqa: BLE001
+            if not isinstance(raw, dict):
+                continue
+            snap_rel = raw.get("snapshot_path")
+            if not snap_rel:
+                continue
+            checked += 1
+            src = raw.get("source")
+            src = src if isinstance(src, dict) else {}
+            threshold_h = float(src.get("staleness_threshold_hours", 24))
+            snap = _REPO_ROOT / snap_rel
+            if not snap.exists():
+                stale.append(f"{label}: snapshot MISSING ({snap_rel})")
+                continue
+            age_h = (now - snap.stat().st_mtime) / 3600.0
+            if age_h > threshold_h:
+                stale.append(f"{label}: {age_h:.0f}h old > {threshold_h:.0f}h threshold")
+        except Exception as exc:  # noqa: BLE001 -- one bad file never aborts the report
+            stale.append(f"{label}: could not evaluate ({exc})")
             continue
-        if not isinstance(raw, dict):
-            continue
-        snap_rel = raw.get("snapshot_path")
-        if not snap_rel:
-            continue
-        checked += 1
-        label = f"{yaml_path.parent.name}/{yaml_path.stem}"
-        threshold_h = float((raw.get("source") or {}).get("staleness_threshold_hours", 24))
-        snap = _REPO_ROOT / snap_rel
-        if not snap.exists():
-            stale.append(f"{label}: snapshot MISSING ({snap_rel})")
-            continue
-        age_h = (now - snap.stat().st_mtime) / 3600.0
-        if age_h > threshold_h:
-            stale.append(f"{label}: {age_h:.0f}h old > {threshold_h:.0f}h threshold")
     if stale:
         return CheckResult(
             "Dynamic snapshots", "warn",
@@ -556,6 +562,49 @@ def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
         )
     return CheckResult("Dynamic snapshots", "ok",
                        f"{checked} dynamic snapshot(s) within staleness threshold.")
+
+
+# Founder CLAUDE.md must be re-swept at least this often (daily static_md sweep + buffer).
+_FOUNDER_KB_STALE_HOURS = 30
+
+
+def check_founder_kb_freshness(now_epoch: float | None = None) -> CheckResult:
+    """FNDR/HJRG current-state is now RETRIEVAL-ONLY (D-084 slim), so the founder
+    CLAUDE.md's KB copy is FNDR's SOLE current-state path. WARN if it isn't indexed,
+    or its newest chunk hasn't been re-ingested recently (a stalled static_md sweep
+    would silently freeze FNDR's current-state without any other alarm firing).
+    `now_epoch` injectable for tests."""
+    now = now_epoch if now_epoch is not None else time.time()
+    if not _KB_DB.exists():
+        return CheckResult("Founder KB freshness", "warn", f"KB db missing at {_KB_DB}")
+    try:
+        conn = sqlite3.connect(str(_KB_DB))
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), MAX(ingested_at) FROM knowledge_chunks "
+                "WHERE entity='FNDR' AND source='static_md' AND source_id='CLAUDE.md'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Founder KB freshness", "warn", f"KB query failed: {exc}")
+    count, newest = (row or (0, None))
+    if not count or not newest:
+        return CheckResult(
+            "Founder KB freshness", "warn",
+            "Founder CLAUDE.md is NOT indexed under FNDR/static_md -- FNDR/HJRG "
+            "current-state (retrieval-only since D-084) has no source. Check the "
+            "static_md KB sweep.")
+    age_h = (now - float(newest)) / 3600.0
+    if age_h > _FOUNDER_KB_STALE_HOURS:
+        return CheckResult(
+            "Founder KB freshness", "warn",
+            f"Founder CLAUDE.md newest KB chunk is {age_h:.0f}h old (> "
+            f"{_FOUNDER_KB_STALE_HOURS}h) -- the static_md sweep may have stalled; "
+            "FNDR current-state retrieval is going stale (D-084).")
+    return CheckResult(
+        "Founder KB freshness", "ok",
+        f"Founder CLAUDE.md indexed ({count} chunks, newest {age_h:.0f}h ago).")
 
 
 def check_logs_24h() -> list[CheckResult]:
@@ -986,6 +1035,9 @@ def main() -> int:
 
     log.info("Checking dynamic-answers snapshot freshness...")
     all_results.append(check_dynamic_snapshots())
+
+    log.info("Checking founder CLAUDE.md KB freshness (FNDR current-state path)...")
+    all_results.append(check_founder_kb_freshness())
 
     log.info("Scanning logs (last 24h)...")
     all_results.extend(check_logs_24h())

@@ -256,6 +256,105 @@ def test_markers_match_context_loader():
     rendered = ctx._format_kb_chunks([fake])
     assert cc._KB_BLOCK_HEADER in rendered
     assert cc._KB_CHUNK_DELIM in rendered
+    # D-051 finding [5]: the integer-index header regex matches a real rendered chunk
+    # header but NOT a bracketed date/label inside a chunk body.
+    assert cc._KB_CHUNK_HEADER_RE.search(rendered) is not None
+    assert cc._KB_CHUNK_HEADER_RE.search("\n## [2026-06-23] a date heading") is None
+
+
+# --------------------------------------------------------------------------- #
+# D-051 remediation
+# --------------------------------------------------------------------------- #
+
+def test_drop_csotw_ignores_marker_quoted_in_known_answers():
+    # [1] the founder brief is always pre-slimmed, so a marker in real block-2 can only
+    # be QUOTED inside protected known-answers/dynamic. Lever B must NOT trim it.
+    txt = ("founder head, no marker\n\n---\n\n"
+           f"{ctx.KNOWN_ANSWERS_SECTION_HEADER}\n\nquote: {ctx._FOUNDER_DYNAMIC_MARKER} here. KEEP-ME")
+    out, changed = cc._drop_founder_csotw(txt)
+    assert changed is False
+    assert out == txt
+    assert "KEEP-ME" in out
+
+
+def test_drop_csotw_drops_real_founder_span_preserving_ka():
+    txt = ("founder head\n" + ctx._FOUNDER_DYNAMIC_MARKER + "\nTOM tail dynamic\n\n---\n\n"
+           f"{ctx.KNOWN_ANSWERS_SECTION_HEADER}\n\nKA-KEEP")
+    out, changed = cc._drop_founder_csotw(txt)
+    assert changed is True
+    assert ctx._FOUNDER_DYNAMIC_MARKER not in out
+    assert "TOM tail dynamic" not in out
+    assert "KA-KEEP" in out
+
+
+def test_marker_in_ka_region_over_budget_preserves_ka(monkeypatch):
+    # End-to-end: an oversized block2 whose ONLY marker is quoted inside known-answers.
+    # Lever B no-ops (correct), Lever C truncates the founder head, KA/dynamic survive.
+    monkeypatch.setenv("CLAUDE_MAX_INPUT_TOKENS", "5000")
+    founder_head = "# HJR constitution HEAD-SENTINEL " + ("F" * 400_000)  # no marker
+    ka = (f"{ctx.KNOWN_ANSWERS_SECTION_HEADER}\n\nKA-SENTINEL quotes "
+          f"'{ctx._FOUNDER_DYNAMIC_MARKER}' verbatim. FACT-XYZ")
+    dyn = f"{ctx.DYNAMIC_ANSWERS_SECTION_HEADER}\n\nDYN-SENTINEL"
+    static = founder_head + "\n\n---\n\n" + ka + "\n\n---\n\n" + dyn
+    blocks = cc._build_cached_system("SYS", "runtime\n\n---\n\n", static_context=static)
+    out = cc._enforce_token_budget(blocks, [], _msgs("q"), "FNDR")
+    assert cc._estimate_request_tokens(out, [], _msgs("q")) <= 5000
+    assert "KA-SENTINEL" in out[1]["text"]   # protected region intact
+    assert "FACT-XYZ" in out[1]["text"]
+    assert "DYN-SENTINEL" in out[1]["text"]
+
+
+def test_estimate_non_ascii_costed_higher():
+    # [2a] non-ASCII (CJK/emoji) tokenizes far denser -> costed at ~1 token/char, so a
+    # dense multibyte blob is NOT undercounted the way char/3.0 alone would.
+    ascii_txt = "a" * 300
+    cjk_txt = "文" * 300
+    assert cc._estimate_tokens(cjk_txt) > cc._estimate_tokens(ascii_txt)
+    assert cc._estimate_tokens(cjk_txt) >= 300
+
+
+def test_lever_d_trims_prior_message_not_current(monkeypatch):
+    # [2b] an over-budget driven by a huge PRIOR turn (which system-block levers can't
+    # reach) is shed from that prior turn; the current user turn is never touched.
+    monkeypatch.setenv("CLAUDE_MAX_INPUT_TOKENS", "5000")
+    blocks = cc._build_cached_system("SYS", "runtime\n\n---\n\n", static_context="small static")
+    messages = [
+        {"role": "user", "content": "OLD-BIG " + ("Z" * 400_000)},
+        {"role": "assistant", "content": "prior reply"},
+        {"role": "user", "content": "CURRENT-QUESTION keep me verbatim"},
+    ]
+    out = cc._enforce_token_budget(blocks, [], messages, "FNDR")
+    assert cc._estimate_request_tokens(out, [], messages) <= 5000
+    assert messages[-1]["content"] == "CURRENT-QUESTION keep me verbatim"  # current untouched
+    assert "truncated to fit" in messages[0]["content"]                    # prior shed
+    assert len(messages[0]["content"]) < 400_000
+
+
+def test_trim_largest_prior_message_unit():
+    messages = [{"role": "user", "content": "X" * 10_000},
+                {"role": "user", "content": "CURR"}]
+    assert cc._trim_largest_prior_message(messages, over_tokens=1000) is True
+    assert messages[-1]["content"] == "CURR"           # current (last) never trimmed
+    assert len(messages[0]["content"]) < 10_000
+    # single-message list (only the current turn) -> no-op
+    assert cc._trim_largest_prior_message([{"role": "user", "content": "X" * 10_000}], 1000) is False
+
+
+def test_kb_chunk_boundary_ignores_body_date_bracket():
+    # [5] a "## [2026-06-23]" inside a chunk BODY is not a chunk boundary; floor honored.
+    hdr = cc._KB_BLOCK_HEADER
+    text = (
+        hdr + "\n\n"
+        "## [1] slack | A | entity=FNDR\n\nbody one\n## [2026-06-23] date heading in body\nmore one\n\n"
+        "## [2] slack | B | entity=FNDR\n\nbody two\n\n"
+        "## [3] slack | C | entity=FNDR\n\nbody three\n\n"
+        "## [4] slack | D | entity=FNDR\n\nbody four"
+    )
+    new, changed = cc._drop_last_kb_chunk(text, floor=3)
+    assert changed
+    assert "## [1]" in new and "## [2]" in new and "## [3]" in new
+    assert "## [4]" not in new                 # only the last REAL chunk dropped
+    assert "## [2026-06-23]" in new            # body date bracket survived (rode with chunk 1)
 
 
 # --------------------------------------------------------------------------- #

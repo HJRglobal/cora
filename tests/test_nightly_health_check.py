@@ -190,6 +190,54 @@ def test_dynamic_snapshots_no_dir_is_ok(monkeypatch, tmp_path):
     assert r.status == "ok"
 
 
+def test_dynamic_snapshots_malformed_source_does_not_raise(monkeypatch, tmp_path):
+    # D-051 [4]: a non-dict `source` (or bad threshold) must be fail-soft, never abort
+    # the whole nightly report.
+    dyn = _setup_dynamic(monkeypatch, tmp_path)
+    ed = dyn / "F3E"
+    ed.mkdir()
+    (ed / "bad.yaml").write_text(
+        "snapshot_path: data/snap/x.yaml\nsource: not-a-dict\n", encoding="utf-8")
+    r = hc.check_dynamic_snapshots(now_epoch=_time.time())  # must not raise
+    assert r.status in ("ok", "warn")
+
+
+# ── Founder CLAUDE.md KB freshness (D-084 / D-051 [3]) ────────────────────────
+def _make_founder_kb(tmp_path, ingested_at, count=5, source_id="CLAUDE.md"):
+    import sqlite3
+    p = tmp_path / "kb.db"
+    c = sqlite3.connect(str(p))
+    c.execute("CREATE TABLE knowledge_chunks "
+              "(entity TEXT, source TEXT, source_id TEXT, ingested_at REAL)")
+    for _ in range(count):
+        c.execute("INSERT INTO knowledge_chunks VALUES ('FNDR','static_md',?,?)",
+                  (source_id, ingested_at))
+    c.commit()
+    c.close()
+    return p
+
+
+def test_founder_kb_fresh_is_ok(monkeypatch, tmp_path):
+    now = _time.time()
+    monkeypatch.setattr(hc, "_KB_DB", _make_founder_kb(tmp_path, now - 3600))
+    r = hc.check_founder_kb_freshness(now_epoch=now)
+    assert r.status == "ok"
+
+
+def test_founder_kb_stale_is_warn(monkeypatch, tmp_path):
+    now = _time.time()
+    monkeypatch.setattr(hc, "_KB_DB", _make_founder_kb(tmp_path, now - 40 * 3600))
+    r = hc.check_founder_kb_freshness(now_epoch=now)
+    assert r.status == "warn" and "static_md sweep" in r.detail
+
+
+def test_founder_kb_missing_is_warn(monkeypatch, tmp_path):
+    now = _time.time()
+    monkeypatch.setattr(hc, "_KB_DB", _make_founder_kb(tmp_path, now, count=0))
+    r = hc.check_founder_kb_freshness(now_epoch=now)
+    assert r.status == "warn" and "NOT indexed" in r.detail
+
+
 # ── W4-07: LastTaskResult classifier ──────────────────────────────────────────
 
 _BENIGN = hc._BENIGN_LAST_RESULTS

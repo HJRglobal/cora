@@ -284,17 +284,31 @@ def _build_cached_tools(entity: str = "FNDR", cross_entity: bool = False) -> lis
 # On 2026-07-17 an FNDR mention 400'd with "prompt is too long: 201524 tokens >
 # 200000 maximum": FNDR/HJRG wholesale-inject the full founder CLAUDE.md (its
 # ~157K-token "Current State of the World" tail), which + tools + KB crossed the
-# 200K input ceiling. This guard estimates the request OFFLINE (no extra API call)
-# before send and, if over a configurable ceiling, TRIMS in priority order and
-# logs a WARNING. It DEGRADES; it never raises a 400 and never trims a protected
-# region (the entity system prompt, the tool schemas, per-entity known-answers, or
-# the runtime security/PHI/firewall/source-opacity/finance instructions).
+# 200K input ceiling. This guard estimates the request OFFLINE (no extra API call --
+# a hard requirement for the request path) before send and, if over a configurable
+# ceiling, TRIMS in priority order and logs a WARNING. It DEGRADES toward fit; it
+# never trims a protected region (the entity system prompt, the tool schemas,
+# per-entity known-answers, or the runtime security/PHI/firewall/source-opacity/
+# finance instructions).
 #
-# Offline estimate: char/N. char/4 (the health-report heuristic) UNDERCOUNTS Cora's
-# dense content by ~30% (founder markdown measured 3.06, KB chunks 2.95, tool JSON
-# 3.58 chars/token via count_tokens 2026-07-17) and would let a 200K request slip
-# through. char/3.0 is a conservative UPPER bound on the real count for every content
-# class Cora sends (min observed density 2.95), so the estimate never under-fires.
+# Offline estimate: char/N over ASCII + a per-char cost for non-ASCII. char/4 (the
+# health-report heuristic) UNDERCOUNTS Cora's dense content by ~30% (founder markdown
+# measured 3.06, KB chunks 2.95, tool JSON 3.58 chars/token via count_tokens
+# 2026-07-17), so ASCII prose/markdown/JSON is costed at char/3.0 -- a conservative
+# bound for those classes (min observed density 2.95). Non-ASCII (CJK/emoji/other
+# multibyte) tokenizes far denser (~1 token/char or worse), so each non-ASCII char is
+# costed at 1 token.
+#
+# ACCEPTED RESIDUAL (D-051, 2026-07-17): a pathologically dense *ASCII* blob
+# (a large base64/hex paste, ~1.15 chars/token) is the one class char/3.0 still
+# undercounts, and there is no single-divisor offline bound for it that isn't
+# uselessly conservative for normal content. Mitigations: (a) the ceiling's ~15K
+# headroom absorbs modest density error; (b) Lever D sheds oversized PRIOR
+# conversation turns (where such a blob most plausibly lands); (c) the current user
+# turn is never trimmed -- if a user's own message is itself a >200K-token blob, a
+# clear HTTP-400 card (user_facing_message) is the honest outcome, not silent
+# mangling of their question. So this guard PREVENTS the structural context overflow
+# that motivated it; it is not a mathematical guarantee against every adversarial input.
 _EST_CHARS_PER_TOKEN = 3.0
 # Ceiling well under Anthropic's 200,000 input maximum: ~15K headroom absorbs
 # estimator variance + the small per-block / per-tool structural overhead the raw
@@ -310,7 +324,12 @@ _KB_CHUNK_FLOOR = 3
 # pins these against freshly-built context so drift fails the suite rather than
 # silently disabling the trimmer.
 _KB_BLOCK_HEADER = "# Retrieved knowledge (semantically matched to user's question)"
-_KB_CHUNK_DELIM = "\n## ["  # each rendered KB chunk starts a line "## [i] ..."
+_KB_CHUNK_DELIM = "\n## ["  # rough KB-chunk marker (drift-pinned in tests)
+# A RENDERED KB chunk header is exactly "## [<int>] " (context_loader enumerate index).
+# Matching the integer index avoids counting body markdown like "## [2026-06-23] ..."
+# (a bracketed non-integer) as a chunk boundary, which would let Lever A truncate a
+# floor-protected chunk mid-body (D-051 finding, 2026-07-17).
+_KB_CHUNK_HEADER_RE = re.compile(r"\n## \[\d+\] ")
 _FOUNDER_CSOTW_MARKER = "# Current State of the World"
 # The block-2 sections that follow the founder brief (join order in
 # context_loader._build_static_context). The CSotW span must stop BEFORE these so
@@ -338,10 +357,14 @@ def _configured_max_input_tokens() -> int:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Conservative OFFLINE token estimate (upper bound; see _EST_CHARS_PER_TOKEN)."""
+    """Conservative OFFLINE token estimate (see the module note). ASCII costed at
+    char/3.0; each non-ASCII char costed at 1 token (CJK/emoji tokenize much denser).
+    ascii-char count via a C-level encode so this stays cheap on a ~200K-char blob."""
     if not text:
         return 0
-    return int(len(text) / _EST_CHARS_PER_TOKEN) + 1
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    non_ascii = len(text) - ascii_chars
+    return int(ascii_chars / _EST_CHARS_PER_TOKEN) + non_ascii + 1
 
 
 def _estimate_messages_tokens(messages: list) -> int:
@@ -387,14 +410,9 @@ def _drop_last_kb_chunk(block_text: str, floor: int) -> tuple[str, bool]:
     hdr = block_text.find(_KB_BLOCK_HEADER)
     if hdr == -1:
         return block_text, False
-    positions: list[int] = []
-    start = hdr
-    while True:
-        p = block_text.find(_KB_CHUNK_DELIM, start)
-        if p == -1:
-            break
-        positions.append(p)
-        start = p + len(_KB_CHUNK_DELIM)
+    # Only true rendered chunk headers ("## [<int>] ") count as boundaries -- not a
+    # bracketed date/label inside a chunk BODY (D-051 finding).
+    positions = [m.start() for m in _KB_CHUNK_HEADER_RE.finditer(block_text, hdr)]
     if len(positions) <= floor:
         return block_text, False
     # Cut from the last chunk boundary to the end of the block (drops the lowest-
@@ -406,19 +424,26 @@ def _drop_last_kb_chunk(block_text: str, floor: int) -> tuple[str, bool]:
 def _drop_founder_csotw(block_text: str) -> tuple[str, bool]:
     """Remove the wholesale 'Current State of the World' span from the static block,
     PRESERVING everything after it (per-entity known-answers + dynamic snapshots).
-    Returns (new_text, changed)."""
-    m = block_text.find(_FOUNDER_CSOTW_MARKER)
-    if m == -1:
-        return block_text, False
-    end = len(block_text)
+    Returns (new_text, changed).
+
+    D-051 (2026-07-17): the founder brief is ALWAYS pre-slimmed now, so the marker
+    NEVER appears in the founder region of a real block-2. If the literal marker is
+    quoted INSIDE a known-answers file or a dynamic snapshot (both protected), a
+    naive first-occurrence match would delete part of that protected content. So the
+    founder region is defined as everything BEFORE the first known-answers/dynamic
+    section header, and a marker at/after that boundary is treated as quoted protected
+    content and left untouched."""
+    protected_start = len(block_text)
     for hdr in _STATIC_SECTION_HEADERS:
-        h = block_text.find(hdr, m)
+        h = block_text.find(hdr)
         if h != -1:
-            # back up to the "\n\n---\n\n" separator that precedes the downstream
-            # section so the join separator isn't left dangling
-            sep = block_text.rfind("\n\n---\n\n", m, h)
-            end = min(end, sep if sep != -1 else h)
-    new_text = block_text[:m].rstrip() + _CSOTW_DROP_NOTE + block_text[end:]
+            sep = block_text.rfind("\n\n---\n\n", 0, h)
+            protected_start = min(protected_start, sep if sep != -1 else h)
+    m = block_text.find(_FOUNDER_CSOTW_MARKER)
+    if m == -1 or m >= protected_start:
+        # No founder-region marker (it lives before protected_start) -> nothing to drop.
+        return block_text, False
+    new_text = block_text[:m].rstrip() + _CSOTW_DROP_NOTE + block_text[protected_start:]
     return new_text, True
 
 
@@ -451,18 +476,55 @@ def _truncate_static_head(block_text: str, over_tokens: int) -> tuple[str, bool]
     return new_head + tail, True
 
 
+_MSG_TRIM_MARKER = "\n\n[... earlier conversation truncated to fit the model input budget ...]"
+# Keep at least this much of a trimmed prior turn (enough to preserve its gist).
+_MSG_HEAD_FLOOR_CHARS = 600
+
+
+def _trim_largest_prior_message(messages: list, over_tokens: int) -> bool:
+    """Lever D last resort: shed ~over_tokens from the LARGEST PRIOR conversation turn
+    (never the current/last user message, and never a tool_use/tool_result list block).
+    Truncates that turn's string content IN PLACE, preserving role alternation, so an
+    over-budget driven by a huge thread history -- which Levers A-C (system blocks only)
+    cannot reach -- still gets shed. Returns True if it changed anything.
+
+    The current user turn (messages[-1]) is deliberately untouched: trimming the asker's
+    own question would corrupt the request more than a clear 400 does."""
+    if not messages or len(messages) < 2:
+        return False
+    best_i, best_len = -1, _MSG_HEAD_FLOOR_CHARS
+    for i in range(len(messages) - 1):  # exclude the current (last) user turn
+        msg = messages[i]
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str) and len(content) > best_len:
+            best_i, best_len = i, len(content)
+    if best_i == -1:
+        return False
+    content = messages[best_i]["content"]
+    cut_chars = int(max(over_tokens, 0) * _EST_CHARS_PER_TOKEN) + 2_000  # + slack
+    keep = max(_MSG_HEAD_FLOOR_CHARS, len(content) - cut_chars)
+    if keep >= len(content):
+        return False
+    messages[best_i] = {**messages[best_i], "content": content[:keep].rstrip() + _MSG_TRIM_MARKER}
+    return True
+
+
 def _enforce_token_budget(
     system_blocks: list, tools: list, messages: list, entity: str,
 ) -> list:
     """Return system_blocks trimmed to fit under the input-token ceiling (D-084).
 
     NEVER trims: block-1 (entity system prompt), the tool schemas, per-entity
-    known-answers / dynamic snapshots, or the runtime security/PHI/firewall/
-    source-opacity/finance instructions (they precede the KB region in block-3).
-    Trim order (lowest-value first): (1) reduce block-3 KB chunks to a floor;
-    (2) drop the wholesale founder 'Current State of the World' from block-2 (it is
-    KB-retrievable). cache_control on blocks 1+2 is preserved (we edit only .text).
-    Degrades; never raises."""
+    known-answers / dynamic snapshots, the runtime security/PHI/firewall/
+    source-opacity/finance instructions (they precede the KB region in block-3), or
+    the CURRENT user turn (messages[-1]).
+    Trim order (lowest-value first): (A) reduce block-3 KB chunks to a floor;
+    (B) drop the wholesale founder 'Current State of the World' from block-2 (it is
+    KB-retrievable); (C) marker-independent truncation of the founder region; (D) shed
+    the largest PRIOR conversation turn. cache_control on blocks 1+2 is preserved (we
+    edit only .text). NOTE: Lever D mutates `messages` IN PLACE -- the caller builds it
+    fresh immediately before this call and uses it right after, so the mutation is
+    contained. Degrades; never raises."""
     ceiling = _configured_max_input_tokens()
     est = _estimate_request_tokens(system_blocks, tools, messages)
     if est <= ceiling:
@@ -510,6 +572,19 @@ def _enforce_token_budget(
                 b2["text"] = new_text
                 est = _estimate_request_tokens(blocks, tools, messages)
                 steps.append("static-head-truncated")
+
+    # Lever D — shed the largest PRIOR conversation turn (never the current user turn).
+    # Covers an over-budget driven by a huge thread history / tool payload that the
+    # system-block levers (A-C) cannot reach. Mutates `messages` IN PLACE.
+    if est > ceiling and messages:
+        msgs_trimmed = 0
+        while est > ceiling:
+            if not _trim_largest_prior_message(messages, est - ceiling):
+                break
+            msgs_trimmed += 1
+            est = _estimate_request_tokens(blocks, tools, messages)
+        if msgs_trimmed:
+            steps.append(f"prior-msgs-{msgs_trimmed}")
 
     log.warning(
         "token-budget guard TRIMMED entity=%s: est %d -> %d tok (ceiling %d) via %s",
