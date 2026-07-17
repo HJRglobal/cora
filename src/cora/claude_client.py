@@ -7,7 +7,9 @@ Two public entry points:
                                     or surface partial output elsewhere
 """
 
+import json
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -276,6 +278,211 @@ def _build_cached_tools(entity: str = "FNDR", cross_entity: bool = False) -> lis
     tools = list(tools)
     tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
+
+
+# ── Pre-send token-budget guard (2026-07-17, D-084) ──────────────────────────
+# On 2026-07-17 an FNDR mention 400'd with "prompt is too long: 201524 tokens >
+# 200000 maximum": FNDR/HJRG wholesale-inject the full founder CLAUDE.md (its
+# ~157K-token "Current State of the World" tail), which + tools + KB crossed the
+# 200K input ceiling. This guard estimates the request OFFLINE (no extra API call)
+# before send and, if over a configurable ceiling, TRIMS in priority order and
+# logs a WARNING. It DEGRADES; it never raises a 400 and never trims a protected
+# region (the entity system prompt, the tool schemas, per-entity known-answers, or
+# the runtime security/PHI/firewall/source-opacity/finance instructions).
+#
+# Offline estimate: char/N. char/4 (the health-report heuristic) UNDERCOUNTS Cora's
+# dense content by ~30% (founder markdown measured 3.06, KB chunks 2.95, tool JSON
+# 3.58 chars/token via count_tokens 2026-07-17) and would let a 200K request slip
+# through. char/3.0 is a conservative UPPER bound on the real count for every content
+# class Cora sends (min observed density 2.95), so the estimate never under-fires.
+_EST_CHARS_PER_TOKEN = 3.0
+# Ceiling well under Anthropic's 200,000 input maximum: ~15K headroom absorbs
+# estimator variance + the small per-block / per-tool structural overhead the raw
+# char estimate omits. Env-overridable so the ceiling can be tuned without a code
+# change (invalid/<=0 -> default).
+_DEFAULT_MAX_INPUT_TOKENS = 185_000
+# Never trim block-3 KB below this many chunks (keep the most-relevant ones).
+_KB_CHUNK_FLOOR = 3
+
+# Structural markers used to locate the two TRIMMABLE regions in the composed
+# system blocks. Kept in sync with context_loader (_format_kb_chunks header,
+# _FOUNDER_DYNAMIC_MARKER) + the block2 section headers; test_token_budget_guard
+# pins these against freshly-built context so drift fails the suite rather than
+# silently disabling the trimmer.
+_KB_BLOCK_HEADER = "# Retrieved knowledge (semantically matched to user's question)"
+_KB_CHUNK_DELIM = "\n## ["  # each rendered KB chunk starts a line "## [i] ..."
+_FOUNDER_CSOTW_MARKER = "# Current State of the World"
+# The block-2 sections that follow the founder brief (join order in
+# context_loader._build_static_context). The CSotW span must stop BEFORE these so
+# per-entity known-answers + dynamic snapshots are NEVER trimmed.
+_STATIC_SECTION_HEADERS = (
+    "# Known Answers (from prior gap reviews)",
+    "# Dynamic Known Answers (refreshed from snapshots)",
+)
+_CSOTW_DROP_NOTE = (
+    "\n\n_[Portfolio Current State / Top of Mind / recent decisions were omitted "
+    "from this brief to fit the model input budget. They live in Cora's knowledge "
+    "base and are surfaced by retrieval below — if the answer needs current "
+    "portfolio state and it isn't in the retrieved knowledge, say so rather than "
+    "guessing.]_\n"
+)
+
+
+def _configured_max_input_tokens() -> int:
+    raw = os.environ.get("CLAUDE_MAX_INPUT_TOKENS", "")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_INPUT_TOKENS
+    return val if val > 0 else _DEFAULT_MAX_INPUT_TOKENS
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative OFFLINE token estimate (upper bound; see _EST_CHARS_PER_TOKEN)."""
+    if not text:
+        return 0
+    return int(len(text) / _EST_CHARS_PER_TOKEN) + 1
+
+
+def _estimate_messages_tokens(messages: list) -> int:
+    """Estimate the conversation payload. Content is usually a str; on tool-loop
+    turns it is a list of blocks (tool_use / tool_result) — sum the text-ish parts."""
+    total = 0
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            total += _estimate_tokens(content)
+        elif isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict):
+                    if isinstance(blk.get("text"), str):
+                        total += _estimate_tokens(blk["text"])
+                    elif isinstance(blk.get("content"), str):
+                        total += _estimate_tokens(blk["content"])
+                    elif blk.get("input") is not None:
+                        total += _estimate_tokens(json.dumps(blk.get("input")))
+                else:
+                    total += _estimate_tokens(str(blk))
+    return total
+
+
+def _estimate_request_tokens(system_blocks: list, tools: list, messages: list) -> int:
+    """Estimate the WHOLE request (system + tools + messages) in tokens, offline."""
+    total = 0
+    for b in system_blocks or []:
+        if isinstance(b, dict) and isinstance(b.get("text"), str):
+            total += _estimate_tokens(b["text"])
+    if tools:
+        # Serialize without the cache_control noise-free enough; JSON size dominates.
+        total += _estimate_tokens(json.dumps(tools, default=str))
+    total += _estimate_messages_tokens(messages)
+    return total
+
+
+def _drop_last_kb_chunk(block_text: str, floor: int) -> tuple[str, bool]:
+    """Remove the LAST rendered KB chunk (lowest-relevance; chunks are best-first)
+    from the volatile block, keeping at least `floor` chunks. Returns
+    (new_text, changed). Only the region from _KB_BLOCK_HEADER onward is touched, so
+    the runtime channel/security context that precedes it is never altered."""
+    hdr = block_text.find(_KB_BLOCK_HEADER)
+    if hdr == -1:
+        return block_text, False
+    positions: list[int] = []
+    start = hdr
+    while True:
+        p = block_text.find(_KB_CHUNK_DELIM, start)
+        if p == -1:
+            break
+        positions.append(p)
+        start = p + len(_KB_CHUNK_DELIM)
+    if len(positions) <= floor:
+        return block_text, False
+    # Cut from the last chunk boundary to the end of the block (drops the lowest-
+    # relevance chunk; any trailing personal-note overlay rides with it — acceptable
+    # only on the rare over-budget path).
+    return block_text[: positions[-1]].rstrip() + "\n", True
+
+
+def _drop_founder_csotw(block_text: str) -> tuple[str, bool]:
+    """Remove the wholesale 'Current State of the World' span from the static block,
+    PRESERVING everything after it (per-entity known-answers + dynamic snapshots).
+    Returns (new_text, changed)."""
+    m = block_text.find(_FOUNDER_CSOTW_MARKER)
+    if m == -1:
+        return block_text, False
+    end = len(block_text)
+    for hdr in _STATIC_SECTION_HEADERS:
+        h = block_text.find(hdr, m)
+        if h != -1:
+            # back up to the "\n\n---\n\n" separator that precedes the downstream
+            # section so the join separator isn't left dangling
+            sep = block_text.rfind("\n\n---\n\n", m, h)
+            end = min(end, sep if sep != -1 else h)
+    new_text = block_text[:m].rstrip() + _CSOTW_DROP_NOTE + block_text[end:]
+    return new_text, True
+
+
+def _enforce_token_budget(
+    system_blocks: list, tools: list, messages: list, entity: str,
+) -> list:
+    """Return system_blocks trimmed to fit under the input-token ceiling (D-084).
+
+    NEVER trims: block-1 (entity system prompt), the tool schemas, per-entity
+    known-answers / dynamic snapshots, or the runtime security/PHI/firewall/
+    source-opacity/finance instructions (they precede the KB region in block-3).
+    Trim order (lowest-value first): (1) reduce block-3 KB chunks to a floor;
+    (2) drop the wholesale founder 'Current State of the World' from block-2 (it is
+    KB-retrievable). cache_control on blocks 1+2 is preserved (we edit only .text).
+    Degrades; never raises."""
+    ceiling = _configured_max_input_tokens()
+    est = _estimate_request_tokens(system_blocks, tools, messages)
+    if est <= ceiling:
+        return system_blocks
+
+    orig_est = est
+    blocks = [dict(b) if isinstance(b, dict) else b for b in system_blocks]
+    steps: list[str] = []
+
+    # Lever A — reduce block-3 (the last block) KB chunks, lowest-relevance first.
+    if blocks:
+        last = blocks[-1]
+        if isinstance(last, dict) and isinstance(last.get("text"), str):
+            dropped = 0
+            while est > ceiling:
+                new_text, changed = _drop_last_kb_chunk(last["text"], _KB_CHUNK_FLOOR)
+                if not changed:
+                    break
+                last["text"] = new_text
+                dropped += 1
+                est = _estimate_request_tokens(blocks, tools, messages)
+            if dropped:
+                steps.append(f"kb_chunks-{dropped}")
+
+    # Lever B — drop the wholesale founder Current State of the World from block-2.
+    if est > ceiling and len(blocks) >= 3:
+        b2 = blocks[1]
+        if isinstance(b2, dict) and isinstance(b2.get("text"), str):
+            new_text, changed = _drop_founder_csotw(b2["text"])
+            if changed:
+                b2["text"] = new_text
+                est = _estimate_request_tokens(blocks, tools, messages)
+                steps.append("founder-csotw-dropped")
+
+    log.warning(
+        "token-budget guard TRIMMED entity=%s: est %d -> %d tok (ceiling %d) via %s",
+        entity, orig_est, est, ceiling, ", ".join(steps) or "no-op",
+    )
+    if est > ceiling:
+        # Floor reached: everything left is protected content. Better to attempt the
+        # send (Anthropic may still count slightly under our conservative estimate)
+        # than to trim a security instruction. Loud so it never passes unnoticed.
+        log.warning(
+            "token-budget guard: entity=%s STILL over ceiling after trimming "
+            "(est %d > %d) — remaining content is protected (system prompt, tools, "
+            "known-answers, security rules); sending as-is",
+            entity, est, ceiling,
+        )
+    return blocks
 
 
 def _log_usage(response: anthropic.types.Message, iteration: int) -> None:
@@ -612,6 +819,10 @@ def generate_response(
     # the current user message. Grows with each tool_use / tool_result exchange.
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
 
+    # Pre-send token-budget guard (D-084): trim to fit under the input ceiling
+    # rather than let an oversized FNDR/HJRG assembly 400. No-op when under budget.
+    system_blocks = _enforce_token_budget(system_blocks, cached_tools, messages, entity)
+
     if meta is not None:
         meta["used_tools"] = False
         meta["used_verbatim_tool"] = False
@@ -766,6 +977,11 @@ def generate_response_streaming(
     effective_model = model or _MODEL
 
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
+
+    # Pre-send token-budget guard (D-084): trim to fit under the input ceiling
+    # rather than let an oversized FNDR/HJRG assembly 400. No-op when under budget.
+    system_blocks = _enforce_token_budget(system_blocks, cached_tools, messages, entity)
+
     accumulated_text = ""
     _last_tool_result_text: str = ""  # safety net: fallback if Claude emits no text after a write
     _last_shopify_result: str = ""    # HIGH-2: the DTC write tool owns its outcome text

@@ -69,6 +69,14 @@ _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 _FOUNDER_DYNAMIC_MARKER = "# Current State of the World"
 _FOUNDER_FULL_ENTITIES: frozenset[str] = frozenset({"FNDR", "HJRG"})
 
+# Section headers for the two static-context parts that follow the founder brief
+# in _build_static_context (join order: entity brief, founder brief, KNOWN answers,
+# DYNAMIC answers). Exported as constants so the claude_client token-budget guard
+# (D-084) can locate — and never trim past — them; test_token_budget_guard pins its
+# private copies against these so a rename here fails the suite loudly.
+KNOWN_ANSWERS_SECTION_HEADER = "# Known Answers (from prior gap reviews)"
+DYNAMIC_ANSWERS_SECTION_HEADER = "# Dynamic Known Answers (refreshed from snapshots)"
+
 
 def _slim_founder(text: str) -> str:
     """Return the founder brief trimmed to its static head (everything before the
@@ -420,7 +428,7 @@ def _build_static_context(entity: str, now: float) -> str:
             ka_path, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=_CTX_RETRY_SECONDS
         ).strip()
         if ka_content:
-            parts.append("# Known Answers (from prior gap reviews)\n\n" + ka_content)
+            parts.append(f"{KNOWN_ANSWERS_SECTION_HEADER}\n\n" + ka_content)
     else:
         log.info("no known-answers file for entity %s", entity)
 
@@ -430,7 +438,7 @@ def _build_static_context(entity: str, now: float) -> str:
     # LOCAL (repo) reads, unaffected by a G: outage.
     dynamic = _load_scoped_dynamic_answers(entity)
     if dynamic:
-        parts.append("# Dynamic Known Answers (refreshed from snapshots)\n\n" + dynamic)
+        parts.append(f"{DYNAMIC_ANSWERS_SECTION_HEADER}\n\n" + dynamic)
 
     text = "\n\n---\n\n".join(parts)
     ka_mtime = _known_answers_mtime(entity)
