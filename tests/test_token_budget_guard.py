@@ -172,6 +172,38 @@ def test_huge_context_trims_under_default_ceiling(monkeypatch):
     assert cc._FOUNDER_CSOTW_MARKER not in out[1]["text"]
 
 
+def test_lever_c_marker_absent_still_trims_under(monkeypatch):
+    # Founder-doc heading rename on Drive -> Lever B's CSotW marker is absent, but the
+    # marker-independent Lever C still truncates the oversized founder region, keeping
+    # the constitution head + known-answers. Proves "never 400 again" survives drift
+    # the repo-side drift test cannot see.
+    monkeypatch.delenv("CLAUDE_MAX_INPUT_TOKENS", raising=False)  # default ceiling
+    prompt = "SYS SECURITY"
+    static = (
+        "# HJR Portfolio constitution HEAD-SENTINEL\n" + ("F" * 2_000_000)
+        + f"\n\n---\n\n{ctx.KNOWN_ANSWERS_SECTION_HEADER}\n\nKA-SENTINEL"
+    )
+    volatile = "## Runtime\nSEC-RUNTIME\n\n---\n\n" + _kb_block(4)
+    blocks = cc._build_cached_system(prompt, volatile, static_context=static)
+    out = cc._enforce_token_budget(blocks, [], _msgs("q"), "FNDR")
+    est = cc._estimate_request_tokens(out, [], _msgs("q"))
+    assert est <= cc._DEFAULT_MAX_INPUT_TOKENS
+    assert cc._FOUNDER_CSOTW_MARKER not in out[1]["text"]  # never had it
+    assert "HEAD-SENTINEL" in out[1]["text"]               # constitution head kept
+    assert "KA-SENTINEL" in out[1]["text"]                 # known-answers preserved
+
+
+def test_truncate_static_head_preserves_tail_and_floor():
+    head = "HEAD-KEEP " + ("Z" * 500_000)
+    text = head + f"\n\n---\n\n{ctx.KNOWN_ANSWERS_SECTION_HEADER}\n\nKA-KEEP"
+    new_text, changed = cc._truncate_static_head(text, over_tokens=100_000)
+    assert changed
+    assert "HEAD-KEEP" in new_text                         # leading head floor kept
+    assert "KA-KEEP" in new_text                            # protected tail kept
+    assert ctx.KNOWN_ANSWERS_SECTION_HEADER in new_text
+    assert len(new_text) < len(text)
+
+
 def test_protected_prompt_never_trimmed_even_when_over(monkeypatch):
     # If the ONLY oversized region is protected (block1 prompt), the guard refuses
     # to trim it — it degrades toward a possible 400 rather than dropping a security

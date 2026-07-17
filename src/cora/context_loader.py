@@ -60,14 +60,21 @@ _FOUNDER_PATH: Path = _DRIVE_ROOT / "CLAUDE.md"
 #
 # That dynamic section is ALSO chunked into the KB (source=static_md) and is
 # already co-scanned on every non-LEX query (include_fndr=True), so injecting it
-# wholesale into every entity's context is pure redundancy — retrieval surfaces
-# the relevant current-state per question. So: aggregators (FNDR/HJRG) that ask
-# portfolio-wide questions keep the FULL founder brief inlined; every other
-# entity gets only the static brief, and leans on retrieval for the long tail.
-# This also stops daily TOM edits from invalidating those entities' cached
-# context block (the caching-split synergy).
+# wholesale into any entity's context is pure redundancy — retrieval surfaces the
+# relevant current-state per question. Every entity, INCLUDING the FNDR/HJRG
+# aggregators, gets only the static brief and leans on retrieval for the long tail.
+#
+# 2026-07-17 (D-084): FNDR/HJRG were removed from the full-inject set. Keeping the
+# full ~157K-token "Current State of the World" tail inlined pushed an FNDR mention
+# past Anthropic's 200,000-token input ceiling (a live 400). The founder doc is
+# freshly, fully KB-indexed under FNDR (source=static_md), so a portfolio-status
+# question retrieves the relevant current-state chunks — FNDR loses no answerable
+# fact, and its cached context block stops being invalidated by daily TOM edits.
+# _FOUNDER_FULL_ENTITIES is retained (empty) so the full-inject lever can be
+# re-enabled per entity if a future need arises; the claude_client token-budget
+# guard (D-084) is the backstop if it ever is.
 _FOUNDER_DYNAMIC_MARKER = "# Current State of the World"
-_FOUNDER_FULL_ENTITIES: frozenset[str] = frozenset({"FNDR", "HJRG"})
+_FOUNDER_FULL_ENTITIES: frozenset[str] = frozenset()
 
 # Section headers for the two static-context parts that follow the founder brief
 # in _build_static_context (join order: entity brief, founder brief, KNOWN answers,

@@ -173,7 +173,10 @@ def test_non_aggregator_entity_gets_slim_founder(monkeypatch, tmp_path):
     assert "knowledge base" in result                         # retrieval note present
 
 
-def test_fndr_keeps_full_founder(monkeypatch, tmp_path):
+def test_fndr_gets_slim_founder(monkeypatch, tmp_path):
+    # D-084: FNDR no longer wholesale-injects the "Current State of the World" tail
+    # (it crossed the 200K input ceiling). It keeps the static head + relies on KB
+    # retrieval for current-state, exactly like every other entity.
     _clear_cache()
     founder = tmp_path / "FNDR.md"
     founder.write_text(_FOUNDER_DOC, encoding="utf-8")
@@ -182,11 +185,13 @@ def test_fndr_keeps_full_founder(monkeypatch, tmp_path):
 
     result = cl.load_context("FNDR")
 
-    assert "Static brief: portfolio principles." in result
-    assert "TOM: secret dynamic stuff." in result             # aggregator keeps full
+    assert "Static brief: portfolio principles." in result    # static head kept
+    assert "TOM: secret dynamic stuff." not in result         # dynamic tail dropped
+    assert "knowledge base" in result                         # retrieval note present
 
 
-def test_hjrg_keeps_full_founder(monkeypatch, tmp_path):
+def test_hjrg_gets_slim_founder(monkeypatch, tmp_path):
+    # D-084: HJRG (the other former aggregator) is slimmed too.
     _clear_cache()
     founder = tmp_path / "FNDR.md"
     founder.write_text(_FOUNDER_DOC, encoding="utf-8")
@@ -195,7 +200,14 @@ def test_hjrg_keeps_full_founder(monkeypatch, tmp_path):
 
     result = cl.load_context("HJRG")
 
-    assert "TOM: secret dynamic stuff." in result             # HJRG is an aggregator
+    assert "Static brief: portfolio principles." in result
+    assert "TOM: secret dynamic stuff." not in result         # HJRG slimmed too
+
+
+def test_no_entities_in_full_founder_set():
+    # The full-inject lever is retained but empty (D-084). If an entity is ever
+    # re-added, this test forces a conscious review of the 200K-ceiling impact.
+    assert cl._FOUNDER_FULL_ENTITIES == frozenset()
 
 
 def test_slim_falls_back_to_full_when_marker_absent(monkeypatch, tmp_path):

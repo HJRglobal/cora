@@ -422,6 +422,35 @@ def _drop_founder_csotw(block_text: str) -> tuple[str, bool]:
     return new_text, True
 
 
+# Last-resort floor: even when truncating the static block's founder region, keep
+# at least this many leading chars (the portfolio table / operating principles /
+# source-of-truth head — the load-bearing "constitution").
+_STATIC_HEAD_FLOOR_CHARS = 4_000
+
+
+def _truncate_static_head(block_text: str, over_tokens: int) -> tuple[str, bool]:
+    """Marker-INDEPENDENT last resort: shed ~over_tokens from the founder/entity-brief
+    region of the static block-2 (everything BEFORE the known-answers/dynamic section
+    headers), preserving those downstream sections. Fires when Lever B could not find
+    the CSotW marker (e.g. the founder-doc heading was renamed on Drive) yet block-2 is
+    still the oversized mass. Keeps a minimal head (the portfolio constitution). Returns
+    (new_text, changed)."""
+    tail_start = len(block_text)
+    for hdr in _STATIC_SECTION_HEADERS:
+        h = block_text.find(hdr)
+        if h != -1:
+            sep = block_text.rfind("\n\n---\n\n", 0, h)
+            tail_start = min(tail_start, sep if sep != -1 else h)
+    head = block_text[:tail_start]
+    tail = block_text[tail_start:]  # known-answers + dynamic — never trimmed
+    cut_chars = int(max(over_tokens, 0) * _EST_CHARS_PER_TOKEN) + 4_000  # + slack to clear it
+    keep = max(_STATIC_HEAD_FLOOR_CHARS, len(head) - cut_chars)
+    if keep >= len(head):
+        return block_text, False  # nothing meaningful to shed above the floor
+    new_head = head[:keep].rstrip() + _CSOTW_DROP_NOTE
+    return new_head + tail, True
+
+
 def _enforce_token_budget(
     system_blocks: list, tools: list, messages: list, entity: str,
 ) -> list:
@@ -467,6 +496,20 @@ def _enforce_token_budget(
                 b2["text"] = new_text
                 est = _estimate_request_tokens(blocks, tools, messages)
                 steps.append("founder-csotw-dropped")
+
+    # Lever C — marker-INDEPENDENT last resort: block-2 is still oversized (the CSotW
+    # marker was absent, e.g. a founder-doc heading rename on Drive). Truncate its
+    # founder/entity-brief region to fit, preserving known-answers + dynamic. This is
+    # what makes the "never 400 again" guarantee robust to a heading the drift test
+    # cannot see (the doc lives on Drive, not in the repo).
+    if est > ceiling and len(blocks) >= 3:
+        b2 = blocks[1]
+        if isinstance(b2, dict) and isinstance(b2.get("text"), str):
+            new_text, changed = _truncate_static_head(b2["text"], est - ceiling)
+            if changed:
+                b2["text"] = new_text
+                est = _estimate_request_tokens(blocks, tools, messages)
+                steps.append("static-head-truncated")
 
     log.warning(
         "token-budget guard TRIMMED entity=%s: est %d -> %d tok (ceiling %d) via %s",
