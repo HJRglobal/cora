@@ -20,6 +20,13 @@ _DYNAMIC_DIR = Path(os.environ.get("DYNAMIC_ANSWERS_DIR")
 
 _TTL = 300  # seconds
 
+# Defensive cap on a single entity's rendered dynamic block (D-084). Today's blocks
+# are tiny (~a few hundred chars each), but this bounds a future oversized snapshot
+# template so it can never balloon the cached static context toward the 200K input
+# ceiling. The claude_client token-budget guard is the request-level backstop; this
+# caps at the source.
+_MAX_DYNAMIC_CHARS = 8_000
+
 # entity -> (text, cached_at, fingerprint)
 _cache: dict[str, tuple[str, float, float]] = {}
 
@@ -170,5 +177,14 @@ def load_dynamic_answers(entity: str) -> str:
         parts.append(rendered)
 
     text = "\n\n".join(parts)
+    if len(text) > _MAX_DYNAMIC_CHARS:
+        log.warning(
+            "dynamic_answers: %s block is %d chars (> %d cap) -- truncating to fit "
+            "the context budget", entity, len(text), _MAX_DYNAMIC_CHARS,
+        )
+        text = (
+            text[:_MAX_DYNAMIC_CHARS].rstrip()
+            + "\n\n_[dynamic answers truncated to fit the context budget]_"
+        )
     _cache[entity] = (text, now, snapshot_fingerprint(entity))
     return text

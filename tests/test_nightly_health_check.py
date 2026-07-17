@@ -131,6 +131,65 @@ def test_qbo_monitor_never_run_is_warn(monkeypatch):
     assert r.status == "warn" and "never run" in r.detail
 
 
+# ── Dynamic-answers snapshot freshness (D-084) ────────────────────────────────
+import time as _time  # noqa: E402
+
+
+def _setup_dynamic(monkeypatch, tmp_path):
+    dyn = tmp_path / "design" / "known-answers" / "dynamic"
+    dyn.mkdir(parents=True)
+    monkeypatch.setattr(hc, "_DYNAMIC_ANSWERS_DIR", dyn)
+    monkeypatch.setattr(hc, "_REPO_ROOT", tmp_path)
+    return dyn
+
+
+def _write_dyn_yaml(dyn, entity, name, snap_rel, threshold_hours=336):
+    ed = dyn / entity
+    ed.mkdir(exist_ok=True)
+    (ed / name).write_text(
+        f"topic: T\nsnapshot_path: {snap_rel}\nsource:\n"
+        f"  staleness_threshold_hours: {threshold_hours}\n",
+        encoding="utf-8",
+    )
+
+
+def test_dynamic_snapshots_fresh_is_ok(monkeypatch, tmp_path):
+    dyn = _setup_dynamic(monkeypatch, tmp_path)
+    _write_dyn_yaml(dyn, "F3E", "pipeline.yaml", "data/snap/p.yaml")
+    snap = tmp_path / "data" / "snap" / "p.yaml"
+    snap.parent.mkdir(parents=True)
+    snap.write_text("x", encoding="utf-8")
+    r = hc.check_dynamic_snapshots(now_epoch=_time.time())
+    assert r.status == "ok" and "1 dynamic snapshot" in r.detail
+
+
+def test_dynamic_snapshots_stale_is_warn(monkeypatch, tmp_path):
+    dyn = _setup_dynamic(monkeypatch, tmp_path)
+    _write_dyn_yaml(dyn, "F3E", "pipeline.yaml", "data/snap/p.yaml", threshold_hours=336)
+    snap = tmp_path / "data" / "snap" / "p.yaml"
+    snap.parent.mkdir(parents=True)
+    snap.write_text("x", encoding="utf-8")
+    old = _time.time() - 1400 * 3600  # the real ~58d staleness observed 2026-07-17
+    import os as _os
+    _os.utime(snap, (old, old))
+    r = hc.check_dynamic_snapshots(now_epoch=_time.time())
+    assert r.status == "warn"
+    assert "stale/missing" in r.detail and "serving the yaml fallback" in r.detail
+
+
+def test_dynamic_snapshots_missing_is_warn(monkeypatch, tmp_path):
+    dyn = _setup_dynamic(monkeypatch, tmp_path)
+    _write_dyn_yaml(dyn, "FNDR", "cash.yaml", "data/snap/does-not-exist.yaml")
+    r = hc.check_dynamic_snapshots(now_epoch=_time.time())
+    assert r.status == "warn" and "MISSING" in r.detail
+
+
+def test_dynamic_snapshots_no_dir_is_ok(monkeypatch, tmp_path):
+    monkeypatch.setattr(hc, "_DYNAMIC_ANSWERS_DIR", tmp_path / "nope")
+    r = hc.check_dynamic_snapshots()
+    assert r.status == "ok"
+
+
 # ── W4-07: LastTaskResult classifier ──────────────────────────────────────────
 
 _BENIGN = hc._BENIGN_LAST_RESULTS

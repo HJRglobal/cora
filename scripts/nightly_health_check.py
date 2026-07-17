@@ -507,6 +507,57 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
 
 
+_DYNAMIC_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers" / "dynamic"
+
+
+def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
+    """WARN when a dynamic-answers snapshot is missing or stale past its yaml
+    threshold (D-084). context_loader serves the yaml `fallback` in that case --
+    honest but permanently stale if nothing refreshes the snapshot. Surfacing it
+    daily turns silent rot into a visible signal. `now_epoch` is injectable for
+    tests. Reads design/known-answers/dynamic/<entity>/*.yaml."""
+    now = now_epoch if now_epoch is not None else time.time()
+    if not _DYNAMIC_ANSWERS_DIR.exists():
+        return CheckResult("Dynamic snapshots", "ok", "No dynamic-answers directory.")
+    try:
+        import yaml  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Dynamic snapshots", "warn", f"yaml import failed: {exc}")
+    stale: list[str] = []
+    checked = 0
+    for yaml_path in sorted(_DYNAMIC_ANSWERS_DIR.glob("*/*.yaml")):
+        try:
+            raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(raw, dict):
+            continue
+        snap_rel = raw.get("snapshot_path")
+        if not snap_rel:
+            continue
+        checked += 1
+        label = f"{yaml_path.parent.name}/{yaml_path.stem}"
+        threshold_h = float((raw.get("source") or {}).get("staleness_threshold_hours", 24))
+        snap = _REPO_ROOT / snap_rel
+        if not snap.exists():
+            stale.append(f"{label}: snapshot MISSING ({snap_rel})")
+            continue
+        age_h = (now - snap.stat().st_mtime) / 3600.0
+        if age_h > threshold_h:
+            stale.append(f"{label}: {age_h:.0f}h old > {threshold_h:.0f}h threshold")
+    if stale:
+        return CheckResult(
+            "Dynamic snapshots", "warn",
+            f"{len(stale)} of {checked} dynamic snapshot(s) stale/missing -- Cora is "
+            f"serving the yaml fallback for these:\n"
+            + "\n".join(f"  - {s}" for s in stale)
+            + "\n  (No auto-refresh writer exists for these seeds -- wire a refresher "
+            "or retire the dynamic-answers feature. See D-084.)",
+        )
+    return CheckResult("Dynamic snapshots", "ok",
+                       f"{checked} dynamic snapshot(s) within staleness threshold.")
+
+
 def check_logs_24h() -> list[CheckResult]:
     """Scan last 24h log files for ERRORs and critical patterns."""
     results: list[CheckResult] = []
@@ -932,6 +983,9 @@ def main() -> int:
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())
+
+    log.info("Checking dynamic-answers snapshot freshness...")
+    all_results.append(check_dynamic_snapshots())
 
     log.info("Scanning logs (last 24h)...")
     all_results.extend(check_logs_24h())

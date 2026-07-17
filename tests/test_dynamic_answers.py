@@ -73,6 +73,25 @@ def test_load_dynamic_answer_basic(dynamic_root, tmp_path):
     assert "Pipeline is healthy, owned by Alice." in result
 
 
+def test_dynamic_block_is_capped(dynamic_root, tmp_path, caplog):
+    # D-084: a pathologically large rendered block is truncated so it can never
+    # balloon the cached static context toward the 200K input ceiling.
+    entity_dir = dynamic_root / "F3E"
+    entity_dir.mkdir()
+    huge = "X" * (da._MAX_DYNAMIC_CHARS + 50_000)
+    _make_snapshot(tmp_path, "data/snapshots/f3e/big.yaml", f"blob: {huge}")
+    _write_answer_yaml(
+        entity_dir, "big.yaml",
+        topic="Big", template="Value: {blob}", fallback="none",
+        snapshot_path="data/snapshots/f3e/big.yaml",
+    )
+    with caplog.at_level(logging.WARNING, logger="cora.dynamic_answers"):
+        result = da.load_dynamic_answers("F3E")
+    assert len(result) <= da._MAX_DYNAMIC_CHARS + 100  # cap + truncation note
+    assert "truncated to fit the context budget" in result
+    assert "truncating" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Stale snapshot → fallback
 # ---------------------------------------------------------------------------
