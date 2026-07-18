@@ -190,6 +190,19 @@ def test_dynamic_snapshots_no_dir_is_ok(monkeypatch, tmp_path):
     assert r.status == "ok"
 
 
+def test_dynamic_snapshots_empty_dir_is_ok(monkeypatch, tmp_path):
+    # D-085 retirement: after the 4 manual seeds were removed, the dynamic dir still
+    # EXISTS (entity subfolders keep their .gitkeep) but holds zero *.yaml seeds.
+    # That zero-seed state must green -- the health check must NOT regress to
+    # WARN-on-empty now that there is nothing to be stale.
+    dyn = _setup_dynamic(monkeypatch, tmp_path)
+    for e in ("FNDR", "F3E", "OSN"):  # empty subdirs, mirroring the kept .gitkeep dirs
+        (dyn / e).mkdir()
+    r = hc.check_dynamic_snapshots(now_epoch=_time.time())
+    assert r.status == "ok"
+    assert "0 dynamic snapshot" in r.detail
+
+
 def test_dynamic_snapshots_malformed_source_does_not_raise(monkeypatch, tmp_path):
     # D-051 [4]: a non-dict `source` (or bad threshold) must be fail-soft, never abort
     # the whole nightly report.
