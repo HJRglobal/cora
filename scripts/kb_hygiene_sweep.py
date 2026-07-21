@@ -603,6 +603,147 @@ def run_proactive(cfg: ArchiveConfig, db_path: Path, *, dup_threshold: float,
     }
 
 
+# ── retention GC (Slice D) ─────────────────────────────────────────────────────
+# GC reads ONLY this loop's manifests (never the one-time D-086
+# archive-founder-os-manifest-*), so the big cleanup archive is never GC'd here.
+_HYGIENE_MANIFEST_GLOB = "kb-hygiene-manifest-*.json"
+
+
+def run_gc(cfg: ArchiveConfig, *, restore_days: int, purge_after_days: int,
+           apply: bool, now_ts: float) -> dict:
+    """Retention: hard-delete _archive files whose sweep manifest is older than
+    purge_after_days. NEVER inside the restore_days easy-restore window (the
+    effective threshold is clamped up to restore_days), and NEVER a path outside
+    _archive (resolved-path containment check). Deletes FILES only -- KB chunks
+    were already purged at archive time; the KB .bak is the deeper fallback."""
+    effective = max(purge_after_days, restore_days)  # never delete inside restore window
+    arch_root = cfg.archive_root.resolve()
+    result = {"effective_purge_after_days": effective, "restore_days": restore_days,
+              "applied": apply, "targets": [], "errors": [], "manifests_aged": 0}
+    for man_path in sorted(LOG_DIR.glob(_HYGIENE_MANIFEST_GLOB)):
+        try:
+            data = json.loads(man_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        dstr = data.get("archived_date") or str(data.get("generated_at", ""))[:10]
+        try:
+            man_ts = datetime.strptime(dstr, "%Y-%m-%d").timestamp()
+        except ValueError:
+            continue
+        if (now_ts - man_ts) / 86400.0 < effective:
+            continue  # within retention -> keep
+        result["manifests_aged"] += 1
+        for m in data.get("moves", []):
+            if not m.get("moved"):
+                continue
+            try:
+                target = (cfg.archive_root / m["src_rel"]).resolve()
+            except (OSError, ValueError):
+                continue
+            # SAFETY (§7D): the target MUST be under _archive -- never a live path.
+            try:
+                target.relative_to(arch_root)
+            except ValueError:
+                result["errors"].append({"rel": m["src_rel"], "why": "not under _archive -- refused"})
+                continue
+            if not target.exists():
+                continue
+            result["targets"].append(m["src_rel"])
+            if apply:
+                try:
+                    target.unlink()
+                except OSError as exc:
+                    result["errors"].append({"rel": m["src_rel"], "why": str(exc)})
+    result["count"] = len(result["targets"])
+    log.info("GC: %d aged _archive file(s) %s (retention %dd, restore floor %dd).",
+             result["count"], "deleted" if apply else "eligible (dry-run)",
+             effective, restore_days)
+    return result
+
+
+def run_from_manifest(manifest_path: Path, db_path: Path, *, apply: bool) -> dict:
+    """Finish a purge from a prior manifest's persisted chunk_ids (no re-walk).
+    Recovery path for a crashed apply."""
+    data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    pg = data.get("purge", {})
+    all_purge = sorted(set(pg.get("static_chunk_ids", [])) | set(pg.get("drive_chunk_ids", [])))
+    log.info("from-manifest: %d chunk(s) to purge (no re-walk).", len(all_purge))
+    result = {"chunks": len(all_purge), "applied": False}
+    if apply and all_purge:
+        rw = kb_archive.connect_rw(db_path)
+        try:
+            totals = kb_archive.delete_chunks(rw, all_purge)
+            log.info("Deleted: %s", totals)
+        finally:
+            rw.close()
+        result["applied"] = True
+    return result
+
+
+# ── report / DM (Slice D) ──────────────────────────────────────────────────────
+HARRISON_SLACK_ID = "U0B2RM2JYJ1"
+
+
+def compose_report(report: dict) -> str:
+    """Compact mrkdwn digest for Harrison: what the marked tier did + proactive
+    candidates to review + GC. Alarms/actions first."""
+    lines = [":broom: *KB Hygiene Sweep*"]
+    mk = report.get("marked")
+    if mk:
+        verb = "archived" if mk.get("applied") else "would archive"
+        head = f"*MARKED*: {mk['to_archive']} banner'd file(s) {verb}, {mk['purge_chunks']} chunk(s) purged."
+        if mk.get("escalated"):
+            head = (f":warning: *MARKED ESCALATED (NOT applied)*: {mk['to_archive']} file(s) / "
+                    f"{mk['purge_chunks']} chunk(s) exceed the live ceiling -- run "
+                    "`deployment\\run-kb-hygiene-apply.ps1` (Cora stopped).")
+        lines.append(head)
+        if mk.get("refused_held"):
+            lines.append(f"   - {len(mk['refused_held'])} banner(s) on held/confidential paths REFUSED.")
+        if mk.get("keep_class_warned"):
+            lines.append(f"   - {len(mk['keep_class_warned'])} banner(s) on KEEP-as-class files WARNED (not archived).")
+    pro = report.get("proactive")
+    if pro:
+        lines.append("*PROACTIVE* (review, then add the KB-STATUS banner to the real ones):")
+        for key, label in (("near_dupes", "near-dupe"), ("ttl_oneoffs", "ttl one-off"),
+                           ("resolved_pending", "resolved decisions-pending")):
+            items = pro.get(key, [])
+            lines.append(f"   - {label}: {len(items)}")
+            for it in items[:5]:
+                lines.append(f"       • {it.get('path') or it.get('item', '')}")
+    gc = report.get("gc")
+    if gc:
+        verb = "deleted" if gc.get("applied") else "eligible"
+        lines.append(f"*GC*: {gc['count']} aged _archive file(s) {verb} "
+                     f"(retention {gc['effective_purge_after_days']}d).")
+    if mk and mk.get("manifest"):
+        lines.append(f"_Manifest: {mk['manifest']}_")
+    return "\n".join(lines)
+
+
+def deliver_report(text: str) -> bool:
+    """DM the report to Harrison ONLY (hard-coded recipient). Sanitized via
+    slack_egress (B1 doctrine) before the post."""
+    from slack_sdk import WebClient
+
+    from cora import slack_egress
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.error("kb-hygiene: SLACK_BOT_TOKEN not set -- cannot DM report")
+        return False
+    try:
+        safe = slack_egress.sanitize_text(text)
+    except Exception:  # noqa: BLE001
+        safe = text
+    try:
+        client = WebClient(token=token)
+        resp = client.conversations_open(users=[HARRISON_SLACK_ID])
+        client.chat_postMessage(channel=resp["channel"]["id"], text=safe[:39000])
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.error("kb-hygiene: DM delivery failed: %s", exc)
+        return False
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="KB-staleness hygiene sweep (dry-run default).")
@@ -629,7 +770,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="cap per proactive detector.")
     ap.add_argument("--db", default=str(KB_DB_PATH), help="Path to the KB sqlite DB.")
     ap.add_argument("--revert", metavar="MANIFEST", help="Reverse the moves recorded in a manifest JSON.")
+    ap.add_argument("--from-manifest", metavar="MANIFEST",
+                    help="Finish a purge from a prior manifest's persisted chunk_ids (no re-walk).")
     ap.add_argument("--report", metavar="PATH", help="Write the candidate/run report JSON to PATH.")
+    ap.add_argument("--slack", action="store_true", help="DM the composed report to Harrison.")
     return ap
 
 
@@ -650,6 +794,10 @@ def main() -> int:
         return 1
 
     apply_changes = args.apply and not args.dry_run
+
+    if args.from_manifest:
+        run_from_manifest(Path(args.from_manifest), db_path, apply=apply_changes)
+        return 0
 
     # Default action: if no tier flag given, run marked (dry-run) as the safe default.
     run_any = args.marked or args.proactive or args.gc
@@ -674,11 +822,16 @@ def main() -> int:
             jaccard=args.jaccard, max_proposals=args.max_proposals,
             now_ts=datetime.now().timestamp())
     if args.gc:
-        log.info("--gc retention is not yet implemented (Slice D).")
+        report["gc"] = run_gc(
+            cfg, restore_days=args.restore_days, purge_after_days=args.purge_after_days,
+            apply=apply_changes, now_ts=datetime.now().timestamp())
 
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=1), encoding="utf-8")
         log.info("Report -> %s", args.report)
+
+    if args.slack:
+        deliver_report(compose_report(report))
 
     if report.get("marked", {}).get("escalated"):
         return 3
