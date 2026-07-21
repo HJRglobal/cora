@@ -35,6 +35,8 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_review import (  # noqa: E402
+    apply_autowrite,
+    autowrite_level,
     correlate_reactions_to_updates,
     get_pending_updates,
     propose_update,
@@ -546,6 +548,33 @@ def _route_operational_to_owners(
     return routed
 
 
+def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
+    """(eligible, tier, reason) for the graduated-trust auto-write flip (§7B).
+
+    Uses the graduated-trust classifier for the tier, then an INDEPENDENT
+    is_high_stakes belt so a high-stakes / conflicts-with-canon item can NEVER
+    auto-write even if the tier were miscomputed. is_high_stakes fails CLOSED (a
+    phi_guard exception counts as high-stakes), and the belt itself fails closed.
+    Tier-2 is never eligible; Tier-1 only at level 'all'; Tier-0 at 'tier0'/'all'.
+    """
+    verdict = str(update.get("_coras_read_verdict", ""))
+    rec = gts.build_shadow_record(update, verdict)
+    tier = int(rec.get("shadow_tier", 2))
+    try:
+        high, _reasons = gts.is_high_stakes(
+            gts.claim_text(update), rec.get("entity", "FNDR"),
+            rec.get("category", ""), rec.get("entities") or None)
+    except Exception:  # noqa: BLE001 -- belt fails closed
+        high = True
+    if high or rec.get("conflicts"):
+        return False, tier, "high_stakes_or_conflict"
+    if tier == 0 and level in ("tier0", "all"):
+        return True, 0, "auto_tier0"
+    if tier == 1 and level == "all":
+        return True, 1, "auto_tier1"
+    return False, tier, "harrison"
+
+
 def _attach_coras_read(items: list[dict], log: logging.Logger) -> None:
     """Attach a fail-soft 'Cora's read' to each KNOWLEDGE item (WS17-C Part 3).
 
@@ -807,6 +836,55 @@ def main() -> int:
             log.info("graduated-shadow: logged %d shadow decision(s)", n_shadow)
     except Exception as exc:  # noqa: BLE001 -- shadow must never block the DM
         log.warning("graduated-shadow: decision logging error (ignored): %s", exc)
+
+    # ── Graduated-trust AUTO-WRITE (§7B, D-011 relaxed). DEFAULT OFF: when
+    # CORA_AUTOWRITE_LIVE is unset this whole block no-ops and every item DMs
+    # Harrison exactly as before. When enabled, Tier-0 (level tier0/all) and
+    # Tier-1 (level all) items auto-apply via the SAME idempotent executor the
+    # gated path uses; Tier-2 (high-stakes/PHI/cross-entity/conflicts) is NEVER
+    # auto-written (classifier + independent belt). Every auto-write is audited +
+    # one-tap revertible in the weekly digest. Any apply failure / error routes
+    # the item to Harrison (never silently dropped).
+    level = autowrite_level()
+    if level != "off":
+        auto_done = 0
+        keep: list[dict] = []
+        for u in k:
+            try:
+                elig, tier, why = _autowrite_eligible(u, level)
+            except Exception as exc:  # noqa: BLE001 -- any error -> route to Harrison
+                log.warning("autowrite: eligibility error (-> Harrison): %s", exc)
+                keep.append(u)
+                continue
+            if not elig:
+                keep.append(u)
+                continue
+            try:
+                ok, summary = apply_autowrite(
+                    u, tier=tier, reason=why,
+                    contributor=str((u.get("payload") or {}).get("contributor_id", "")))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("autowrite: apply error (-> Harrison): %s", exc)
+                keep.append(u)
+                continue
+            if ok:
+                auto_done += 1
+            else:
+                log.warning("autowrite: apply failed %s (-> Harrison): %s",
+                            str(u.get("update_id", ""))[:8], summary)
+                keep.append(u)
+        if auto_done:
+            log.info("autowrite(%s): %d item(s) auto-written; %d -> Harrison",
+                     level, auto_done, len(keep))
+        k = keep
+
+    if not k:
+        log.info("autowrite: all knowledge items handled automatically -- no Harrison DM needed")
+        log.info(
+            "Knowledge review complete — approved=%d dismissed=%d pending=%d (exit=%d)",
+            len(approved_updates), len(dismissed_updates), len(pending), exit_code,
+        )
+        return exit_code
 
     send_dm_to_harrison(
         f"Cora knowledge review: {len(k)} item(s) below for your approval. "

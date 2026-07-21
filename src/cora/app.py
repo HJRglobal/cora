@@ -2507,6 +2507,45 @@ def handle_knowledge_dismiss(ack, body, client) -> None:
     _handle_knowledge_one_tap(body, client, approve=False)
 
 
+# ── One-tap auto-write REVERT (§7B, 2026-07-21) ──────────────────────────────
+# The weekly auto-write digest carries a Revert button per item. Harrison taps it
+# and knowledge_review.process_autowrite_revert removes the auto-written block +
+# marks the audit reverted (Harrison-only; D-011-relaxed reversibility). All
+# correctness lives in knowledge_review; this wrapper is only Slack I/O.
+
+def _handle_autowrite_revert(body, client) -> None:
+    try:
+        actions = body.get("actions") or []
+        update_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        outcome, msg = knowledge_review.process_autowrite_revert(update_id, actor_id)
+
+        if outcome == "not_authorized":
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Post the outcome as a threaded reply so the digest stays intact and the
+        # other items keep their Revert buttons.
+        if channel_id and message_ts:
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=message_ts, text=msg)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("autowrite revert: reply failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("autowrite revert handler error (non-fatal)", exc_info=True)
+
+
+@app.action(knowledge_review.ACTION_AUTOWRITE_REVERT)
+def handle_autowrite_revert(ack, body, client) -> None:
+    ack()
+    _handle_autowrite_revert(body, client)
+
+
 # ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
 # Mirrors the knowledge one-tap contract: ack() immediately, then delegate; ALL
 # correctness (Harrison gate, idempotency, apply-then-record, re-guard-at-post)

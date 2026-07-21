@@ -790,3 +790,242 @@ def process_one_tap_action(
         resolve_update(update_id, "APPROVED", reason="one_tap_button")
         log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
         return "approved", f"✅ Saved to Cora's known-answers. ({summary})"
+
+
+# ── Graduated-trust AUTO-WRITE (§7B, 2026-07-21; D-011 relaxed -> reversible) ────
+# WS17-C's SILENT auto-approve was retired (D-060). This RE-INTRODUCES auto-write
+# for LOW-STAKES knowledge, but DELIBERATELY and safely:
+#   * env-gated, DEFAULT OFF (CORA_AUTOWRITE_LIVE unset -> today's behavior exactly)
+#   * tier-scoped: the graduated_trust classifier keeps Tier-2 (money/contracts/
+#     legal/equity/comp/PHI/LEX/cross-entity/conflicts-with-canon) Harrison-gated
+#     BY CONSTRUCTION; only Tier 0/1 can reach apply_autowrite
+#   * fully AUDITED (logs/cora-autowrite-audit.jsonl) + REVERTIBLE (one-tap in the
+#     weekly digest). Oversight-after-the-fact replaces the per-item gate.
+# The CALLER (run_knowledge_review) owns the tier decision + an independent
+# is_high_stakes belt; this module owns the durable write + audit + revert.
+
+_AUTOWRITE_AUDIT_PATH = _REPO_ROOT / "logs" / "cora-autowrite-audit.jsonl"
+_AUTOWRITE_LOCK = Lock()
+ACTION_AUTOWRITE_REVERT = "kb_autowrite_revert"
+
+
+def autowrite_level() -> str:
+    """CORA_AUTOWRITE_LIVE: 'off' (default -> nothing auto-writes), 'tier0' (only
+    CORROBORATED + allowlist + recognized-teammate items auto-write), or 'all'
+    (Tier-0 AND Tier-1). Tier-2 is NEVER auto-written at any level."""
+    v = (os.environ.get("CORA_AUTOWRITE_LIVE", "off") or "off").strip().lower()
+    return v if v in ("off", "tier0", "all") else "off"
+
+
+def _autowrite_target_files() -> list[Path]:
+    """The .md files an auto-write appends to (env-aware), snapshotted around an
+    apply so the revert payload is the exact inserted block."""
+    files: list[Path] = []
+    try:
+        from .gap_autofill import _known_answers_dir
+        kd = _known_answers_dir()
+        if kd.exists():
+            files.extend(sorted(kd.glob("*.md")))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from .friction_mining import _backlog_path
+        bp = _backlog_path()
+        if bp.exists():
+            files.append(bp)
+    except Exception:  # noqa: BLE001
+        pass
+    return files
+
+
+def _snapshot(files: list[Path]) -> dict[str, str]:
+    snap: dict[str, str] = {}
+    for f in files:
+        try:
+            snap[str(f)] = f.read_text(encoding="utf-8")
+        except OSError:
+            snap[str(f)] = ""
+    return snap
+
+
+def _diff_added(before: str, after: str) -> list[str]:
+    """The lines present in `after` but not `before` (the inserted block)."""
+    import difflib
+    b = before.splitlines()
+    a = after.splitlines()
+    added: list[str] = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=b, b=a, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            added.extend(a[j1:j2])
+    return added
+
+
+def _remove_block(lines: list[str], block: list[str]) -> list[str] | None:
+    """Remove the first contiguous occurrence of `block` from `lines`. Returns the
+    new list, or None if the block is not present (file changed / already gone)."""
+    if not block:
+        return None
+    n = len(block)
+    for i in range(0, len(lines) - n + 1):
+        if lines[i:i + n] == block:
+            return lines[:i] + lines[i + n:]
+    return None
+
+
+def log_autowrite(record: dict[str, Any]) -> None:
+    """Append one auto-write audit record to logs/cora-autowrite-audit.jsonl."""
+    record.setdefault("ts", _now_iso())
+    _AUTOWRITE_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _AUTOWRITE_LOCK:
+        with _AUTOWRITE_AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _read_autowrite_records_locked() -> list[dict[str, Any]]:
+    if not _AUTOWRITE_AUDIT_PATH.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in _AUTOWRITE_AUDIT_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def read_autowrite_audit(since_ts: float | None = None) -> list[dict[str, Any]]:
+    """Read audit records (optionally only ts >= since_ts epoch seconds)."""
+    with _AUTOWRITE_LOCK:
+        records = _read_autowrite_records_locked()
+    if since_ts is None:
+        return records
+    out = []
+    for rec in records:
+        try:
+            if datetime.fromisoformat(str(rec.get("ts", ""))).timestamp() >= since_ts:
+                out.append(rec)
+        except ValueError:
+            out.append(rec)
+    return out
+
+
+def apply_autowrite(update: dict[str, Any], *, tier: int, reason: str,
+                    contributor: str = "") -> tuple[bool, str]:
+    """Auto-apply a low-stakes knowledge update WITHOUT a Harrison gate, capturing
+    a revert payload + an audit line. Reuses the SAME idempotent executor the gated
+    path uses (apply_knowledge_update), so an auto-write is byte-identical to a
+    Harrison-approved one -- including the fail-closed PHI re-check inside the
+    appliers. Returns (ok, summary). Never raises."""
+    targets = _autowrite_target_files()
+    before = _snapshot(targets)
+    try:
+        ok, summary = apply_knowledge_update(update)
+    except Exception as exc:  # noqa: BLE001 -- apply already never raises, belt anyway
+        return False, f"apply failed: {exc}"
+    if not ok:
+        return ok, summary
+    after = _snapshot(_autowrite_target_files())
+    target_file = ""
+    added: list[str] = []
+    for path, aft in after.items():
+        if aft != before.get(path, ""):
+            target_file = path
+            added = _diff_added(before.get(path, ""), aft)
+            break
+    uid = str(update.get("update_id", ""))
+    resolve_update(uid, "APPROVED", reason=reason)
+    log_autowrite({
+        "update_id": uid,
+        "update_type": update.get("update_type", ""),
+        "entity": (update.get("payload") or {}).get("entity", ""),
+        "tier": tier,
+        "decision_reason": reason,
+        "contributor": contributor,
+        "summary": summary,
+        "reverted": False,
+        "revert": {"target_file": target_file, "added_lines": added},
+    })
+    log.info("knowledge_review: AUTO-WRITE %s tier=%d (%s)", uid[:8], tier, summary)
+    return ok, summary
+
+
+def process_autowrite_revert(update_id: str, actor_id: str) -> tuple[str, str]:
+    """Harrison-only revert of an auto-write: remove the exact inserted block from
+    the target .md (the next static sync self-heals any KB copy via
+    replace-on-conflict), mark the audit record reverted, and flip the proposed
+    update to DISMISSED. Idempotent: a second revert is a no-op. Returns
+    (outcome, message)."""
+    if actor_id != HARRISON_SLACK_USER_ID:
+        return "not_authorized", "Only Harrison can revert an auto-write."
+    tf = ""
+    removed = 0
+    with _AUTOWRITE_LOCK:
+        records = _read_autowrite_records_locked()
+        target = None
+        for rec in reversed(records):
+            if rec.get("update_id") == update_id and rec.get("decision_reason") != "revert":
+                target = rec
+                break
+        if target is None:
+            return "not_found", "I can't find that auto-write in the audit log."
+        if target.get("reverted"):
+            return "already_reverted", "That auto-write was already reverted."
+        rv = target.get("revert") or {}
+        tf = rv.get("target_file") or ""
+        added = rv.get("added_lines") or []
+        if tf and added:
+            p = Path(tf)
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                return "error", f"Couldn't read {tf}: {exc}"
+            new_lines = _remove_block(lines, added)
+            if new_lines is not None:
+                try:
+                    p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+                    removed = len(added)
+                except OSError as exc:
+                    return "error", f"Couldn't rewrite {tf}: {exc}"
+        # mark reverted + append a revert marker; rewrite the whole audit atomically
+        target["reverted"] = True
+        records.append({"ts": _now_iso(), "update_id": update_id,
+                        "update_type": target.get("update_type", ""),
+                        "decision_reason": "revert", "reverted": True,
+                        "summary": f"reverted by {actor_id}; removed {removed} line(s) from {tf}"})
+        tmp = _AUTOWRITE_AUDIT_PATH.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        tmp.replace(_AUTOWRITE_AUDIT_PATH)
+    # outside the audit lock: flip the proposed update so it isn't treated as applied
+    try:
+        resolve_update(update_id, "DISMISSED", reason="autowrite_reverted")
+    except Exception:  # noqa: BLE001
+        pass
+    tail = Path(tf).name if tf else "the target file"
+    return "reverted", f"↩️ Reverted -- removed the auto-written block from {tail}."
+
+
+def build_autowrite_digest_blocks(records: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """(fallback_text, Block Kit) for the weekly auto-write digest: one section +
+    a one-tap Revert button per item (value = update_id)."""
+    n = len(records)
+    header = f":robot_face: *Cora auto-learned {n} item(s) this week* (Tier 0/1, reversible)"
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+    ]
+    for rec in records[:20]:
+        uid = str(rec.get("update_id", ""))
+        ent = rec.get("entity", "")
+        summ = str(rec.get("summary", ""))[:200]
+        txt = (f"*[{rec.get('update_type', '')}]* tier {rec.get('tier', '?')}"
+               f"{(' · ' + ent) if ent else ''}\n{summ}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": txt[:2900]}})
+        blocks.append({"type": "actions", "block_id": f"aw_{uid}"[:255], "elements": [
+            {"type": "button", "action_id": ACTION_AUTOWRITE_REVERT,
+             "text": {"type": "plain_text", "text": "↩️ Revert"}, "style": "danger",
+             "value": uid}]})
+    return header, blocks
