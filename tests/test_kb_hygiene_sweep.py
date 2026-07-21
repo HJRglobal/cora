@@ -100,9 +100,19 @@ def test_parse_banner_no_reason():
     assert b["ref"] == "00-Founder\\x.md" and b["reason"] == ""
 
 
-def test_parse_banner_not_first_line():
-    b = M.parse_banner("# A title\n\n" + BANNER + "\nbody")
-    assert b is not None and b["date"] == "2026-07-21"
+def test_parse_banner_only_first_nonempty_line():
+    # a banner AFTER a title/prose is documentation, NOT a real supersession
+    assert M.parse_banner("# A title\n\n" + BANNER + "\nbody") is None
+    # leading blank lines are allowed before a genuine first-line banner
+    assert M.parse_banner("\n\n" + BANNER) is not None
+
+
+def test_parse_banner_rejects_placeholder_ref():
+    # the convention's OWN documentation example (a placeholder ref) must NOT match,
+    # even on line 1 -- else any doc explaining the banner gets archived (the live
+    # dry-run caught exactly this: the session prompt matched itself).
+    ex = "<!-- KB-STATUS: SUPERSEDED 2026-07-21 by <relative/path/or/decision-ref> -- <one-line reason> -->"
+    assert M.parse_banner(ex) is None
 
 
 @pytest.mark.parametrize("txt", [
@@ -147,6 +157,19 @@ def test_scan_marked_collects_and_refuses(fake):
     ref_rels = {r["rel"] for r in refused}
     assert any("watchtower" in r for r in ref_rels)
     assert any("oneamerica" in r for r in ref_rels)
+
+
+def test_scan_ignores_documentation_example_banner(fake):
+    """A doc that DOCUMENTS the banner (an example mid-prose) must NOT be collected
+    -- the banner must be the FIRST non-empty line to count (regression for the
+    live dry-run false-positive on the session prompt)."""
+    root, arch, mk = fake
+    p = root / "00-Founder" / "knowledge-doctrine.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# Knowledge persistence doctrine\n\nStamp superseded files: " + BANNER + "\n",
+                 encoding="utf-8")
+    marked, refused = M.scan_marked(M.hygiene_cfg())
+    assert not any("knowledge-doctrine" in m["rel"] for m in marked)
 
 
 # ── D: KEEP-as-class banner -> warn, not archive ──────────────────────────────
@@ -228,3 +251,49 @@ def test_run_marked_allow_large_bypasses(fake, tmp_path, monkeypatch):
                        live_purge_max=500, live_move_max=1, drive_purge=True)
     assert res["applied"] is True and res["escalated"] is False
     assert (arch / "00-Founder" / "p" / "a.md").exists()
+
+
+# ── H: purge gated on move success (D-051 fix) ────────────────────────────────
+def test_purge_gated_on_move_success(fake, tmp_path, monkeypatch):
+    """A file whose move fails (CONFLICT / lock) KEEPS its chunks; only moved-ok
+    files are purged -- else the KB drops a doc still live in the tree."""
+    root, arch, mk = fake
+    mk(r"00-Founder\p\a.md")
+    mk(r"00-Founder\p\b.md")
+    # pre-create a.md's archive dst so its move CONFLICTs (moved=False), src stays
+    (arch / "00-Founder" / "p").mkdir(parents=True, exist_ok=True)
+    (arch / "00-Founder" / "p" / "a.md").write_text("already", encoding="utf-8")
+    dbp = _db(tmp_path, monkeypatch)
+    _add(dbp, "sa", "static_md", r"00-Founder\p\a.md")
+    _add(dbp, "sb", "static_md", r"00-Founder\p\b.md")
+    res = M.run_marked(M.hygiene_cfg(), dbp, apply=True, allow_large=False,
+                       live_purge_max=500, live_move_max=100, drive_purge=False)
+    assert res["applied"] is True
+    assert _count(dbp, "sa") == 1   # move CONFLICTed -> chunk KEPT
+    assert _count(dbp, "sb") == 0   # moved OK -> purged
+    assert (root / "00-Founder" / "p" / "a.md").exists()   # still live in the tree
+
+
+# ── I: drive-purge opt-in + collision self-guard (D-051 fix) ──────────────────
+def test_drive_purge_opt_in_default_off():
+    assert M.build_arg_parser().parse_args([]).drive_purge is False
+
+
+def test_hygiene_cfg_drive_max_fileids_is_one():
+    assert M.hygiene_cfg().drive_title_max_fileids == 1
+
+
+def test_drive_two_fileids_not_collateral_purged(tmp_path):
+    """Under the hygiene cfg (max_fileids=1) a basename mapping to the superseded
+    file's own copy + an UNRELATED same-named doc (2 file-ids) is refused, not
+    collateral-purged."""
+    from cora import kb_archive
+    dbp = tmp_path / "kb.db"
+    conn = sqlite3.connect(dbp)
+    conn.execute("CREATE TABLE knowledge_chunks (chunk_id TEXT PRIMARY KEY, source TEXT, source_id TEXT, title TEXT, entity TEXT)")
+    conn.execute("INSERT INTO knowledge_chunks VALUES ('y1','drive_sweep','fileY','roadmap.md','F3E')")
+    conn.execute("INSERT INTO knowledge_chunks VALUES ('x1','drive_sweep','fileX','roadmap.md','OSN')")
+    conn.commit()
+    ids, inc, skip = kb_archive.select_drive_purge(conn, [r"02-F3-Energy\_notes\roadmap.md"], M.hygiene_cfg())
+    assert ids == []   # 2 file-ids > max(1) -> ambiguous -> NOT purged
+    assert any("ambiguous" in s["reason"] for s in skip)

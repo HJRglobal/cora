@@ -936,18 +936,26 @@ def apply_autowrite(update: dict[str, Any], *, tier: int, reason: str,
             added = _diff_added(before.get(path, ""), aft)
             break
     uid = str(update.get("update_id", ""))
+    # Audit BEFORE resolve (D-051 fix): a crash between the two must leave the item
+    # PENDING (idempotently re-applied next run) rather than APPROVED-but-unaudited/
+    # unrevertable. Dedup: an idempotent no-op re-apply yields added==[]; do NOT
+    # shadow the original real-payload record with an empty one -- (re-)audit only
+    # when there is a real payload OR no prior record exists for this uid.
+    prior = any(r.get("update_id") == uid and r.get("decision_reason") != "revert"
+                for r in read_autowrite_audit())
+    if added or not prior:
+        log_autowrite({
+            "update_id": uid,
+            "update_type": update.get("update_type", ""),
+            "entity": (update.get("payload") or {}).get("entity", ""),
+            "tier": tier,
+            "decision_reason": reason,
+            "contributor": contributor,
+            "summary": summary,
+            "reverted": False,
+            "revert": {"target_file": target_file, "added_lines": added},
+        })
     resolve_update(uid, "APPROVED", reason=reason)
-    log_autowrite({
-        "update_id": uid,
-        "update_type": update.get("update_type", ""),
-        "entity": (update.get("payload") or {}).get("entity", ""),
-        "tier": tier,
-        "decision_reason": reason,
-        "contributor": contributor,
-        "summary": summary,
-        "reverted": False,
-        "revert": {"target_file": target_file, "added_lines": added},
-    })
     log.info("knowledge_review: AUTO-WRITE %s tier=%d (%s)", uid[:8], tier, summary)
     return ok, summary
 
@@ -983,12 +991,19 @@ def process_autowrite_revert(update_id: str, actor_id: str) -> tuple[str, str]:
             except OSError as exc:
                 return "error", f"Couldn't read {tf}: {exc}"
             new_lines = _remove_block(lines, added)
-            if new_lines is not None:
-                try:
-                    p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-                    removed = len(added)
-                except OSError as exc:
-                    return "error", f"Couldn't rewrite {tf}: {exc}"
+            if new_lines is None:
+                # The file was edited since the auto-write -- the exact block is no
+                # longer present. Do NOT mark reverted (leave it re-attemptable) and
+                # do NOT report a success that removed nothing (D-051 fix).
+                return ("content_changed",
+                        f"{Path(tf).name} was edited since the auto-write -- I could not find the "
+                        "exact block to remove. Left it un-reverted; please remove it manually.")
+            try:
+                p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+                removed = len(added)
+            except OSError as exc:
+                return "error", f"Couldn't rewrite {tf}: {exc}"
+        # The block was removed (or there was no .md payload to remove) -> revert.
         # mark reverted + append a revert marker; rewrite the whole audit atomically
         target["reverted"] = True
         records.append({"ts": _now_iso(), "update_id": update_id,

@@ -43,11 +43,11 @@ def test_autowrite_level_parse(monkeypatch, val, exp):
 
 
 # ── eligibility gate: Tier-2 / high-stakes / conflict NEVER auto-write ────────
-def _patch_classifier(monkeypatch, *, tier, high=False, conflicts=False):
+def _patch_classifier(monkeypatch, *, tier, high=False, conflicts=False, verdict="CORROBORATED"):
     monkeypatch.setattr(RK.gts, "build_shadow_record",
                         lambda u, v: {"shadow_tier": tier, "entity": "F3E",
                                       "category": "operational", "entities": [],
-                                      "conflicts": conflicts})
+                                      "conflicts": conflicts, "coras_read_verdict": verdict})
     monkeypatch.setattr(RK.gts, "is_high_stakes", lambda *a, **k: (high, []))
     monkeypatch.setattr(RK.gts, "claim_text", lambda u: "some claim")
 
@@ -72,8 +72,21 @@ def test_tier0_eligible_at_tier0_and_all(monkeypatch):
 
 
 def test_tier1_eligible_only_at_all(monkeypatch):
-    _patch_classifier(monkeypatch, tier=1)
+    _patch_classifier(monkeypatch, tier=1, verdict="CORROBORATED")
     assert RK._autowrite_eligible(_u(), "tier0")[0] is False   # tier1 needs 'all'
+    assert RK._autowrite_eligible(_u(), "all")[0] is True
+
+
+def test_tier1_fails_safe_on_unavailable_verdict(monkeypatch):
+    # D-051 fix: Tier-1 must NOT auto-write when the coras_read verdict is empty
+    # (fail-soft/errored read) -- else a conflicting fact could auto-write.
+    _patch_classifier(monkeypatch, tier=1, verdict="")
+    elig, tier, why = RK._autowrite_eligible(_u(), "all")
+    assert elig is False and why == "tier1_read_unavailable"
+
+
+def test_tier1_eligible_with_adds_context_verdict(monkeypatch):
+    _patch_classifier(monkeypatch, tier=1, verdict="ADDS-CONTEXT")
     assert RK._autowrite_eligible(_u(), "all")[0] is True
 
 
@@ -177,6 +190,58 @@ def test_process_autowrite_revert_not_found(tmp_path, monkeypatch):
     audit.write_text("", encoding="utf-8")
     monkeypatch.setattr(kr, "_AUTOWRITE_AUDIT_PATH", audit)
     assert kr.process_autowrite_revert("nope", HARRISON)[0] == "not_found"
+
+
+def test_revert_content_changed_leaves_reattemptable(tmp_path, monkeypatch):
+    """D-051 fix: if the file was edited since the auto-write so the exact block is
+    gone, revert must NOT report success or lock retry -- it returns content_changed
+    and leaves reverted=False."""
+    target = tmp_path / "f3e.md"
+    # the recorded block is NOT present (file was reworded since)
+    target.write_text("# head\n\n**Q:** hi?\n**A:** yes, CONFIRMED and reworded.\n", encoding="utf-8")
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(json.dumps({
+        "ts": "2026-07-21T00:00:00+00:00", "update_id": "u1", "update_type": "known_answer",
+        "decision_reason": "auto_tier0", "reverted": False,
+        "revert": {"target_file": str(target), "added_lines": ["**Q:** hi?", "**A:** yes."]},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(kr, "_AUTOWRITE_AUDIT_PATH", audit)
+    monkeypatch.setattr(kr, "resolve_update", lambda *a, **k: True)
+    outcome, _msg = kr.process_autowrite_revert("u1", HARRISON)
+    assert outcome == "content_changed"
+    # not marked reverted -> a manual removal + a later retry is still possible
+    recs = [json.loads(l) for l in audit.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert recs[0]["reverted"] is False
+    assert kr.process_autowrite_revert("u1", HARRISON)[0] == "content_changed"  # still re-attemptable
+
+
+def test_apply_autowrite_dedup_empty_reapply(kadir, monkeypatch):
+    """D-051 fix (audit-before-resolve + dedup): an idempotent no-op re-apply
+    (added==[]) must NOT append a second empty-payload audit record that shadows
+    the original."""
+    target, audit, resolved = kadir
+    calls = {"n": 0}
+
+    def fake_apply(update):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            target.write_text(target.read_text(encoding="utf-8") + "**Q:** x?\n**A:** y.\n", encoding="utf-8")
+            return True, "wrote"
+        return True, "already applied"   # idempotent no-op: nothing appended
+    monkeypatch.setattr(kr, "apply_knowledge_update", fake_apply)
+
+    kr.apply_autowrite(_u(), tier=0, reason="auto_tier0")   # real write -> 1 record
+    kr.apply_autowrite(_u(), tier=0, reason="auto_tier0")   # no-op re-apply -> skip
+    recs = [json.loads(l) for l in audit.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(recs) == 1 and recs[0]["revert"]["added_lines"]   # one real-payload record
+
+
+def test_gts_contributor_id_reads_answered_by():
+    """D-051 fix (contributor): the audit must record the real contributor. Pin the
+    extractor the fixed call site uses (gts.contributor_id), reading answered_by."""
+    from cora import graduated_trust_shadow as gts
+    u = {"update_type": "known_answer", "payload": {"answered_by": "U0B3AEJCYGP", "entity": "F3E"}}
+    assert gts.contributor_id(u) == "U0B3AEJCYGP"
 
 
 # ── digest blocks + WoW counting ──────────────────────────────────────────────

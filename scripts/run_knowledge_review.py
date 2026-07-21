@@ -552,10 +552,16 @@ def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
     """(eligible, tier, reason) for the graduated-trust auto-write flip (§7B).
 
     Uses the graduated-trust classifier for the tier, then an INDEPENDENT
-    is_high_stakes belt so a high-stakes / conflicts-with-canon item can NEVER
-    auto-write even if the tier were miscomputed. is_high_stakes fails CLOSED (a
-    phi_guard exception counts as high-stakes), and the belt itself fails closed.
-    Tier-2 is never eligible; Tier-1 only at level 'all'; Tier-0 at 'tier0'/'all'.
+    is_high_stakes belt (fails CLOSED: a phi_guard exception counts as
+    high-stakes) so a high-stakes item can never auto-write even if the tier were
+    miscomputed. NOTE: is_high_stakes does NOT detect conflicts-with-canon -- that
+    signal lives ONLY in the coras_read verdict. Tier-0 already requires a
+    CORROBORATED verdict, so it fails SAFE when the read is unavailable; Tier-1
+    does NOT, so we additionally require Tier-1 to carry a real, non-CONFLICTS
+    verdict -- an unavailable/empty read (KB locked, no API key, LLM timeout)
+    routes the item to Harrison rather than auto-writing a possibly-conflicting
+    fact (D-051 fix). Tier-2 never eligible; Tier-1 only at 'all'; Tier-0 at
+    'tier0'/'all'.
     """
     verdict = str(update.get("_coras_read_verdict", ""))
     rec = gts.build_shadow_record(update, verdict)
@@ -571,7 +577,13 @@ def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
     if tier == 0 and level in ("tier0", "all"):
         return True, 0, "auto_tier0"
     if tier == 1 and level == "all":
-        return True, 1, "auto_tier1"
+        # Fail SAFE: Tier-1 (no corroboration required) auto-writes ONLY when a
+        # real non-conflict coras_read verdict was produced. '' (fail-soft/errored
+        # read) or CONFLICTS -> route to Harrison, never auto-write.
+        v = str(rec.get("coras_read_verdict", "")).strip().upper()
+        if v and v != "CONFLICTS":
+            return True, 1, "auto_tier1"
+        return False, 1, "tier1_read_unavailable"
     return False, tier, "harrison"
 
 
@@ -862,7 +874,7 @@ def main() -> int:
             try:
                 ok, summary = apply_autowrite(
                     u, tier=tier, reason=why,
-                    contributor=str((u.get("payload") or {}).get("contributor_id", "")))
+                    contributor=str(gts.contributor_id(u) or ""))
             except Exception as exc:  # noqa: BLE001
                 log.warning("autowrite: apply error (-> Harrison): %s", exc)
                 keep.append(u)

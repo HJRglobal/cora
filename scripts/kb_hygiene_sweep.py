@@ -148,7 +148,13 @@ def hygiene_cfg() -> ArchiveConfig:
         class_exceptions=frozenset(),
         keep_substrings=(),
         scaffold_basenames=_SCAFFOLD_BASENAMES,
-        drive_title_max_fileids=2,
+        # Tighter than the D-086 tool (=2): in the RECURRING loop a title is
+        # purged from the Drive copies only when it maps to EXACTLY ONE Drive
+        # file-id -- so a 2-way basename collision (the superseded file's own copy
+        # + an unrelated same-named doc) is refused-as-ambiguous rather than
+        # collateral-purging the unrelated doc (D-051 fix). Drive purge is also
+        # opt-in (default off) on the unattended path -- see run_marked/main.
+        drive_title_max_fileids=1,
         copa_purge_glob=None,
         copa_drive_titles=(),
         copa_loose_dup=None,
@@ -159,17 +165,31 @@ def hygiene_cfg() -> ArchiveConfig:
 
 # ── banner + walk ──────────────────────────────────────────────────────────────
 def parse_banner(head_text: str) -> dict | None:
-    """Return {status, date, ref, reason} for the first KB-STATUS: SUPERSEDED
-    banner in the head text, else None."""
-    m = _BANNER_RE.search(head_text or "")
-    if not m:
-        return None
-    return {
-        "status": "SUPERSEDED",
-        "date": m.group("date"),
-        "ref": (m.group("ref") or "").strip(),
-        "reason": (m.group("reason") or "").strip(),
-    }
+    """Return {status, date, ref, reason} iff the FIRST non-empty line of the file
+    is a real KB-STATUS: SUPERSEDED banner, else None.
+
+    The banner is the first line by convention (spec 2). Requiring it on the first
+    non-empty line -- NOT anywhere in the head -- is what keeps a doc that merely
+    *documents* the convention (an example banner in prose, e.g. this build's own
+    session prompt / the founder playbook) from being mistaken for a superseded
+    file. A second guard rejects placeholder/example refs (containing < or >, like
+    'by <relative/path/or/decision-ref>')."""
+    for line in (head_text or "").splitlines():
+        if not line.strip():
+            continue
+        m = _BANNER_RE.search(line)
+        if not m:
+            return None  # first non-empty line is not a banner -> not superseded
+        ref = (m.group("ref") or "").strip()
+        if "<" in ref or ">" in ref:
+            return None  # placeholder/example ref -> documentation, not a real banner
+        return {
+            "status": "SUPERSEDED",
+            "date": m.group("date"),
+            "ref": ref,
+            "reason": (m.group("reason") or "").strip(),
+        }
+    return None
 
 
 def is_phi_path(path: Path) -> bool:
@@ -317,6 +337,7 @@ def run_marked(cfg: ArchiveConfig, db_path: Path, *, apply: bool, allow_large: b
 
     # Apply. Small sweeps run live (WAL DELETE, no VACUUM, no Cora stop). A large
     # sweep reaches here only with --allow-large (Cora stopped by the wrapper).
+    moved_relpaths: list[str] = []
     if archive:
         log.info("Moving %d file(s) into _archive ...", len(archive))
         try:
@@ -328,22 +349,43 @@ def run_marked(cfg: ArchiveConfig, db_path: Path, *, apply: bool, allow_large: b
                 static_ids=static_ids, drive_ids=drive_ids, moved_static=moved_static,
                 copa_static=copa_static, drive_included=drive_included,
                 drive_skipped=drive_skipped, purge_enabled=drive_purge or bool(static_ids))
-        moved_ok = sum(1 for m in moves if m.get("moved"))
+        moved_relpaths = [m["src_rel"] for m in moves if m.get("moved")]
         failed = [m["src_rel"] for m in moves if str(m.get("result", "")).startswith("error")]
-        log.info("Moved %d/%d file(s).", moved_ok, len(moves))
+        log.info("Moved %d/%d file(s).", len(moved_relpaths), len(moves))
         if failed:
             log.error("%d file(s) FAILED to move (retryable): %s", len(failed), failed[:10])
 
-    if all_purge:
-        log.info("Purging %d chunk(s) from knowledge_chunks + both vec tables ...", len(all_purge))
+    # Purge is GATED ON MOVE SUCCESS (D-051 fix): a file that failed to move (a
+    # Drive/Windows lock or a CONFLICT) KEEPS its chunks -- else the KB would drop
+    # a doc still live in the tree, and the next sync would re-ingest it (banner
+    # intact) and answer from it again. Re-select the purge from ONLY moved-ok files.
+    if set(moved_relpaths) == set(archive):
+        purge_ids = all_purge
+    else:
+        ro2 = kb_archive.connect_ro(db_path)
+        try:
+            s2, _, _ = kb_archive.select_static_purge(ro2, moved_relpaths, cfg)
+            d2: list[str] = []
+            if drive_purge:
+                d2, _, _ = kb_archive.select_drive_purge(ro2, moved_relpaths, cfg)
+        finally:
+            ro2.close()
+        purge_ids = sorted(set(s2) | set(d2))
+        log.warning("Purge restricted to moved-ok files: %d chunk(s) (was %d); %d failed-move "
+                    "file(s) keep their chunks.", len(purge_ids), len(all_purge),
+                    len(archive) - len(moved_relpaths))
+
+    if purge_ids:
+        log.info("Purging %d chunk(s) from knowledge_chunks + both vec tables ...", len(purge_ids))
         rw = kb_archive.connect_rw(db_path)
         try:
-            totals = kb_archive.delete_chunks(rw, all_purge, cfg)
+            totals = kb_archive.delete_chunks(rw, purge_ids, cfg)
             log.info("Deleted: %s", totals)
         finally:
             rw.close()
 
     result["applied"] = True
+    result["purge_chunks_applied"] = len(purge_ids)
     return result
 
 
@@ -754,8 +796,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true", help="Report only (the default).")
     ap.add_argument("--allow-large", action="store_true",
                     help="Bypass the auto-apply escalation ceiling (Cora STOPPED -- via the apply wrapper).")
-    ap.add_argument("--no-drive-purge", action="store_true",
-                    help="Skip purging drive_sweep/drive_asset copies (static_md purge only).")
+    ap.add_argument("--drive-purge", action="store_true",
+                    help="OPT-IN: also purge drive_sweep/drive_asset copies (keyed by basename "
+                         "title, self-guarded to a single unambiguous file-id). Default OFF -- the "
+                         "unattended monthly path purges static_md by exact source_id only.")
     ap.add_argument("--live-purge-max", type=int, default=DEFAULT_LIVE_PURGE_MAX)
     ap.add_argument("--live-move-max", type=int, default=DEFAULT_LIVE_MOVE_MAX)
     ap.add_argument("--restore-days", type=int, default=DEFAULT_RESTORE_DAYS)
@@ -811,7 +855,7 @@ def main() -> int:
             report["marked"] = run_marked(
                 cfg, db_path, apply=apply_changes, allow_large=args.allow_large,
                 live_purge_max=args.live_purge_max, live_move_max=args.live_move_max,
-                drive_purge=not args.no_drive_purge)
+                drive_purge=args.drive_purge)
         except HoldGuardTripped as exc:
             log.error("%s", exc)
             return 2
