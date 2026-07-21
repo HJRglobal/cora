@@ -43,8 +43,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import shutil
-import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -56,8 +54,11 @@ load_dotenv()
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
-from cora.kb_exclusions import is_copa_bhrf_path  # noqa: E402
-from cora.knowledge_base import schema  # noqa: E402
+# The move/purge/manifest engine now lives in the shared, reusable core module
+# (src/cora/kb_archive.py). This script keeps its disposition-list clusters + all
+# guard constants + CLI/orchestration and is a thin config+CLI over that core.
+from cora import kb_archive  # noqa: E402
+from cora.kb_archive import ArchiveConfig, HoldGuardTripped  # noqa: E402
 
 FOUNDER_OS_ROOT = Path(r"G:\My Drive\HJR-Founder-OS")
 ARCHIVE_ROOT = FOUNDER_OS_ROOT / "_archive"
@@ -479,369 +480,101 @@ ARCHIVE_CLUSTERS: list[dict] = [
 ]
 
 
+def _cfg() -> ArchiveConfig:
+    """Build the archive config from THIS module's constants. Read at CALL time so
+    tests that monkeypatch FOUNDER_OS_ROOT / ARCHIVE_ROOT / KEEP_SUBSTRINGS / etc.
+    are honored by every wrapper below."""
+    return ArchiveConfig(
+        founder_os_root=FOUNDER_OS_ROOT,
+        archive_root=ARCHIVE_ROOT,
+        hold_segments=HOLD_SEGMENTS,
+        keep_class_basenames=KEEP_CLASS_BASENAMES,
+        keep_class_segments=KEEP_CLASS_SEGMENTS,
+        keep_class_basename_substr=KEEP_CLASS_BASENAME_SUBSTR,
+        class_exceptions=CLASS_EXCEPTIONS,
+        keep_substrings=KEEP_SUBSTRINGS,
+        scaffold_basenames=_SCAFFOLD_BASENAMES,
+        drive_title_max_fileids=_DRIVE_TITLE_MAX_FILEIDS,
+        copa_purge_glob=COPA_PURGE_GLOB,
+        copa_drive_titles=COPA_DRIVE_TITLES,
+        copa_loose_dup=COPA_LOOSE_DUP,
+        batch=_BATCH,
+    )
+
+
 def _rel(path: Path) -> str:
-    """Backslash relpath from FOUNDER_OS_ROOT (the KB source_id key + move key)."""
-    return str(path.relative_to(FOUNDER_OS_ROOT))
+    return kb_archive.rel(path, _cfg())
 
 
 def _segments_lower(relpath: str) -> list[str]:
-    return [p.lower() for p in relpath.replace("/", "\\").split("\\") if p]
+    return kb_archive.segments_lower(relpath)
 
 
 def _is_keep_as_class(relpath: str) -> str | None:
-    """Return a reason string if a GLOB candidate is KEEP-as-class, else None."""
-    segs = _segments_lower(relpath)
-    base = segs[-1] if segs else ""
-    if base in KEEP_CLASS_BASENAMES:
-        return f"keep-as-class basename:{base}"
-    if any(s in KEEP_CLASS_SEGMENTS for s in segs[:-1]):
-        hit = next(s for s in segs[:-1] if s in KEEP_CLASS_SEGMENTS)
-        return f"keep-as-class segment:{hit}"
-    if any(sub in base for sub in KEEP_CLASS_BASENAME_SUBSTR):
-        return "keep-as-class brand-guidelines"
-    return None
+    return kb_archive.is_keep_as_class(relpath, _cfg())
 
 
 def _hold_reason(relpath: str) -> str | None:
-    """Return an abort reason if a relpath is a HARD-HELD/sensitive path, else None.
-    copa-bhrf: only the one loose-dup path is permitted; any other copa path aborts."""
-    segs = set(_segments_lower(relpath))
-    hit = segs & HOLD_SEGMENTS
-    if hit:
-        return f"HOLD segment {sorted(hit)}"
-    if is_copa_bhrf_path(relpath) and relpath != COPA_LOOSE_DUP:
-        return "copa-bhrf (only the loose duplicate may be archived)"
-    return None
+    return kb_archive.hold_reason(relpath, _cfg())
 
 
 def _is_keep_substr(relpath: str) -> str | None:
-    low = relpath.lower()
-    for sub in KEEP_SUBSTRINGS:
-        if sub in low:
-            return f"keep-substring:{sub}"
-    return None
+    return kb_archive.is_keep_substr(relpath, _cfg())
 
 
 def expand_archive_set(clusters: list[dict]) -> tuple[list[str], dict, list[tuple[str, str]], list[tuple[str, str]]]:
-    """Expand clusters -> (sorted unique archive relpaths, per-cluster report,
-    keep_as_class_filtered, keep_substr_filtered). ABORTS via SystemExit(2) if any
-    HOLD path enters the set. Glob candidates AND explicit entries pass the
-    KEEP-as-class + substring-KEEP filters; only CLASS_EXCEPTIONS paths bypass
-    KEEP-as-class (the disposition-named class exceptions)."""
-    archive: dict[str, str] = {}          # relpath -> cluster_id (first wins; dedup across clusters)
-    report: dict[str, dict] = {}
-    class_filtered: list[tuple[str, str]] = []
-    substr_filtered: list[tuple[str, str]] = []
-
-    for cl in clusters:
-        cid = cl["id"]
-        keep_set = {k.replace("/", "\\") for k in cl.get("keep", [])}
-        matched: list[str] = []
-
-        # Globs -> candidates (KEEP-as-class filter applies).
-        for pattern in cl.get("globs", []):
-            pat = pattern.replace("\\", "/")   # pathlib glob wants forward slashes
-            for p in FOUNDER_OS_ROOT.glob(pat):
-                if not p.is_file():
-                    continue
-                rel = _rel(p)
-                if rel in keep_set:
-                    continue
-                sub = _is_keep_substr(rel)
-                if sub:
-                    substr_filtered.append((rel, f"{cid}:{sub}"))
-                    continue
-                cls = _is_keep_as_class(rel)
-                if cls:
-                    class_filtered.append((rel, f"{cid}:{cls}"))
-                    continue
-                matched.append(rel)
-
-        # Explicit entries are hand-verified but STILL pass the substring-KEEP
-        # guard AND the KEEP-as-class filter (unless allowlisted in
-        # CLASS_EXCEPTIONS) -- defense-in-depth so no class/held file slips
-        # through an explicit list (D-051 LEAK-2).
-        for e in cl.get("explicit", []):
-            rel = e.replace("/", "\\")
-            if rel in keep_set:
-                continue
-            sub = _is_keep_substr(rel)
-            if sub:
-                substr_filtered.append((rel, f"{cid}:{sub}(explicit-skipped)"))
-                continue
-            if rel not in CLASS_EXCEPTIONS:
-                cls = _is_keep_as_class(rel)
-                if cls:
-                    class_filtered.append((rel, f"{cid}:{cls}(explicit-blocked)"))
-                    continue
-            src = FOUNDER_OS_ROOT / rel
-            if not src.exists():
-                log.warning("  [%s] explicit path not found on disk: %s", cid, rel)
-            matched.append(rel)
-
-        # HARD HOLD guard -- abort on any held/sensitive path.
-        for rel in matched:
-            hr = _hold_reason(rel)
-            if hr:
-                log.error("HOLD-GUARD TRIPPED in cluster %s: %s -> %s", cid, rel, hr)
-                raise SystemExit(2)
-
-        uniq = sorted(set(matched))
-        report[cid] = {
-            "section": cl.get("section", ""),
-            "expected": cl.get("expected", ""),
-            "count": len(uniq),
-            "purge": cl.get("purge", True),
-            "files": uniq,
-        }
-        for rel in uniq:
-            archive.setdefault(rel, cid)
-
-    return sorted(archive), report, class_filtered, substr_filtered
+    """Delegate to the shared core; translate the typed HOLD abort back to the
+    historical SystemExit(2) contract this tool + its tests rely on."""
+    try:
+        return kb_archive.build_move_manifest(clusters, _cfg())
+    except HoldGuardTripped:
+        raise SystemExit(2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KB purge selection (read-only SELECTs; work on either a ro or rw connection).
 # ─────────────────────────────────────────────────────────────────────────────
 def _chunk_ids_for_static(conn, relpaths: list[str]) -> list[str]:
-    ids: list[str] = []
-    for i in range(0, len(relpaths), _BATCH):
-        batch = relpaths[i : i + _BATCH]
-        ph = ",".join("?" * len(batch))
-        rows = conn.execute(
-            f"SELECT chunk_id FROM knowledge_chunks WHERE source='static_md' AND source_id IN ({ph})",
-            batch,
-        ).fetchall()
-        ids.extend(r[0] for r in rows)
-    return ids
+    return kb_archive.chunk_ids_for_static(conn, relpaths, _cfg())
 
 
 def select_static_purge(conn, archive_relpaths: list[str]) -> tuple[list[str], int, int]:
-    """chunk_ids to purge: static_md rows whose source_id is a moved archive path,
-    PLUS ALL copa-bhrf static_md rows (whole folder, canonical + loose + notes).
-    Returns (chunk_ids, moved_static_count, copa_static_count)."""
-    # Archived moved files (their source_id == the pre-move relpath).
-    moved_ids = set(_chunk_ids_for_static(conn, archive_relpaths))
-    # copa-bhrf whole folder (GLOB; backslash literal; NEVER LIKE).
-    copa_rows = conn.execute(
-        "SELECT chunk_id FROM knowledge_chunks WHERE source='static_md' AND source_id GLOB ?",
-        (COPA_PURGE_GLOB,),
-    ).fetchall()
-    copa_ids = {r[0] for r in copa_rows}
-    all_ids = moved_ids | copa_ids
-    return sorted(all_ids), len(moved_ids), len(copa_ids)
+    return kb_archive.select_static_purge(conn, archive_relpaths, _cfg())
 
 
 def select_drive_purge(conn, archive_relpaths: list[str]) -> tuple[list[str], list[dict], list[dict]]:
-    """Drive-copy (drive_sweep/drive_asset) purge, SELF-GUARDED by file-id count.
-    Candidate titles = basenames of moved files + the 2 copa-bhrf .md titles.
-    A title is purged only when it maps to <= _DRIVE_TITLE_MAX_FILEIDS distinct
-    file-ids AND is not a generic scaffolding basename. Returns
-    (chunk_ids, included[list of {title,chunks,file_ids}], skipped[...]).
-
-    Batches the title lookups into few IN() queries (one full scan per <=500-title
-    batch) instead of a per-title scan of the ~231K drive rows."""
-    candidates: set[str] = set()
-    for rel in archive_relpaths:
-        candidates.add(rel.replace("/", "\\").split("\\")[-1])
-    candidates.update(COPA_DRIVE_TITLES)
-
-    skipped: list[dict] = []
-    scaffold = sorted(t for t in candidates if t.lower() in _SCAFFOLD_BASENAMES)
-    for t in scaffold:
-        skipped.append({"title": t, "reason": "scaffolding-denylist"})
-    query_titles = sorted(t for t in candidates if t.lower() not in _SCAFFOLD_BASENAMES)
-
-    title_ids: dict[str, list[str]] = {}
-    # per title: {source_id (Drive file-id): {"chunks": n, "entities": set}} -- carried
-    # into the manifest so the human review can eyeball EVERY Drive file a title matches
-    # and distinguish a genuine duplicate from a 2-way basename collision (D-051 review).
-    title_src: dict[str, dict[str, dict]] = {}
-    for i in range(0, len(query_titles), _BATCH):
-        batch = query_titles[i : i + _BATCH]
-        ph = ",".join("?" * len(batch))
-        rows = conn.execute(
-            f"SELECT chunk_id, source_id, title, entity FROM knowledge_chunks "
-            f"WHERE source IN ('drive_sweep','drive_asset') AND title IN ({ph})",
-            batch,
-        ).fetchall()
-        for chunk_id, source_id, title, entity in rows:
-            title_ids.setdefault(title, []).append(chunk_id)
-            s = title_src.setdefault(title, {}).setdefault(source_id, {"chunks": 0, "entities": set()})
-            s["chunks"] += 1
-            s["entities"].add(str(entity or ""))
-
-    included: list[dict] = []
-    ids: list[str] = []
-    for title in query_titles:
-        if title not in title_ids:
-            continue  # no drive copy exists for this filename
-        srcs = title_src[title]
-        if len(srcs) > _DRIVE_TITLE_MAX_FILEIDS:
-            skipped.append({"title": title, "reason": f"ambiguous ({len(srcs)} file-ids)",
-                            "chunks": len(title_ids[title])})
-            continue
-        included.append({
-            "title": title,
-            "chunks": len(title_ids[title]),
-            "file_ids": len(srcs),
-            "sources": [
-                {"file_id": sid, "chunks": v["chunks"], "entities": sorted(v["entities"])}
-                for sid, v in sorted(srcs.items())
-            ],
-        })
-        ids.extend(title_ids[title])
-    return ids, included, skipped
+    return kb_archive.select_drive_purge(conn, archive_relpaths, _cfg())
 
 
 def delete_chunks(conn, chunk_ids: list[str]) -> dict:
-    """Batched delete from all 3 tables (vec0 shadow tables cascade). rw conn only."""
-    totals = {"knowledge_vec_bin": 0, "knowledge_vec_f32": 0, "knowledge_chunks": 0}
-    for i in range(0, len(chunk_ids), _BATCH):
-        batch = chunk_ids[i : i + _BATCH]
-        ph = ",".join("?" * len(batch))
-        for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
-            cur = conn.execute(f"DELETE FROM {tbl} WHERE chunk_id IN ({ph})", batch)
-            totals[tbl] += cur.rowcount
-    conn.commit()
-    return totals
+    return kb_archive.delete_chunks(conn, chunk_ids, _cfg())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Move phase.
 # ─────────────────────────────────────────────────────────────────────────────
 def plan_moves(archive_relpaths: list[str]) -> list[dict]:
-    moves = []
-    for rel in archive_relpaths:
-        src = FOUNDER_OS_ROOT / rel
-        dst = ARCHIVE_ROOT / rel
-        moves.append({"src_rel": rel, "dst_rel": str(Path("_archive") / rel),
-                      "src_exists": src.exists(), "dst_exists": dst.exists()})
-    return moves
+    return kb_archive.plan_moves(archive_relpaths, _cfg())
 
 
 def execute_moves(moves: list[dict]) -> None:
-    for m in moves:
-        src = FOUNDER_OS_ROOT / m["src_rel"]
-        dst = ARCHIVE_ROOT / m["src_rel"]
-        if dst.exists() and not src.exists():
-            m["moved"], m["result"] = False, "already-archived"
-            continue
-        if dst.exists() and src.exists():
-            m["moved"], m["result"] = False, "CONFLICT: both src and dst exist -- skipped"
-            log.warning("  CONFLICT (skipped): %s", m["src_rel"])
-            continue
-        if not src.exists():
-            m["moved"], m["result"] = False, "src-missing"
-            log.warning("  src missing (skipped): %s", m["src_rel"])
-            continue
-        # Per-file soft failure: a Windows lock / permission error on ONE file
-        # (e.g. Drive sync holding it) must not strand the rest of the batch or
-        # raise out before the manifest is re-flushed (D-051 CONFIRMED #2).
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
-            m["moved"], m["result"] = True, "moved"
-        except OSError as exc:
-            m["moved"], m["result"] = False, f"error: {exc}"
-            log.error("  move FAILED (skipped, retryable): %s -> %s", m["src_rel"], exc)
+    kb_archive.execute_moves(moves, _cfg())
 
 
 def revert(manifest_path: Path) -> int:
-    data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    moves = data.get("moves", [])
-    restored = 0
-    for m in moves:
-        if not m.get("moved"):
-            continue
-        dst = ARCHIVE_ROOT / m["src_rel"]      # where it now lives
-        src = FOUNDER_OS_ROOT / m["src_rel"]   # where it came from
-        if not dst.exists():
-            log.warning("  revert: archived file missing: %s", m["src_rel"])
-            continue
-        if src.exists():
-            log.warning("  revert: original path occupied, skipped: %s", m["src_rel"])
-            continue
-        src.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(dst), str(src))
-        restored += 1
-    log.info("Reverted %d file(s) back from _archive.", restored)
-    log.warning("NOTE: --revert restores FILES only. Purged KB chunks are NOT restored "
-                "here -- re-ingest (incremental_sync_static) or restore cora_kb.db from "
-                "the pre-apply backup.")
-    return 0
+    return kb_archive.revert(manifest_path, _cfg())
 
 
 def write_manifest(path: Path, *, mode: str, report: dict, moves: list[dict],
                    class_filtered, substr_filtered, static_ids, drive_ids,
                    moved_static, copa_static, drive_included, drive_skipped,
                    purge_enabled) -> None:
-    """Write the JSON manifest (source of truth + reversibility record) + a
-    human-readable companion. The JSON PERSISTS the resolved purge chunk_ids so a
-    resumed / purge-only run reads them from here instead of re-globbing a
-    now-moved tree (D-051 CONFIRMED #1). Written BEFORE any mutation, then again
-    after moves complete (D-051 CONFIRMED #2)."""
-    total = len(moves)
-    static_ids = list(static_ids)
-    drive_ids = list(drive_ids)
-    payload = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "mode": mode,
-        "founder_os_root": str(FOUNDER_OS_ROOT),
-        "archive_root": str(ARCHIVE_ROOT),
-        "total_files": total,
-        "clusters": {cid: {k: v for k, v in r.items() if k != "files"} for cid, r in report.items()},
-        "purge": {
-            "enabled": purge_enabled,
-            "static_md_chunks_total": len(static_ids),
-            "static_md_from_moved_files": moved_static,
-            "copa_bhrf_static_chunks": copa_static,
-            "drive_copy_chunks_total": len(drive_ids),
-            "drive_copy_included": drive_included,
-            "drive_copy_skipped_ambiguous": drive_skipped,
-            # Persisted so --skip-move / --from-manifest finishes the purge exactly,
-            # decoupled from a live-tree re-glob (D-051 CONFIRMED #1).
-            "static_chunk_ids": static_ids,
-            "drive_chunk_ids": drive_ids,
-        },
-        "keep_as_class_filtered": [{"path": p, "why": w} for p, w in class_filtered],
-        "keep_substring_filtered": [{"path": p, "why": w} for p, w in substr_filtered],
-        "moves": moves,
-    }
-    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-    log.info("Full manifest (JSON, reversible; persists purge chunk_ids) -> %s", path)
-
-    # Human-readable companion.
-    txt = path.with_suffix(".txt")
-    with txt.open("w", encoding="utf-8") as fh:
-        fh.write(f"Founder-OS KB archive+purge manifest  mode={mode}  {payload['generated_at']}\n")
-        fh.write(f"TOTAL files to archive: {total}\n\n")
-        fh.write("== Per-cluster ==\n")
-        for cid, r in report.items():
-            fh.write(f"  [{cid}] {r['count']:>4d} files  (expected {r['expected']})  purge={r['purge']}\n")
-            fh.write(f"        {r['section']}\n")
-        fh.write("\n== KB purge ==\n")
-        fh.write(f"  static_md chunks: {len(static_ids)} (from moved files {moved_static} + copa-bhrf folder {copa_static})\n")
-        fh.write(f"  drive-copy chunks: {len(drive_ids)}\n")
-        fh.write(f"  drive-copy titles INCLUDED ({len(drive_included)}) -- review each file-id:\n")
-        for d in drive_included:
-            fh.write(f"      {d['title']}  ({d['chunks']} chunks / {d['file_ids']} file-id)\n")
-            for s in d.get("sources", []):
-                ents = ",".join(s.get("entities", [])) or "?"
-                fh.write(f"          - file_id={s['file_id']}  ({s['chunks']} chunks, entity={ents})\n")
-        fh.write(f"  drive-copy titles SKIPPED-ambiguous ({len(drive_skipped)}):\n")
-        for d in drive_skipped:
-            fh.write(f"      {d['title']}  [{d['reason']}]\n")
-        fh.write(f"\n== KEEP-as-class filtered ({len(class_filtered)}) ==\n")
-        for p, w in class_filtered:
-            fh.write(f"      {p}  [{w}]\n")
-        fh.write(f"\n== KEEP-substring filtered ({len(substr_filtered)}) ==\n")
-        for p, w in substr_filtered:
-            fh.write(f"      {p}  [{w}]\n")
-        fh.write("\n== Moves (src -> _archive) ==\n")
-        for m in moves:
-            fh.write(f"      {m['src_rel']}\n")
-    log.info("Human-readable manifest -> %s", txt)
+    kb_archive.write_manifest(
+        path, _cfg(), mode=mode, report=report, moves=moves,
+        class_filtered=class_filtered, substr_filtered=substr_filtered,
+        static_ids=static_ids, drive_ids=drive_ids, moved_static=moved_static,
+        copa_static=copa_static, drive_included=drive_included,
+        drive_skipped=drive_skipped, purge_enabled=purge_enabled)
 
 
 def _write(manifest, *, mode, report, moves, class_filtered, substr_filtered,
@@ -925,8 +658,7 @@ def main() -> int:
         moved_static = copa_static = 0
         drive_included, drive_skipped = [], []
         if not args.skip_purge:
-            ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
-            ro.execute("PRAGMA query_only=ON")
+            ro = kb_archive.connect_ro(db_path)
             try:
                 static_ids, moved_static, copa_static = select_static_purge(ro, archive_relpaths)
                 drive_ids, drive_included, drive_skipped = select_drive_purge(ro, archive_relpaths)
@@ -985,7 +717,7 @@ def main() -> int:
     if apply_changes and not args.skip_purge:
         if all_purge:
             log.info("Purging %d chunks from knowledge_chunks + both vec tables ...", len(all_purge))
-            rw = schema.connect(db_path)
+            rw = kb_archive.connect_rw(db_path)
             try:
                 totals = delete_chunks(rw, all_purge)
                 log.info("Deleted: %s", totals)
