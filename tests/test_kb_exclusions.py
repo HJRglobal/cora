@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 from cora.kb_exclusions import (
+    KB_EXCLUDED_FOLDER_IDS,
+    is_copa_bhrf_path,
     is_cora_internal_path,
     is_cora_internal_source_id,
     is_cora_internal_title,
@@ -284,3 +286,34 @@ class TestIsCoraInternalTitle:
         # under any path/source_id is caught everywhere, not just by title.
         assert is_cora_internal_source_id("logs/cora-2026-06-06.log")
         assert is_cora_internal_path(Path("C:/x/cora-2026-06-06.log"))
+
+
+class TestIsCopaBhrfPath:
+    """2026-07-21 KB cleanup (§2c): the LEX copa-bhrf NDA folder is permanently
+    KB-excluded. Segment-based -- never a 'copa' substring."""
+
+    def test_project_folder_paths_excluded(self):
+        for p in (
+            r"08-Lexington-Services\projects\copa-bhrf\CLAUDE.md",
+            r"08-Lexington-Services\projects\copa-bhrf\_notes\2026-05-15-fireflies-context-doc.md",
+            r"08-Lexington-Services\projects\copa-bhrf\LBHS - COPA Research Project\_notes\x.md",
+            "08-Lexington-Services/projects/copa-bhrf/y.md",  # forward slash
+            r"G:\My Drive\HJR-Founder-OS\08-Lexington-Services\projects\copa-bhrf\_notes\a.md",
+        ):
+            assert is_copa_bhrf_path(p), p
+
+    def test_copa_substring_not_over_matched(self):
+        # 'copa' inside Maricopa / Copayment / copack / Chrysler Voyager is NOT copa-bhrf.
+        for p in (
+            r"02-F3-Energy\manufacturing\fwd-maricopa-county-inspection.pdf",
+            r"_shared\Division_Operations_Manual_Chapter_431 Copayment.pdf",
+            r"02-F3-Energy\bluechip-copack-knowledge.md",
+            r"08-Lexington-Services\financial\lex-fleet-chrysler-voyager.pdf",
+            r"08-Lexington-Services\projects\other\file.md",
+            "",
+        ):
+            assert not is_copa_bhrf_path(p), p
+
+    def test_copa_folder_id_registered_for_drive_sweep(self):
+        # The drive_sweep enumeration exclusion relies on the folder-id being present.
+        assert "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ" in KB_EXCLUDED_FOLDER_IDS

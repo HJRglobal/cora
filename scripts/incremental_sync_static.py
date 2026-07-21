@@ -30,7 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
-from cora.kb_exclusions import is_cora_internal_path, is_swept_path  # noqa: E402
+from cora.kb_exclusions import (  # noqa: E402
+    is_copa_bhrf_path,
+    is_cora_internal_path,
+    is_swept_path,
+)
 
 CORA_REPO_ROOT = Path(__file__).resolve().parents[1]
 KB_DB_PATH = CORA_REPO_ROOT / "data" / "cora_kb.db"
@@ -144,6 +148,12 @@ def file_to_document(path: Path) -> Document | None:
     # knowledge — keep them out of the KB (they fabricate "diagnostics" via RAG).
     if is_cora_internal_path(path):
         return None
+    # copa-bhrf: LEX NDA'd M&A-diligence folder, purged from the KB 2026-07-21.
+    # The canonical copy stays on Drive IN PLACE (outside _archive), so it would
+    # otherwise re-ingest on the next static sweep (decision §2c). Belt for the
+    # store Step-0 chokepoint (which also blocks it).
+    if is_copa_bhrf_path(str(path)):
+        return None
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -223,6 +233,9 @@ def main() -> int:
         # Cora's own build/audit/forensic docs are NOT org knowledge — never ingest.
         if is_cora_internal_path(path):
             skipped_cora_internal += 1
+            continue
+        # copa-bhrf NDA folder (decision §2c) — never re-ingest after the purge.
+        if is_copa_bhrf_path(str(path)):
             continue
         if any(part.startswith(".") for part in path.parts):
             continue

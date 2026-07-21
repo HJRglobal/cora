@@ -71,15 +71,20 @@ from pathlib import Path
 # allow-list (application/json is not requested), but their `.md` / `.xlsx`
 # siblings (capital-raise deal docs, the OneAmerica tracker workbook) WOULD be
 # swept. Hardcoded here -- NOT read from dashboard-access.yaml -- so an ingest
-# sweep can never fail-open on a YAML parse error. Keep in sync with the
-# `kb_ingest: never` / `kb_excluded_folders` entries in
-# data/maps/dashboard-access.yaml.
+# sweep can never fail-open on a YAML parse error. The first four are dashboard
+# backing-stores; keep those in sync with the `kb_ingest: never` /
+# `kb_excluded_folders` entries in data/maps/dashboard-access.yaml. The
+# copa-bhrf entry is a SEPARATE class (a LEX NDA'd M&A-diligence project folder,
+# NOT a dashboard -- deliberately NOT in dashboard-access.yaml); it blocks the
+# drive_sweep re-ingest of the copa-bhrf tree after the 2026-07-21 KB purge
+# (see is_copa_bhrf_path below + decision §2c).
 KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
     {
         "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # 00-Founder/insurance/oneamerica (PERSONAL)
         "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP",  # 02-F3-Energy/projects/capital-raise (HIGHLY CONFIDENTIAL)
         "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # 00-Founder/travel-points (PERSONAL)
         "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # Downloads/OneAmerica-Handoff dup (PERSONAL, F-09 parked #2)
+        "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ",  # 08-Lexington-Services/projects/copa-bhrf (LEX NDA -- 2026-07-21 purge)
     }
 )
 
@@ -109,6 +114,29 @@ def is_dashboard_store_path(path_or_source_id: str) -> bool:
     direction here (these stores must never be KB-ingested)."""
     segs = {s.lower() for s in _segments(str(path_or_source_id or ""))}
     return bool(segs & _DASHBOARD_STORE_SEGMENTS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEX NDA'd project folders (2026-07-21 KB cleanup, decision §2c): the copa-bhrf
+# LBHS-COPA M&A-diligence folder is NDA'd -- its chunks were purged from the KB
+# and it must never re-ingest. Unlike the dashboard stores, only ONE canonical
+# copy stays on Drive IN PLACE (outside _archive), so a path-segment exclusion at
+# the ingest chokepoint (store upsert_documents Step 0 + incremental_sync_static)
+# is what keeps it out; the drive_sweep path (no stored path) is covered by the
+# copa-bhrf folder-id in KB_EXCLUDED_FOLDER_IDS above. "copa-bhrf" is a full path
+# segment, so this never false-matches "Maricopa"/"Copayment"/"copack".
+# ─────────────────────────────────────────────────────────────────────────────
+_LEX_NDA_SEGMENTS: frozenset[str] = frozenset({"copa-bhrf"})
+
+
+def is_copa_bhrf_path(path_or_source_id: str) -> bool:
+    """True if a filesystem path, Drive path, or path-shaped source_id sits inside
+    the LEX copa-bhrf NDA project folder. Segment-based, case-insensitive, handles
+    ``/`` and ``\\``. Distinct from the dashboard stores; kept separate so the
+    "dashboard" semantics stay clean. Matches the whole ``copa-bhrf`` folder
+    segment only -- never a "copa" substring."""
+    segs = {s.lower() for s in _segments(str(path_or_source_id or ""))}
+    return bool(segs & _LEX_NDA_SEGMENTS)
 
 
 def folder_ids_excluded(
