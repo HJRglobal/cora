@@ -1889,6 +1889,28 @@ deployment/
 10. **Entity scoping** -- Tools filter by entity (F3E, OSN, LEX, etc.) from
     channel routing. FNDR channels see all entities (no filter).
 
+11. **KB-staleness hygiene + supersede-in-place (D-087)** -- Update canonical
+    doctrine IN PLACE (edit the file; the nightly static sync's replace-on-conflict
+    auto-cleans its chunks). Create-new only for dated captures/one-offs. Stamp a
+    superseded standalone `.md` with `<!-- KB-STATUS: SUPERSEDED <date> by <ref> --
+    <why> -->` (first line) so the monthly `cowork-cora-kb-hygiene` sweep
+    archives+purges it: SMALL sweeps auto-apply LIVE (WAL DELETE, no VACUUM, no Cora
+    stop), a LARGE sweep (>500 chunks or >100 files) ESCALATES to the Cora-stopped
+    `deployment\run-kb-hygiene-apply.ps1`. `--proactive` detectors are PROPOSE-ONLY.
+    Append-only logs (`decisions.md`) are EXEMPT -- never archive them. Move/purge
+    core is shared in `src/cora/kb_archive.py`; the sweep reuses it.
+
+12. **Autonomous knowledge writes are reversible, not ungated (D-087, D-011 relaxed)**
+    -- `CORA_AUTOWRITE_LIVE` (default OFF = every item still DMs Harrison) lets
+    graduated-trust Tier-0/1 knowledge auto-write. This is NOT the retired WS17-C
+    silent auto-approve (D-060): every auto-write is AUDITED (`logs/cora-autowrite-audit.jsonl`)
+    and one-tap REVERTIBLE in the weekly `cowork-cora-autowrite-digest`, and Tier-2
+    (money/contracts/legal/equity/comp/PHI/LEX/cross-entity/conflicts-with-canon)
+    stays Harrison-gated by the classifier + an independent fail-closed
+    is_high_stakes belt. Ship a "flip a classifier live" change default-OFF behind
+    an operator flag with the digest AS the validation; keep the flip in the
+    CONSUMER, not the pure shadow module.
+
 ---
 
 ## SCHEDULED TASKS (full registry as of 2026-06-03)
