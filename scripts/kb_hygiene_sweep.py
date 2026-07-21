@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime
@@ -346,6 +347,262 @@ def run_marked(cfg: ArchiveConfig, db_path: Path, *, apply: bool, allow_large: b
     return result
 
 
+# ── proactive tier (Slice C -- PROPOSE-ONLY; never moves or purges) ────────────
+# Defaults tuned on dry-run before enabling; near-dupe threshold starts HIGH (a
+# near-identical successor), well above the reconciliation "same topic" 0.72 floor.
+DEFAULT_DUP_THRESHOLD = 0.90
+DEFAULT_TTL_DAYS = 75
+DEFAULT_PENDING_JACCARD = 0.55
+DEFAULT_MAX_PROPOSALS = 25
+
+_ONEOFF_PATTERNS = ("chrome-agent", "resume-prompt", "kickoff", "bootstrap",
+                    "session-prompt", "cowork-prompt", "code-prompt")
+_FILE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9\-]{2,}")
+_STOPWORDS = frozenset(
+    "the a an and or of to in for on with is are was were be this that it as at by "
+    "from we our you your they their but not have has had will would can may see per".split()
+)
+
+
+def _decisions_pending_path() -> Path:
+    return Path(os.environ.get("FNDR_DECISIONS_PENDING_PATH")
+                or (FOUNDER_OS_ROOT / "memory" / "decisions-pending.md"))
+
+
+def _decisions_path() -> Path:
+    return Path(os.environ.get("STRATEGY_DECISIONS_PATH")
+                or (FOUNDER_OS_ROOT / "memory" / "decisions.md"))
+
+
+def _file_date_ts(path: Path, mtime: float) -> float:
+    m = _FILE_DATE_RE.search(path.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").timestamp()
+        except ValueError:
+            pass
+    return mtime
+
+
+def _tokens(s: str) -> set[str]:
+    return {w for w in _TOKEN_RE.findall((s or "").lower()) if w not in _STOPWORDS}
+
+
+def _project_dir(rel: str) -> str:
+    """The project folder for a file: the parent of a `_notes` folder, else the
+    file's own parent."""
+    parent = Path(rel).parent
+    if parent.name.lower() == "_notes":
+        return str(parent.parent)
+    return str(parent)
+
+
+def gather_candidate_files(cfg: ArchiveConfig) -> list[dict]:
+    """Walk once; return eligible non-banner'd, non-held, non-KEEP-class file
+    records for the propose-only detectors."""
+    out: list[dict] = []
+    for path in cfg.founder_os_root.rglob("*.md"):
+        if not path.is_file() or _walk_skip(path):
+            continue
+        try:
+            rel = kb_archive.rel(path, cfg)
+        except ValueError:
+            continue
+        if kb_archive.hold_reason(rel, cfg):
+            continue
+        if kb_archive.is_keep_as_class(rel, cfg):
+            continue
+        if parse_banner(_read_head(path)):
+            continue  # already marked -> the marked tier's job
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        out.append({"path": path, "rel": rel, "name": path.name.lower(),
+                    "mtime": mtime, "date_ts": _file_date_ts(path, mtime)})
+    return out
+
+
+def _fetch_file_centroid(conn, source_id: str) -> list[float] | None:
+    """Mean-pool a static_md file's chunk vectors from knowledge_vec_f32 (zero embed
+    cost). Returns None if the file has no vectors (never ingested / excluded)."""
+    import struct
+
+    from cora.knowledge_base.embeddings import EMBEDDING_DIM
+    rows = conn.execute(
+        "SELECT f.embedding FROM knowledge_chunks k JOIN knowledge_vec_f32 f "
+        "ON f.chunk_id = k.chunk_id WHERE k.source='static_md' AND k.source_id=?",
+        (source_id,),
+    ).fetchall()
+    vecs: list[list[float]] = []
+    for (blob,) in rows:
+        try:
+            vecs.append(list(struct.unpack(f"{EMBEDDING_DIM}f", blob)))
+        except Exception:  # noqa: BLE001
+            continue
+    if not vecs:
+        return None
+    dim = len(vecs[0])
+    centroid = [0.0] * dim
+    used = 0
+    for v in vecs:
+        if len(v) != dim:
+            continue
+        used += 1
+        for i in range(dim):
+            centroid[i] += v[i]
+    if used == 0:
+        return None
+    return [x / used for x in centroid]
+
+
+def detect_near_dupes(cfg: ArchiveConfig, db_path: Path, files: list[dict], *,
+                      threshold: float, max_proposals: int) -> list[dict]:
+    """Within each folder, PROPOSE archiving the OLDER of any dated pair whose
+    doc-level centroid cosine >= threshold. Propose-only; never acts."""
+    from cora.reconciliation_engine import _cosine_sim
+
+    groups: dict[str, list[dict]] = {}
+    for f in files:
+        groups.setdefault(str(Path(f["rel"]).parent), []).append(f)
+
+    proposals: list[dict] = []
+    conn = kb_archive.connect_ro(db_path)
+    try:
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            for f in group:
+                if "centroid" not in f:
+                    try:
+                        f["centroid"] = _fetch_file_centroid(conn, f["rel"])
+                    except Exception:  # noqa: BLE001 -- fail-soft, skip the file
+                        f["centroid"] = None
+            withvec = sorted((f for f in group if f.get("centroid")), key=lambda f: f["date_ts"])
+            proposed: set[str] = set()
+            for i in range(len(withvec)):
+                older = withvec[i]
+                if older["rel"] in proposed:
+                    continue
+                for j in range(i + 1, len(withvec)):
+                    newer = withvec[j]
+                    sim = _cosine_sim(older["centroid"], newer["centroid"])
+                    if sim >= threshold:
+                        proposals.append({
+                            "kind": "near-dupe",
+                            "path": older["rel"],
+                            "superseded_by": newer["rel"],
+                            "cosine": round(sim, 4),
+                            "reason": f"near-duplicate of newer {newer['rel']} (cosine {sim:.3f})",
+                        })
+                        proposed.add(older["rel"])
+                        break
+    finally:
+        conn.close()
+    proposals.sort(key=lambda p: -p["cosine"])
+    return proposals[:max_proposals]
+
+
+def detect_ttl_oneoffs(cfg: ArchiveConfig, files: list[dict], *, ttl_days: int,
+                       now_ts: float, max_proposals: int) -> list[dict]:
+    """PROPOSE archiving dated one-off _notes docs (chrome-agent / RESUME-PROMPT /
+    KICKOFF / bootstrap / *-prompt) older than ttl_days whose project has newer
+    activity. ALWAYS keeps the latest RESUME-PROMPT per project."""
+    latest_resume: dict[str, dict] = {}
+    newest_activity: dict[str, float] = {}
+    for f in files:
+        pd = _project_dir(f["rel"])
+        newest_activity[pd] = max(newest_activity.get(pd, 0.0), f["mtime"])
+        if "resume-prompt" in f["name"]:
+            cur = latest_resume.get(pd)
+            if cur is None or f["date_ts"] > cur["date_ts"]:
+                latest_resume[pd] = f
+
+    proposals: list[dict] = []
+    for f in files:
+        rel, name = f["rel"], f["name"]
+        parent_segs = {s.lower() for s in Path(rel).parts[:-1]}
+        if "_notes" not in parent_segs:
+            continue
+        if not any(pat in name for pat in _ONEOFF_PATTERNS):
+            continue
+        age_days = (now_ts - f["date_ts"]) / 86400.0
+        if age_days < ttl_days:
+            continue
+        pd = _project_dir(rel)
+        if "resume-prompt" in name and latest_resume.get(pd) is f:
+            continue  # keep the latest RESUME-PROMPT per project
+        if newest_activity.get(pd, 0.0) <= f["mtime"]:
+            continue  # no newer activity in the project -> not clearly superseded
+        proposals.append({
+            "kind": "ttl-oneoff",
+            "path": rel,
+            "age_days": int(age_days),
+            "reason": f"one-off ({name}) ~{int(age_days)}d old; project has newer activity",
+        })
+    proposals.sort(key=lambda p: -p["age_days"])
+    return proposals[:max_proposals]
+
+
+def detect_resolved_pending(pending_path: Path, decisions_path: Path, *,
+                            jaccard: float, max_proposals: int) -> list[dict]:
+    """PROPOSE closing decisions-pending items whose outcome already appears in
+    decisions.md (token-overlap match). Fail-soft if either file is unreadable.
+    The >7-day stalled-P0 escalation is a SEPARATE live task (run_due_date_escalation)
+    -- this detector only surfaces the resolved-but-not-removed hygiene gap."""
+    proposals: list[dict] = []
+    try:
+        if not pending_path.exists() or not decisions_path.exists():
+            return proposals
+        ptext = pending_path.read_text(encoding="utf-8", errors="replace")
+        dtext = decisions_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return proposals
+
+    items = [ln.strip() for ln in ptext.splitlines() if ln.strip().startswith(("-", "*", "+"))]
+    dlines = [t for t in (_tokens(ln) for ln in dtext.splitlines()) if len(t) >= 4]
+
+    for item in items:
+        it = _tokens(item)
+        if len(it) < 4:
+            continue
+        best = 0.0
+        for dt in dlines:
+            inter = len(it & dt)
+            if inter == 0:
+                continue
+            j = inter / len(it | dt)
+            if j > best:
+                best = j
+        if best >= jaccard:
+            proposals.append({
+                "kind": "resolved-pending",
+                "item": item[:200],
+                "match_jaccard": round(best, 3),
+                "reason": f"pending item may already be resolved in decisions.md (overlap {best:.2f})",
+            })
+    proposals.sort(key=lambda p: -p["match_jaccard"])
+    return proposals[:max_proposals]
+
+
+def run_proactive(cfg: ArchiveConfig, db_path: Path, *, dup_threshold: float,
+                  ttl_days: int, jaccard: float, max_proposals: int, now_ts: float) -> dict:
+    files = gather_candidate_files(cfg)
+    near = detect_near_dupes(cfg, db_path, files, threshold=dup_threshold, max_proposals=max_proposals)
+    ttl = detect_ttl_oneoffs(cfg, files, ttl_days=ttl_days, now_ts=now_ts, max_proposals=max_proposals)
+    resolved = detect_resolved_pending(_decisions_pending_path(), _decisions_path(),
+                                       jaccard=jaccard, max_proposals=max_proposals)
+    log.info("Proactive candidates (PROPOSE-ONLY): %d near-dupe, %d ttl-oneoff, %d resolved-pending "
+             "(from %d candidate files).", len(near), len(ttl), len(resolved), len(files))
+    return {
+        "candidate_files_scanned": len(files),
+        "near_dupes": near,
+        "ttl_oneoffs": ttl,
+        "resolved_pending": resolved,
+    }
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="KB-staleness hygiene sweep (dry-run default).")
@@ -362,6 +619,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--live-move-max", type=int, default=DEFAULT_LIVE_MOVE_MAX)
     ap.add_argument("--restore-days", type=int, default=DEFAULT_RESTORE_DAYS)
     ap.add_argument("--purge-after-days", type=int, default=DEFAULT_PURGE_AFTER_DAYS)
+    ap.add_argument("--dup-threshold", type=float, default=DEFAULT_DUP_THRESHOLD,
+                    help="near-dupe centroid-cosine threshold (proactive).")
+    ap.add_argument("--ttl-days", type=int, default=DEFAULT_TTL_DAYS,
+                    help="age past which a one-off _notes doc is proposed (proactive).")
+    ap.add_argument("--jaccard", type=float, default=DEFAULT_PENDING_JACCARD,
+                    help="decisions-pending resolved-match token-overlap threshold.")
+    ap.add_argument("--max-proposals", type=int, default=DEFAULT_MAX_PROPOSALS,
+                    help="cap per proactive detector.")
     ap.add_argument("--db", default=str(KB_DB_PATH), help="Path to the KB sqlite DB.")
     ap.add_argument("--revert", metavar="MANIFEST", help="Reverse the moves recorded in a manifest JSON.")
     ap.add_argument("--report", metavar="PATH", help="Write the candidate/run report JSON to PATH.")
@@ -404,7 +669,10 @@ def main() -> int:
             return 2
 
     if args.proactive:
-        log.info("--proactive detectors are not yet implemented (Slice C).")
+        report["proactive"] = run_proactive(
+            cfg, db_path, dup_threshold=args.dup_threshold, ttl_days=args.ttl_days,
+            jaccard=args.jaccard, max_proposals=args.max_proposals,
+            now_ts=datetime.now().timestamp())
     if args.gc:
         log.info("--gc retention is not yet implemented (Slice D).")
 
