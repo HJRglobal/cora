@@ -6879,22 +6879,25 @@ TOOL_DEFINITIONS = [
     {
         "name": "f3e_shopify_set_inventory",
         "description": (
-            "STAGED-WRITE tool. Set F3 Energy DTC inventory to an absolute number "
-            "for ONE product/variant at ONE location. Use when a user asks to set, "
-            "update, correct, or adjust the on-hand count -- phrases like 'set Pure "
-            "Original at the office to 240', 'update Mood 12-pack stock to 50', "
-            "'change the office count for Energy to 0'. This is a WRITE: two calls. "
-            "First call with confirmed=false (or omitted) resolves the product + "
-            "location, reads the CURRENT count, and returns a preview for the user "
-            "to approve. Then, after the user says yes, call again with "
-            "confirmed=true -- I REMEMBER the exact item, location, and target from "
-            "the preview, so you do NOT need to re-echo anything; just confirmed=true "
-            "(re-passing the same product/location/quantity is fine but not required, "
-            "and if the user changed the number, pass the new quantity and I'll "
-            "re-preview). I re-check the live count before writing. "
+            "STAGED-WRITE tool for F3 Energy DTC inventory. Set an ABSOLUTE count "
+            "(product+quantity, e.g. 'set Pure Original to 240'), ADD/REMOVE a "
+            "relative amount (product+delta; negative removes, e.g. 'remove 13 cases "
+            "of Mood' -> delta=-13), or do MANY at once (items=[...]). This is a "
+            "WRITE: two calls. First call with confirmed=false (or omitted) resolves "
+            "each product + location, reads the CURRENT count, and returns a preview "
+            "for the user to approve. After the user says yes, call again with just "
+            "confirmed=true -- I REMEMBER the exact item(s), location(s), and target(s) "
+            "from the preview (identity is server-side, no echo needed); I re-check "
+            "the live count(s) before writing and re-preview if anything moved. "
+            "Product resolution is alias-aware: friendly names ('Strawberries & Cream "
+            "Mood', 'original energy 12-pack') resolve to the right SKU; an ambiguous "
+            "bare word ('variety') or an unknown name is asked/refused -- do not guess. "
+            "Location is OPTIONAL in a channel with a default (e.g. "
+            "#f3-hq-inventory-adjustments defaults to the office, counted in CASES -- "
+            "a 12-pack is one case, NEVER divide or multiply by 12); elsewhere ask. "
             "Relay refusals plainly (do not argue): a synced location (a fulfillment "
-            "partner's) can't be set manually -- only the office; an ambiguous product "
-            "or location means ask which one; an un-stocked item can't be set. "
+            "partner's) can't be set manually -- only the office; an un-stocked item "
+            "can't be set; a removal can't take a count below 0. "
             "Source-opaque: never name the store, platform, or a URL -- say 'DTC "
             "inventory'/'online'. F3E channels only (or Harrison cross-entity)."
         ),
@@ -6904,53 +6907,77 @@ TOOL_DEFINITIONS = [
                 "product": {
                     "type": "string",
                     "description": (
-                        "Product/variant name or SKU to set, e.g. 'Pure Original 12-pack' "
-                        "or a SKU. If it matches more than one variant the tool asks you "
-                        "to disambiguate; pass the fuller name the user gives."
+                        "Single-item mode: product/variant name or SKU, e.g. 'Pure "
+                        "Original 12-pack' or a friendly name. Omit when using `items`."
                     ),
                 },
                 "location": {
                     "type": "string",
                     "description": (
-                        "Location name to set at, e.g. 'office'. Ask the user which "
-                        "location -- do NOT assume one."
+                        "Location name, e.g. 'office'. OPTIONAL in a channel with a "
+                        "configured default; otherwise ask the user -- do NOT assume one."
                     ),
                 },
                 "quantity": {
                     "type": "integer",
-                    "description": "The absolute on-hand count to set (0 or more).",
+                    "description": (
+                        "Absolute on-hand count to SET (0 or more). Use this OR `delta`, "
+                        "not both."
+                    ),
+                },
+                "delta": {
+                    "type": "integer",
+                    "description": (
+                        "Relative change instead of an absolute set: positive ADDS, "
+                        "negative REMOVES (e.g. -13 = remove 13). Applied to the current "
+                        "count; won't go below 0. Use for 'remove/add N'."
+                    ),
+                },
+                "items": {
+                    "type": "array",
+                    "description": (
+                        "BULK: several adjustments from ONE message. Each element sets or "
+                        "adjusts one product. When `items` is present the top-level "
+                        "product/quantity/delta/location are ignored; one preview + one "
+                        "confirm applies the whole batch."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "product": {"type": "string"},
+                            "quantity": {"type": "integer", "description": "absolute set (use this OR delta)"},
+                            "delta": {"type": "integer", "description": "relative add(+)/remove(-)"},
+                            "location": {"type": "string", "description": "optional; falls back to the channel default"},
+                        },
+                        "required": ["product"],
+                    },
                 },
                 "confirmed": {
                     "type": "boolean",
                     "description": (
                         "false/omitted = preview only. true = execute the previewed "
-                        "change, ONLY after the user approved it. On true I use the "
-                        "item/location/target I resolved during the preview and re-check "
-                        "the live count first -- no echo needed."
+                        "change(s), ONLY after the user approved. On true I use the "
+                        "item(s)/location(s)/target(s) I resolved during the preview and "
+                        "re-check the live count(s) first -- no echo needed."
                     ),
                 },
                 "expected_current": {
                     "type": "integer",
-                    "description": (
-                        "Optional / legacy. Ignored for the confirm decision -- the tool "
-                        "re-reads the live count itself. Safe to omit."
-                    ),
+                    "description": "Optional / legacy. Ignored -- the tool re-reads live. Safe to omit.",
                 },
                 "expected_item": {
                     "type": "string",
-                    "description": (
-                        "Optional / legacy. Ignored for the confirm decision -- the tool "
-                        "binds identity to its own resolved ids, not this echo. Safe to omit."
-                    ),
+                    "description": "Optional / legacy. Ignored (identity is server-resolved). Safe to omit.",
                 },
                 "expected_location": {
                     "type": "string",
-                    "description": (
-                        "Optional / legacy. Ignored for the confirm decision. Safe to omit."
-                    ),
+                    "description": "Optional / legacy. Ignored. Safe to omit.",
                 },
             },
-            "required": ["product", "location", "quantity", "confirmed"],
+            # Only `confirmed` is always required; product/quantity/delta/location are
+            # conditionally required and the tool asks (NOT-WRITTEN) when they're missing
+            # -- so a bulk call (product/quantity live inside `items`) validates cleanly.
+            "required": ["confirmed"],
         },
     },
     # ── F3E warehouse inventory (batch report, not live DTC) ──

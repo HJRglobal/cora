@@ -445,11 +445,20 @@ class TestWiring:
     def test_definition_exists(self):
         assert self._def() is not None
 
-    def test_required_fields(self):
+    def test_schema_props_and_required(self):
         d = self._def()
         props = d["input_schema"]["properties"]
-        for f in ("product", "location", "quantity", "confirmed"):
-            assert f in props and f in d["input_schema"]["required"]
+        # the new capabilities are exposed to the model...
+        for f in ("product", "location", "quantity", "delta", "items", "confirmed"):
+            assert f in props
+        # ...but only `confirmed` is unconditionally required (product/quantity/delta/
+        # location are conditional -- a bulk call carries them inside `items`).
+        assert d["input_schema"]["required"] == ["confirmed"]
+        assert props["items"]["type"] == "array"
+
+    def test_description_covers_delta_bulk_cases(self):
+        desc = self._def()["description"].lower()
+        assert "delta" in desc and "items=" in desc and "case" in desc
 
     def test_mentions_staged_write(self):
         assert "STAGED-WRITE" in self._def()["description"].upper()
