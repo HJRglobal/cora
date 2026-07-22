@@ -3715,6 +3715,164 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
         variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty, unit=unit))
 
 
+def _short_block_reason(blocked: str) -> str:
+    """Pull the human reason out of a WRITE_BLOCKED string (the line(s) after the
+    last NOT-WRITTEN marker), for a per-row 'skipped' note in a bulk preview."""
+    tail = blocked.split(_NOT_WRITTEN)[-1].strip()
+    return (tail.split("\n", 1)[0].strip() or "couldn't resolve").rstrip(".")
+
+
+def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: bool = False) -> str:
+    """Source-opaque NOT-WRITTEN preview for a BULK request: one line per resolved
+    row + an explicit skipped list (never silently dropped). Inner text only -- the
+    caller wraps it via _shopify_write_blocked."""
+    moved_note = (" Some counts moved or changed since I checked -- here is the updated batch."
+                  if moved else "")
+    lines = [f"{_NOT_WRITTEN}{moved_note}",
+             f"Batch preview -- {len(rows)} item(s) to set (nothing written yet):"]
+    for r in rows:
+        unit = r.get("unit", "units")
+        lines.append(f"  - {r['variant_label']} at {r['location_label']}: "
+                     f"{r['preview_qty']} -> {r['target_qty']} {unit}")
+    if skipped:
+        lines.append(f"Skipped ({len(skipped)}, NOT applied):")
+        for sk in skipped:
+            lines.append(f"  - {sk['product']}: {sk['reason']}")
+    lines.append('@mention me and say "confirm" and I\'ll set them all.')
+    return "\n".join(lines)
+
+
+def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) -> str:
+    """Phase 1 (bulk): resolve every requested row through the SAME _shopify_resolve
+    (so each row gets server-resolved ids + a live current + the alias/allowlist/
+    channel-default/delta handling), stash the resolved rows as ONE batch pending
+    keyed (user, channel), and return a single WRITE_BLOCKED preview table. Rows
+    that don't resolve are listed as skipped, never silently dropped."""
+    resolved: list[dict] = []
+    skipped: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            skipped.append({"product": str(it), "reason": "not a valid item"})
+            continue
+        row_input = {
+            "product": it.get("product"),
+            "location": it.get("location") or "",
+            "quantity": it.get("quantity"),
+            "delta": it.get("delta"),
+            "_channel_name": channel,
+        }
+        blocked, data = _shopify_resolve(slack_user_id, row_input, channel=channel)
+        if blocked:
+            skipped.append({"product": str(it.get("product") or "?"),
+                            "reason": _short_block_reason(blocked)})
+            continue
+        m = data["match"]
+        resolved.append({
+            "inventory_item_id": m.inventory_item_id,
+            "location_id": data["loc_id"],
+            "target_qty": data["quantity"],
+            "preview_qty": data["current"],
+            "delta": data.get("delta"),
+            "unit": data.get("unit", "units"),
+            "variant_label": m.label,
+            "location_label": data["loc_name"],
+        })
+
+    if not resolved:
+        detail = "\n".join(f"  - {sk['product']}: {sk['reason']}" for sk in skipped)
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nI couldn't resolve any of those, so nothing is staged:\n{detail}")
+
+    _store_pending_shopify_write(slack_user_id, channel,
+                                 {"rows": resolved, "skipped": skipped, "ts": time.time()})
+    log.info("f3e_shopify_set_inventory BATCH PREVIEW user=%s rows=%d skipped=%d",
+             slack_user_id, len(resolved), len(skipped))
+    return _shopify_write_blocked(_shopify_bulk_preview_text(resolved, skipped))
+
+
+def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: dict) -> str:
+    """Phase 2 (bulk): FRESH per-row live re-check (delta rows re-apply to the fresh
+    count, floor-guarded), then WRITE every stable+valid row. Mirrors the single-item
+    contract: if ANY row drifted or turned invalid, RE-PREVIEW the whole batch and
+    write NOTHING; only an all-stable batch writes. Identity per row = the tool's
+    server-resolved ids, never an LLM echo."""
+    rows = pending.get("rows") or []
+    allowed, _ = _load_shopify_write_config()
+    refreshed: list[dict] = []
+    invalid: list[dict] = []
+    drift = False
+    for r in rows:
+        loc_name = r["location_label"]
+        unit = r.get("unit", "units")
+        if loc_name.strip().lower() not in allowed:  # defense-in-depth (live-reload)
+            invalid.append({"product": r["variant_label"], "reason": f"{loc_name} is sync-managed"})
+            continue
+        try:
+            live = shopify_client.get_inventory_level(r["inventory_item_id"], r["location_id"])
+        except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+            log.warning("f3e_shopify_set_inventory BATCH re-read error user=%s: %s", slack_user_id, exc)
+            return _shopify_write_blocked(
+                f"{_NOT_WRITTEN}\nI couldn't read the current counts just now -- nothing was changed. "
+                f"Try again in a moment.")
+        if live is None:
+            invalid.append({"product": r["variant_label"], "reason": "not stocked here anymore"})
+            continue
+        delta = r.get("delta")
+        if delta is not None:
+            target = live + int(delta)
+            if target < 0:
+                invalid.append({"product": r["variant_label"],
+                                "reason": f"only {live} {unit} on hand, can't remove {abs(int(delta))}"})
+                continue
+        else:
+            target = int(r["target_qty"])
+        if live != int(r["preview_qty"]):
+            drift = True
+        refreshed.append({**r, "preview_qty": live, "target_qty": target})
+
+    if drift or invalid:
+        # Re-preview the still-valid rows (recomputed); write NOTHING (all counts
+        # must be exactly as previewed before a write -- same rule as single-item).
+        if refreshed:
+            _store_pending_shopify_write(slack_user_id, channel, {"rows": refreshed, "ts": time.time()})
+        else:
+            _take_pending_shopify_write(slack_user_id, channel)  # nothing valid left -> clear
+        log.info("f3e_shopify_set_inventory BATCH re-preview user=%s valid=%d invalid=%d drift=%s",
+                 slack_user_id, len(refreshed), len(invalid), drift)
+        return _shopify_write_blocked(_shopify_bulk_preview_text(refreshed, invalid, moved=True))
+
+    # All rows stable + valid -> write every row.
+    ok_lines: list[str] = []
+    failed: list[str] = []
+    for r in refreshed:
+        try:
+            new_avail = shopify_client.set_inventory_level(
+                r["inventory_item_id"], r["location_id"], int(r["target_qty"]))
+        except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
+            log.warning("f3e_shopify_set_inventory BATCH write failed user=%s item=%s: %s",
+                        slack_user_id, r["inventory_item_id"], exc)
+            failed.append(r["variant_label"])
+            continue
+        _audit_shopify_write(slack_user=slack_user_id, channel=channel,
+                             variant=r["variant_label"], location=r["location_label"],
+                             old=int(r["preview_qty"]), new=new_avail)
+        ok_lines.append(f"  - {r['variant_label']} at {r['location_label']}: "
+                        f"{r['preview_qty']} -> {new_avail} {r.get('unit', 'units')}")
+    log.info("f3e_shopify_set_inventory BATCH WROTE user=%s ok=%d failed=%d",
+             slack_user_id, len(ok_lines), len(failed))
+    if not ok_lines:
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nThose DTC inventory updates didn't go through -- try again shortly.")
+    body = f"DTC inventory updated ({len(ok_lines)} item(s)):\n" + "\n".join(ok_lines)
+    if failed:
+        body += "\nCould not update (try again): " + ", ".join(failed)
+    return (
+        "WRITE_CONFIRMED -- post the lines after the blank as your entire response "
+        "(no preamble, no meta-commentary, do not name the store or platform):\n\n"
+        f"{body}"
+    )
+
+
 def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
     """Crash-safe wrapper (review #1): a WRITE tool must fail SOURCE-OPAQUE and say
     NOT WRITTEN, never surface a raw crash string. Any unexpected exception becomes a
@@ -3759,11 +3917,18 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
         )
 
     confirmed = input_data.get("confirmed", False) is True
+    items = input_data.get("items")
+    is_bulk = isinstance(items, list) and len(items) > 0
 
     # --- Phase 2: confirmed -> execute the caller's pending write ------------------
     if confirmed:
         pending = _take_pending_shopify_write(slack_user_id, channel)
         if pending is not None:
+            if pending.get("rows"):
+                # A batch was previewed -> execute the whole batch. A confirm-turn
+                # quantity edit is ambiguous across rows, so it is ignored here; the
+                # user restates the message to change a row.
+                return _shopify_execute_pending_batch(slack_user_id, channel, pending)
             # Did the model pass a DIFFERENT target than was previewed?
             new_qty = None
             q_raw = input_data.get("quantity")
@@ -3784,13 +3949,17 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             return _repreview_pending_new_target(slack_user_id, channel, pending, new_qty)
         # No fresh pending (expired / never previewed / a machine restart cleared it)
         # -> resolve fresh and re-preview.
+        if is_bulk:
+            return _resolve_and_preview_batch(slack_user_id, channel, items)
         blocked, data = _shopify_resolve(slack_user_id, input_data, channel=channel)
         if blocked:
             return blocked
         return _store_and_preview_shopify(slack_user_id, channel, data)
 
     # --- Phase 1: resolve + preview ------------------------------------------------
-    blocked, data = _shopify_resolve(slack_user_id, input_data)
+    if is_bulk:
+        return _resolve_and_preview_batch(slack_user_id, channel, items)
+    blocked, data = _shopify_resolve(slack_user_id, input_data, channel=channel)
     if blocked:
         return blocked
     return _store_and_preview_shopify(slack_user_id, channel, data)

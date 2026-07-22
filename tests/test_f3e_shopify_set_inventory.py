@@ -43,6 +43,7 @@ from cora.tools.tool_dispatch import (
 _HARRISON = tool_dispatch._HARRISON_SLACK_ID
 _ALEX = "U0B3VGWJTMJ"
 _CHAN = "f3e-leadership"
+_HQ = "f3-hq-inventory-adjustments"   # the channel with a default location + cases unit
 _OFFICE = "1337 S Gilbert Rd"
 _LOCS = [{"id": 81567023424, "name": _OFFICE}, {"id": 110064533824, "name": "Nimbl"}]
 _CONFIG = (frozenset({_OFFICE.lower()}), {"office": _OFFICE.lower(), "the office": _OFFICE.lower()})
@@ -70,8 +71,14 @@ def _stub(stack: ExitStack, *, locations=None, variants=None, current=202,
     m_set = stack.enter_context(patch.object(shopify_client, "set_inventory_level", return_value=set_result))
     stack.enter_context(patch.object(tool_dispatch, "_load_shopify_write_config",
                                      return_value=(_CONFIG if config is None else config)))
+
+    # Channel-config is channel-SENSITIVE (side_effect on the name arg) so tests
+    # actually exercise channel THREADING -- chan_cfg is returned ONLY for _HQ.
+    def _chan_cfg(name):
+        n = (name or "").strip().lstrip("#").lower()
+        return dict(chan_cfg) if (chan_cfg and n == _HQ) else {}
     stack.enter_context(patch.object(tool_dispatch, "_load_inventory_channel_config",
-                                     return_value=dict(chan_cfg or {})))
+                                     side_effect=_chan_cfg))
     return m_set
 
 
@@ -554,9 +561,6 @@ class TestDelta:
 
 # ── channel-scoped defaults (location + unit=cases) ─────────────────────────────
 
-_HQ = "f3-hq-inventory-adjustments"
-
-
 class TestChannelDefaults:
     def test_default_location_and_cases_unit_applied(self):
         with ExitStack() as s:
@@ -587,3 +591,98 @@ class TestChannelDefaults:
             r = _preview(_channel_name=_HQ, product="pure original 12", location="nimbl", quantity=5)
             assert r.startswith("WRITE_BLOCKED") and "sync" in r.lower()
             m_set.assert_not_called()
+
+    def test_channel_default_threaded_not_leaked_to_other_channel(self):
+        # same chan_cfg, but a preview in a DIFFERENT channel gets no default (proves
+        # the channel name is threaded into the config lookup, not applied blanket).
+        with ExitStack() as s:
+            _stub(s, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            r = _preview(product="pure original 12", quantity=5)   # _CHAN=f3e-leadership
+            assert r.startswith("WRITE_BLOCKED") and "which location" in r.lower()
+
+
+# ── bulk multi-SKU: one message -> one preview table -> one confirm ─────────────
+
+def _vmap():
+    """Three DISTINCT variants keyed by canonical SKU (so bulk rows don't collide)."""
+    return {
+        "F3-Original": VariantMatch("F3 Original Energy", "12 Pack", "F3-Original", 1, 1001),
+        "F3-Citrus": VariantMatch("F3 Citrus Energy", "12 Pack", "F3-Citrus", 2, 1002),
+        "F3SC": VariantMatch("Strawberries & Cream Mood", "12 Pack", "F3SC", 3, 1003),
+    }
+
+
+class TestBulk:
+    def test_one_preview_one_confirm_writes_all(self):
+        vmap = _vmap()
+        with ExitStack() as s:
+            m_set = _stub(s, current=100, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            items = [
+                {"product": "original energy 12 pack", "delta": -24},
+                {"product": "citrus energy", "delta": -18},
+                {"product": "strawberries and cream mood", "delta": -13},
+            ]
+            r = _preview(_channel_name=_HQ, items=items)
+            assert r.startswith("WRITE_BLOCKED")
+            for lbl in ("F3 Original Energy", "F3 Citrus Energy", "Strawberries & Cream Mood"):
+                assert lbl in r
+            assert "cases" in r and has_pending_shopify_write(_ALEX, _HQ)
+            r2 = _confirm(_channel_name=_HQ)
+            assert r2.startswith("WRITE_CONFIRMED")
+            assert m_set.call_count == 3
+            written = {c.args[0]: c.args[2] for c in m_set.call_args_list}  # item_id -> target
+            assert written == {1001: 76, 1002: 82, 1003: 87}   # 100 + delta, floor ok
+
+    def test_unresolved_row_surfaced_not_dropped(self):
+        vmap = _vmap()
+        with ExitStack() as s:
+            m_set = _stub(s, current=100, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            items = [{"product": "original energy 12 pack", "delta": -5},
+                     {"product": "nonexistent flavor", "delta": -5}]
+            r = _preview(_channel_name=_HQ, items=items)
+            assert "Skipped" in r and "nonexistent flavor" in r and "F3 Original Energy" in r
+            r2 = _confirm(_channel_name=_HQ)
+            assert r2.startswith("WRITE_CONFIRMED") and m_set.call_count == 1
+
+    def test_all_unresolved_stages_nothing(self):
+        with ExitStack() as s:
+            m_set = _stub(s, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants", side_effect=lambda q: []))
+            r = _preview(_channel_name=_HQ, items=[{"product": "xyz", "delta": -5}])
+            assert r.startswith("WRITE_BLOCKED") and "couldn't resolve any" in r.lower()
+            assert not has_pending_shopify_write(_ALEX, _HQ)
+            m_set.assert_not_called()
+
+    def test_drift_repreviews_whole_batch_no_write(self):
+        vmap = _vmap()
+        with ExitStack() as s:
+            # preview reads [100,100]; confirm re-reads [100, 90] -> row2 drifted
+            m_set = _stub(s, levels=[100, 100, 100, 90],
+                          chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            items = [{"product": "original energy 12 pack", "delta": -5},
+                     {"product": "citrus energy", "delta": -5}]
+            _preview(_channel_name=_HQ, items=items)
+            r2 = _confirm(_channel_name=_HQ)
+            assert r2.startswith("WRITE_BLOCKED") and "updated batch" in r2.lower()
+            m_set.assert_not_called()
+
+    def test_bulk_floor_guard_skips_row(self):
+        vmap = _vmap()
+        with ExitStack() as s:
+            m_set = _stub(s, current=10, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            # remove 5 (ok: 10->5) and remove 50 (floor -> skipped)
+            items = [{"product": "original energy 12 pack", "delta": -5},
+                     {"product": "citrus energy", "delta": -50}]
+            r = _preview(_channel_name=_HQ, items=items)
+            assert "Skipped" in r and "F3 Citrus Energy" in r   # floor-guarded row skipped
+            r2 = _confirm(_channel_name=_HQ)
+            assert r2.startswith("WRITE_CONFIRMED") and m_set.call_count == 1
+            assert m_set.call_args_list[0].args[2] == 5
