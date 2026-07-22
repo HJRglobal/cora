@@ -1,0 +1,22 @@
+# data/maps/inventory-channel-config.yaml -- per-channel defaults for the F3E DTC
+# inventory write tool (f3e_shopify_set_inventory).
+#
+# Keyed by the Slack channel NAME (no leading '#'), because that is the only
+# reliable channel signal inside a tool on the Q&A path (channel_id is not
+# forwarded). For each channel:
+#   default_location : a location name/alias auto-applied when the user omits one
+#                      (still validated through _resolve_shopify_location + the
+#                      refuse-by-default write-location allowlist -- a default can
+#                      NEVER bypass the allowlist).
+#   unit             : "cases" | "units". A 12-pack variant IS one case
+#                      (1 unit = 1 case = 12 cans); the tool treats the variant
+#                      quantity as the case count and NEVER converts (no /12 or
+#                      x12). This just labels the preview so the count is
+#                      unambiguous and kills the cans/cases wobble at the source.
+#
+# FAIL-SOFT: a missing/unparseable file or an unlisted channel simply means "no
+# default" -- the tool falls back to asking for the location (never a write bypass).
+channels:
+  f3-hq-inventory-adjustments:      # Slack id C0B7X2E4VNG; Shopify location id 81567023424
+    default_location: "1337 S Gilbert Rd"
+    unit: cases

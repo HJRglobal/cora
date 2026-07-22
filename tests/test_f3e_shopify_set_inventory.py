@@ -54,9 +54,11 @@ _PURE_LABEL = "F3 PURE Original Energy Drink (12 Pack)"
 
 
 def _stub(stack: ExitStack, *, locations=None, variants=None, current=202,
-          levels=None, set_result=203, config=None):
+          levels=None, set_result=203, config=None, chan_cfg=None):
     """Patch the connector + allowlist deps. `levels` (list) -> side_effect for
-    sequential get_inventory_level calls (preview then confirm); else `current`."""
+    sequential get_inventory_level calls (preview then confirm); else `current`.
+    `chan_cfg` (dict) -> the per-channel inventory default config the tool reads;
+    defaults to {} (no channel default) so tests never depend on the real YAML."""
     stack.enter_context(patch.object(shopify_client, "get_active_locations",
                                      return_value=list(_LOCS if locations is None else locations)))
     stack.enter_context(patch.object(shopify_client, "resolve_variants",
@@ -68,6 +70,8 @@ def _stub(stack: ExitStack, *, locations=None, variants=None, current=202,
     m_set = stack.enter_context(patch.object(shopify_client, "set_inventory_level", return_value=set_result))
     stack.enter_context(patch.object(tool_dispatch, "_load_shopify_write_config",
                                      return_value=(_CONFIG if config is None else config)))
+    stack.enter_context(patch.object(tool_dispatch, "_load_inventory_channel_config",
+                                     return_value=dict(chan_cfg or {})))
     return m_set
 
 
@@ -461,3 +465,125 @@ class TestWiring:
 
     def test_not_in_verbatim_table_tools(self):
         assert "f3e_shopify_set_inventory" not in tool_dispatch.VERBATIM_TABLE_TOOLS
+
+
+# ── SKU alias map (the #1 fix) -- tested against the REAL seeded YAML ────────────
+
+class TestAliasMap:
+    def test_exact_2026_07_21_failures_resolve(self):
+        # the paraphrase Hannah typed today -> canonical SKU (deterministic)
+        assert tool_dispatch._resolve_sku_alias("F3 Mood Strawberries & Cream 12-pack") == ("F3SC", True)
+        assert tool_dispatch._resolve_sku_alias("strawberries and cream mood") == ("F3SC", True)
+
+    def test_reordered_and_case_variants_resolve(self):
+        assert tool_dispatch._resolve_sku_alias("ORIGINAL ENERGY 12 PACK") == ("F3-Original", True)
+        assert tool_dispatch._resolve_sku_alias("citrus energy") == ("F3-Citrus", True)
+        assert tool_dispatch._resolve_sku_alias("piña colada mood") == ("F3PC", True)
+
+    def test_ambiguous_bare_word_not_auto_resolved(self):
+        # 'variety' collides across Energy/Mood/Pure -> deliberately NOT mapped;
+        # falls through unchanged so resolve_variants disambiguates.
+        assert tool_dispatch._resolve_sku_alias("variety") == ("variety", False)
+        assert tool_dispatch._resolve_sku_alias("original") == ("original", False)
+        assert tool_dispatch._resolve_sku_alias("citrus") == ("citrus", False)
+
+    def test_exact_shopify_title_passes_through(self):
+        # the exact Shopify title is not an alias -> unchanged -> live fuzzy handles it
+        q, hit = tool_dispatch._resolve_sku_alias("Strawberries & Cream Mood - 12 Pack")
+        assert hit is False and q == "Strawberries & Cream Mood - 12 Pack"
+
+    def test_closest_alias_suggests_on_near_miss(self):
+        assert tool_dispatch._closest_alias("citrus energ") is not None
+
+    def test_aliased_input_previews_fine(self):
+        with ExitStack() as s:
+            _stub(s, current=239)
+            r = _preview(product="F3 Mood Strawberries & Cream 12-pack", location="office", quantity=239)
+            assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
+            assert has_pending_shopify_write(_ALEX, _CHAN)
+
+    def test_alias_miss_refuses_and_may_suggest(self):
+        with ExitStack() as s:
+            _stub(s, variants=[])   # resolve_variants finds nothing
+            r = _preview(product="totally unknown flavor zzz", location="office", quantity=5)
+            assert r.startswith("WRITE_BLOCKED") and "won't guess" in r
+            assert not has_pending_shopify_write(_ALEX, _CHAN)
+
+
+# ── delta adjustments (add/remove N) + floor guard ──────────────────────────────
+
+class TestDelta:
+    def test_remove_previews_current_minus_delta(self):
+        with ExitStack() as s:
+            _stub(s, current=202)
+            r = _preview(product="pure original 12", location="office", delta=-13)
+            assert "202 -> 189" in r and "NOT WRITTEN" in r
+            assert has_pending_shopify_write(_ALEX, _CHAN)
+
+    def test_add_previews_current_plus_delta(self):
+        with ExitStack() as s:
+            _stub(s, current=202)
+            r = _preview(product="pure original 12", location="office", delta=20)
+            assert "202 -> 222" in r
+
+    def test_floor_guard_refuses_below_zero(self):
+        with ExitStack() as s:
+            m_set = _stub(s, current=202)
+            r = _preview(product="pure original 12", location="office", delta=-500)
+            assert r.startswith("WRITE_BLOCKED") and "below zero" in r
+            assert not has_pending_shopify_write(_ALEX, _CHAN)
+            m_set.assert_not_called()
+
+    def test_delta_confirm_writes_computed_absolute(self):
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[202, 202])   # preview read, confirm re-check (no drift)
+            _preview(product="pure original 12", location="office", delta=-13)
+            r = _confirm()
+            assert r.startswith("WRITE_CONFIRMED")
+            m_set.assert_called_once_with(_PURE.inventory_item_id, 81567023424, 189)
+
+    def test_delta_recomputes_against_drift(self):
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[202, 210])   # drifted to 210 by confirm time
+            _preview(product="pure original 12", location="office", delta=-13)
+            r = _confirm()
+            # a delta re-applies to the fresh count: 210 - 13 = 197, RE-PREVIEW (no write)
+            assert r.startswith("WRITE_BLOCKED") and "197" in r and "moved" in r.lower()
+            m_set.assert_not_called()
+
+
+# ── channel-scoped defaults (location + unit=cases) ─────────────────────────────
+
+_HQ = "f3-hq-inventory-adjustments"
+
+
+class TestChannelDefaults:
+    def test_default_location_and_cases_unit_applied(self):
+        with ExitStack() as s:
+            _stub(s, current=203, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            # no location given -> channel default fills it; unit labelled 'cases'
+            r = _preview(_channel_name=_HQ, product="pure original 12", quantity=203)
+            assert r.startswith("WRITE_BLOCKED") and "cases" in r
+            assert "units" not in r.split("\n")[-2] if "\n" in r else True
+            assert has_pending_shopify_write(_ALEX, _HQ)
+
+    def test_cases_never_divides(self):
+        with ExitStack() as s:
+            _stub(s, current=202, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            r = _preview(_channel_name=_HQ, product="pure original 12", quantity=239)
+            # the entered number is the absolute case count -- no /12 or x12
+            assert "-> 239 cases" in r
+
+    def test_non_configured_channel_still_asks_location(self):
+        with ExitStack() as s:
+            _stub(s)   # chan_cfg defaults to {} -> no default
+            r = _preview(product="pure original 12", quantity=5)   # no location
+            assert r.startswith("WRITE_BLOCKED") and "which location" in r.lower()
+
+    def test_non_office_location_still_refused_in_hq_channel(self):
+        with ExitStack() as s:
+            m_set = _stub(s, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            # an explicit non-office location overrides the default and is refused
+            r = _preview(_channel_name=_HQ, product="pure original 12", location="nimbl", quantity=5)
+            assert r.startswith("WRITE_BLOCKED") and "sync" in r.lower()
+            m_set.assert_not_called()

@@ -1,0 +1,32 @@
+# data/maps/f3e-sku-aliases.yaml -- friendly name -> canonical Shopify SKU.
+# The f3e_shopify_set_inventory tool resolves a product query in this order:
+#   (1) exact SKU -> (2) alias-map hit here -> canonical SKU -> (3) live Shopify
+#       title/fuzzy fallback (shopify_client.resolve_variants).
+# Deterministic-first kills "couldn't find product" on paraphrased names. A miss
+# still refuses ("won't guess") but suggests the closest alias.
+#
+# Aliases MUST be unambiguous. Do NOT add a bare word that collides across lines
+# (variety / original / citrus / strawberry lemonade collide across Energy/Mood/
+# Pure) -- the tool must ask "which line?" rather than guess. Matched
+# case-insensitively; punctuation/extra spaces are stripped before compare.
+# Seed = all 15 live 12-packs, pulled 2026-07-21.
+skus:
+  # --- F3 ENERGY (regular) ---
+  F3-Original:   ["original energy", "original energy 12 pack", "f3 original energy"]
+  F3-Citrus:     ["citrus clarity energy", "citrus energy"]
+  F3SL:          ["strawberry lemonade energy", "straw lemonade energy", "sl energy"]
+  F3-Tropical:   ["tropical theory energy", "tropical energy"]
+  F3VPE4:        ["energy variety", "energy variety pack", "energy variety 12 pack"]
+  # --- F3 MOOD ---
+  F3-Orange:     ["orangesicle mood", "orangesicle", "orangecicle mood", "orange mood"]
+  F3-Peach:      ["peach paradise mood", "peach paradise", "peach mood"]
+  F3PC:          ["pina colada mood", "piña colada mood", "pina colada", "piña colada"]
+  F3SC:          ["strawberries & cream mood", "strawberries and cream mood", "strawberries & cream",
+                  "strawberries and cream", "s&c mood", "f3 mood strawberries & cream 12-pack"]
+  F3VPM4:        ["mood variety", "mood variety pack", "mood variety 12 pack"]
+  # --- F3 PURE ---
+  PURE-Original: ["pure original", "f3 pure original"]
+  PURE-Citrus:   ["pure citrus", "pure citrus clarity"]
+  PURESL:        ["pure strawberry lemonade", "pure sl", "pure straw lemonade"]
+  PURE-Tropical: ["pure tropical", "pure tropical theory"]
+  F3-PureE-V4F:  ["pure variety", "f3 pure variety", "pure variety pack", "f3 pure energy drink variety pack"]

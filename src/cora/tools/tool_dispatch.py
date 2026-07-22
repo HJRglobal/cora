@@ -44,6 +44,11 @@ _HIERARCHY_PATH = _REPO_ROOT / "data" / "maps" / "supervisor-hierarchy.yaml"
 _SHOPIFY_WRITE_LOC_PATH = _REPO_ROOT / "data" / "maps" / "shopify-inventory-write-locations.yaml"
 # Per-write audit trail for DTC inventory sets.
 _SHOPIFY_WRITE_AUDIT_PATH = _REPO_ROOT / "logs" / "shopify-inventory-writes.jsonl"
+# Friendly-name -> canonical SKU alias map (deterministic-first product resolution)
+# and per-channel inventory defaults (default location + unit). Both read fresh per
+# call (live-reload). See each file header.
+_SHOPIFY_SKU_ALIAS_PATH = _REPO_ROOT / "data" / "maps" / "f3e-sku-aliases.yaml"
+_INV_CHANNEL_CFG_PATH = _REPO_ROOT / "data" / "maps" / "inventory-channel-config.yaml"
 
 # HubSpot pipeline → entity routing. Used to scope hubspot_get_my_deals by channel.
 HUBSPOT_PIPELINE_BY_ENTITY: dict[str, str] = {
@@ -3232,6 +3237,88 @@ def _load_shopify_write_config() -> tuple[frozenset[str], dict[str, str]]:
         return frozenset(), {}
 
 
+def _norm_alias(s: str) -> str:
+    """Normalize a product name/alias for comparison: lowercase, keep alphanumerics
+    + spaces + '&' (so 's&c' / 'strawberries & cream' survive), collapse whitespace,
+    drop other punctuation (so '12-pack' == '12 pack')."""
+    s = (s or "").lower().strip()
+    kept = "".join(c if (c.isalnum() or c in " &") else " " for c in s)
+    return " ".join(kept.split())
+
+
+def _load_sku_aliases() -> tuple[dict[str, str], list[str]]:
+    """Parse f3e-sku-aliases.yaml -> (normalized_alias -> canonical_SKU, all_alias_display).
+    Read fresh (live-reload). FAIL-SOFT: missing/unparseable -> ({}, []) so the tool
+    just falls through to the live Shopify title/fuzzy resolve. An alias map is
+    ADDITIVE (a deterministic-first shortcut), NEVER a gate."""
+    try:
+        if not _SHOPIFY_SKU_ALIAS_PATH.exists():
+            return {}, []
+        with open(_SHOPIFY_SKU_ALIAS_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        skus = data.get("skus") or {}
+        alias_to_sku: dict[str, str] = {}
+        display: list[str] = []
+        for sku, aliases in skus.items():
+            sku = str(sku).strip()
+            if not sku:
+                continue
+            for alias in (aliases or []):
+                a = str(alias).strip()
+                if not a:
+                    continue
+                display.append(a)
+                alias_to_sku[_norm_alias(a)] = sku
+        return alias_to_sku, display
+    except Exception as exc:  # noqa: BLE001 -- fail soft; the alias map is additive
+        log.warning("f3e sku-alias map load failed (%s) -- falling back to live resolve", exc)
+        return {}, []
+
+
+def _resolve_sku_alias(product_query: str) -> tuple[str, bool]:
+    """If product_query matches a seeded alias, return (canonical_SKU, True); else
+    (product_query unchanged, False). Deterministic; case/punctuation-insensitive.
+    Ambiguous bare words (variety/original/citrus/...) are deliberately NOT aliased,
+    so they fall through to resolve_variants and get disambiguated."""
+    alias_to_sku, _ = _load_sku_aliases()
+    hit = alias_to_sku.get(_norm_alias(product_query))
+    return (hit, True) if hit else (product_query, False)
+
+
+def _closest_alias(product_query: str) -> str | None:
+    """The nearest seeded alias to a miss, for a 'did you mean ...' suggestion
+    (never auto-applied -- the tool still refuses + won't guess)."""
+    import difflib
+    _, display = _load_sku_aliases()
+    if not display:
+        return None
+    by_norm = {_norm_alias(a): a for a in display}
+    m = difflib.get_close_matches(_norm_alias(product_query), list(by_norm.keys()), n=1, cutoff=0.6)
+    return by_norm[m[0]] if m else None
+
+
+def _load_inventory_channel_config(channel_name: str) -> dict:
+    """Per-channel inventory defaults {default_location, unit} for a channel NAME
+    (keyed by name because channel_id is not reliably threaded to tools). Read fresh
+    (live-reload). FAIL-SOFT: missing/unparseable/unlisted -> {} (no default applied
+    -- a channel default NEVER bypasses the write-location allowlist)."""
+    name = (channel_name or "").strip().lstrip("#").lower()
+    if not name:
+        return {}
+    try:
+        if not _INV_CHANNEL_CFG_PATH.exists():
+            return {}
+        with open(_INV_CHANNEL_CFG_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        for k, v in (data.get("channels") or {}).items():
+            if str(k).strip().lstrip("#").lower() == name and isinstance(v, dict):
+                return v
+        return {}
+    except Exception as exc:  # noqa: BLE001 -- fail soft; no default on error
+        log.warning("inventory channel-config load failed (%s) -- no channel default", exc)
+        return {}
+
+
 def _audit_shopify_write(
     *, slack_user: str, channel: str, variant: str, location: str, old, new: int,
 ) -> None:
@@ -3364,14 +3451,17 @@ def _shopify_write_blocked(user_text: str) -> str:
 
 def _shopify_preview_text(
     *, variant_label: str, location_name: str, current: int, quantity: int,
-    moved_from: int | None = None,
+    moved_from: int | None = None, unit: str = "units",
 ) -> str:
-    """Source-opaque NOT-WRITTEN preview line the net posts to the user."""
+    """Source-opaque NOT-WRITTEN preview line the net posts to the user. `unit`
+    labels the count ('cases' for the office channel) -- the tool NEVER converts;
+    this just makes the number unambiguous and kills the cans/cases wobble."""
+    unit = (unit or "units").strip() or "units"
     moved = (f" The count moved since I checked (now {current}, was {moved_from})."
              if moved_from is not None else "")
     return (
         f"{_NOT_WRITTEN}{moved}\n"
-        f"{variant_label} at {location_name}: {current} -> {quantity} units. "
+        f"{variant_label} at {location_name}: {current} -> {quantity} {unit}. "
         # F-18: a bare in-thread reply may not reach Cora (Path-2 delivery, F-19),
         # so instruct the reliable path -- @mention + confirm -- which pops the
         # (user, channel) pending entry regardless of thread.
@@ -3379,22 +3469,50 @@ def _shopify_preview_text(
     )
 
 
-def _shopify_resolve(slack_user_id: str, input_data: dict):
-    """Validate + resolve the write target (shared by Phase 1 and the Phase-2
-    re-preview). Returns (blocked_str, None) on any stop/ask/refuse, or
-    (None, data) with data=dict(match, loc_id, loc_name, current, quantity)."""
-    quantity_raw = input_data.get("quantity")
-    if quantity_raw is None or str(quantity_raw).strip() == "":
-        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nWhat number should I set the count to?"), None
-    try:
-        quantity = int(quantity_raw)
-    except (TypeError, ValueError):
-        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nGive me a whole number to set the count to."), None
-    if quantity < 0:
-        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nThe count can't be negative -- give me zero or more."), None
+def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = ""):
+    """Validate + resolve ONE write target (shared by Phase 1, the Phase-2
+    re-preview, and each row of a bulk request). Returns (blocked_str, None) on any
+    stop/ask/refuse, or (None, data) with
+    data=dict(match, loc_id, loc_name, current, quantity, delta, unit).
 
+    Accepts either an absolute `quantity` (set to N) OR a `delta` (add/remove N,
+    computed against the freshly-read current, floor-guarded at 0). A channel default
+    location + unit label are applied from inventory-channel-config.yaml when set."""
     product_query = (input_data.get("product") or "").strip()
     location_query = (input_data.get("location") or "").strip()
+
+    # Channel defaults (fail-soft): a default location fills an omitted location and
+    # STILL runs through the allowlist below (never a bypass); unit only labels output.
+    cfg = _load_inventory_channel_config(channel)
+    unit = str(cfg.get("unit") or "units").strip().lower() or "units"
+    if not location_query and cfg.get("default_location"):
+        location_query = str(cfg["default_location"]).strip()
+
+    # quantity XOR delta -- validate now; compute the absolute target after the live read.
+    q_raw = input_data.get("quantity")
+    d_raw = input_data.get("delta")
+    has_q = q_raw is not None and str(q_raw).strip() != ""
+    has_d = d_raw is not None and str(d_raw).strip() != ""
+    if not has_q and not has_d:
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nShould I set the count to a number, or add/remove some?"), None
+    delta = None
+    quantity = None
+    if has_d:
+        try:
+            delta = int(d_raw)
+        except (TypeError, ValueError):
+            return _shopify_write_blocked(f"{_NOT_WRITTEN}\nGive me a whole number to add or remove."), None
+        if delta == 0:
+            return _shopify_write_blocked(f"{_NOT_WRITTEN}\nThat's a change of zero -- nothing to do."), None
+    if has_q:
+        try:
+            quantity = int(q_raw)
+        except (TypeError, ValueError):
+            return _shopify_write_blocked(f"{_NOT_WRITTEN}\nGive me a whole number to set the count to."), None
+        if quantity < 0:
+            return _shopify_write_blocked(f"{_NOT_WRITTEN}\nThe count can't be negative -- give me zero or more."), None
+
     if not product_query:
         return _shopify_write_blocked(f"{_NOT_WRITTEN}\nWhich product or variant should I set? (a name or SKU)"), None
     if not location_query:
@@ -3419,14 +3537,20 @@ def _shopify_resolve(slack_user_id: str, input_data: dict):
             f"overwritten. Manual updates go to: {allowed_display}. Changing {loc_name} is a call "
             f"for Harrison."), None
 
+    # Deterministic-first product resolution: an alias hit rewrites to the canonical
+    # SKU (which resolve_variants treats as authoritative); otherwise the raw query
+    # goes to the live title/fuzzy resolver unchanged. Additive, never a gate.
+    resolved_query, _alias_hit = _resolve_sku_alias(product_query)
     try:
-        matches = shopify_client.resolve_variants(product_query)
+        matches = shopify_client.resolve_variants(resolved_query)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
         log.warning("f3e_shopify_set_inventory variant resolve error user=%s: %s", slack_user_id, exc)
         return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI can't reach inventory right now -- try again in a moment."), None
     if not matches:
+        hint = _closest_alias(product_query)
+        suggest = f" Did you mean \"{hint}\"?" if hint else ""
         return _shopify_write_blocked(
-            f"{_NOT_WRITTEN}\nI couldn't find a product matching '{product_query}'. "
+            f"{_NOT_WRITTEN}\nI couldn't find a product matching '{product_query}'.{suggest} "
             f"Restate the name or give the SKU -- I won't guess."), None
     if len(matches) > 1:
         listing = "; ".join(f"{m.label}" + (f" [SKU {m.sku}]" if m.sku else "") for m in matches[:12])
@@ -3444,6 +3568,17 @@ def _shopify_resolve(slack_user_id: str, input_data: dict):
             f"{_NOT_WRITTEN}\n{match.label} isn't stocked at {loc_name} yet, so I can't set a count "
             f"there -- the item has to be connected to that location first (a call for Harrison)."), None
 
+    # Compute the ABSOLUTE target. A delta applies to the freshly-read current; the
+    # floor guard refuses a change that would go below zero (never a negative set).
+    if delta is not None:
+        target = current + delta
+        if target < 0:
+            return _shopify_write_blocked(
+                f"{_NOT_WRITTEN}\n{match.label} at {loc_name} has {current} {unit}; removing "
+                f"{abs(delta)} would go below zero. The most I can remove is {current}."), None
+    else:
+        target = quantity
+
     # Optional belt-and-suspenders (NEVER a gate, HIGH-1): if the model echoed an
     # expected_item, log a soft normalized-mismatch but PROCEED -- the pending store's
     # server-resolved ids are the identity binding, not the LLM echo.
@@ -3453,7 +3588,7 @@ def _shopify_resolve(slack_user_id: str, input_data: dict):
                  slack_user_id, exp_item, match.label)
 
     return None, {"match": match, "loc_id": loc_id, "loc_name": loc_name,
-                  "current": current, "quantity": quantity}
+                  "current": current, "quantity": target, "delta": delta, "unit": unit}
 
 
 def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
@@ -3461,20 +3596,23 @@ def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
     """Stash the resolved write as the caller's pending confirm + return the
     NOT-WRITTEN preview (WRITE_BLOCKED)."""
     match = data["match"]
+    unit = data.get("unit", "units")
     _store_pending_shopify_write(slack_user_id, channel, {
         "inventory_item_id": match.inventory_item_id,
         "location_id": data["loc_id"],
         "target_qty": data["quantity"],
         "preview_qty": data["current"],
+        "delta": data.get("delta"),   # None for an absolute set; int for add/remove
+        "unit": unit,
         "variant_label": match.label,
         "location_label": data["loc_name"],
         "ts": time.time(),
     })
-    log.info("f3e_shopify_set_inventory PREVIEW user=%s item=%s loc=%s cur=%s -> %s",
-             slack_user_id, match.inventory_item_id, data["loc_id"], data["current"], data["quantity"])
+    log.info("f3e_shopify_set_inventory PREVIEW user=%s item=%s loc=%s cur=%s -> %s (delta=%s)",
+             slack_user_id, match.inventory_item_id, data["loc_id"], data["current"], data["quantity"], data.get("delta"))
     return _shopify_write_blocked(_shopify_preview_text(
         variant_label=match.label, location_name=data["loc_name"],
-        current=data["current"], quantity=data["quantity"], moved_from=moved_from))
+        current=data["current"], quantity=data["quantity"], moved_from=moved_from, unit=unit))
 
 
 def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) -> str:
@@ -3485,6 +3623,8 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     loc_id = pending["location_id"]
     target = int(pending["target_qty"])
     preview_qty = int(pending["preview_qty"])
+    delta = pending.get("delta")
+    unit = pending.get("unit", "units")
     variant_label = pending["variant_label"]
     loc_name = pending["location_label"]
 
@@ -3505,14 +3645,24 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
     if live != preview_qty:
-        # The live number moved between preview and confirm -> re-preview (re-store
-        # a fresh pending so the user can confirm the updated number), NO write.
-        _store_pending_shopify_write(slack_user_id, channel, {**pending, "preview_qty": live, "ts": time.time()})
-        log.info("f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s preview=%s live=%s",
-                 slack_user_id, item_id, preview_qty, live)
+        # The live number moved between preview and confirm -> re-preview (NO write).
+        # For a DELTA op the change re-applies to the fresh count (target = live+delta,
+        # floor-guarded); for an absolute set the target is unchanged.
+        if delta is not None:
+            new_target = live + int(delta)
+            if new_target < 0:
+                _store_pending_shopify_write(slack_user_id, channel, {**pending, "preview_qty": live, "ts": time.time()})
+                return _shopify_write_blocked(
+                    f"{_NOT_WRITTEN}\n{variant_label} at {loc_name} has {live} {unit} now; removing "
+                    f"{abs(int(delta))} would go below zero. The most I can remove is {live}.")
+            target = new_target
+        _store_pending_shopify_write(slack_user_id, channel,
+                                     {**pending, "target_qty": target, "preview_qty": live, "ts": time.time()})
+        log.info("f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s preview=%s live=%s delta=%s",
+                 slack_user_id, item_id, preview_qty, live, delta)
         return _shopify_write_blocked(_shopify_preview_text(
             variant_label=variant_label, location_name=loc_name,
-            current=live, quantity=target, moved_from=preview_qty))
+            current=live, quantity=target, moved_from=preview_qty, unit=unit))
 
     try:
         new_available = shopify_client.set_inventory_level(item_id, loc_id, target)
@@ -3529,7 +3679,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     return (
         f"WRITE_CONFIRMED -- post the line after the blank as your entire response "
         f"(no preamble, no meta-commentary, do not name the store or platform):\n\n"
-        f"DTC inventory updated -- {variant_label} at {loc_name}: {live} -> {new_available} units."
+        f"DTC inventory updated -- {variant_label} at {loc_name}: {live} -> {new_available} {unit}."
     )
 
 
@@ -3543,6 +3693,7 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
     loc_id = pending["location_id"]
     variant_label = pending["variant_label"]
     loc_name = pending["location_label"]
+    unit = pending.get("unit", "units")
     try:
         live = shopify_client.get_inventory_level(item_id, loc_id)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
@@ -3551,15 +3702,17 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
     if live is None:
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
+    # A confirm-turn number is an absolute new target (delta cleared).
     _store_pending_shopify_write(slack_user_id, channel, {
         "inventory_item_id": item_id, "location_id": loc_id, "target_qty": new_qty,
-        "preview_qty": live, "variant_label": variant_label, "location_label": loc_name,
+        "preview_qty": live, "delta": None, "unit": unit,
+        "variant_label": variant_label, "location_label": loc_name,
         "ts": time.time(),
     })
     log.info("f3e_shopify_set_inventory RE-PREVIEW(new target) user=%s item=%s loc=%s cur=%s -> %s",
              slack_user_id, item_id, loc_id, live, new_qty)
     return _shopify_write_blocked(_shopify_preview_text(
-        variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty))
+        variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty, unit=unit))
 
 
 def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -3631,7 +3784,7 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             return _repreview_pending_new_target(slack_user_id, channel, pending, new_qty)
         # No fresh pending (expired / never previewed / a machine restart cleared it)
         # -> resolve fresh and re-preview.
-        blocked, data = _shopify_resolve(slack_user_id, input_data)
+        blocked, data = _shopify_resolve(slack_user_id, input_data, channel=channel)
         if blocked:
             return blocked
         return _store_and_preview_shopify(slack_user_id, channel, data)
