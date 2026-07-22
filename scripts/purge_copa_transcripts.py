@@ -4,8 +4,10 @@ the KB (2026-07-21 Harrison decision; BUILD 2 of the remaining-work kickoff).
 
 These meetings (Fireflies transcripts) live OUTSIDE the copa-bhrf project folder the
 D-086 pass handled, so they are keyed by MEETING TITLE, not path. This is a chunk
-purge + (separately) a forward Fireflies-ingest exclusion (in
-connectors/fireflies_connector via kb_exclusions.is_copa_meeting_title).
+purge + a forward TITLE-based ingest exclusion (kb_exclusions.is_copa_meeting_title)
+wired into BOTH ingest paths so a purge stays DURABLE against re-ingest: Fireflies
+(connectors/fireflies_connector.backfill) AND the Drive meeting-export sources
+drive_sweep/drive_asset (store.upsert_documents Step-0, source-scoped).
 
 MATCH: kb_exclusions.is_copa_meeting_title -- the whole word "copa" (the acronym /
 "Copa Health" / "Copa Model"), case-insensitive. NEVER a bare "copa" LIKE (would hit

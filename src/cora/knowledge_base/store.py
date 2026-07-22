@@ -27,7 +27,7 @@ from .lex_sub_entity import (
     restricted_lex_phi_content_drop,
 )
 from ..finance_doc_classifier import is_financial_document
-from ..kb_exclusions import is_copa_bhrf_path, is_dashboard_store_path
+from ..kb_exclusions import is_copa_bhrf_path, is_copa_meeting_title, is_dashboard_store_path
 
 log = logging.getLogger(__name__)
 
@@ -213,6 +213,14 @@ class KnowledgeBase:
                 or is_dashboard_store_path(meta_path)
                 or is_copa_bhrf_path(doc.source_id)
                 or is_copa_bhrf_path(meta_path)
+                # NDA'd COPA meeting EXPORTS live OUTSIDE copa-bhrf (under
+                # _shared/meetings) and carry no useful path, so key on TITLE -- but
+                # ONLY for the Drive meeting-export sources, so this never drops an
+                # ordinary gmail/asana item that merely mentions Copa. This makes the
+                # Drive-copy COPA purge DURABLE against re-ingest (2026-07-21 BUILD 2,
+                # D-051 fix). Fireflies COPA is excluded earlier in backfill.
+                or (doc.source in ("drive_sweep", "drive_asset")
+                    and is_copa_meeting_title(doc.title))
             ):
                 dropped += 1
                 continue

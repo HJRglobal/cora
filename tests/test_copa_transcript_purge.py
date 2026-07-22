@@ -140,3 +140,62 @@ def test_ingest_exclusion_drops_copa_keeps_unrelated(monkeypatch):
     titles = {d.title for d in docs}
     assert "Virtual Voyager/Copa Model Discussion" not in titles   # COPA dropped
     assert "F3E Weekly Sales Sync" in titles                        # unrelated kept
+
+
+# ── store Step-0 durability guard (D-051 fix: Drive-copy purge stays purged) ────
+from cora.knowledge_base import embeddings as _embeddings   # noqa: E402
+from cora.knowledge_base.store import Document, KnowledgeBase  # noqa: E402
+
+_DIM = 1536
+
+
+def _unit_vec():
+    v = [0.0] * _DIM
+    v[0] = 1.0
+    return v
+
+
+@pytest.fixture
+def kb(tmp_path, monkeypatch):
+    monkeypatch.setattr(_embeddings, "embed_texts", lambda texts: [_unit_vec() for _ in texts])
+    monkeypatch.setattr(_embeddings, "embed_query", lambda q: _unit_vec())
+    db = KnowledgeBase(tmp_path / "kb.db")
+    yield db
+    db.close()
+
+
+def _n(kb, sid):
+    return kb._conn.execute("SELECT COUNT(*) FROM knowledge_chunks WHERE source_id=?", (sid,)).fetchone()[0]
+
+
+class TestStoreForwardExclusion:
+    """The Drive meeting-export sources re-ingest via the nightly Drive sweep, so a
+    Drive-copy COPA purge is only durable if the store chokepoint also drops them by
+    title. Source-scoped so ordinary gmail/asana Copa mentions are NOT affected."""
+
+    def test_drive_asset_copa_title_dropped(self, kb):
+        n = kb.upsert_documents([Document(
+            source="drive_asset", source_id="fa1", entity="FNDR",
+            content="COPA diligence transcript body.",
+            title="Virtual Voyager/Copa Model Discussion transcript 2026 06 10",
+            metadata={"path": "HJR-Founder-OS/_shared/meetings/Fireflies Meetings/Transcripts/x"})])
+        assert n == 0 and _n(kb, "fa1") == 0
+
+    def test_drive_sweep_copa_title_dropped(self, kb):
+        n = kb.upsert_documents([Document(
+            source="drive_sweep", source_id="fs1", entity="FNDR",
+            content="COPA meeting content.", title="Virtual Voyager/Copa Model Discussion")])
+        assert n == 0 and _n(kb, "fs1") == 0
+
+    def test_gmail_copa_mention_kept(self, kb):
+        # source-scoped: an ordinary gmail item mentioning Copa is NOT dropped
+        n = kb.upsert_documents([Document(
+            source="gmail", source_id="gm1", entity="HJRG",
+            content="Notes from the Copa Health call.", title="Copa Health follow-up")])
+        assert n > 0 and _n(kb, "gm1") > 0
+
+    def test_asana_copa_mention_kept(self, kb):
+        n = kb.upsert_documents([Document(
+            source="asana", source_id="as1", entity="HJRG",
+            content="Coordinate questions for Copa and UHC.", title="Copa/UHC diligence prep")])
+        assert n > 0 and _n(kb, "as1") > 0
