@@ -3644,18 +3644,23 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     if live is None:
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
+    # A DELTA op re-applies to the FRESH live count on EVERY confirm (never a stale
+    # absolute) and re-runs the floor guard HERE -- so a downward drift after a prior
+    # floor-refuse can never slip a stale target past the guard (D-051 fix). An
+    # absolute set keeps its previewed target.
+    if delta is not None:
+        target = live + int(delta)
+        if target < 0:
+            # Keep preview_qty STALE (do not advance to live) so the next confirm still
+            # re-runs this guard; never leave a writable stale target behind.
+            _store_pending_shopify_write(slack_user_id, channel, {**pending, "ts": time.time()})
+            return _shopify_write_blocked(
+                f"{_NOT_WRITTEN}\n{variant_label} at {loc_name} has {live} {unit} now; removing "
+                f"{abs(int(delta))} would go below zero. The most I can remove is {live}.")
+
     if live != preview_qty:
-        # The live number moved between preview and confirm -> re-preview (NO write).
-        # For a DELTA op the change re-applies to the fresh count (target = live+delta,
-        # floor-guarded); for an absolute set the target is unchanged.
-        if delta is not None:
-            new_target = live + int(delta)
-            if new_target < 0:
-                _store_pending_shopify_write(slack_user_id, channel, {**pending, "preview_qty": live, "ts": time.time()})
-                return _shopify_write_blocked(
-                    f"{_NOT_WRITTEN}\n{variant_label} at {loc_name} has {live} {unit} now; removing "
-                    f"{abs(int(delta))} would go below zero. The most I can remove is {live}.")
-            target = new_target
+        # The live number moved between preview and confirm -> re-preview (NO write);
+        # `target` already reflects the fresh count for a delta op.
         _store_pending_shopify_write(slack_user_id, channel,
                                      {**pending, "target_qty": target, "preview_qty": live, "ts": time.time()})
         log.info("f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s preview=%s live=%s delta=%s",
@@ -3742,6 +3747,48 @@ def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: 
     return "\n".join(lines)
 
 
+def _dedup_batch_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Collapse duplicate (inventory_item_id, location_id) rows so a batch never
+    issues two conflicting ABSOLUTE writes to the same variant+location (which would
+    silently last-write-clobber -- D-051 fix). Pure-delta duplicates SUM into one net
+    row (floor-checked against the shared current); a group that mixes an absolute set
+    with anything else is refused as ambiguous. Returns (deduped_rows, extra_skipped)."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for r in rows:
+        key = (r["inventory_item_id"], r["location_id"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    out: list[dict] = []
+    skipped: list[dict] = []
+    for key in order:
+        grp = groups[key]
+        if len(grp) == 1:
+            out.append(grp[0])
+            continue
+        base = grp[0]
+        unit = base.get("unit", "units")
+        if any(g.get("delta") is None for g in grp):
+            skipped.append({"product": base["variant_label"],
+                            "reason": "listed more than once with a conflicting set/adjust -- restate as one line"})
+            continue
+        net = sum(int(g["delta"]) for g in grp)
+        cur = int(base["preview_qty"])
+        if net == 0:
+            skipped.append({"product": base["variant_label"],
+                            "reason": "the adjustments cancel out (net change 0)"})
+            continue
+        target = cur + net
+        if target < 0:
+            skipped.append({"product": base["variant_label"],
+                            "reason": f"only {cur} {unit} on hand -- the net removal is too large"})
+            continue
+        out.append({**base, "delta": net, "target_qty": target})
+    return out, skipped
+
+
 def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) -> str:
     """Phase 1 (bulk): resolve every requested row through the SAME _shopify_resolve
     (so each row gets server-resolved ids + a live current + the alias/allowlist/
@@ -3777,6 +3824,11 @@ def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) ->
             "variant_label": m.label,
             "location_label": data["loc_name"],
         })
+
+    # Fold/refuse duplicate (item, location) rows so two rows for one variant can't
+    # last-write-clobber each other (D-051 fix).
+    resolved, dup_skipped = _dedup_batch_rows(resolved)
+    skipped.extend(dup_skipped)
 
     if not resolved:
         detail = "\n".join(f"  - {sk['product']}: {sk['reason']}" for sk in skipped)

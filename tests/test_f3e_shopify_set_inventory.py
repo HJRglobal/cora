@@ -567,6 +567,18 @@ class TestDelta:
             assert r.startswith("WRITE_BLOCKED") and "197" in r and "moved" in r.lower()
             m_set.assert_not_called()
 
+    def test_delta_floor_refuse_does_not_write_stale_on_reconfirm(self):
+        # D-051 fix: a remove that floors after a DOWNWARD drift must keep refusing on
+        # re-confirm -- it must NOT fall through and write the stale preview-time target.
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[20, 10, 10])   # preview 20; confirm reads 10, 10
+            _preview(product="pure original 12", location="office", delta=-13)  # 20 -> 7
+            r1 = _confirm()   # live 10 -> 10-13<0 -> floor refuse
+            assert r1.startswith("WRITE_BLOCKED") and "below zero" in r1
+            r2 = _confirm()   # live 10 again -> MUST re-refuse, not write stale 7
+            assert r2.startswith("WRITE_BLOCKED") and "below zero" in r2
+            m_set.assert_not_called()
+
 
 # ── channel-scoped defaults (location + unit=cases) ─────────────────────────────
 
@@ -695,3 +707,34 @@ class TestBulk:
             r2 = _confirm(_channel_name=_HQ)
             assert r2.startswith("WRITE_CONFIRMED") and m_set.call_count == 1
             assert m_set.call_args_list[0].args[2] == 5
+
+    def test_duplicate_item_delta_rows_fold_net(self):
+        # D-051 fix: two delta rows for the SAME item+location fold to one net write
+        # (never two clobbering absolute sets). +12 then -3 on current 100 -> net 109.
+        vmap = _vmap()
+        with ExitStack() as s:
+            m_set = _stub(s, current=100, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            items = [{"product": "original energy 12 pack", "delta": 12},  # alias -> F3-Original
+                     {"product": "F3-Original", "delta": -3}]              # SKU -> same item
+            r = _preview(_channel_name=_HQ, items=items)
+            assert "100 -> 109" in r          # ONE folded line (net +9), not two
+            r2 = _confirm(_channel_name=_HQ)
+            assert r2.startswith("WRITE_CONFIRMED") and m_set.call_count == 1
+            assert m_set.call_args_list[0].args[2] == 109
+
+    def test_duplicate_item_mixed_set_and_delta_refused(self):
+        # D-051 fix: an absolute set + a delta for the same item+location is ambiguous
+        # -> refused (never last-write-wins).
+        vmap = _vmap()
+        with ExitStack() as s:
+            m_set = _stub(s, current=100, chan_cfg={"default_location": _OFFICE, "unit": "cases"})
+            s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                         side_effect=lambda q: [vmap[q]] if q in vmap else []))
+            items = [{"product": "original energy 12 pack", "quantity": 50},
+                     {"product": "F3-Original", "delta": -3}]
+            r = _preview(_channel_name=_HQ, items=items)
+            assert r.startswith("WRITE_BLOCKED") and "restate" in r.lower()
+            assert not has_pending_shopify_write(_ALEX, _HQ)
+            m_set.assert_not_called()
