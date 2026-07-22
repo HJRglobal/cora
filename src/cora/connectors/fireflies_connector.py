@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from cora.kb_exclusions import is_copa_meeting_title
 from cora.knowledge_base.store import Document
 
 log = logging.getLogger(__name__)
@@ -869,10 +870,20 @@ def backfill(since: datetime) -> Iterator[Document]:
     skipped_phi = 0
     skipped_empty = 0
     skipped_lex_excluded = 0
+    skipped_copa = 0
     for t in winners:
         title = (t.get("title") or "").strip()
         if not title:
             skipped_empty += 1
+            continue
+
+        # NDA hard-exclude (2026-07-21): the LBHS-COPA / Copa Health M&A-diligence
+        # meetings must NEVER enter the KB (matched by title; retroactively purged by
+        # scripts/purge_copa_transcripts.py). Fail-safe direction -- exclude on match,
+        # before any entity/PHI classification.
+        if is_copa_meeting_title(title):
+            skipped_copa += 1
+            log.info("COPA NDA hard-exclude from KB: %r", title)
             continue
 
         entity = _classify_entity(title)
@@ -940,8 +951,9 @@ def backfill(since: datetime) -> Iterator[Document]:
 
     log.info(
         "Fireflies backfill done: %d transcripts yielded, %d skipped for PHI, "
-        "%d LEX program/client hard-excluded from KB, %d skipped empty",
-        transcript_count, skipped_phi, skipped_lex_excluded, skipped_empty,
+        "%d LEX program/client hard-excluded from KB, %d COPA NDA hard-excluded, "
+        "%d skipped empty",
+        transcript_count, skipped_phi, skipped_lex_excluded, skipped_copa, skipped_empty,
     )
 
 
