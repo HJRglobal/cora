@@ -139,6 +139,24 @@ def is_copa_bhrf_path(path_or_source_id: str) -> bool:
     return bool(segs & _LEX_NDA_SEGMENTS)
 
 
+# The NDA'd LBHS-COPA / Copa Health M&A-diligence MEETINGS (Fireflies transcripts +
+# their Drive copies) live OUTSIDE the copa-bhrf project folder, so is_copa_bhrf_path
+# (path-segment) can't catch them -- they are keyed by MEETING TITLE. Anchor on the
+# whole word "copa" (the acronym / "Copa Health" / "Copa Model"); NEVER a bare
+# "voyager" (Lexington's fleet Chrysler Voyager minivans collide with it across the
+# corpus) and NEVER a "copa" substring (Maricopa / copayment / copacker are spared by
+# the word boundary). Used by BOTH the one-time purge (scripts/purge_copa_transcripts)
+# and the forward Fireflies-ingest exclusion.
+_COPA_MEETING_TITLE_RE = re.compile(r"\bcopa\b", re.IGNORECASE)
+
+
+def is_copa_meeting_title(title: str) -> bool:
+    """True if a meeting/transcript TITLE names the NDA'd COPA diligence (whole-word
+    'copa', case-insensitive). Excludes Maricopa/copayment/copacker (word boundary)
+    and bare 'Voyager' (the fleet minivan). Empty/None -> False."""
+    return bool(_COPA_MEETING_TITLE_RE.search(str(title or "")))
+
+
 def folder_ids_excluded(
     parents: list[str] | None, folder_set: frozenset[str] | set[str] | None = None
 ) -> bool:
