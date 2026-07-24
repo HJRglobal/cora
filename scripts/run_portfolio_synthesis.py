@@ -79,12 +79,16 @@ def main() -> int:
     if args.dry_run:
         print("\n===== PORTFOLIO SYNTHESIS (DRY RUN) =====\n")
         print(result["body"])
+        print("\n===== FOUNDER-OS MARKDOWN (would write to "
+              "00-Founder/_daily-synthesis/YYYY-MM/) =====\n")
+        print(result.get("founder_os_md") or "(none)")
         print("\n===== FACT BASE =====\n")
         print(result["facts"])
 
     log.info("portfolio_synthesis result: scope=%s synthesized=%s delivered=%s "
-             "first_run=%s", result["scope"], result["synthesized"],
-             result["delivered"], result["first_run"])
+             "first_run=%s founder_os=%s", result["scope"], result["synthesized"],
+             result["delivered"], result["first_run"],
+             result.get("founder_os_path"))
     # Nonzero on a real (non-dry-run) post failure so Task Scheduler surfaces a
     # silent no-post instead of always reading success.
     return 0 if (args.dry_run or result["delivered"]) else 1

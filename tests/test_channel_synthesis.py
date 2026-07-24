@@ -1112,3 +1112,142 @@ class TestSourcePostSites:
         assert src.count("chat_postMessage") == 1
         assert src.count("conversations_open") == 1
         assert 'HARRISON_SLACK_ID = "U0B2RM2JYJ1"' in src
+
+
+# ---------------------------------------------------------------------------
+# Slice 1: portfolio synthesis persisted to Founder OS at generation
+# ---------------------------------------------------------------------------
+
+# A realistic run_synthesis body: deterministic date header + Slack-bold section
+# headers + a Needs-Harrison bullet list with inline bold. 2026-07-23 is Thursday.
+_SYNTH_BODY = (
+    "*Thursday, 2026-07-23*\n\n"
+    "*Portfolio pulse*\n"
+    "Portfolio closed at $533,876, down $472,266 WoW.\n\n"
+    "*Cash*\n"
+    "F3 Energy: -$147,318. One Stop Nutrition: $31,578.\n\n"
+    "*Needs Harrison*\n"
+    "- *[P0] HJRG:* AI Email Tracker exposure -- delete or resolve.\n"
+    "- *[P1] UFL:* Pivot announcement -- schedule CAA call."
+)
+
+
+class TestDailySynthesisRender:
+    def test_title_and_frame(self):
+        md = cs.render_daily_synthesis_md(_SYNTH_BODY, date(2026, 7, 23))
+        # Title matches the harvester: "# Daily Portfolio Synthesis — Thursday, 2026-07-23"
+        assert md.splitlines()[0] == (
+            "# Daily Portfolio Synthesis — Thursday, 2026-07-23")
+        assert "knowledge-persistence-doctrine.md" in md   # provenance preamble
+        assert md.count("\n---\n") == 2                     # two rule separators
+        assert md.rstrip().endswith("(write-at-generation)._")
+
+    def test_section_headers_converted_to_h2(self):
+        md = cs.render_daily_synthesis_md(_SYNTH_BODY, date(2026, 7, 23))
+        assert "## Portfolio pulse" in md
+        assert "## Cash" in md
+        assert "## Needs Harrison" in md
+        # Slack single-asterisk section headers do NOT survive as-is.
+        assert "*Portfolio pulse*" not in md
+
+    def test_date_header_stripped_not_duplicated(self):
+        md = cs.render_daily_synthesis_md(_SYNTH_BODY, date(2026, 7, 23))
+        # The date appears only in the title line, never again as a body line.
+        assert md.count("2026-07-23") == 2  # title + footer "Written 2026-07-23"
+        assert "*Thursday, 2026-07-23*" not in md
+
+    def test_inline_bold_becomes_markdown(self):
+        import re as _re
+        md = cs.render_daily_synthesis_md(_SYNTH_BODY, date(2026, 7, 23))
+        assert "- **[P0] HJRG:** AI Email Tracker exposure" in md
+        assert "- **[P1] UFL:** Pivot announcement" in md
+        # No lone single-asterisk bold survives (every * is part of a ** pair).
+        assert _re.search(r"(?<!\*)\*(?!\*)", md) is None
+
+    def test_fallback_body_renders(self):
+        # A deterministic fallback body (no clean section headers) still renders
+        # a valid file without raising.
+        body = "*Wednesday, 2026-07-08*\n\nSYNTHESIS UNAVAILABLE -- factual rollup."
+        md = cs.render_daily_synthesis_md(body, date(2026, 7, 8))
+        assert md.startswith("# Daily Portfolio Synthesis — Wednesday, 2026-07-08")
+        assert "SYNTHESIS UNAVAILABLE" in md
+
+
+class TestDailySynthesisPath:
+    def test_month_foldered_convention(self, tmp_path):
+        p = cs._daily_synthesis_path(date(2026, 7, 23), root=tmp_path)
+        assert p.parent.name == "2026-07"
+        assert p.parent.parent.name == "_daily-synthesis"
+        assert p.parent.parent.parent.name == "00-Founder"
+        assert p.name == "2026-07-23_fndr_daily-synthesis.md"
+
+    def test_root_env_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path))
+        p = cs._daily_synthesis_path(date(2026, 7, 23))
+        assert str(tmp_path) in str(p)
+
+
+class TestDailySynthesisPersist:
+    def test_writes_file(self, tmp_path):
+        md = cs.render_daily_synthesis_md(_SYNTH_BODY, date(2026, 7, 23))
+        path = cs.persist_daily_synthesis(md, date(2026, 7, 23), root=tmp_path)
+        assert path is not None and path.exists()
+        assert path.read_text(encoding="utf-8") == md
+
+    def test_fail_soft_returns_none_never_raises(self, tmp_path, monkeypatch):
+        import cora.drive_io as dio
+
+        def boom(*a, **k):
+            raise dio.DriveUnavailable("G: gone")
+        monkeypatch.setattr(dio, "write_text_atomic", boom)
+        # Must not raise; returns None.
+        assert cs.persist_daily_synthesis("x", date(2026, 7, 23), root=tmp_path) is None
+
+
+class TestRunPortfolioPersist:
+    def _wire(self, tmp_path, monkeypatch, *, slack_ok=True):
+        monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "syn"))
+        monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path / "fos"))
+        monkeypatch.setattr(sm, "gather_all", lambda today=None: _pgathered())
+        monkeypatch.setattr(cs, "synthesize_channel_portfolio",
+                            lambda f: "*Portfolio pulse*\nAll steady.")
+        import slack_sdk
+        monkeypatch.setattr(slack_sdk, "WebClient",
+                            _FakeClient if slack_ok else _BoomClient)
+        _FakeClient.last = {}
+
+    def test_real_run_persists_founder_os_file(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch)
+        out = cs.run_portfolio(dry_run=False, today=date(2026, 7, 23))
+        assert out["delivered"] is True
+        assert out["founder_os_path"] is not None
+        assert out["founder_os_path"].exists()
+        assert "## Portfolio pulse" in out["founder_os_path"].read_text(encoding="utf-8")
+
+    def test_dry_run_writes_no_file_but_previews_md(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch)
+        out = cs.run_portfolio(dry_run=True, today=date(2026, 7, 23))
+        assert out["founder_os_path"] is None
+        assert out["founder_os_md"] and "## Portfolio pulse" in out["founder_os_md"]
+        # write-nothing dry-run invariant: no file under the founder-os root.
+        fos = tmp_path / "fos"
+        assert not fos.exists() or not any(fos.rglob("*.md"))
+
+    def test_write_failure_does_not_affect_delivery(self, tmp_path, monkeypatch):
+        """Acceptance 1: a simulated Founder-OS write failure must NOT break the
+        Slack post -- delivery already happened and persist is fail-soft."""
+        self._wire(tmp_path, monkeypatch)
+        import cora.drive_io as dio
+        monkeypatch.setattr(dio, "write_text_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+        out = cs.run_portfolio(dry_run=False, today=date(2026, 7, 23))
+        assert out["delivered"] is True          # post unaffected
+        assert out["founder_os_path"] is None     # write failed, degraded soft
+
+
+class TestPortfolioRunnerPersistWiring:
+    def test_runner_surfaces_founder_os(self):
+        src = (_REPO_ROOT / "scripts" / "run_portfolio_synthesis.py").read_text(
+            encoding="utf-8")
+        assert "founder_os_md" in src
+        assert "_daily-synthesis" in src
