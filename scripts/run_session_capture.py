@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
                    help="Cap sessions processed this run (default 50).")
     p.add_argument("--with-kb", action="store_true",
                    help="Also ingest each note into the KB immediately (idempotent).")
+    p.add_argument("--no-cowork", action="store_true",
+                   help="Skip the Cowork desktop store; harvest only ~/.claude/projects "
+                        "Code sessions.")
+    p.add_argument("--max-cowork-sessions", type=int, default=None,
+                   help="Cap Cowork sessions processed this run (default = --max-sessions).")
     return p.parse_args()
 
 
@@ -68,8 +73,8 @@ def main() -> int:
     args = parse_args()
     log = _setup_logging()
     log.info("=" * 60)
-    log.info("Session capture starting (dry_run=%s lookback=%dh)",
-             args.dry_run, args.lookback_hours)
+    log.info("Session capture starting (dry_run=%s lookback=%dh cowork=%s)",
+             args.dry_run, args.lookback_hours, not args.no_cowork)
 
     kb = None
     if args.with_kb and not args.dry_run:
@@ -85,6 +90,8 @@ def main() -> int:
         dry_run=args.dry_run,
         with_kb=args.with_kb,
         kb=kb,
+        include_cowork=not args.no_cowork,
+        max_cowork_sessions=args.max_cowork_sessions,
     )
 
     captured = [r for r in results if r.distilled and r.note_path]

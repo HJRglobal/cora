@@ -18,9 +18,13 @@ Locked decisions (Universal Session Capture spec, 2026-06-09):
   4. PHI storage is LEX-scoped + entity-tagged so the KB's existing
      sibling_guard / cross_entity_guard / lex_phi_access gate keep it scoped.
 
-Scope (confirmed reachable): Claude Code transcripts on this machine. The
-Claude Desktop Cowork store is a separate, undocumented location and is NOT
-harvested here — those sessions rely on the session-end self-capture doctrine.
+Scope: Claude Code transcripts on this machine (~/.claude/projects) AND the
+Claude Desktop Cowork store (agent-mode transcripts, opt-in via harvest's
+include_cowork; the runner enables it). The Cowork store was located on disk
+2026-07-23: standard Agent-SDK JSONL under %LOCALAPPDATA%/Packages/*laude*/
+LocalCache/Roaming/Claude/local-agent-mode-sessions/<ws>/<agent>/local_<uuid>/
+.claude/projects/<slug>/<inner>.jsonl. Cowork captures share this pipeline
+(distill / entity-tag / PHI->LEX / ledger dedup with a "cowork:" key prefix).
 
 Entity routing rule: Haiku classifies which business the session is ABOUT
 (default = the cwd's entity). If real PHI patterns are present, the note is
@@ -92,6 +96,7 @@ VALID_ENTITIES: frozenset[str] = frozenset(ENTITY_FOLDERS) | frozenset(
 )
 
 SURFACE = "code-session"
+SURFACE_COWORK = "cowork-session"
 
 # Don't harvest a session whose last activity is younger than this — it may
 # still be live; let it settle so we capture the finished conversation.
@@ -101,6 +106,11 @@ SETTLE_MINUTES = 30
 # bounds what we hand Haiku. Higher for PHI/LEX so nothing material is dropped.
 _MAX_INPUT_CHARS = 24_000
 _MAX_INPUT_CHARS_PHI = 60_000
+
+# Bound accumulated turn-text while MERGING a Cowork session's transcript(s).
+# The desktop store is ~2 GB with multi-MB transcripts; distill truncates to
+# _MAX_INPUT_CHARS_PHI regardless, so reading past this is wasted work.
+_COWORK_MAX_TEXT_CHARS = _MAX_INPUT_CHARS_PHI + 4_000
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 LEDGER_PATH = _REPO_ROOT / "logs" / "session-captures.jsonl"
@@ -281,6 +291,195 @@ def _is_noise_turn(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cowork desktop store (Claude Desktop agent-mode transcripts)
+# ---------------------------------------------------------------------------
+# The desktop app writes standard Agent-SDK JSONL transcripts under
+#   %LOCALAPPDATA%/Packages/*laude*/LocalCache/Roaming/Claude/
+#     local-agent-mode-sessions/<ws>/<agent>/local_<uuid>/.claude/projects/<slug>/<inner>.jsonl
+# (validated on disk 2026-07-23). The sibling `claude-code-sessions` tree holds
+# only per-session UI-state JSON (title/metadata); its local_<uuid> ids are
+# DISJOINT from the agent-mode ids, so the agent-mode transcript is the harvest
+# unit -- it is where the actual conversation lives. Each agent-mode session dir
+# is one capture; its top-level transcript(s) are merged (resumes), deduped by
+# message uuid, `type:"result"` summary lines skipped, and text-bounded.
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _discover_cowork_roots() -> list[Path]:
+    """Discover the Cowork agent-mode transcript root(s) WITHOUT hardcoding the
+    package hash. Honors COWORK_SESSIONS_ROOT (a single explicit root, for tests
+    / relocation). Never raises."""
+    override = os.environ.get("COWORK_SESSIONS_ROOT", "").strip()
+    if override:
+        return [Path(override)]
+    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_appdata:
+        return []
+    roots: list[Path] = []
+    try:
+        for pkg in (Path(local_appdata) / "Packages").glob("*laude*"):
+            root = (pkg / "LocalCache" / "Roaming" / "Claude"
+                    / "local-agent-mode-sessions")
+            if root.exists():
+                roots.append(root)
+    except OSError:
+        pass
+    return roots
+
+
+def iter_cowork_session_dirs(roots: list[Path]) -> Iterator[Path]:
+    """Yield agent-mode session dirs (``local_<uuid>`` holding a ``.claude/projects``)
+    across every workspace/agent guid under each root. Fail-soft per level."""
+    for root in roots:
+        try:
+            ws_dirs = [w for w in root.iterdir() if w.is_dir()]
+        except OSError:
+            continue
+        for ws in ws_dirs:
+            try:
+                agent_dirs = [a for a in ws.iterdir() if a.is_dir()]
+            except OSError:
+                continue
+            for agent in agent_dirs:
+                try:
+                    sess_dirs = [s for s in agent.iterdir() if s.is_dir()]
+                except OSError:
+                    continue
+                for sess in sess_dirs:
+                    if not sess.name.startswith("local_"):
+                        continue
+                    if (sess / ".claude" / "projects").exists():
+                        yield sess
+
+
+def _cowork_transcripts_for(session_dir: Path) -> list[Path]:
+    """Top-level agent-mode transcripts for a session dir, oldest-first.
+
+    Uses ``projects/*/*.jsonl`` (the observed ``<slug>/<inner>.jsonl`` depth) so
+    the subagent subtree is never descended -- cheap and bounded on the 2 GB
+    store. Belt-and-suspenders skip of any subagents / mcp-logs path segment."""
+    proj = session_dir / ".claude" / "projects"
+    out: list[Path] = []
+    try:
+        for tf in proj.glob("*/*.jsonl"):
+            parts = tf.parts
+            if "subagents" in parts or any("mcp-logs" in p for p in parts):
+                continue
+            out.append(tf)
+    except OSError:
+        return []
+    out.sort(key=_safe_mtime)
+    return out
+
+
+def parse_cowork_session(session_dir: Path,
+                         transcripts: list[Path] | None = None) -> ParsedSession | None:
+    """Parse a Cowork agent-mode session dir into a ParsedSession.
+
+    Merges the dir's top-level transcript(s) in mtime order, DEDUPES by message
+    ``uuid`` (resumed transcripts repeat ids), SKIPS ``type:"result"`` summary
+    entries (duplicates of per-message data), bounds accumulated turn-text for
+    the ~2 GB store, and falls back to file mtime for last-activity when
+    per-message timestamps are absent. ``session_id`` = the dir name
+    (``local_<uuid>``), the stable Cowork session id."""
+    if transcripts is None:
+        transcripts = _cowork_transcripts_for(session_dir)
+    if not transcripts:
+        return None
+
+    cwd: str | None = None
+    first_ts: str | None = None
+    last_ts: str | None = None
+    last_epoch = 0.0
+    turns: list[str] = []
+    n_turns = 0
+    seen_uuids: set[str] = set()
+    total_chars = 0
+    done = False
+
+    for tf in transcripts:
+        last_epoch = max(last_epoch, _safe_mtime(tf))
+        if done:
+            continue
+        try:
+            with open(tf, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "result":
+                        continue  # session-summary duplicate
+                    if d.get("cwd") and not cwd:
+                        cwd = d["cwd"]
+                    ts = d.get("timestamp")
+                    if ts:
+                        if first_ts is None:
+                            first_ts = ts
+                        last_ts = ts
+                    uid = d.get("uuid")
+                    if uid is not None:
+                        if uid in seen_uuids:
+                            continue  # resumed-session duplicate message
+                        seen_uuids.add(uid)
+                    if d.get("type") not in ("user", "assistant"):
+                        continue
+                    msg = d.get("message")
+                    if isinstance(msg, dict) and msg.get("role") in ("user", "assistant"):
+                        text = _extract_text(msg.get("content"))
+                        if text and not _is_noise_turn(text):
+                            turns.append(f"{msg['role'].upper()}: {text}")
+                            n_turns += 1
+                            total_chars += len(text)
+                            if total_chars >= _COWORK_MAX_TEXT_CHARS:
+                                done = True
+                                break
+        except OSError as exc:
+            log.warning("session_capture: cannot read cowork transcript %s: %s", tf, exc)
+            continue
+
+    if n_turns == 0:
+        return None
+    last_epoch = _iso_to_epoch(last_ts) or last_epoch
+    return ParsedSession(
+        session_id=session_dir.name,
+        path=session_dir,
+        cwd=cwd,
+        last_activity_epoch=last_epoch,
+        started_iso=first_ts,
+        ended_iso=last_ts,
+        text="\n\n".join(turns),
+        n_turns=n_turns,
+    )
+
+
+# A Cowork agent-mode session launched by a Windows scheduled task opens with a
+# harness-injected first user turn: `<scheduled-task name="..." file="...">`.
+# ~Half of the in-window Cowork sessions are such automation runs (validated on
+# the live store 2026-07-23) -- including the two tasks this capture RETIRES --
+# and their distilled notes would be pure automation noise. Skip them (Cowork
+# only; the Code path is unchanged). Keyed on the START of the first turn so a
+# normal chat that merely mentions the tag is never mistaken for one.
+_SCHEDULED_TASK_MARKER = "<scheduled-task"
+
+
+def _is_scheduled_task_session(session: ParsedSession) -> bool:
+    text = session.text.lstrip()
+    if text.startswith("USER: "):
+        text = text[len("USER: "):].lstrip()
+    return text.startswith(_SCHEDULED_TASK_MARKER)
+
+
+# ---------------------------------------------------------------------------
 # Entity inference
 # ---------------------------------------------------------------------------
 
@@ -394,7 +593,7 @@ def _parse_distilled(raw: str, default_entity: str) -> dict[str, Any] | None:
 
 
 def render_note(distilled: dict[str, Any], session: ParsedSession,
-                date_str: str, phi: bool) -> str:
+                date_str: str, phi: bool, *, surface: str = SURFACE) -> str:
     """Render the distilled session into the locked note schema."""
     def _bullets(items: list[str]) -> str:
         if not items:
@@ -402,7 +601,7 @@ def render_note(distilled: dict[str, Any], session: ParsedSession,
         return "\n".join(f"  - {it}" for it in items)
 
     entity = distilled["entity"]
-    header = f"## {date_str} — {SURFACE} — {entity} — {distilled['topic']}"
+    header = f"## {date_str} — {surface} — {entity} — {distilled['topic']}"
     phi_line = "- PHI: yes (LEX-scoped, access-controlled)\n" if phi else ""
     return (
         f"{header}\n\n"
@@ -418,13 +617,17 @@ def render_note(distilled: dict[str, Any], session: ParsedSession,
 
 
 def note_path_for(entity: str, when: datetime, session_id: str,
-                  root: Path = FOUNDER_OS_ROOT) -> Path:
+                  root: Path = FOUNDER_OS_ROOT, *, surface: str = SURFACE) -> Path:
     """Compute the .md path: <root>/<folder>/_session-captures/YYYY-MM/<file>."""
     folder = entity_folder(entity)
     month = when.strftime("%Y-%m")
     date = when.strftime("%Y-%m-%d")
-    short = session_id[:8] if session_id else uuid.uuid4().hex[:8]
-    fname = f"{date}_{SURFACE}_{short}.md"
+    # session_id may be a ledger-prefixed / "local_"-prefixed id; strip both so
+    # the filename short is the clean transcript-id head, unique per session.
+    clean = session_id.split(":", 1)[-1]
+    clean = clean[len("local_"):] if clean.startswith("local_") else clean
+    short = clean[:8] if clean else uuid.uuid4().hex[:8]
+    fname = f"{date}_{surface}_{short}.md"
     return root / folder / "_session-captures" / month / fname
 
 
@@ -471,6 +674,85 @@ def _now_epoch() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
+def _finalize_capture(
+    session: ParsedSession, *, surface: str, ledger_key: str,
+    captured: set[str], dry_run: bool, with_kb: bool,
+    founder_os_root: Path, ledger_path: Path,
+    anthropic_client: Any, kb: Any,
+) -> CaptureResult:
+    """Distill -> entity-tag -> PHI-route -> write -> ledger for one parsed
+    session. Shared by the Code and Cowork harvest loops so PHI routing, the
+    fail-closed distill skip, the fail-soft G: write, and dedup are IDENTICAL
+    on both paths. ``ledger_key`` (Code: raw id; Cowork: ``cowork:<id>``) is the
+    dedup + ledger key; ``session.session_id`` remains the clean id shown in the
+    note + filename."""
+    phi = phi_guard.is_phi_risk(session.text)
+    default_entity = entity_from_cwd(session.cwd)
+
+    distilled = distill(session.text, default_entity, phi=phi, client=anthropic_client)
+    if distilled is None:
+        # Fail-closed: do not write, do not mark captured — retry next run.
+        return CaptureResult(
+            session_id=session.session_id, entity=default_entity,
+            note_path=None, phi=phi, distilled=False,
+            skipped_reason="distill_failed",
+        )
+
+    entity = distilled["entity"]
+    # PHI present -> force into the LEX-scoped, access-controlled store.
+    if phi:
+        entity = "LEX" if not entity.startswith("LEX") else entity
+        distilled["entity"] = entity
+
+    when = datetime.now(timezone.utc)
+    npath = note_path_for(entity, when, session.session_id,
+                          root=founder_os_root, surface=surface)
+    note = render_note(distilled, session, when.strftime("%Y-%m-%d"), phi, surface=surface)
+
+    result = CaptureResult(
+        session_id=session.session_id, entity=entity, note_path=npath,
+        phi=phi, distilled=True,
+        meta={"topic": distilled["topic"], "n_turns": session.n_turns,
+              "surface": surface},
+    )
+
+    if dry_run:
+        log.info("[DRY] would write %s (entity=%s phi=%s surface=%s)",
+                 npath, entity, phi, surface)
+        captured.add(ledger_key)
+        return result
+
+    try:
+        # G: write, atomic + timeout-bounded (make_parents creates the YYYY-MM dir).
+        # A transient unmount raises drive_io.DriveUnavailable (an OSError, caught
+        # here -> this session is skipped + retries next run) instead of hanging the
+        # nightly capture process.
+        drive_io.write_text_atomic(npath, note, encoding="utf-8")
+    except OSError as exc:
+        log.error("session_capture: failed writing %s: %s", npath, exc)
+        result.skipped_reason = "write_failed"
+        result.note_path = None
+        return result
+
+    if with_kb and kb is not None:
+        _ingest_note(kb, npath, entity, distilled, session, founder_os_root,
+                     content=note, when=when)
+
+    append_ledger({
+        "session_id": ledger_key,
+        "entity": entity,
+        "phi": phi,
+        "note_path": str(npath),
+        "topic": distilled["topic"],
+        "surface": surface,
+        "captured_at": when.isoformat(),
+    }, ledger_path)
+    captured.add(ledger_key)
+    log.info("Captured session %s -> %s (entity=%s phi=%s surface=%s)",
+             ledger_key, npath.name, entity, phi, surface)
+    return result
+
+
 def harvest(
     *,
     lookback_hours: int = 24,
@@ -482,15 +764,27 @@ def harvest(
     ledger_path: Path = LEDGER_PATH,
     anthropic_client: Any = None,
     kb: Any = None,
+    include_cowork: bool = False,
+    cowork_roots: list[Path] | None = None,
+    max_cowork_sessions: int | None = None,
 ) -> list[CaptureResult]:
-    """Harvest un-captured sessions in the lookback window. Returns results."""
+    """Harvest un-captured sessions in the lookback window. Returns results.
+
+    Two sources, each with its own budget so neither starves the other:
+      * Code sessions under ``projects_root`` (~/.claude/projects).
+      * Cowork desktop agent-mode sessions (opt-in via ``include_cowork``; the
+        runner enables it, the module default is OFF so unit tests / other
+        callers see the exact prior Code-only behavior). Cowork ledger keys are
+        ``cowork:`` prefixed to namespace them off Code-session ids.
+    """
     now = _now_epoch()
     cutoff = now - lookback_hours * 3600
     settle = now - SETTLE_MINUTES * 60
     captured = load_captured_ids(ledger_path)
     results: list[CaptureResult] = []
-    processed = 0
 
+    # --- Code sessions (~/.claude/projects) ---
+    processed = 0
     for path in iter_transcript_files(projects_root):
         if processed >= max_sessions:
             break
@@ -508,70 +802,48 @@ def harvest(
             continue
 
         processed += 1
-        phi = phi_guard.is_phi_risk(session.text)
-        default_entity = entity_from_cwd(session.cwd)
+        results.append(_finalize_capture(
+            session, surface=SURFACE, ledger_key=session.session_id,
+            captured=captured, dry_run=dry_run, with_kb=with_kb,
+            founder_os_root=founder_os_root, ledger_path=ledger_path,
+            anthropic_client=anthropic_client, kb=kb))
 
-        distilled = distill(
-            session.text, default_entity, phi=phi, client=anthropic_client
-        )
-        if distilled is None:
-            # Fail-closed: do not write, do not mark captured — retry next run.
-            results.append(CaptureResult(
-                session_id=session.session_id, entity=default_entity,
-                note_path=None, phi=phi, distilled=False,
-                skipped_reason="distill_failed",
-            ))
-            continue
-
-        entity = distilled["entity"]
-        # PHI present -> force into the LEX-scoped, access-controlled store.
-        if phi:
-            entity = "LEX" if not entity.startswith("LEX") else entity
-            distilled["entity"] = entity
-
-        when = datetime.now(timezone.utc)
-        npath = note_path_for(entity, when, session.session_id, root=founder_os_root)
-        note = render_note(distilled, session, when.strftime("%Y-%m-%d"), phi)
-
-        result = CaptureResult(
-            session_id=session.session_id, entity=entity, note_path=npath,
-            phi=phi, distilled=True,
-            meta={"topic": distilled["topic"], "n_turns": session.n_turns},
-        )
-
-        if dry_run:
-            log.info("[DRY] would write %s (entity=%s phi=%s)", npath, entity, phi)
-            results.append(result)
-            continue
-
-        try:
-            # G: write, atomic + timeout-bounded (make_parents creates the YYYY-MM dir).
-            # A transient unmount raises drive_io.DriveUnavailable (an OSError, caught
-            # here -> this session is skipped + retries next run) instead of hanging the
-            # nightly capture process.
-            drive_io.write_text_atomic(npath, note, encoding="utf-8")
-        except OSError as exc:
-            log.error("session_capture: failed writing %s: %s", npath, exc)
-            result.skipped_reason = "write_failed"
-            result.note_path = None
-            results.append(result)
-            continue
-
-        if with_kb and kb is not None:
-            _ingest_note(kb, npath, entity, distilled, session, founder_os_root,
-                         content=note, when=when)
-
-        append_ledger({
-            "session_id": session.session_id,
-            "entity": entity,
-            "phi": phi,
-            "note_path": str(npath),
-            "topic": distilled["topic"],
-            "captured_at": when.isoformat(),
-        }, ledger_path)
-        log.info("Captured session %s -> %s (entity=%s phi=%s)",
-                 session.session_id[:8], npath.name, entity, phi)
-        results.append(result)
+    # --- Cowork desktop agent-mode sessions ---
+    if include_cowork:
+        roots = cowork_roots if cowork_roots is not None else _discover_cowork_roots()
+        cw_budget = max_cowork_sessions if max_cowork_sessions is not None else max_sessions
+        cw_processed = 0
+        for sess_dir in iter_cowork_session_dirs(roots):
+            if cw_processed >= cw_budget:
+                break
+            transcripts = _cowork_transcripts_for(sess_dir)
+            if not transcripts:
+                continue
+            mtime = max((_safe_mtime(p) for p in transcripts), default=0.0)
+            if mtime < cutoff or mtime > settle:
+                continue  # outside window, or too fresh (may be live)
+            ledger_key = f"cowork:{sess_dir.name}"
+            if ledger_key in captured:
+                continue
+            session = parse_cowork_session(sess_dir, transcripts=transcripts)
+            if session is None:
+                continue
+            # Skip scheduled-task automation runs (pure noise) BEFORE the Haiku
+            # call. Not budget-consuming and not ledger-marked -- they age out of
+            # the window on their own; surfaced as a skipped result for the run log.
+            if _is_scheduled_task_session(session):
+                log.info("session_capture: skipping cowork scheduled-task session %s",
+                         sess_dir.name)
+                results.append(CaptureResult(
+                    session_id=sess_dir.name, entity="FNDR", note_path=None,
+                    phi=False, distilled=False, skipped_reason="scheduled_task"))
+                continue
+            cw_processed += 1
+            results.append(_finalize_capture(
+                session, surface=SURFACE_COWORK, ledger_key=ledger_key,
+                captured=captured, dry_run=dry_run, with_kb=with_kb,
+                founder_os_root=founder_os_root, ledger_path=ledger_path,
+                anthropic_client=anthropic_client, kb=kb))
 
     return results
 

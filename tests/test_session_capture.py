@@ -322,3 +322,312 @@ def test_harvest_distill_failure_not_marked(tmp_path):
     assert results[0].skipped_reason == "distill_failed"
     # Not marked captured -> will retry next run.
     assert scap.load_captured_ids(ledger) == set()
+
+
+# ---------------------------------------------------------------------------
+# Slice 2: Cowork desktop store harvesting
+# ---------------------------------------------------------------------------
+
+def _cowork_session(root: Path, uuid_stem: str, *, inner: str = "innr-0001",
+                    slug: str = "C--slug-outputs",
+                    text_extra: str = "",
+                    cwd: str = r"C:\Users\Harri\AppData\...\local_x\outputs",
+                    extra_lines: list[dict] | None = None,
+                    subagent: bool = False, mtime_ago: float = 3600.0) -> Path:
+    """Build a fake Cowork agent-mode session dir under root and return the dir."""
+    ws = root / "13ef-ws" / "b9ec-agent"
+    sess = ws / f"local_{uuid_stem}"
+    proj = sess / ".claude" / "projects" / slug
+    proj.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"type": "queue-operation", "sessionId": inner, "content": "noise"},
+        {"type": "user", "uuid": "u1", "cwd": cwd,
+         "timestamp": "2026-07-23T01:00:00.000Z",
+         "message": {"role": "user", "content": f"do cowork work {text_extra}"}},
+        {"type": "assistant", "uuid": "a1", "timestamp": "2026-07-23T01:05:00.000Z",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "ok finished cowork"}]}},
+        # A result summary line -- MUST be skipped (duplicate of per-message data).
+        {"type": "result", "uuid": "r1",
+         "message": {"role": "assistant", "content": "DUPLICATE SUMMARY leak"}},
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+    f = proj / f"{inner}.jsonl"
+    f.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+    old = scap._now_epoch() - mtime_ago
+    os.utime(f, (old, old))
+    if subagent:
+        sub = proj / inner / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        sf = sub / "agent-deadbeef.jsonl"
+        sf.write_text(json.dumps(
+            {"type": "user", "uuid": "s1",
+             "message": {"role": "user", "content": "SUBAGENT should be skipped"}}),
+            encoding="utf-8")
+        os.utime(sf, (old, old))
+    return sess
+
+
+class TestCoworkDiscovery:
+    def test_override_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COWORK_SESSIONS_ROOT", str(tmp_path))
+        assert scap._discover_cowork_roots() == [tmp_path]
+
+    def test_iter_yields_only_local_dirs_with_projects(self, tmp_path):
+        _cowork_session(tmp_path, "aaaa1111")
+        # A non-local_ dir (e.g. "rpm") and a local_ dir without projects: skipped.
+        (tmp_path / "13ef-ws" / "b9ec-agent" / "rpm").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "13ef-ws" / "b9ec-agent" / "local_empty").mkdir(parents=True)
+        found = list(scap.iter_cowork_session_dirs([tmp_path]))
+        names = {p.name for p in found}
+        assert names == {"local_aaaa1111"}
+
+    def test_transcripts_skip_subagents(self, tmp_path):
+        sess = _cowork_session(tmp_path, "bbbb2222", subagent=True)
+        tf = scap._cowork_transcripts_for(sess)
+        assert len(tf) == 1
+        assert "subagents" not in str(tf[0])
+
+
+class TestParseCoworkSession:
+    def test_basic_merge_skips_result_and_queue(self, tmp_path):
+        sess = _cowork_session(tmp_path, "cccc3333")
+        s = scap.parse_cowork_session(sess)
+        assert s is not None
+        assert s.session_id == "local_cccc3333"
+        assert s.n_turns == 2                       # user + assistant only
+        assert "do cowork work" in s.text
+        assert "ok finished cowork" in s.text
+        assert "DUPLICATE SUMMARY leak" not in s.text   # type:result skipped
+        assert "noise" not in s.text                    # queue-operation skipped
+
+    def test_dedup_by_uuid_across_transcripts(self, tmp_path):
+        # Second transcript in the SAME dir repeats uuid u1/a1 (a resume) + adds a2.
+        extra = [
+            {"type": "user", "uuid": "u1", "timestamp": "2026-07-23T02:00:00.000Z",
+             "message": {"role": "user", "content": "do cowork work"}},
+            {"type": "assistant", "uuid": "a2", "timestamp": "2026-07-23T02:05:00.000Z",
+             "message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "second-run reply"}]}},
+        ]
+        sess = _cowork_session(tmp_path, "dddd4444")
+        # write a second transcript file (newer) in the same slug dir
+        proj = sess / ".claude" / "projects" / "C--slug-outputs"
+        f2 = proj / "innr-0002.jsonl"
+        f2.write_text("\n".join(json.dumps(x) for x in extra), encoding="utf-8")
+        old = scap._now_epoch() - 1800
+        os.utime(f2, (old, old))
+        s = scap.parse_cowork_session(sess)
+        # u1 appears twice but is deduped; a1 + a2 are distinct.
+        assert s.text.count("do cowork work") == 1
+        assert "second-run reply" in s.text
+        assert s.n_turns == 3                # u1, a1, a2 (dup u1 dropped)
+
+    def test_text_bound_stops_early(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scap, "_COWORK_MAX_TEXT_CHARS", 50)
+        big = [{"type": "assistant", "uuid": f"x{i}",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "A" * 40}]}}
+               for i in range(10)]
+        sess = _cowork_session(tmp_path, "eeee5555", extra_lines=big)
+        s = scap.parse_cowork_session(sess)
+        # Stops accumulating once the cap is crossed -> far fewer than 12 turns.
+        assert s.n_turns < 12
+
+    def test_no_transcripts_returns_none(self, tmp_path):
+        empty = tmp_path / "13ef-ws" / "b9ec-agent" / "local_ffff6666"
+        (empty / ".claude" / "projects").mkdir(parents=True)
+        assert scap.parse_cowork_session(empty) is None
+
+
+class TestSurfaceParam:
+    def test_render_note_cowork_surface(self):
+        note = scap.render_note(_distilled_body("F3E"), _fake_session(), "2026-07-23",
+                                phi=False, surface=scap.SURFACE_COWORK)
+        assert note.startswith("## 2026-07-23 — cowork-session — F3E — did a thing")
+
+    def test_note_path_cowork_surface_and_clean_short(self, tmp_path):
+        p = scap.note_path_for("F3E", scap.datetime(2026, 7, 23, tzinfo=scap.timezone.utc),
+                               "local_c25465c2-b7a8", root=tmp_path,
+                               surface=scap.SURFACE_COWORK)
+        # "local_" prefix stripped from the filename short; cowork surface tag.
+        assert p.name == "2026-07-23_cowork-session_c25465c2.md"
+
+
+class TestHarvestCowork:
+    def test_cowork_capture_writes_note_and_dedups(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "1111aaaa")
+
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",   # no code sessions
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E", "cowork thing")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.distilled and r.note_path is not None
+        assert "02-F3-Energy" in str(r.note_path)
+        assert "cowork-session" in r.note_path.name
+        assert "cowork-session" in r.note_path.read_text(encoding="utf-8")
+        assert scap.load_captured_ids(ledger) == {"cowork:local_1111aaaa"}
+
+        # Second run: already in ledger (cowork: key) -> no re-capture.
+        results2 = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert results2 == []
+
+    def test_cowork_phi_forces_lex(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "2222bbbb", text_extra="review the care plan")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E", "phi cowork")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert len(results) == 1
+        assert results[0].phi is True
+        assert results[0].entity == "LEX"
+        assert "08-Lexington-Services" in str(results[0].note_path)
+        assert "- PHI: yes" in results[0].note_path.read_text(encoding="utf-8")
+
+    def test_cowork_disabled_by_default(self, tmp_path):
+        """Module default include_cowork=False: a real store on the host must NOT
+        be harvested unless the caller opts in (protects unit tests + other callers)."""
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "3333cccc")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E")),
+            cowork_roots=[store],   # provided, but include_cowork defaults False
+        )
+        assert results == []
+
+    def test_cowork_dry_run_writes_nothing(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "4444dddd")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=True,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("OSN")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert len(results) == 1
+        assert not fos.exists() or not any(fos.rglob("*.md"))
+        assert scap.load_captured_ids(ledger) == set()
+
+    def test_cowork_budget_cap(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        for i in range(3):
+            _cowork_session(store, f"cap{i}5555")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=True,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E")),
+            include_cowork=True, cowork_roots=[store], max_cowork_sessions=2,
+        )
+        assert len(results) == 2
+
+    def test_code_and_cowork_both_captured(self, tmp_path):
+        projects = tmp_path / "projects"
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _setup_session_file(projects, "code-6666-eeee")
+        _cowork_session(store, "6666ffff")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False, projects_root=projects,
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E", "both")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        ids = scap.load_captured_ids(ledger)
+        assert "code-6666-eeee" in ids
+        assert "cowork:local_6666ffff" in ids
+        surfaces = {r.meta.get("surface") for r in results}
+        assert surfaces == {"code-session", "cowork-session"}
+
+
+class TestCoworkScheduledTaskGate:
+    def test_scheduled_task_first_turn_detected(self):
+        s = scap.ParsedSession(
+            session_id="local_x", path=Path("x"), cwd=None, last_activity_epoch=0.0,
+            started_iso=None, ended_iso=None, n_turns=1,
+            text='USER: <scheduled-task name="fndr-daily-synthesis-persist" '
+                 'file="C:\\x">\n\nASSISTANT: done')
+        assert scap._is_scheduled_task_session(s) is True
+
+    def test_normal_session_not_flagged(self):
+        s = scap.ParsedSession(
+            session_id="local_x", path=Path("x"), cwd=None, last_activity_epoch=0.0,
+            started_iso=None, ended_iso=None, n_turns=1,
+            text="USER: Let's discuss the <scheduled-task> concept in the abstract")
+        assert scap._is_scheduled_task_session(s) is False
+
+    def test_harvest_skips_scheduled_task_no_distill(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        # A real work session + a scheduled-task automation session.
+        _cowork_session(store, "aaaa1111")
+        _cowork_session(store, "bbbb2222", extra_lines=None)
+        # Overwrite bbbb2222's transcript so its FIRST user turn is a scheduled task.
+        proj = (store / "13ef-ws" / "b9ec-agent" / "local_bbbb2222"
+                / ".claude" / "projects" / "C--slug-outputs")
+        f = proj / "innr-0001.jsonl"
+        f.write_text(json.dumps(
+            {"type": "user", "uuid": "u1",
+             "message": {"role": "user",
+                         "content": '<scheduled-task name="cora-knowledge-review" '
+                                    'file="C:\\x">run it'}}),
+            encoding="utf-8")
+        old = scap._now_epoch() - 3600
+        os.utime(f, (old, old))
+
+        # A distill client that RAISES if ever called on the scheduled task would
+        # be ideal; here we assert the scheduled-task result is a skip, not a write.
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False, projects_root=tmp_path / "empty",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E", "real work")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        by_reason = {r.session_id: r.skipped_reason for r in results}
+        assert by_reason.get("local_bbbb2222") == "scheduled_task"
+        # The real session still captured; the scheduled task never entered the ledger.
+        ids = scap.load_captured_ids(ledger)
+        assert "cowork:local_aaaa1111" in ids
+        assert "cowork:local_bbbb2222" not in ids
+
+
+class TestSessionCaptureRunnerWiring:
+    def test_runner_enables_cowork_with_optout(self):
+        src = (_REPO_ROOT / "scripts" / "run_session_capture.py").read_text(
+            encoding="utf-8")
+        assert "include_cowork=not args.no_cowork" in src
+        assert "--no-cowork" in src
+        assert "--max-cowork-sessions" in src
