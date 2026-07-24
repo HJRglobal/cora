@@ -608,14 +608,31 @@ class TestCoworkScheduledTaskGate:
         old = scap._now_epoch() - 3600
         os.utime(f, (old, old))
 
-        # A distill client that RAISES if ever called on the scheduled task would
-        # be ideal; here we assert the scheduled-task result is a skip, not a write.
+        # Spy client: FAILS if distill is ever called on a scheduled-task transcript
+        # (the gate MUST skip before the Haiku call -- that is the economic guarantee
+        # justifying retirement of the Cowork tasks). Asserts exactly one call (the
+        # real session), so a future refactor moving the gate after distill fails here.
+        class _Spy:
+            def __init__(self):
+                self.calls = []
+                self.messages = SimpleNamespace(create=self._create)
+
+            def _create(self, **kw):
+                content = kw["messages"][0]["content"]
+                self.calls.append(content)
+                assert "<scheduled-task" not in content, \
+                    "distill was called on a scheduled-task session -- gate ran too late"
+                return SimpleNamespace(content=[SimpleNamespace(
+                    text=json.dumps(_distilled_body("F3E", "real work")))])
+
+        spy = _Spy()
         results = scap.harvest(
             lookback_hours=24, dry_run=False, projects_root=tmp_path / "empty",
             founder_os_root=fos, ledger_path=ledger,
-            anthropic_client=_FakeClient(_distilled_body("F3E", "real work")),
-            include_cowork=True, cowork_roots=[store],
+            anthropic_client=spy, include_cowork=True, cowork_roots=[store],
         )
+        # Haiku called exactly once -> only the real session, never the scheduled task.
+        assert len(spy.calls) == 1
         by_reason = {r.session_id: r.skipped_reason for r in results}
         assert by_reason.get("local_bbbb2222") == "scheduled_task"
         # The real session still captured; the scheduled task never entered the ledger.

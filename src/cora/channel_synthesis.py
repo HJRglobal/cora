@@ -390,8 +390,16 @@ def _slack_body_to_markdown(body: str, today: date) -> str:
     """Convert the Slack-formatted synthesis body to the harvester's markdown:
     strip the deterministic date header (it becomes the `#` title), turn each
     whole-line Slack-bold section header into a `## ` header, and convert any
-    remaining inline `*bold*` to markdown `**bold**`."""
-    text = body
+    remaining inline `*bold*` to markdown `**bold**`.
+
+    FIRST normalizes markdown bold (`**x**`/`__x__` -> `*x*`) exactly as the Slack
+    delivery path does (deliver_to_channel -> normalize_slack_bold), so the file
+    derives from the SAME single-asterisk text as the post. Without this, a body
+    where Sonnet emitted `**Header**` (which normalize_slack_bold exists to catch)
+    would fail the single-asterisk section regex -> the `##` header is dropped and
+    inline bold mangles to `***` -- a real seam vs the harvester files (D-051)."""
+    from .reply_formatter import normalize_slack_bold
+    text = normalize_slack_bold(body)
     header_line = _date_header(today)
     if text.startswith(header_line):
         text = text[len(header_line):]

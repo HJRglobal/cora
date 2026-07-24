@@ -1164,6 +1164,22 @@ class TestDailySynthesisRender:
         # No lone single-asterisk bold survives (every * is part of a ** pair).
         assert _re.search(r"(?<!\*)\*(?!\*)", md) is None
 
+    def test_markdown_bold_body_normalized_like_slack_path(self):
+        """D-051: if Sonnet emits **markdown bold** (the case normalize_slack_bold
+        exists to catch), the persisted file must still get clean `## Header` +
+        `- **[P0]:**` -- NOT a dropped header or triple-asterisk mangle."""
+        body = ("*Thursday, 2026-07-23*\n\n"
+                "**Portfolio pulse**\nCash steady.\n\n"
+                "**Needs Harrison**\n"
+                "- **[P0] HJRG:** delete the tracker.\n"
+                "- __[P1] UFL:__ schedule the call.")
+        md = cs.render_daily_synthesis_md(body, date(2026, 7, 23))
+        assert "## Portfolio pulse" in md          # ** header still becomes ##
+        assert "## Needs Harrison" in md
+        assert "- **[P0] HJRG:** delete the tracker." in md
+        assert "- **[P1] UFL:** schedule the call." in md   # __ handled too
+        assert "***" not in md                     # no triple-asterisk mangle
+
     def test_leading_dash_bullets_normalized_midline_dash_kept(self):
         body = ("*Wednesday, 2026-07-08*\n\n*Cash*\n"
                 "F3 Energy: -$147,318 — negative and deepening.\n\n*Needs Harrison*\n"
