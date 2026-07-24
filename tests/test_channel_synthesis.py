@@ -1164,6 +1164,17 @@ class TestDailySynthesisRender:
         # No lone single-asterisk bold survives (every * is part of a ** pair).
         assert _re.search(r"(?<!\*)\*(?!\*)", md) is None
 
+    def test_leading_dash_bullets_normalized_midline_dash_kept(self):
+        body = ("*Wednesday, 2026-07-08*\n\n*Cash*\n"
+                "F3 Energy: -$147,318 — negative and deepening.\n\n*Needs Harrison*\n"
+                "— [P0] HJRG: delete the tracker.\n"
+                "– [P1] UFL: schedule the call.")
+        md = cs.render_daily_synthesis_md(body, date(2026, 7, 8))
+        assert "- [P0] HJRG: delete the tracker." in md   # em-dash bullet -> "-"
+        assert "- [P1] UFL: schedule the call." in md      # en-dash bullet -> "-"
+        # mid-line em-dash in the cash line is preserved (not a bullet)
+        assert "-$147,318 — negative and deepening." in md
+
     def test_fallback_body_renders(self):
         # A deterministic fallback body (no clean section headers) still renders
         # a valid file without raising.

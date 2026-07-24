@@ -406,7 +406,12 @@ def _slack_body_to_markdown(body: str, today: date) -> str:
             out.append(f"## {m.group(1).strip()}")
             out.append("")
         else:
-            out.append(_INLINE_BOLD_RE.sub(r"**\1**", raw))
+            line = _INLINE_BOLD_RE.sub(r"**\1**", raw)
+            # Normalize a LEADING em/en-dash bullet to a markdown "-" (the harvester
+            # convention). Anchored at line start so mid-line em-dashes (e.g.
+            # "$147,318 — negative") are untouched.
+            line = re.sub(r"^(\s*)[—–]\s+", r"\1- ", line)
+            out.append(line)
     md = "\n".join(out)
     md = re.sub(r"\n{3,}", "\n\n", md).strip("\n")
     return md
