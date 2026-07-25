@@ -252,6 +252,17 @@ def test_build_digest_blocks_have_revert_buttons():
     assert btns and btns[0]["action_id"] == kr.ACTION_AUTOWRITE_REVERT and btns[0]["value"] == "a"
 
 
+def test_digest_header_carries_revert_hint():
+    """D5 (Rider D): the digest header tells Harrison it's a safety net -- act
+    only if something looks wrong, via the Revert button."""
+    recs = [{"update_id": "a", "update_type": "known_answer", "tier": 0, "entity": "F3E", "summary": "x"}]
+    fallback, blocks = kr.build_autowrite_digest_blocks(recs)
+    header_text = blocks[0]["text"]["text"]
+    assert "Nothing needed unless something looks wrong" in header_text
+    assert "Revert" in header_text
+    assert fallback == header_text  # fallback carries the same hint
+
+
 def test_digest_wow_counts(monkeypatch):
     import run_autowrite_digest as D
     now = 1_800_000_000.0

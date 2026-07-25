@@ -1081,7 +1081,10 @@ def build_autowrite_digest_blocks(records: list[dict[str, Any]]) -> tuple[str, l
     """(fallback_text, Block Kit) for the weekly auto-write digest: one section +
     a one-tap Revert button per item (value = update_id)."""
     n = len(records)
-    header = f":robot_face: *Cora auto-learned {n} item(s) this week* (Tier 0/1, reversible)"
+    # D5 (Rider D): the second line tells Harrison the digest is a safety net, not
+    # a to-do -- the only action is Revert, and only if something looks wrong.
+    header = (f":robot_face: *Cora auto-learned {n} item(s) this week* (Tier 0/1, reversible)"
+              f"\n_Nothing needed unless something looks wrong -- tap ↩️ Revert to undo an item._")
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
