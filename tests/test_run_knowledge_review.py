@@ -340,6 +340,102 @@ def test_route_two_owners_two_dms(tmp_path, monkeypatch):
     assert n == 2 and sent.call_count == 2  # one DM per distinct owner
 
 
+# == Rider D: D2 (acknowledge every processed emoji reaction) ==================
+
+def test_ack_reaction_text():
+    t = rkr._ack_reaction_text
+    assert "known-answers" in t("APPROVED", "known_answer").lower()
+    assert "backlog" in t("APPROVED", "efficiency").lower()
+    assert "recorded" in t("APPROVED", "asana_task").lower()
+    assert "dismissed" in t("DISMISSED", "known_answer").lower()
+    assert t("OTHER", "known_answer") == ""  # non-actionable -> no ack
+
+
+def test_ack_correlated_reaction_threads_reply_and_reacts():
+    from unittest.mock import MagicMock
+    import logging
+    client = MagicMock()
+    reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "111.2"}
+    rkr._ack_correlated_reaction(
+        reaction, "APPROVED", {"update_type": "known_answer"},
+        "xoxb-test", logging.getLogger("t"), _client_factory=lambda: client)
+    # threaded one-liner on the original card
+    kw = client.chat_postMessage.call_args.kwargs
+    assert kw["channel"] == "D1" and kw["thread_ts"] == "111.2"
+    assert "known-answers" in kw["text"].lower()
+    # glanceable check reaction for an approval
+    assert client.reactions_add.call_args.kwargs["name"] == "white_check_mark"
+
+
+def test_ack_correlated_reaction_dismiss_no_reaction_add():
+    from unittest.mock import MagicMock
+    import logging
+    client = MagicMock()
+    reaction = {"action": "DISMISSED", "channel_id": "D1", "message_ts": "111.2"}
+    rkr._ack_correlated_reaction(
+        reaction, "DISMISSED", {"update_type": "known_answer"},
+        "xoxb-test", logging.getLogger("t"), _client_factory=lambda: client)
+    assert client.chat_postMessage.called          # still threads the ack
+    client.reactions_add.assert_not_called()        # no check-mark on a dismiss
+
+
+def test_ack_correlated_reaction_noop_without_anchor():
+    from unittest.mock import MagicMock
+    import logging
+    client = MagicMock()
+    # missing channel/ts -> nothing to anchor to -> no Slack call
+    rkr._ack_correlated_reaction(
+        {"action": "APPROVED"}, "APPROVED", {"update_type": "known_answer"},
+        "xoxb-test", logging.getLogger("t"), _client_factory=lambda: client)
+    client.chat_postMessage.assert_not_called()
+
+
+def test_ack_correlated_reaction_failsoft():
+    import logging
+    def _boom():
+        raise RuntimeError("slack down")
+    # a client build/post failure must not raise
+    rkr._ack_correlated_reaction(
+        {"action": "APPROVED", "channel_id": "D1", "message_ts": "1.2"},
+        "APPROVED", {"update_type": "known_answer"},
+        "xoxb-test", logging.getLogger("t"), _client_factory=_boom)
+
+
+def test_correlated_reaction_is_acked_in_main(tmp_path, monkeypatch):
+    """D2 wiring: a processed DISMISSED reaction triggers an ack in main()."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+
+    (tmp_path / "proposed.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    kr._ARCHIVE_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+
+    update = {"update_id": "kx", "update_type": "known_answer", "state": "PENDING"}
+    reaction = {"action": "DISMISSED", "channel_id": "D1", "message_ts": "111.222"}
+    monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [(update, reaction)])
+    monkeypatch.setattr(rkr, "resolve_update", MagicMock())
+    ack = MagicMock()
+    monkeypatch.setattr(rkr, "_ack_correlated_reaction", ack)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+    monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+    monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    ack.assert_called_once()
+    assert ack.call_args.args[0] is reaction and ack.call_args.args[1] == "DISMISSED"
+
+
 def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
     """Item 4: a MED known_answer DMs Harrison on a NON-digest day (no Monday gate)."""
     import importlib

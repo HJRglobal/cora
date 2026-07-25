@@ -463,6 +463,61 @@ def _send_dm_to_user(user_id: str, text: str, slack_token: str, _client_factory=
         return None
 
 
+def _ack_reaction_text(action: str, update_type: str) -> str:
+    """The one-liner Cora posts back on a card whose emoji reaction the scheduled
+    run just processed (D2). Pure function -- kept separate for testing."""
+    if action == "APPROVED":
+        if update_type == "known_answer":
+            return ":white_check_mark: Saved to Cora's known-answers."
+        if update_type == "efficiency":
+            return ":white_check_mark: Logged to the efficiency backlog."
+        return ":white_check_mark: Approved -- I've recorded this."
+    if action == "DISMISSED":
+        return ":x: Dismissed -- no action taken."
+    return ""
+
+
+def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
+                             slack_token: str, log: logging.Logger,
+                             _client_factory=None) -> None:
+    """D2: acknowledge on the ORIGINAL card that an emoji reaction Harrison already
+    made has now been processed by this run -- a threaded one-liner ("Saved to
+    known-answers" / "Dismissed") plus, for an approval, a glanceable check
+    reaction. Silent processing (the run resolved his reaction with no visible
+    response) is the trust-killer this rider exists to fix.
+
+    Only fires for the emoji-fallback path: correlate_reactions_to_updates yields
+    reaction_added events, never block_action button taps (those resolve + ack
+    in-message in app.py), so there is no double-ack. Fail-soft: an ack error must
+    never affect the resolve/execute that already happened."""
+    text = _ack_reaction_text(action, update.get("update_type", ""))
+    if not text or not slack_token:
+        return
+    channel = (reaction or {}).get("channel_id", "")
+    ts = (reaction or {}).get("message_ts", "")
+    if not channel or not ts:
+        return  # nothing to anchor the ack to
+    try:
+        if _client_factory is not None:
+            client = _client_factory()
+        else:
+            from slack_sdk import WebClient as _WC
+            client = _WC(token=slack_token)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reaction-ack: client build failed: %s", exc)
+        return
+    try:
+        client.chat_postMessage(channel=channel, thread_ts=ts, text=text,
+                                unfurl_links=False, unfurl_media=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reaction-ack: threaded reply failed: %s", exc)
+    if action == "APPROVED":
+        try:
+            client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
+        except Exception:  # noqa: BLE001 -- already_reacted / perms; the reply is the ack
+            pass
+
+
 _OWNER_ITEM_LABELS = {
     "asana_task": "Suggested Asana task",
     "task_close": "Asana task may be done",
@@ -789,9 +844,14 @@ def main() -> int:
 
     approved_updates = []
     dismissed_updates = []
+    # D2: token + reaction lookup so a processed reaction can be acknowledged on
+    # its original card (dismiss acked in-loop; approve acked after execution).
+    ack_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    reaction_by_uid: dict[str, dict] = {}
 
     for update, reaction in pairs:
         uid = update["update_id"]
+        reaction_by_uid[uid] = reaction
         action = reaction["action"]
         log.info(
             "Resolving update_id=%s (%s) -> %s",
@@ -804,6 +864,8 @@ def main() -> int:
             approved_updates.append(update)
         elif action == "DISMISSED":
             dismissed_updates.append(update)
+            if not args.dry_run:
+                _ack_correlated_reaction(reaction, "DISMISSED", update, ack_token, log)
 
     if approved_updates:
         log.info("APPROVED %d updates — executing now:", len(approved_updates))
@@ -811,6 +873,11 @@ def main() -> int:
         for u in approved_updates:
             log.info("  [%s] %s — %s", u["update_type"], u["update_id"][:8], u["description"][:120])
             _execute_approved_update(u, slack_token, log)
+            # D2: ack AFTER the apply so "Saved" reflects the durable write.
+            if not args.dry_run:
+                _ack_correlated_reaction(
+                    reaction_by_uid.get(u["update_id"]) or {}, "APPROVED", u,
+                    slack_token, log)
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
