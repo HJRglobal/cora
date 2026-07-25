@@ -431,6 +431,13 @@ def test_shadow_acts_on_nothing_byte_identical(tmp_path, monkeypatch):
         monkeypatch.setattr(rkr, "_attach_coras_read", _fake_attach)
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
         monkeypatch.setenv("CORA_GRADUATED_SHADOW", "1" if shadow_on else "0")
+        # Pin the graduated-trust auto-write flip OFF: this test isolates the
+        # SHADOW (observe-only) layer, which is only meaningful when nothing
+        # auto-writes. Without this pin the test inherits the operator's live
+        # .env CORA_AUTOWRITE_LIVE=all flip, which auto-writes this Tier-0 item
+        # before the Harrison-DM path and empties `captured` (D-088/D-089 flip,
+        # 2026-07-24). Test-only hermeticity fix; the flip decision is untouched.
+        monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
 
         captured: dict[str, str] = {}
 
