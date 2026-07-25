@@ -436,6 +436,120 @@ def test_correlated_reaction_is_acked_in_main(tmp_path, monkeypatch):
     assert ack.call_args.args[0] is reaction and ack.call_args.args[1] == "DISMISSED"
 
 
+# == Rider D D-051 remediation: ack never shows a false "Saved" on a failed apply =
+
+def test_ack_reaction_text_failed_apply_is_not_saved():
+    """D-051 (MEDIUM): a failed durable apply must NOT be acked as Saved."""
+    msg = rkr._ack_reaction_text("APPROVED", "known_answer", success=False)
+    assert "saved" not in msg.lower()
+    assert "didn't go through" in msg.lower() and "hjrg-leadership" in msg.lower()
+    # success path unchanged
+    assert "saved" in rkr._ack_reaction_text("APPROVED", "known_answer", success=True).lower()
+
+
+def test_ack_correlated_reaction_failed_apply_no_checkmark():
+    """D-051 (MEDIUM): on a failed apply, the threaded ack is the honest warning
+    and NO white_check_mark reaction is added (that would read as success)."""
+    from unittest.mock import MagicMock
+    import logging
+    client = MagicMock()
+    reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "1.2"}
+    rkr._ack_correlated_reaction(
+        reaction, "APPROVED", {"update_type": "known_answer"},
+        "xoxb-test", logging.getLogger("t"), _client_factory=lambda: client, success=False)
+    assert client.chat_postMessage.called
+    assert "saved" not in client.chat_postMessage.call_args.kwargs["text"].lower()
+    client.reactions_add.assert_not_called()
+
+
+def test_correlated_approved_failed_apply_acks_failure(tmp_path, monkeypatch):
+    """D-051 (MEDIUM) wiring: a correlated APPROVED whose _execute_approved_update
+    returns False is acked with success=False (never a false 'Saved')."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+    (tmp_path / "proposed.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    kr._ARCHIVE_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+
+    update = {"update_id": "kx", "update_type": "known_answer", "state": "PENDING",
+              "description": "a fact"}
+    reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "9.9"}
+    monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [(update, reaction)])
+    monkeypatch.setattr(rkr, "resolve_update", MagicMock())
+    monkeypatch.setattr(rkr, "_execute_approved_update", MagicMock(return_value=False))
+    ack = MagicMock()
+    monkeypatch.setattr(rkr, "_ack_correlated_reaction", ack)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+    monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+    monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    ack.assert_called_once()
+    assert ack.call_args.args[1] == "APPROVED"
+    assert ack.call_args.kwargs.get("success") is False
+
+
+def test_execute_approved_update_returns_success_bool(tmp_path, monkeypatch):
+    """The D2 ack depends on this: advisory post -> True; failed durable apply -> False."""
+    import logging
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+    # advisory generic post (no durable write) -> True
+    ok = rkr._execute_approved_update(
+        {"update_id": "g1", "update_type": "generic", "description": "d", "payload": {}},
+        "", logging.getLogger("t"))
+    assert ok is True
+    # known_answer whose apply fails (empty answer) -> False
+    bad = rkr._execute_approved_update(
+        {"update_id": "k1", "update_type": "known_answer", "description": "d",
+         "payload": {"entity": "FNDR", "question": "q", "answer": ""}},
+        "", logging.getLogger("t"))
+    assert bad is False
+
+
+def test_route_partial_failure_defers_conservatively(tmp_path, monkeypatch):
+    """D-051 (LOW, documented): under a partial DM failure the per-run cap counts
+    SELECTED items, so a failed owner's slots can defer another owner's items one
+    run -- strictly conservative (nothing wrongly dismissed; deferred stays PENDING).
+    Pins the accepted per-owner-batching trade-off."""
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    monkeypatch.setattr("cora.gap_autofill.resolve_owner",
+                        lambda e: {"EA": "UA", "EB": "UB", "EC": "UC"}.get((e or "").strip().upper()))
+    sent = MagicMock(side_effect=lambda user, text, token, cf=None: None if user == "UA" else "ts")
+    monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
+    resolved = MagicMock(return_value=True)
+    monkeypatch.setattr(rkr, "resolve_update", resolved)
+
+    items = []
+    for i in range(5):  # owner UA, earliest -> selected first, DM fails
+        items.append(_op(f"a{i}", "hubspot_note", "EA", proposed=f"2026-06-01T00:0{i}:00+00:00"))
+    for i in range(5):  # owner UB -> fills the per-run cap of 10, DM succeeds
+        items.append(_op(f"b{i}", "hubspot_note", "EB", proposed=f"2026-06-02T00:0{i}:00+00:00"))
+    for i in range(2):  # owner UC -> deferred (cap consumed by A+B selection)
+        items.append(_op(f"c{i}", "hubspot_note", "EC", proposed=f"2026-06-03T00:0{i}:00+00:00"))
+
+    n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
+    resolved_ids = {c.args[0] for c in resolved.call_args_list}
+    assert n == 5                                    # only owner B delivered
+    assert resolved_ids == {f"b{i}" for i in range(5)}
+    assert not any(u.startswith("a") for u in resolved_ids)  # A: DM failed -> PENDING
+    assert not any(u.startswith("c") for u in resolved_ids)  # C: deferred -> PENDING (conservative)
+
+
 def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
     """Item 4: a MED known_answer DMs Harrison on a NON-digest day (no Monday gate)."""
     import importlib

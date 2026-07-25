@@ -192,7 +192,7 @@ def _post_to_slack(token: str, channel: str, text: str) -> None:
         )
 
 
-def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger) -> None:
+def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger) -> bool:
     """Execute one approved gap update. Dispatches by update_type.
 
     asana_task     → create the task via Asana API
@@ -200,6 +200,12 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
     decision       → post formatted entry to #hjrg-leadership for manual add
     hubspot_note   → post formatted note to #hjrg-leadership with deal link
     generic        → post description to #hjrg-leadership
+
+    Returns True when the durable apply succeeded (or the action was an advisory
+    post-for-manual-add), False on any apply failure or unexpected error. The D2
+    reaction-ack consumes this so it never shows Harrison a false "Saved" (D-051
+    remediation): the advisory post branches (decision_capture / hubspot_note /
+    plain generic) have no durable write, so a successful post is a truthful ack.
     """
     import json
     update_type = update.get("update_type", "generic")
@@ -207,6 +213,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
     desc = update.get("description", "")
     uid_short = update.get("update_id", "?")[:8]
     notify_ch = "hjrg-leadership"
+    success = True
 
     try:
         if update_type == "asana_task":
@@ -223,6 +230,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 msg = f":white_check_mark: *Gap executor* created Asana task: <{url}|{task_name}> `[{uid_short}]`"
                 log.info("gap-executor: created Asana task gid=%s name=%s", task.get("gid"), task_name)
             except AsanaClientError as exc:
+                success = False
                 msg = f":warning: *Gap executor* could not create Asana task `[{uid_short}]`: {exc}\n> {task_name}"
                 log.warning("gap-executor: create_task failed: %s", exc)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -240,9 +248,11 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                     msg = f":white_check_mark: *Gap executor* marked complete: {link} `[{uid_short}]`"
                     log.info("gap-executor: completed task gid=%s", task_gid)
                 except AsanaClientError as exc:
+                    success = False
                     msg = f":warning: *Gap executor* could not close task `[{uid_short}]`: {exc}\n> {task_name}"
                     log.warning("gap-executor: complete_task failed: %s", exc)
             else:
+                success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` task_close missing task_gid — skipped."
                 log.warning("gap-executor: task_close payload has no task_gid: %s", payload)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -279,6 +289,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                     log.warning("golden-set auto-growth failed (non-fatal)",
                                 exc_info=True)
             else:
+                success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` known_answer failed: {summary}"
                 log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -296,6 +307,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 )
                 log.info("gap-executor: efficiency applied uid=%s", uid_short)
             else:
+                success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` efficiency apply failed: {summary}"
                 log.warning("gap-executor: efficiency failed uid=%s: %s", uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -333,6 +345,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                     log.warning("golden-set auto-growth failed (non-fatal)",
                                 exc_info=True)
             else:
+                success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"
                 log.warning("gap-executor: info-for-cora note failed uid=%s: %s", uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -343,7 +356,9 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             _post_to_slack(slack_token, notify_ch, msg)
 
     except Exception as exc:
+        success = False
         log.error("gap-executor: unexpected error for update %s: %s", uid_short, exc, exc_info=True)
+    return success
 
 
 def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
@@ -463,10 +478,18 @@ def _send_dm_to_user(user_id: str, text: str, slack_token: str, _client_factory=
         return None
 
 
-def _ack_reaction_text(action: str, update_type: str) -> str:
+def _ack_reaction_text(action: str, update_type: str, success: bool = True) -> str:
     """The one-liner Cora posts back on a card whose emoji reaction the scheduled
-    run just processed (D2). Pure function -- kept separate for testing."""
+    run just processed (D2). Pure function -- kept separate for testing.
+
+    For APPROVED, `success` reflects whether the durable apply actually landed
+    (_execute_approved_update's return): a FAILED apply must NEVER be acked as
+    "Saved" (D-051 remediation -- a false success would invert the exact trust
+    guarantee D2 exists to provide)."""
     if action == "APPROVED":
+        if not success:
+            return (":warning: Approved -- but the automatic save didn't go through; "
+                    "I've flagged it in #hjrg-leadership.")
         if update_type == "known_answer":
             return ":white_check_mark: Saved to Cora's known-answers."
         if update_type == "efficiency":
@@ -479,18 +502,20 @@ def _ack_reaction_text(action: str, update_type: str) -> str:
 
 def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
                              slack_token: str, log: logging.Logger,
-                             _client_factory=None) -> None:
+                             _client_factory=None, success: bool = True) -> None:
     """D2: acknowledge on the ORIGINAL card that an emoji reaction Harrison already
     made has now been processed by this run -- a threaded one-liner ("Saved to
-    known-answers" / "Dismissed") plus, for an approval, a glanceable check
-    reaction. Silent processing (the run resolved his reaction with no visible
-    response) is the trust-killer this rider exists to fix.
+    known-answers" / "Dismissed") plus, for a SUCCESSFUL approval, a glanceable
+    check reaction. Silent processing (the run resolved his reaction with no
+    visible response) is the trust-killer this rider exists to fix; an equally bad
+    outcome is a FALSE "Saved", so `success` (the durable-apply result) gates both
+    the wording and the check reaction (D-051 remediation).
 
     Only fires for the emoji-fallback path: correlate_reactions_to_updates yields
     reaction_added events, never block_action button taps (those resolve + ack
     in-message in app.py), so there is no double-ack. Fail-soft: an ack error must
     never affect the resolve/execute that already happened."""
-    text = _ack_reaction_text(action, update.get("update_type", ""))
+    text = _ack_reaction_text(action, update.get("update_type", ""), success)
     if not text or not slack_token:
         return
     channel = (reaction or {}).get("channel_id", "")
@@ -511,7 +536,7 @@ def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
                                 unfurl_links=False, unfurl_media=False)
     except Exception as exc:  # noqa: BLE001
         log.warning("reaction-ack: threaded reply failed: %s", exc)
-    if action == "APPROVED":
+    if action == "APPROVED" and success:
         try:
             client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception:  # noqa: BLE001 -- already_reacted / perms; the reply is the ack
@@ -571,14 +596,24 @@ def _route_operational_to_owners(
     count of items routed (marked DISMISSED with reason 'routed_to_owner:<id>').
 
     D4: each owner receives ONE batched decision-support DM per run whose lead line
-    states no action is needed (D3), instead of one DM per item. Guardrails and the
-    routing DECISION are unchanged -- WHICH items route to WHOM (floor, HIGH-first
-    order, per-owner + per-run caps, LEX/no-owner skips) is identical to the
-    per-item version; only DELIVERY collapses from N DMs into one DM per owner:
+    states no action is needed (D3), instead of one DM per item. The routing
+    DECISION is unchanged -- floor, HIGH-first order, per-owner + per-run caps, and
+    LEX/no-owner skips select the SAME items in the SAME order; only DELIVERY
+    collapses from N DMs into one DM per owner:
       * LEX* entities are NEVER routed (PHI) -- left PENDING.
       * Only items proposed >= the routing floor are routed (no stale-backlog spam).
       * Per-owner + per-run caps so no owner is flooded; deferred counts are logged.
       * A failed owner DM leaves that owner's items PENDING for the next run.
+
+    Invariance scope (D-051): on an ALL-SUCCESS run the DISMISSED-as-routed SET is
+    identical to the old per-item version. The per-run cap here counts SELECTED
+    items (Phase 1), whereas the old version counted SUCCESSFULLY-SENT items, so
+    under a PARTIAL DM failure a failed owner's selected items can defer another
+    owner's items to the next run. This is strictly conservative (no item is ever
+    wrongly dismissed; deferred items stay PENDING and route next run) and is the
+    accepted trade-off of per-owner batching -- keeping the per-run cap on selection
+    preserves the all-success SET exactly, which the alternative (cap on delivery)
+    would not. See test_route_partial_failure_defers_conservatively.
     """
     if not items or not slack_token:
         return 0
@@ -872,12 +907,13 @@ def main() -> int:
         slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
         for u in approved_updates:
             log.info("  [%s] %s — %s", u["update_type"], u["update_id"][:8], u["description"][:120])
-            _execute_approved_update(u, slack_token, log)
-            # D2: ack AFTER the apply so "Saved" reflects the durable write.
+            ok = _execute_approved_update(u, slack_token, log)
+            # D2: ack AFTER the apply, gated on its result so "Saved" reflects the
+            # durable write and a failed apply is never shown as success (D-051).
             if not args.dry_run:
                 _ack_correlated_reaction(
                     reaction_by_uid.get(u["update_id"]) or {}, "APPROVED", u,
-                    slack_token, log)
+                    slack_token, log, success=ok)
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
