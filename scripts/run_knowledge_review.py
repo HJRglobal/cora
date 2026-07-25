@@ -463,41 +463,67 @@ def _send_dm_to_user(user_id: str, text: str, slack_token: str, _client_factory=
         return None
 
 
-def _format_owner_dm(update: dict) -> str:
-    """Owner-facing card for an operational suggestion. Cora is decision-SUPPORT:
-    the owner acts in the native tool (HubSpot/Asana/decisions); Cora does not."""
+_OWNER_ITEM_LABELS = {
+    "asana_task": "Suggested Asana task",
+    "task_close": "Asana task may be done",
+    "hubspot_note": "Suggested HubSpot note",
+    "decision_capture": "Possible decision to record",
+    "generic": "FYI",
+}
+
+
+def _format_owner_item_line(update: dict, idx: int) -> str:
+    """One numbered suggestion line inside the batched owner DM (D4). Cora is
+    decision-SUPPORT: the owner acts in the native tool; Cora does not."""
     utype = update.get("update_type", "generic")
-    desc = update.get("description", "(no description)")
+    desc = (update.get("description") or "(no description)").strip()
     payload = update.get("payload") or {}
-    label = {
-        "asana_task": "Suggested Asana task",
-        "task_close": "Asana task may be done",
-        "hubspot_note": "Suggested HubSpot note",
-        "decision_capture": "Possible decision to record",
-        "generic": "FYI",
-    }.get(utype, utype)
-    lines = [f":information_source: *{label}* (from Cora):", desc[:600]]
+    label = _OWNER_ITEM_LABELS.get(utype, utype)
+    line = f"{idx}. *{label}*: {desc[:400]}"
+    links = []
     deal_url = payload.get("deal_url")
     task_url = payload.get("task_url")
     if deal_url:
-        lines.append(f"<{deal_url}|Open the deal>")
+        links.append(f"<{deal_url}|Open the deal>")
     if task_url:
-        lines.append(f"<{task_url}|Open the task>")
-    lines.append("\n_This is a suggestion — handle it directly in the tool if it's right. "
-                 "No reply needed._")
+        links.append(f"<{task_url}|Open the task>")
+    if links:
+        line += "\n   " + "  ".join(links)
+    return line
+
+
+def _format_owner_batch_dm(updates: list[dict]) -> str:
+    """D3 + D4: ONE decision-support DM per owner per run.
+
+    The no-action line LEADS (D3 -- it was previously the last line, below the
+    links) so the informational nature is clear at a glance, and every suggestion
+    for this owner in this run is batched into a single message (D4) so a genuinely
+    actionable card elsewhere stands out when it arrives. Per-item links preserved."""
+    n = len(updates)
+    noun = "suggestion" if n == 1 else "suggestions"
+    head = (f":information_source: *FYI -- no action needed.* I've routed {n} {noun} "
+            f"below; handle any directly in Asana/HubSpot if it looks right. No reply needed.")
+    lines = [head, ""]
+    for i, u in enumerate(updates, 1):
+        lines.append(_format_owner_item_line(u, i))
     return "\n".join(lines)
 
 
 def _route_operational_to_owners(
     items: list[dict], slack_token: str, log: logging.Logger, _client_factory=None,
 ) -> int:
-    """Route operational-nudge items to their entity's domain owner. Returns count routed.
+    """Route operational-nudge items to their entity's domain owner. Returns the
+    count of items routed (marked DISMISSED with reason 'routed_to_owner:<id>').
 
-    Each routed item is DM'd to the owner (decision-SUPPORT) then marked DISMISSED
-    with reason 'routed_to_owner:<id>'. Guardrails:
-      * LEX* entities are NEVER routed (PHI) — left PENDING.
+    D4: each owner receives ONE batched decision-support DM per run whose lead line
+    states no action is needed (D3), instead of one DM per item. Guardrails and the
+    routing DECISION are unchanged -- WHICH items route to WHOM (floor, HIGH-first
+    order, per-owner + per-run caps, LEX/no-owner skips) is identical to the
+    per-item version; only DELIVERY collapses from N DMs into one DM per owner:
+      * LEX* entities are NEVER routed (PHI) -- left PENDING.
       * Only items proposed >= the routing floor are routed (no stale-backlog spam).
       * Per-owner + per-run caps so no owner is flooded; deferred counts are logged.
+      * A failed owner DM leaves that owner's items PENDING for the next run.
     """
     if not items or not slack_token:
         return 0
@@ -509,7 +535,7 @@ def _route_operational_to_owners(
 
     floor = _routing_floor()
     if not floor:
-        log.warning("route-to-owner: no routing floor — routing nothing this run")
+        log.warning("route-to-owner: no routing floor -- routing nothing this run")
         return 0
 
     # HIGH-confidence first, then oldest first (stable).
@@ -517,14 +543,18 @@ def _route_operational_to_owners(
     eligible.sort(key=lambda u: (0 if u.get("confidence") == "HIGH" else 1,
                                  u.get("proposed_at", "")))
 
-    routed = 0
+    # Phase 1 -- SELECT items per owner under the SAME caps and gating as the
+    # per-item version (selection order identical -> the DISMISSED-as-routed set on
+    # an all-success run is unchanged). dict preserves insertion order (3.7+), so
+    # owners are delivered in first-seen order.
     deferred_cap = 0
     skipped_lex = 0
     skipped_no_owner = 0
-    per_owner: dict[str, int] = {}
+    selected = 0
+    buckets: dict[str, list[dict]] = {}
 
     for u in eligible:
-        if routed >= _MAX_OWNER_DMS_PER_RUN:
+        if selected >= _MAX_OWNER_DMS_PER_RUN:
             deferred_cap += 1
             continue
         entity = ((u.get("payload") or {}).get("entity") or "FNDR").strip().upper()
@@ -535,21 +565,29 @@ def _route_operational_to_owners(
         if not owner:
             skipped_no_owner += 1
             continue
-        if per_owner.get(owner, 0) >= _MAX_OWNER_DMS_PER_OWNER:
+        if len(buckets.get(owner, [])) >= _MAX_OWNER_DMS_PER_OWNER:
             deferred_cap += 1
             continue
-        ts = _send_dm_to_user(owner, _format_owner_dm(u), slack_token, _client_factory)
+        buckets.setdefault(owner, []).append(u)
+        selected += 1
+
+    # Phase 2 -- DELIVER one batched DM per owner; resolve that owner's items ONLY
+    # on a successful send (a failed DM leaves them PENDING to retry next run).
+    routed = 0
+    for owner, owner_items in buckets.items():
+        ts = _send_dm_to_user(
+            owner, _format_owner_batch_dm(owner_items), slack_token, _client_factory)
         if not ts:
-            continue  # DM failed — leave PENDING, retry next run
-        resolve_update(u["update_id"], "DISMISSED", reason=f"routed_to_owner:{owner}")
-        per_owner[owner] = per_owner.get(owner, 0) + 1
-        routed += 1
+            continue  # DM failed -- leave this owner's items PENDING, retry next run
+        for u in owner_items:
+            resolve_update(u["update_id"], "DISMISSED", reason=f"routed_to_owner:{owner}")
+        routed += len(owner_items)
 
     if routed or deferred_cap or skipped_lex or skipped_no_owner:
         log.info(
-            "route-to-owner: routed=%d deferred(cap)=%d skipped(lex)=%d skipped(no-owner)=%d "
-            "below-floor=%d",
-            routed, deferred_cap, skipped_lex, skipped_no_owner,
+            "route-to-owner: routed=%d owners=%d deferred(cap)=%d skipped(lex)=%d "
+            "skipped(no-owner)=%d below-floor=%d",
+            routed, len(buckets), deferred_cap, skipped_lex, skipped_no_owner,
             len([u for u in items if u.get("proposed_at", "") < floor]),
         )
     return routed

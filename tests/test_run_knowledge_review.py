@@ -277,6 +277,69 @@ def test_route_nothing_without_token():
                                             "", logging.getLogger("t")) == 0
 
 
+# == Rider D: D3 (no-action line on top) + D4 (batch one DM per owner) =========
+
+def test_owner_batch_dm_leads_with_no_action_and_keeps_links():
+    """D3: the FYI/no-action line LEADS the card (was previously the last line).
+    D4: many items render in ONE body; per-item links preserved."""
+    items = [
+        {"update_id": "a", "update_type": "hubspot_note", "description": "note one",
+         "payload": {"entity": "F3E", "deal_url": "https://hub/deal/1"}},
+        {"update_id": "b", "update_type": "asana_task", "description": "task two",
+         "payload": {"entity": "F3E", "task_url": "https://asana/task/2"}},
+    ]
+    body = rkr._format_owner_batch_dm(items)
+    first_line = body.splitlines()[0]
+    assert "no action needed" in first_line.lower()  # D3: leads, not trails
+    assert "2 suggestions" in first_line               # D4: batch count
+    # both items + their links are present in the single body
+    assert "note one" in body and "task two" in body
+    assert "https://hub/deal/1" in body and "https://asana/task/2" in body
+    # numbered lines for legibility
+    assert "1. " in body and "2. " in body
+
+
+def test_route_batches_one_dm_per_owner(tmp_path, monkeypatch):
+    """D4: three items for the SAME owner produce exactly ONE DM (not three),
+    and all three are still marked routed/DISMISSED."""
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    sent = MagicMock(return_value="ts-1")
+    resolved = MagicMock(return_value=True)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
+    monkeypatch.setattr(rkr, "resolve_update", resolved)
+
+    items = [_op("f1", "hubspot_note", "F3E"),
+             _op("f2", "asana_task", "F3E"),
+             _op("f3", "decision_capture", "F3E")]  # all -> Tommy
+    n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
+
+    assert n == 3
+    assert sent.call_count == 1  # ONE batched DM, not three
+    body = sent.call_args.args[1]
+    assert "3 suggestions" in body and body.splitlines()[0].lower().startswith(":information_source:")
+    assert {c.args[0] for c in resolved.call_args_list} == {"f1", "f2", "f3"}
+
+
+def test_route_two_owners_two_dms(tmp_path, monkeypatch):
+    """D4: distinct owners each get their own single batched DM."""
+    import logging
+    from unittest.mock import MagicMock
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    sent = MagicMock(return_value="ts")
+    monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
+    monkeypatch.setattr(rkr, "resolve_update", MagicMock(return_value=True))
+    items = [_op("f1", "hubspot_note", "F3E"),      # -> Tommy
+             _op("d1", "decision_capture", "FNDR")]  # -> Harrison
+    n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
+    assert n == 2 and sent.call_count == 2  # one DM per distinct owner
+
+
 def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
     """Item 4: a MED known_answer DMs Harrison on a NON-digest day (no Monday gate)."""
     import importlib
