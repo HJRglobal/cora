@@ -65,7 +65,12 @@ log = logging.getLogger("due_date_escalation")
 
 _THROTTLE_PATH = _REPO_ROOT / "data" / "state" / "due_date_escalation_throttle.json"
 _ASANA_MAP_PATH = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
-_DECISIONS_PENDING_PATH = _REPO_ROOT / "memory" / "decisions-pending.md"
+# decisions-pending.md lives on the G: Founder-OS mount, NOT in the repo (the
+# repo has no memory/ dir). Pass 2 was a silent no-op because this pointed at the
+# repo. Read it via drive_io (bounded, fail-soft). Env-overridable for tests.
+_DECISIONS_PENDING_PATH = Path(
+    os.environ.get("FNDR_DECISIONS_PENDING_PATH")
+    or r"G:\My Drive\HJR-Founder-OS\memory\decisions-pending.md")
 _HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 _FALLBACK_CHANNEL = "C0B3K67J10T"  # #hjrg-leadership
 
@@ -211,60 +216,62 @@ def run_pass1_due_tasks(
 # Pass 2 -- P0 stalled decisions
 # ---------------------------------------------------------------------------
 
-_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-_P0_RE = re.compile(r"\bP0\b", re.IGNORECASE)
-
-
 def _parse_pending_decisions(path: Path) -> list[dict[str, Any]]:
-    """Parse decisions-pending.md and return list of decision dicts."""
-    if not path.exists():
+    """Parse the Founder-OS pending-decisions queue -> stalled P0/P1 entries.
+
+    Reads via drive_io (bounded, fail-soft on a G: mount blip -- this is a
+    scheduled job that must never hang). Format is '### topic' blocks with
+    '**Severity**: P0/P1' + '**Last touched**: YYYY-MM-DD'; skips the '[Topic]'
+    template skeleton and the '## Recently resolved' section. Ports the tested
+    parser from strategy_memo.gather_stalled_decisions so it matches the real
+    file (the old list-marker+P0 parser false-matched the template/rubric lines
+    and read the date off the wrong line). age_days is computed from Last touched
+    (None when absent -> not escalated)."""
+    from cora import drive_io
+
+    try:
+        content = drive_io.read_text(path, timeout=5.0, retry_seconds=2.0)
+    except drive_io.DriveUnavailable:
+        log.warning("decisions-pending.md unavailable (G: mount reconnecting) -- "
+                    "skipping pass 2")
+        return []
+    except FileNotFoundError:
         log.info("decisions-pending.md not found at %s, skipping pass 2", path)
         return []
-
-    decisions = []
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- a read error must not crash the job
         log.warning("Failed to read decisions-pending.md: %s", exc)
         return []
 
-    # Parse lines that start with a list marker and contain P0
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith(("-", "*", "+")):
-            continue
-        if not _P0_RE.search(stripped):
-            continue
+    today = _az_now().date()
+    resolved = re.search(r"^## Recently resolved\b", content, re.MULTILINE)
+    parseable = content[: resolved.start()] if resolved else content
 
-        # Try to extract a date from the line
-        dates = _DATE_RE.findall(stripped)
-        decision_date: datetime | None = None
-        for d in dates:
+    decisions: list[dict[str, Any]] = []
+    for block in re.split(r"\n(?=### )", parseable):
+        if not block.startswith("### "):
+            continue
+        topic = block.split("\n", 1)[0][4:].strip()
+        if topic == "[Topic]":
+            continue  # the "How to use" template skeleton, not a real entry
+        # Match an annotated real value ("P0 (decision Monday)") but NOT the
+        # template alternatives line "P0 / P1 / P2 / P3" -- the (?!\s*/) guard.
+        sev = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
+        if not sev or sev.group(1) not in ("P0", "P1"):
+            continue
+        age_days: int | None = None
+        touched = re.search(r"\*\*Last touched\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
+        if touched:
             try:
-                decision_date = datetime.strptime(d, "%Y-%m-%d").replace(
-                    tzinfo=timezone.utc
-                )
-                break
+                age_days = (today - datetime.strptime(
+                    touched.group(1), "%Y-%m-%d").date()).days
             except ValueError:
-                continue
-
-        decisions.append(
-            {
-                "text": stripped[:400],
-                "date": decision_date,
-            }
-        )
-
+                pass
+        decisions.append({
+            "topic": topic[:300],
+            "severity": sev.group(1),
+            "age_days": age_days,
+        })
     return decisions
-
-
-def _decision_age_days(decision: dict, file_mtime: float, now_ts: float) -> int:
-    """Return approximate age of decision in days."""
-    if decision.get("date"):
-        dt = decision["date"]
-        return int((now_ts - dt.timestamp()) / 86400)
-    # Fall back to file mtime
-    return int((now_ts - file_mtime) / 86400)
 
 
 def run_pass2_stalled_decisions(
@@ -279,14 +286,16 @@ def run_pass2_stalled_decisions(
         return stats
 
     now_ts = time.time()
-    file_mtime = _DECISIONS_PENDING_PATH.stat().st_mtime if _DECISIONS_PENDING_PATH.exists() else now_ts
 
     for decision in decisions:
-        age_days = _decision_age_days(decision, file_mtime, now_ts)
-        if age_days < _DECISION_STALE_DAYS:
+        age_days = decision.get("age_days")
+        # Undated (age_days None) -> can't tell it's stale, don't escalate.
+        if age_days is None or age_days < _DECISION_STALE_DAYS:
             continue
 
-        text_hash = hashlib.md5(decision["text"].encode()).hexdigest()
+        sev = decision["severity"]
+        topic = decision["topic"]
+        text_hash = hashlib.md5(f"{sev}:{topic}".encode()).hexdigest()
         throttle_key = f"decision:{text_hash}"
 
         if _is_throttled(throttle, throttle_key, _DECISION_THROTTLE_SECONDS):
@@ -294,15 +303,15 @@ def run_pass2_stalled_decisions(
             continue
 
         msg = (
-            f":rotating_light: *Stalled P0 decision (>{age_days}d open)*\n"
-            f"{decision['text'][:300]}\n\n"
+            f":rotating_light: *Stalled {sev} decision (>{age_days}d open)*\n"
+            f"{topic[:300]}\n\n"
             f"This has been open for {age_days}+ days."
         )
 
         if _send_dm(slack_client, _HARRISON_SLACK_ID, msg, dry_run):
             throttle[throttle_key] = now_ts
             stats["alerted"] += 1
-            log.info("Alerted Harrison on stalled decision age=%dd", age_days)
+            log.info("Alerted Harrison on stalled %s decision age=%dd", sev, age_days)
 
     return stats
 

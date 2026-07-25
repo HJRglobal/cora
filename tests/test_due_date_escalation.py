@@ -207,47 +207,96 @@ class TestPass1:
 # ---------------------------------------------------------------------------
 
 class TestParsePendingDecisions:
-    def test_parses_p0_lines(self, tmp_path):
-        f = tmp_path / "decisions-pending.md"
-        f.write_text(
-            "# Decisions Pending\n"
-            "- **P0** Harrison OIC pre-qualifier 2026-04-01\n"
-            "- **P1** Something lower priority\n"
-            "- **P0** OSN structure decision 2026-05-15\n",
-            encoding="utf-8",
+    """Rider B: parses the REAL Founder-OS '### topic' format via drive_io
+    (the old list-marker+P0 parser false-matched the template/rubric and read the
+    date off the wrong line; the path pointed at a non-existent repo memory/)."""
+
+    def _fixture(self, fresh_date):
+        # Mirrors the real file: the '### [Topic]' skeleton (with the
+        # 'P0 / P1 / P2 / P3' alternatives line + the '- **P0**:' rubric), a
+        # genuine stale P0, a fresh P1, and a '## Recently resolved' section.
+        return (
+            "# Pending Decisions Queue\n\n"
+            "## How to use\n\n"
+            "### [Topic]\n"
+            "- **Severity**: P0 / P1 / P2 / P3\n"
+            "- **Last touched**: YYYY-MM-DD\n\n"
+            "Severity rubric:\n"
+            "- **P0**: Decision must happen this week\n"
+            "- **P1**: Decision must happen this month\n\n"
+            "---\n\n"
+            "## Active (as of 2026-07-20)\n\n"
+            "### A genuinely stale P0 decision\n"
+            "- **Entity**: FNDR\n"
+            "- **Severity**: P0 (open ~3 months)\n"
+            "- **Last touched**: 2025-01-01\n\n"
+            "### A fresh P1 decision\n"
+            "- **Entity**: F3E\n"
+            "- **Severity**: P1\n"
+            f"- **Last touched**: {fresh_date}\n\n"
+            "## Recently resolved\n\n"
+            "### This was resolved and must be ignored\n"
+            "- **Severity**: P0\n"
+            "- **Last touched**: 2025-01-01\n"
         )
-        decisions = mod._parse_pending_decisions(f)
+
+    def _parse(self, monkeypatch, content):
+        from cora import drive_io
+        monkeypatch.setattr(drive_io, "read_text", lambda *a, **k: content)
+        return mod._parse_pending_decisions(Path("decisions-pending.md"))
+
+    def test_parses_real_format_p0_and_p1(self, monkeypatch):
+        fresh = _az_now().date().isoformat()
+        decisions = self._parse(monkeypatch, self._fixture(fresh))
+        # skeleton + resolved excluded; the stale P0 + fresh P1 remain
         assert len(decisions) == 2
-        assert all("P0" in d["text"] for d in decisions)
+        assert {d["severity"] for d in decisions} == {"P0", "P1"}
 
-    def test_missing_file_returns_empty(self, tmp_path):
-        f = tmp_path / "nonexistent.md"
-        assert mod._parse_pending_decisions(f) == []
-
-    def test_extracts_date_from_line(self, tmp_path):
-        f = tmp_path / "dp.md"
-        f.write_text("- P0 something 2026-03-01\n", encoding="utf-8")
-        decisions = mod._parse_pending_decisions(f)
-        assert len(decisions) == 1
-        assert decisions[0]["date"] is not None
-        assert decisions[0]["date"].strftime("%Y-%m-%d") == "2026-03-01"
-
-    def test_no_date_falls_back_to_none(self, tmp_path):
-        f = tmp_path / "dp.md"
-        f.write_text("- P0 no date in this line\n", encoding="utf-8")
-        decisions = mod._parse_pending_decisions(f)
-        assert len(decisions) == 1
-        assert decisions[0]["date"] is None
-
-    def test_non_p0_lines_excluded(self, tmp_path):
-        f = tmp_path / "dp.md"
-        f.write_text(
-            "- P1 lower priority item\n"
-            "- Regular line without priority\n",
-            encoding="utf-8",
+    def test_skeleton_and_rubric_not_matched(self, monkeypatch):
+        content = (
+            "## How to use\n\n"
+            "### [Topic]\n"
+            "- **Severity**: P0 / P1 / P2 / P3\n\n"
+            "Severity rubric:\n"
+            "- **P0**: Decision must happen this week\n"
         )
-        decisions = mod._parse_pending_decisions(f)
-        assert len(decisions) == 0
+        assert self._parse(monkeypatch, content) == []
+
+    def test_recently_resolved_excluded(self, monkeypatch):
+        content = (
+            "## Active\n\n"
+            "### Live one\n- **Severity**: P0\n- **Last touched**: 2025-01-01\n\n"
+            "## Recently resolved\n\n"
+            "### Dead one\n- **Severity**: P0\n- **Last touched**: 2025-01-01\n"
+        )
+        decisions = self._parse(monkeypatch, content)
+        assert len(decisions) == 1
+        assert "Live one" in decisions[0]["topic"]
+
+    def test_p2_p3_excluded(self, monkeypatch):
+        content = ("## Active\n\n### A P2 item\n- **Severity**: P2\n"
+                   "- **Last touched**: 2025-01-01\n")
+        assert self._parse(monkeypatch, content) == []
+
+    def test_drive_unavailable_returns_empty(self, monkeypatch):
+        from cora import drive_io
+        def _boom(*a, **k):
+            raise drive_io.DriveUnavailable("mount gone")
+        monkeypatch.setattr(drive_io, "read_text", _boom)
+        assert mod._parse_pending_decisions(Path("decisions-pending.md")) == []
+
+    def test_file_not_found_returns_empty(self, monkeypatch):
+        from cora import drive_io
+        def _nf(*a, **k):
+            raise FileNotFoundError("nope")
+        monkeypatch.setattr(drive_io, "read_text", _nf)
+        assert mod._parse_pending_decisions(Path("x.md")) == []
+
+    def test_default_path_targets_founder_os(self):
+        # The Rider B fix: default path is the G: Founder-OS file, NOT repo memory/.
+        p = str(mod._DECISIONS_PENDING_PATH)
+        assert "HJR-Founder-OS" in p and "memory" in p
+        assert not p.startswith(str(_REPO_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -255,60 +304,73 @@ class TestParsePendingDecisions:
 # ---------------------------------------------------------------------------
 
 class TestPass2:
-    def _decisions_file(self, tmp_path, content):
-        f = tmp_path / "decisions-pending.md"
-        f.write_text(content, encoding="utf-8")
-        return f
+    def _patch(self, monkeypatch, content):
+        from cora import drive_io
+        monkeypatch.setattr(drive_io, "read_text", lambda *a, **k: content)
 
-    def test_stale_p0_alerts_harrison(self, tmp_path, monkeypatch):
-        f = self._decisions_file(
-            tmp_path,
-            "- P0 Old decision 2025-01-01\n"
-        )
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def _entry(self, severity, last_touched, topic="Some decision"):
+        return (f"## Active\n\n### {topic}\n- **Severity**: {severity}\n"
+                f"- **Last touched**: {last_touched}\n")
+
+    def test_stale_p0_alerts_harrison(self, monkeypatch):
+        self._patch(monkeypatch, self._entry("P0", "2025-01-01"))
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
         assert stats["alerted"] == 1
         slack.chat_postMessage.assert_called_once()
 
-    def test_recent_p0_not_alerted(self, tmp_path, monkeypatch):
-        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
-        f = self._decisions_file(tmp_path, f"- P0 Recent decision {tomorrow}\n")
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def test_stale_p1_also_alerts(self, monkeypatch):
+        # Rider B: P1 (not just P0) now escalates, matching strategy_memo.
+        self._patch(monkeypatch, self._entry("P1", "2025-01-01"))
+        slack = _make_slack()
+        stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        assert stats["alerted"] == 1
+
+    def test_recent_p0_not_alerted(self, monkeypatch):
+        fresh = _az_now().date().isoformat()
+        self._patch(monkeypatch, self._entry("P0", fresh))
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
         assert stats["alerted"] == 0
 
-    def test_throttled_decision_skipped(self, tmp_path, monkeypatch):
-        f = self._decisions_file(tmp_path, "- P0 Stale decision 2025-01-01\n")
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def test_undated_not_alerted(self, monkeypatch):
+        # No Last touched -> age unknown -> not escalated (no false alert; the old
+        # file-mtime fallback was itself broken since the file is edited often).
+        self._patch(monkeypatch, "## Active\n\n### No date\n- **Severity**: P0\n")
+        slack = _make_slack()
+        stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        assert stats["alerted"] == 0
+
+    def test_throttled_decision_skipped(self, monkeypatch):
         import hashlib
-        text = "- P0 Stale decision 2025-01-01"
-        h = hashlib.md5(text.encode()).hexdigest()
+        topic = "Some decision"
+        self._patch(monkeypatch, self._entry("P0", "2025-01-01", topic))
+        h = hashlib.md5(f"P0:{topic}".encode()).hexdigest()
         throttle = {f"decision:{h}": time.time() - 100}
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, throttle, dry_run=False)
         assert stats["throttled"] == 1
         slack.chat_postMessage.assert_not_called()
 
-    def test_dry_run_no_dm(self, tmp_path, monkeypatch):
-        f = self._decisions_file(tmp_path, "- P0 Old decision 2025-01-01\n")
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def test_dry_run_no_dm(self, monkeypatch):
+        self._patch(monkeypatch, self._entry("P0", "2025-01-01"))
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=True)
         assert stats["alerted"] == 1
         slack.chat_postMessage.assert_not_called()
 
-    def test_no_file_returns_empty_stats(self, tmp_path, monkeypatch):
-        f = tmp_path / "missing.md"
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def test_drive_unavailable_no_crash(self, monkeypatch):
+        from cora import drive_io
+        def _boom(*a, **k):
+            raise drive_io.DriveUnavailable("gone")
+        monkeypatch.setattr(drive_io, "read_text", _boom)
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
-        assert stats["alerted"] == 0
+        assert stats == {"alerted": 0, "throttled": 0}
+        slack.chat_postMessage.assert_not_called()
 
-    def test_dm_sent_to_harrison(self, tmp_path, monkeypatch):
-        f = self._decisions_file(tmp_path, "- P0 Old decision 2025-01-01\n")
-        monkeypatch.setattr(mod, "_DECISIONS_PENDING_PATH", f)
+    def test_dm_sent_to_harrison(self, monkeypatch):
+        self._patch(monkeypatch, self._entry("P0", "2025-01-01"))
         slack = _make_slack()
         mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
         slack.conversations_open.assert_called_once_with(users=[mod._HARRISON_SLACK_ID])
