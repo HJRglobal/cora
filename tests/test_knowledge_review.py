@@ -257,6 +257,79 @@ class TestProposeUpdateIO:
 
 
 @pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable on this mount")
+class TestOperationalTTL:
+    """Slice 2 (2026-07-24): propose_update stamps expires_at -- None for
+    KNOWLEDGE items (never TTL-expired), proposed_at + TTL for OPERATIONAL
+    nudges. Classification is the single-source is_knowledge_update, so it can't
+    drift from the drain's knowledge/operational split."""
+
+    def _propose_read(self, tmp_path, **kw):
+        from datetime import datetime
+        with patch.object(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "u.jsonl"):
+            kr.propose_update(**kw)
+            line = (tmp_path / "u.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        e = json.loads(line)
+        return e, datetime
+
+    def test_operational_gets_expires_at_default_7d(self, tmp_path):
+        e, dt = self._propose_read(
+            tmp_path, update_id="ttl-op", update_type=kr.UPDATE_TYPE_ASANA_TASK,
+            description="op", payload={"entity": "FNDR"})
+        assert e["expires_at"] is not None
+        days = round((dt.fromisoformat(e["expires_at"])
+                      - dt.fromisoformat(e["proposed_at"])).total_seconds() / 86400)
+        assert days == kr._DEFAULT_OPERATIONAL_TTL_DAYS == 7
+
+    def test_known_answer_never_expires(self, tmp_path):
+        e, _ = self._propose_read(
+            tmp_path, update_id="ttl-ka", update_type="known_answer",
+            description="fact", payload={"question": "q", "answer": "a"})
+        assert e["expires_at"] is None
+
+    def test_infocora_generic_never_expires(self, tmp_path):
+        e, _ = self._propose_read(
+            tmp_path, update_id="ttl-ic", update_type=kr.UPDATE_TYPE_GENERIC,
+            description="note", payload={"source": "info-for-cora", "text": "x"})
+        assert e["expires_at"] is None
+
+    def test_drive_person_generic_is_operational_and_expires(self, tmp_path):
+        # A drive_extractor person fact is a bare generic (NO info-for-cora
+        # source) -> OPERATIONAL -> gets a TTL. Guards the classifier-drift bug.
+        e, _ = self._propose_read(
+            tmp_path, update_id="ttl-dp", update_type=kr.UPDATE_TYPE_GENERIC,
+            description="person", payload={"fact_type": "person"})
+        assert e["expires_at"] is not None
+
+    def test_ttl_env_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CORA_OPERATIONAL_TTL_DAYS", "3")
+        e, dt = self._propose_read(
+            tmp_path, update_id="ttl-env", update_type=kr.UPDATE_TYPE_HUBSPOT_NOTE,
+            description="op", payload={})
+        days = round((dt.fromisoformat(e["expires_at"])
+                      - dt.fromisoformat(e["proposed_at"])).total_seconds() / 86400)
+        assert days == 3
+
+    def test_classifier_matches_drain_split(self):
+        # Single source of truth: kr.is_knowledge_update and the drain's
+        # _is_knowledge_item must agree on every case.
+        import scripts.run_knowledge_review as rkr
+        cases = [
+            ("known_answer", {}, True),
+            ("efficiency", {}, True),
+            ("generic", {"source": "info-for-cora"}, True),
+            ("generic", {"fact_type": "person"}, False),
+            ("generic", {}, False),
+            ("asana_task", {}, False),
+            ("hubspot_note", {}, False),
+            ("task_close", {}, False),
+            ("decision_capture", {}, False),
+        ]
+        for ut, pl, expect in cases:
+            assert kr.is_knowledge_update(ut, pl) is expect
+            assert rkr._is_knowledge_item({"update_type": ut, "payload": pl}) is expect
+
+
+@pytest.mark.skipif(not _IMPORT_OK, reason="cora imports unavailable on this mount")
 class TestLogReplyReaction:
     """Layer B — file I/O for log_reply_reaction()."""
 

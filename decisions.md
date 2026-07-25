@@ -2758,3 +2758,56 @@ stays LOG-ONLY; nothing new DMs/routes/writes).
 evidence a distance floor could ever fire), OR (ii) the log reaches N>=1000 rows;
 whichever first. Hard review date 2026-09-01. Env override
 `CORA_KB_MISS_SHADOW_FLOOR`. NEVER wire the shadow/floor into a gating path.
+
+---
+
+## D-089 - Operational proposal backlog: already bounded; a 7d TTL-at-creation tightens it (2026-07-24)
+
+**Context:** The flywheel-gate-fixes kickoff framed the ~296 operational PENDING
+backlog as re-clogging Harrison's 7am knowledge review and "regrowing
+unboundedly." Verify-first against the live ledger corrected both premises.
+
+**Findings (live, 2026-07-24):**
+- Harrison's review DM ALREADY carries KNOWLEDGE ONLY. Operational nudges
+  (asana_task / task_close / hubspot_note / decision_capture / bare generic)
+  route to domain OWNERS (WS17-B, `_route_operational_to_owners`); only
+  known_answer / efficiency / #info-for-cora generics DM Harrison. The "0
+  knowledge / 295 operational" drain line means the KNOWLEDGE STREAM IS EMPTY
+  (a Slice-1 detection problem), NOT that operational clogs Harrison's queue.
+- The backlog is ALREADY BOUNDED, not unbounded: it is ~286 = a ~14-day rolling
+  window of operational inflow. The existing `_auto_expire_unrouted_operational`
+  (14d) does ~95% of the draining (archive: expired_unrouted 3,963 vs
+  routed_to_owner ~200); the 10/run owner-routing barely dents it because 94% is
+  FNDR-owned reconciliation output routed to ONE owner (Harrison) at 5/run.
+
+**Decision:** Add an explicit per-item `expires_at`, stamped at creation by
+`propose_update` (the SOLE minting choke point, so one edit covers all 8
+producers): `None` for KNOWLEDGE items (never TTL-expired -- the D-051
+never-expire-unseen guarantee), and proposed_at + a default 7d for OPERATIONAL
+nudges. The drain's expiry sweep honors `expires_at` when present and falls back
+to the historical `proposed_at + 14d` for pre-Slice-2 rows (back-compat).
+Classification uses a SINGLE source of truth (`knowledge_review.is_knowledge_update`,
+which the drain's `_is_knowledge_item` now delegates to) so it cannot drift --
+in particular a drive_extractor 'person' fact is a bare `generic` (no
+info-for-cora source) and stays OPERATIONAL. Default 7d (env
+`CORA_OPERATIONAL_TTL_DAYS`) tightens the standing pool from ~286 to ~140.
+
+Also fix a bulk-expire defect: `scripts/expire_stale_operational_updates.py`
+accepted `--cutoff-days 0`, which would expire the ENTIRE unrouted backlog
+including rows proposed seconds ago -- violating its stale-cohort contract. Add a
+7-day minimum-safe floor (overridable with `--force`).
+
+**Alternatives considered:**
+- Raise the owner-routing cap -- rejected: 94% single-owner (Harrison)
+  concentration means more cap = more low-value Harrison spam, not more drain.
+- Skip the TTL (already bounded) -- viable, but the 7d TTL is a clean one-site
+  change that halves the standing pool (hot-path ledger read cost) and makes the
+  bound explicit + per-item + future-tunable.
+- Blindly shorten the global 14d constant -- rejected: less precise than a
+  per-item expires_at and would silently reinterpret pre-existing rows.
+
+**Rationale:** The durable-boundedness the kickoff asked for already exists; the
+TTL is a tightening + explicitness win, not a fix for an unbounded leak. The
+one-time bulk-expire (Harrison-gated `--apply`) clears the current stale cohort
+faster; the TTL keeps the steady state tighter. Nothing new auto-commits;
+knowledge items still route to Harrison / graduated-trust auto-write.

@@ -231,3 +231,28 @@ class TestGuards:
         rc = mod.main(["--ledger", str(ledger), "--manifest-dir", str(tmp_path),
                        "--cutoff-days", "-1"])
         assert rc == 1
+
+    def test_sub_floor_cutoff_rejected_without_force(self, tmp_path):
+        # Slice 2 defect fix: cutoff 0 would expire the ENTIRE operational
+        # backlog including rows proposed seconds ago -> blocked below the floor.
+        ledger = tmp_path / "ledger.jsonl"
+        _write_ledger(ledger, [_row()])
+        rc = mod.main(["--ledger", str(ledger), "--manifest-dir", str(tmp_path),
+                       "--cutoff-days", "0"])
+        assert rc == 1
+
+    def test_sub_floor_cutoff_allowed_with_force(self, tmp_path):
+        # --force overrides the minimum-safe floor; dry-run still returns 0.
+        ledger = tmp_path / "ledger.jsonl"
+        _write_ledger(ledger, [_row()])
+        rc = mod.main(["--ledger", str(ledger), "--manifest-dir", str(tmp_path),
+                       "--cutoff-days", "3", "--force"])
+        assert rc == 0
+
+    def test_floor_boundary_cutoff_allowed(self, tmp_path):
+        # cutoff == the floor (7) is allowed without --force.
+        ledger = tmp_path / "ledger.jsonl"
+        _write_ledger(ledger, [_row()])
+        rc = mod.main(["--ledger", str(ledger), "--manifest-dir", str(tmp_path),
+                       "--cutoff-days", str(mod._MIN_SAFE_CUTOFF_DAYS)])
+        assert rc == 0

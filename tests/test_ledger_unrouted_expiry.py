@@ -95,3 +95,42 @@ def test_malformed_proposed_at_survives():
     e["proposed_at"] = "not-a-date"
     assert _run([e]) == 0
     assert e["state"] == "PENDING"
+
+
+# ── Slice 2 (2026-07-24): per-item expires_at honored, proposed_at fallback ────
+
+def _op_entry(expires_at=None, age_days=3, dm_ts="", state="PENDING"):
+    e = _entry("asana_task", dm_ts=dm_ts, age_days=age_days, state=state)
+    e["expires_at"] = expires_at
+    return e
+
+
+def test_expires_at_in_past_expires_even_when_recently_proposed():
+    # A 7d TTL fires BEFORE the 14d proposed_at fallback would: proposed 3d ago
+    # (fallback would keep it) but expires_at is 1d in the past -> expires.
+    e = _op_entry(expires_at=(_now() - timedelta(days=1)).isoformat(), age_days=3)
+    assert _run([e]) == 1
+    assert e["state"] == "DISMISSED"
+    assert e["resolved_reason"] == "expired_unrouted"
+
+
+def test_expires_at_in_future_survives_even_when_old():
+    # expires_at OVERRIDES the proposed_at+14d fallback: an old row whose TTL is
+    # still in the future is NOT expired (per-item TTL is authoritative).
+    e = _op_entry(expires_at=(_now() + timedelta(days=2)).isoformat(), age_days=60)
+    assert _run([e]) == 0
+    assert e["state"] == "PENDING"
+
+
+def test_missing_expires_at_falls_back_to_proposed_at_cutoff():
+    # Pre-Slice-2 rows (no expires_at key) still expire at the historical 14d.
+    e = _entry("asana_task", age_days=20)
+    assert "expires_at" not in e
+    assert _run([e]) == 1
+
+
+def test_malformed_expires_at_survives():
+    # A corrupt expires_at fails SAFE (kept), never crashes the sweep.
+    e = _op_entry(expires_at="not-a-date", age_days=60)
+    assert _run([e]) == 0
+    assert e["state"] == "PENDING"

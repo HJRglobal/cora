@@ -39,6 +39,7 @@ from cora.knowledge_review import (  # noqa: E402
     autowrite_level,
     correlate_reactions_to_updates,
     get_pending_updates,
+    is_knowledge_update,
     propose_update,
     resolve_update,
     send_dm_to_harrison,
@@ -393,7 +394,17 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
         if e.get("update_type") not in _OPERATIONAL_TYPES:
             continue
         try:
-            if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
+            # Slice 2 TTL-at-creation: honor the per-item expires_at stamped by
+            # propose_update when present; fall back to the old fixed
+            # proposed_at + cutoff for pre-Slice-2 rows that have no expires_at
+            # (back-compat -- the ~286-row pre-existing backlog still expires at
+            # the historical 14d).
+            exp = e.get("expires_at")
+            if exp:
+                expired = now_dt >= _dt.fromisoformat(exp)
+            else:
+                expired = _dt.fromisoformat(e["proposed_at"]) < cutoff_dt
+            if expired:
                 e["state"] = "DISMISSED"
                 e["resolved_at"] = now_dt.isoformat()
                 e["resolved_reason"] = "expired_unrouted"
@@ -421,14 +432,10 @@ def _routing_floor() -> str:
 
 def _is_knowledge_item(update: dict) -> bool:
     """True if this update belongs in Harrison's knowledge queue (vs an operational
-    nudge routed to an owner). Knowledge = known_answer / efficiency, or a generic
-    contributed via #info-for-cora (a human-fed fact, not machine noise)."""
-    utype = update.get("update_type")
-    if utype in _KNOWLEDGE_TYPES:
-        return True
-    if utype == "generic" and (update.get("payload") or {}).get("source") == "info-for-cora":
-        return True
-    return False
+    nudge routed to an owner). Delegates to knowledge_review.is_knowledge_update so
+    the drain's knowledge/operational split and propose_update's TTL-at-creation
+    decision share ONE definition and cannot drift (Slice 2)."""
+    return is_knowledge_update(update.get("update_type"), update.get("payload"))
 
 
 def _send_dm_to_user(user_id: str, text: str, slack_token: str, _client_factory=None) -> str | None:

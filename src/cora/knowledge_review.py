@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -241,6 +241,49 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Knowledge vs operational classification (single source of truth) ──────────
+# Mirrors run_knowledge_review._is_knowledge_item so the drain's knowledge/
+# operational split and propose_update's TTL decision can NEVER drift (the
+# drive_extractor 'person' fact is a bare 'generic' with no info-for-cora source
+# -> OPERATIONAL, and must be classified the same in both places). KNOWLEDGE =
+# the two knowledge update_types OR a generic contributed via #info-for-cora (a
+# human-fed fact). Everything else is an OPERATIONAL nudge routed to owners.
+_KNOWLEDGE_UPDATE_TYPES = frozenset({"known_answer", "efficiency"})
+
+
+def is_knowledge_update(update_type: str | None, payload: dict | None) -> bool:
+    """True if this update belongs in Harrison's knowledge queue (never TTL-
+    expired), vs an operational nudge routed to owners (TTL-bounded)."""
+    if update_type in _KNOWLEDGE_UPDATE_TYPES:
+        return True
+    if update_type == UPDATE_TYPE_GENERIC and (payload or {}).get("source") == "info-for-cora":
+        return True
+    return False
+
+
+# ── Operational TTL-at-creation (flywheel-gate-fixes Slice 2, 2026-07-24) ─────
+# An operational nudge proposal (asana_task / hubspot_note / decision_capture /
+# task_close / a non-info-for-cora generic) gets an explicit expires_at stamped
+# at creation, so the standing PENDING pool is bounded PER ITEM rather than only
+# by a global constant read at drain time. KNOWLEDGE items get expires_at=None
+# and are NEVER TTL-expired (the D-051 never-expire-unseen guarantee for
+# Harrison's queue). The drain's _auto_expire_unrouted_operational honors
+# expires_at when present and falls back to proposed_at +
+# _OPERATIONAL_UNROUTED_EXPIRY_DAYS for pre-existing rows (back-compat). Default
+# 7d tightens the pool from a ~14d-of-inflow window (~286) to ~7d (~140);
+# env-overridable via CORA_OPERATIONAL_TTL_DAYS.
+_DEFAULT_OPERATIONAL_TTL_DAYS = 7
+
+
+def _operational_ttl_days() -> int:
+    try:
+        v = int(os.environ.get("CORA_OPERATIONAL_TTL_DAYS",
+                               _DEFAULT_OPERATIONAL_TTL_DAYS))
+        return v if v > 0 else _DEFAULT_OPERATIONAL_TTL_DAYS
+    except (TypeError, ValueError):
+        return _DEFAULT_OPERATIONAL_TTL_DAYS
+
+
 # ── Reply log ─────────────────────────────────────────────────────────────────
 
 
@@ -328,10 +371,19 @@ def propose_update(
       "state": str,              "PENDING" | "APPROVED" | "DISMISSED" | "COMMENT_REQUESTED"
       "proposed_at": str,        ISO 8601
       "resolved_at": str|null,
+      "expires_at": str|null,    operational: proposed_at + TTL; knowledge: null
       "dm_message_ts": str,      Slack message ts of the Harrison DM (for reaction correlation)
       "dm_channel_id": str,      Slack channel (DM channel ID) where the DM was sent
     }
     """
+    _now = datetime.now(timezone.utc)
+    # TTL-at-creation (Slice 2): knowledge items never expire (expires_at=None);
+    # operational nudges expire proposed_at + TTL. Classified with the SINGLE
+    # source of truth so it can't drift from the drain's knowledge/op split.
+    if is_knowledge_update(update_type, payload):
+        expires_at = None
+    else:
+        expires_at = (_now + timedelta(days=_operational_ttl_days())).isoformat()
     entry = {
         "update_id": update_id,
         "update_type": update_type,
@@ -340,8 +392,9 @@ def propose_update(
         "source_evidence": source_evidence[:1000] if source_evidence else "",
         "confidence": confidence,
         "state": "PENDING",
-        "proposed_at": _now_iso(),
+        "proposed_at": _now.isoformat(),
         "resolved_at": None,
+        "expires_at": expires_at,
         "dm_message_ts": dm_message_ts,
         "dm_channel_id": dm_channel_id,
     }

@@ -75,6 +75,12 @@ _PROTECTED_TYPES = frozenset({"known_answer", "generic", "efficiency", "founder"
 
 _EXPIRE_REASON = "expired_bulk"
 _DEFAULT_CUTOFF_DAYS = 14
+# Minimum-safe cutoff floor (Slice 2 defect fix): the script's contract is
+# "expire the STALE cohort, keep fresh items routing". A cutoff below this floor
+# (e.g. 0) would expire essentially the ENTIRE operational unrouted PENDING
+# backlog including rows proposed seconds ago -- violating that contract. Reject
+# a sub-floor cutoff unless the operator explicitly passes --force.
+_MIN_SAFE_CUTOFF_DAYS = 7
 # Cutoffs shown in the dry-run sensitivity table so Harrison can pick one.
 _SENSITIVITY_CUTOFFS = (7, 10, 14, 21, 30)
 
@@ -170,10 +176,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Directory to write the audit manifest into.")
     parser.add_argument("--apply", action="store_true",
                         help="Actually expire (default is dry-run). Makes a .bak first.")
+    parser.add_argument(
+        "--force", action="store_true",
+        help=f"Override the {_MIN_SAFE_CUTOFF_DAYS}-day minimum-safe cutoff floor "
+             "(required to run a cutoff that would expire fresh, still-routing rows).")
     args = parser.parse_args(argv)
 
     if args.cutoff_days < 0:
         print("ERROR: --cutoff-days must be >= 0.")
+        return 1
+    if args.cutoff_days < _MIN_SAFE_CUTOFF_DAYS and not args.force:
+        print(f"ERROR: --cutoff-days {args.cutoff_days} is below the "
+              f"{_MIN_SAFE_CUTOFF_DAYS}-day minimum-safe floor -- it would expire "
+              "fresh, still-routing operational rows, not just the stale cohort. "
+              "Pass --force if you really mean it.")
         return 1
 
     expire_types = frozenset(t.strip() for t in args.types.split(",") if t.strip())
