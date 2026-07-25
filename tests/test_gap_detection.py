@@ -314,21 +314,34 @@ class TestRetrievalDecisionLog:
         rows = _read_decisions(_isolated_state)
         assert rows[0]["shadow_floor"] == 0.90 and rows[0]["shadow_kb_miss"] is True
 
-    def test_shadow_excludes_tool_note_fallback_thread(self, _isolated_state):
-        # used_tools -> not a shadow miss even at high distance.
+    def test_shadow_excludes_only_tool_and_fallback(self, _isolated_state):
+        # 2026-07-24 relabel: the watch is suppressed ONLY when another answer
+        # source was in play -- a tool call or a cross-entity fallback.
+        # used_tools -> not a shadow watch even at high distance.
         _detect(_isolated_state, kb_meta=self._good(1.4),
                 gen_meta={"used_tools": True},
                 response="A tool-answered reply with real content.")
-        # notes_hit -> not a shadow miss.
+        # cross_entity_fallback -> not a shadow watch.
+        meta_fb = self._good(1.4); meta_fb["cross_entity_fallback"] = True
+        _detect(_isolated_state, kb_meta=meta_fb,
+                response="An answer surfaced via the FNDR cross-entity fallback.")
+        rows = _read_decisions(_isolated_state)
+        assert len(rows) == 2
+        assert all(r["shadow_kb_miss"] is False for r in rows)
+
+    def test_notes_and_thread_no_longer_suppress_the_watch(self, _isolated_state):
+        # 2026-07-24: the notes_hit / thread_context guards were DROPPED from the
+        # predicate -- they suppressed 65%/61% of traffic AND were set on the
+        # very real misses. A high-distance answered query now enters the watch
+        # even with an unrelated owner note or prior-thread context present.
         meta_notes = self._good(1.4); meta_notes["kb_notes_hit"] = True
         _detect(_isolated_state, kb_meta=meta_notes,
-                response="An answer that came from the asker's own note.")
-        # thread_context -> not a shadow miss.
+                response="An answer alongside an unrelated owner note.")
         _detect(_isolated_state, kb_meta=self._good(1.4), thread_context=True,
-                response="An answer sourced from the prior thread messages.")
+                response="An answer with prior-thread context also present.")
         rows = _read_decisions(_isolated_state)
-        assert len(rows) == 3
-        assert all(r["shadow_kb_miss"] is False for r in rows)
+        assert len(rows) == 2
+        assert all(r["shadow_kb_miss"] is True for r in rows)
 
     def test_no_decision_line_when_search_never_ran(self, _isolated_state):
         # Pure tool path (no KB search) -> no retrieval decision to record.
@@ -351,11 +364,12 @@ class TestRetrievalDecisionLog:
         row = _read_decisions(_isolated_state)[0]
         blob = json.dumps(row).lower()
         assert "coffee" not in blob and "sensitive wording" not in blob
-        # only numeric + entity/channel fields
+        # only numeric + entity/channel fields (+ the unknown_response label)
         assert set(row) == {"ts", "entity", "channel", "best_distance",
                             "chunks_returned", "relevant_hits", "notes_hit",
                             "cross_entity_fallback", "used_tools",
-                            "thread_context", "shadow_kb_miss", "shadow_floor"}
+                            "thread_context", "unknown_response",
+                            "shadow_kb_miss", "shadow_floor"}
 
     def test_unknown_response_gap_still_logs_and_decision_recorded(self, _isolated_state):
         # A genuine unknown miss: the real unknown_response gap fires AND the
@@ -365,6 +379,29 @@ class TestRetrievalDecisionLog:
         assert det == "unknown_response"
         assert len(_read_gaps(_isolated_state)) == 1
         assert len(_read_decisions(_isolated_state)) == 1
+
+    def test_negative_result_default_floor_is_1_06(self, _isolated_state):
+        # 2026-07-24 NEGATIVE RESULT (Slice 1): a hard kb_miss floor is not
+        # lockable; the shadow floor was lowered 1.10 -> 1.06 (answerable p95)
+        # so the log-only watch is non-empty. Pin the locked default.
+        assert gd._DEFAULT_SHADOW_KB_MISS_FLOOR == 1.06
+
+    def test_unknown_response_label_recorded_per_row(self, _isolated_state):
+        # SUPERVISED-LABEL add (2026-07-24): each decision row carries whether
+        # the reply was an unknown/no-data shape, so a future kb_miss floor can
+        # be calibrated against ground truth. A genuine unknown -> True.
+        _detect(_isolated_state, response=_SMOKE_THAT_CONTEXT,
+                kb_meta=self._good(0.95))
+        row = _read_decisions(_isolated_state)[0]
+        assert row["unknown_response"] is True
+
+    def test_unknown_response_label_false_on_good_answer(self, _isolated_state):
+        # A confidently-answered query records unknown_response=False -- the
+        # negative class for the supervised distribution.
+        _detect(_isolated_state, kb_meta=self._good(0.95),
+                response="Here is a specific, well-sourced answer with detail.")
+        row = _read_decisions(_isolated_state)[0]
+        assert row["unknown_response"] is False
 
 
 class TestDeflectionPointerVsReason:

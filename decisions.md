@@ -2708,3 +2708,53 @@ VERIFY-FIRST reconciliation (against live code, 9-subsystem parallel map): confi
 - **Auto-write flip (7B):** `CORA_AUTOWRITE_LIVE` (default `off` -> byte-identical to today) promotes graduated-trust Tier-0 (`tier0`) and Tier-0+1 (`all`) to auto-write. The tier decision keeps Tier-2 (money/contracts/legal/equity/comp/PHI/LEX/cross-entity/conflicts-with-canon) Harrison-gated BY CONSTRUCTION; an INDEPENDENT is_high_stakes belt (fails CLOSED) re-checks each candidate. Every auto-write reuses the SAME idempotent executor (incl. its fail-closed PHI re-check), is audited to `logs/cora-autowrite-audit.jsonl` with a snapshot-diff revert payload, and is one-tap revertible in the weekly `cowork-cora-autowrite-digest`. Any apply failure/error routes the item to Harrison -- never silently dropped. WS17-C's SILENT auto-approve (retired D-060) is NOT reintroduced.
 
 **DOCTRINE (D-087):** (1) SUPERSEDE-IN-PLACE for canonical doctrine (entity/project CLAUDE.md, playbooks, known-answers, briefs) -- EDIT the file so replace-on-conflict auto-cleans it; create-new only for dated captures/one-offs. Append-only logs (`decisions.md` newest-first + SUPERSEDED notes) are EXEMPT -- never archive them. (2) A recurring destructive tool splits by blast radius: SMALL applies live (WAL DELETE, no VACUUM), a LARGE run ESCALATES to a Cora-stopped window -- never auto-run at scale. (3) D-011 relaxed = reversibility + audit REPLACE the per-item gate, they do not remove it: every autonomous write is env-gated + default-off, AUDITED, and one-tap REVERTIBLE; high-stakes/PHI/cross-entity/conflicts-with-canon stay Harrison-gated by construction + an independent fail-closed belt. (4) When a "flip a classifier live" ask has NO positive track record, ship it default-OFF behind an operator flag with the audit digest AS the validation -- do not hardcode it on. (5) A shadow/instrumentation module stays pure -- the live flip belongs in the CONSUMER, keying only on the classifier's returned tier so every rail is preserved for free.
+
+---
+
+## D-088 - kb_miss floor is NOT lockable at scale: negative result + supervised label + relabeled shadow (2026-07-24)
+
+**Context:** D-066's follow-up scheduled a "lock the real kb_miss floor" ~2026-07-16
+from the ~1-week `best_distance` distribution collected in
+`logs/kb-retrieval-decisions.jsonl`. The lock slipped. This is the delayed lock,
+resolved from the live 195-row distribution (flywheel-gate-fixes Slice 1, GL-01).
+
+**Decision:** Do NOT lock a distance-based `kb_miss` floor -- the data proves one
+is not defensible. Instead: (a) leave the real `kb_miss` detector unchanged
+(`relevant_hits==0`, kept as a belt for an empty/corrupt-KB case); (b) add a
+per-row `unknown_response` ground-truth label to the decision log so a future
+lock can be SUPERVISED; (c) lower + honestly relabel the log-only SHADOW from
+1.10 to 1.06 (answerable p95) as a "high-distance-answered watch" (NOT a miss
+proxy), dropping the over-broad `notes_hit`/`thread_context` suppressor guards;
+(d) redirect the real-miss lever to the `unknown_response` response-shape signal,
+which already catches the real misses and feeds `knowledge_gaps`/gap_autofill.
+
+**The data (195 answerable rows):** `best_distance` min 0.3715 / p50 0.9163 /
+p90 1.0498 / p95 1.0627 / max 1.1515. `relevant_hits==0` occurs 0/195 (so the
+real detector is structurally unreachable at ~570K chunks -- correct, not a bug).
+The 7 logged real misses (`unknown_response`) span `best_distance` 0.45-1.04,
+straddling the answerable p50 (0.92): NO threshold separates misses from good
+answers. A floor at ~0.93 (to catch the lowest in-window miss) would flag ~40%
+of ANSWERED traffic; the as-coded 1.10 shadow flags 0/195. The `notes_hit` (65%
+of traffic) / `thread_context` (61%) guards were set on the very real misses, so
+they zero the watch out.
+
+**Alternatives considered:**
+- Lock a hard floor at ~0.93-1.06 anyway -- rejected: false precision; either
+  floods the Harrison-gated review with ~40% false gaps (0.93) or fires 0 (1.06).
+- The kickoff fallback "p90/p95 AND relevant_hits==0" -- rejected: both halves
+  are broken (relevant_hits is never 0; p90/p95 of all rows flags ~0 of the
+  eligible subset).
+- Keep the 1.10 shadow as-is -- rejected: dead (0/195), yields no calibratable
+  stream.
+
+**Rationale:** L2 distance carries essentially no miss signal at this corpus
+size. The honest miss signal lives in the RESPONSE shape (`unknown_response`),
+already captured. Recording that label per decision row turns the un-lockable
+floor into a future SUPERVISED lock without any live gating change (everything
+stays LOG-ONLY; nothing new DMs/routes/writes).
+
+**Re-lock trigger:** revisit a real distance floor ONLY when EITHER (i)
+`relevant_hits==0` appears in the decision log for the first time (the first
+evidence a distance floor could ever fire), OR (ii) the log reaches N>=1000 rows;
+whichever first. Hard review date 2026-09-01. Env override
+`CORA_KB_MISS_SHADOW_FLOOR`. NEVER wire the shadow/floor into a gating path.
