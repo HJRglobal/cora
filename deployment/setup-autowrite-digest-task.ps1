@@ -9,7 +9,11 @@
 #
 # NOTE: the digest itself only reports; auto-writing is gated separately by the
 # CORA_AUTOWRITE_LIVE env var (default OFF). Enable auto-write by setting that in
-# .env to 'tier0' (corroborated only) or 'all' (Tier 0 + Tier 1), then restart.
+# .env to 'tier0' (corroborated only) or 'all' (Tier 0 + Tier 1). The flip is
+# SCRIPT-SIDE: the Mon-Fri 7am knowledge-review re-reads .env each fire, so it
+# activates at the NEXT fire -- NO bot restart. (Only the digest's Revert BUTTON
+# needs the bot on current main.) A value other than off|tier0|all falls back to
+# off, so do NOT set '1'.
 
 $TaskName = "cowork-cora-autowrite-digest"
 $Python   = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"

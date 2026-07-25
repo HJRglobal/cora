@@ -54,6 +54,11 @@ disabled:
   # inventory flags, so the standalone tasks are host-disabled to avoid duplicate posts.
   - Cora - F3E Daily Ecom Brief
   - Cora - Inventory Alerts
+  # Auto-create-project-channels task DELIBERATELY disabled (confirmed by Harrison
+  # 2026-07-24). Last good run 2026-07-12; disabled thereafter. Recorded here so the
+  # nightly health check stops warning "unexpectedly Disabled" every day. It creates
+  # Slack channels (a connector write) -- re-enable only via a deliberate admin action.
+  - cowork-cora-project-channel-sync
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
