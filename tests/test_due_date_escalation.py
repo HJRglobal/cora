@@ -278,6 +278,27 @@ class TestParsePendingDecisions:
                    "- **Last touched**: 2025-01-01\n")
         assert self._parse(monkeypatch, content) == []
 
+    def test_phi_topic_skipped(self, monkeypatch):
+        # D-051 defense-in-depth: a PHI-flagged decision topic is never itemized.
+        content = ("## Active\n\n### patient diagnosis review for a client\n"
+                   "- **Severity**: P0\n- **Last touched**: 2025-01-01\n")
+        assert self._parse(monkeypatch, content) == []
+
+    def test_visibility_cpa_topic_skipped(self, monkeypatch):
+        content = ("## Active\n\n### Visibility CPA fee decision\n"
+                   "- **Severity**: P0\n- **Last touched**: 2025-01-01\n")
+        assert self._parse(monkeypatch, content) == []
+
+    def test_month_only_last_touched_dated(self, monkeypatch):
+        # '~YYYY-MM' -> first of month so a coarsely-dated stale P0 still ages
+        # (D-051: the '~2026-04' 1040 OIC P0 was silently never escalated).
+        content = ("## Active\n\n### Old month-only P0\n"
+                   "- **Severity**: P0\n- **Last touched**: ~2020-01\n")
+        decisions = self._parse(monkeypatch, content)
+        assert len(decisions) == 1
+        assert decisions[0]["age_days"] is not None
+        assert decisions[0]["age_days"] > 30
+
     def test_drive_unavailable_returns_empty(self, monkeypatch):
         from cora import drive_io
         def _boom(*a, **k):
@@ -340,6 +361,22 @@ class TestPass2:
         slack = _make_slack()
         stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
         assert stats["alerted"] == 0
+
+    def test_month_only_stale_p0_escalates(self, monkeypatch):
+        # D-051 fix: a '~YYYY-MM' month-only stale P0 now escalates (was skipped).
+        self._patch(monkeypatch, self._entry("P0", "~2020-01"))
+        slack = _make_slack()
+        stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        assert stats["alerted"] == 1
+
+    def test_phi_topic_never_dmd(self, monkeypatch):
+        # A PHI-flagged stale P0 is dropped by the filter -> no DM, no dry-run log.
+        self._patch(monkeypatch, "## Active\n\n### patient diagnosis for a client\n"
+                    "- **Severity**: P0\n- **Last touched**: 2020-01-01\n")
+        slack = _make_slack()
+        stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        assert stats["alerted"] == 0
+        slack.chat_postMessage.assert_not_called()
 
     def test_throttled_decision_skipped(self, monkeypatch):
         import hashlib

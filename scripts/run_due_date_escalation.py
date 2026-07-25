@@ -28,7 +28,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ load_dotenv(_REPO_ROOT / ".env")
 import yaml  # noqa: E402
 
 from cora.tools.asana_client import get_user_tasks, AsanaClientError  # noqa: E402
+from cora.phi_guard import is_phi_risk, is_visibility_cpa_mention  # noqa: E402
 
 LOG_DIR = _REPO_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -216,17 +217,44 @@ def run_pass1_due_tasks(
 # Pass 2 -- P0 stalled decisions
 # ---------------------------------------------------------------------------
 
+def _last_touched_age_days(block: str, today: date) -> int | None:
+    """Age in days from the block's '**Last touched**' value. Prefers a full
+    YYYY-MM-DD; falls back to a month-only value (YYYY-MM, optionally
+    '~'-prefixed) treated as the FIRST of that month so a clearly-stale but
+    coarsely-dated P0 still escalates (D-051 review: the '~2026-04' 1040 OIC P0
+    otherwise never fired). None when the value is undatable."""
+    line = re.search(r"\*\*Last touched\*\*:\s*([^\n]+)", block)
+    if not line:
+        return None
+    val = line.group(1)
+    full = re.search(r"(\d{4})-(\d{2})-(\d{2})", val)
+    if full:
+        try:
+            return (today - date(int(full.group(1)), int(full.group(2)),
+                                 int(full.group(3)))).days
+        except ValueError:
+            return None
+    month = re.search(r"(\d{4})-(\d{2})\b", val)
+    if month:
+        try:
+            return (today - date(int(month.group(1)), int(month.group(2)), 1)).days
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_pending_decisions(path: Path) -> list[dict[str, Any]]:
     """Parse the Founder-OS pending-decisions queue -> stalled P0/P1 entries.
 
     Reads via drive_io (bounded, fail-soft on a G: mount blip -- this is a
-    scheduled job that must never hang). Format is '### topic' blocks with
-    '**Severity**: P0/P1' + '**Last touched**: YYYY-MM-DD'; skips the '[Topic]'
-    template skeleton and the '## Recently resolved' section. Ports the tested
-    parser from strategy_memo.gather_stalled_decisions so it matches the real
-    file (the old list-marker+P0 parser false-matched the template/rubric lines
-    and read the date off the wrong line). age_days is computed from Last touched
-    (None when absent -> not escalated)."""
+    scheduled job that must never hang). Ports strategy_memo.gather_stalled_
+    decisions for this SAME file: the '### topic' block format parse (skip the
+    '[Topic]' skeleton + the '## Recently resolved' section; '**Severity**: P0/P1'
+    with the (?!\\s*/) template guard; age from '**Last touched**') AND its
+    is_phi_risk / is_visibility_cpa_mention SAFETY filter (never itemize a PHI/CPA
+    decision topic into a DM -- defense-in-depth, D-051 review). The old
+    list-marker+P0 parser false-matched the template/rubric, read the date off
+    the wrong line, and pointed at a nonexistent repo path (silent no-op)."""
     from cora import drive_io
 
     try:
@@ -258,18 +286,21 @@ def _parse_pending_decisions(path: Path) -> list[dict[str, Any]]:
         sev = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
         if not sev or sev.group(1) not in ("P0", "P1"):
             continue
-        age_days: int | None = None
-        touched = re.search(r"\*\*Last touched\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
-        if touched:
-            try:
-                age_days = (today - datetime.strptime(
-                    touched.group(1), "%Y-%m-%d").date()).days
-            except ValueError:
-                pass
+        entity_m = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
+        entity = entity_m.group(1).strip() if entity_m else "FNDR"
+        # Defense-in-depth (mirrors strategy_memo on this SAME file): never
+        # itemize a PHI-flagged or Visibility-CPA decision topic into a Slack DM.
+        # topic + entity is the ONLY text that ever egresses (topic[:300] in the
+        # DM; the throttle stores a hash, the alert log stores sev+age only). The
+        # upstream filter also keeps a flagged topic out of the dry-run preview log.
+        text_blob = f"{topic} {entity}"
+        if is_phi_risk(text_blob) or is_visibility_cpa_mention(text_blob):
+            continue
         decisions.append({
             "topic": topic[:300],
+            "entity": entity[:60],
             "severity": sev.group(1),
-            "age_days": age_days,
+            "age_days": _last_touched_age_days(block, today),
         })
     return decisions
 
