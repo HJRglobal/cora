@@ -270,6 +270,12 @@ entities:
     catch_all_gid: "1209152923740511"  # [LEX-LBHS] Operations (this IS the catch-all)
     note: "LBHS is COPA-sensitive. Cora creates tasks here only for operational items. Never surface COPA/BHRF details in tasks."
 
+  LEX-LTS:
+    # Lexington Therapies sub-entity (LTS Team 1215480830642802). Added 2026-07-27
+    # (Asana Standard v1). Before this, LEX-LTS fell back to the LEX parent, so LTS
+    # tasks homed in the LEX-LLC catch-all; now they land in the LTS catch-all.
+    catch_all_gid: "1216928755480116"  # [LEX-LTS] Operations — General
+
   # ── ONE STOP NUTRITION ─────────────────────
   OSN:
     catch_all_gid: "1215470834881074"  # [OSN] Operations — General
@@ -318,7 +324,7 @@ entities:
 
   # ── HJR PROPERTIES ─────────────────────────
   HJRP:
-    catch_all_gid: "1212895000591057"  # [HJRP] Property Management
+    catch_all_gid: "1216928758714643"  # [HJRP] Operations — General (repointed 2026-07-27, Asana Standard v1; was [HJRP] Property Management)
 
     keyword_rules:
       # ── 2026-06-08 governance restructure: Harrison-owned replacements ──
@@ -405,7 +411,7 @@ entities:
 
   # ── F3 COMMUNITY ───────────────────────────
   F3C:
-    catch_all_gid: "1214489612964340"  # [F3C] Programs
+    catch_all_gid: "1216928758905250"  # [F3C] Operations — General (repointed 2026-07-27, Asana Standard v1; was [F3C] Programs)
 
     keyword_rules:
       - project_gid: "1214485863902222"  # [F3C] Grant Pipeline
@@ -422,10 +428,10 @@ entities:
 
   # ── UFL (PAUSED) ───────────────────────────
   UFL:
-    catch_all_gid: "1211401911685190"  # [UFL] UFL Strategic Planning (monitor-only)
+    catch_all_gid: "1216928707369575"  # [UFL] Operations — General (repointed 2026-07-27, Asana Standard v1; was [UFL] UFL Strategic Planning)
     paused: true
     note: >
       UFL is paused until F3 Energy and Lexington reach profitability.
-      All task creation routes to Strategic Planning as monitor-only.
+      All task creation routes to [UFL] Operations — General as monitor-only.
       No active work execution. Sponsors pipeline closed in HubSpot.
       Do not create tasks in Venue & Production, AZ Sponsorships, or Sponsor Pipeline.
