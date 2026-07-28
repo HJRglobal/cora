@@ -133,7 +133,7 @@ The following people are NEVER to be included in Slack drafts, Slack message sug
 ## Lex-specific context to keep in mind
 
 - **Ownership:** Harrison Rogers majority. Jeff Montgomery 20% minority ownership of Lexington Services overall — IT Director role at HJR Global.
-- **Four sub-entities** with distinct teams: LLC (Shaun Hawkins, Asana gid 1209152915815732), LLA (Sandy Patel, gid 1209152923740446), LBHS (Jared Harker, gid 1209152923740451), LTS (Justin Gilmore — separate from Justin Moran, gid 1209152923740448). Each has its own Asana team, Slack channel prefix, and Cora context.
+- **Four sub-entities** with distinct teams: LLC (Shaun Hawkins, Asana gid 1209152915815732), LLA (Sandy Patel, gid 1209152923740446), LBHS (Jared Harker, gid 1209152923740451), LTS (Justin Gilmore — separate from Justin Moran, gid 1215480830642802). Each has its own Asana team, Slack channel prefix, and Cora context.
 - Sub-entity-specific questions should be redirected to #llc-*, #lts-*, #lbhs-*, or #lla-* channels.
 - **CT Corporation UCC lien** is STILL ACTIVE against Lexington LLC + HJR Global through 2027-01-04. Believed-settled lawsuits but no UCC-3 termination filed. Surface this if relevant.
 - **AZ DOR penalty pattern** affects multiple Lex sub-entities — systemic filing-process issue worth a Justin conversation.

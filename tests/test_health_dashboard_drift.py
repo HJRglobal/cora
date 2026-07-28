@@ -6,8 +6,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 _REPO = Path(__file__).resolve().parents[1]
 
 
@@ -64,10 +62,8 @@ def test_drift_section_no_dir_is_no_op(tmp_path, monkeypatch):
     assert out["available"] is False
 
 
-def test_live_registry_has_zero_drift():
-    """With the real repo yaml + the real host artifacts dir, drift must be zero
-    (this session registered all 17). If the host dir is absent, skip -- CI safe."""
-    out = chr.dashboard_drift_section()
-    if not out.get("available"):
-        pytest.skip("no artifacts dir on this host")
-    assert out["unregistered"] == [], f"unregistered artifacts: {out['unregistered']}"
+# NOTE: no test asserts zero drift against the REAL host OneDrive artifacts dir --
+# that would couple the pytest gate to mutable host state outside the repo (a later
+# unregistered artifact would fail the suite for reasons unrelated to any branch).
+# Live drift is the weekly cora_health_report --slack alarm's job; the hermetic
+# test_drift_section_unions_all_buckets above pins the mechanism.

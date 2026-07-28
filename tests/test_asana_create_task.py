@@ -375,6 +375,42 @@ def test_create_subentity_without_entity_option_stamps_status_priority_only():
     assert fields[_PRIORITY_FIELD] == _PRIORITY_MEDIUM
 
 
+def test_create_aggregator_cross_entity_project_tags_by_project_owner():
+    """D-051 fix: an aggregator (FNDR/HJRG) channel that files a task into ANOTHER
+    entity's project via an explicit project_gid must stamp the Entity of the
+    LANDING project, not the channel -- otherwise the task is misattributed."""
+    created = {"gid": "T4", "permalink_url": "http://x/T4", "projects": []}
+    f3e_project = "1214824237490027"  # [F3E] Sales Pipeline — Tommy (F3E-owned in the real map)
+    with patch.object(td.asana_client, "create_task", return_value=created), \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+         patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"title": "Founder files into F3E", "confirmed": True, "project_gid": f3e_project},
+        )
+    stamp.assert_called_once()
+    _gid, fields = stamp.call_args.args
+    assert fields[_ENTITY_FIELD] == _F3E_ENTITY_OPT          # tagged F3E, the project's owner
+    assert fields[_ENTITY_FIELD] != "1214487026542597"       # NOT the FNDR channel option
+
+
+def test_create_aggregator_own_catchall_tags_channel_entity():
+    """The aggregator default path (no explicit project -> the shared HJRG catch-all,
+    owned by FNDR/HJRG) must still stamp the channel entity."""
+    created = {"gid": "T5", "permalink_url": "http://x/T5", "projects": []}
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task", return_value=created), \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+         patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"title": "Founder default task", "confirmed": True},
+        )
+    stamp.assert_called_once()
+    _gid, fields = stamp.call_args.args
+    assert fields[_ENTITY_FIELD] == "1214487026542597"       # FNDR option (channel entity)
+
+
 def test_asana_tool_descriptions_carry_standard_doctrine():
     """Belt-and-suspenders: the 3 write-tool descriptions reflect the Asana Standard."""
     defs = {d["name"]: d for d in td.TOOL_DEFINITIONS}

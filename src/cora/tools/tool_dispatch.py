@@ -887,7 +887,19 @@ def _execute_asana_create(slack_user_id: str, r: dict, entity: str = "") -> str:
     # Status/Priority only -- identical to the capture path's behavior.
     try:
         from ..connectors import fireflies_action_extractor as _fae
-        _fields = _fae._capture_custom_fields(entity)
+        from cora.tools import project_resolver as _pr
+        # Tag the Entity by where the task ACTUALLY lands, not the channel. A
+        # non-aggregator channel always re-routes a cross-entity project back to the
+        # channel entity (belongs_to_entity holds), so this only diverges for an
+        # aggregator (FNDR/HJRG) that filed into another entity's project via an
+        # explicit project_gid: tag by that project's sole owner, else drop the
+        # Entity field (Status/Priority still apply) -- never misattribute.
+        _stamp_entity = entity
+        _proj = r.get("project_gid")
+        if _proj and not _pr.belongs_to_entity(_proj, entity):
+            _owners = sorted(o for o in _pr.project_owner_entities(_proj) if o not in ("FNDR", "HJRG"))
+            _stamp_entity = _owners[0] if len(_owners) == 1 else ""
+        _fields = _fae._capture_custom_fields(_stamp_entity)
         if _fields and created.get("gid"):
             asana_client.set_task_custom_fields(str(created["gid"]), _fields)
     except Exception:  # noqa: BLE001 -- custom-field stamping is best-effort enrichment
