@@ -88,6 +88,11 @@ _NOTES_DIR = _REPO_ROOT / "_notes"
 
 _LEDGER_LOCK = threading.RLock()
 
+# In-flight DM-card reservations (guarded by _LEDGER_LOCK): counts cards whose send
+# is between the cap-check and the persisted dm_sent event, so concurrent capture
+# threads cannot each pass the 5/day check and collectively breach the cap (D-051).
+_DM_RESERVE: dict[str, Any] = {"date": None, "n": 0}
+
 # Test hook: when True, _submit runs the worker INLINE (synchronous) so tests are
 # deterministic. Production leaves it False -> capture work runs on a daemon thread.
 _SYNC = False
@@ -133,6 +138,27 @@ def _normalize(text: str) -> str:
 def _fingerprint(signal: str, representative: str) -> str:
     basis = f"{signal}:{_normalize(representative)}"
     return hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()  # noqa: S324 -- dedup, not security
+
+
+def _is_phi_or_lex(text: str, entity: str) -> bool:
+    """True if free text must NOT be persisted raw at rest: LEX-sourced OR
+    is_phi_risk (fail-closed on error). D-082 extension."""
+    if str(entity or "").strip().upper().startswith("LEX"):
+        return True
+    try:
+        return bool(phi_guard.is_phi_risk(text))
+    except Exception:  # noqa: BLE001 -- fail closed
+        return True
+
+
+def _phi_safe_key(text: str, entity: str) -> str:
+    """A PHI-safe, DISCRIMINATING key for a counting ledger (e.g. thumbs-down
+    signals): the raw text when safe (so fuzzy counting clusters similar items),
+    else a content hash (exact-only counting; distinct texts stay distinct without
+    storing any raw LEX/PHI content)."""
+    if _is_phi_or_lex(text, entity):
+        return "h:" + _fingerprint("phi", text)
+    return (text or "")[:300]
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -373,29 +399,37 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     if store_rep != representative:
         rec["representative"] = ""
 
-    existing_id = find_fingerprint(signal, representative)
-    if existing_id:
-        _append_event({
-            "event": "recurrence", "ts": _now_iso(), "id": existing_id,
-            "evidence": (rec.get("evidence") or [None])[0],
-        })
-        _render_backlog_safe()
-        if code_queue_level() == "live":
-            _thread_count_update(existing_id, client_factory)
-        return existing_id
+    # Dedup decision + ledger writes are ONE atomic critical section (D-051 TOCTOU
+    # fix): find_fingerprint (read) and the fingerprint append must not interleave,
+    # or two concurrent captures of the same signal both miss and both mint a card.
+    # _LEDGER_LOCK is reentrant, so the nested _append_jsonl re-acquire is fine.
+    # Network (DM) + backlog render stay OUTSIDE the lock.
+    with _LEDGER_LOCK:
+        existing_id = find_fingerprint(signal, representative)
+        if existing_id:
+            _append_event({
+                "event": "recurrence", "ts": _now_iso(), "id": existing_id,
+                "evidence": (rec.get("evidence") or [None])[0],
+            })
+            is_new = False
+            result_id = existing_id
+        else:
+            result_id = "cq-" + uuid.uuid4().hex[:12]
+            rec["id"] = result_id
+            rec["ts"] = _now_iso()
+            rec["status"] = initial_status
+            rec.setdefault("count", 1)
+            _append_event({"event": "captured", **rec})
+            _append_fingerprint(rec["fingerprint"], signal, store_rep, result_id)
+            is_new = True
 
-    cq_id = "cq-" + uuid.uuid4().hex[:12]
-    rec["id"] = cq_id
-    rec["ts"] = _now_iso()
-    rec["status"] = initial_status
-    rec.setdefault("count", 1)
-    _append_event({"event": "captured", **rec})
-    _append_fingerprint(rec["fingerprint"], signal, store_rep, cq_id)
     _render_backlog_safe()
-
     if code_queue_level() == "live":
-        _send_new_item_card(rec, client_factory)
-    return cq_id
+        if is_new:
+            _send_new_item_card(rec, client_factory)
+        else:
+            _thread_count_update(result_id, client_factory)
+    return result_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -539,8 +573,13 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
         return  # fail-closed: API/parse error proposes nothing
     kind = verdict.get("kind")
     if kind == "noise":
-        # Remember the fingerprint so identical noise never re-classifies.
-        _append_fingerprint(_fingerprint(signal, question), signal, question, "noise")
+        # Remember the fingerprint so identical noise never re-classifies. The
+        # exact-dedup HASH is stored in the fingerprint field; the raw text is the
+        # (fuzzy-only) representative -- redact it for LEX so no raw LEX message text
+        # lands in the ledger (D-082). Exact dedup via the hash is unaffected.
+        is_lex = str(entity or "").strip().upper().startswith("LEX")
+        _append_fingerprint(_fingerprint(signal, question), signal,
+                            "" if is_lex else question, "noise")
         return
     if kind == "knowledge":
         _route_to_flywheel(question, entity, channel_name, slack_user_id)
@@ -611,8 +650,12 @@ def _process_thumbsdown(channel_id: str, message_ts: str, entity: str, reactor: 
     # Fingerprint basis: the reacted reply text if we could fetch it, else the ts
     # (so a lone thumbs-down we can't read still counts once, never dedups falsely).
     basis = reply_text.strip() or f"ts:{message_ts}"
-    _record_signal("thumbsdown", basis[:300])
-    n = _count_signals("thumbsdown", basis[:300], days=THUMBSDOWN_WINDOW_DAYS, fuzzy=True)
+    # PHI-safe signals key: NEVER persist raw LEX/PHI reply text at rest -- hash it
+    # so counting still discriminates distinct replies without storing content
+    # (D-082). Non-LEX/non-PHI keeps the raw text so fuzzy counting clusters.
+    key = _phi_safe_key(basis, entity)
+    _record_signal("thumbsdown", key)
+    n = _count_signals("thumbsdown", key, days=THUMBSDOWN_WINDOW_DAYS, fuzzy=True)
     if n < THUMBSDOWN_THRESHOLD:
         return
     rec = {
@@ -980,14 +1023,38 @@ def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return text, blocks
 
 
+def _reserve_dm_slot() -> bool:
+    """Atomically claim a DM-card slot for today if under the 5/day cap. Returns
+    True if reserved (caller MUST later _release_dm_slot), False if over cap."""
+    with _LEDGER_LOCK:
+        today = _now().date().isoformat()
+        if _DM_RESERVE["date"] != today:
+            _DM_RESERVE["date"] = today
+            _DM_RESERVE["n"] = 0
+        if _dm_sent_today() + _DM_RESERVE["n"] >= MAX_DM_PER_DAY:
+            return False
+        _DM_RESERVE["n"] += 1
+        return True
+
+
+def _release_dm_slot() -> None:
+    """Release an in-flight DM reservation (the send finished -- persisted or failed)."""
+    with _LEDGER_LOCK:
+        _DM_RESERVE["n"] = max(0, _DM_RESERVE["n"] - 1)
+
+
 def _send_new_item_card(rec: dict[str, Any], client_factory: Callable | None) -> None:
     """Send one new-item DM card to Harrison, respecting the 5/day storm cap.
-    Over cap -> mark dm_held (the overflow flush delivers a '+N more' card)."""
-    try:
-        if _dm_sent_today() >= MAX_DM_PER_DAY:
+    Over cap -> mark dm_held (the overflow flush delivers a '+N more' card). The cap
+    is reservation-guarded so concurrent captures can't collectively breach it."""
+    if not _reserve_dm_slot():
+        try:
             _append_event({"event": "dm_held", "ts": _now_iso(), "id": rec["id"]})
-            log.info("code_queue: DM cap hit -- holding item %s for overflow flush", rec["id"])
-            return
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("code_queue: DM cap hit -- holding item %s for overflow flush", rec["id"])
+        return
+    try:
         client = (client_factory or _default_client_factory)()
         if client is None:
             return
@@ -1004,6 +1071,10 @@ def _send_new_item_card(rec: dict[str, Any], client_factory: Callable | None) ->
         })
     except Exception:  # noqa: BLE001 -- card delivery is best-effort
         log.warning("code_queue: new-item card send failed (non-fatal)", exc_info=True)
+    finally:
+        # Release the in-flight slot: on success the persisted dm_sent now covers it;
+        # on failure the slot is freed so it isn't wasted for the rest of the day.
+        _release_dm_slot()
 
 
 def _thread_count_update(cq_id: str, client_factory: Callable | None) -> None:
@@ -1070,7 +1141,9 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
     status = str(rec.get("status", "PROPOSED"))
 
     if action_id == ACTION_APPROVE:
-        if status == "APPROVED":
+        # STAGED is already past approval (a P0/P1 auto-staged on the first approve);
+        # re-approving must NOT re-run the Sonnet generator / append a second prompt.
+        if status in ("APPROVED", "STAGED"):
             return "noop", "Already queued."
         if status in ("DISMISSED", "SHIPPED", "SUPERSEDED"):
             return "noop", f"Item is {status} -- not re-queuing."
@@ -1341,21 +1414,29 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
         return "not_authorized", "Only Harrison can stage a bundle."
     raw = value[len("bundle:"):] if value.startswith("bundle:") else value
     ids = [x for x in raw.split(",") if x]
-    recs = [get_item(i) for i in ids]
-    recs = [r for r in recs if r]
+    recs = [r for r in (get_item(i) for i in ids) if r]
     if not recs:
         return "error", "No items to stage."
-    slug = _slug(str(recs[0].get("subsystem_guess") or recs[0].get("entity") or "bundle"))
-    path = generate_kickoff_prompt(recs, slug=f"{slug}-bundle")
+    # Idempotency (D-051): the Monday menu is one multi-item message, so its
+    # "Stage bundle" button threads a reply (it is NOT consumed) and can be tapped
+    # again. Only stage items still awaiting a prompt; a re-tap finds none pending
+    # and is a no-op pointing at the existing prompt (no second Sonnet call).
+    pending = [r for r in recs if r.get("status") in ("PROPOSED", "APPROVED")]
+    if not pending:
+        existing = next((r.get("prompt_path") for r in recs if r.get("prompt_path")), "")
+        return "noop", (f"Bundle already staged: `{existing}`" if existing
+                        else "Bundle already staged.")
+    slug = _slug(str(pending[0].get("subsystem_guess") or pending[0].get("entity") or "bundle"))
+    path = generate_kickoff_prompt(pending, slug=f"{slug}-bundle")
     if not path:
         return "error", "Prompt generation failed -- nothing staged."
     bundle_id = "bnd-" + uuid.uuid4().hex[:8]
-    for r in recs:
+    for r in pending:
         _append_event({"event": "staged", "ts": _now_iso(), "id": r["id"],
                        "prompt_path": path, "bundle_id": bundle_id})
     _render_backlog_safe()
     _dm_prompt_path(path)
-    return "staged", f"📝 Bundle prompt staged ({len(recs)} items): `{path}`"
+    return "staged", f"📝 Bundle prompt staged ({len(pending)} items): `{path}`"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

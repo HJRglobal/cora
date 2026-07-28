@@ -68,6 +68,8 @@ def qenv(tmp_path, monkeypatch):
     # No ANTHROPIC key by default -> classifier fail-closed / generator skeleton.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    # Reset the module-global DM reservation so it can't leak across tests.
+    cq._DM_RESERVE.update({"date": None, "n": 0})
     return {"tmp": tmp_path, "backlog": backlog_writes}
 
 
@@ -660,3 +662,77 @@ def test_seed_script_apply_idempotent(qenv, monkeypatch):
     assert any("phantom" in it["title"].lower() for it in items)  # seed #0
     mod.main()  # re-run
     assert len(cq.load_items()) == len(mod.SEEDS)           # idempotent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 remediation regression tests (all 6 confirmed defects)
+# ─────────────────────────────────────────────────────────────────────────────
+def _racer_rec():
+    return {"kind": "bug", "severity": "P2", "title": "racer", "summary": "s",
+            "entity": "F3E", "signal": "tool_error", "representative": "racer_tool",
+            "evidence": [], "reporter": "U1"}
+
+
+def test_dedup_toctou_concurrent_single_item(qenv, monkeypatch):
+    # Fix A: concurrent captures of the SAME signal produce exactly ONE item.
+    import threading
+    monkeypatch.setattr(cq, "_SYNC", False)          # real daemon threads
+    monkeypatch.setenv("CORA_CODE_QUEUE", "log")     # no DM network
+    threads = [threading.Thread(target=lambda: cq._capture(_racer_rec())) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    items = cq.load_items()
+    assert len(items) == 1                            # no duplicate cards/records
+    assert items[0]["count"] == 10                   # 1 captured + 9 recurrences
+
+
+def test_dm_reservation_caps(qenv):
+    # Fix B: the reservation guard hands out at most MAX_DM_PER_DAY slots.
+    got = [cq._reserve_dm_slot() for _ in range(cq.MAX_DM_PER_DAY + 3)]
+    assert got.count(True) == cq.MAX_DM_PER_DAY
+    cq._release_dm_slot()                            # freeing one opens a slot
+    assert cq._reserve_dm_slot() is True
+
+
+def test_noise_lex_fingerprint_redacted(qenv, monkeypatch):
+    # Fix F: a noise-classified LEX message never lands raw in the fingerprint ledger.
+    monkeypatch.setattr(cq, "classify_candidate", lambda m, e: {"kind": "noise"})
+    cq.capture_message_signal("cora should get an LTS coffee machine",
+                              "LEX-LLC", "C1", "lex", "U1")
+    fps = cq._read_jsonl(cq._FINGERPRINT_LEDGER)
+    noise = [f for f in fps if f.get("id") == "noise"]
+    assert noise and all(f.get("representative") == "" for f in noise)
+
+
+def test_thumbsdown_lex_signals_hashed(qenv):
+    # Fix E: LEX reply text is hashed (not stored raw) in the signals ledger.
+    fake = FakeClient()
+    fake.history_text = "client Jane Doe DDD authorization status pending"
+    cq.capture_thumbsdown("C1", "1.0", "LEX", "U1", client=fake)
+    sigs = [s for s in cq._read_jsonl(cq._SIGNALS_LEDGER) if s.get("signal") == "thumbsdown"]
+    assert sigs and all(str(s.get("key", "")).startswith("h:") for s in sigs)
+    assert all("Jane Doe" not in str(s.get("key", "")) for s in sigs)
+
+
+def test_approve_stage_idempotent(qenv):
+    # Fix D: re-approving a STAGED P1 item is a no-op (no second prompt).
+    cid = cq.seed_item(kind="bug", severity="P1", title="crash hard", summary="s",
+                       entity="F3E", signal="tool_error", status="PROPOSED")
+    cq.process_queue_action(cq.ACTION_APPROVE, cid, "U0B2RM2JYJ1")
+    p1 = cq.get_item(cid)["prompt_path"]
+    assert cq.get_item(cid)["status"] == "STAGED" and p1
+    o, _ = cq.process_queue_action(cq.ACTION_APPROVE, cid, "U0B2RM2JYJ1")
+    assert o == "noop" and cq.get_item(cid)["prompt_path"] == p1
+
+
+def test_stage_bundle_idempotent(qenv):
+    # Fix C: re-staging a bundle is a no-op (menu button is re-tappable).
+    ids = [cq.seed_item(kind="feature", severity="P3", title=f"B {i}", summary="s",
+                        entity="F3E", signal="friction", status="APPROVED",
+                        subsystem_guess="shopify") for i in range(2)]
+    o, _ = cq.stage_bundle("bundle:" + ",".join(ids), "U0B2RM2JYJ1")
+    assert o == "staged"
+    o2, msg2 = cq.stage_bundle("bundle:" + ",".join(ids), "U0B2RM2JYJ1")
+    assert o2 == "noop" and "already staged" in msg2.lower()
