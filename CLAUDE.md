@@ -1302,10 +1302,7 @@ Three code-level anti-recurrence fixes for the issues the 2026-06-06 hygiene-asa
 - Problem: Fireflies-captured action items created with NO project → untaggable orphans cluttering My Tasks.
 - New `data/maps/meeting-capture-projects.yaml` maps each entity → its catch-all Asana project. All GIDs sourced from asana-project-map.yaml and cross-checked (catch_all_gid per entity). BDM intentionally excluded (empty). ~~LEX* entries populated but inert — PHI guardrail skips all LEX meetings before routing ever runs.~~ **SUPERSEDED 2026-06-14 (D-052): LEX meetings now flow through capture, SCOPED — LEX* entries are ACTIVE for routing (LEX-only projects via `_resolve_lex_project`, validated allowlist); LEX-LBHS excluded (Part 2). See D-052.**
 - Captured tasks now: routed into project + `Status=Not Started` + `Priority=Medium` stamped at creation.
-- **⬜ Open**: Entity custom-field option GIDs not yet supplied → entity tagging still OFF. Field GIDs when ready:
-  - Entity field: `1214487026542596`
-  - Status: `1214566926973275` / Not Started: `1214566926973276`
-  - Priority: `1204547177535963` / Medium: `1204547177535965`
+- **✅ Entity tagging SHIPPED 2026-06-16 (Phase 1.10), not open** (supersedes the old "⬜ Open / entity tagging OFF" note): the Entity/Status/Priority fields were attached to the capture catch-all projects and the Entity option GIDs were wired into `meeting-capture-projects.yaml` `custom_fields.entity_options`. Captured tasks now stamp Entity too (fail-safe: an entity with no option — e.g. LEX-LTS, HJRP-RR — gets Status/Priority only). As of 2026-07-27 (Asana Standard v1) the conversational `asana_create_task` path stamps the same fields via the shared `_capture_custom_fields`. Field GIDs: Entity `1214487026542596` / Status `1214566926973275` (Not Started `1214566926973276`) / Priority `1204547177535963` (Medium `1204547177535965`).
 
 **Additional fixes same session:**
 - `8381b6f` — **KB-signal guard repaired**: `_has_kb_signal` queried table `"chunks"` but the live KB table is `"knowledge_chunks"` → guard had NEVER fired since it shipped. Also switched recency column `ingested_at` → `date_modified` (full KB re-ingest resets `ingested_at` to today, making the window a no-op). Validated via dry-run: `skipped_signal` 0 → 65.
@@ -1549,8 +1546,11 @@ Full entries in KEY IDS section below. Critical corrections for code:
 - Hannah Grant owner ID: 165179973 (invite pending -- add to slack-to-hubspot.yaml when she accepts).
 
 **Asana corrections:**
-- LTS team does NOT exist as a separate Asana team. Prior notes were wrong.
-  Lex sub-teams: LLC (1209152915815732) / LLA (1209152923740446) / LBHS (1209152923740451).
+- ~~LTS team does NOT exist as a separate Asana team.~~ **SUPERSEDED 2026-07-27
+  (Asana Standard v1): LTS Team `1215480830642802` DOES exist (created ~2026-06)
+  under parent team Lexington Services `1215480830642799`.** The 4 Lex sub-teams
+  are LLC (1209152915815732) / LLA (1209152923740446) / LBHS (1209152923740451) /
+  LTS (1215480830642802). Canonical registry: `_shared/playbooks/asana-architecture.md`.
 - Entity custom field internal name: `f3_entity` (22 options). New options vs. prior:
   LEX-DDS, FF, HJR-PB, CHK, CHB.
 - "Slack Feed - Task Completed" rule is broken/paused workspace-wide. Cleanup needed (low priority).
@@ -1724,18 +1724,25 @@ HubSpot (portal 246351746)
   NOTE: Workflows NOT available on Sales Hub Starter. Make.com is the sole deal automation layer.
 
 Asana (workspace 682743441507584)
-  Teams:
-    HJRG:      1211723492575901
-    F3E:       1209079638382203
-    OSN:       1209426556623911
-    UFL:       1209152923740455
-    BDM:       1211265649994430
-    HJRP:      1209152923740487
-    HJRPROD:   1209152923740471
-    LLC Team:  1209152915815732   <- Lex sub-team (LTS team does NOT exist -- see note below)
-    LLA Team:  1209152923740446
-    LBHS Team: 1209152923740451
-  NOTE: There is NO LTS Asana team. Lex sub-teams are LLC/LLA/LBHS only.
+  CANONICAL team/project registry: _shared/playbooks/asana-architecture.md
+  (the founder CLAUDE.md "Layer 3 -- Asana" points there; this block is a quick ref).
+  Teams (15):
+    HJRG:              1211723492575901   <- also home of [FNDR] + [HJRG] projects
+    F3E:               1209079638382203
+    F3 Community:      1209152923740479   <- [F3C]
+    OSN:               1209426556623911
+    UFL Team:          1209152923740455
+    BDM:               1211265649994430
+    HJRP:              1209152923740487
+    HJRPROD:           1209152923740471
+    Lexington Services: 1215480830642799  <- LEX parent team ([LEX] projects)
+    LLC Team:          1209152915815732   <- [LEX-LLC]
+    LLA Team:          1209152923740446   <- [LEX-LLA]
+    LBHS Team:         1209152923740451   <- [LEX-LBHS]
+    LTS Team:          1215480830642802   <- [LEX-LTS] (exists since ~2026-06)
+    Harrison Private:  1209086911828214   <- exempt from governance
+  NOTE (2026-07-27, Asana Standard v1): the 4 Lex sub-teams are LLC/LLA/LBHS/LTS.
+  Older "no LTS team" notes were STALE -- LTS Team exists (1215480830642802).
   Key projects:
     [HJRG] Q1 Goals - HAT:            1212816399207681
     [F3E] Sales Pipeline — Tommy:     1214824237490027
@@ -1748,6 +1755,19 @@ Asana (workspace 682743441507584)
     [HJRP-RR] Operations:             1215070431026838
     [POD] Episode Pipeline:           1214487014690541
     [POD] Guest Pipeline:             1214487014638100
+  Catch-alls (Cora meeting-capture targets, one per operating entity;
+  2026-07-27 Asana Standard v1 created/repointed UFL/HJRP/F3C/LEX-LTS):
+    [F3E] Operations — General:       1215470928454227
+    [OSN] Operations — General:       1215470834881074
+    [HJRG] Operations — General:      1215470834914137   <- FNDR + HJRG share this
+    [UFL] Operations — General:       1216928707369575
+    [HJRP] Operations — General:      1216928758714643
+    [F3C] Operations — General:       1216928758905250
+    [POD] Operations — General:       1215470944131060
+    [LEX-LLC] Operations — General:   1215470944114390   <- LEX GM-level shares this
+    [LEX-LLA] Operations — General:   1215470928477598
+    [LEX-LTS] Operations — General:   1216928755480116
+    (BDM + LEX-LBHS intentionally excluded from meeting capture -- canon / D-052)
   Entity custom field: internal name = f3_entity (22 options; includes LEX-DDS, FF, HJR-PB, CHK, CHB)
   Total workspace users: 69
   Harrison open tasks: 100+ overdue (oldest Jan 2025). Hygiene nudge validated.
