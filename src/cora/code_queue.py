@@ -184,7 +184,11 @@ def _now_iso() -> str:
 # / user mention tokens; two otherwise-identical asks differing only by these read as
 # distinct under a naive normalize (day-one defect #1 -- the RepRally double-file).
 _MENTION_RE = re.compile(r"<[@#!][^>]*>")
-_SENT_USING_RE = re.compile(r"\*?\s*sent using\b.*$", re.IGNORECASE | re.DOTALL)
+# Anchored to the ACTUAL Cowork footer shape: optional "*Sent using*" mrkdwn wrapping a
+# trailing <@user> mention at END of message. NOT DOTALL and NOT a bare "sent using .*$"
+# -- an unanchored greedy strip would eat legitimate mid-sentence content (e.g. "flag
+# invoices sent using the old template") and collide distinct asks (D-051 defect B).
+_SENT_USING_RE = re.compile(r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$", re.IGNORECASE)
 
 
 def _normalize(text: str) -> str:
@@ -242,6 +246,12 @@ def _embedding_dup_id(signal: str, representative: str, entity: str,
         cr = str(it.get("representative") or "").strip()
         if len(cr) < 8:
             continue  # LEX/PHI-redacted ("") or too-short candidate -- skip
+        # Defense-in-depth (D-051 defect A): never embed a candidate whose stored rep is
+        # LEX-sourced or PHI-tripping, even if a raw one slipped past the write-time
+        # redaction (e.g. a legacy seed_item row). The write path (seed_item + _capture)
+        # now redacts, but the read side must not TRUST that invariant for egress.
+        if _is_phi_or_lex(cr, str(it.get("entity") or "")):
+            continue
         cands.append((str(it.get("id") or ""), cr))
     if not cands:
         return None
@@ -1811,6 +1821,16 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     existing = find_fingerprint(signal, title, class_key=class_key)
     if existing:
         return existing
+    # PHI-safe persistence (mirror _capture, D-051 defect A): NEVER persist a raw LEX or
+    # PHI-tripping representative -- else it becomes an embedding candidate whose raw text
+    # egresses to OpenAI. Exact-hash dedup still works (fingerprint is over `title`).
+    is_lex = str(entity or "").strip().upper().startswith("LEX")
+    try:
+        rep_phi = phi_guard.is_phi_risk(title)
+    except Exception:  # noqa: BLE001 -- fail closed
+        rep_phi = True
+    store_rep = "" if (is_lex or rep_phi) else title
+    rec["representative"] = store_rep
     cq_id = "cq-" + uuid.uuid4().hex[:12]
     rec["id"] = cq_id
     rec["ts"] = _now_iso()
@@ -1818,5 +1838,5 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     rec["count"] = 1
     rec["fingerprint"] = _fingerprint(signal, title)
     _append_event({"event": "captured", **rec})
-    _append_fingerprint(rec["fingerprint"], signal, title, cq_id, class_key=class_key)
+    _append_fingerprint(rec["fingerprint"], signal, store_rep, cq_id, class_key=class_key)
     return cq_id

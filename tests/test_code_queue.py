@@ -1105,3 +1105,60 @@ def test_rehome_script_dry_run_no_delete(qenv, monkeypatch):
     monkeypatch.setattr("sys.argv", ["rehome"])
     assert mod.main() == 0
     assert src.exists()  # dry-run never deletes
+
+
+# ── D-051 v1.1-review remediation (2 confirmed MEDIUM) ─────────────────────────
+def test_seed_item_redacts_lex_representative(qenv):
+    # Defect A root cause: seed_item must not persist a raw LEX representative (else it
+    # becomes an embedding candidate that egresses to OpenAI).
+    cid = cq.seed_item(kind="feature", severity="P3", title="lex_lbhs_ar_aging tool",
+                       summary="s", entity="LEX", signal="friction", status="APPROVED")
+    assert cq.get_item(cid)["representative"] == ""
+    fps = cq._read_jsonl(cq._FINGERPRINT_LEDGER)
+    assert all(f.get("representative") == "" for f in fps if f.get("id") == cid)
+
+
+def test_embedding_never_egresses_lex_candidate(qenv, monkeypatch):
+    # Defect A defense-in-depth: even a LEX candidate with a RAW stored rep (legacy row)
+    # is never handed to the embedder.
+    seen = {"texts": []}
+
+    def _spy(texts):
+        seen["texts"].extend(texts)
+        return [[0.0, 1.0] for _ in texts]
+    monkeypatch.setattr(cq, "_default_embed", _spy)
+    # Force a raw LEX rep into the ledger (simulate a legacy/pre-fix row).
+    cq._append_event({"event": "captured", "id": "cq-legacylex", "ts": cq._now_iso(),
+                      "status": "APPROVED", "count": 1, "entity": "LEX-LLC",
+                      "signal": "phrase", "kind": "feature", "severity": "P3",
+                      "title": "raw", "summary": "",
+                      "representative": "client Jane Doe DDD authorization tracker request"})
+    # A non-LEX capture triggers the embedding candidate scan.
+    cq._capture({"kind": "feature", "severity": "P3", "title": "osn thing", "summary": "",
+                 "entity": "OSN", "signal": "phrase",
+                 "representative": "cora should build an osn franchise pulse tool",
+                 "evidence": [], "reporter": "U1"})
+    assert all("Jane Doe" not in t for t in seen["texts"])  # LEX rep never embedded
+
+
+def test_dedup_inline_sent_using_not_merged(qenv):
+    # Defect B: an inline "sent using X" (no trailing mention) is NOT a footer and must
+    # NOT be stripped -- two distinct asks sharing a prefix stay distinct.
+    r1 = {"kind": "feature", "severity": "P3", "title": "auto-file receipts amex",
+          "summary": "", "entity": "F3E", "signal": "phrase",
+          "representative": "cora should auto-file receipts sent using amex card",
+          "evidence": [], "reporter": "U1"}
+    r2 = {"kind": "feature", "severity": "P3", "title": "auto-file receipts chase",
+          "summary": "", "entity": "F3E", "signal": "phrase",
+          "representative": "cora should auto-file receipts sent using the chase portal every monday",
+          "evidence": [], "reporter": "U1"}
+    assert cq._normalize(r1["representative"]) != cq._normalize(r2["representative"])
+    id1 = cq._capture(dict(r1))
+    id2 = cq._capture(dict(r2))
+    assert id1 != id2  # distinct items -- inline "sent using" not over-stripped
+
+
+def test_footer_strip_still_works_after_anchor(qenv):
+    # The genuine Cowork footer (trailing <@..> mention) is STILL stripped post-fix.
+    base = "cora should ship a new osn pulse view"
+    assert cq._normalize(base + "\n\n*Sent using* <@U0B2RM2JYJ1>") == cq._normalize(base)
