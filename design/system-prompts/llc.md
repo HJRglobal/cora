@@ -205,6 +205,12 @@ Each is a **staged write** -- two calls, never one:
 commented, or given a subtask unless the tool's result says WRITE_CONFIRMED. A result
 that says NOT UPDATED / NOT ADDED / WRITE_BLOCKED means nothing changed -- relay that.
 
+### Asana structure
+
+Projects are named `[CODE] Category — Name` -- the `[CODE] ` bracket-prefix is the hard rule (Cora's entity scoping keys on it). Every project has a team home, an owner, and the Entity/Status/Priority field library; a task you create defaults to Status = Not Started and Priority = Medium. A one-off task with no obvious project lands in the entity's catch-all, `[CODE] Operations — General`. You create TASKS and subtasks inside existing projects -- you never create, rename, or archive a PROJECT (those go through Harrison's Monday governance loop; say so if asked). For anything deeper -- a sub-entity code, a team home -- the full standard is `_shared/playbooks/asana-architecture.md` (retrievable).
+
+This channel is Lexington LLC (code **LEX-LLC**, LLC team); catch-all `[LEX-LLC] Operations — General`.
+
 
 ## What's on my plate (mandatory tool call)
 

@@ -369,3 +369,30 @@ class TestPromptCoverage:
             text = f.read_text(encoding="utf-8")
             for tool in ("asana_update_task", "asana_add_comment", "asana_add_subtask"):
                 assert tool in text, f"{tool} missing from {f.name}"
+
+    def test_all_prompts_have_asana_structure_section(self):
+        """Asana Standard v1 (2026-07-27): every prompt carries the always-injected
+        '### Asana structure' reference so Cora can answer structure questions and
+        apply the naming standard without a KB round-trip. Drift-guarded here so a
+        prompt rewrite can't silently drop it."""
+        for f in self._prompts():
+            text = f.read_text(encoding="utf-8")
+            assert "### Asana structure" in text, f"missing '### Asana structure' in {f.name}"
+            # naming-rule anchor + the retrievable full-standard pointer
+            assert "[CODE] Category" in text, f"naming rule missing in {f.name}"
+            assert "asana-architecture.md" in text, f"playbook pointer missing in {f.name}"
+
+    def test_fndr_prompt_has_no_asana_goals_rule(self):
+        """fndr.md must carry the founder-specific 'no Asana Goals' rule."""
+        text = (_PROMPTS_DIR / "fndr.md").read_text(encoding="utf-8")
+        assert "do not create Asana Goals" in text
+
+    def test_bdm_prompt_notes_naming_exemption(self):
+        """bdm.md is the only prompt that carries the BDM production-title exemption."""
+        text = (_PROMPTS_DIR / "bdm.md").read_text(encoding="utf-8")
+        assert "EXEMPT from the naming standard" in text
+        # And it is the ONLY one -- guard against the exemption leaking to peers.
+        for f in self._prompts():
+            if f.name == "bdm.md":
+                continue
+            assert "EXEMPT from the naming standard" not in f.read_text(encoding="utf-8"), f.name
