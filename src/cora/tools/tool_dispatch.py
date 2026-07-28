@@ -871,6 +871,22 @@ def _execute_asana_create(slack_user_id: str, r: dict, entity: str = "") -> str:
     pm_metrics.log_pm_action("create", slack_user_id, entity, created.get("gid", ""),
                              title=r.get("title"))
 
+    # Asana Standard v1 (2026-07-27): stamp Entity/Status/Priority on the created
+    # task, reusing the SAME meeting-capture-projects.yaml config the capture path
+    # uses (one config, two consumers -- fae._capture_custom_fields). Best-effort +
+    # non-fatal: set_task_custom_fields never raises, and a field not attached to the
+    # task's project is dropped, so a field failure NEVER blocks or fails the create
+    # (matches capture semantics). `entity` is the routed channel entity, so a
+    # sub-entity with no Entity option (LEX-LTS, HJRP-RR, OSN stores) fail-safes to
+    # Status/Priority only -- identical to the capture path's behavior.
+    try:
+        from ..connectors import fireflies_action_extractor as _fae
+        _fields = _fae._capture_custom_fields(entity)
+        if _fields and created.get("gid"):
+            asana_client.set_task_custom_fields(str(created["gid"]), _fields)
+    except Exception:  # noqa: BLE001 -- custom-field stamping is best-effort enrichment
+        log.debug("asana_create_task: custom-field stamp skipped", exc_info=True)
+
     added_followers: list[str] = []
     if r.get("follower_gids") and created.get("gid"):
         try:
@@ -5914,7 +5930,13 @@ TOOL_DEFINITIONS = [
             "'create a task to...', 'add a task for Sean to...', 'set up a task to do X', 'queue a "
             "task for Hannah'. Default assignee is the @-mentioning user; cross-assignment is "
             "allowed (any teammate in slack-to-asana.yaml; aliases supported). On confirm the tool "
-            "returns a clickable Slack link to the created task."
+            "returns a clickable Slack link to the created task.\n"
+            "\n"
+            "Asana Standard: the tool auto-homes the task in the channel entity's project (a "
+            "keyword-matched project, else the entity's `[CODE] Operations — General` catch-all) "
+            "and stamps Entity/Status=Not Started/Priority=Medium. You create TASKS, never "
+            "PROJECTS — if a user asks to create, rename, or archive a project, tell them that "
+            "goes through Harrison's Asana governance (the playbook checklist), not this tool."
         ),
         "input_schema": {
             "type": "object",
@@ -6013,7 +6035,10 @@ TOOL_DEFINITIONS = [
             "approval, THEN call again with confirmed=true. Only the asker's OWN open tasks "
             "(reassigning your own task to a teammate is allowed); if it reports zero or "
             "multiple matches, relay that. The tool owns the wording -- never say a field "
-            "changed unless the result says WRITE_CONFIRMED."
+            "changed unless the result says WRITE_CONFIRMED.\n"
+            "Asana Standard: Status values are Not Started / In Progress / Review / Blocked / "
+            "Complete; Priority is High / Medium / Low. This tool edits an existing task's "
+            "fields only -- it never creates, renames, or archives a PROJECT."
         ),
         "input_schema": {
             "type": "object",
@@ -6068,7 +6093,10 @@ TOOL_DEFINITIONS = [
             "PHI-scrubs Lexington content, and returns a NOT-CREATED-yet preview; show it "
             "verbatim, get explicit approval, THEN call again with confirmed=true. The "
             "parent must be one of the asker's OWN open tasks. The tool owns the wording -- "
-            "never say a subtask was created unless the result says WRITE_CONFIRMED."
+            "never say a subtask was created unless the result says WRITE_CONFIRMED.\n"
+            "Asana Standard: a subtask lives under its parent and inherits the parent's "
+            "project, so it does NOT carry its own Entity/Status/Priority fields -- set those "
+            "on the top-level task, not here."
         ),
         "input_schema": {
             "type": "object",

@@ -306,3 +306,79 @@ def test_create_task_refuses_unresolvable_assignee():
 
     mock.assert_not_called()
     assert "didn't match" in result.lower() or "didn't match" in result
+
+
+# ---------------------------------------------------------------------------
+# Asana Standard v1 (2026-07-27): create path stamps Entity/Status/Priority
+# using the SAME meeting-capture-projects.yaml custom_fields config (one config,
+# two consumers). Best-effort + non-fatal.
+# ---------------------------------------------------------------------------
+
+_ENTITY_FIELD = "1214487026542596"
+_STATUS_FIELD = "1214566926973275"
+_STATUS_NOT_STARTED = "1214566926973276"
+_PRIORITY_FIELD = "1204547177535963"
+_PRIORITY_MEDIUM = "1204547177535965"
+_F3E_ENTITY_OPT = "1214487026542599"
+
+
+def test_create_stamps_entity_status_priority():
+    """A confirmed create stamps Entity/Status=Not Started/Priority=Medium on the
+    new task via set_task_custom_fields."""
+    created = {"gid": "T1", "permalink_url": "http://x/T1", "projects": []}
+    with patch.object(td.asana_client, "create_task", return_value=created), \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+         patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="F3E",
+            _input={"title": "Neutral placeholder item", "confirmed": True},
+        )
+    stamp.assert_called_once()
+    gid_arg, fields = stamp.call_args.args
+    assert gid_arg == "T1"
+    assert fields[_STATUS_FIELD] == _STATUS_NOT_STARTED
+    assert fields[_PRIORITY_FIELD] == _PRIORITY_MEDIUM
+    assert fields[_ENTITY_FIELD] == _F3E_ENTITY_OPT
+    assert "WRITE_CONFIRMED" in out
+
+
+def test_create_field_stamp_failure_never_fails_create():
+    """A custom-field stamp error must NOT fail the create (best-effort enrichment)."""
+    created = {"gid": "T2", "permalink_url": "http://x/T2", "projects": []}
+    with patch.object(td.asana_client, "create_task", return_value=created) as mk, \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+         patch.object(td.asana_client, "set_task_custom_fields", side_effect=RuntimeError("boom")):
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="F3E",
+            _input={"title": "Another neutral item", "confirmed": True},
+        )
+    mk.assert_called_once()
+    assert "WRITE_CONFIRMED" in out   # create still succeeded despite the stamp error
+
+
+def test_create_subentity_without_entity_option_stamps_status_priority_only():
+    """A non-LEX sub-entity with no Entity option (HJRP-RR) fail-safes to
+    Status/Priority only -- the Entity field is dropped, never fatal (matches the
+    capture path's behavior for LEX-LTS / HJRP-RR / OSN stores)."""
+    created = {"gid": "T3", "permalink_url": "http://x/T3", "projects": []}
+    with patch.object(td.asana_client, "create_task", return_value=created), \
+         patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+         patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="HJRP-RR",
+            _input={"title": "Ranch placeholder task", "confirmed": True},
+        )
+    stamp.assert_called_once()
+    _gid, fields = stamp.call_args.args
+    assert _ENTITY_FIELD not in fields          # no HJRP-RR Entity option -> dropped
+    assert fields[_STATUS_FIELD] == _STATUS_NOT_STARTED
+    assert fields[_PRIORITY_FIELD] == _PRIORITY_MEDIUM
+
+
+def test_asana_tool_descriptions_carry_standard_doctrine():
+    """Belt-and-suspenders: the 3 write-tool descriptions reflect the Asana Standard."""
+    defs = {d["name"]: d for d in td.TOOL_DEFINITIONS}
+    for name in ("asana_create_task", "asana_update_task", "asana_add_subtask"):
+        assert "Asana Standard" in defs[name]["description"], name
+    create_desc = defs["asana_create_task"]["description"]
+    assert "PROJECT" in create_desc  # "you create TASKS, never PROJECTS" governance line
