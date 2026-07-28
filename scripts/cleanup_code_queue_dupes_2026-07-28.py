@@ -38,6 +38,14 @@ MERGES: list[tuple[str, str]] = [
     ("cq-dad80c0011c9", "cq-06f4797db4f1"),
 ]
 
+# The build-REQUEST items whose work v1.1 delivers -> mark SHIPPED at cascade (prompt
+# section 0). NOT the RepRally survivor cq-5f48.. (that is a genuine future build; only
+# its duplicate is superseded above).
+SHIPS: list[str] = [
+    "cq-72b3e2ab670f",  # the dedup improvement (delivered by slice 1a)
+    "cq-06f4797db4f1",  # the env-flag docstring fix (delivered by slice 1f)
+]
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -67,15 +75,33 @@ def main() -> int:
         else:
             print(f"WOULD MERGE: {line}")
 
+    shipped = 0
+    for cid in SHIPS:
+        rec = code_queue.get_item(cid)
+        if not rec:
+            print(f"SKIP SHIP (missing id): {cid}")
+            continue
+        if rec.get("status") == "SHIPPED":
+            print(f"SKIP SHIP (already shipped): {cid}")
+            continue
+        line = f"{cid} [{rec.get('status')}] '{rec.get('title', '')[:60]}'"
+        if args.apply:
+            code_queue.process_queue_action(
+                code_queue.ACTION_MARK_SHIPPED, cid, code_queue.HARRISON_ID)
+            print(f"SHIPPED: {line}")
+            shipped += 1
+        else:
+            print(f"WOULD SHIP: {line}")
+
     print("")
     if args.apply:
-        print(f"Done. Merged {merged}, skipped {skipped}.")
+        print(f"Done. Merged {merged}, shipped {shipped}, skipped {skipped}.")
         try:
             code_queue.render_backlog()
         except Exception as exc:  # noqa: BLE001
             print(f"(backlog render skipped: {exc})")
     else:
-        print(f"Dry-run: would merge {len(MERGES) - skipped} pair(s), {skipped} skipped. "
+        print(f"Dry-run: would merge {len(MERGES) - skipped} pair(s) + ship {len(SHIPS)} item(s). "
               "Re-run with --apply to write.")
     return 0
 

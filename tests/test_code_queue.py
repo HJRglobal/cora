@@ -1044,16 +1044,21 @@ def test_cleanup_script_dry_run_then_apply(qenv, monkeypatch):
                       entity="F3E", signal="explicit", status="APPROVED")
     l1 = cq.seed_item(kind="feature", severity="P2", title="Lose 1", summary="s",
                       entity="F3E", signal="phrase", status="PROPOSED")
+    ship = cq.seed_item(kind="feature", severity="P2", title="Ship me", summary="s",
+                        entity="F3E", signal="explicit", status="APPROVED")
     monkeypatch.setattr(mod, "MERGES", [(l1, w1)])
+    monkeypatch.setattr(mod, "SHIPS", [ship, "cq-does-not-exist"])
     # dry-run: nothing changes
     monkeypatch.setattr("sys.argv", ["cleanup"])
     assert mod.main() == 0
     assert cq.get_item(l1)["status"] == "PROPOSED"
-    # apply: merged
+    assert cq.get_item(ship)["status"] == "APPROVED"
+    # apply: merged + shipped (missing SHIP id is skipped gracefully)
     monkeypatch.setattr("sys.argv", ["cleanup", "--apply"])
     assert mod.main() == 0
     assert cq.get_item(l1)["status"] == "SUPERSEDED"
     assert cq.get_item(w1)["count"] == 2
+    assert cq.get_item(ship)["status"] == "SHIPPED"
 
 
 # ── Slice 1d: re-home planner/applier + migration script ───────────────────────
