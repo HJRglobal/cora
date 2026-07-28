@@ -54,6 +54,8 @@ _HAIKU_MODEL = "claude-haiku-4-5"
 _SONNET_MODEL = "claude-sonnet-4-6"
 
 FUZZY_DEDUP_RATIO = 0.85          # same-signal paraphrase-dedup threshold (friction pattern)
+DEDUP_EMBED_SIM = 0.82            # cosine sim for SEMANTIC (paraphrase) dedup (friction CLUSTER_SIM)
+DEDUP_EMBED_WINDOW_DAYS = 14      # embedding dedup only considers OPEN items this recent
 MAX_DM_PER_DAY = 5                # storm cap: new-item DM cards per day
 SILENT_TIMEOUT_THRESHOLD = 3      # UC6: >= this many same-tool timeouts in the window -> candidate
 SILENT_TIMEOUT_WINDOW_DAYS = 7
@@ -65,6 +67,11 @@ EXPLICIT_THROTTLE_PER_DAY = 3    # per-user cap on the explicit tool
 
 VALID_KINDS = ("bug", "feature", "config")
 VALID_SEVERITIES = ("P0", "P1", "P2", "P3")
+
+# Statuses at which an item is still "live" -- a new similar signal should dedup INTO
+# it (used by the embedding paraphrase layer). Terminal statuses are excluded so a
+# dismissed/shipped item never absorbs a genuinely fresh ask.
+_OPEN_STATUSES = frozenset({"PROPOSED", "APPROVED", "STAGED", "SNOOZED", "BLOCKED"})
 
 # Block Kit action ids (own namespace; handled by app.py wrappers)
 ACTION_APPROVE = "code_queue_approve"
@@ -93,6 +100,30 @@ _LEDGER_LOCK = threading.RLock()
 # threads cannot each pass the 5/day check and collectively breach the cap (D-051).
 _DM_RESERVE: dict[str, Any] = {"date": None, "n": 0}
 
+# In-flight staging reservations (guarded by _LEDGER_LOCK): the id(s) whose kickoff
+# prompt is being generated RIGHT NOW. The persisted `staged` event is only appended
+# AFTER the (multi-second) Sonnet generate returns, so a second Stage tap in that
+# window would otherwise pass the "already STAGED?" check and generate a SECOND prompt
+# (day-one defect #3 -- a TOCTOU on the stage path). A concurrent tap that sees an id
+# reserved here backs off with an "already staging" ack -- no second generate.
+_STAGING_INFLIGHT: set[str] = set()
+
+
+def _begin_staging(keys: list[str]) -> bool:
+    """Atomically reserve staging for ``keys`` (item ids). Returns True if reserved
+    (caller MUST later _end_staging), False if any key is already being staged."""
+    with _LEDGER_LOCK:
+        if any(k in _STAGING_INFLIGHT for k in keys):
+            return False
+        _STAGING_INFLIGHT.update(keys)
+        return True
+
+
+def _end_staging(keys: list[str]) -> None:
+    with _LEDGER_LOCK:
+        for k in keys:
+            _STAGING_INFLIGHT.discard(k)
+
 # Test hook: when True, _submit runs the worker INLINE (synchronous) so tests are
 # deterministic. Production leaves it False -> capture work runs on a daemon thread.
 _SYNC = False
@@ -109,13 +140,30 @@ def backlog_path() -> Path:
     return _founder_os_root() / "_shared" / "projects" / "cora" / "code-session-backlog.md"
 
 
+def founder_os_notes_dir() -> Path:
+    """Canonical home for generated kickoff prompts: the Founder-OS ``_notes`` folder
+    (NOT the repo ``_notes``). KB-excluded by filename (``cora-code-prompt`` -> the
+    kb_exclusions rule), so living under the swept Drive tree leaks nothing."""
+    return _founder_os_root() / "_shared" / "projects" / "cora" / "_notes"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Rollout flag
 # ─────────────────────────────────────────────────────────────────────────────
 def code_queue_level() -> str:
     """CORA_CODE_QUEUE: 'off' (default, fully inert), 'log' (capture + ledger +
     backlog, NO DMs), or 'live' (+ immediate DM cards). Unrecognized -> 'off'.
-    Read per-call so a flip needs no restart (mirrors autowrite_level())."""
+
+    Read per-call from the PROCESS ENVIRONMENT. NOTE (day-one defect: the docstring
+    used to claim "a flip needs no restart" -- that is only true for freshly-spawned
+    SCRIPTS, which re-run ``load_dotenv`` at import). The always-on bot loads ``.env``
+    ONCE at startup, so editing the ``.env`` FILE does NOT change a running bot's value
+    -- confirmed live 2026-07-28 (the 7am menu script read the flip fresh; the bot did
+    not). To flip the BOT: change the value AND restart (or set it in the service
+    environment). Runbook: CLAUDE.md 'RESTART' step. A per-call ``.env`` re-read was
+    considered and rejected -- it would let a stale/edited ``.env`` silently override an
+    operator's real-environment value and break the test contract (tests set os.environ
+    directly); a restart is already required for the bot-loaded hooks anyway."""
     v = (os.environ.get("CORA_CODE_QUEUE", "off") or "off").strip().lower()
     return v if v in ("off", "log", "live") else "off"
 
@@ -131,13 +179,91 @@ def _now_iso() -> str:
     return _now().isoformat()
 
 
+# Slack/Cowork connector noise that must NOT defeat dedup. The Cowork connector
+# appends a trailing "*Sent using* <@U...>" footer, and asks routinely carry channel
+# / user mention tokens; two otherwise-identical asks differing only by these read as
+# distinct under a naive normalize (day-one defect #1 -- the RepRally double-file).
+_MENTION_RE = re.compile(r"<[@#!][^>]*>")
+_SENT_USING_RE = re.compile(r"\*?\s*sent using\b.*$", re.IGNORECASE | re.DOTALL)
+
+
 def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+    """Lowercase + whitespace-collapse AFTER stripping the Cowork "Sent using" footer
+    and any Slack mention tokens, so connector noise can't split a dedup group."""
+    t = _SENT_USING_RE.sub("", text or "")
+    t = _MENTION_RE.sub(" ", t)
+    return re.sub(r"\s+", " ", t.strip().lower())
 
 
 def _fingerprint(signal: str, representative: str) -> str:
     basis = f"{signal}:{_normalize(representative)}"
     return hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()  # noqa: S324 -- dedup, not security
+
+
+def _class_key(title: str, subsystem: str) -> str | None:
+    """Second dedup key over the CLASSIFIER OUTPUT (title + subsystem), so two
+    paraphrased asks that the classifier collapses to the same (title, subsystem)
+    dedup even across DIFFERENT signals. A hash -> PHI-safe (stores nothing raw).
+    None when either field is empty (too coarse to key on)."""
+    t = _normalize(title)
+    s = _normalize(subsystem)
+    if not t or not s:
+        return None
+    return "c:" + hashlib.sha1(f"{t}|{s}".encode("utf-8", "replace")).hexdigest()  # noqa: S324 -- dedup, not security
+
+
+def _default_embed(texts: list[str]) -> list[list[float]]:
+    """Lazy import so tests / offline runs don't require the openai dependency
+    (mirrors friction_mining._default_embed)."""
+    from cora.knowledge_base.embeddings import embed_texts
+    return embed_texts(texts)
+
+
+def _embedding_dup_id(signal: str, representative: str, entity: str,
+                      *, embed_fn: Callable | None = None) -> str | None:
+    """Semantic (paraphrase) dedup: cosine >= DEDUP_EMBED_SIM against OPEN items
+    captured within DEDUP_EMBED_WINDOW_DAYS. Cross-signal. Returns the matched cq-id
+    or None. FAIL-SOFT (any embedding error -> None). NEVER embeds LEX/PHI text (egress
+    guard); LEX candidates carry no stored representative, so they are excluded on the
+    candidate side too. Runs OUTSIDE the ledger lock (it makes a network call)."""
+    if _is_phi_or_lex(representative, entity):
+        return None
+    rep = (representative or "").strip()
+    if len(rep) < 8:
+        return None
+    cutoff = _now() - timedelta(days=DEDUP_EMBED_WINDOW_DAYS)
+    cands: list[tuple[str, str]] = []
+    for it in load_items():
+        if it.get("status") not in _OPEN_STATUSES:
+            continue
+        ts = _parse_ts(it.get("ts"))
+        if ts is None or ts < cutoff:
+            continue
+        cr = str(it.get("representative") or "").strip()
+        if len(cr) < 8:
+            continue  # LEX/PHI-redacted ("") or too-short candidate -- skip
+        cands.append((str(it.get("id") or ""), cr))
+    if not cands:
+        return None
+    try:
+        from .reconciliation_engine import _cosine_sim
+        fn = embed_fn or _default_embed
+        vecs = fn([rep] + [c[1] for c in cands])
+    except Exception:  # noqa: BLE001 -- fail-soft: no embeddings, no semantic dedup
+        return None
+    if not vecs or len(vecs) != len(cands) + 1:
+        return None
+    q = vecs[0]
+    best_id: str | None = None
+    best = DEDUP_EMBED_SIM
+    for (cid, _cr), v in zip(cands, vecs[1:]):
+        try:
+            s = _cosine_sim(q, v)
+        except Exception:  # noqa: BLE001
+            continue
+        if s >= best:
+            best, best_id = s, cid
+    return best_id
 
 
 def _is_phi_or_lex(text: str, entity: str) -> bool:
@@ -186,23 +312,33 @@ def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Fingerprint dedup ledger (friction pattern: exact OR same-signal fuzzy)
 # ─────────────────────────────────────────────────────────────────────────────
-def _append_fingerprint(fp: str, signal: str, representative: str, cq_id: str) -> None:
+def _append_fingerprint(fp: str, signal: str, representative: str, cq_id: str,
+                        class_key: str | None = None) -> None:
     _append_jsonl(_FINGERPRINT_LEDGER, {
         "fingerprint": fp,
         "signal": signal,
         "representative": (representative or "")[:300],
+        "class_key": class_key or "",
         "id": cq_id,
         "ts": _now_iso(),
     })
 
 
-def find_fingerprint(signal: str, representative: str) -> str | None:
-    """Return the cq-id of a prior candidate matching this signal+text (exact
-    fingerprint OR same-signal paraphrase >= FUZZY_DEDUP_RATIO), else None."""
+def find_fingerprint(signal: str, representative: str,
+                     *, class_key: str | None = None) -> str | None:
+    """Return the cq-id of a prior candidate matching this signal+text, else None.
+    Deterministic (no network); three layers, first hit wins:
+      1. exact fingerprint (same signal + normalized text),
+      2. cross-signal identical classifier key (title + subsystem), when supplied,
+      3. same-signal paraphrase (SequenceMatcher >= FUZZY_DEDUP_RATIO).
+    Runs inside the ledger lock in ``_capture`` (the semantic/embedding layer runs
+    OUTSIDE the lock -- see ``_embedding_dup_id``)."""
     fp = _fingerprint(signal, representative)
     rep = _normalize(representative)
     for entry in _read_jsonl(_FINGERPRINT_LEDGER):
         if entry.get("fingerprint") == fp:
+            return entry.get("id")
+        if class_key and entry.get("class_key") == class_key:
             return entry.get("id")
         if entry.get("signal") == signal:
             prior = _normalize(str(entry.get("representative") or ""))
@@ -295,6 +431,8 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             rec["status"] = "SHIPPED"
         elif et == "superseded":
             rec["status"] = "SUPERSEDED"
+            if ev.get("superseded_by"):
+                rec["superseded_by"] = ev.get("superseded_by")
         elif et == "blocked":
             rec["status"] = "BLOCKED"
         elif et == "edited":
@@ -386,6 +524,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     signal = str(rec.get("signal") or "unknown")
     representative = _representative(rec)
     rec["fingerprint"] = _fingerprint(signal, representative)
+    class_key = _class_key(str(rec.get("title", "")), str(rec.get("subsystem_guess", "")))
 
     # PHI-safe persistence of the dedup basis: NEVER store raw LEX or PHI-tripping
     # text in the fingerprint ledger OR the event record. The hash (already
@@ -399,13 +538,25 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     if store_rep != representative:
         rec["representative"] = ""
 
+    # Semantic (embedding) dedup runs OUTSIDE the lock -- it makes a network call and
+    # must not hold the process-wide ledger lock. Only computed when the cheap
+    # deterministic layers miss (a lock-free pre-read), so an exact/near-exact repeat
+    # never pays an embedding round-trip. Re-validated inside the lock below.
+    emb_id: str | None = None
+    if find_fingerprint(signal, representative, class_key=class_key) is None:
+        emb_id = _embedding_dup_id(signal, representative, entity)
+
     # Dedup decision + ledger writes are ONE atomic critical section (D-051 TOCTOU
-    # fix): find_fingerprint (read) and the fingerprint append must not interleave,
-    # or two concurrent captures of the same signal both miss and both mint a card.
-    # _LEDGER_LOCK is reentrant, so the nested _append_jsonl re-acquire is fine.
-    # Network (DM) + backlog render stay OUTSIDE the lock.
+    # fix): the deterministic find (read) and the fingerprint append must not
+    # interleave, or two concurrent captures of the same signal both miss and both
+    # mint a card. _LEDGER_LOCK is reentrant, so the nested _append_jsonl re-acquire
+    # is fine. Network (embedding, DM) + backlog render stay OUTSIDE the lock.
     with _LEDGER_LOCK:
-        existing_id = find_fingerprint(signal, representative)
+        existing_id = find_fingerprint(signal, representative, class_key=class_key)
+        if existing_id is None and emb_id:
+            cand = get_item(emb_id)
+            if cand and cand.get("status") in _OPEN_STATUSES:
+                existing_id = emb_id  # semantic paraphrase of a still-open item
         if existing_id:
             _append_event({
                 "event": "recurrence", "ts": _now_iso(), "id": existing_id,
@@ -420,7 +571,8 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
             rec["status"] = initial_status
             rec.setdefault("count", 1)
             _append_event({"event": "captured", **rec})
-            _append_fingerprint(rec["fingerprint"], signal, store_rep, result_id)
+            _append_fingerprint(rec["fingerprint"], signal, store_rep, result_id,
+                                class_key=class_key)
             is_new = True
 
     _render_backlog_safe()
@@ -855,6 +1007,37 @@ def _slug(title: str) -> str:
     return (s or "code-session")[:48]
 
 
+def _id_suffix(items: list[dict[str, Any]]) -> str:
+    """A short, deterministic id-derived suffix so two DIFFERENT items whose titles
+    slugify identically get DISTINCT filenames (day-one defect #4: the env-flag pair
+    clobbered each other). Derived from the sorted item ids (bundle-stable)."""
+    ids = sorted(str(it.get("id") or "") for it in items if it.get("id"))
+    basis = ",".join(ids) or "noid"
+    return hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:6]  # noqa: S324 -- filename disambig, not security
+
+
+def _write_prompt_file(body: str, fname: str) -> tuple[str | None, bool]:
+    """Write a generated prompt. Primary target: the Founder-OS ``_notes`` folder via
+    drive_io (mount-resilient). If G: is unavailable (DriveUnavailable) or the write
+    otherwise fails, fail-soft to the repo ``_notes`` folder, log a WARNING, and flag
+    the write ``mis_homed`` so the caller records it on the ledger event. Returns
+    ``(path, mis_homed)``; ``(None, False)`` only if BOTH targets fail."""
+    fos = founder_os_notes_dir() / fname
+    try:
+        drive_io.write_text_atomic(fos, body)
+        return str(fos), False
+    except Exception as exc:  # noqa: BLE001 -- DriveUnavailable or any write error
+        log.warning("code_queue: prompt mis-homed to repo _notes (Founder-OS write failed: %s)", exc)
+    try:
+        _NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        rp = _NOTES_DIR / fname
+        rp.write_text(body, encoding="utf-8")
+        return str(rp), True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("code_queue: prompt file write failed entirely: %s", exc)
+        return None, False
+
+
 _PROMPT_SYS = """\
 You write a paste-ready Code-session kickoff prompt for "Cora" (an internal
 Slack AI-assistant codebase). Match this house skeleton EXACTLY:
@@ -920,10 +1103,16 @@ def _deterministic_prompt(items: list[dict[str, Any]], slug: str) -> str:
     return "\n".join(lines)
 
 
-def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = None) -> str | None:
-    """Render a kickoff prompt for one item or a bundle and write it to _notes/.
-    Returns the written path (str) or None on write failure. Model call is fail-soft:
-    on any Sonnet error a deterministic skeleton is written instead of nothing."""
+def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = None,
+                            meta_out: dict[str, Any] | None = None) -> str | None:
+    """Render a kickoff prompt for one item or a bundle and write it to the Founder-OS
+    ``_notes`` folder (mount-resilient; fail-soft to the repo ``_notes``). Returns the
+    written path (str) or None on total write failure. Model call is fail-soft: on any
+    Sonnet error a deterministic skeleton is written instead of nothing.
+
+    ``meta_out`` (optional): populated with ``{"mis_homed": bool}`` so the caller can
+    stamp the ledger ``staged`` event when the prompt fell back to the repo ``_notes``
+    (G: was unavailable)."""
     if not items:
         return None
     slug = slug or _slug(str(items[0].get("title", "")))
@@ -954,15 +1143,13 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
     if not body:
         body = _deterministic_prompt(items, slug)
 
-    fname = f"{today}_fndr_cora-code-prompt-{slug}.md"
-    try:
-        _NOTES_DIR.mkdir(parents=True, exist_ok=True)
-        path = _NOTES_DIR / fname
-        path.write_text(body, encoding="utf-8")
-        return str(path)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("code_queue: prompt file write failed: %s", exc)
-        return None
+    # Id-suffix the filename so two items with the same slug can never clobber each
+    # other's prompt (day-one defect #4).
+    fname = f"{today}_fndr_cora-code-prompt-{slug}-{_id_suffix(items)}.md"
+    path, mis_homed = _write_prompt_file(body, fname)
+    if meta_out is not None:
+        meta_out["mis_homed"] = mis_homed
+    return path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1150,16 +1337,25 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         _append_event({"event": "approved", "ts": _now_iso(), "id": cq_id})
         _render_backlog_safe()
         msg = "✅ Queued (APPROVED)."
-        # P0/P1 get a full kickoff prompt immediately.
-        if str(rec.get("severity", "")).upper() in ("P0", "P1"):
-            fresh = get_item(cq_id) or rec
-            path = generate_kickoff_prompt([fresh])
-            if path:
-                _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
-                               "prompt_path": path})
-                _render_backlog_safe()
-                _dm_prompt_path(path)
-                msg = f"✅ Queued + prompt staged: `{path}`"
+        # P0/P1 get a full kickoff prompt immediately -- reservation-guarded so a
+        # concurrent approve can't double-generate (defect #3 TOCTOU class).
+        if str(rec.get("severity", "")).upper() in ("P0", "P1") and _begin_staging([cq_id]):
+            try:
+                fresh = get_item(cq_id) or rec
+                if not (fresh.get("status") == "STAGED" and fresh.get("prompt_path")):
+                    meta: dict[str, Any] = {}
+                    path = generate_kickoff_prompt([fresh], meta_out=meta)
+                    if path:
+                        ev = {"event": "staged", "ts": _now_iso(), "id": cq_id,
+                              "prompt_path": path}
+                        if meta.get("mis_homed"):
+                            ev["mis_homed"] = True
+                        _append_event(ev)
+                        _render_backlog_safe()
+                        _dm_prompt_path(path)
+                        msg = f"✅ Queued + prompt staged: `{path}`"
+            finally:
+                _end_staging([cq_id])
         return "approved", msg
 
     if action_id == ACTION_DISMISS:
@@ -1179,13 +1375,30 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
     if action_id == ACTION_STAGE:
         if status == "STAGED" and rec.get("prompt_path"):
             return "noop", f"Already staged: `{rec['prompt_path']}`"
-        path = generate_kickoff_prompt([rec])
-        if not path:
-            return "error", "Prompt generation failed -- nothing staged."
-        _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path})
-        _render_backlog_safe()
-        _dm_prompt_path(path)
-        return "staged", f"📝 Prompt staged: `{path}`"
+        # Reservation guard (defect #3): a re-tap while the first tap is still
+        # generating finds the id reserved and returns WITHOUT a second Sonnet call
+        # or a second `staged` event.
+        if not _begin_staging([cq_id]):
+            cur = get_item(cq_id) or rec
+            return "noop", (f"Already staged: `{cur['prompt_path']}`" if cur.get("prompt_path")
+                            else "Already staging -- I'll post the prompt path when it's ready.")
+        try:
+            fresh = get_item(cq_id) or rec
+            if fresh.get("status") == "STAGED" and fresh.get("prompt_path"):
+                return "noop", f"Already staged: `{fresh['prompt_path']}`"
+            meta: dict[str, Any] = {}
+            path = generate_kickoff_prompt([rec], meta_out=meta)
+            if not path:
+                return "error", "Prompt generation failed -- nothing staged."
+            ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path}
+            if meta.get("mis_homed"):
+                ev["mis_homed"] = True
+            _append_event(ev)
+            _render_backlog_safe()
+            _dm_prompt_path(path)
+            return "staged", f"📝 Prompt staged: `{path}`"
+        finally:
+            _end_staging([cq_id])
 
     if action_id == ACTION_MARK_SHIPPED:
         _append_event({"event": "shipped", "ts": _now_iso(), "id": cq_id})
@@ -1304,10 +1517,35 @@ def _effort(n: int) -> str:
     return "S" if n <= 2 else ("M" if n <= 4 else "L")
 
 
+def _affinity_key(rec: dict[str, Any]) -> str:
+    """Grouping key for a bundle: subsystem_guess (the true affinity), falling back to
+    entity, then 'general'. Normalized so 'Shopify' and 'shopify' group together."""
+    return _normalize(str(rec.get("subsystem_guess") or "")) or \
+        _normalize(str(rec.get("entity") or "")) or "general"
+
+
+def _bundle_theme(items: list[dict[str, Any]]) -> str:
+    """The shared theme of a bundle (defect #5: the slug must come from the common
+    theme, NOT item #1). Returns the most common affinity key among the items."""
+    counts: dict[str, int] = {}
+    for it in items:
+        counts[_affinity_key(it)] = counts.get(_affinity_key(it), 0) + 1
+    return max(counts, key=lambda k: counts[k]) if counts else "bundle"
+
+
+_MAX_BUNDLE_ITEMS = 4  # defect #5: cap items per staged bundle
+
+
+_MENU_MAX_ROWS = 12  # cap stage-able rows shown (bundles + singletons) -- Slack's
+#                      50-block ceiling; overflow is NOTED, never silently dropped.
+
+
 def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
     """(text, blocks) for the Monday menu, or None if there is nothing to show.
-    APPROVED items grouped into <=3 subsystem bundles + config items + a staleness
-    sweep (STAGED >14d and expired SNOOZEs)."""
+    APPROVED items are grouped by AFFINITY (subsystem_guess -> entity) into bundles of
+    at most _MAX_BUNDLE_ITEMS; a group of one is listed singly. There is NO kitchen-sink
+    "other" bundle (defect #5). Plus config items + a staleness sweep (STAGED >14d and
+    expired SNOOZEs)."""
     items = load_items()
     approved = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") != "config"]
     config_items = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") == "config"]
@@ -1328,34 +1566,53 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
     ]
     text_lines = ["*Cora code-session queue -- Monday menu*"]
 
-    # APPROVED -> <=3 subsystem bundles.
+    # APPROVED -> affinity bundles (<= _MAX_BUNDLE_ITEMS each), singletons listed singly.
     if approved:
-        bundles: dict[str, list[dict[str, Any]]] = {}
+        groups: dict[str, list[dict[str, Any]]] = {}
         for it in approved:
-            key = str(it.get("subsystem_guess") or it.get("entity") or "general")
-            bundles.setdefault(key, []).append(it)
-        ordered = sorted(bundles.items(), key=lambda kv: -len(kv[1]))
-        top = ordered[:3]
-        overflow = ordered[3:]
-        if overflow:
-            merged: list[dict[str, Any]] = []
-            for _, v in overflow:
-                merged.extend(v)
-            top.append(("other", merged))
-        for key, group in top:
-            eff = _effort(len(group))
-            titles = "; ".join(str(g.get("title", "")) for g in group[:6])
-            bline = f"*{key}* ({len(group)} item(s), ~{eff}): {titles}"
-            text_lines.append("- " + bline)
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bline[:2900]}})
-            blocks.append({
-                "type": "actions", "block_id": f"cq_bundle_{_slug(key)}"[:255],
-                "elements": [
-                    {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
-                     "text": {"type": "plain_text", "text": "📝 Stage bundle"},
-                     "value": "bundle:" + ",".join(str(g.get("id", "")) for g in group)},
-                ],
-            })
+            groups.setdefault(_affinity_key(it), []).append(it)
+        # Deterministic order: largest group first, then key. Split each group into
+        # chunks of <= _MAX_BUNDLE_ITEMS -- NO cross-affinity merge.
+        rows: list[list[dict[str, Any]]] = []
+        for _key, group in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            for start in range(0, len(group), _MAX_BUNDLE_ITEMS):
+                rows.append(group[start:start + _MAX_BUNDLE_ITEMS])
+        shown, overflow_n = rows[:_MENU_MAX_ROWS], max(0, len(rows) - _MENU_MAX_ROWS)
+        for chunk in shown:
+            ids_csv = ",".join(str(g.get("id", "")) for g in chunk)
+            if len(chunk) == 1:
+                it = chunk[0]
+                sline = f"• [{it.get('entity', '?')}] {it.get('title', '')} (`{it.get('id', '?')}`)"
+                text_lines.append("- " + sline)
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
+                blocks.append({
+                    "type": "actions", "block_id": f"cq_single_{it.get('id', '')}"[:255],
+                    "elements": [
+                        {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
+                         "text": {"type": "plain_text", "text": "📝 Stage prompt"},
+                         "value": str(it.get("id", ""))},
+                    ],
+                })
+            else:
+                theme = _bundle_theme(chunk)
+                eff = _effort(len(chunk))
+                titles = "; ".join(str(g.get("title", "")) for g in chunk[:6])
+                bline = f"*{theme}* ({len(chunk)} items, ~{eff}): {titles}"
+                text_lines.append("- " + bline)
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bline[:2900]}})
+                blocks.append({
+                    "type": "actions", "block_id": f"cq_bundle_{_slug(theme)}_{_id_suffix(chunk)}"[:255],
+                    "elements": [
+                        {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
+                         "text": {"type": "plain_text", "text": "📝 Stage bundle"},
+                         "value": "bundle:" + ids_csv},
+                    ],
+                })
+        if overflow_n:
+            oline = (f"_+{overflow_n} more bundle(s) not shown -- review the generated "
+                     f"backlog; nothing was dropped._")
+            text_lines.append(oline)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": oline}})
 
     if config_items:
         cline = "*No Code session needed (config):* " + "; ".join(
@@ -1426,17 +1683,114 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
         existing = next((r.get("prompt_path") for r in recs if r.get("prompt_path")), "")
         return "noop", (f"Bundle already staged: `{existing}`" if existing
                         else "Bundle already staged.")
-    slug = _slug(str(pending[0].get("subsystem_guess") or pending[0].get("entity") or "bundle"))
-    path = generate_kickoff_prompt(pending, slug=f"{slug}-bundle")
-    if not path:
-        return "error", "Prompt generation failed -- nothing staged."
-    bundle_id = "bnd-" + uuid.uuid4().hex[:8]
-    for r in pending:
-        _append_event({"event": "staged", "ts": _now_iso(), "id": r["id"],
-                       "prompt_path": path, "bundle_id": bundle_id})
+    # Reservation guard (defect #3): a double-tap while the first tap is still
+    # generating the (multi-second) Sonnet prompt must not double-generate.
+    keys = [str(r["id"]) for r in pending]
+    if not _begin_staging(keys):
+        return "noop", "Bundle already staging -- I'll post the prompt path when it's ready."
+    try:
+        # Re-read under the reservation: another tap may have JUST finished staging.
+        fresh = [get_item(k) for k in keys]
+        still = [r for r in fresh if r and r.get("status") in ("PROPOSED", "APPROVED")]
+        if not still:
+            existing = next((r.get("prompt_path") for r in fresh if r and r.get("prompt_path")), "")
+            return "noop", (f"Bundle already staged: `{existing}`" if existing
+                            else "Bundle already staged.")
+        # Slug from the shared theme, NOT item #1 (defect #5).
+        slug = _slug(_bundle_theme(still))
+        meta: dict[str, Any] = {}
+        path = generate_kickoff_prompt(still, slug=f"{slug}-bundle", meta_out=meta)
+        if not path:
+            return "error", "Prompt generation failed -- nothing staged."
+        bundle_id = "bnd-" + uuid.uuid4().hex[:8]
+        for r in still:
+            ev = {"event": "staged", "ts": _now_iso(), "id": r["id"],
+                  "prompt_path": path, "bundle_id": bundle_id}
+            if meta.get("mis_homed"):
+                ev["mis_homed"] = True
+            _append_event(ev)
+        _render_backlog_safe()
+        _dm_prompt_path(path)
+        return "staged", f"📝 Bundle prompt staged ({len(still)} items): `{path}`"
+    finally:
+        _end_staging(keys)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Maintenance helpers -- used by the one-shot cleanup / re-home scripts (1f / 1d)
+# ─────────────────────────────────────────────────────────────────────────────
+def supersede_item(loser_id: str, winner_id: str) -> bool:
+    """Merge ``loser_id`` INTO ``winner_id`` (a dedup miss caught after the fact):
+    mark the loser SUPERSEDED (recording ``superseded_by``) and bump the winner's
+    recurrence count so its card reflects the duplicate. Both ids must exist and the
+    loser must not already be SUPERSEDED. Returns True iff a merge was written."""
+    loser, winner = get_item(loser_id), get_item(winner_id)
+    if not loser or not winner or loser_id == winner_id:
+        return False
+    if loser.get("status") == "SUPERSEDED":
+        return False
+    _append_event({"event": "recurrence", "ts": _now_iso(), "id": winner_id})
+    _append_event({"event": "superseded", "ts": _now_iso(), "id": loser_id,
+                   "superseded_by": winner_id})
     _render_backlog_safe()
-    _dm_prompt_path(path)
-    return "staged", f"📝 Bundle prompt staged ({len(pending)} items): `{path}`"
+    return True
+
+
+def _latest_staged_prompt_paths() -> dict[str, str]:
+    """Latest prompt_path per cq-id across all ``staged`` events (fold order)."""
+    out: dict[str, str] = {}
+    for ev in _read_jsonl(_EVENT_LEDGER):
+        if ev.get("event") == "staged" and ev.get("prompt_path"):
+            out[str(ev.get("id") or "")] = str(ev["prompt_path"])
+    return out
+
+
+def plan_prompt_rehome() -> list[dict[str, str]]:
+    """Plan re-homing of prompt files that landed under the REPO ``_notes`` (day-one
+    defect #4) to the Founder-OS ``_notes``. CONSERVATIVE (D-051 over-deletion guard):
+    a file is included ONLY if it (a) is referenced by a ``staged`` event, (b) lives
+    under the repo ``_notes`` dir, (c) has a ``cora-code-prompt`` basename, and (d)
+    still exists. Never globs or deletes blindly."""
+    repo_notes = _NOTES_DIR.resolve()
+    plan: list[dict[str, str]] = []
+    for cq_id, p in _latest_staged_prompt_paths().items():
+        src = Path(p)
+        try:
+            parents = list(src.resolve().parents)
+        except OSError:
+            continue
+        if repo_notes not in parents:
+            continue  # already Founder-OS-homed (or elsewhere) -- leave it
+        if "cora-code-prompt" not in src.name:
+            continue
+        if not src.exists():
+            continue
+        plan.append({"id": cq_id, "src": str(src),
+                     "dst": str(founder_os_notes_dir() / src.name)})
+    return plan
+
+
+def apply_prompt_rehome(plan: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """Execute a ``plan_prompt_rehome`` plan: copy src -> Founder-OS ``_notes`` (via
+    drive_io), backfill the ledger prompt_path (a ``staged`` event, ``rehomed=True``),
+    then delete the repo copy. Best-effort per item -- one failure never aborts the
+    rest. Returns the per-item outcomes."""
+    done: list[dict[str, Any]] = []
+    for a in plan:
+        src, dst, cq_id = Path(a["src"]), Path(a["dst"]), a["id"]
+        try:
+            body = src.read_text(encoding="utf-8", errors="replace")
+            drive_io.write_text_atomic(dst, body)
+            _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
+                           "prompt_path": str(dst), "rehomed": True})
+            src.unlink()
+            done.append({"id": cq_id, "src": str(src), "dst": str(dst), "ok": True})
+        except Exception as exc:  # noqa: BLE001 -- best-effort per item
+            log.warning("code_queue: rehome failed for %s: %s", cq_id, exc)
+            done.append({"id": cq_id, "src": str(src), "dst": str(dst),
+                         "ok": False, "error": str(exc)})
+    _render_backlog_safe()
+    return done
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1453,7 +1807,8 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
         "evidence": [{"channel_id": "", "ts": "", "note": summary[:200]}],
         "reporter": HARRISON_ID,
     }
-    existing = find_fingerprint(signal, title)
+    class_key = _class_key(title, subsystem_guess or entity)
+    existing = find_fingerprint(signal, title, class_key=class_key)
     if existing:
         return existing
     cq_id = "cq-" + uuid.uuid4().hex[:12]
@@ -1463,5 +1818,5 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     rec["count"] = 1
     rec["fingerprint"] = _fingerprint(signal, title)
     _append_event({"event": "captured", **rec})
-    _append_fingerprint(rec["fingerprint"], signal, title, cq_id)
+    _append_fingerprint(rec["fingerprint"], signal, title, cq_id, class_key=class_key)
     return cq_id

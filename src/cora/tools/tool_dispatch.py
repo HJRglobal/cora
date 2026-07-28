@@ -8087,10 +8087,15 @@ TOOL_DEFINITIONS = [
             "any data and does NOT execute code -- it files a candidate and sends Harrison "
             "a card to approve.\n"
             "\n"
-            "REQUIRED PATTERN (staged-write -- never skip):\n"
-            "1. On the first ask, show a preview: \"Queueing to the code-session queue: "
-            "   <one-sentence request>\" and ask them to confirm. DO NOT call the tool yet.\n"
-            "2. On their explicit yes, call with confirmed=true.\n"
+            "REQUIRED PATTERN (staged-write, TWO calls -- never skip):\n"
+            "1. On the first ask, call this tool WITHOUT confirmed (pass just `request`). "
+            "It files NOTHING -- it returns a preview to show the user and stashes the "
+            "request server-side.\n"
+            "2. Show the user the preview and wait for their explicit yes.\n"
+            "3. On their yes, call AGAIN with confirmed=true. The confirmed call files the "
+            "request STASHED on step 1 (not any re-typed text). A confirmed=true with no "
+            "prior step-1 call for this user+channel files NOTHING and just re-previews -- "
+            "so never fabricate a confirm.\n"
             "\n"
             "Do NOT use this for factual questions Cora should learn the answer to (that is "
             "the knowledge loop, not a code build) -- only for actual defects or new "
@@ -8105,10 +8110,10 @@ TOOL_DEFINITIONS = [
                 },
                 "confirmed": {
                     "type": "boolean",
-                    "description": "Must be true. Only set after showing the user the queue preview and receiving explicit approval.",
+                    "description": "Set true ONLY on the SECOND call, after step 1's preview and the user's explicit yes. The server files the request stashed on step 1, not this call's text.",
                 },
             },
-            "required": ["request", "confirmed"],
+            "required": ["request"],
         },
     },
     {
@@ -8405,42 +8410,97 @@ TOOL_DEFINITIONS = [
 # Aggregators (FNDR, HJRG) and the founder from ANY channel get the full set —
 # they ask cross-entity questions by design.
 
+# ── code-session queue: server-side confirm gate (F-23 parity) ────────────────
+# The explicit tool is a two-call staged write. The FIRST (unconfirmed) call stashes
+# the request SERVER-SIDE and returns a preview; the confirmed call executes the
+# STASHED request, NEVER a model-echoed payload. This closes the day-one confirm race
+# (defect #2): a "yes" that arrived before the preview posted let the model fire
+# confirmed=True with a paraphrased request and no matching stash, minting a duplicate.
+# Doctrine parity: Shopify inventory hotfix ("staged-write identity binds SERVER-SIDE,
+# never an LLM echo") + F-23 ("a confirm executes the STASHED payload or nothing").
+_CODE_QUEUE_PENDING_LOCK = Lock()
+_CODE_QUEUE_PENDING_TTL_SECONDS = 600  # 10 min (matches the other pending stores)
+_PENDING_CODE_QUEUE: dict[tuple[str, str], dict] = {}
+
+
+def _cq_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _cq_channel(input_data: dict) -> str:
+    return str(input_data.get("_channel_name") or input_data.get("_channel_id") or "")
+
+
+def _store_pending_code_queue(slack_user: str, channel: str, entry: dict) -> None:
+    with _CODE_QUEUE_PENDING_LOCK:
+        _PENDING_CODE_QUEUE[_cq_pending_key(slack_user, channel)] = entry
+
+
+def _claim_pending_code_queue(slack_user: str, channel: str) -> dict | None:
+    """Atomically pop-and-return the caller's pending queue request IFF it is fresh.
+    Returns None (leaving nothing behind) when there is no fresh pending -- the
+    confirmed call then re-previews instead of trusting the model echo."""
+    key = _cq_pending_key(slack_user, channel)
+    with _CODE_QUEUE_PENDING_LOCK:
+        entry = _PENDING_CODE_QUEUE.get(key)
+        if not entry:
+            return None
+        _PENDING_CODE_QUEUE.pop(key, None)
+    if (time.time() - float(entry.get("ts", 0))) > _CODE_QUEUE_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
 def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> str:
     """Queue a build idea or bug report to Harrison's code-session queue.
 
-    Staged-write (doctrine 1): preview + confirmed=True. NOT canon (D-011) -- the
-    queue only files a candidate + DMs Harrison a card; nothing executes. Founder
-    fast-path: Harrison's confirmed call lands the item APPROVED directly."""
+    Two-call staged-write (doctrine 1 + F-23 parity): the unconfirmed call stashes the
+    request server-side + previews; the confirmed call executes the STASHED request,
+    never a model-echoed payload (defect #2 fix). NOT canon (D-011) -- the queue only
+    files a candidate + DMs Harrison a card; nothing executes. Founder fast-path:
+    Harrison's confirmed call lands the item APPROVED directly."""
     from cora import code_queue
 
     input_data = _input or {}
-    request = str(input_data.get("request", "") or "").strip()
-    if not request:
-        return ("cora_queue_code_session: `request` is required -- one or two sentences "
-                "describing the bug or the feature to build.")
     if code_queue.code_queue_level() == "off":
         return ("The code-session queue is currently turned off -- tell the user their "
                 "idea was NOT filed.")
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "cora_queue_code_session refused: `confirmed` must be true ONLY after you "
-            "have shown the user a preview -- format it as \"Queueing to the code-session "
-            "queue: <request>\" -- and received explicit approval. Show the preview, wait "
-            "for their yes, then call again with confirmed=true."
-        )
+    request = str(input_data.get("request", "") or "").strip()
+    channel = _cq_channel(input_data)
     channel_id = str(input_data.get("_channel_id", "") or "")
-    is_founder = slack_user_id == code_queue.HARRISON_ID
-    cq_id = code_queue.queue_explicit(slack_user_id, entity, channel_id, request, is_founder)
-    if not cq_id:
-        return ("I couldn't file that (you may have hit today's queue limit) -- tell the "
-                "user it wasn't queued and to try again later.")
-    if is_founder:
-        return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
-                "code-session queue (APPROVED). Tap \"Stage prompt\" on the card when you "
-                "want the kickoff written.")
-    return ("WRITE_CONFIRMED -- post as your entire response: Queued for Harrison's "
-            "review -- he'll approve it from his queue.")
+    confirmed = input_data.get("confirmed") is True
+
+    if confirmed:
+        pending = _claim_pending_code_queue(slack_user_id, channel)
+        if pending:
+            # Execute the STASHED request (server-side), NOT the model echo.
+            req = str(pending.get("request") or "").strip()
+            is_founder = slack_user_id == code_queue.HARRISON_ID
+            cq_id = code_queue.queue_explicit(
+                slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
+            if not cq_id:
+                return ("I couldn't file that (you may have hit today's queue limit) -- "
+                        "tell the user it wasn't queued and to try again later.")
+            if is_founder:
+                return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
+                        "code-session queue (APPROVED). Tap \"Stage prompt\" on the card "
+                        "when you want the kickoff written.")
+            return ("WRITE_CONFIRMED -- post as your entire response: Queued for "
+                    "Harrison's review -- he'll approve it from his queue.")
+        # No fresh server-side pending -> DO NOT trust the model-echoed confirmed=True
+        # (F-23: a confirm executes the STASHED payload or nothing). Fall through to
+        # re-preview so the human confirms against a freshly stashed request.
+
+    if not request:
+        return ("cora_queue_code_session: `request` is required -- one or two sentences "
+                "describing the bug or the feature to build.")
+    _store_pending_code_queue(slack_user_id, channel, {
+        "request": request, "channel_id": channel_id, "ts": time.time(),
+    })
+    return _write_blocked_contract(
+        f'Queueing to the code-session queue: "{request[:200]}". Reply to confirm and '
+        "I'll file it. Nothing is filed until you confirm."
+    )
 
 
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio

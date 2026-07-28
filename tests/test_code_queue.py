@@ -68,8 +68,17 @@ def qenv(tmp_path, monkeypatch):
     # No ANTHROPIC key by default -> classifier fail-closed / generator skeleton.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-    # Reset the module-global DM reservation so it can't leak across tests.
+    # Embedding dedup is OFF by default (stubbed -> [] -> fail-soft None): keeps the
+    # suite network-free. Tests that exercise the semantic layer override _default_embed.
+    monkeypatch.setattr(cq, "_default_embed", lambda texts: [])
+    # Reset the module-global reservations/pending so they can't leak across tests.
     cq._DM_RESERVE.update({"date": None, "n": 0})
+    cq._STAGING_INFLIGHT.clear()
+    try:
+        import cora.tools.tool_dispatch as _td
+        _td._PENDING_CODE_QUEUE.clear()
+    except Exception:  # noqa: BLE001
+        pass
     return {"tmp": tmp_path, "backlog": backlog_writes}
 
 
@@ -736,3 +745,363 @@ def test_stage_bundle_idempotent(qenv):
     assert o == "staged"
     o2, msg2 = cq.stage_bundle("bundle:" + ",".join(ids), "U0B2RM2JYJ1")
     assert o2 == "noop" and "already staged" in msg2.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.1 hardening -- day-one field defects (2026-07-28)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Slice 1a: dedup v2 (normalize / classifier key / embedding paraphrase) ─────
+def test_dedup_normalizes_cowork_footer(qenv):
+    # Two identical asks differing ONLY by the Cowork "*Sent using* <@..>" footer merge.
+    base = "cora should be able to check reprally order status for a customer"
+    r1 = {"kind": "feature", "severity": "P3", "title": "reprally check", "summary": "",
+          "entity": "F3E", "signal": "phrase", "representative": base,
+          "evidence": [], "reporter": "U1"}
+    r2 = dict(r1, representative=base + "\n\n*Sent using* <@U0B2RM2JYJ1>")
+    id1 = cq._capture(dict(r1))
+    id2 = cq._capture(dict(r2))
+    assert id1 == id2 and cq.get_item(id1)["count"] == 2
+
+
+def test_dedup_strips_inline_mentions(qenv):
+    r1 = {"kind": "feature", "severity": "P3", "title": "t", "summary": "",
+          "entity": "F3E", "signal": "phrase",
+          "representative": "cora should ping <@U123> when a deal stalls",
+          "evidence": [], "reporter": "U1"}
+    r2 = dict(r1, representative="cora should ping <@U999> when a deal stalls")
+    assert cq._capture(dict(r1)) == cq._capture(dict(r2))
+
+
+def test_dedup_classifier_key_cross_signal(qenv):
+    # Same (title, subsystem) from the classifier merges even across DIFFERENT signals
+    # and different raw text (title-dedup + subsystem key).
+    r1 = {"kind": "feature", "severity": "P2", "title": "Add RepRally order-status check",
+          "summary": "", "entity": "F3E", "signal": "phrase", "subsystem_guess": "reprally",
+          "representative": "can cora check reprally", "evidence": [], "reporter": "U1"}
+    r2 = {"kind": "feature", "severity": "P2", "title": "Add RepRally order-status check",
+          "summary": "", "entity": "F3E", "signal": "explicit", "subsystem_guess": "reprally",
+          "representative": "reprally lookup please", "evidence": [], "reporter": "U2"}
+    id1 = cq._capture(dict(r1))
+    id2 = cq._capture(dict(r2))
+    assert id1 == id2  # merged on classifier key despite different signal + text
+
+
+def _reprally_embed(texts):
+    # Fake embedder: anything mentioning reprally -> one direction, else another.
+    return [[1.0, 0.0] if "reprally" in t.lower() else [0.0, 1.0] for t in texts]
+
+
+def test_dedup_embedding_paraphrase_reprally(qenv, monkeypatch):
+    # THE regression: two RepRally paraphrases that (a) are not exact, (b) share no
+    # classifier key (no subsystem), and (c) fall below the fuzzy ratio, still MERGE
+    # via the embedding layer. Reproduces the day-one double-file cq-5f48.. / cq-3c26...
+    monkeypatch.setattr(cq, "_default_embed", _reprally_embed)
+    r1 = {"kind": "feature", "severity": "P2",
+          "title": "Check RepRally order status", "summary": "",
+          "entity": "F3E", "signal": "phrase",
+          "representative": "Cora should be able to check RepRally order status for a customer",
+          "evidence": [], "reporter": "U1"}
+    r2 = {"kind": "feature", "severity": "P2",
+          "title": "Where is my RepRally shipment", "summary": "",
+          "entity": "F3E", "signal": "phrase",
+          "representative": "look up whether a RepRally shipment has actually gone out yet",
+          "evidence": [], "reporter": "U2"}
+    # Guard the isolation: the deterministic layers must MISS so only embedding merges.
+    assert cq.find_fingerprint("phrase", r2["representative"],
+                               class_key=cq._class_key(r2["title"], "")) is None
+    id1 = cq._capture(dict(r1))
+    id2 = cq._capture(dict(r2))
+    assert id1 == id2 and cq.get_item(id1)["count"] == 2
+
+
+def test_embedding_dedup_failsoft(qenv, monkeypatch):
+    def _boom(_texts):
+        raise RuntimeError("embed exploded")
+    monkeypatch.setattr(cq, "_default_embed", _boom)
+    r1 = {"kind": "feature", "severity": "P2", "title": "a", "summary": "",
+          "entity": "F3E", "signal": "phrase",
+          "representative": "cora should build a reprally order tracker widget",
+          "evidence": [], "reporter": "U1"}
+    r2 = dict(r1, title="b", representative="a tool to see reprally shipment progress live")
+    id1 = cq._capture(dict(r1))
+    id2 = cq._capture(dict(r2))
+    assert id1 != id2  # embedding failed -> no semantic merge, but NO crash
+
+
+def test_embedding_never_called_for_lex(qenv, monkeypatch):
+    calls = {"n": 0}
+
+    def _counting(texts):
+        calls["n"] += 1
+        return [[1.0, 0.0] for _ in texts]
+    monkeypatch.setattr(cq, "_default_embed", _counting)
+    for i in range(2):
+        cq._capture({"kind": "feature", "severity": "P3", "title": f"lts thing {i}",
+                     "summary": "generic", "entity": "LEX-LTS", "signal": "phrase",
+                     "representative": f"cora should add an LTS scheduler variant {i}",
+                     "evidence": [], "reporter": "U1"})
+    assert calls["n"] == 0  # LEX text never embedded (egress guard)
+
+
+# ── Slice 1b: confirm gate (F-23 parity) via dispatch ──────────────────────────
+def _dispatch_cq(monkeypatch, inp, user="U0B2RM2JYJ1", channel_id="C1"):
+    import cora.tools.tool_dispatch as td
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    return td.dispatch("cora_queue_code_session", inp, user, entity="F3E", channel_id=channel_id)
+
+
+def test_cq_confirm_requires_stash(qenv, monkeypatch):
+    # A confirmed=True with NO prior unconfirmed call files NOTHING (re-previews).
+    out = _dispatch_cq(monkeypatch, {"request": "add a reprally widget", "confirmed": True})
+    assert "WRITE_BLOCKED" in out and cq.load_items() == []
+
+
+def test_cq_confirm_executes_stashed_not_echo(qenv, monkeypatch):
+    # Preview stashes req_A; the confirm carries a PARAPHRASE (req_B) -- the STASHED
+    # req_A is filed, never the echo.
+    _dispatch_cq(monkeypatch, {"request": "Cora should check RepRally order status"})
+    assert cq.load_items() == []  # preview files nothing
+    out2 = _dispatch_cq(monkeypatch, {"request": "do the reprally thing", "confirmed": True})
+    assert "WRITE_CONFIRMED" in out2
+    items = cq.load_items()
+    assert len(items) == 1
+    assert "check RepRally order status" in items[0]["title"]  # stashed text, not the echo
+
+
+def test_cq_confirm_race_no_duplicate(qenv, monkeypatch):
+    # Reproduce the 07:21:53 race: a premature confirmed=True (paraphrase) with no stash
+    # -> no item; then the proper preview+confirm -> exactly ONE item.
+    _dispatch_cq(monkeypatch, {"request": "check reprally status now", "confirmed": True})
+    assert cq.load_items() == []                                   # race confirm filed nothing
+    _dispatch_cq(monkeypatch, {"request": "Cora should check RepRally order status"})
+    _dispatch_cq(monkeypatch, {"request": "yep", "confirmed": True})
+    assert len(cq.load_items()) == 1                               # exactly one item
+
+
+# ── Slice 1c: stage idempotency under a concurrent double-tap ──────────────────
+def _slow_counting_gen(counter):
+    import time as _t
+
+    def _g(items, *, slug=None, meta_out=None):
+        counter["n"] += 1
+        _t.sleep(0.25)  # widen the TOCTOU window
+        if meta_out is not None:
+            meta_out["mis_homed"] = False
+        return f"/tmp/prompt-{counter['n']}.md"
+    return _g
+
+
+def test_stage_single_concurrent_double_tap(qenv, monkeypatch):
+    import threading
+    calls = {"n": 0}
+    monkeypatch.setattr(cq, "generate_kickoff_prompt", _slow_counting_gen(calls))
+    cid = cq.seed_item(kind="feature", severity="P2", title="X", summary="s",
+                       entity="F3E", signal="explicit", status="APPROVED")
+    threads = [threading.Thread(target=lambda: cq.process_queue_action(cq.ACTION_STAGE, cid, "U0B2RM2JYJ1"))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert calls["n"] == 1  # exactly one generator call despite two taps
+    staged = [e for e in cq._read_jsonl(cq._EVENT_LEDGER)
+              if e.get("event") == "staged" and e.get("id") == cid]
+    assert len(staged) == 1
+    assert cq.get_item(cid)["status"] == "STAGED"
+
+
+def test_stage_bundle_concurrent_double_tap(qenv, monkeypatch):
+    import threading
+    calls = {"n": 0}
+    monkeypatch.setattr(cq, "generate_kickoff_prompt", _slow_counting_gen(calls))
+    ids = [cq.seed_item(kind="feature", severity="P3", title=f"B {i}", summary="s",
+                        entity="F3E", signal="friction", status="APPROVED",
+                        subsystem_guess="shopify") for i in range(3)]
+    val = "bundle:" + ",".join(ids)
+    threads = [threading.Thread(target=lambda: cq.stage_bundle(val, "U0B2RM2JYJ1"))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert calls["n"] == 1
+    for i in ids:
+        assert cq.get_item(i)["status"] == "STAGED"
+
+
+# ── Slice 1d: output dir + slug id-suffix + mis-homed fallback ─────────────────
+def test_prompt_writes_to_founder_os(qenv):
+    cid = cq.seed_item(kind="bug", severity="P1", title="Founder OS home test",
+                       summary="s", entity="FNDR", signal="explicit", status="APPROVED")
+    path = cq.generate_kickoff_prompt([cq.get_item(cid)])
+    assert path is not None
+    from pathlib import Path
+    norm = str(Path(path)).replace("\\", "/")
+    assert "/_shared/projects/cora/_notes/" in norm  # Founder-OS, not repo _notes
+
+
+def test_prompt_slug_id_suffix_no_collision(qenv):
+    # Two DIFFERENT items whose long titles SLUGIFY to the same 48-char prefix (the
+    # day-one env-flag-pair clobber) get DISTINCT filenames via the id suffix. Distinct
+    # signals keep them distinct items (no fingerprint/fuzzy dedup).
+    shared = "the env flag docstring claims read per call needs no restart"
+    id1 = cq.seed_item(kind="feature", severity="P2", title=shared + " alpha", summary="a",
+                       entity="F3E", signal="phrase", status="APPROVED")
+    id2 = cq.seed_item(kind="feature", severity="P2", title=shared + " beta", summary="b",
+                       entity="F3E", signal="explicit", status="APPROVED")
+    assert id1 != id2  # genuinely two items
+    from pathlib import Path
+    p1 = Path(cq.generate_kickoff_prompt([cq.get_item(id1)])).name
+    p2 = Path(cq.generate_kickoff_prompt([cq.get_item(id2)])).name
+    assert cq._slug(shared + " alpha") == cq._slug(shared + " beta")  # slugs DO collide
+    assert p1 != p2  # ...but filenames don't (id suffix)
+    import re
+    assert re.search(r"-[0-9a-f]{6}\.md$", p1) and re.search(r"-[0-9a-f]{6}\.md$", p2)
+
+
+def test_prompt_mis_homed_on_drive_unavailable(qenv, monkeypatch):
+    def _raise(*a, **k):
+        raise cq.drive_io.DriveUnavailable("mount gone")
+    monkeypatch.setattr(cq.drive_io, "write_text_atomic", _raise)
+    cid = cq.seed_item(kind="bug", severity="P2", title="mis-home me", summary="s",
+                       entity="F3E", signal="explicit", status="APPROVED")
+    outcome, _msg = cq.process_queue_action(cq.ACTION_STAGE, cid, "U0B2RM2JYJ1")
+    assert outcome == "staged"
+    it = cq.get_item(cid)
+    from pathlib import Path
+    assert Path(it["prompt_path"]).exists()                      # fell back to repo _notes
+    staged = [e for e in cq._read_jsonl(cq._EVENT_LEDGER)
+              if e.get("event") == "staged" and e.get("id") == cid]
+    assert staged and staged[-1].get("mis_homed") is True         # flagged on the ledger
+
+
+# ── Slice 1e: bundle grouping (<=4, affinity-only, no kitchen sink, theme slug) ─
+def test_bundle_max_four(qenv):
+    for i in range(6):
+        cq.seed_item(kind="feature", severity="P3", title=f"shop {i}", summary="s",
+                     entity="F3E", signal="friction", status="APPROVED", subsystem_guess="shopify")
+    _text, blocks = cq.build_weekly_menu()
+    bundle_vals = [e["value"] for b in blocks if b.get("type") == "actions"
+                   for e in b["elements"] if str(e.get("value", "")).startswith("bundle:")]
+    assert len(bundle_vals) == 2  # 6 items -> chunks of 4 + 2
+    sizes = sorted(len(v[len("bundle:"):].split(",")) for v in bundle_vals)
+    assert sizes == [2, 4] and all(s <= 4 for s in sizes)
+
+
+def test_bundle_affinity_no_kitchen_sink(qenv):
+    for sub in ["ar", "bookings", "dna", "brandvoice", "flywheel"]:
+        cq.seed_item(kind="feature", severity="P3", title=f"{sub} thing", summary="s",
+                     entity="F3E", signal="friction", status="APPROVED", subsystem_guess=sub)
+    text, blocks = cq.build_weekly_menu()
+    assert "other" not in text.lower()  # NO kitchen-sink merge
+    single_btns = [e for b in blocks if b.get("type") == "actions"
+                   for e in b["elements"]
+                   if e.get("action_id") == cq.ACTION_STAGE
+                   and not str(e.get("value", "")).startswith("bundle:")]
+    assert len(single_btns) == 5  # five distinct subsystems -> five singletons
+
+
+def test_bundle_slug_from_theme(qenv):
+    ids = [cq.seed_item(kind="feature", severity="P3", title=t, summary="s",
+                        entity="F3E", signal="friction", status="APPROVED",
+                        subsystem_guess="reprally")
+           for t in ("Alpha widget", "Beta widget")]
+    _o, msg = cq.stage_bundle("bundle:" + ",".join(ids), "U0B2RM2JYJ1")
+    it = cq.get_item(ids[0])
+    from pathlib import Path
+    name = Path(it["prompt_path"]).name
+    assert "reprally" in name and "alpha" not in name.lower()  # theme slug, not item #1
+
+
+# ── Slice 1f: supersede + cleanup script ───────────────────────────────────────
+def test_supersede_item_merges(qenv):
+    winner = cq.seed_item(kind="feature", severity="P2", title="RepRally check A", summary="s",
+                          entity="F3E", signal="explicit", status="APPROVED")
+    loser = cq.seed_item(kind="feature", severity="P2", title="RepRally check B", summary="s",
+                         entity="F3E", signal="phrase", status="PROPOSED")
+    assert cq.supersede_item(loser, winner) is True
+    assert cq.get_item(loser)["status"] == "SUPERSEDED"
+    assert cq.get_item(loser)["superseded_by"] == winner
+    assert cq.get_item(winner)["count"] == 2          # recurrence bumped
+    assert cq.supersede_item(loser, winner) is False  # idempotent (already superseded)
+    assert cq.supersede_item("cq-missing", winner) is False  # missing id -> no-op
+
+
+def _load_script(name):
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "scripts" / name
+    spec = importlib.util.spec_from_file_location(name.replace(".", "_"), path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_cleanup_script_dry_run_then_apply(qenv, monkeypatch):
+    mod = _load_script("cleanup_code_queue_dupes_2026-07-28.py")
+    w1 = cq.seed_item(kind="feature", severity="P2", title="Win 1", summary="s",
+                      entity="F3E", signal="explicit", status="APPROVED")
+    l1 = cq.seed_item(kind="feature", severity="P2", title="Lose 1", summary="s",
+                      entity="F3E", signal="phrase", status="PROPOSED")
+    monkeypatch.setattr(mod, "MERGES", [(l1, w1)])
+    # dry-run: nothing changes
+    monkeypatch.setattr("sys.argv", ["cleanup"])
+    assert mod.main() == 0
+    assert cq.get_item(l1)["status"] == "PROPOSED"
+    # apply: merged
+    monkeypatch.setattr("sys.argv", ["cleanup", "--apply"])
+    assert mod.main() == 0
+    assert cq.get_item(l1)["status"] == "SUPERSEDED"
+    assert cq.get_item(w1)["count"] == 2
+
+
+# ── Slice 1d: re-home planner/applier + migration script ───────────────────────
+def _seed_mishomed(qenv, name="2026-07-28_fndr_cora-code-prompt-x-abc123.md"):
+    """Create a mis-homed prompt file under the repo _notes + a staged event for it."""
+    cid = cq.seed_item(kind="bug", severity="P1", title="mishomed", summary="s",
+                       entity="FNDR", signal="explicit", status="APPROVED")
+    cq._NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    src = cq._NOTES_DIR / name
+    src.write_text("# a mis-homed prompt\n", encoding="utf-8")
+    cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid,
+                      "prompt_path": str(src)})
+    return cid, src
+
+
+def test_rehome_plan_conservative(qenv):
+    cid, src = _seed_mishomed(qenv)
+    plan = cq.plan_prompt_rehome()
+    assert len(plan) == 1 and plan[0]["id"] == cid
+    # A NON-cora-code-prompt file referenced by a staged event is NOT touched.
+    other = cq._NOTES_DIR / "unrelated-note.md"
+    other.write_text("x", encoding="utf-8")
+    cid2 = cq.seed_item(kind="bug", severity="P2", title="other", summary="s",
+                        entity="F3E", signal="tool_error", status="APPROVED")
+    cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid2,
+                      "prompt_path": str(other)})
+    ids = {p["id"] for p in cq.plan_prompt_rehome()}
+    assert cid in ids and cid2 not in ids  # over-deletion guard: basename gate
+
+
+def test_rehome_apply_moves_and_backfills(qenv):
+    cid, src = _seed_mishomed(qenv)
+    plan = cq.plan_prompt_rehome()
+    done = cq.apply_prompt_rehome(plan)
+    from pathlib import Path
+    assert done and done[0]["ok"] is True
+    assert not src.exists()                                   # repo copy deleted
+    new_path = cq.get_item(cid)["prompt_path"]
+    norm = str(Path(new_path)).replace("\\", "/")
+    assert "/_shared/projects/cora/_notes/" in norm and Path(new_path).exists()
+    staged = [e for e in cq._read_jsonl(cq._EVENT_LEDGER)
+              if e.get("event") == "staged" and e.get("id") == cid]
+    assert staged[-1].get("rehomed") is True
+
+
+def test_rehome_script_dry_run_no_delete(qenv, monkeypatch):
+    mod = _load_script("rehome_code_queue_prompts_2026-07-28.py")
+    _cid, src = _seed_mishomed(qenv)
+    monkeypatch.setattr("sys.argv", ["rehome"])
+    assert mod.main() == 0
+    assert src.exists()  # dry-run never deletes
