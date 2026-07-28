@@ -158,7 +158,7 @@ def _trips_capital_program(text: str) -> bool:
 
 
 # ── Class: travel points ──────────────────────────────────────────────────────
-# Dashboard: travel-points-optimizer (PERSONAL, DM-to-Harrison only).
+# Dashboard: travel-points-command-center (PERSONAL, DM-to-Harrison only).
 # Highly specific loyalty-program terms -- negligible false-positive risk.
 # NO standalone "A-List" (D-051 #5: "our A-list creators" is core F3E sponsorship
 # vocabulary -- only the qualified Southwest tier "A-List Preferred" is a signal).
@@ -256,7 +256,7 @@ _CLASSES: tuple[tuple[str, object, str | None, str], ...] = (
     ("capital_program", _trips_capital_program,
      "f3-capital-program", _REFUSE_CAPITAL),
     ("travel_points", _trips_travel_points,
-     "travel-points-optimizer", _REFUSE_TRAVEL),
+     "travel-points-command-center", _REFUSE_TRAVEL),
     ("creator_crm", _trips_creator_crm,
      "f3-creator-sponsorship-command-center", _REFUSE_CRM),
     ("content_pipeline", _trips_content_pipeline,

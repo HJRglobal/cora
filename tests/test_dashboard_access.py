@@ -199,10 +199,14 @@ def test_empty_dashboards_not_cached(monkeypatch, tmp_path):
 
 
 def test_real_yaml_loads_and_caches():
-    # Sanity: the shipped file parses and yields the five dashboards.
+    # Sanity: the shipped file parses and yields the mapped dashboards. The
+    # travel-points key was renamed to match its on-disk artifact (Asana Standard
+    # v1, 2026-07-27); f3-retail-rangeme + f3-cultural-radar were added.
     m = dashboard_access._load_access_map()
-    for dash in [ONEAMERICA, CAPITAL, CREATOR, CONTENT, "travel-points-optimizer"]:
+    for dash in [ONEAMERICA, CAPITAL, CREATOR, CONTENT,
+                 "travel-points-command-center", "f3-retail-rangeme", "f3-cultural-radar"]:
         assert dash in m
+    assert "travel-points-optimizer" not in m  # old id fully retired
 
 
 def test_shipped_file_exists():

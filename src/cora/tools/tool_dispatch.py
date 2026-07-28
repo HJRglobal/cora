@@ -113,6 +113,12 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "personal_capital_program_state",
     "f3e_creator_crm",
     "fndr_content_pipeline",
+    "f3e_rangeme_status",
+    "f3e_cultural_radar",
+    "personal_travel_points",
+    # cowork_dashboards_index is surface-dependent (guard-filtered per channel/DM) so
+    # its reply MUST never be reused from the shared cache.
+    "cowork_dashboards_index",
 })
 
 
@@ -5389,6 +5395,9 @@ _DASH_ONEAMERICA = "oneamerica-whole-life-portfolio"
 _DASH_CAPITAL = "f3-capital-program"
 _DASH_CREATOR = "f3-creator-sponsorship-command-center"
 _DASH_CONTENT = "f3-content-pipeline"
+_DASH_TRAVEL = "travel-points-command-center"
+_DASH_RANGEME = "f3-retail-rangeme"
+_DASH_CULTURAL = "f3-cultural-radar"
 
 
 # Source-opacity scrub for pass-through free-text field values. These tools are
@@ -5858,6 +5867,197 @@ def _tool_fndr_content_pipeline(slack_user_id: str, entity: str, _input: dict) -
     events = _rows("events", ["Event", "Status", "Date", "Fit score"])
     log.info("fndr_content_pipeline user=%s", slack_user_id)
     return _format_content_pipeline(deliverables.records, calendar, campaigns, budget, events)
+
+
+# --- F3 RangeMe retail submissions (F3E + founder channels + DM; ENTITY) ---
+
+def _format_rangeme(data: dict) -> str:
+    opps = [o for o in (data.get("opportunities") or []) if isinstance(o, dict)]
+    last = data.get("last_checked") or ""
+    last_d = last[:10] if isinstance(last, str) else "recently"
+    n = len(opps)
+    status_counts: Counter = Counter(str(o.get("status") or "?").strip() for o in opps)
+
+    def _status(o: dict) -> str:
+        return str(o.get("status") or "").strip().lower()
+
+    in_review = [o for o in opps if _status(o) == "in review"]
+    advanced = [o for o in opps if _status(o) in ("messaged", "approved")]
+
+    lines = [f"*RangeMe retail submissions* -- last checked {last_d or 'recently'} ({n} tracked)."]
+    summ = ", ".join(f"{k} {v}" for k, v in status_counts.most_common() if k and k != "—")
+    if summ:
+        lines.append("By status: " + summ)
+
+    # Sort In Review so the soonest-closing live windows come first, then live
+    # windows with no parseable number ("A month left"), then closed/no-window.
+    _unit_days = {"hour": 1 / 24, "day": 1.0, "week": 7.0, "month": 30.0}
+
+    def _window_sort(o: dict):
+        w = str(o.get("window") or "").lower()
+        if "left" not in w:
+            return (2, 0.0)  # not a live window -> last
+        m = re.search(r"(\d+)\s*(hour|day|week|month)", w)
+        if not m:
+            return (1, 0.0)  # live but no parseable number
+        return (0, float(m.group(1)) * _unit_days[m.group(2)])  # soonest first
+
+    if in_review:
+        lines.append("")
+        lines.append(f"In Review -- waiting on a buyer ({len(in_review)}):")
+        for o in sorted(in_review, key=_window_sort)[:15]:
+            w = str(o.get("window") or "").strip()
+            wtag = f" [{w}]" if "left" in w.lower() else ""
+            note = str(o.get("note") or "").strip()
+            note = f" -- {note[:120]}" if note else ""
+            lines.append(f"  - {o.get('name', '?')}{wtag}{note}")
+        if len(in_review) > 15:
+            lines.append(f"  ...and {len(in_review) - 15} more In Review.")
+
+    if advanced:
+        lines.append("")
+        lines.append(f"Buyer replied / advanced ({len(advanced)}):")
+        for o in advanced[:8]:
+            note = str(o.get("note") or "").strip()
+            note = f" -- {note[:140]}" if note else ""
+            lines.append(f"  - {o.get('name', '?')} [{o.get('status')}]{note}")
+    return _dash_scrub("\n".join(lines))
+
+
+def _tool_f3e_rangeme_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_RANGEME, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_RANGEME)
+    data = dashboard_drive_reader.newest_json_by_title(
+        store.get("folder", ""), store.get("title", "")
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("opportunities"), list):
+        return "I couldn't pull the retail submissions tracker just now -- try again in a moment."
+    log.info("f3e_rangeme_status user=%s", slack_user_id)
+    return _format_rangeme(data)
+
+
+# --- F3 cultural radar (F3E + founder channels + DM; ENTITY) ---
+
+def _format_cultural_radar(data: dict, *, max_items: int = 6) -> str:
+    runs = [r for r in (data.get("runs") or []) if isinstance(r, dict)]
+    if not runs:
+        return "The cultural radar has no runs yet."
+    latest = max(runs, key=lambda r: str(r.get("date") or ""))
+    d = str(latest.get("date") or "recently")
+    lines = [f"*F3 cultural radar* -- latest run {d}."]
+    if latest.get("headline"):
+        lines.append(str(latest.get("headline")))
+    if latest.get("pulse"):
+        p = str(latest.get("pulse"))
+        lines.append(p if len(p) <= 420 else p[:420] + "...")
+    items = [i for i in (latest.get("items") or []) if isinstance(i, dict)]
+    if items:
+        lines.append("")
+        lines.append(f"Top hooks ({min(len(items), max_items)} of {len(items)}):")
+        for it in items[:max_items]:
+            topic = str(it.get("topic") or "?")
+            brand = str(it.get("bestBrand") or "").strip()
+            flags = []
+            if it.get("claimsRisk"):
+                flags.append("claims-gated")
+            if it.get("escalate"):
+                flags.append("escalate")
+            head = f"  - [{brand}] {topic}" if brand else f"  - {topic}"
+            meta = []
+            win = str(it.get("window") or "").strip()
+            if win:
+                meta.append(win)
+            if flags:
+                meta.append("/".join(flags))
+            if meta:
+                head += f" ({'; '.join(meta)})"
+            lines.append(head)
+            action = str(it.get("action") or "").strip()
+            if action:
+                lines.append(f"      -> {action[:180]}")
+    return _dash_scrub("\n".join(lines))
+
+
+def _tool_f3e_cultural_radar(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_CULTURAL, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_CULTURAL)
+    data = dashboard_drive_reader.newest_json_by_title(
+        store.get("folder", ""), store.get("title", "")
+    )
+    if not isinstance(data, dict) or not data.get("runs"):
+        return "I couldn't pull the cultural radar just now -- try again in a moment."
+    log.info("f3e_cultural_radar user=%s", slack_user_id)
+    return _format_cultural_radar(data)
+
+
+# --- Travel points (Harrison DM only, PERSONAL) ---
+
+def _format_travel_points(data: dict) -> str:
+    # The travel-points artifact is localStorage-based; a synced Drive export (once
+    # present) is rendered generically since its shape isn't pinned here.
+    lines = ["*Travel points*"]
+    for k, v in list(data.items())[:20]:
+        if str(k).lower() in ("meta", "_meta"):
+            continue
+        lines.append(f"- {str(k).replace('_', ' ')}: {_dash_render_state(v)}")
+    return _dash_scrub("\n".join(lines))
+
+
+def _tool_personal_travel_points(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_TRAVEL, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_TRAVEL)
+    data = dashboard_drive_reader.newest_json_by_title(
+        store.get("folder", ""), store.get("title", "")
+    )
+    if not isinstance(data, dict) or not data:
+        return ("I don't have a travel-points snapshot yet -- export it from the dashboard "
+                "into its Drive folder first, then ask again.")
+    log.info("personal_travel_points user=%s", slack_user_id)
+    return _format_travel_points(data)
+
+
+# --- Dashboard discovery index (guard-filtered; leak-safe) ---
+# (dashboard id -> (source-opaque subject, example ask)). The index NEVER names a
+# dashboard the current surface can't reach -- each line is gated by the real
+# check_dashboard_access, so a channel index can't leak (or count) a personal one.
+_DASH_INDEX: dict[str, tuple[str, str]] = {
+    _DASH_ONEAMERICA: ("Your whole-life insurance portfolio -- cash value, policy loans, premiums", "what's my cash value / policy loans?"),
+    _DASH_CAPITAL: ("The F3 capital raise / equity program -- terms, cap table, candidates", "where does the raise stand?"),
+    _DASH_TRAVEL: ("Your travel points & loyalty balances", "what are my travel points?"),
+    _DASH_CREATOR: ("The F3 creator & ambassador CRM -- roster, follow-ups, top creators", "how's the creator CRM?"),
+    _DASH_CONTENT: ("The content & freelancer pipeline -- deliverables, budget, events", "what's overdue in content?"),
+    _DASH_RANGEME: ("F3 retail submissions on RangeMe -- what's In Review, buyer replies", "where do we stand on RangeMe?"),
+    _DASH_CULTURAL: ("The weekly F3 cultural radar -- trending hooks by brand", "what's on the cultural radar?"),
+}
+
+
+def _tool_cowork_dashboards_index(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    ch = inp.get("_channel_name", "")
+    allowed = []
+    for dash_id, (subject, ask) in _DASH_INDEX.items():
+        if dashboard_access.check_dashboard_access(dash_id, slack_user_id, ch) is None:
+            allowed.append(f'- {subject} -- ask "{ask}"')
+    if not allowed:
+        return ("I don't have a dashboard readout to pull up here. Ask in the entity's own "
+                "channel, or in a DM for anything personal.")
+    log.info("cowork_dashboards_index user=%s ch=%r shown=%d", slack_user_id, ch, len(allowed))
+    return _dash_scrub("Here's what I can pull up for you here:\n" + "\n".join(allowed))
 
 
 TOOL_DEFINITIONS = [
@@ -8094,6 +8294,49 @@ TOOL_DEFINITIONS = [
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "f3e_rangeme_status",
+        "description": (
+            "F3 Energy's retail-buyer submissions on RangeMe: what's currently In Review "
+            "(waiting on a buyer), which buyers replied or advanced, live application "
+            "windows, and a status breakdown. Use when someone asks where F3 stands on "
+            "RangeMe, retail submissions, buyer responses, or which retailers are In "
+            "Review. Available in F3E + founder channels and Harrison's DM (refuses "
+            "elsewhere)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "f3e_cultural_radar",
+        "description": (
+            "The weekly F3 cultural radar: the latest run's headline + pulse and the top "
+            "trending hooks scored by brand (Pure / Mood / Energy), each with its window, "
+            "suggested action, and any claims-gated / escalate flag. Use when someone asks "
+            "what's on the cultural radar, this week's trends or hooks, or what F3 should "
+            "post about. Available in F3E + founder channels and Harrison's DM (refuses "
+            "elsewhere)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "personal_travel_points",
+        "description": (
+            "Harrison's travel points & loyalty balances. Use when Harrison asks about his "
+            "travel points, miles, or loyalty balances. Private -- only reachable in "
+            "Harrison's DM (it refuses everywhere else)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "cowork_dashboards_index",
+        "description": (
+            "List the dashboards / saved readouts the CURRENT channel or DM is allowed to "
+            "ask about, one line each (what it shows + how to ask). Use when someone asks "
+            "'what dashboards can I ask you about', 'what reports do you have', or 'what "
+            "can you pull up here'. It only ever lists what this surface is allowed to see."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -8142,6 +8385,9 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "fndr_open_decisions",
     "cora_self_check",
     "cora_person_dossier",
+    # Dashboard discovery -- available everywhere; guard-filtered per surface, so it
+    # only ever lists what the current channel/DM can actually reach (no leak).
+    "cowork_dashboards_index",
 })
 
 # QBO + Drive close-pack financial depth — only entities that have QBO
@@ -8177,6 +8423,8 @@ _F3_IMAGE_TOOLS: frozenset[str] = frozenset({
 _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
         "f3e_creator_crm",
+        "f3e_rangeme_status",
+        "f3e_cultural_radar",
         "f3e_shopify_sales_pulse",
         "f3e_shopify_inventory",
         "f3e_shopify_set_inventory",
@@ -8320,6 +8568,10 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "personal_capital_program_state": _tool_personal_capital_program_state,
     "f3e_creator_crm": _tool_f3e_creator_crm,
     "fndr_content_pipeline": _tool_fndr_content_pipeline,
+    "f3e_rangeme_status": _tool_f3e_rangeme_status,
+    "f3e_cultural_radar": _tool_f3e_cultural_radar,
+    "personal_travel_points": _tool_personal_travel_points,
+    "cowork_dashboards_index": _tool_cowork_dashboards_index,
 }
 
 
@@ -8417,6 +8669,10 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "personal_capital_program_state": 15,  # folder list + newest JSON download
     "f3e_creator_crm": 15,                 # 2 Airtable list calls
     "fndr_content_pipeline": 20,           # 5 sequential Airtable list calls
+    "f3e_rangeme_status": 20,              # folder list + newest JSON download
+    "f3e_cultural_radar": 20,              # folder list + newest JSON download
+    "personal_travel_points": 20,          # folder list + newest JSON download
+    "cowork_dashboards_index": 8,          # local yaml reads only (fast tier)
 }
 _DEFAULT_TOOL_TIMEOUT = 15
 

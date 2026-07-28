@@ -46,6 +46,18 @@ except Exception:  # noqa: BLE001 -- .env load is best-effort; offline mode stil
 KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 LOGS_DIR = REPO_ROOT / "logs"
 
+# Dashboard drift check (Asana Standard v1 Slice 6e): every pinned Cowork artifact
+# must be registered in dashboard-access.yaml so a new dashboard surfaces as a
+# Monday alarm instead of relying on human memory. Host/OneDrive-specific dir, so
+# it is env-overridable and a missing dir is a no-op (never a hard error).
+_ARTIFACTS_DIR = Path(
+    os.environ.get(
+        "COWORK_ARTIFACTS_DIR",
+        str(Path.home() / "OneDrive" / "Documents" / "Claude" / "Artifacts"),
+    )
+)
+_DASHBOARD_ACCESS_YAML = REPO_ROOT / "data" / "maps" / "dashboard-access.yaml"
+
 # Entities whose static context we size. Keys of _ENTITY_PATHS plus FNDR
 # (FNDR has no entity CLAUDE.md but _load_static_context still assembles the
 # founder brief + known-answers + dynamic snapshots for it).
@@ -365,6 +377,37 @@ def flywheel_metrics_section() -> dict:
         return {"available": False, "reason": str(exc)}
 
 
+def dashboard_drift_section() -> dict:
+    """Diff the on-disk Cowork artifact ids against dashboard-access.yaml so an
+    unregistered dashboard shows up as a Monday alarm (Slice 6e).
+
+    Unions ALL registry buckets (dashboards / covered_by_existing / utility /
+    retired) -- omitting any would false-positive on legitimately-registered
+    artifacts. Fail-soft: a missing artifacts dir (a machine without the OneDrive
+    mount) returns available=False, no alarm."""
+    try:
+        import yaml  # PyYAML is a repo dependency
+        if not _ARTIFACTS_DIR.exists():
+            return {"available": False, "reason": f"no artifacts dir at {_ARTIFACTS_DIR}"}
+        on_disk = {p.parent.name for p in _ARTIFACTS_DIR.glob("*/index.html")}
+        with _DASHBOARD_ACCESS_YAML.open("r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        registered = (
+            set(cfg.get("dashboards", {}) or {})
+            | set(cfg.get("covered_by_existing", {}) or {})
+            | set(cfg.get("utility", []) or [])
+            | set(cfg.get("retired", []) or [])
+        )
+        return {
+            "available": True,
+            "on_disk_count": len(on_disk),
+            "registered_count": len(registered),
+            "unregistered": sorted(on_disk - registered),
+        }
+    except Exception as exc:  # noqa: BLE001 -- fail-soft convention (see kb_corpus)
+        return {"available": False, "reason": str(exc)}
+
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -409,6 +452,16 @@ def threshold_alarms(report: dict) -> list[str]:
         alarms.append(
             f"up to {sch['max_concurrent_in_window']} tasks share a clock time in "
             f"the 03:00-09:00 window; collisions at {times} -- stagger them."
+        )
+    # Dashboard drift (Slice 6e): a pinned Cowork artifact with no dashboard-access
+    # registry entry -- register it (as a data dashboard, covered_by_existing, or
+    # utility) or purge the artifact.
+    dd = report.get("dashboard_drift", {})
+    if dd.get("available") and dd.get("unregistered"):
+        ids = ", ".join(dd["unregistered"])
+        alarms.append(
+            f"dashboard drift: {len(dd['unregistered'])} pinned artifact(s) not in "
+            f"dashboard-access.yaml -- {ids} (register or purge)."
         )
     # Flywheel alarms come pre-evaluated by cora.flywheel_metrics (WS-2) so the
     # thresholds are single-sourced with the nightly health check.
@@ -614,6 +667,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "state": state_sizes(),
         "scheduled_tasks": scheduled_tasks(),
         "flywheel": flywheel_metrics_section(),
+        "dashboard_drift": dashboard_drift_section(),
     }
     report["alarms"] = threshold_alarms(report)
     return report

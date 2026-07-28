@@ -373,3 +373,190 @@ def test_all_entity_prompts_carry_meeting_action_items_section():
         or "meeting_action_items" not in f.read_text(encoding="utf-8")
     ]
     assert not missing, f"prompts missing the meeting-action-items section: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# Slice 6 (Asana Standard v1, 2026-07-27): dashboard-layer extension.          #
+# --------------------------------------------------------------------------- #
+import yaml  # noqa: E402
+
+_ACCESS_YAML = Path(__file__).resolve().parent.parent / "data" / "maps" / "dashboard-access.yaml"
+
+NEW_DASH_TOOLS = [
+    "f3e_rangeme_status", "f3e_cultural_radar", "personal_travel_points", "cowork_dashboards_index",
+]
+
+_RANGEME_DATA = {
+    "last_checked": "2026-07-27T20:15:00-07:00",
+    "opportunities": [
+        {"name": "Walmart Open Call 2026", "section": "Immediate Opportunities", "status": "In Review", "date": "2026-07-15", "window": "7 days left", "note": None},
+        {"name": "Sysco Marketplace Campaign", "section": "Immediate Opportunities", "status": "In Review", "date": "2026-07-15", "window": "9 hours left", "note": "Dallas ECRM cluster."},
+        {"name": "Metropolitan Market", "section": "Immediate Opportunities", "status": "Not Selected", "date": "2026-07-07", "window": "Closed Jul 20th, 2026", "note": None},
+        {"name": "Marine Corp Exchange Submissions", "section": "Ongoing Submissions", "status": "Messaged", "date": "2026-07-07", "window": None, "note": "Buyer declined; invited to revisit later."},
+        {"name": "Casey's Innovation Summit 2024", "section": "Immediate Opportunities", "status": "Approved", "date": "2024-08-15", "window": "Closed", "note": "Historical record only."},
+        {"name": "Old draft", "section": "Ongoing Submissions", "status": "—", "date": None, "window": None, "note": None},
+    ],
+}
+
+_CULTURAL_DATA = {
+    "schema": 1,
+    "updated": "2026-07-27T12:01:42-07:00",
+    "runs": [
+        {"date": "2026-07-20", "headline": "older", "pulse": "old pulse", "items": []},
+        {"date": "2026-07-27", "headline": "AZ heat week gives Pure a live hook",
+         "pulse": "Phoenix extreme heat is the freshest hook this week.",
+         "items": [
+             {"topic": "Phoenix heat wave", "bestBrand": "pure", "window": "through Wed 7/29",
+              "claimsRisk": False, "escalate": False, "action": "Local Pure post riding the warning.",
+              "sources": ["https://example.com/a"]},
+             {"topic": "Cortisol wave", "bestBrand": "mood", "window": "hot now",
+              "claimsRisk": True, "escalate": False, "action": "Claims-safe Mood pre-warm set.",
+              "sources": ["https://x.example/b"]},
+         ]},
+    ],
+}
+
+
+@pytest.mark.parametrize("name", NEW_DASH_TOOLS)
+def test_new_dash_tool_registered_everywhere(name):
+    assert name in td._TOOL_FUNCTIONS
+    assert name in td._TOOL_TIMEOUTS
+    assert name in td.VERBATIM_TABLE_TOOLS
+    assert any(t["name"] == name for t in td.TOOL_DEFINITIONS)
+
+
+def test_new_tool_exposure():
+    f3e = {t["name"] for t in td.tools_for_entity("F3E")}
+    assert "f3e_rangeme_status" in f3e and "f3e_cultural_radar" in f3e
+    assert "personal_travel_points" not in f3e  # DM/founder only
+    # index is global-core -> reachable from any channel
+    for ent in ("OSN", "LEX", "F3E", "HJRP"):
+        assert "cowork_dashboards_index" in {t["name"] for t in td.tools_for_entity(ent)}
+
+
+# --- RangeMe ---
+def test_rangeme_guard_refuses_before_read(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("reader must not run when the guard refuses")
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", _boom)
+    out = td._tool_f3e_rangeme_status(OTHER, "OSN", {"_channel_name": "osn-leadership"})
+    assert out == "That's not available in this channel."
+
+
+def test_rangeme_happy_path_opaque(monkeypatch):
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", lambda f, t: _RANGEME_DATA)
+    out = td._tool_f3e_rangeme_status(HARRISON, "FNDR", {"_channel_name": "dm"})
+    assert "2026-07-27" in out
+    assert "In Review" in out and "Walmart Open Call 2026" in out
+    assert "Marine Corp Exchange Submissions" in out  # Messaged surfaced
+    # live window sorted ahead of the 7-days one
+    assert out.index("9 hours left") < out.index("7 days left")
+    _assert_opaque(out)
+
+
+def test_rangeme_failsoft(monkeypatch):
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", lambda f, t: None)
+    out = td._tool_f3e_rangeme_status(HARRISON, "FNDR", {"_channel_name": "dm"})
+    assert "couldn't pull" in out.lower()
+
+
+# --- Cultural radar ---
+def test_cultural_guard_refuses_before_read(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("reader must not run when the guard refuses")
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", _boom)
+    out = td._tool_f3e_cultural_radar(OTHER, "OSN", {"_channel_name": "osn-leadership"})
+    assert out == "That's not available in this channel."
+
+
+def test_cultural_happy_path_latest_run_and_opaque(monkeypatch):
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", lambda f, t: _CULTURAL_DATA)
+    out = td._tool_f3e_cultural_radar(HARRISON, "FNDR", {"_channel_name": "dm"})
+    assert "2026-07-27" in out and "2026-07-20" not in out  # newest run only
+    assert "[pure]" in out and "[mood]" in out
+    assert "claims-gated" in out                # the mood item's claimsRisk flag
+    assert "http" not in out.lower()            # sources never rendered
+    _assert_opaque(out)
+
+
+# --- Travel points (DM only, currently data-less) ---
+def test_travel_points_dm_only_and_failsoft(monkeypatch):
+    out = td._tool_personal_travel_points(HARRISON, "FNDR", {"_channel_name": "f3e-leadership"})
+    assert out == "I don't have that here -- ask me in a DM."
+    monkeypatch.setattr(td.dashboard_drive_reader, "newest_json_by_title", lambda f, t: None)
+    out2 = td._tool_personal_travel_points(HARRISON, "FNDR", {"_channel_name": "dm"})
+    assert "snapshot" in out2.lower()
+
+
+# --- Discovery index: guard-filtered, leak-safe ---
+def test_index_channel_never_leaks_personal():
+    out = td._tool_cowork_dashboards_index(OTHER, "OSN", {"_channel_name": "osn-leadership"})
+    low = out.lower()
+    for term in ("insurance", "cash value", "capital raise", "travel points", "creator", "rangeme", "cultural"):
+        assert term not in low, f"index leaked {term!r} in a non-allowed channel"
+
+
+def test_index_dm_lists_personal_for_harrison():
+    out = td._tool_cowork_dashboards_index(HARRISON, "FNDR", {"_channel_name": "dm"})
+    low = out.lower()
+    assert "insurance" in low and "capital raise" in low and "travel points" in low
+    assert "rangeme" in low and "cultural radar" in low
+    _assert_opaque(out)
+
+
+def test_index_f3e_channel_scoped():
+    out = td._tool_cowork_dashboards_index(OTHER, "F3E", {"_channel_name": "f3e-leadership"})
+    low = out.lower()
+    assert "rangeme" in low and "cultural radar" in low and "creator" in low
+    for term in ("insurance", "capital raise", "travel points", "content & freelancer"):
+        assert term not in low, f"index leaked founder/personal {term!r} in an F3E channel"
+
+
+# --- Registry reconciliation (drift-guard) ---
+# The live Cowork artifact manifest (2026-07-27, 17 ids). Every one MUST live in
+# exactly one registry bucket so the health-report drift check stays quiet.
+_MANIFEST_ARTIFACTS_2026_07_27 = [
+    "run-cowork-session-capture", "f3-ecom", "press-pipeline-dashboard",
+    "f3-ambassador-command-center", "f3-pure-tiktok-cockpit",
+    "f3-creator-sponsorship-command-center", "f3-capital-program", "f3-content-pipeline",
+    "travel-points-command-center", "f3-productions-dashboard", "claude-cost-review",
+    "f3e-marketing-budget-calculator", "session-launcher", "oneamerica-whole-life-portfolio",
+    "f3-ai-visibility-dashboard", "f3-cultural-radar", "f3-retail-dashboard",
+]
+
+
+def _registry():
+    return yaml.safe_load(_ACCESS_YAML.read_text(encoding="utf-8")) or {}
+
+
+def test_every_manifest_artifact_is_registered():
+    d = _registry()
+    registered = (
+        set(d.get("dashboards", {}) or {})
+        | set(d.get("covered_by_existing", {}) or {})
+        | set(d.get("utility", []) or [])
+        | set(d.get("retired", []) or [])
+    )
+    missing = [a for a in _MANIFEST_ARTIFACTS_2026_07_27 if a not in registered]
+    assert not missing, f"unregistered artifacts (would trip the drift check): {missing}"
+
+
+def test_travel_points_key_fixed_to_manifest_id():
+    d = _registry()
+    assert "travel-points-command-center" in d["dashboards"]
+    assert "travel-points-optimizer" not in d["dashboards"]
+
+
+def test_registry_buckets_disjoint():
+    d = _registry()
+    buckets = {
+        "dashboards": set(d.get("dashboards", {}) or {}),
+        "covered_by_existing": set(d.get("covered_by_existing", {}) or {}),
+        "utility": set(d.get("utility", []) or []),
+        "retired": set(d.get("retired", []) or []),
+    }
+    names = list(buckets)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            overlap = buckets[names[i]] & buckets[names[j]]
+            assert not overlap, f"{names[i]} and {names[j]} overlap: {overlap}"

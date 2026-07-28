@@ -49,12 +49,54 @@ dashboards:
     no_cache: true
     kb_ingest: never
 
-  travel-points-optimizer:           # RESERVED -- artifact not built yet; store.files empty
+  travel-points-command-center:      # id matches the on-disk Cowork artifact (2026-07-27)
+    # DATA NOTE: the artifact is currently localStorage-only; it exports
+    # `travel-points-state.json`. The reader picks up that export the moment it lands
+    # in this folder (newest-by-title) -- until then the tool fail-softs. Wiring the
+    # artifact to write to Drive (or a manual export) is a Harrison follow-up.
     sensitivity: PERSONAL
     dm_users: ["U0B2RM2JYJ1"]        # Harrison
     allow_channels: []
     allow_entities: []
-    store: {type: drive_json, folder: "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752", files: {}}
+    store: {type: drive_json_newest_by_title, folder: "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752", title: "travel-points-state.json"}
+    tools: [personal_travel_points]
+    no_cache: true
+    kb_ingest: never
+
+  # F3 retail submissions on RangeMe -- the weekly Drive snapshot behind the
+  # f3-retail-dashboard's RangeMe section (2026-07-27). ENTITY (F3E + founder).
+  f3-retail-rangeme:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [founder-operations]
+    allow_entities: [F3E, FNDR, HJRG]
+    store: {type: drive_json_newest_by_title, folder: "1Qv7EajECAezJ0GznQshqcrheEXN9scEj", title: "rangeme-status-snapshot.json"}
+    tools: [f3e_rangeme_status]
+
+  # Weekly F3 cultural radar (trending hooks by brand). ENTITY (F3E + founder).
+  # The read tool serves the Drive JSON; the artifact separately WRITES ideas to
+  # Airtable -- Cora only reads here.
+  f3-cultural-radar:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [founder-operations]
+    allow_entities: [F3E, FNDR, HJRG]
+    store: {type: drive_json_newest_by_title, folder: "1ySgHEVXcUN3yXZ-jv64fglq5J8ONGnX5", title: "f3-cultural-radar-data.json"}
+    tools: [f3e_cultural_radar]
+
+  # RESERVED (registration + sensitivity only). claude-cost-review is a STATIC
+  # snapshot baked into the artifact HTML -- there is no live backing store to read,
+  # so no reader tool is wired. Registered here so the drift check treats it as
+  # known and its PERSONAL sensitivity is on record. Building a reader needs the
+  # data exported to a store first (cascade flag).
+  claude-cost-review:
+    sensitivity: PERSONAL
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: []
+    allow_entities: []
+    store: {}
     tools: []
     no_cache: true
     kb_ingest: never
@@ -89,8 +131,19 @@ covered_by_existing:
   f3-ai-visibility-dashboard: {tool: f3e_ai_visibility, store: "data/ai_visibility.db", overlay_bridge: deferred}
   f3-ecom: {tools: [f3e_shopify_sales_pulse, f3e_shopify_inventory, polar_tools]}
   f3-productions-dashboard: {tools: [asana_tools, f3_production_kb]}
-  f3-retail-dashboard: {tool: f3e_hubspot_pipeline_summary}
+  # f3-retail-dashboard's HubSpot pipeline is f3e_hubspot_pipeline_summary; its
+  # RangeMe section (added 2026-07-27) is served by f3e_rangeme_status via the
+  # f3-retail-rangeme dashboards entry above.
+  f3-retail-dashboard: {tools: [f3e_hubspot_pipeline_summary, f3e_rangeme_status]}
   press-pipeline-dashboard: {tool: fndr_press_pipeline_summary}
+
+# --- Utility / infra artifacts: no data backing store, no read tool. Listed so
+# the health-report drift check treats them as known (register-or-purge), not
+# unregistered dashboards. ---
+utility:
+  - session-launcher                  # Cowork session launcher UI (no data)
+  - run-cowork-session-capture        # Cowork session-capture control (no data)
+  - f3e-marketing-budget-calculator   # client-side calculator, localStorage only (no remote store)
 
 # --- Folders that must NEVER be KB-ingested (personal / highly confidential). ---
 # Documentation mirror of the store.folder ids carrying kb_ingest: never above.
