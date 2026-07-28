@@ -508,9 +508,15 @@ def _scrub_evidence(evidence: list[dict[str, Any]] | None, *, is_lex: bool) -> l
 
 
 def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
-             client_factory: Callable | None = None) -> str | None:
+             client_factory: Callable | None = None,
+             dm_held: bool = False) -> str | None:
     """Deduplicate, PHI-gate, persist, and (if live) DM a card. Returns the cq-id
     (existing on recurrence, new on first sighting) or None if dropped.
+
+    dm_held: capture the item but suppress the immediate DM card (persist it
+    dm_held so the overflow flush surfaces it on the next knowledge-review run).
+    Used when a confirmed ask is over quota -- it must never vanish, but Harrison
+    must not be stormed (1g). Only meaningful for a NEW item.
 
     Runs off the hot path (see the public capture_* entry points)."""
     entity = str(rec.get("entity") or "FNDR").strip().upper()
@@ -580,6 +586,10 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
             rec["ts"] = _now_iso()
             rec["status"] = initial_status
             rec.setdefault("count", 1)
+            if dm_held:
+                # Persist the hold on the captured event so the reducer folds it and
+                # maybe_flush_overflow() delivers it on the next review run (never lost).
+                rec["dm_held"] = True
             _append_event({"event": "captured", **rec})
             _append_fingerprint(rec["fingerprint"], signal, store_rep, result_id,
                                 class_key=class_key)
@@ -587,9 +597,9 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
 
     _render_backlog_safe()
     if code_queue_level() == "live":
-        if is_new:
+        if is_new and not dm_held:
             _send_new_item_card(rec, client_factory)
-        else:
+        elif not is_new:
             _thread_count_update(result_id, client_factory)
     return result_id
 
@@ -1502,14 +1512,25 @@ def _explicit_count_today(user: str) -> int:
 
 
 def queue_explicit(user: str, entity: str, channel_id: str, request: str,
-                   is_founder: bool) -> str | None:
-    """Backend for the explicit tool's confirmed call. Founder -> APPROVED
-    fast-path; teammate -> PROPOSED. Returns cq-id (or existing on dedup)."""
+                   is_founder: bool) -> tuple[str | None, str]:
+    """Backend for the explicit tool's confirmed call. Returns (cq_id, outcome).
+
+    outcome is one of:
+      "ok"      -- captured (APPROVED for founder, PROPOSED for a teammate) + carded
+      "held"    -- captured PROPOSED but over the daily cap: no immediate card, rides
+                   the overflow flush (a confirmed ask MUST NOT vanish -- 1g)
+      "empty"   -- nothing to file (blank request)
+      "dropped" -- captured nothing (PHI summary gate refused the request)
+
+    Founder is THROTTLE-EXEMPT: he IS the approval gate, so his explicit files are
+    never capped (1g). `is_founder` is derived by the caller from the real Slack
+    event user id (never a model-supplied field). A teammate over
+    EXPLICIT_THROTTLE_PER_DAY is still captured -- with dm_held so the confirmed ask
+    is not lost -- and the caller voices an honest, structured over-quota message."""
     request = (request or "").strip()
     if not request:
-        return None
-    if _explicit_count_today(user) >= EXPLICIT_THROTTLE_PER_DAY:
-        return None
+        return None, "empty"
+    held = (not is_founder) and _explicit_count_today(user) >= EXPLICIT_THROTTLE_PER_DAY
     rec = {
         "kind": "feature", "severity": "P2", "title": request[:120],
         "summary": request[:200], "subsystem_guess": "", "entity": entity,
@@ -1517,7 +1538,11 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
         "evidence": [{"channel_id": channel_id, "ts": "", "note": request[:400]}],
         "reporter": user,
     }
-    return _capture(rec, initial_status="APPROVED" if is_founder else "PROPOSED")
+    cq_id = _capture(rec, initial_status="APPROVED" if is_founder else "PROPOSED",
+                     dm_held=held)
+    if cq_id is None:
+        return None, "dropped"
+    return cq_id, ("held" if held else "ok")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1821,10 +1846,14 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     existing = find_fingerprint(signal, title, class_key=class_key)
     if existing:
         return existing
-    # PHI-safe persistence (mirror _capture, D-051 defect A): NEVER persist a raw LEX or
-    # PHI-tripping representative -- else it becomes an embedding candidate whose raw text
-    # egresses to OpenAI. Exact-hash dedup still works (fingerprint is over `title`).
+    # PHI-safe persistence (mirror _capture FULLY, D-051 defect A): NEVER persist a raw
+    # LEX or PHI-tripping representative -- else it becomes an embedding candidate whose
+    # raw text egresses to OpenAI. Exact-hash dedup still works (fingerprint is over
+    # `title`). The evidence note is scrubbed on the SAME rule as _capture (LEX -> pointer
+    # only; any note that itself trips is_phi_risk -> dropped) -- the seed path previously
+    # persisted summary[:200] raw, an at-rest LEX/PHI leak for a LEX seed (1i).
     is_lex = str(entity or "").strip().upper().startswith("LEX")
+    rec["evidence"] = _scrub_evidence(rec.get("evidence"), is_lex=is_lex)
     try:
         rep_phi = phi_guard.is_phi_risk(title)
     except Exception:  # noqa: BLE001 -- fail closed

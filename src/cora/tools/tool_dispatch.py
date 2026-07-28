@@ -8475,16 +8475,26 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
         if pending:
             # Execute the STASHED request (server-side), NOT the model echo.
             req = str(pending.get("request") or "").strip()
+            # is_founder is derived from the REAL Slack event user id, never a
+            # model-supplied field -- the throttle exemption can't be spoofed (1g).
             is_founder = slack_user_id == code_queue.HARRISON_ID
-            cq_id = code_queue.queue_explicit(
+            cq_id, outcome = code_queue.queue_explicit(
                 slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
-            if not cq_id:
-                return ("I couldn't file that (you may have hit today's queue limit) -- "
-                        "tell the user it wasn't queued and to try again later.")
+            if outcome == "dropped" or cq_id is None:
+                return ("I couldn't file that -- it looked like it contained protected "
+                        "info. Tell the user it wasn't queued and to rephrase without "
+                        "any client/patient details.")
             if is_founder:
                 return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
                         "code-session queue (APPROVED). Tap \"Stage prompt\" on the card "
                         "when you want the kickoff written.")
+            if outcome == "held":
+                # Confirmed ask, over the teammate daily cap -> captured (never lost)
+                # but held from Harrison's DM; it surfaces in his next queue digest (1g).
+                return ("WRITE_CONFIRMED -- post as your entire response: You've hit "
+                        "today's code-queue limit (3/day, resets midnight AZ), but I "
+                        "still logged this for Harrison -- it'll surface in his next "
+                        "queue digest for review.")
             return ("WRITE_CONFIRMED -- post as your entire response: Queued for "
                     "Harrison's review -- he'll approve it from his queue.")
         # No fresh server-side pending -> DO NOT trust the model-echoed confirmed=True

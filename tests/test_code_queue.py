@@ -236,6 +236,45 @@ def test_phi_check_error_fails_closed(qenv, monkeypatch):
     assert cq._capture(dict(rec)) is None  # fail-closed -> drop
 
 
+def test_explicit_lex_redacts_representative_and_evidence_at_rest(qenv):
+    # 1i: the explicit write path builds rec with a RAW request in both the
+    # representative AND the evidence note; _capture must redact BOTH for LEX before
+    # anything is persisted (never a raw-LEX-at-rest window in the ledger).
+    cid, outcome = cq.queue_explicit(
+        "U9", "LEX-LTS", "C1", "cora should retrieve DDD service definitions", False)
+    assert outcome in ("ok", "held") and cid
+    item = cq.get_item(cid)
+    assert item["representative"] == ""                 # redacted at rest
+    assert item["evidence"][0].get("note") is None      # pointer-only (LEX)
+    # The fingerprint ledger likewise stores no raw LEX representative.
+    fps = cq._read_jsonl(cq._FINGERPRINT_LEDGER)
+    assert all(f.get("representative") == "" for f in fps if f.get("id") == cid)
+
+
+def test_seed_item_lex_evidence_pointer_only(qenv):
+    # 1i fix: seed_item previously persisted summary[:200] raw as the evidence note.
+    # For a LEX seed it must now be pointer-only + representative redacted (matches the
+    # capture path). This is what makes the 1h LEX-DDD seed evidence-pointer-only.
+    cid = cq.seed_item(
+        kind="feature", severity="P2",
+        title="LEX-LLC DDD service-definition retrieval (RSP/HAH/ATC)",
+        summary="alias/glossary layer + verified re-chunk + Notion sync",
+        entity="LEX", signal="explicit", status="APPROVED")
+    item = cq.get_item(cid)
+    assert item["status"] == "APPROVED"
+    assert item["representative"] == ""
+    assert item["evidence"][0].get("note") is None      # pointer-only, no raw text
+
+
+def test_seed_item_non_lex_phi_note_dropped(qenv, monkeypatch):
+    # Belt: a non-LEX seed whose note itself trips is_phi_risk still drops the note.
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    cid = cq.seed_item(
+        kind="bug", severity="P2", title="f3e widget", summary="contains phi text",
+        entity="F3E", signal="explicit", status="APPROVED")
+    assert cq.get_item(cid)["evidence"][0].get("note") is None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Classifier
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,17 +318,21 @@ def test_phrase_becomes_bug_item(qenv, monkeypatch):
 # Founder fast-path / explicit throttle
 # ─────────────────────────────────────────────────────────────────────────────
 def test_founder_fastpath_approved(qenv):
-    cid = cq.queue_explicit("U0B2RM2JYJ1", "F3E", "C1", "add a TikTok voucher check", True)
+    cid, outcome = cq.queue_explicit("U0B2RM2JYJ1", "F3E", "C1", "add a TikTok voucher check", True)
+    assert outcome == "ok"
     assert cq.get_item(cid)["status"] == "APPROVED"
 
 
 def test_teammate_proposed(qenv):
-    cid = cq.queue_explicit("U9", "F3E", "C1", "the tiktok digest misses vouchers", False)
+    cid, outcome = cq.queue_explicit("U9", "F3E", "C1", "the tiktok digest misses vouchers", False)
+    assert outcome == "ok"
     assert cq.get_item(cid)["status"] == "PROPOSED"
 
 
-def test_explicit_throttle(qenv):
-    # Distinct requests (fuzzy dedup would collapse near-identical ones).
+def test_explicit_throttle_teammate_over_cap_is_held_not_dropped(qenv):
+    # A teammate is capped at EXPLICIT_THROTTLE_PER_DAY explicit files/day, but a
+    # CONFIRMED ask over the cap must NEVER vanish (1g): it is captured with dm_held
+    # (no immediate card) and surfaces via the overflow flush.
     distinct = [
         "add a tiktok voucher check to the digest",
         "fix the rangeme status refresh timing",
@@ -297,8 +340,60 @@ def test_explicit_throttle(qenv):
     ]
     assert len(distinct) == cq.EXPLICIT_THROTTLE_PER_DAY
     for req in distinct:
-        assert cq.queue_explicit("U9", "F3E", "C1", req, False)
-    assert cq.queue_explicit("U9", "F3E", "C1", "create a lex audit dashboard view", False) is None
+        cid, outcome = cq.queue_explicit("U9", "F3E", "C1", req, False)
+        assert outcome == "ok" and cid
+    over = "create a lex audit dashboard view"
+    cid, outcome = cq.queue_explicit("U9", "F3E", "C1", over, False)
+    assert outcome == "held"                      # over quota -> held, not dropped
+    item = cq.get_item(cid)
+    assert item is not None                        # the confirmed ask was NOT lost
+    assert item["status"] == "PROPOSED"
+    assert item.get("dm_held") is True
+    # It is in the flushable set (surfaces on the next knowledge-review run).
+    assert cid in {it["id"] for it in cq.load_items()
+                   if it.get("dm_held") and not it.get("dm_flushed")}
+
+
+def test_founder_is_throttle_exempt(qenv):
+    # Harrison IS the approval gate -> never capped. Well past the cap, still APPROVED
+    # + not held (1g). Distinct requests so fuzzy dedup doesn't collapse them.
+    reqs = [
+        "add a tiktok voucher check to the digest",
+        "fix the rangeme status refresh timing",
+        "build an osn franchise thread pulse tool",
+        "wire a ddd service-definition retrieval alias layer",
+        "add a cash-flow pulse export for hjrp leases",
+    ]
+    for req in reqs:
+        cid, outcome = cq.queue_explicit("U0B2RM2JYJ1", "F3E", "C1", req, True)
+        assert outcome == "ok" and cid
+        item = cq.get_item(cid)
+        assert item["status"] == "APPROVED"
+        assert not item.get("dm_held")
+
+
+def test_explicit_empty_and_dropped_outcomes(qenv):
+    # Blank request -> empty; nothing filed.
+    assert cq.queue_explicit("U9", "F3E", "C1", "   ", False) == (None, "empty")
+
+
+def test_capture_dm_held_suppresses_card(qenv):
+    # dm_held capture persists the item + hold but sends NO immediate DM card.
+    fake = FakeClient()
+    rec = {
+        "kind": "feature", "severity": "P2", "title": "held item",
+        "summary": "held item summary", "subsystem_guess": "", "entity": "F3E",
+        "signal": "explicit", "representative": "held item summary",
+        "evidence": [{"channel_id": "C1", "ts": "", "note": "held item summary"}],
+        "reporter": "U9",
+    }
+    cid = cq._capture(dict(rec), initial_status="PROPOSED", dm_held=True,
+                      client_factory=lambda: fake)
+    assert cid and cq.get_item(cid).get("dm_held") is True
+    assert fake.posts == []                        # no card while held
+    # The overflow flush then delivers it as ONE summary DM.
+    assert cq.maybe_flush_overflow(client_factory=lambda: fake) == 1
+    assert len(fake.posts) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
