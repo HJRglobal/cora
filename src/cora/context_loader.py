@@ -607,7 +607,10 @@ def _try_kb_retrieve(
         # The founder CLAUDE.md is indexed under entity=FNDR and contains
         # cross-entity financial data for all portfolio entities.
         include_fndr = entity not in _NO_FOUNDER_CONTEXT
-        # Shared connection — serialize access (KB searches are ms-scale).
+        # Shared connection — serialize access (KB searches are ms-scale). Time the search
+        # (incl. lock wait) so the health report can watch warm p50/p95 per entity and the
+        # partition-key win (Slice 2-1/2-3) is measurable; emitted on the log line below.
+        _kb_t0 = time.monotonic()
         with _SHARED_KB_LOCK:
             results = kb.search(
                 query,
@@ -618,6 +621,7 @@ def _try_kb_retrieve(
                 sub_entity=sub_entity_scope,
                 query_vec=query_vec,
             )
+        kb_ms = (time.monotonic() - _kb_t0) * 1000.0
     except Exception as exc:
         log.warning("KB retrieval failed for entity=%s query=%r: %s", entity, query[:60], exc)
         return None
@@ -697,9 +701,9 @@ def _try_kb_retrieve(
 
         if relevant:
             log.info(
-                "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f",
+                "KB retrieved %d chunks (of %d returned) for entity=%s — best distance=%.3f kb_ms=%.0f",
                 len(relevant), len(results), entity,
-                relevant[0].distance,
+                relevant[0].distance, kb_ms,
             )
             main_block = _format_kb_chunks(relevant)
 

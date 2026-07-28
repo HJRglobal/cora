@@ -66,6 +66,11 @@ _USAGE_RE = re.compile(
     r"cache_read=(\d+) output=(\d+)"
 )
 
+# KB retrieval latency (Slice 2-3): "KB retrieved N chunks (of M returned) for
+# entity=<E> — best distance=<d> kb_ms=<ms>". Entity token stops at whitespace so
+# codes like LEX-LLC parse whole.
+_KB_MS_RE = re.compile(r"KB retrieved .*? entity=(\S+).*?kb_ms=(\d+(?:\.\d+)?)")
+
 
 # --------------------------------------------------------------------------- #
 # token counting
@@ -191,6 +196,51 @@ def _median(values: list[int]) -> float:
     n = len(s)
     mid = n // 2
     return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _percentile(values: list[float], p: float) -> float:
+    """Nearest-rank percentile (adequate for latency observability)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    idx = min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))
+    return float(s[idx])
+
+
+def kb_latency(log_days: int) -> dict:
+    """Warm KB-search latency per entity, parsed from the cora-*.log kb_ms lines.
+
+    Feeds the section-5 warm-p95 < 3s threshold and makes the Slice 2-1 partition-key
+    win measurable. No API/DB access -- pure log parse.
+    """
+    logs = sorted(LOGS_DIR.glob("cora-2*.log"))[-log_days:] if LOGS_DIR.exists() else []
+    by_entity: dict[str, list[float]] = {}
+    for log_path in logs:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "kb_ms=" not in line:
+                        continue
+                    m = _KB_MS_RE.search(line)
+                    if m:
+                        by_entity.setdefault(m.group(1), []).append(float(m.group(2)))
+        except OSError:
+            continue
+    all_ms: list[float] = []
+    per_entity: dict[str, dict] = {}
+    for ent, vals in by_entity.items():
+        all_ms.extend(vals)
+        per_entity[ent] = {
+            "n": len(vals),
+            "p50": round(_percentile(vals, 50)),
+            "p95": round(_percentile(vals, 95)),
+        }
+    return {
+        "samples": len(all_ms),
+        "overall_p50": round(_percentile(all_ms, 50)) if all_ms else 0,
+        "overall_p95": round(_percentile(all_ms, 95)) if all_ms else 0,
+        "by_entity": per_entity,
+    }
 
 
 def recent_billing(log_days: int) -> dict:
@@ -446,6 +496,18 @@ def threshold_alarms(report: dict) -> list[str]:
             f"logs/ + JSONL ledgers {_fmt_bytes(ledger_bytes)} > 300MB -- run the "
             f"compaction/rotation job."
         )
+    # KB warm latency (Slice 2-3): any entity with enough samples whose warm p95 exceeds
+    # the game-plan section-5 3s budget. Min-sample floor so a couple of cold outliers
+    # don't cry wolf.
+    kl = report.get("kb_latency", {})
+    slow = {e: v for e, v in kl.get("by_entity", {}).items()
+            if v.get("n", 0) >= 5 and v.get("p95", 0) > 3000}
+    if slow:
+        parts = ", ".join(f"{e} p95={int(v['p95'])}ms"
+                          for e, v in sorted(slow.items(), key=lambda kv: -kv[1]["p95"]))
+        alarms.append(
+            f"KB warm p95 > 3s: {parts} -- investigate the coarse-scan / partition index."
+        )
     sch = report.get("scheduled_tasks", {})
     if sch.get("available") and sch.get("max_concurrent_in_window", 0) > 2:
         times = ", ".join(sch.get("concurrent_peak_times", [])) or "?"
@@ -509,6 +571,15 @@ def format_slack(report: dict) -> str:
         f"*Billing* ({b.get('usage_lines', 0)} lines): median input "
         f"{b.get('median_input', 0):,.0f} | cache_read/input {b.get('cache_read_over_input', 0)}"
     )
+    kl = report.get("kb_latency", {})
+    if kl.get("samples", 0):
+        top = sorted(kl.get("by_entity", {}).items(),
+                     key=lambda kv: -kv[1].get("p95", 0))[:3]
+        ent_str = " | ".join(f"{e} p50/{int(v['p50'])} p95/{int(v['p95'])}ms" for e, v in top)
+        lines.append(
+            f"*KB latency* ({kl['samples']} q): overall p50 {int(kl['overall_p50'])} / "
+            f"p95 {int(kl['overall_p95'])}ms | {ent_str}"
+        )
     lines.append(
         f"*Disk:* cora_kb.db {_fmt_bytes(st.get('cora_kb_db_bytes', 0))} | "
         f"logs/ {_fmt_bytes(st.get('logs_dir_bytes', 0))}"
@@ -616,6 +687,17 @@ def render(report: dict) -> None:
     print(f"    cache_read / input:  {b['cache_read_over_input']}  "
           f"<-- BASELINE; the caching split should raise this")
 
+    # 4b. KB latency (Slice 2-3)
+    kl = report.get("kb_latency", {})
+    print(f"\n[4b] KB WARM LATENCY ({kl.get('samples', 0):,} queries)  "
+          f"[threshold to alarm: p95 > 3000ms]")
+    if not kl.get("samples"):
+        print("    no kb_ms samples in the parsed logs")
+    else:
+        print(f"    overall: p50 {int(kl['overall_p50'])}ms  p95 {int(kl['overall_p95'])}ms")
+        for ent, v in sorted(kl.get("by_entity", {}).items(), key=lambda kv: -kv[1]["p95"]):
+            print(f"      {ent:<10} n={v['n']:>4}  p50 {int(v['p50']):>5}ms  p95 {int(v['p95']):>5}ms")
+
     # 5. state
     s = report["state"]
     print("\n[5] STATE-STORE SIZES")
@@ -664,6 +746,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "static_context": static_context_tokens(counter),
         "tool_block": tool_block_tokens(counter),
         "billing": recent_billing(log_days),
+        "kb_latency": kb_latency(log_days),
         "state": state_sizes(),
         "scheduled_tasks": scheduled_tasks(),
         "flywheel": flywheel_metrics_section(),
