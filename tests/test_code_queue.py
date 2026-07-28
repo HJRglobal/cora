@@ -266,13 +266,24 @@ def test_seed_item_lex_evidence_pointer_only(qenv):
     assert item["evidence"][0].get("note") is None      # pointer-only, no raw text
 
 
-def test_seed_item_non_lex_phi_note_dropped(qenv, monkeypatch):
-    # Belt: a non-LEX seed whose note itself trips is_phi_risk still drops the note.
+def test_seed_item_phi_title_refused(qenv, monkeypatch):
+    # D-051 fix: a PHI-tripping seed is REFUSED outright (mirrors _capture) -- the seed
+    # title/summary persist raw + egress via code-session-backlog.md, so a PHI seed must
+    # never be stored, not merely stored-with-scrubbed-evidence.
     monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
     cid = cq.seed_item(
         kind="bug", severity="P2", title="f3e widget", summary="contains phi text",
         entity="F3E", signal="explicit", status="APPROVED")
-    assert cq.get_item(cid)["evidence"][0].get("note") is None
+    assert cid is None
+    assert cq.load_items() == []
+
+
+def test_seed_item_phi_check_error_fails_closed(qenv, monkeypatch):
+    def _boom(_t):
+        raise RuntimeError("phi check exploded")
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", _boom)
+    assert cq.seed_item(kind="bug", severity="P2", title="x", summary="y",
+                        entity="F3E", signal="explicit", status="APPROVED") is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,6 +386,48 @@ def test_founder_is_throttle_exempt(qenv):
 def test_explicit_empty_and_dropped_outcomes(qenv):
     # Blank request -> empty; nothing filed.
     assert cq.queue_explicit("U9", "F3E", "C1", "   ", False) == (None, "empty")
+
+
+def test_explicit_reask_after_dismiss_resurfaces(qenv):
+    # D-051 finding A: a confirmed EXPLICIT ask must NEVER silently merge into a CLOSED
+    # item (the finding-6 invariant). Re-asking an exact match of a DISMISSED item mints a
+    # FRESH item instead of a dead-end recurrence.
+    cid1, o1 = cq.queue_explicit("U0B2RM2JYJ1", "F3E", "C1",
+                                 "build a tiktok voucher digest tool", True)
+    assert o1 == "ok"
+    assert cq.process_queue_action(cq.ACTION_DISMISS, cid1, "U0B2RM2JYJ1")[0] == "dismissed"
+    assert cq.get_item(cid1)["status"] == "DISMISSED"
+    cid2, o2 = cq.queue_explicit("U0B2RM2JYJ1", "F3E", "C1",
+                                 "build a tiktok voucher digest tool", True)
+    assert cid2 != cid1                            # not a recurrence onto the dismissed item
+    assert cq.get_item(cid2)["status"] == "APPROVED"   # resurfaced, actionable
+
+
+def test_non_explicit_still_dedups_onto_closed(qenv):
+    # The A-fix is EXPLICIT-only: other signals keep dedup-onto-any so a resolved bug
+    # recurrence doesn't spam a new item. A friction signal matching a dismissed item is a
+    # recurrence (same id).
+    fp = "vendor cox billing flood needs a make filter"
+    id1 = cq._capture({"kind": "feature", "severity": "P3", "title": "cox flood",
+                       "summary": "s", "entity": "F3E", "signal": "friction",
+                       "representative": fp, "evidence": [], "reporter": "U1"})
+    cq._append_event({"event": "dismissed", "ts": cq._now_iso(), "id": id1})
+    id2 = cq._capture({"kind": "feature", "severity": "P3", "title": "cox flood",
+                       "summary": "s", "entity": "F3E", "signal": "friction",
+                       "representative": fp, "evidence": [], "reporter": "U1"})
+    assert id2 == id1                              # recurrence onto the dismissed item (unchanged)
+
+
+def test_explicit_over_cap_dedup_reports_ok_not_held(qenv):
+    # D-051 finding C: an over-cap ask that dedups onto the asker's OWN still-open item is
+    # a recurrence (rides the existing card) -> report "ok", NOT a false "held / digest"
+    # promise (the item carries no dm_held flag and would never be flushed).
+    first = "add a tiktok voucher check to the digest"
+    for req in (first, "fix the rangeme status refresh timing", "build an osn thread pulse"):
+        assert cq.queue_explicit("U9", "F3E", "C1", req, False)[1] == "ok"
+    cid, outcome = cq.queue_explicit("U9", "F3E", "C1", first, False)   # over cap + exact dedup
+    assert outcome == "ok"
+    assert not cq.get_item(cid).get("dm_held")
 
 
 def test_capture_dm_held_suppresses_card(qenv):

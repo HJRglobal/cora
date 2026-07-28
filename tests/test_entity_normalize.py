@@ -91,6 +91,17 @@ def test_idempotent():
         assert normalize_entity(*once) == once
 
 
+def test_store_parent_agrees_with_normalize():
+    # Coupling guard (D-051 P3): every code the retrieval-side _STORE_PARENT folds must
+    # normalize (ingest-side) to the SAME parent -- else a store/property channel would
+    # search a different partition than where its chunks land, and go dark on its own
+    # content. Keeps the two independent lists in sync.
+    from cora.context_loader import _STORE_PARENT
+    for code, parent in _STORE_PARENT.items():
+        norm_entity, _ = normalize_entity(code, None)
+        assert norm_entity == parent, f"{code}: normalize->{norm_entity} but _STORE_PARENT->{parent}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step-0e wiring in upsert_documents
 # ─────────────────────────────────────────────────────────────────────────────

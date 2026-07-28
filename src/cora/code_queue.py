@@ -569,6 +569,16 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     # is fine. Network (embedding, DM) + backlog render stay OUTSIDE the lock.
     with _LEDGER_LOCK:
         existing_id = find_fingerprint(signal, representative, class_key=class_key)
+        # A confirmed EXPLICIT human ask must NEVER silently merge into a CLOSED item
+        # (finding-6 invariant: a confirmed ask never vanishes). find_fingerprint is
+        # status-blind, so an explicit re-ask matching a DISMISSED/SHIPPED/SUPERSEDED
+        # fingerprint would otherwise record a recurrence onto the terminal item and never
+        # resurface. For the explicit signal only, ignore a terminal match and mint a fresh
+        # (APPROVED/PROPOSED) item. Other signals keep the existing dedup-onto-any behavior.
+        if existing_id and signal == "explicit":
+            cand = get_item(existing_id)
+            if not (cand and cand.get("status") in _OPEN_STATUSES):
+                existing_id = None
         if existing_id is None and emb_id:
             cand = get_item(emb_id)
             if cand and cand.get("status") in _OPEN_STATUSES:
@@ -1542,7 +1552,14 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
                      dm_held=held)
     if cq_id is None:
         return None, "dropped"
-    return cq_id, ("held" if held else "ok")
+    # Derive the outcome from what was actually persisted, not the pre-decision `held`
+    # flag: dm_held is set ONLY on a NEW held item, never on a dedup-recurrence. So an
+    # over-quota ask that paraphrase-merges into the asker's own still-open item reports
+    # "ok" (it rides the existing card) rather than a false "will surface in the digest"
+    # promise for an item that has no dm_held flag and will not be flushed.
+    item = get_item(cq_id)
+    outcome = "held" if (item and item.get("dm_held")) else "ok"
+    return cq_id, outcome
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1842,6 +1859,19 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
         "evidence": [{"channel_id": "", "ts": "", "note": summary[:200]}],
         "reporter": HARRISON_ID,
     }
+    # Summary PHI gate -- FAIL-CLOSED, mirroring _capture (D-051): the seed persists
+    # title/summary RAW (title is the dedup basis; it also renders into the KB-ingested
+    # code-session-backlog.md and would egress). A PHI-tripping seed is refused outright,
+    # never persisted -- same contract as the capture path (fixes the seed/ _capture
+    # asymmetry). The 1h LEX-DDD seed is generic build text and passes cleanly.
+    try:
+        if phi_guard.is_phi_risk(f"{title} {summary}".strip()):
+            log.info("code_queue.seed_item: refused PHI-flagged seed (signal=%s entity=%s)",
+                     signal, entity)
+            return None
+    except Exception:  # noqa: BLE001 -- fail closed
+        log.info("code_queue.seed_item: PHI check errored -- refusing seed (fail-closed)")
+        return None
     class_key = _class_key(title, subsystem_guess or entity)
     existing = find_fingerprint(signal, title, class_key=class_key)
     if existing:

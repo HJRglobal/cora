@@ -127,8 +127,18 @@ def main() -> int:
     if args.unarm:
         conn.execute("DELETE FROM checkpoint_state WHERE key = ?", (_READY_CKPT,))
         conn.commit()
-        print("UNARMED: kb_bin_partition_ready cleared. Restart Cora -> coarse scan falls "
-              "back to the legacy knowledge_vec_bin.")
+        if _table_exists(conn, _LEGACY):
+            print("UNARMED: kb_bin_partition_ready cleared. Restart Cora -> coarse scan "
+                  "falls back to the legacy knowledge_vec_bin.")
+        else:
+            # Legacy was already --drop-legacy'd. Unarmed search targets a table that
+            # init_schema will recreate EMPTY -> the store's coarse-scan belt routes to the
+            # exact float fallback (correct but slower). v2 still holds the data. Warn loudly.
+            print("UNARMED, but the legacy knowledge_vec_bin was already DROPPED. After "
+                  "restart the coarse scan has no populated bin table, so the store falls "
+                  "back to the exact FLOAT scan (correct but slower). v2 still holds the "
+                  "data -- to restore fast search, re-run this migration (populate + --swap) "
+                  "to rebuild + re-arm v2.", file=sys.stderr)
         conn.close()
         return 0
 

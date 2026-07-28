@@ -8480,6 +8480,12 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
             is_founder = slack_user_id == code_queue.HARRISON_ID
             cq_id, outcome = code_queue.queue_explicit(
                 slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
+            if outcome == "empty":
+                # Nothing to file (blank stashed request) -- never voice this as a PHI
+                # refusal (the "dropped" branch below). Unreachable via the live two-call
+                # path (the stash is guarded non-empty), but correct if any caller passes "".
+                return ("cora_queue_code_session: there was nothing to file -- ask the user "
+                        "to restate the bug or feature in a sentence.")
             if outcome == "dropped" or cq_id is None:
                 return ("I couldn't file that -- it looked like it contained protected "
                         "info. Tell the user it wasn't queued and to rephrase without "

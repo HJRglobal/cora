@@ -12,6 +12,7 @@ Doctrine:
 
 import json
 import logging
+import sqlite3
 import struct
 import time
 import uuid
@@ -602,9 +603,8 @@ class KnowledgeBase:
         # k PER partition, returning a superset of the legacy global-top-k candidates
         # (recall >= legacy); the exact re-rank below still yields the true top-k.
         bin_tbl = self._bin_search_table()
-        cand_ids = [
-            row[0]
-            for row in self._conn.execute(
+        try:
+            coarse_rows = self._conn.execute(
                 f"""
                 SELECT chunk_id FROM {bin_tbl}
                 WHERE embedding MATCH vec_quantize_binary(?)
@@ -614,9 +614,23 @@ class KnowledgeBase:
                 """,
                 [qbytes, *entity_filter, coarse_k],
             ).fetchall()
-        ]
+        except sqlite3.OperationalError:
+            # The coarse bin table is missing (e.g. --drop-legacy followed by --unarm, or a
+            # cached table name that was dropped out from under a live instance). NEVER black
+            # out RAG -- fall back to the exact float scan over knowledge_vec_f32, which
+            # always reflects the live corpus. (D-051 fix: the documented rollback must not
+            # silently zero out retrieval.)
+            log.warning("KB coarse index %s unusable -- exact float-scan fallback", bin_tbl)
+            return self._search_float(query_vec, entity_filter, k, cutoff,
+                                      sub_entity_clause, sub_entity_params)
+        cand_ids = [row[0] for row in coarse_rows]
         if not cand_ids:
-            return []
+            # Empty coarse result: either a genuinely empty entity partition (the float scan
+            # returns [] too) OR an empty/broken coarse index (float returns the TRUE
+            # results). Either way the exact float scan is correct and can never silently
+            # black out retrieval, so route through it rather than returning [].
+            return self._search_float(query_vec, entity_filter, k, cutoff,
+                                      sub_entity_clause, sub_entity_params)
 
         # Stage 2: exact re-rank of candidates against float32 vectors (true PK
         # reads from knowledge_vec_f32), applying the authoritative entity /

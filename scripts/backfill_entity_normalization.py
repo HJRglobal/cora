@@ -58,10 +58,16 @@ def _stray_entities(conn) -> list[tuple[str, int]]:
     return [(e, n) for e, n in rows if (e or "").strip().upper() not in CANONICAL]
 
 
-def _bin_has_table(conn) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name='knowledge_vec_bin'"
-    ).fetchone() is not None
+_BIN_TABLES = ("knowledge_vec_bin", "knowledge_vec_bin_v2")
+
+
+def _existing_bin_tables(conn) -> list[str]:
+    """Every binary coarse-index table that exists. Rebuilding ALL of them (not just the
+    legacy one) makes the backfill ORDER-INDEPENDENT: if the partition migration was run
+    BEFORE this backfill (operator error), v2's stale franchise/sub-entity partitions get
+    corrected here too, so those chunks aren't dark on the armed v2 coarse scan."""
+    return [t for t in _BIN_TABLES
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (t,)).fetchone()]
 
 
 def main() -> int:
@@ -77,7 +83,7 @@ def main() -> int:
         return 2
 
     conn = schema.connect(args.db)   # loads sqlite-vec (vec_quantize_binary)
-    have_bin = _bin_has_table(conn)
+    bin_tables = _existing_bin_tables(conn)
 
     strays = _stray_entities(conn)
     if not strays:
@@ -120,21 +126,20 @@ def main() -> int:
                     (new_e, new_sub, chunk_id),
                 )
                 changed += 1
-                if have_bin:
+                if bin_tables:
                     frow = conn.execute(
                         "SELECT embedding FROM knowledge_vec_f32 WHERE chunk_id = ?",
                         (chunk_id,),
                     ).fetchone()
-                    conn.execute(
-                        "DELETE FROM knowledge_vec_bin WHERE chunk_id = ?", (chunk_id,)
-                    )
-                    if frow is not None:
-                        conn.execute(
-                            "INSERT INTO knowledge_vec_bin (chunk_id, entity, embedding) "
-                            "VALUES (?, ?, vec_quantize_binary(?))",
-                            (chunk_id, new_e, frow[0]),
-                        )
-                        bin_rebuilt += 1
+                    for bt in bin_tables:
+                        conn.execute(f"DELETE FROM {bt} WHERE chunk_id = ?", (chunk_id,))
+                        if frow is not None:
+                            conn.execute(
+                                f"INSERT INTO {bt} (chunk_id, entity, embedding) "
+                                "VALUES (?, ?, vec_quantize_binary(?))",
+                                (chunk_id, new_e, frow[0]),
+                            )
+                            bin_rebuilt += 1
             conn.commit()
             print(f"  {stray_ent} -> {new_ent}: {min(i + len(batch), len(rows))}/{len(rows)}")
 

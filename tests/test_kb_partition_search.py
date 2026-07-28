@@ -20,7 +20,7 @@ import pytest
 
 from cora.knowledge_base import embeddings, schema
 from cora.knowledge_base.store import (
-    Document, KnowledgeBase, _LEGACY_BIN, _V2_BIN, _PARTITION_READY_KEY,
+    Document, KnowledgeBase, _LEGACY_BIN, _V2_BIN, _PARTITION_READY_KEY, _BIN_READY_KEY,
 )
 
 _DIM = 1536
@@ -165,6 +165,35 @@ def test_partitioned_no_fndr_when_disabled(kb):
 
 
 # ── strict LEX sub_entity scoping preserved on the partitioned path ───────────────
+def _arm_fast(kb):
+    kb.set_checkpoint(_BIN_READY_KEY, {"ready": True})
+    kb._bin_ready = None
+
+
+def test_empty_coarse_index_falls_back_to_float_no_blackout(kb):
+    # D-051 HIGH: --drop-legacy then --unarm recreates an EMPTY legacy bin, but f32 still
+    # holds the corpus. The coarse-scan belt must route to the exact float scan, never
+    # return [] (silent RAG blackout).
+    _seed(kb)
+    _arm_fast(kb)
+    kb._conn.execute(f"DELETE FROM {_LEGACY_BIN}")   # active (unarmed) coarse table now empty
+    kb._conn.commit()
+    res = kb.search("F3E content 3 about widgets revenue", entity="F3E", k=10, max_age_days=None)
+    assert res and any(r.entity == "F3E" for r in res)   # float fallback returned the truth
+
+
+def test_missing_coarse_index_falls_back_to_float(kb):
+    # The bin table is DROPPED out from under a live instance that cached its name -> the
+    # coarse query raises OperationalError; the belt must catch it and float-scan.
+    _seed(kb)
+    _arm_fast(kb)
+    assert kb._bin_search_table() == _LEGACY_BIN          # resolve + cache the name
+    kb._conn.execute(f"DROP TABLE {_LEGACY_BIN}")
+    kb._conn.commit()
+    res = kb.search("F3E content 3 about widgets revenue", entity="F3E", k=10, max_age_days=None)
+    assert res and any(r.entity == "F3E" for r in res)   # no blackout
+
+
 def test_partitioned_lex_sub_entity_strict(kb):
     _create_v2(kb)
     kb.upsert_documents([
