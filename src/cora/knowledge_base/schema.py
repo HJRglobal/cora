@@ -11,6 +11,7 @@ The embedding dimension (1536) is fixed by OpenAI text-embedding-3-small. If we 
 switch to a different model, this table needs to be rebuilt.
 """
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -107,19 +108,42 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # float32 blob table (exact re-rank AND the brute-force fallback in
     # _search_float) are the only vector stores. Do not re-add knowledge_vec.
 
-    # Binary-quantized vec0 table for the fast coarse scan (~1/32 the bytes of
-    # the float index). `entity` is a vec0 metadata column so the hamming knn
-    # can be entity-pre-filtered (prevents result starvation in narrow channels).
-    # Coarse candidates are re-ranked against the exact float vectors below.
-    conn.execute(
-        f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_vec_bin USING vec0(
-            chunk_id TEXT PRIMARY KEY,
-            entity TEXT,
-            embedding bit[{EMBEDDING_DIM}]
+    # Binary-quantized vec0 coarse index. Two shapes exist across the Slice 2-1 (2026-07-28)
+    # migration: the legacy metadata-column `knowledge_vec_bin` (entity as a filterable
+    # column) and the partitioned `knowledge_vec_bin_v2` (entity as a PARTITION KEY, so the
+    # entity IN (...) filter prunes to the named partitions). Once the migration ARMS
+    # kb_bin_partition_ready, v2 is the coarse index -- ensure it exists and do NOT recreate
+    # the legacy table (so `migrate_kb_partition_key.py --drop-legacy` stays dropped and its
+    # ~space reclaim sticks across restarts). A fresh / unmigrated DB gets the legacy table
+    # exactly as before -- deploy stays inert until the migration is run + armed.
+    _armed_row = conn.execute(
+        "SELECT value_json FROM checkpoint_state WHERE key = 'kb_bin_partition_ready'"
+    ).fetchone()
+    try:
+        _partition_armed = bool(_armed_row and json.loads(_armed_row[0]).get("ready"))
+    except Exception:  # noqa: BLE001 -- malformed checkpoint -> treat as unarmed (safe)
+        _partition_armed = False
+
+    if _partition_armed:
+        conn.execute(
+            f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_vec_bin_v2 USING vec0(
+                chunk_id TEXT PRIMARY KEY,
+                entity TEXT PARTITION KEY,
+                embedding bit[{EMBEDDING_DIM}]
+            )
+            """
         )
-        """
-    )
+    else:
+        conn.execute(
+            f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_vec_bin USING vec0(
+                chunk_id TEXT PRIMARY KEY,
+                entity TEXT,
+                embedding bit[{EMBEDDING_DIM}]
+            )
+            """
+        )
 
     # Plain btree-indexed blob table holding the exact float32 embeddings for
     # re-rank. vec0 point-lookups by chunk_id degrade to a full scan; this table

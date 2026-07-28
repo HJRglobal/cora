@@ -62,6 +62,15 @@ _COARSE_MULT = 50
 # checkpoint_state key set by the migration once every chunk has a bin + f32 row.
 _BIN_READY_KEY = "kb_bin_index_ready"
 
+# Slice 2-1 partition-key coarse index. The legacy (metadata-column) table and the v2
+# (PARTITION KEY) table are queried with the IDENTICAL SQL -- the empirical probe on
+# 0.1.9 confirmed `entity IN (...)` both WORKS on a partition key and PRUNES to the named
+# partitions, returning a SUPERSET of the metadata path's candidates (per-partition k), so
+# recall is >= the legacy path and the exact f32 re-rank still yields the true top-k.
+_LEGACY_BIN = "knowledge_vec_bin"
+_V2_BIN = "knowledge_vec_bin_v2"
+_PARTITION_READY_KEY = "kb_bin_partition_ready"
+
 # Personal user notes (Org Synthesis Phase 5). HARD INVARIANT (D-034 pattern):
 # user_note chunks are EXCLUDED from the general search() paths at the SQL
 # layer — they are retrievable ONLY via search_user_notes(), which filters on
@@ -160,6 +169,15 @@ class KnowledgeBase:
         # The migration runs with Cora stopped, so a fresh post-restart instance
         # always reads the correct value.
         self._bin_ready: bool | None = None
+        # Slice 2-1: partition-key coarse index. Once the migration arms
+        # kb_bin_partition_ready, the coarse scan reads knowledge_vec_bin_v2 (entity
+        # PARTITION KEY -> the entity IN (...) filter prunes to the named partitions).
+        # Cached like _bin_ready (arming is followed by a restart per the cutover).
+        # NOTE: activation is a checkpoint flip, NOT an ALTER TABLE RENAME -- vec0 shadow
+        # tables can't be renamed (probed 2026-07-28: RENAME -> "no such table
+        # ..._rowids"), so the legacy table is retained as a fallback and dropped later.
+        self._partition_ready: bool | None = None
+        self._search_bin: str | None = None
 
     def close(self) -> None:
         self._conn.close()
@@ -180,7 +198,9 @@ class KnowledgeBase:
             if not old_ids:
                 continue
             placeholders = ",".join("?" * len(old_ids))
-            for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
+            # Every existing bin table (legacy + v2 during the migration window) + f32 +
+            # chunks -- so replace-on-conflict keeps ALL vector stores in sync.
+            for tbl in (*self._bin_write_tables(), "knowledge_vec_f32", "knowledge_chunks"):
                 cur.execute(
                     f"DELETE FROM {tbl} WHERE chunk_id IN ({placeholders})", old_ids
                 )
@@ -377,6 +397,11 @@ class KnowledgeBase:
 
         self._delete_chunks_for_keys(cur, seen_keys)
 
+        # Bin tables to write (legacy + v2 if the partition migration has created it) --
+        # resolved once per batch so a live bot dual-writes to v2 the moment it exists,
+        # keeping it current through the Cora-up migration window (no drift, no restart).
+        bin_tables = self._bin_write_tables()
+
         # Insert new chunks
         for (doc, chunk_str, chunk_id), vec in zip(chunk_tuples, vectors):
             cur.execute(
@@ -403,12 +428,15 @@ class KnowledgeBase:
             vec_bytes = _serialize_vec(vec)
             # The legacy float vec0 table (knowledge_vec) was dropped 2026-06-08;
             # the binary index (coarse scan) + the float32 blob table (exact
-            # re-rank AND the fallback path) are the only vector stores now.
-            cur.execute(
-                "INSERT INTO knowledge_vec_bin (chunk_id, entity, embedding) "
-                "VALUES (?, ?, vec_quantize_binary(?))",
-                (chunk_id, doc.entity, vec_bytes),
-            )
+            # re-rank AND the fallback path) are the only vector stores now. Write the
+            # binary vector to EVERY existing bin table (legacy + v2 during the migration
+            # window) so both stay in sync until the legacy table is dropped.
+            for _bt in bin_tables:
+                cur.execute(
+                    f"INSERT INTO {_bt} (chunk_id, entity, embedding) "
+                    "VALUES (?, ?, vec_quantize_binary(?))",
+                    (chunk_id, doc.entity, vec_bytes),
+                )
             cur.execute(
                 "INSERT INTO knowledge_vec_f32 (chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, vec_bytes),
@@ -493,6 +521,36 @@ class KnowledgeBase:
             self._bin_ready = bool(cp and cp.get("ready"))
         return self._bin_ready
 
+    def _table_exists(self, name: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone() is not None
+
+    def _is_partition_ready(self) -> bool:
+        """True once the partition migration has armed kb_bin_partition_ready. Cached for
+        the instance lifetime (arming is followed by a restart per the cutover)."""
+        if self._partition_ready is None:
+            cp = self.get_checkpoint(_PARTITION_READY_KEY)
+            self._partition_ready = bool(cp and cp.get("ready"))
+        return self._partition_ready
+
+    def _bin_search_table(self) -> str:
+        """The bin table the coarse scan reads: the partitioned v2 once armed (and it
+        exists), else the legacy metadata-column table. Resolved once per instance."""
+        if self._search_bin is None:
+            self._search_bin = (
+                _V2_BIN if (self._is_partition_ready() and self._table_exists(_V2_BIN))
+                else _LEGACY_BIN
+            )
+        return self._search_bin
+
+    def _bin_write_tables(self) -> list[str]:
+        """Every bin table that currently EXISTS. upsert / delete touch all of them so the
+        active table and the retained fallback stay in sync across the migration window.
+        Uncached (checked per call) so a live bot picks up v2 the moment the migration
+        creates it -- no drift while v2 is being populated before the arming restart."""
+        return [t for t in (_LEGACY_BIN, _V2_BIN) if self._table_exists(t)]
+
     def _rows_to_results(self, rows: list) -> list[SearchResult]:
         results: list[SearchResult] = []
         for r in rows:
@@ -538,13 +596,17 @@ class KnowledgeBase:
         coarse_k = max(_COARSE_MIN, int(k) * _COARSE_MULT)
         ent_ph = ",".join("?" * len(entity_filter))
 
-        # Stage 1: coarse candidate generation over the binary index, entity
-        # pre-filtered (vec0 metadata column) so narrow channels aren't starved.
+        # Stage 1: coarse candidate generation over the binary index, entity pre-filtered
+        # (vec0 metadata column, or PARTITION KEY on v2 -> partition pruning) so narrow
+        # channels aren't starved. On the partitioned v2 the entity IN (...) filter applies
+        # k PER partition, returning a superset of the legacy global-top-k candidates
+        # (recall >= legacy); the exact re-rank below still yields the true top-k.
+        bin_tbl = self._bin_search_table()
         cand_ids = [
             row[0]
             for row in self._conn.execute(
                 f"""
-                SELECT chunk_id FROM knowledge_vec_bin
+                SELECT chunk_id FROM {bin_tbl}
                 WHERE embedding MATCH vec_quantize_binary(?)
                   AND entity IN ({ent_ph})
                   AND k = ?
@@ -841,9 +903,8 @@ class KnowledgeBase:
         if not chunk_ids:
             return 0
         ph = ",".join("?" * len(chunk_ids))
-        cur.execute(f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({ph})", chunk_ids)
-        cur.execute(f"DELETE FROM knowledge_vec_f32 WHERE chunk_id IN ({ph})", chunk_ids)
-        cur.execute(f"DELETE FROM knowledge_chunks WHERE chunk_id IN ({ph})", chunk_ids)
+        for tbl in (*self._bin_write_tables(), "knowledge_vec_f32", "knowledge_chunks"):
+            cur.execute(f"DELETE FROM {tbl} WHERE chunk_id IN ({ph})", chunk_ids)
         self._conn.commit()
         return len(chunk_ids)
 
