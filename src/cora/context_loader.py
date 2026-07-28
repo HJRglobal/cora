@@ -241,11 +241,27 @@ _TTL = 300  # seconds
 
 # LEX sub-entity channels route to e.g. "LEX-LLC"; the KB stores documents under "LEX".
 # Map sub-entity codes → their parent entity so KB searches hit the right rows.
+# LEX sub-entities additionally drive STRICT sub_entity scoping (see below).
 _LEX_PARENT: dict[str, str] = {
     "LEX-LLC":  "LEX",
     "LEX-LTS":  "LEX",
     "LEX-LBHS": "LEX",
     "LEX-LLA":  "LEX",
+}
+
+# Store-level / property channels whose KB content lives under the CANONICAL parent
+# entity but WITHOUT sub_entity scoping. Entity-tag normalization (Slice 2-2, 2026-07-28)
+# folds their ingested chunks onto the parent (OSNGF→OSN, HJRP-1337→HJRP, F3→F3E), so a
+# store/property channel MUST search under the parent or it goes dark on its own content.
+# OSN franchises + HJRP properties are one entity each per cross_entity_guard (no PHI /
+# security boundary within them), so there is no sub_entity restriction. Mirrors the
+# tool-exposure parent map in tool_dispatch. (LEX stays in _LEX_PARENT — it keeps strict
+# sub_entity scoping and is NOT folded onto the parent for retrieval.)
+_STORE_PARENT: dict[str, str] = {
+    "OSNGF": "OSN", "OSNGM": "OSN", "OSNGW": "OSN", "OSNVV": "OSN",
+    "HJRP-1337": "HJRP", "HJRP-1555": "HJRP", "HJRP-LCI": "HJRP",
+    "HJRP-CL": "HJRP", "HJRP-RR": "HJRP",
+    "F3": "F3E",
 }
 
 # (content, cached_at, known_answers_mtime | None)
@@ -581,8 +597,11 @@ def _try_kb_retrieve(
         return None
 
     try:
-        # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX".
-        kb_entity = _LEX_PARENT.get(entity, entity)
+        # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX"
+        # with STRICT sub_entity scoping. OSN store + HJRP property channels also store
+        # under their canonical parent (via _STORE_PARENT) but WITHOUT sub_entity scoping,
+        # since entity-tag normalization (Slice 2-2) folds their chunks onto the parent.
+        kb_entity = _LEX_PARENT.get(entity) or _STORE_PARENT.get(entity, entity)
         sub_entity_scope = entity if entity in _LEX_PARENT else None
         # LEX sub-entity channels must NOT receive FNDR-entity KB chunks.
         # The founder CLAUDE.md is indexed under entity=FNDR and contains

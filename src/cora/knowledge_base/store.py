@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 from . import embeddings, schema
 from .chunker import chunk_text
+from .entity_normalize import normalize_entity
 from .lex_sub_entity import (
     detect_sub_entity,
     is_restricted_lex_ingest,
@@ -230,6 +231,23 @@ class KnowledgeBase:
         docs_list = kept
         if not docs_list:
             return 0
+
+        # Step 0e: canonical entity-code normalization (Part 2 Slice 2-2, 2026-07-28).
+        # A doc arriving under a sub-entity / franchise code (entity='LEX-LLC', 'OSNGF',
+        # 'HJRP-LCI', 'F3', ...) is remapped to its canonical parent so retrieval's entity
+        # filter can see it (otherwise it is DARK); a LEX-* code moves into sub_entity,
+        # PRESERVING the LEX security scoping. Runs BEFORE Step 0 so a normalized LEX doc
+        # then hits Step 0's entity=='LEX' sub-entity detection (which no-ops when the
+        # LEX-* normalization already set sub_entity). Fail-open (unknown -> WARN, kept).
+        # EXCLUDES user_note: notes are retrieved via search_user_notes(), which scopes on
+        # the RAW channel entity VERBATIM (LEX-LLC is a first-class note scope key, not
+        # sub_entity) -- folding a note's entity onto the parent would desync save-scope
+        # from retrieve-scope and break note containment (e.g. a LEX-LLC note leaking into
+        # an LEX-LTS channel). Notes never enter the canonical search() path anyway.
+        for doc in docs_list:
+            if doc.source == USER_NOTE_SOURCE:
+                continue
+            doc.entity, doc.sub_entity = normalize_entity(doc.entity, doc.sub_entity)
 
         # Step 0: ingest-time LEX sub-entity tagging (Part 2 of the 5/23 siloing fix).
         # Connectors that don't know the sub-entity write LEX docs with sub_entity=None;
