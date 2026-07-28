@@ -174,6 +174,22 @@ def folder_ids_excluded(
 # metadata, never org knowledge.
 _CORA_WORKSPACE_SEGMENTS: tuple[str, ...] = ("_shared", "projects", "cora")
 
+# KB ALLOWLIST (2026-07-28, code-session queue): a small set of GENERATED views
+# that live under the Cora workspace but ARE intended as org-answerable knowledge
+# ("@Cora what's in the build queue"). These override BOTH the keystone folder
+# rule and the filename rule so they ingest. Exact basename match only (never a
+# substring), case-insensitive -- a tightly-scoped positive exception so the
+# folder-rule surface is not widened. The backlog is a clean generated status
+# list, not audit prose, so it does not reintroduce the fabricated-diagnostic
+# failure mode the folder rule guards against.
+_KB_ALLOWLIST_BASENAMES: frozenset[str] = frozenset({"code-session-backlog.md"})
+
+
+def _is_kb_allowlisted(raw: str) -> bool:
+    """True if a path / source_id / title's basename is an explicitly-allowlisted
+    generated view that must ingest despite the Cora-workspace exclusion."""
+    return _basename(str(raw or "")).lower() in _KB_ALLOWLIST_BASENAMES
+
 # Keyword matching anchors on \b...\b over a name where underscores have first been
 # normalized to hyphens (see _name_is_build_doc). Two bugs this avoids, both caught by
 # the WS1-DRIVE reviews: (1) sub-word over-match -- "fix" must not fire inside "fixed",
@@ -267,6 +283,8 @@ def _name_is_build_doc(name: str, *, broad: bool = False) -> bool:
 
 
 def _is_cora_internal(raw: str, *, broad: bool = False) -> bool:
+    if _is_kb_allowlisted(raw):
+        return False  # generated views ingest despite the workspace/filename rules
     parts = _segments(raw)
     if _contains_subsequence(parts, _CORA_WORKSPACE_SEGMENTS):
         return True
@@ -310,6 +328,8 @@ def is_cora_internal_title(title: str, *, broad: bool = False) -> bool:
     Cora's full ops/build doc set; the default stays narrow (build/audit + logs).
     """
     title = title or ""
+    if _is_kb_allowlisted(title):
+        return False  # generated views ingest despite the filename rule
     return _name_is_build_doc(title, broad=broad) or _name_is_build_doc(
         _basename(title), broad=broad
     )

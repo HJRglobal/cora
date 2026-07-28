@@ -8077,6 +8077,41 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "cora_queue_code_session",
+        "description": (
+            "Queue a BUILD IDEA or BUG REPORT about Cora herself to Harrison's "
+            "code-session queue. Use this when a teammate reports that Cora is broken, "
+            "asks for a capability Cora does not have, or explicitly says to queue / log "
+            "a build -- phrases like 'Cora should ...', 'can Cora ...?', 'that's a bug', "
+            "'queue a code session to ...', 'log this for the devs'. This does NOT change "
+            "any data and does NOT execute code -- it files a candidate and sends Harrison "
+            "a card to approve.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write -- never skip):\n"
+            "1. On the first ask, show a preview: \"Queueing to the code-session queue: "
+            "   <one-sentence request>\" and ask them to confirm. DO NOT call the tool yet.\n"
+            "2. On their explicit yes, call with confirmed=true.\n"
+            "\n"
+            "Do NOT use this for factual questions Cora should learn the answer to (that is "
+            "the knowledge loop, not a code build) -- only for actual defects or new "
+            "capabilities."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "description": "One or two sentences describing the bug or the feature to build.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true. Only set after showing the user the queue preview and receiving explicit approval.",
+                },
+            },
+            "required": ["request", "confirmed"],
+        },
+    },
+    {
         "name": "cora_my_notes",
         "description": (
             "List the asking user's own saved personal notes with dates and ids. Use "
@@ -8370,9 +8405,48 @@ TOOL_DEFINITIONS = [
 # Aggregators (FNDR, HJRG) and the founder from ANY channel get the full set —
 # they ask cross-entity questions by design.
 
+def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Queue a build idea or bug report to Harrison's code-session queue.
+
+    Staged-write (doctrine 1): preview + confirmed=True. NOT canon (D-011) -- the
+    queue only files a candidate + DMs Harrison a card; nothing executes. Founder
+    fast-path: Harrison's confirmed call lands the item APPROVED directly."""
+    from cora import code_queue
+
+    input_data = _input or {}
+    request = str(input_data.get("request", "") or "").strip()
+    if not request:
+        return ("cora_queue_code_session: `request` is required -- one or two sentences "
+                "describing the bug or the feature to build.")
+    if code_queue.code_queue_level() == "off":
+        return ("The code-session queue is currently turned off -- tell the user their "
+                "idea was NOT filed.")
+    confirmed = input_data.get("confirmed", False)
+    if confirmed is not True:
+        return (
+            "cora_queue_code_session refused: `confirmed` must be true ONLY after you "
+            "have shown the user a preview -- format it as \"Queueing to the code-session "
+            "queue: <request>\" -- and received explicit approval. Show the preview, wait "
+            "for their yes, then call again with confirmed=true."
+        )
+    channel_id = str(input_data.get("_channel_id", "") or "")
+    is_founder = slack_user_id == code_queue.HARRISON_ID
+    cq_id = code_queue.queue_explicit(slack_user_id, entity, channel_id, request, is_founder)
+    if not cq_id:
+        return ("I couldn't file that (you may have hit today's queue limit) -- tell the "
+                "user it wasn't queued and to try again later.")
+    if is_founder:
+        return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
+                "code-session queue (APPROVED). Tap \"Stage prompt\" on the card when you "
+                "want the kickoff written.")
+    return ("WRITE_CONFIRMED -- post as your entire response: Queued for Harrison's "
+            "review -- he'll approve it from his queue.")
+
+
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
+    "cora_queue_code_session",
     "whats_on_my_plate",
     "meeting_action_items",
     "cora_remember",
@@ -8569,6 +8643,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_remember": _tool_cora_remember,
     "cora_my_notes": _tool_cora_my_notes,
     "cora_forget_note": _tool_cora_forget_note,
+    "cora_queue_code_session": _tool_queue_code_session,
     # Read-only operational self-status (heartbeat + KB size + sync watermarks)
     "cora_self_check": _tool_cora_self_check,
     # Per-person involvement dossier (founder-or-self; North Star pillar 4)
@@ -8676,6 +8751,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_my_notes": 8,
     "cora_forget_note": 8,
     "cora_self_check": 8,
+    "cora_queue_code_session": 8,  # local ledger append + (off-thread) DM/classify
     # Dashboard read layer: Drive/Airtable network reads.
     "personal_oneamerica_portfolio": 20,   # Drive JSON download
     "personal_capital_program_state": 15,  # folder list + newest JSON download
@@ -8744,9 +8820,26 @@ def dispatch(
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             log.warning("Tool %s timed out after %ds for user=%s entity=%s", tool_name, timeout, slack_user_id, entity)
-            return "Tool timed out — please try again."
+            result = "Tool timed out — please try again."
+            # Code-session queue S1 (fail-soft, reply-inert): emit a candidate
+            # AFTER composing the return string, in its own try/except. No message
+            # text is captured (channel pointer only) -> inherently PHI-safe.
+            try:
+                from cora import code_queue
+                code_queue.capture_tool_failure(
+                    tool_name, entity, "TimeoutError", channel_id, slack_user_id, True)
+            except Exception:  # noqa: BLE001 -- capture may never affect the reply
+                pass
+            return result
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
     except Exception as exc:
         log.exception("Tool %s raised unexpected error", tool_name)
-        return f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."
+        result = f"Tool {tool_name} crashed: {exc}. Apologize to the user and continue."
+        try:
+            from cora import code_queue
+            code_queue.capture_tool_failure(
+                tool_name, entity, type(exc).__name__, channel_id, slack_user_id, False)
+        except Exception:  # noqa: BLE001 -- capture may never affect the reply
+            pass
+        return result

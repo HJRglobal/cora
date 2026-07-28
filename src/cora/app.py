@@ -29,6 +29,7 @@ from . import intent_classifier as ic
 from . import knowledge_gaps
 from . import gap_detection
 from . import gap_autofill
+from . import code_queue
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
@@ -736,6 +737,12 @@ def _dispatch_qa(
             thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
             thread_context=bool(prior_messages),
         )
+        # Code-session queue S2/S4 (fail-soft, off-thread, reply-inert): a build-signal
+        # phrase in the ask or a capability deflection in the reply becomes a candidate.
+        code_queue.capture_message_signal(
+            user_message, entity, channel_id, channel_name, user_id or "",
+            response_text=response_text,
+        )
         # D-032 / Phase 2.1: conversational replies pass through the deterministic
         # voice formatter; only genuine verbatim-table tools bypass it. The old
         # bool(used_tools) heuristic bypassed EVERY tool-using reply (so a prose
@@ -828,6 +835,12 @@ def _dispatch_qa(
         kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
         thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
         thread_context=bool(prior_messages),
+    )
+    # Code-session queue S2/S4 (fail-soft, off-thread, reply-inert): a build-signal
+    # phrase in the ask or a capability deflection in the reply becomes a candidate.
+    code_queue.capture_message_signal(
+        user_message, entity, channel_id, channel_name, user_id or "",
+        response_text=response_text,
     )
     # D-032 / Phase 2.1: conversational replies pass through the deterministic
     # voice formatter; only genuine verbatim-table tools bypass it (used_verbatim_tool,
@@ -2418,6 +2431,9 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
             entity=entity,
             message_ts=message_ts,
         )
+        # Code-session queue S3 (fail-soft, off-thread): >= threshold thumbs-downs
+        # on similar replies within the window promotes to a bug candidate.
+        code_queue.capture_thumbsdown(channel_id, message_ts, entity, reactor, client=client)
 
 
 @app.event("reaction_added")
@@ -2675,6 +2691,141 @@ def handle_catchup_edit_submit(ack, body, client, view) -> None:
                 pass
     except Exception:  # noqa: BLE001
         log.warning("catchup edit-submit handler error (non-fatal)", exc_info=True)
+
+
+# ── Code-session queue one-tap (Queue / Edit / Dismiss / Later / Stage / etc.) ───
+# Mirrors the knowledge/catchup one-tap contract: ack() first, delegate; ALL
+# correctness (Harrison gate, idempotency, apply-then-record) lives in
+# code_queue.process_queue_action / stage_bundle / apply_edit. A single-item card
+# is its OWN message -> chat_update drops its actions block; the Monday menu is ONE
+# message with MANY actions blocks -> a threaded reply keeps the others tappable.
+
+def _cq_ack_in_message(client, body: dict, msg: str) -> None:
+    channel_id = (body.get("channel") or {}).get("id", "")
+    message_ts = (body.get("message") or {}).get("ts", "")
+    if not (channel_id and message_ts):
+        return
+    blocks = (body.get("message") or {}).get("blocks") or []
+    actions_blocks = [b for b in blocks if b.get("type") == "actions"]
+    try:
+        if len(actions_blocks) > 1:
+            client.chat_postMessage(channel=channel_id, thread_ts=message_ts, text=msg,
+                                    unfurl_links=False, unfurl_media=False)
+        else:
+            section_blocks = [b for b in blocks if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            client.chat_update(channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("code-queue ack update failed: %s", exc)
+
+
+def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        value = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        if action_id == code_queue.ACTION_STAGE and value.startswith("bundle:"):
+            outcome, msg = code_queue.stage_bundle(value, actor_id)
+        else:
+            outcome, msg = code_queue.process_queue_action(action_id, value, actor_id)
+        if outcome == "not_authorized":
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        _cq_ack_in_message(client, body, msg)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("code-queue button handler error (non-fatal)", exc_info=True)
+
+
+@app.action(code_queue.ACTION_APPROVE)
+def handle_cq_approve(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_APPROVE)
+
+
+@app.action(code_queue.ACTION_DISMISS)
+def handle_cq_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_DISMISS)
+
+
+@app.action(code_queue.ACTION_LATER)
+def handle_cq_later(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_LATER)
+
+
+@app.action(code_queue.ACTION_STAGE)
+def handle_cq_stage(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_STAGE)
+
+
+@app.action(code_queue.ACTION_MARK_SHIPPED)
+def handle_cq_shipped(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_MARK_SHIPPED)
+
+
+@app.action(code_queue.ACTION_KEEP)
+def handle_cq_keep(ack, body, client) -> None:
+    ack()
+    _handle_code_queue_button(body, client, code_queue.ACTION_KEEP)
+
+
+@app.action(code_queue.ACTION_EDIT)
+def handle_cq_edit(ack, body, client) -> None:
+    """Open a modal prefilled with the item's title + summary."""
+    ack()
+    try:
+        actions = body.get("actions") or []
+        cq_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+        trigger_id = body.get("trigger_id", "")
+        if actor_id != code_queue.HARRISON_ID:
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id,
+                                          text="Only Harrison can edit queue items.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        view = code_queue.edit_modal_view(cq_id, channel_id, message_ts)
+        client.views_open(trigger_id=trigger_id, view=view)
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue edit-modal open failed (non-fatal)", exc_info=True)
+
+
+@app.view(code_queue.VIEW_EDIT_SUBMIT)
+def handle_cq_edit_submit(ack, body, client, view) -> None:
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        cq_id = meta.get("cq_id", "")
+        dm_channel = meta.get("dm_channel", "")
+        dm_ts = meta.get("dm_ts", "")
+        actor_id = (body.get("user") or {}).get("id", "")
+        state = (view.get("state") or {}).get("values") or {}
+        title = ((state.get("cq_title") or {}).get("v", {}) or {}).get("value", "") or ""
+        summary = ((state.get("cq_summary") or {}).get("v", {}) or {}).get("value", "") or ""
+        outcome, _msg = code_queue.apply_edit(cq_id, actor_id, title, summary)
+        if dm_channel and dm_ts and outcome == "edited":
+            rec = code_queue.get_item(cq_id)
+            if rec:
+                text, blocks = code_queue.build_item_card(rec)
+                try:
+                    client.chat_update(channel=dm_channel, ts=dm_ts, text=text, blocks=blocks)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue edit-submit handler error (non-fatal)", exc_info=True)
 
 
 @app.event("channel_created")

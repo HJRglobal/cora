@@ -188,6 +188,33 @@ def test_phi_summary_drops_item(qenv, monkeypatch):
     assert cq.load_items() == []
 
 
+def test_lex_representative_not_persisted(qenv):
+    rec = {"kind": "feature", "severity": "P3", "title": "lts scheduler tool",
+           "summary": "generic", "entity": "LEX-LTS", "signal": "phrase",
+           "representative": "cora should add an LTS scheduler",
+           "evidence": [{"channel_id": "C1", "ts": ""}], "reporter": "U1"}
+    cid = cq._capture(dict(rec))
+    assert cq.get_item(cid)["representative"] == ""  # redacted in the event record
+    fps = cq._read_jsonl(cq._FINGERPRINT_LEDGER)
+    assert all(f.get("representative") == "" for f in fps if f.get("id") == cid)
+
+
+def _counting_classifier(counter):
+    def _c(_m, _e):
+        counter["n"] += 1
+        return {"kind": "bug", "severity": "P2", "summary": "x"}
+    return _c
+
+
+def test_message_signal_phi_dropped_preclassify(qenv, monkeypatch):
+    counter = {"n": 0}
+    monkeypatch.setattr(cq, "classify_candidate", _counting_classifier(counter))
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    cq.capture_message_signal("cora should track patient billing authorization",
+                              "LEX", "C1", "lex", "U1")
+    assert cq.load_items() == [] and counter["n"] == 0  # classifier never called
+
+
 def test_phi_check_error_fails_closed(qenv, monkeypatch):
     def _boom(_t):
         raise RuntimeError("phi check exploded")
@@ -486,3 +513,150 @@ def test_menu_no_op_when_not_live(qenv, monkeypatch):
     cq.seed_item(kind="feature", severity="P3", title="X", summary="s",
                  entity="F3E", signal="friction", status="APPROVED")
     assert cq.maybe_send_weekly_menu(client_factory=lambda: FakeClient()) is False
+
+
+def test_approved_card_has_stage_button(qenv):
+    cid = cq.seed_item(kind="feature", severity="P2", title="X", summary="s",
+                       entity="F3E", signal="explicit", status="APPROVED")
+    _text, blocks = cq.build_item_card(cq.get_item(cid))
+    ids = [e["action_id"] for b in blocks if b.get("type") == "actions" for e in b["elements"]]
+    assert cq.ACTION_STAGE in ids and cq.ACTION_APPROVE not in ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wiring: kb_exclusions allowlist
+# ─────────────────────────────────────────────────────────────────────────────
+def test_kb_exclusions_allowlist_backlog():
+    from pathlib import Path
+
+    from cora import kb_exclusions as ke
+    p = Path(r"G:\My Drive\HJR-Founder-OS\_shared\projects\cora\code-session-backlog.md")
+    assert ke.is_cora_internal_path(p) is False
+    assert ke.is_cora_internal_title("code-session-backlog.md") is False
+    assert ke.is_cora_internal_source_id(
+        "_shared/projects/cora/code-session-backlog.md") is False
+    # A sibling Cora build doc is STILL excluded (allowlist is exact-basename only).
+    sib = Path(r"G:\My Drive\HJR-Founder-OS\_shared\projects\cora\x_cora-code-prompt-y.md")
+    assert ke.is_cora_internal_path(sib) is True
+    assert ke.is_cora_internal_title("x_cora-code-prompt-y.md") is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wiring: explicit tool via dispatch + exposure
+# ─────────────────────────────────────────────────────────────────────────────
+def test_explicit_tool_in_global_core():
+    import cora.tools.tool_dispatch as td
+    assert "cora_queue_code_session" in td._GLOBAL_CORE_TOOLS
+    names = [t["name"] for t in td.tools_for_entity("F3C")]  # lean entity gets it
+    assert "cora_queue_code_session" in names
+
+
+def test_explicit_tool_via_dispatch(qenv, monkeypatch):
+    import cora.tools.tool_dispatch as td
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    out = td.dispatch("cora_queue_code_session", {"request": "add a rangeme widget"},
+                      "U0B2RM2JYJ1", entity="F3E", channel_id="C1")
+    assert "confirmed" in out.lower() and cq.load_items() == []  # staged-write gate
+    out2 = td.dispatch("cora_queue_code_session",
+                       {"request": "add a rangeme widget", "confirmed": True},
+                       "U0B2RM2JYJ1", entity="F3E", channel_id="C1")
+    assert "WRITE_CONFIRMED" in out2
+    items = cq.load_items()
+    assert len(items) == 1 and items[0]["status"] == "APPROVED" and items[0]["signal"] == "explicit"
+
+
+def test_explicit_tool_off_flag(qenv, monkeypatch):
+    import cora.tools.tool_dispatch as td
+    monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    out = td.dispatch("cora_queue_code_session",
+                      {"request": "x", "confirmed": True}, "U0B2RM2JYJ1",
+                      entity="F3E", channel_id="C1")
+    assert "turned off" in out.lower() and cq.load_items() == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wiring: S1 dispatch capture (fail-soft, reply-inert)
+# ─────────────────────────────────────────────────────────────────────────────
+def _boom_tool(uid, entity, inp):
+    raise ValueError("kaboom")
+
+
+def test_dispatch_crash_captures_item(qenv, monkeypatch):
+    import cora.tools.tool_dispatch as td
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    monkeypatch.setitem(td._TOOL_FUNCTIONS, "test_boom", _boom_tool)
+    out = td.dispatch("test_boom", {}, "U1", entity="F3E", channel_id="C1")
+    assert "crashed" in out.lower()
+    items = cq.load_items()
+    assert len(items) == 1 and items[0]["signal"] == "tool_error" and items[0]["severity"] == "P1"
+
+
+def _raise_capture(*a, **k):
+    raise RuntimeError("capture boom")
+
+
+def test_dispatch_capture_raise_reply_unchanged(qenv, monkeypatch):
+    import cora.tools.tool_dispatch as td
+    monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+    monkeypatch.setitem(td._TOOL_FUNCTIONS, "test_boom2", _boom_tool)
+    monkeypatch.setattr(cq, "capture_tool_failure", _raise_capture)
+    out = td.dispatch("test_boom2", {}, "U1", entity="F3E", channel_id="C1")
+    assert "crashed" in out.lower()  # reply unchanged despite capture raising
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wiring: friction S6 cross-registration
+# ─────────────────────────────────────────────────────────────────────────────
+def test_friction_s6_registers_cora_tool(qenv, monkeypatch, tmp_path):
+    from cora import friction_mining as fm
+    monkeypatch.setattr(fm, "_backlog_path", lambda: tmp_path / "eff-backlog.md")
+    ok, _ = fm.apply_efficiency({"title": "Build a BDM brand-voice check tool",
+                                 "entity": "BDM", "recommendation": "extend it",
+                                 "route": "cora_tool", "signal_type": "x",
+                                 "frequency": "3", "evidence": []})
+    assert ok
+    items = cq.load_items()
+    assert len(items) == 1 and items[0]["signal"] == "friction" and items[0]["status"] == "APPROVED"
+
+
+def test_friction_s6_skips_make_com(qenv, monkeypatch, tmp_path):
+    from cora import friction_mining as fm
+    monkeypatch.setattr(fm, "_backlog_path", lambda: tmp_path / "eff-backlog2.md")
+    fm.apply_efficiency({"title": "A Make.com scenario", "entity": "F3E",
+                         "recommendation": "automate", "route": "make_com",
+                         "signal_type": "x", "frequency": "1", "evidence": []})
+    assert cq.load_items() == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wiring: seed script (dry-run default, idempotent)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_seed_module():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "scripts" / "seed_code_queue.py"
+    spec = importlib.util.spec_from_file_location("seed_code_queue_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_seed_script_dry_run_default(qenv, monkeypatch):
+    mod = _load_seed_module()
+    monkeypatch.setattr("sys.argv", ["seed_code_queue.py"])
+    assert mod.main() == 0
+    assert cq.load_items() == []  # dry-run writes nothing
+
+
+def test_seed_script_apply_idempotent(qenv, monkeypatch):
+    mod = _load_seed_module()
+    monkeypatch.setattr("sys.argv", ["seed_code_queue.py", "--apply"])
+    mod.main()
+    items = cq.load_items()
+    assert len(items) == len(mod.SEEDS)
+    assert any(it["status"] == "SHIPPED" for it in items)   # #2 shopify
+    assert any(it["kind"] == "config" for it in items)      # #3 known-answers
+    assert any("phantom" in it["title"].lower() for it in items)  # seed #0
+    mod.main()  # re-run
+    assert len(cq.load_items()) == len(mod.SEEDS)           # idempotent

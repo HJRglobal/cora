@@ -1071,6 +1071,22 @@ def main() -> int:
         "Knowledge review complete — approved=%d dismissed=%d pending=%d (exit=%d)",
         len(approved_updates), len(dismissed_updates), len(pending), exit_code,
     )
+
+    # ── Code-session queue (rides this run; zero new scheduled tasks) ────────────
+    # Overflow flush on EVERY run; the bundle menu only on the Monday digest day
+    # (_is_digest_day). Both no-op unless CORA_CODE_QUEUE=live. Fail-soft: a queue
+    # error must never change the knowledge-review exit code.
+    if not args.dry_run:
+        try:
+            from cora import code_queue
+            flushed = code_queue.maybe_flush_overflow()
+            if flushed:
+                log.info("code_queue: flushed %d overflow item(s)", flushed)
+            if _is_digest_day() and code_queue.maybe_send_weekly_menu():
+                log.info("code_queue: Monday build menu sent")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("code_queue menu/flush failed (non-fatal): %s", exc)
+
     return exit_code
 
 

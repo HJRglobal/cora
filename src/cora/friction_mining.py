@@ -891,6 +891,16 @@ def apply_efficiency(payload: dict[str, Any]) -> tuple[bool, str]:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(entry)
         log.info("friction_mining: backlog entry appended -- %s", title)
+        # S6 (code-session queue): a language-side Cora-tool build (D-029, route
+        # == 'cora_tool') also lands APPROVED in the code-session queue so it rides
+        # the Monday build menu. Fail-soft + idempotent on fingerprint; the queue's
+        # own CORA_CODE_QUEUE flag gates whether anything is emitted.
+        if str(payload.get("route") or "").strip().lower() == "cora_tool":
+            try:
+                from . import code_queue
+                code_queue.register_from_efficiency(payload)
+            except Exception as exc:  # noqa: BLE001 -- never break the executor
+                log.warning("friction_mining: code_queue cross-register failed: %s", exc)
         return True, f"appended to {path.name}"
     except Exception as exc:  # noqa: BLE001 -- executor must not crash the run
         log.error("friction_mining: apply_efficiency failed: %s", exc, exc_info=True)

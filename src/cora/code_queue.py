@@ -343,7 +343,9 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     is_lex = entity.startswith("LEX")
 
     # Summary PHI gate -- FAIL-CLOSED. is_phi_risk error is treated as PHI (drop).
-    summary_text = f"{rec.get('title', '')} {rec.get('summary', '')}".strip()
+    # Covers every model-authored field that could carry PHI (title/summary/fix).
+    summary_text = (f"{rec.get('title', '')} {rec.get('summary', '')} "
+                    f"{rec.get('fix_sketch', '')}").strip()
     try:
         phi = phi_guard.is_phi_risk(summary_text)
     except Exception:  # noqa: BLE001 -- fail closed
@@ -358,6 +360,18 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     signal = str(rec.get("signal") or "unknown")
     representative = _representative(rec)
     rec["fingerprint"] = _fingerprint(signal, representative)
+
+    # PHI-safe persistence of the dedup basis: NEVER store raw LEX or PHI-tripping
+    # text in the fingerprint ledger OR the event record. The hash (already
+    # computed from the full text) still dedups exact repeats; only fuzzy dedup is
+    # forgone for these. D-082 extension.
+    try:
+        rep_phi = phi_guard.is_phi_risk(representative)
+    except Exception:  # noqa: BLE001 -- fail closed
+        rep_phi = True
+    store_rep = "" if (is_lex or rep_phi) else representative
+    if store_rep != representative:
+        rec["representative"] = ""
 
     existing_id = find_fingerprint(signal, representative)
     if existing_id:
@@ -376,7 +390,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     rec["status"] = initial_status
     rec.setdefault("count", 1)
     _append_event({"event": "captured", **rec})
-    _append_fingerprint(rec["fingerprint"], signal, representative, cq_id)
+    _append_fingerprint(rec["fingerprint"], signal, store_rep, cq_id)
     _render_backlog_safe()
 
     if code_queue_level() == "live":
@@ -508,6 +522,16 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
         _render_backlog_safe()
         if code_queue_level() == "live":
             _thread_count_update(existing_id, client_factory)
+        return
+
+    # PHI egress guard (fail-closed): never send LEX/PHI client text to the Haiku
+    # classifier. Non-PHI LEX build-asks (e.g. "cora should add an LTS scheduler")
+    # still pass; PHI-tripping ones are dropped before any model call.
+    try:
+        if phi_guard.is_phi_risk(question):
+            log.info("code_queue: message signal dropped pre-classify (PHI)")
+            return
+    except Exception:  # noqa: BLE001 -- fail closed
         return
 
     verdict = classify_candidate(question, entity)
@@ -910,16 +934,20 @@ def _default_client_factory() -> Any:
 
 
 def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    """(fallback_text, Block Kit blocks) for one new-item card with the four
-    Queue / Edit / Dismiss / Later buttons. value = cq-id."""
+    """(fallback_text, Block Kit blocks) for one item card. A PROPOSED item gets
+    the four Queue / Edit / Dismiss / Later buttons; an already-APPROVED item
+    (founder fast-path / friction spillover) gets Stage-prompt / Dismiss. value =
+    cq-id."""
     cq_id = str(rec.get("id", ""))
+    status = str(rec.get("status", "PROPOSED"))
     ev_lines = []
     for e in (rec.get("evidence") or [])[:3]:
         if e.get("channel_id") or e.get("ts"):
             ev_lines.append(f"<slack://channel?id={e.get('channel_id', '')}> ts `{e.get('ts', '')}`")
     ev_txt = ("\n" + "\n".join(f"> {x}" for x in ev_lines)) if ev_lines else ""
+    lead = "queued" if status == "APPROVED" else "new"
     text = (
-        f"*Code-session queue* -- new {rec.get('kind', '?')} `{rec.get('severity', '?')}` "
+        f"*Code-session queue* -- {lead} {rec.get('kind', '?')} `{rec.get('severity', '?')}` "
         f"[{rec.get('entity', '?')}]\n"
         f"*{rec.get('title', '(untitled)')}*\n"
         f"{rec.get('summary', '')}"
@@ -927,22 +955,27 @@ def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     if rec.get("fix_sketch"):
         text += f"\n_Fix sketch:_ {rec['fix_sketch']}"
     text += ev_txt
+    if status == "APPROVED":
+        elements = [
+            {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
+             "text": {"type": "plain_text", "text": "📝 Stage prompt"}, "value": cq_id},
+            {"type": "button", "action_id": ACTION_DISMISS,
+             "text": {"type": "plain_text", "text": "🗑️ Dismiss"}, "value": cq_id},
+        ]
+    else:
+        elements = [
+            {"type": "button", "action_id": ACTION_APPROVE, "style": "primary",
+             "text": {"type": "plain_text", "text": "✅ Queue"}, "value": cq_id},
+            {"type": "button", "action_id": ACTION_EDIT,
+             "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": cq_id},
+            {"type": "button", "action_id": ACTION_DISMISS,
+             "text": {"type": "plain_text", "text": "🗑️ Dismiss"}, "value": cq_id},
+            {"type": "button", "action_id": ACTION_LATER,
+             "text": {"type": "plain_text", "text": "⏸ Later"}, "value": cq_id},
+        ]
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
-        {
-            "type": "actions",
-            "block_id": f"cq_actions_{cq_id}"[:255],
-            "elements": [
-                {"type": "button", "action_id": ACTION_APPROVE, "style": "primary",
-                 "text": {"type": "plain_text", "text": "✅ Queue"}, "value": cq_id},
-                {"type": "button", "action_id": ACTION_EDIT,
-                 "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": cq_id},
-                {"type": "button", "action_id": ACTION_DISMISS,
-                 "text": {"type": "plain_text", "text": "🗑️ Dismiss"}, "value": cq_id},
-                {"type": "button", "action_id": ACTION_LATER,
-                 "text": {"type": "plain_text", "text": "⏸ Later"}, "value": cq_id},
-            ],
-        },
+        {"type": "actions", "block_id": f"cq_actions_{cq_id}"[:255], "elements": elements},
     ]
     return text, blocks
 
@@ -1207,8 +1240,9 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
     config_items = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") == "config"]
 
     now = _now()
+    # last_touch (a "Keep" tap) takes precedence so Keeping resets the staleness clock.
     stale_staged = [it for it in items if it.get("status") == "STAGED"
-                    and _age_days(it.get("staged_at") or it.get("last_touch") or it.get("ts")) >= STALE_STAGED_DAYS]
+                    and _age_days(it.get("last_touch") or it.get("staged_at") or it.get("ts")) >= STALE_STAGED_DAYS]
     expired_snoozed = [it for it in items if it.get("status") == "SNOOZED"
                        and (_parse_ts(it.get("snooze_until")) or now) <= now]
 
