@@ -123,3 +123,43 @@ def test_apply_is_idempotent(gaps_env):
     resolved_lines = [json.loads(l) for l in
                       gaps_env["resolved"].read_text(encoding="utf-8").splitlines()]
     assert len(resolved_lines) == 3  # no duplicate resolved entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 adversarial-review remediation (2026-07-30, 2 review lenses independently
+# flagged this): apply_redaction() must re-read the file FRESH immediately
+# before writing, not rewrite from a stale plan() snapshot -- a stale snapshot
+# would silently drop any gap the live bot process appended in between (the
+# in-process knowledge_gaps._LOCK provides zero protection against this
+# separate script process).
+# ─────────────────────────────────────────────────────────────────────────────
+def test_apply_redaction_preserves_a_row_appended_after_plan(gaps_env):
+    """Simulates the live bot appending a new gap between plan() and the write."""
+    p = m.plan()
+    assert len(p["targets"]) == 3
+
+    # The bot appends a fresh gap AFTER plan() was computed but BEFORE the
+    # redaction write runs.
+    concurrent_row = {
+        "ts": "2026-07-30T06:00:00.000000+00:00", "entity": "F3E",
+        "channel": "f3e-leadership", "user": "U9",
+        "question": "who is the Sprouts buyer?", "response_chars": 200,
+        "gap": "Sprouts buyer specifics", "latency_ms": 900,
+        "detector": "unknown_response",
+    }
+    with gaps_env["gaps"].open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(concurrent_row) + "\n")
+
+    n_redacted = m.apply_redaction(p)
+    assert n_redacted == 3
+
+    lines = [json.loads(l) for l in
+             gaps_env["gaps"].read_text(encoding="utf-8").splitlines()]
+    # The concurrently-appended row must survive, untouched.
+    concurrent = [r for r in lines if r["ts"] == concurrent_row["ts"]]
+    assert len(concurrent) == 1
+    assert concurrent[0]["question"] == "who is the Sprouts buyer?"
+    # And the 3 targets are still correctly redacted.
+    by_ts = {r["ts"]: r for r in lines}
+    for ts in m._TARGET_TS:
+        assert by_ts[ts]["question"] == m._REDACTED_QUESTION

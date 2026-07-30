@@ -510,14 +510,24 @@ def _fold_items() -> dict[str, dict[str, Any]]:
 
 
 def load_items() -> list[dict[str, Any]]:
-    """All queue records (folded), newest-captured first."""
-    items = list(_fold_items().values())
+    """All queue records (folded), newest-captured first.
+
+    D-051 finding (2026-07-30 adversarial review, all 3 review lenses
+    independently): the egress-side LEX redaction (_lex_safe_view) was wired
+    into render_backlog_text ONLY -- build_item_card, generate_kickoff_prompt,
+    process_queue_action, and stage_bundle all read via get_item/load_items and
+    would render/egress a legacy (pre-parity-raise) raw-LEX-title record
+    verbatim, including to the Anthropic API via generate_kickoff_prompt. Now
+    centralized HERE (the read layer) so every consumer gets the redacted view
+    by construction -- no consumer can forget to call it."""
+    items = [_lex_safe_view(r) for r in _fold_items().values()]
     items.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
     return items
 
 
 def get_item(cq_id: str) -> dict[str, Any] | None:
-    return _fold_items().get(cq_id)
+    item = _fold_items().get(cq_id)
+    return _lex_safe_view(item) if item is not None else None
 
 
 def _dm_sent_today() -> int:
@@ -843,16 +853,6 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
     except Exception:  # noqa: BLE001 -- fail closed
         return
 
-    # Fork 3a (Wave-1 flywheel-conversion calibration): a deterministic capability
-    # ask pre-empts the Haiku "knowledge" branch entirely -- no model call needed
-    # when the verdict is already certain, and this guarantees Haiku can never
-    # mis-route a capability ask into "bug"/"config"/"knowledge" instead.
-    from . import knowledge_gaps
-    if knowledge_gaps.is_capability_ask(question):
-        capture_capability_ask(question, entity, channel_name, slack_user_id,
-                               client_factory=client_factory)
-        return
-
     verdict = classify_candidate(question, entity)
     if verdict is None:
         return  # fail-closed: API/parse error proposes nothing
@@ -867,7 +867,24 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
                             "" if is_lex else question, "noise")
         return
     if kind == "knowledge":
-        _route_to_flywheel(question, entity, channel_name, slack_user_id)
+        # Fork 3a (Wave-1 flywheel-conversion calibration): a capability ask
+        # ("can you access X", "do you have access to X") is a missing TOOL, not
+        # a missing FACT -- reroute it to the code-queue as a feature candidate
+        # instead of the knowledge flywheel. D-051 adversarial review MEDIUM:
+        # an earlier version ran this check BEFORE classify_candidate for every
+        # signal (including S2 phrase / S4 deflection hits), which downgraded a
+        # real bug report ("it's not working -- can you check why the Shopify
+        # sync failed?") from Haiku's P1/P2 "bug" verdict to a P3 "feature"
+        # verdict, since ordinary bug-report phrasing ("can you check X")
+        # matches the capability-ask pattern too. Now the deterministic check
+        # only ever OVERRIDES Haiku's OWN "knowledge" verdict -- it can never
+        # downgrade a bug/feature/config classification Haiku already made.
+        from . import knowledge_gaps
+        if knowledge_gaps.is_capability_ask(question):
+            capture_capability_ask(question, entity, channel_name, slack_user_id,
+                                   client_factory=client_factory)
+        else:
+            _route_to_flywheel(question, entity, channel_name, slack_user_id)
         return
 
     rec = {

@@ -20,6 +20,13 @@ win) so the 2-week review has a clean before/after comparison.
 Dry-run by default (prints the triage table + computed baseline, writes nothing).
 Pass --write to persist the baseline snapshot.
 
+ORDERING (D-051 adversarial review finding): run this script with --write
+BEFORE running scripts/purge_lex_capability_gap_rows_2026-07-30.py --apply.
+The purge script's mark_resolved effect removes 3 of these 13 gaps from
+gap_autofill.load_open_gaps(), so running it first would make this script
+snapshot 10 open gaps instead of 13 -- understating the T0 baseline the
+2-week review compares against.
+
 Usage:
     python scripts/triage_flywheel_pool_2026-07-30.py            # dry-run
     python scripts/triage_flywheel_pool_2026-07-30.py --write     # persist baseline

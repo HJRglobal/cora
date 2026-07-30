@@ -874,7 +874,7 @@ class TestAggregateQualityRejections:
             "\n".join(lines) + "\n", encoding="utf-8")
 
     def test_counts_by_reason_code(self, tmp_path):
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now().date().isoformat()
         self._write_log(tmp_path, today, [
             "2026-07-30 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
             "rejected (quality) for gap 2026-07-15T08:00:00+00:00: answer is a "
@@ -896,7 +896,7 @@ class TestAggregateQualityRejections:
         assert result["non_time_decaying"] == 1   # vague_deflection
 
     def test_unrecognized_reason_buckets_to_other_not_raw_text(self, tmp_path):
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now().date().isoformat()
         self._write_log(tmp_path, today, [
             "2026-07-30 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
             "rejected (quality) for gap 2026-07-15T08:00:00+00:00: some future "
@@ -912,7 +912,7 @@ class TestAggregateQualityRejections:
         assert "diagnosis" not in blob
 
     def test_window_excludes_old_logs(self, tmp_path):
-        old_date = (datetime.now(timezone.utc).date() - timedelta(days=30)).isoformat()
+        old_date = (datetime.now().date() - timedelta(days=30)).isoformat()
         self._write_log(tmp_path, old_date, [
             "2026-07-01 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
             "rejected (quality) for gap 2026-06-01T08:00:00+00:00: answer too "
@@ -929,7 +929,7 @@ class TestAggregateQualityRejections:
         }
 
     def test_ignores_unrelated_log_lines(self, tmp_path):
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now().date().isoformat()
         self._write_log(tmp_path, today, [
             "2026-07-30 06:00:00,000 INFO gap-autofill run started",
             "2026-07-30 06:00:05,000 INFO gap-autofill mined 2 gap(s)",

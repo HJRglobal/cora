@@ -150,6 +150,7 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     cutoff = now - timedelta(days=_WINDOW_DAYS)
+    root = Path(repo_root) if repo_root else _REPO_ROOT
     p = _paths(repo_root)
     out: dict = {"available": True}
 
@@ -310,7 +311,7 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     # 2026-07-30 handoff doc). Fail-soft: any error here degrades this section
     # only, never the metrics already collected above.
     try:
-        out.update(_collect_wave1_conversion_metrics(cutoff, p))
+        out.update(_collect_wave1_conversion_metrics(cutoff, p, root))
     except Exception as exc:  # noqa: BLE001
         log.warning("flywheel_metrics: wave1 conversion metrics failed: %s", exc)
         out["wave1_conversion_error"] = str(exc)
@@ -318,13 +319,21 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     return out
 
 
-def _collect_wave1_conversion_metrics(cutoff: datetime, p: dict[str, Path]) -> dict:
+def _collect_wave1_conversion_metrics(
+    cutoff: datetime, p: dict[str, Path], root: Path,
+) -> dict:
     """Fork 5a gauges: eligible-signal inflow, per-lane knowledge conversions,
     code-queue routing-completeness (separate denominator), gap routing-
-    completeness (>7d-old gaps that have SOME disposition vs none), and a
-    read-through of the STEP-0 T0 baseline snapshot if present. Never raises --
-    the caller wraps this in a try/except, but each sub-section is independently
-    fail-soft too so one broken source never blanks the rest."""
+    completeness (>7d-old gaps that have SOME disposition vs none), a
+    read-through of the STEP-0 T0 baseline snapshot if present, and Fork 1's
+    quality-rejection aggregation. Never raises -- the caller wraps this in a
+    try/except, but each sub-section is independently fail-soft too so one
+    broken source never blanks the rest.
+
+    D-051 adversarial review LOW: `_ga` (gap_autofill) MUST be genuinely used
+    below, not just imported -- an unused defensive import at the top of this
+    function would blank ALL FIVE Fork-5a gauges if that import ever failed,
+    for no behavioral benefit."""
     from . import gap_autofill as _ga
     from . import knowledge_gaps as _kg
 
@@ -428,6 +437,17 @@ def _collect_wave1_conversion_metrics(cutoff: datetime, p: dict[str, Path]) -> d
         out["t0_baseline"] = _json_object(p["t0_baseline"]) or None
     except Exception:  # noqa: BLE001
         out["t0_baseline"] = None
+
+    # Fork 1 (2026-07-30): wire the rejection-log aggregation into the shared
+    # metrics source so it actually reaches the digest, per Fork 1's own stated
+    # goal ("so the 2-week review can read it as a summary instead of grepping
+    # logs by hand") -- D-051 review LOW: the function existed but had zero
+    # production callers until this line.
+    try:
+        out["quality_rejections_14d"] = _ga.aggregate_quality_rejections(
+            days=14, repo_root=root)
+    except Exception:  # noqa: BLE001
+        out["quality_rejections_14d"] = None
 
     return out
 
@@ -538,5 +558,11 @@ def format_lines(metrics: dict) -> list[str]:
             f"T0 baseline ({t0.get('computed_at', '?')}): "
             f"eligible_open={t0.get('eligible_open_count', '?')} "
             f"disposition={t0.get('disposition_counts', {})}"
+        )
+    qr = metrics.get("quality_rejections_14d")
+    if qr:
+        lines.append(
+            f"MINE draft rejections, 14d: {qr.get('total_rejections', 0)} "
+            f"({qr.get('by_reason', {})}, time_decaying={qr.get('time_decaying', 0)})"
         )
     return lines

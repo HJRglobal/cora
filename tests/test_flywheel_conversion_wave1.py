@@ -292,3 +292,118 @@ def test_seed_item_redacts_lex_and_uses_any_phi(tmp_path, monkeypatch):
         summary=_LEX_BILLING_TEXT, entity="LEX", signal="capability", status="PROPOSED",
     )
     assert refused is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 adversarial-review remediation (2026-07-30, all 3 review lenses):
+# centralized LEX redaction at the read layer (get_item/load_items) so EVERY
+# consumer -- not just render_backlog_text -- gets the safe view
+# ─────────────────────────────────────────────────────────────────────────────
+def test_generate_kickoff_prompt_never_egresses_legacy_raw_lex_text(
+        tmp_path, monkeypatch):
+    """The review found _lex_safe_view wired into render_backlog_text ONLY --
+    build_item_card and generate_kickoff_prompt read via get_item/load_items
+    and would send a legacy (pre-fix) raw-LEX-title record to the Anthropic API
+    and a Drive file verbatim. Now centralized in get_item/load_items; this
+    proves generate_kickoff_prompt's evidence string (what actually reaches the
+    model + the written file) never contains the raw legacy text."""
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
+    legacy_event = {
+        "event": "captured", "id": "cq-legacy002", "ts": "2026-07-01T00:00:00+00:00",
+        "status": "APPROVED", "kind": "feature", "severity": "P3",
+        "title": "raw LEX client text that must never egress",
+        "summary": "raw LEX client text that must never egress",
+        "fix_sketch": "raw LEX client text that must never egress",
+        "entity": "LEX", "signal": "capability", "count": 1,
+    }
+    (tmp_path / "cq-events.jsonl").write_text(
+        json.dumps(legacy_event) + "\n", encoding="utf-8")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)  # force the deterministic path
+    item = cq.get_item("cq-legacy002")
+    assert item["title"] == cq._LEX_REDACTED_TITLE
+    body = cq._deterministic_prompt([item], slug="test")
+    assert "raw LEX client text that must never egress" not in body
+
+    # build_item_card must also be safe when fed a get_item()/load_items() result.
+    text, _blocks = cq.build_item_card(item)
+    assert "raw LEX client text that must never egress" not in text
+
+
+def test_load_items_redacts_lex_for_every_consumer(tmp_path, monkeypatch):
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
+    legacy_event = {
+        "event": "captured", "id": "cq-legacy003", "ts": "2026-07-01T00:00:00+00:00",
+        "status": "PROPOSED", "kind": "feature", "severity": "P3",
+        "title": "raw LEX", "summary": "raw LEX", "fix_sketch": "raw LEX",
+        "entity": "LEX", "signal": "capability", "count": 1,
+    }
+    (tmp_path / "cq-events.jsonl").write_text(
+        json.dumps(legacy_event) + "\n", encoding="utf-8")
+    items = cq.load_items()
+    assert len(items) == 1
+    assert items[0]["title"] == cq._LEX_REDACTED_TITLE
+    assert items[0]["summary"] == ""
+    assert items[0]["fix_sketch"] == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 remediation: the capability-ask check must only override Haiku's OWN
+# "knowledge" verdict, never downgrade a bug/feature verdict Haiku already made
+# ─────────────────────────────────────────────────────────────────────────────
+def test_bug_report_not_downgraded_by_capability_check(tmp_path, monkeypatch):
+    """D-051 finding (correctness/security lens): 'it's not working -- can you
+    check why the Shopify sync failed?' matches is_capability_ask ('can you
+    check'), but it is a PHRASE-signal bug report. Running the capability check
+    BEFORE Haiku downgraded Haiku's own P1/P2 'bug' verdict to a P3 'feature'.
+    Now the check only fires AFTER Haiku, and only overrides a 'knowledge'
+    verdict -- Haiku's 'bug' verdict here must survive untouched."""
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
+    monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "cq-fp.jsonl")
+    monkeypatch.setattr(cq, "_SYNC", True)
+    monkeypatch.setenv("CORA_CODE_QUEUE", "log")
+    monkeypatch.setattr(cq, "classify_candidate", lambda m, e: {
+        "kind": "bug", "severity": "P1", "summary": "Shopify sync failing",
+        "subsystem_guess": "shopify", "fix_sketch": "check the sync job logs",
+    })
+    cq.capture_message_signal(
+        "it's not working -- can you check why the Shopify sync failed?",
+        "F3E", "C1", "f3e-leadership", "U1",
+    )
+    items = cq.load_items()
+    assert len(items) == 1
+    assert items[0]["kind"] == "bug"
+    assert items[0]["severity"] == "P1"
+
+
+def test_knowledge_verdict_still_overridden_by_capability_check(tmp_path, monkeypatch):
+    """The override must still work for its intended case: Haiku itself says
+    'knowledge' for a capability-shaped ask -- route to the code-queue, not the
+    flywheel."""
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
+    monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "cq-fp.jsonl")
+    monkeypatch.setattr(cq, "_SYNC", True)
+    monkeypatch.setenv("CORA_CODE_QUEUE", "log")
+    monkeypatch.setattr(cq, "classify_candidate", lambda m, e: {"kind": "knowledge"})
+    # Call the internal classifier-dispatch function directly: this test targets
+    # the post-Haiku override ordering, independent of capture_message_signal's
+    # own S2/S4 phrase/deflection entry gate (a separate concern).
+    cq._process_message_signal(
+        "can you check our RepRally wholesale listings?", "FNDR", "C1", "cora-build",
+        "U1", "phrase", None,
+    )
+    items = cq.load_items()
+    assert len(items) == 1
+    assert items[0]["kind"] == "feature"
+    assert items[0]["signal"] == "capability"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 remediation: the "shared/saved/gave IT" false-positive branch removed
+# ─────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("text", [
+    "I saved it to the wrong folder -- what is the correct DDD form?",
+    "I shared it with the team last week, what did we decide?",
+    "i gave it to Justin already",
+])
+def test_capability_ask_no_longer_false_positives_on_bare_it(text):
+    assert kg.is_capability_ask(text) is False

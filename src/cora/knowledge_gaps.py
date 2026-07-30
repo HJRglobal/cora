@@ -42,7 +42,13 @@ _CAPABILITY_ASK_RE = re.compile(
     r"\b(?:can|could|do|does|are|is)\s+you\s+(?:" + _CAPABILITY_VERBS + r")\b"
     r"|\bdo\s+you\s+have\s+access\s+to\b"
     r"|\bare\s+you\s+able\s+to\b"
-    r"|\bi\s+(?:just\s+)?(?:shared|saved|gave)\s+(?:you|it)\b",
+    # "I (just) shared/saved/gave YOU X" -- second-person target required (D-051
+    # adversarial review MEDIUM: the prior "...you|it" alternative had no
+    # second-person target at all and false-matched genuine gap questions like
+    # "I saved it to the wrong folder -- what is the correct DDD form?" or
+    # "I shared it with the team last week, what did we decide?", diverting them
+    # into the P3 feature queue instead of knowledge-gap/known-answer drafting).
+    r"|\bi\s+(?:just\s+)?(?:shared|saved|gave)\s+you\b",
     re.IGNORECASE,
 )
 

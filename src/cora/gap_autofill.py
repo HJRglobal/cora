@@ -465,9 +465,14 @@ _REASON_CODES: dict[str, tuple[str, bool]] = {
 
 
 def _rejection_log_files(days: int, repo_root: Path | None = None) -> list[Path]:
+    """D-051 adversarial review LOW: scripts/run_gap_autofill.py's logging setup
+    names its dated log file from LOCAL `datetime.now()`, not UTC -- using
+    `datetime.now(timezone.utc).date()` here silently shifted the window by a
+    day in the evening AZ hours (UTC date is already "tomorrow"), dropping the
+    oldest day's file from the scan. Match the writer's local-date basis."""
     root = Path(repo_root) if repo_root else _REPO_ROOT
     log_dir = root / "logs"
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now().date()
     out = []
     for i in range(days):
         d = today - timedelta(days=i)

@@ -26,6 +26,16 @@ Dry-run by default (prints what would change, touches nothing). Pass --apply
 to write. Idempotent: a second --apply run is a no-op (redaction check is by
 exact-value comparison; resolved-ledger append checks the existing ledger
 first).
+
+ORDERING (D-051 adversarial review finding): run
+`scripts/triage_flywheel_pool_2026-07-30.py --write` (STEP 0's T0 baseline)
+BEFORE running this script with --apply. This script's `mark_resolved` effect
+removes the 3 target gaps from gap_autofill.load_open_gaps(), so if it runs
+FIRST, the T0 baseline would snapshot 10 open gaps instead of the 13 the
+handoff doc verified live -- understating the pool the 2-week review compares
+against. Both scripts are safe to run in either order operationally (neither
+corrupts live state), but this ordering preserves an accurate historical T0
+snapshot.
 """
 
 from __future__ import annotations
@@ -87,11 +97,24 @@ def plan() -> dict:
 
 
 def apply_redaction(p: dict) -> int:
+    """Redact the target rows in place. D-051 finding (adversarial review): the
+    live bot process appends to knowledge-gaps.jsonl concurrently via
+    knowledge_gaps.log_gap, and that write is guarded by an IN-PROCESS
+    threading.Lock -- which provides zero protection against this SEPARATE
+    process. Using a stale `plan()` snapshot (read at an arbitrary earlier
+    time) to build the full rewritten file would silently drop any row the bot
+    appended in between. Fixed by re-reading the file FRESH here, immediately
+    before the write, so the only remaining race window is the few
+    milliseconds between this read and the atomic tmp.replace() below --
+    equivalent to any other file-rewrite race in this codebase. `target_ts`
+    (from `p["targets"]`) is safe to reuse across the gap: those are historical
+    rows that cannot change identity, only whether they still need redacting."""
     path = _gaps_log_path()
     target_ts = {t["ts"] for t in p["targets"]}
+    fresh_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     out_lines = []
     n = 0
-    for line in p["lines"]:
+    for line in fresh_lines:
         stripped = line.strip()
         if not stripped:
             out_lines.append(line)
@@ -105,6 +128,14 @@ def apply_redaction(p: dict) -> int:
             rec["question"] = _REDACTED_QUESTION
             n += 1
         out_lines.append(json.dumps(rec, ensure_ascii=False))
+    # Sanity check: a rewrite must never SHRINK the file (every fresh line is
+    # preserved, only `question` values change) -- abort rather than risk
+    # silently dropping rows if something unexpected happened mid-read.
+    if len(out_lines) < len(fresh_lines):
+        raise RuntimeError(
+            f"apply_redaction: rewritten line count ({len(out_lines)}) is less "
+            f"than the fresh read ({len(fresh_lines)}) -- aborting without writing"
+        )
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     tmp.replace(path)
