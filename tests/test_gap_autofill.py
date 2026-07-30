@@ -859,3 +859,80 @@ def test_contributed_note_info_for_cora_provenance(tmp_path, monkeypatch):
     assert ok
     content = (tmp_path / "fndr.md").read_text(encoding="utf-8")
     assert "via #info-for-cora by Harrison" in content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fork 1 (Wave-1 flywheel-conversion calibration, 2026-07-30): rejection-log
+# aggregation (PHI-safe review-time surfacing of draft_answer's existing
+# "draft rejected (quality)" log lines, gap_autofill.py:~473)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestAggregateQualityRejections:
+    def _write_log(self, tmp_path, date_str, lines):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"gap-autofill-{date_str}.log").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_counts_by_reason_code(self, tmp_path):
+        today = datetime.now(timezone.utc).date().isoformat()
+        self._write_log(tmp_path, today, [
+            "2026-07-30 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
+            "rejected (quality) for gap 2026-07-15T08:00:00+00:00: answer is a "
+            "point-in-time snapshot, not durable canon",
+            "2026-07-30 06:00:02,000 INFO cora.gap_autofill gap_autofill: draft "
+            "rejected (quality) for gap 2026-07-16T09:00:00+00:00: answer punts "
+            "to a person/doc/tool instead of stating the fact",
+            "2026-07-30 06:00:03,000 INFO cora.gap_autofill gap_autofill: draft "
+            "rejected (quality) for gap 2026-07-17T10:00:00+00:00: answer "
+            "describes in-progress work, not a settled fact",
+        ])
+        result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
+        assert result["total_rejections"] == 3
+        assert result["unique_gaps"] == 3
+        assert result["by_reason"] == {
+            "snapshot": 1, "vague_deflection": 1, "in_progress": 1,
+        }
+        assert result["time_decaying"] == 2       # snapshot + in_progress
+        assert result["non_time_decaying"] == 1   # vague_deflection
+
+    def test_unrecognized_reason_buckets_to_other_not_raw_text(self, tmp_path):
+        today = datetime.now(timezone.utc).date().isoformat()
+        self._write_log(tmp_path, today, [
+            "2026-07-30 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
+            "rejected (quality) for gap 2026-07-15T08:00:00+00:00: some future "
+            "reason string containing Marcus's diagnosis of autism",
+        ])
+        result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
+        assert result["by_reason"] == {"other": 1}
+        # PHI-safe assertion: the raw matched reason text never appears anywhere
+        # in the surfaced record -- only the bucketed code + counts.
+        blob = json.dumps(result)
+        assert "Marcus" not in blob
+        assert "autism" not in blob
+        assert "diagnosis" not in blob
+
+    def test_window_excludes_old_logs(self, tmp_path):
+        old_date = (datetime.now(timezone.utc).date() - timedelta(days=30)).isoformat()
+        self._write_log(tmp_path, old_date, [
+            "2026-07-01 06:00:01,000 INFO cora.gap_autofill gap_autofill: draft "
+            "rejected (quality) for gap 2026-06-01T08:00:00+00:00: answer too "
+            "short to be a durable fact",
+        ])
+        result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
+        assert result["total_rejections"] == 0
+
+    def test_no_logs_returns_zeros(self, tmp_path):
+        result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
+        assert result == {
+            "window_days": 14, "total_rejections": 0, "unique_gaps": 0,
+            "by_reason": {}, "time_decaying": 0, "non_time_decaying": 0,
+        }
+
+    def test_ignores_unrelated_log_lines(self, tmp_path):
+        today = datetime.now(timezone.utc).date().isoformat()
+        self._write_log(tmp_path, today, [
+            "2026-07-30 06:00:00,000 INFO gap-autofill run started",
+            "2026-07-30 06:00:05,000 INFO gap-autofill mined 2 gap(s)",
+        ])
+        result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
+        assert result["total_rejections"] == 0

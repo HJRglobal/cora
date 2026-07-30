@@ -37,7 +37,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -427,6 +427,94 @@ def answer_quality_ok(answer: str) -> tuple[bool, str]:
     if _SNAPSHOT_RE.search(text):
         return False, "answer is a point-in-time snapshot, not durable canon"
     return True, ""
+
+
+# ── Fork 1 (Wave-1 flywheel-conversion calibration, 2026-07-30): rejection-log
+# aggregation ──────────────────────────────────────────────────────────────────
+# Decision: keep answer_quality_ok STRICT (it rejected exactly 1 gap -- it is not
+# the bottleneck; the binding constraint is intake, not conversion). The per-
+# rejection signal already exists (draft_answer logs "gap_autofill: draft
+# rejected (quality) for gap <id>: <reason>" at INFO on every rejection); the
+# missing piece is AGGREGATION so the 2-week review can read it as a summary
+# instead of grepping logs by hand.
+#
+# PHI-safe by construction: the <reason> logged is always one of
+# answer_quality_ok's four fixed, canned strings (never raw mined-answer or raw
+# gap text), and <id> is a bare gap ts (no content). This aggregator re-parses
+# those log lines from gap-autofill-{date}.log (this module's own dated log
+# family, written by scripts/run_gap_autofill.py's logging setup) and tallies by
+# a short REASON CODE -- an unrecognized/garbled reason (a future edit to the
+# canned strings, or log corruption) buckets to "other" rather than surfacing
+# the raw matched text, so this can never become a PHI leak path even if the
+# reason strings ever change.
+_REJECTION_LOG_RE = re.compile(
+    r"gap_autofill: draft rejected \(quality\) for gap (\S+): (.+)$"
+)
+
+# reason string (from answer_quality_ok) -> (reason_code, time_decaying).
+# time_decaying=True marks the "dated-snapshot-with-expiry" class (in-progress /
+# point-in-time-snapshot rejections) the 2-week review may want to reopen;
+# time_decaying=False marks structural rejections (too-short / vague-deflection)
+# unrelated to that question.
+_REASON_CODES: dict[str, tuple[str, bool]] = {
+    "answer too short to be a durable fact": ("too_short", False),
+    "answer punts to a person/doc/tool instead of stating the fact": ("vague_deflection", False),
+    "answer describes in-progress work, not a settled fact": ("in_progress", True),
+    "answer is a point-in-time snapshot, not durable canon": ("snapshot", True),
+}
+
+
+def _rejection_log_files(days: int, repo_root: Path | None = None) -> list[Path]:
+    root = Path(repo_root) if repo_root else _REPO_ROOT
+    log_dir = root / "logs"
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        p = log_dir / f"gap-autofill-{d.isoformat()}.log"
+        if p.exists():
+            out.append(p)
+    return out
+
+
+def aggregate_quality_rejections(days: int = 14, repo_root: Path | None = None) -> dict[str, Any]:
+    """PHI-safe review-time aggregation of the existing draft-rejection log lines.
+
+    Returns a dict: window_days, total_rejections, unique_gaps, by_reason (dict
+    of reason_code -> count), time_decaying / non_time_decaying counts. Never
+    raises -- a missing/unreadable log file just contributes nothing (fail-soft,
+    matching every other flywheel-metrics gauge)."""
+    by_reason: dict[str, int] = {}
+    time_decaying = 0
+    non_time_decaying = 0
+    total = 0
+    gap_ids: set[str] = set()
+    for path in _rejection_log_files(days, repo_root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = _REJECTION_LOG_RE.search(line)
+            if not match:
+                continue
+            gap_id, reason = match.group(1), match.group(2).strip()
+            code, decaying = _REASON_CODES.get(reason, ("other", False))
+            by_reason[code] = by_reason.get(code, 0) + 1
+            if decaying:
+                time_decaying += 1
+            else:
+                non_time_decaying += 1
+            total += 1
+            gap_ids.add(gap_id)
+    return {
+        "window_days": days,
+        "total_rejections": total,
+        "unique_gaps": len(gap_ids),
+        "by_reason": by_reason,
+        "time_decaying": time_decaying,
+        "non_time_decaying": non_time_decaying,
+    }
 
 
 def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | None:
