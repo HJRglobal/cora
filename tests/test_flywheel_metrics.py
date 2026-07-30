@@ -193,11 +193,19 @@ class TestCollect:
 class TestEvaluate:
     def test_starvation_warns(self):
         alarms = fm.evaluate({"knowledge_dms_7d": 0,
-                              "gaps_last_entry_age_days": 16.0,
+                              "gaps_last_entry_age_days": 25.0,  # > the 21d threshold
                               "pending_total": 100})
         msgs = [m for _s, m in alarms]
         assert any("0 knowledge items" in m for m in msgs)
-        assert any("16d ago" in m for m in msgs)
+        assert any("no new knowledge-gaps" in m and "25d" in m for m in msgs)
+
+    def test_normal_gap_lull_does_not_warn(self):
+        """Slice 6 recalibration: a routine sporadic-intake lull (16d, between the old
+        7d and the new 21d threshold) must NOT fire the stale-gap alarm."""
+        alarms = fm.evaluate({"knowledge_dms_7d": 5,
+                              "gaps_last_entry_age_days": 16.0,
+                              "pending_total": 100})
+        assert not any("knowledge-gaps" in m for _s, m in alarms)
 
     def test_healthy_is_quiet(self):
         alarms = fm.evaluate({"knowledge_dms_7d": 5,

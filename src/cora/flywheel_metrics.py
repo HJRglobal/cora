@@ -41,7 +41,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # WARN when zero knowledge items were DM'd to Harrison over this window.
 WARN_ZERO_KNOWLEDGE_DMS_DAYS = 7
 # WARN when the newest knowledge-gaps.jsonl entry is older than this.
-WARN_GAP_LOG_STALE_DAYS = 7
+# Recalibrated 7 -> 21 (Slice 6, 2026-07-29 audit): post-D-088 the LIVE intake is the
+# `unknown_response` detector, which is naturally SPORADIC (a good week can log zero
+# gaps). The 7d threshold cried wolf on normal lulls -- the 2026-07-27 weekly health
+# post alarmed "gap intake may be dead" during a routine 2026-07-14 -> 07-28 gap, yet
+# the detector was live (entries landed 7/28 + 7/29). 21d still catches a genuine
+# multi-week plumbing regression (the June-2026 "dry since 6/15" outage) without firing
+# on an ordinary quiet stretch. Do NOT drop below this to "catch it sooner" -- the
+# sporadic signal makes a tighter window pure noise.
+WARN_GAP_LOG_STALE_DAYS = 21
 # WARN when the live ledger's PENDING count exceeds this.
 WARN_PENDING_SIZE = 6_000
 # WARN when PENDING grew by more than this over the last ~7 days.
@@ -314,8 +322,9 @@ def evaluate(metrics: dict) -> list[tuple[str, str]]:
     elif age is not None and age > WARN_GAP_LOG_STALE_DAYS:
         alarms.append((
             "warn",
-            f"knowledge-gaps.jsonl last entry {age:.0f}d ago "
-            f"(threshold {WARN_GAP_LOG_STALE_DAYS}d) -- gap intake may be dead",
+            f"no new knowledge-gaps in {age:.0f}d "
+            f"(threshold {WARN_GAP_LOG_STALE_DAYS}d) -- verify the unknown_response "
+            f"gap detector is still wired (it may just be a quiet stretch)",
         ))
     pending = metrics.get("pending_total")
     if isinstance(pending, int) and pending > WARN_PENDING_SIZE:
