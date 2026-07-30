@@ -541,3 +541,18 @@ class TestRealMapsSmoke:
         assert asana_gid("U0B6LQNSR25") is None
         assert slack_id_from_name("Dorfman") == "U0B6LQNSR25"
         assert slack_id_from_name("Jason") == "U0B6LQNSR25"
+
+
+def test_resolve_slack_mentions(monkeypatch):
+    """Slice 3 (2026-07-29 audit): embedded Slack tokens (<@U…> and bare <U…>) resolve
+    to @name; an unmapped id is stripped, never leaked; plain text is unchanged."""
+    monkeypatch.setattr(
+        user_identity, "display_name",
+        lambda sid: {"U0B2RM2JYJ1": "Harrison Rogers"}.get(sid, sid),
+    )
+    from cora.tools.user_identity import resolve_slack_mentions
+    assert resolve_slack_mentions("ping <@U0B2RM2JYJ1> please") == "ping @Harrison Rogers please"
+    assert resolve_slack_mentions("from <U0B2RM2JYJ1>") == "from @Harrison Rogers"
+    out = resolve_slack_mentions("note <U0B3V5RHT3P>: done")
+    assert "U0B3V5RHT3P" not in out
+    assert resolve_slack_mentions("plain text here") == "plain text here"

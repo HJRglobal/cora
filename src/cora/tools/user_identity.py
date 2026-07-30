@@ -23,6 +23,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,6 +250,30 @@ def hubspot_owner_id(slack_user_id: str) -> Optional[str]:
 def slack_mention(slack_user_id: str) -> str:
     """Return Slack mrkdwn @mention string, e.g. '<@U0B3AEQS0NB>'."""
     return f"<@{slack_user_id}>"
+
+
+# Matches both the proper <@U…> mention and the bare <U…> token that swept content
+# sometimes carries (a synthesis line that quoted a user id without the @).
+_EMBEDDED_MENTION_RE = re.compile(r"<@?(U[A-Z0-9]{6,})>")
+
+
+def resolve_slack_mentions(text: str) -> str:
+    """Replace raw Slack user tokens embedded in free text -- both ``<@U…>`` and the
+    bare ``<U…>`` form -- with a friendly ``@name``. An unmapped id is STRIPPED rather
+    than leaked, so swept content quoted into a person-facing card never shows a raw
+    ``<U…>`` token (Slice 3, 2026-07-29 audit)."""
+    if not text or "<" not in text:
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        sid = m.group(1)
+        name = display_name(sid)
+        return f"@{name}" if name and name != sid else ""
+
+    out = _EMBEDDED_MENTION_RE.sub(_sub, text)
+    # Collapse the doubled spaces a stripped token can leave (spaces/tabs only, so
+    # newlines in multi-line evidence survive).
+    return re.sub(r"[ \t]{2,}", " ", out)
 
 
 def all_users() -> list[UserRecord]:

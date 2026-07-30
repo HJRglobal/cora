@@ -49,6 +49,7 @@ from cora.knowledge_review import (  # noqa: E402
 )
 from cora.coras_read import build_coras_read_struct  # noqa: E402  (WS17-C enrichment)
 from cora import graduated_trust_shadow as gts  # noqa: E402  (graduated-trust SHADOW)
+from cora.tools.user_identity import resolve_slack_mentions  # noqa: E402  (Slice 3)
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 
@@ -556,7 +557,10 @@ def _format_owner_item_line(update: dict, idx: int) -> str:
     """One numbered suggestion line inside the batched owner DM (D4). Cora is
     decision-SUPPORT: the owner acts in the native tool; Cora does not."""
     utype = update.get("update_type", "generic")
-    desc = (update.get("description") or "(no description)").strip()
+    # Defensive resolve (Slice 3): strip/resolve any raw <U…> token quoted from swept
+    # content -- catches already-PENDING items proposed before the reconciliation-side
+    # fix, so no Harrison-facing card ever shows a bare Slack id.
+    desc = resolve_slack_mentions((update.get("description") or "(no description)").strip())
     payload = update.get("payload") or {}
     label = _OWNER_ITEM_LABELS.get(utype, utype)
     line = f"{idx}. *{label}*: {desc[:400]}"

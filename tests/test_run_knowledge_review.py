@@ -751,3 +751,19 @@ def test_shadow_acts_on_nothing_byte_identical(tmp_path, monkeypatch):
     recs = [_json.loads(l) for l in on_files[0].read_text(encoding="utf-8").splitlines()]
     ka = [r for r in recs if r.get("update_id") == "ka-x" and r["type"] == "shadow_decision"]
     assert ka and ka[0]["shadow_tier"] == 0 and ka[0]["shadow_decision"] == "would-auto-approve"
+
+
+def test_owner_item_line_resolves_raw_slack_id():
+    """Slice 3 (2026-07-29 audit): a raw <U…> token quoted from swept content into an
+    owner card must be stripped/resolved before display (belt at the render chokepoint,
+    catching already-PENDING items proposed before the reconciliation-side fix)."""
+    line = rkr._format_owner_item_line(
+        {
+            "update_type": "task_close",
+            "description": (
+                'Possible task completion: "X" -- slack says: "<U0B3V5RHT3P>: done"'
+            ),
+        },
+        1,
+    )
+    assert "U0B3V5RHT3P" not in line

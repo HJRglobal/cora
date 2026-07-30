@@ -744,6 +744,44 @@ def pass3_uncaptured_decisions(
 
 # ── Pass 4: Stale open tasks ───────────────────────────────────────────────────
 
+# Negated-completion guard (Slice 3, 2026-07-29 audit): a swept line like "No LEX
+# task closures" / "nothing was completed" denies the very thing a task_close card
+# would claim. A negator that DIRECTLY governs the completion verb (over a short run
+# of auxiliary/adverb fillers only) marks that verb negated; the sentence is dropped
+# only when EVERY completion verb in it is negated -- so "not yet closed, but the
+# final step is done" is KEPT (the affirmative "done" governs), guarding the D-051
+# under-suppression case.
+_NEG_NEGATORS = frozenset({
+    "not", "no", "never", "nothing", "none", "without",
+    "isn't", "aren't", "wasn't", "weren't", "hasn't", "haven't", "hadn't",
+    "won't", "can't", "cannot", "couldn't", "didn't", "don't", "doesn't", "wouldn't",
+})
+_NEG_FILLERS = frozenset({
+    "yet", "been", "be", "being", "get", "got", "gotten", "fully", "quite",
+    "actually", "really", "even", "all", "was", "were", "is", "are", "have",
+    "has", "had", "it", "that", "this", "them", "still", "ever", "any",
+})
+
+
+def _completion_is_negated(sentence: str, completion_re) -> bool:
+    """True only when EVERY completion-verb hit in `sentence` is directly governed by a
+    negator (the sentence denies completion). A single affirmative hit keeps it."""
+    matches = list(completion_re.finditer(sentence))
+    if not matches:
+        return False
+    for m in matches:
+        prefix_tokens = re.findall(r"[a-z']+", sentence[: m.start()].lower())
+        negated = False
+        for w in reversed(prefix_tokens[-6:]):  # short local window
+            if w in _NEG_FILLERS:
+                continue
+            negated = w in _NEG_NEGATORS
+            break
+        if not negated:
+            return False  # an affirmative completion verb governs -> keep the sentence
+    return True
+
+
 def pass4_stale_open_tasks(
     open_tasks: list[dict[str, Any]],
     *,
@@ -858,6 +896,10 @@ def pass4_stale_open_tasks(
                 continue
             if not _COMPLETION_RE.search(sentence):
                 continue
+            if _completion_is_negated(sentence, _COMPLETION_RE):
+                # A negated completion ("No ... closures", "nothing completed") denies
+                # what a task_close card would claim -- never propose from it (Slice 3).
+                continue
 
             best_task: dict[str, Any] = {}
             match_score: float = 0.0
@@ -911,14 +953,16 @@ def pass4_stale_open_tasks(
             if confidence == "LOW":
                 continue
 
-            # Best-score-wins: keep the highest-confidence match per task
+            # Best-score-wins: keep the highest-confidence match per task. Carry the
+            # matched SENTENCE (not the chunk head) so the card quotes the actual signal.
             prev = best_per_task.get(task_gid)
             if prev is None or match_score > prev[0]:
-                best_per_task[task_gid] = (match_score, used_semantic, chunk, best_task)
+                best_per_task[task_gid] = (match_score, used_semantic, chunk, best_task, sentence)
 
     # Build gap list from best-per-task matches, sorted by score descending
+    from cora.tools.user_identity import resolve_slack_mentions
     gaps: list[ReconciliationGap] = []
-    for task_gid, (match_score, used_semantic, chunk, best_task) in sorted(
+    for task_gid, (match_score, used_semantic, chunk, best_task, matched_sentence) in sorted(
         best_per_task.items(), key=lambda x: x[1][0], reverse=True
     ):
         if len(gaps) >= MAX_GAPS_PER_PASS:
@@ -934,9 +978,13 @@ def pass4_stale_open_tasks(
             f"sim={match_score:.3f}" if used_semantic else f"ratio={match_score:.3f}"
         )
 
+        # Quote the SENTENCE that actually matched (not the chunk head, which can be an
+        # unrelated -- even contradicting -- synthesis line), and resolve/strip any raw
+        # Slack <U…> token so a Harrison-facing card never leaks an id (Slice 3).
+        evidence_quote = resolve_slack_mentions(matched_sentence).strip()
         description = (
             f"Possible task completion: \"{task_name}\" "
-            f"-- {chunk['source']} says: \"{chunk['content'][:120]}\""
+            f"-- {chunk['source']} says: \"{evidence_quote[:200]}\""
         )
         if assignee_name:
             description += f" (assigned to {assignee_name})"
@@ -945,7 +993,7 @@ def pass4_stale_open_tasks(
             gap_id=_gap_id("stale_open_task", chunk["source_id"], task_gid),
             gap_type="stale_open_task",
             description=description,
-            source_evidence=chunk["content"][:400],
+            source_evidence=resolve_slack_mentions(chunk["content"][:400]),
             source=chunk["source"],
             source_id=chunk["source_id"],
             entity=chunk["entity"],

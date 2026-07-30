@@ -1169,3 +1169,69 @@ class TestContentDateWindowAndBudgets:
             deadline_monotonic=time.monotonic() - 1,
         )
         assert gaps == []
+
+
+# ── Slice 3 (2026-07-29 audit): negation guard + faithful evidence + no id leak ──
+
+from cora.tools.completion_detector import _COMPLETION_RE as _CR  # noqa: E402
+
+
+class TestCompletionNegationUnit:
+    def test_directly_negated_is_negated(self):
+        assert _re._completion_is_negated("The deck has not been completed.", _CR)
+
+    def test_nothing_was_completed(self):
+        assert _re._completion_is_negated("nothing was completed today", _CR)
+
+    def test_affirmative_with_unrelated_negation_kept(self):
+        # D-051 lens (d): "not yet closed" is negated but "done" is affirmative -> KEEP
+        assert not _re._completion_is_negated(
+            "The audit is not yet closed, but the final step is done.", _CR)
+
+    def test_negated_noun_not_verb_kept(self):
+        # "no" negates "blockers", not "completed" -> affirmative completion -> KEEP
+        assert not _re._completion_is_negated(
+            "No blockers remain; the pricing deck has been completed.", _CR)
+
+    def test_plain_affirmative_kept(self):
+        assert not _re._completion_is_negated("The invoice has been paid.", _CR)
+
+
+class TestPass4NegationAndIdLeak:
+    def _mk(self, content: str) -> dict:
+        return {"source": "slack", "source_id": f"slack:C0C:{time.time():.6f}",
+                "entity": "F3E", "content": content, "title": "f3e-ops"}
+
+    def test_negated_completion_not_flagged(self):
+        db_path = _make_db([self._mk("The pricing deck has not been completed yet.")])
+        gaps = _re.pass4_stale_open_tasks(
+            open_tasks=[{"gid": "T1", "name": "Complete and send the pricing deck",
+                         "permalink_url": "", "assignee": {}}],
+            db_path=db_path)
+        assert gaps == []
+
+    def test_quotes_matched_sentence_not_chunk_head(self):
+        # The chunk HEAD contradicts completion; the matched sentence (later) affirms it.
+        content = ("No LEX task closures this week. "
+                   "The DDD attestation audit has been completed and filed.")
+        db_path = _make_db([self._mk(content)])
+        gaps = _re.pass4_stale_open_tasks(
+            open_tasks=[{"gid": "T2", "name": "DDD attestation audit",
+                         "permalink_url": "", "assignee": {}}],
+            db_path=db_path)
+        assert len(gaps) == 1
+        # The contradicting chunk-head line must NOT be quoted as the evidence.
+        assert "No LEX task closures" not in gaps[0].description
+        assert "completed" in gaps[0].description.lower()
+
+    def test_raw_slack_id_stripped_from_card(self):
+        content = ("The onboarding report has been completed and delivered "
+                   "by <U0B3V5RHT3P>.")
+        db_path = _make_db([self._mk(content)])
+        gaps = _re.pass4_stale_open_tasks(
+            open_tasks=[{"gid": "T3", "name": "Complete the onboarding report",
+                         "permalink_url": "", "assignee": {}}],
+            db_path=db_path)
+        assert len(gaps) == 1
+        assert "<U0B3V5RHT3P>" not in gaps[0].description
+        assert "<U0B3V5RHT3P>" not in gaps[0].source_evidence
