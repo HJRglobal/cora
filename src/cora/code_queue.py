@@ -278,12 +278,15 @@ def _embedding_dup_id(signal: str, representative: str, entity: str,
 
 
 def _is_phi_or_lex(text: str, entity: str) -> bool:
-    """True if free text must NOT be persisted raw at rest: LEX-sourced OR
-    is_phi_risk (fail-closed on error). D-082 extension."""
+    """True if free text must NOT be persisted raw at rest (or embedded/egressed):
+    LEX-sourced OR is_any_phi (fail-closed on error). D-082 extension; upgraded to
+    the 3-predicate union (is_any_phi) 2026-07-30 PHI parity-raise -- this gate also
+    decides what is safe to send to the OpenAI embedding API, so it must not miss
+    named LEX billing/status text with no clinical keyword."""
     if str(entity or "").strip().upper().startswith("LEX"):
         return True
     try:
-        return bool(phi_guard.is_phi_risk(text))
+        return bool(phi_guard.is_any_phi(text))
     except Exception:  # noqa: BLE001 -- fail closed
         return True
 
@@ -497,15 +500,51 @@ def _representative(rec: dict[str, Any]) -> str:
 
 def _scrub_evidence(evidence: list[dict[str, Any]] | None, *, is_lex: bool) -> list[dict[str, Any]]:
     """LEX -> pointers only (channel_id + ts, never text). Any entity -> a note is
-    dropped to a pointer if it itself trips is_phi_risk (belt-and-braces)."""
+    dropped to a pointer if it itself trips is_any_phi (belt-and-braces; upgraded to
+    the 3-predicate union 2026-07-30 PHI parity-raise)."""
     out: list[dict[str, Any]] = []
     for e in (evidence or [])[:5]:
         ptr = {"channel_id": str(e.get("channel_id", "") or ""), "ts": str(e.get("ts", "") or "")}
         note = str(e.get("note", "") or "")
-        if note and not is_lex and not phi_guard.is_phi_risk(note):
+        if note and not is_lex and not phi_guard.is_any_phi(note):
             ptr["note"] = note[:200]
         out.append(ptr)
     return out
+
+
+# LEX build-ask redaction (D-051 PHI parity-raise, 2026-07-30 Wave-1 Fork 3b): the
+# fixed placeholder used for a LEX-entity item's title/summary/fix_sketch wherever
+# they would otherwise egress -- capture (write), render_backlog_text, and the MCP
+# code_queue_view surface (which simply calls render_backlog_text, so one fix covers
+# both). representative/evidence already got this treatment (D-082); title/summary/
+# fix_sketch did not, and persisted RAW into code-session-queue.jsonl, exposed
+# verbatim by render_backlog_text, build_item_card, and generate_kickoff_prompt.
+# Applied unconditionally for ANY LEX entity, not just PHI-tripping text -- the LEX
+# wall is fail-closed regardless of whether this particular ask happens to trip a
+# PHI predicate (mirrors the existing representative/evidence blanket redaction).
+_LEX_REDACTED_TITLE = "[LEX build ask -- details withheld]"
+
+
+def _redact_lex_build_fields(rec: dict[str, Any]) -> None:
+    """In-place: blank title/summary/fix_sketch for a LEX-entity record. Call BEFORE
+    the record is ever persisted (only meaningful on the NEW-item capture path --
+    a recurrence event never re-persists these fields)."""
+    rec["title"] = _LEX_REDACTED_TITLE
+    rec["summary"] = ""
+    rec["fix_sketch"] = ""
+
+
+def _lex_safe_view(it: dict[str, Any]) -> dict[str, Any]:
+    """Egress-side re-check (D-051: never trust the write-side redaction alone) --
+    used by render_backlog_text (and therefore the MCP code_queue_view surface,
+    which calls it directly) so a legacy/pre-fix record or any future write-path
+    regression still cannot surface raw LEX title/summary/fix_sketch text."""
+    if str(it.get("entity", "")).strip().upper().startswith("LEX"):
+        it = dict(it)
+        it["title"] = _LEX_REDACTED_TITLE
+        it["summary"] = ""
+        it["fix_sketch"] = ""
+    return it
 
 
 def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
@@ -523,12 +562,17 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     entity = str(rec.get("entity") or "FNDR").strip().upper()
     is_lex = entity.startswith("LEX")
 
-    # Summary PHI gate -- FAIL-CLOSED. is_phi_risk error is treated as PHI (drop).
+    # Summary PHI gate -- FAIL-CLOSED. is_any_phi error is treated as PHI (drop).
     # Covers every model-authored field that could carry PHI (title/summary/fix).
+    # Upgraded from is_phi_risk alone to the 3-predicate union (2026-07-30 PHI
+    # parity-raise): is_phi_risk alone missed named LEX billing/authorization/
+    # eligibility text with no clinical keyword (is_lex_billing_status_phi) and bare
+    # diagnosis/medication terms (is_clinical_phi) -- exactly the class a LEX
+    # capability ask like "can you access Marcus's service hours?" falls into.
     summary_text = (f"{rec.get('title', '')} {rec.get('summary', '')} "
                     f"{rec.get('fix_sketch', '')}").strip()
     try:
-        phi = phi_guard.is_phi_risk(summary_text)
+        phi = phi_guard.is_any_phi(summary_text)
     except Exception:  # noqa: BLE001 -- fail closed
         phi = True
     if phi:
@@ -546,9 +590,9 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     # PHI-safe persistence of the dedup basis: NEVER store raw LEX or PHI-tripping
     # text in the fingerprint ledger OR the event record. The hash (already
     # computed from the full text) still dedups exact repeats; only fuzzy dedup is
-    # forgone for these. D-082 extension.
+    # forgone for these. D-082 extension; is_any_phi 2026-07-30 parity-raise.
     try:
-        rep_phi = phi_guard.is_phi_risk(representative)
+        rep_phi = phi_guard.is_any_phi(representative)
     except Exception:  # noqa: BLE001 -- fail closed
         rep_phi = True
     store_rep = "" if (is_lex or rep_phi) else representative
@@ -597,6 +641,12 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
             rec["ts"] = _now_iso()
             rec["status"] = initial_status
             rec.setdefault("count", 1)
+            if is_lex:
+                # D-051 PHI parity-raise (2026-07-30): redact BEFORE this record is
+                # ever persisted -- title/summary/fix_sketch previously survived raw
+                # (only representative/evidence were redacted). rec is the SAME
+                # object used below for the DM card, so the card is covered too.
+                _redact_lex_build_fields(rec)
             if dm_held:
                 # Persist the hold on the captured event so the reducer folds it and
                 # maybe_flush_overflow() delivers it on the next review run (never lost).
@@ -743,12 +793,23 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
 
     # PHI egress guard (fail-closed): never send LEX/PHI client text to the Haiku
     # classifier. Non-PHI LEX build-asks (e.g. "cora should add an LTS scheduler")
-    # still pass; PHI-tripping ones are dropped before any model call.
+    # still pass; PHI-tripping ones are dropped before any model call. Upgraded to
+    # the 3-predicate union (is_any_phi) 2026-07-30 PHI parity-raise.
     try:
-        if phi_guard.is_phi_risk(question):
+        if phi_guard.is_any_phi(question):
             log.info("code_queue: message signal dropped pre-classify (PHI)")
             return
     except Exception:  # noqa: BLE001 -- fail closed
+        return
+
+    # Fork 3a (Wave-1 flywheel-conversion calibration): a deterministic capability
+    # ask pre-empts the Haiku "knowledge" branch entirely -- no model call needed
+    # when the verdict is already certain, and this guarantees Haiku can never
+    # mis-route a capability ask into "bug"/"config"/"knowledge" instead.
+    from . import knowledge_gaps
+    if knowledge_gaps.is_capability_ask(question):
+        capture_capability_ask(question, entity, channel_name, slack_user_id,
+                               client_factory=client_factory)
         return
 
     verdict = classify_candidate(question, entity)
@@ -784,8 +845,27 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
 
 
 def _route_to_flywheel(question: str, entity: str, channel_name: str, user: str) -> None:
-    """Knowledge-shaped finding -> the existing knowledge flywheel, never the queue."""
+    """Knowledge-shaped finding -> the existing knowledge flywheel, never the queue.
+
+    D-051 PHI PARITY-RAISE (2026-07-30, Wave-1 Fork 3b -- the load-bearing fix): this
+    path previously called log_gap with ZERO PHI screening -- a LEX ask Haiku
+    miscalled "knowledge" would persist RAW client text into knowledge-gaps.jsonl
+    (confirmed live: the 7/30 LEX how-to-guide asks). Now fail-closed on two levels:
+    LEX entities are skipped OUTRIGHT (mirrors gap_detection.maybe_log_gap's existing
+    LEX-skip -- this path must never be a side-door around it), and any other
+    entity's question is screened with the 3-predicate union (is_any_phi) before the
+    write. knowledge_gaps.log_gap ALSO carries its own capability-ask intercept
+    (Fork 3a) that fires before this function's write would land, so most capability
+    asks reaching here never write at all -- this guard is the belt for the rest.
+    """
     try:
+        ent = (entity or "FNDR").strip().upper()
+        if ent.startswith("LEX"):
+            log.debug("code_queue: LEX entity -- flywheel route skipped (fail-closed)")
+            return
+        if phi_guard.is_any_phi(question):
+            log.info("code_queue: flywheel route dropped (PHI-flagged question)")
+            return
         from . import knowledge_gaps
         knowledge_gaps.log_gap(
             entity=entity, channel=channel_name, user=user or "",
@@ -795,6 +875,44 @@ def _route_to_flywheel(question: str, entity: str, channel_name: str, user: str)
         )
     except Exception:  # noqa: BLE001
         log.debug("code_queue: flywheel route failed (non-fatal)", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fork 3a (Wave-1 flywheel-conversion calibration) -- capability-ask routing
+# ─────────────────────────────────────────────────────────────────────────────
+def capture_capability_ask(question: str, entity: str, channel: str, user: str | None,
+                           *, client_factory: Callable | None = None) -> None:
+    """Route a deterministically-classified capability ask (knowledge_gaps.
+    is_capability_ask) straight to the code-queue as a feature candidate -- never
+    through Haiku (the deterministic verdict already decided kind) and never through
+    the knowledge-gap log. Hot-path entry (called from knowledge_gaps.log_gap on all
+    three of its callers, and directly from _process_message_signal before the Haiku
+    call): fail-soft, off-thread. `channel` may be a channel NAME or ID depending on
+    the caller -- stored only as a note string, never as a slack:// deep-link target,
+    so an inconsistent shape can never render a broken link."""
+    try:
+        if code_queue_level() == "off":
+            return
+        question = (question or "").strip()
+        if not question:
+            return
+        _submit(_process_capability_ask, question, entity, channel, user, client_factory)
+    except Exception:  # noqa: BLE001
+        log.debug("code_queue.capture_capability_ask swallowed", exc_info=True)
+
+
+def _process_capability_ask(question: str, entity: str, channel: str, user: str | None,
+                            client_factory: Callable | None) -> None:
+    rec = {
+        "kind": "feature", "severity": "P3",
+        "title": question[:120], "summary": question[:200],
+        "subsystem_guess": "", "entity": entity, "signal": "capability",
+        "representative": question,
+        "evidence": [{"channel_id": "", "ts": "",
+                      "note": f"#{channel}" if channel else ""}],
+        "reporter": user or "",
+    }
+    _capture(rec, client_factory=client_factory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -951,7 +1069,8 @@ def classify_candidate(message: str, entity: str) -> dict[str, Any] | None:
         severity = "P3"
     summary = str(verdict.get("summary") or "").strip()
     # Belt-and-braces: a PHI-tripping summary is treated as noise (dropped).
-    if summary and phi_guard.is_phi_risk(summary):
+    # is_any_phi 2026-07-30 parity-raise (3-predicate union).
+    if summary and phi_guard.is_any_phi(summary):
         return {"kind": "noise"}
     return {
         "kind": kind, "severity": severity,
@@ -988,6 +1107,10 @@ def render_backlog_text(items: list[dict[str, Any]] | None = None) -> str:
         lines.append(f"## {status} ({len(group)})")
         lines.append("")
         for it in group:
+            # Egress-side LEX redaction re-check (D-051: never trust the write-side
+            # redaction alone) -- covers this renderer AND the MCP code_queue_view
+            # surface, which calls render_backlog_text directly.
+            it = _lex_safe_view(it)
             age = _age_days(it.get("ts"))
             cnt = int(it.get("count", 1))
             cnt_s = f" x{cnt}" if cnt > 1 else ""
@@ -1494,9 +1617,10 @@ def apply_edit(cq_id: str, actor_id: str, title: str, summary: str) -> tuple[str
         return "error", "That queue item no longer exists."
     title = (title or "").strip()[:120]
     summary = (summary or "").strip()[:200]
-    # PHI belt-and-braces on the edited text (fail-closed).
+    # PHI belt-and-braces on the edited text (fail-closed). is_any_phi 2026-07-30
+    # parity-raise (3-predicate union).
     try:
-        if phi_guard.is_phi_risk(f"{title} {summary}"):
+        if phi_guard.is_any_phi(f"{title} {summary}"):
             return "error", "Edit rejected -- text tripped the PHI guard."
     except Exception:  # noqa: BLE001
         return "error", "Edit rejected -- PHI check failed (fail-closed)."
@@ -1866,8 +1990,9 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     # code-session-backlog.md and would egress). A PHI-tripping seed is refused outright,
     # never persisted -- same contract as the capture path (fixes the seed/ _capture
     # asymmetry). The 1h LEX-DDD seed is generic build text and passes cleanly.
+    # is_any_phi 2026-07-30 parity-raise (3-predicate union).
     try:
-        if phi_guard.is_phi_risk(f"{title} {summary}".strip()):
+        if phi_guard.is_any_phi(f"{title} {summary}".strip()):
             log.info("code_queue.seed_item: refused PHI-flagged seed (signal=%s entity=%s)",
                      signal, entity)
             return None
@@ -1882,16 +2007,20 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     # LEX or PHI-tripping representative -- else it becomes an embedding candidate whose
     # raw text egresses to OpenAI. Exact-hash dedup still works (fingerprint is over
     # `title`). The evidence note is scrubbed on the SAME rule as _capture (LEX -> pointer
-    # only; any note that itself trips is_phi_risk -> dropped) -- the seed path previously
+    # only; any note that itself trips is_any_phi -> dropped) -- the seed path previously
     # persisted summary[:200] raw, an at-rest LEX/PHI leak for a LEX seed (1i).
     is_lex = str(entity or "").strip().upper().startswith("LEX")
     rec["evidence"] = _scrub_evidence(rec.get("evidence"), is_lex=is_lex)
     try:
-        rep_phi = phi_guard.is_phi_risk(title)
+        rep_phi = phi_guard.is_any_phi(title)
     except Exception:  # noqa: BLE001 -- fail closed
         rep_phi = True
     store_rep = "" if (is_lex or rep_phi) else title
     rec["representative"] = store_rep
+    if is_lex:
+        # D-051 PHI parity-raise (2026-07-30): same title/summary redaction as
+        # _capture -- the seed path is a capture-equivalent write.
+        _redact_lex_build_fields(rec)
     cq_id = "cq-" + uuid.uuid4().hex[:12]
     rec["id"] = cq_id
     rec["ts"] = _now_iso()

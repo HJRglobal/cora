@@ -163,6 +163,25 @@ def is_lex_billing_status_phi(text: str) -> bool:
     return bool(_CLIENT_STATUS_RE.search(text))
 
 
+def is_any_phi(text: str) -> bool:
+    """3-predicate PHI union: is_phi_risk OR is_clinical_phi OR is_lex_billing_status_phi.
+
+    Single screening function for any write/egress checkpoint that must not miss PHI
+    carried by only ONE of the three narrower detectors. Added 2026-07-30 (Wave-1
+    flywheel-conversion calibration, Fork 3 PHI parity-raise): the code-queue's PHI
+    screen was single-predicate (is_phi_risk only) and missed named LEX billing/
+    authorization/eligibility text with no clinical keyword at all (e.g. "can you
+    access Marcus's service hours?" trips is_lex_billing_status_phi but not
+    is_phi_risk). gap_detection.py already composes this same union inline at its
+    question-side PHI gate; this gives every OTHER checkpoint (code_queue.py, any
+    future write/egress gate) the identical, single, fail-closed screen instead of
+    each reimplementing the union or -- worse -- using only is_phi_risk.
+    """
+    if not text:
+        return False
+    return bool(is_phi_risk(text) or is_clinical_phi(text) or is_lex_billing_status_phi(text))
+
+
 # ---------------------------------------------------------------------------
 # Non-LEX PHI backstop — shared by the LIVE retrieval path and the Drive egress
 # ---------------------------------------------------------------------------
