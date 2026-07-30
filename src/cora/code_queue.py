@@ -94,6 +94,12 @@ _FINGERPRINT_LEDGER = _STATE_DIR / "code-queue-fingerprints.jsonl"
 _SIGNALS_LEDGER = _STATE_DIR / "code-queue-signals.jsonl"
 _NOTES_DIR = _REPO_ROOT / "_notes"
 
+# The REAL, canonical event-ledger path -- a separate constant from _EVENT_LEDGER
+# (never monkeypatched) so the leak guard below can detect when _EVENT_LEDGER has
+# been redirected (a test/sandbox isolating it to a tmp dir), independent of
+# whatever _EVENT_LEDGER currently points at.
+_DEFAULT_EVENT_LEDGER = _STATE_DIR / "code-session-queue.jsonl"
+
 _LEDGER_LOCK = threading.RLock()
 
 # In-flight DM-card reservations (guarded by _LEDGER_LOCK): counts cards whose send
@@ -139,6 +145,41 @@ def _founder_os_root() -> Path:
 def backlog_path() -> Path:
     """Generated backlog view -- KB-ingested (see kb_exclusions allowlist)."""
     return _founder_os_root() / "_shared" / "projects" / "cora" / "code-session-backlog.md"
+
+
+def _real_backlog_path() -> Path:
+    """The REAL, unredirected default backlog path -- ignores any FOUNDER_OS_ROOT
+    override. Used only by the leak guard below to detect "the write target is
+    STILL the live Founder-OS default" even in a process that happens to leave
+    FOUNDER_OS_ROOT unset."""
+    return Path(r"G:\My Drive\HJR-Founder-OS") / "_shared" / "projects" / "cora" / "code-session-backlog.md"
+
+
+def _backlog_write_would_leak() -> bool:
+    """True when _EVENT_LEDGER has been redirected away from its real, canonical
+    path (signalling a test/sandbox context reading an ISOLATED ledger) WHILE the
+    backlog write target is STILL the real, unredirected Founder-OS default --
+    the exact mismatch that let a 1-item isolated test ledger render into the
+    live G:\\...\\code-session-backlog.md on 2026-07-30 (item cq-96fdd1850605, a
+    LEX-redacted TEST title that was never a real queue item). A properly
+    isolated caller that also redirects FOUNDER_OS_ROOT (or mocks
+    drive_io.write_text_atomic) is unaffected -- this only trips on the
+    inconsistent HALF-isolated state, never on legitimate isolation.
+
+    Fail-CLOSED on any path-resolution error (an unresolvable path counts as
+    both "redirected" and "still the real default" -- i.e. refuse the write).
+    """
+    try:
+        ledger_redirected = Path(_EVENT_LEDGER).resolve() != _DEFAULT_EVENT_LEDGER.resolve()
+    except OSError:
+        ledger_redirected = True
+    if not ledger_redirected:
+        return False
+    try:
+        target_is_real_default = backlog_path().resolve() == _real_backlog_path().resolve()
+    except OSError:
+        target_is_real_default = True
+    return target_is_real_default
 
 
 def founder_os_notes_dir() -> Path:
@@ -1129,8 +1170,19 @@ def render_backlog_text(items: list[dict[str, Any]] | None = None) -> str:
 def render_backlog(items: list[dict[str, Any]] | None = None) -> bool:
     """Write the backlog view to the Founder-OS Drive path. Fail-soft: a G: outage
     (DriveUnavailable) or any error returns False and NEVER raises (a button ack
-    must not break on a Drive blip -- Rider B / drive_io doctrine)."""
+    must not break on a Drive blip -- Rider B / drive_io doctrine).
+
+    2026-07-30 incident guard: refuses the write outright when the event ledger
+    is redirected (test/sandbox) but the backlog target is STILL the real,
+    unredirected Founder-OS default -- see _backlog_write_would_leak()."""
     try:
+        if _backlog_write_would_leak():
+            log.warning(
+                "code_queue: refusing to write the real Founder-OS backlog -- "
+                "the event ledger is redirected but the backlog target is not "
+                "(test/sandbox isolation mismatch; see the 2026-07-30 incident)"
+            )
+            return False
         text = render_backlog_text(items)
         drive_io.write_text_atomic(backlog_path(), text)
         return True

@@ -22,6 +22,27 @@ from cora import knowledge_gaps as kg
 from cora import phi_guard
 
 
+@pytest.fixture
+def isolate_backlog_writes(tmp_path, monkeypatch):
+    """Belt-and-suspenders isolation for any test that drives cq._capture() to a
+    successful (non-dropped) new-item persist: _capture unconditionally calls
+    _render_backlog_safe() -> render_backlog() -> drive_io.write_text_atomic(
+    backlog_path(), ...) afterward. Without this, a test that only redirects the
+    event ledger (not FOUNDER_OS_ROOT / drive_io) writes to the REAL live
+    G:\\...\\code-session-backlog.md -- exactly the 2026-07-30 incident (item
+    cq-96fdd1850605, a LEX-redacted TEST title). code_queue.render_backlog()'s
+    own leak guard (_backlog_write_would_leak) is defense-in-depth for THIS
+    exact mismatch; tests still isolate properly rather than relying on it."""
+    monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path / "founder-os"))
+
+    def _plain_write(path, text, **kw):
+        from pathlib import Path as _P
+        _P(path).parent.mkdir(parents=True, exist_ok=True)
+        _P(path).write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(cq.drive_io, "write_text_atomic", _plain_write)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # is_capability_ask -- deterministic classifier
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,7 +211,8 @@ def test_is_any_phi_catches_billing_status_without_clinical_keyword():
     assert phi_guard.is_any_phi(_LEX_BILLING_TEXT) is True
 
 
-def test_capture_drops_billing_status_phi_via_parity_raise(tmp_path, monkeypatch):
+def test_capture_drops_billing_status_phi_via_parity_raise(
+        tmp_path, monkeypatch, isolate_backlog_writes):
     monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
     monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "cq-fp.jsonl")
     rec = {
@@ -208,7 +230,8 @@ def test_capture_drops_billing_status_phi_via_parity_raise(tmp_path, monkeypatch
 # ─────────────────────────────────────────────────────────────────────────────
 # Fork 3b -- LEX title/summary/fix_sketch redaction at capture + render + MCP
 # ─────────────────────────────────────────────────────────────────────────────
-def test_capture_redacts_lex_title_summary_fix_sketch(tmp_path, monkeypatch):
+def test_capture_redacts_lex_title_summary_fix_sketch(
+        tmp_path, monkeypatch, isolate_backlog_writes):
     monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "cq-events.jsonl")
     monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "cq-fp.jsonl")
     rec = {

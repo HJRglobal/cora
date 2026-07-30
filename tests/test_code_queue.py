@@ -592,6 +592,54 @@ def test_backlog_render_failsoft(qenv, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2026-07-30 incident guard: an isolated (redirected) ledger must never render
+# into the REAL, unredirected Founder-OS backlog file
+# ─────────────────────────────────────────────────────────────────────────────
+def test_backlog_leak_guard_refuses_when_ledger_redirected_but_target_real(
+        tmp_path, monkeypatch):
+    """The exact 2026-07-30 mismatch: _EVENT_LEDGER points at an isolated tmp
+    ledger (as any test/sandbox does) but FOUNDER_OS_ROOT/backlog_path() is
+    STILL the real, unredirected default -- render_backlog() must refuse the
+    write outright rather than rendering an isolated ledger into the live
+    Founder-OS Drive file (item cq-96fdd1850605, a LEX-redacted TEST title,
+    rendered into the real G:\\...\\code-session-backlog.md this way). The write
+    function itself is patched to RAISE if ever called, so a bug in the guard
+    fails this test loudly instead of silently touching the real drive."""
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "isolated-ledger.jsonl")
+    monkeypatch.delenv("FOUNDER_OS_ROOT", raising=False)
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError(
+            "drive_io.write_text_atomic must NEVER be called in the leak scenario")
+    monkeypatch.setattr(cq.drive_io, "write_text_atomic", _must_not_be_called)
+
+    assert cq._backlog_write_would_leak() is True
+    assert cq.render_backlog() is False
+
+
+def test_backlog_leak_guard_does_not_trip_when_fully_isolated(qenv):
+    """A properly isolated caller (ledger AND FOUNDER_OS_ROOT both redirected --
+    the qenv fixture's normal shape) must NOT trip the guard -- only the
+    ledger-redirected-but-target-real MISMATCH does."""
+    assert cq._backlog_write_would_leak() is False
+    cq.seed_item(kind="bug", severity="P1", title="Beta", summary="s",
+                 entity="F3E", signal="tool_error", status="APPROVED")
+    assert cq.render_backlog() is True
+
+
+def test_backlog_leak_guard_does_not_trip_when_ledger_not_redirected(monkeypatch):
+    """If _EVENT_LEDGER is (explicitly, for this test) at its real default, the
+    guard must not block a write purely because FOUNDER_OS_ROOT differs -- it
+    only trips on the redirected-ledger + real-target MISMATCH, never on the
+    target alone. (The suite's own autouse fixture normally redirects
+    _EVENT_LEDGER for every test -- this test explicitly restores the real
+    default to isolate the OTHER half of the guard's condition.)"""
+    monkeypatch.setattr(cq, "_EVENT_LEDGER", cq._DEFAULT_EVENT_LEDGER)
+    monkeypatch.delenv("FOUNDER_OS_ROOT", raising=False)
+    assert cq._backlog_write_would_leak() is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Prompt generator
 # ─────────────────────────────────────────────────────────────────────────────
 def test_prompt_filename_kb_excluded(qenv):
