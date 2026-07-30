@@ -292,14 +292,20 @@ class TestConfirmFlow:
         assert rec["variant"] == _PURE_LABEL and rec["location"] == _OFFICE
         assert rec["old"] == 202 and rec["new"] == 203
 
-    def test_confirm_no_pending_re_previews(self):
+    def test_confirm_no_pending_refuses(self):
+        """Slice 1 (contract change): a confirm with NO pending REFUSES truthfully; it
+        must NOT re-derive a fresh action from the model's echoed args (the 2026-07-28
+        direction-flip vector). Previously this re-previewed."""
         with ExitStack() as s:
             m_set = _stub(s, current=202)
             r = _confirm(product="pure original 12", location="office", quantity=203)
             m_set.assert_not_called()
             assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
+            assert "don't have a pending" in r.lower()
 
-    def test_ttl_expiry_re_previews(self):
+    def test_ttl_expiry_refuses(self):
+        """Slice 1 (contract change): an EXPIRED pending is treated as no pending ->
+        refuse, never a silent re-derive from the confirm-turn args."""
         with ExitStack() as s:
             m_set = _stub(s, current=202)
             _preview(product="pure original 12", location="office", quantity=203)
@@ -309,6 +315,7 @@ class TestConfirmFlow:
             r = _confirm(product="pure original 12", location="office", quantity=203)
             m_set.assert_not_called()
             assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
+            assert "don't have a pending" in r.lower()
 
     def test_quantity_drift_re_previews(self):
         with ExitStack() as s:
@@ -375,6 +382,80 @@ class TestConfirmFlow:
             r = _confirm()
             assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
             assert "WRITE_CONFIRMED" not in r
+
+
+# ── Slice 1 (2026-07-29 audit): absolute-set sanity guard + no-flip on confirm ──
+
+class TestSanityGuard:
+    def test_absurd_absolute_refused_not_staged(self):
+        """Incident 1 (2026-07-21): a '-1 case' request previewed 535 -> 5003 (the model
+        computed an absolute off a hallucinated base). It must refuse-and-flag, never
+        surface as a normal 'say confirm' prompt, and never stash a pending."""
+        with ExitStack() as s:
+            m_set = _stub(s, current=535)
+            r = _preview(product="pure original 12", location="office", quantity=5003)
+            m_set.assert_not_called()
+            assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
+            assert "far larger than a normal" in r
+            assert not has_pending_shopify_write(_ALEX, _CHAN)
+
+    def test_large_explicit_delta_allowed(self):
+        """Escape hatch: the SAME 535 -> 5003 change stated as an explicit add (delta)
+        carries real intent, is NOT refused, and previews + confirms normally."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[535, 535], set_result=5003)
+            r1 = _preview(product="pure original 12", location="office", delta=4468)
+            assert r1.startswith("WRITE_BLOCKED") and "535 -> 5003" in r1
+            assert has_pending_shopify_write(_ALEX, _CHAN)
+            r2 = _confirm()
+            m_set.assert_called_once_with(52999599030592, 81567023424, 5003)
+            assert r2.startswith("WRITE_CONFIRMED")
+
+    def test_moderate_absolute_set_allowed(self):
+        """A normal restock (100 -> 150) is well under the guard and passes untouched."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[100, 100], set_result=150)
+            r1 = _preview(product="pure original 12", location="office", quantity=150)
+            assert r1.startswith("WRITE_BLOCKED") and "100 -> 150" in r1
+            r2 = _confirm()
+            m_set.assert_called_once_with(52999599030592, 81567023424, 150)
+            assert r2.startswith("WRITE_CONFIRMED")
+
+    def test_absurd_new_target_on_confirm_turn_refused(self):
+        """A valid small preview, then the model re-echoes an absurd number on the
+        confirm turn -> the re-preview path refuses it, never stashing an absurd target."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[535, 535])
+            _preview(product="pure original 12", location="office", quantity=536)
+            r = _confirm(product="pure original 12", location="office", quantity=5003)
+            m_set.assert_not_called()
+            assert r.startswith("WRITE_BLOCKED") and "far larger than a normal" in r
+
+    def test_direction_flip_on_lost_pending_refuses(self):
+        """Incident 3 (2026-07-28): a removal was previewed, the pending was lost
+        (TTL/restart), and the confirm turn re-derived an OPPOSITE addition preview. A
+        confirm with no live pending now refuses -- it can never silently flip direction."""
+        with ExitStack() as s:
+            m_set = _stub(s, current=198)
+            r0 = _preview(product="pure original 12", location="office", delta=-1)
+            assert "198 -> 197" in r0
+            # Simulate a restart / TTL loss clearing the in-memory pending store.
+            tool_dispatch._PENDING_SHOPIFY_WRITES.clear()
+            # The model, on the confirm turn, fabricates the OPPOSITE (an addition).
+            r = _confirm(product="pure original 12", location="office", delta=1)
+            m_set.assert_not_called()
+            assert r.startswith("WRITE_BLOCKED") and "don't have a pending" in r.lower()
+            assert "197 -> 198" not in r  # no fabricated opposite-direction preview
+
+    def test_two_confirm_first_executes_with_valid_pending(self):
+        """Incident 2 (2026-07-28 08:24): with a VALID pending, the FIRST bare confirm
+        must execute -- never re-display the identical preview and demand a second."""
+        with ExitStack() as s:
+            m_set = _stub(s, levels=[197, 197], set_result=198)
+            _preview(product="pure original 12", location="office", delta=1)
+            r = _confirm()  # first bare confirm
+            m_set.assert_called_once_with(52999599030592, 81567023424, 198)
+            assert r.startswith("WRITE_CONFIRMED")
 
 
 # ── crash safety (review #1): a tool crash must be source-opaque + NOT WRITTEN ──

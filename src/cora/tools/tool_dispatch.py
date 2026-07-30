@@ -3503,6 +3503,46 @@ def _shopify_preview_text(
     )
 
 
+# --- Absolute-set sanity guard (Slice 1, 2026-07-29 audit) --------------------
+# The 2026-07-21 "-1 case" incident previewed "535 -> 5003": the model computed an
+# ABSOLUTE `quantity` off a stale/hallucinated base. This high-precision guard trips
+# ONLY when an absolute set moves stock by BOTH a large absolute amount AND a large
+# multiple of the current count -- ordinary restocks pass; a genuine order-of-magnitude
+# jump is held for re-confirmation, never silently staged. A DELTA op is NEVER checked
+# here: the delta IS the user's own stated magnitude.
+_INV_SANITY_MOVE_FLOOR = 1000
+_INV_SANITY_MULT = 5
+
+
+def _inv_absurd_absolute(current: int, target: int) -> bool:
+    """True when an absolute set jumps by both a large absolute amount (>= the floor)
+    and a large multiple of the current stock -- the signature of a hallucinated
+    absolute (the 535 -> 5003 bug)."""
+    try:
+        cur = int(current)
+        move = abs(int(target) - cur)
+    except (TypeError, ValueError):
+        return False
+    if move < _INV_SANITY_MOVE_FLOOR:
+        return False
+    return move > cur * _INV_SANITY_MULT
+
+
+def _inv_absurd_block_text(label: str, loc_name: str, current: int, target: int,
+                           unit: str) -> str:
+    """Source-opaque NOT-WRITTEN refusal for an absurd absolute set. Points the user at
+    an explicit add/remove (which carries their real intent and is not re-checked here),
+    so a genuine large change is guided through, never permanently blocked."""
+    move = abs(int(target) - int(current))
+    verb = "add" if int(target) > int(current) else "remove"
+    return _shopify_write_blocked(
+        f"{_NOT_WRITTEN}\nThat would set {label} at {loc_name} to {target} {unit} -- a "
+        f"change of {move} from the current {current}, far larger than a normal "
+        f"adjustment here. I did NOT stage it, in case the number is off. If you really "
+        f"mean a change this big, tell me as an add or remove (e.g. \"{verb} {move}\") "
+        f"and I'll preview it; otherwise restate the count.")
+
+
 def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = ""):
     """Validate + resolve ONE write target (shared by Phase 1, the Phase-2
     re-preview, and each row of a bulk request). Returns (blocked_str, None) on any
@@ -3612,6 +3652,13 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
                 f"{abs(delta)} would go below zero. The most I can remove is {current}."), None
     else:
         target = quantity
+        # Sanity guard (Slice 1): an ABSOLUTE set that jumps by an order of magnitude
+        # vs the live count is almost always a hallucinated absolute (535 -> 5003).
+        # Refuse WITHOUT stashing -- the user re-confirms via an explicit add/remove.
+        if _inv_absurd_absolute(current, target):
+            log.warning("f3e_shopify_set_inventory absurd absolute REFUSED user=%s item=%s "
+                        "cur=%s -> %s", slack_user_id, match.inventory_item_id, current, target)
+            return _inv_absurd_block_text(match.label, loc_name, current, target, unit), None
 
     # Optional belt-and-suspenders (NEVER a gate, HIGH-1): if the model echoed an
     # expected_item, log a soft normalized-mismatch but PROCEED -- the pending store's
@@ -3703,6 +3750,15 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
             variant_label=variant_label, location_name=loc_name,
             current=live, quantity=target, moved_from=preview_qty, unit=unit))
 
+    # Belt-and-suspenders (Slice 1): resolve/re-preview already guard every absolute
+    # stash path, so this should never fire -- but never WRITE an absurd absolute even
+    # if one somehow reached here (a delta op re-applied to fresh live is exempt: its
+    # magnitude is the user's own stated delta).
+    if delta is None and _inv_absurd_absolute(live, target):
+        log.warning("f3e_shopify_set_inventory absurd absolute at EXECUTE (blocked) user=%s "
+                    "item=%s cur=%s -> %s", slack_user_id, item_id, live, target)
+        return _inv_absurd_block_text(variant_label, loc_name, live, target, unit)
+
     try:
         new_available = shopify_client.set_inventory_level(item_id, loc_id, target)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
@@ -3741,7 +3797,13 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
     if live is None:
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
-    # A confirm-turn number is an absolute new target (delta cleared).
+    # A confirm-turn number is an absolute new target (delta cleared). Same absolute
+    # sanity guard as Phase 1 -- a model that re-echoes an absurd number on the confirm
+    # turn must never stash it (Slice 1).
+    if _inv_absurd_absolute(live, new_qty):
+        log.warning("f3e_shopify_set_inventory absurd new-target REFUSED user=%s item=%s "
+                    "cur=%s -> %s", slack_user_id, item_id, live, new_qty)
+        return _inv_absurd_block_text(variant_label, loc_name, live, new_qty, unit)
     _store_pending_shopify_write(slack_user_id, channel, {
         "inventory_item_id": item_id, "location_id": loc_id, "target_qty": new_qty,
         "preview_qty": live, "delta": None, "unit": unit,
@@ -4033,14 +4095,17 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             # User changed the number -> re-preview the NEW target against the SAME
             # resolved item/location (reuse the pending's ids; never dead-end).
             return _repreview_pending_new_target(slack_user_id, channel, pending, new_qty)
-        # No fresh pending (expired / never previewed / a machine restart cleared it)
-        # -> resolve fresh and re-preview.
-        if is_bulk:
-            return _resolve_and_preview_batch(slack_user_id, channel, items)
-        blocked, data = _shopify_resolve(slack_user_id, input_data, channel=channel)
-        if blocked:
-            return blocked
-        return _store_and_preview_shopify(slack_user_id, channel, data)
+        # No fresh pending to confirm (expired TTL / never previewed / a restart cleared
+        # the in-memory store). Do NOT re-resolve+preview a fresh action from the model's
+        # echoed args on a confirm turn (Slice 1): that is exactly what let a confirm
+        # re-derive an OPPOSITE-direction preview (2026-07-28 flip) or silently substitute
+        # a different pending than the one the user confirmed. Refuse truthfully; the user
+        # restates the change to get a fresh preview (F-23 doctrine: a no-pending "yes" is
+        # honest, never a fabricated action).
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nI don't have a pending inventory change to confirm -- it may "
+            f"have expired or already been applied. Tell me the change again (e.g. "
+            f"\"remove 1 case of Pure Original from the office\") and I'll preview it first.")
 
     # --- Phase 1: resolve + preview ------------------------------------------------
     if is_bulk:
