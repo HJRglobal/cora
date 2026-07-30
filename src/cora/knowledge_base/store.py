@@ -161,11 +161,27 @@ def _serialize_vec(embedding: list[float]) -> bytes:
 class KnowledgeBase:
     """High-level KB API. Wraps sqlite + sqlite-vec + OpenAI embeddings."""
 
-    def __init__(self, db_path: Path | str, check_same_thread: bool = True):
+    def __init__(
+        self,
+        db_path: Path | str,
+        check_same_thread: bool = True,
+        read_only: bool = False,
+    ):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = schema.connect(self.db_path, check_same_thread=check_same_thread)
-        schema.init_schema(self._conn)
+        self.read_only = read_only
+        if read_only:
+            # Read-only construction (see open_readonly): open mode=ro and SKIP
+            # both the parent mkdir and init_schema — those are writes and would
+            # fail on a read-only handle. The DB is created + schema-migrated by
+            # the live bot; a reader attaches to it as-is. If the DB file does not
+            # exist yet, the mode=ro open raises (correct: nothing to read).
+            self._conn = schema.connect(
+                self.db_path, check_same_thread=check_same_thread, read_only=True
+            )
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = schema.connect(self.db_path, check_same_thread=check_same_thread)
+            schema.init_schema(self._conn)
         # Lazily resolved on first search; cached for the life of the instance.
         # The migration runs with Cora stopped, so a fresh post-restart instance
         # always reads the correct value.
@@ -179,6 +195,27 @@ class KnowledgeBase:
         # ..._rowids"), so the legacy table is retained as a fallback and dropped later.
         self._partition_ready: bool | None = None
         self._search_bin: str | None = None
+
+    @classmethod
+    def open_readonly(
+        cls, db_path: Path | str, check_same_thread: bool = False
+    ) -> "KnowledgeBase":
+        """Open the KB read-only (SQLite ``mode=ro``) for a read surface.
+
+        The returned instance can call every READ method (``search``,
+        ``search_owned``, ``stats``, ``get_checkpoint``, ``get_chunks_since``,
+        ...) but any write (``upsert_documents``, ``set_checkpoint``,
+        ``set_sync_state``, ``delete_*``) raises ``sqlite3.OperationalError``
+        from the underlying read-only connection — the write path does not exist,
+        it is not merely refused. Used by the read-only MCP server so its surface
+        is read-only by construction.
+
+        ``check_same_thread`` defaults to False because the MCP server's sync tool
+        handlers run in a worker-thread pool; callers MUST serialize access to the
+        single connection with a lock (sqlite3 connections are not safe for
+        concurrent use even for reads).
+        """
+        return cls(db_path, check_same_thread=check_same_thread, read_only=True)
 
     def close(self) -> None:
         self._conn.close()

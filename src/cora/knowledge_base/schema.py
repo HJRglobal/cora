@@ -23,13 +23,43 @@ log = logging.getLogger(__name__)
 EMBEDDING_DIM = 1536  # text-embedding-3-small
 
 
-def connect(db_path: Path | str, check_same_thread: bool = True) -> sqlite3.Connection:
+def connect(
+    db_path: Path | str,
+    check_same_thread: bool = True,
+    read_only: bool = False,
+) -> sqlite3.Connection:
     """Open a sqlite connection with the vec0 extension loaded + WAL mode.
 
     check_same_thread=False is used for the long-lived shared KB instance that
     the prewarm thread creates and request threads reuse (access is serialized
     by a lock in context_loader, so concurrent use on one connection is safe).
+
+    read_only=True opens the database in SQLite ``mode=ro`` (a URI open). The
+    connection physically CANNOT write the main database — every ``INSERT`` /
+    ``UPDATE`` / ``DELETE`` / ``CREATE`` raises ``sqlite3.OperationalError:
+    attempt to write a readonly database``. It is the construction the read-only
+    MCP server (mcp_server.py) uses so its read surface is read-only by
+    construction, not merely by convention. A ``mode=ro`` reader can still read a
+    live WAL database (it builds the wal-index in shared memory), so it sees the
+    live bot's committed writes without blocking the writer. On the read-only
+    path we deliberately DO NOT issue the WAL/synchronous/foreign_keys pragmas —
+    those are writer-side settings (and journal_mode=WAL would attempt a write on
+    a read-only handle); only busy_timeout (a per-connection read-safe setting) is
+    applied.
     """
+    if read_only:
+        # file: URI open with mode=ro. Reader-only; never creates the DB.
+        conn = sqlite3.connect(
+            f"file:{Path(db_path).as_posix()}?mode=ro",
+            uri=True,
+            check_same_thread=check_same_thread,
+        )
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
     conn = sqlite3.connect(str(db_path), check_same_thread=check_same_thread)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
