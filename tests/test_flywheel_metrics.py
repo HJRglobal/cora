@@ -312,3 +312,130 @@ class TestHealthSurfaceWiring:
         msg = chr_mod.format_slack(report)
         assert "*Flywheel:*" in msg
         assert "knowledge DMs 7d 2" in msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fork 5a (Wave-1 flywheel-conversion calibration, 2026-07-30): conversion-of-
+# eligible rate, per lane; eligible-signal inflow; routing-completeness; T0
+# baseline read-through
+# ─────────────────────────────────────────────────────────────────────────────
+class TestWave1ConversionMetrics:
+    def test_eligible_signal_inflow_excludes_lex_and_capability(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("KNOWLEDGE_GAPS_LOG_PATH", raising=False)
+        recent = NOW - timedelta(days=2)
+        _write_jsonl(tmp_path / "logs" / "knowledge-gaps.jsonl", [
+            {"ts": recent.isoformat(), "entity": "F3E",
+             "question": "who is the Sprouts buyer?", "gap": "g"},
+            {"ts": recent.isoformat(), "entity": "LEX",
+             "question": "will RSP be affected by HNT?", "gap": "g"},
+            {"ts": recent.isoformat(), "entity": "FNDR",
+             "question": "can you check our RepRally wholesale listings?", "gap": "g"},
+        ])
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        assert m["eligible_signal_inflow_7d"] == 1
+
+    def test_conversions_by_lane_splits_mining_vs_escalation_and_efficiency(
+            self, tmp_path, monkeypatch):
+        recent = NOW - timedelta(days=2)
+        _write_jsonl(tmp_path / "data" / "cora-proposed-memory-updates.jsonl", [
+            {"update_id": "gapfill-mined", "update_type": "known_answer",
+             "state": "APPROVED", "resolved_at": recent.isoformat(),
+             "payload": {"answer_source": "slack_kb"}},
+            {"update_id": "gapfill-asked", "update_type": "known_answer",
+             "state": "APPROVED", "resolved_at": recent.isoformat(),
+             "payload": {"answer_source": "teammate_dm"}},
+            {"update_id": "friction-1", "update_type": "efficiency",
+             "state": "APPROVED", "resolved_at": recent.isoformat()},
+            # Not APPROVED -> not a conversion.
+            {"update_id": "gapfill-pending", "update_type": "known_answer",
+             "state": "PENDING", "proposed_at": recent.isoformat()},
+        ])
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        assert m["conversions_by_lane_7d"] == {
+            "known_answer_mined": 1, "known_answer_escalation_asker": 1,
+            "friction_efficiency": 1, "decision_staged": 0,
+        }
+
+    def test_code_queue_routings_tracked_separately_not_in_knowledge_numerator(
+            self, tmp_path):
+        recent = NOW - timedelta(days=2)
+        old = NOW - timedelta(days=20)
+        _write_jsonl(tmp_path / "data" / "state" / "code-session-queue.jsonl", [
+            {"event": "captured", "id": "cq-1", "ts": recent.isoformat(),
+             "signal": "capability", "entity": "FNDR"},
+            {"event": "captured", "id": "cq-2", "ts": recent.isoformat(),
+             "signal": "capability", "entity": "LEX"},
+            {"event": "captured", "id": "cq-3", "ts": old.isoformat(),
+             "signal": "capability", "entity": "FNDR"},  # outside window
+            {"event": "captured", "id": "cq-4", "ts": recent.isoformat(),
+             "signal": "tool_error", "entity": "F3E"},  # not capability
+        ])
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        assert m["code_queue_capability_routed_7d"] == 2
+        # Never folded into the knowledge-conversion numerator.
+        assert "code_queue_capability_routed_7d" not in m["conversions_by_lane_7d"]
+
+    def test_gap_routing_completeness_routed_vs_rotting(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("KNOWLEDGE_GAPS_LOG_PATH", raising=False)
+        old1 = NOW - timedelta(days=10)
+        old2 = NOW - timedelta(days=12)
+        old3 = NOW - timedelta(days=15)
+        recent = NOW - timedelta(days=1)  # within 7d -- excluded from the >7d count
+        _write_jsonl(tmp_path / "logs" / "knowledge-gaps.jsonl", [
+            {"ts": old1.isoformat(), "entity": "F3E", "question": "q1", "gap": "g"},
+            {"ts": old2.isoformat(), "entity": "OSN", "question": "q2", "gap": "g"},
+            {"ts": old3.isoformat(), "entity": "FNDR", "question": "q3", "gap": "g"},
+            {"ts": recent.isoformat(), "entity": "F3E", "question": "q4", "gap": "g"},
+        ])
+        # old1 resolved; old2 has an autofill state entry; old3 has neither (rotting).
+        _write_jsonl(tmp_path / "design" / "known-answers" / ".resolved-gaps.jsonl", [
+            {"id": old1.isoformat(), "action": "answer"},
+        ])
+        (tmp_path / "data" / "state").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "data" / "state" / "gap_autofill_state.json").write_text(
+            json.dumps({old2.isoformat(): {"state": "proposed"}}), encoding="utf-8")
+
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        routing = m["gap_routing_completeness_7d"]
+        assert routing["total_over_7d"] == 3
+        assert routing["routed"] == 2
+        assert routing["rotting"] == 1
+
+    def test_t0_baseline_passthrough(self, tmp_path):
+        baseline = {
+            "computed_at": "2026-07-30T12:00:00+00:00",
+            "eligible_open_count": 0,
+            "disposition_counts": {"walled-permanent": 6, "capability": 5, "expire": 2},
+        }
+        (tmp_path / "data" / "state").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "data" / "state" / "flywheel-t0-baseline.json").write_text(
+            json.dumps(baseline), encoding="utf-8")
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        assert m["t0_baseline"] == baseline
+
+    def test_t0_baseline_none_when_absent(self, tmp_path):
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        assert m["t0_baseline"] is None
+
+    def test_format_lines_surfaces_wave1_fields(self):
+        lines = fm.format_lines({
+            "available": True, "gaps_by_detector": {}, "gaps_last_entry_age_days": None,
+            "eligible_signal_inflow_7d": 2,
+            "conversions_by_lane_7d": {
+                "known_answer_mined": 1, "known_answer_escalation_asker": 0,
+                "friction_efficiency": 0, "decision_staged": 0,
+            },
+            "code_queue_capability_routed_7d": 3,
+            "gap_routing_completeness_7d": {
+                "total_over_7d": 5, "routed": 4, "rotting": 1,
+            },
+            "t0_baseline": {"computed_at": "2026-07-30", "eligible_open_count": 0,
+                           "disposition_counts": {}},
+        })
+        blob = "\n".join(lines)
+        assert "eligible-signal inflow, 7d: 2" in blob
+        assert "known_answer_mined=1" in blob
+        assert "code-queue capability routings, 7d: 3" in blob
+        assert "NOT a knowledge conversion" in blob
+        assert "4/5 routed, 1 rotting" in blob
+        assert "T0 baseline" in blob

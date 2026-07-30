@@ -94,6 +94,11 @@ def _paths(repo_root: Path | None = None) -> dict[str, Path]:
         "shadow_dir": Path(os.environ.get("CORA_GRADUATED_SHADOW_DIR")
                            or root / "logs"),
         "baseline": root / "data" / "health-flywheel-baseline.json",
+        # Fork 5a (Wave-1 flywheel-conversion calibration, 2026-07-30):
+        "resolved_gaps": Path(os.environ.get("RESOLVED_GAPS_PATH")
+                              or root / "design" / "known-answers" / ".resolved-gaps.jsonl"),
+        "code_queue_ledger": root / "data" / "state" / "code-session-queue.jsonl",
+        "t0_baseline": root / "data" / "state" / "flywheel-t0-baseline.json",
     }
 
 
@@ -297,7 +302,146 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     except Exception as exc:  # noqa: BLE001
         log.warning("flywheel_metrics: baseline handling failed: %s", exc)
 
+    # -- Fork 5a (Wave-1 flywheel-conversion calibration, 2026-07-30) ----------
+    # Conversion-of-ELIGIBLE rate, per lane -- not absolute volume (inflow is
+    # ~1-3/wk; an absolute-N target manufactures false failure at this scale).
+    # Code-queue routings are tracked under a SEPARATE denominator, never folded
+    # into the knowledge-conversion numerator (see section 0 framing in the
+    # 2026-07-30 handoff doc). Fail-soft: any error here degrades this section
+    # only, never the metrics already collected above.
+    try:
+        out.update(_collect_wave1_conversion_metrics(cutoff, p))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("flywheel_metrics: wave1 conversion metrics failed: %s", exc)
+        out["wave1_conversion_error"] = str(exc)
+
     return out
+
+
+def _collect_wave1_conversion_metrics(cutoff: datetime, p: dict[str, Path]) -> dict:
+    """Fork 5a gauges: eligible-signal inflow, per-lane knowledge conversions,
+    code-queue routing-completeness (separate denominator), gap routing-
+    completeness (>7d-old gaps that have SOME disposition vs none), and a
+    read-through of the STEP-0 T0 baseline snapshot if present. Never raises --
+    the caller wraps this in a try/except, but each sub-section is independently
+    fail-soft too so one broken source never blanks the rest."""
+    from . import gap_autofill as _ga
+    from . import knowledge_gaps as _kg
+
+    out: dict = {}
+
+    # Eligible-signal inflow, 7d: new gap-log rows that are NOT LEX (walled) and
+    # NOT capability-ask-shaped (post-Fork-3a these no longer even reach the gap
+    # log, but the check stays as defense-in-depth for any pre-fix stragglers).
+    # ACCEPTED APPROXIMATION (documented, not silent): this does not attempt to
+    # detect the finance / DM-test walled classes -- no reliable deterministic
+    # signal exists for those, and STEP 0's one-time hand triage is authoritative
+    # for the T0 denominator. This is a LEADING INDICATOR, not an exact count.
+    try:
+        eligible_inflow = 0
+        for rec in _iter_jsonl(p["gaps_log"]):
+            ts = _parse_iso(rec.get("ts") or "")
+            if not ts or ts < cutoff:
+                continue
+            entity = str(rec.get("entity") or "FNDR").strip().upper()
+            if entity.startswith("LEX"):
+                continue
+            if _kg.is_capability_ask(rec.get("question") or ""):
+                continue
+            eligible_inflow += 1
+        out["eligible_signal_inflow_7d"] = eligible_inflow
+    except Exception:  # noqa: BLE001
+        out["eligible_signal_inflow_7d"] = None
+
+    # Per-lane knowledge conversions, 7d -- state=="APPROVED" (Harrison's
+    # thumbs-up) within the window, split by update_type/answer_source. Code-
+    # queue routings NEVER count here (tracked separately below).
+    conversions = {
+        "known_answer_mined": 0, "known_answer_escalation_asker": 0,
+        "friction_efficiency": 0,
+        # Fork 4 (decisions lane) is NOT built in Wave 1 -- always 0 until its
+        # own dedicated session ships; kept here so the shape is stable for the
+        # 2-week review from day one.
+        "decision_staged": 0,
+    }
+    try:
+        for path in (p["ledger_live"], p["ledger_archive"]):
+            for rec in _iter_jsonl(path):
+                if rec.get("state") != "APPROVED":
+                    continue
+                resolved_at = _parse_iso(rec.get("resolved_at") or "")
+                if not resolved_at or resolved_at < cutoff:
+                    continue
+                ut = rec.get("update_type")
+                if ut == "known_answer":
+                    payload = rec.get("payload") or {}
+                    if payload.get("answer_source") == "teammate_dm":
+                        conversions["known_answer_escalation_asker"] += 1
+                    else:
+                        conversions["known_answer_mined"] += 1
+                elif ut == "efficiency":
+                    conversions["friction_efficiency"] += 1
+        out["conversions_by_lane_7d"] = conversions
+    except Exception:  # noqa: BLE001
+        out["conversions_by_lane_7d"] = conversions
+
+    # Code-queue routing, 7d -- a SEPARATE denominator (routing-completeness),
+    # never folded into the knowledge numerator above.
+    try:
+        capability_routed = 0
+        for rec in _iter_jsonl(p["code_queue_ledger"]):
+            if rec.get("event") != "captured" or rec.get("signal") != "capability":
+                continue
+            ts = _parse_iso(rec.get("ts") or "")
+            if ts and ts >= cutoff:
+                capability_routed += 1
+        out["code_queue_capability_routed_7d"] = capability_routed
+    except Exception:  # noqa: BLE001
+        out["code_queue_capability_routed_7d"] = None
+
+    # Gap routing-completeness: of every gap-log row older than 7d, how many
+    # have SOME disposition (resolved -- answered/expired/capability_routed --
+    # or an autofill state entry -- proposed/asked/exhausted) vs none at all
+    # (silently rotting, the state Fork 5 must make visible).
+    try:
+        resolved_ids = _resolved_ids_from(p["resolved_gaps"])
+        state_ids = set(_json_object(p["gap_autofill_state"]).keys())
+        total_over_7d = routed = 0
+        for rec in _iter_jsonl(p["gaps_log"]):
+            ts = _parse_iso(rec.get("ts") or "")
+            if not ts or ts >= cutoff:
+                continue
+            total_over_7d += 1
+            gid = rec.get("ts", "")
+            if gid in resolved_ids or gid in state_ids:
+                routed += 1
+        out["gap_routing_completeness_7d"] = {
+            "total_over_7d": total_over_7d, "routed": routed,
+            "rotting": max(0, total_over_7d - routed),
+        }
+    except Exception:  # noqa: BLE001
+        out["gap_routing_completeness_7d"] = None
+
+    # T0 baseline read-through (written once by STEP 0's triage script) -- lets
+    # the 2-week review compute a real before/after delta. None if not yet run.
+    try:
+        out["t0_baseline"] = _json_object(p["t0_baseline"]) or None
+    except Exception:  # noqa: BLE001
+        out["t0_baseline"] = None
+
+    return out
+
+
+def _resolved_ids_from(path: Path) -> set[str]:
+    return {str(rec.get("id")) for rec in _iter_jsonl(path) if rec.get("id")}
+
+
+def _json_object(path: Path) -> dict:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -366,4 +510,33 @@ def format_lines(metrics: dict) -> list[str]:
         f"(routed={metrics.get('routed_to_owner_7d', '?')}, "
         f"expired_unrouted={metrics.get('expired_unrouted_7d', '?')})",
     ]
+    # Fork 5a (Wave-1 flywheel-conversion calibration): conversion-of-eligible,
+    # per lane -- surfaced alongside the leading inflow indicator so a low
+    # conversion count is read against available supply, not in a vacuum.
+    conv = metrics.get("conversions_by_lane_7d")
+    if conv is not None:
+        conv_str = ", ".join(f"{k}={v}" for k, v in conv.items())
+        lines.append(
+            f"eligible-signal inflow, 7d: {metrics.get('eligible_signal_inflow_7d', '?')} "
+            f"| knowledge conversions by lane, 7d: {conv_str}"
+        )
+    cq_routed = metrics.get("code_queue_capability_routed_7d")
+    if cq_routed is not None:
+        lines.append(
+            f"code-queue capability routings, 7d: {cq_routed} "
+            "(separate denominator -- NOT a knowledge conversion)"
+        )
+    routing = metrics.get("gap_routing_completeness_7d")
+    if routing is not None:
+        lines.append(
+            f"gap routing-completeness (>7d old): {routing['routed']}/"
+            f"{routing['total_over_7d']} routed, {routing['rotting']} rotting"
+        )
+    t0 = metrics.get("t0_baseline")
+    if t0:
+        lines.append(
+            f"T0 baseline ({t0.get('computed_at', '?')}): "
+            f"eligible_open={t0.get('eligible_open_count', '?')} "
+            f"disposition={t0.get('disposition_counts', {})}"
+        )
     return lines
