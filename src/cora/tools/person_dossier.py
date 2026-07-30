@@ -535,6 +535,7 @@ def _synthesize(p: PersonIdentity, signals: str, days: int, client: Any) -> Opti
         resp = client.messages.create(
             model=_SYNTH_MODEL,
             max_tokens=_SONNET_MAX_TOKENS,
+            thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()

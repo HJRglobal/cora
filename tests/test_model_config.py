@@ -6,8 +6,9 @@ single-source-of-truth wiring so a future edit can't silently:
   - fork one of the derived sites back onto a hardcoded model, or
   - accidentally fold the AI-visibility measurement engine into the flip.
 
-The defaults keep every value identical to the pre-refresh literals, so this
-file is green whether or not Harrison has flipped .env.
+Assertions test the RESOLVER + the literal default constant, never the import-time
+constant against a fixed string, so this file stays green whether or not Harrison has
+flipped CORA_SONNET_MODEL in the real .env (D-051 remediation).
 """
 
 from __future__ import annotations
@@ -62,10 +63,12 @@ def test_single_source_values_equal():
     assert model_router.DEFAULT_MODEL == model_router.MODEL_SONNET
 
 
-def test_default_env_values_are_sonnet_4_6(monkeypatch):
-    # Guard the offline default explicitly (conftest never sets CORA_SONNET_MODEL).
-    assert model_router.MODEL_SONNET == "claude-sonnet-4-6"
-    assert claude_client._MODEL == "claude-sonnet-4-6"
+def test_code_default_is_sonnet_4_6():
+    # The FLIP is opt-in: the code default (used when CORA_SONNET_MODEL is unset) must
+    # stay 4.6, so a merge never silently moves the hot path to 5. This asserts the literal
+    # default constant + the resolver-with-no-env, NOT the import-time constant -- so it
+    # stays green after Harrison flips the real .env (that's a config change, not a code one).
+    assert model_router._SONNET_DEFAULT == "claude-sonnet-4-6"
 
 
 def test_wiring_is_structural():
@@ -91,7 +94,11 @@ def test_reload_picks_up_env(monkeypatch):
     finally:
         monkeypatch.delenv("CORA_SONNET_MODEL", raising=False)
         importlib.reload(model_router)
-        assert model_router.MODEL_SONNET == "claude-sonnet-4-6"
+        # Restore to a CONSISTENT state, not a fixed literal: the reload re-runs
+        # load_dotenv, so if the real .env carries CORA_SONNET_MODEL (post-flip) the
+        # constant resolves to that value -- and so does the resolver. Asserting they
+        # MATCH is flip-safe; asserting == "claude-sonnet-4-6" would break post-flip.
+        assert model_router.MODEL_SONNET == model_router._resolve_sonnet_model()
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +147,43 @@ def test_opus_wiring_structural():
 
 def test_opus_call_has_no_sampling_params():
     """Sonnet-5/Opus-5 reject non-default temperature/top_p/top_k. Pin that the
-    sales-deck create() call carries none (guards a future accidental add)."""
+    sales-deck create() call carries none (guards a future accidental add). thinking is
+    the ONE allowed param (disabled) -- excluded from the banned set below."""
     sdc = (_SRC / "tools" / "sales_deck_client.py").read_text(encoding="utf-8")
     # Locate the messages.create(...) block for the deck synthesis call.
     idx = sdc.index("model=_OPUS_MODEL")
-    window = sdc[idx: idx + 300]
-    for banned in ("temperature", "top_p", "top_k", "thinking", "budget_tokens"):
+    window = sdc[idx: idx + 400]
+    for banned in ("temperature", "top_p", "top_k", "budget_tokens"):
         assert banned not in window, f"unexpected {banned} on the opus call"
+
+
+# ---------------------------------------------------------------------------
+# D-051: every flippable Sonnet/Opus call site MUST disable thinking
+# ---------------------------------------------------------------------------
+# Sonnet 5 / Opus 5 run adaptive thinking by default and share the max_tokens budget
+# with the visible answer, so a call that omits `thinking` truncates/blanks after the
+# flip (silent, no exception). Each site below resolves to the flippable model and must
+# carry thinking={"type":"disabled"}. Windowed so a NEW call in one of these files is
+# caught too. The Haiku call in code_queue (model=_HAIKU_MODEL) is intentionally not a
+# marker -- Haiku is not flipped and defaults to no thinking.
+_FLIPPABLE_CALL_SITES = [
+    ("claude_client.py", "model=effective_model"),
+    ("strategy_memo.py", "model=SONNET_MODEL"),
+    ("code_queue.py", "model=_SONNET_MODEL"),
+    ("channel_synthesis.py", "model=sm.SONNET_MODEL"),
+    ("tools/person_dossier.py", "model=_SYNTH_MODEL"),
+    ("tools/sales_deck_client.py", "model=_OPUS_MODEL"),
+]
+
+
+@pytest.mark.parametrize("relpath,marker", _FLIPPABLE_CALL_SITES)
+def test_flippable_call_sites_disable_thinking(relpath, marker):
+    lines = (_SRC / relpath).read_text(encoding="utf-8").splitlines()
+    hits = [i for i, ln in enumerate(lines) if marker in ln]
+    assert hits, f"marker {marker!r} not found in {relpath} -- call site moved/renamed?"
+    for i in hits:
+        window = "\n".join(lines[max(0, i - 3): i + 8])
+        assert '"type": "disabled"' in window or "_THINKING_DISABLED" in window, (
+            f"{relpath}: the {marker!r} call near line {i + 1} does not disable thinking "
+            f"-- it will truncate/blank on a Sonnet-5/Opus-5 flip (D-051)"
+        )

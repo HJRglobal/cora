@@ -351,6 +351,10 @@ If location/territory is known, tailor any regional references accordingly.
     response = client.messages.create(
         model=_OPUS_MODEL,
         max_tokens=4096,
+        # D-051: Opus 5 thinks by default + shares the max_tokens budget; disable it (accepted
+        # only at effort <= high, and no effort is set here so the default is high -> fine). Also
+        # keeps response.content[0] a text block for the parse below (a thinking block would break it).
+        thinking={"type": "disabled"},
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )

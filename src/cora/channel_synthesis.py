@@ -221,6 +221,7 @@ def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
         response = client.messages.create(
             model=sm.SONNET_MODEL,
             max_tokens=sm._SYNTH_MAX_TOKENS,
+            thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
             messages=[{"role": "user", "content": prompt_text}],
         )
         text = (response.content[0].text or "").strip()

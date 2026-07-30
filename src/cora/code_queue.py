@@ -1164,6 +1164,7 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
             client = anthropic.Anthropic(api_key=api_key)
             resp = client.messages.create(
                 model=_SONNET_MODEL, max_tokens=2000, system=_PROMPT_SYS,
+                thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
                 messages=[{"role": "user", "content":
                            f"Slug: {slug}\nItems to cover:\n{evidence}"}],
             )

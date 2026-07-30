@@ -32,6 +32,16 @@ _MODEL = MODEL_SONNET  # default Sonnet -- single source of truth is
                        # model_router.MODEL_SONNET (CORA_SONNET_MODEL-overridable).
                        # Per-request override via the `model` kwarg (app.py passes
                        # the router's choice; this is the fallback when it doesn't).
+
+# Sonnet 5 / Opus 5 run adaptive thinking BY DEFAULT when `thinking` is omitted, and
+# `max_tokens` is a HARD cap on thinking + visible output COMBINED -- so after a flip to
+# claude-sonnet-5 a non-trivial query would spend thinking tokens against the 1024 cap and
+# truncate/blank the reply (stop_reason=max_tokens), with no exception raised (D-051). We
+# want fast, deterministic Slack replies with the current tight cap, so thinking is disabled
+# explicitly. Verified accepted (no-op) on claude-sonnet-4-6 AND claude-haiku-4-5, so this is
+# safe on both hot-path models today and flip-safe for Sonnet 5. Enabling thinking is a
+# separate, deliberate change (raise max_tokens + accept latency), out of scope here.
+_THINKING_DISABLED = {"type": "disabled"}
 _MAX_TOKENS = 1024  # lowered 2048→1024 on 2026-05-21 — Cora replies are almost
                     # always <500 tokens; tighter ceiling = faster streaming + lower
                     # tail latency. If a reply gets clipped at max_tokens, bump back up.
@@ -960,6 +970,7 @@ def generate_response(
             messages=messages,
             tools=cached_tools,
             timeout=_TIMEOUT,
+            thinking=_THINKING_DISABLED,  # D-051: keep thinking off (see _THINKING_DISABLED)
         )
         _apply_forced_tool(create_kwargs, force_tool, iteration, cached_tools)
         response = _create_with_retry(**create_kwargs)
@@ -1125,6 +1136,7 @@ def generate_response_streaming(
             messages=messages,
             tools=cached_tools,
             timeout=_TIMEOUT,
+            thinking=_THINKING_DISABLED,  # D-051: keep thinking off (see _THINKING_DISABLED)
         )
         _apply_forced_tool(stream_kwargs, force_tool, iteration, cached_tools)
         try:

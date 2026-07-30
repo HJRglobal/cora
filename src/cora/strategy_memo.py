@@ -816,6 +816,7 @@ def synthesize_memo(facts_text: str) -> str | None:
         response = client.messages.create(
             model=SONNET_MODEL,
             max_tokens=_SYNTH_MAX_TOKENS,
+            thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
             messages=[{"role": "user",
                        "content": _SYNTH_PROMPT.format(facts=facts_text)}],
         )
