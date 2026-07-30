@@ -1,0 +1,13 @@
+{
+  "//": "Template for Claude Code MCP registration of Cora's read-only server.",
+  "//1": "Harrison registers this: copy to the repo root as .mcp.json (a connector",
+  "//2": "write is his action). Claude Code launches the command from the workspace",
+  "//3": "root; the server derives its own repo root + .env from its file location,",
+  "//4": "so it is cwd-independent. See deployment/mcp-server-registration.md.",
+  "mcpServers": {
+    "cora": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["scripts\\run_mcp_server.py"]
+    }
+  }
+}
