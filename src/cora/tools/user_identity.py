@@ -254,19 +254,27 @@ def slack_mention(slack_user_id: str) -> str:
 
 # Matches both the proper <@U…> mention and the bare <U…> token that swept content
 # sometimes carries (a synthesis line that quoted a user id without the @).
-_EMBEDDED_MENTION_RE = re.compile(r"<@?(U[A-Z0-9]{6,})>")
+_EMBEDDED_MENTION_RE = re.compile(r"<(@?)(U[A-Z0-9]{6,})>")
 
 
 def resolve_slack_mentions(text: str) -> str:
     """Replace raw Slack user tokens embedded in free text -- both ``<@U…>`` and the
     bare ``<U…>`` form -- with a friendly ``@name``. An unmapped id is STRIPPED rather
     than leaked, so swept content quoted into a person-facing card never shows a raw
-    ``<U…>`` token (Slice 3, 2026-07-29 audit)."""
+    ``<U…>`` token (Slice 3, 2026-07-29 audit).
+
+    A bare ``<U…>`` (no ``@``) is only treated as a mention when it LOOKS like a real
+    Slack id (contains a digit) -- so an angle-bracketed placeholder word like
+    ``<USERNAME>`` / ``<UPDATED>`` / ``<UNKNOWN>`` is left intact, not silently deleted
+    (D-051 remediation). The ``<@U…>`` form is always resolved (it is explicitly a
+    mention)."""
     if not text or "<" not in text:
         return text
 
     def _sub(m: "re.Match[str]") -> str:
-        sid = m.group(1)
+        at, sid = m.group(1), m.group(2)
+        if not at and not any(ch.isdigit() for ch in sid):
+            return m.group(0)  # a bare all-letters <UWORD> is not a real id -- keep it
         name = display_name(sid)
         return f"@{name}" if name and name != sid else ""
 

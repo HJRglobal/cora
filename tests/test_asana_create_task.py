@@ -437,11 +437,12 @@ def test_create_task_stale_explicit_date_warns_in_preview():
 
 def test_create_task_relative_due_flows_resolved_to_client():
     """Slice 4: 'tomorrow' resolves to a real future ISO date and reaches create_task --
-    never the literal 'tomorrow', never a stale year."""
-    from datetime import datetime, timedelta
-    expected = (datetime.now(td._AZ_TZ).date() + timedelta(days=1)).isoformat()
+    never the literal 'tomorrow', never a stale year. The assertion is a tolerant range
+    (not exact equality) so it is deterministic across the AZ-midnight boundary between
+    the tool's clock sample and the test's."""
+    from datetime import date, datetime, timedelta
     created = {"gid": "T1", "name": "Do it", "permalink_url": "http://x/T1",
-               "assignee": {"name": "Harrison Rogers"}, "due_on": expected, "projects": []}
+               "assignee": {"name": "Harrison Rogers"}, "due_on": "resolved", "projects": []}
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock:
         td._tool_asana_create_task(
@@ -453,5 +454,9 @@ def test_create_task_relative_due_flows_resolved_to_client():
             _input={"confirmed": True, "_channel_name": "dm"},
         )
     mock.assert_called_once()
-    assert mock.call_args.kwargs["due_on"] == expected
+    got = mock.call_args.kwargs["due_on"]
+    assert got != "tomorrow"  # resolved server-side, not the literal phrase
+    d = date.fromisoformat(got)  # a real ISO date
+    today = datetime.now(td._AZ_TZ).date()
+    assert today <= d <= today + timedelta(days=2)  # "tomorrow", midnight-edge tolerant
     assert "WRITE_CONFIRMED" in out

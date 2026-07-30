@@ -83,16 +83,34 @@ def main() -> int:
             log.error("finance-receipt-digest: crash alert also failed to send")
         return 1
 
+    scanned = result.get("accounts_scanned", 0)
+    total = result.get("total_accounts", scanned)
+    scanned_ok = result.get("scanned_ok", scanned)
+    # A budget-truncated OR total-failure run must NOT read as a clean "all N inboxes"
+    # bill of health -- surface the real coverage in the posted digest (D-051 remediation).
+    if result.get("budget_hit") or scanned < total:
+        digest += (f"\n\n_Coverage: scanned {scanned} of {total} inboxes this run"
+                   + (" (time budget reached; the rest are picked up next run)._"
+                      if result.get("budget_hit") else ")._"))
+    # Total scan failure: every attempted mailbox failed to even LIST (e.g. DWD auth
+    # expired) -> a "no new receipts" digest is a false clean bill. Flag it in the digest
+    # AND exit nonzero so the health check catches it, even though the post succeeds.
+    total_failure = scanned > 0 and scanned_ok == 0
+    if total_failure:
+        digest += (f"\n\n:warning: _All {scanned} inboxes failed to scan this run -- "
+                   f"this is NOT a reliable clean bill; check Gmail access._")
+
     log.info(
-        "digest complete: %d new financial docs across %d accounts (%d per-item error(s))%s%s",
-        len(result["rows"]), result["accounts_scanned"], result.get("errors", 0),
+        "digest complete: %d new financial docs across %d/%d inbox(es) (%d listed ok, "
+        "%d per-item error(s))%s%s",
+        len(result["rows"]), scanned, total, scanned_ok, result.get("errors", 0),
         " [budget hit -- partial scan, rest next run]" if result.get("budget_hit") else "",
         " [dry-run]" if args.dry_run else "",
     )
 
     if args.dry_run or args.no_slack:
         print(digest)
-        return 0
+        return 1 if total_failure else 0
 
     posted = finance_receipts.post_digest_to_slack(digest)
     if not posted:
@@ -104,9 +122,17 @@ def main() -> int:
             "(%d docs filed but summary not delivered)", len(result["rows"]),
         )
         finance_receipts.alert_delivery_failure(
-            len(result["rows"]), result["accounts_scanned"],
+            len(result["rows"]), scanned,
         )
         print(digest)
+        return 1
+
+    if total_failure:
+        # The digest posted, but every attempted mailbox failed to list -- exit nonzero
+        # so the nightly LastResult probe flags what is actually a broken scan.
+        log.error("finance-receipt-digest: ALL %d attempted inbox(es) failed to list -- "
+                  "total scan failure (posted digest is not a reliable clean bill)", scanned)
+        finance_receipts.alert_delivery_failure(len(result["rows"]), scanned)
         return 1
 
     # Slice 7: the digest posted -> success. Per-item errors (a transiently-unreachable

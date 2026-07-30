@@ -1196,6 +1196,19 @@ class TestCompletionNegationUnit:
     def test_plain_affirmative_kept(self):
         assert not _re._completion_is_negated("The invoice has been paid.", _CR)
 
+    def test_yet_to_be_completed_is_negated(self):
+        # D-051 remediation: the "yet to be X" idiom denies completion with no explicit
+        # negator -- it must still be suppressed.
+        assert _re._completion_is_negated("The Q3 report is yet to be completed.", _CR)
+
+    def test_remains_to_be_signed_is_negated(self):
+        assert _re._completion_is_negated("The contract remains to be signed.", _CR)
+
+    def test_affirmative_with_trailing_to_kept(self):
+        # "to" AFTER the completion verb must not falsely negate it.
+        assert not _re._completion_is_negated(
+            "The deck was completed and delivered to the buyers.", _CR)
+
 
 class TestPass4NegationAndIdLeak:
     def _mk(self, content: str) -> dict:
@@ -1235,3 +1248,13 @@ class TestPass4NegationAndIdLeak:
         assert len(gaps) == 1
         assert "<U0B3V5RHT3P>" not in gaps[0].description
         assert "<U0B3V5RHT3P>" not in gaps[0].source_evidence
+
+    def test_yet_to_be_completed_not_flagged(self):
+        # D-051 remediation: the "yet to be completed" idiom must suppress the card.
+        db_path = _make_db([self._mk(
+            "The Q3 marketing report is yet to be completed by the team.")])
+        gaps = _re.pass4_stale_open_tasks(
+            open_tasks=[{"gid": "T4", "name": "Complete the Q3 marketing report",
+                         "permalink_url": "", "assignee": {}}],
+            db_path=db_path)
+        assert gaps == []

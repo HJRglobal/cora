@@ -438,6 +438,8 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
     accounts = _digest_accounts()
     deadline = (time.monotonic() + time_budget_seconds) if time_budget_seconds else None
     budget_hit = False
+    scanned = 0      # mailboxes actually entered this run (excludes the budget-skipped tail)
+    scanned_ok = 0   # mailboxes whose message list succeeded (0 of >0 => total scan failure)
 
     for idx, mailbox in enumerate(accounts):
         if deadline is not None and time.monotonic() > deadline:
@@ -448,6 +450,7 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
                 time_budget_seconds, len(rows), len(accounts) - idx,
             )
             break
+        scanned += 1
         since = int(marks.get(mailbox) or default_since)
         try:
             msg_ids = list_messages_with_attachments(mailbox, since, max_results=200)
@@ -455,10 +458,13 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
             log.warning("finance_receipts digest: skipping %s: %s", mailbox, exc)
             errors += 1
             continue
+        scanned_ok += 1
 
+        interrupted = False  # did the BUDGET stop us mid-mailbox (not a full scan)?
         for message_id in msg_ids:
             if deadline is not None and time.monotonic() > deadline:
                 budget_hit = True
+                interrupted = True
                 break
             ledger_key = f"{mailbox}:{message_id}"
             if ledger_key in filed_ids:
@@ -518,7 +524,11 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
                 log.warning("finance_receipts digest: row build failed %s: %s", message_id, exc)
                 errors += 1
 
-        if not dry_run:
+        # Advance the watermark ONLY for a FULLY-scanned mailbox. A mid-scan budget
+        # interruption must leave it where it was, or messages #N.. after the cutoff are
+        # permanently skipped next run (the dedup ledger prevents double-FILING, so a
+        # re-scan is idempotent). (Slice 7 D-051 remediation)
+        if not dry_run and not interrupted:
             marks[mailbox] = sync_start
             _save_watermarks(marks)  # atomic per account (D-038)
         if budget_hit:
@@ -532,8 +542,12 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
             items=[f"{r['mailbox']}:{r['subject'][:80]}" for r in rows],
             mode="digest",
         )
-    return {"rows": rows, "accounts_scanned": len(accounts), "errors": errors,
-            "budget_hit": budget_hit}
+    # accounts_scanned = mailboxes actually processed this run (NOT len(accounts)), so a
+    # budget-truncated run never claims coverage it didn't do. scanned_ok distinguishes a
+    # total scan failure (0 of >0 listed) from a genuine quiet week. (Slice 7 D-051)
+    return {"rows": rows, "accounts_scanned": scanned, "errors": errors,
+            "budget_hit": budget_hit, "total_accounts": len(accounts),
+            "scanned_ok": scanned_ok}
 
 
 def format_digest(rows: list[dict[str, str]], accounts_scanned: int) -> str:

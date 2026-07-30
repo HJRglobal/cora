@@ -761,22 +761,34 @@ _NEG_FILLERS = frozenset({
     "actually", "really", "even", "all", "was", "were", "is", "are", "have",
     "has", "had", "it", "that", "this", "them", "still", "ever", "any",
 })
+# "yet/remains/still TO (be) <verb>" denies completion WITHOUT an explicit negator
+# ("the Q3 report is yet to be completed"). When the backward scan reaches a "to"
+# governed by one of these, treat the completion as negated (D-051 remediation).
+_NEG_TOBE_MARKERS = frozenset({"yet", "remains", "remain", "still"})
 
 
 def _completion_is_negated(sentence: str, completion_re) -> bool:
     """True only when EVERY completion-verb hit in `sentence` is directly governed by a
-    negator (the sentence denies completion). A single affirmative hit keeps it."""
+    negator -- an explicit one ("not/no/never …") OR the "yet/remains/still to (be) X"
+    idiom -- so the sentence denies completion. A single affirmative hit keeps it (so
+    "not yet closed, but the final step is done" is KEPT via the affirmative 'done')."""
     matches = list(completion_re.finditer(sentence))
     if not matches:
         return False
     for m in matches:
-        prefix_tokens = re.findall(r"[a-z']+", sentence[: m.start()].lower())
+        window = re.findall(r"[a-z']+", sentence[: m.start()].lower())[-6:]
         negated = False
-        for w in reversed(prefix_tokens[-6:]):  # short local window
+        for j in range(len(window) - 1, -1, -1):  # scan back over the local window
+            w = window[j]
             if w in _NEG_FILLERS:
                 continue
-            negated = w in _NEG_NEGATORS
-            break
+            if w in _NEG_NEGATORS:
+                negated = True
+                break
+            if w == "to" and j >= 1 and window[j - 1] in _NEG_TOBE_MARKERS:
+                negated = True  # "... yet/remains/still to (be) <verb>"
+                break
+            break  # a content word governs the verb -> affirmative
         if not negated:
             return False  # an affirmative completion verb governs -> keep the sentence
     return True

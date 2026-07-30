@@ -553,6 +553,12 @@ def test_resolve_slack_mentions(monkeypatch):
     from cora.tools.user_identity import resolve_slack_mentions
     assert resolve_slack_mentions("ping <@U0B2RM2JYJ1> please") == "ping @Harrison Rogers please"
     assert resolve_slack_mentions("from <U0B2RM2JYJ1>") == "from @Harrison Rogers"
-    out = resolve_slack_mentions("note <U0B3V5RHT3P>: done")
+    out = resolve_slack_mentions("note <U0B3V5RHT3P>: done")  # digit-bearing real id -> stripped
     assert "U0B3V5RHT3P" not in out
     assert resolve_slack_mentions("plain text here") == "plain text here"
+    # D-051 remediation: an angle-bracketed all-letters placeholder is NOT a real id
+    # (no digit) and must be left intact, not silently deleted.
+    assert resolve_slack_mentions("the <USERNAME> profile") == "the <USERNAME> profile"
+    assert resolve_slack_mentions("see <UPDATED> and <UNKNOWN>") == "see <UPDATED> and <UNKNOWN>"
+    # the <@…> form is always a mention even without a digit
+    assert resolve_slack_mentions("hi <@U0B2RM2JYJ1>") == "hi @Harrison Rogers"

@@ -502,3 +502,72 @@ def test_run_digest_time_budget_stops_scanning(monkeypatch):
     result = fr.run_digest(dry_run=True, time_budget_seconds=-1.0)
     assert result["budget_hit"] is True
     assert calls["n"] == 0  # never scanned a mailbox
+    # D-051 remediation: coverage is honest -- 0 scanned of 2 total.
+    assert result["accounts_scanned"] == 0 and result["total_accounts"] == 2
+    assert result["scanned_ok"] == 0
+
+
+class _FakeTime:
+    """A deterministic clock for run_digest: monotonic() yields a fixed sequence then a
+    large constant; time() is fixed. Patched onto finance_receipts.time only (module-local,
+    so no global side effect)."""
+
+    def __init__(self, seq):
+        self._it = iter(seq)
+
+    def monotonic(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            return 99.0
+
+    def time(self):
+        return 1785000000
+
+
+def test_run_digest_budget_interruption_does_not_advance_watermark(monkeypatch):
+    """D-051 remediation (data-loss): a budget interruption MID-mailbox must NOT advance
+    that mailbox's watermark, or its unprocessed messages are permanently skipped."""
+    import cora.connectors.gmail_reader as gr
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["box@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments",
+                        lambda mb, since, max_results=200: ["m1", "m2"])
+    monkeypatch.setattr(fr, "_load_watermarks", lambda: {})
+    saved = []
+    monkeypatch.setattr(fr, "_save_watermarks", lambda m: saved.append(dict(m)))
+    # deadline setup -> 0.0 (deadline=1.0); outer check mb -> 0.1 (enter); inner msg1 -> 2.0 (interrupt)
+    monkeypatch.setattr(fr, "time", _FakeTime([0.0, 0.1, 2.0]))
+    result = fr.run_digest(dry_run=False, time_budget_seconds=1.0)
+    assert result["budget_hit"] is True
+    assert saved == []  # interrupted mid-mailbox -> watermark NOT advanced (re-scan next run)
+
+
+def test_run_digest_partial_coverage_counts(monkeypatch):
+    """D-051 remediation: a budget-truncated run reports accounts_scanned = actually-
+    scanned (< total_accounts), so the digest never claims coverage it didn't do."""
+    import cora.connectors.gmail_reader as gr
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["a@x.com", "b@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments",
+                        lambda mb, since, max_results=200: [])  # empty -> no inner monotonic calls
+    monkeypatch.setattr(fr, "_load_watermarks", lambda: {})
+    monkeypatch.setattr(fr, "_save_watermarks", lambda m: None)
+    # setup 0.0; outer mb1 0.1 (enter, scan ok, empty list); outer mb2 2.0 (budget stop)
+    monkeypatch.setattr(fr, "time", _FakeTime([0.0, 0.1, 2.0]))
+    result = fr.run_digest(dry_run=False, time_budget_seconds=1.0)
+    assert result["budget_hit"] is True
+    assert result["accounts_scanned"] == 1 and result["total_accounts"] == 2
+
+
+def test_run_digest_total_scan_failure_flags_scanned_ok_zero(monkeypatch):
+    """D-051 remediation: when EVERY mailbox fails to LIST, scanned_ok==0 (the total-scan-
+    failure signal the script uses to exit nonzero) even though rows is empty."""
+    import cora.connectors.gmail_reader as gr
+
+    def _boom(mb, since, max_results=200):
+        raise gr.GmailReaderError("auth expired")
+
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["a@x.com", "b@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments", _boom)
+    result = fr.run_digest(dry_run=True)
+    assert result["rows"] == [] and result["scanned_ok"] == 0
+    assert result["accounts_scanned"] == 2 and result["total_accounts"] == 2
