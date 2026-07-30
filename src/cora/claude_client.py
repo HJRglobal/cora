@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import anthropic
 
 from .config import config
+from .model_router import MODEL_SONNET
 from .tools.tool_dispatch import (
     TOOL_DEFINITIONS,
     VERBATIM_TABLE_TOOLS,
@@ -27,7 +28,10 @@ from .tools.tool_dispatch import (
 
 log = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-6"  # default; per-request override via `model` kwarg.
+_MODEL = MODEL_SONNET  # default Sonnet -- single source of truth is
+                       # model_router.MODEL_SONNET (CORA_SONNET_MODEL-overridable).
+                       # Per-request override via the `model` kwarg (app.py passes
+                       # the router's choice; this is the fallback when it doesn't).
 _MAX_TOKENS = 1024  # lowered 2048→1024 on 2026-05-21 — Cora replies are almost
                     # always <500 tokens; tighter ceiling = faster streaming + lower
                     # tail latency. If a reply gets clipped at max_tokens, bump back up.

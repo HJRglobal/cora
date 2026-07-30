@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import drive_io, phi_guard
+from .model_router import MODEL_SONNET
 
 log = logging.getLogger("cora.code_queue")
 
@@ -51,7 +52,7 @@ log = logging.getLogger("cora.code_queue")
 HARRISON_ID = os.environ.get("HARRISON_SLACK_USER_ID", "U0B2RM2JYJ1")
 
 _HAIKU_MODEL = "claude-haiku-4-5"
-_SONNET_MODEL = "claude-sonnet-4-6"
+_SONNET_MODEL = MODEL_SONNET  # single source: model_router (CORA_SONNET_MODEL-overridable)
 
 FUZZY_DEDUP_RATIO = 0.85          # same-signal paraphrase-dedup threshold (friction pattern)
 DEDUP_EMBED_SIM = 0.82            # cosine sim for SEMANTIC (paraphrase) dedup (friction CLUSTER_SIM)

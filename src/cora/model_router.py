@@ -21,12 +21,41 @@ which Haiku responses get thumbs-down reactions.
 from __future__ import annotations
 
 import logging
+import os
 import re
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
 
-# Model strings -- exposed for tests + claude_client.
-MODEL_SONNET = "claude-sonnet-4-6"
+# .env is loaded defensively here so the CORA_SONNET_MODEL override is visible
+# regardless of import order: the always-on bot loads .env via config at startup,
+# scripts re-load it at their own import, and a standalone `import model_router`
+# still resolves the override. override defaults to False (matches config.py) --
+# an OS-level env var still wins over the .env line.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
+_SONNET_DEFAULT = "claude-sonnet-4-6"
+
+
+def _resolve_sonnet_model() -> str:
+    """The Sonnet model Cora uses for its own reasoning/generation.
+
+    SINGLE SOURCE OF TRUTH: claude_client._MODEL, strategy_memo.SONNET_MODEL, and
+    code_queue._SONNET_MODEL all derive from MODEL_SONNET below. Flip everything at
+    once with one `.env` line -- ``CORA_SONNET_MODEL=claude-sonnet-5`` -- plus a
+    restart; rollback is removing that line + a restart. Read once at import (a
+    process snapshot), so a running bot must be restarted to pick up a change.
+    AI-visibility's web-grounded Claude engine is deliberately NOT wired here -- it
+    keeps its own AI_VIS_CLAUDE_MODEL knob (it is a measurement instrument, not
+    Cora's conversational brain).
+    """
+    return (os.environ.get("CORA_SONNET_MODEL") or _SONNET_DEFAULT).strip() or _SONNET_DEFAULT
+
+
+# Model strings -- exposed for tests + claude_client + strategy_memo + code_queue.
+MODEL_SONNET = _resolve_sonnet_model()
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
 
 # Default model when no router signal can be derived.

@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import drive_io
+from .model_router import MODEL_SONNET
 from .phi_guard import is_phi_risk, is_visibility_cpa_mention
 
 log = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 HARRISON_SLACK_ID = "U0B2RM2JYJ1"
 
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = MODEL_SONNET  # single source: model_router (CORA_SONNET_MODEL-overridable)
 _SYNTH_MAX_TOKENS = 2400
 
 KB_ACTIVITY_DAYS = 7            # KB momentum window
