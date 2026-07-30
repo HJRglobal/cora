@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -71,6 +72,22 @@ from . import hubspot_client
 log = logging.getLogger(__name__)
 
 _ALLOWED_ENTITIES = frozenset({"F3E", "FNDR"})
+
+# Opus model for the sales-deck synthesis call. Env-overridable + reversible like
+# CORA_SONNET_MODEL, but note the deliberate asymmetry: the DEFAULT here is
+# claude-opus-5 (the 4.7 -> 5 bump goes live at the next restart), whereas
+# CORA_SONNET_MODEL defaults to 4.6 (its flip is validation-gated). Rollback is
+# `CORA_OPUS_MODEL=claude-opus-4-7` in .env + a restart. Read once at import
+# (.env already loaded via config above); no sampling params ride this call, so the
+# swap is safe. This is a single low-traffic Harrison-triggered tool, not the hot path.
+_OPUS_DEFAULT = "claude-opus-5"
+
+
+def _resolve_opus_model() -> str:
+    return (os.environ.get("CORA_OPUS_MODEL") or _OPUS_DEFAULT).strip() or _OPUS_DEFAULT
+
+
+_OPUS_MODEL = _resolve_opus_model()
 
 # ---------------------------------------------------------------------------
 # F3 Program Catalog
@@ -332,7 +349,7 @@ If location/territory is known, tailor any regional references accordingly.
 
     client = anthropic.Anthropic(api_key=config.anthropic_api_key)
     response = client.messages.create(
-        model="claude-opus-4-7",
+        model=_OPUS_MODEL,
         max_tokens=4096,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],

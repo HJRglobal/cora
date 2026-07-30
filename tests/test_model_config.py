@@ -104,3 +104,46 @@ def test_ai_search_is_not_folded_into_the_flip():
     # shared Cora flip var -- changing it would silently change what's measured.
     assert "AI_VIS_CLAUDE_MODEL" in ai
     assert "CORA_SONNET_MODEL" not in ai
+
+
+# ---------------------------------------------------------------------------
+# Opus resolver (sales-deck tool) -- default IS the bump (claude-opus-5)
+# ---------------------------------------------------------------------------
+
+def test_resolve_opus_default(monkeypatch):
+    from cora.tools import sales_deck_client
+    monkeypatch.delenv("CORA_OPUS_MODEL", raising=False)
+    assert sales_deck_client._resolve_opus_model() == "claude-opus-5"
+
+
+def test_resolve_opus_override_rollback(monkeypatch):
+    from cora.tools import sales_deck_client
+    monkeypatch.setenv("CORA_OPUS_MODEL", "claude-opus-4-7")
+    assert sales_deck_client._resolve_opus_model() == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_resolve_opus_blank_falls_back(monkeypatch, blank):
+    from cora.tools import sales_deck_client
+    monkeypatch.setenv("CORA_OPUS_MODEL", blank)
+    assert sales_deck_client._resolve_opus_model() == "claude-opus-5"
+
+
+def test_opus_wiring_structural():
+    """The sales-deck call must use the env-gated constant, not a literal, and the
+    old opus-4-7 literal must be gone from the call path."""
+    sdc = (_SRC / "tools" / "sales_deck_client.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("CORA_OPUS_MODEL"' in sdc
+    assert "model=_OPUS_MODEL" in sdc
+    assert '"claude-opus-4-7"' not in sdc  # no hardcoded old model on the call path
+
+
+def test_opus_call_has_no_sampling_params():
+    """Sonnet-5/Opus-5 reject non-default temperature/top_p/top_k. Pin that the
+    sales-deck create() call carries none (guards a future accidental add)."""
+    sdc = (_SRC / "tools" / "sales_deck_client.py").read_text(encoding="utf-8")
+    # Locate the messages.create(...) block for the deck synthesis call.
+    idx = sdc.index("model=_OPUS_MODEL")
+    window = sdc[idx: idx + 300]
+    for banned in ("temperature", "top_p", "top_k", "thinking", "budget_tokens"):
+        assert banned not in window, f"unexpected {banned} on the opus call"
