@@ -418,3 +418,40 @@ def test_asana_tool_descriptions_carry_standard_doctrine():
         assert "Asana Standard" in defs[name]["description"], name
     create_desc = defs["asana_create_task"]["description"]
     assert "PROJECT" in create_desc  # "you create TASKS, never PROJECTS" governance line
+
+
+def test_create_task_stale_explicit_date_warns_in_preview():
+    """Slice 4: an explicit far-past due date is flagged for re-confirmation in the
+    preview (not silently created); the user can still confirm an intentional backdate."""
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task") as mock:
+        result = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"title": "Backfill task", "due_on": "2020-01-15",
+                    "_channel_name": "dm"},
+        )
+    mock.assert_not_called()
+    assert "WRITE_BLOCKED" in result
+    assert "WARNING" in result and "past" in result.lower()
+
+
+def test_create_task_relative_due_flows_resolved_to_client():
+    """Slice 4: 'tomorrow' resolves to a real future ISO date and reaches create_task --
+    never the literal 'tomorrow', never a stale year."""
+    from datetime import datetime, timedelta
+    expected = (datetime.now(td._AZ_TZ).date() + timedelta(days=1)).isoformat()
+    created = {"gid": "T1", "name": "Do it", "permalink_url": "http://x/T1",
+               "assignee": {"name": "Harrison Rogers"}, "due_on": expected, "projects": []}
+    with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
+         patch.object(td.asana_client, "create_task", return_value=created) as mock:
+        td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"title": "Do it", "due_on": "tomorrow", "_channel_name": "dm"},
+        )
+        out = td._tool_asana_create_task(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={"confirmed": True, "_channel_name": "dm"},
+        )
+    mock.assert_called_once()
+    assert mock.call_args.kwargs["due_on"] == expected
+    assert "WRITE_CONFIRMED" in out

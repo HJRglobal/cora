@@ -18,7 +18,7 @@ import os
 import re
 import time
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -724,6 +724,98 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     return _execute_asana_create(slack_user_id, resolved, entity)
 
 
+# --- Relative due-date resolution (Slice 4, 2026-07-29 audit) ------------------
+# "tomorrow" resolved to 2025-07-29 (a year stale) because the model pre-resolved the
+# word against its own notion of "now" and the tool only shape-checked the result.
+# Resolve relative phrases HERE against the live date, and flag a resolved date far in
+# the past for re-confirmation rather than silently creating a backdated task.
+_AZ_TZ = timezone(timedelta(hours=-7))  # Arizona (no DST) -- the org's clock
+_WEEKDAY_NAMES = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_DUE_PAST_WARN_DAYS = 183  # ~6 months
+
+
+def _resolve_relative_due_date(raw, *, now: datetime | None = None):
+    """Resolve a due-date string to YYYY-MM-DD. Handles relative phrases against the LIVE
+    date (today / tomorrow / yesterday / this week / next week / 'in N days' / weekday
+    names), passes an explicit YYYY-MM-DD through UNCHANGED (backward compat), and drops
+    an unrecognised value with a note (never a crash, never a stray literal reaching the
+    Asana client). Returns (iso_or_None, warning_or_None)."""
+    if raw is None:
+        return None, None
+    s = str(raw).strip()
+    if not s:
+        return None, None
+
+    # Explicit ISO date -- backward-compatible pass-through.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        try:
+            date.fromisoformat(s)
+            return s, None
+        except ValueError:
+            return None, f"I didn't recognize the due date {s!r}, so I left it unset."
+
+    low = " ".join(s.lower().split())
+    base = now or datetime.now(_AZ_TZ)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=_AZ_TZ)
+    today = base.date()
+    resolved: date | None = None
+
+    if low in ("today", "tonight", "eod", "end of day"):
+        resolved = today
+    elif low == "tomorrow":
+        resolved = today + timedelta(days=1)
+    elif low == "yesterday":
+        resolved = today - timedelta(days=1)
+    elif low in ("this week", "end of week", "eow"):
+        resolved = today + timedelta(days=(4 - today.weekday()) % 7)  # upcoming Friday
+    elif low == "next week":
+        resolved = today + timedelta(days=7)
+    else:
+        m = re.fullmatch(r"(?:in\s+)?(\d{1,3})\s+days?(?:\s+(?:from\s+now|out))?", low)
+        if m:
+            resolved = today + timedelta(days=int(m.group(1)))
+        else:
+            key = low[5:].strip() if low.startswith("next ") else low
+            wd = _WEEKDAY_NAMES.get(key)
+            if wd is not None:
+                delta = (wd - today.weekday()) % 7 or 7  # always a future weekday (1-7d)
+                resolved = today + timedelta(days=delta)
+
+    if resolved is None:
+        return None, (f"I didn't recognize the due date {s!r}, so I left it unset -- "
+                      f"give me a date like \"tomorrow\", \"next week\", or 2026-08-15.")
+    return resolved.isoformat(), None
+
+
+def _due_date_past_warning(iso: str, *, now: datetime | None = None) -> str | None:
+    """If a resolved due date is more than ~6 months in the past, return a re-confirm
+    warning (a stale-year mistake OR an intentional backdate -- the user decides on the
+    staged preview). None otherwise."""
+    try:
+        d = date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    base = now or datetime.now(_AZ_TZ)
+    today = base.date()
+    days_past = (today - d).days
+    if days_past <= _DUE_PAST_WARN_DAYS:
+        return None
+    # Suggest the same day one year later when the past date looks like a year-off typo.
+    hint = ""
+    try:
+        plus_year = d.replace(year=d.year + 1)
+        if -_DUE_PAST_WARN_DAYS <= (today - plus_year).days <= _DUE_PAST_WARN_DAYS:
+            hint = f" Did you mean {plus_year.isoformat()}?"
+    except ValueError:
+        pass
+    return (f"WARNING: the due date {iso} is about {days_past // 30} months in the past.{hint} "
+            f"Reply to confirm it as-is, or give me the right date.")
+
+
 def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
     """Validate + resolve an Asana create request. Returns a resolved payload dict, or a
     model-facing error/refusal STRING (title / assignee / LEX-scrub / dedup). Shared by
@@ -781,7 +873,11 @@ def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
 
     # Optional fields
     notes = input_data.get("notes") or None
-    due_on = (input_data.get("due_on") or "").strip() or None
+    # Resolve a relative due phrase against the LIVE date; flag a far-past resolved date
+    # for re-confirmation on the preview (Slice 4).
+    due_on, due_warning = _resolve_relative_due_date(input_data.get("due_on"))
+    if due_on and not due_warning:
+        due_warning = _due_date_past_warning(due_on)
     explicit_project = (input_data.get("project_gid") or "").strip() or None
     force_duplicate = input_data.get("force_duplicate", False) is True
 
@@ -818,6 +914,10 @@ def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
             follower_gids.append(g)
             follower_displays.append(fu.get("display_name", str(nm)))
 
+    notices = list(plan["notices"])
+    if due_warning:
+        notices.append(due_warning)
+
     return {
         "title": f_title,
         "assignee_gid": assignee_gid,
@@ -825,7 +925,7 @@ def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
         "project_gid": f_project,
         "notes": f_notes,
         "due_on": due_on,
-        "notices": list(plan["notices"]),
+        "notices": notices,
         "follower_gids": follower_gids,
         "follower_displays": follower_displays,
     }
@@ -6237,7 +6337,14 @@ TOOL_DEFINITIONS = [
                 },
                 "due_on": {
                     "type": "string",
-                    "description": "Optional. Due date in YYYY-MM-DD format.",
+                    "description": (
+                        "Optional. Due date. Pass EITHER a relative phrase -- 'today', "
+                        "'tomorrow', 'next week', 'in 3 days', or a weekday like 'friday' "
+                        "-- OR an explicit YYYY-MM-DD. Prefer the relative phrase: the tool "
+                        "resolves it server-side against the CURRENT date, so you never have "
+                        "to compute (or guess) the year. A resolved date more than ~6 months "
+                        "in the past is flagged in the preview for re-confirmation."
+                    ),
                 },
                 "project_gid": {
                     "type": "string",
