@@ -740,6 +740,47 @@ class KnowledgeBase:
         rows = self._conn.execute(sql, params).fetchall()
         return self._rows_to_results(rows)
 
+    def search_decisions(
+        self,
+        query: str,
+        k: int = 8,
+        query_vec: list[float] | None = None,
+    ) -> list[SearchResult]:
+        """Exact vector search restricted to the FOUNDER decision log + Top-of-Mind:
+        static_md chunks tagged entity='FNDR' whose source_id is the founder
+        CLAUDE.md (exact) or any decisions.md. This corpus is ~1K chunks, so a
+        brute-force float32 scan is fast AND gives perfect recall over it -- unlike a
+        top-k search over the whole ~160K-chunk FNDR corpus, where swept Slack /
+        email / meeting content (99%+ of FNDR) crowds the tiny decisions fraction out
+        of the pre-filter window (D-051 finding). Used by the read-only MCP server's
+        cora_decisions_search. READ-ONLY (SELECT); user_note excluded belt-and-braces
+        (decisions/TOM are never notes). Entity='FNDR' scopes to the founder log — a
+        project decisions.md (e.g. rogers-ranch, entity=HJRP) is excluded.
+        """
+        if query_vec is None:
+            try:
+                query_vec = embeddings.embed_query(query)
+            except embeddings.EmbeddingError as exc:
+                raise KnowledgeBaseError(f"Query embedding failed: {exc}") from exc
+        qbytes = _serialize_vec(query_vec)
+        sql = f"""
+            SELECT
+                k.chunk_id, k.source, k.source_id, k.entity, k.title, k.content,
+                k.deep_link, k.date_modified,
+                vec_distance_l2(?, f.embedding) AS distance,
+                k.author, k.metadata
+            FROM knowledge_chunks k
+            JOIN knowledge_vec_f32 f ON f.chunk_id = k.chunk_id
+            WHERE k.entity = 'FNDR'
+              AND k.source = 'static_md'
+              AND (k.source_id = 'CLAUDE.md' OR k.source_id LIKE '%decisions.md')
+              AND k.source != '{USER_NOTE_SOURCE}'
+            ORDER BY distance
+            LIMIT {int(k)}
+        """
+        rows = self._conn.execute(sql, [qbytes]).fetchall()
+        return self._rows_to_results(rows)
+
     # --- Owner-scoped retrieval (Tier 2 / Tier 2-Finance) ---
 
     def search_owned(

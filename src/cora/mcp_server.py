@@ -23,14 +23,20 @@ Design invariants (D-051 load-bearing — v1):
     OneAmerica / capital-raise / COPA-NDA / Fireflies-COPA) are dropped at INGEST
     (store Step-0 + kb_exclusions), so they are absent from the corpus by
     construction — nothing to re-exclude here.
-3.  FOUNDER-SCOPE POSTURE, TREATED AS NON-CUSTODIAN. Results feed into other LLM
-    sessions' context (a wider blast radius than a Slack DM to Harrison), so LEX
-    content passes through the SAME retrieval scrub the founder path uses today
-    (context_loader._apply_lex_phi_scrub for LEX; _withhold_non_lex_phi for a
-    LEX-PHI chunk mis-tagged under a non-LEX entity) — REUSED, not reimplemented.
-    Tier-1 personal-mail header stripping is a documented no-op here: the surface
-    serves the founder (unrestricted), for whom historical_access.apply_tier1
-    returns results unchanged; the PHI scrub (the regulated class) still fires.
+3.  READ SURFACE POSTURE, TREATED AS NON-CUSTODIAN. Results feed into an autonomous
+    Cowork / Claude Code session with egress connectors — a materially wider blast
+    radius than a Slack DM to Harrison's eyeballs. So this surface is deliberately
+    STRICTER than the founder's own live view:
+      * LEX/PHI content passes through the SAME retrieval scrub the founder path uses
+        (context_loader._apply_lex_phi_scrub for LEX; _withhold_non_lex_phi for a
+        LEX-PHI chunk mis-tagged under a non-LEX entity) — REUSED, not reimplemented.
+      * Tier-1 email-header stripping (historical_access.apply_tier1) IS applied with
+        unrestricted=False (D-051 finding): a gmail/drive_sweep chunk owned by a
+        TEAMMATE is header-stripped (From/To/Subject/Date/deep_link) before it enters
+        the surface; the founder's OWN mailboxes and org-shared founders_os@ pass. The
+        factual body survives as institutional knowledge either way. This aligns the
+        email posture with the non-custodian PHI posture, rather than relying on the
+        founder-is-unrestricted no-op the live bot uses.
 4.  PROMPT-INJECTION FRAMING. KB / known-answers / backlog text is untrusted
     content entering a session's context. Every content-bearing result is
     prefixed with a provenance framing line marking it as reference DATA (treat
@@ -56,10 +62,16 @@ from pathlib import Path
 from typing import Any
 
 from cora import context_loader as cl
-from cora import drive_io
+from cora import drive_io, historical_access
+from cora.knowledge_base import embeddings
 from cora.knowledge_base.store import KnowledgeBase
 
 log = logging.getLogger("cora.mcp_server")
+
+# The founder whose surface this serves (local, founder-scope). Used to resolve the
+# founder's owned mailboxes for the Tier-1 email-header strip below. Overridable via
+# env for a different operator; defaults to Harrison's Slack id.
+_FOUNDER_SLACK_ID = os.environ.get("CORA_FOUNDER_SLACK_ID", "U0B2RM2JYJ1")
 
 # Token-conscious result budgets. Default top-8 chunks; a caller may raise up to
 # _MAX_LIMIT but no further (a read surface that dumps 100 chunks into a session
@@ -126,6 +138,32 @@ def _get_ro_kb() -> KnowledgeBase | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Result shaping + scrub (reuses context_loader — does NOT reimplement)
 # ─────────────────────────────────────────────────────────────────────────────
+_founder_emails_cache: frozenset[str] | None = None
+
+
+def _founder_emails() -> frozenset[str]:
+    """The founder's owned mailboxes (for the Tier-1 teammate-header strip). Cached;
+    fail-closed to empty (which strips ALL personal headers — the safe direction)."""
+    global _founder_emails_cache
+    if _founder_emails_cache is None:
+        try:
+            _founder_emails_cache = historical_access.owned_emails(_FOUNDER_SLACK_ID)
+        except Exception:  # noqa: BLE001
+            _founder_emails_cache = frozenset()
+    return _founder_emails_cache
+
+
+def _embed(query: str) -> list[float] | None:
+    """Embed the query OUTSIDE the KB lock (D-051 finding: the lock serializes only
+    the sqlite connection, never a network round-trip). None on failure -> caller
+    reports the KB unavailable rather than crashing."""
+    try:
+        return embeddings.embed_query(query)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("MCP embed_query failed: %s", exc)
+        return None
+
+
 def _scrub_for_founder_surface(relevant: list, kb_entity: str) -> list:
     """Apply the SAME non-custodian PHI scrub the founder retrieval path applies.
 
@@ -194,6 +232,14 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
     sub_entity_scope = entity if entity in cl._LEX_PARENT else None
     include_fndr = entity not in cl._NO_FOUNDER_CONTEXT
 
+    # Embed OUTSIDE the lock (finding 1) so the lock covers only the sqlite read.
+    query_vec = _embed(query)
+    if query_vec is None:
+        return {
+            "query": query, "entity_searched": kb_entity, "count": 0, "results": [],
+            "text": _KB_PROVENANCE + "\n\n_Knowledge base is unavailable._",
+        }
+
     try:
         with _RO_KB_LOCK:
             results = kb.search(
@@ -203,6 +249,7 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
                 max_age_days=cl._KB_MAX_AGE_DAYS,
                 include_fndr=include_fndr,
                 sub_entity=sub_entity_scope,
+                query_vec=query_vec,
             )
     except Exception as exc:  # noqa: BLE001 — retrieval is an upgrade, never a crash
         log.warning("MCP kb_search failed entity=%s: %s", entity, exc)
@@ -212,6 +259,9 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
         }
 
     relevant = [r for r in results if r.distance <= cl._KB_MAX_DISTANCE]
+    # Tier-1 (finding 3): strip teammate-owned gmail/drive_sweep headers for the
+    # autonomous consumer; founder-owned + org-shared pass. Then the PHI scrub.
+    relevant, _ = historical_access.apply_tier1(relevant, _founder_emails(), False)
     relevant = _scrub_for_founder_surface(relevant, kb_entity)
 
     return {
@@ -224,19 +274,12 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
     }
 
 
-def _is_decisions_chunk(r: Any) -> bool:
-    """True for a founder TOM (CLAUDE.md) or a decisions.md chunk. static_md
-    source_id is a repo-relative path with OS separators; normalize before match."""
-    if getattr(r, "source", "") != "static_md":
-        return False
-    sid = (getattr(r, "source_id", "") or "").replace("\\", "/").lower()
-    return sid == "claude.md" or sid.endswith("/decisions.md") or sid == "decisions.md"
-
-
 def decisions_search(query: str, limit: int | None = None) -> dict[str, Any]:
     """Search the founder decision log + Top-of-Mind (decisions.md + founder
-    CLAUDE.md), both KB-ingested under FNDR via static_md. Implemented as a
-    filtered founder-scope KB search."""
+    CLAUDE.md), both KB-ingested under FNDR via static_md. Uses the store's
+    source-restricted exact scan (KnowledgeBase.search_decisions) so the tiny
+    decisions/TOM fraction of the FNDR corpus is never crowded out of a top-k
+    pre-filter (D-051 finding)."""
     query = (query or "").strip()
     if not query:
         return {"error": "query is required", "results": [], "text": "query is required"}
@@ -249,15 +292,16 @@ def decisions_search(query: str, limit: int | None = None) -> dict[str, Any]:
             "text": _KB_PROVENANCE + "\n\n_Knowledge base is unavailable._",
         }
 
+    query_vec = _embed(query)  # outside the lock (finding 1)
+    if query_vec is None:
+        return {
+            "query": query, "count": 0, "results": [],
+            "text": _KB_PROVENANCE + "\n\n_Knowledge base is unavailable._",
+        }
+
     try:
         with _RO_KB_LOCK:
-            # Wider net (decisions/TOM are dense within FNDR) then filter to the
-            # two source files. max_age_days=None: the decision log is timeless
-            # reference, not recent-activity.
-            results = kb.search(
-                query, entity="FNDR", k=max(limit * 4, 40),
-                max_age_days=None, include_fndr=True,
-            )
+            results = kb.search_decisions(query, k=limit, query_vec=query_vec)
     except Exception as exc:  # noqa: BLE001
         log.warning("MCP decisions_search failed: %s", exc)
         return {
@@ -265,14 +309,11 @@ def decisions_search(query: str, limit: int | None = None) -> dict[str, Any]:
             "text": _KB_PROVENANCE + "\n\n_Decisions search failed._",
         }
 
-    relevant = [
-        r for r in results
-        if r.distance <= cl._KB_MAX_DISTANCE and _is_decisions_chunk(r)
-    ]
-    # FNDR corpus: apply the non-LEX PHI backstop (defense-in-depth; decisions.md
-    # is business text but a mis-tagged PHI line must never leak through).
+    relevant = [r for r in results if r.distance <= cl._KB_MAX_DISTANCE]
+    # Defense-in-depth: the corpus is business text, but a mis-tagged PHI line must
+    # never leak through (this backstop caught a real FNDR-mis-tagged PHI chunk in
+    # review).
     relevant = cl._withhold_non_lex_phi(relevant)
-    relevant = relevant[:limit]
 
     return {
         "query": query,

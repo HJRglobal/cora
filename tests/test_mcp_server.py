@@ -55,16 +55,23 @@ def _patch_staff(monkeypatch, names=("Shaun Hawkins",)):
 
 
 class _FakeKB:
-    """Records the last search() kwargs; returns canned results. Raises on any
-    write method so a test can prove the surface never mutates."""
+    """Records search()/search_decisions() kwargs; returns canned results. Raises on
+    any write / owner-scoped method so a test can prove the surface never mutates or
+    reaches notes."""
 
-    def __init__(self, results):
+    def __init__(self, results, decisions_results=None):
         self._results = list(results)
+        self._decisions = list(decisions_results if decisions_results is not None else results)
         self.calls: list[dict] = []
+        self.decision_calls: list[dict] = []
 
     def search(self, query, **kwargs):
         self.calls.append({"query": query, **kwargs})
         return list(self._results)
+
+    def search_decisions(self, query, **kwargs):
+        self.decision_calls.append({"query": query, **kwargs})
+        return list(self._decisions)
 
     def search_user_notes(self, *a, **k):  # pragma: no cover - must never be called
         raise AssertionError("mcp_server must not call search_user_notes")
@@ -73,9 +80,13 @@ class _FakeKB:
         raise AssertionError("mcp_server must not call search_owned")
 
 
-def _wire(monkeypatch, results):
-    fake = _FakeKB(results)
+def _wire(monkeypatch, results, decisions_results=None):
+    fake = _FakeKB(results, decisions_results)
     monkeypatch.setattr(mcp_server, "_get_ro_kb", lambda: fake)
+    # Never hit OpenAI in unit tests; the embed runs OUTSIDE the KB lock now.
+    monkeypatch.setattr(mcp_server, "_embed", lambda q: [0.0] * 1536)
+    # Deterministic founder mailbox set (Tier-1 keeps founder-owned + org-shared).
+    monkeypatch.setattr(mcp_server, "_founder_emails", lambda: frozenset({"harrison@hjrglobal.com"}))
     return fake
 
 
@@ -163,6 +174,23 @@ def test_kb_search_nonlex_phi_is_withheld(monkeypatch):
     assert out["count"] == 0  # LEX-PHI mis-tagged under F3E -> withheld
 
 
+def test_kb_search_applies_tier1_as_non_owner(monkeypatch):
+    # Finding 3: the autonomous consumer is stripped like a non-owner, not the
+    # founder's own eyes -> apply_tier1(unrestricted=False, founder mailboxes).
+    _patch_staff(monkeypatch)
+    seen = {}
+
+    def _spy(results, asker_emails, unrestricted):
+        seen["asker_emails"] = asker_emails
+        seen["unrestricted"] = unrestricted
+        return results, False
+    monkeypatch.setattr(mcp_server.historical_access, "apply_tier1", _spy)
+    _wire(monkeypatch, [_result("body", source="gmail", entity="F3E", title="a")])
+    mcp_server.kb_search("q", entity="F3E")
+    assert seen["unrestricted"] is False
+    assert "harrison@hjrglobal.com" in seen["asker_emails"]
+
+
 def test_kb_search_nonlex_ordinary_prose_passes(monkeypatch):
     _patch_staff(monkeypatch)
     body = "The F3 Energy Walmart launch ships in Q3; margins hold at 42 percent."
@@ -236,37 +264,53 @@ def test_kb_search_no_kb_is_graceful(monkeypatch):
     assert "unavailable" in out["text"].lower()
 
 
-# ── D. decisions_search filter ───────────────────────────────────────────────
-def test_decisions_search_filters_to_founder_tom_and_decisions(monkeypatch):
+# ── D. decisions_search (store-side filter + wiring) ─────────────────────────
+def _insert_chunk(kb, chunk_id, *, source, source_id, entity, content):
+    import struct
+    vec = struct.pack("1536f", *([0.0] * 1536))
+    kb._conn.execute(
+        "INSERT INTO knowledge_chunks(chunk_id,source,source_id,entity,content,"
+        "ingested_at) VALUES(?,?,?,?,?,?)",
+        (chunk_id, source, source_id, entity, content, 1),
+    )
+    kb._conn.execute(
+        "INSERT INTO knowledge_vec_f32(chunk_id,embedding) VALUES(?,?)", (chunk_id, vec)
+    )
+    kb._conn.commit()
+
+
+def test_search_decisions_store_filter(tmp_path):
+    """The store SQL restricts to entity=FNDR static_md CLAUDE.md/*decisions.md."""
+    kb = KnowledgeBase(tmp_path / "kb.db")
+    _insert_chunk(kb, "a", source="static_md", source_id="CLAUDE.md", entity="FNDR", content="tom")
+    _insert_chunk(kb, "b", source="static_md", source_id="memory\\decisions.md", entity="FNDR", content="dec")
+    _insert_chunk(kb, "c", source="static_md", source_id="02-F3-Energy\\CLAUDE.md", entity="FNDR", content="proj-claude")
+    _insert_chunk(kb, "d", source="slack", source_id="x", entity="FNDR", content="chatter")
+    _insert_chunk(kb, "e", source="static_md", source_id="rogers-ranch/memory/decisions.md", entity="HJRP", content="rr")
+    got = {r.chunk_id for r in kb.search_decisions("q", k=50, query_vec=[0.0] * 1536)}
+    assert got == {"a", "b"}  # founder TOM + founder decisions.md only
+    kb.close()
+
+
+def test_decisions_search_uses_search_decisions_and_backstop(monkeypatch):
     _patch_staff(monkeypatch)
-    _wire(monkeypatch, [
-        _result("tom body", source="static_md", entity="FNDR",
-                source_id="CLAUDE.md", title="Claude"),
-        _result("dec body", source="static_md", entity="FNDR",
-                source_id="memory\\decisions.md", title="Decisions"),
-        _result("other md", source="static_md", entity="FNDR",
-                source_id="02-F3-Energy\\CLAUDE.md", title="F3E brief"),
-        _result("slack msg", source="slack", entity="FNDR",
-                source_id="x", title="chatter"),
-        _result("proj decisions", source="static_md", entity="FNDR",
-                source_id="06-HJR-Properties/rogers-ranch/memory/decisions.md",
-                title="RR decisions"),
+    fake = _wire(monkeypatch, [], decisions_results=[
+        _result("D-026: QBO is primary financial source.", source="static_md",
+                entity="FNDR", source_id="memory\\decisions.md", title="Decisions"),
     ])
-    out = mcp_server.decisions_search("anything", limit=8)
-    titles = {r["title"] for r in out["results"]}
-    # founder CLAUDE.md + any *decisions.md, but NOT a project sub-CLAUDE.md or slack.
-    assert "Claude" in titles
-    assert "Decisions" in titles
-    assert "RR decisions" in titles
-    assert "F3E brief" not in titles
-    assert "chatter" not in titles
+    out = mcp_server.decisions_search("QBO", limit=5)
+    assert fake.decision_calls, "must call kb.search_decisions"
+    assert fake.decision_calls[-1]["k"] == 5
+    assert out["count"] == 1
+    assert "QBO" in out["results"][0]["content"]
 
 
-def test_decisions_search_searches_fndr(monkeypatch):
+def test_decisions_search_embeds_outside_lock(monkeypatch):
+    # _embed is patched by _wire; assert the fake never had to embed internally.
     _patch_staff(monkeypatch)
-    fake = _wire(monkeypatch, [])
-    mcp_server.decisions_search("q", limit=5)
-    assert fake.calls[-1]["entity"] == "FNDR"
+    fake = _wire(monkeypatch, [], decisions_results=[])
+    mcp_server.decisions_search("q", limit=3)
+    assert fake.decision_calls[-1].get("query_vec") is not None
 
 
 # ── E. known_answers ─────────────────────────────────────────────────────────
