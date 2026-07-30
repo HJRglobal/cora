@@ -825,6 +825,21 @@ def _parse_iso8601(value: str | None) -> int | None:
         return None
 
 
+def _escape_slack_link_label(label: str) -> str:
+    """Escape the label portion of a Slack mrkdwn link ``<url|label>``. A literal ``&``,
+    ``<``, or ``>`` in a task name breaks the link token (Slack requires those escaped
+    inside label text), which is what produced the stray ``&gt;`` after some daily-
+    briefing Asana links (Slice 2, 2026-07-29 audit): a ``>`` in the name closed the
+    link early and the trailing text was rendered/HTML-escaped as a loose ``&gt;``.
+    Order matters -- ``&`` first, so we never double-escape our own ``&lt;``/``&gt;``."""
+    return (
+        str(label)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def format_created_task_for_llm(task: dict[str, Any]) -> str:
     """Render a freshly-created task as a Slack-mrkdwn confirmation line."""
     name = task.get("name", "(no name)")
@@ -834,7 +849,7 @@ def format_created_task_for_llm(task: dict[str, Any]) -> str:
     projects = ", ".join(p.get("name", "") for p in (task.get("projects") or [])) or "(no project — in assignee's My Tasks)"
 
     if permalink:
-        name_link = f"<{permalink}|{name}>"
+        name_link = f"<{permalink}|{_escape_slack_link_label(name)}>"
     else:
         name_link = name
 
@@ -1009,9 +1024,11 @@ def format_tasks_for_llm(
         notes = (t.get("notes") or "").replace("\n", " ").strip()
         notes_preview = f" — {notes[:120]}..." if len(notes) > 120 else (f" — {notes}" if notes else "")
 
-        # Wrap task name in Slack mrkdwn hyperlink (renders as clickable in Slack)
+        # Wrap task name in Slack mrkdwn hyperlink (renders as clickable in Slack).
+        # Escape the label so a literal <, >, or & in the task name can't break the
+        # link token and leave a stray &gt; after it (Slice 2, 2026-07-29 audit).
         if permalink:
-            name_with_link = f"<{permalink}|{name}>"
+            name_with_link = f"<{permalink}|{_escape_slack_link_label(name)}>"
         else:
             name_with_link = name
 
