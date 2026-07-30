@@ -39,6 +39,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-slack", action="store_true")
     parser.add_argument("--lookback-days", type=int, default=7)
+    parser.add_argument(
+        "--time-budget-min", type=float, default=45.0,
+        help="Self-bound the filing scan to this many minutes so a slow run posts a "
+             "PARTIAL digest instead of being killed by the task's 1h ExecutionTimeLimit "
+             "(a backstop). 0 disables the budget.",
+    )
     args = parser.parse_args()
 
     LOG_PATH.mkdir(parents=True, exist_ok=True)
@@ -56,39 +62,58 @@ def main() -> int:
     )
     log = logging.getLogger("finance-receipt-digest")
 
-    result = finance_receipts.run_digest(
-        dry_run=args.dry_run, lookback_days=args.lookback_days,
-    )
-    digest = finance_receipts.format_digest(
-        result["rows"], result["accounts_scanned"],
-    )
+    budget = args.time_budget_min * 60 if args.time_budget_min and args.time_budget_min > 0 else None
+    try:
+        result = finance_receipts.run_digest(
+            dry_run=args.dry_run, lookback_days=args.lookback_days,
+            time_budget_seconds=budget,
+        )
+        digest = finance_receipts.format_digest(
+            result["rows"], result["accounts_scanned"],
+        )
+    except Exception:
+        # Slice 7: a crash here previously escaped to stderr as a bare exit 1 with NO
+        # log-file trace (2026-07-27, log ended mid-upload), so the failure was
+        # undiagnosable. Log the full traceback to the log file, raise a metadata-only
+        # ops alert, and exit nonzero.
+        log.exception("finance-receipt-digest crashed before the digest could be built")
+        try:
+            finance_receipts.alert_delivery_failure(0, 0)
+        except Exception:  # noqa: BLE001
+            log.error("finance-receipt-digest: crash alert also failed to send")
+        return 1
 
     log.info(
-        "digest complete: %d new financial docs across %d accounts (%d errors)%s",
-        len(result["rows"]), result["accounts_scanned"], result["errors"],
+        "digest complete: %d new financial docs across %d accounts (%d per-item error(s))%s%s",
+        len(result["rows"]), result["accounts_scanned"], result.get("errors", 0),
+        " [budget hit -- partial scan, rest next run]" if result.get("budget_hit") else "",
         " [dry-run]" if args.dry_run else "",
     )
 
     if args.dry_run or args.no_slack:
         print(digest)
-    else:
-        posted = finance_receipts.post_digest_to_slack(digest)
-        if not posted:
-            # W4-02: never silently succeed-then-drop. The digest work is done
-            # (docs filed) but the summary didn't reach the finance channel
-            # (e.g. it was archived). Raise a loud metadata-only alert to a
-            # live ops channel AND exit nonzero so the nightly health check's
-            # LastResult probe (W4-07) also flags it.
-            log.error(
-                "digest post FAILED — raising delivery-failure alert "
-                "(%d docs filed but summary not delivered)", len(result["rows"]),
-            )
-            finance_receipts.alert_delivery_failure(
-                len(result["rows"]), result["accounts_scanned"],
-            )
-            print(digest)
-            return 1
-    return 0 if result["errors"] == 0 else 2
+        return 0
+
+    posted = finance_receipts.post_digest_to_slack(digest)
+    if not posted:
+        # W4-02: never silently succeed-then-drop. The docs are filed but the summary
+        # didn't reach the finance channel (e.g. it was archived). Loud metadata-only
+        # alert + exit nonzero -- this is a GENUINE delivery failure worth flagging.
+        log.error(
+            "digest post FAILED -- raising delivery-failure alert "
+            "(%d docs filed but summary not delivered)", len(result["rows"]),
+        )
+        finance_receipts.alert_delivery_failure(
+            len(result["rows"]), result["accounts_scanned"],
+        )
+        print(digest)
+        return 1
+
+    # Slice 7: the digest posted -> success. Per-item errors (a transiently-unreachable
+    # mailbox, a single un-parseable receipt) are EXPECTED and logged above; they must
+    # NOT red the task. The old `return 2 if errors else 0` flipped LastResult nonzero
+    # for 10+ days on any hiccup even though the digest posted fine -- alarm-blindness.
+    return 0
 
 
 if __name__ == "__main__":

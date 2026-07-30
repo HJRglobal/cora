@@ -438,3 +438,67 @@ def test_fallback_channel_precedence(monkeypatch):
     assert fr._fallback_alert_channel() == "cora-health"
     monkeypatch.setenv("FINANCE_DIGEST_FALLBACK_CHANNEL", "explicit-chan")
     assert fr._fallback_alert_channel() == "explicit-chan"
+
+
+# ── Slice 7 (2026-07-29 audit): digest resilience -- crash guard + self-bounding ──
+
+def test_run_digest_row_build_crash_guarded(monkeypatch):
+    """A bad date_ts must NOT crash the whole digest AFTER the doc was filed (the
+    2026-07-27 exit-1, whose log ended mid-upload). The row is built with a fallback
+    date instead."""
+    import cora.connectors.gmail_reader as gr
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["box@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments",
+                        lambda mb, since, max_results=200: ["m1"])
+    monkeypatch.setattr(gr, "get_message", lambda mb, mid: {"id": mid})
+    monkeypatch.setattr(gr, "parse_message_metadata", lambda msg: {
+        "subject": "Invoice 123", "from": "v@x.com", "snippet": "amount due $10",
+        "attachments": [{"filename": "inv.pdf"}], "date_ts": "not-a-timestamp",
+    })
+    monkeypatch.setattr(fr, "is_phi_risk", lambda t: False)
+    monkeypatch.setattr(fr, "is_financial_document", lambda *a, **k: True)
+    monkeypatch.setattr(fr, "file_message_attachments",
+                        lambda mb, mid, dry_run=False: [{"link": "http://drive/x", "name": "inv.pdf"}])
+    monkeypatch.setattr(fr, "parse_amount", lambda s, sn: "$10")
+    result = fr.run_digest(dry_run=True)  # dry_run -> no watermark/audit writes
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["date"]  # fallback date present, no crash
+    assert result["budget_hit"] is False
+
+
+def test_run_digest_missing_link_guarded(monkeypatch):
+    """A filed result missing the 'link' key must not KeyError-crash the run."""
+    import cora.connectors.gmail_reader as gr
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["box@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments",
+                        lambda mb, since, max_results=200: ["m1"])
+    monkeypatch.setattr(gr, "get_message", lambda mb, mid: {"id": mid})
+    monkeypatch.setattr(gr, "parse_message_metadata", lambda msg: {
+        "subject": "Invoice", "from": "v@x.com", "snippet": "$5",
+        "attachments": [{"filename": "a.pdf"}], "date_ts": 1785000000,
+    })
+    monkeypatch.setattr(fr, "is_phi_risk", lambda t: False)
+    monkeypatch.setattr(fr, "is_financial_document", lambda *a, **k: True)
+    monkeypatch.setattr(fr, "file_message_attachments",
+                        lambda mb, mid, dry_run=False: [{"name": "a.pdf"}])  # no 'link'
+    monkeypatch.setattr(fr, "parse_amount", lambda s, sn: "$5")
+    result = fr.run_digest(dry_run=True)
+    assert len(result["rows"]) == 1 and result["rows"][0]["link"] == ""
+
+
+def test_run_digest_time_budget_stops_scanning(monkeypatch):
+    """An exhausted time budget stops the scan and returns budget_hit=True so the caller
+    can still post a partial digest instead of being killed mid-loop."""
+    calls = {"n": 0}
+    import cora.connectors.gmail_reader as gr
+
+    def _list(mb, since, max_results=200):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(fr, "_digest_accounts", lambda: ["a@x.com", "b@x.com"])
+    monkeypatch.setattr(gr, "list_messages_with_attachments", _list)
+    # A negative budget puts the deadline in the past immediately -> stop on mailbox 1.
+    result = fr.run_digest(dry_run=True, time_budget_seconds=-1.0)
+    assert result["budget_hit"] is True
+    assert calls["n"] == 0  # never scanned a mailbox

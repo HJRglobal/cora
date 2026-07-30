@@ -405,7 +405,8 @@ def parse_amount(*texts: str) -> str:
     return ""
 
 
-def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAYS) -> dict:
+def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAYS,
+               time_budget_seconds: float | None = None) -> dict:
     """Scan all inboxes for new financial documents, file them, build a digest.
 
     Per-account ATOMIC watermark (D-038): each account's watermark advances as
@@ -413,8 +414,14 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
     Dedup ledger (finance-receipt-filed-ids.json) guarantees once-only filing
     even across watermark resets.
 
-    Returns {"rows": [...], "accounts_scanned": int, "errors": int} — the
-    caller (scripts/run_finance_receipt_digest.py) posts the Slack digest.
+    time_budget_seconds (Slice 7, 6/12 self-bounding doctrine): if set, stop
+    scanning further mailboxes once the budget is spent and return what was filed
+    so the caller can still post the digest -- the scheduled-task ExecutionTimeLimit
+    is only a backstop; the script self-bounds so a slow Drive-upload run posts a
+    partial digest instead of being killed mid-loop.
+
+    Returns {"rows": [...], "accounts_scanned": int, "errors": int,
+    "budget_hit": bool} — the caller posts the Slack digest.
     """
     from .connectors.gmail_reader import (  # lazy — Google deps
         GmailReaderError, get_message, list_messages_with_attachments,
@@ -429,8 +436,18 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
     rows: list[dict[str, str]] = []
     errors = 0
     accounts = _digest_accounts()
+    deadline = (time.monotonic() + time_budget_seconds) if time_budget_seconds else None
+    budget_hit = False
 
-    for mailbox in accounts:
+    for idx, mailbox in enumerate(accounts):
+        if deadline is not None and time.monotonic() > deadline:
+            budget_hit = True
+            log.warning(
+                "finance_receipts digest: time budget (%.0fs) reached -- posting with "
+                "%d doc(s) filed so far, %d mailbox(es) left unscanned this run",
+                time_budget_seconds, len(rows), len(accounts) - idx,
+            )
+            break
         since = int(marks.get(mailbox) or default_since)
         try:
             msg_ids = list_messages_with_attachments(mailbox, since, max_results=200)
@@ -440,6 +457,9 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
             continue
 
         for message_id in msg_ids:
+            if deadline is not None and time.monotonic() > deadline:
+                budget_hit = True
+                break
             ledger_key = f"{mailbox}:{message_id}"
             if ledger_key in filed_ids:
                 continue
@@ -475,20 +495,34 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
             if not filed:
                 continue
 
-            rows.append({
-                "vendor": sender,
-                "subject": subject,
-                "amount": parse_amount(subject, snippet),
-                "date": datetime.fromtimestamp(
-                    meta.get("date_ts", sync_start), tz=timezone.utc
-                ).strftime("%Y-%m-%d"),
-                "mailbox": mailbox,
-                "link": filed[0]["link"],
-            })
+            # Guard the row build: a bad date_ts (datetime.fromtimestamp raises on an
+            # out-of-range / non-numeric value) or a missing link must NOT crash the
+            # whole digest AFTER the doc was already filed to Drive -- that unhandled
+            # exception was the 2026-07-27 exit-1 (log ended mid-upload). (Slice 7)
+            try:
+                try:
+                    doc_date = datetime.fromtimestamp(
+                        meta.get("date_ts", sync_start), tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                except (TypeError, ValueError, OverflowError, OSError):
+                    doc_date = datetime.fromtimestamp(sync_start, tz=timezone.utc).strftime("%Y-%m-%d")
+                rows.append({
+                    "vendor": sender,
+                    "subject": subject,
+                    "amount": parse_amount(subject, snippet),
+                    "date": doc_date,
+                    "mailbox": mailbox,
+                    "link": (filed[0].get("link") if filed else "") or "",
+                })
+            except Exception as exc:  # noqa: BLE001 -- never crash a filed doc's row build
+                log.warning("finance_receipts digest: row build failed %s: %s", message_id, exc)
+                errors += 1
 
         if not dry_run:
             marks[mailbox] = sync_start
             _save_watermarks(marks)  # atomic per account (D-038)
+        if budget_hit:
+            break
 
     if rows and not dry_run:
         audit(
@@ -498,7 +532,8 @@ def run_digest(dry_run: bool = False, lookback_days: int = _DEFAULT_LOOKBACK_DAY
             items=[f"{r['mailbox']}:{r['subject'][:80]}" for r in rows],
             mode="digest",
         )
-    return {"rows": rows, "accounts_scanned": len(accounts), "errors": errors}
+    return {"rows": rows, "accounts_scanned": len(accounts), "errors": errors,
+            "budget_hit": budget_hit}
 
 
 def format_digest(rows: list[dict[str, str]], accounts_scanned: int) -> str:
