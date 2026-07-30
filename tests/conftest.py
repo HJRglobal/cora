@@ -213,6 +213,47 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         _td._PENDING_SHOPIFY_WRITES.clear()
     except Exception:
         pass
+    # Slice 5 (2026-07-29 audit): the two rollout flags live in .env
+    # (CORA_AUTOWRITE_LIVE=all, CORA_CODE_QUEUE=live) and config.py's import-time
+    # load_dotenv() pulls them into the test process. Both writers read their flag
+    # per-call (knowledge_review.autowrite_level / code_queue.code_queue_level), so
+    # reset both to "off" for EVERY test -- a test that needs a live value sets it
+    # explicitly (test_code_queue's qenv sets "live"; test_kb_autowrite / the three
+    # test_run_knowledge_review cases set the value they need). This is the
+    # ROOT-CAUSE fix for the ledger test-pollution that contaminated
+    # logs/cora-autowrite-audit.jsonl + data/state/code-session-queue*.jsonl.
+    monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+    monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    # Belt: even if a test flips a flag live but forgets to isolate the path,
+    # redirect every module-constant ledger writer to tmp so a test can NEVER touch
+    # a real logs/ or data/state/ file. Each in its own try/except (a missing or
+    # renamed module must never break the fixture). A test that patches one of
+    # these itself wins -- its monkeypatch runs after this autouse one.
+    import importlib as _importlib
+    _LEDGER_CONSTS = [
+        ("cora.code_queue", "_EVENT_LEDGER", "code-session-queue.jsonl"),
+        ("cora.code_queue", "_FINGERPRINT_LEDGER", "code-queue-fingerprints.jsonl"),
+        ("cora.code_queue", "_SIGNALS_LEDGER", "code-queue-signals.jsonl"),
+        ("cora.knowledge_review", "_AUTOWRITE_AUDIT_PATH", "cora-autowrite-audit.jsonl"),
+        ("cora.pm_metrics", "_ACTION_LOG", "pm-actions.jsonl"),
+        ("cora.pm_metrics", "_SNAPSHOT_DIR", "pm-adoption-snapshots"),
+        ("cora.finance_receipts", "_AUDIT_LOG_PATH", "finance-access-audit.jsonl"),
+        ("cora.historical_access", "_AUDIT_LOG_PATH", "historical-access-audit.jsonl"),
+        ("cora.session_capture", "LEDGER_PATH", "session-captures.jsonl"),
+        ("cora.feedback_log", "_LOG_PATH", "feedback.jsonl"),
+        ("cora.user_feedback_tracker", "_LOG_PATH", "cora-user-feedback.jsonl"),
+        ("cora.connectors.fireflies_connector", "_DEDUP_LEDGER_PATH",
+         "fireflies-dedup-ledger.json"),
+        ("cora.connectors.fireflies_action_extractor", "_WATERMARK_PATH",
+         "meeting_action_watermark.json"),
+    ]
+    for _mod_name, _attr, _fname in _LEDGER_CONSTS:
+        try:
+            _mod = _importlib.import_module(_mod_name)
+            if hasattr(_mod, _attr):
+                monkeypatch.setattr(_mod, _attr, tmp_path / _fname, raising=False)
+        except Exception:
+            pass
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:
@@ -227,27 +268,52 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         pass
 
 
+# Real ledger/state files under logs/ and data/ that the test suite must NEVER
+# mutate (Slice 5, 2026-07-29 audit: generalized from the single shopify audit
+# file). Repo-relative; the autouse fixture above redirects each writer's module
+# constant to tmp, so a change here at session end means a test escaped isolation.
+_GUARDED_LEDGERS = (
+    "logs/shopify-inventory-writes.jsonl",
+    "logs/cora-autowrite-audit.jsonl",
+    "data/state/code-session-queue.jsonl",
+    "data/state/code-queue-fingerprints.jsonl",
+    "data/state/code-queue-signals.jsonl",
+    "logs/pm-actions.jsonl",
+    "logs/finance-access-audit.jsonl",
+    "logs/historical-access-audit.jsonl",
+    "logs/session-captures.jsonl",
+    "logs/feedback.jsonl",
+    "logs/cora-user-feedback.jsonl",
+    "data/cora-proposed-memory-updates.jsonl",
+    "data/cora-reply-log.jsonl",
+    "data/state/fireflies-dedup-ledger.json",
+    "data/state/meeting_action_watermark.json",
+)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _guard_logs_untouched():
-    """MED-3 repo guard: the test suite must NOT mutate the real DTC inventory
-    audit log. Snapshot its (size, mtime) at session start and check it at session
-    end -- if a test writes to logs/ instead of a tmp path, fail.
+    """Repo guard (Slice 5): the test suite must NOT mutate any real ledger under
+    logs/ or data/. Snapshot each guarded file's (size, mtime) at session start and
+    re-check at session end -- if a test writes to a real path instead of its tmp
+    redirect, flag it (naming the offending file).
 
-    Live-host safety (review #6): the always-on bot appends to this same file. If
-    the bot is running concurrently (heartbeat fresh), a change is almost certainly
-    a legitimate live write, NOT a test regression -- so downgrade to a warning
-    rather than false-failing the whole suite. On a quiet host (CI / dev, no live
-    bot) the redirect means tests can't touch it, so a change IS a regression -> fail.
+    Live-host safety (review #6): the always-on bot appends to several of these
+    files. If the bot is running concurrently (heartbeat fresh), a change is almost
+    certainly a legitimate live write, NOT a test regression -- so downgrade to a
+    warning rather than false-failing the whole suite. On a quiet host (CI / dev,
+    no live bot) the redirects mean tests can't touch these, so a change IS a
+    regression -> fail.
     """
     import warnings
     from pathlib import Path as _Path
     root = _Path(__file__).resolve().parent.parent
-    audit = root / "logs" / "shopify-inventory-writes.jsonl"
     heartbeat = root / "data" / "health" / "heartbeat.txt"
+    guarded = [root / rel for rel in _GUARDED_LEDGERS]
 
-    def _snap():
+    def _snap(p):
         try:
-            st = audit.stat()
+            st = p.stat()
             return (st.st_size, int(st.st_mtime))
         except FileNotFoundError:
             return None
@@ -259,15 +325,17 @@ def _guard_logs_untouched():
         except Exception:
             return False
 
-    before = _snap()
+    before = {p: _snap(p) for p in guarded}
     yield
-    after = _snap()
-    if after == before:
+    changed = [p for p in guarded if _snap(p) != before[p]]
+    if not changed:
         return
-    msg = (f"the real audit log {audit} changed during the suite ({before} -> {after})")
+    names = ", ".join(str(p) for p in changed)
+    msg = f"real ledger(s) changed during the suite: {names}"
     if _bot_live():
         warnings.warn(msg + " -- but the live bot is running (heartbeat fresh), so this "
                       "is most likely a concurrent real write, not a test regression.")
     else:
         raise AssertionError(
-            msg + " -- a test wrote to logs/ instead of a tmp path (no live bot detected)")
+            msg + " -- a test wrote to a real ledger instead of a tmp path "
+            "(no live bot detected). Extend the autouse ledger-isolation fixture.")
