@@ -53,6 +53,35 @@ log = logging.getLogger(__name__)
 
 app = App(token=config.slack_bot_token, signing_secret=config.slack_signing_secret)
 
+
+@app.middleware
+def _dedup_event_deliveries(body, next, logger):  # noqa: A002 -- Bolt's contract names it `next`
+    """Suppress duplicate Slack event DELIVERIES (cq-479b157f8c00): Socket Mode is
+    at-least-once, and an ack lost on a flapping WebSocket makes Slack redeliver —
+    each delivery previously ran the full Q&A pipeline (two contradictory replies
+    14ms apart, live 7/27). Keyed STRICTLY on the events-API top-level event_id
+    (commands / block-actions / shortcuts carry none and pass through; the
+    app_mention+message dual-path for one message has distinct event_ids and is
+    governed by W1-01, not this). Returning a 200 BoltResponse without next()
+    halts dispatch AND acks the envelope so Slack stops retrying. Fail-open:
+    any error here must never block dispatch."""
+    try:
+        from slack_bolt.response import BoltResponse
+
+        from . import event_dedup
+
+        event_id = body.get("event_id") if isinstance(body, dict) else None
+        if event_id and event_dedup.is_duplicate(event_id):
+            etype = ((body.get("event") or {}).get("type")
+                     if isinstance(body, dict) else None)
+            log.warning("event_dedup: duplicate delivery suppressed event_id=%s type=%s",
+                        event_id, etype)
+            return BoltResponse(status=200, body="duplicate event delivery ignored")
+    except Exception:  # noqa: BLE001 -- dedup must never 500 an event
+        log.warning("event_dedup: middleware error (failing open)", exc_info=True)
+    return next()
+
+
 _MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
 # ── Permanently blocked channel IDs ────────────────────────────────────────────
 # Cora must NEVER post to these channels under any circumstance.

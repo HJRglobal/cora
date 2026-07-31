@@ -707,9 +707,18 @@ def format_location_inventory_for_llm(
         for s in b_skus:
             flag = "\U0001f6a8" if s.available <= 10 else "\u26a0\ufe0f" if s.available <= 50 else "\u2705"
             lines.append(f"{flag} {s.product_title}: *{s.available:,}* units")
+        # Explicit per-brand total (additive; cq-479b157f8c00 rider): the 7/27
+        # duplicate-reply incident's data-bearing twin had Haiku SUMMING the
+        # per-SKU lines itself and getting the Energy total wrong while Mood and
+        # Pure happened to add up. Pre-compute every total so the model never
+        # does the arithmetic.
         if not brand:
+            lines.append(f"F3 {b} total at {loc_display}: "
+                         f"*{sum(s.available for s in b_skus):,}* units")
             lines.append("")
 
+    lines.append(f"Total at {loc_display} (all brands shown): "
+                 f"*{sum(s.available for s in skus):,}* units")
     lines.append("_Live data. Units = individual cans._")
     return "\n".join(lines)
 
