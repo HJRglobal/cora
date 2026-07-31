@@ -3299,10 +3299,22 @@ def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dic
     brand = (_input.get("brand") or "").strip() or None
 
     if not location:
-        return (
-            "f3e_inventory_by_location called without `location`. "
-            "Ask the user which location to check: 'Nimbl', 'UNIS' (warehouse), or 'office'."
-        )
+        # cq-9845f2effb8d: READ queries in a channel with a configured default
+        # location ("how many cases are at the office" in #f3-hq-inventory-
+        # adjustments) must scope to the SAME per-channel default the WRITE path
+        # already applies -- not fall back to asking (or worse, an all-locations
+        # aggregate from the sibling tool). Fail-soft: unlisted channel -> ask.
+        channel_default = str(_load_inventory_channel_config(
+            str(_input.get("_channel_name") or "")).get("default_location") or "")
+        if channel_default:
+            location = channel_default.strip().lower()
+            log.info("f3e_inventory_by_location user=%s channel-default location=%r",
+                     slack_user_id, location)
+        else:
+            return (
+                "f3e_inventory_by_location called without `location`. "
+                "Ask the user which location to check: 'Nimbl', 'UNIS' (warehouse), or 'office'."
+            )
 
     # Nimbl = live Shopify inventory_levels
     if location == "nimbl":
@@ -3327,9 +3339,12 @@ def _tool_f3e_inventory_by_location(slack_user_id: str, entity: str, _input: dic
     # writes ("1337 S Gilbert Rd"), or a "how many at the office" pre-check reads the
     # stale weekly Excel (0) while the write previews the live count (202). Resolve via
     # the write-path alias map so read + write always agree; Excel is a labeled fallback
-    # only on a live error.
-    _, _write_aliases = _load_shopify_write_config()
-    canonical = _write_aliases.get(location)
+    # only on a live error. The CANONICAL name typed verbatim (or arriving via the
+    # channel default) must also go live -- the alias map is alias->name only
+    # (cq-9845f2effb8d).
+    _write_allowed, _write_aliases = _load_shopify_write_config()
+    canonical = _write_aliases.get(location) or (
+        location if location in _write_allowed else None)
     if canonical:
         try:
             skus = shopify_client.get_inventory_by_location(canonical, brand)
@@ -4169,8 +4184,8 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
     Phase 2 (confirmed=true): execute the caller's OWN pending entry -- identity is
     the tool's server-resolved ids, NOT an LLM echo (HIGH-1) -- after a FRESH live-qty
     re-check (drift -> re-preview; match -> WRITE). A changed target re-previews
-    against the same resolved ids; no fresh pending falls back to a fresh resolve.
-    Never a blind write.
+    against the same resolved ids; no fresh pending REFUSES honestly (D-090/S1 --
+    never re-derives a write from scratch on a confirm). Never a blind write.
 
     Every non-write return is WRITE_BLOCKED-wrapped and leads with a NOT-WRITTEN
     marker; the claude_client narration net posts the tool's own outcome text so a
@@ -4189,7 +4204,9 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             f"{_NOT_WRITTEN}\nDTC inventory updates are only available from F3E channels."
         )
 
-    confirmed = input_data.get("confirmed", False) is True
+    # A model string-echo ("true") must land in the honest Phase-2 refusal, never in
+    # Phase 1 where it would silently regenerate a preview (cq-ed29165fca97 A2).
+    confirmed = input_data.get("confirmed", False) in (True, "true", "True")
     items = input_data.get("items")
     is_bulk = isinstance(items, list) and len(items) > 0
 
@@ -4372,6 +4389,33 @@ def _peek_pending_shopify(slack_user: str, channel: str) -> dict | None:
     return None
 
 
+def _pop_expired_shopify_write(slack_user: str, channel: str) -> dict | None:
+    """Pop-and-return an EXPIRED Shopify pending entry (None when absent or still
+    fresh). cq-ed29165fca97: the peeks treat an expired entry as absent, so a bare
+    "confirm" after the 10-min TTL fell through to the MODEL, which re-derived the
+    write from thread text — a silent byte-identical batch re-preview (7/30
+    09:56→10:36) or a re-parsed mangled product label that failed resolution
+    (7/30 17:14→20:48, "F3 Pure Variety Pack 12-pack"). D-090/S1 fixed only the
+    confirmed=true tool-arg path; the interceptor serves the honest expiry reply
+    from this tombstone instead of falling through."""
+    key = _shopify_pending_key(slack_user, channel)
+    with _SHOPIFY_PENDING_LOCK:
+        entry = _PENDING_SHOPIFY_WRITES.get(key)
+        if entry and (time.time() - float(entry.get("ts", 0))) > _SHOPIFY_PENDING_TTL_SECONDS:
+            return _PENDING_SHOPIFY_WRITES.pop(key)
+    return None
+
+
+def _expired_pending_label(entry: dict) -> str:
+    """Short human label for an expired pending entry (batch or single)."""
+    rows = entry.get("rows")
+    if rows:
+        return f"the {len(rows)}-item batch previewed earlier"
+    label = str(entry.get("variant_label") or "the change previewed earlier")
+    loc = str(entry.get("location_label") or "")
+    return f"{label} at {loc}" if loc else label
+
+
 def _peek_pending_calendar(slack_user: str, channel: str) -> dict | None:
     """Read-only fresh-pending peek (does NOT pop) for the Calendar staged-write store.
     The interceptor peeks calendar for FRESHNESS ONLY -- it never executes a calendar
@@ -4471,6 +4515,23 @@ def try_confirm_pending_write(
     if calendar:
         entries.append((float(calendar.get("ts", 0)), "calendar", calendar.get("action")))
     if not entries:
+        # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
+        # affirmative + an EXPIRED Shopify entry means the user is confirming a
+        # preview that timed out — serve ONE honest deterministic expiry reply
+        # instead of falling to the model (which re-derives the write from thread
+        # text: silent identical re-preview / mangled re-parsed product name, both
+        # live 7/30). Pop-on-serve: only the first post-expiry confirm gets this;
+        # any non-affirmative message leaves the tombstone in place and falls
+        # through untouched (the conservative _confirm_intent gate is load-bearing —
+        # an unrelated "yes" to a question with content words never lands here).
+        if _confirm_intent(message, None) == "affirm":
+            expired = _pop_expired_shopify_write(slack_user_id, channel_name)
+            if expired:
+                log.info("confirm_interceptor EXPIRED-refuse user=%s kind=shopify",
+                         slack_user_id)
+                return (f"That inventory change expired before you confirmed "
+                        f"({_expired_pending_label(expired)}). Nothing was written -- "
+                        "tell me the change again and I'll re-preview it.")
         return None
     entries.sort(reverse=True)  # freshest first
     _ts, kind, action = entries[0]
@@ -7347,6 +7408,8 @@ TOOL_DEFINITIONS = [
             "Returns variant-level inventory with low-stock flags (default threshold: 10 units). "
             "Defaults to low-stock-only view; set low_stock_only=false for full inventory. "
             "Note: Nimbl 3PL syncs to Shopify in real time -- this is the canonical inventory. "
+            "IMPORTANT: totals span ALL Shopify locations combined. For a SINGLE location "
+            "('at the office', 'at Nimbl', 'at UNIS') use f3e_inventory_by_location instead. "
             "Output is source-opaque. Only call in F3E or FNDR channels."
         ),
         "input_schema": {
@@ -7503,9 +7566,14 @@ TOOL_DEFINITIONS = [
             "\n"
             "Location routing:\n"
             "  - 'nimbl'  -> LIVE Shopify inventory (real-time; Nimbl syncs with Shopify).\n"
+            "  - 'office', 'hq', '117', 'gilbert' -> LIVE Shopify (the SAME 1337 S "
+            "Gilbert Rd location the inventory write tool uses -- office-level detail "
+            "IS surfaced live).\n"
             "  - 'unis', 'warehouse', or 'cotton' -> weekly Excel batch report (snapshot).\n"
-            "  - 'office' or '117' -> weekly Excel batch report (snapshot).\n"
             "\n"
+            "In a channel with a configured default location (e.g. "
+            "#f3-hq-inventory-adjustments -> the office), you may omit `location` and "
+            "the channel default applies -- same rule as the write tool.\n"
             "The optional `brand` parameter filters to one F3 sub-brand. "
             "If the user says 'Pure inventory at Nimbl', set brand=pure and location=nimbl. "
             "If they say 'Nimbl inventory' with no brand, omit brand to return all SKUs. "
@@ -7518,10 +7586,12 @@ TOOL_DEFINITIONS = [
                 "location": {
                     "type": "string",
                     "description": (
-                        "Which location to query. Required. Case-insensitive. "
+                        "Which location to query. Case-insensitive. "
                         "Valid values: 'nimbl' (live Shopify data), "
-                        "'unis' / 'warehouse' / 'cotton' (weekly Excel snapshot), "
-                        "'office' / '117' (weekly Excel snapshot)."
+                        "'office' / 'hq' / '117' / 'gilbert' (live Shopify -- the "
+                        "write tool's 1337 S Gilbert Rd location), "
+                        "'unis' / 'warehouse' / 'cotton' (weekly Excel snapshot). "
+                        "Omit in a channel with a configured default location."
                     ),
                 },
                 "brand": {
@@ -7533,7 +7603,10 @@ TOOL_DEFINITIONS = [
                     ),
                 },
             },
-            "required": ["location"],
+            # location is optional (cq-9845f2effb8d): omitted -> the per-channel
+            # default location applies (same config the write tool uses); in a
+            # channel with no default the tool still asks.
+            "required": [],
         },
     },
     # ── F3 brand voice tools (F3E only — social channels + any F3E/FNDR channel) ──

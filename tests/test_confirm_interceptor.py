@@ -311,3 +311,88 @@ class TestInterceptorShopify:
         ms.assert_called_once()
         md.assert_not_called()
         assert out == "DTC inventory updated."
+
+
+# ── expired-confirm tombstone (cq-ed29165fca97) ─────────────────────────────
+class TestExpiredShopifyTombstone:
+    """A Shopify pending that aged past TTL + a bare confirm must get ONE honest
+    deterministic expiry reply -- never fall through to the model (which re-derives
+    the write from thread text: the 7/30 silent identical batch re-preview and the
+    7/30 mangled re-parsed product name were both this fall-through)."""
+
+    def _stash_expired_single(self):
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "inventory_item_id": "i1", "location_id": "l1", "target_qty": 198,
+            "preview_qty": 202, "delta": -4, "unit": "cases",
+            "variant_label": "F3 Pure Variety Pack", "location_label": "1337 S Gilbert Rd",
+            "ts": time.time() - (td._SHOPIFY_PENDING_TTL_SECONDS + 5),
+        })
+
+    def test_expired_single_confirm_gets_honest_reply_and_pops(self):
+        self._stash_expired_single()
+        with patch.object(td, "_tool_f3e_shopify_set_inventory") as tool:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+            )
+        tool.assert_not_called()                       # never an execute
+        assert out is not None and "expired" in out.lower()
+        assert "Nothing was written" in out
+        assert "F3 Pure Variety Pack" in out           # names what expired
+        # Pop-on-serve: the tombstone is consumed -- a second confirm falls through.
+        out2 = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+        )
+        assert out2 is None
+
+    def test_expired_batch_confirm_gets_honest_reply_never_a_repreview(self):
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "rows": [{"variant_label": f"SKU {i}"} for i in range(4)],
+            "skipped": [],
+            "ts": time.time() - (td._SHOPIFY_PENDING_TTL_SECONDS + 5),
+        })
+        with patch.object(td, "_tool_f3e_shopify_set_inventory") as tool:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+            )
+        tool.assert_not_called()
+        assert out is not None and "expired" in out.lower()
+        assert "4-item batch" in out
+
+    def test_non_affirmative_leaves_tombstone_for_a_later_confirm(self):
+        self._stash_expired_single()
+        out = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E",
+            message="how many cases are at the office",
+        )
+        assert out is None                             # content msg falls through
+        out2 = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+        )
+        assert out2 is not None and "expired" in out2.lower()
+
+    def test_fresh_pending_still_executes_not_tombstoned(self):
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "inventory_item_id": "i1", "location_id": "l1", "target_qty": 5,
+            "preview_qty": 4, "variant_label": "V", "location_label": "Office",
+            "ts": time.time(),
+        })
+        with patch.object(td, "_tool_f3e_shopify_set_inventory",
+                          return_value="WRITE_CONFIRMED\n\nDTC inventory updated.") as tool:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+            )
+        tool.assert_called_once()
+        assert out == "DTC inventory updated."
+
+    def test_expired_asana_still_falls_through_unchanged(self):
+        # The tombstone is deliberately Shopify-scoped: an expired Asana pending's
+        # Phase-1 fall-through regenerates a VISIBLE preview (not a silent write
+        # path) -- keep the pinned None contract.
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "create", "gid": "g1", "label": "X",
+            "ts": time.time() - (td._ASANA_PENDING_TTL_SECONDS + 5),
+        })
+        out = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="yes",
+        )
+        assert out is None

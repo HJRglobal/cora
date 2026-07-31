@@ -719,11 +719,50 @@ class TestToolDispatchInventoryByLocation:
         return handler("U123", "F3E", input_data)
 
     def test_no_location_returns_helpful_error(self):
+        # A channel with NO configured default still asks (fail-soft).
         from cora.tools import tool_dispatch
         handler = tool_dispatch._TOOL_FUNCTIONS["f3e_inventory_by_location"]
         result = handler("U123", "F3E", {})
         assert "location" in result.lower()
         assert "Nimbl" in result or "UNIS" in result
+
+    def test_no_location_applies_channel_default(self):
+        """cq-9845f2effb8d: 'how many cases are at the office' with no explicit
+        location, in a channel with a configured default, must scope to the SAME
+        live location the write path defaults to -- never ask, never aggregate."""
+        from cora.tools import tool_dispatch
+        handler = tool_dispatch._TOOL_FUNCTIONS["f3e_inventory_by_location"]
+        with patch.object(tool_dispatch, "_load_inventory_channel_config",
+                          return_value={"default_location": "1337 S Gilbert Rd",
+                                        "unit": "cases"}) as mock_cfg, \
+             patch.object(tool_dispatch, "_load_shopify_write_config",
+                          return_value=(frozenset({"1337 s gilbert rd"}),
+                                        {"office": "1337 s gilbert rd"})), \
+             patch("cora.connectors.shopify_client.get_inventory_by_location",
+                   return_value=[]) as mock_get, \
+             patch("cora.connectors.shopify_client.format_location_inventory_for_llm",
+                   return_value="office live result"):
+            result = handler("U123", "F3E",
+                             {"_channel_name": "f3-hq-inventory-adjustments"})
+        mock_cfg.assert_called_once_with("f3-hq-inventory-adjustments")
+        mock_get.assert_called_once_with("1337 s gilbert rd", None)
+        assert result == "office live result"
+
+    def test_canonical_location_name_verbatim_goes_live(self):
+        """The canonical allowlisted name typed verbatim (not an alias) must hit
+        the live path too -- the alias map is alias->name only."""
+        from cora.tools import tool_dispatch
+        handler = tool_dispatch._TOOL_FUNCTIONS["f3e_inventory_by_location"]
+        with patch.object(tool_dispatch, "_load_shopify_write_config",
+                          return_value=(frozenset({"1337 s gilbert rd"}),
+                                        {"office": "1337 s gilbert rd"})), \
+             patch("cora.connectors.shopify_client.get_inventory_by_location",
+                   return_value=[]) as mock_get, \
+             patch("cora.connectors.shopify_client.format_location_inventory_for_llm",
+                   return_value="live verbatim"):
+            result = handler("U123", "F3E", {"location": "1337 S Gilbert Rd"})
+        mock_get.assert_called_once_with("1337 s gilbert rd", None)
+        assert result == "live verbatim"
 
     def test_nimbl_routes_to_shopify(self):
         from cora.tools import tool_dispatch
@@ -861,10 +900,22 @@ class TestToolDefinitionsRegistration:
         names = [t["name"] for t in TOOL_DEFINITIONS]
         assert "f3e_inventory_by_location" in names
 
-    def test_location_is_required(self):
+    def test_location_is_optional_for_channel_default(self):
+        # cq-9845f2effb8d: location omitted -> the per-channel default applies
+        # (same config the write tool reads), so the schema no longer requires it.
         from cora.tools.tool_dispatch import TOOL_DEFINITIONS
         td = next(t for t in TOOL_DEFINITIONS if t["name"] == "f3e_inventory_by_location")
-        assert "location" in td["input_schema"]["required"]
+        assert "location" not in td["input_schema"].get("required", [])
+
+    def test_description_routes_office_to_live_not_excel(self):
+        # cq-9845f2effb8d: the stale "'office' or '117' -> weekly Excel" description
+        # is what made the model claim office-level detail "isn't surfaced live".
+        from cora.tools.tool_dispatch import TOOL_DEFINITIONS
+        td = next(t for t in TOOL_DEFINITIONS if t["name"] == "f3e_inventory_by_location")
+        desc = td["description"]
+        office_line = next(ln for ln in desc.splitlines() if "'office'" in ln)
+        assert "LIVE Shopify" in office_line
+        assert "Excel" not in office_line
 
     def test_brand_is_not_required(self):
         from cora.tools.tool_dispatch import TOOL_DEFINITIONS

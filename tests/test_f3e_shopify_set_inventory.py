@@ -317,6 +317,18 @@ class TestConfirmFlow:
             assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
             assert "don't have a pending" in r.lower()
 
+    def test_confirm_string_true_lands_in_phase2_refusal(self):
+        """cq-ed29165fca97 A2: a model string-echo confirmed="true" must land in
+        the honest Phase-2 no-pending refusal -- NOT Phase 1, where it would
+        silently regenerate an identical preview."""
+        with ExitStack() as s:
+            m_set = _stub(s, current=202)
+            r = _confirm(confirmed="true", product="pure original 12",
+                         location="office", quantity=203)
+            m_set.assert_not_called()
+            assert r.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in r
+            assert "don't have a pending" in r.lower()
+
     def test_quantity_drift_re_previews(self):
         with ExitStack() as s:
             m_set = _stub(s, levels=[202, 250])  # preview sees 202, confirm re-check sees 250
