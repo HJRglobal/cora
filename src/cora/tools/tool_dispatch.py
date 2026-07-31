@@ -2929,13 +2929,19 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
         if not portfolio_wide and severity not in ("P0", "P1", "P2"):
             continue
 
-        # Parse Last touched — handles "2026-05-23", "2026-05-12 (note)", "~2026-04"
+        # Parse Last touched — handles "2026-05-23", "2026-05-12 (note)", "~2026-04".
+        # This is STALENESS (days since a human touched the entry), NOT the item's
+        # age — a verify/consolidation pass resets it by design (cq-935a18e2969e).
         touched_match = re.search(r"\*\*Last touched\*\*:\s*([^\n]+)", block)
         age_days: int | None = None
         if touched_match:
             raw = touched_match.group(1).strip()
             date_match = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
-            month_match = re.search(r"~?(\d{4}-\d{2})$", raw.strip())
+            # Month-only fallback matches mid-string too ("2026-04 (note)") so the
+            # three parsers of this file agree on the same entry (bug-hunt recon:
+            # the old end-anchored regex yielded None where the escalation script
+            # parsed the same value).
+            month_match = re.search(r"~?(\d{4}-\d{2})(?!-\d)", raw)
             if date_match:
                 try:
                     touched = datetime.strptime(date_match.group(1), "%Y-%m-%d").date()
@@ -2949,6 +2955,19 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
                 except ValueError:
                     pass
 
+        # Parse Surfaced — the immutable origination date (file field rule #5,
+        # normalized to absolute YYYY-MM-DD 2026-07-31). TRUE open age lives here.
+        surfaced_match = re.search(r"\*\*Surfaced\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
+        open_days: int | None = None
+        surfaced_date: str | None = None
+        if surfaced_match:
+            try:
+                surfaced_d = datetime.strptime(surfaced_match.group(1), "%Y-%m-%d").date()
+                open_days = (today - surfaced_d).days
+                surfaced_date = surfaced_match.group(1)
+            except ValueError:
+                pass
+
         owner_match = re.search(r"\*\*Owner of next nudge\*\*:\s*([^\n]+)", block)
         owner = owner_match.group(1).strip() if owner_match else "unassigned"
 
@@ -2957,6 +2976,8 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
                 "topic": topic,
                 "severity": severity,
                 "age_days": age_days,
+                "open_days": open_days,
+                "surfaced": surfaced_date,
                 "owner": owner,
                 "entity": entry_entity_raw,
             }
@@ -2967,34 +2988,38 @@ def _tool_fndr_open_decisions(slack_user_id: str, entity: str, _input: dict) -> 
             return "No P0 or P1 decisions are currently pending."
         return f"No open decisions found for {calling_entity}."
 
-    p0 = sorted(
-        [e for e in entries if e["severity"] == "P0"],
-        key=lambda x: x["age_days"] or 0,
-        reverse=True,
-    )
-    p1 = sorted(
-        [e for e in entries if e["severity"] == "P1"],
-        key=lambda x: x["age_days"] or 0,
-        reverse=True,
-    )
-    p2 = sorted(
-        [e for e in entries if e["severity"] == "P2"],
-        key=lambda x: x["age_days"] or 0,
-        reverse=True,
-    )
+    def _rank(x: dict) -> int:
+        return x.get("open_days") or x["age_days"] or 0
+
+    p0 = sorted([e for e in entries if e["severity"] == "P0"], key=_rank, reverse=True)
+    p1 = sorted([e for e in entries if e["severity"] == "P1"], key=_rank, reverse=True)
+    p2 = sorted([e for e in entries if e["severity"] == "P2"], key=_rank, reverse=True)
 
     def _fmt(e: dict) -> str:
+        # Dual metric, never conflated (cq-935a18e2969e): "open Nd" anchors to the
+        # immutable Surfaced date; staleness anchors to Last touched. A verify/
+        # consolidation touch resets ONLY staleness — the 7/19-7/31 evidence was a
+        # ~10-week-old P0 narrated as "4 days" after a legitimate 7/20 touch.
         age = e["age_days"]
         if age is None:
-            age_str = "age unknown"
+            stale_str = "staleness unknown"
         elif age == 0:
-            age_str = "touched today"
+            stale_str = "touched today"
         elif age == 1:
-            age_str = "1d stale"
+            stale_str = "untouched 1d"
         else:
-            age_str = f"{age}d stale"
-        # 🚨 = P0 >14d, 🔴 = P0 <=14d, 🟡 = P1, ⚪ = P2
-        if e["severity"] == "P0" and (age or 0) > 14:
+            stale_str = f"untouched {age}d"
+        open_days = e.get("open_days")
+        if open_days is not None:
+            age_str = f"open {open_days}d, {stale_str}"
+        elif age is not None:
+            age_str = f"origination unknown, {stale_str}"
+        else:
+            age_str = "age unknown"
+        # 🚨 = P0 open >14d (file field rule #4 keys on Surfaced; staleness is the
+        # fallback only when origination is unknown), 🔴 = other P0, 🟡 P1, ⚪ P2
+        overdue_metric = open_days if open_days is not None else age
+        if e["severity"] == "P0" and (overdue_metric or 0) > 14:
             marker = "🚨"
         elif e["severity"] == "P0":
             marker = "🔴"

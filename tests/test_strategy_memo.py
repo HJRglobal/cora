@@ -261,6 +261,52 @@ class TestDecisions:
         out = sm.gather_stalled_decisions(today=TODAY)
         assert out["ok"] is False
 
+    def test_surfaced_open_age_distinct_from_touch_staleness(self, paths):
+        """cq-935a18e2969e: a verify/consolidation touch resets ONLY staleness;
+        true open age anchors to the immutable Surfaced date. A frozen relative
+        Surfaced string is flagged unknown, never silently misread."""
+        (paths / "pending.md").write_text(
+            "# Pending\n\n"
+            "### Consolidated call\n- **Entity**: F3E\n- **Severity**: P0\n"
+            "- **Surfaced**: 2026-03-16\n"
+            "- **Last touched**: 2026-06-12 (VERIFIED STILL LIVE 2026-06-12)\n"
+            "- **Owner of next nudge**: Harrison\n\n"
+            "### Frozen-string call\n- **Entity**: OSN\n- **Severity**: P1\n"
+            "- **Surfaced**: 14+ days\n"
+            "- **Last touched**: 2026-06-01\n",
+            encoding="utf-8")
+        out = sm.gather_stalled_decisions(today=TODAY)  # TODAY = 2026-06-14
+        by_topic = {d["topic"]: d for d in out["decisions"]}
+        d0 = by_topic["Consolidated call"]
+        assert d0["open_days"] == 90          # since Surfaced, NOT since the touch
+        assert d0["age_days"] == 2            # staleness (kept under its old key)
+        assert d0["stale_days"] == 2
+        assert d0["surfaced"] == "2026-03-16"
+        assert d0["origination_unknown"] is False
+        d1 = by_topic["Frozen-string call"]
+        assert d1["open_days"] is None
+        assert d1["origination_unknown"] is True
+
+    def test_decision_age_label_renders_both_metrics(self):
+        d = {"open_days": 90, "surfaced": "2026-03-16", "stale_days": 2, "age_days": 2}
+        assert sm._decision_age_label(d) == "open 90d (since 2026-03-16), untouched 2d"
+        assert "origination unknown" in sm._decision_age_label(
+            {"open_days": None, "age_days": 5, "stale_days": 5})
+        assert sm._decision_age_label({}) == "age unknown"
+
+    def test_departed_decision_gets_one_exit_line(self):
+        """cq-935a18e2969e item d: an item leaving the stalled list (e.g. a
+        P0->P2 downgrade) is announced once, never a silent disappearance."""
+        prev = {"date": "2026-06-07", "decisions": {"ok": True, "decisions": [
+            {"topic": "OSN cost-structure conversation"},
+            {"topic": "Still here"},
+        ]}}
+        current = {"date": "2026-06-14", "decisions": {"ok": True, "decisions": [
+            {"topic": "Still here"},
+        ]}}
+        deltas = sm.compute_deltas(current, [prev])
+        assert deltas["departed_decisions"] == ["OSN cost-structure conversation"]
+
     def test_template_skeleton_never_parsed_but_annotated_severity_is(self, paths):
         """The 'How to use' template block (topic '[Topic]', severity line
         'P0 / P1 / P2 / P3') must be skipped; a real entry with an annotated

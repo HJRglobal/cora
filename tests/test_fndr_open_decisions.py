@@ -116,7 +116,7 @@ def _parse_decisions(content: str, entity: str = "FNDR", today: date | None = No
         if touched_match:
             raw = touched_match.group(1).strip()
             date_match = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
-            month_match = re.search(r"~?(\d{4}-\d{2})$", raw.strip())
+            month_match = re.search(r"~?(\d{4}-\d{2})(?!-\d)", raw)
             if date_match:
                 try:
                     touched = datetime.strptime(date_match.group(1), "%Y-%m-%d").date()
@@ -130,6 +130,17 @@ def _parse_decisions(content: str, entity: str = "FNDR", today: date | None = No
                 except ValueError:
                     pass
 
+        surfaced_match = re.search(r"\*\*Surfaced\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
+        open_days: int | None = None
+        surfaced_date: str | None = None
+        if surfaced_match:
+            try:
+                surfaced_d = datetime.strptime(surfaced_match.group(1), "%Y-%m-%d").date()
+                open_days = (today - surfaced_d).days
+                surfaced_date = surfaced_match.group(1)
+            except ValueError:
+                pass
+
         owner_match = re.search(r"\*\*Owner of next nudge\*\*:\s*([^\n]+)", block)
         owner = owner_match.group(1).strip() if owner_match else "unassigned"
 
@@ -138,6 +149,8 @@ def _parse_decisions(content: str, entity: str = "FNDR", today: date | None = No
                 "topic": topic,
                 "severity": severity,
                 "age_days": age_days,
+                "open_days": open_days,
+                "surfaced": surfaced_date,
                 "owner": owner,
                 "entity": entry_entity_raw,
             }
@@ -148,30 +161,32 @@ def _parse_decisions(content: str, entity: str = "FNDR", today: date | None = No
             return "No P0 or P1 decisions are currently pending."
         return f"No open decisions found for {calling_entity}."
 
-    p0 = sorted(
-        [e for e in entries if e["severity"] == "P0"],
-        key=lambda x: x["age_days"] or 0, reverse=True,
-    )
-    p1 = sorted(
-        [e for e in entries if e["severity"] == "P1"],
-        key=lambda x: x["age_days"] or 0, reverse=True,
-    )
-    p2 = sorted(
-        [e for e in entries if e["severity"] == "P2"],
-        key=lambda x: x["age_days"] or 0, reverse=True,
-    )
+    def _rank(x: dict) -> int:
+        return x.get("open_days") or x["age_days"] or 0
+
+    p0 = sorted([e for e in entries if e["severity"] == "P0"], key=_rank, reverse=True)
+    p1 = sorted([e for e in entries if e["severity"] == "P1"], key=_rank, reverse=True)
+    p2 = sorted([e for e in entries if e["severity"] == "P2"], key=_rank, reverse=True)
 
     def _fmt(e: dict) -> str:
         age = e["age_days"]
         if age is None:
-            age_str = "age unknown"
+            stale_str = "staleness unknown"
         elif age == 0:
-            age_str = "touched today"
+            stale_str = "touched today"
         elif age == 1:
-            age_str = "1d stale"
+            stale_str = "untouched 1d"
         else:
-            age_str = f"{age}d stale"
-        if e["severity"] == "P0" and (age or 0) > 14:
+            stale_str = f"untouched {age}d"
+        open_days = e.get("open_days")
+        if open_days is not None:
+            age_str = f"open {open_days}d, {stale_str}"
+        elif age is not None:
+            age_str = f"origination unknown, {stale_str}"
+        else:
+            age_str = "age unknown"
+        overdue_metric = open_days if open_days is not None else age
+        if e["severity"] == "P0" and (overdue_metric or 0) > 14:
             marker = "\U0001f6a8"  # siren
         elif e["severity"] == "P0":
             marker = "\U0001f534"  # red circle
@@ -216,13 +231,16 @@ def _make_entry(
     last_touched: str,
     owner: str,
     entity: str = "FNDR",
+    surfaced: str | None = None,
 ) -> str:
+    surfaced_line = f"- **Surfaced**: {surfaced}\n" if surfaced else ""
     return (
         f"### {topic}\n"
         f"- **Entity**: {entity}\n"
         f"- **Question**: what needs to be decided\n"
         f"- **Decision-maker**: Harrison\n"
         f"- **Severity**: {severity}\n"
+        f"{surfaced_line}"
         f"- **Last touched**: {last_touched}\n"
         f"- **Owner of next nudge**: {owner}\n"
     )
@@ -635,7 +653,20 @@ class TestDateParsing:
             _make_entry("OIC pre-qualifier", "P0", "~2026-04", "Harrison", "FNDR"),
         ))
         assert "OIC pre-qualifier" in result
-        assert "stale" in result or "touched today" in result
+        assert "untouched" in result or "touched today" in result
+
+    def test_month_only_date_with_trailing_note_parses(self):
+        """The live AZ-DOR entry is 'Last touched: 2026-04 (Visibility batch
+        response)' — the old end-anchored month regex yielded None here while the
+        escalation script's mid-string regex parsed it; the three parsers of this
+        file must agree (bug-hunt 2026-07-31)."""
+        result = _parse_decisions(_make_md(
+            _make_entry("AZ DOR item", "P0", "2026-04 (Visibility batch response)",
+                        "Harrison", "FNDR"),
+        ))
+        assert "AZ DOR item" in result
+        assert "untouched" in result           # parsed to a real staleness
+        assert "staleness unknown" not in result
 
     def test_month_only_date_is_older_than_recent(self):
         result = _parse_decisions(_make_md(
@@ -650,17 +681,72 @@ class TestDateParsing:
         ))
         assert "touched today" in result
 
-    def test_one_day_renders_1d_stale(self):
+    def test_one_day_renders_untouched_1d(self):
         result = _parse_decisions(_make_md(
             _make_entry("Yesterday item", "P0", _ago(1), "Harrison", "FNDR"),
         ))
-        assert "1d stale" in result
+        assert "untouched 1d" in result
 
-    def test_exact_7d_renders_7d_stale(self):
+    def test_exact_7d_renders_untouched_7d(self):
         result = _parse_decisions(_make_md(
             _make_entry("Week-old item", "P0", _ago(7), "Harrison", "FNDR"),
         ))
-        assert "7d stale" in result
+        assert "untouched 7d" in result
+
+
+class TestDualMetric:
+    """cq-935a18e2969e regression pins: open age anchors to the immutable
+    Surfaced date; a verify/consolidation touch resets ONLY staleness. The
+    7/19-7/31 evidence was a ~10-week-old P0 narrated as '4 days' after a
+    legitimate 7/20 'verified still live' touch."""
+
+    def test_consolidated_touch_never_resets_open_age(self):
+        result = _parse_decisions(_make_md(
+            _make_entry("AI Email Tracker anyone:writer", "P0",
+                        f"{_ago(2)} (VERIFIED STILL LIVE)", "Harrison", "FNDR",
+                        surfaced=_ago(90)),
+        ))
+        assert "open 90d" in result           # true age, from Surfaced
+        assert "untouched 2d" in result       # honest staleness, clearly labeled
+        assert "90d old" not in result        # never the old conflated label
+        # The touch two days ago must NOT read as the item's age anywhere.
+        assert "open 2d" not in result
+
+    def test_p0_siren_keys_on_open_age_not_touch_recency(self):
+        """File field rule #4 keys escalation on Surfaced > 14d — a fresh touch
+        must not clear the siren on a months-old P0."""
+        result = _parse_decisions(_make_md(
+            _make_entry("Old but touched P0", "P0", _ago(2), "Harrison", "FNDR",
+                        surfaced=_ago(90)),
+        ))
+        assert "\U0001f6a8" in result
+        assert "\U0001f534" not in result
+
+    def test_frozen_relative_surfaced_flags_origination_unknown(self):
+        """A pre-normalization frozen string ('14+ days') must be flagged, never
+        silently misread as a date."""
+        result = _parse_decisions(_make_md(
+            _make_entry("Frozen-string item", "P0", _ago(20), "Harrison", "FNDR",
+                        surfaced="14+ days"),
+        ))
+        assert "origination unknown" in result
+        assert "untouched 20d" in result
+        assert "\U0001f6a8" in result         # falls back to staleness for the siren
+
+    def test_no_surfaced_field_falls_back_gracefully(self):
+        result = _parse_decisions(_make_md(
+            _make_entry("Legacy entry", "P1", _ago(5), "Harrison", "FNDR"),
+        ))
+        assert "origination unknown, untouched 5d" in result
+
+    def test_open_age_sorts_ahead_of_staleness(self):
+        """Ranking uses true open age when available — an old-but-recently-touched
+        item outranks a newer-but-stale one."""
+        result = _parse_decisions(_make_md(
+            _make_entry("Ancient touched", "P0", _ago(1), "H", "FNDR", surfaced=_ago(120)),
+            _make_entry("Newer stale", "P0", _ago(30), "H", "FNDR", surfaced=_ago(35)),
+        ))
+        assert result.index("Ancient touched") < result.index("Newer stale")
 
 
 class TestEdgeCases:

@@ -283,12 +283,28 @@ def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
             continue
         entity_m = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
         entity = entity_m.group(1).strip() if entity_m else "FNDR"
+        # TWO distinct metrics (bug-hunt 2026-07-31, cq-935a18e2969e): age_days is
+        # days-since-LAST-TOUCH (staleness — the surfacing trigger per the file's
+        # own header rules) and open_days is days-since-SURFACED (true open age).
+        # The 7/19-7/31 evidence was these being conflated: a legitimate
+        # "verify-the-yellows" touch on 7/20 reset the narrated "age" of a
+        # ~10-week-old P0 to "4 days". Renderers must never label one as the other.
         age_days: int | None = None
         touched = re.search(r"\*\*Last touched\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
         if touched:
             try:
                 age_days = (today - datetime.strptime(
                     touched.group(1), "%Y-%m-%d").date()).days
+            except ValueError:
+                pass
+        open_days: int | None = None
+        surfaced_date: str | None = None
+        surfaced = re.search(r"\*\*Surfaced\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
+        if surfaced:
+            try:
+                open_days = (today - datetime.strptime(
+                    surfaced.group(1), "%Y-%m-%d").date()).days
+                surfaced_date = surfaced.group(1)
             except ValueError:
                 pass
         owner_m = re.search(r"\*\*Owner of next nudge\*\*:\s*([^\n]+)", block)
@@ -299,11 +315,37 @@ def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
             "topic": topic[:140],
             "entity": entity[:60],
             "severity": sev.group(1),
+            # KEPT under its historical name (staleness) — persisted strategy-memo
+            # snapshots compare these dicts across weeks; never rename/remove.
             "age_days": age_days,
+            "stale_days": age_days,
+            "open_days": open_days,
+            "surfaced": surfaced_date,
+            # A Surfaced field that exists but isn't an absolute date (the frozen
+            # "14+ days" strings the 2026-07-31 normalization cleaned up) must be
+            # flagged, never silently misread.
+            "origination_unknown": open_days is None,
             "owner": (owner_m.group(1).strip() if owner_m else "unassigned")[:60],
         })
-    decisions.sort(key=lambda d: (d["severity"], -(d["age_days"] or 0)))
+    decisions.sort(key=lambda d: (d["severity"], -(d["open_days"] or d["age_days"] or 0)))
     return {"ok": True, "decisions": decisions}
+
+
+def _decision_age_label(d: dict[str, Any]) -> str:
+    """Render BOTH decision metrics, never conflated (cq-935a18e2969e): true open
+    age anchors to `Surfaced` (immutable origination); `untouched` is days since
+    `Last touched` (a verify/consolidation touch resets THIS, and only this).
+    Shared by the memo fact base and channel_synthesis's Needs-you fact base."""
+    open_days = d.get("open_days")
+    stale = d.get("stale_days", d.get("age_days"))
+    if open_days is not None:
+        label = f"open {open_days}d (since {d.get('surfaced')})"
+        if stale is not None:
+            label += f", untouched {stale}d"
+        return label
+    if stale is not None:
+        return f"origination unknown -- needs normalization; untouched {stale}d"
+    return "age unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +652,15 @@ def compute_deltas(current: dict[str, Any],
         if streak >= 2:
             unmoved[topic] = streak
     deltas["unmoved_decisions"] = unmoved
+
+    # Courtesy (cq-935a18e2969e item d): topics that LEFT the stalled list since
+    # the last memo — resolved, downgraded below P1, or renamed — get one explicit
+    # exit line instead of silently vanishing (the OSN cost-structure P0->P2
+    # downgrade on 7/20 read as a disappeared item for the next 10 days). One-time
+    # by construction: only the immediately-prior snapshot is compared.
+    current_topics = _topics(current)
+    deltas["departed_decisions"] = sorted(
+        t for t in _topics(prev) if t and t not in current_topics)[:8]
     return deltas
 
 
@@ -696,7 +747,7 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
     rows = decisions.get("decisions") or []
     if decisions.get("ok") and rows:
         for d in rows[:12]:
-            age = f"{d['age_days']}d old" if d.get("age_days") is not None else "age unknown"
+            age = _decision_age_label(d)
             streak = (deltas.get("unmoved_decisions") or {}).get(d["topic"], 0)
             tail = f" [unmoved {streak} memos running]" if streak >= 2 else ""
             lines.append(f"- [{d['severity']}] [{d['entity']}] {d['topic']} "
@@ -705,6 +756,10 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
         lines.append("(no open P0/P1 decisions)")
     else:
         lines.append("(decisions source unavailable this week)")
+    if decisions.get("ok"):
+        for topic in (deltas.get("departed_decisions") or []):
+            lines.append(f"- LEFT THE LIST since last memo: {topic} "
+                         "(resolved or downgraded below P1)")
 
     # DEADLINES
     lines.append(f"\n== DEADLINE RADAR (next {DEADLINE_RADAR_DAYS}d) ==")

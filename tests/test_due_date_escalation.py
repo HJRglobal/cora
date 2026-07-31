@@ -378,6 +378,33 @@ class TestPass2:
         assert stats["alerted"] == 0
         slack.chat_postMessage.assert_not_called()
 
+    def test_dm_wording_never_narrates_touch_staleness_as_open_time(self, monkeypatch):
+        """cq-935a18e2969e: the DM said 'open for {N}+ days' where N was days since
+        Last touched — a 7/20 verify touch made a months-old item read as ~7d open.
+        The trigger stays on staleness (by design), but the wording must say
+        'untouched' and state true open age from Surfaced when known."""
+        self._patch(monkeypatch,
+                    "## Active\n\n### Old verified item\n- **Severity**: P0\n"
+                    "- **Surfaced**: 2025-01-01\n"
+                    "- **Last touched**: 2025-06-01 (VERIFIED STILL LIVE)\n")
+        slack = _make_slack()
+        stats = mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        assert stats["alerted"] == 1
+        msg = slack.chat_postMessage.call_args.kwargs.get("text") or \
+            slack.chat_postMessage.call_args[1].get("text", "")
+        assert "Open " in msg and "since 2025-01-01" in msg
+        assert "untouched" in msg
+        assert "been open for" not in msg   # the old conflated copy
+
+    def test_dm_wording_without_surfaced_says_origination_unknown(self, monkeypatch):
+        self._patch(monkeypatch, self._entry("P0", "2025-01-01"))
+        slack = _make_slack()
+        mod.run_pass2_stalled_decisions(slack, {}, dry_run=False)
+        msg = slack.chat_postMessage.call_args.kwargs.get("text") or \
+            slack.chat_postMessage.call_args[1].get("text", "")
+        assert "origination unknown" in msg
+        assert "untouched" in msg
+
     def test_throttled_decision_skipped(self, monkeypatch):
         import hashlib
         topic = "Some decision"

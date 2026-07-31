@@ -1139,7 +1139,9 @@ def build_entity_facts_text(entity: str, gathered: dict, deltas: dict) -> str:
     rows = decisions.get("decisions") or []
     if decisions.get("ok") and rows:
         for d in rows[:10]:
-            age = f"{d['age_days']}d old" if d.get("age_days") is not None else "age unknown"
+            # Dual metric, never conflated (cq-935a18e2969e): a verify/consolidate
+            # touch resets "untouched", never the open age.
+            age = sm._decision_age_label(d)
             lines.append(f"- [{d['severity']}] {d['topic']} ({age}; "
                          f"next: {d['owner']})")
     elif decisions.get("ok"):

@@ -296,11 +296,27 @@ def _parse_pending_decisions(path: Path) -> list[dict[str, Any]]:
         text_blob = f"{topic} {entity}"
         if is_phi_risk(text_blob) or is_visibility_cpa_mention(text_blob):
             continue
+        # Dual metric (cq-935a18e2969e): age_days = days since Last touched (the
+        # escalation TRIGGER stays keyed on this, per the file's own header rule
+        # "Last touched > 7d"); open_days = days since Surfaced (true open age,
+        # for honest DM wording — never narrate touch-staleness as open-time).
+        open_days: int | None = None
+        surfaced_date: str | None = None
+        surfaced = re.search(r"\*\*Surfaced\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
+        if surfaced:
+            try:
+                open_days = (today - datetime.strptime(
+                    surfaced.group(1), "%Y-%m-%d").date()).days
+                surfaced_date = surfaced.group(1)
+            except ValueError:
+                pass
         decisions.append({
             "topic": topic[:300],
             "entity": entity[:60],
             "severity": sev.group(1),
             "age_days": _last_touched_age_days(block, today),
+            "open_days": open_days,
+            "surfaced": surfaced_date,
         })
     return decisions
 
@@ -333,10 +349,21 @@ def run_pass2_stalled_decisions(
             stats["throttled"] += 1
             continue
 
+        # Honest wording (cq-935a18e2969e): age_days is days-since-LAST-TOUCH —
+        # say "untouched", and state the true open age (from Surfaced) separately
+        # when known. The old copy said "open for {age_days}+ days", so a 7/20
+        # verify-pass touch made a months-old item read as ~7 days open.
+        open_days = decision.get("open_days")
+        if open_days is not None:
+            open_line = (f"Open {open_days} days (since {decision.get('surfaced')}); "
+                         f"untouched {age_days} days.")
+        else:
+            open_line = (f"Untouched {age_days} days "
+                         f"(origination unknown -- needs normalization).")
         msg = (
-            f":rotating_light: *Stalled {sev} decision (>{age_days}d open)*\n"
+            f":rotating_light: *Stalled {sev} decision (untouched >{age_days}d)*\n"
             f"{topic[:300]}\n\n"
-            f"This has been open for {age_days}+ days."
+            f"{open_line}"
         )
 
         if _send_dm(slack_client, _HARRISON_SLACK_ID, msg, dry_run):
