@@ -949,7 +949,9 @@ def _format_kb_chunks(chunks: list) -> str:
         "question across CLAUDE.md briefs, decisions.md, project notes, and other "
         "static portfolio documentation. Use these to ground your answer — cite the "
         "source when you quote specific facts. If a chunk has a deep_link, preserve "
-        "it as a Slack-mrkdwn `<url|label>` link in your reply per the Link Preservation rule.)",
+        "it as a Slack-mrkdwn `<url|label>` link in your reply per the Link Preservation "
+        "rule. CAUTION: chunks can include superseded facts and Cora's OWN earlier "
+        "swept replies — they never override the Known Answers section.)",
         "",
     ]
     for i, r in enumerate(chunks, 1):

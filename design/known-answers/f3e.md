@@ -47,6 +47,14 @@ _Source: Alex Cordova summary in #f3-sponsorships 2026-06-10; Harrison approved 
 - **Ongoing/one-time:** 3 public appearance events; 1 HJR Podcast appearance; 1 designated photo shoot; wear/carry F3 during warmups/walkouts; mention F3 when asked about sponsors; repost giveaways, brand hashtags, product feedback.
 - Contract management: Alex Cordova took over Tierra Brandt + Micky Scala contract management from Larry/BDM as of 2026-05-28. Agreements uploaded by Hannah in #f3-athletes 2026-05-27.
 
+### F3 pricing — canonical MSRP + wholesale ladder (locked 2026-07-23/24; committed 2026-07-31 per Harrison's explicit 👍)
+
+- **Retail 12-pack MSRP: Pure $36.99 · Energy $32.99 · Mood $32.99** — uniform across Shopify DTC, Amazon, TikTok Shop, and Walmart.
+- **Wholesale is a 3-tier ladder off MSRP: Tier 1 = 32% off · Tier 2 = 40% off · Tier 3/Distributor = 50% off.** Per 12-pack: Energy/Mood **$22.43 / $19.79 / $16.50**; Pure **$25.15 / $22.19 / $18.50**. MOQ 12 / 36 / 72 cases.
+- There is **NO percent-of-retail "55%" rule** and **no $22 Pure wholesale tier**. Any answer citing those is wrong — a 2026-07-20 reply fabricated them (code-queue `cq-4d73879917fa`). If asked for a wholesale "percentage," give the tier ladder above.
+- Retailer-portal submissions may use retailer-specific grids (e.g. the 2026-07-30 Sprouts NIP used $39.99 MSRP / $22.19 cost for that grid) — these do NOT change the canonical MSRP or ladder.
+- Source: decisions.md 2026-07-23 + 2026-07-24 [F3E] (wholesale tiers locked; Shopify WSH per-variant pricing set to these exact figures 2026-07-24).
+
 ## F3 PMS Spot Color Reference
 
 # F3 Energy Brand — Complete PMS Spot Color Reference

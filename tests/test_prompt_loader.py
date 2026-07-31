@@ -107,6 +107,27 @@ def test_universal_rules_carry_diagnostic_hedging_nudge():
     assert "Do not confidently blame your own code" in rules
 
 
+def test_universal_rules_carry_provenance_grounding():
+    """cq-4d73879917fa: every prompt forbids derived pricing rules/percentages and
+    unstated provenance claims, and makes Known Answers win retrieval conflicts
+    (the 7/20 '55% of retail, locked 7/13' fabrication class)."""
+    rules = pl._UNIVERSAL_RULES
+    assert "Numbers and provenance are traceable or absent" in rules
+    assert "Never derive a pricing rule, percentage, or attribution" in rules
+    assert "Known Answers win conflicts" in rules
+    assert "one of Cora's own earlier (possibly wrong) replies" in rules
+    # The carve-out that keeps legitimate arithmetic over context/tool figures OK.
+    assert "Plain" in rules and "arithmetic OVER figures already in context" in rules
+
+
+def test_composed_prompt_includes_provenance_grounding(monkeypatch, tmp_path):
+    _clear_cache()
+    (tmp_path / "f3e.md").write_text("F3E system prompt", encoding="utf-8")
+    monkeypatch.setattr(pl, "_PROMPTS_DIR", tmp_path)
+    result = pl.load_prompt("F3E")
+    assert "Known Answers win conflicts" in result
+
+
 def test_composed_prompt_includes_hedging_nudge(monkeypatch, tmp_path):
     """The hedging nudge ships to every entity prompt (it lives in _UNIVERSAL_RULES)."""
     _clear_cache()

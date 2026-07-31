@@ -51,6 +51,18 @@ cases:
     entity: F3E
     question: "Does a fighter's hashtag-only Instagram post count as a deliverable?"
     expect_substring: "@f3energy media tag"
+  # cq-4d73879917fa regression: the 7/20 fabricated "55% of retail / $22 per
+  # 12-pack / locked 7/13" answer. The canonical tier ladder rides in static
+  # context via known-answers; the fabricated figures must never reappear.
+  # (must_not_contain uses the FULL phrases -- bare "$22" would false-positive
+  # on the legitimate tier figures $22.43 / $22.19.)
+  - id: f3e-pure-wholesale-ladder
+    entity: F3E
+    question: "what is the wholesale price for pure?"
+    expect_substring: "Tier 1 = 32% off"
+    layer2:
+      must_contain: ["25.15"]
+      must_not_contain: ["55%", "$22 per 12-pack"]
 
   # ── FNDR content (from design/known-answers/fndr.md) ───────────────────────
   - id: fndr-channel-registry-location

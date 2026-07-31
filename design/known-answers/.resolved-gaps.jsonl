@@ -14,3 +14,6 @@
 {"id": "2026-05-24T23:18:59.572604+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_ttl"}
 {"id": "2026-05-26T09:04:43.198658+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_ttl"}
 {"id": "2026-05-28T18:49:14.574041+00:00", "action": "expired", "timestamp": "2026-07-02T13:10:03.078291+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_ttl"}
+{"id": "2026-07-30T04:58:49.176210+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
+{"id": "2026-07-30T05:01:15.827097+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
+{"id": "2026-07-30T05:24:01.404247+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
