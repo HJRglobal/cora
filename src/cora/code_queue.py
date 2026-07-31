@@ -2092,7 +2092,20 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     except Exception:  # noqa: BLE001 -- fail closed
         log.info("code_queue.seed_item: PHI check errored -- refusing seed (fail-closed)")
         return None
-    class_key = _class_key(title, subsystem_guess or entity)
+    # D-051 2026-07-31 follow-through: screen subsystem_guess here too -- the seed
+    # lane is caller-supplied (incl. the MCP cora_code_queue_seed tool) and bypasses
+    # _capture's screen, yet the value egresses via mixed-bundle prompt-path slugs
+    # (_affinity_key -> _bundle_theme -> _slug). Fail-closed blank (falls back to
+    # the entity code); the seed itself survives.
+    sub = str(subsystem_guess or "")
+    if sub:
+        try:
+            if phi_guard.is_any_phi(sub):
+                sub = ""
+        except Exception:  # noqa: BLE001 -- fail closed
+            sub = ""
+    rec["subsystem_guess"] = sub or entity
+    class_key = _class_key(title, sub or entity)
     existing = find_fingerprint(signal, title, class_key=class_key)
     if existing:
         return existing

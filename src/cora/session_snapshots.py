@@ -327,7 +327,8 @@ def _log_mirror_transition(ok: bool, detail: str = "") -> None:
         log.info("session-snapshots: G: mirror active (%s)", _mirror_dir())
     else:
         log.warning("session-snapshots: G: mirror unavailable (%s) -- repo lane "
-                    "unaffected, mirror retries next tick", detail or "unknown")
+                    "unaffected, mirror retries after the outage cooldown",
+                    detail or "unknown")
     _mirror_healthy = ok
 
 

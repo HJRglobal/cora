@@ -463,7 +463,8 @@ def health() -> dict[str, Any]:
     out["heartbeat_age_seconds"] = None if age is None else round(age, 1)
     out["alive"] = (age is not None and age <= 300)
 
-    # Uptime: last "heartbeat alive uptime_s=N" in today's log (best-effort read).
+    # Uptime: last "heartbeat alive uptime_s=N" in the live log (newest dated
+    # log by mtime -- the basename keeps the process START date; best-effort).
     out["uptime_seconds"] = _read_uptime_from_log()
 
     # Recent scheduled-task fire results (read-only schtasks query; best-effort).

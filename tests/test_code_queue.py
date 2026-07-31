@@ -259,6 +259,18 @@ def test_phi_tripping_subsystem_guess_blanked_at_capture(qenv, monkeypatch):
     assert cq.get_item(cid2)["subsystem_guess"] == "shopify inventory"
 
 
+def test_phi_tripping_subsystem_guess_blanked_in_seed_lane(qenv, monkeypatch):
+    """Same screen on the seed lane (verify-pass follow-up): seed_item is
+    caller-supplied via the MCP cora_code_queue_seed tool and bypasses _capture,
+    so it must screen subsystem_guess itself (falls back to the entity code)."""
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi", lambda t: "SECRETSUB" in t)
+    cid = cq.seed_item(kind="bug", severity="P2", title="clean title",
+                       summary="clean summary", entity="F3E", signal="explicit",
+                       status="PROPOSED", subsystem_guess="SECRETSUB detail")
+    assert cid is not None
+    assert cq.get_item(cid)["subsystem_guess"] == "F3E"  # blanked -> entity fallback
+
+
 def test_lex_prompt_path_redacted_in_read_layer(qenv):
     """D-051 2026-07-31: a staged LEX item's prompt_path (filename embeds the
     title slug) is replaced with the fixed placeholder in the read-layer view --
