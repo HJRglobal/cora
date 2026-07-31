@@ -260,6 +260,9 @@ multi-day decline streaks. Lexington is aggregate only.
 *Deadlines* -- what is due soon and what is overdue (counts plus the few that matter).
 *Needs Harrison* -- the stalled P0/P1 decisions: the shortest possible list of what
 needs a founder call. This is an operational status list, not strategic advice.
+Every item drawn from the stalled-decisions block MUST end with the visible label
+"(founder decision log -- not an Asana task)" so nobody hunts Asana for it;
+"founder decision log" is a functional description and is required here.
 
 Hard rules:
 - Use ONLY facts present in the fact base. Never invent numbers, deals, dates, or
@@ -1139,7 +1142,12 @@ def build_entity_facts_text(entity: str, gathered: dict, deltas: dict) -> str:
         lines.append("(deadline source unavailable today)")
 
     # DECISIONS
-    lines.append("\n== STALLED P0/P1 DECISIONS ==")
+    # Source label (cq-a40ca0e72d86): these come from the founder decision log,
+    # NOT Asana -- teammates asked "which Asana project is this in?" and nobody
+    # could tell them. Functional label only (never a filename/path/platform,
+    # per the D-051 #6 opacity posture).
+    lines.append("\n== STALLED P0/P1 DECISIONS "
+                 "(source: founder decision log -- NOT Asana tasks) ==")
     decisions = gathered.get("decisions") or {}
     rows = decisions.get("decisions") or []
     if decisions.get("ok") and rows:
@@ -1148,7 +1156,7 @@ def build_entity_facts_text(entity: str, gathered: dict, deltas: dict) -> str:
             # touch resets "untouched", never the open age.
             age = sm._decision_age_label(d)
             lines.append(f"- [{d['severity']}] {d['topic']} ({age}; "
-                         f"next: {d['owner']})")
+                         f"next: {d['owner']}) [founder decision log]")
     elif decisions.get("ok"):
         lines.append("(no open P0/P1 decisions)")
     else:
@@ -1188,7 +1196,10 @@ Hard rules:
   names. A quiet day is fine to state plainly.
 - SOURCE-OPAQUE: describe activity by function ("DTC", "subscriptions", "paid",
   "retail pipeline", "production"), NEVER name the underlying platform, tool, sheet,
-  or ad network.
+  or ad network. ONE carve-out: every *Needs you* item drawn from the
+  stalled-decisions block MUST end with the visible label "(founder decision log --
+  not an Asana task)" -- that phrase is a functional description, not a source name,
+  and is required so nobody hunts Asana for the item.
 - Stay STRICTLY within {label}. Do NOT mention, compare against, or route to any
   other portfolio entity.
 - Never include client names, diagnoses, or client-level health information.
@@ -1223,6 +1234,8 @@ Below is today's verified, AGGREGATE fact base. Write a tight operational post
 (roughly 120-180 words) with bold headers (omit any empty section):
 *Moved* -- aggregate changes since the prior business day (cash, workload counts).
 *Needs you* -- stalled leadership decisions needing attention (no client detail).
+Every item drawn from the stalled-decisions block MUST end with the visible label
+"(founder decision log -- not an Asana task)".
 *Due soon* -- aggregate deadline counts and overdue load by staff owner.
 *Watch* -- aggregate program-level trends worth monitoring.
 

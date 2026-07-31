@@ -434,3 +434,132 @@ class TestUploadFileDedup:
                                    "application/pdf", content_md5="zzz")
         assert fid == "NEW"
         assert len(svc.created) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cq-f583932a625e: within-message collision uniquify + truthful collapse
+# reporting + digest dedup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _multi_meta(n=4, message_id="mm1", rfc="<multi@host>"):
+    m = _meta(message_id=message_id, rfc=rfc, subject="4 store invoices")
+    m["attachments"] = [
+        {"filename": f"store{i}.pdf", "mime_type": "application/pdf",
+         "size": 100000, "attachment_id": f"att{i}", "data": None}
+        for i in range(n)
+    ]
+    return m
+
+
+def _multi_decisions(n=4, desc="american-fitness-az-invoice"):
+    # The 7/27 shape: N sibling attachments, IDENTICAL description slug.
+    return [{"action": "file", "entity": "OSN", "subfolder": "invoices",
+             "description": desc, "filename": f"store{i}.pdf",
+             "reason": f"invoice for store {i}"} for i in range(n)]
+
+
+class TestSiblingCollisionUniquify:
+    def test_same_slug_siblings_upload_as_distinct_files(self, tmp_path, monkeypatch):
+        """The 7/27 regression shape: 4 different-bytes attachments classified to
+        ONE slug must produce 4 uploads under 4 DISTINCT canonical names and 4
+        results rows with distinct file_ids -- never a silent collapse that
+        discards 3 real invoices."""
+        _set_ledger_paths(tmp_path, monkeypatch)
+        meta = _multi_meta(4)
+        monkeypatch.setattr(af, "get_message", lambda u, m: {"id": m})
+        monkeypatch.setattr(af, "parse_message_metadata", lambda msg: meta)
+        monkeypatch.setattr(af, "classify_attachments",
+                            lambda meta_, atts, entity_hint=None: _multi_decisions(4))
+        # Different bytes per attachment (different md5s -> content ledger passes all).
+        monkeypatch.setattr(af, "download_attachment",
+                            lambda u, m, a: f"BYTES-{a['attachment_id']}".encode())
+        monkeypatch.setattr(af, "ensure_folder_path", lambda segs: "fold")
+        uploaded_names: list[str] = []
+
+        def fake_upload(folder_id, name, content, mime, content_md5=None):
+            uploaded_names.append(name)
+            return (f"file-{len(uploaded_names)}", f"https://drive/{len(uploaded_names)}")
+
+        monkeypatch.setattr(af, "upload_file", fake_upload)
+        results = af.process_email("harrison@hjrglobal.com", "mm1",
+                                   content_ledger={}, seen_messages=set())
+        assert len(results) == 4
+        assert len(set(uploaded_names)) == 4          # all canonical names distinct
+        assert len({r["file_id"] for r in results}) == 4
+        # Uniquified names keep the extension.
+        assert all(n.endswith(".pdf") for n in uploaded_names)
+
+    def test_cross_message_collapse_not_reported_as_new_filing(self, tmp_path, monkeypatch):
+        """upload_file returning an ALREADY-LEDGERED file_id (a name/md5 collapse
+        onto an existing Drive file) must record the md5 alias but emit NO results
+        row -- the digest previously re-listed the same file with a fresh AI
+        description."""
+        _set_ledger_paths(tmp_path, monkeypatch)
+        upload = _patch_pipeline(monkeypatch, meta=_meta(), decisions=_decisions(),
+                                 content=b"NEW-BYTES-SAME-NAME")
+        upload.return_value = ("file-EXISTING", "https://drive/existing")
+        ledger = {"aaaa": {"md5": "aaaa", "file_id": "file-EXISTING",
+                           "drive_path": "x", "filed_at": int(time.time())}}
+        results = af.process_email("harrison@hjrglobal.com", "m1",
+                                   content_ledger=ledger, seen_messages=set())
+        assert results == []                          # no digest row
+        # The alias was still recorded so re-sends keep deduping.
+        import hashlib
+        md5 = hashlib.md5(b"NEW-BYTES-SAME-NAME").hexdigest()
+        assert md5 in ledger and ledger[md5]["file_id"] == "file-EXISTING"
+
+
+class TestDigestDedup:
+    def _summaries(self):
+        item = lambda fid, reason: {  # noqa: E731
+            "canonical_filename": f"{fid}.pdf", "drive_path": f"HJR/x/{fid}.pdf",
+            "web_link": f"https://drive/{fid}", "file_id": fid, "reason": reason,
+        }
+        return [{
+            "email": "a@x.com", "filed": 3,
+            "filed_items": [item("F1", "first description"),
+                            item("F1", "second different description"),
+                            item("F1", "third different description")],
+        }, {
+            "email": "b@x.com", "filed": 1,
+            "filed_items": [item("F2", "unique file")],
+        }]
+
+    def test_one_digest_line_per_drive_file_first_description_wins(self, monkeypatch):
+        posted = {}
+
+        class FakeClient:
+            def __init__(self, token):
+                pass
+
+            def chat_postMessage(self, channel, text):
+                posted["text"] = text
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setattr(af, "_SlackWebClient", FakeClient)
+        assert af.post_slack_summary(self._summaries()) is True
+        text = posted["text"]
+        assert text.count("https://drive/F1") == 1     # one line per file
+        assert "first description" in text
+        assert "second different description" not in text
+        assert "2 file(s) archived" in text            # honest deduped headline
+
+    def test_all_duplicates_skips_post(self, monkeypatch):
+        # If dedup empties everything (all rows repeat one already-listed key
+        # within the run), the headline count reflects the deduped truth.
+        posted = {}
+
+        class FakeClient:
+            def __init__(self, token):
+                pass
+
+            def chat_postMessage(self, channel, text):
+                posted["text"] = text
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setattr(af, "_SlackWebClient", FakeClient)
+        summaries = self._summaries()
+        summaries[1]["filed_items"] = []               # only the F1 triplet remains
+        af.post_slack_summary(summaries)
+        assert posted["text"].count("F1.pdf") == 1
+        assert "1 file(s) archived" in posted["text"]

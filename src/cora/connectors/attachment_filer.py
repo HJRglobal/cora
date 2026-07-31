@@ -405,6 +405,12 @@ def process_email(
 
     results: list[dict[str, Any]] = []
     skipped_count = 0
+    # cq-f583932a625e: canonical names already emitted for THIS message (root
+    # fix, see below) + every Drive file_id the ledger already knows (truthful
+    # reporting for a cross-message/cross-run collapse). The ledger dict mutates
+    # in lockstep with appends, so later messages in this run see earlier ids.
+    emitted_canonicals: dict[str, int] = {}
+    known_file_ids = {r.get("file_id") for r in content_ledger.values() if r.get("file_id")}
 
     for decision in decisions:
         if decision.get("action") != "file":
@@ -438,6 +444,23 @@ def process_email(
             continue
 
         canonical = _canonical_filename(decision, orig_filename, meta["date_ts"])
+        # cq-f583932a625e ROOT FIX: sibling attachments in ONE email routinely get
+        # the SAME canonical name (the classifier sees email metadata only, never
+        # file bytes), and upload_file's name-dedup then COLLAPSED the later ones
+        # onto the first file -- 3 of 4 OSN store invoices (7/27) and a litigation
+        # earning statement (7/30) were silently DISCARDED this way, their md5s
+        # ledger-poisoned against the wrong file. Uniquify within the message so
+        # distinct siblings upload as distinct Drive files.
+        base = canonical
+        if base in emitted_canonicals:
+            emitted_canonicals[base] += 1
+            stem, dot, ext = canonical.rpartition(".")
+            n = emitted_canonicals[base]
+            canonical = f"{stem}-{n}.{ext}" if dot else f"{canonical}-{n}"
+            log.info("Canonical-name collision within message %s: %r -> %r",
+                     message_id, base, canonical)
+        else:
+            emitted_canonicals[base] = 1
         entity_folder = _ENTITY_TO_DRIVE_FOLDER[entity]
         drive_path_segments = [entity_folder, subfolder]
         drive_path_display = f"{entity_folder}/{subfolder}/{canonical}"
@@ -492,6 +515,23 @@ def process_email(
             log.warning("Upload failed for %r: %s", canonical, exc)
             continue
 
+        # cq-f583932a625e truthful reporting: upload_file returns an identical
+        # 2-tuple whether it CREATED a file or name/md5-MATCHED an existing one.
+        # If the returned file_id is already in the ledger, this was a collapse
+        # onto an already-reported file -- record the md5 alias (so re-sends keep
+        # deduping) but do NOT log "Filed" or emit a digest row claiming a new
+        # filing with a fresh AI description of the same file.
+        if file_id in known_file_ids:
+            log.info("Already filed -- %r collapsed onto existing Drive file %s "
+                     "(not a new filing)", orig_filename, file_id)
+            filer_ledger.append_content(
+                content_ledger, content_md5,
+                file_id=file_id, web_link=web_link, drive_path=drive_path_display,
+                canonical=canonical, sha256=content_sha256, source_email=user_email,
+            )
+            skipped_count += 1
+            continue
+
         log.info("Filed %r -> %s (%s)", orig_filename, drive_path_display, web_link)
 
         # Record content hash immediately so the very next attachment / message /
@@ -501,6 +541,7 @@ def process_email(
             file_id=file_id, web_link=web_link, drive_path=drive_path_display,
             canonical=canonical, sha256=content_sha256, source_email=user_email,
         )
+        known_file_ids.add(file_id)
 
         # Immediate KB indexing so Cora can answer questions without waiting for next sync
         if kb is not None:
@@ -528,6 +569,7 @@ def process_email(
             "canonical_filename": canonical,
             "drive_path": drive_path_display,
             "web_link": web_link,
+            "file_id": file_id,
             "entity": entity,
             "subfolder": subfolder,
             "reason": decision.get("reason", ""),
@@ -761,19 +803,43 @@ def reconcile_ledger_from_drive(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _digest_dedup_key(item: dict[str, Any]) -> str:
+    """One digest line per Drive FILE (cq-f583932a625e belt): key on file_id,
+    falling back to web_link, then drive_path+canonical (dry-run rows)."""
+    return (str(item.get("file_id") or "")
+            or str(item.get("web_link") or "")
+            or f"{item.get('drive_path', '')}::{item.get('canonical_filename', '')}")
+
+
 def post_slack_summary(summaries: list[dict[str, Any]]) -> bool:
-    """Post a filing summary to the configured Slack channel. Non-fatal on failure."""
-    total_filed = sum(s["filed"] for s in summaries)
+    """Post a filing summary to the configured Slack channel. Non-fatal on failure.
+
+    Deduped by Drive file across the whole run (cq-f583932a625e): the 7/27-7/30
+    digests listed the same file id 2-4 times, each with a DIFFERENT AI-generated
+    description of the same file. The first occurrence's description wins and the
+    headline counts unique files — the honest number."""
+    seen_keys: set[str] = set()
+    deduped: list[tuple[str, list[dict[str, Any]]]] = []
+    for summary in summaries:
+        kept: list[dict[str, Any]] = []
+        for item in summary.get("filed_items") or []:
+            key = _digest_dedup_key(item)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            kept.append(item)
+        if kept:
+            deduped.append((summary["email"], kept))
+
+    total_filed = sum(len(items) for _, items in deduped)
     if total_filed == 0:
         log.info("No attachments filed this run — skipping Slack notification")
         return True
 
     lines = [f":file_folder: *Email Attachment Filing Summary* — {total_filed} file(s) archived"]
-    for summary in summaries:
-        if not summary["filed_items"]:
-            continue
-        lines.append(f"\n*{summary['email']}*")
-        for item in summary["filed_items"]:
+    for email, items in deduped:
+        lines.append(f"\n*{email}*")
+        for item in items:
             if item.get("web_link"):
                 lines.append(
                     f"  • <{item['web_link']}|{item['canonical_filename']}> -> `{item['drive_path'].rsplit('/', 1)[0]}`"

@@ -794,7 +794,10 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
         lines.append("(pipeline source unavailable this week)")
 
     # DECISIONS
-    lines.append("\n== STALLED P0/P1 DECISIONS ==")
+    # Source label (cq-a40ca0e72d86): functional description only, never a
+    # filename/path/platform name.
+    lines.append("\n== STALLED P0/P1 DECISIONS "
+                 "(source: founder decision log -- NOT Asana tasks) ==")
     decisions = gathered.get("decisions") or {}
     rows = decisions.get("decisions") or []
     if decisions.get("ok") and rows:
@@ -803,7 +806,8 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
             streak = (deltas.get("unmoved_decisions") or {}).get(d["topic"], 0)
             tail = f" [unmoved {streak} memos running]" if streak >= 2 else ""
             lines.append(f"- [{d['severity']}] [{d['entity']}] {d['topic']} "
-                         f"({age}; next nudge: {d['owner']}){tail}")
+                         f"({age}; next nudge: {d['owner']}){tail} "
+                         f"[founder decision log]")
     elif decisions.get("ok"):
         lines.append("(no open P0/P1 decisions)")
     else:

@@ -810,3 +810,23 @@ class TestSourceWiring:
         assert sm.HARRISON_SLACK_ID == "U0B2RM2JYJ1"
         assert sm.SONNET_MODEL.startswith("claude-sonnet")
         assert sm.DEADLINE_RADAR_DAYS == 14
+
+
+class TestDecisionSourceLabel:
+    def test_memo_facts_label_decisions_block(self):
+        """cq-a40ca0e72d86: the memo/portfolio facts base labels stalled
+        decisions with their source system -- functional phrase only."""
+        gathered = {
+            "date": "2026-06-14",
+            "decisions": {"ok": True, "decisions": [
+                {"topic": "Some P0 call", "severity": "P0", "entity": "OSN",
+                 "age_days": 3, "stale_days": 3, "open_days": 44,
+                 "surfaced": "2026-05-01", "owner": "Harrison"},
+            ]},
+        }
+        text = sm.build_facts_text(gathered, {"first_run": True})
+        header = next(ln for ln in text.splitlines() if "STALLED P0/P1" in ln)
+        assert "founder decision log" in header and "NOT Asana" in header
+        item = next(ln for ln in text.splitlines() if "Some P0 call" in ln)
+        assert item.rstrip().endswith("[founder decision log]")
+        assert "decisions-pending" not in text

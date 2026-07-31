@@ -1282,3 +1282,33 @@ class TestPortfolioRunnerPersistWiring:
             encoding="utf-8")
         assert "founder_os_md" in src
         assert "_daily-synthesis" in src
+
+
+# ── Needs-you source labels (cq-a40ca0e72d86) ────────────────────────────────
+class TestDecisionSourceLabels:
+    """Hannah asked which Asana project a 'Needs you' item lived in -- nobody
+    could tell her. Every stalled-decision surface must carry a functional
+    source label (never a filename/path/platform, per the opacity posture)."""
+
+    def test_entity_facts_label_decisions_block(self):
+        gathered = {
+            "entity": "UFL", "date": "2026-07-31",
+            "decisions": {"ok": True, "decisions": [
+                {"topic": "UFL pivot announcement timing", "severity": "P1",
+                 "age_days": 5, "stale_days": 5, "open_days": 79,
+                 "surfaced": "2026-05-10", "owner": "Harrison"},
+            ]},
+        }
+        text = cs.build_entity_facts_text("UFL", gathered, {"first_run": True})
+        header = next(ln for ln in text.splitlines() if "STALLED P0/P1" in ln)
+        assert "founder decision log" in header
+        assert "NOT Asana" in header
+        item = next(ln for ln in text.splitlines() if "UFL pivot" in ln)
+        assert "[founder decision log]" in item
+        assert "decisions-pending" not in text        # never the filename
+
+    def test_all_three_prompts_carry_label_rule(self):
+        for p in (cs._PORTFOLIO_PROMPT, cs._ENTITY_PROMPT, cs._LEX_PROMPT):
+            flat = " ".join(p.split())
+            assert "founder decision log" in flat
+            assert "not an Asana task" in flat
