@@ -80,21 +80,27 @@ class TestLogAction:
 
 
 # ─────────────────────────── read_actions ───────────────────────────
+_G1 = "1200000000000001"
+_G2 = "1200000000000002"
+_G3 = "1200000000000003"
+_G4 = "1200000000000004"
+
+
 class TestReadActions:
     def test_window_filter(self):
         _write_actions([
-            {"ts": _ts(2), "action": "create", "actor": "U1", "entity": "F3E", "gid": "a"},
-            {"ts": _ts(10), "action": "create", "actor": "U1", "entity": "F3E", "gid": "b"},
+            {"ts": _ts(2), "action": "create", "actor": "U1", "entity": "F3E", "gid": _G1},
+            {"ts": _ts(10), "action": "create", "actor": "U1", "entity": "F3E", "gid": _G2},
         ])
         recent = pm_metrics.read_actions(_ts(7))
-        assert [e["gid"] for e in recent] == ["a"]
+        assert [e["gid"] for e in recent] == [_G1]
 
     def test_skips_bad_lines(self):
         pm_metrics._ACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
         pm_metrics._ACTION_LOG.write_text(
-            '{"ts": %d, "gid": "ok"}\nnot json\n' % _ts(1), encoding="utf-8")
+            '{"ts": %d, "gid": "%s"}\nnot json\n' % (_ts(1), _G1), encoding="utf-8")
         got = pm_metrics.read_actions(_ts(7))
-        assert [e["gid"] for e in got] == ["ok"]
+        assert [e["gid"] for e in got] == [_G1]
 
 
 # ─────────────────────────── run() / digest math ───────────────────────────
@@ -113,10 +119,10 @@ def _asana_state():
 class TestRun:
     def test_buckets_cora_actions(self):
         _write_actions([
-            {"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "a"},
-            {"ts": _ts(1), "action": "complete", "actor": "U1", "entity": "F3E", "gid": "b"},
-            {"ts": _ts(2), "action": "subtask", "actor": "U2", "entity": "OSN", "gid": "c"},
-            {"ts": _ts(9), "action": "create", "actor": "U1", "entity": "F3E", "gid": "old"},
+            {"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": _G1},
+            {"ts": _ts(1), "action": "complete", "actor": "U1", "entity": "F3E", "gid": _G2},
+            {"ts": _ts(2), "action": "subtask", "actor": "U2", "entity": "OSN", "gid": _G3},
+            {"ts": _ts(9), "action": "create", "actor": "U1", "entity": "F3E", "gid": _G4},
         ])
         with patch.object(pm_metrics, "_gather_asana_state", return_value=_asana_state()):
             r = pm_metrics.run(now=NOW, write_state=False)
@@ -128,7 +134,7 @@ class TestRun:
         assert r["cora"]["by_actor"]["U1"] == 2
 
     def test_asana_failure_is_fail_soft(self):
-        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "a"}])
+        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "1200000000000001"}])
         with patch.object(pm_metrics, "_gather_asana_state", side_effect=RuntimeError("boom")):
             r = pm_metrics.run(now=NOW, write_state=False)
         assert r["asana"] is None
@@ -136,7 +142,7 @@ class TestRun:
         assert r["cora"]["total_this_week"] == 1  # Cora metrics still deliver
 
     def test_overdue_wow_from_prior_snapshot(self):
-        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "a"}])
+        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "1200000000000001"}])
         pm_metrics._SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         (pm_metrics._SNAPSHOT_DIR / "2026-07-08.json").write_text(
             json.dumps({"date": "2026-07-08", "overdue_total": 5}), encoding="utf-8")
@@ -147,7 +153,7 @@ class TestRun:
         assert (pm_metrics._SNAPSHOT_DIR / "2026-07-15.json").exists()
 
     def test_dry_run_writes_no_snapshot(self):
-        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "a"}])
+        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "1200000000000001"}])
         with patch.object(pm_metrics, "_gather_asana_state", return_value=_asana_state()):
             pm_metrics.run(now=NOW, write_state=False)
         assert not (pm_metrics._SNAPSHOT_DIR / "2026-07-15.json").exists()
@@ -300,3 +306,94 @@ class TestHandlerWiring:
         logm.assert_called_once()
         assert logm.call_args.args[0] == "create"
         assert logm.call_args.args[2] == "F3E"  # entity threaded through
+
+
+# ─────────────────────────── fixture-row screen (cq-b38f9293fe3b) ───────────
+class TestFixtureRowScreen:
+    """Row-shaped garbage (the pre-2026-07-29 test-fixture pollution -- 2,710 of
+    2,730 live rows) must never count toward the Phase-2 go/no-go instrument."""
+
+    def test_fixture_shaped_rows_excluded_and_tallied(self):
+        _write_actions([
+            {"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": _G1},
+            {"ts": _ts(1), "action": "create", "actor": "U_ASKER", "entity": "F3E", "gid": "T1"},
+            {"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E", "gid": "123"},
+            {"ts": _ts(1), "action": "create", "actor": "U1", "entity": "F3E",
+             "gid": _G2, "title": "legacy fixture that persisted a title"},
+            {"ts": _ts(1), "action": "complete", "actor": "U1", "entity": "F3E", "gid": "mine"},
+        ])
+        with patch.object(pm_metrics, "_gather_asana_state", return_value=_asana_state()):
+            r = pm_metrics.run(now=NOW, write_state=False)
+        assert r["cora"]["total_this_week"] == 1     # only the real-shaped row
+        assert r["cora"]["created"] == 1
+        assert r["cora"]["completed"] == 0
+        assert r["cora"]["malformed_rows_ignored"] == 4
+        text = pm_metrics.format_digest(r)
+        assert "4 malformed/fixture-shaped rows ignored" in text
+
+    def test_real_row_with_meeting_capture_extra_still_counts(self):
+        _write_actions([
+            {"ts": _ts(1), "action": "create", "actor": "UBOT", "entity": "LEX",
+             "gid": "1210000000000009", "extra": {"via": "meeting_capture"}},
+        ])
+        assert len(pm_metrics.read_actions(_ts(7))) == 1
+
+    def test_clean_log_reports_zero_ignored_and_no_digest_note(self):
+        _write_actions([{"ts": _ts(1), "action": "create", "actor": "U1",
+                         "entity": "F3E", "gid": _G1}])
+        with patch.object(pm_metrics, "_gather_asana_state", return_value=_asana_state()):
+            r = pm_metrics.run(now=NOW, write_state=False)
+        assert r["cora"]["malformed_rows_ignored"] == 0
+        assert "malformed" not in pm_metrics.format_digest(r)
+
+
+# ─────────────────────────── purge-script predicate ─────────────────────────
+def _load_purge_script():
+    import importlib.util
+    from pathlib import Path
+    path = (Path(__file__).resolve().parents[1] / "scripts"
+            / "purge_test_fixture_ledger_rows.py")
+    spec = importlib.util.spec_from_file_location("purge_fixture_rows", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class TestPmActionsPurgePredicate:
+    """The one-time purge (extends the S5 purge script) must keep every real
+    row shape byte-for-byte and remove each observed fixture shape."""
+
+    def test_keeps_every_real_row_shape(self):
+        m = _load_purge_script()
+        real_rows = [
+            {"ts": 1753000000, "action": "create", "actor": "U0B2RM2JYJ1",
+             "entity": "F3E", "gid": "1210936363057519"},
+            {"ts": 1753400000, "action": "create", "actor": "UBOT", "entity": "LEX",
+             "gid": "1210900000000001", "extra": {"via": "meeting_capture"}},
+        ]
+        for row in real_rows:
+            is_fixture, _ = m._is_pm_actions_fixture(row)
+            assert is_fixture is False, row
+
+    def test_removes_each_observed_fixture_shape(self):
+        m = _load_purge_script()
+        fixture_rows = [
+            {"ts": 1753000000, "action": "create", "actor": "U_ASKER",
+             "entity": "F3E", "gid": "T1"},
+            {"ts": 1753000000, "action": "create", "actor": "U1", "entity": "F3E",
+             "gid": "123"},
+            {"ts": 1753000000, "action": "complete", "actor": "U1", "entity": "F3E",
+             "gid": "mine"},
+            {"ts": 1753000000, "action": "create", "actor": "U1", "entity": "F3E",
+             "gid": "1210936363057519", "title": "fixture with a title key"},
+            {"ts": 1753000000, "action": "create", "actor": "U1", "entity": "F3E",
+             "gid": ""},
+        ]
+        for row in fixture_rows:
+            is_fixture, why = m._is_pm_actions_fixture(row)
+            assert is_fixture is True, row
+            assert why
+
+    def test_pm_actions_is_a_purge_target(self):
+        m = _load_purge_script()
+        assert any(rel == "logs/pm-actions.jsonl" for rel, _ in m._TARGETS)

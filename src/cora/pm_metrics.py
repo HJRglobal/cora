@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -91,8 +92,29 @@ def _load_roster() -> list[dict]:
         return []
 
 
-def read_actions(since_ts: int) -> list[dict]:
-    """Parse pm-actions.jsonl, returning entries with ts >= since_ts. Skips bad lines."""
+# A REAL logged action always carries the Asana task gid (>=10 digits; every
+# genuine row observed is 16 digits) and never a 'title' key (log_pm_action
+# deliberately doesn't persist titles). INVARIANT for future writers: a row
+# whose gid is not a real Asana gid is invisible to the adoption metrics.
+_REAL_GID_RE = re.compile(r"^\d{10,}$")
+
+
+def _is_countable_action(e: dict) -> bool:
+    """Row-shape screen (cq-b38f9293fe3b): pre-2026-07-29 full-suite runs had no
+    conftest redirect for this log and appended 2,710 fixture rows (gids 'T1',
+    '123', 'mine'...; some with a 'title' key) with live timestamps — inflating
+    the Phase-2 go/no-go headline ~14x (740 vs 53). The forward leak is closed
+    (conftest redirect + session-end guard) and the historical rows ride the S5
+    purge; this screen is the belt so row-shaped garbage can never count again."""
+    if "title" in e:
+        return False
+    return bool(_REAL_GID_RE.match(str(e.get("gid") or "")))
+
+
+def read_actions(since_ts: int, *, counters: dict | None = None) -> list[dict]:
+    """Parse pm-actions.jsonl, returning countable entries with ts >= since_ts.
+    Skips bad lines and fixture-shaped rows (tallied into counters['skipped_malformed']
+    when a counters dict is passed)."""
     out: list[dict] = []
     if not _ACTION_LOG.exists():
         return out
@@ -106,8 +128,13 @@ def read_actions(since_ts: int) -> list[dict]:
                     e = json.loads(line)
                 except Exception:
                     continue
-                if int(e.get("ts", 0)) >= since_ts:
-                    out.append(e)
+                if int(e.get("ts", 0)) < since_ts:
+                    continue
+                if not _is_countable_action(e):
+                    if counters is not None:
+                        counters["skipped_malformed"] = counters.get("skipped_malformed", 0) + 1
+                    continue
+                out.append(e)
     except Exception as exc:  # noqa: BLE001
         log.error("pm_metrics: action-log read failed: %s", exc)
     return out
@@ -142,8 +169,12 @@ def run(lookback_days: int = 7, stale_days: int = _STALE_DAYS,
     ws_ts = int(window_start.timestamp())
     ps_ts = int(prev_start.timestamp())
 
+    # counters passed on the WIDER (14d) read only — the two reads overlap, so
+    # counting both would double-tally skipped rows in the current week.
+    counters: dict[str, int] = {}
     this_week = read_actions(ws_ts)
-    prev_week = [e for e in read_actions(ps_ts) if int(e.get("ts", 0)) < ws_ts]
+    prev_week = [e for e in read_actions(ps_ts, counters=counters)
+                 if int(e.get("ts", 0)) < ws_ts]
 
     def _bucket(entries):
         by_action, by_actor, by_entity = {}, {}, {}
@@ -170,6 +201,7 @@ def run(lookback_days: int = 7, stale_days: int = _STALE_DAYS,
             "by_actor": tw_actor,
             "created": cora_created,
             "completed": cora_completed,
+            "malformed_rows_ignored": counters.get("skipped_malformed", 0),
         },
         "asana": None,
         "asana_error": None,
@@ -327,6 +359,9 @@ def format_digest(result: dict) -> str:
             f"{k} {v}" for k, v in sorted(cora["by_entity"].items(), key=lambda x: -x[1])
         )
         lines.append(f"   by entity: {ent}")
+    if cora.get("malformed_rows_ignored"):
+        lines.append(f"   _({cora['malformed_rows_ignored']} malformed/fixture-shaped "
+                     "rows ignored -- see cq-b38f9293fe3b)_")
 
     if asana:
         created_via_cora = min(cora["created"], asana["created_this_week"])

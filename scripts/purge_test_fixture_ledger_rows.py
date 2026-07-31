@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,12 +79,34 @@ def _is_fingerprints_fixture(row: dict) -> tuple[bool, str]:
     return False, ""
 
 
+_REAL_ASANA_GID_RE = re.compile(r"^\d{10,}$")
+
+
+def _is_pm_actions_fixture(row: dict) -> tuple[bool, str]:
+    """logs/pm-actions.jsonl (cq-b38f9293fe3b): pre-2026-07-29 full-suite runs
+    had no conftest redirect for this log and appended 2,710 fixture rows (of
+    2,730 total) with live timestamps -- the source of the inflated PM-adoption
+    headlines ('create 740' vs 53 real) AND the TOM adoption figures. Forward
+    leak closed by acb920f (conftest redirect + session-end guard); this purges
+    the history. Conservative predicate, verified against every real row
+    2026-07-31: a REAL row has a >=10-digit Asana task gid (all 20 real rows
+    are 16-digit) and never a 'title' key (log_pm_action deliberately does not
+    persist titles; title-bearing rows are early fixtures)."""
+    if "title" in row:
+        return True, "carries a 'title' key (schema never persists titles)"
+    gid = str(row.get("gid") or "")
+    if not _REAL_ASANA_GID_RE.match(gid):
+        return True, f"gid {gid!r} is not a >=10-digit Asana gid (fixture shape)"
+    return False, ""
+
+
 # (repo-relative path, predicate) -- add here if more contamination is found.
 _TARGETS = [
     ("logs/cora-autowrite-audit.jsonl", _is_autowrite_fixture),
     ("data/state/code-session-queue.jsonl", _is_code_queue_fixture),
     ("data/state/code-queue-signals.jsonl", _is_signals_fixture),
     ("data/state/code-queue-fingerprints.jsonl", _is_fingerprints_fixture),
+    ("logs/pm-actions.jsonl", _is_pm_actions_fixture),
 ]
 
 
