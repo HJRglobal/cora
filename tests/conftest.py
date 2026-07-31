@@ -224,6 +224,15 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # logs/cora-autowrite-audit.jsonl + data/state/code-session-queue*.jsonl.
     monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
     monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    # cq-d9432f552a33 (bug-hunt Slice 10): the known-answers WRITE targets resolve
+    # via PER-CALL env reads (gap_autofill._known_answers_dir/_resolved_path), so
+    # the module-constant belt below cannot cover them -- and .env carries the
+    # LIVE Drive store (KNOWN_ANSWERS_DIR=..._brain/known-answers), which is how a
+    # 2026-07-25 suite run auto-wrote the U-TOMMY/"lives in Polar" fixture into
+    # the PRODUCTION f3e.md. Redirect both for EVERY test; a test that needs a
+    # specific value sets it explicitly (its monkeypatch wins).
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
+    monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved-gaps.jsonl"))
     # Belt: even if a test flips a flag live but forgets to isolate the path,
     # redirect every module-constant ledger writer to tmp so a test can NEVER touch
     # a real logs/ or data/state/ file. Each in its own try/except (a missing or
@@ -310,6 +319,22 @@ def _guard_logs_untouched():
     root = _Path(__file__).resolve().parent.parent
     heartbeat = root / "data" / "health" / "heartbeat.txt"
     guarded = [root / rel for rel in _GUARDED_LEDGERS]
+    # cq-d9432f552a33: guard the known-answers stores too -- repo seeds AND the
+    # live Drive store. The Drive dir must come from the repo .env parsed
+    # DIRECTLY (never os.environ: the autouse redirect deliberately points env
+    # at tmp for every test). Fail-soft: no .env line / no G: -> nothing added.
+    guarded.extend(sorted((root / "design" / "known-answers").glob("*.md")))
+    guarded.append(root / "design" / "known-answers" / ".resolved-gaps.jsonl")
+    try:
+        env_text = (root / ".env").read_text(encoding="utf-8", errors="replace")
+        for line in env_text.splitlines():
+            if line.strip().startswith("KNOWN_ANSWERS_DIR="):
+                live_dir = _Path(line.split("=", 1)[1].strip().strip('"').strip("'"))
+                if live_dir.exists():
+                    guarded.extend(sorted(live_dir.glob("*.md")))
+                break
+    except Exception:
+        pass
 
     def _snap(p):
         try:

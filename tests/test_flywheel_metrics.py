@@ -377,6 +377,10 @@ class TestWave1ConversionMetrics:
 
     def test_gap_routing_completeness_routed_vs_rotting(self, tmp_path, monkeypatch):
         monkeypatch.delenv("KNOWLEDGE_GAPS_LOG_PATH", raising=False)
+        # The conftest autouse write-isolation (cq-d9432f552a33) points
+        # RESOLVED_GAPS_PATH at a tmp file; this test builds its OWN repo-root
+        # tree and needs the repo-relative fallback to resolve within it.
+        monkeypatch.delenv("RESOLVED_GAPS_PATH", raising=False)
         old1 = NOW - timedelta(days=10)
         old2 = NOW - timedelta(days=12)
         old3 = NOW - timedelta(days=15)

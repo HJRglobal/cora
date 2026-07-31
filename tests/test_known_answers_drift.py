@@ -106,21 +106,23 @@ def test_every_seed_still_parses_as_fallback():
 def _drive_ka_dir() -> Path | None:
     """Resolve the live Drive known-answers dir if mounted, else None.
 
-    Checks the env var first (as the bot does), then falls back to parsing the
-    repo .env so the host-only check runs under a plain `pytest` invocation
-    (conftest does not load the real .env). Returns None on anything unusual so
-    the gated test skips rather than errors.
+    Parses the repo .env FIRST, os.environ as the fallback (cq-d9432f552a33):
+    the conftest autouse fixture now redirects KNOWN_ANSWERS_DIR to a tmp dir
+    for EVERY test (write-isolation), so the env var at runtime points at an
+    empty tmp path -- only the .env file names the real Drive store. Returns
+    None on anything unusual so the gated test skips rather than errors.
     """
     try:
-        val = os.environ.get("KNOWN_ANSWERS_DIR")
+        val = ""
+        env_path = _REPO / ".env"
+        if env_path.is_file():
+            for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("KNOWN_ANSWERS_DIR=") and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
         if not val:
-            env_path = _REPO / ".env"
-            if env_path.is_file():
-                for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    line = line.strip()
-                    if line.startswith("KNOWN_ANSWERS_DIR=") and "=" in line:
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
+            val = os.environ.get("KNOWN_ANSWERS_DIR") or ""
         if not val:
             return None
         d = Path(val)
@@ -153,3 +155,47 @@ def test_repo_seed_covers_live_drive_store():
         "live Drive known-answers files lack a repo DR-seed: "
         + ", ".join(missing_seed)
     )
+
+
+def test_unpinned_known_answer_write_lands_in_tmp():
+    """cq-d9432f552a33 regression: a test that drives the known-answers WRITER
+    without setting its own KNOWN_ANSWERS_DIR must land in the conftest autouse
+    tmp redirect -- NEVER the live Drive store. (The 2026-07-25 leak mode: a
+    full knowledge-review drain with CORA_AUTOWRITE_LIVE=all and no redirect
+    auto-wrote the U-TOMMY fixture into the PRODUCTION _brain/f3e.md.)"""
+    from cora import gap_autofill as ga
+
+    target = Path(os.environ["KNOWN_ANSWERS_DIR"])
+    assert "_brain" not in str(target)            # the redirect is in force
+    ok, msg = ga.apply_known_answer({
+        "entity": "F3E",
+        "question": "where is the dashboard",
+        "answer": "REGRESSION-PROBE-ANSWER (must land in tmp only)",
+    })
+    assert ok, msg
+    written = target / "f3e.md"
+    assert written.exists()
+    assert "REGRESSION-PROBE-ANSWER" in written.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    _drive_ka_dir() is None,
+    reason="Drive known-answers store not mounted (CI / no KNOWN_ANSWERS_DIR)",
+)
+def test_live_store_carries_no_fixture_markers():
+    """Host-only: the PRODUCTION known-answers store must never contain the
+    test-fixture text (leaked 2026-07-25, purged 2026-07-31 -- the daily
+    flywheel monitor re-flagged it every run until then). The exact fixture
+    phrase is asserted; the legitimate fndr.md 'Polar Analytics' entry
+    (2026-05-18) deliberately does not match."""
+    drive = _drive_ka_dir()
+    assert drive is not None
+    for p in sorted(drive.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            pytest.skip(f"could not read {p.name}: {exc}")
+        assert "ops dashboard lives in Polar" not in text, (
+            f"test-fixture marker present in LIVE {p.name} -- a suite run wrote "
+            "to the production known-answers store (see cq-d9432f552a33)")
+        assert "U-TOMMY" not in text, f"fixture user id in LIVE {p.name}"
