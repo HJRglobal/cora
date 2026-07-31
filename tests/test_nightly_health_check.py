@@ -131,6 +131,55 @@ def test_qbo_monitor_never_run_is_warn(monkeypatch):
     assert r.status == "warn" and "never run" in r.detail
 
 
+# ── MCP HTTP bridge freshness (2026-07-30 kickoff, extends D-092) ────────────
+def _mock_mcp_task_schtasks(monkeypatch, returncode):
+    monkeypatch.setattr(
+        hc.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=returncode, stdout="", stderr=""))
+
+
+def test_mcp_http_bridge_unregistered_is_ok(monkeypatch):
+    _mock_mcp_task_schtasks(monkeypatch, returncode=1)
+    r = hc.check_mcp_http_bridge()
+    assert r.status == "ok"
+    assert "Not registered" in r.detail
+
+
+def test_mcp_http_bridge_registered_and_answering_is_ok(monkeypatch):
+    import socket
+
+    _mock_mcp_task_schtasks(monkeypatch, returncode=0)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        r = hc.check_mcp_http_bridge(port=port)
+        assert r.status == "ok"
+        assert "answering" in r.detail
+    finally:
+        srv.close()
+
+
+def test_mcp_http_bridge_registered_but_not_answering_is_warn(monkeypatch):
+    import socket
+
+    _mock_mcp_task_schtasks(monkeypatch, returncode=0)
+    # Bind + immediately close to get a port almost certainly refusing connections.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.close()
+    r = hc.check_mcp_http_bridge(port=port)
+    assert r.status == "warn"
+    assert "not answering" in r.detail
+
+
+def test_mcp_http_bridge_default_port_matches_bridge_default():
+    import run_mcp_server_http as http_bridge
+    assert http_bridge._DEFAULT_PORT == 8791
+
+
 # ── Dynamic-answers snapshot freshness (D-084) ────────────────────────────────
 import time as _time  # noqa: E402
 

@@ -507,6 +507,45 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
 
 
+_MCP_HTTP_TASK = "cowork-cora-mcp-http"
+
+
+def check_mcp_http_bridge(port: int | None = None) -> CheckResult:
+    """WARN if the MCP local-HTTP bridge task (scripts/run_mcp_server_http.py,
+    2026-07-30 kickoff, extends D-092) is registered but has stopped answering
+    on its loopback port. The task is OPTIONAL and opt-in (Harrison's manual
+    GO/NO-GO smoke gates registration) -- if it was never registered, this is
+    a silent OK, never a WARN; registering it is not required. `port` is
+    injectable for tests."""
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/Query", "/TN", _MCP_HTTP_TASK, "/FO", "LIST"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("MCP HTTP bridge", "ok", f"schtasks query failed (non-fatal): {exc}")
+    if proc.returncode != 0:
+        return CheckResult(
+            "MCP HTTP bridge", "ok",
+            "Not registered (optional; see deployment/setup-cora-mcp-http-task.ps1).")
+
+    if port is None:
+        try:
+            port = int(os.environ.get("CORA_MCP_HTTP_PORT", "8791"))
+        except ValueError:
+            port = 8791
+    import socket  # noqa: PLC0415
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            pass
+    except OSError as exc:
+        return CheckResult(
+            "MCP HTTP bridge", "warn",
+            f"Task '{_MCP_HTTP_TASK}' is registered but 127.0.0.1:{port} is not "
+            f"answering: {exc}")
+    return CheckResult("MCP HTTP bridge", "ok", f"Registered and 127.0.0.1:{port} is answering.")
+
+
 _DYNAMIC_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers" / "dynamic"
 
 
@@ -1035,6 +1074,9 @@ def main() -> int:
 
     log.info("Checking dynamic-answers snapshot freshness...")
     all_results.append(check_dynamic_snapshots())
+
+    log.info("Checking MCP HTTP bridge (if registered)...")
+    all_results.append(check_mcp_http_bridge())
 
     log.info("Checking founder CLAUDE.md KB freshness (FNDR current-state path)...")
     all_results.append(check_founder_kb_freshness())

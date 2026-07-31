@@ -8,14 +8,19 @@ Decision of record: memory/decisions.md 2026-07-28 [FNDR/CORA]; eval doc
 reading Cora's stores through deterministic guards) and gives the one-corpus
 doctrine its first LIVE query path.
 
-Design invariants (D-051 load-bearing — v1):
+Design invariants (D-051 load-bearing — v1, extended 2026-07-30 for the HTTP
+bridge + the code-queue seed write tool):
 
-1.  READ-ONLY BY CONSTRUCTION. The KB is opened SQLite ``mode=ro`` (see
-    KnowledgeBase.open_readonly / schema.connect(read_only=True)); every write
-    statement raises on that handle. NO write tool is exposed and no write code
-    path exists in this module — the file-reads (known-answers, backlog render)
-    are reads only. The one future exception (code-queue seed via its confirm
-    gate) is explicitly OUT of v1.
+1.  READ-ONLY BY CONSTRUCTION, WITH ONE NAMED EXCEPTION. The KB is opened SQLite
+    ``mode=ro`` (see KnowledgeBase.open_readonly / schema.connect(read_only=True));
+    every write statement raises on that handle. No KB write, canon write, or raw
+    SQL exists anywhere in this module. The ONE exception, decided IN 2026-07-30
+    (kickoff note `_notes/2026-07-30_fndr_cora-code-prompt-mcp-http-bridge.md`,
+    extends D-092): ``cora_code_queue_seed`` is a thin passthrough to
+    ``code_queue.seed_item`` — the SAME Harrison-gated, PHI-fail-closed,
+    fingerprint-idempotent write path the code-queue capture flow already uses.
+    It writes to the code-session backlog only, which is explicitly NOT canon
+    (D-011 untouched); everything else on this surface stays read-only forever.
 2.  EVERY KB QUERY GOES THROUGH ``store.search`` (never raw SQL against
     knowledge_chunks). The store-layer security invariants — strict LEX
     sub_entity scoping, the in-SQL ``user_note`` exclusion, recency, entity
@@ -380,6 +385,67 @@ def code_queue_view() -> dict[str, Any]:
     }
 
 
+_SEED_ALLOWED_STATUS = frozenset({"PROPOSED", "APPROVED"})
+
+
+def code_queue_seed(
+    kind: str,
+    severity: str,
+    title: str,
+    summary: str,
+    entity: str,
+    status: str | None = None,
+    subsystem_guess: str = "",
+) -> dict[str, Any]:
+    """The ONE write tool on this surface: seed a single item into the code-session
+    backlog via ``code_queue.seed_item`` — same PHI-fail-closed, fingerprint-
+    idempotent gate the capture flow uses; nothing is bypassed or reimplemented.
+    The backlog is NOT canon (D-011 untouched, decisions.md/CLAUDE.md are
+    unreachable from this surface). ``status`` is restricted to PROPOSED
+    (default) / APPROVED — any other value is refused before ``seed_item`` is
+    ever called."""
+    from cora import code_queue
+
+    kind = (kind or "").strip()
+    severity = (severity or "").strip()
+    title = (title or "").strip()
+    summary = (summary or "").strip()
+    entity = (entity or "").strip().upper()
+    status = (status or "PROPOSED").strip().upper()
+
+    missing = [n for n, v in (("kind", kind), ("severity", severity), ("title", title),
+                              ("summary", summary), ("entity", entity)) if not v]
+    if missing:
+        return {"id": None, "seeded": False,
+                "error": f"missing required field(s): {', '.join(missing)}"}
+    if status not in _SEED_ALLOWED_STATUS:
+        return {"id": None, "seeded": False,
+                "error": f"status must be one of {sorted(_SEED_ALLOWED_STATUS)}, got {status!r}"}
+
+    try:
+        cq_id = code_queue.seed_item(
+            kind=kind, severity=severity, title=title, summary=summary,
+            entity=entity, signal="explicit", status=status,
+            subsystem_guess=subsystem_guess or "",
+        )
+    except Exception as exc:  # noqa: BLE001 — a write tool still never crashes the server
+        log.warning("MCP code_queue_seed failed: %s", exc)
+        return {"id": None, "seeded": False, "error": f"seed failed: {exc}"}
+
+    if cq_id is None:
+        return {
+            "id": None, "seeded": False,
+            "message": ("Refused: title/summary tripped the PHI/LEX-sensitivity guard. "
+                        "Nothing was written."),
+        }
+    return {
+        "id": cq_id, "seeded": True, "status": status,
+        "message": (f"Seeded {cq_id} (status={status}). This is the code-session "
+                    "backlog, not canon — Harrison reviews it in the normal flow. "
+                    "Re-seeding the same title is idempotent (returns this id)."),
+    }
+
+
 def health() -> dict[str, Any]:
     """Cora liveness snapshot — heartbeat age, uptime, and recent scheduled-task
     fire results. READ-ONLY: unlike the nightly health check, this NEVER restarts
@@ -571,6 +637,46 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         "fn": lambda a: code_queue_view(),
+    },
+    {
+        "name": "cora_code_queue_seed",
+        "description": (
+            "Seed ONE item into the Harrison-gated code-session backlog (the same queue "
+            "`cora_code_queue` reads) — the ONLY write tool on this whole surface; every "
+            "other tool stays read-only. Use it to log a build signal (a bug, a gap, a "
+            "capability ask, an idea) found during this session so it lands in Harrison's "
+            "normal review flow. Do NOT use it to record decisions, doctrine, or canon — "
+            "the backlog is explicitly NOT canon (decisions.md / CLAUDE.md writes remain "
+            "Harrison-only via Cowork, D-011 unchanged). `status` must be PROPOSED (default) "
+            "or APPROVED — pass APPROVED only when Harrison explicitly approved this exact "
+            "item earlier in this session; every other case is PROPOSED. The write is "
+            "PHI-fail-closed (a title/summary that trips the sensitivity guard is silently "
+            "refused, nothing persisted) and idempotent (re-seeding an identical title "
+            "returns the existing id, no duplicate)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "Short category, e.g. bug, gap, capability_ask, idea."},
+                "severity": {"type": "string", "description": "e.g. HIGH / MEDIUM / LOW."},
+                "title": {"type": "string", "description": "Short title — this is the dedup key."},
+                "summary": {"type": "string", "description": "1-3 sentence description of the signal."},
+                "entity": {"type": "string", "description": "Entity code (F3E/OSN/LEX/UFL/BDM/HJRP/HJRPROD/HJRG/F3C/FNDR)."},
+                "status": {
+                    "type": "string",
+                    "enum": ["PROPOSED", "APPROVED"],
+                    "description": "Default PROPOSED. APPROVED only if Harrison explicitly approved this in-session.",
+                },
+                "subsystem_guess": {"type": "string", "description": "Optional: module/area this touches."},
+            },
+            "required": ["kind", "severity", "title", "summary", "entity"],
+            "additionalProperties": False,
+        },
+        "fn": lambda a: code_queue_seed(
+            a.get("kind", ""), a.get("severity", ""), a.get("title", ""),
+            a.get("summary", ""), a.get("entity", ""), a.get("status"),
+            a.get("subsystem_guess", ""),
+        ),
     },
     {
         "name": "cora_health",

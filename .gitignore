@@ -1,6 +1,10 @@
 # Secrets — never commit
 .env
 
+# Claude Code MCP server config (machine-specific local path); see
+# deployment/mcp-server-registration.md for the template.
+.mcp.json
+
 # Python
 __pycache__/
 *.pyc

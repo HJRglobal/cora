@@ -118,14 +118,18 @@ def test_open_readonly_missing_db_raises(tmp_path):
         KnowledgeBase.open_readonly(tmp_path / "nope.db")
 
 
-def test_no_write_tool_is_exposed():
+def test_exactly_one_write_tool_is_exposed():
+    """2026-07-30: cora_code_queue_seed is the ONE decided-in write tool (extends
+    D-092; kickoff `_notes/2026-07-30_fndr_cora-code-prompt-mcp-http-bridge.md`).
+    Every other tool on the surface must stay read-only-shaped by name."""
     names = {s["name"] for s in mcp_server._TOOL_SPECS}
     assert names == {
         "cora_kb_search", "cora_decisions_search", "cora_known_answers",
-        "cora_code_queue", "cora_health",
+        "cora_code_queue", "cora_code_queue_seed", "cora_health",
     }
     forbidden = ("create", "update", "delete", "set", "write", "upsert", "remove", "add")
-    for n in names:
+    read_only_names = names - {"cora_code_queue_seed"}
+    for n in read_only_names:
         assert not any(tok in n.lower() for tok in forbidden), n
 
 
@@ -437,4 +441,75 @@ def test_build_server_ok():
     pytest.importorskip("mcp")
     srv = mcp_server.build_server()
     assert srv is not None
-    assert len(mcp_server._TOOL_SPECS) == 5
+    assert len(mcp_server._TOOL_SPECS) == 6
+
+
+# ── K. cora_code_queue_seed — the ONE write tool ─────────────────────────────
+def test_seed_requires_all_fields(monkeypatch):
+    out = mcp_server.code_queue_seed("", "HIGH", "title", "summary", "F3E")
+    assert out["seeded"] is False
+    assert "kind" in out["error"]
+
+
+def test_seed_rejects_bad_status(monkeypatch):
+    out = mcp_server.code_queue_seed("bug", "HIGH", "title", "summary", "F3E", status="SHIPPED")
+    assert out["seeded"] is False
+    assert "status" in out["error"]
+
+
+def test_seed_defaults_to_proposed(monkeypatch):
+    from cora import code_queue
+    captured = {}
+
+    def _fake_seed_item(**kw):
+        captured.update(kw)
+        return "cq-abc123"
+    monkeypatch.setattr(code_queue, "seed_item", _fake_seed_item)
+    out = mcp_server.code_queue_seed("bug", "HIGH", "title", "summary", "F3E")
+    assert out["seeded"] is True
+    assert out["id"] == "cq-abc123"
+    assert out["status"] == "PROPOSED"
+    assert captured["status"] == "PROPOSED"
+    assert captured["signal"] == "explicit"
+
+
+def test_seed_allows_explicit_approved(monkeypatch):
+    from cora import code_queue
+    monkeypatch.setattr(code_queue, "seed_item", lambda **kw: "cq-xyz789")
+    out = mcp_server.code_queue_seed("bug", "HIGH", "title", "summary", "F3E", status="approved")
+    assert out["seeded"] is True
+    assert out["status"] == "APPROVED"
+
+
+def test_seed_phi_refusal_is_silent_not_an_error(monkeypatch):
+    """seed_item returns None on a PHI-tripping refusal — the tool reports
+    seeded=False with a message, not an "error" key (a refusal is not a crash)."""
+    from cora import code_queue
+    monkeypatch.setattr(code_queue, "seed_item", lambda **kw: None)
+    out = mcp_server.code_queue_seed("bug", "HIGH", "title", "summary", "LEX")
+    assert out["seeded"] is False
+    assert out["id"] is None
+    assert "error" not in out
+    assert "Refused" in out["message"]
+
+
+def test_seed_exception_is_caught(monkeypatch):
+    from cora import code_queue
+
+    def _boom(**kw):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(code_queue, "seed_item", _boom)
+    out = mcp_server.code_queue_seed("bug", "HIGH", "title", "summary", "F3E")
+    assert out["seeded"] is False
+    assert "disk full" in out["error"]
+
+
+def test_seed_tool_spec_wired_and_defaults_status(monkeypatch):
+    from cora import code_queue
+    captured = {}
+    monkeypatch.setattr(code_queue, "seed_item", lambda **kw: captured.update(kw) or "cq-1")
+    spec = next(s for s in mcp_server._TOOL_SPECS if s["name"] == "cora_code_queue_seed")
+    out = spec["fn"]({"kind": "gap", "severity": "LOW", "title": "t", "summary": "s", "entity": "OSN"})
+    assert out["seeded"] is True
+    assert captured["status"] == "PROPOSED"
+    assert captured["entity"] == "OSN"
