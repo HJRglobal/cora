@@ -672,6 +672,17 @@ def _plan_asana_create(
     }
 
 
+def _confirmed_flag(input_data: dict) -> bool:
+    """The staged-write confirm flag, tolerant of the model STRING-echo variants
+    ("true"/"True") observed live 7/30 (cq-ed29165fca97 A2). A string echo must
+    land in the honest Phase-2 no-pending refusal, never in Phase 1 where it
+    silently regenerates a preview (or, for delete/complete, re-arms a fresh-ts
+    destructive pending). Applied uniformly to ALL seven staged-write tools —
+    the D-051 bundle review found the widening initially shipped on Shopify only.
+    Anything else (False, "false", None, 0) is unconfirmed."""
+    return input_data.get("confirmed", False) in (True, "true", "True")
+
+
 def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> str:
     """Create a new Asana task in the HJR Global workspace.
 
@@ -691,7 +702,7 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     """
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed", False) is True
+    confirmed = _confirmed_flag(input_data)
 
     # ── Phase 2a: confirm turn with a fresh pending create -> execute the STASHED
     # payload (F-23 Slice 4). Identity = the server-resolved payload, not a confirm-turn
@@ -1203,7 +1214,7 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
     """Mark one of the asker's tasks complete (staged-write, server-side pending)."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "complete")
@@ -1245,7 +1256,7 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     """PERMANENTLY delete one of the asker's tasks (staged-write, server-side pending)."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "delete")
@@ -1328,7 +1339,7 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
     the ownership check, same as complete/delete (WS5)."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     # ── Phase 2: confirm -> apply the STASHED change-set (native PUT + custom fields).
     if confirmed:
@@ -1495,7 +1506,7 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
     pending). Founder + FNDR/HJRG cross-entity-exempt (WS5)."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "comment")
@@ -1546,7 +1557,7 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
     Founder + FNDR/HJRG cross-entity-exempt for the PARENT-ownership check (WS5)."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "subtask")
@@ -1938,7 +1949,7 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
     """
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     # ── Phase 2: confirm turn -- execute ONLY the caller's own stashed create ──
     if confirmed:
@@ -2040,7 +2051,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
     the confirm turn. Attendees are notified (sendUpdates='all')."""
     input_data = _input or {}
     channel = str(input_data.get("_channel_name") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     user_email, err = _calendar_resolve_email(slack_user_id)
     if err:
@@ -4215,9 +4226,7 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             f"{_NOT_WRITTEN}\nDTC inventory updates are only available from F3E channels."
         )
 
-    # A model string-echo ("true") must land in the honest Phase-2 refusal, never in
-    # Phase 1 where it would silently regenerate a preview (cq-ed29165fca97 A2).
-    confirmed = input_data.get("confirmed", False) in (True, "true", "True")
+    confirmed = _confirmed_flag(input_data)
     items = input_data.get("items")
     is_bulk = isinstance(items, list) and len(items) > 0
 
@@ -4400,6 +4409,14 @@ def _peek_pending_shopify(slack_user: str, channel: str) -> dict | None:
     return None
 
 
+# How long past TTL-expiry the tombstone still SERVES its honest reply. Sized to
+# comfortably cover both live 7/30 incidents (confirm 30min and 3h24m past
+# expiry); beyond it the entry is popped SILENTLY (D-051 bundle review: an
+# unbounded window let a days-old abandoned preview hijack an unrelated later
+# "yes" — the entry must never outlive its plausibility).
+_SHOPIFY_TOMBSTONE_SERVE_SECONDS = 6 * 3600
+
+
 def _pop_expired_shopify_write(slack_user: str, channel: str) -> dict | None:
     """Pop-and-return an EXPIRED Shopify pending entry (None when absent or still
     fresh). cq-ed29165fca97: the peeks treat an expired entry as absent, so a bare
@@ -4527,22 +4544,36 @@ def try_confirm_pending_write(
         entries.append((float(calendar.get("ts", 0)), "calendar", calendar.get("action")))
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
-        # affirmative + an EXPIRED Shopify entry means the user is confirming a
-        # preview that timed out — serve ONE honest deterministic expiry reply
+        # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
+        # a preview that timed out — serve ONE honest deterministic expiry reply
         # instead of falling to the model (which re-derives the write from thread
         # text: silent identical re-preview / mangled re-parsed product name, both
-        # live 7/30). Pop-on-serve: only the first post-expiry confirm gets this;
-        # any non-affirmative message leaves the tombstone in place and falls
-        # through untouched (the conservative _confirm_intent gate is load-bearing —
-        # an unrelated "yes" to a question with content words never lands here).
-        if _confirm_intent(message, None) == "affirm":
+        # live 7/30). Hardened per the D-051 bundle review:
+        #   * the intent gate passes "set" (mirroring the fresh-pending path) so an
+        #     action-verb message ("delete that task", "done") conflicts and falls
+        #     through — pending_action=None treated every action verb as a go and
+        #     hijacked unrelated requests;
+        #   * a NEGATE pops the tombstone silently (an explicit "no, cancel" must
+        #     disarm it, not leave it lying in wait for the next bare "yes");
+        #   * the reply is served only within _SHOPIFY_TOMBSTONE_SERVE_SECONDS past
+        #     expiry — older entries pop silently and the turn falls to the model
+        #     (bounded window; a days-old abandoned preview never hijacks anything).
+        intent = _confirm_intent(message, "set")
+        if intent is not None:
             expired = _pop_expired_shopify_write(slack_user_id, channel_name)
-            if expired:
-                log.info("confirm_interceptor EXPIRED-refuse user=%s kind=shopify",
+            if expired and intent == "affirm":
+                age = time.time() - float(expired.get("ts", 0))
+                if age <= _SHOPIFY_PENDING_TTL_SECONDS + _SHOPIFY_TOMBSTONE_SERVE_SECONDS:
+                    log.info("confirm_interceptor EXPIRED-refuse user=%s kind=shopify",
+                             slack_user_id)
+                    return (f"That inventory change expired before you confirmed "
+                            f"({_expired_pending_label(expired)}). Nothing was written -- "
+                            "tell me the change again and I'll re-preview it.")
+                log.info("confirm_interceptor tombstone too old (age=%.0fs) -- "
+                         "discarded silently user=%s", age, slack_user_id)
+            elif expired:
+                log.info("confirm_interceptor tombstone cleared on negate user=%s",
                          slack_user_id)
-                return (f"That inventory change expired before you confirmed "
-                        f"({_expired_pending_label(expired)}). Nothing was written -- "
-                        "tell me the change again and I'll re-preview it.")
         return None
     entries.sort(reverse=True)  # freshest first
     _ts, kind, action = entries[0]
@@ -8752,7 +8783,7 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
     request = str(input_data.get("request", "") or "").strip()
     channel = _cq_channel(input_data)
     channel_id = str(input_data.get("_channel_id", "") or "")
-    confirmed = input_data.get("confirmed") is True
+    confirmed = _confirmed_flag(input_data)
 
     if confirmed:
         pending = _claim_pending_code_queue(slack_user_id, channel)

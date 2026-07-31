@@ -746,16 +746,27 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
                        else f" ({itemized_n} of {expected_n} summable -- sum incomplete)")
             sum_bits = [f"- Sum of itemized entities: {_fmt_money(itemized_sum)}{partial}"]
             if itemized_delta_n:
-                sum_bits.append(_fmt_delta(itemized_delta_sum))
+                # Completeness note (D-051 bundle review): a summed delta over a
+                # SUBSET of the itemized entities must say so, or a missing
+                # per-entity delta silently understates the WoW movement.
+                delta_note = ("" if itemized_delta_n == itemized_n
+                              else f" [delta from {itemized_delta_n} of {itemized_n} entities]")
+                sum_bits.append(_fmt_delta(itemized_delta_sum) + delta_note)
             lines.append(" ".join(sum_bits))
             fndr_ent = (cash.get("entities") or {}).get("FNDR") or {}
             fndr_bal = None if fndr_ent.get("error") else fndr_ent.get("closing_balance")
+            weeks_diverged = any(
+                (e.get("week_label") and cash.get("week_label")
+                 and e["week_label"] != cash["week_label"])
+                for e in (cash.get("entities") or {}).values() if not e.get("error"))
             if fndr_bal is not None and itemized_n == expected_n:
+                caveat = (" [some tabs anchored to a different week -- component "
+                          "approximate]" if weeks_diverged else "")
                 lines.append(
                     f"- Non-itemized component (Portfolio minus itemized sum): "
-                    f"{_fmt_money(fndr_bal - itemized_sum)} -- real accounts in the "
-                    "summary tab with no line above. NEVER present the Portfolio "
-                    "figure or its WoW as the sum of the entity lines.")
+                    f"{_fmt_money(fndr_bal - itemized_sum)}{caveat} -- real accounts "
+                    "in the summary tab with no line above. NEVER present the "
+                    "Portfolio figure or its WoW as the sum of the entity lines.")
         # Deterministic negative-balance list (cq-90f8ca56c758): the ONLY entities
         # that may be described as "in a negative cash position". A negative WoW
         # delta means DECLINING, never "negative" (the 7/26 memo called HJR

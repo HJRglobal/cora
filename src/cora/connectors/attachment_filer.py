@@ -410,6 +410,7 @@ def process_email(
     # reporting for a cross-message/cross-run collapse). The ledger dict mutates
     # in lockstep with appends, so later messages in this run see earlier ids.
     emitted_canonicals: dict[str, int] = {}
+    emitted_names: set[str] = set()
     known_file_ids = {r.get("file_id") for r in content_ledger.values() if r.get("file_id")}
 
     for decision in decisions:
@@ -452,15 +453,19 @@ def process_email(
         # ledger-poisoned against the wrong file. Uniquify within the message so
         # distinct siblings upload as distinct Drive files.
         base = canonical
-        if base in emitted_canonicals:
-            emitted_canonicals[base] += 1
-            stem, dot, ext = canonical.rpartition(".")
+        # Loop until the FINAL name is unused too (D-051 bundle review: an
+        # original slug that happens to equal an earlier sibling's uniquified
+        # name, e.g. a literal "...-2.pdf", must also uniquify).
+        while canonical in emitted_names:
+            emitted_canonicals[base] = emitted_canonicals.get(base, 1) + 1
             n = emitted_canonicals[base]
-            canonical = f"{stem}-{n}.{ext}" if dot else f"{canonical}-{n}"
+            stem, dot, ext = base.rpartition(".")
+            canonical = f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
+        if canonical != base:
             log.info("Canonical-name collision within message %s: %r -> %r",
                      message_id, base, canonical)
-        else:
-            emitted_canonicals[base] = 1
+        emitted_canonicals.setdefault(base, 1)
+        emitted_names.add(canonical)
         entity_folder = _ENTITY_TO_DRIVE_FOLDER[entity]
         drive_path_segments = [entity_folder, subfolder]
         drive_path_display = f"{entity_folder}/{subfolder}/{canonical}"
@@ -522,8 +527,16 @@ def process_email(
         # deduping) but do NOT log "Filed" or emit a digest row claiming a new
         # filing with a fresh AI description of the same file.
         if file_id in known_file_ids:
-            log.info("Already filed -- %r collapsed onto existing Drive file %s "
-                     "(not a new filing)", orig_filename, file_id)
+            # WARNING not info (D-051 bundle review, contested finding accepted as
+            # residual): with upload_file's name-dedup unverified by md5, this CAN
+            # be a genuinely different document name-collapsing cross-run -- i.e.
+            # possible data loss. Visible in the log for the weekly eyeball; the
+            # md5-verify option inside upload_file is a flagged follow-up decision
+            # (bot-loaded; finance_receipts relies on current name-dedup semantics).
+            log.warning("Already filed -- %r collapsed onto existing Drive file %s "
+                        "(not a new filing; if this was a DIFFERENT document, it was "
+                        "not archived -- see cq-f583932a625e follow-up)",
+                        orig_filename, file_id)
             filer_ledger.append_content(
                 content_ledger, content_md5,
                 file_id=file_id, web_link=web_link, drive_path=drive_path_display,

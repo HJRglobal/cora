@@ -322,25 +322,34 @@ def _guard_logs_untouched():
     # cq-d9432f552a33: guard the known-answers stores too -- repo seeds AND the
     # live Drive store. The Drive dir must come from the repo .env parsed
     # DIRECTLY (never os.environ: the autouse redirect deliberately points env
-    # at tmp for every test). Fail-soft: no .env line / no G: -> nothing added.
+    # at tmp for every test). Every G: touch is BOUNDED via drive_io (D-051
+    # bundle review: a plain glob/stat on a degraded mount can hang or raise
+    # non-FileNotFoundError OSErrors -- the guard must never wedge or crash the
+    # suite). Fail-soft everywhere: no .env line / no G: / drive_io outage ->
+    # the Drive files are simply not guarded this session.
     guarded.extend(sorted((root / "design" / "known-answers").glob("*.md")))
     guarded.append(root / "design" / "known-answers" / ".resolved-gaps.jsonl")
     try:
+        from cora import drive_io as _dio
         env_text = (root / ".env").read_text(encoding="utf-8", errors="replace")
         for line in env_text.splitlines():
             if line.strip().startswith("KNOWN_ANSWERS_DIR="):
                 live_dir = _Path(line.split("=", 1)[1].strip().strip('"').strip("'"))
-                if live_dir.exists():
-                    guarded.extend(sorted(live_dir.glob("*.md")))
+                guarded.extend(sorted(
+                    _dio.glob(live_dir, "*.md", timeout=5.0, retry_seconds=0)))
                 break
     except Exception:
         pass
 
     def _snap(p):
+        # Bounded + broadly fail-soft (D-051 bundle review): a degraded G: mount
+        # raises OSErrors beyond FileNotFoundError and a raw stat can hang --
+        # the guard is best-effort observability, never a suite-wedger.
         try:
-            st = p.stat()
-            return (st.st_size, int(st.st_mtime))
-        except FileNotFoundError:
+            from cora import drive_io as _dio
+            info = _dio.stat_info(p, timeout=5.0, retry_seconds=0)
+            return None if info is None else (info[1], int(info[0]))
+        except Exception:
             return None
 
     def _bot_live():

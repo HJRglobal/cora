@@ -86,7 +86,11 @@ def main() -> int:
             print("DRY RUN -- nothing deleted. Re-run with --apply (Cora stopped).")
             return 0
 
-        for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
+        # Every vec table that may exist, incl. the partition-key v2 index the
+        # pending migration populates (D-051 bundle review: omitting v2 leaves an
+        # orphan that permanently blocks the migrate --swap v2==f32 verification).
+        for tbl in ("knowledge_vec_bin", "knowledge_vec_bin_v2",
+                    "knowledge_vec_f32", "knowledge_chunks"):
             try:
                 cur = conn.execute(f"DELETE FROM {tbl} WHERE chunk_id = ?", (chunk_id,))
                 print(f"   {tbl}: deleted {cur.rowcount}")

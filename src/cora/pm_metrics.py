@@ -169,11 +169,12 @@ def run(lookback_days: int = 7, stale_days: int = _STALE_DAYS,
     ws_ts = int(window_start.timestamp())
     ps_ts = int(prev_start.timestamp())
 
-    # counters passed on the WIDER (14d) read only — the two reads overlap, so
-    # counting both would double-tally skipped rows in the current week.
+    # counters on the CURRENT-week read only — the digest frames everything as
+    # "past N days", so the ignored-rows note must match that window (D-051
+    # bundle review: a 14d tally under a 7d headline misleads).
     counters: dict[str, int] = {}
-    this_week = read_actions(ws_ts)
-    prev_week = [e for e in read_actions(ps_ts, counters=counters)
+    this_week = read_actions(ws_ts, counters=counters)
+    prev_week = [e for e in read_actions(ps_ts)
                  if int(e.get("ts", 0)) < ws_ts]
 
     def _bucket(entries):

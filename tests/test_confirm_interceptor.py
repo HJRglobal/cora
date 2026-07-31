@@ -370,6 +370,48 @@ class TestExpiredShopifyTombstone:
         )
         assert out2 is not None and "expired" in out2.lower()
 
+    def test_action_verb_messages_never_hijacked(self):
+        """D-051 bundle review: the tombstone gate passes 'set' (like the fresh
+        path), so an action-verb request ('delete that task', 'done') conflicts
+        and falls through to the model -- the old pending_action=None gate
+        treated every action verb as a go and swallowed unrelated requests."""
+        for msg in ("delete that task", "complete it", "done"):
+            self._stash_expired_single()
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message=msg,
+            )
+            assert out is None, msg
+            td._PENDING_SHOPIFY_WRITES.clear()
+
+    def test_negate_clears_the_tombstone_silently(self):
+        """An explicit 'no, cancel' after expiry must DISARM the tombstone (fall
+        through to the model), so a later bare 'yes' can never resurrect it."""
+        self._stash_expired_single()
+        out = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E",
+            message="no, cancel",
+        )
+        assert out is None                             # model handles the cancel turn
+        out2 = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="confirm",
+        )
+        assert out2 is None                            # tombstone gone
+
+    def test_ancient_tombstone_pops_silently_never_served(self):
+        """Bounded serve window: an abandoned preview from days ago must never
+        hijack a later affirmative -- popped silently, turn falls to the model."""
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "inventory_item_id": "i1", "location_id": "l1", "target_qty": 5,
+            "preview_qty": 9, "variant_label": "Old", "location_label": "Office",
+            "ts": time.time() - (td._SHOPIFY_PENDING_TTL_SECONDS
+                                 + td._SHOPIFY_TOMBSTONE_SERVE_SECONDS + 60),
+        })
+        out = td.try_confirm_pending_write(
+            slack_user_id=HARRISON, channel_name=_CH, entity="F3E", message="yes",
+        )
+        assert out is None                             # never the expiry reply
+        assert not td._PENDING_SHOPIFY_WRITES          # and the entry is gone
+
     def test_fresh_pending_still_executes_not_tombstoned(self):
         td._store_pending_shopify_write(HARRISON, _CH, {
             "inventory_item_id": "i1", "location_id": "l1", "target_qty": 5,

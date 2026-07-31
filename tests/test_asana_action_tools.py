@@ -216,3 +216,27 @@ class TestCreateWithFollowers:
         mock.assert_not_called()
         assert out.startswith("WRITE_BLOCKED")
         assert "NOT CREATED" in out
+
+
+class TestConfirmedStringEcho:
+    """D-051 bundle review: the string-echo widening must cover ALL staged-write
+    tools, not just Shopify -- a model confirmed:"true" on an Asana confirm turn
+    previously landed in Phase 1 and re-previewed (re-arming a fresh-ts
+    DESTRUCTIVE pending for delete/complete) instead of executing."""
+
+    def test_string_true_executes_a_fresh_pending_create(self):
+        created = {"gid": "T1", "permalink_url": "http://x", "projects": []}
+        with patch.object(td.asana_client, "create_task", return_value=created) as mock, \
+             patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+            td._tool_asana_create_task(HARRISON, "FNDR", {"title": "Echo test"})
+            out = td._tool_asana_create_task(HARRISON, "FNDR", {"confirmed": "true"})
+        mock.assert_called_once()
+        assert "WRITE_CONFIRMED" in out
+
+    def test_string_false_still_previews(self):
+        with patch.object(td.asana_client, "create_task") as mock:
+            out = td._tool_asana_create_task(HARRISON, "FNDR", {
+                "title": "Falsy echo", "confirmed": "false"})
+        mock.assert_not_called()
+        assert out.startswith("WRITE_BLOCKED")
+        assert td.has_pending_asana_write(HARRISON, "")

@@ -62,7 +62,10 @@ cases:
     expect_substring: "Tier 1 = 32% off"
     layer2:
       must_contain: ["25.15"]
-      must_not_contain: ["55%", "$22 per 12-pack"]
+      # "55% of" not bare "55%": the canon itself says 'there is NO
+      # percent-of-retail "55%" rule', so a correct canon-quoting answer would
+      # false-fail a bare-"55%" ban (D-051 bundle review).
+      must_not_contain: ["55% of", "$22 per 12-pack"]
 
   # ── FNDR content (from design/known-answers/fndr.md) ───────────────────────
   - id: fndr-channel-registry-location
