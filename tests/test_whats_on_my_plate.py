@@ -638,3 +638,74 @@ def test_max_items_none_preserves_full_render():
     assert len(rendered) == 25
     assert "Long list" in out
     assert "soonest-due of" not in out
+
+
+# ── code-computed due framing (cq-c6392ebbaa45) ──────────────────────────────
+def test_due_framing_is_code_computed_29_days_overdue():
+    """The 44-vs-29 regression: a task due exactly 29 days ago must render a
+    code-computed '(29 days overdue)' -- the model reproduces it, never invents
+    its own count."""
+    from datetime import date
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm(
+        [{"name": "Focus group panel", "due_on": "2026-06-30", "projects": []}],
+        today=date(2026, 7, 29),
+    )
+    assert "[2026-06-30] (29 days overdue)" in out
+
+
+def test_due_framing_keeps_year_on_year_old_task():
+    """The hidden-year case: '[2025-07-29]' abbreviated to 'due 7/29' read as due
+    TODAY. The full ISO year must survive alongside the computed count."""
+    from datetime import date
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm(
+        [{"name": "Ancient", "due_on": "2025-07-29",
+          "permalink_url": "https://app.asana.com/t/9", "projects": []}],
+        today=date(2026, 7, 29),
+    )
+    assert "[2025-07-29] (365 days overdue)" in out
+    assert "<https://app.asana.com/t/9|Ancient>" in out  # link token survives the suffix
+
+
+def test_due_framing_variants():
+    from datetime import date
+    from cora.tools import asana_client
+    today = date(2026, 7, 29)
+    tasks = [
+        {"name": "DueToday", "due_on": "2026-07-29", "projects": []},
+        {"name": "Tomorrow", "due_on": "2026-07-30", "projects": []},
+        {"name": "NextWeek", "due_on": "2026-08-05", "projects": []},
+        {"name": "OneOver", "due_on": "2026-07-28", "projects": []},
+        {"name": "NoDue", "projects": []},
+        {"name": "BadDate", "due_on": "not-a-date", "projects": []},
+    ]
+    out = asana_client.format_tasks_for_llm(tasks, today=today)
+
+    def _line(name):
+        return next(ln for ln in out.splitlines()
+                    if ln.startswith("- [") and name in ln)
+
+    assert "(due today)" in _line("DueToday")
+    assert "(due tomorrow)" in _line("Tomorrow")
+    assert "(due in 7 days)" in _line("NextWeek")
+    assert "(1 day overdue)" in _line("OneOver")
+    assert "overdue" not in _line("NoDue") and "due in" not in _line("NoDue")
+    assert "overdue" not in _line("BadDate")
+
+
+def test_formatter_carries_no_recompute_instruction():
+    from cora.tools import asana_client
+    out = asana_client.format_tasks_for_llm([{"name": "T", "projects": []}])
+    assert "do NOT recompute day counts" in out
+
+
+def test_briefing_prompt_carries_no_recompute_instruction():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "rdb", Path(__file__).resolve().parents[1] / "scripts" / "run_daily_briefing.py")
+    rdb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rdb)
+    rec = RoleRecord(slack_id="U1", name="Test Person", role="Ops", entity="F3E")
+    prompt = rdb._build_briefing_prompt(rec, "sections", "context", "2026-07-31")
+    assert "NEVER compute day counts yourself" in prompt

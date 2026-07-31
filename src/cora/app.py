@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from slack_bolt import App
 
@@ -513,8 +514,14 @@ def _dispatch_qa(
         "entity scope. Do not redirect to other channels based on entity scoping.\n"
     ) if is_founder else ""
 
+    # cq-c6392ebbaa45: anchor the model's "now" — with no date line the model
+    # free-handed day arithmetic ("44 days overdue" for a 29-day gap) and even
+    # resolved relative phrases against a stale internal date (the S4 create-path
+    # incident). One factual line; rides the uncached runtime block.
+    az_today = datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
     runtime_context = (
         f"## Runtime channel context\n\n"
+        f"Today's date: {az_today} (America/Phoenix).\n"
         f"This channel (#{channel_name}) has these properties:\n"
         f"- Entity: {entity}\n"
         f"- Function: {function}\n"

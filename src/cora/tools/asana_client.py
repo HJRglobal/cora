@@ -937,6 +937,7 @@ def format_tasks_for_llm(
     entity_scope: str | None = None,
     total_before_filter: int | None = None,
     max_items: int | None = None,
+    today: date | None = None,
 ) -> str:
     """Render task list as a string suitable for a tool_result content block.
 
@@ -983,10 +984,36 @@ def format_tasks_for_llm(
     capped = bool(max_items) and total_tasks > max_items
     render = tasks[:max_items] if capped else tasks
 
+    # cq-c6392ebbaa45: day-count framing is CODE-computed here (the shared
+    # renderer for plate / my-tasks / daily briefing) so the model never does
+    # date arithmetic or drops the year -- the 7/29 evidence had the same
+    # [2025-07-29] tool line narrated as "due 7/29" (reads as this year) in one
+    # reply and a model-invented "44 days overdue" (real gap: 29) in another.
+    if today is None:
+        today = datetime.now().date()
+
+    def _due_suffix(raw_due: str) -> str:
+        d = _parse_due_date(raw_due)
+        if d is None:
+            return ""
+        delta = (today - d).days
+        if delta > 1:
+            return f" ({delta} days overdue)"
+        if delta == 1:
+            return " (1 day overdue)"
+        if delta == 0:
+            return " (due today)"
+        if delta == -1:
+            return " (due tomorrow)"
+        return f" (due in {-delta} days)"
+
     lines = [header]
     lines.append(
         "(Task names below are Slack-formatted hyperlinks — preserve the `<url|name>` "
-        "syntax verbatim in your reply so the user can click through to edit in Asana.)"
+        "syntax verbatim in your reply so the user can click through to edit in Asana. "
+        "Due dates and the parenthesized overdue/due-in framing are code-computed — "
+        "reproduce them verbatim; do NOT recompute day counts, abbreviate dates, or "
+        "drop the year.)"
     )
     if capped:
         # F-03: a full verbatim reproduction of a long list overran the reply's
@@ -1032,7 +1059,8 @@ def format_tasks_for_llm(
         else:
             name_with_link = name
 
-        lines.append(f"- [{due}] {name_with_link} ({project_str}){notes_preview}")
+        lines.append(f"- [{due}]{_due_suffix(str(due))} {name_with_link} "
+                     f"({project_str}){notes_preview}")
 
     # Footer for scoped results — helps the LLM mention the scope to the user
     if entity_scope and total_before_filter and total_before_filter > len(tasks):
