@@ -2,8 +2,14 @@
 .env
 
 # Claude Code MCP server config (machine-specific local path); see
-# deployment/mcp-server-registration.md for the template.
-.mcp.json
+# deployment/mcp-server-registration.md for the template. Anchored to the repo
+# root: the cora-tools PLUGIN's .mcp.json (deployment/cora-tools-plugin/) is
+# source and MUST commit.
+/.mcp.json
+
+# Session-bus snapshots (runtime output of src/cora/session_snapshots.py; the
+# parent dir also reserves space for the deferred request/response mailbox).
+data/session-bus/
 
 # MCP HTTP bridge TLS material (self-signed loopback cert + private key; see
 # deployment/new-mcp-https-cert.ps1). Already covered by data/state/ below --

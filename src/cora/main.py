@@ -15,6 +15,7 @@ from .app import app
 from .config import config
 from .context_loader import _load_static_context
 from .health_endpoint import start_health_server, start_ping_thread
+from .session_snapshots import start_snapshot_writer
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEARTBEAT_FILE = _REPO_ROOT / "data" / "health" / "heartbeat.txt"
@@ -210,6 +211,13 @@ def main() -> None:
         name="DriveMonitor",
         daemon=True,
     ).start()
+
+    # Session snapshot writer (SLIM session-comms, 2026-07-30 decision): durable
+    # JSON snapshots of the D-092 read surface under data/session-bus/snapshots/
+    # plus a G: _brain mirror. Its OWN process-lifetime daemon — deliberately NOT
+    # the heartbeat thread: a slow render (bounded schtasks query, G: mirror write)
+    # must never delay the liveness sentinel. Fail-soft per file per tick.
+    start_snapshot_writer(log)
 
     attempt = 0
     last_error = ""

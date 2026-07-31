@@ -355,6 +355,28 @@ def stat_mtime(
     return _guarded(_op, what=f"stat {p}", timeout=timeout, retry_seconds=retry_seconds)
 
 
+def stat_info(
+    path: str | os.PathLike[str],
+    *,
+    timeout: float = TIMEOUT_SECONDS,
+    retry_seconds: float = RETRY_SECONDS,
+) -> tuple[float, int] | None:
+    """Resilient ``(st_mtime, st_size)`` read — companion to :func:`stat_mtime` for
+    callers that need size too without paying a second bounded round-trip. Returns
+    ``None`` if the file does not exist while the mount is UP; raises
+    :class:`DriveUnavailable` when the mount is gone."""
+    p = Path(path)
+
+    def _op() -> tuple[float, int] | None:
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            return None
+        return (st.st_mtime, st.st_size)
+
+    return _guarded(_op, what=f"stat {p}", timeout=timeout, retry_seconds=retry_seconds)
+
+
 def glob(
     directory: str | os.PathLike[str],
     pattern: str,
