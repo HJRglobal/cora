@@ -53,6 +53,20 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _monotonic_stamps(monkeypatch):
+    """Windows' datetime.now granularity (~15ms) can hand two back-to-back forced
+    ticks IDENTICAL updated_at stamps — impossible at the 60s production cadence,
+    but it breaks stamp-ordering/change-gating assertions in tests. Substitute a
+    strictly increasing fake."""
+    counter = {"n": 0}
+
+    def fake():
+        counter["n"] += 1
+        return f"2026-07-31T00:00:{counter['n']:02d}.000000+00:00"
+
+    monkeypatch.setattr(ss, "_utc_now_iso", fake)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tick mechanics: writes, atomicity, cadence
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +121,7 @@ def test_cadence_skips_until_due(monkeypatch):
 # Fail-soft: a failing render keeps the stale file + stamp, tick continues
 # ─────────────────────────────────────────────────────────────────────────────
 def test_failing_render_keeps_stale_file_and_stamp(monkeypatch):
+    _monotonic_stamps(monkeypatch)
     state = {"fail": False}
 
     def flaky():
@@ -180,6 +195,7 @@ def test_index_reports_null_stamp_for_never_written_file(monkeypatch):
 # Mirror: change-gated, fail-soft, retried
 # ─────────────────────────────────────────────────────────────────────────────
 def test_mirror_pushes_exact_bytes_and_skips_unchanged(monkeypatch):
+    _monotonic_stamps(monkeypatch)
     _fake_specs(monkeypatch, [
         _spec("hot.json", lambda: {"v": 1}, cadence=0),
         _spec("cold.json", lambda: {"v": 2}, cadence=99999),
@@ -237,9 +253,101 @@ def test_mirror_retries_after_outage(monkeypatch):
     assert ss._last_mirrored == {}
 
     state["fail"] = False
-    ss._mirror_pass()                              # e.g. the next tick's pass
+    ss._mirror_cooldown_until = 0.0                # outage cooldown elapsed
+    ss._mirror_pass()                              # e.g. a later tick's pass
     assert sorted(pushed) == ["a.json", "index.json"]
     assert set(ss._last_mirrored) == {"a.json", "index.json"}
+
+
+def test_mirror_outage_starts_cooldown(monkeypatch):
+    """D-051 loop-kill fix: after a DriveUnavailable, mirror attempts stand down
+    for the cooldown window (in a hang-mode outage each attempt leaks an
+    abandoned drive-io worker; a 60s cadence would defeat the 30s breaker)."""
+    _fake_specs(monkeypatch, [_spec("a.json", lambda: {"v": 1})])
+    attempts = {"n": 0}
+
+    def gone(path, text, **kwargs):
+        attempts["n"] += 1
+        raise drive_io.DriveUnavailable("hang-mode")
+
+    monkeypatch.setattr(ss.drive_io, "write_text_atomic", gone)
+    ss.tick(force=True)
+    assert attempts["n"] == 1                      # aborted after the first file
+    assert ss._mirror_cooldown_until > 0
+    ss.tick(force=True)                            # next tick: inside cooldown
+    assert attempts["n"] == 1                      # no new attempt, no new leak
+
+    ss._mirror_cooldown_until = 0.0                # cooldown elapsed
+    ss.tick(force=True)
+    assert attempts["n"] == 2                      # attempts resume
+
+
+def test_mirror_withholds_index_while_a_data_file_push_fails(monkeypatch):
+    """D-051 clobber fix: a per-file (non-outage) mirror failure must withhold
+    the mirror index — otherwise the index claims freshness for a file that
+    never landed (e.g. a sync-locked read-only target failing every tick)."""
+    _fake_specs(monkeypatch, [
+        _spec("stuck.json", lambda: {"v": 1}, cadence=99999),
+        _spec("fine.json", lambda: {"v": 2}, cadence=99999),
+    ])
+    state = {"stuck_fails": True}
+    pushed: list[str] = []
+    real_write = drive_io.write_text_atomic
+
+    def selective(path, text, **kwargs):
+        name = Path(path).name
+        if name == "stuck.json" and state["stuck_fails"]:
+            raise PermissionError(5, "target sync-locked")
+        pushed.append(name)
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(ss.drive_io, "write_text_atomic", selective)
+    ss.tick(force=True)
+    assert "fine.json" in pushed                   # per-file failure: pass continues
+    assert "index.json" not in pushed              # ...but the index is withheld
+    assert "stuck.json" not in ss._last_mirrored
+
+    state["stuck_fails"] = False
+    ss._mirror_pass()                              # file recovers -> self-heals
+    assert "stuck.json" in pushed
+    assert "index.json" in pushed
+    assert ss._last_mirrored["index.json"] == ss._last_stamp["index.json"]
+
+
+def test_uptime_reads_newest_live_log_across_midnight(tmp_path):
+    """D-051 fix pin: the live log keeps the process-START-date basename across
+    midnight rollovers — uptime must come from the newest-mtime dated log, and a
+    heartbeat-less same-day decoy file must fall through to the real one."""
+    import os as _os
+
+    import cora.mcp_server as ms
+
+    live = tmp_path / "cora-2026-07-30.log"        # start-date basename, still live
+    live.write_text(
+        "2026-07-31 00:18:00 INFO cora heartbeat alive uptime_s=93780\n",
+        encoding="utf-8")
+    decoy = tmp_path / "cora-2026-07-31.log"       # empty same-day file, no heartbeat
+    decoy.write_text("", encoding="utf-8")
+    # Make the decoy NEWEST by mtime — the fallback must still find the live log.
+    _os.utime(live, (1_000_000_000, 1_000_000_000))
+    assert ms._read_uptime_from_log(log_dir=tmp_path) == 93780
+
+    # And when the live file IS the newest (the normal shape), it wins directly.
+    _os.utime(decoy, (999_999_999, 999_999_999))
+    assert ms._read_uptime_from_log(log_dir=tmp_path) == 93780
+
+
+def test_snapshot_writer_warns_when_dir_off_repo_volume(monkeypatch, caplog):
+    """D-051 fix pin: pointing CORA_SNAPSHOT_DIR at a non-repo volume (e.g. G:)
+    routes unbounded raw I/O at a mount that can hang — warn loudly at startup."""
+    import logging as _logging
+
+    monkeypatch.setenv("CORA_SNAPSHOT_DIR", "Q:/somewhere/snapshots")
+    monkeypatch.setattr(ss, "_snapshot_loop", lambda *a, **k: None)  # don't run
+    with caplog.at_level(_logging.WARNING, logger="cora.session_snapshots"):
+        t = ss.start_snapshot_writer()
+        t.join(timeout=5)
+    assert any("not on the repo volume" in r.message for r in caplog.records)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,9 +355,10 @@ def test_mirror_retries_after_outage(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 def test_code_queue_snapshot_redacts_lex_items():
     """Read-layer redaction pin: even a legacy raw-LEX row in the event ledger
-    (pre-parity-raise) must never surface raw title/summary/fix_sketch in the
-    snapshot — code-queue.json inherits load_items/_lex_safe_view + the
-    render-side re-check by construction."""
+    (pre-parity-raise) must never surface raw title/summary/fix_sketch — nor a
+    staged prompt_path whose FILENAME embeds the raw-title slug (D-051
+    2026-07-31 finding) — in the snapshot. code-queue.json inherits
+    load_items/_lex_safe_view + the render-side re-check by construction."""
     row = {
         "event": "captured", "id": "cq-lextest0001",
         "ts": "2026-07-30T00:00:00+00:00", "status": "PROPOSED",
@@ -257,14 +366,38 @@ def test_code_queue_snapshot_redacts_lex_items():
         "title": "Marcus Alvarez billing authorization lookup",
         "summary": "raw sensitive summary", "fix_sketch": "raw fix detail",
     }
+    staged = {
+        "event": "staged", "id": "cq-lextest0001",
+        "ts": "2026-07-30T01:00:00+00:00",
+        "prompt_path": "_notes/2026-07-30_fndr_cora-code-prompt-"
+                       "marcus-alvarez-billing-authorization-lookup-abc123.md",
+    }
     cq._EVENT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    cq._EVENT_LEDGER.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    cq._EVENT_LEDGER.write_text(
+        json.dumps(row) + "\n" + json.dumps(staged) + "\n", encoding="utf-8")
 
     payload = ss._render_code_queue()
     assert "Marcus" not in payload["backlog"]
+    assert "marcus-alvarez" not in payload["backlog"]  # the slug channel
     assert "raw sensitive summary" not in payload["backlog"]
     assert cq._LEX_REDACTED_TITLE in payload["backlog"]
     assert payload["provenance"]  # injection framing rides along
+
+
+def test_lex_safe_view_redacts_prompt_path_but_keeps_it_truthy():
+    """The prompt_path replacement must stay TRUTHY: process_queue_action's
+    staging idempotency keys on it — a blanked path would re-stage (and
+    double-generate) an already-staged LEX item."""
+    it = {"id": "cq-x", "entity": "LEX", "status": "STAGED",
+          "title": "raw", "summary": "raw", "fix_sketch": "raw",
+          "prompt_path": "_notes/2026-07-28_cora-code-prompt-client-name-slug.md"}
+    safe = cq._lex_safe_view(it)
+    assert safe["prompt_path"] == cq._LEX_REDACTED_PROMPT_PATH
+    assert safe["prompt_path"]  # truthy — idempotency preserved
+    assert "client-name-slug" not in json.dumps(safe)
+    # Non-LEX untouched; LEX item without a path gains nothing.
+    assert cq._lex_safe_view({"entity": "F3E", "prompt_path": "p.md"})["prompt_path"] == "p.md"
+    assert "prompt_path" not in cq._lex_safe_view({"entity": "LEX", "title": "t"})
 
 
 def test_known_answers_index_excludes_lex_subentities_and_contents(tmp_path, monkeypatch):

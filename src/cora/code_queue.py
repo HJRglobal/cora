@@ -575,6 +575,14 @@ def _scrub_evidence(evidence: list[dict[str, Any]] | None, *, is_lex: bool) -> l
 # PHI predicate (mirrors the existing representative/evidence blanket redaction).
 _LEX_REDACTED_TITLE = "[LEX build ask -- details withheld]"
 
+# D-051 2026-07-31 (session-snapshots review): the staged prompt FILENAME embeds
+# _slug(title) -- title-DERIVED text that must not outlive the title redaction
+# (pre-parity-raise LEX rows persisted raw titles, so their staged paths carry
+# raw-title slugs forever). Replaced with a fixed placeholder that stays TRUTHY:
+# the staging idempotency checks in process_queue_action key on prompt_path
+# truthiness, so blanking it would re-stage (and double-generate) LEX items.
+_LEX_REDACTED_PROMPT_PATH = "[LEX staged prompt -- path withheld]"
+
 
 def _redact_lex_build_fields(rec: dict[str, Any]) -> None:
     """In-place: blank title/summary/fix_sketch for a LEX-entity record. Call BEFORE
@@ -595,6 +603,8 @@ def _lex_safe_view(it: dict[str, Any]) -> dict[str, Any]:
         it["title"] = _LEX_REDACTED_TITLE
         it["summary"] = ""
         it["fix_sketch"] = ""
+        if it.get("prompt_path"):
+            it["prompt_path"] = _LEX_REDACTED_PROMPT_PATH
     return it
 
 
@@ -630,6 +640,20 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
         log.info("code_queue: dropped PHI-flagged candidate (signal=%s entity=%s)",
                  rec.get("signal"), entity)
         return None
+
+    # D-051 2026-07-31 (session-snapshots review follow-through): subsystem_guess
+    # was the ONE model-authored field outside the PHI screen above, yet it
+    # egresses via mixed-bundle prompt-path slugs (_affinity_key -> _bundle_theme
+    # -> _slug), where the LEX prompt_path redaction cannot reach co-bundled
+    # non-LEX items. A PHI-tripping value must never persist. Fail-closed blank
+    # (the item survives; only the affinity hint is dropped).
+    sub = str(rec.get("subsystem_guess") or "")
+    if sub:
+        try:
+            if phi_guard.is_any_phi(sub):
+                rec["subsystem_guess"] = ""
+        except Exception:  # noqa: BLE001 -- fail closed
+            rec["subsystem_guess"] = ""
 
     rec["evidence"] = _scrub_evidence(rec.get("evidence"), is_lex=is_lex)
 

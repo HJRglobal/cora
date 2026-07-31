@@ -236,6 +236,44 @@ def test_phi_check_error_fails_closed(qenv, monkeypatch):
     assert cq._capture(dict(rec)) is None  # fail-closed -> drop
 
 
+def test_phi_tripping_subsystem_guess_blanked_at_capture(qenv, monkeypatch):
+    """D-051 2026-07-31: subsystem_guess egresses via mixed-bundle prompt-path
+    slugs (_affinity_key -> _bundle_theme -> _slug), where the LEX prompt_path
+    redaction can't reach co-bundled non-LEX items -- so a PHI-tripping value is
+    blanked at capture (item survives, hint dropped)."""
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi",
+                        lambda t: "billing authorization" in t)
+    rec = {"kind": "bug", "severity": "P2", "title": "tool crashed", "summary": "boom",
+           "entity": "F3E", "signal": "tool_error", "representative": "tool",
+           "subsystem_guess": "Bob Smith billing authorization",
+           "evidence": [], "reporter": "U1"}
+    cid = cq._capture(dict(rec))
+    assert cid is not None                      # the item itself survives
+    assert cq.get_item(cid)["subsystem_guess"] == ""
+
+    clean = dict(rec, title="shopify sync loses inventory rows",
+                 representative="a completely different shopify sync defect",
+                 subsystem_guess="shopify inventory")
+    cid2 = cq._capture(clean)
+    assert cid2 != cid                          # genuinely distinct item
+    assert cq.get_item(cid2)["subsystem_guess"] == "shopify inventory"
+
+
+def test_lex_prompt_path_redacted_in_read_layer(qenv):
+    """D-051 2026-07-31: a staged LEX item's prompt_path (filename embeds the
+    title slug) is replaced with the fixed placeholder in the read-layer view --
+    and stays TRUTHY so process_queue_action's staging idempotency holds."""
+    rec = {"kind": "feature", "severity": "P3", "title": "lts scheduler tool",
+           "summary": "generic", "entity": "LEX-LTS", "signal": "phrase",
+           "representative": "x", "evidence": [], "reporter": "U1"}
+    cid = cq._capture(dict(rec))
+    cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid,
+                      "prompt_path": "_notes/cora-code-prompt-raw-title-slug.md"})
+    item = cq.get_item(cid)
+    assert item["prompt_path"] == cq._LEX_REDACTED_PROMPT_PATH
+    assert "raw-title-slug" not in cq.render_backlog_text()
+
+
 def test_explicit_lex_redacts_representative_and_evidence_at_rest(qenv):
     # 1i: the explicit write path builds rec with a RAW request in both the
     # representative AND the evidence note; _capture must redact BOTH for LEX before

@@ -491,23 +491,38 @@ def health() -> dict[str, Any]:
     return out
 
 
-def _read_uptime_from_log() -> int | None:
-    """Parse the most recent `heartbeat alive uptime_s=N` from today's Cora log.
+def _read_uptime_from_log(log_dir: Path | None = None) -> int | None:
+    """Parse the most recent `heartbeat alive uptime_s=N` from the LIVE Cora log.
+
+    The live file is ``cora-<process-START-date>.log`` — main's
+    TimedRotatingFileHandler keeps writing the start-date basename across
+    midnight rollovers, so a today()-named read returned None (or another
+    process's file) on any day after the bot's start day (D-051 2026-07-31,
+    session-snapshots review; verified live). Scan the newest few dated logs by
+    mtime and read only a 64 KiB tail (this runs on a 60s snapshot cadence).
     Best-effort, read-only; None if unavailable."""
     try:
-        today = datetime.date.today().isoformat()
-        log_path = cl._REPO_ROOT / "logs" / f"cora-{today}.log"
-        if not log_path.exists():
-            return None
-        last = None
-        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+        directory = log_dir if log_dir is not None else cl._REPO_ROOT / "logs"
+        candidates = sorted(
+            directory.glob("cora-????-??-??.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # Newest-first, bounded: a heartbeat-less decoy (e.g. an empty same-day
+        # file another process created) falls through to the next-newest log.
+        for path in candidates[:3]:
+            size = path.stat().st_size
+            with path.open("rb") as fh:
+                fh.seek(max(0, size - 65536))
+                tail = fh.read().decode("utf-8", errors="replace")
+            last = None
+            for line in tail.splitlines():
                 idx = line.find("uptime_s=")
                 if idx != -1 and "heartbeat alive" in line:
                     last = line[idx + len("uptime_s="):].strip()
-        if last is None:
-            return None
-        return int("".join(ch for ch in last if ch.isdigit()) or "0")
+            if last is not None:
+                return int("".join(ch for ch in last if ch.isdigit()) or "0")
+        return None
     except Exception:  # noqa: BLE001
         return None
 

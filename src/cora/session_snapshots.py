@@ -171,7 +171,13 @@ def _render_flywheel() -> dict[str, Any]:
 def _render_known_answers_index() -> dict[str, Any]:
     """entity -> known-answers file mtime/size — an INDEX only, never contents.
     LEX sub-entities are excluded, matching the MCP known_answers exposure rule
-    (their answers surface only at the LEX GM level)."""
+    (their answers surface only at the LEX GM level).
+
+    Stats go through drive_io because the PRODUCTION dir is on G: (the live .env
+    points KNOWN_ANSWERS_DIR at the Drive _brain store). Accepted residual
+    (D-051 2026-07-31, contested-LOW): with a LOCAL dir (the repo default), a
+    G:-outage window can open drive_io's global breaker and mark these stats
+    'unavailable' for a tick — an honest unknown that self-heals."""
     from cora import context_loader as cl
     from cora.known_answers_map import ENTITY_FILES
 
@@ -243,14 +249,25 @@ _last_stamp: dict[str, str] = {}       # name -> updated_at written to the file
 _last_mirrored: dict[str, str] = {}    # name -> updated_at last pushed to the mirror
 _mirror_healthy: bool | None = None    # None until the first mirror attempt
 
+# D-051 2026-07-31 (loop-kill lens): in a HANG-mode G: outage every mirror attempt
+# leaks one abandoned drive-io worker thread, and a 60s tick cadence re-attempts
+# after drive_io's 30s breaker has already closed -- the breaker never fast-fails
+# a 60s-periodic caller. After a DriveUnavailable, stand down for this long so the
+# leak rate stays inside the envelope the codebase already accepts (the
+# DriveMonitor's 1-probe-per-300s). Mirror staleness during the cooldown is
+# honest -- the mirrored index's stamps simply age.
+_MIRROR_OUTAGE_COOLDOWN_SECS = 300
+_mirror_cooldown_until = 0.0           # monotonic deadline
+
 
 def reset_state_for_tests() -> None:
-    global _task_results_cache, _mirror_healthy
+    global _task_results_cache, _mirror_healthy, _mirror_cooldown_until
     _last_success.clear()
     _last_stamp.clear()
     _last_mirrored.clear()
     _task_results_cache = None
     _mirror_healthy = None
+    _mirror_cooldown_until = 0.0
 
 
 def _bootstrap_stamp(name: str) -> str | None:
@@ -314,34 +331,62 @@ def _log_mirror_transition(ok: bool, detail: str = "") -> None:
     _mirror_healthy = ok
 
 
+def _mirror_one(src_dir: Path, target_dir: Path, name: str) -> str:
+    """Push one file's exact local bytes to the mirror. Returns 'ok' |
+    'unavailable' (mount gone -- caller aborts the pass + starts the cooldown) |
+    'error' (per-file failure -- caller continues)."""
+    try:
+        text = (src_dir / name).read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("session-snapshots: mirror read-back of %s failed: %s", name, exc)
+        return "error"
+    try:
+        drive_io.write_text_atomic(target_dir / name, text, retry_seconds=0)
+    except drive_io.DriveUnavailable as exc:
+        _log_mirror_transition(False, str(exc))
+        return "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        _log_mirror_transition(False, f"{name}: {exc}")
+        return "error"
+    _last_mirrored[name] = _last_stamp[name]
+    _log_mirror_transition(True)
+    return "ok"
+
+
 def _mirror_pass() -> None:
     """Push every file whose updated_at advanced since its last successful mirror
     write. Mirrors the exact local bytes (one serialization, one truth). Entirely
-    fail-soft: a Drive blip skips this pass and retries later."""
-    names = [spec["name"] for spec in _SPECS] + [_INDEX_NAME]
-    to_push = [n for n in names
-               if _last_stamp.get(n) and _last_stamp.get(n) != _last_mirrored.get(n)]
-    if not to_push:
+    fail-soft: a Drive blip skips this pass, starts the outage cooldown, and
+    retries later."""
+    global _mirror_cooldown_until
+    if time.monotonic() < _mirror_cooldown_until:
         return
     src_dir = _snapshot_dir()
     target_dir = _mirror_dir()
-    for name in to_push:
-        stamp = _last_stamp[name]
-        try:
-            text = (src_dir / name).read_text(encoding="utf-8")
-        except OSError as exc:
-            log.warning("session-snapshots: mirror read-back of %s failed: %s", name, exc)
+    data_names = [spec["name"] for spec in _SPECS]
+    for name in data_names:
+        if not _last_stamp.get(name) or _last_stamp[name] == _last_mirrored.get(name):
             continue
-        try:
-            drive_io.write_text_atomic(target_dir / name, text, retry_seconds=0)
-        except drive_io.DriveUnavailable as exc:
-            _log_mirror_transition(False, str(exc))
+        outcome = _mirror_one(src_dir, target_dir, name)
+        if outcome == "unavailable":
+            _mirror_cooldown_until = time.monotonic() + _MIRROR_OUTAGE_COOLDOWN_SECS
             return  # mount is gone; the rest of this pass would fail identically
-        except Exception as exc:  # noqa: BLE001
-            _log_mirror_transition(False, f"{name}: {exc}")
-            continue
-        _last_mirrored[name] = stamp
-        _log_mirror_transition(True)
+
+    # index.json goes LAST, and ONLY when every stamped data file has actually
+    # arrived on the mirror (D-051 clobber lens: a per-file failure followed by
+    # an index push would publish a mirror index claiming freshness for a file
+    # that never landed -- e.g. a sync-locked read-only target raising
+    # PermissionError every tick, forever). Withholding the index UNDER-claims,
+    # the conservative direction; it self-heals the pass after the file recovers.
+    caught_up = all(
+        _last_mirrored.get(n) == _last_stamp.get(n)
+        for n in data_names if _last_stamp.get(n)
+    )
+    if not caught_up:
+        return
+    if _last_stamp.get(_INDEX_NAME) and _last_stamp[_INDEX_NAME] != _last_mirrored.get(_INDEX_NAME):
+        if _mirror_one(src_dir, target_dir, _INDEX_NAME) == "unavailable":
+            _mirror_cooldown_until = time.monotonic() + _MIRROR_OUTAGE_COOLDOWN_SECS
 
 
 def tick(*, force: bool = False) -> dict[str, str]:
@@ -400,6 +445,17 @@ def _snapshot_loop(stop: threading.Event, loop_log: logging.Logger | None = None
 def start_snapshot_writer(loop_log: logging.Logger | None = None) -> threading.Thread:
     """Start the process-lifetime snapshot daemon. The stop Event is never set in
     production (the thread dies with the process); it exists for tests."""
+    # D-051 2026-07-31: the repo lane's writes are raw pathlib (correct for a
+    # local volume, UNBOUNDED on a network one). If CORA_SNAPSHOT_DIR ever points
+    # off the repo volume, say so loudly at startup -- a G: hang would silently
+    # freeze the writer thread (never the heartbeat) with no error line at all.
+    snap = _snapshot_dir()
+    if snap.drive.upper() != _REPO_ROOT.drive.upper():
+        (loop_log or log).warning(
+            "session-snapshots: CORA_SNAPSHOT_DIR (%s) is not on the repo volume "
+            "(%s) -- repo-lane writes are unbounded there and a network hang would "
+            "stall the snapshot writer. Keep the repo lane LOCAL; the G: mirror "
+            "already provides Drive visibility.", snap, _REPO_ROOT.drive)
     thread = threading.Thread(
         target=_snapshot_loop,
         args=(threading.Event(), loop_log),
