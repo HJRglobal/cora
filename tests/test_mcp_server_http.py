@@ -67,7 +67,11 @@ def _make_client(monkeypatch, token: str | None):
     else:
         monkeypatch.setenv("CORA_MCP_HTTP_TOKEN", token)
     app = http_bridge.build_app()
-    return TestClient(app)
+    # TestClient's default Host is "testserver", which the Host-allowlist (the
+    # DNS-rebinding mitigation) correctly refuses -- point it at a real
+    # loopback hostname so these tests exercise the auth/tool-call logic, not
+    # the Host check (that check has its own dedicated tests below).
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 _LIST_TOOLS = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
@@ -107,6 +111,63 @@ def test_extract_bearer_handles_missing_and_malformed_headers():
     assert http_bridge._extract_bearer(
         {"headers": [(b"authorization", b"Bearer abc123")]}
     ) == "abc123"
+
+
+# ── B2. Host-header allowlist (DNS-rebinding mitigation, D-051-light finding) ─
+def test_host_is_allowed_for_loopback_hostnames():
+    assert http_bridge._host_is_allowed("127.0.0.1:8791")
+    assert http_bridge._host_is_allowed("localhost:8791")
+    assert http_bridge._host_is_allowed("localhost")
+    assert http_bridge._host_is_allowed("[::1]:8791")
+
+
+def test_host_is_rejected_for_attacker_hostname():
+    """A DNS-rebinding page's fetch() carries Host: <attacker-domain>, not
+    127.0.0.1, even though the TCP connection lands on the real loopback
+    socket -- the allowlist must reject it."""
+    assert not http_bridge._host_is_allowed("evil.example:8791")
+    assert not http_bridge._host_is_allowed("evil.example")
+    assert not http_bridge._host_is_allowed("")
+
+
+def test_disallowed_host_header_gets_401(monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.delenv("CORA_MCP_HTTP_TOKEN", raising=False)
+    app = http_bridge.build_app()
+    with TestClient(app, base_url="http://evil.example") as client:
+        r = client.post("/mcp", json=_LIST_TOOLS, headers=_HEADERS)
+        assert r.status_code == 401
+
+
+def test_non_http_scope_is_never_dispatched():
+    """A websocket (or any non-http) ASGI scope must be refused outright, not
+    fall through the token check via an `and` on scope type."""
+    import asyncio
+
+    app = http_bridge.build_app()
+
+    async def _try_websocket_scope():
+        sent = []
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "websocket", "path": "/mcp", "headers": [],
+                  "query_string": b"", "root_path": "", "asgi": {"version": "3.0"}}
+        try:
+            await app(scope, receive, send)
+        except Exception:
+            pass
+        return sent
+
+    sent = asyncio.run(_try_websocket_scope())
+    # No websocket.accept (or any other protocol message) was ever emitted --
+    # the scope was refused before it ever reached the session manager.
+    assert not any(m.get("type") == "websocket.accept" for m in sent)
 
 
 def test_token_check_uses_constant_time_compare():

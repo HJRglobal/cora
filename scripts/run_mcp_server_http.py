@@ -94,6 +94,32 @@ def _extract_bearer(scope: dict[str, Any]) -> str:
     return ""
 
 
+# D-051-light network-surface finding (2026-07-30): a loopback BIND alone does
+# not stop DNS rebinding -- a page at http://evil.example running in the
+# operator's own browser can have evil.example's DNS record point at
+# 127.0.0.1, and the browser will still send same-origin fetch()es carrying
+# `Host: evil.example:<port>` to this real loopback socket. The TCP peer really
+# is local (rebinding cannot reach an off-machine bind), but the request is
+# attacker-controlled. Browsers set Host from the URL's hostname, never from
+# the resolved IP, so an allowlist on Host is the standard mitigation -- reject
+# anything whose Host is not literally 127.0.0.1 / localhost / ::1.
+_ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _host_header(scope: dict[str, Any]) -> str:
+    for k, v in scope.get("headers") or []:
+        if k == b"host":
+            return v.decode("latin-1", errors="replace")
+    return ""
+
+
+def _host_is_allowed(host_header: str) -> bool:
+    """True iff the request's Host header names this machine, not an
+    attacker-chosen hostname that merely resolved (via rebinding) to 127.0.0.1."""
+    hostname = host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+    return hostname in _ALLOWED_HOSTNAMES
+
+
 def build_app():
     """Wrap cora.mcp_server's tool surface (the SAME Server the stdio lane
     serves) in a Starlette ASGI app exposing it over streamable-HTTP at
@@ -117,7 +143,18 @@ def build_app():
     token = _bearer_token()
 
     async def mcp_asgi(scope: dict[str, Any], receive, send) -> None:
-        if scope["type"] == "http" and token:
+        if scope["type"] != "http":
+            # This bridge only ever serves the streamable-HTTP transport (plain
+            # HTTP request/response). Never dispatch any other ASGI scope type
+            # (e.g. websocket) to the session manager -- D-051-light finding:
+            # a non-http scope must not be able to skip the checks below by
+            # construction, not by falling through an `and` on scope type.
+            return
+        if not _host_is_allowed(_host_header(scope)):
+            resp = PlainTextResponse("Unauthorized", status_code=401)
+            await resp(scope, receive, send)
+            return
+        if token:
             provided = _extract_bearer(scope)
             # Constant-time compare (locked fork #2); a mismatch gets a bare
             # 401 with no further detail -- never "bad token" vs "no header"
