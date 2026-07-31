@@ -98,7 +98,7 @@ scripts/*.png
 data/.fuse_hidden*
 data/channel-sweep/
 data/state/
-data/health/heartbeat.txt
+data/health/
 data/*.db.bak*
 /.git-corrupt-backup/
 /backups/
