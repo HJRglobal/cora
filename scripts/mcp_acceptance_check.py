@@ -40,6 +40,9 @@ async def _run() -> int:
             expected = {
                 "cora_kb_search", "cora_decisions_search", "cora_known_answers",
                 "cora_code_queue", "cora_health",
+                # Listed but deliberately NOT called below: it is the surface's one
+                # gated WRITE tool and an acceptance check must never write.
+                "cora_code_queue_seed",
             }
             ok = tools == expected
             print(f"[{'PASS' if ok else 'FAIL'}] list_tools -> {sorted(tools)}")

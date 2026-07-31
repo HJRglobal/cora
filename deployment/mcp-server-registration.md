@@ -10,8 +10,20 @@ health — instead of file-grepping the Founder OS._
   `_shared/projects/cora/2026-07-28_cora_claude-integration-opportunities-evaluation.md` §8.
 - **Read-only, founder-scope, local** (stdio child process — no network listener,
   no port). It attaches to the live KB in SQLite `mode=ro`; every write raises on
-  that handle, and no write tool is exposed.
+  that handle. One named write exception (2026-07-30): `cora_code_queue_seed`,
+  a passthrough to the Harrison-gated, PHI-fail-closed code-queue seed path.
 - **No bot restart** — it is a separate process the MCP client spawns on demand.
+
+> **Lanes (updated 2026-07-31).** The **Cowork lane is now the `cora-tools`
+> PLUGIN** (source committed at `deployment/cora-tools-plugin/`; proven live in
+> the 2026-07-30 session-comms spike) — section B below is the legacy manual
+> connector route, kept as fallback. For **Claude Code sessions OUTSIDE this
+> repo**, register once at user scope instead of a per-repo `.mcp.json`:
+> `claude mcp add --scope user cora -- C:\Users\Harri\code\cora\.venv\Scripts\python.exe C:\Users\Harri\code\cora\scripts\run_mcp_server.py`.
+> Surfaces with no MCP at all (claude.ai web/mobile via the Drive connector,
+> mount-less sandboxes) read the snapshot files instead:
+> `data/session-bus/snapshots/` (mirrored to `_brain/_bus/snapshots/`), written
+> by `src/cora/session_snapshots.py`.
 
 > **Registration is Harrison's action** (a connector write). The steps below are
 > the exact snippets; nothing here has been applied. Prereq: `mcp` is installed
@@ -29,6 +41,7 @@ health — instead of file-grepping the Founder OS._
 | `cora_known_answers` | `entity` | The entity's curated known-answers file (LEX sub-entities excluded) |
 | `cora_code_queue` | — | The generated code-session backlog view |
 | `cora_health` | — | Heartbeat age / uptime / recent task-fire results (never restarts) |
+| `cora_code_queue_seed` | `kind`, `severity`, `title`, `summary`, `entity`, `status?`, `subsystem_guess?` | **The one write tool**: seeds a backlog item via the gated `code_queue.seed_item` path (PHI-fail-closed, idempotent; backlog only, never canon) |
 
 `entity` codes: `F3E OSN LEX UFL BDM HJRP HJRPROD HJRG F3C FNDR` (+ LEX sub-entities
 `LEX-LLC/LEX-LTS/LEX-LBHS/LEX-LLA` for `cora_kb_search`).
@@ -78,9 +91,11 @@ From the repo root (or have the first mounting session run it):
 ```
 
 It spawns the server exactly as a client would and drives an
-`initialize → list_tools → call_tool` round-trip across all five tools, printing
-a PASS/FAIL summary (exit 0 = all green). Expected: `list_tools` shows the five
-tools and every call returns `is_error=False` with a provenance-framed result.
+`initialize → list_tools → call_tool` round-trip across the five read-only tools,
+printing a PASS/FAIL summary (exit 0 = all green). Expected: `list_tools` shows
+all six tools (`cora_code_queue_seed` is listed but deliberately never called —
+an acceptance check must not write) and every call returns `is_error=False` with
+a provenance-framed result.
 
 In a mounted session, the 3-query smoke is simply:
 
@@ -94,9 +109,11 @@ In a mounted session, the 3-query smoke is simply:
 
 ## Notes / boundaries
 
-- **Read-only by construction:** the KB handle is `mode=ro`; there is no write
-  tool and no write code path. The one future exception (code-queue seed via its
-  confirm gate) is explicitly out of v1.
+- **Read-only by construction:** the KB handle is `mode=ro`; no KB/canon write
+  code path exists. The one named exception (shipped 2026-07-30) is
+  `cora_code_queue_seed` — the same Harrison-gated, PHI-fail-closed,
+  fingerprint-idempotent path the code-queue capture flow uses; backlog only,
+  never canon (D-011 untouched).
 - **PHI:** LEX content is returned scrubbed to a non-custodian view (client-name
   citations neutralized) — the same scrub the founder retrieval path uses, reused
   verbatim. The KB-excluded confidential stores (dashboard / OneAmerica /

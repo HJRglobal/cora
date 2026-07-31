@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cora": {
+      "command": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\Harri\\code\\cora\\scripts\\run_mcp_server.py"]
+    }
+  }
+}
