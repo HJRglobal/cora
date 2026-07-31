@@ -5,6 +5,11 @@
 # deployment/mcp-server-registration.md for the template.
 .mcp.json
 
+# MCP HTTP bridge TLS material (self-signed loopback cert + private key; see
+# deployment/new-mcp-https-cert.ps1). Already covered by data/state/ below --
+# listed explicitly too since this is private-key material, not just state.
+data/state/mcp-tls/
+
 # Python
 __pycache__/
 *.pyc

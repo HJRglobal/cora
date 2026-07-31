@@ -61,6 +61,37 @@ if (-not $hasToken) {
     Write-Host "        supports a custom header." -ForegroundColor Yellow
 }
 
+# TLS is entirely .env-driven (run_mcp_server_http.py calls load_dotenv itself
+# at process start, same as every other env var) -- this script does NOT need
+# to thread CORA_MCP_HTTP_CERT/KEY through the scheduled-task action. It DOES
+# pre-flight-check them here so a misconfigured pair is caught at registration
+# time, not at the next silent restart.
+$certLine = Select-String -Path $ENV_FILE -Pattern "^CORA_MCP_HTTP_CERT=(.+)$" -ErrorAction SilentlyContinue
+$keyLine  = Select-String -Path $ENV_FILE -Pattern "^CORA_MCP_HTTP_KEY=(.+)$" -ErrorAction SilentlyContinue
+$UseTls = $false
+if ($certLine -and $keyLine) {
+    $certPath = $certLine.Matches[0].Groups[1].Value.Trim()
+    $keyPath  = $keyLine.Matches[0].Groups[1].Value.Trim()
+    if (-not [System.IO.Path]::IsPathRooted($certPath)) { $certPath = Join-Path $REPO_DIR $certPath }
+    if (-not [System.IO.Path]::IsPathRooted($keyPath))  { $keyPath  = Join-Path $REPO_DIR $keyPath }
+    if ((Test-Path $certPath -PathType Leaf) -and (Test-Path $keyPath -PathType Leaf)) {
+        Write-Host "  OK  TLS configured -- bridge will serve https:// ($certPath)"
+        $UseTls = $true
+    } else {
+        Write-Host "  ERROR: CORA_MCP_HTTP_CERT/CORA_MCP_HTTP_KEY are set in .env but the" -ForegroundColor Red
+        Write-Host "         referenced file(s) do not exist. Run deployment\new-mcp-https-cert.ps1" -ForegroundColor Red
+        Write-Host "         first, or fix the paths in .env." -ForegroundColor Red
+        exit 1
+    }
+} elseif ($certLine -or $keyLine) {
+    Write-Host "  ERROR: only one of CORA_MCP_HTTP_CERT / CORA_MCP_HTTP_KEY is set in .env" -ForegroundColor Red
+    Write-Host "         -- the bridge requires BOTH or NEITHER. Fix .env before registering." -ForegroundColor Red
+    exit 1
+} else {
+    Write-Host "  NOTE: no TLS cert configured -- bridge will serve plain http://. Run" -ForegroundColor Yellow
+    Write-Host "        deployment\new-mcp-https-cert.ps1 first if the client UI requires https." -ForegroundColor Yellow
+}
+
 # ------------------------------------------------------------------
 # [3/5] Locate the venv python (absolute path - D-005: never "uv run" in a
 # scheduled-task action)
@@ -143,7 +174,8 @@ Write-Host "The task will start automatically at next logon."
 Write-Host "To start it NOW without logging off/on:"
 Write-Host "  Start-ScheduledTask -TaskName '$TASK_NAME'"
 Write-Host ""
-Write-Host "Bridge listens on http://127.0.0.1:8791/mcp by default (CORA_MCP_HTTP_PORT"
+$scheme = if ($UseTls) { "https" } else { "http" }
+Write-Host "Bridge listens on ${scheme}://127.0.0.1:8791/mcp by default (CORA_MCP_HTTP_PORT"
 Write-Host "in .env overrides the port; the bind host is hard-coded and cannot be"
 Write-Host "overridden). Point the Cowork connector at that URL."
 Write-Host ""

@@ -40,6 +40,21 @@ reuse it). If CORA_MCP_HTTP_TOKEN is set in .env, the client must send
 `Authorization: Bearer <token>`.
 
 Register as a standing background task: deployment\\setup-cora-mcp-http-task.ps1
+
+--- TLS fallback (2026-07-30 GO/NO-GO follow-up) ---
+
+The first GO/NO-GO smoke found the Cowork Add-connector UI rejects a plain
+`http://` URL outright ("URL must start with 'https'") -- a scheme check, not
+a localhost block. `CORA_MCP_HTTP_CERT` + `CORA_MCP_HTTP_KEY` (both set) make
+this process terminate TLS itself and serve `https://127.0.0.1:<port>/mcp`
+instead, with EVERY other invariant unchanged: same hard-coded `_BIND_HOST`,
+same Host-header allowlist, same optional bearer token. TLS here is a
+transport-scheme requirement some client UIs impose, not a new trust
+boundary -- the peer is still only ever reachable from this machine.
+Generate the self-signed pair with `deployment\\new-mcp-https-cert.ps1`
+(loopback-SAN leaf, gitignored under `data\\state\\mcp-tls\\`). If either env
+var is unset, this process serves plain HTTP exactly as before (Claude Code's
+stdio lane is unaffected either way).
 """
 
 from __future__ import annotations
@@ -78,6 +93,20 @@ def _bearer_token() -> str:
     """The configured bridge token, or "" if none is set (no auth gate beyond
     the loopback bind itself)."""
     return (os.environ.get("CORA_MCP_HTTP_TOKEN") or "").strip()
+
+
+def _tls_paths() -> tuple[str, str] | None:
+    """(certfile, keyfile) if BOTH CORA_MCP_HTTP_CERT and CORA_MCP_HTTP_KEY are
+    set, else None (plain HTTP -- unchanged v1 behavior). Optional TLS is a
+    transport-scheme accommodation for client UIs that refuse a bare `http://`
+    URL (2026-07-30 GO/NO-GO finding); it does not relax or replace the
+    loopback bind, the Host allowlist, or the bearer-token gate -- all three
+    apply identically over TLS."""
+    cert = (os.environ.get("CORA_MCP_HTTP_CERT") or "").strip()
+    key = (os.environ.get("CORA_MCP_HTTP_KEY") or "").strip()
+    if cert and key:
+        return cert, key
+    return None
 
 
 def _extract_bearer(scope: dict[str, Any]) -> str:
@@ -186,9 +215,16 @@ def main() -> int:
         port = _DEFAULT_PORT
 
     app = build_app()
-    log.info("Starting cora MCP HTTP bridge on %s:%s/mcp (loopback-only, hard-coded)",
-              _BIND_HOST, port)
-    uvicorn.run(app, host=_BIND_HOST, port=port, log_level="info")
+    tls = _tls_paths()
+    scheme = "https" if tls else "http"
+    log.info("Starting cora MCP HTTP bridge on %s://%s:%s/mcp (loopback-only, hard-coded)",
+              scheme, _BIND_HOST, port)
+    if tls:
+        certfile, keyfile = tls
+        uvicorn.run(app, host=_BIND_HOST, port=port, log_level="info",
+                    ssl_certfile=certfile, ssl_keyfile=keyfile)
+    else:
+        uvicorn.run(app, host=_BIND_HOST, port=port, log_level="info")
     return 0
 
 

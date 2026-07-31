@@ -58,6 +58,124 @@ def test_default_port_does_not_collide_with_health_endpoint():
     assert http_bridge._DEFAULT_PORT != 8787  # Cora's bot health endpoint
 
 
+# ── A2. Optional TLS plumbing (2026-07-30 GO/NO-GO follow-up) ───────────────
+def test_tls_paths_none_when_both_unset(monkeypatch):
+    monkeypatch.delenv("CORA_MCP_HTTP_CERT", raising=False)
+    monkeypatch.delenv("CORA_MCP_HTTP_KEY", raising=False)
+    assert http_bridge._tls_paths() is None
+
+
+@pytest.mark.parametrize("set_cert,set_key", [(True, False), (False, True)])
+def test_tls_paths_none_when_only_one_set(monkeypatch, set_cert, set_key):
+    """Both-or-neither: a lone cert or lone key must not enable TLS silently
+    (that would misconfigure uvicorn, or -- worse -- pass a key path where a
+    cert is expected)."""
+    monkeypatch.delenv("CORA_MCP_HTTP_CERT", raising=False)
+    monkeypatch.delenv("CORA_MCP_HTTP_KEY", raising=False)
+    if set_cert:
+        monkeypatch.setenv("CORA_MCP_HTTP_CERT", "cert.pem")
+    if set_key:
+        monkeypatch.setenv("CORA_MCP_HTTP_KEY", "key.pem")
+    assert http_bridge._tls_paths() is None
+
+
+def test_tls_paths_returns_both_when_set(monkeypatch):
+    monkeypatch.setenv("CORA_MCP_HTTP_CERT", "data/state/mcp-tls/cert.pem")
+    monkeypatch.setenv("CORA_MCP_HTTP_KEY", "data/state/mcp-tls/key.pem")
+    assert http_bridge._tls_paths() == ("data/state/mcp-tls/cert.pem", "data/state/mcp-tls/key.pem")
+
+
+def test_main_passes_ssl_kwargs_to_uvicorn_when_tls_configured(monkeypatch):
+    monkeypatch.setenv("CORA_MCP_HTTP_CERT", "c.pem")
+    monkeypatch.setenv("CORA_MCP_HTTP_KEY", "k.pem")
+    monkeypatch.delenv("CORA_MCP_HTTP_TOKEN", raising=False)
+
+    captured = {}
+
+    def _fake_run(app, **kwargs):
+        captured.update(kwargs)
+
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", _fake_run)
+    http_bridge.main()
+
+    assert captured.get("host") == "127.0.0.1"
+    assert captured.get("ssl_certfile") == "c.pem"
+    assert captured.get("ssl_keyfile") == "k.pem"
+
+
+def test_main_omits_ssl_kwargs_when_tls_not_configured(monkeypatch):
+    monkeypatch.delenv("CORA_MCP_HTTP_CERT", raising=False)
+    monkeypatch.delenv("CORA_MCP_HTTP_KEY", raising=False)
+
+    captured = {}
+
+    def _fake_run(app, **kwargs):
+        captured.update(kwargs)
+
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", _fake_run)
+    http_bridge.main()
+
+    assert "ssl_certfile" not in captured
+    assert "ssl_keyfile" not in captured
+
+
+# ── A3. TLS cert/key material is never committed ─────────────────────────────
+def test_gitignore_excludes_mcp_tls_dir():
+    repo_root = Path(__file__).resolve().parent.parent
+    gitignore = (repo_root / ".gitignore").read_text(encoding="utf-8")
+    assert "data/state/mcp-tls/" in gitignore
+
+
+def test_git_check_ignore_confirms_mcp_tls_path():
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        ["git", "check-ignore", "-q", "data/state/mcp-tls/cert.pem"],
+        cwd=repo_root, capture_output=True, timeout=15,
+    )
+    assert proc.returncode == 0, "data/state/mcp-tls/cert.pem must be git-ignored"
+
+
+def test_new_cert_script_writes_only_under_gitignored_dir():
+    """The cert-generation script must only ever write cert/key output under
+    data\\state\\mcp-tls -- never anywhere else in the repo tree."""
+    src_path = (Path(__file__).resolve().parent.parent /
+                "deployment" / "new-mcp-https-cert.ps1")
+    src = src_path.read_text(encoding="utf-8")
+    assert r"data\state\mcp-tls" in src
+    assert "CERT_PEM" in src and "KEY_PEM" in src
+
+
+def test_new_cert_script_generates_a_leaf_not_a_ca():
+    src_path = (Path(__file__).resolve().parent.parent /
+                "deployment" / "new-mcp-https-cert.ps1")
+    src = src_path.read_text(encoding="utf-8").lower()
+    # Basic Constraints (2.5.29.19) explicitly ca=0 -- never ca=1/CA:TRUE.
+    assert "ca=0" in src
+    assert "ca=1" not in src
+    assert "ca:true" not in src.replace(" ", "")
+
+
+def test_new_cert_script_restricts_san_to_loopback_only():
+    src_path = (Path(__file__).resolve().parent.parent /
+                "deployment" / "new-mcp-https-cert.ps1")
+    src = src_path.read_text(encoding="utf-8")
+    assert "IPAddress=127.0.0.1" in src
+    assert "IPAddress=::1" in src
+    assert "DNS=localhost" in src
+
+
+def test_new_cert_script_locks_down_key_permissions():
+    src_path = (Path(__file__).resolve().parent.parent /
+                "deployment" / "new-mcp-https-cert.ps1")
+    src = src_path.read_text(encoding="utf-8")
+    assert "icacls" in src
+    assert "/inheritance:r" in src
+
+
 # ── B. Token enforcement (constant-time; no detail leaked) ───────────────────
 def _make_client(monkeypatch, token: str | None):
     from starlette.testclient import TestClient
