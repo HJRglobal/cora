@@ -264,6 +264,11 @@ needs a founder call. This is an operational status list, not strategic advice.
 Hard rules:
 - Use ONLY facts present in the fact base. Never invent numbers, deals, dates, or
   names. If a section's source was unavailable, say so in one short line.
+- The Portfolio figure is the workbook's consolidated summary tab and includes
+  accounts not itemized in the entity lines -- NEVER present it as the sum of the
+  entity lines; if a sum is needed, cite the "Sum of itemized entities" line.
+- Only entities on the "Entities with NEGATIVE closing balance" line may be called
+  negative-cash; a negative day-over-day delta means DECLINING, never "negative".
 - This is an OPERATIONAL status post for the team -- NOT founder strategy. Do NOT make
   business-restructuring recommendations or blunt strategic calls; those live in the
   private weekly memo. Report the state of the world and what needs a decision.

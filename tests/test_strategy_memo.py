@@ -546,6 +546,78 @@ class TestSynthesis:
         assert "client-level health" in sm._SYNTH_PROMPT
         assert "trade-off" in sm._SYNTH_PROMPT
         assert "should this live at HJR Global" in sm._SYNTH_PROMPT
+        # cq-90f8ca56c758: total-vs-sum + balance-vs-delta semantics rules
+        assert "Sum of itemized entities" in sm._SYNTH_PROMPT
+        assert "NEGATIVE closing balance" in sm._SYNTH_PROMPT
+        assert "DECLINING" in sm._SYNTH_PROMPT
+
+
+class TestCashReconciliation:
+    """cq-7dde32efa597 + cq-90f8ca56c758: the Portfolio figure (workbook
+    CF_SUMMARY tab) includes accounts never itemized -- the facts base must
+    reconcile it explicitly, and only balance<0 entities may be listed as
+    negative-cash (a negative WoW delta is 'declining', not 'negative')."""
+
+    def _gathered(self, entities, week_label="Week of 6/09"):
+        return {"date": "2026-06-14",
+                "cash": {"ok": True, "week_label": week_label,
+                         "entities": entities}}
+
+    def _entities(self, fndr_balance, entity_balance=50_000.0):
+        entities = {}
+        for code, label in sm.CASH_ENTITIES:
+            bal = fndr_balance if code == "FNDR" else entity_balance
+            entities[code] = {"label": label, "closing_balance": bal}
+        return entities
+
+    def test_total_neq_sum_reconciled_never_silently_folded(self):
+        entities = self._entities(fndr_balance=1_000_000.0)  # 8 x 50K itemized
+        text = sm.build_facts_text(self._gathered(entities), {"first_run": True})
+        assert "includes accounts not itemized below" in text  # headline relabeled
+        assert "- Sum of itemized entities: $400,000" in text
+        assert ("Non-itemized component (Portfolio minus itemized sum): "
+                "$600,000") in text
+        assert "NEVER present the Portfolio figure" in text
+        assert "sum incomplete" not in text
+
+    def test_partial_sum_flagged_incomplete_no_bogus_component(self):
+        entities = self._entities(fndr_balance=1_000_000.0)
+        entities["OSN"] = {"label": "One Stop Nutrition", "error": True}
+        text = sm.build_facts_text(self._gathered(entities), {"first_run": True})
+        assert "7 of 8 summable -- sum incomplete" in text
+        assert "Non-itemized component" not in text  # partial math would be bogus
+
+    def test_negative_balance_line_excludes_positive_decliner(self):
+        """The HJRPROD shape: +$167 balance with a -$18,210 WoW delta must NOT
+        appear on the negative-balance line; a genuinely negative balance must."""
+        entities = self._entities(fndr_balance=500_000.0)
+        entities["HJRPROD"]["closing_balance"] = 167.0
+        entities["BDM"]["closing_balance"] = -5_000.0
+        deltas = {"first_run": False, "prev_date": "2026-06-07",
+                  "cash": {"HJRPROD": {"delta": -18_210.0, "decline_streak": 0}}}
+        text = sm.build_facts_text(self._gathered(entities), deltas)
+        neg_line = next(ln for ln in text.splitlines()
+                        if "NEGATIVE closing balance" in ln)
+        assert "Big D Media -$5,000" in neg_line
+        assert "HJR Productions" not in neg_line
+        # The decliner still shows its delta on its own line, correctly framed.
+        assert "HJR Productions: $167 (down $18,210 WoW)" in text
+
+    def test_no_negative_balances_says_none(self):
+        text = sm.build_facts_text(
+            self._gathered(self._entities(fndr_balance=500_000.0)),
+            {"first_run": True})
+        assert "Entities with NEGATIVE closing balance: (none)" in text
+
+    def test_week_misalignment_tagged_per_entity(self):
+        entities = self._entities(fndr_balance=500_000.0)
+        entities["UFL"]["week_label"] = "Week of 6/02"   # lags the headline week
+        entities["F3E"]["week_label"] = "Week of 6/09"   # matches -> no tag
+        text = sm.build_facts_text(self._gathered(entities), {"first_run": True})
+        ufl_line = next(ln for ln in text.splitlines() if "United Fight League" in ln)
+        f3e_line = next(ln for ln in text.splitlines() if "F3 Energy" in ln)
+        assert "[week of Week of 6/02]" in ufl_line
+        assert "[week of" not in f3e_line
 
 
 # ---------------------------------------------------------------------------

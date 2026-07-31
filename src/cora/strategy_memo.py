@@ -161,6 +161,10 @@ def gather_cash() -> dict[str, Any]:
                 "closing_balance": summary.closing_balance,
                 "actual": summary.portfolio_actual,
                 "forecast": summary.portfolio_forecast,
+                # Additive (cq-7dde32efa597): each tab anchors its OWN latest-actual
+                # week; keeping it lets the facts renderer surface week misalignment
+                # (one component of the non-monotonic total-vs-sum gap).
+                "week_label": summary.week_label,
             }
             week_label = week_label or summary.week_label
         except GsheetsConnectorError as exc:
@@ -697,19 +701,67 @@ def build_facts_text(gathered: dict[str, Any], deltas: dict[str, Any]) -> str:
     if cash.get("ok"):
         if cash.get("week_label"):
             lines.append(f"Sheet week: {cash['week_label']}")
+        # Reconciliation (cq-7dde32efa597 / cq-90f8ca56c758): the Portfolio figure
+        # is the workbook's consolidated CF_SUMMARY tab, which includes real
+        # accounts with NO itemized line below (Lexington operating tabs, OSN
+        # Core4, HJR Podcast...) — it will NOT equal the sum of the entity lines,
+        # and narrating it as if it did produced $357K-$1.12M "gaps". Make the
+        # reconciliation explicit and deterministic instead.
+        itemized_sum = 0.0
+        itemized_n = 0
+        itemized_delta_sum = 0.0
+        itemized_delta_n = 0
+        negative_balances: list[str] = []
         for code, _label in CASH_ENTITIES:
             ent = (cash.get("entities") or {}).get(code) or {}
             if ent.get("error"):
                 lines.append(f"- {ent.get('label', code)}: unavailable")
                 continue
             d = (deltas.get("cash") or {}).get(code) or {}
-            bits = [f"- {ent.get('label', code)}: "
-                    f"{_fmt_money(ent.get('closing_balance'))}"]
+            label_txt = ent.get("label", code)
+            if code == "FNDR":
+                label_txt += (" (workbook summary-tab total -- includes accounts "
+                              "not itemized below)")
+            bal = ent.get("closing_balance")
+            if code != "FNDR" and bal is not None:
+                itemized_sum += bal
+                itemized_n += 1
+                if bal < 0:
+                    negative_balances.append(f"{ent.get('label', code)} {_fmt_money(bal)}")
+                if d.get("delta") is not None:
+                    itemized_delta_sum += d["delta"]
+                    itemized_delta_n += 1
+            bits = [f"- {label_txt}: {_fmt_money(bal)}"]
             if d.get("delta") is not None:
                 bits.append(_fmt_delta(d["delta"]))
             if d.get("decline_streak", 0) >= 2:
                 bits.append(f"[cash down {d['decline_streak']} weeks straight]")
+            if (ent.get("week_label") and cash.get("week_label")
+                    and ent["week_label"] != cash["week_label"]):
+                bits.append(f"[week of {ent['week_label']}]")
             lines.append(" ".join(b for b in bits if b))
+        expected_n = len(CASH_ENTITIES) - 1
+        if itemized_n:
+            partial = ("" if itemized_n == expected_n
+                       else f" ({itemized_n} of {expected_n} summable -- sum incomplete)")
+            sum_bits = [f"- Sum of itemized entities: {_fmt_money(itemized_sum)}{partial}"]
+            if itemized_delta_n:
+                sum_bits.append(_fmt_delta(itemized_delta_sum))
+            lines.append(" ".join(sum_bits))
+            fndr_ent = (cash.get("entities") or {}).get("FNDR") or {}
+            fndr_bal = None if fndr_ent.get("error") else fndr_ent.get("closing_balance")
+            if fndr_bal is not None and itemized_n == expected_n:
+                lines.append(
+                    f"- Non-itemized component (Portfolio minus itemized sum): "
+                    f"{_fmt_money(fndr_bal - itemized_sum)} -- real accounts in the "
+                    "summary tab with no line above. NEVER present the Portfolio "
+                    "figure or its WoW as the sum of the entity lines.")
+        # Deterministic negative-balance list (cq-90f8ca56c758): the ONLY entities
+        # that may be described as "in a negative cash position". A negative WoW
+        # delta means DECLINING, never "negative" (the 7/26 memo called HJR
+        # Productions at +$167 a negative cash position off its -$18K delta).
+        lines.append("- Entities with NEGATIVE closing balance: "
+                     + (", ".join(negative_balances) if negative_balances else "(none)"))
     else:
         lines.append("(cash source unavailable this week)")
 
@@ -847,6 +899,13 @@ deltas. Write a memo of roughly 600-900 words with EXACTLY these five sections:
 Hard rules:
 - Use ONLY facts present in the fact base. Never invent numbers, deals,
   dates, or names. If a section's source was unavailable, say so plainly.
+- The Portfolio figure is the workbook's consolidated summary tab and includes
+  accounts not itemized in the entity lines -- NEVER present it (or its WoW
+  delta) as the sum of the entity lines; if a sum is needed, cite the
+  "Sum of itemized entities" line.
+- Only entities on the "Entities with NEGATIVE closing balance" line may be
+  described as having a negative cash position. A negative WoW delta means
+  DECLINING cash, never "negative cash".
 - Recommendations are ADVISORY for Harrison only; never instruct anyone else
   or imply anything will execute automatically.
 - Never include client names, diagnoses, or any client-level health

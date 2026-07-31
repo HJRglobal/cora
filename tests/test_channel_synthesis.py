@@ -307,6 +307,10 @@ class TestPortfolioSynthesis:
         assert "Never invent numbers" in p
         assert "aggregate" in p
         assert "weekly memo" in p
+        # cq-7dde32efa597: total-vs-sum + balance-vs-delta semantics rules
+        assert "NEVER present it as the sum" in p
+        assert "NEGATIVE closing balance" in p
+        assert "DECLINING" in p
 
 
 class TestRunSynthesis:
