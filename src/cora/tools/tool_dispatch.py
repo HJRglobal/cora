@@ -701,9 +701,24 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         pending = _claim_pending_asana(slack_user_id, channel, "create")
         if pending:
             return _execute_asana_create(slack_user_id, pending, entity)
-        # No fresh pending create -> fall through and resolve. A single-call
-        # confirmed=true (honor-system / backward-compat) still creates directly. A
+        # ── No fresh pending create -> REFUSE truthfully (cq-532b1c30256c). The old
+        # honor-system fall-through executed a blind create from the confirm-turn
+        # echoed args, making create the ONLY staged-write tool with an ungated
+        # execute path: on a model confirm turn the FIRST confirmed=true call
+        # claims the pending (create #1) and a second call -- a parallel tool_use
+        # block, a later tool-loop round, or a re-call after a dispatch-timeout
+        # "please try again" -- found no pending and blind-created the 7/20
+        # near-identical duplicate 8s later. Refusal (not re-preview) is deliberate:
+        # re-previewing from echoed args violates the server-side-identity doctrine
+        # AND would re-stash a pending that a later stray "yes" could fire. A
         # pending delete/complete is left intact by _claim_pending_asana (review #8).
+        log.info("asana_create_task confirmed-with-no-pending REFUSED user=%s",
+                 slack_user_id)
+        return _write_blocked_contract(
+            "NOT CREATED. I don't have a pending task create to confirm -- it may "
+            "have expired, or it was already created a moment ago. If the task is "
+            "genuinely still wanted, tell me the task again (WITHOUT confirmed) and "
+            "I'll show a fresh preview.")
 
     resolved = _resolve_asana_create(slack_user_id, entity, input_data)
     if isinstance(resolved, str):
@@ -711,17 +726,13 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         # so the model mediates it source-opaquely -- unchanged from before Slice 4.
         return resolved
 
-    if not confirmed:
-        # ── Phase 1: stash the resolved payload + return a WRITE_BLOCKED preview. The
-        # confirm interceptor executes it on a bare "yes"; the narration net posts the
-        # preview verbatim.
-        _store_pending_asana_write(slack_user_id, channel, {
-            "action": "create", **resolved, "ts": time.time(),
-        })
-        return _write_blocked_contract(_asana_create_preview_text(resolved))
-
-    # ── Phase 2b: confirmed=true with no pending (honor-system / backward-compat) -> create now.
-    return _execute_asana_create(slack_user_id, resolved, entity)
+    # ── Phase 1: stash the resolved payload + return a WRITE_BLOCKED preview. The
+    # confirm interceptor executes it on a bare "yes"; the narration net posts the
+    # preview verbatim.
+    _store_pending_asana_write(slack_user_id, channel, {
+        "action": "create", **resolved, "ts": time.time(),
+    })
+    return _write_blocked_contract(_asana_create_preview_text(resolved))
 
 
 # --- Relative due-date resolution (Slice 4, 2026-07-29 audit) ------------------
@@ -6385,7 +6396,10 @@ TOOL_DEFINITIONS = [
             "   returns a NOT-CREATED-yet preview. Show that preview to the user verbatim — do "
             "   NOT draft your own; the tool's preview reflects the real routing/scrub.\n"
             "2. On the user's explicit approval ('yes', 'create it', 'go ahead'), call again "
-            "   with confirmed=true. Nothing is created until then.\n"
+            "   with confirmed=true EXACTLY ONCE. Nothing is created until then. One approval = "
+            "   ONE task: a request naming two people is one task (assignee) + follower_names, "
+            "   never two create calls. A confirmed=true call with no pending preview is "
+            "   REFUSED (nothing created) -- re-call WITHOUT confirmed for a fresh preview.\n"
             "3. If they want changes, call again (no confirmed) with the changes to re-preview.\n"
             "4. If they reject, don't call again.\n"
             "\n"
@@ -9097,7 +9111,12 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_my_notes": 8,
     "cora_forget_note": 8,
     "cora_self_check": 8,
-    "cora_queue_code_session": 8,  # local ledger append + (off-thread) DM/classify
+    # cq-7fb82054ee4a residual: the confirmed explicit path runs an OpenAI embed
+    # (novel-request dedup), a G: backlog render (drive_io default timeout 10s),
+    # and 2 synchronous Slack DM calls INLINE -- an 8s budget was smaller than a
+    # single slow Drive write, yielding "Tool timed out" while the abandoned
+    # worker usually still filed the item (filed-but-reported-failed).
+    "cora_queue_code_session": 20,
     # Dashboard read layer: Drive/Airtable network reads.
     "personal_oneamerica_portfolio": 20,   # Drive JSON download
     "personal_capital_program_state": 15,  # folder list + newest JSON download

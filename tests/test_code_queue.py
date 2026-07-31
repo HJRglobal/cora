@@ -1413,3 +1413,18 @@ def test_footer_strip_still_works_after_anchor(qenv):
     # The genuine Cowork footer (trailing <@..> mention) is STILL stripped post-fix.
     base = "cora should ship a new osn pulse view"
     assert cq._normalize(base + "\n\n*Sent using* <@U0B2RM2JYJ1>") == cq._normalize(base)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool-timeout pin (cq-7fb82054ee4a residual)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_queue_tool_timeout_exceeds_inline_drive_write_budget():
+    """cq-7fb82054ee4a: the confirmed explicit path runs an OpenAI embed, a G:
+    backlog render (drive_io default timeout 10s), and 2 Slack DM calls INLINE --
+    the old 8s tool budget was smaller than a single slow Drive write, yielding
+    'Tool timed out' while the abandoned worker usually still filed the item
+    (filed-but-reported-failed). The budget must exceed drive_io's per-attempt
+    timeout with headroom."""
+    from cora import drive_io
+    from cora.tools import tool_dispatch as td
+    assert td._TOOL_TIMEOUTS["cora_queue_code_session"] >= drive_io.TIMEOUT_SECONDS + 5

@@ -301,8 +301,11 @@ class TestHandlerWiring:
         with patch.object(td.pm_metrics, "log_pm_action") as logm, \
              patch.object(td.asana_client, "create_task", return_value=created), \
              patch.object(td.asana_client, "get_project_tasks", return_value=[]):
+            # Two-call staged flow (single-call confirmed=true removed, cq-532b1c30256c)
             td._tool_asana_create_task("U0B2RM2JYJ1", "F3E", {
-                "title": "Ship it", "confirmed": True, "_channel_name": "f3e-leadership"})
+                "title": "Ship it", "_channel_name": "f3e-leadership"})
+            td._tool_asana_create_task("U0B2RM2JYJ1", "F3E", {
+                "confirmed": True, "_channel_name": "f3e-leadership"})
         logm.assert_called_once()
         assert logm.call_args.args[0] == "create"
         assert logm.call_args.args[2] == "F3E"  # entity threaded through

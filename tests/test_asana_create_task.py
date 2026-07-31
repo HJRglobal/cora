@@ -23,11 +23,32 @@ def _clear_asana_pending():
     td._PENDING_ASANA_WRITES.clear()
 
 
+def _create(slack_user_id, entity, _input):
+    """Drive the tool through the staged TWO-CALL flow when the caller passes
+    confirmed=True — the honor-system single-call confirmed=true path was removed
+    (cq-532b1c30256c: it let a second model call blind-create a duplicate).
+    Preview first (stash), then a bare confirm executes the STASHED payload;
+    a resolve-time refusal (dedup/PHI/assignee/title) is returned as-is."""
+    if not _input.get("confirmed"):
+        return td._tool_asana_create_task(
+            slack_user_id=slack_user_id, entity=entity, _input=_input)
+    preview_input = dict(_input)
+    preview_input.pop("confirmed")
+    first = td._tool_asana_create_task(
+        slack_user_id=slack_user_id, entity=entity, _input=preview_input)
+    if not first.startswith("WRITE_BLOCKED"):
+        return first  # refused at resolve time -- no pending to confirm
+    return td._tool_asana_create_task(
+        slack_user_id=slack_user_id, entity=entity,
+        _input={"confirmed": True,
+                "_channel_name": str(_input.get("_channel_name") or "")})
+
+
 def test_create_task_unconfirmed_previews_and_stashes():
     """F-23 Slice 4: the FIRST call (no confirmed) does NOT create -- it stashes a
     server-side pending + returns a WRITE_BLOCKED preview the narration net posts."""
     with patch.object(td.asana_client, "create_task") as mock:
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
             _input={"title": "Try to skip the preview", "_channel_name": "dm"},
@@ -41,7 +62,7 @@ def test_create_task_unconfirmed_previews_and_stashes():
 def test_create_task_confirmed_false_previews_not_creates():
     """Explicit confirmed=false previews too (does not create)."""
     with patch.object(td.asana_client, "create_task") as mock:
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
             _input={"title": "Try false", "confirmed": False, "_channel_name": "dm"},
@@ -59,7 +80,7 @@ def test_create_task_two_call_flow_creates_stashed_payload():
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock:
         # Phase 1: preview + stash.
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="FNDR",
             _input={"title": "Coordinate launch", "_channel_name": "dm"},
         )
@@ -76,7 +97,7 @@ def test_create_task_two_call_flow_creates_stashed_payload():
 
 
 def test_create_task_refuses_without_title():
-    result = td._tool_asana_create_task(
+    result = _create(
         slack_user_id=HARRISON_SLACK,
         entity="FNDR",
         _input={"confirmed": True},
@@ -99,7 +120,7 @@ def test_create_task_with_confirmation_calls_asana_client():
     # picks up the stub (preserving the original expectation: project_gid=None when not given).
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task", return_value=fake_created) as mock:
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
             _input={
@@ -135,7 +156,7 @@ def test_create_task_resolves_assignee_via_aliases():
     }
     with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
             _input={
@@ -165,7 +186,7 @@ def test_explicit_cross_entity_project_is_dropped_and_rerouted():
     created = {"gid": "1", "permalink_url": "http://x", "projects": []}
     with patch.object(td.asana_client, "create_task", return_value=created) as mock, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="F3E",
             _input={"title": "Plan something", "confirmed": True, "project_gid": _LEX_CATCH_ALL},
@@ -181,7 +202,7 @@ def test_no_orphan_routes_to_entity_catch_all():
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK,
             entity="F3E",
             _input={"title": "Some F3E task", "confirmed": True},
@@ -197,7 +218,7 @@ def test_lex_channel_scrubs_phi_and_routes_lex():
          patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: (t or "").replace("John Doe", "[client]")), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="LEX-LLC",
             _input={"title": "Follow up with John Doe re billing", "confirmed": True},
@@ -216,7 +237,7 @@ def test_dedup_refuses_then_force_creates():
     created = {"gid": "NEW", "permalink_url": "http://new", "projects": []}
     with patch.object(td.asana_client, "get_project_tasks", return_value=existing), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock:
-        blocked = td._tool_asana_create_task(
+        blocked = _create(
             slack_user_id=HARRISON_SLACK, entity="F3E",
             _input={"title": "Send the deck", "confirmed": True},
         )
@@ -224,7 +245,7 @@ def test_dedup_refuses_then_force_creates():
         assert "force_duplicate" in blocked
         mock.assert_not_called()
 
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="F3E",
             _input={"title": "Send the deck", "confirmed": True, "force_duplicate": True},
         )
@@ -236,7 +257,7 @@ def test_unconfirmed_preview_surfaces_lex_scrub():
     so the user sees it BEFORE approving (the WS3 invariant clamp)."""
     with patch.object(td.org_roles, "all_roles", return_value=[]), \
          patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: (t or "").replace("John Doe", "[client]")):
-        out = td._tool_asana_create_task(
+        out = _create(
             slack_user_id=HARRISON_SLACK,
             entity="LEX-LLC",
             _input={"title": "Call John Doe"},
@@ -254,7 +275,7 @@ def test_lex_unmapped_project_gid_fails_closed():
          patch("cora.phi_guard.scrub_lex_phi", side_effect=lambda t, allowed_names=None: t), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        out = td._tool_asana_create_task(
+        out = _create(
             slack_user_id=HARRISON_SLACK, entity="LEX-LLC",
             _input={"title": "Follow up", "confirmed": True, "project_gid": "999999999999"},
         )
@@ -271,7 +292,7 @@ def test_lex_scrub_failure_fails_closed():
          patch("cora.phi_guard.scrub_lex_phi", side_effect=RuntimeError("scrub boom")), \
          patch.object(td.asana_client, "create_task") as mock_create, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]):
-        out = td._tool_asana_create_task(
+        out = _create(
             slack_user_id=HARRISON_SLACK, entity="LEX-LLC",
             _input={"title": "Follow up with John Doe re billing", "confirmed": True},
         )
@@ -284,7 +305,7 @@ def test_dedup_fails_open_on_read_error():
     created = {"gid": "NEW", "permalink_url": "http://new", "projects": []}
     with patch.object(td.asana_client, "get_project_tasks", side_effect=Exception("read failed")), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock:
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="F3E",
             _input={"title": "Send the deck", "confirmed": True},
         )
@@ -294,7 +315,7 @@ def test_dedup_fails_open_on_read_error():
 def test_create_task_refuses_unresolvable_assignee():
     """Unknown assignee → tool returns a graceful error string (no API call)."""
     with patch.object(td.asana_client, "create_task") as mock:
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK,
             entity="FNDR",
             _input={
@@ -329,7 +350,7 @@ def test_create_stamps_entity_status_priority():
     with patch.object(td.asana_client, "create_task", return_value=created), \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
          patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
-        out = td._tool_asana_create_task(
+        out = _create(
             slack_user_id=HARRISON_SLACK, entity="F3E",
             _input={"title": "Neutral placeholder item", "confirmed": True},
         )
@@ -348,7 +369,7 @@ def test_create_field_stamp_failure_never_fails_create():
     with patch.object(td.asana_client, "create_task", return_value=created) as mk, \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
          patch.object(td.asana_client, "set_task_custom_fields", side_effect=RuntimeError("boom")):
-        out = td._tool_asana_create_task(
+        out = _create(
             slack_user_id=HARRISON_SLACK, entity="F3E",
             _input={"title": "Another neutral item", "confirmed": True},
         )
@@ -364,7 +385,7 @@ def test_create_subentity_without_entity_option_stamps_status_priority_only():
     with patch.object(td.asana_client, "create_task", return_value=created), \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
          patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="HJRP-RR",
             _input={"title": "Ranch placeholder task", "confirmed": True},
         )
@@ -384,7 +405,7 @@ def test_create_aggregator_cross_entity_project_tags_by_project_owner():
     with patch.object(td.asana_client, "create_task", return_value=created), \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
          patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="FNDR",
             _input={"title": "Founder files into F3E", "confirmed": True, "project_gid": f3e_project},
         )
@@ -402,7 +423,7 @@ def test_create_aggregator_own_catchall_tags_channel_entity():
          patch.object(td.asana_client, "create_task", return_value=created), \
          patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
          patch.object(td.asana_client, "set_task_custom_fields", return_value=True) as stamp:
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="FNDR",
             _input={"title": "Founder default task", "confirmed": True},
         )
@@ -425,7 +446,7 @@ def test_create_task_stale_explicit_date_warns_in_preview():
     preview (not silently created); the user can still confirm an intentional backdate."""
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task") as mock:
-        result = td._tool_asana_create_task(
+        result = _create(
             slack_user_id=HARRISON_SLACK, entity="FNDR",
             _input={"title": "Backfill task", "due_on": "2020-01-15",
                     "_channel_name": "dm"},
@@ -445,7 +466,7 @@ def test_create_task_relative_due_flows_resolved_to_client():
                "assignee": {"name": "Harrison Rogers"}, "due_on": "resolved", "projects": []}
     with patch("cora.tools.project_resolver.resolve_project", return_value=None), \
          patch.object(td.asana_client, "create_task", return_value=created) as mock:
-        td._tool_asana_create_task(
+        _create(
             slack_user_id=HARRISON_SLACK, entity="FNDR",
             _input={"title": "Do it", "due_on": "tomorrow", "_channel_name": "dm"},
         )

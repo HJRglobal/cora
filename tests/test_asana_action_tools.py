@@ -166,12 +166,53 @@ class TestCreateWithFollowers:
         with patch.object(td.asana_client, "create_task", return_value=created), \
              patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
              patch.object(td.asana_client, "add_task_followers", return_value={}) as mock:
-            out = td._tool_asana_create_task(HARRISON, "FNDR", {
+            # Two-call staged flow (the single-call confirmed=true honor-system
+            # path was removed, cq-532b1c30256c): preview stashes, confirm executes.
+            td._tool_asana_create_task(HARRISON, "FNDR", {
                 "title": "Coordinate the launch",
-                "confirmed": True,
                 "follower_names": ["Shaun"],
             })
+            out = td._tool_asana_create_task(HARRISON, "FNDR", {"confirmed": True})
         mock.assert_called_once()
         assert mock.call_args.args[0] == "T1"            # added to the created task
         assert mock.call_args.args[1] == [SHAUN_GID]     # 'Shaun' resolved to his real gid
         assert "following" in out.lower()
+
+    def test_one_confirm_two_people_creates_exactly_one_task(self):
+        """cq-532b1c30256c regression: a request naming two people (assignee +
+        follower), confirmed once, produces EXACTLY one Asana task -- a second
+        confirmed=true call (parallel tool_use block / later tool-loop round /
+        timeout re-call) is REFUSED, never blind-created. The old honor-system
+        fall-through made create the only staged-write tool with an ungated
+        execute path (the 7/20 near-identical duplicate, 8s apart)."""
+        created = {"gid": "T1", "permalink_url": "http://x", "projects": []}
+        with patch.object(td.asana_client, "create_task", return_value=created) as mock_create, \
+             patch.object(td.asana_client, "get_project_tasks", return_value=[]), \
+             patch.object(td.asana_client, "add_task_followers", return_value={}) as mock_follow:
+            td._tool_asana_create_task(HARRISON, "FNDR", {
+                "title": "Coordinate the launch",
+                "follower_names": ["Shaun"],
+            })
+            first = td._tool_asana_create_task(HARRISON, "FNDR", {"confirmed": True})
+            # The duplicate vector: a SECOND confirmed=true call on the same turn.
+            second = td._tool_asana_create_task(HARRISON, "FNDR", {
+                "confirmed": True, "title": "Coordinate the launch with Shaun",
+            })
+        mock_create.assert_called_once()                 # exactly ONE task
+        mock_follow.assert_called_once()                 # follower, not a 2nd task
+        assert "WRITE_CONFIRMED" in first
+        assert second.startswith("WRITE_BLOCKED")
+        assert "NOT CREATED" in second
+        assert "pending task create" in second
+
+    def test_confirm_with_no_pending_refuses_never_creates(self):
+        """cq-532b1c30256c: confirmed=true with no pending at all (expired TTL,
+        model skipped the preview, duplicate event re-derivation) refuses
+        truthfully -- mirrors the Shopify D-090 contract."""
+        with patch.object(td.asana_client, "create_task") as mock:
+            out = td._tool_asana_create_task(HARRISON, "FNDR", {
+                "confirmed": True, "title": "Straight to create",
+            })
+        mock.assert_not_called()
+        assert out.startswith("WRITE_BLOCKED")
+        assert "NOT CREATED" in out
