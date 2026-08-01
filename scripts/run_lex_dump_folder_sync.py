@@ -350,9 +350,10 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
         old_ids = [row[0] for row in cur.fetchall()]
         if old_ids:
             placeholders = ",".join("?" * len(old_ids))
-            cur.execute(f"DELETE FROM knowledge_vec_bin WHERE chunk_id IN ({placeholders})", old_ids)
-            cur.execute(f"DELETE FROM knowledge_vec_f32 WHERE chunk_id IN ({placeholders})", old_ids)
-            cur.execute(f"DELETE FROM knowledge_chunks WHERE chunk_id IN ({placeholders})", old_ids)
+            # Same cascade the store uses: every existing bin table (legacy +
+            # v2 across the partition migration) + f32 + chunks -- no orphans.
+            for tbl in (*kb._bin_write_tables(), "knowledge_vec_f32", "knowledge_chunks"):
+                cur.execute(f"DELETE FROM {tbl} WHERE chunk_id IN ({placeholders})", old_ids)
             kb._conn.commit()
             log.info("  -> removed %d legacy one-shot chunks", len(old_ids))
 

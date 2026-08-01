@@ -14,7 +14,8 @@ MATCH: kb_exclusions.is_copa_meeting_title -- the whole word "copa" (the acronym
 Maricopa / copayment / copacker) and NEVER bare "Voyager" (Lexington's fleet Chrysler
 Voyager minivans collide with it across the corpus). Titles are enumerated then
 filtered in Python (precise); chunk_ids are resolved by exact title IN and purged via
-the shared 3-table cascade (kb_archive.delete_chunks).
+the shared vector-store cascade (kb_archive.delete_chunks -- every present bin
+table + knowledge_vec_f32 + knowledge_chunks).
 
 SAFETY: PHI/NDA-adjacent, so this stays HUMAN-REVIEWED even under the D-011 relaxation.
 Dry-run is the DEFAULT: it PREVIEWS the matched titles for Harrison to review before

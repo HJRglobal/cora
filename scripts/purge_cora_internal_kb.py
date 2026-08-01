@@ -122,13 +122,16 @@ def target_notes(conn, pattern: str) -> list[tuple[str, str, str]]:
 
 
 def delete_chunks(conn, chunk_ids) -> dict:
-    """Batched delete from all 3 tables. Returns rows deleted per table."""
-    totals = {"knowledge_vec_bin": 0, "knowledge_vec_f32": 0, "knowledge_chunks": 0}
+    """Batched delete from every vector table + knowledge_chunks (discovered via
+    schema.vec_cascade_tables, incl. knowledge_vec_bin_v2). Returns rows deleted
+    per table."""
+    tables = schema.vec_cascade_tables(conn)
+    totals = {tbl: 0 for tbl in tables}
     ids = list(chunk_ids)
     for i in range(0, len(ids), _BATCH):
         batch = ids[i : i + _BATCH]
         ph = ",".join("?" * len(batch))
-        for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
+        for tbl in tables:
             cur = conn.execute(f"DELETE FROM {tbl} WHERE chunk_id IN ({ph})", batch)
             totals[tbl] += cur.rowcount
     conn.commit()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Remove orphaned vector rows -- embeddings whose knowledge_chunks row is gone.
 
-sqlite-vec's vec0 virtual tables (knowledge_vec_bin, knowledge_vec_f32) do not
+The vector tables (every present bin coarse table -- legacy knowledge_vec_bin
+and/or partitioned knowledge_vec_bin_v2 -- plus knowledge_vec_f32) do not
 enforce referential integrity, so a crash mid-upsert, the binary-index migration,
 or a source item that is deleted-and-never-reingested can leave embedding rows
 whose chunk_id no longer exists in knowledge_chunks. Orphans waste space and can
@@ -16,7 +17,7 @@ sweep is the mitigation.
 
 Usage (--dry-run is safe anytime; stop Cora before --apply):
     python scripts/cleanup_stale_vec.py            # dry-run: report orphan counts
-    python scripts/cleanup_stale_vec.py --apply    # delete orphans from both tables
+    python scripts/cleanup_stale_vec.py --apply    # delete orphans from every vec table
 
 After --apply, reclaim disk with VACUUM INTO (D-035, scripts/reclaim_kb_space.py)
 -- a plain in-place VACUUM in WAL mode reports success but does not shrink the file.
@@ -40,7 +41,13 @@ from cora.knowledge_base import schema  # noqa: E402
 CORA_REPO_ROOT = Path(__file__).resolve().parents[1]
 KB_DB_PATH = CORA_REPO_ROOT / "data" / "cora_kb.db"
 
-_VEC_TABLES = ("knowledge_vec_bin", "knowledge_vec_f32")
+def vec_tables(conn) -> list[str]:
+    """Vector tables to sweep on THIS db: every bin coarse table that exists
+    (schema.bin_tables_present -- legacy knowledge_vec_bin and/or partitioned
+    knowledge_vec_bin_v2) + knowledge_vec_f32. Discovered per-connection so the
+    sweep covers v2 during the migration window and keeps working after the
+    legacy table is dropped."""
+    return [*schema.bin_tables_present(conn), "knowledge_vec_f32"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,7 +107,8 @@ def main() -> int:
     conn = schema.connect(KB_DB_PATH)
     total = 0
     try:
-        for vec_table in _VEC_TABLES:
+        tables = vec_tables(conn)
+        for vec_table in tables:
             try:
                 orphans = find_orphans(conn, vec_table)
             except Exception as exc:  # noqa: BLE001
@@ -118,7 +126,7 @@ def main() -> int:
         elif not apply_changes:
             log.info("Dry-run: %d total orphan(s) across %d table(s). Re-run with "
                      "--apply (Cora stopped) to delete, then VACUUM INTO.",
-                     total, len(_VEC_TABLES))
+                     total, len(tables))
         else:
             log.info("Deleted orphans. Reclaim disk with VACUUM INTO (reclaim_kb_space.py).")
     except Exception as exc:  # noqa: BLE001

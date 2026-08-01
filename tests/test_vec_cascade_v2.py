@@ -13,6 +13,8 @@ and defeats the point of a purge.
 
 from __future__ import annotations
 
+import importlib
+import re
 import struct
 import sys
 from pathlib import Path
@@ -187,3 +189,75 @@ def test_prune_chunks_clears_v2_no_orphans(kb):
                 "knowledge_vec_bin_v2", "knowledge_vec_f32"):
         assert _count(kb._conn, tbl, "old-1") == 0, f"orphan left in {tbl}"
         assert _count(kb._conn, tbl, "keep-1") == 1
+
+
+# ---------------------------------------------------------------------------
+# Standalone purge scripts share the same discovered cascade
+# ---------------------------------------------------------------------------
+
+_STANDALONE_PURGE_MODULES = (
+    "purge_cora_internal_kb",
+    "purge_dashboard_kb",
+    "purge_denied_kb",
+    "purge_lex_program_kb",
+    "purge_lex_restricted_kb",
+)
+
+
+@pytest.mark.parametrize("mod_name", _STANDALONE_PURGE_MODULES)
+def test_standalone_purge_delete_clears_v2(kb, mod_name):
+    mod = importlib.import_module(mod_name)
+    _create_v2(kb._conn)
+    _insert_everywhere(kb._conn, "k1")
+
+    totals = mod.delete_chunks(kb._conn, ["k1"])
+
+    assert totals.get("knowledge_vec_bin_v2") == 1, f"{mod_name} missed v2"
+    for tbl in ("knowledge_chunks", "knowledge_vec_bin",
+                "knowledge_vec_bin_v2", "knowledge_vec_f32"):
+        assert _count(kb._conn, tbl, "k1") == 0, f"{mod_name}: orphan in {tbl}"
+
+
+# ---------------------------------------------------------------------------
+# cleanup_stale_vec (the orphan-mitigation sweep) must see v2
+# ---------------------------------------------------------------------------
+
+def test_cleanup_stale_vec_sweeps_v2(kb):
+    sweep = importlib.import_module("cleanup_stale_vec")
+    assert "knowledge_vec_bin_v2" not in sweep.vec_tables(kb._conn)
+    _create_v2(kb._conn)
+    tables = sweep.vec_tables(kb._conn)
+    assert "knowledge_vec_bin_v2" in tables and "knowledge_vec_f32" in tables
+
+    # A v2 row with no knowledge_chunks parent is an orphan the sweep must find.
+    kb._conn.execute(
+        "INSERT INTO knowledge_vec_bin_v2 (chunk_id, entity, embedding) "
+        "VALUES ('orph', 'FNDR', vec_quantize_binary(?))",
+        (_DUMMY_VEC,),
+    )
+    kb._conn.commit()
+    orphans = sweep.find_orphans(kb._conn, "knowledge_vec_bin_v2")
+    assert orphans == ["orph"]
+    assert sweep.delete_orphans(kb._conn, "knowledge_vec_bin_v2", orphans) == 1
+    assert _count(kb._conn, "knowledge_vec_bin_v2", "orph") == 0
+
+
+# ---------------------------------------------------------------------------
+# CI guard: no new hard-coded pre-v2 cascade may enter the repo
+# ---------------------------------------------------------------------------
+
+def test_no_hardcoded_pre_v2_cascade_in_repo():
+    """A quoted "knowledge_vec_bin", "knowledge_vec_f32" adjacency is the
+    signature of a hard-coded pre-partition cascade (it skips v2). New delete
+    code must discover its tables via schema.bin_tables_present /
+    schema.vec_cascade_tables / store._bin_write_tables instead."""
+    pat = re.compile(r'"knowledge_vec_bin"\s*,\s*"knowledge_vec_f32"')
+    offenders = []
+    for root in (_REPO_ROOT / "scripts", _REPO_ROOT / "src" / "cora"):
+        for p in root.rglob("*.py"):
+            if pat.search(p.read_text(encoding="utf-8", errors="replace")):
+                offenders.append(str(p.relative_to(_REPO_ROOT)))
+    assert offenders == [], (
+        f"hard-coded pre-v2 vec cascade in: {offenders} -- use "
+        "schema.vec_cascade_tables(conn) (or store._bin_write_tables) instead"
+    )

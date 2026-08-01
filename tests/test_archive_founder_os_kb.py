@@ -10,7 +10,7 @@ Groups:
      bypass), explicit-class-blocked, per-cluster keep, substring-KEEP.
   C  select_static_purge -- exact IN (a '_' is NOT a wildcard) + copa whole-folder GLOB.
   D  select_drive_purge -- self-guard: distinctive included, scaffolding + >2-file-id skipped.
-  E  delete_chunks -- 3-table batched cascade.
+  E  delete_chunks -- batched cascade over every present vec table + chunks.
   F  moves + revert round-trip (reversibility).
 """
 
