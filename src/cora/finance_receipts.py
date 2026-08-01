@@ -317,7 +317,9 @@ def file_message_attachments(
             log.warning("finance_receipts: download failed %s: %s", filename, exc)
             continue
         try:
-            _file_id, link = upload_file(
+            # No content_md5 -> upload_file keeps legacy name-dedup semantics
+            # (any same-name file in the folder is the same receipt).
+            _file_id, link, _final_name = upload_file(
                 folder_id, canonical, content, att.get("mime_type") or "application/octet-stream",
             )
         except DriveConnectorError as exc:

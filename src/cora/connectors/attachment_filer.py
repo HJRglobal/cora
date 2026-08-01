@@ -511,32 +511,36 @@ def process_email(
             log.warning("Folder creation failed for %r: %s", drive_path_display, exc)
             continue
 
-        # Upload (upload_file dedups by name AND by content md5 within the folder)
+        # Upload (upload_file dedups by name+md5 AND by content md5 within the folder)
         try:
-            file_id, web_link = upload_file(
+            file_id, web_link, final_name = upload_file(
                 folder_id, canonical, content, att["mime_type"], content_md5=content_md5,
             )
         except DriveConnectorError as exc:
             log.warning("Upload failed for %r: %s", canonical, exc)
             continue
 
-        # cq-f583932a625e truthful reporting: upload_file returns an identical
-        # 2-tuple whether it CREATED a file or name/md5-MATCHED an existing one.
-        # If the returned file_id is already in the ledger, this was a collapse
-        # onto an already-reported file -- record the md5 alias (so re-sends keep
-        # deduping) but do NOT log "Filed" or emit a digest row claiming a new
-        # filing with a fresh AI description of the same file.
+        # cq-349a17012ddf: upload_file uniquifies the name when a cross-message/
+        # cross-run collision carries DIFFERENT bytes. Keep the ledger + digest
+        # truthful to the name that actually landed in Drive.
+        if final_name != canonical:
+            log.info("Cross-message name collision: %r stored in Drive as %r",
+                     canonical, final_name)
+            canonical = final_name
+            drive_path_display = f"{entity_folder}/{subfolder}/{canonical}"
+
+        # cq-f583932a625e truthful reporting: upload_file returns the same tuple
+        # shape whether it CREATED a file or md5-MATCHED an existing one. If the
+        # returned file_id is already in the ledger, this was a same-content
+        # collapse onto an already-reported file -- record the md5 alias (so
+        # re-sends keep deduping) but do NOT log "Filed" or emit a digest row
+        # claiming a new filing with a fresh AI description of the same file.
         if file_id in known_file_ids:
-            # WARNING not info (D-051 bundle review, contested finding accepted as
-            # residual): with upload_file's name-dedup unverified by md5, this CAN
-            # be a genuinely different document name-collapsing cross-run -- i.e.
-            # possible data loss. Visible in the log for the weekly eyeball; the
-            # md5-verify option inside upload_file is a flagged follow-up decision
-            # (bot-loaded; finance_receipts relies on current name-dedup semantics).
-            log.warning("Already filed -- %r collapsed onto existing Drive file %s "
-                        "(not a new filing; if this was a DIFFERENT document, it was "
-                        "not archived -- see cq-f583932a625e follow-up)",
-                        orig_filename, file_id)
+            # Since the cq-349a17012ddf md5-verify, a returned existing id is
+            # content-verified -- this is a true duplicate, never data loss.
+            log.info("Already filed -- %r md5-matched existing Drive file %s "
+                     "(same content, not a new filing)",
+                     orig_filename, file_id)
             filer_ledger.append_content(
                 content_ledger, content_md5,
                 file_id=file_id, web_link=web_link, drive_path=drive_path_display,

@@ -73,7 +73,9 @@ def _patch_pipeline(monkeypatch, *, meta, decisions, content=b"THE-PDF-BYTES"):
                         lambda meta_, atts, entity_hint=None: decisions)
     monkeypatch.setattr(af, "download_attachment", lambda u, m, a: content)
     monkeypatch.setattr(af, "ensure_folder_path", lambda segs: "folder-" + "/".join(segs))
-    upload = MagicMock(return_value=("file1", "https://drive/file1"))
+    upload = MagicMock(
+        side_effect=lambda folder_id, name, content_, mime, content_md5=None:
+            ("file1", "https://drive/file1", name))
     monkeypatch.setattr(af, "upload_file", upload)
     return upload
 
@@ -270,7 +272,9 @@ class TestAlwaysNamedFolderInvariant:
                             lambda meta_, atts, entity_hint=None: _decisions(entity="OSN", subfolder="legal"))
         monkeypatch.setattr(af, "download_attachment", lambda u, m, a: b"BYTES")
         monkeypatch.setattr(af, "ensure_folder_path", _ensure)
-        upload = MagicMock(return_value=("file1", "https://drive/file1"))
+        upload = MagicMock(
+            side_effect=lambda folder_id, name, content_, mime, content_md5=None:
+                ("file1", "https://drive/file1", name))
         monkeypatch.setattr(af, "upload_file", upload)
 
         out = af.process_email("harrison@hjrglobal.com", "m1",
@@ -403,16 +407,33 @@ class _FakeDriveSvc:
         return {"id": "NEW", "webViewLink": "newlink"}
 
 
+class _FakeDriveSvcNameHit(_FakeDriveSvc):
+    """Like _FakeDriveSvc but the name-dedup list returns the given candidates."""
+
+    def __init__(self, name_hits):
+        super().__init__()
+        self._name_hits = name_hits
+
+    def execute(self):
+        op, _ = self._op
+        if op == "list":
+            return {"files": self._name_hits}
+        return {"id": "NEW", "webViewLink": "newlink"}
+
+
 class TestUploadFileDedup:
     def test_name_match_skips_upload(self, monkeypatch):
+        # No content_md5 (the finance_receipts path): ANY name hit is treated as
+        # the same document — legacy semantics, pinned.
         svc = MagicMock()
         # name query returns an existing file
         svc.files.return_value.list.return_value.execute.return_value = {
             "files": [{"id": "existing", "webViewLink": "u"}]
         }
         monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
-        fid, link = dc.upload_file("folder1", "x.pdf", b"bytes", "application/pdf")
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"bytes", "application/pdf")
         assert fid == "existing"
+        assert name == "x.pdf"
         svc.files.return_value.create.assert_not_called()
 
     def test_md5_match_under_different_name_skips_upload(self, monkeypatch):
@@ -421,19 +442,92 @@ class TestUploadFileDedup:
         monkeypatch.setattr(dc, "list_folder_files_with_md5",
                             lambda fid: [{"id": "dup", "name": "other.pdf",
                                           "md5Checksum": "abc", "webViewLink": "duplink"}])
-        fid, link = dc.upload_file("folder1", "new-name.pdf", b"bytes",
-                                   "application/pdf", content_md5="abc")
+        fid, link, name = dc.upload_file("folder1", "new-name.pdf", b"bytes",
+                                         "application/pdf", content_md5="abc")
         assert fid == "dup" and link == "duplink"
+        assert name == "other.pdf"  # truthful: the content lives under that name
         assert svc.created == []  # never uploaded
 
     def test_no_match_uploads(self, monkeypatch):
         svc = _FakeDriveSvc()
         monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
         monkeypatch.setattr(dc, "list_folder_files_with_md5", lambda fid: [])
-        fid, link = dc.upload_file("folder1", "fresh.pdf", b"bytes",
-                                   "application/pdf", content_md5="zzz")
+        fid, link, name = dc.upload_file("folder1", "fresh.pdf", b"bytes",
+                                         "application/pdf", content_md5="zzz")
         assert fid == "NEW"
+        assert name == "fresh.pdf"
         assert len(svc.created) == 1
+
+    # cq-349a17012ddf: md5-verify inside the name dedup ------------------------
+
+    def test_name_hit_md5_match_skips_upload(self, monkeypatch):
+        svc = _FakeDriveSvcNameHit(
+            [{"id": "existing", "webViewLink": "u", "md5Checksum": "abc"}])
+        monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"bytes",
+                                         "application/pdf", content_md5="abc")
+        assert fid == "existing"
+        assert name == "x.pdf"
+        assert svc.created == []
+
+    def test_name_hit_md5_match_scans_all_candidates(self, monkeypatch):
+        # The matching candidate is NOT first — must dedup to IT, never existing[0].
+        svc = _FakeDriveSvcNameHit([
+            {"id": "wrong", "webViewLink": "w", "md5Checksum": "OTHER"},
+            {"id": "right", "webViewLink": "r", "md5Checksum": "abc"},
+        ])
+        monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"bytes",
+                                         "application/pdf", content_md5="abc")
+        assert fid == "right" and link == "r"
+        assert svc.created == []
+
+    def test_name_hit_md5_mismatch_uploads_uniquified(self, monkeypatch):
+        # The cross-message collision class: same name, DIFFERENT bytes must
+        # upload as a distinct file under a uniquified name — never alias.
+        svc = _FakeDriveSvcNameHit(
+            [{"id": "existing", "webViewLink": "u", "md5Checksum": "OTHER"}])
+        monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
+        monkeypatch.setattr(dc, "list_folder_files_with_md5",
+                            lambda fid: [{"id": "existing", "name": "x.pdf",
+                                          "md5Checksum": "OTHER", "webViewLink": "u"}])
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"different-bytes",
+                                         "application/pdf", content_md5="abc")
+        assert fid == "NEW"
+        assert name == "x-2.pdf"
+        assert len(svc.created) == 1
+        assert svc.created[0]["body"]["name"] == "x-2.pdf"
+
+    def test_name_hit_md5_mismatch_uniquify_skips_taken_suffixes(self, monkeypatch):
+        # x.pdf AND x-2.pdf already exist with other content -> lands on x-3.pdf.
+        svc = _FakeDriveSvcNameHit(
+            [{"id": "existing", "webViewLink": "u", "md5Checksum": "OTHER"}])
+        monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
+        monkeypatch.setattr(dc, "list_folder_files_with_md5",
+                            lambda fid: [
+                                {"id": "existing", "name": "x.pdf",
+                                 "md5Checksum": "OTHER", "webViewLink": "u"},
+                                {"id": "e2", "name": "x-2.pdf",
+                                 "md5Checksum": "OTHER2", "webViewLink": "u2"},
+                            ])
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"different-bytes",
+                                         "application/pdf", content_md5="abc")
+        assert fid == "NEW"
+        assert name == "x-3.pdf"
+
+    def test_name_hit_mismatch_still_md5_dedups_against_folder(self, monkeypatch):
+        # Name collision with different bytes, but the SAME content already
+        # exists under another name -> layer 2 wins, no upload.
+        svc = _FakeDriveSvcNameHit(
+            [{"id": "existing", "webViewLink": "u", "md5Checksum": "OTHER"}])
+        monkeypatch.setattr(dc, "_build_drive_service", lambda *a, **k: svc)
+        monkeypatch.setattr(dc, "list_folder_files_with_md5",
+                            lambda fid: [{"id": "dup", "name": "renamed.pdf",
+                                          "md5Checksum": "abc", "webViewLink": "duplink"}])
+        fid, link, name = dc.upload_file("folder1", "x.pdf", b"bytes",
+                                         "application/pdf", content_md5="abc")
+        assert fid == "dup" and name == "renamed.pdf"
+        assert svc.created == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +572,7 @@ class TestSiblingCollisionUniquify:
 
         def fake_upload(folder_id, name, content, mime, content_md5=None):
             uploaded_names.append(name)
-            return (f"file-{len(uploaded_names)}", f"https://drive/{len(uploaded_names)}")
+            return (f"file-{len(uploaded_names)}", f"https://drive/{len(uploaded_names)}", name)
 
         monkeypatch.setattr(af, "upload_file", fake_upload)
         results = af.process_email("harrison@hjrglobal.com", "mm1",
@@ -489,6 +583,34 @@ class TestSiblingCollisionUniquify:
         # Uniquified names keep the extension.
         assert all(n.endswith(".pdf") for n in uploaded_names)
 
+    def test_cross_message_collision_uniquified_name_kept_truthful(self, tmp_path, monkeypatch):
+        """cq-349a17012ddf acceptance shape: when upload_file uniquifies a
+        cross-message name collision (same canonical, DIFFERENT bytes), the
+        ledger row + digest row must carry the name that actually landed in
+        Drive, and the filing must be reported as a real new archive."""
+        _set_ledger_paths(tmp_path, monkeypatch)
+        upload = _patch_pipeline(monkeypatch, meta=_meta(), decisions=_decisions(),
+                                 content=b"SECOND-DOC-DIFFERENT-BYTES")
+        # Simulate the new upload_file contract: the requested name collided
+        # with different content, so the file landed under a -2 suffix.
+        def _uniquified(folder_id, name, content_, mime, content_md5=None):
+            stem, dot, ext = name.rpartition(".")
+            return ("file-2", "https://drive/2", f"{stem}-2.{ext}" if dot else f"{name}-2")
+        upload.side_effect = _uniquified
+        ledger: dict = {}
+        results = af.process_email("harrison@hjrglobal.com", "m1",
+                                   content_ledger=ledger, seen_messages=set())
+        assert len(results) == 1
+        row = results[0]
+        assert row["file_id"] == "file-2"
+        assert row["canonical_filename"].endswith("-2.pdf")
+        assert row["drive_path"].endswith(row["canonical_filename"])
+        # Ledger row is truthful to the Drive name too.
+        import hashlib
+        md5 = hashlib.md5(b"SECOND-DOC-DIFFERENT-BYTES").hexdigest()
+        assert ledger[md5]["canonical"].endswith("-2.pdf")
+        assert ledger[md5]["drive_path"].endswith("-2.pdf")
+
     def test_cross_message_collapse_not_reported_as_new_filing(self, tmp_path, monkeypatch):
         """upload_file returning an ALREADY-LEDGERED file_id (a name/md5 collapse
         onto an existing Drive file) must record the md5 alias but emit NO results
@@ -497,7 +619,9 @@ class TestSiblingCollisionUniquify:
         _set_ledger_paths(tmp_path, monkeypatch)
         upload = _patch_pipeline(monkeypatch, meta=_meta(), decisions=_decisions(),
                                  content=b"NEW-BYTES-SAME-NAME")
-        upload.return_value = ("file-EXISTING", "https://drive/existing")
+        upload.side_effect = (
+            lambda folder_id, name, content_, mime, content_md5=None:
+                ("file-EXISTING", "https://drive/existing", name))
         ledger = {"aaaa": {"md5": "aaaa", "file_id": "file-EXISTING",
                            "drive_path": "x", "filed_at": int(time.time())}}
         results = af.process_email("harrison@hjrglobal.com", "m1",

@@ -732,21 +732,45 @@ def resolve_folder_path(path_segments: list[str]) -> str | None:
     return current_id
 
 
+def _uniquify_name(filename: str, taken: set[str], content_md5: str) -> str:
+    """Pick a -2/-3… pre-extension suffix for `filename` not present in `taken`;
+    after -9, fall back to a content-derived suffix. Cosmetic only — Drive itself
+    permits duplicate names in a folder; this keeps folders human-legible."""
+    stem, dot, ext = filename.rpartition(".")
+
+    def _mk(suffix) -> str:
+        return f"{stem}-{suffix}.{ext}" if dot else f"{filename}-{suffix}"
+
+    for n in range(2, 10):
+        cand = _mk(n)
+        if cand not in taken:
+            return cand
+    return _mk(content_md5[:8])
+
+
 def upload_file(
     parent_folder_id: str,
     filename: str,
     content: bytes,
     mime_type: str,
     content_md5: str | None = None,
-) -> tuple[str, str]:
-    """Upload bytes as a new file in parent_folder_id. Returns (file_id, web_view_link).
+) -> tuple[str, str, str]:
+    """Upload bytes as a new file in parent_folder_id. Returns
+    (file_id, web_view_link, final_name) — final_name is the name the file
+    actually carries in Drive (== filename unless a name collision with
+    DIFFERENT content forced a uniquified upload, see below).
 
     Idempotency, two layers (both return the existing file instead of uploading):
-      1. Same NAME already in the folder -> skip (cheap, single query).
+      1. Same NAME already in the folder. Without content_md5 (finance_receipts),
+         any name hit is treated as the same document (legacy semantics). With
+         content_md5 supplied (the attachment filer), a name hit is a match ONLY
+         when a same-name candidate's md5Checksum equals content_md5 — the same
+         name with different bytes is a DIFFERENT document (cq-349a17012ddf) and
+         falls through to layer 2 / a uniquified upload instead of silently
+         aliasing onto the existing file.
       2. Same CONTENT (content_md5 matches an existing file's md5Checksum in the
          folder) -> skip, even under a different name. This catches the LLM
-         renaming the same document across runs. Only runs when content_md5 is
-         supplied and the name check missed.
+         renaming the same document across runs.
     """
     service = _build_drive_service()
 
@@ -758,29 +782,50 @@ def upload_file(
                 f"and '{parent_folder_id}' in parents "
                 f"and trashed = false"
             ),
-            fields="files(id, webViewLink)",
-            pageSize=2,
+            fields="files(id, webViewLink, md5Checksum)",
+            pageSize=25,
         ).execute()
     except HttpError as exc:
         raise DriveConnectorError(f"Dedup check failed for {filename!r}: {exc}") from exc
 
     existing = resp.get("files", [])
+    name_collision = False
     if existing:
-        log.info(
-            "Drive dedup: %r already exists in folder %s — skipping upload",
-            filename, parent_folder_id,
+        if content_md5 is None:
+            log.info(
+                "Drive dedup: %r already exists in folder %s — skipping upload",
+                filename, parent_folder_id,
+            )
+            return existing[0]["id"], existing[0].get("webViewLink", ""), filename
+        for f in existing:
+            if f.get("md5Checksum") == content_md5:
+                log.info(
+                    "Drive dedup: %r already exists in folder %s (md5 verified) — skipping upload",
+                    filename, parent_folder_id,
+                )
+                return f["id"], f.get("webViewLink", ""), filename
+        # cq-349a17012ddf: same name, different bytes — NOT the same document.
+        name_collision = True
+        log.warning(
+            "Drive name collision: %r exists in folder %s with DIFFERENT content "
+            "(md5 %s not among %d same-name candidate(s)) — uploading as a distinct file",
+            filename, parent_folder_id, content_md5, len(existing),
         )
-        return existing[0]["id"], existing[0].get("webViewLink", "")
 
-    # Layer 2 — content dedup: same md5 under a different name in this folder
+    final_name = filename
     if content_md5:
-        for f in list_folder_files_with_md5(parent_folder_id):
+        # Layer 2 — content dedup: same md5 under a different name in this folder
+        folder_files = list_folder_files_with_md5(parent_folder_id)
+        for f in folder_files:
             if f.get("md5Checksum") == content_md5:
                 log.info(
                     "Drive md5 dedup: %r matches existing %r (md5=%s) in folder %s — skipping upload",
                     filename, f.get("name"), content_md5, parent_folder_id,
                 )
-                return f["id"], f.get("webViewLink", "")
+                return f["id"], f.get("webViewLink", ""), f.get("name") or filename
+        if name_collision:
+            taken = {f.get("name") for f in folder_files if f.get("name")} | {filename}
+            final_name = _uniquify_name(filename, taken, content_md5)
 
     media = MediaIoBaseUpload(
         io.BytesIO(content),
@@ -791,17 +836,17 @@ def upload_file(
     try:
         result = safe_drive_create(
             service,
-            body={"name": filename, "parents": [parent_folder_id]},
+            body={"name": final_name, "parents": [parent_folder_id]},
             media_body=media,
             fields="id,webViewLink",
         )
     except HttpError as exc:
         raise DriveConnectorError(
-            f"Drive upload failed for {filename!r}: {exc}"
+            f"Drive upload failed for {final_name!r}: {exc}"
         ) from exc
 
     log.info(
         "Uploaded %r to Drive folder %s (file_id=%s)",
-        filename, parent_folder_id, result["id"],
+        final_name, parent_folder_id, result["id"],
     )
-    return result["id"], result.get("webViewLink", "")
+    return result["id"], result.get("webViewLink", ""), final_name
