@@ -25,6 +25,7 @@ snapshot for the weekly health-metric ritual (section 8 of the game plan).
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import os
 import re
@@ -278,12 +279,29 @@ def recent_billing(log_days: int) -> dict:
     summed per caller with a $-estimate from _MODEL_RATES.
     """
     cora_logs = sorted(LOGS_DIR.glob("cora-2*.log"))[-log_days:] if LOGS_DIR.exists() else []
-    window_dates = {p.stem[-10:] for p in cora_logs}
-    # file -> is_cora_log; only cora-*.log lines may enter the bot bucket.
+    # Window = the selected cora logs' stem dates UNION the last N calendar
+    # days (the bot bucket keeps its historical last-N-files semantics; the
+    # calendar anchor keeps the SCRIPT bucket honest even when cora-*.log
+    # naming is sparse).
+    today = _dt.date.today()
+    window_dates = {p.stem[-10:] for p in cora_logs} | {
+        (today - _dt.timedelta(days=i)).isoformat() for i in range(log_days)}
+    # file -> is_cora_log; ONLY the selected cora_logs feed the bot bucket.
     all_logs: dict[Path, bool] = dict.fromkeys(cora_logs, True)
     if LOGS_DIR.exists():
         for p in LOGS_DIR.glob("*.log"):
-            if p not in all_logs and p.stem[-10:] in window_dates:
+            if p in all_logs:
+                continue
+            # Admit by filename date OR by mtime date: the always-on bot's
+            # TimedRotatingFileHandler keeps writing its process-START-date
+            # basename across midnight rollovers (D-051 2026-08-01 finding 3),
+            # so bot-resident caller= lines live in a file whose NAME date can
+            # be weeks old while its mtime is today.
+            try:
+                mtime_date = _dt.date.fromtimestamp(p.stat().st_mtime).isoformat()
+            except OSError:
+                mtime_date = ""
+            if p.stem[-10:] in window_dates or mtime_date in window_dates:
                 all_logs[p] = False
 
     inputs: list[int] = []
@@ -303,6 +321,14 @@ def recent_billing(log_days: int) -> dict:
                         continue
                     caller = m.group("caller")
                     if caller:
+                        # Bound whole-file scans to the window: a long-lived
+                        # (mtime-admitted) file can hold weeks of caller=
+                        # lines; skip any line whose leading timestamp date is
+                        # outside the window. Undated line formats pass (their
+                        # files are dated per day and window-gated already).
+                        prefix = line[:10]
+                        if prefix[:4].isdigit() and prefix not in window_dates:
+                            continue
                         model = m.group("model") or "-"
                         row = scripts.setdefault(caller, {
                             "calls": 0, "input": 0, "cache_create": 0,

@@ -44,10 +44,25 @@ load_dotenv()
 _HAIKU_MODEL = "claude-haiku-4-5"
 _MAX_VERIFY = 50  # cap candidates sent to Haiku per run (bounds cost/tokens)
 
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+log = logging.getLogger(__name__)
+# Dated FileHandler (D-051 2026-08-01 finding 4): scheduled-task stdout is not
+# retained on this host, so a console-only config made the S1 usage lines (and
+# every other log line) vanish. Date-prefixed format so the health report's
+# billing window filter can bound whole-file scans.
+_LOG_DIR = REPO_ROOT / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(
+            _LOG_DIR / f"decision-capture-{datetime.now().strftime('%Y-%m-%d')}.log",
+            encoding="utf-8"),
+    ],
+)
 KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 SURFACED_PATH = REPO_ROOT / "data" / "surfaced-decisions.jsonl"
 TARGET_CHANNEL = "hjrg-leadership"

@@ -236,16 +236,33 @@ def _synthesis_params(prompt_text: str) -> dict:
     }
 
 
-def _generate(prompt_text: str, api_key: str):
-    """One synthesis response object, batch-first when the runner opted in."""
+def _generate(prompt_text: str, api_key: str, *, allow_batch: bool = True):
+    """One synthesis response object, batch-first when the runner opted in.
+
+    ``allow_batch=False`` pins a leg to the sync transport regardless of the
+    runner opt-in -- the LEX leg uses it (PHI posture: its raw pre-scrub
+    output must not gain a 29-day Anthropic-side retrievable copy; see
+    batch_client's module docstring).
+    """
     from . import batch_client
     params = _synthesis_params(prompt_text)
-    if _USE_BATCH and batch_client.batch_enabled("CORA_BATCH_SYNTHESIS"):
-        deadline = float(os.environ.get("CORA_BATCH_SYNTHESIS_DEADLINE_S", "600"))
-        results = batch_client.batch_generate(
-            [{"custom_id": "synthesis-0", "params": params}],
-            caller="channel_synthesis", deadline_s=deadline, api_key=api_key)
-        return results.get("synthesis-0")
+    if allow_batch and _USE_BATCH and batch_client.batch_enabled("CORA_BATCH_SYNTHESIS"):
+        # Belt (D-051 2026-08-01 finding 1): ANY batch-LAYER error here --
+        # including a malformed CORA_BATCH_SYNTHESIS_DEADLINE_S value, which a
+        # bare float() would otherwise raise straight into _synthesize's
+        # fail-CLOSED catch and demote all 9 daily posts to the fallback memo
+        # -- falls through to the plain sync transport below. A None RESULT
+        # (batch ran and both its transports failed) still returns None: that
+        # path already sync-retried inside batch_generate.
+        try:
+            deadline = float(os.environ.get("CORA_BATCH_SYNTHESIS_DEADLINE_S", "600"))
+            results = batch_client.batch_generate(
+                [{"custom_id": "synthesis-0", "params": params}],
+                caller="channel_synthesis", deadline_s=deadline, api_key=api_key)
+            return results.get("synthesis-0")
+        except Exception as exc:  # noqa: BLE001 -- never worse than sync
+            log.warning("channel_synthesis: batch transport unavailable (%s) "
+                        "-- using plain sync call", exc)
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(**params)
@@ -254,7 +271,7 @@ def _generate(prompt_text: str, api_key: str):
     return response
 
 
-def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
+def _synthesize(prompt_text: str, *, phi_check=None, allow_batch: bool = True) -> str | None:
     """One Sonnet synthesis call. FAIL-CLOSED: None on missing key / API error /
     empty output / a positive PHI check -- the caller falls back to a deterministic
     factual rollup, never a hallucinated or PHI-bearing post."""
@@ -263,7 +280,7 @@ def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
         log.warning("channel_synthesis: ANTHROPIC_API_KEY not set -- no synthesis")
         return None
     try:
-        response = _generate(prompt_text, api_key)
+        response = _generate(prompt_text, api_key, allow_batch=allow_batch)
         text = (response.content[0].text or "").strip() if response else ""
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design
         log.warning("channel_synthesis: synthesis failed: %s", exc)
@@ -1329,7 +1346,12 @@ def synthesize_channel_lex(facts_text: str) -> str | None:
     closable by regex; the aggregate gather + prompt + custodian/channel containment
     are the primary net."""
     from .phi_guard import is_clinical_phi, scrub_lex_phi
-    text = _synthesize(_LEX_PROMPT.format(facts=facts_text), phi_check=is_clinical_phi)
+    # allow_batch=False (D-051 2026-08-01 finding 2): the LEX synthesis output
+    # is scrubbed LOCALLY (scrub_lex_phi below) -- routing it through the
+    # Batches API would store the PRE-scrub output Anthropic-side, retrievable
+    # by API key for 29 days. The one LEX leg stays on the sync transport.
+    text = _synthesize(_LEX_PROMPT.format(facts=facts_text),
+                       phi_check=is_clinical_phi, allow_batch=False)
     if text is None:
         return None
     try:

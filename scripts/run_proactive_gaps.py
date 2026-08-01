@@ -103,12 +103,23 @@ Return ONLY the JSON array. No preamble.
 
 
 def _setup_logging() -> None:
+    # Dated FileHandler (D-051 2026-08-01 finding 4): scheduled-task stdout is
+    # not retained, so console-only logging hid this runner's usage lines from
+    # the health report's billing fold.
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(
-            open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)
-        )],
+        handlers=[
+            logging.StreamHandler(
+                open(sys.stdout.fileno(), "w", encoding="utf-8",
+                     errors="replace", closefd=False)
+            ),
+            logging.FileHandler(
+                log_dir / f"proactive-gaps-{datetime.now().strftime('%Y-%m-%d')}.log",
+                encoding="utf-8"),
+        ],
     )
 
 

@@ -116,6 +116,58 @@ class TestSynthesisBatchTransport:
         assert cs._synthesize("facts") == "*Moved* sync"
         assert called == []
 
+    def test_malformed_deadline_env_falls_back_to_sync(self, monkeypatch):
+        """D-051 2026-08-01 finding 1: a .env typo in the deadline var must
+        degrade to the plain SYNC transport, never demote the post to the
+        deterministic fallback memo (the 'never worse than sync' invariant)."""
+        monkeypatch.setattr(cs, "_USE_BATCH", True)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("CORA_BATCH_SYNTHESIS_DEADLINE_S", "600s")  # typo
+        monkeypatch.setattr(
+            batch_client, "batch_generate",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("batch ran")))
+        import anthropic
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.messages = SimpleNamespace(
+                    create=lambda **kw: _batch_msg("*Moved* sync rescue"))
+        monkeypatch.setattr(anthropic, "Anthropic", _Client)
+        assert cs._synthesize("facts") == "*Moved* sync rescue"
+
+    def test_batch_layer_exception_falls_back_to_sync(self, monkeypatch):
+        monkeypatch.setattr(cs, "_USE_BATCH", True)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(
+            batch_client, "batch_generate",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("layer bug")))
+        import anthropic
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.messages = SimpleNamespace(
+                    create=lambda **kw: _batch_msg("*Moved* sync rescue"))
+        monkeypatch.setattr(anthropic, "Anthropic", _Client)
+        assert cs._synthesize("facts") == "*Moved* sync rescue"
+
+    def test_lex_leg_pinned_to_sync_transport(self, monkeypatch):
+        """D-051 2026-08-01 finding 2: the LEX synthesis output is scrubbed
+        LOCALLY -- it must never gain a 29-day Anthropic-side batch copy."""
+        monkeypatch.setattr(cs, "_USE_BATCH", True)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(
+            batch_client, "batch_generate",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("LEX batched!")))
+        import anthropic
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.messages = SimpleNamespace(
+                    create=lambda **kw: _batch_msg("*Moved* aggregate load steady"))
+        monkeypatch.setattr(anthropic, "Anthropic", _Client)
+        out = cs.synthesize_channel_lex("AGGREGATE FACTS")
+        assert out is not None and "*Moved*" in out
+
     def test_runners_opt_in_source_pin(self):
         """The scheduled runners are the batch opt-in point -- pin it so a
         refactor can't silently drop the pilot back to sync."""
@@ -308,22 +360,14 @@ class TestBatchDistillHelper:
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert scap._batch_distill([(_session(), scap.SURFACE, "k")]) == {}
 
-    def test_phi_session_gets_phi_cap(self, monkeypatch):
-        """A PHI-flagged transcript keeps the LARGER input cap in the batch
-        prompt, exactly as the sync distill path does."""
-        monkeypatch.delenv("CORA_BATCH_CAPTURE", raising=False)
-        monkeypatch.setattr(scap.phi_guard, "is_phi_risk", lambda t: True)
+    def test_phi_cap_preserved_on_sync_path(self):
+        """PHI-flagged transcripts never batch (finding-2 posture), so the
+        larger PHI input cap lives on the SYNC prompt builder they use."""
         long_text = "x" * (scap._MAX_INPUT_CHARS + 5000)
-        seen = {}
-
-        def _fake_batch(requests, **kw):
-            seen["prompt"] = requests[0]["params"]["messages"][0]["content"]
-            return {"item-0": None}
-        monkeypatch.setattr(batch_client, "batch_generate", _fake_batch)
-        scap._batch_distill([(_session(text=long_text), scap.SURFACE, "k")])
-        # Under the non-PHI cap the transcript would have been truncated to
-        # _MAX_INPUT_CHARS; the PHI cap admits the full text.
-        assert "x" * (scap._MAX_INPUT_CHARS + 1) in seen["prompt"]
+        phi_prompt = scap._build_distill_prompt(long_text, "FNDR", phi=True)
+        plain_prompt = scap._build_distill_prompt(long_text, "FNDR", phi=False)
+        assert "x" * (scap._MAX_INPUT_CHARS + 1) in phi_prompt
+        assert "x" * (scap._MAX_INPUT_CHARS + 1) not in plain_prompt
 
     def test_deadline_env_honored(self, monkeypatch):
         monkeypatch.delenv("CORA_BATCH_CAPTURE", raising=False)
@@ -336,3 +380,38 @@ class TestBatchDistillHelper:
         monkeypatch.setattr(batch_client, "batch_generate", _fake_batch)
         scap._batch_distill([(_session(), scap.SURFACE, "k")])
         assert seen["deadline"] == 300.0
+
+    def test_phi_sessions_excluded_from_batch(self, monkeypatch):
+        """D-051 2026-08-01 finding 2: PHI-flagged transcripts never enter a
+        batch payload (no 29-day Anthropic-side at-rest copy) -- they are left
+        out of the pre-distill map so finalize runs the inline sync distill."""
+        monkeypatch.delenv("CORA_BATCH_CAPTURE", raising=False)
+        monkeypatch.setattr(
+            scap.phi_guard, "is_phi_risk",
+            lambda t: "PHI-MARKER" in t)
+        seen = {}
+
+        def _fake_batch(requests, **kw):
+            seen["requests"] = requests
+            return {"item-0": _batch_msg(json.dumps(_distilled("F3E", "clean")))}
+        monkeypatch.setattr(batch_client, "batch_generate", _fake_batch)
+        pending = [
+            (_session("clean-1", text="USER: normal work"), scap.SURFACE, "clean-1"),
+            (_session("phi-1", text="USER: PHI-MARKER client detail"),
+             scap.SURFACE, "phi-1"),
+        ]
+        out = scap._batch_distill(pending)
+        # Only the clean session was submitted; the PHI one is ABSENT from the
+        # map entirely (finalize -> sync distill), not mapped to None.
+        assert len(seen["requests"]) == 1
+        assert "PHI-MARKER" not in json.dumps(seen["requests"])
+        assert out["clean-1"]["entity"] == "F3E"
+        assert "phi-1" not in out
+
+    def test_all_phi_pending_skips_batch_submission(self, monkeypatch):
+        monkeypatch.delenv("CORA_BATCH_CAPTURE", raising=False)
+        monkeypatch.setattr(scap.phi_guard, "is_phi_risk", lambda t: True)
+        monkeypatch.setattr(
+            batch_client, "batch_generate",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("submitted!")))
+        assert scap._batch_distill([(_session(), scap.SURFACE, "k")]) == {}

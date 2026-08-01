@@ -159,8 +159,13 @@ class TestRecentBillingBuckets:
             "input=10000 cache_create=0 cache_read=0 output=500 "
             "model=claude-haiku-4-5 caller=session_capture via=batch",
         ])
-        # A non-dated log never enters the window.
-        self._write(tmp_path / "random.log", [script_in_cora])
+        # A non-dated log IS admitted by mtime (it's actively written), but
+        # its caller lines only count when their leading date is in-window --
+        # this one's is 60 days stale, so it contributes nothing.
+        self._write(tmp_path / "random.log", [
+            "2026-06-01 06:31:00 [INFO] cora.llm_usage -- claude usage iter=1 "
+            "input=4000 cache_create=0 cache_read=0 output=800 "
+            "model=claude-sonnet-5 caller=channel_synthesis"])
 
         b = chr_mod.recent_billing(3)
         # Bot bucket: ONLY the caller-less cora-*.log line.
@@ -192,6 +197,38 @@ class TestRecentBillingBuckets:
         monkeypatch.setattr(chr_mod, "LOGS_DIR", tmp_path / "nope")
         b = chr_mod.recent_billing(3)
         assert b["usage_lines"] == 0 and b["script_lines"] == 0
+
+    def test_live_bot_log_admitted_by_mtime(self, tmp_path, monkeypatch):
+        """D-051 2026-08-01 finding 3: the always-on bot keeps writing its
+        process-START-date basename, so bot-resident caller= lines live in a
+        file whose NAME date is stale. Admission by mtime catches it; the
+        per-line date filter bounds the whole-file scan to the window."""
+        import datetime as dt
+        monkeypatch.setattr(chr_mod, "LOGS_DIR", tmp_path)
+        today = dt.date.today().isoformat()
+        old_day = (dt.date.today() - dt.timedelta(days=40)).isoformat()
+        # Today's cora log anchors the window.
+        self._write(tmp_path / f"cora-{today}.log", [
+            f"{today} 10:00:00 [INFO] cora.claude_client -- claude usage "
+            "iter=1 input=100 cache_create=0 cache_read=0 output=10",
+        ])
+        # The live bot's file: stale NAME date, fresh mtime (written today).
+        # One in-window caller line + one 40-day-old caller line.
+        self._write(tmp_path / f"cora-{old_day}.log", [
+            f"{today} 09:00:00 [INFO] cora.llm_usage -- claude usage iter=1 "
+            "input=500 cache_create=0 cache_read=0 output=50 "
+            "model=claude-haiku-4-5 caller=code_queue.classify",
+            f"{old_day} 09:00:00 [INFO] cora.llm_usage -- claude usage iter=1 "
+            "input=999999 cache_create=0 cache_read=0 output=999 "
+            "model=claude-haiku-4-5 caller=code_queue.classify",
+        ])
+        b = chr_mod.recent_billing(1)
+        # Bot bucket: cora-{today} is the lexically-last file -> its 1 line.
+        assert b["usage_lines"] == 1
+        # Script bucket: exactly the ONE in-window caller line; the stale-dated
+        # line inside the mtime-admitted file is excluded.
+        assert b["script_lines"] == 1
+        assert b["script_usage"]["code_queue.classify"]["input"] == 500
 
 
 class TestD047Purity:

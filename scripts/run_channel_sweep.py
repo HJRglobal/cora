@@ -42,10 +42,20 @@ load_dotenv()
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+# Dated FileHandler added + full-date asctime (D-051 2026-08-01 finding 4):
+# scheduled-task stdout vanishes with its window, so console-only logging made
+# the per-user Haiku synthesis usage lines invisible to the billing fold.
+_LOG_DIR = _REPO_ROOT / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(
+            _LOG_DIR / f"channel-sweep-{date.today().isoformat()}.log",
+            encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("channel_sweep")
 

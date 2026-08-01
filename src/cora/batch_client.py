@@ -17,11 +17,17 @@ That bound is logged loudly. There is no persistent batch ledger, so a batch
 "completing after the fallback ran" can never double-DELIVER -- only
 double-spend, bounded to one batch's worth, on the rare deadline path.
 
-At-rest surface (D-051 concern #4): batch payloads/results live on Anthropic's
-side for up to 29 days, retrievable with the org API key -- the same trust
-boundary as the sync calls these legs already make. LOCALLY this module never
-writes payloads or response content anywhere: log lines carry only ids,
-counts, statuses and token usage (test-pinned).
+At-rest surface (D-051 concern #4, wording corrected by the 2026-08-01
+review): batch payloads/results live on Anthropic's side for up to 29 days,
+enumerable and downloadable with the org API key. That is a REAL delta vs the
+sync Messages API, which offers no retrieval of past traffic -- under key
+compromise, batched requests/outputs are exposed where sync ones would not
+be. Accepted for the piloted legs BECAUSE the callers keep PHI off this
+transport: session_capture excludes PHI-flagged transcripts from its batch
+and the LEX synthesis leg is pinned to sync (allow_batch=False). Consumers
+adding new legs must apply the same screen. LOCALLY this module never writes
+payloads or response content anywhere: log lines carry only ids, counts,
+statuses and token usage (test-pinned).
 
 Standalone by design (D-047): imports anthropic + cora.llm_usage + stdlib
 only, so channel_synthesis / session_capture / strategy_memo may import it

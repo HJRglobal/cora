@@ -914,16 +914,29 @@ def _batch_distill(pending: list[tuple[ParsedSession, str, str]]) -> dict[str, A
         deadline = float(os.environ.get("CORA_BATCH_CAPTURE_DEADLINE_S", "900"))
         keys: list[tuple[str, str]] = []  # (ledger_key, default_entity)
         requests: list[dict] = []
+        skipped_phi = 0
         for session, _surface, ledger_key in pending:
-            phi = phi_guard.is_phi_risk(session.text)
+            # PHI posture (D-051 2026-08-01 finding 2): a PHI-flagged
+            # transcript stays on the SYNC distill (omit from the batch -> the
+            # finalize loop distills it inline). Batch results are retrievable
+            # Anthropic-side for 29 days by API key; PHI-bearing distills must
+            # not gain that at-rest copy.
+            if phi_guard.is_phi_risk(session.text):
+                skipped_phi += 1
+                continue
             default_entity = entity_from_cwd(session.cwd)
-            prompt = _build_distill_prompt(session.text, default_entity, phi=phi)
+            prompt = _build_distill_prompt(session.text, default_entity, phi=False)
             requests.append({
                 "custom_id": f"item-{len(keys)}",
                 "params": {"model": _HAIKU_MODEL, "max_tokens": 1500,
                            "messages": [{"role": "user", "content": prompt}]},
             })
             keys.append((ledger_key, default_entity))
+        if skipped_phi:
+            log.info("session_capture: %d PHI-flagged session(s) kept on the "
+                     "sync distill path (excluded from the batch)", skipped_phi)
+        if not requests:
+            return {}
         results = batch_client.batch_generate(
             requests, caller="session_capture", deadline_s=deadline)
     except Exception as exc:  # noqa: BLE001 -- belt: never worse than sync
