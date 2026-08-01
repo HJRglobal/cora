@@ -96,6 +96,20 @@ def test_prune_candidates_cover_all_bin_tables_plus_f32():
     assert "knowledge_vec_f32" in prune._CANDIDATE_VEC_TABLES
 
 
+def test_gmail_alias_purge_candidates_cover_all_bin_tables():
+    """purge_gmail_alias_dup_chunks keeps its own NAMED candidate list -- a
+    DELIBERATE exemption from the shared schema discovery: its dry-run must
+    import and run without cora/sqlite-vec (schema.py imports sqlite_vec at
+    module top; the script lazy-imports schema only under --apply). This pin
+    keeps that list a superset of the shared bin candidates so the exemption
+    can never drift when a new bin table (v3, ...) is added."""
+    gmail_alias_purge = importlib.import_module("purge_gmail_alias_dup_chunks")
+    assert set(schema.BIN_TABLE_CANDIDATES) <= set(
+        gmail_alias_purge._CANDIDATE_VEC_TABLES
+    )
+    assert "knowledge_vec_f32" in gmail_alias_purge._CANDIDATE_VEC_TABLES
+
+
 # ---------------------------------------------------------------------------
 # The pinned invariant: cascade set == store._bin_write_tables() + f32 + chunks
 # in every migration state.

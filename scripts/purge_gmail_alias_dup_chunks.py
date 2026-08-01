@@ -64,6 +64,12 @@ def _keep_rank(user_email: str, chunk_id: str) -> tuple:
 # discovery, which also matches vec0's internal shadow tables
 # (knowledge_vec_bin_chunks/_rowids/_info/...); deleting from those directly
 # corrupts the virtual table. Caught live by this script's first dry-run.
+# DELIBERATE exemption from schema.BIN_TABLE_CANDIDATES / vec_cascade_tables
+# (the shared discovery every other purge utility uses): dry-run must import
+# and run WITHOUT cora/sqlite-vec installed (schema.py imports sqlite_vec at
+# module top; this script lazy-imports schema only under --apply), and
+# _vec_tables() is printed on the dry-run path too. Drift is pinned instead by
+# tests/test_vec_cascade_v2.py::test_gmail_alias_purge_candidates_cover_all_bin_tables.
 _CANDIDATE_VEC_TABLES = (
     "knowledge_vec_bin",
     "knowledge_vec_bin_v2",

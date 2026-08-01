@@ -34,6 +34,10 @@ EMBEDDING_DIM = 1536  # text-embedding-3-small
 # and so the cascade keeps working after migrate_kb_partition_key.py
 # --drop-legacy removes knowledge_vec_bin. A pinned regression test
 # (tests/test_vec_cascade_v2.py) fails the suite if this list and store.py drift.
+# Discovery is NAMED-candidates-existence-checked -- NEVER a bare
+# LIKE 'knowledge_vec%' scan, which also matches vec0's internal shadow tables
+# (knowledge_vec_bin_chunks/_rowids/_info/...); deleting from those directly
+# corrupts the virtual table (2026-07-31 audit, proposed D-096).
 BIN_TABLE_CANDIDATES: tuple[str, ...] = ("knowledge_vec_bin", "knowledge_vec_bin_v2")
 
 
