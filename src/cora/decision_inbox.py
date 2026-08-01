@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -53,9 +54,15 @@ _INBOX_HEADER = """# Cora Decisions Inbox -- NON-CANON
 # Conservative LEX token match for content-level detection (the 65-row pass5
 # payload shape carries entity only as a "[HJRP]"-style description prefix, so
 # an entity-field check alone is blind). Word-bounded: "complex"/"flex" do not
-# match; "LEX", "lex-llc", "[LEX-LTS]", "Lexington" do. Erring toward exclusion
-# is the safe direction for this surface.
-_LEX_TOKEN_RE = re.compile(r"(?i)\blex(?:-[a-z0-9]+)?\b|\blexington\b")
+# match; "LEX", "lex-llc", "LEX_LLC", "[LEX-LTS]", "Lexington",
+# "LexingtonServices" do. D-051 (lex-subentity-token-blind): the distinctive
+# Lexington sub-entity codes (LBHS/LTS/LLA) are matched WITHOUT a LEX prefix
+# too -- a decision mined from a non-LEX-tagged chunk can reference the
+# program only by sub-entity code. "LLC" alone is deliberately NOT matched
+# (every HJR entity is an LLC). Erring toward exclusion is the safe direction
+# for this surface.
+_LEX_TOKEN_RE = re.compile(
+    r"(?i)\blex(?:[-_][a-z0-9]+)*\b|\blexington[a-z]*\b|\b(?:lbhs|lts|lla)\b")
 
 _ENTITY_PREFIX_RE = re.compile(r"^\s*\[([A-Za-z0-9-]{2,12})\]")
 
@@ -167,17 +174,73 @@ def _uid_marker(uid: str) -> str:
     return f"<!-- decision-inbox-id: {uid} -->"
 
 
+# D-051 (cross-process-duplicate-inbox-filing): the bot tap and the scheduled
+# executor run in SEPARATE processes, so _INBOX_LOCK alone cannot serialize the
+# check-then-append idempotency section. A best-effort O_CREAT|O_EXCL lockfile
+# (the _acquire_run_lock pattern) closes the cross-process window; failure to
+# acquire returns a retryable refusal rather than risking a double-file.
+_XPROC_LOCK_STALE_S = 60.0
+_XPROC_LOCK_TIMEOUT_S = 3.0
+
+
+def _xproc_lock_path() -> Path:
+    return _ledger_path().parent / "decisions-inbox.lock"
+
+
+def _acquire_xproc_lock() -> bool:
+    lock = _xproc_lock_path()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _XPROC_LOCK_TIMEOUT_S
+    while True:
+        try:
+            age = time.time() - lock.stat().st_mtime
+            if age > _XPROC_LOCK_STALE_S:
+                log.warning("decision_inbox: clearing stale inbox lock (age %.0fs)", age)
+                lock.unlink()
+        except OSError:
+            pass
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        except OSError:
+            return False
+
+
+def _release_xproc_lock() -> None:
+    try:
+        _xproc_lock_path().unlink()
+    except OSError:
+        pass
+
+
 def apply_decision_accept(update: dict[str, Any],
                           *, via: str = "one_tap_button") -> tuple[bool, str]:
     """File an accepted decision into the NON-canon inbox. Returns (ok, summary).
-    Never raises.
+    Never raises (outer belt: ANY unexpected error -> retryable (False, ...)).
 
     * Re-screens LEX/PHI fail-closed (ok=False, summary starts "excluded:").
     * Idempotent by update_id (crash-recovery / double-path safe): a repeat call
       returns ok=True without duplicating. Write order is inbox-md FIRST then
       ledger; a crash between the two converges on retry because the md append
       is skipped when the uid marker is already present.
+    * Cross-process safe: the check-then-append runs under an O_EXCL lockfile
+      in addition to the in-process _INBOX_LOCK; a busy lock returns a
+      retryable (False, ...) -- callers leave the row PENDING and retry.
     """
+    try:
+        return _apply_decision_accept_inner(update, via=via)
+    except Exception as exc:  # noqa: BLE001 -- never-raises belt (D-051)
+        log.error("decision_inbox: unexpected apply error: %s", exc, exc_info=True)
+        return False, f"apply failed: {exc}"
+
+
+def _apply_decision_accept_inner(update: dict[str, Any],
+                                 *, via: str) -> tuple[bool, str]:
     uid = str((update or {}).get("update_id") or "").strip()
     if not uid:
         return False, "missing update_id"
@@ -200,8 +263,12 @@ def apply_decision_accept(update: dict[str, Any],
     now_iso = datetime.now(timezone.utc).isoformat()
     inbox = _inbox_path()
     ledger = _ledger_path()
+    got_lock = False
     try:
         with _INBOX_LOCK:
+            got_lock = _acquire_xproc_lock()
+            if not got_lock:
+                return False, "inbox busy (another process is filing) -- retry"
             if uid in _ledger_ids(ledger):
                 return True, "already filed (idempotent no-op)"
 
@@ -233,9 +300,15 @@ def apply_decision_accept(update: dict[str, Any],
                     "via": via,
                     "description": str((update or {}).get("description") or "")[:300],
                 }, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        log.error("decision_inbox: filing failed for %s: %s", uid[:12], exc)
+    except Exception as exc:  # noqa: BLE001 -- "never raises" must hold for ANY
+        # error here, not just OSError: a hand-edited non-UTF-8 inbox raises
+        # UnicodeDecodeError (a ValueError), which previously escaped (D-051).
+        log.error("decision_inbox: filing failed for %s: %s", uid[:12], exc,
+                  exc_info=True)
         return False, f"inbox write failed: {exc}"
+    finally:
+        if got_lock:
+            _release_xproc_lock()
 
     log.info("decision_inbox: FILED %s entity=%s via=%s", uid[:12], ent or "?", via)
     return True, f"filed to {inbox.name}" + (f" [{ent}]" if ent else "")
@@ -264,6 +337,16 @@ def inbox_stats(now: datetime | None = None, days: int = 7) -> dict[str, int]:
                         recent += 1
                 except ValueError:
                     pass
-    except OSError:
+    except Exception:  # noqa: BLE001 -- never-raises incl. decode errors (D-051)
         pass
     return {"total": total, "recent": recent}
+
+
+def filed_update_ids() -> set[str]:
+    """update_ids already filed to the inbox ledger. Consumed by the drain's
+    cross-process self-heal (a PENDING decision row whose id is filed had its
+    resolution clobbered by a concurrent ledger rewrite). Never raises."""
+    try:
+        return _ledger_ids(_ledger_path())
+    except Exception:  # noqa: BLE001
+        return set()

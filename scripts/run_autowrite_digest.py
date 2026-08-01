@@ -89,22 +89,26 @@ def build_digest(now_ts: float, days: int = 7) -> tuple[dict, list[dict]]:
 
 
 def _decisions_inbox_line(days: int = 7) -> str:
-    """One fail-soft context line about the Fork-4 decisions inbox (accepted
-    decision cards awaiting Cowork-cascade promotion). "" when empty or on any
-    error -- the digest must never fail because of the inbox."""
+    """One fail-soft context line about the Fork-4 decisions inbox. "" when
+    empty or on any error -- the digest must never fail because of the inbox.
+
+    Wording is LIFETIME counts (D-051 digest-awaiting-count-monotonic): the
+    ledger is append-only and the Cowork cascade has no hook to mark rows
+    promoted, so claiming "N awaiting promotion" would overstate forever once
+    anything is promoted. The .md itself is the authoritative to-promote view."""
     try:
         from cora.decision_inbox import inbox_stats, _inbox_path
         s = inbox_stats(days=days)
         if not s.get("total"):
             return ""
-        return (f"\n:inbox_tray: _Decisions inbox: {s['total']} accepted "
-                f"({s['recent']} this week) awaiting cascade promotion -- "
+        return (f"\n:inbox_tray: _Decisions inbox: {s['total']} accepted all-time "
+                f"({s['recent']} in the last {days}d) -- review/promote from "
                 f"{_inbox_path().name}_")
     except Exception:  # noqa: BLE001
         return ""
 
 
-def deliver(stats: dict, items: list[dict]) -> bool:
+def deliver(stats: dict, items: list[dict], days: int = 7) -> bool:
     from slack_sdk import WebClient
 
     from cora import slack_egress
@@ -116,7 +120,7 @@ def deliver(stats: dict, items: list[dict]) -> bool:
     summary = (f"{fallback}\n_This week {stats['this_week']} · last week "
                f"{stats['prev_week']} · reverts this week {stats['reverts_this_week']} · "
                f"level={stats['level']}_")
-    summary += _decisions_inbox_line()
+    summary += _decisions_inbox_line(days=days)
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}] + blocks[1:]
     try:
         safe_fallback = slack_egress.sanitize_text(summary)
@@ -166,7 +170,7 @@ def main() -> int:
         if line:
             log.info("[DRY RUN]%s", line.strip())
         return 0
-    ok = deliver(stats, items)
+    ok = deliver(stats, items, days=args.days)
     return 0 if ok else 2
 
 

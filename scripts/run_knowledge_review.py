@@ -271,19 +271,35 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             # the decisions inbox -- instead of the old "add to memory/decisions.md"
             # advisory post (which implied a canon write nothing performed).
             # Promotion into decisions.md stays the Cowork cascade (D-011).
+            # APPLY-FIRST-THEN-RESOLVE (D-051 emoji-resolve-before-apply): the
+            # Step-1 loop deliberately did NOT resolve this row; this branch
+            # resolves APPROVED only after the durable filing succeeds. A
+            # deterministic LEX/PHI refusal dismisses (parity with the tap
+            # path); any transient failure (I/O, lock busy, screen_error)
+            # leaves the row PENDING so the next run's correlate retries.
             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
             from cora.decision_inbox import apply_decision_accept
             ok, summary = apply_decision_accept(update, via="emoji_reaction")
             if ok:
+                resolve_update(update.get("update_id", ""), "APPROVED",
+                               reason="emoji_reaction")
                 msg = (
                     f":inbox_tray: *Gap executor* `[{uid_short}]` decision filed to the "
                     f"non-canon inbox ({summary}):\n> {desc[:300]}"
                 )
                 log.info("gap-executor: decision filed to inbox uid=%s", uid_short)
+            elif summary.startswith("excluded:") and "screen_error" not in summary:
+                resolve_update(update.get("update_id", ""), "DISMISSED",
+                               reason="lex_phi_excluded")
+                success = False
+                msg = (f":no_entry_sign: *Gap executor* `[{uid_short}]` decision "
+                       f"withheld -- LEX/PHI hard-exclusion (fail-closed). Dismissed.")
+                log.warning("gap-executor: decision excluded uid=%s: %s",
+                            uid_short, summary)
             else:
                 success = False
                 msg = (f":warning: *Gap executor* `[{uid_short}]` decision inbox filing "
-                       f"failed: {summary}")
+                       f"failed: {summary}. Left pending -- will retry next run.")
                 log.warning("gap-executor: decision inbox failed uid=%s: %s",
                             uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
@@ -455,6 +471,55 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
         except Exception:
             pass
     return n
+
+
+# Fork 4 D-051 (step0-rmw-zombie / clobbered-tap): a PENDING decision row DM'd
+# this long ago with no action is RE-CARDED (dm_message_ts cleared -> a fresh
+# card renders next run). Decisions never expire; without this, a row whose
+# tap resolution was clobbered by a concurrent whole-ledger rewrite -- or one
+# simply buried in Harrison's DM scroll -- would sit PENDING and invisible
+# forever (knowledge rows had the 14d backstop; decisions deliberately don't).
+_DECISION_RECARD_DAYS = 14
+
+
+def _self_heal_decisions(entries: list, filed_ids: set, now_dt) -> tuple[int, int]:
+    """Fork 4 cross-process belts, in place over the loaded ledger (runs inside
+    Step 0's lock+rewrite):
+
+    (a) SELF-HEAL: a PENDING decision row whose update_id already appears in
+        the decisions-inbox ledger WAS durably filed -- its APPROVED resolution
+        was lost to a concurrent whole-ledger rewrite (bot tap racing this
+        script's Step 0 / _patch_dm_ts read-modify-write; the two processes
+        hold different in-process locks). Re-resolve it APPROVED.
+    (b) RE-CARD: a PENDING decision row DM'd > _DECISION_RECARD_DAYS ago with
+        no action gets dm_message_ts cleared so a FRESH card renders -- the
+        never-expire guarantee stays visibility, not a zombie state.
+
+    Returns (healed, recarded)."""
+    healed = recarded = 0
+    for e in entries:
+        if e.get("update_type") != _kr_UPDATE_TYPE_DECISION:
+            continue
+        if e.get("state") != "PENDING":
+            continue
+        if e.get("update_id") in filed_ids:
+            e["state"] = "APPROVED"
+            e["resolved_at"] = now_dt.isoformat()
+            e["resolved_reason"] = "self_heal_inbox_filed"
+            healed += 1
+            continue
+        ts = str(e.get("dm_message_ts") or "").strip()
+        if not ts:
+            continue
+        try:
+            age_days = (now_dt.timestamp() - float(ts)) / 86400.0
+        except (ValueError, TypeError):
+            continue  # unparseable ts -> leave alone (fail-safe)
+        if age_days > _DECISION_RECARD_DAYS:
+            e["dm_message_ts"] = ""
+            e["dm_channel_id"] = ""
+            recarded += 1
+    return healed, recarded
 
 
 def _routing_floor() -> str:
@@ -743,12 +808,21 @@ def _screen_and_send_decision_cards(
 
     renderable: list[dict] = []
     excluded = 0
+    skipped_err = 0
     for u in items:
         try:
             bad, reason = screen_decision(u)
         except Exception:  # noqa: BLE001 -- screen_decision is documented
             bad, reason = True, "screen_error"  # never-raise; belt anyway
         if bad:
+            if reason == "screen_error":
+                # D-051 (screen-error-terminal-mass-dismiss): a TRANSIENT screen
+                # failure must never terminally DISMISS the pool (one bad
+                # phi_guard import run would otherwise wipe every PENDING
+                # decision unrecoverably). Fail closed on RENDERING only: skip
+                # this run, leave the row PENDING for the next.
+                skipped_err += 1
+                continue
             resolve_update(u["update_id"], "DISMISSED",
                            reason=f"lex_phi_excluded:{reason}")
             excluded += 1
@@ -756,6 +830,9 @@ def _screen_and_send_decision_cards(
                      str(u.get("update_id", "?"))[:12], reason)
             continue
         renderable.append(u)
+    if skipped_err:
+        log.warning("decision-cards: %d row(s) skipped on screen_error (left "
+                    "PENDING; will retry next run)", skipped_err)
 
     renderable.sort(key=lambda u: (0 if u.get("confidence") == "HIGH" else 1,
                                    u.get("proposed_at", "")))
@@ -954,6 +1031,19 @@ def main() -> int:
                 unrouted_cutoff = now - _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS)
                 expired_unrouted = _auto_expire_unrouted_operational(
                     entries, unrouted_cutoff, now)
+                # Fork 4 cross-process belts: heal filed-but-unresolved decision
+                # rows + re-card stale DM'd ones (same lock, same rewrite).
+                _filed_ids: set = set()
+                try:
+                    from cora.decision_inbox import filed_update_ids
+                    _filed_ids = filed_update_ids()
+                except Exception:  # noqa: BLE001 -- heal is best-effort
+                    _filed_ids = set()
+                healed, recarded = _self_heal_decisions(entries, _filed_ids, now)
+                if healed or recarded:
+                    log.info("Decision self-heal: %d filed-row(s) re-resolved "
+                             "APPROVED, %d stale card(s) queued for re-send",
+                             healed, recarded)
                 # atomic — no partial-write window; malformed lines kept verbatim.
                 _write_entries_atomic(_PROPOSED_UPDATES_PATH, entries, raw_lines=malformed)
         if auto_dismissed:
@@ -993,11 +1083,24 @@ def main() -> int:
             "Resolving update_id=%s (%s) -> %s",
             uid[:8], update.get("update_type"), action,
         )
-        if not args.dry_run:
+        # D-051 (emoji-resolve-before-apply): an APPROVED decision_capture is
+        # NOT resolved here -- its durable inbox filing resolves it inside
+        # _execute_approved_update (apply-first-then-resolve, mirroring
+        # process_decision_tap). Resolving first would strand the decision
+        # APPROVED-but-never-filed on a crash or transient filing failure, and
+        # with no TTL + dm_ts set nothing would ever retry it. A dry run also
+        # skips EXECUTING decisions (the decision branch has a durable write +
+        # its own resolve, unlike the advisory branches).
+        defer = (action == "APPROVED"
+                 and update.get("update_type") == _kr_UPDATE_TYPE_DECISION)
+        if not args.dry_run and not defer:
             resolve_update(uid, action)
 
         if action == "APPROVED":
-            approved_updates.append(update)
+            if defer and args.dry_run:
+                log.info("[DRY RUN] would file decision %s to the inbox", uid[:8])
+            else:
+                approved_updates.append(update)
         elif action == "DISMISSED":
             dismissed_updates.append(update)
             if not args.dry_run:

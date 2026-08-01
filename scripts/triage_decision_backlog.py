@@ -12,17 +12,20 @@ left behind (the kickoff's "existing 63"):
     --stale-days (default 14) and never DM'd -- with
     resolved_reason="fork4_backfill_stale". The recent remainder stays PENDING
     and rides the new card lane at 5/run.
-  * --apply --rearm: additionally flip BACK to PENDING any live decision row
+  * --apply --rearm: additionally flip BACK to PENDING any decision row
     AUTO-dismissed (expired_unrouted / auto_expired_dmd_unreacted) within
     --rearm-days (default 7) -- recovers rows the old TTL killed between the
-    Fork-4 kickoff and this merge. Harrison-resolved rows (one-tap, emoji,
-    routed_to_owner, bulk-triage) are NEVER re-armed, and a row that fails the
-    LEX/PHI screen is never re-armed (it could only be excluded at the drain).
+    Fork-4 kickoff and this merge. Scans BOTH the live ledger AND the archive
+    (rotate_resolved moves dismissed rows to the archive after ~3 days, so the
+    archive holds most of the window -- D-051); archive rows are moved back to
+    the live ledger. Harrison-resolved rows (one-tap, emoji, routed_to_owner,
+    bulk-triage) are NEVER re-armed, and a row that fails the LEX/PHI screen
+    is never re-armed (it could only be excluded at the drain).
 
 Safety rails (mirrors expire_stale_operational_updates.py): dry-run default;
-fingerprint-abort if the ledger changes between load and rewrite; timestamped
-.bak before any write; manifest to logs/ on every run; malformed ledger lines
-preserved verbatim; the archive is READ-ONLY.
+fingerprint-abort if the ledger (or archive) changes between load and rewrite;
+timestamped .bak of every file before writing it; manifest to logs/ on every
+run; malformed ledger lines preserved verbatim.
 
 Usage:
     .venv\Scripts\python.exe scripts\triage_decision_backlog.py
@@ -153,7 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger", type=Path, default=_LEDGER_PATH,
                         help="Path to the proposed-updates ledger.")
     parser.add_argument("--archive", type=Path, default=_ARCHIVE_PATH,
-                        help="Path to the archive ledger (READ-ONLY census).")
+                        help="Path to the archive ledger (census; --rearm also "
+                             "moves rearmable rows back to the live ledger).")
     parser.add_argument("--manifest-dir", type=Path, default=_MANIFEST_DIR,
                         help="Directory to write the audit manifest into.")
     parser.add_argument("--apply", action="store_true",
@@ -201,23 +205,42 @@ def main(argv: list[str] | None = None) -> int:
         elif skip_why:
             rearm_skipped[skip_why] += 1
 
-    # Archive census (READ-ONLY -- the stale majority the kickoff lets go).
+    # Archive: census + (with --rearm) rearmable-row scan. D-051
+    # (rearm-window-defeated-by-3d-archive-rotation): rotate_resolved moves
+    # DISMISSED rows to the archive after ~3 days on every daily run, so a
+    # live-ledger-only re-arm silently misses most of its 7-day window -- the
+    # archive MUST be scanned too. Archive rows re-armed on --apply are moved
+    # back to the live ledger (archive gets its own .bak + fingerprint abort).
     archive_counts: Counter = Counter()
+    archive_records: list[dict] = []
+    archive_rearm: list[dict] = []
+    try:
+        archive_fp = (args.archive.stat().st_mtime, args.archive.stat().st_size)
+    except OSError:
+        archive_fp = None
     if args.archive.exists():
         try:
-            with args.archive.open(encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if rec.get("update_type") == _TYPE:
-                        archive_counts[rec.get("state", "?")] += 1
+            archive_records = _load_records(args.archive)
         except OSError:
             archive_counts["(unreadable)"] += 1
+            archive_records = []
+        for rec in archive_records:
+            if rec.get("__raw__") is not None:
+                continue
+            if rec.get("update_type") == _TYPE:
+                archive_counts[rec.get("state", "?")] += 1
+        if args.rearm:
+            live_uids = {r.get("update_id") for r in decisions}
+            for rec in archive_records:
+                if rec.get("__raw__") is not None:
+                    continue
+                if rec.get("update_id") in live_uids:
+                    continue  # a live copy exists -- never resurrect a duplicate
+                ok, skip_why = _is_rearmable(rec, rearm_cutoff)
+                if ok:
+                    archive_rearm.append(rec)
+                elif skip_why:
+                    rearm_skipped[skip_why] += 1
 
     # ── Manifest (always, even on dry-run) ───────────────────────────────────
     args.manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         "keep_pending_total": len(keep_pending),
         "rearm_total": len(rearm_rows),
         "rearm_update_ids": [r.get("update_id", "?") for r in rearm_rows],
+        "rearm_from_archive_total": len(archive_rearm),
+        "rearm_from_archive_ids": [r.get("update_id", "?") for r in archive_rearm],
         "rearm_skipped": dict(rearm_skipped),
         "archive_decision_counts": dict(archive_counts),
         "resolved_reason": _STALE_REASON,
@@ -264,10 +289,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"WOULD KEEP PENDING (ride the new card lane): {len(keep_pending)}")
     if args.rearm:
         print(f"WOULD RE-ARM (auto-expired within {args.rearm_days}d, screen-clean): "
-              f"{len(rearm_rows)}")
+              f"{len(rearm_rows)} live + {len(archive_rearm)} from the archive")
         if rearm_skipped:
             print(f"   re-arm skipped (LEX/PHI screen / errors): {dict(rearm_skipped)}")
-    print(f"Archive (READ-ONLY, the stale majority): {dict(archive_counts)}")
+    print(f"Archive (the stale majority; touched only to extract --rearm rows): "
+          f"{dict(archive_counts)}")
     print(f"\nManifest written: {manifest_path}")
 
     if not args.apply:
@@ -275,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
               + (" --rearm" if args.rearm else "") + " to execute.")
         return 0
 
-    if not to_dismiss and not (args.rearm and rearm_rows):
+    if not to_dismiss and not (args.rearm and (rearm_rows or archive_rearm)):
         print("\nNothing to change -- ledger unchanged.")
         return 0
 
@@ -321,8 +347,53 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     tmp.replace(ledger)
 
+    # ── Archive re-arm (D-051: rotated rows are most of the rearm window) ────
+    # Order is crash-safe: append the re-armed rows to the LIVE ledger FIRST,
+    # then rewrite the archive without them. A crash between the two leaves the
+    # row in BOTH files -- the live PENDING copy is authoritative (get_pending
+    # reads live only; propose-dedup unions both, unchanged either way).
+    n_rearmed_archive = 0
+    if args.rearm and archive_rearm:
+        try:
+            arch_fp_now = (args.archive.stat().st_mtime, args.archive.stat().st_size)
+        except OSError:
+            arch_fp_now = None
+        if archive_fp is None or arch_fp_now != archive_fp:
+            print("\nWARNING: the archive changed since it was loaded -- skipping the "
+                  "archive re-arm leg (live-ledger changes above already applied). "
+                  "Re-run --apply --rearm to retry it.")
+        else:
+            arch_bak = args.archive.with_name(args.archive.name + f".bak-{stamp}")
+            shutil.copy2(args.archive, arch_bak)
+            print(f"Archive backup written: {arch_bak}")
+            rearm_arch_ids = {r.get("update_id") for r in archive_rearm}
+            with ledger.open("a", encoding="utf-8") as fh:
+                for rec in archive_rearm:
+                    rec = dict(rec)
+                    rec["state"] = "PENDING"
+                    rec["resolved_at"] = None
+                    rec.pop("resolved_reason", None)
+                    rec["dm_message_ts"] = ""
+                    rec["dm_channel_id"] = ""
+                    rec["rearmed_at"] = now_iso
+                    rec["rearm_reason"] = _REARM_MARK
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    n_rearmed_archive += 1
+            tmp2 = args.archive.with_suffix(args.archive.suffix + ".tmp")
+            with tmp2.open("w", encoding="utf-8") as fh:
+                for rec in archive_records:
+                    if rec.get("__raw__") is not None:
+                        fh.write(rec["__raw__"] + "\n")
+                        continue
+                    if (rec.get("update_id") in rearm_arch_ids
+                            and _is_rearmable(rec, rearm_cutoff)[0]):
+                        continue  # moved to the live ledger above
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            tmp2.replace(args.archive)
+
     print(f"APPLIED: dismissed {n_dismissed} stale row(s); re-armed {n_rearmed} "
-          f"row(s). Backup at {bak_path.name}.")
+          f"live row(s) + {n_rearmed_archive} from the archive. "
+          f"Backup at {bak_path.name}.")
     print(f"To revert: restore {bak_path.name} over {ledger.name}.")
     return 0
 

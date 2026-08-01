@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -101,6 +102,25 @@ class TestScreenDecision:
 
     def test_complex_and_flex_do_not_false_positive(self):
         u = _decision(desc="Decision: the complex flex-schedule rollout is approved.")
+        assert di.screen_decision(u) == (False, "")
+
+    # D-051 remediation (lex-subentity-token-blind): bare sub-entity codes and
+    # underscore/concatenated LEX forms are excluded too.
+    def test_bare_subentity_codes_excluded(self):
+        for txt in ("We decided to move the client into the LBHS Mesa house.",
+                    "Decision: LTS scheduling moves to Thursdays.",
+                    "Decision: the LLA program audit is approved."):
+            excluded, reason = di.screen_decision(_decision(desc=txt))
+            assert excluded is True and reason == "lex_token", txt
+
+    def test_underscore_and_concatenated_lex_forms_excluded(self):
+        for txt in ("Decision recorded in LEX_LLC_Contract.pdf",
+                    "Decision: LexingtonServices billing moves in-house."):
+            assert di.screen_decision(_decision(desc=txt))[0] is True, txt
+
+    def test_plain_llc_alone_not_excluded(self):
+        # Every HJR entity is an LLC -- the bare word must not false-positive.
+        u = _decision(desc="Decision: the F3E LLC operating agreement is signed.")
         assert di.screen_decision(u) == (False, "")
 
     def test_phi_text_excluded(self):
@@ -568,8 +588,11 @@ class TestDigestLine:
         import scripts.run_autowrite_digest as rad
         di.apply_decision_accept(_decision(uid="dg1"))
         line = rad._decisions_inbox_line()
-        assert "1 accepted" in line and "(1 this week)" in line
-        assert "decisions-inbox.md" in line and "cascade" in line
+        # D-051 (digest-awaiting-count-monotonic): LIFETIME wording -- the line
+        # must NOT claim an "awaiting promotion" backlog it cannot track.
+        assert "1 accepted all-time" in line and "(1 in the last 7d)" in line
+        assert "decisions-inbox.md" in line
+        assert "awaiting" not in line.lower()
 
     def test_line_fail_soft(self, inbox_env, monkeypatch):
         import scripts.run_autowrite_digest as rad
@@ -600,6 +623,232 @@ class TestDigestLine:
         monkeypatch.setattr("sys.argv", ["run_autowrite_digest.py"])
         assert rad.main() == 0
         sent.assert_not_called()
+
+
+# ── D-051 remediation (2026-08-01 review) ────────────────────────────────────
+
+class TestScreenErrorNotTerminal:
+    """D-051 screen-error-terminal-mass-dismiss: a transient screening failure
+    must never DISMISS the pool -- rows stay PENDING and retry."""
+
+    def test_drain_skips_pool_on_screen_error(self, monkeypatch):
+        import logging
+        monkeypatch.setattr(di, "screen_decision",
+                            lambda u: (True, "screen_error"))
+        resolved = MagicMock()
+        monkeypatch.setattr(rkr, "resolve_update", resolved)
+        sent = MagicMock(return_value={})
+        monkeypatch.setattr(rkr, "send_individual_dms", sent)
+        monkeypatch.setattr(rkr, "send_dm_to_harrison", MagicMock())
+        n_sent, n_excluded = rkr._screen_and_send_decision_cards(
+            [_decision(uid=f"d{i}") for i in range(4)], "xoxb-test",
+            logging.getLogger("t"))
+        resolved.assert_not_called()   # nothing dismissed
+        sent.assert_not_called()       # nothing rendered either (fail closed)
+        assert n_sent == 0 and n_excluded == 0
+
+    def test_tap_screen_error_leaves_pending(self, tmp_path, monkeypatch, inbox_env):
+        p = tmp_path / "u.jsonl"
+        p.write_text(json.dumps(_decision()) + "\n", encoding="utf-8")
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", p)
+        kr._SEEN_IDS_CACHE = None
+        kr._ARCHIVE_IDS_CACHE = None
+        monkeypatch.setattr(di, "screen_decision", lambda u: (True, "screen_error"))
+        outcome, _ = kr.process_decision_tap(
+            "dec-1", kr.HARRISON_SLACK_USER_ID, approve=True)
+        assert outcome == "apply_failed"  # NOT excluded/dismissed
+        row = json.loads(p.read_text(encoding="utf-8").splitlines()[0])
+        assert row["state"] == "PENDING"
+
+    def test_deterministic_exclusion_still_dismisses(self, tmp_path, monkeypatch,
+                                                     inbox_env):
+        p = tmp_path / "u.jsonl"
+        p.write_text(json.dumps(_decision(payload={"entity": "LEX-LLC"})) + "\n",
+                     encoding="utf-8")
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", p)
+        kr._SEEN_IDS_CACHE = None
+        kr._ARCHIVE_IDS_CACHE = None
+        outcome, _ = kr.process_decision_tap(
+            "dec-1", kr.HARRISON_SLACK_USER_ID, approve=True)
+        assert outcome == "excluded"
+        row = json.loads(p.read_text(encoding="utf-8").splitlines()[0])
+        assert row["state"] == "DISMISSED"
+
+
+class TestEmojiApplyFirstThenResolve:
+    """D-051 emoji-resolve-before-apply (HIGH): the scheduled path must not
+    strand an APPROVED-but-never-filed decision."""
+
+    def _executor(self, update, monkeypatch, inbox_env):
+        import logging
+        monkeypatch.setattr(rkr, "_post_to_slack", lambda *a: None)
+        resolved = MagicMock(return_value=True)
+        monkeypatch.setattr(rkr, "resolve_update", resolved)
+        ok = rkr._execute_approved_update(update, "xoxb-test",
+                                          logging.getLogger("t"))
+        return ok, resolved
+
+    def test_executor_resolves_approved_only_on_success(self, monkeypatch, inbox_env):
+        ok, resolved = self._executor(_decision(), monkeypatch, inbox_env)
+        assert ok is True
+        resolved.assert_called_once()
+        assert resolved.call_args.args[1] == "APPROVED"
+        assert resolved.call_args.kwargs["reason"] == "emoji_reaction"
+
+    def test_executor_transient_failure_leaves_pending(self, monkeypatch, inbox_env):
+        monkeypatch.setattr(di, "apply_decision_accept",
+                            lambda u, via="": (False, "inbox write failed: disk"))
+        ok, resolved = self._executor(_decision(), monkeypatch, inbox_env)
+        assert ok is False
+        resolved.assert_not_called()  # left PENDING -> correlate retries
+
+    def test_executor_excluded_dismisses(self, monkeypatch, inbox_env):
+        ok, resolved = self._executor(
+            _decision(payload={"entity": "LEX-LLC"}), monkeypatch, inbox_env)
+        assert ok is False
+        resolved.assert_called_once()
+        assert resolved.call_args.args[1] == "DISMISSED"
+        assert resolved.call_args.kwargs["reason"] == "lex_phi_excluded"
+
+    def test_main_defers_resolve_for_approved_decisions(self, tmp_path, monkeypatch,
+                                                        inbox_env):
+        """E2E: emoji-APPROVED decision -> row APPROVED only AFTER a successful
+        filing; on filing failure the row stays PENDING."""
+        inbox, _ = inbox_env
+        row = _decision(uid="em1", dm_message_ts="111.222")
+        (tmp_path / "proposed.jsonl").write_text(
+            json.dumps(row) + "\n", encoding="utf-8")
+        (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+        monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+        monkeypatch.setattr(kr, "_ARCHIVE_PATH", tmp_path / "archive.jsonl")
+        kr._SEEN_IDS_CACHE = None
+        kr._ARCHIVE_IDS_CACHE = None
+        monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+        monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+        monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+        reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "111.222"}
+        monkeypatch.setattr(rkr, "correlate_reactions_to_updates",
+                            lambda: [(row, reaction)])
+        monkeypatch.setattr(rkr, "_post_to_slack", lambda *a: None)
+        monkeypatch.setattr(rkr, "_ack_correlated_reaction", MagicMock())
+        monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+        monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+        monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+
+        monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+        rkr.main()
+
+        after = json.loads((tmp_path / "proposed.jsonl").read_text(
+            encoding="utf-8").splitlines()[0])
+        assert after["state"] == "APPROVED"
+        assert after["resolved_reason"] == "emoji_reaction"
+        assert inbox.exists() and "em1" in inbox.read_text(encoding="utf-8")
+
+    def test_main_failed_filing_stays_pending(self, tmp_path, monkeypatch, inbox_env):
+        row = _decision(uid="em2", dm_message_ts="111.333")
+        (tmp_path / "proposed.jsonl").write_text(
+            json.dumps(row) + "\n", encoding="utf-8")
+        (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+        monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+        monkeypatch.setattr(kr, "_ARCHIVE_PATH", tmp_path / "archive.jsonl")
+        kr._SEEN_IDS_CACHE = None
+        kr._ARCHIVE_IDS_CACHE = None
+        monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+        monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+        monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+        reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "111.333"}
+        monkeypatch.setattr(rkr, "correlate_reactions_to_updates",
+                            lambda: [(row, reaction)])
+        monkeypatch.setattr(di, "apply_decision_accept",
+                            lambda u, via="": (False, "inbox write failed: disk"))
+        monkeypatch.setattr(rkr, "_post_to_slack", lambda *a: None)
+        monkeypatch.setattr(rkr, "_ack_correlated_reaction", MagicMock())
+        monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+        monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+        monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+
+        monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+        rkr.main()
+
+        after = json.loads((tmp_path / "proposed.jsonl").read_text(
+            encoding="utf-8").splitlines()[0])
+        assert after["state"] == "PENDING"  # retried at the next run
+
+
+class TestSelfHealAndRecard:
+    """D-051 step0-rmw-zombie: filed-but-unresolved rows re-resolve APPROVED;
+    stale DM'd PENDING cards re-card instead of rotting invisibly."""
+
+    def test_self_heal_and_recard(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        old_ts = f"{(now - timedelta(days=20)).timestamp():.6f}"
+        fresh_ts = f"{(now - timedelta(days=5)).timestamp():.6f}"
+        entries = [
+            _decision(uid="filed", dm_message_ts=old_ts),          # -> healed
+            _decision(uid="stale-card", dm_message_ts=old_ts),     # -> re-carded
+            _decision(uid="fresh-card", dm_message_ts=fresh_ts),   # untouched
+            _decision(uid="no-dm"),                                # untouched
+            _decision(uid="bad-ts", dm_message_ts="not-a-ts"),     # untouched
+            {"update_id": "kn", "update_type": "known_answer",
+             "state": "PENDING", "dm_message_ts": old_ts},         # not our lane
+        ]
+        healed, recarded = rkr._self_heal_decisions(entries, {"filed"}, now)
+        assert healed == 1 and recarded == 1
+        assert entries[0]["state"] == "APPROVED"
+        assert entries[0]["resolved_reason"] == "self_heal_inbox_filed"
+        assert entries[1]["state"] == "PENDING"
+        assert entries[1]["dm_message_ts"] == ""     # rejoins the unsent pool
+        assert entries[2]["dm_message_ts"] == fresh_ts
+        assert entries[3]["state"] == "PENDING"
+        assert entries[4]["dm_message_ts"] == "not-a-ts"
+        assert entries[5]["dm_message_ts"] == old_ts  # knowledge lane untouched
+
+    def test_filed_update_ids_never_raises(self, inbox_env):
+        assert di.filed_update_ids() == set()
+        di.apply_decision_accept(_decision(uid="fid"))
+        assert "fid" in di.filed_update_ids()
+
+
+class TestCrossProcessLockAndNeverRaises:
+    """D-051 cross-process-duplicate-inbox-filing + apply-accept-raises."""
+
+    def test_busy_lock_returns_retryable(self, inbox_env, monkeypatch):
+        monkeypatch.setattr(di, "_XPROC_LOCK_TIMEOUT_S", 0.2)
+        lock = di._xproc_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("held", encoding="utf-8")
+        try:
+            ok, summary = di.apply_decision_accept(_decision(uid="locked"))
+        finally:
+            lock.unlink()
+        assert ok is False and "busy" in summary
+        assert "locked" not in di.filed_update_ids()
+
+    def test_stale_lock_cleared_and_apply_proceeds(self, inbox_env, monkeypatch):
+        import os as _os
+        lock = di._xproc_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("stale", encoding="utf-8")
+        old = time.time() - 120
+        _os.utime(lock, (old, old))
+        ok, _ = di.apply_decision_accept(_decision(uid="after-stale"))
+        assert ok is True
+        assert not lock.exists()  # released after the filing
+
+    def test_non_utf8_inbox_never_raises(self, inbox_env):
+        inbox, _ = inbox_env
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_bytes(b"# header\x93smart quote\x94\n")  # cp1252 bytes
+        ok, summary = di.apply_decision_accept(_decision(uid="utf8"))
+        assert ok is False
+        assert "failed" in summary  # truthful, retryable -- no exception
 
 
 # ── source-level canon-boundary + wiring pins ────────────────────────────────

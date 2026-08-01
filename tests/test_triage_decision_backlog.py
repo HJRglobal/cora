@@ -136,6 +136,56 @@ class TestApply:
                 for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()}
         assert rows["auto"]["state"] == "DISMISSED"
 
+    def test_rearm_recovers_from_archive_too(self, tmp_path):
+        """D-051 (rearm-window-defeated-by-3d-archive-rotation): rotate_resolved
+        moves auto-dismissed rows to the archive after ~3d; --rearm must scan it
+        and move recoverable rows back to the live ledger."""
+        ledger = tmp_path / "ledger.jsonl"
+        archive = tmp_path / "archive.jsonl"
+        _write(ledger, [_row("live-old", days_ago=30)])  # something to apply
+        _write(archive, [
+            _row("arch-auto", days_ago=10, state="DISMISSED",
+                 resolved_reason="expired_unrouted", resolved_at=_iso(2)),
+            _row("arch-harrison", days_ago=10, state="DISMISSED",
+                 resolved_reason="one_tap_button", resolved_at=_iso(2)),
+            _row("arch-ancient", days_ago=60, state="DISMISSED",
+                 resolved_reason="expired_unrouted", resolved_at=_iso(30)),
+            _row("arch-lex", days_ago=10, state="DISMISSED",
+                 resolved_reason="expired_unrouted", resolved_at=_iso(2),
+                 desc="[LEX-LLC] Decision: schedule change."),
+        ])
+        rc = tdb.main(["--ledger", str(ledger), "--archive", str(archive),
+                       "--manifest-dir", str(tmp_path), "--apply", "--rearm"])
+        assert rc == 0
+        live = {json.loads(l)["update_id"]: json.loads(l)
+                for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()}
+        # the archived auto-expired row moved to live as PENDING
+        assert live["arch-auto"]["state"] == "PENDING"
+        assert live["arch-auto"]["rearm_reason"] == "fork4_backfill_rearm"
+        # ...and left the archive; the others stayed archived
+        arch = {json.loads(l)["update_id"]: json.loads(l)
+                for l in archive.read_text(encoding="utf-8").splitlines() if l.strip()}
+        assert "arch-auto" not in arch
+        for stay in ("arch-harrison", "arch-ancient", "arch-lex"):
+            assert arch[stay]["state"] == "DISMISSED", stay
+        assert list(tmp_path.glob("archive.jsonl.bak-*"))  # archive .bak taken
+
+    def test_archive_rearm_never_duplicates_live_uid(self, tmp_path):
+        ledger = tmp_path / "ledger.jsonl"
+        archive = tmp_path / "archive.jsonl"
+        _write(ledger, [_row("dup", days_ago=2),          # live PENDING copy
+                        _row("live-old", days_ago=30)])   # something to apply
+        _write(archive, [
+            _row("dup", days_ago=10, state="DISMISSED",
+                 resolved_reason="expired_unrouted", resolved_at=_iso(2)),
+        ])
+        rc = tdb.main(["--ledger", str(ledger), "--archive", str(archive),
+                       "--manifest-dir", str(tmp_path), "--apply", "--rearm"])
+        assert rc == 0
+        uids = [json.loads(l)["update_id"]
+                for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert uids.count("dup") == 1  # never resurrected alongside the live copy
+
     def test_nothing_to_do_leaves_ledger_untouched(self, tmp_path):
         ledger = tmp_path / "ledger.jsonl"
         _write(ledger, [_row("new", days_ago=1)])

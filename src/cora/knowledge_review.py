@@ -928,10 +928,12 @@ def process_decision_tap(
     apply_knowledge_update, so the autowrite path can never reach this type.
 
     Outcomes: not_authorized | not_found | already_resolved | accepted |
-    excluded | apply_failed | dismissed. A LEX/PHI re-screen refusal at apply
-    time DISMISSES the item (reason lex_phi_excluded) -- it should never have
-    rendered, and with no TTL on this lane an un-dismissable refused row would
-    sit PENDING forever."""
+    excluded | apply_failed | dismissed. A DETERMINISTIC LEX/PHI re-screen
+    refusal at apply time DISMISSES the item (reason lex_phi_excluded) -- it
+    should never have rendered, and with no TTL on this lane an un-dismissable
+    refused row would sit PENDING forever. A screen ERROR (transient: import/
+    env failure inside the screen) is NOT terminal -- the row stays PENDING and
+    the tap reports apply_failed (D-051 screen-error-terminal-mass-dismiss)."""
     if actor_id != HARRISON_SLACK_USER_ID:
         log.warning("knowledge_review: decision tap by non-Harrison %s ignored", actor_id)
         return "not_authorized", "Only Harrison can act on decision cards."
@@ -952,8 +954,11 @@ def process_decision_tap(
         from .decision_inbox import apply_decision_accept
         ok, summary = apply_decision_accept(update, via="one_tap_button")
         if not ok:
-            if summary.startswith("excluded:"):
-                # Fail-closed LEX/PHI wall tripped at the durable write.
+            if (summary.startswith("excluded:")
+                    and "screen_error" not in summary):
+                # Fail-closed LEX/PHI wall tripped DETERMINISTICALLY at the
+                # durable write. (A screen_error falls through to apply_failed
+                # below -- transient, retryable, never a terminal dismissal.)
                 resolve_update(update_id, "DISMISSED", reason="lex_phi_excluded")
                 log.warning("knowledge_review: decision %s excluded at apply (%s)",
                             update_id[:8], summary)
