@@ -58,9 +58,12 @@ HEARTBEAT_PATH = REPO_ROOT / "data" / "health" / "heartbeat.txt"
 PRUNE_SOURCES: tuple[str, ...] = ("gmail", "drive_sweep")
 
 # Vector tables that may hold a row per chunk. Only the ones that actually exist
-# in the DB are touched (knowledge_vec_i8 is forward-compat -- absent today).
+# in the DB are touched (knowledge_vec_i8 is forward-compat -- absent today;
+# knowledge_vec_bin_v2 is the ARMED partition-key index -- omitting it orphaned
+# vectors, 2026-07-31 audit).
 _CANDIDATE_VEC_TABLES: tuple[str, ...] = (
     "knowledge_vec_bin",
+    "knowledge_vec_bin_v2",
     "knowledge_vec_f32",
     "knowledge_vec_i8",
 )

@@ -20,6 +20,7 @@ Exit codes:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import re
@@ -27,7 +28,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -167,6 +168,111 @@ def _chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks
 
 
+_QUOTED_LINE_RE = re.compile(r"^\s*>")
+
+
+def _strip_quoted_lines(body: str) -> str:
+    """Drop '>'-quoted reply history from an email body before chunking.
+
+    Quoted copies of earlier thread messages re-embed the same text once per
+    reply — the near-duplicate class that crowds k-limited retrieval and
+    re-bills embeddings (2026-07-31 alias-dup audit). A message that is
+    ENTIRELY quoted history collapses to empty and is skipped by the existing
+    empty-body check. Precedent: friction_mining's quoted-reply skip.
+    """
+    lines = [ln for ln in (body or "").splitlines() if not _QUOTED_LINE_RE.match(ln)]
+    return "\n".join(lines).strip()
+
+
+def _body_fingerprint(body: str) -> str:
+    """Whitespace/case-normalized content hash for duplicate-delivery detection
+    WITHIN one thread (same body delivered twice under two message ids)."""
+    norm = re.sub(r"\s+", " ", (body or "")).strip().lower()
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest() if norm else ""
+
+
+def _canonical_mailbox(user_email: str) -> str:
+    """The physical mailbox address behind a roster entry, via users.getProfile.
+
+    Alias roster entries (harrison@f3energy.com, harrison@lexingtonservices.com)
+    resolve to the SAME underlying mailbox as the primary (harrison@hjrglobal.com)
+    — Gmail returns the canonical emailAddress regardless of which alias was
+    impersonated. Fail-soft: any error returns the entry's own email (the entry
+    stays swept; no mailbox ever goes dark because getProfile hiccuped).
+    """
+    try:
+        from cora.connectors.gmail_reader import _build_service
+        service = _build_service(user_email)
+        profile = service.users().getProfile(userId="me").execute()
+        addr = (profile or {}).get("emailAddress", "")
+        if addr:
+            return addr.lower()
+    except Exception as exc:  # noqa: BLE001 — never let dedup break the sweep
+        logging.getLogger("kb-sync-gmail").warning(
+            "getProfile failed for %s (%s) — treating as its own mailbox",
+            user_email, exc,
+        )
+    return user_email.lower()
+
+
+def _dedup_alias_accounts(
+    accounts: list[dict[str, Any]],
+    resolve: Callable[[str], str] = _canonical_mailbox,
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Collapse roster entries that resolve to the same physical Gmail mailbox.
+
+    THE alias-duplication root cause (2026-07-31 audit): the same mailbox
+    enrolled under 2-3 alias addresses was swept 2-3x per night, and
+    source_id embeds user_email, so replace-on-conflict could never fold the
+    copies — ~48% of the gmail partition was exact-duplicate rows.
+
+    Returns (kept_accounts, alias_map) where alias_map maps each kept entry's
+    email -> the skipped alias emails in its group. Preference within a group:
+    the entry whose roster email IS the canonical mailbox address; else the
+    first in roster order (stable across runs).
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for a in accounts:
+        email = (a.get("email") or "").lower()
+        if not email:
+            continue
+        canon = (resolve(email) or email).lower()
+        if canon not in groups:
+            groups[canon] = []
+            order.append(canon)
+        groups[canon].append(a)
+
+    kept: list[dict[str, Any]] = []
+    alias_map: dict[str, list[str]] = {}
+    for canon in order:
+        members = groups[canon]
+        primary = next(
+            (m for m in members if (m.get("email") or "").lower() == canon),
+            members[0],
+        )
+        kept.append(primary)
+        skipped = [m.get("email", "") for m in members if m is not primary]
+        if skipped:
+            alias_map[primary.get("email", "")] = skipped
+    return kept, alias_map
+
+
+def _group_watermark(
+    watermarks: dict[str, int],
+    primary_email: str,
+    alias_emails: list[str],
+    fallback_ts: int,
+) -> int:
+    """Effective watermark for a deduped mailbox = the freshest sweep across
+    ALL of its alias keys (any alias's past sweep covered the same mailbox).
+    Preserves continuity when the kept entry differs from past sweep keys."""
+    candidates = [watermarks.get(primary_email, 0)]
+    candidates += [watermarks.get(e, 0) for e in alias_emails]
+    best = max(candidates)
+    return best if best > 0 else fallback_ts
+
+
 def _order_accounts(
     accounts: list[dict[str, Any]],
     watermarks: dict[str, int],
@@ -298,6 +404,14 @@ def main() -> int:
         log.info("Account filter active: %d of requested %d accounts matched",
                  len(accounts), len(account_filter))
 
+    # Alias-mailbox collapse (2026-07-31 audit): sweep each PHYSICAL mailbox
+    # once per run, not once per roster alias. ~48% of the gmail partition was
+    # exact-duplicate rows from alias multi-sweep before this.
+    accounts, alias_map = _dedup_alias_accounts(accounts)
+    for primary, aliases in alias_map.items():
+        log.info("Alias collapse: sweeping %s once (skipping alias entries: %s)",
+                 primary, ", ".join(aliases))
+
     # Stale-first: process the most-neglected mailboxes first so that even if this
     # run is cut short by the Task Scheduler time limit, every account is reached
     # over successive runs (no account is permanently starved behind the wall).
@@ -320,7 +434,10 @@ def main() -> int:
         if not user_email:
             continue
 
-        watermark_ts = watermarks.get(user_email, fallback_ts)
+        # Freshest sweep across the mailbox's alias keys (a past sweep under
+        # any alias covered the same physical mailbox).
+        watermark_ts = _group_watermark(
+            watermarks, user_email, alias_map.get(user_email, []), fallback_ts)
         watermark_ts = _effective_since(watermark_ts, args.force_since_days, sync_start)
         log.info(
             "Sweeping %s (%s, entity_default=%s, since=%d)",
@@ -368,17 +485,31 @@ def main() -> int:
                 continue
 
             # Process each message as a Document
+            seen_body_fps: set[str] = set()  # duplicate-delivery guard, per thread
             for msg in messages:
                 subject = msg.get("subject", "(no subject)")
                 sender  = msg.get("sender", "")
                 recipients = msg.get("recipients", "")
                 date_ts = msg.get("date_ts", 0)
-                body_text = msg.get("body_text", "").strip()
+                # Quoted reply history is a copy of earlier messages, not new
+                # knowledge — strip before chunking/embedding.
+                body_text = _strip_quoted_lines(msg.get("body_text", ""))
                 att_names = msg.get("attachment_names", [])
 
                 if not body_text and not att_names:
-                    # Empty message (probably calendar invite or delivery notification)
+                    # Empty message (calendar invite, delivery notification, or
+                    # a reply that was ENTIRELY quoted history)
                     continue
+
+                # Same body delivered twice into one thread under two message
+                # ids (e.g. the RangeMe double-delivery class) — ingest once.
+                fp = _body_fingerprint(body_text)
+                if fp:
+                    if fp in seen_body_fps:
+                        log.debug("Duplicate delivery in thread %s — skipping message %s",
+                                  thread_id, msg.get("message_id", "?"))
+                        continue
+                    seen_body_fps.add(fp)
 
                 entity = _derive_entity(subject, sender, recipients, msg.get("label_ids", []), entity_default)
 

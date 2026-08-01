@@ -316,15 +316,42 @@ def select_drive_purge(
     return ids, included, skipped
 
 
+# Vec tables a purge must cascade to. A NAMED candidate list existence-checked
+# against the DB -- NEVER a bare LIKE 'knowledge_vec%' discovery, which also
+# matches vec0's internal shadow tables (knowledge_vec_bin_chunks/_rowids/
+# _info/...) and deleting from those corrupts the virtual table. bin_v2 is the
+# ARMED partition index the old 3-table cascade missed (2026-07-31 audit);
+# i8 is forward-compat.
+_CANDIDATE_VEC_TABLES: tuple[str, ...] = (
+    "knowledge_vec_bin",
+    "knowledge_vec_bin_v2",
+    "knowledge_vec_f32",
+    "knowledge_vec_i8",
+)
+
+
+def _existing_vec_tables(conn) -> list[str]:
+    """Subset of _CANDIDATE_VEC_TABLES that actually exist in this DB."""
+    present = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        ).fetchall()
+    }
+    return [t for t in _CANDIDATE_VEC_TABLES if t in present]
+
+
 def delete_chunks(conn, chunk_ids: list[str], cfg: ArchiveConfig | None = None) -> dict:
-    """Batched delete from all 3 tables (manual application-level cascade; there
-    is NO SQL FK). rw connection only. Commits once at the end."""
+    """Batched delete from knowledge_chunks + every vec table present (manual
+    application-level cascade; there is NO SQL FK). rw connection only.
+    Commits once at the end."""
     batch_size = cfg.batch if cfg is not None else _DEFAULT_BATCH
-    totals = {"knowledge_vec_bin": 0, "knowledge_vec_f32": 0, "knowledge_chunks": 0}
+    tables = _existing_vec_tables(conn) + ["knowledge_chunks"]
+    totals = {t: 0 for t in tables}
     for i in range(0, len(chunk_ids), batch_size):
         batch = chunk_ids[i : i + batch_size]
         ph = ",".join("?" * len(batch))
-        for tbl in ("knowledge_vec_bin", "knowledge_vec_f32", "knowledge_chunks"):
+        for tbl in tables:
             cur = conn.execute(f"DELETE FROM {tbl} WHERE chunk_id IN ({ph})", batch)
             totals[tbl] += cur.rowcount
     conn.commit()
