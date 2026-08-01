@@ -64,14 +64,15 @@ def _make_db(chunks: list[dict]) -> Path:
             title      TEXT,
             ingested_at INTEGER,
             date_created INTEGER,
-            date_modified INTEGER
+            date_modified INTEGER,
+            metadata   TEXT
         )
         """
     )
     now = int(time.time())
     for i, c in enumerate(chunks):
         conn.execute(
-            "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 c.get("chunk_id", f"chunk_{i}"),
                 c.get("source", "slack"),
@@ -84,6 +85,7 @@ def _make_db(chunks: list[dict]) -> Path:
                 c.get("ingested_at", now),
                 c.get("date_created"),
                 c.get("date_modified"),
+                c.get("metadata"),
             ),
         )
     conn.commit()

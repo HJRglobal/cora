@@ -67,7 +67,8 @@ def _make_db(path: Path, chunks=(), cache_rows=()):
     conn.execute("""
         CREATE TABLE knowledge_chunks (
             source TEXT, source_id TEXT, entity TEXT, sub_entity TEXT,
-            content TEXT, title TEXT, ingested_at INTEGER, deep_link TEXT
+            content TEXT, title TEXT, ingested_at INTEGER, deep_link TEXT,
+            metadata TEXT
         )""")
     conn.execute("""
         CREATE TABLE semantic_cache (

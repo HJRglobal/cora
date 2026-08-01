@@ -171,7 +171,8 @@ class TestChunkThread:
         fn = self._load()
         parent = self._msg("1717000000.000000", "U0A", "Hello")
         chunks = fn(parent, [], "f3e-leadership")
-        assert "#f3e-leadership" in chunks[0]
+        # _chunk_thread returns (chunk_text, chunk_msgs) pairs (cq-8d16969e85fb)
+        assert "#f3e-leadership" in chunks[0][0]
 
     def test_long_content_splits_into_multiple_chunks(self):
         fn = self._load()
@@ -190,7 +191,7 @@ class TestChunkThread:
             self._msg("1717000002.000002", "U0C", "Reply from C"),
         ]
         chunks = fn(parent, replies, "osn-leadership")
-        combined = " ".join(chunks)
+        combined = " ".join(text for text, _msgs in chunks)
         assert "Reply from B" in combined
         assert "Reply from C" in combined
 

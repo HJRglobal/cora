@@ -256,6 +256,10 @@ def query_chunks(
               AND source IN ({placeholders})
               AND entity NOT LIKE 'LEX%'
               AND (sub_entity IS NULL OR sub_entity NOT LIKE 'LEX%')
+              -- cq-8d16969e85fb: pure bot/automation chunks (incl. Cora's own
+              -- swept replies) are not human friction signal
+              AND (metadata IS NULL
+                   OR json_extract(metadata, '$.bot_authored') IS NOT 1)
             ORDER BY ingested_at DESC
             """,
             [cutoff, *sources],

@@ -298,6 +298,12 @@ def search_slack_evidence(kb: Any, gap: dict[str, Any]) -> list[Any]:
             continue
         if getattr(r, "distance", 99.0) > MAX_DISTANCE:
             continue
+        # cq-8d16969e85fb: pure bot/automation chunks (incl. Cora's own swept
+        # replies) are never evidence — the self-poisoning class. Mixed chunks
+        # (human ask + Cora reply) stay: the human question is real evidence.
+        meta = getattr(r, "metadata", None)
+        if isinstance(meta, dict) and meta.get("bot_authored"):
+            continue
         content = getattr(r, "content", "") or ""
         if is_phi_risk(content):
             continue

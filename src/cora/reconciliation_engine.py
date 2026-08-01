@@ -180,6 +180,12 @@ def _query_kb_chunks(
     try:
         params: list[Any] = [cutoff_ts]
         clauses: list[str] = [f"{content_date} >= ?"]
+        # cq-8d16969e85fb: pure bot/automation chunks (incl. Cora's own swept
+        # replies) are not reconciliation signal -- Cora reconciling against her
+        # own replies is the self-poisoning class. Mixed human+Cora chunks pass.
+        clauses.append(
+            "(metadata IS NULL OR json_extract(metadata, '$.bot_authored') IS NOT 1)"
+        )
 
         if sources:
             placeholders = ",".join("?" * len(sources))

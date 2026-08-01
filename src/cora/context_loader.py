@@ -975,8 +975,21 @@ def _format_kb_chunks(chunks: list) -> str:
         else:
             link_block = ""
 
+        # cq-8d16969e85fb: per-chunk authorship label — strengthens the generic
+        # caution above to chunk-specific. Cora's own swept replies are never
+        # canon; bot/automation chunks are not human knowledge.
+        meta = getattr(r, "metadata", None)
+        bot_label = ""
+        if isinstance(meta, dict):
+            if meta.get("has_cora_reply") and meta.get("bot_authored"):
+                bot_label = " — [CORA'S OWN PRIOR REPLY — not canon, never a source of truth]"
+            elif meta.get("has_cora_reply"):
+                bot_label = " — [includes Cora's own prior reply — Cora-authored lines are not canon]"
+            elif meta.get("bot_authored"):
+                bot_label = " — [bot/automation-authored — not human knowledge]"
+
         lines.append(
-            f"## [{i}] {r.source} | {title} | entity={r.entity}{date_str}{link_block}"
+            f"## [{i}] {r.source} | {title} | entity={r.entity}{date_str}{link_block}{bot_label}"
         )
         lines.append("")
         lines.append(r.content.strip())

@@ -59,6 +59,59 @@ MAX_CHUNK_CHARS = 2000
 # Max messages to include in a single thread chunk
 MAX_MESSAGES_PER_CHUNK = 20
 
+# cq-8d16969e85fb: Cora's own bot user id (fallback when auth.test is
+# unreachable). Used to tag bot-authored chunks at ingest so miners can
+# exclude them and retrieval can label them — the self-poisoning class
+# (the 7/20 pricing fabrication entered the KB as an untagged swept reply).
+CORA_FALLBACK_USER_ID = "U0B44MDGC5R"
+
+# Pure system-event noise — mirrors channel_sweep.py's fetch-time skip.
+# Dropping these is not knowledge loss (tag-don't-drop applies to real replies).
+_SKIP_SUBTYPES = {"channel_join", "channel_leave", "channel_topic"}
+
+
+def _resolve_cora_user_id() -> str:
+    """Cora's bot user id via auth.test, fail-soft to the known constant.
+
+    Per the missed_message_catchup doctrine: a bare bot_id check counts EVERY
+    app (Make.com, Tag); Cora-specific detection needs the auth.test user id.
+    """
+    try:
+        from cora.connectors.slack_connector import _build_client
+        resp = _build_client().auth_test()
+        uid = (resp or {}).get("user_id", "")
+        if uid:
+            return uid
+    except Exception as exc:  # noqa: BLE001 — never let tagging break the sweep
+        logging.getLogger("kb-sync-slack").warning(
+            "auth.test failed (%s) — falling back to %s", exc, CORA_FALLBACK_USER_ID)
+    return CORA_FALLBACK_USER_ID
+
+
+def _is_bot_msg(msg: dict[str, Any], cora_uid: str) -> bool:
+    """True when the message was posted by ANY app (Cora, Make.com, Tag, ...)."""
+    return bool(msg.get("bot_id")) or (bool(cora_uid) and msg.get("user") == cora_uid)
+
+
+def _is_cora_msg(msg: dict[str, Any], cora_uid: str) -> bool:
+    return bool(cora_uid) and msg.get("user") == cora_uid
+
+
+def _bot_flags(msgs: list[dict[str, Any]], cora_uid: str) -> dict[str, bool]:
+    """Per-chunk authorship flags (cq-8d16969e85fb, tag-don't-drop).
+
+    bot_authored  — EVERY message in the chunk is app-posted (pure automation;
+                    miners exclude these).
+    has_cora_reply — at least one message is Cora's own reply (retrieval labels
+                    these "not canon"; mixed chunks keep the human ask minable).
+    """
+    flags: dict[str, bool] = {}
+    if msgs and all(_is_bot_msg(m, cora_uid) for m in msgs):
+        flags["bot_authored"] = True
+    if any(_is_cora_msg(m, cora_uid) for m in msgs):
+        flags["has_cora_reply"] = True
+    return flags
+
 
 def _setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,28 +187,33 @@ def _chunk_thread(
     parent_msg: dict[str, Any],
     replies: list[dict[str, Any]],
     channel_name: str,
-) -> list[str]:
+) -> list[tuple[str, list[dict[str, Any]]]]:
     """Combine parent + replies into chunks of at most MAX_CHUNK_CHARS characters.
 
-    Returns list of text chunks.
+    Returns list of (chunk_text, chunk_msgs) pairs — the message dicts that went
+    into each chunk ride along so the caller can compute per-chunk authorship
+    flags (cq-8d16969e85fb).
     """
     all_msgs = [parent_msg] + replies
-    lines = [serialize_message(m) for m in all_msgs]
 
-    chunks: list[str] = []
+    chunks: list[tuple[str, list[dict[str, Any]]]] = []
     current: list[str] = []
+    current_msgs: list[dict[str, Any]] = []
     current_len = 0
 
-    for line in lines:
+    for msg in all_msgs:
+        line = serialize_message(msg)
         if current_len + len(line) > MAX_CHUNK_CHARS and current:
-            chunks.append(f"#{channel_name}\n" + "\n".join(current))
+            chunks.append((f"#{channel_name}\n" + "\n".join(current), current_msgs))
             current = []
+            current_msgs = []
             current_len = 0
         current.append(line)
+        current_msgs.append(msg)
         current_len += len(line)
 
     if current:
-        chunks.append(f"#{channel_name}\n" + "\n".join(current))
+        chunks.append((f"#{channel_name}\n" + "\n".join(current), current_msgs))
 
     return chunks
 
@@ -184,6 +242,8 @@ def main() -> int:
 
     routes = _load_routing()
     watermarks = _load_watermarks()
+    cora_uid = _resolve_cora_user_id()
+    log.info("Bot-authorship tagging active (cora_uid=%s)", cora_uid)
     kb = KnowledgeBase(KB_DB_PATH)
 
     sync_start = int(time.time())
@@ -234,9 +294,13 @@ def main() -> int:
             total_channels += 1
             continue
 
-        # Group messages by thread_ts (parent ts); plain messages get their own ts
+        # Group messages by thread_ts (parent ts); plain messages get their own ts.
+        # join/leave/topic system events are pure noise — skipped outright
+        # (cq-8d16969e85fb; mirrors channel_sweep.py's fetch-time skip).
         threads: dict[str, dict[str, Any]] = {}
         for msg in messages:
+            if msg.get("subtype") in _SKIP_SUBTYPES:
+                continue
             thread_ts = msg.get("thread_ts") or msg.get("ts")
             if thread_ts not in threads:
                 threads[thread_ts] = {"parent": None, "replies": []}
@@ -263,13 +327,19 @@ def main() -> int:
                     log.warning(
                         "get_thread_replies(%s, %s) failed: %s", ch_id, thread_ts, exc
                     )
+            local_replies = [
+                m for m in local_replies if m.get("subtype") not in _SKIP_SUBTYPES
+            ]
 
             chunks = _chunk_thread(parent, local_replies, ch_name)
             parent_ts = _ts_to_int(thread_ts)
             source_id = f"slack:{ch_id}:{thread_ts}"
             deep_link = f"https://hjrglobal.slack.com/archives/{ch_id}/p{thread_ts.replace('.', '')}"
 
-            for i, chunk_text in enumerate(chunks):
+            for i, (chunk_text, chunk_msgs) in enumerate(chunks):
+                metadata = {"channel_id": ch_id, "channel_name": ch_name,
+                            "thread_ts": thread_ts}
+                metadata.update(_bot_flags(chunk_msgs, cora_uid))
                 doc = Document(
                     source="slack",
                     source_id=f"{source_id}:chunk{i}" if len(chunks) > 1 else source_id,
@@ -280,7 +350,7 @@ def main() -> int:
                     title=f"#{ch_name} thread {datetime.fromtimestamp(parent_ts, tz=timezone.utc).strftime('%Y-%m-%d')}",
                     deep_link=deep_link,
                     sub_entity=sub_entity,
-                    metadata={"channel_id": ch_id, "channel_name": ch_name, "thread_ts": thread_ts},
+                    metadata=metadata,
                 )
                 docs_batch.append(doc)
 
