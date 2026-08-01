@@ -72,7 +72,16 @@ def main() -> int:
                         help=f"Override target channel id (default "
                              f"{cs.SCOPE_CHANNELS['portfolio']}; smoke "
                              f"{cs.SMOKE_CHANNEL})")
+    parser.add_argument("--no-batch", action="store_true",
+                        help="Force the plain sync Anthropic call instead of the "
+                             "50%%-off Batch API transport (env kill switches: "
+                             "CORA_BATCH_SYNTHESIS=0 / CORA_BATCH_DISABLE=1)")
     args = parser.parse_args()
+
+    # Batch-first transport (pilot slice 3): submit at fire time with a tight
+    # deadline + sync fallback -- the post rides its own clock, so a bounded
+    # delay (CORA_BATCH_SYNTHESIS_DEADLINE_S, default 600s) is acceptable.
+    cs.set_batch_transport(not args.no_batch)
 
     result = cs.run_portfolio(dry_run=args.dry_run, channel=args.channel)
 

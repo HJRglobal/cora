@@ -207,6 +207,53 @@ def _default_phi_check(text: str) -> bool:
     return is_clinical_phi(text)
 
 
+# --- Batch transport (2026-07-31 pilot slice 3) -------------------------------
+# Module default OFF so library consumers and tests keep the exact sync
+# behavior; the scheduled RUNNER opts in via set_batch_transport(True)
+# (script-side -> activates at its next fire, no task re-registration). Each
+# synthesis leg is its own process (9 tasks, 06:31-06:58 AZ), so the batch is
+# a batch of ONE -- still billed at the 50% batch rate. Env kill switches win
+# at call time: CORA_BATCH_SYNTHESIS=0 (leg) / CORA_BATCH_DISABLE=1 (global);
+# CORA_BATCH_SYNTHESIS_DEADLINE_S bounds the post delay (default 600s), after
+# which batch_generate itself falls back to a plain sync call -- the post is
+# never lost to a stuck batch, only the fallback memo path remains as before.
+_USE_BATCH = False
+
+
+def set_batch_transport(enabled: bool) -> None:
+    global _USE_BATCH  # noqa: PLW0603 -- runner-set process-wide toggle
+    _USE_BATCH = bool(enabled)
+
+
+def _synthesis_params(prompt_text: str) -> dict:
+    """messages.create kwargs for one synthesis call -- shared verbatim by the
+    sync and batch transports (batching changes transport, never content)."""
+    return {
+        "model": sm.SONNET_MODEL,
+        "max_tokens": sm._SYNTH_MAX_TOKENS,
+        "thinking": {"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
+        "messages": [{"role": "user", "content": prompt_text}],
+    }
+
+
+def _generate(prompt_text: str, api_key: str):
+    """One synthesis response object, batch-first when the runner opted in."""
+    from . import batch_client
+    params = _synthesis_params(prompt_text)
+    if _USE_BATCH and batch_client.batch_enabled("CORA_BATCH_SYNTHESIS"):
+        deadline = float(os.environ.get("CORA_BATCH_SYNTHESIS_DEADLINE_S", "600"))
+        results = batch_client.batch_generate(
+            [{"custom_id": "synthesis-0", "params": params}],
+            caller="channel_synthesis", deadline_s=deadline, api_key=api_key)
+        return results.get("synthesis-0")
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(**params)
+    from .llm_usage import log_usage
+    log_usage(response, caller="channel_synthesis")
+    return response
+
+
 def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
     """One Sonnet synthesis call. FAIL-CLOSED: None on missing key / API error /
     empty output / a positive PHI check -- the caller falls back to a deterministic
@@ -216,17 +263,8 @@ def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
         log.warning("channel_synthesis: ANTHROPIC_API_KEY not set -- no synthesis")
         return None
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=sm.SONNET_MODEL,
-            max_tokens=sm._SYNTH_MAX_TOKENS,
-            thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
-            messages=[{"role": "user", "content": prompt_text}],
-        )
-        from .llm_usage import log_usage
-        log_usage(response, caller="channel_synthesis")
-        text = (response.content[0].text or "").strip()
+        response = _generate(prompt_text, api_key)
+        text = (response.content[0].text or "").strip() if response else ""
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design
         log.warning("channel_synthesis: synthesis failed: %s", exc)
         return None

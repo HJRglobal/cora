@@ -66,6 +66,13 @@ def parse_args() -> argparse.Namespace:
                         "Code sessions.")
     p.add_argument("--max-cowork-sessions", type=int, default=None,
                    help="Cap Cowork sessions processed this run (default = --max-sessions).")
+    p.add_argument("--no-batch", action="store_true",
+                   help="Distill each session with a plain sync call instead of one "
+                        "50%%-off Message Batch (env kill switches: "
+                        "CORA_BATCH_CAPTURE=0 / CORA_BATCH_DISABLE=1; deadline "
+                        "CORA_BATCH_CAPTURE_DEADLINE_S, default 900s -- the 05:15 "
+                        "fire + fallback stays inside the 1h task limit and well "
+                        "ahead of the 07:00 knowledge review).")
     return p.parse_args()
 
 
@@ -92,6 +99,7 @@ def main() -> int:
         kb=kb,
         include_cowork=not args.no_cowork,
         max_cowork_sessions=args.max_cowork_sessions,
+        use_batch=not args.no_batch,
     )
 
     captured = [r for r in results if r.distilled and r.note_path]

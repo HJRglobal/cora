@@ -177,7 +177,9 @@ _FLIPPABLE_CALL_SITES = [
     ("claude_client.py", "model=effective_model"),
     ("strategy_memo.py", "model=SONNET_MODEL"),
     ("code_queue.py", "model=_SONNET_MODEL"),
-    ("channel_synthesis.py", "model=sm.SONNET_MODEL"),
+    # channel_synthesis builds a shared params DICT (batch pilot slice 3), so
+    # the marker is the dict form -- same invariant, same window check.
+    ("channel_synthesis.py", '"model": sm.SONNET_MODEL'),
     ("tools/person_dossier.py", "model=_SYNTH_MODEL"),
     ("tools/sales_deck_client.py", "model=_OPUS_MODEL"),
 ]

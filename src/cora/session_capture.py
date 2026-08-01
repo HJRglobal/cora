@@ -515,6 +515,15 @@ def entity_folder(entity: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _build_distill_prompt(text: str, default_entity: str, *, phi: bool) -> str:
+    """The exact distill prompt for one transcript -- shared verbatim by the
+    sync path (distill) and the batch path (_batch_distill), so batching
+    changes transport, never content."""
+    cap = _MAX_INPUT_CHARS_PHI if phi else _MAX_INPUT_CHARS
+    return _DISTILL_PROMPT.format(default_entity=default_entity,
+                                  transcript=text[:cap])
+
+
 def distill(text: str, default_entity: str, *, phi: bool,
             client: Any = None) -> dict[str, Any] | None:
     """Distill a transcript with Haiku. Fail-closed: returns None on any error.
@@ -522,9 +531,6 @@ def distill(text: str, default_entity: str, *, phi: bool,
     `client` may be injected (tests); otherwise an Anthropic client is built
     from ANTHROPIC_API_KEY.
     """
-    cap = _MAX_INPUT_CHARS_PHI if phi else _MAX_INPUT_CHARS
-    transcript = text[:cap]
-
     if client is None:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
@@ -537,7 +543,7 @@ def distill(text: str, default_entity: str, *, phi: bool,
             log.warning("session_capture: anthropic client init failed: %s", exc)
             return None
 
-    prompt = _DISTILL_PROMPT.format(default_entity=default_entity, transcript=transcript)
+    prompt = _build_distill_prompt(text, default_entity, phi=phi)
     try:
         resp = client.messages.create(
             model=_HAIKU_MODEL,
@@ -676,22 +682,34 @@ def _now_epoch() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
+# Sentinel distinguishing "no batch pre-distill ran" (sync-distill inline)
+# from "the batch ran and this item failed BOTH transports" (None -> the same
+# fail-closed skip a failed sync distill produces).
+_NO_PREDISTILL = object()
+
+
 def _finalize_capture(
     session: ParsedSession, *, surface: str, ledger_key: str,
     captured: set[str], dry_run: bool, with_kb: bool,
     founder_os_root: Path, ledger_path: Path,
     anthropic_client: Any, kb: Any,
+    pre_distilled: Any = _NO_PREDISTILL,
 ) -> CaptureResult:
     """Distill -> entity-tag -> PHI-route -> write -> ledger for one parsed
     session. Shared by the Code and Cowork harvest loops so PHI routing, the
     fail-closed distill skip, the fail-soft G: write, and dedup are IDENTICAL
     on both paths. ``ledger_key`` (Code: raw id; Cowork: ``cowork:<id>``) is the
     dedup + ledger key; ``session.session_id`` remains the clean id shown in the
-    note + filename."""
+    note + filename. ``pre_distilled`` carries a batch-path result (parsed dict,
+    or None when batch AND its per-item sync fallback both failed)."""
     phi = phi_guard.is_phi_risk(session.text)
     default_entity = entity_from_cwd(session.cwd)
 
-    distilled = distill(session.text, default_entity, phi=phi, client=anthropic_client)
+    if pre_distilled is _NO_PREDISTILL:
+        distilled = distill(session.text, default_entity, phi=phi,
+                            client=anthropic_client)
+    else:
+        distilled = pre_distilled
     if distilled is None:
         # Fail-closed: do not write, do not mark captured — retry next run.
         return CaptureResult(
@@ -769,6 +787,7 @@ def harvest(
     include_cowork: bool = False,
     cowork_roots: list[Path] | None = None,
     max_cowork_sessions: int | None = None,
+    use_batch: bool = False,
 ) -> list[CaptureResult]:
     """Harvest un-captured sessions in the lookback window. Returns results.
 
@@ -778,12 +797,21 @@ def harvest(
         runner enables it, the module default is OFF so unit tests / other
         callers see the exact prior Code-only behavior). Cowork ledger keys are
         ``cowork:`` prefixed to namespace them off Code-session ids.
+
+    ``use_batch`` (pilot slice 3; module default OFF, the runner opts in) runs
+    ALL pending distills as ONE Message Batch (50% off) before finalizing --
+    collection and finalization order, budgets, dedup, PHI routing, and the
+    fail-closed skip are byte-identical to the sync path. Ignored when a
+    ``anthropic_client`` is injected (tests / bespoke callers keep sync).
     """
     now = _now_epoch()
     cutoff = now - lookback_hours * 3600
     settle = now - SETTLE_MINUTES * 60
     captured = load_captured_ids(ledger_path)
-    results: list[CaptureResult] = []
+    # Collection phase: ("pending", (session, surface, ledger_key)) entries in
+    # the EXACT order the sync path would have finalized them, with
+    # ("skipped", CaptureResult) rows interleaved where pre-distill skips land.
+    entries: list[tuple[str, Any]] = []
 
     # --- Code sessions (~/.claude/projects) ---
     processed = 0
@@ -804,11 +832,7 @@ def harvest(
             continue
 
         processed += 1
-        results.append(_finalize_capture(
-            session, surface=SURFACE, ledger_key=session.session_id,
-            captured=captured, dry_run=dry_run, with_kb=with_kb,
-            founder_os_root=founder_os_root, ledger_path=ledger_path,
-            anthropic_client=anthropic_client, kb=kb))
+        entries.append(("pending", (session, SURFACE, session.session_id)))
 
     # --- Cowork desktop agent-mode sessions ---
     if include_cowork:
@@ -836,18 +860,89 @@ def harvest(
             if _is_scheduled_task_session(session):
                 log.info("session_capture: skipping cowork scheduled-task session %s",
                          sess_dir.name)
-                results.append(CaptureResult(
+                entries.append(("skipped", CaptureResult(
                     session_id=sess_dir.name, entity="FNDR", note_path=None,
-                    phi=False, distilled=False, skipped_reason="scheduled_task"))
+                    phi=False, distilled=False, skipped_reason="scheduled_task")))
                 continue
             cw_processed += 1
-            results.append(_finalize_capture(
-                session, surface=SURFACE_COWORK, ledger_key=ledger_key,
-                captured=captured, dry_run=dry_run, with_kb=with_kb,
-                founder_os_root=founder_os_root, ledger_path=ledger_path,
-                anthropic_client=anthropic_client, kb=kb))
+            entries.append(("pending", (session, SURFACE_COWORK, ledger_key)))
+
+    # Batch pre-distill (one submission for every pending session). Empty dict
+    # => every item finalizes through the unchanged sync distill path.
+    pending = [payload for kind, payload in entries if kind == "pending"]
+    pre: dict[str, Any] = {}
+    if use_batch and pending and anthropic_client is None:
+        pre = _batch_distill(pending)
+
+    results: list[CaptureResult] = []
+    for kind, payload in entries:
+        if kind == "skipped":
+            results.append(payload)
+            continue
+        session, surface, ledger_key = payload
+        results.append(_finalize_capture(
+            session, surface=surface, ledger_key=ledger_key,
+            captured=captured, dry_run=dry_run, with_kb=with_kb,
+            founder_os_root=founder_os_root, ledger_path=ledger_path,
+            anthropic_client=anthropic_client, kb=kb,
+            pre_distilled=pre.get(ledger_key, _NO_PREDISTILL)))
 
     return results
+
+
+def _batch_distill(pending: list[tuple[ParsedSession, str, str]]) -> dict[str, Any]:
+    """One Message Batch over every pending session's distill prompt.
+
+    Returns ``{ledger_key: parsed-dict-or-None}``; an EMPTY dict means "no
+    batch ran" (leg disabled, or an unexpected helper error) and every item
+    falls back to the inline sync distill. custom_ids are positional
+    ("item-N") -- opaque by construction, so no session id / cwd / PHI
+    material ever rides in a batch identifier. Item-level batch failures were
+    already retried SYNC inside batch_generate; a None value here is the same
+    terminal state as a failed sync distill (fail-closed: the session is not
+    ledger-marked and retries next run).
+
+    Scheduling (verified dependency graph): the capture task fires 05:15 AZ
+    with a 1h ExecutionTimeLimit, and its --with-kb ingest is what makes
+    notes visible to the 07:00 knowledge review. The default 900s deadline +
+    bounded sync fallback keeps the whole run well inside both.
+    """
+    from . import batch_client
+    if not batch_client.batch_enabled("CORA_BATCH_CAPTURE"):
+        return {}
+    try:
+        deadline = float(os.environ.get("CORA_BATCH_CAPTURE_DEADLINE_S", "900"))
+        keys: list[tuple[str, str]] = []  # (ledger_key, default_entity)
+        requests: list[dict] = []
+        for session, _surface, ledger_key in pending:
+            phi = phi_guard.is_phi_risk(session.text)
+            default_entity = entity_from_cwd(session.cwd)
+            prompt = _build_distill_prompt(session.text, default_entity, phi=phi)
+            requests.append({
+                "custom_id": f"item-{len(keys)}",
+                "params": {"model": _HAIKU_MODEL, "max_tokens": 1500,
+                           "messages": [{"role": "user", "content": prompt}]},
+            })
+            keys.append((ledger_key, default_entity))
+        results = batch_client.batch_generate(
+            requests, caller="session_capture", deadline_s=deadline)
+    except Exception as exc:  # noqa: BLE001 -- belt: never worse than sync
+        log.warning("session_capture: batch distill unavailable (%s) -- "
+                    "falling back to per-session sync distills", exc)
+        return {}
+    out: dict[str, Any] = {}
+    for i, (ledger_key, default_entity) in enumerate(keys):
+        msg = results.get(f"item-{i}")
+        if msg is None:
+            out[ledger_key] = None
+            continue
+        try:
+            raw = msg.content[0].text.strip()
+        except Exception:  # noqa: BLE001 -- malformed message == failed distill
+            out[ledger_key] = None
+            continue
+        out[ledger_key] = _parse_distilled(raw, default_entity)
+    return out
 
 
 def _ingest_note(kb: Any, npath: Path, entity: str, distilled: dict[str, Any],
