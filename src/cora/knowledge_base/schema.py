@@ -54,8 +54,23 @@ def bin_tables_present(conn: sqlite3.Connection) -> list[str]:
 
 def vec_cascade_tables(conn: sqlite3.Connection) -> list[str]:
     """Full chunk-delete cascade for this DB: every present bin coarse table +
-    knowledge_vec_f32 + knowledge_chunks (vectors first, parent row last)."""
-    return [*bin_tables_present(conn), "knowledge_vec_f32", "knowledge_chunks"]
+    knowledge_vec_f32 + knowledge_vec_i8 (existence-checked forward-compat --
+    the deferred int8 re-rank table, absent today; without it a purge would
+    strand quantized embeddings of purged content if int8 ever lands) +
+    knowledge_chunks (vectors first, parent row last)."""
+    present = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        ).fetchall()
+    }
+    aux = [t for t in ("knowledge_vec_i8",) if t in present]
+    return [
+        *(t for t in BIN_TABLE_CANDIDATES if t in present),
+        "knowledge_vec_f32",
+        *aux,
+        "knowledge_chunks",
+    ]
 
 
 def connect(

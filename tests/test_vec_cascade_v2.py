@@ -143,6 +143,35 @@ def test_cascade_matches_store_v2_only(kb):
 
 
 # ---------------------------------------------------------------------------
+# Forward-compat: the deferred int8 re-rank table joins the cascade if present
+# ---------------------------------------------------------------------------
+
+def test_cascade_includes_i8_when_present(kb):
+    """Parity with the named candidate lists (prune, gmail-alias purge): if the
+    deferred knowledge_vec_i8 re-rank table ever lands, purges routed through
+    vec_cascade_tables must clear it too -- else PHI/NDA purges (copa,
+    lex_restricted, ...) would strand quantized embeddings of purged content
+    (D-051-light rebase review, 2026-07-31)."""
+    assert "knowledge_vec_i8" not in schema.vec_cascade_tables(kb._conn)
+    kb._conn.execute(
+        "CREATE TABLE knowledge_vec_i8 (chunk_id TEXT PRIMARY KEY, embedding BLOB)"
+    )
+    kb._conn.commit()
+    tables = schema.vec_cascade_tables(kb._conn)
+    assert "knowledge_vec_i8" in tables
+    assert tables[-1] == "knowledge_chunks"  # parent row still deleted last
+
+    _insert_everywhere(kb._conn, "k1")
+    kb._conn.execute(
+        "INSERT INTO knowledge_vec_i8 (chunk_id, embedding) VALUES ('k1', x'00')"
+    )
+    kb._conn.commit()
+    totals = kb_archive.delete_chunks(kb._conn, ["k1"])
+    assert totals["knowledge_vec_i8"] == 1
+    assert _count(kb._conn, "knowledge_vec_i8", "k1") == 0, "orphan left in i8"
+
+
+# ---------------------------------------------------------------------------
 # kb_archive.delete_chunks clears v2 (the reported defect)
 # ---------------------------------------------------------------------------
 
