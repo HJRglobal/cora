@@ -131,8 +131,16 @@ def _drive_ka_dir() -> Path | None:
         return None
 
 
+# Resolved ONCE at import (collection time), BEFORE the autouse write-isolation
+# fixture redirects KNOWN_ANSWERS_DIR to a per-test tmp dir. Re-resolving inside
+# the test body broke in git worktrees: no .env there, so the os.environ fallback
+# read the redirected (non-existent) tmp path and returned None -- the skipif
+# gate and the body disagreed, failing instead of skipping/passing.
+_DRIVE_KA_DIR = _drive_ka_dir()
+
+
 @pytest.mark.skipif(
-    _drive_ka_dir() is None,
+    _DRIVE_KA_DIR is None,
     reason="Drive known-answers store not mounted (CI / no KNOWN_ANSWERS_DIR)",
 )
 def test_repo_seed_covers_live_drive_store():
@@ -142,7 +150,7 @@ def test_repo_seed_covers_live_drive_store():
     file added on Drive) without a matching repo seed. Content staleness is
     expected and deliberately NOT checked.
     """
-    drive = _drive_ka_dir()
+    drive = _DRIVE_KA_DIR
     assert drive is not None  # guarded by skipif
     seed_names = set(_SEED_FILES)
     try:
@@ -179,7 +187,7 @@ def test_unpinned_known_answer_write_lands_in_tmp():
 
 
 @pytest.mark.skipif(
-    _drive_ka_dir() is None,
+    _DRIVE_KA_DIR is None,
     reason="Drive known-answers store not mounted (CI / no KNOWN_ANSWERS_DIR)",
 )
 def test_live_store_carries_no_fixture_markers():
@@ -188,8 +196,8 @@ def test_live_store_carries_no_fixture_markers():
     flywheel monitor re-flagged it every run until then). The exact fixture
     phrase is asserted; the legitimate fndr.md 'Polar Analytics' entry
     (2026-05-18) deliberately does not match."""
-    drive = _drive_ka_dir()
-    assert drive is not None
+    drive = _DRIVE_KA_DIR
+    assert drive is not None  # guarded by skipif (import-time resolution)
     for p in sorted(drive.glob("*.md")):
         try:
             text = p.read_text(encoding="utf-8", errors="replace")

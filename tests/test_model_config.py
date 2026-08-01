@@ -86,19 +86,26 @@ def test_wiring_is_structural():
 def test_reload_picks_up_env(monkeypatch):
     """MODEL_SONNET is resolved at import -- a fresh process (restart) sees the
     override. Reload in isolation, then restore so downstream tests are unaffected."""
+    original = model_router.MODEL_SONNET
     monkeypatch.setenv("CORA_SONNET_MODEL", "claude-sonnet-5-canarytest")
     try:
         importlib.reload(model_router)
         assert model_router.MODEL_SONNET == "claude-sonnet-5-canarytest"
         assert model_router.DEFAULT_MODEL == "claude-sonnet-5-canarytest"
     finally:
-        monkeypatch.delenv("CORA_SONNET_MODEL", raising=False)
+        # Restore the exact pre-test resolution by PINNING the original
+        # import-time value through the reload (monkeypatch teardown then
+        # returns the process env to its true prior state). The old restore
+        # (delenv + reload, trusting the module's repo-root-anchored
+        # load_dotenv to re-establish the flip) broke in git worktrees: no
+        # .env at the worktree root, so the reload fell back to the code
+        # default while every already-collected test module still held the
+        # collection-time constant -- 49 order-dependent failures downstream
+        # in test_model_router. Pinning is flip-safe AND checkout-agnostic.
+        monkeypatch.setenv("CORA_SONNET_MODEL", original)
         importlib.reload(model_router)
-        # Restore to a CONSISTENT state, not a fixed literal: the reload re-runs
-        # load_dotenv, so if the real .env carries CORA_SONNET_MODEL (post-flip) the
-        # constant resolves to that value -- and so does the resolver. Asserting they
-        # MATCH is flip-safe; asserting == "claude-sonnet-4-6" would break post-flip.
-        assert model_router.MODEL_SONNET == model_router._resolve_sonnet_model()
+        assert model_router.MODEL_SONNET == original
+        assert model_router.DEFAULT_MODEL == original
 
 
 # ---------------------------------------------------------------------------
