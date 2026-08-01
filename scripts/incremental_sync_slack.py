@@ -336,13 +336,20 @@ def main() -> int:
             source_id = f"slack:{ch_id}:{thread_ts}"
             deep_link = f"https://hjrglobal.slack.com/archives/{ch_id}/p{thread_ts.replace('.', '')}"
 
-            for i, (chunk_text, chunk_msgs) in enumerate(chunks):
+            # ALL of a thread's chunks share the BARE source_id: the store's
+            # replace-on-conflict dedups keys batch-wide, so a re-sweep
+            # replaces the whole thread family atomically even when the chunk
+            # COUNT changed (threads GROW as replies land; the old
+            # ':chunkN'-when-multi scheme orphaned the bare row the moment a
+            # 1-chunk thread became 2 chunks -- D-051 review, same class as
+            # the gmail quote-strip shrink).
+            for chunk_text, chunk_msgs in chunks:
                 metadata = {"channel_id": ch_id, "channel_name": ch_name,
                             "thread_ts": thread_ts}
                 metadata.update(_bot_flags(chunk_msgs, cora_uid))
                 doc = Document(
                     source="slack",
-                    source_id=f"{source_id}:chunk{i}" if len(chunks) > 1 else source_id,
+                    source_id=source_id,
                     entity=entity,
                     content=chunk_text,
                     date_created=parent_ts,

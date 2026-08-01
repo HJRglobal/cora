@@ -80,6 +80,87 @@ class TestBodyFingerprint:
         assert m._body_fingerprint("   ") == ""
 
 
+class TestDeliveryFingerprint:
+    """D-051 review: body-only fingerprints dropped a DIFFERENT sender's
+    identical short reply ('Approved.') — sender + attachments are in the key."""
+
+    def test_same_sender_same_body_matches(self):
+        m = _load_sweep()
+        a = m._delivery_fingerprint("A <a@x.com>", [], "Approved.")
+        b = m._delivery_fingerprint("a <a@x.com>", [], "approved.")
+        assert a == b != ""
+
+    def test_different_sender_same_body_differs(self):
+        m = _load_sweep()
+        a = m._delivery_fingerprint("A <a@x.com>", [], "Approved.")
+        b = m._delivery_fingerprint("B <b@x.com>", [], "Approved.")
+        assert a != b
+
+    def test_different_attachments_differ(self):
+        m = _load_sweep()
+        a = m._delivery_fingerprint("A", ["inv1.pdf"], "see attached")
+        b = m._delivery_fingerprint("A", ["inv2.pdf"], "see attached")
+        assert a != b
+
+    def test_attachment_order_irrelevant(self):
+        m = _load_sweep()
+        a = m._delivery_fingerprint("A", ["x.pdf", "y.pdf"], "b")
+        b = m._delivery_fingerprint("A", ["y.pdf", "x.pdf"], "b")
+        assert a == b
+
+
+class TestEffectiveBody:
+    """D-051 review: a forward's '>'-quoted block can be the ONLY copy of an
+    external exchange — forwards keep their body; ordinary replies strip."""
+
+    def test_forwarded_message_keeps_quoted_block(self):
+        m = _load_sweep()
+        body = ("FYI see below\n\n---------- Forwarded message ---------\n"
+                "> From: External Party\n> the original external exchange")
+        out = m._effective_body(body)
+        assert "original external exchange" in out
+
+    def test_original_message_marker_keeps_quoted_block(self):
+        m = _load_sweep()
+        body = "see below\n-----Original Message-----\n> external content here"
+        assert "external content here" in m._effective_body(body)
+
+    def test_ordinary_reply_still_strips(self):
+        m = _load_sweep()
+        body = "Sounds good.\n> earlier thread text"
+        out = m._effective_body(body)
+        assert out == "Sounds good."
+
+    def test_empty_safe(self):
+        m = _load_sweep()
+        assert m._effective_body("") == ""
+        assert m._effective_body(None) == ""
+
+
+class TestFilterAccounts:
+    """D-051 review: --accounts must apply AFTER the alias collapse and match
+    a kept entry via its aliases, else a targeted alias run re-creates the
+    purged duplicate class under the alias identity."""
+
+    def test_alias_address_matches_kept_primary(self):
+        m = _load_sweep()
+        accounts = [_acct("harrison@hjrglobal.com"), _acct("hannah@hjrglobal.com")]
+        alias_map = {"harrison@hjrglobal.com": ["harrison@f3energy.com"]}
+        kept = m._filter_accounts(accounts, {"harrison@f3energy.com"}, alias_map)
+        assert [a["email"] for a in kept] == ["harrison@hjrglobal.com"]
+
+    def test_primary_address_matches_directly(self):
+        m = _load_sweep()
+        accounts = [_acct("a@x.com"), _acct("b@x.com")]
+        kept = m._filter_accounts(accounts, {"b@x.com"}, {})
+        assert [a["email"] for a in kept] == ["b@x.com"]
+
+    def test_empty_filter_returns_all(self):
+        m = _load_sweep()
+        accounts = [_acct("a@x.com")]
+        assert m._filter_accounts(accounts, set(), {}) == accounts
+
+
 # ── alias-account dedup ───────────────────────────────────────────────────────
 
 def _acct(email, **kw):
@@ -240,6 +321,58 @@ class TestPurgeApply:
             remaining = conn.execute(
                 f"SELECT chunk_id FROM {t}").fetchall()
             assert remaining == [("c2",)]
+
+
+class TestPurgeApplyRealVec0:
+    """D-051 review: the first apply test used PLAIN tables named like vec
+    tables and passed vacuously while the live --apply crashed ('no such
+    module: vec0'). This one uses REAL vec0 virtual tables over the same
+    extension-loaded connection main() now builds via schema.connect."""
+
+    def test_apply_deletes_from_real_vec0_tables(self, tmp_path):
+        pytest.importorskip("sqlite_vec")
+        p = _load_purge()
+        from cora.knowledge_base import schema
+        db = tmp_path / "kb_vec0.db"
+        conn = schema.connect(db)
+        conn.execute("""CREATE TABLE knowledge_chunks (
+            chunk_id TEXT PRIMARY KEY, source TEXT, source_id TEXT, entity TEXT,
+            sub_entity TEXT, content TEXT, title TEXT, metadata TEXT,
+            ingested_at INTEGER)""")
+        for t in ("knowledge_vec_bin", "knowledge_vec_bin_v2"):
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {t} USING vec0("
+                f"chunk_id TEXT PRIMARY KEY, embedding bit[8])")
+        conn.execute(
+            "CREATE TABLE knowledge_vec_f32 (chunk_id TEXT PRIMARY KEY, v BLOB)")
+        import struct
+        f32 = struct.pack("8f", *([1.0] * 8))
+        for cid, email in (("c1", "harrison@f3energy.com"),
+                           ("c2", "harrison@hjrglobal.com")):
+            conn.execute(
+                "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?,?,?,?)",
+                (cid, "gmail", f"gmail:{email}:mid1", "F3E", None, "body", "t",
+                 json.dumps({"message_id": "mid1", "user_email": email}),
+                 int(time.time())))
+            for t in ("knowledge_vec_bin", "knowledge_vec_bin_v2"):
+                # Same insert shape the store uses (vec_quantize_binary over f32)
+                conn.execute(
+                    f"INSERT INTO {t}(chunk_id, embedding) "
+                    "VALUES (?, vec_quantize_binary(?))", (cid, f32))
+            conn.execute("INSERT INTO knowledge_vec_f32 VALUES (?, ?)", (cid, b"v"))
+        conn.commit()
+
+        delete_ids, _ = p.plan_purge(conn)
+        assert delete_ids == ["c1"]
+        deleted = p.apply_purge(conn, delete_ids)
+        assert deleted["knowledge_vec_bin"] >= 1
+        assert deleted["knowledge_vec_bin_v2"] >= 1
+        assert deleted["knowledge_chunks"] == 1
+        for t in ("knowledge_vec_bin", "knowledge_vec_bin_v2",
+                  "knowledge_vec_f32", "knowledge_chunks"):
+            remaining = conn.execute(f"SELECT chunk_id FROM {t}").fetchall()
+            assert remaining == [("c2",)], t
+        conn.close()
 
 
 class TestKbArchiveCascadeDiscovery:

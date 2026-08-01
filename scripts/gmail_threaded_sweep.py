@@ -203,7 +203,11 @@ def _canonical_mailbox(user_email: str) -> str:
     try:
         from cora.connectors.gmail_reader import _build_service
         service = _build_service(user_email)
-        profile = service.users().getProfile(userId="me").execute()
+        # num_retries: a single transient 429/500 must not fail-soft an alias
+        # into its own group (D-051 review: that re-opens the dup leak for a
+        # night; the watermark mirror below bounds the damage, retries shrink
+        # the trigger).
+        profile = service.users().getProfile(userId="me").execute(num_retries=2)
         addr = (profile or {}).get("emailAddress", "")
         if addr:
             return addr.lower()
@@ -256,6 +260,62 @@ def _dedup_alias_accounts(
         if skipped:
             alias_map[primary.get("email", "")] = skipped
     return kept, alias_map
+
+
+_FORWARD_MARKER_RE = re.compile(
+    r"(begin forwarded message|forwarded message|original message)", re.I)
+
+
+def _effective_body(raw_body: str) -> str:
+    """The body text to ingest: quote-stripped UNLESS the message is a forward.
+
+    A forwarded email's '>'-quoted block can be the ONLY copy of an external
+    exchange the KB will ever see (D-051 review) — stripping it is permanent
+    knowledge loss, so forward-marked messages keep their full body. Ordinary
+    replies strip: their quoted history duplicates sibling thread messages
+    that are ingested in their own right.
+    """
+    raw_body = raw_body or ""
+    if _FORWARD_MARKER_RE.search(raw_body):
+        return raw_body.strip()
+    return _strip_quoted_lines(raw_body)
+
+
+def _delivery_fingerprint(sender: str, att_names: list[str], body: str) -> str:
+    """Duplicate-delivery key WITHIN one thread: sender + attachments + body.
+
+    Body alone is not enough (D-051 review): two DIFFERENT people's short
+    replies ('Approved.') normalize identically after quote-stripping and the
+    second would be silently dropped. Sender + attachment names are invariant
+    across a true double-delivery (same message, two message ids) but differ
+    across genuinely-distinct messages.
+    """
+    parts = "\x00".join([
+        (sender or "").strip().lower(),
+        "|".join(sorted((n or "").strip().lower() for n in att_names or [])),
+        body or "",
+    ])
+    return _body_fingerprint(parts)
+
+
+def _filter_accounts(
+    accounts: list[dict[str, Any]],
+    account_filter: set[str],
+    alias_map: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    """Apply the --accounts filter AFTER the alias collapse: a requested email
+    matches a kept entry directly OR via any of its alias emails. Filtering
+    BEFORE the collapse let a targeted `--accounts <alias>` run sweep under the
+    alias identity and re-create the purged duplicate class (D-051 review)."""
+    if not account_filter:
+        return accounts
+    kept = []
+    for a in accounts:
+        email = (a.get("email") or "").lower()
+        aliases = [x.lower() for x in alias_map.get(a.get("email", ""), [])]
+        if email in account_filter or any(x in account_filter for x in aliases):
+            kept.append(a)
+    return kept
 
 
 def _group_watermark(
@@ -397,20 +457,23 @@ def main() -> int:
     fallback_ts = sync_start - (args.fallback_days * 86400)
     max_threads = max(1, args.max_threads)
 
-    # Optional --accounts filter for targeted backfill
-    account_filter = {e.strip().lower() for e in args.accounts.split(",") if e.strip()}
-    if account_filter:
-        accounts = [a for a in accounts if a.get("email", "").lower() in account_filter]
-        log.info("Account filter active: %d of requested %d accounts matched",
-                 len(accounts), len(account_filter))
-
     # Alias-mailbox collapse (2026-07-31 audit): sweep each PHYSICAL mailbox
     # once per run, not once per roster alias. ~48% of the gmail partition was
-    # exact-duplicate rows from alias multi-sweep before this.
+    # exact-duplicate rows from alias multi-sweep before this. Runs on the FULL
+    # enabled roster BEFORE any --accounts filter so a targeted alias run still
+    # sweeps under the canonical identity (D-051 review).
     accounts, alias_map = _dedup_alias_accounts(accounts)
     for primary, aliases in alias_map.items():
         log.info("Alias collapse: sweeping %s once (skipping alias entries: %s)",
                  primary, ", ".join(aliases))
+
+    # Optional --accounts filter for targeted backfill (matches a kept entry
+    # directly or via any of its aliases)
+    account_filter = {e.strip().lower() for e in args.accounts.split(",") if e.strip()}
+    if account_filter:
+        accounts = _filter_accounts(accounts, account_filter, alias_map)
+        log.info("Account filter active: %d kept entr%s matched %d requested address(es)",
+                 len(accounts), "y" if len(accounts) == 1 else "ies", len(account_filter))
 
     # Stale-first: process the most-neglected mailboxes first so that even if this
     # run is cut short by the Task Scheduler time limit, every account is reached
@@ -492,8 +555,9 @@ def main() -> int:
                 recipients = msg.get("recipients", "")
                 date_ts = msg.get("date_ts", 0)
                 # Quoted reply history is a copy of earlier messages, not new
-                # knowledge — strip before chunking/embedding.
-                body_text = _strip_quoted_lines(msg.get("body_text", ""))
+                # knowledge — strip before chunking/embedding (forwards keep
+                # their quoted block, see _effective_body).
+                body_text = _effective_body(msg.get("body_text", ""))
                 att_names = msg.get("attachment_names", [])
 
                 if not body_text and not att_names:
@@ -501,9 +565,11 @@ def main() -> int:
                     # a reply that was ENTIRELY quoted history)
                     continue
 
-                # Same body delivered twice into one thread under two message
-                # ids (e.g. the RangeMe double-delivery class) — ingest once.
-                fp = _body_fingerprint(body_text)
+                # Same message delivered twice into one thread under two
+                # message ids (e.g. the RangeMe double-delivery class) —
+                # ingest once. Keyed on sender+attachments+body so distinct
+                # people's identical short replies both survive.
+                fp = _delivery_fingerprint(sender, att_names, body_text)
                 if fp:
                     if fp in seen_body_fps:
                         log.debug("Duplicate delivery in thread %s — skipping message %s",
@@ -526,10 +592,18 @@ def main() -> int:
                 chunks = _chunk_text(full_text)
                 source_id = f"gmail:{user_email}:{msg['message_id']}"
 
-                for i, chunk in enumerate(chunks):
+                # ALL of a message's chunks share the BARE source_id: the
+                # store's replace-on-conflict dedups keys batch-wide, so a
+                # re-ingest replaces the whole family atomically no matter how
+                # the chunk COUNT changed (quote-strip shrinks bodies; the old
+                # ':chunkN'-when-multi scheme orphaned stale rows on any
+                # count change -- D-051 review). Legacy ':chunkN' rows persist
+                # until touched by a deep backfill; the alias purge removes
+                # the alias copies of that class.
+                for chunk in chunks:
                     doc = Document(
                         source="gmail",
-                        source_id=f"{source_id}:chunk{i}" if len(chunks) > 1 else source_id,
+                        source_id=source_id,
                         entity=entity,
                         content=chunk,
                         date_created=date_ts,
@@ -579,6 +653,13 @@ def main() -> int:
         )
         if next_wm > 0:
             watermarks[user_email] = next_wm
+            # Mirror onto the group's alias keys (D-051 review): if a future
+            # night's getProfile fails-soft and an alias sweeps standalone, it
+            # starts from LAST NIGHT, not from its frozen pre-collapse value --
+            # bounding the duplicate re-ingest to one sweep interval.
+            for alias in alias_map.get(user_email, []):
+                if alias:
+                    watermarks[alias] = next_wm
             if len(thread_ids) >= max_threads:
                 capped_accounts += 1
                 log.warning(

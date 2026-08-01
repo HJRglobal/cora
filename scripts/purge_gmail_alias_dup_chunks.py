@@ -46,6 +46,8 @@ from collections import Counter
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
 KB_DB_PATH = _REPO_ROOT / "data" / "cora_kb.db"
 
 _BATCH = 500
@@ -89,7 +91,7 @@ def plan_purge(conn: sqlite3.Connection) -> tuple[list[str], dict]:
     """
     cursor = conn.execute(
         """
-        SELECT chunk_id, entity, content,
+        SELECT chunk_id, entity, sub_entity, content,
                json_extract(metadata, '$.message_id') AS mid,
                json_extract(metadata, '$.user_email') AS user_email
         FROM knowledge_chunks
@@ -101,10 +103,12 @@ def plan_purge(conn: sqlite3.Connection) -> tuple[list[str], dict]:
     import hashlib
     groups: dict[tuple, list[tuple]] = {}
     scanned = 0
-    for chunk_id, entity, content, mid, user_email in cursor:
+    for chunk_id, entity, sub_entity, content, mid, user_email in cursor:
         scanned += 1
         digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
-        key = (mid, entity or "", digest)
+        # sub_entity in the key: the strict LEX sub-entity filter is its own
+        # retrieval partition -- each (entity, sub_entity) keeps a survivor.
+        key = (mid, entity or "", sub_entity or "", digest)
         groups.setdefault(key, []).append((chunk_id, user_email or ""))
 
     delete_ids: list[str] = []
@@ -165,9 +169,18 @@ def main() -> int:
         print(f"KB DB not found: {db_path}")
         return 1
 
-    mode = "rw" if args.apply else "ro"
-    conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True)
-    conn.execute("PRAGMA busy_timeout=30000")
+    # --apply MUST go through schema.connect: knowledge_vec_bin/_v2 are vec0
+    # VIRTUAL tables and DELETE against them requires the sqlite-vec extension
+    # loaded ('no such module: vec0' otherwise -- D-051 review; same reason
+    # kb_archive.connect_rw and every sibling purge script use it). Dry-run
+    # reads only knowledge_chunks + sqlite_master, so a plain ro open suffices
+    # and works even where sqlite-vec is not installed.
+    if args.apply:
+        from cora.knowledge_base import schema
+        conn = schema.connect(db_path)
+    else:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA busy_timeout=30000")
 
     delete_ids, stats = plan_purge(conn)
     print(f"gmail rows scanned:      {stats['gmail_rows_scanned']}")
