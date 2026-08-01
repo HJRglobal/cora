@@ -227,12 +227,20 @@ COMMENT_REACTIONS = {"speech_balloon", "thinking_face", "eyes"}
 ACTION_APPROVE = "knowledge_approve"
 ACTION_DISMISS = "knowledge_dismiss"
 
+# Decisions lane (Fork 4, 2026-08-01): decision_capture cards carry their OWN
+# action ids so the tap routes to process_decision_tap (inbox filing), never to
+# process_one_tap_action / apply_knowledge_update -- keeping the type
+# structurally unreachable from the graduated-trust autowrite path, which
+# reuses apply_knowledge_update.
+ACTION_DECISION_ACCEPT = "decision_accept"
+ACTION_DECISION_DISMISS = "decision_dismiss"
+
 # ── Update types ─────────────────────────────────────────────────────────────
 
 # These mirror the gap_type values used by reconciliation_engine.py
 UPDATE_TYPE_ASANA_TASK    = "asana_task"       # Create Asana task
 UPDATE_TYPE_HUBSPOT_NOTE  = "hubspot_note"     # Add HubSpot deal note
-UPDATE_TYPE_DECISION      = "decision_capture" # Append to decisions.md
+UPDATE_TYPE_DECISION      = "decision_capture" # Harrison decision card -> NON-canon inbox
 UPDATE_TYPE_TASK_CLOSE    = "task_close"       # Close open Asana task
 UPDATE_TYPE_GENERIC       = "generic"          # Free-form action for Harrison
 
@@ -380,7 +388,10 @@ def propose_update(
     # TTL-at-creation (Slice 2): knowledge items never expire (expires_at=None);
     # operational nudges expire proposed_at + TTL. Classified with the SINGLE
     # source of truth so it can't drift from the drain's knowledge/op split.
-    if is_knowledge_update(update_type, payload):
+    # decision_capture is its OWN lane (Fork 4): NOT knowledge (it never enters
+    # Harrison's knowledge queue or the autowrite scan) but never-expiring by
+    # locked design -- the drain's expiry helpers also skip it by type.
+    if is_knowledge_update(update_type, payload) or update_type == UPDATE_TYPE_DECISION:
         expires_at = None
     else:
         expires_at = (_now + timedelta(days=_operational_ttl_days())).isoformat()
@@ -618,6 +629,62 @@ def build_single_item_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str
     return text, blocks
 
 
+def format_decision_dm(update: dict[str, Any]) -> str:
+    """One decision_capture card body (Fork 4). States the non-canon contract
+    inline so a tap is never mistaken for a decisions.md write."""
+    conf = update.get("confidence", "?")
+    desc = (update.get("description") or "(no description)").strip()
+    try:  # defensive: no raw <U...> tokens on a Harrison-facing card
+        from .tools.user_identity import resolve_slack_mentions
+        desc = resolve_slack_mentions(desc)
+    except Exception:  # noqa: BLE001
+        pass
+    conf_emoji = {"HIGH": "🔴", "MED": "🟡", "LOW": "⚪"}.get(conf, "⚪")
+    lines = [f"*[Decision capture]* {conf_emoji} `{conf}`\n{desc}"]
+    evidence = update.get("source_evidence", "")
+    if evidence:
+        lines.append(f"_Source: {evidence[:300].replace(chr(10), ' ')}_")
+    lines.append(
+        "_📥 Accept files this to your decisions inbox (NON-canon; promotion to "
+        "decisions.md stays with the Cowork cascade). This card never expires._"
+    )
+    lines.append("\n👍 Accept · 👎 Dismiss  (or tap a button below)")
+    return "\n".join(lines)
+
+
+def build_decision_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """(fallback_text, Block Kit blocks) for one decision card. Same shape as
+    build_single_item_blocks but with the decision action ids, so app.py routes
+    the tap to process_decision_tap (inbox filing) -- never the knowledge
+    applier. The emoji 👍/👎 fallback still works via the scheduled executor's
+    decision branch."""
+    text = format_decision_dm(update)
+    uid = str(update.get("update_id", ""))
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
+        {
+            "type": "actions",
+            "block_id": f"dc_actions_{uid}"[:255],
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": ACTION_DECISION_ACCEPT,
+                    "text": {"type": "plain_text", "text": "📥 Accept → inbox"},
+                    "style": "primary",
+                    "value": uid,
+                },
+                {
+                    "type": "button",
+                    "action_id": ACTION_DECISION_DISMISS,
+                    "text": {"type": "plain_text", "text": "👎 Dismiss"},
+                    "value": uid,
+                },
+            ],
+        },
+    ]
+    return text, blocks
+
+
 def format_pending_dm(updates: list[dict[str, Any]]) -> str:
     """Format a batch of pending updates into a single Slack DM (legacy/fallback).
 
@@ -695,14 +762,18 @@ def send_individual_dms(
     updates: list[dict[str, Any]],
     slack_bot_token: str,
     _client_factory=None,
+    block_builder=None,
 ) -> dict[str, str]:
     """Send one DM per pending update. Returns {update_id: message_ts}.
 
     Skips updates that already have dm_message_ts set (already delivered).
     Adds a 0.5s delay between messages to stay within Slack rate limits.
+    block_builder defaults to build_single_item_blocks (knowledge cards); the
+    decisions lane passes build_decision_blocks.
     """
     import time as _time
 
+    builder = block_builder or build_single_item_blocks
     unsent = [u for u in updates if not u.get("dm_message_ts")]
     if not unsent:
         return {}
@@ -721,7 +792,7 @@ def send_individual_dms(
 
     results: dict[str, str] = {}
     for update in unsent:
-        text, blocks = build_single_item_blocks(update)
+        text, blocks = builder(update)
         try:
             resp = client.chat_postMessage(
                 channel=dm_channel,
@@ -843,6 +914,62 @@ def process_one_tap_action(
         resolve_update(update_id, "APPROVED", reason="one_tap_button")
         log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
         return "approved", f"✅ Saved to Cora's known-answers. ({summary})"
+
+
+def process_decision_tap(
+    update_id: str, actor_id: str, *, approve: bool,
+) -> tuple[str, str]:
+    """Handle a one-tap Accept/Dismiss on a DECISION card (Fork 4).
+
+    Same contract and concurrency discipline as process_one_tap_action
+    (Harrison-only, _ONE_TAP_LOCK, re-read inside the lock, apply-first-then-
+    resolve), but the accept path files to the NON-canon decisions inbox via
+    decision_inbox.apply_decision_accept -- deliberately NOT
+    apply_knowledge_update, so the autowrite path can never reach this type.
+
+    Outcomes: not_authorized | not_found | already_resolved | accepted |
+    excluded | apply_failed | dismissed. A LEX/PHI re-screen refusal at apply
+    time DISMISSES the item (reason lex_phi_excluded) -- it should never have
+    rendered, and with no TTL on this lane an un-dismissable refused row would
+    sit PENDING forever."""
+    if actor_id != HARRISON_SLACK_USER_ID:
+        log.warning("knowledge_review: decision tap by non-Harrison %s ignored", actor_id)
+        return "not_authorized", "Only Harrison can act on decision cards."
+
+    with _ONE_TAP_LOCK:
+        update = _find_update(update_id)
+        if update is None:
+            return "not_found", "I can't find that decision anymore."
+        if update.get("state") != "PENDING":
+            return ("already_resolved",
+                    f"Already handled ({str(update.get('state', '')).lower() or 'resolved'}).")
+
+        if not approve:
+            resolve_update(update_id, "DISMISSED", reason="one_tap_button")
+            log.info("knowledge_review: decision one-tap DISMISS %s", update_id[:8])
+            return "dismissed", "👎 Dismissed — not filed."
+
+        from .decision_inbox import apply_decision_accept
+        ok, summary = apply_decision_accept(update, via="one_tap_button")
+        if not ok:
+            if summary.startswith("excluded:"):
+                # Fail-closed LEX/PHI wall tripped at the durable write.
+                resolve_update(update_id, "DISMISSED", reason="lex_phi_excluded")
+                log.warning("knowledge_review: decision %s excluded at apply (%s)",
+                            update_id[:8], summary)
+                return ("excluded",
+                        "🚫 Withheld — this looks LEX/PHI-scoped, so it can't be "
+                        "filed (fail-closed). Dismissed.")
+            log.warning("knowledge_review: decision one-tap apply failed %s: %s",
+                        update_id[:8], summary)
+            # Left PENDING (transient I/O failure): the emoji 👍 path or a re-run
+            # can retry; the card never expires so nothing is silently lost.
+            return "apply_failed", f"⚠️ Couldn't file: {summary}. Left pending."
+        resolve_update(update_id, "APPROVED", reason="one_tap_button")
+        log.info("knowledge_review: decision one-tap ACCEPT %s (%s)", update_id[:8], summary)
+        return ("accepted",
+                f"📥 Filed to your decisions inbox — non-canon; promotion to "
+                f"decisions.md stays with the cascade. ({summary})")
 
 
 # ── Graduated-trust AUTO-WRITE (§7B, 2026-07-21; D-011 relaxed -> reversible) ────
@@ -972,6 +1099,12 @@ def apply_autowrite(update: dict[str, Any], *, tier: int, reason: str,
     path uses (apply_knowledge_update), so an auto-write is byte-identical to a
     Harrison-approved one -- including the fail-closed PHI re-check inside the
     appliers. Returns (ok, summary). Never raises."""
+    # Fork 4 invariant belt: decision_capture is never-autowrite-eligible BY
+    # TYPE. Structurally it can't reach here (the drain's decision lane never
+    # enters the autowrite scan, and apply_knowledge_update refuses the type),
+    # but the invariant is load-bearing enough to state at this chokepoint too.
+    if (update or {}).get("update_type") == UPDATE_TYPE_DECISION:
+        return False, "decision_capture is never autowrite-eligible (by type)"
     targets = _autowrite_target_files()
     before = _snapshot(targets)
     try:

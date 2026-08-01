@@ -2600,7 +2600,8 @@ def handle_reaction_removed(event: dict, client) -> None:
 # (Harrison gate, idempotency, apply-first-then-resolve) lives in
 # knowledge_review.process_one_tap_action; this wrapper is only Slack I/O.
 
-def _handle_knowledge_one_tap(body: dict, client, *, approve: bool) -> None:
+def _handle_knowledge_one_tap(body: dict, client, *, approve: bool,
+                              processor=None) -> None:
     try:
         actions = body.get("actions") or []
         update_id = (actions[0].get("value") if actions else "") or ""
@@ -2608,9 +2609,11 @@ def _handle_knowledge_one_tap(body: dict, client, *, approve: bool) -> None:
         channel_id = (body.get("channel") or {}).get("id", "")
         message_ts = (body.get("message") or {}).get("ts", "")
 
-        outcome, msg = knowledge_review.process_one_tap_action(
-            update_id, actor_id, approve=approve,
-        )
+        # Same wrapper serves the knowledge cards and the Fork-4 decision cards;
+        # only the correctness processor differs (both share the contract:
+        # Harrison gate, _ONE_TAP_LOCK, apply-first-then-resolve).
+        proc = processor or knowledge_review.process_one_tap_action
+        outcome, msg = proc(update_id, actor_id, approve=approve)
 
         # Audit trail. event_type="block_action" (NOT reaction_added) so the
         # scheduled correlate_reactions_to_updates never re-processes this item.
@@ -2666,6 +2669,28 @@ def handle_knowledge_approve(ack, body, client) -> None:
 def handle_knowledge_dismiss(ack, body, client) -> None:
     ack()
     _handle_knowledge_one_tap(body, client, approve=False)
+
+
+# ── Decision cards (Fork 4, 2026-08-01): Accept -> NON-canon decisions inbox ──
+# Dedicated action ids so a decision tap can never reach the knowledge applier
+# (and via it the autowrite path). Correctness lives in
+# knowledge_review.process_decision_tap + decision_inbox.apply_decision_accept;
+# these wrappers are only Slack I/O.
+
+@app.action(knowledge_review.ACTION_DECISION_ACCEPT)
+def handle_decision_accept(ack, body, client) -> None:
+    ack()
+    _handle_knowledge_one_tap(
+        body, client, approve=True,
+        processor=knowledge_review.process_decision_tap)
+
+
+@app.action(knowledge_review.ACTION_DECISION_DISMISS)
+def handle_decision_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_knowledge_one_tap(
+        body, client, approve=False,
+        processor=knowledge_review.process_decision_tap)
 
 
 # ── One-tap auto-write REVERT (§7B, 2026-07-21) ──────────────────────────────

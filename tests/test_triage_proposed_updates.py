@@ -37,13 +37,20 @@ _DEFAULT = frozenset(tpu._DEFAULT_DISMISS_TYPES)
 
 def test_should_dismiss_operational_deadends():
     assert tpu._should_dismiss(_rec("a", "hubspot_note"), _DEFAULT)
-    assert tpu._should_dismiss(_rec("b", "decision_capture"), _DEFAULT)
     assert tpu._should_dismiss(_rec("c", "generic"), _DEFAULT)
 
 
 def test_protects_knowledge_types():
     assert not tpu._should_dismiss(_rec("d", "known_answer"), _DEFAULT)
     assert not tpu._should_dismiss(_rec("e", "efficiency"), _DEFAULT)
+
+
+def test_protects_decision_capture_since_fork4():
+    # Fork 4 (2026-08-01): decisions are a never-expiring Harrison one-tap lane.
+    # Not in the default set AND protected -- an explicit --types opt-in refuses.
+    assert not tpu._should_dismiss(_rec("b", "decision_capture"), _DEFAULT)
+    assert not tpu._should_dismiss(
+        _rec("b", "decision_capture"), frozenset({"decision_capture"}))
 
 
 def test_protects_info_for_cora_generic():
@@ -94,7 +101,7 @@ def test_apply_dismisses_and_backs_up(tmp_path, monkeypatch):
     ledger = tmp_path / "ledger.jsonl"
     records = [
         _rec("a", "hubspot_note"),                       # dismiss
-        _rec("b", "decision_capture"),                   # dismiss
+        _rec("b", "decision_capture"),                   # KEEP (protected, Fork 4)
         _rec("c", "generic", source=None),               # dismiss (drive generic)
         _rec("d", "generic", source="info-for-cora"),    # KEEP (human note)
         _rec("e", "known_answer"),                        # KEEP
@@ -116,10 +123,9 @@ def test_apply_dismisses_and_backs_up(tmp_path, monkeypatch):
              (json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip())}
     assert after["a"]["state"] == "DISMISSED"
     assert after["a"]["resolved_reason"] == "bulk_triage_ws17b"
-    assert after["b"]["state"] == "DISMISSED"
     assert after["c"]["state"] == "DISMISSED"
-    # Kept:
-    for keep in ("d", "e", "f", "g"):
+    # Kept (b = decision_capture, protected since Fork 4):
+    for keep in ("b", "d", "e", "f", "g"):
         assert after[keep]["state"] == "PENDING", keep
     assert after["h"]["state"] == "APPROVED"
 

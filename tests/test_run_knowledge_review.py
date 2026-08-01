@@ -228,7 +228,7 @@ def test_route_operational_to_owners(tmp_path, monkeypatch):
 
     items = [
         _op("op1", "hubspot_note", "F3E"),       # -> Tommy
-        _op("op2", "decision_capture", "FNDR"),  # -> Harrison
+        _op("op2", "task_close", "FNDR"),        # -> Harrison
         _op("lex1", "asana_task", "LEX-LLC"),    # PHI -> never routed
         _op("old", "hubspot_note", "F3E", proposed="1999-01-01T00:00:00+00:00"),  # below floor
     ]
@@ -314,7 +314,7 @@ def test_route_batches_one_dm_per_owner(tmp_path, monkeypatch):
 
     items = [_op("f1", "hubspot_note", "F3E"),
              _op("f2", "asana_task", "F3E"),
-             _op("f3", "decision_capture", "F3E")]  # all -> Tommy
+             _op("f3", "task_close", "F3E")]  # all -> Tommy
     n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
 
     assert n == 3
@@ -334,8 +334,8 @@ def test_route_two_owners_two_dms(tmp_path, monkeypatch):
     sent = MagicMock(return_value="ts")
     monkeypatch.setattr(rkr, "_send_dm_to_user", sent)
     monkeypatch.setattr(rkr, "resolve_update", MagicMock(return_value=True))
-    items = [_op("f1", "hubspot_note", "F3E"),      # -> Tommy
-             _op("d1", "decision_capture", "FNDR")]  # -> Harrison
+    items = [_op("f1", "hubspot_note", "F3E"),  # -> Tommy
+             _op("d1", "task_close", "FNDR")]   # -> Harrison
     n = rkr._route_operational_to_owners(items, "xoxb-test", logging.getLogger("t"))
     assert n == 2 and sent.call_count == 2  # one DM per distinct owner
 

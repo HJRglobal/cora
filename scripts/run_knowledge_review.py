@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cora.knowledge_review import (  # noqa: E402
     apply_autowrite,
     autowrite_level,
+    build_decision_blocks,
     correlate_reactions_to_updates,
     get_pending_updates,
     is_knowledge_update,
@@ -45,6 +46,7 @@ from cora.knowledge_review import (  # noqa: E402
     send_dm_to_harrison,
     send_individual_dms,
     HARRISON_SLACK_USER_ID,
+    UPDATE_TYPE_DECISION as _kr_UPDATE_TYPE_DECISION,
     UPDATE_TYPE_GENERIC,
 )
 from cora.coras_read import build_coras_read_struct  # noqa: E402  (WS17-C enrichment)
@@ -105,11 +107,17 @@ _DIGEST_WEEKDAY = 0  # Monday
 # owner acts in the native tool). A #info-for-cora generic is a human knowledge
 # contribution, so it rides the knowledge stream, not the operational one.
 _KNOWLEDGE_TYPES = frozenset({"known_answer", "efficiency"})
+# decision_capture left this set 2026-08-01 (Fork 4): decisions are their OWN
+# drain lane -- never-expiring one-tap cards to Harrison, never owner-routed,
+# never TTL-expired. Its absence here is load-bearing: it keeps
+# _auto_expire_unrouted_operational off decision rows (incl. legacy rows that
+# still carry a stamped expires_at).
 _OPERATIONAL_TYPES = frozenset(
-    {"asana_task", "task_close", "hubspot_note", "decision_capture", "generic"}
+    {"asana_task", "task_close", "hubspot_note", "generic"}
 )
 
 _MAX_KNOWLEDGE_DMS_PER_RUN = 10   # Harrison's daily knowledge queue
+_MAX_DECISION_DMS_PER_RUN = 5     # Harrison's decision cards (never expire; pool drains over runs)
 _MAX_OWNER_DMS_PER_RUN = 10       # total operational items routed to owners per run
 _MAX_OWNER_DMS_PER_OWNER = 5      # per-owner cap so no single owner is flooded
 
@@ -259,12 +267,25 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             _post_to_slack(slack_token, notify_ch, msg)
 
         elif update_type == "decision_capture":
-            formatted = payload.get("formatted_entry") or payload.get("decision_text") or desc
-            msg = (
-                f":pencil: *Gap executor* `[{uid_short}]` — add to `memory/decisions.md`:\n"
-                f"```{formatted[:600]}```"
-            )
-            log.info("gap-executor: decision_capture posted to #%s uid=%s", notify_ch, uid_short)
+            # Fork 4: an approved decision now has a DURABLE, non-canon landing --
+            # the decisions inbox -- instead of the old "add to memory/decisions.md"
+            # advisory post (which implied a canon write nothing performed).
+            # Promotion into decisions.md stays the Cowork cascade (D-011).
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.decision_inbox import apply_decision_accept
+            ok, summary = apply_decision_accept(update, via="emoji_reaction")
+            if ok:
+                msg = (
+                    f":inbox_tray: *Gap executor* `[{uid_short}]` decision filed to the "
+                    f"non-canon inbox ({summary}):\n> {desc[:300]}"
+                )
+                log.info("gap-executor: decision filed to inbox uid=%s", uid_short)
+            else:
+                success = False
+                msg = (f":warning: *Gap executor* `[{uid_short}]` decision inbox filing "
+                       f"failed: {summary}")
+                log.warning("gap-executor: decision inbox failed uid=%s: %s",
+                            uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
 
         elif update_type == "known_answer":
@@ -374,6 +395,10 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
     from datetime import datetime as _dt
     n = 0
     for e in entries:
+        if e.get("update_type") == _kr_UPDATE_TYPE_DECISION:
+            # Fork 4: decision cards NEVER expire -- not even DM'd-unreacted.
+            # The 63-expired-unseen failure is the exact reason this lane exists.
+            continue
         if e.get("state") == "PENDING" and e.get("dm_message_ts"):
             try:
                 if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
@@ -407,6 +432,8 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
             continue
         if _is_knowledge_item(e):
             continue
+        if e.get("update_type") == _kr_UPDATE_TYPE_DECISION:
+            continue  # Fork 4: never TTL-expired, even legacy rows w/ expires_at
         if e.get("update_type") not in _OPERATIONAL_TYPES:
             continue
         try:
@@ -495,6 +522,9 @@ def _ack_reaction_text(action: str, update_type: str, success: bool = True) -> s
             return ":white_check_mark: Saved to Cora's known-answers."
         if update_type == "efficiency":
             return ":white_check_mark: Logged to the efficiency backlog."
+        if update_type == "decision_capture":
+            return (":inbox_tray: Filed to your decisions inbox (non-canon; "
+                    "promotion stays with the cascade).")
         return ":white_check_mark: Approved -- I've recorded this."
     if action == "DISMISSED":
         return ":x: Dismissed -- no action taken."
@@ -548,7 +578,6 @@ _OWNER_ITEM_LABELS = {
     "asana_task": "Suggested Asana task",
     "task_close": "Asana task may be done",
     "hubspot_note": "Suggested HubSpot note",
-    "decision_capture": "Possible decision to record",
     "generic": "FYI",
 }
 
@@ -685,6 +714,74 @@ def _route_operational_to_owners(
             len([u for u in items if u.get("proposed_at", "") < floor]),
         )
     return routed
+
+
+def _screen_and_send_decision_cards(
+    items: list[dict], slack_token: str, log: logging.Logger, _client_factory=None,
+) -> tuple[int, int]:
+    """Fork 4 decision lane: LEX/PHI-screen unsent decision_capture items, then
+    DM Harrison up to _MAX_DECISION_DMS_PER_RUN never-expiring one-tap cards.
+    Returns (sent, excluded).
+
+    * Screening is FAIL-CLOSED (decision_inbox.screen_decision: any error =
+      excluded). Excluded items are DISMISSED with resolved_reason
+      "lex_phi_excluded:<reason>" -- with no TTL on this lane, leaving them
+      PENDING would accumulate un-renderable rows forever.
+    * Order: HIGH confidence first, then oldest first (stable), matching the
+      knowledge queue. Overflow just waits -- cards never expire.
+    * A failed DM leaves the item PENDING and unsent (no dm_message_ts), so it
+      re-sends next run.
+    """
+    if not items:
+        return 0, 0
+    try:
+        from cora.decision_inbox import screen_decision
+    except Exception as exc:  # noqa: BLE001 -- fail closed: render nothing
+        log.warning("decision-cards: could not import screen_decision (%s) -- "
+                    "sending nothing this run", exc)
+        return 0, 0
+
+    renderable: list[dict] = []
+    excluded = 0
+    for u in items:
+        try:
+            bad, reason = screen_decision(u)
+        except Exception:  # noqa: BLE001 -- screen_decision is documented
+            bad, reason = True, "screen_error"  # never-raise; belt anyway
+        if bad:
+            resolve_update(u["update_id"], "DISMISSED",
+                           reason=f"lex_phi_excluded:{reason}")
+            excluded += 1
+            log.info("decision-cards: excluded %s (%s)",
+                     str(u.get("update_id", "?"))[:12], reason)
+            continue
+        renderable.append(u)
+
+    renderable.sort(key=lambda u: (0 if u.get("confidence") == "HIGH" else 1,
+                                   u.get("proposed_at", "")))
+    batch = renderable[:_MAX_DECISION_DMS_PER_RUN]
+    if not batch:
+        return 0, excluded
+    if len(renderable) > len(batch):
+        log.info("decision-cards: %d renderable, sending first %d (rest never "
+                 "expire and ride the next runs)", len(renderable), len(batch))
+
+    send_dm_to_harrison(
+        f"📥 {len(batch)} captured decision(s) below. Accept files each to your "
+        f"decisions inbox (non-canon; promotion to decisions.md stays with the "
+        f"cascade). These cards never expire.",
+        slack_token, _client_factory=_client_factory,
+    )
+    sent_map = send_individual_dms(batch, slack_token, _client_factory,
+                                   block_builder=build_decision_blocks)
+    for u in batch:
+        ts = sent_map.get(u["update_id"])
+        if ts:
+            _patch_dm_ts(u["update_id"], ts)
+    if len(sent_map) < len(batch):
+        log.warning("decision-cards: sent %d/%d (failed sends stay PENDING and "
+                    "retry next run)", len(sent_map), len(batch))
+    return len(sent_map), excluded
 
 
 def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
@@ -941,11 +1038,21 @@ def main() -> int:
     # and auto-expire (Steps 0/1) already ran above.
     pending = get_pending_updates()
     unsent = [u for u in pending if not u.get("dm_message_ts")]
+    # Three-way split (Fork 4): knowledge -> Harrison's queue; decisions ->
+    # Harrison's never-expiring one-tap cards; everything else -> owner routing.
+    decision_unsent = [
+        u for u in unsent if u.get("update_type") == _kr_UPDATE_TYPE_DECISION
+    ]
     knowledge_unsent = [u for u in unsent if _is_knowledge_item(u)]
-    operational_unsent = [u for u in unsent if not _is_knowledge_item(u)]
+    operational_unsent = [
+        u for u in unsent
+        if not _is_knowledge_item(u)
+        and u.get("update_type") != _kr_UPDATE_TYPE_DECISION
+    ]
     log.info(
-        "Step 2 drain: %d PENDING, %d unsent (%d knowledge, %d operational)",
-        len(pending), len(unsent), len(knowledge_unsent), len(operational_unsent),
+        "Step 2 drain: %d PENDING, %d unsent (%d knowledge, %d decision, %d operational)",
+        len(pending), len(unsent), len(knowledge_unsent), len(decision_unsent),
+        len(operational_unsent),
     )
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -953,8 +1060,13 @@ def main() -> int:
     if args.dry_run:
         for i, u in enumerate(knowledge_unsent[:_MAX_KNOWLEDGE_DMS_PER_RUN], 1):
             log.info("[DRY RUN] knowledge %d: %s", i, u.get("description", "?")[:120])
-        log.info("[DRY RUN] would route up to %d operational item(s) to owners",
-                 len(operational_unsent))
+        for i, u in enumerate(decision_unsent[:_MAX_DECISION_DMS_PER_RUN], 1):
+            log.info("[DRY RUN] decision %d: %s", i, u.get("description", "?")[:120])
+        log.info("[DRY RUN] would send up to %d decision card(s) (of %d unsent; "
+                 "screening not run in dry-run) and route up to %d operational "
+                 "item(s) to owners",
+                 min(len(decision_unsent), _MAX_DECISION_DMS_PER_RUN),
+                 len(decision_unsent), len(operational_unsent))
         return exit_code
 
     if not slack_token:
@@ -968,6 +1080,17 @@ def main() -> int:
             log.info("Routed %d operational nudge(s) to domain owners", n_routed)
     except Exception as exc:  # noqa: BLE001 — routing must not block the knowledge DM
         log.warning("route-to-owner: unexpected error (continuing): %s", exc)
+
+    # ── 2a.5: Decision cards -> Harrison (Fork 4; BEFORE the knowledge-empty
+    # early-returns below so an all-decision run still sends its cards) ──────
+    try:
+        n_dec_sent, n_dec_excluded = _screen_and_send_decision_cards(
+            decision_unsent, slack_token, log)
+        if n_dec_sent or n_dec_excluded:
+            log.info("Decision cards: sent %d, excluded %d (lex_phi_excluded)",
+                     n_dec_sent, n_dec_excluded)
+    except Exception as exc:  # noqa: BLE001 — decisions must not block the knowledge DM
+        log.warning("decision-cards: unexpected error (continuing): %s", exc)
 
     # ── 2b: Knowledge items → Harrison, every run (item 4) ──────────────────
     k = knowledge_unsent

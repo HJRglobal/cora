@@ -148,7 +148,7 @@ class TestApply:
             _row(update_id="c", update_type="known_answer", proposed_at=_iso(40)),      # protected, kept
             _row(update_id="d", update_type="asana_task", proposed_at=_iso(20),
                  dm_message_ts="99.9"),                                                 # surfaced, kept
-            _row(update_id="e", update_type="decision_capture", proposed_at=_iso(60)),  # -> DISMISSED
+            _row(update_id="e", update_type="decision_capture", proposed_at=_iso(60)),  # protected (Fork 4), kept
             "{malformed json line",                                                     # preserved
         ]
         _write_ledger(ledger, rows)
@@ -169,8 +169,8 @@ class TestApply:
         assert parsed["a"]["state"] == "DISMISSED"
         assert parsed["a"]["resolved_reason"] == "expired_bulk"
         assert parsed["a"]["resolved_at"]
-        assert parsed["e"]["state"] == "DISMISSED"
-        # untouched
+        # untouched (decision_capture is protected since Fork 4 -- never bulk-expired)
+        assert parsed["e"]["state"] == "PENDING"
         assert parsed["b"]["state"] == "PENDING"
         assert parsed["c"]["state"] == "PENDING"
         assert parsed["d"]["state"] == "PENDING"

@@ -49,10 +49,14 @@ _LEDGER_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.jsonl"
 _MANIFEST_DIR = _REPO_ROOT / "logs"
 
 # Default operational "dead-end" types the brief scoped for bulk dismissal.
-_DEFAULT_DISMISS_TYPES = ("hubspot_note", "decision_capture", "generic")
+# decision_capture removed 2026-08-01 (Fork 4): decisions are a never-expiring
+# Harrison one-tap lane now -- bulk-dismissing them would silently drain it.
+_DEFAULT_DISMISS_TYPES = ("hubspot_note", "generic")
 
-# Never dismissed in bulk -- the genuine learning / human-contribution stream.
-_PROTECTED_TYPES = frozenset({"known_answer", "efficiency"})
+# Never dismissed in bulk -- the genuine learning / human-contribution stream
+# and the never-expiring decisions lane (Fork 4; cleanup goes through the
+# dedicated triage_decision_backlog script instead).
+_PROTECTED_TYPES = frozenset({"known_answer", "efficiency", "decision_capture"})
 
 _DISMISS_REASON = "bulk_triage_ws17b"
 

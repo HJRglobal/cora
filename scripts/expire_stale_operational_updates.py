@@ -66,12 +66,17 @@ _LEDGER_PATH = _REPO_ROOT / "data" / "cora-proposed-memory-updates.jsonl"
 _MANIFEST_DIR = _REPO_ROOT / "logs"
 
 # The operational "dead-end" types Harrison scoped for bulk expiry (2026-07-10).
-_DEFAULT_EXPIRE_TYPES = ("hubspot_note", "asana_task", "task_close", "decision_capture")
+# decision_capture removed 2026-08-01 (Fork 4): decisions are a never-expiring
+# Harrison one-tap lane now -- bulk-expiring them would silently drain it.
+_DEFAULT_EXPIRE_TYPES = ("hubspot_note", "asana_task", "task_close")
 
-# Never expired in bulk -- the knowledge / human-contribution stream and the
-# founder layer. (Belt-and-braces: these are already excluded by the allowlist;
-# this set makes passing one via --types a hard error.)
-_PROTECTED_TYPES = frozenset({"known_answer", "generic", "efficiency", "founder"})
+# Never expired in bulk -- the knowledge / human-contribution stream, the
+# founder layer, and the never-expiring decisions lane (Fork 4). (Belt-and-
+# braces: these are already excluded by the allowlist; this set makes passing
+# one via --types a hard error. Decision-pool cleanup goes through the
+# dedicated triage_decision_backlog script instead.)
+_PROTECTED_TYPES = frozenset(
+    {"known_answer", "generic", "efficiency", "founder", "decision_capture"})
 
 _EXPIRE_REASON = "expired_bulk"
 _DEFAULT_CUTOFF_DAYS = 14
