@@ -949,6 +949,8 @@ def synthesize_memo(facts_text: str) -> str | None:
             messages=[{"role": "user",
                        "content": _SYNTH_PROMPT.format(facts=facts_text)}],
         )
+        from .llm_usage import log_usage
+        log_usage(response, caller="strategy_memo")
         text = (response.content[0].text or "").strip()
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design
         log.warning("strategy_memo: synthesis failed: %s", exc)

@@ -1215,6 +1215,9 @@ def pass5_drive_insights(
                 system=_DRIVE_SYNTHESIS_PROMPT,
                 messages=[{"role": "user", "content": user_msg}],
             )
+            from .llm_usage import log_usage
+            log_usage(resp, caller="reconciliation.pass5",
+                      model="claude-haiku-4-5-20251001")
             raw = (resp.content[0].text or "").strip()
         except Exception as exc:
             log.error("pass5: Haiku call failed for entity %s: %s", entity, exc)

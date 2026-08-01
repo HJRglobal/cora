@@ -627,6 +627,8 @@ def classify_still_open(question: str, following: list[str]) -> bool:
             max_tokens=8,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(resp, caller="missed_message_catchup", model=MODEL_HAIKU)
         out = "".join(
             b.text for b in resp.content if getattr(b, "type", "") == "text"
         ).strip().upper()

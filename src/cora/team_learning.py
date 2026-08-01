@@ -376,6 +376,8 @@ def paraphrase_note(raw_content: str, entity: str, correction: str | None = None
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(msg, caller="team_learning", model="claude-haiku-4-5-20251001")
         return (msg.content[0].text or raw_content).strip()
     except Exception as exc:
         log.warning("paraphrase_note: Haiku call failed (%s) -- using raw content", exc)

@@ -162,6 +162,8 @@ def synthesize_user_activity(
             system=_SYNTHESIS_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
         )
+        from ..llm_usage import log_usage
+        log_usage(resp, caller="channel_sweep", model=_SYNTHESIS_MODEL)
         raw = (resp.content[0].text or "").strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1]

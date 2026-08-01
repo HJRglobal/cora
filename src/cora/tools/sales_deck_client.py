@@ -359,6 +359,8 @@ If location/territory is known, tailor any regional references accordingly.
         messages=[{"role": "user", "content": user_message}],
     )
 
+    from ..llm_usage import log_usage
+    log_usage(response, caller="sales_deck")
     raw = response.content[0].text.strip()
     # Strip markdown code fences if model wraps response
     raw = re.sub(r"^```(?:json)?\s*", "", raw)

@@ -780,6 +780,8 @@ def draft_proposal(finding: FrictionFinding) -> dict[str, Any] | None:
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(response, caller="friction_mining", model=_HAIKU_MODEL)
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = "\n".join(l for l in raw.split("\n") if not l.startswith("```")).strip()

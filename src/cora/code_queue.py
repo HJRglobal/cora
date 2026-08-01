@@ -1131,6 +1131,8 @@ def classify_candidate(message: str, entity: str) -> dict[str, Any] | None:
             model=_HAIKU_MODEL, max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(resp, caller="code_queue.classify", model=_HAIKU_MODEL)
         raw = resp.content[0].text.strip()
         if raw.startswith("```"):
             raw = "\n".join(l for l in raw.split("\n") if not l.startswith("```")).strip()
@@ -1384,6 +1386,8 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
                 messages=[{"role": "user", "content":
                            f"Slug: {slug}\nItems to cover:\n{evidence}"}],
             )
+            from .llm_usage import log_usage
+            log_usage(resp, caller="code_queue.kickoff")
             body = resp.content[0].text.strip()
         except Exception as exc:  # noqa: BLE001 -- fail-soft to the skeleton
             log.warning("code_queue: prompt generation failed, using skeleton: %s", exc)

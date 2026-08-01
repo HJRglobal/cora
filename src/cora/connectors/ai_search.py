@@ -370,6 +370,8 @@ def query_claude_web(prompt: str) -> QueryResult:
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
         messages=[{"role": "user", "content": prompt}],
     )
+    from ..llm_usage import log_usage
+    log_usage(resp, caller="ai_search", model=CLAUDE_WEB_MODEL)
     r = _parse_claude(resp)
     r.prompt = prompt
     return r

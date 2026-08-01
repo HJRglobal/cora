@@ -201,6 +201,8 @@ def _synthesize_recap(chunks: list[str], api_key: str) -> str:
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}],
     )
+    from cora.llm_usage import log_usage
+    log_usage(msg, caller="finance_weekly_recap", model=_HAIKU_MODEL)
     return (msg.content[0].text or "").strip()
 
 

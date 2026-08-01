@@ -544,6 +544,8 @@ def distill(text: str, default_entity: str, *, phi: bool,
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(resp, caller="session_capture", model=_HAIKU_MODEL)
         raw = resp.content[0].text.strip()
     except Exception as exc:  # noqa: BLE001 — fail-closed
         log.warning("session_capture: Haiku distill failed: %s", exc)

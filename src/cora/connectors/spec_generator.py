@@ -236,6 +236,8 @@ def _call_claude(brand: str, brief: str) -> dict:
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
+    from ..llm_usage import log_usage
+    log_usage(response, caller="spec_generator", model="claude-haiku-4-5-20251001")
     raw = response.content[0].text.strip()
 
     # Strip any accidental markdown fences

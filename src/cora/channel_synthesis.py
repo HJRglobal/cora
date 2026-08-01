@@ -224,6 +224,8 @@ def _synthesize(prompt_text: str, *, phi_check=None) -> str | None:
             thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
             messages=[{"role": "user", "content": prompt_text}],
         )
+        from .llm_usage import log_usage
+        log_usage(response, caller="channel_synthesis")
         text = (response.content[0].text or "").strip()
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design
         log.warning("channel_synthesis: synthesis failed: %s", exc)

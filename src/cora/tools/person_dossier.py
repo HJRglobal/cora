@@ -538,6 +538,8 @@ def _synthesize(p: PersonIdentity, signals: str, days: int, client: Any) -> Opti
             thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
             messages=[{"role": "user", "content": prompt}],
         )
+        from ..llm_usage import log_usage
+        log_usage(resp, caller="person_dossier")
         raw = resp.content[0].text.strip()
     except Exception as exc:  # noqa: BLE001 -- fail-soft (do NOT write back on failure)
         log.warning("person_dossier: synthesis failed for %s: %s", p.slug, exc)

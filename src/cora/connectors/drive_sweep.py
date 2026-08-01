@@ -147,6 +147,8 @@ def _classify(anthropic_client: Any, filename: str, user_name: str,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
+        from ..llm_usage import log_usage
+        log_usage(msg, caller="drive_sweep", model="claude-haiku-4-5-20251001")
         raw = msg.content[0].text.strip()
         # Strip markdown fences if Haiku adds them
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()

@@ -64,7 +64,31 @@ _DASHBOARD_ACCESS_YAML = REPO_ROOT / "data" / "maps" / "dashboard-access.yaml"
 _USAGE_RE = re.compile(
     r"claude usage iter=(\d+) input=(\d+) cache_create=(\d+) "
     r"cache_read=(\d+) output=(\d+)"
+    # Trailing fields added by cora.llm_usage (script-side instrumentation,
+    # 2026-07-31 batch pilot slice 1). Optional so legacy bot lines from
+    # claude_client._log_usage keep parsing; presence of caller= is the
+    # bot-vs-script bucket discriminator in recent_billing().
+    r"(?: model=(?P<model>\S+))?(?: caller=(?P<caller>\S+))?"
 )
+
+# USD per MTok (input, output) by model-id PREFIX, first match wins -- so dated
+# snapshots (claude-haiku-4-5-20251001) and CORA_SONNET_MODEL variants
+# (claude-sonnet-4-6 / claude-sonnet-5) resolve. Cache reads bill ~0.1x the
+# input rate; cache writes ~1.25x (5-min TTL). ESTIMATE only -- ignores intro
+# pricing and batch discounts (batch legs log via= and already spent 50% less).
+_MODEL_RATES: tuple[tuple[str, tuple[float, float]], ...] = (
+    ("claude-haiku-4-5", (1.0, 5.0)),
+    ("claude-sonnet", (3.0, 15.0)),
+    ("claude-opus", (5.0, 25.0)),
+    ("claude-fable", (10.0, 50.0)),
+)
+
+
+def _rate_for(model: str) -> tuple[float, float] | None:
+    for prefix, rates in _MODEL_RATES:
+        if model.startswith(prefix):
+            return rates
+    return None
 
 # KB retrieval latency (Slice 2-3): "KB retrieved N chunks (of M returned) for
 # entity=<E> — best distance=<d> kb_ms=<ms>". Entity token stops at whitespace so
@@ -244,12 +268,31 @@ def kb_latency(log_days: int) -> dict:
 
 
 def recent_billing(log_days: int) -> dict:
-    logs = sorted(LOGS_DIR.glob("cora-2*.log"))[-log_days:] if LOGS_DIR.exists() else []
+    """Parse "claude usage" lines into a BOT bucket and a SCRIPT bucket.
+
+    Bot bucket (existing semantics): lines WITHOUT caller= in logs/cora-2*.log
+    -- claude_client._log_usage output, median-summarized. Script bucket
+    (2026-07-31 slice 1): lines WITH caller= from EVERY dated log file in the
+    same date window (scripts log to per-family files like
+    session-capture-YYYY-MM-DD.log; the synthesis runners share cora-*.log),
+    summed per caller with a $-estimate from _MODEL_RATES.
+    """
+    cora_logs = sorted(LOGS_DIR.glob("cora-2*.log"))[-log_days:] if LOGS_DIR.exists() else []
+    window_dates = {p.stem[-10:] for p in cora_logs}
+    # file -> is_cora_log; only cora-*.log lines may enter the bot bucket.
+    all_logs: dict[Path, bool] = dict.fromkeys(cora_logs, True)
+    if LOGS_DIR.exists():
+        for p in LOGS_DIR.glob("*.log"):
+            if p not in all_logs and p.stem[-10:] in window_dates:
+                all_logs[p] = False
+
     inputs: list[int] = []
     cache_reads: list[int] = []
     cache_creates: list[int] = []
     outputs: list[int] = []
-    for log_path in logs:
+    scripts: dict[str, dict] = {}
+    script_est_incomplete = False
+    for log_path, is_cora in all_logs.items():
         try:
             with log_path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -258,24 +301,56 @@ def recent_billing(log_days: int) -> dict:
                     m = _USAGE_RE.search(line)
                     if not m:
                         continue
-                    inputs.append(int(m.group(2)))
-                    cache_creates.append(int(m.group(3)))
-                    cache_reads.append(int(m.group(4)))
-                    outputs.append(int(m.group(5)))
+                    caller = m.group("caller")
+                    if caller:
+                        model = m.group("model") or "-"
+                        row = scripts.setdefault(caller, {
+                            "calls": 0, "input": 0, "cache_create": 0,
+                            "cache_read": 0, "output": 0, "est_usd": 0.0,
+                        })
+                        row["calls"] += 1
+                        row["input"] += int(m.group(2))
+                        row["cache_create"] += int(m.group(3))
+                        row["cache_read"] += int(m.group(4))
+                        row["output"] += int(m.group(5))
+                        rates = _rate_for(model)
+                        if rates is None:
+                            script_est_incomplete = True
+                        else:
+                            in_rate, out_rate = rates
+                            row["est_usd"] += (
+                                int(m.group(2)) * in_rate
+                                + int(m.group(3)) * in_rate * 1.25
+                                + int(m.group(4)) * in_rate * 0.1
+                                + int(m.group(5)) * out_rate
+                            ) / 1_000_000
+                    elif is_cora:
+                        inputs.append(int(m.group(2)))
+                        cache_creates.append(int(m.group(3)))
+                        cache_reads.append(int(m.group(4)))
+                        outputs.append(int(m.group(5)))
         except OSError:
             continue
 
+    for row in scripts.values():
+        row["est_usd"] = round(row["est_usd"], 4)
     med_input = _median(inputs)
     med_cache_read = _median(cache_reads)
     ratio = round(med_cache_read / med_input, 3) if med_input else 0.0
     return {
-        "logs_parsed": [p.name for p in logs],
+        "logs_parsed": [p.name for p in cora_logs],
         "usage_lines": len(inputs),
         "median_input": med_input,
         "median_cache_read": med_cache_read,
         "median_cache_create": _median(cache_creates),
         "median_output": _median(outputs),
         "cache_read_over_input": ratio,
+        "script_usage": dict(sorted(scripts.items(),
+                                    key=lambda kv: -kv[1]["est_usd"])),
+        "script_lines": sum(r["calls"] for r in scripts.values()),
+        "script_est_usd": round(sum(r["est_usd"] for r in scripts.values()), 4),
+        "script_est_incomplete": script_est_incomplete,
+        "script_files_parsed": len(all_logs) - len(cora_logs),
     }
 
 
@@ -571,6 +646,15 @@ def format_slack(report: dict) -> str:
         f"*Billing* ({b.get('usage_lines', 0)} lines): median input "
         f"{b.get('median_input', 0):,.0f} | cache_read/input {b.get('cache_read_over_input', 0)}"
     )
+    if b.get("script_lines"):
+        top_scripts = list(b.get("script_usage", {}).items())[:4]
+        script_str = " | ".join(
+            f"{name} ${row['est_usd']:.2f}/{row['calls']}c" for name, row in top_scripts)
+        lines.append(
+            f"*Script LLM spend* ({b['script_lines']} calls, "
+            f"{len(b.get('logs_parsed', []))}d window): ~${b.get('script_est_usd', 0):.2f}"
+            f"{' (partial est)' if b.get('script_est_incomplete') else ''} | {script_str}"
+        )
     kl = report.get("kb_latency", {})
     if kl.get("samples", 0):
         top = sorted(kl.get("by_entity", {}).items(),
@@ -686,6 +770,17 @@ def render(report: dict) -> None:
     print(f"    median output:       {b['median_output']:,.0f}")
     print(f"    cache_read / input:  {b['cache_read_over_input']}  "
           f"<-- BASELINE; the caching split should raise this")
+    if b.get("script_lines"):
+        print(f"\n    SCRIPT-SIDE callers (caller= lines, "
+              f"{b.get('script_files_parsed', 0)} extra log files, "
+              f"~${b.get('script_est_usd', 0):.2f} est over the window"
+              f"{', partial' if b.get('script_est_incomplete') else ''}):")
+        for name, row in b.get("script_usage", {}).items():
+            print(f"      {name:<28} {row['calls']:>4} calls  "
+                  f"in {row['input']:>9,}  out {row['output']:>8,}  "
+                  f"~${row['est_usd']:.3f}")
+    else:
+        print("    (no script-side caller= usage lines in window yet)")
 
     # 4b. KB latency (Slice 2-3)
     kl = report.get("kb_latency", {})

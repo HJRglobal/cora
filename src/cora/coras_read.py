@@ -205,6 +205,8 @@ def _classify(claim: str, prior: str, evidence: list[str]) -> dict | None:
             model=_HAIKU_MODEL, max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(resp, caller="coras_read", model=_HAIKU_MODEL)
         raw = resp.content[0].text.strip()
         if raw.startswith("```"):
             raw = "\n".join(l for l in raw.split("\n") if not l.startswith("```")).strip()

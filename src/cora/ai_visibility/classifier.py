@@ -121,14 +121,10 @@ def _judge_raw(user_prompt: str) -> str:
         system=_SYSTEM,
         messages=[{"role": "user", "content": user_prompt}],
     )
-    try:
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            log.info("ai_visibility_judge usage input=%d output=%d",
-                     int(getattr(usage, "input_tokens", 0) or 0),
-                     int(getattr(usage, "output_tokens", 0) or 0))
-    except (TypeError, ValueError, AttributeError):
-        pass
+    # Uniform usage line (replaces the old ad-hoc "ai_visibility_judge usage"
+    # line, which the billing parse could not see).
+    from ..llm_usage import log_usage
+    log_usage(resp, caller="ai_visibility_judge", model=_HAIKU_MODEL)
     return resp.content[0].text
 
 

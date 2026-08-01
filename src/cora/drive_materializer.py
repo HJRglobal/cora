@@ -251,6 +251,8 @@ def _distill_entity(entity: str, source_chunks: dict[str, list], client: Any) ->
             max_tokens=1800,
             messages=[{"role": "user", "content": prompt}],
         )
+        from .llm_usage import log_usage
+        log_usage(resp, caller="drive_materializer", model=_HAIKU_MODEL)
         raw = resp.content[0].text.strip()
     except Exception as exc:  # noqa: BLE001 — fail-closed
         log.warning("drive_materializer: distill failed for %s: %s", entity, exc)

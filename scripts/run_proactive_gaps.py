@@ -213,6 +213,8 @@ def _ask_haiku(entity: str, chunks: list[str], api_key: str) -> list[str]:
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )
+        from cora.llm_usage import log_usage
+        log_usage(msg, caller="proactive_gaps", model="claude-haiku-4-5-20251001")
         raw = (msg.content[0].text or "").strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):

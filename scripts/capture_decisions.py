@@ -281,6 +281,8 @@ def verify_decisions_with_haiku(candidates: list[dict]) -> list[dict]:
             max_tokens=2048,
             messages=[{"role": "user", "content": _VERIFY_PROMPT.format(items=items_text)}],
         )
+        from cora.llm_usage import log_usage
+        log_usage(response, caller="capture_decisions", model=_HAIKU_MODEL)
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = "\n".join(

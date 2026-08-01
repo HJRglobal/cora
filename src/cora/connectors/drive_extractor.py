@@ -227,6 +227,8 @@ def extract_facts_for_file(
             system=_EXTRACTION_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
+        from ..llm_usage import log_usage
+        log_usage(resp, caller="drive_extractor", model="claude-haiku-4-5-20251001")
         raw = (resp.content[0].text or "").strip()
     except Exception as exc:
         log.error("drive_extractor: Haiku call failed for %s: %s", filename, exc)

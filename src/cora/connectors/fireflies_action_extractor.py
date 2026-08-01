@@ -661,6 +661,8 @@ def _parse_action_items_with_haiku(action_items_text: str) -> list[dict[str, Any
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
+        from ..llm_usage import log_usage
+        log_usage(response, caller="fireflies_actions", model=_HAIKU_MODEL)
         raw = response.content[0].text.strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):

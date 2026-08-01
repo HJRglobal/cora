@@ -467,6 +467,8 @@ def _synthesize(
         messages=[{"role": "user", "content": prompt}],
         timeout=_ANTHROPIC_TIMEOUT_S,
     )
+    from cora.llm_usage import log_usage
+    log_usage(resp, caller="daily_briefing", model=_HAIKU_MODEL)
     # WS-5: Haiku emits literal **bold** despite the prompt; this composer
     # egresses outside format_reply's conversational path, so normalize here --
     # one call covers both the user-DM delivery and the Harrison review copy.

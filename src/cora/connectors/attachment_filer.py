@@ -288,6 +288,8 @@ def classify_attachments(
     except Exception as exc:
         raise AttachmentFilerError(f"Claude classification failed: {exc}") from exc
 
+    from ..llm_usage import log_usage
+    log_usage(response, caller="attachment_filer", model=_CLASSIFIER_MODEL)
     raw = response.content[0].text.strip()
     # Strip markdown code fences if Claude wrapped the JSON (e.g. ```json ... ```)
     if raw.startswith("```"):
