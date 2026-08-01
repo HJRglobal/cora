@@ -1,13 +1,14 @@
-"""Web-search tools gate + server-tool plumbing (2026-07-31 kickoff).
+"""Web-search tools gate + server-tool plumbing (2026-07-31 kickoff + D-051 remediation).
 
 Pins the kickoff acceptance criteria:
   - explicit live-web intent in a non-LEX channel -> tools attach
   - the same ask in a LEX channel/scope -> tools never offered
   - a query carrying a client-shaped name / PHI never reaches the search API
     (evaluate blocks BEFORE any attach; fail-closed on errors)
-plus the claude_client server-tool mechanics (tool defs appended after the
-cache breakpoint, pause_turn continuation, citations/usage meta) and the
-sources-line rendering through format_reply.
+plus the claude_client server-tool mechanics (web-tools-only tool set, pause_turn
+continuation on both loops, citations/usage meta) and the sources-line rendering
+through format_reply, and the D-051 remediation (skip_kb not a miss, model-support
+gate, tightened intent regexes, personal-context exclusion at the app gate).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from cora import web_guard
 from cora.web_guard import WebDecision
 
 ACCEPTANCE_QUERY = "what does a 96GB DDR5 kit cost right now?"
+SUP = "claude-sonnet-5"  # a model that accepts the 20260209 web tool revisions
 
 KB_HIT = {"kb_search_ran": True, "kb_relevant_hits": 3, "kb_best_distance": 0.92}
 KB_MISS = {"kb_search_ran": True, "kb_relevant_hits": 0, "kb_best_distance": 1.42}
@@ -30,8 +32,6 @@ KB_MISS = {"kb_search_ran": True, "kb_relevant_hits": 0, "kb_best_distance": 1.4
 def _tmp_ledger(tmp_path, monkeypatch):
     # Belt on top of the conftest _LEDGER_CONSTS redirect: unique per test.
     monkeypatch.setattr(web_guard, "_USAGE_LEDGER", tmp_path / "web-usage.jsonl")
-    monkeypatch.delenv("CORA_WEB_TOOLS", raising=False)
-    monkeypatch.delenv("CORA_WEB_SEARCH_DAILY_CAP", raising=False)
     yield
 
 
@@ -53,6 +53,7 @@ class TestIntent:
             "what's the current price of copper per pound?",
             "latest news on the port strike",
             "how much is a pallet of 20oz cans going for these days?",
+            "web search for the current gas price in phoenix",
         ],
     )
     def test_explicit_intent_positive(self, text):
@@ -67,6 +68,15 @@ class TestIntent:
             "look up Tommy's open deals",  # internal look-up, no web anchor
             "yes",
             "",
+            # D-051: Google Workspace product phrasing must NOT read as web search.
+            "can you check the Google Sheet for last week's OSN cash?",
+            "pull the numbers from our Google Drive",
+            "what's on the Google Calendar tomorrow?",
+            "share the google doc with the team",
+            # D-051: internal-subject price asks are not web intent.
+            "what's our current pricing on the 12-pack?",
+            "how does F3E cost structure compare to last year",
+            "what's the current status of the launch",
         ],
     )
     def test_internal_phrasings_not_web_intent(self, text):
@@ -74,25 +84,53 @@ class TestIntent:
 
     def test_time_sensitive_plus_kb_miss_attaches(self):
         dec = web_guard.evaluate(
-            "what is the AZ minimum wage as of now?", "F3E", kb_meta=dict(KB_MISS)
+            "what is the AZ minimum wage as of now?", "F3E", kb_meta=dict(KB_MISS), model=SUP
         )
         assert dec.attach and dec.reason == "time_sensitive_kb_miss"
 
     def test_time_sensitive_with_kb_hit_does_not_attach(self):
         dec = web_guard.evaluate(
-            "what is the AZ minimum wage as of now?", "F3E", kb_meta=dict(KB_HIT)
+            "what is the AZ minimum wage as of now?", "F3E", kb_meta=dict(KB_HIT), model=SUP
         )
         assert not dec.attach and dec.reason == "no_intent"
 
-    def test_no_intent_no_attach(self):
-        dec = web_guard.evaluate("summarize the OSN recon status", "OSN", kb_meta=dict(KB_MISS))
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "what's the current status of the recon",
+            "any updates on the launch",
+            "what's currently on my plate",
+            "the latest on the OSN reconciliation",
+        ],
+    )
+    def test_internal_status_not_time_sensitive(self, text):
+        # D-051: bare "current status"/"latest on X"/"currently" must not trip the
+        # fallback even on a KB miss.
+        assert not web_guard.is_time_sensitive(text)
+        dec = web_guard.evaluate(text, "OSN", kb_meta=dict(KB_MISS), model=SUP)
         assert not dec.attach and dec.reason == "no_intent"
 
-    def test_kb_missing_meta_counts_as_miss(self):
+    def test_skip_kb_is_not_a_miss(self):
+        # A FINANCIAL/IDENTITY intent skips KB (kb_meta stays empty). A
+        # time-sensitive internal question must NOT attach web tools.
+        assert not web_guard._kb_missed({}, skip_kb=True)
+        dec = web_guard.evaluate(
+            "what's our cash position as of today?", "OSN", kb_meta={}, skip_kb=True, model=SUP
+        )
+        # (also blocked by internal-subject + no market anchor, but skip_kb is the
+        # deterministic belt for the empty-kb_meta case)
+        assert not dec.attach
+
+    def test_kb_missing_meta_counts_as_miss_when_not_skipped(self):
         assert web_guard._kb_missed(None)
         assert web_guard._kb_missed({})
         assert web_guard._kb_missed({"kb_search_ran": True, "kb_best_distance": None})
         assert not web_guard._kb_missed(dict(KB_HIT))
+
+    def test_kb_miss_boundary_is_strict(self):
+        # distance == threshold is a HIT (aligns with context_loader's <= gate).
+        assert not web_guard._kb_missed({"kb_search_ran": True, "kb_best_distance": 1.30})
+        assert web_guard._kb_missed({"kb_search_ran": True, "kb_best_distance": 1.301})
 
 
 # ---------------------------------------------------------------------------
@@ -102,18 +140,37 @@ class TestIntent:
 
 class TestScope:
     def test_acceptance_attaches_in_founder_scope(self):
-        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT))
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=SUP)
         assert dec.attach and dec.reason == "explicit_intent"
 
     @pytest.mark.parametrize("entity", ["LEX", "LEX-LLC", "LEX-LTS", "LEX-LBHS", "LEX-LLA", "lex"])
     def test_lex_scope_never_offered(self, entity):
-        dec = web_guard.evaluate(ACCEPTANCE_QUERY, entity, kb_meta=dict(KB_MISS))
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, entity, kb_meta=dict(KB_MISS), model=SUP)
         assert not dec.attach and dec.reason == "lex_scope"
 
-    def test_kill_switch(self, monkeypatch):
-        monkeypatch.setenv("CORA_WEB_TOOLS", "off")
-        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT))
-        assert not dec.attach and dec.reason == "disabled"
+    def test_lex_without_intent_is_no_intent_not_lex_scope(self):
+        # Intent is checked before the LEX gate, so a no-intent LEX ask is not
+        # ledgered as a high-volume lex_scope block.
+        dec = web_guard.evaluate("what's the revalidation status?", "LEX", kb_meta=dict(KB_HIT), model=SUP)
+        assert not dec.attach and dec.reason == "no_intent"
+
+    def test_model_unsupported_soft_degrades(self):
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model="claude-haiku-4-5")
+        assert not dec.attach and dec.reason == "model_unsupported"
+        assert web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=None).reason == "model_unsupported"
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-5", "claude-opus-4-8"])
+    def test_supported_models(self, model):
+        assert web_guard.web_model_supported(model)
+
+    def test_kill_switch_and_fail_closed_spellings(self, monkeypatch):
+        for val in ("off", "0", "false", "no", "disabled", "none", "maybe"):
+            monkeypatch.setenv("CORA_WEB_TOOLS", val)
+            dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=SUP)
+            assert not dec.attach and dec.reason == "disabled", val
+        for val in ("on", "1", "true", "yes"):
+            monkeypatch.setenv("CORA_WEB_TOOLS", val)
+            assert web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=SUP).attach
 
 
 # ---------------------------------------------------------------------------
@@ -125,38 +182,37 @@ class TestEgressScreen:
     @pytest.mark.parametrize(
         "query",
         [
-            # The D-050 live-bug string shape: named billing/authorization.
             "search the web for Bob Smith's billing authorization requirements",
-            # Care-noun-governed client name + clinical term.
             "look up online whether client Marcus being autistic qualifies for DDD",
-            # Possessive + psych med name.
             "google Jalen's risperidone dosage guidelines",
-            # Clinical framing.
             "search the web for what diagnosed with fragile x means for eligibility",
         ],
     )
     def test_client_shaped_names_blocked(self, query):
-        dec = web_guard.evaluate(query, "FNDR", kb_meta=dict(KB_MISS))
-        assert not dec.attach
-        assert dec.reason == "blocked:phi"
+        dec = web_guard.evaluate(query, "FNDR", kb_meta=dict(KB_MISS), model=SUP)
+        assert not dec.attach and dec.reason == "blocked:phi"
 
     def test_email_blocked(self):
         dec = web_guard.evaluate(
-            "search the web for jane.doe@example.com", "F3E", kb_meta=dict(KB_MISS)
+            "search the web for jane.doe@example.com", "F3E", kb_meta=dict(KB_MISS), model=SUP
         )
         assert not dec.attach and dec.reason == "blocked:email"
 
-    def test_internal_figure_blocked(self):
-        dec = web_guard.evaluate(
+    @pytest.mark.parametrize(
+        "query",
+        [
             "search the web for why OSN revenue was $77,629 last week",
-            "OSN",
-            kb_meta=dict(KB_MISS),
-        )
+            "look up online how F3 Energy revenue of 1.2M compares",  # bare magnitude
+            "web search for our HJRP burn of $35k",
+        ],
+    )
+    def test_internal_figure_blocked(self, query):
+        dec = web_guard.evaluate(query, "OSN", kb_meta=dict(KB_MISS), model=SUP)
         assert not dec.attach and dec.reason == "blocked:internal_figure"
 
     def test_shopping_figure_not_blocked(self):
         dec = web_guard.evaluate(
-            "search the web for laptops under $1000", "F3E", kb_meta=dict(KB_MISS)
+            "search the web for laptops under $1000", "F3E", kb_meta=dict(KB_MISS), model=SUP
         )
         assert dec.attach
 
@@ -164,7 +220,7 @@ class TestEgressScreen:
         monkeypatch.setattr(
             web_guard.phi_guard, "is_any_phi", MagicMock(side_effect=RuntimeError("boom"))
         )
-        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT))
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=SUP)
         assert not dec.attach and dec.reason == "error"
 
 
@@ -177,34 +233,67 @@ class TestCapAndLedger:
     def test_daily_cap_blocks(self, monkeypatch):
         monkeypatch.setenv("CORA_WEB_SEARCH_DAILY_CAP", "5")
         web_guard.record_usage(5, 0, entity="F3E")
-        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "F3E", kb_meta=dict(KB_HIT))
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "F3E", kb_meta=dict(KB_HIT), model=SUP)
         assert not dec.attach and dec.reason == "daily_cap"
+
+    def test_below_cap_attaches(self, monkeypatch):
+        monkeypatch.setenv("CORA_WEB_SEARCH_DAILY_CAP", "5")
+        web_guard.record_usage(4, 0, entity="F3E")
+        assert web_guard.evaluate(ACCEPTANCE_QUERY, "F3E", kb_meta=dict(KB_HIT), model=SUP).attach
+
+    def test_cap_zero_disables(self, monkeypatch):
+        monkeypatch.setenv("CORA_WEB_SEARCH_DAILY_CAP", "0")
+        dec = web_guard.evaluate(ACCEPTANCE_QUERY, "F3E", kb_meta=dict(KB_HIT), model=SUP)
+        assert not dec.attach and dec.reason == "daily_cap"
+
+    def test_max_uses_floored_at_one(self, monkeypatch):
+        monkeypatch.setenv("CORA_WEB_SEARCH_MAX_USES", "0")
+        monkeypatch.setenv("CORA_WEB_FETCH_MAX_USES", "-3")
+        assert web_guard.search_max_uses() == 1
+        assert web_guard.fetch_max_uses() == 1
 
     def test_usage_accumulates_today_only(self):
         web_guard.record_usage(2, 1, entity="F3E")
         web_guard.record_usage(3, 0, entity="OSN")
-        # A stale line from another day is ignored.
         with open(web_guard._USAGE_LEDGER, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"event": "usage", "date": "2000-01-01", "searches": 99}) + "\n")
         assert web_guard.searches_today() == 5
 
     def test_decision_ledger_never_stores_query_text(self):
         dec = web_guard.evaluate(
-            "search the web for Bob Smith's billing authorization", "FNDR", kb_meta=dict(KB_MISS)
+            "search the web for Bob Smith's billing authorization", "FNDR",
+            kb_meta=dict(KB_MISS), model=SUP,
         )
-        web_guard.record_decision(dec, entity="FNDR", channel_name="founder-operations")
+        web_guard.record_decision(dec, entity="FNDR", channel_name="founder-operations", user_id="U1")
         raw = open(web_guard._USAGE_LEDGER, encoding="utf-8").read()
         assert "Bob Smith" not in raw
         assert "blocked:phi" in raw
+        assert '"user": "U1"' in raw
 
     def test_no_intent_not_ledgered(self):
-        dec = WebDecision(False, "no_intent")
-        web_guard.record_decision(dec, entity="F3E")
+        web_guard.record_decision(WebDecision(False, "no_intent"), entity="F3E")
         assert not web_guard._USAGE_LEDGER.exists()
+
+    def test_lex_scope_is_ledgered(self):
+        # lex_scope only arises when web intent was present -> worth recording.
+        web_guard.record_decision(WebDecision(False, "lex_scope"), entity="LEX")
+        assert "lex_scope" in open(web_guard._USAGE_LEDGER, encoding="utf-8").read()
 
     def test_zero_usage_not_ledgered(self):
         web_guard.record_usage(0, 0, entity="F3E")
         assert not web_guard._USAGE_LEDGER.exists()
+
+    def test_ledger_self_trims_when_large(self, monkeypatch):
+        monkeypatch.setattr(web_guard, "_LEDGER_TRIM_BYTES", 200)
+        # Old rows (well beyond the 7-day keep window).
+        with open(web_guard._USAGE_LEDGER, "w", encoding="utf-8") as fh:
+            for _ in range(50):
+                fh.write(json.dumps({"event": "usage", "date": "2000-01-01", "searches": 1}) + "\n")
+        # A fresh append triggers the size-gated trim, dropping the stale rows.
+        web_guard.record_usage(1, 0, entity="F3E")
+        raw = open(web_guard._USAGE_LEDGER, encoding="utf-8").read()
+        assert "2000-01-01" not in raw
+        assert web_guard.searches_today() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +317,8 @@ class TestSourcesLine:
         cites = [
             {"url": "https://docs.google.com/spreadsheets/d/xyz", "title": "internal sheet"},
             {"url": "https://quickbooks.intuit.com/r/x", "title": "intuit"},
+            {"url": "https://app.hubspot.com/deal/1", "title": "deal"},
+            {"url": "https://app.fireflies.ai/view/1", "title": "meeting"},
             {"url": "https://a.example.com/1", "title": "A"},
             {"url": "https://a.example.com/1", "title": "A dup"},
             {"url": "https://b.example.com/2", "title": "B"},
@@ -236,10 +327,18 @@ class TestSourcesLine:
             {"url": "https://e.example.com/5", "title": "E"},
         ]
         line = web_guard.format_sources_line(cites, max_sources=4)
-        assert "docs.google.com" not in line
-        assert "intuit.com" not in line
+        for host in ("docs.google.com", "intuit.com", "hubspot.com", "fireflies.ai"):
+            assert host not in line
         assert line.count("<https://") == 4
         assert line.count("a.example.com") == 1
+
+    def test_entity_token_label_falls_back_to_host(self):
+        # A page must not smuggle an internal entity token into the visible link.
+        line = web_guard.format_sources_line(
+            [{"url": "https://evil.example.com/x", "title": "OSN internal revenue leak"}]
+        )
+        assert "OSN" not in line
+        assert "<https://evil.example.com/x|evil.example.com>" in line
 
     def test_label_escaping_and_bad_urls(self):
         line = web_guard.format_sources_line(
@@ -291,7 +390,7 @@ class TestClaudeClientWebTools:
         return client
 
     @staticmethod
-    def _text_response(text, stop_reason="end_turn", citations=None, searches=0):
+    def _text_response(text, stop_reason="end_turn", citations=None, searches=0, fetches=0):
         block = MagicMock()
         block.type = "text"
         block.text = text
@@ -306,7 +405,7 @@ class TestClaudeClientWebTools:
         usage.output_tokens = 5
         stu = MagicMock()
         stu.web_search_requests = searches
-        stu.web_fetch_requests = 0
+        stu.web_fetch_requests = fetches
         usage.server_tool_use = stu
         resp.usage = usage
         return resp
@@ -323,7 +422,8 @@ class TestClaudeClientWebTools:
             assert "cache_control" not in d
         assert defs[0]["user_location"]["timezone"] == "America/Phoenix"
 
-    def test_web_tools_appended_after_cache_breakpoint(self):
+    def test_web_turn_is_web_tools_only(self):
+        # D-034 injection belt: a web-enabled turn drops the client tool set.
         from cora import claude_client
 
         with patch.object(claude_client, "_get_client", return_value=self._mock_client(
@@ -334,15 +434,10 @@ class TestClaudeClientWebTools:
             )
         kwargs = _.return_value.messages.create.call_args.kwargs
         tools = kwargs["tools"]
-        assert tools[-1]["type"] == "web_fetch_20260209"
-        assert tools[-2]["type"] == "web_search_20260209"
-        # The cache breakpoint stays on the last CLIENT tool so the client-tools
-        # cache prefix is byte-identical between web and non-web requests.
-        client_tools = tools[:-2]
-        assert client_tools, "entity tool set unexpectedly empty"
-        assert client_tools[-1].get("cache_control") == {"type": "ephemeral"}
-        assert all("cache_control" not in t for t in tools[-2:])
+        assert [t["type"] for t in tools] == ["web_search_20260209", "web_fetch_20260209"]
+        assert all("cache_control" not in t for t in tools)
         assert kwargs["timeout"] == claude_client._WEB_TIMEOUT
+        assert kwargs["max_tokens"] == claude_client._WEB_MAX_TOKENS
 
     def test_no_web_tools_by_default(self):
         from cora import claude_client
@@ -354,6 +449,7 @@ class TestClaudeClientWebTools:
         kwargs = _.return_value.messages.create.call_args.kwargs
         assert all(not str(t.get("type", "")).startswith("web_") for t in kwargs["tools"])
         assert kwargs["timeout"] == claude_client._TIMEOUT
+        assert kwargs["max_tokens"] == claude_client._MAX_TOKENS
 
     def test_pause_turn_resumes_and_concatenates_text(self):
         from cora import claude_client
@@ -368,24 +464,51 @@ class TestClaudeClientWebTools:
         assert mock.messages.create.call_count == 2
         assert out == "Searching for prices... A 96GB kit runs about $280."
         assert "  " not in out
-        # The paused assistant turn was appended verbatim, with NO tool_result turn.
         second_messages = mock.messages.create.call_args_list[1].kwargs["messages"]
         assert second_messages[-1]["role"] == "assistant"
 
-    def test_pause_turn_without_web_tools_returns_text(self):
-        # Defensive: a pause_turn on a non-web call (should not happen) must not
-        # loop -- but with no server tools it just ends the turn via the != gate.
+    def test_pause_turn_iteration_cap_returns_partial(self):
         from cora import claude_client
 
-        paused = self._text_response("partial", stop_reason="pause_turn")
-        done = self._text_response("finished", stop_reason="end_turn")
-        mock = self._mock_client([paused, done])
+        # More pauses than the iteration budget -> partial text, no raise.
+        pauses = [self._text_response(f"chunk{i} ", stop_reason="pause_turn") for i in range(6)]
+        mock = self._mock_client(pauses)
         with patch.object(claude_client, "_get_client", return_value=mock):
-            out = claude_client.generate_response("prompt", "context", "q", entity="FNDR")
-        # pause_turn is resumed regardless of web_tools (server tools may exist
-        # in future paths); two calls, concatenated text.
-        assert mock.messages.create.call_count == 2
-        assert out == "partial finished"
+            out = claude_client.generate_response(
+                "prompt", "context", "q", entity="FNDR", web_tools=True,
+            )
+        assert mock.messages.create.call_count == claude_client._MAX_TOOL_ITERATIONS + 1
+        assert out.startswith("chunk0")
+
+    def test_streaming_pause_turn_resumes(self):
+        from cora import claude_client
+
+        # Streaming: text arrives as deltas and accumulates ACROSS iterations; the
+        # final message per iteration carries stop_reason. iter0 streams "interim "
+        # then pauses; iter1 streams the answer then ends. The done branch must NOT
+        # replace the fuller accumulated text with the shorter final-message tail.
+        def _stream_cm(deltas, final):
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=_FakeStream(deltas, final))
+            cm.__exit__ = MagicMock(return_value=False)
+            return cm
+
+        paused_final = self._text_response("interim ", stop_reason="pause_turn")
+        done_final = self._text_response("final answer $280.", stop_reason="end_turn")
+        client = MagicMock()
+        client.messages.stream.side_effect = [
+            _stream_cm(["interim "], paused_final),
+            _stream_cm(["final answer $280."], done_final),
+        ]
+        with patch.object(claude_client, "_get_client", return_value=client):
+            out = claude_client.generate_response_streaming(
+                "prompt", "context", "q", entity="FNDR", web_tools=True,
+            )
+        assert client.messages.stream.call_count == 2
+        assert out == "interim final answer $280."
+        skw = client.messages.stream.call_args_list[0].kwargs
+        assert skw["max_tokens"] == claude_client._WEB_MAX_TOKENS
+        assert [t["type"] for t in skw["tools"]] == ["web_search_20260209", "web_fetch_20260209"]
 
     def test_citations_and_usage_collected_into_meta(self):
         from cora import claude_client
@@ -393,13 +516,14 @@ class TestClaudeClientWebTools:
         cite = MagicMock()
         cite.url = "https://www.newegg.com/p/abc"
         cite.title = "Newegg"
-        resp = self._text_response("answer", citations=[cite], searches=2)
+        resp = self._text_response("answer", citations=[cite], searches=2, fetches=1)
         meta: dict = {}
         with patch.object(claude_client, "_get_client", return_value=self._mock_client([resp])):
             claude_client.generate_response(
                 "prompt", "context", "q", entity="FNDR", meta=meta, web_tools=True,
             )
         assert meta["web_search_requests"] == 2
+        assert meta["web_fetch_requests"] == 1
         assert meta["web_citations"] == [
             {"url": "https://www.newegg.com/p/abc", "title": "Newegg"}
         ]
@@ -418,21 +542,42 @@ class TestClaudeClientWebTools:
         assert "web_search_requests" not in meta
 
 
+class _FakeStream:
+    """Minimal streaming context body: yields text-delta events, then get_final_message()."""
+
+    def __init__(self, deltas, final):
+        self._deltas = deltas
+        self._final = final
+
+    def __iter__(self):
+        for d in self._deltas:
+            ev = MagicMock()
+            ev.type = "content_block_delta"
+            ev.delta = MagicMock()
+            ev.delta.type = "text_delta"
+            ev.delta.text = d
+            yield ev
+
+    def get_final_message(self):
+        return self._final
+
+
 # ---------------------------------------------------------------------------
-# app.py dispatch wiring
+# app.py dispatch wiring (source-level pins — the dispatch path needs a live
+# Slack client to run end-to-end)
 # ---------------------------------------------------------------------------
 
 
 class TestAppWiring:
-    def test_dispatch_source_wires_web_gate(self):
-        # Source-level pins (the dispatch path needs a live Slack client to run
-        # end-to-end): the gate is consulted, both generate calls carry web_tools,
-        # LEX-off + screen live in web_guard.evaluate which is the only entry.
+    def _src(self):
         import inspect
 
         import cora.app as app_module
 
-        src = inspect.getsource(app_module._dispatch_qa)
+        return inspect.getsource(app_module._dispatch_qa)
+
+    def test_dispatch_source_wires_web_gate(self):
+        src = self._src()
         assert "web_guard.evaluate(" in src
         assert src.count("web_tools=web_on") == 2
         assert "web_guard.record_usage(" in src
@@ -440,16 +585,28 @@ class TestAppWiring:
         assert "cache_storable = False" in src
         assert "WEB_MODE_CONTEXT" in src
 
-    def test_web_gate_skipped_on_forced_tool_turns(self):
-        import inspect
+    def test_web_gate_excludes_confirm_grant_and_personal_context(self):
+        src = self._src()
+        # Forced-tool / confirm / retrieval-grant / custodian / personal exclusions.
+        assert "force_tool is None" in src
+        assert "not assume_confirm" in src
+        assert "retrieval_grant is None" in src
+        assert "not phi_custodian" in src
+        assert 'not kb_meta.get("unstripped_personal")' in src
 
-        import cora.app as app_module
+    def test_web_gate_passes_skip_kb_and_model(self):
+        src = self._src()
+        assert "skip_kb=hints.skip_kb" in src
+        assert "model=model_router.MODEL_SONNET" in src
 
-        src = inspect.getsource(app_module._dispatch_qa)
-        assert (
-            "if force_tool is None and not assume_confirm and retrieval_grant is None:"
-            in src
-        )
+    def test_web_turn_skips_gap_logging(self):
+        src = self._src()
+        assert "if not web_on:" in src
+
+    def test_web_intent_bypasses_cache(self):
+        src = self._src()
+        assert "web_intent = web_guard.is_web_intent(user_message)" in src
+        assert "and not web_intent" in src
 
     def test_generate_response_signature_carries_web_tools(self):
         import inspect

@@ -45,6 +45,10 @@ _THINKING_DISABLED = {"type": "disabled"}
 _MAX_TOKENS = 1024  # lowered 2048→1024 on 2026-05-21 — Cora replies are almost
                     # always <500 tokens; tighter ceiling = faster streaming + lower
                     # tail latency. If a reply gets clipped at max_tokens, bump back up.
+_WEB_MAX_TOKENS = 2048  # web-enabled calls synthesize multi-source answers + a
+                        # Sources line; the tight 1024 cap (a hard ceiling on
+                        # thinking+output combined) truncated cited answers and
+                        # wasted the billed searches (D-051 review).
 _TOOL_DISPATCH_MAX_WORKERS = 4  # parallel cap when an iteration emits multiple
                                 # tool_use blocks. Most iterations have 1-2 tools;
                                 # 4 covers the pathological case without thrashing.
@@ -301,9 +305,11 @@ def _build_web_tool_defs() -> list[dict]:
     """Server-side web tool definitions (web_search / web_fetch, 2026-02-09 rev).
 
     Anthropic executes these server-side — no dispatch entry, no client loop.
-    Appended AFTER the client tools' cache_control breakpoint so the shared
-    client-tools cache prefix stays byte-identical between web and non-web
-    requests (web-enabled requests just get a distinct system-block lineage).
+    On a web-enabled turn these REPLACE the client tool set entirely (D-034
+    injection belt): a live-web question needs no internal tool, so the
+    finance/gmail/write tools are dropped to remove the surface a hostile
+    fetched page could steer. The cacheable mass (system blocks 1+2) is
+    unaffected; only the small tools block differs on a web turn.
     max_uses bounds per-call spend; the daily cap lives in web_guard.
     """
     from . import web_guard  # local import — web_guard has no claude_client dep
@@ -1029,9 +1035,16 @@ def generate_response(
     Raises ClaudeClientError on hard failure after retries.
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
-    cached_tools = _build_cached_tools(entity, cross_entity_tools)
     if web_tools:
-        cached_tools = cached_tools + _build_web_tool_defs()
+        # D-034 injection belt: a web-enabled turn is served the web tools ONLY.
+        # A live-web question never needs an internal tool, so dropping the client
+        # tool set removes the surface a hostile fetched page could use to pull
+        # internal data into a later search query or trigger a write. The system
+        # blocks (prompt + static context) still cache; only the tools block is
+        # web-only (small, and web turns are rare + Sonnet-forced anyway).
+        cached_tools = _build_web_tool_defs()
+    else:
+        cached_tools = _build_cached_tools(entity, cross_entity_tools)
     effective_model = model or _MODEL
 
     # Conversation accumulator — prepend thread history if provided, then append
@@ -1055,7 +1068,7 @@ def generate_response(
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         create_kwargs = dict(
             model=effective_model,
-            max_tokens=_MAX_TOKENS,
+            max_tokens=_WEB_MAX_TOKENS if web_tools else _MAX_TOKENS,
             system=system_blocks,
             messages=messages,
             tools=cached_tools,
@@ -1097,6 +1110,12 @@ def generate_response(
         if meta is not None:
             meta["used_tools"] = True
 
+        # A client tool_use round supersedes any pre-pause narration: the model
+        # is mid-task, not delivering a final answer, so the paused text is not
+        # part of the reply. (Structurally unreachable on a web turn, which is
+        # web-tools-only -- kept as a defensive reset.)
+        _paused_text = ""
+
         if iteration >= _MAX_TOOL_ITERATIONS:
             log.warning(
                 "Tool-use iteration cap (%d) hit — returning partial response",
@@ -1105,7 +1124,7 @@ def generate_response(
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
             return _guard_phantom_destructive(
-                _paused_text + _extract_text(response),
+                _extract_text(response),
                 broaden=_should_broaden(assume_confirm, meta)) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
@@ -1214,9 +1233,16 @@ def generate_response_streaming(
     Raises ClaudeClientError on hard failure after retries.
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
-    cached_tools = _build_cached_tools(entity, cross_entity_tools)
     if web_tools:
-        cached_tools = cached_tools + _build_web_tool_defs()
+        # D-034 injection belt: a web-enabled turn is served the web tools ONLY.
+        # A live-web question never needs an internal tool, so dropping the client
+        # tool set removes the surface a hostile fetched page could use to pull
+        # internal data into a later search query or trigger a write. The system
+        # blocks (prompt + static context) still cache; only the tools block is
+        # web-only (small, and web turns are rare + Sonnet-forced anyway).
+        cached_tools = _build_web_tool_defs()
+    else:
+        cached_tools = _build_cached_tools(entity, cross_entity_tools)
     effective_model = model or _MODEL
 
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
@@ -1244,7 +1270,7 @@ def generate_response_streaming(
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         stream_kwargs = dict(
             model=effective_model,
-            max_tokens=_MAX_TOKENS,
+            max_tokens=_WEB_MAX_TOKENS if web_tools else _MAX_TOKENS,
             system=system_blocks,
             messages=messages,
             tools=cached_tools,
@@ -1340,6 +1366,12 @@ def generate_response_streaming(
 
         if meta is not None:
             meta["used_tools"] = True
+
+        # A client tool_use round re-aligns accumulated_text with the next final
+        # message, so the pause-suppression of the final-text safety net no longer
+        # applies. (Structurally unreachable on a web turn -- web-tools-only --
+        # kept as a defensive reset.)
+        _web_paused = False
 
         if iteration >= _MAX_TOOL_ITERATIONS:
             log.warning(

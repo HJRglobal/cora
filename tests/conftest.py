@@ -224,6 +224,14 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # logs/cora-autowrite-audit.jsonl + data/state/code-session-queue*.jsonl.
     monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
     monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    # Web-tools knobs are read per-call from the environment; a live .env flip
+    # (CORA_WEB_TOOLS=off, a custom cap) would otherwise redden web_guard tests.
+    # Delete them so every test starts from the code defaults (tools ON, cap 40).
+    for _wv in (
+        "CORA_WEB_TOOLS", "CORA_WEB_SEARCH_MAX_USES", "CORA_WEB_FETCH_MAX_USES",
+        "CORA_WEB_SEARCH_DAILY_CAP", "CORA_WEB_KB_MISS_DISTANCE",
+    ):
+        monkeypatch.delenv(_wv, raising=False)
     # cq-d9432f552a33 (bug-hunt Slice 10): the known-answers WRITE targets resolve
     # via PER-CALL env reads (gap_autofill._known_answers_dir/_resolved_path), so
     # the module-constant belt below cannot cover them -- and .env carries the

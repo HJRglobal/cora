@@ -595,10 +595,15 @@ def _dispatch_qa(
     )
 
     question_embedding: list[float] | None = None
+    # Explicit live-web intent must never be served a (≤30-min) stale KB-only
+    # cached answer -- bypass the cache read for it (pure-regex, no KB/ledger
+    # dependency). The time-sensitive fallback still uses the cache: it only
+    # attaches on a KB miss, so a cache hit means the KB DID have the answer.
+    web_intent = web_guard.is_web_intent(user_message)
     # Grant-path responses contain owner-private mail/file content — they must
     # never be served from (or stored into) the shared semantic cache, where a
     # different user's similar question would replay them.
-    if not hints.bypass_cache and retrieval_grant is None:
+    if not hints.bypass_cache and retrieval_grant is None and not web_intent:
         try:
             question_embedding = kb_embeddings.embed_query(user_message)
             cached_response = sc.get_cache().lookup(entity, question_embedding)
@@ -719,20 +724,41 @@ def _dispatch_qa(
         channel_name, user_id, model_router.short_label(chosen_model), len(user_message),
     )
 
+    # A live-web-intent query is never cache-STORED either (the read was already
+    # bypassed above): a KB-only degraded answer to a web ask must not shadow the
+    # web path for the next asker.
+    if web_intent:
+        cache_storable = False
     # ── Web tools gate (2026-07-31): the server-side web_search/web_fetch tools
     # attach only when web_guard says so — explicit web intent, or a time-sensitive
     # question whose KB retrieval missed; NEVER in LEX scope; the user query is
     # egress-screened fail-closed; a daily search cap bounds spend. A block is a
-    # soft degradation (KB-only behavior), never a user-facing refusal. Forced-tool,
-    # bare-affirmative confirm, and Tier-2 retrieval-grant turns (personal mailbox
-    # content in context) never carry web tools.
+    # soft degradation (KB-only behavior), never a user-facing refusal.
+    #
+    # DETERMINISTIC EXCLUSIONS (never carry web tools):
+    #  - forced-tool / bare-affirmative confirm / Tier-2 retrieval-grant turns;
+    #  - phi_custodian or unstripped_personal context: unscrubbed LEX/personal
+    #    content is already in this turn's context (custodian DM, cross-entity
+    #    fallback, personal-notes overlay), and could ride into a model-composed
+    #    search query — mirror the cache_storable exclusion (D-051 remediation).
     web_on = False
-    if force_tool is None and not assume_confirm and retrieval_grant is None:
+    if (
+        force_tool is None
+        and not assume_confirm
+        and retrieval_grant is None
+        and not phi_custodian
+        and not kb_meta.get("unstripped_personal")
+    ):
+        # Web attach forces Sonnet, so screen the model that will actually run
+        # (soft-degrades to KB-only if it can't accept the 20260209 tool types).
         web_decision = web_guard.evaluate(
-            user_message, entity, kb_meta=kb_meta, channel_name=channel_name,
+            user_message, entity, kb_meta=kb_meta,
+            skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
         )
         web_on = web_decision.attach
-        web_guard.record_decision(web_decision, entity=entity, channel_name=channel_name)
+        web_guard.record_decision(
+            web_decision, entity=entity, channel_name=channel_name, user_id=user_id or "",
+        )
         if web_on:
             # Multi-source live synthesis is not a Haiku job, and the model must
             # support the 20260209 tool revisions — force Sonnet.
@@ -741,8 +767,9 @@ def _dispatch_qa(
             # Live-web answers are time-anchored — never enter the shared cache.
             cache_storable = False
             log.info(
-                "web_tools ATTACHED channel=#%s user=%s reason=%s",
-                channel_name, user_id, web_decision.reason,
+                "web_tools ATTACHED channel=#%s user=%s model=%s reason=%s",
+                channel_name, user_id, model_router.short_label(chosen_model),
+                web_decision.reason,
             )
         elif web_decision.reason not in ("no_intent", "disabled"):
             log.info(
@@ -751,11 +778,15 @@ def _dispatch_qa(
             )
 
     # ── Streaming: post placeholder, then update it as Claude streams ──────
+    # A web turn spends its first seconds in the server-side search/fetch phase
+    # emitting no text deltas, so a web-specific placeholder tells the user what
+    # the pause is (the throttled stream updates take over once text arrives).
+    placeholder_text = ":mag: searching the web…" if web_on else ":thought_balloon: thinking…"
     placeholder_ts: str | None = None
     placeholder_channel: str = channel_id
     try:
         placeholder_resp = say(
-            text=":thought_balloon: thinking…",
+            text=placeholder_text,
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
@@ -793,19 +824,31 @@ def _dispatch_qa(
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
+            # Ledger any searches billed before the failure (retries re-bill), so
+            # the daily cap does not undercount on error days (D-051 remediation).
+            if web_on:
+                web_guard.record_usage(
+                    gen_meta.get("web_search_requests", 0),
+                    gen_meta.get("web_fetch_requests", 0),
+                    entity=entity, channel_name=channel_name,
+                )
             say(text=user_facing_message(exc), thread_ts=reply_thread_ts)
             return
 
         latency_ms = int((time.monotonic() - t0) * 1000)
-        response_text = _extract_and_log_gap(
-            response_text, entity, channel_name, user_id, user_message, latency_ms,
-            kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
-            # No thread root (e.g. /cora-ask) -> no thread key; "C123:None"
-            # would collapse every slash-command ask in a channel into one
-            # 48h dedup bucket (adversarial review LOW).
-            thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
-            thread_context=bool(prior_messages),
-        )
+        if not web_on:
+            # Skip gap logging on web turns: a web answer is not a KB gap, and an
+            # UNKNOWN sentinel echoed from attacker-controlled web text must never
+            # feed gap_autofill -> known-answers canon (D-051 remediation).
+            response_text = _extract_and_log_gap(
+                response_text, entity, channel_name, user_id, user_message, latency_ms,
+                kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
+                # No thread root (e.g. /cora-ask) -> no thread key; "C123:None"
+                # would collapse every slash-command ask in a channel into one
+                # 48h dedup bucket (adversarial review LOW).
+                thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+                thread_context=bool(prior_messages),
+            )
         # Code-session queue S2/S4 (fail-soft, off-thread, reply-inert): a build-signal
         # phrase in the ask or a capability deflection in the reply becomes a candidate.
         code_queue.capture_message_signal(
@@ -819,7 +862,7 @@ def _dispatch_qa(
             web_guard.record_usage(
                 gen_meta.get("web_search_requests", 0),
                 gen_meta.get("web_fetch_requests", 0),
-                entity=entity,
+                entity=entity, channel_name=channel_name,
             )
             sources_line = web_guard.format_sources_line(gen_meta.get("web_citations"))
             if sources_line:
@@ -908,16 +951,26 @@ def _dispatch_qa(
                 placeholder_ts, upd_exc,
             )
             say(text=error_msg, thread_ts=reply_thread_ts)
+        # Ledger any searches billed before the streaming failure (D-051 remediation).
+        if web_on:
+            web_guard.record_usage(
+                gen_meta.get("web_search_requests", 0),
+                gen_meta.get("web_fetch_requests", 0),
+                entity=entity, channel_name=channel_name,
+            )
         throttle.release_stream(stream_id)
         return
 
     latency_ms = int((time.monotonic() - t0) * 1000)
-    response_text = _extract_and_log_gap(
-        response_text, entity, channel_name, user_id, user_message, latency_ms,
-        kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
-        thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
-        thread_context=bool(prior_messages),
-    )
+    if not web_on:
+        # Skip gap logging on web turns (see non-streaming path): a web answer is
+        # not a KB gap, and an echoed UNKNOWN sentinel must not feed canon.
+        response_text = _extract_and_log_gap(
+            response_text, entity, channel_name, user_id, user_message, latency_ms,
+            kb_meta=kb_meta, gen_meta=gen_meta, is_dm=is_dm,
+            thread_key=f"{channel_id}:{register_ts}" if register_ts else "",
+            thread_context=bool(prior_messages),
+        )
     # Code-session queue S2/S4 (fail-soft, off-thread, reply-inert): a build-signal
     # phrase in the ask or a capability deflection in the reply becomes a candidate.
     code_queue.capture_message_signal(
@@ -929,7 +982,7 @@ def _dispatch_qa(
         web_guard.record_usage(
             gen_meta.get("web_search_requests", 0),
             gen_meta.get("web_fetch_requests", 0),
-            entity=entity,
+            entity=entity, channel_name=channel_name,
         )
         sources_line = web_guard.format_sources_line(gen_meta.get("web_citations"))
         if sources_line:
