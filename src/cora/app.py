@@ -46,6 +46,7 @@ from . import semantic_cache as sc
 from . import slack_update_throttle
 from . import team_learning
 from . import user_feedback_tracker as uft
+from . import web_guard
 from .tools import user_identity
 from .tools import osn_shift_handler
 from .tools import tool_dispatch as _tool_dispatch
@@ -718,6 +719,37 @@ def _dispatch_qa(
         channel_name, user_id, model_router.short_label(chosen_model), len(user_message),
     )
 
+    # ── Web tools gate (2026-07-31): the server-side web_search/web_fetch tools
+    # attach only when web_guard says so — explicit web intent, or a time-sensitive
+    # question whose KB retrieval missed; NEVER in LEX scope; the user query is
+    # egress-screened fail-closed; a daily search cap bounds spend. A block is a
+    # soft degradation (KB-only behavior), never a user-facing refusal. Forced-tool,
+    # bare-affirmative confirm, and Tier-2 retrieval-grant turns (personal mailbox
+    # content in context) never carry web tools.
+    web_on = False
+    if force_tool is None and not assume_confirm and retrieval_grant is None:
+        web_decision = web_guard.evaluate(
+            user_message, entity, kb_meta=kb_meta, channel_name=channel_name,
+        )
+        web_on = web_decision.attach
+        web_guard.record_decision(web_decision, entity=entity, channel_name=channel_name)
+        if web_on:
+            # Multi-source live synthesis is not a Haiku job, and the model must
+            # support the 20260209 tool revisions — force Sonnet.
+            chosen_model = model_router.MODEL_SONNET
+            runtime_context = runtime_context + "\n\n" + web_guard.WEB_MODE_CONTEXT
+            # Live-web answers are time-anchored — never enter the shared cache.
+            cache_storable = False
+            log.info(
+                "web_tools ATTACHED channel=#%s user=%s reason=%s",
+                channel_name, user_id, web_decision.reason,
+            )
+        elif web_decision.reason not in ("no_intent", "disabled"):
+            log.info(
+                "web_tools withheld channel=#%s user=%s reason=%s",
+                channel_name, user_id, web_decision.reason,
+            )
+
     # ── Streaming: post placeholder, then update it as Claude streams ──────
     placeholder_ts: str | None = None
     placeholder_channel: str = channel_id
@@ -757,6 +789,7 @@ def _dispatch_qa(
                 meta=gen_meta,
                 force_tool=force_tool,
                 assume_confirm=assume_confirm,
+                web_tools=web_on,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -779,6 +812,18 @@ def _dispatch_qa(
             user_message, entity, channel_id, channel_name, user_id or "",
             response_text=response_text,
         )
+        if web_on:
+            # Daily-cap accounting + deterministic provenance: the Sources line is
+            # composed from the API's own citations as sanctioned <url|label> tokens,
+            # which format_reply Pass 1 and the egress boundary preserve end-to-end.
+            web_guard.record_usage(
+                gen_meta.get("web_search_requests", 0),
+                gen_meta.get("web_fetch_requests", 0),
+                entity=entity,
+            )
+            sources_line = web_guard.format_sources_line(gen_meta.get("web_citations"))
+            if sources_line:
+                response_text = response_text.rstrip() + "\n\n" + sources_line
         # D-032 / Phase 2.1: conversational replies pass through the deterministic
         # voice formatter; only genuine verbatim-table tools bypass it. The old
         # bool(used_tools) heuristic bypassed EVERY tool-using reply (so a prose
@@ -846,6 +891,7 @@ def _dispatch_qa(
             meta=gen_meta,
             force_tool=force_tool,
             assume_confirm=assume_confirm,
+            web_tools=web_on,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
@@ -878,6 +924,16 @@ def _dispatch_qa(
         user_message, entity, channel_id, channel_name, user_id or "",
         response_text=response_text,
     )
+    if web_on:
+        # Daily-cap accounting + deterministic provenance (see non-streaming path).
+        web_guard.record_usage(
+            gen_meta.get("web_search_requests", 0),
+            gen_meta.get("web_fetch_requests", 0),
+            entity=entity,
+        )
+        sources_line = web_guard.format_sources_line(gen_meta.get("web_citations"))
+        if sources_line:
+            response_text = response_text.rstrip() + "\n\n" + sources_line
     # D-032 / Phase 2.1: conversational replies pass through the deterministic
     # voice formatter; only genuine verbatim-table tools bypass it (used_verbatim_tool,
     # not the old too-broad bool(used_tools)). Applied before the cache store so

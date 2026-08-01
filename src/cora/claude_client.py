@@ -51,6 +51,9 @@ _TOOL_DISPATCH_MAX_WORKERS = 4  # parallel cap when an iteration emits multiple
 _TIMEOUT = 60.0  # bumped 25→60 for tool-use loops where the second pass synthesizes
                  # large tool results (e.g. 25-event week calendar). Anthropic SDK has
                  # its own internal retries; we just need to give them headroom.
+_WEB_TIMEOUT = 120.0  # web-enabled calls: the server-side search/fetch loop (incl.
+                      # dynamic-filtering code execution) can exceed 60s; a timeout
+                      # here retries the WHOLE turn and re-bills the searches.
 _RETRY_DELAYS = (1, 2)  # seconds before attempt 1 and attempt 2
 _MAX_TOOL_ITERATIONS = 3  # safety cap on tool-use loop
 
@@ -292,6 +295,82 @@ def _build_cached_tools(entity: str = "FNDR", cross_entity: bool = False) -> lis
     tools = list(tools)
     tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
+
+
+def _build_web_tool_defs() -> list[dict]:
+    """Server-side web tool definitions (web_search / web_fetch, 2026-02-09 rev).
+
+    Anthropic executes these server-side — no dispatch entry, no client loop.
+    Appended AFTER the client tools' cache_control breakpoint so the shared
+    client-tools cache prefix stays byte-identical between web and non-web
+    requests (web-enabled requests just get a distinct system-block lineage).
+    max_uses bounds per-call spend; the daily cap lives in web_guard.
+    """
+    from . import web_guard  # local import — web_guard has no claude_client dep
+
+    blocked = list(web_guard.BLOCKED_DOMAINS)
+    return [
+        {
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "max_uses": web_guard.search_max_uses(),
+            "blocked_domains": blocked,
+            "user_location": {
+                "type": "approximate",
+                "city": "Phoenix",
+                "region": "Arizona",
+                "country": "US",
+                "timezone": "America/Phoenix",
+            },
+        },
+        {
+            "type": "web_fetch_20260209",
+            "name": "web_fetch",
+            "max_uses": web_guard.fetch_max_uses(),
+            "blocked_domains": blocked,
+            "citations": {"enabled": True},
+            "max_content_tokens": 15000,
+        },
+    ]
+
+
+def _collect_web_meta(response: "anthropic.types.Message", meta: dict | None) -> None:
+    """Accumulate server-tool usage + web citations into the caller's meta dict.
+
+    Called once per iteration on web-enabled requests only (citations can land
+    on any iteration's text blocks, incl. a pause_turn continuation). Fail-soft:
+    observability, never a correctness contract.
+    """
+    if meta is None:
+        return
+    try:
+        usage = getattr(response, "usage", None)
+        stu = getattr(usage, "server_tool_use", None) if usage is not None else None
+        if stu is not None:
+            searches = int(getattr(stu, "web_search_requests", 0) or 0)
+            fetches = int(getattr(stu, "web_fetch_requests", 0) or 0)
+            if searches or fetches:
+                meta["web_search_requests"] = meta.get("web_search_requests", 0) + searches
+                meta["web_fetch_requests"] = meta.get("web_fetch_requests", 0) + fetches
+                log.info(
+                    "claude web usage searches=%d fetches=%d", searches, fetches,
+                )
+        cites = meta.setdefault("web_citations", [])
+        seen = {c.get("url") for c in cites}
+        for block in getattr(response, "content", None) or []:
+            if getattr(block, "type", None) != "text":
+                continue
+            for cit in getattr(block, "citations", None) or []:
+                url = getattr(cit, "url", None)
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                cites.append(
+                    {"url": str(url), "title": str(getattr(cit, "title", "") or "")}
+                )
+    except (TypeError, ValueError, AttributeError):
+        # Mock responses / unexpected shapes — never break the request.
+        pass
 
 
 # ── Pre-send token-budget guard (2026-07-17, D-084) ──────────────────────────
@@ -903,8 +982,14 @@ def generate_response(
     meta: dict | None = None,
     force_tool: str | None = None,
     assume_confirm: bool = False,
+    web_tools: bool = False,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
+
+    web_tools: attach the server-side web_search/web_fetch tools for THIS call
+    (gated upstream by web_guard.evaluate — LEX-off, egress screen, daily cap).
+    Web-enabled calls use a longer timeout, handle stop_reason=pause_turn, and
+    accumulate meta["web_citations"] / meta["web_search_requests"].
 
     force_tool: when set, the FIRST model turn is forced (tool_choice) to call that
     tool -- F-23 Slice 2, so a destructive/create intent produces a TOOL preview +
@@ -945,6 +1030,8 @@ def generate_response(
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
     cached_tools = _build_cached_tools(entity, cross_entity_tools)
+    if web_tools:
+        cached_tools = cached_tools + _build_web_tool_defs()
     effective_model = model or _MODEL
 
     # Conversation accumulator — prepend thread history if provided, then append
@@ -961,6 +1048,9 @@ def generate_response(
         meta["tool_names"] = []
 
     _last_shopify_result: str = ""  # HIGH-2: the write tool owns its outcome text
+    _paused_text: str = ""  # text emitted before a pause_turn continuation — each
+                            # response carries only ITS OWN new blocks, so pre-pause
+                            # text must be carried forward or it is silently dropped
 
     for iteration in range(_MAX_TOOL_ITERATIONS + 1):
         create_kwargs = dict(
@@ -969,12 +1059,27 @@ def generate_response(
             system=system_blocks,
             messages=messages,
             tools=cached_tools,
-            timeout=_TIMEOUT,
+            timeout=_WEB_TIMEOUT if web_tools else _TIMEOUT,
             thinking=_THINKING_DISABLED,  # D-051: keep thinking off (see _THINKING_DISABLED)
         )
         _apply_forced_tool(create_kwargs, force_tool, iteration, cached_tools)
         response = _create_with_retry(**create_kwargs)
         _log_usage(response, iteration)
+        if web_tools:
+            _collect_web_meta(response, meta)
+
+        if response.stop_reason == "pause_turn" and iteration < _MAX_TOOL_ITERATIONS:
+            # Server-side tool turn paused mid-flight (web_search/web_fetch hit the
+            # server loop limit). Re-send with the paused assistant turn appended and
+            # NO tool_result — the API detects the trailing server_tool_use and
+            # resumes. At the iteration cap we fall through to the != "tool_use"
+            # branch below and return the partial text instead of raising.
+            paused_chunk = _extract_text(response)
+            if paused_chunk:
+                # _extract_text strips, so restore a separator at the seam.
+                _paused_text += paused_chunk + " "
+            messages.append({"role": "assistant", "content": response.content})
+            continue
 
         if response.stop_reason != "tool_use":
             # Model is done. If the DTC write tool returned a CONTRACT result
@@ -986,7 +1091,8 @@ def generate_response(
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             # No contract-write sentinel this turn -> phantom-destructive guard (F-23).
             return _guard_phantom_destructive(
-                _extract_text(response), broaden=_should_broaden(assume_confirm, meta)) or "(Cora returned no text)"
+                _paused_text + _extract_text(response),
+                broaden=_should_broaden(assume_confirm, meta)) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True
@@ -999,7 +1105,8 @@ def generate_response(
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result)
             return _guard_phantom_destructive(
-                _extract_text(response), broaden=_should_broaden(assume_confirm, meta)) or (
+                _paused_text + _extract_text(response),
+                broaden=_should_broaden(assume_confirm, meta)) or (
                 "I tried to look that up but couldn't finish in time — try rephrasing."
             )
 
@@ -1073,10 +1180,11 @@ def generate_response_streaming(
     meta: dict | None = None,
     force_tool: str | None = None,
     assume_confirm: bool = False,
+    web_tools: bool = False,
 ) -> str:
     """Streaming variant of generate_response.
 
-    force_tool / assume_confirm: see generate_response (F-23 Slices 2 + 3).
+    force_tool / assume_confirm / web_tools: see generate_response.
 
     meta: optional caller-owned dict for out-of-band response metadata — sets
     meta["used_tools"] (bool) exactly like generate_response (D-032 bypass signal).
@@ -1107,6 +1215,8 @@ def generate_response_streaming(
     """
     system_blocks = _build_cached_system(system_prompt, context, static_context=cached_context)
     cached_tools = _build_cached_tools(entity, cross_entity_tools)
+    if web_tools:
+        cached_tools = cached_tools + _build_web_tool_defs()
     effective_model = model or _MODEL
 
     messages: list[dict] = list(prior_messages or []) + [{"role": "user", "content": user_message}]
@@ -1118,6 +1228,9 @@ def generate_response_streaming(
     accumulated_text = ""
     _last_tool_result_text: str = ""  # safety net: fallback if Claude emits no text after a write
     _last_shopify_result: str = ""    # HIGH-2: the DTC write tool owns its outcome text
+    _web_paused = False  # a pause_turn continuation happened — accumulated_text then
+                         # spans responses, so the final-message text (continuation
+                         # tail only) must NOT replace it in the done branch below
 
     if meta is not None:
         meta["used_tools"] = False
@@ -1135,7 +1248,7 @@ def generate_response_streaming(
             system=system_blocks,
             messages=messages,
             tools=cached_tools,
-            timeout=_TIMEOUT,
+            timeout=_WEB_TIMEOUT if web_tools else _TIMEOUT,
             thinking=_THINKING_DISABLED,  # D-051: keep thinking off (see _THINKING_DISABLED)
         )
         _apply_forced_tool(stream_kwargs, force_tool, iteration, cached_tools)
@@ -1165,12 +1278,26 @@ def generate_response_streaming(
             raise ClaudeClientError(f"Streaming error: {exc}") from exc
 
         _log_usage(final, iteration)
+        if web_tools:
+            _collect_web_meta(final, meta)
+
+        if final.stop_reason == "pause_turn" and iteration < _MAX_TOOL_ITERATIONS:
+            # Server-side tool turn paused (see generate_response). Text already
+            # streamed into accumulated_text; append the paused assistant turn and
+            # resume. At the cap, fall through and return the partial text.
+            _web_paused = True
+            messages.append({"role": "assistant", "content": final.content})
+            continue
 
         if final.stop_reason != "tool_use":
             # Model is done — return the cumulative text.
             # `accumulated_text` should already match the final message's text
-            # content, but extract from final as a safety net if streaming dropped events.
+            # content, but extract from final as a safety net if streaming dropped
+            # events. After a pause_turn continuation the final message holds only
+            # the continuation tail, so the replacement must be skipped.
             final_text = _extract_text(final)
+            if _web_paused:
+                final_text = ""
             if final_text and final_text != accumulated_text:
                 # Stream missed some text — push the corrected final
                 accumulated_text = final_text

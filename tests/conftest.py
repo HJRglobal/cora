@@ -255,6 +255,7 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
          "fireflies-dedup-ledger.json"),
         ("cora.connectors.fireflies_action_extractor", "_WATERMARK_PATH",
          "meeting_action_watermark.json"),
+        ("cora.web_guard", "_USAGE_LEDGER", "web-search-usage.jsonl"),
     ]
     for _mod_name, _attr, _fname in _LEDGER_CONSTS:
         try:
@@ -297,6 +298,7 @@ _GUARDED_LEDGERS = (
     "data/cora-reply-log.jsonl",
     "data/state/fireflies-dedup-ledger.json",
     "data/state/meeting_action_watermark.json",
+    "data/state/web-search-usage.jsonl",
 )
 
 
