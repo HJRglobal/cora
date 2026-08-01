@@ -1358,6 +1358,65 @@ def test_rehome_script_dry_run_no_delete(qenv, monkeypatch):
     assert src.exists()  # dry-run never deletes
 
 
+def test_rehome_shared_file_moves_once_backfills_all_rows(qenv):
+    """2026-07-31 defect: a bundle stages ONE prompt file for N rows. The old
+    per-row copy-then-unlink deleted the shared file on row 1 and
+    FileNotFoundError'd rows 2..N (the 5 stale bnd-1fbf2c12 rows)."""
+    from pathlib import Path
+    cid1, src = _seed_mishomed(qenv, name="2026-07-28_fndr_cora-code-prompt-bundle-a1b2c3.md")
+    cid2 = cq.seed_item(kind="feature", severity="P3", title="bundle sibling",
+                        summary="s", entity="HJRP", signal="explicit",
+                        status="APPROVED")
+    cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid2,
+                      "prompt_path": str(src)})
+    plan = cq.plan_prompt_rehome()
+    assert {p["id"] for p in plan} == {cid1, cid2}
+    done = cq.apply_prompt_rehome(plan)
+    assert all(d["ok"] for d in done), done
+    assert not src.exists()  # moved exactly once
+    for cid in (cid1, cid2):
+        new_path = cq.get_item(cid)["prompt_path"]
+        assert "/_shared/projects/cora/_notes/" in str(Path(new_path)).replace("\\", "/")
+        assert Path(new_path).exists()
+        staged = [e for e in cq._read_jsonl(cq._EVENT_LEDGER)
+                  if e.get("event") == "staged" and e.get("id") == cid]
+        assert staged[-1].get("rehomed") is True
+
+
+def test_rehome_self_heals_missing_src_when_dst_exists(qenv):
+    """The live-damage shape: the shared file was already moved by a pre-fix
+    run, so src is gone but the Founder-OS copy exists -- the row gets a
+    backfill-only entry (no file ops) and its ledger pointer is fixed."""
+    from pathlib import Path
+    cid, src = _seed_mishomed(qenv, name="2026-07-28_fndr_cora-code-prompt-healme-d4e5f6.md")
+    dst = cq.founder_os_notes_dir() / src.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    src.unlink()  # simulate the pre-fix applier having moved-and-deleted it
+    plan = cq.plan_prompt_rehome()
+    assert len(plan) == 1 and plan[0]["id"] == cid and plan[0].get("backfill_only")
+    done = cq.apply_prompt_rehome(plan)
+    assert done[0]["ok"] is True
+    assert Path(cq.get_item(cid)["prompt_path"]) == dst
+    assert dst.exists()
+
+
+def test_rehome_never_plans_non_staged_rows(qenv):
+    """Appending a 'staged' backfill event to a terminal row would RESURRECT it
+    via the last-write-wins fold -- the plan must exclude non-STAGED rows (the
+    cq-dad80c0011c9 trap)."""
+    cid, src = _seed_mishomed(qenv, name="2026-07-28_fndr_cora-code-prompt-term-778899.md")
+    winner = cq.seed_item(kind="bug", severity="P2", title="winner", summary="s",
+                          entity="FNDR", signal="explicit", status="APPROVED")
+    assert cq.supersede_item(cid, winner)
+    assert cq.get_item(cid)["status"] == "SUPERSEDED"
+    plan = cq.plan_prompt_rehome()
+    assert cid not in {p["id"] for p in plan}
+    # And even after an apply of the (empty) plan the row stays SUPERSEDED.
+    cq.apply_prompt_rehome(plan)
+    assert cq.get_item(cid)["status"] == "SUPERSEDED"
+
+
 # ── D-051 v1.1-review remediation (2 confirmed MEDIUM) ─────────────────────────
 def test_seed_item_redacts_lex_representative(qenv):
     # Defect A root cause: seed_item must not persist a raw LEX representative (else it

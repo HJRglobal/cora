@@ -2021,10 +2021,20 @@ def plan_prompt_rehome() -> list[dict[str, str]]:
     defect #4) to the Founder-OS ``_notes``. CONSERVATIVE (D-051 over-deletion guard):
     a file is included ONLY if it (a) is referenced by a ``staged`` event, (b) lives
     under the repo ``_notes`` dir, (c) has a ``cora-code-prompt`` basename, and (d)
-    still exists. Never globs or deletes blindly."""
+    still exists -- OR (self-heal, 2026-07-31 defect) is already at the Founder-OS
+    destination but the row's ledger pointer was never backfilled (the pre-group-by-src
+    applier moved a SHARED file on its first row and FileNotFoundError'd rows 2..N);
+    those get a ``backfill_only`` entry. Never globs or deletes blindly.
+
+    Only rows whose CURRENT status is STAGED are planned: appending a ``staged``
+    backfill event to a terminal row (SUPERSEDED/SHIPPED/DISMISSED) would resurrect
+    it via the last-write-wins fold."""
     repo_notes = _NOTES_DIR.resolve()
+    status_by_id = {it.get("id"): it.get("status") for it in load_items()}
     plan: list[dict[str, str]] = []
     for cq_id, p in _latest_staged_prompt_paths().items():
+        if status_by_id.get(cq_id) != "STAGED":
+            continue
         src = Path(p)
         try:
             parents = list(src.resolve().parents)
@@ -2034,10 +2044,13 @@ def plan_prompt_rehome() -> list[dict[str, str]]:
             continue  # already Founder-OS-homed (or elsewhere) -- leave it
         if "cora-code-prompt" not in src.name:
             continue
+        dst = founder_os_notes_dir() / src.name
         if not src.exists():
+            if dst.exists():
+                plan.append({"id": cq_id, "src": str(src), "dst": str(dst),
+                             "backfill_only": "1"})
             continue
-        plan.append({"id": cq_id, "src": str(src),
-                     "dst": str(founder_os_notes_dir() / src.name)})
+        plan.append({"id": cq_id, "src": str(src), "dst": str(dst)})
     return plan
 
 
@@ -2045,16 +2058,31 @@ def apply_prompt_rehome(plan: list[dict[str, str]]) -> list[dict[str, Any]]:
     """Execute a ``plan_prompt_rehome`` plan: copy src -> Founder-OS ``_notes`` (via
     drive_io), backfill the ledger prompt_path (a ``staged`` event, ``rehomed=True``),
     then delete the repo copy. Best-effort per item -- one failure never aborts the
-    rest. Returns the per-item outcomes."""
+    rest. Returns the per-item outcomes.
+
+    GROUPED BY SOURCE FILE (2026-07-31 defect): a bundle stages ONE prompt file for
+    N rows, so the file is moved exactly once and every row that references it gets
+    its ledger backfill. The old per-row copy-then-unlink deleted the shared file on
+    row 1 and FileNotFoundError'd rows 2..N, freezing their prompt_path at the
+    deleted repo path (the 5 stale STAGED rows of bnd-1fbf2c12)."""
     done: list[dict[str, Any]] = []
+    moved: set[str] = set()  # srcs already copied+unlinked this run
     for a in plan:
         src, dst, cq_id = Path(a["src"]), Path(a["dst"]), a["id"]
         try:
-            body = src.read_text(encoding="utf-8", errors="replace")
-            drive_io.write_text_atomic(dst, body)
+            if a.get("backfill_only") or str(src) in moved:
+                # File already at dst (moved earlier this run, or by a prior
+                # pre-fix run) -- only the ledger pointer needs fixing.
+                if not dst.exists():
+                    raise FileNotFoundError(f"destination missing: {dst}")
+            else:
+                body = src.read_text(encoding="utf-8", errors="replace")
+                drive_io.write_text_atomic(dst, body)
             _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
                            "prompt_path": str(dst), "rehomed": True})
-            src.unlink()
+            if str(src) not in moved and not a.get("backfill_only") and src.exists():
+                src.unlink()
+                moved.add(str(src))
             done.append({"id": cq_id, "src": str(src), "dst": str(dst), "ok": True})
         except Exception as exc:  # noqa: BLE001 -- best-effort per item
             log.warning("code_queue: rehome failed for %s: %s", cq_id, exc)
