@@ -58,12 +58,14 @@ HEARTBEAT_PATH = REPO_ROOT / "data" / "health" / "heartbeat.txt"
 PRUNE_SOURCES: tuple[str, ...] = ("gmail", "drive_sweep")
 
 # Vector tables that may hold a row per chunk. Only the ones that actually exist
-# in the DB are touched (knowledge_vec_i8 is forward-compat -- absent today;
-# knowledge_vec_bin_v2 is the ARMED partition-key index -- omitting it orphaned
-# vectors, 2026-07-31 audit).
+# in the DB are touched (knowledge_vec_i8 is forward-compat -- absent today). The
+# bin coarse tables come from schema.BIN_TABLE_CANDIDATES (legacy knowledge_vec_bin
+# + partitioned knowledge_vec_bin_v2 -- the ARMED partition-key index; omitting it
+# orphaned vectors, 2026-07-31 audit) so this cascade stays in lockstep with
+# store._bin_write_tables() across the partition migration -- a prune that missed
+# a bin table would strand orphan vectors and defeat the point of the purge.
 _CANDIDATE_VEC_TABLES: tuple[str, ...] = (
-    "knowledge_vec_bin",
-    "knowledge_vec_bin_v2",
+    *schema.BIN_TABLE_CANDIDATES,
     "knowledge_vec_f32",
     "knowledge_vec_i8",
 )

@@ -2,7 +2,10 @@
 
 Tables:
 - knowledge_chunks: one row per chunk with source/entity/date/content/deep_link/metadata
-- knowledge_vec_bin: binary-quantized vec0 table (fast coarse hamming scan)
+- knowledge_vec_bin: binary-quantized vec0 table (fast coarse hamming scan; legacy
+  metadata-column shape, retained as a fallback across the Slice 2-1 migration)
+- knowledge_vec_bin_v2: partitioned (entity PARTITION KEY) coarse table, active once
+  the kb_bin_partition_ready checkpoint is armed
 - knowledge_vec_f32: float32 blob table (exact re-rank + brute-force fallback)
   (the legacy float vec0 table `knowledge_vec` was dropped 2026-06-08)
 - sync_state: per-source watermark tracking for incremental ingest
@@ -21,6 +24,34 @@ import sqlite_vec
 log = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 1536  # text-embedding-3-small
+
+# Every coarse binary vec0 table that can exist across the Slice 2-1 (2026-07-28)
+# partition migration: the legacy metadata-column table and the partitioned v2.
+# This list is THE source of truth for chunk-delete cascades: store's
+# _bin_write_tables() and every standalone purge/prune utility must discover the
+# bin tables from here (existence-checked via bin_tables_present) so a delete
+# never strands orphan vectors in a bin table the deleter didn't know about --
+# and so the cascade keeps working after migrate_kb_partition_key.py
+# --drop-legacy removes knowledge_vec_bin. A pinned regression test
+# (tests/test_vec_cascade_v2.py) fails the suite if this list and store.py drift.
+BIN_TABLE_CANDIDATES: tuple[str, ...] = ("knowledge_vec_bin", "knowledge_vec_bin_v2")
+
+
+def bin_tables_present(conn: sqlite3.Connection) -> list[str]:
+    """Subset of BIN_TABLE_CANDIDATES that actually exists on this connection."""
+    present = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        ).fetchall()
+    }
+    return [t for t in BIN_TABLE_CANDIDATES if t in present]
+
+
+def vec_cascade_tables(conn: sqlite3.Connection) -> list[str]:
+    """Full chunk-delete cascade for this DB: every present bin coarse table +
+    knowledge_vec_f32 + knowledge_chunks (vectors first, parent row last)."""
+    return [*bin_tables_present(conn), "knowledge_vec_f32", "knowledge_chunks"]
 
 
 def connect(
