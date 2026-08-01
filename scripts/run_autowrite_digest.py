@@ -88,6 +88,22 @@ def build_digest(now_ts: float, days: int = 7) -> tuple[dict, list[dict]]:
     return stats, this_week
 
 
+def _decisions_inbox_line(days: int = 7) -> str:
+    """One fail-soft context line about the Fork-4 decisions inbox (accepted
+    decision cards awaiting Cowork-cascade promotion). "" when empty or on any
+    error -- the digest must never fail because of the inbox."""
+    try:
+        from cora.decision_inbox import inbox_stats, _inbox_path
+        s = inbox_stats(days=days)
+        if not s.get("total"):
+            return ""
+        return (f"\n:inbox_tray: _Decisions inbox: {s['total']} accepted "
+                f"({s['recent']} this week) awaiting cascade promotion -- "
+                f"{_inbox_path().name}_")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def deliver(stats: dict, items: list[dict]) -> bool:
     from slack_sdk import WebClient
 
@@ -100,6 +116,7 @@ def deliver(stats: dict, items: list[dict]) -> bool:
     summary = (f"{fallback}\n_This week {stats['this_week']} · last week "
                f"{stats['prev_week']} · reverts this week {stats['reverts_this_week']} · "
                f"level={stats['level']}_")
+    summary += _decisions_inbox_line()
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}] + blocks[1:]
     try:
         safe_fallback = slack_egress.sanitize_text(summary)
@@ -127,13 +144,27 @@ def main() -> int:
     log.info("autowrite-digest: this_week=%d prev_week=%d reverts=%d level=%s",
              stats["this_week"], stats["prev_week"], stats["reverts_this_week"], stats["level"])
 
-    if not items and stats["reverts_this_week"] == 0 and not args.force:
-        log.info("No auto-write activity this week -- no DM (use --force to send anyway).")
+    # Fork 4: a week with newly-accepted decisions is oversight-relevant even if
+    # no auto-write happened -- the inbox line must not wait for a busier week.
+    inbox_recent = 0
+    try:
+        from cora.decision_inbox import inbox_stats
+        inbox_recent = int(inbox_stats(days=args.days).get("recent", 0))
+    except Exception:  # noqa: BLE001 -- inbox is fail-soft for this digest
+        inbox_recent = 0
+
+    if (not items and stats["reverts_this_week"] == 0 and inbox_recent == 0
+            and not args.force):
+        log.info("No auto-write or decisions-inbox activity this week -- no DM "
+                 "(use --force to send anyway).")
         return 0
     if args.dry_run:
         for it in items:
             log.info("[DRY RUN] %s tier=%s %s", it.get("update_type"), it.get("tier"),
                      str(it.get("summary", ""))[:120])
+        line = _decisions_inbox_line(days=args.days)
+        if line:
+            log.info("[DRY RUN]%s", line.strip())
         return 0
     ok = deliver(stats, items)
     return 0 if ok else 2

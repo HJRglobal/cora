@@ -557,6 +557,51 @@ class TestEmojiFallback:
         assert "inbox" not in fail.lower()
 
 
+# ── weekly digest line (S2) ──────────────────────────────────────────────────
+
+class TestDigestLine:
+    def test_empty_inbox_no_line(self, inbox_env):
+        import scripts.run_autowrite_digest as rad
+        assert rad._decisions_inbox_line() == ""
+
+    def test_line_carries_counts_and_filename(self, inbox_env):
+        import scripts.run_autowrite_digest as rad
+        di.apply_decision_accept(_decision(uid="dg1"))
+        line = rad._decisions_inbox_line()
+        assert "1 accepted" in line and "(1 this week)" in line
+        assert "decisions-inbox.md" in line and "cascade" in line
+
+    def test_line_fail_soft(self, inbox_env, monkeypatch):
+        import scripts.run_autowrite_digest as rad
+        monkeypatch.setattr(di, "inbox_stats",
+                            lambda days=7: (_ for _ in ()).throw(RuntimeError("x")))
+        assert rad._decisions_inbox_line() == ""
+
+    def test_recent_inbox_activity_triggers_quiet_week_send(
+            self, inbox_env, monkeypatch):
+        import scripts.run_autowrite_digest as rad
+        di.apply_decision_accept(_decision(uid="dg2"))
+        monkeypatch.setattr(rad, "build_digest", lambda now, days=7: (
+            {"this_week": 0, "prev_week": 0, "reverts_this_week": 0,
+             "level": "off"}, []))
+        sent = MagicMock(return_value=True)
+        monkeypatch.setattr(rad, "deliver", sent)
+        monkeypatch.setattr("sys.argv", ["run_autowrite_digest.py"])
+        assert rad.main() == 0
+        sent.assert_called_once()
+
+    def test_truly_quiet_week_still_skips(self, inbox_env, monkeypatch):
+        import scripts.run_autowrite_digest as rad
+        monkeypatch.setattr(rad, "build_digest", lambda now, days=7: (
+            {"this_week": 0, "prev_week": 0, "reverts_this_week": 0,
+             "level": "off"}, []))
+        sent = MagicMock(return_value=True)
+        monkeypatch.setattr(rad, "deliver", sent)
+        monkeypatch.setattr("sys.argv", ["run_autowrite_digest.py"])
+        assert rad.main() == 0
+        sent.assert_not_called()
+
+
 # ── source-level canon-boundary + wiring pins ────────────────────────────────
 
 class TestCanonBoundaryAndWiring:
