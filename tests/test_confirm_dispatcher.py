@@ -319,8 +319,20 @@ class TestResolveAndClaimStashSecurity:
         assert bar_pending is not None
         assert bar_pending["stash_id"] == bar_sid
         assert bar_pending["title"] == "Bar"
-        # Bar's own stash_id is still live and independently confirmable.
-        assert cc.index_lookup(bar_sid) is not None
+        # Bar's index record must NOT have been marked resolved by Foo's confirm
+        # (index_mark_resolved is keyed on the exact stash_id being claimed --
+        # this pins that Foo's claim never touches Bar's entry).
+        bar_idx = cc.index_lookup(bar_sid)
+        assert bar_idx is not None
+        assert not bar_idx.get("resolved")
+        # Bar is fully, independently confirmable end-to-end -- not just "still
+        # present in the store", but actually actionable via its own button tap.
+        fake_created = {"gid": "999888777", "name": "Bar", "permalink_url": "",
+                        "assignee": {"name": "H"}, "due_on": None, "projects": []}
+        with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock_create:
+            bar_result = td.resolve_and_claim_stash(bar_sid, HARRISON, "confirm")
+        assert bar_result["outcome"] == "executed"
+        mock_create.assert_called_once()
 
     def test_concurrent_unrelated_shopify_write_during_execute_is_not_misreported(self):
         # Same defect, reproduced within Shopify itself -- the ONE kind whose own
@@ -360,7 +372,48 @@ class TestResolveAndClaimStashSecurity:
         assert other_pending is not None
         assert other_pending["stash_id"] == other_sid
         assert other_pending["variant_label"] == "Other Variant"
-        assert cc.index_lookup(other_sid) is not None
+        other_idx = cc.index_lookup(other_sid)
+        assert other_idx is not None
+        assert not other_idx.get("resolved")
+        # And it's fully, independently confirmable end-to-end -- not just
+        # "still present in the store".
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=15), \
+             patch.object(td.shopify_client, "set_inventory_level", return_value=20) as mock_set2, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            other_result = td.resolve_and_claim_stash(other_sid, HARRISON, "confirm")
+        assert other_result["outcome"] == "executed"
+        mock_set2.assert_called_once()
+
+    def test_shopify_batch_drift_during_execute_reports_re_previewed_via_button_path(self):
+        # The batch executor (_shopify_execute_pending_batch) got the SAME
+        # (message, fresh_stash_id) migration as the single-item executor, but
+        # no existing test drove its own re-preview branch through the button
+        # path (resolve_and_claim_stash) -- only through the typed-confirm path,
+        # which discards the fresh id entirely. Pin it directly, mirroring
+        # test_drift_during_execute_reports_re_previewed_not_executed's rigor
+        # (re-confirm the fresh batch id end-to-end).
+        sid = _stash_shopify_batch(n=2)  # both rows preview_qty=8
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=5), \
+             patch.object(td.shopify_client, "set_inventory_level") as mock_set, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "re_previewed"
+        mock_set.assert_not_called()
+        fresh_sid = result["stash_id"]
+        assert fresh_sid and fresh_sid != sid
+        fresh_pending = td._peek_pending_shopify(HARRISON, _CH)
+        assert fresh_pending["stash_id"] == fresh_sid
+        assert all(r["preview_qty"] == 5 for r in fresh_pending["rows"])
+        # The OLD stash_id is dead -- a stale tap on it reads already_handled.
+        stale_result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert stale_result["outcome"] == "already_handled"
+        # The FRESH batch stash_id is fully confirmable via the button path.
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=5), \
+             patch.object(td.shopify_client, "set_inventory_level", return_value=5) as mock_set2, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            final = td.resolve_and_claim_stash(fresh_sid, HARRISON, "confirm")
+        assert final["outcome"] == "executed"
+        assert mock_set2.call_count == 2
 
     def test_cancel_pops_without_executing(self):
         sid = _stash_asana_delete()
