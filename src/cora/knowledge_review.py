@@ -243,6 +243,7 @@ UPDATE_TYPE_HUBSPOT_NOTE  = "hubspot_note"     # Add HubSpot deal note
 UPDATE_TYPE_DECISION      = "decision_capture" # Harrison decision card -> NON-canon inbox
 UPDATE_TYPE_TASK_CLOSE    = "task_close"       # Close open Asana task
 UPDATE_TYPE_GENERIC       = "generic"          # Free-form action for Harrison
+UPDATE_TYPE_LEXICON       = "lexicon"          # Company-lexicon term -> file of record
 
 
 def _now_iso() -> str:
@@ -256,7 +257,7 @@ def _now_iso() -> str:
 # -> OPERATIONAL, and must be classified the same in both places). KNOWLEDGE =
 # the two knowledge update_types OR a generic contributed via #info-for-cora (a
 # human-fed fact). Everything else is an OPERATIONAL nudge routed to owners.
-_KNOWLEDGE_UPDATE_TYPES = frozenset({"known_answer", "efficiency"})
+_KNOWLEDGE_UPDATE_TYPES = frozenset({"known_answer", "efficiency", "lexicon"})
 
 
 def is_knowledge_update(update_type: str | None, payload: dict | None) -> bool:
@@ -562,7 +563,29 @@ _TYPE_LABEL: dict[str, str] = {
     UPDATE_TYPE_DECISION:     "Decision capture",
     UPDATE_TYPE_TASK_CLOSE:   "Close task",
     UPDATE_TYPE_GENERIC:      "Action",
+    UPDATE_TYPE_LEXICON:      "Lexicon term",
 }
+
+
+def _lexicon_card_detail(update: dict[str, Any]) -> str:
+    """One structured detail line for a lexicon card (term, meaning, type,
+    entity, lane, evidence counts). Re-screened with is_any_phi at THIS egress
+    (the read side never trusts write-side redaction); fail-closed withheld."""
+    payload = update.get("payload") or {}
+    detail = (
+        f"`{payload.get('term', '?')}` -> {payload.get('canonical_name', '?')} "
+        f"[{payload.get('type', '?')}, {payload.get('entity', '?')}] "
+        f"(lane: {payload.get('lane', '?')}"
+        + (f", evidence: {payload.get('evidence')}" if payload.get("evidence") else "")
+        + ")"
+    )
+    try:
+        from .phi_guard import is_any_phi
+        if is_any_phi(detail):
+            return "_(term details withheld -- PHI-shaped; see the file diff on approval)_"
+    except Exception:  # noqa: BLE001 -- screen failure withholds (fail-closed)
+        return "_(term details withheld -- screen unavailable)_"
+    return detail
 
 
 def format_single_item_dm(update: dict[str, Any]) -> str:
@@ -579,6 +602,8 @@ def format_single_item_dm(update: dict[str, Any]) -> str:
     type_label = _TYPE_LABEL.get(utype, utype)
 
     lines = [f"*[{type_label}]* {conf_emoji} `{conf}`\n{desc}"]
+    if utype == UPDATE_TYPE_LEXICON:
+        lines.append(_lexicon_card_detail(update))
     if evidence:
         snippet = evidence[:300].replace("\n", " ")
         lines.append(f"_Source: {snippet}_")
@@ -843,6 +868,16 @@ def apply_knowledge_update(update: dict[str, Any]) -> tuple[bool, str]:
         if utype == "efficiency":
             from .friction_mining import apply_efficiency
             return apply_efficiency(payload)
+        if utype == UPDATE_TYPE_LEXICON:
+            from .lexicon_writer import apply_lexicon_update
+            ok, summary = apply_lexicon_update(payload)
+            if ok:
+                try:  # golden-set auto-growth (fail-soft; parity w/ known_answer)
+                    from .golden_set import append_case_from_lexicon
+                    append_case_from_lexicon(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)", exc_info=True)
+            return ok, summary
         if utype == "generic" and payload.get("source") == "info-for-cora":
             from .gap_autofill import apply_contributed_note
             ok, summary = apply_contributed_note(payload)
@@ -1018,6 +1053,19 @@ def _autowrite_target_files() -> list[Path]:
         bp = _backlog_path()
         if bp.exists():
             files.append(bp)
+    except Exception:  # noqa: BLE001
+        pass
+    # Lexicon stores (S4): the three files of record a lexicon apply may touch.
+    # Appended AFTER the known-answers/backlog set so the existing revert
+    # behavior for those files stays byte-identical (test-pinned).
+    try:
+        from . import lexicon as _lexicon
+        lex_dir = _lexicon._lexicon_dir()
+        if lex_dir.is_dir():
+            files.extend(sorted(lex_dir.glob("*.yaml")))
+        for p in (_lexicon._sku_aliases_path(), _lexicon._user_aliases_path()):
+            if p.exists():
+                files.append(p)
     except Exception:  # noqa: BLE001
         pass
     return files
