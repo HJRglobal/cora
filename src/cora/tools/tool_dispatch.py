@@ -3858,6 +3858,129 @@ def _inv_absurd_block_text(label: str, loc_name: str, current: int, target: int,
         f"and I'll preview it; otherwise restate the count.")
 
 
+# ── Shopify inventory ambiguity picker (ask_stash, S4, 2026-08-02) ────────────
+# Two deterministic candidate-list asks live inside _shopify_resolve: a lexicon
+# collision (2+ exact hits) and an inventory-alias/variant ambiguity (a bare
+# word like "variety" matching several products). Both are stashed here (a
+# SEPARATE single-slot namespace from the confirm stash -- an ask answers a
+# question, it never itself authorizes a write) so a picker tap can bind the
+# chosen candidate into the SAME resolution tail (_shopify_resolve_from_match)
+# the original request would have reached -- the disambiguated term never
+# round-trips through the model (design doc 4.2).
+_ASK_STASH_LOCK = RLock()
+_ASK_STASH_TTL_SECONDS = 600
+_PENDING_ASK_STASH: dict[tuple[str, str], dict] = {}
+
+
+def _ask_stash_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_ask(slack_user: str, channel: str, entry: dict) -> None:
+    with _ASK_STASH_LOCK:
+        _PENDING_ASK_STASH[_ask_stash_key(slack_user, channel)] = entry
+
+
+def _take_pending_ask(slack_user: str, channel: str) -> dict | None:
+    key = _ask_stash_key(slack_user, channel)
+    with _ASK_STASH_LOCK:
+        entry = _PENDING_ASK_STASH.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _ASK_STASH_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _peek_pending_ask(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe (confirm-button snapshot/diff)."""
+    key = _ask_stash_key(slack_user, channel)
+    with _ASK_STASH_LOCK:
+        entry = _PENDING_ASK_STASH.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _ASK_STASH_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _stash_shopify_ask(
+    slack_user_id: str, channel: str, *, ask_kind: str, loc_id: str, loc_name: str,
+    unit: str, quantity: int | None, delta: int | None, product_query: str = "",
+    candidates: list[tuple[str, Any]],
+) -> str:
+    """Stash an ambiguity ask. `candidates` is [(label, value), ...] where value
+    is a lexicon canonical string (ask_kind='lexicon') or a VariantMatch field
+    dict (ask_kind='variant'), already capped to <=5 by the caller. Returns the
+    ask_id (also embedded in the entry for the superseded/atomic-claim check)."""
+    ask_id = confirm_cards.mint_ask_id(slack_user_id, channel)
+    _store_pending_ask(slack_user_id, channel, {
+        "ask_id": ask_id, "ask_kind": ask_kind,
+        "loc_id": loc_id, "loc_name": loc_name, "unit": unit,
+        "quantity": quantity, "delta": delta, "product_query": product_query,
+        "candidates": [(str(i), label, value) for i, (label, value) in enumerate(candidates)],
+        "ts": time.time(),
+    })
+    return ask_id
+
+
+def resolve_shopify_ask_pick(
+    ask_id: str, tapping_user_id: str, candidate_key: str,
+) -> tuple[str, str | None]:
+    """Bind a picker tap's chosen candidate into the stashed resolve context
+    and re-enter _shopify_resolve_from_match directly -- the disambiguated
+    term never round-trips through the model. Returns (outcome, text):
+    outcome in 'orphaned' / 'unauthorized' / 'superseded' / 'invalid_candidate'
+    / 'preview'; `text` is the owner display name for 'unauthorized', or the
+    fresh WRITE_BLOCKED preview text for 'preview'."""
+    idx = confirm_cards.ask_index_lookup(ask_id)
+    if idx is None:
+        return "orphaned", None
+    if idx["user"] != tapping_user_id:
+        return "unauthorized", idx["user"]
+    channel = idx["channel"]
+
+    # Atomic claim: pop under the SAME lock the peek uses, then verify the
+    # popped entry's OWN ask_id still matches the tapped one (a newer ask in
+    # this (user, channel) slot would have overwritten it -- superseded).
+    claimed = _take_pending_ask(tapping_user_id, channel)
+    confirm_cards.ask_index_release(ask_id)
+    if claimed is None or claimed.get("ask_id") != ask_id:
+        return "superseded", None
+
+    candidate = next((c for c in claimed["candidates"] if c[0] == candidate_key), None)
+    if candidate is None:
+        return "invalid_candidate", None
+    _key, label, value = candidate
+    loc_id, loc_name, unit = claimed["loc_id"], claimed["loc_name"], claimed["unit"]
+    quantity, delta = claimed.get("quantity"), claimed.get("delta")
+
+    if claimed["ask_kind"] == "lexicon":
+        # value = the candidate's canonical SKU -- an exact identifier, so
+        # re-resolving it can never re-trigger a DIFFERENT ambiguity.
+        try:
+            matches = shopify_client.resolve_variants(value)
+        except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError):
+            return "invalid_candidate", None
+        if len(matches) != 1:
+            return "invalid_candidate", None
+        match = matches[0]
+        lex_meta = {"query": claimed.get("product_query", ""), "canonical": value,
+                    "matched_term": label}
+        blocked, data = _shopify_resolve_from_match(
+            match, loc_id, loc_name, unit, quantity, delta, tapping_user_id,
+            resolved_from=claimed.get("product_query", ""), lex_meta=lex_meta,
+        )
+    else:  # ask_kind == "variant" -- value already carries the resolved ids
+        match = shopify_client.VariantMatch(**value)
+        blocked, data = _shopify_resolve_from_match(
+            match, loc_id, loc_name, unit, quantity, delta, tapping_user_id,
+        )
+
+    if blocked:
+        return "preview", blocked
+    preview = _store_and_preview_shopify(tapping_user_id, channel, data)
+    return "preview", preview
+
+
 def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = ""):
     """Validate + resolve ONE write target (shared by Phase 1, the Phase-2
     re-preview, and each row of a bulk request). Returns (blocked_str, None) on any
@@ -3950,6 +4073,12 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
     if lex_res is not None and lex_res.status == "ambiguous":
         listing = "; ".join(
             dict.fromkeys(f"{c.canonical_name}" for c in lex_res.candidates[:6]))
+        if len(lex_res.candidates) <= 5:
+            _stash_shopify_ask(
+                slack_user_id, channel, ask_kind="lexicon", loc_id=loc_id, loc_name=loc_name,
+                unit=unit, quantity=quantity, delta=delta, product_query=product_query,
+                candidates=[(c.canonical_name, c.canonical) for c in lex_res.candidates[:5]],
+            )
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n'{product_query}' could mean {len(lex_res.candidates)} "
             f"different products: {listing}. Which one?"), None
@@ -3973,10 +4102,41 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
             f"Restate the name or give the SKU -- I won't guess."), None
     if len(matches) > 1:
         listing = "; ".join(f"{m.label}" + (f" [SKU {m.sku}]" if m.sku else "") for m in matches[:12])
+        if len(matches) <= 5:
+            _stash_shopify_ask(
+                slack_user_id, channel, ask_kind="variant", loc_id=loc_id, loc_name=loc_name,
+                unit=unit, quantity=quantity, delta=delta,
+                candidates=[(m.label, {
+                    "product_title": m.product_title, "variant_title": m.variant_title,
+                    "sku": m.sku, "variant_id": m.variant_id,
+                    "inventory_item_id": m.inventory_item_id,
+                }) for m in matches[:5]],
+            )
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n'{product_query}' matches {len(matches)} variants: {listing}. Which one?"), None
     match = matches[0]
+    exp_item = str(input_data.get("expected_item") or "").strip()
+    return _shopify_resolve_from_match(
+        match, loc_id, loc_name, unit, quantity, delta, slack_user_id,
+        resolved_from=resolved_from, lex_meta=lex_meta, expected_item=exp_item,
+    )
 
+
+def _shopify_resolve_from_match(
+    match, loc_id: str, loc_name: str, unit: str, quantity: int | None, delta: int | None,
+    slack_user_id: str, *, resolved_from: str = "", lex_meta: dict | None = None,
+    expected_item: str = "",
+):
+    """Given an ALREADY-CHOSEN variant match (the single exact resolve, or an
+    ambiguity-picker's chosen candidate) + an already-resolved location, run
+    the remaining resolve steps: live-qty read, delta/absolute target
+    computation, floor + absurd-absolute guards. Returns (blocked_str, None) or
+    (None, data) -- same contract as _shopify_resolve.
+
+    Shared by _shopify_resolve's own single-match tail AND the ambiguity-picker
+    tap handler (resolve_shopify_ask_pick, S4) -- a picker binds a candidate
+    into THIS tail directly, without ever re-running product-string
+    resolution, so a pick can never re-trigger a DIFFERENT ambiguity."""
     try:
         current = shopify_client.get_inventory_level(match.inventory_item_id, loc_id)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
@@ -4008,10 +4168,9 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
     # Optional belt-and-suspenders (NEVER a gate, HIGH-1): if the model echoed an
     # expected_item, log a soft normalized-mismatch but PROCEED -- the pending store's
     # server-resolved ids are the identity binding, not the LLM echo.
-    exp_item = str(input_data.get("expected_item") or "").strip()
-    if exp_item and _normalize_inv_label(exp_item) != _normalize_inv_label(match.label):
+    if expected_item and _normalize_inv_label(expected_item) != _normalize_inv_label(match.label):
         log.info("f3e_shopify_set_inventory expected_item soft-mismatch (ignored) user=%s exp=%r got=%r",
-                 slack_user_id, exp_item, match.label)
+                 slack_user_id, expected_item, match.label)
 
     return None, {"match": match, "loc_id": loc_id, "loc_name": loc_name,
                   "current": current, "quantity": target, "delta": delta, "unit": unit,
@@ -9882,6 +10041,223 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
         preview += ("\n(TRIAL MODE: confirmed jobs are recorded for validation "
                     "but not executed yet.)")
     return _write_blocked_contract(preview)
+
+
+# ── Confirm-button generic dispatcher (S2, design 2026-08-02) ────────────────
+# One shared claim-then-execute path for all 9 stash kinds, used by the Slack
+# Confirm/Cancel tap handler in app.py. Reuses the SAME lock + dict + TTL each
+# kind's own typed-path peek/claim already uses (no new lock, no TOCTOU window
+# against a concurrent typed confirm) and the SAME _execute_claimed_* function
+# the typed path calls -- exactly one execute implementation per kind
+# regardless of which path (typed or button) triggered it.
+#
+# Built as a FUNCTION (not a module-level dict literal) so its definition
+# doesn't depend on where each of the ~9 stores happens to be defined earlier
+# in this file -- it is only ever CALLED after the module has fully loaded.
+def _stash_kind_specs() -> dict[str, dict]:
+    return {
+        "asana": {"lock": _ASANA_PENDING_LOCK, "store": _PENDING_ASANA_WRITES,
+                  "key": _asana_pending_key, "ttl": _ASANA_PENDING_TTL_SECONDS,
+                  "peek": _peek_pending_asana},
+        "shopify": {"lock": _SHOPIFY_PENDING_LOCK, "store": _PENDING_SHOPIFY_WRITES,
+                    "key": _shopify_pending_key, "ttl": _SHOPIFY_PENDING_TTL_SECONDS,
+                    "peek": _peek_pending_shopify},
+        "calendar": {"lock": _CALENDAR_PENDING_LOCK, "store": _PENDING_CALENDAR_WRITES,
+                     "key": _calendar_pending_key, "ttl": _CALENDAR_PENDING_TTL_SECONDS,
+                     "peek": _peek_pending_calendar},
+        "lexicon": {"lock": _SHOPIFY_PENDING_LOCK, "store": _PENDING_LEXICON_ADDS,
+                    "key": _shopify_pending_key, "ttl": _LEXICON_PENDING_TTL_SECONDS,
+                    "peek": _peek_pending_lexicon},
+        "code_queue": {"lock": _CODE_QUEUE_PENDING_LOCK, "store": _PENDING_CODE_QUEUE,
+                       "key": _cq_pending_key, "ttl": _CODE_QUEUE_PENDING_TTL_SECONDS,
+                       "peek": _peek_pending_code_queue},
+        "delegated": {"lock": _DELEGATED_PENDING_LOCK, "store": _PENDING_DELEGATED_WORK,
+                      "key": _delegated_pending_key, "ttl": _DELEGATED_PENDING_TTL_SECONDS,
+                      "peek": _peek_pending_delegated},
+        "remember": {"lock": _REMEMBER_PENDING_LOCK, "store": _PENDING_REMEMBER,
+                     "key": _remember_pending_key, "ttl": _REMEMBER_PENDING_TTL_SECONDS,
+                     "peek": _peek_pending_remember},
+        "forget_note": {"lock": _FORGET_NOTE_PENDING_LOCK, "store": _PENDING_FORGET_NOTE,
+                        "key": _forget_note_pending_key, "ttl": _FORGET_NOTE_PENDING_TTL_SECONDS,
+                        "peek": _peek_pending_forget_note},
+        "schedule_meeting": {"lock": _SCHEDULE_MEETING_PENDING_LOCK,
+                             "store": _PENDING_SCHEDULE_MEETING,
+                             "key": _schedule_meeting_pending_key,
+                             "ttl": _SCHEDULE_MEETING_PENDING_TTL_SECONDS,
+                             "peek": _peek_pending_schedule_meeting},
+    }
+
+
+def snapshot_stash_ids(slack_user_id: str, channel_name: str) -> dict[str, str | None]:
+    """Snapshot each kind's CURRENT stash_id (or ask_id) for (user, channel).
+    Call once at the top of a turn (app._dispatch_qa, before the confirm
+    interceptor and before the model's tool loop); compare against a second
+    snapshot taken AFTER the turn via freshest_changed_stash() to detect which
+    kind (if any) got a fresh preview -- or ambiguity ask -- during this turn,
+    the trigger for attaching a button card to the reply.
+
+    Deliberately marker-free: this works identically whether a kind's preview
+    text is code-enforced verbatim (Asana/Shopify/delegated/code-queue) or
+    model-mediated (calendar/lexicon/the 3 Class-B tools) -- the diff is
+    presence/identity of the id, never a token embedded in reply text."""
+    specs = _stash_kind_specs()
+    snap = {k: (spec["peek"](slack_user_id, channel_name) or {}).get("stash_id")
+            for k, spec in specs.items()}
+    snap["ask"] = (_peek_pending_ask(slack_user_id, channel_name) or {}).get("ask_id")
+    return snap
+
+
+def freshest_changed_stash(before: dict, slack_user_id: str, channel_name: str) -> tuple[str, str] | None:
+    """Return (kind, id) for the stash whose id changed vs `before` (a fresh
+    preview/re-preview/ask was minted this turn), or None. 'ask' is a distinct
+    pseudo-kind (id is an ask_id, not a confirm stash_id) -- the caller renders
+    a picker card for it, a Confirm/Cancel card for every other kind. Prefers
+    the entry with the newest ts if more than one kind changed (rare: more
+    than one tool call landed in a single turn)."""
+    after = snapshot_stash_ids(slack_user_id, channel_name)
+    changed = [k for k, v in after.items() if v and v != before.get(k)]
+    if not changed:
+        return None
+    if len(changed) == 1:
+        k = changed[0]
+        return k, after[k]
+    specs = _stash_kind_specs()
+
+    def _ts_for(k: str) -> float:
+        entry = _peek_pending_ask(slack_user_id, channel_name) if k == "ask" \
+            else specs[k]["peek"](slack_user_id, channel_name)
+        return float((entry or {}).get("ts", 0))
+
+    k = max(changed, key=_ts_for)
+    return k, after[k]
+
+
+def _claim_stash_by_id(kind: str, user: str, channel: str, stash_id: str) -> tuple[str, dict | None]:
+    """Generic atomic by-id claim. Runs under the SAME lock + dict each kind's
+    typed-path peek/claim already uses. Returns (status, entry): status in
+    'claimed' / 'superseded' (a newer preview overwrote the slot) / 'expired'
+    (TTL passed; the stale entry is popped here too) / 'not_found'."""
+    spec = _stash_kind_specs().get(kind)
+    if spec is None:
+        return "not_found", None
+    lock, store, key_fn, ttl = spec["lock"], spec["store"], spec["key"], spec["ttl"]
+    key = key_fn(user, channel)
+    with lock:
+        entry = store.get(key)
+        if not entry:
+            return "not_found", None
+        if entry.get("stash_id") != stash_id:
+            return "superseded", None
+        if (time.time() - float(entry.get("ts", 0))) > ttl:
+            store.pop(key, None)
+            return "expired", entry
+        store.pop(key, None)
+        return "claimed", entry
+
+
+def _stash_expired_label(kind: str, entry: dict) -> str:
+    """Short human label for an expired-tombstone reply, per kind."""
+    if kind == "shopify":
+        return _expired_pending_label(entry)
+    labels = {
+        "asana": f'"{entry.get("label", "that task")}"',
+        "calendar": f'"{entry.get("summary", "that event")}"',
+        "code_queue": "that queue request",
+        "delegated": "that job request",
+        "lexicon": "that lexicon entry",
+        "remember": "that note",
+        "forget_note": "that note deletion",
+        "schedule_meeting": "that meeting proposal",
+    }
+    return labels.get(kind, "that request")
+
+
+def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity: str, channel: str) -> str:
+    """Dispatch an ALREADY-CLAIMED stash entry to its kind's own execute
+    function -- the identical function the typed-confirm path calls."""
+    if kind == "asana":
+        return _execute_claimed_asana(entry.get("action", ""), entry, tapping_user_id, entity)
+    if kind == "shopify":
+        if entry.get("rows"):
+            return _shopify_execute_pending_batch(tapping_user_id, channel, entry)
+        return _shopify_execute_pending(tapping_user_id, channel, entry)
+    if kind == "calendar":
+        return _execute_claimed_calendar(entry.get("action", ""), entry, tapping_user_id)
+    if kind == "lexicon":
+        return _execute_claimed_lexicon(entry, tapping_user_id, channel)
+    if kind == "code_queue":
+        return _execute_claimed_code_queue(entry, tapping_user_id, entity)
+    if kind == "delegated":
+        return _execute_claimed_delegated(entry, tapping_user_id, entity)
+    if kind == "remember":
+        return _execute_claimed_remember(entry, tapping_user_id)
+    if kind == "forget_note":
+        return _execute_claimed_forget_note(entry, tapping_user_id)
+    if kind == "schedule_meeting":
+        # The Confirm button always books the FIRST (soonest) offered slot --
+        # design section 4.1's single Confirm/Cancel pair, not a 3-way picker
+        # (the typed path is UNCHANGED and unaffected: a user who wants a
+        # different one of the up-to-3 options still types "2" or the exact
+        # iso strings, exactly as before this feature existed).
+        slots = entry.get("slots") or []
+        if not slots:
+            return "calendar_schedule_meeting: no slot was available to book."
+        start, end = slots[0]
+        return _execute_claimed_schedule_meeting(entry, tapping_user_id, start, end)
+    return "Internal error -- unrecognized stash kind. Nothing changed."
+
+
+def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) -> dict:
+    """Resolve + authorize + atomically claim a Confirm/Cancel button tap.
+    `action` is 'confirm' or 'cancel'. Returns a result dict:
+      {'outcome': 'unauthorized', 'owner': <slack id>}
+      {'outcome': 'orphaned' | 'superseded'}
+      {'outcome': 'expired', 'label': <str>}
+      {'outcome': 'cancelled'}
+      {'outcome': 'executed', 'message': <str>}
+      {'outcome': 'indeterminate'}
+
+    Security invariants (design doc section 5): the button value carries ONLY
+    the opaque stash_id -- resolved via the index to (kind, user, channel);
+    authorization compares the INDEX-recorded requester against the REAL
+    tapping user id from the Slack action payload, BEFORE any state is
+    touched; the claim is a single atomic pop keyed on an EXACT stash_id
+    match, so a double-tap or a tap racing a typed confirm can win at most
+    once. CORA_EVAL_MODE=1 refuses everything (catch-up reconstruction must
+    never fire a write) -- same gate as the typed-confirm interceptor."""
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return {"outcome": "orphaned"}
+    idx = confirm_cards.index_lookup(stash_id)
+    if idx is None:
+        return {"outcome": "orphaned"}
+    if idx["user"] != tapping_user_id:
+        return {"outcome": "unauthorized", "owner": idx["user"]}
+    kind, user, channel = idx["kind"], idx["user"], idx["channel"]
+
+    status, entry = _claim_stash_by_id(kind, user, channel, stash_id)
+    confirm_cards.index_release(stash_id)
+    if status == "not_found":
+        return {"outcome": "orphaned"}
+    if status == "superseded":
+        return {"outcome": "superseded"}
+    if status == "expired":
+        return {"outcome": "expired", "label": _stash_expired_label(kind, entry)}
+
+    # status == "claimed" -- exactly one caller (this one) reaches here for
+    # this stash_id; the lock inside _claim_stash_by_id already resolved any
+    # concurrent race.
+    if action == "cancel":
+        return {"outcome": "cancelled"}
+
+    from ..entity_router import route
+    entity = route(channel)
+    try:
+        message = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
+    except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
+        log.exception("confirm-button execute crashed AFTER claim kind=%s user=%s",
+                      kind, tapping_user_id)
+        return {"outcome": "indeterminate"}
+    return {"outcome": "executed", "message": message}
 
 
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
