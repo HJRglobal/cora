@@ -426,6 +426,47 @@ def _asana_destructive_intent(text: str) -> str | None:
     return None
 
 
+# ── Remember/forget-note preview intent detector (S4, live-smoke 2026-08-02) ─
+# A clear "remember X" / "forget that note" command must not run on Haiku,
+# which live-fabricated preview-shaped TEXT with ZERO tool_use (no stash
+# minted -- a buttonless, fake-looking confirm card exposed it, since
+# remember/forget_note have no deterministic confirm-interceptor fallback the
+# way Asana/Shopify do -- see tool_dispatch.try_confirm_pending_write's
+# docstring). Unlike _asana_destructive_intent, this does NOT force the tool
+# via tool_choice: cora_forget_note requires a note_id the model can only have
+# after a prior cora_my_notes call, so forcing it blind could produce a
+# nonsensical tool call. Instead this feeds the SAME sonnet-escalation
+# OR-chain _asana_destructive_intent already forces Sonnet through below --
+# a lower-risk intervention (Sonnet is more reliable at everything, not just
+# one tool, so an over-broad match just means an unnecessary but harmless
+# model upgrade, never a forced wrong tool call). Anchored to the START of
+# the message (after the bot-mention strip) and excludes any "?" so a genuine
+# question ("do you remember...") or a reminiscing aside never matches -- a
+# miss just leaves the turn on today's model_router pick, same fallback
+# safety as the Asana detector.
+_REMEMBER_INTENT_RE = re.compile(
+    r"^\s*(?:please\s+)?remember\b"
+    r"|^\s*(?:please\s+)?note\s+that\b"
+    r"|^\s*make\s+a\s+note\b",
+    re.IGNORECASE,
+)
+_FORGET_NOTE_INTENT_RE = re.compile(
+    r"^\s*(?:please\s+)?forget\b[^.\n]{0,40}\bnote\b"
+    r"|^\s*(?:please\s+)?(?:delete|remove)\b[^.\n]{0,40}\bnote\b",
+    re.IGNORECASE,
+)
+
+
+def _remember_or_forget_intent(text: str) -> bool:
+    """True for a clear imperative 'remember'/'forget note' command -- see
+    the module comment above for why this only escalates the MODEL, never
+    forces a specific tool."""
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return False
+    return bool(_REMEMBER_INTENT_RE.search(t) or _FORGET_NOTE_INTENT_RE.search(t))
+
+
 def _dispatch_qa(
     *,
     channel_id: str,
@@ -570,6 +611,13 @@ def _dispatch_qa(
     # was minted THIS turn" -- the trigger for attaching a Confirm/Cancel (or
     # picker) button card. Marker-free by design: works whether a kind's
     # preview text is code-enforced verbatim or model-mediated.
+    # begin_turn() (v1.1 S1 fix, live-smoke 2026-08-02) tags every stash this
+    # turn's own tool call mints with a fresh turn id, BEFORE anything in this
+    # turn could mint one -- freshest_changed_stash() uses it to bind a reply's
+    # card to a stash THIS turn minted, never a concurrent turn's, even when
+    # their snapshot/diff windows overlap (same (user, channel), overlapping
+    # @mentions).
+    confirm_cards.begin_turn()
     _confirm_before_snapshot = (
         _tool_dispatch.snapshot_stash_ids(user_id, channel_name) if user_id else {}
     )
@@ -790,11 +838,21 @@ def _dispatch_qa(
     # not a Haiku job (both live confirm turns ran on Haiku). Also force Sonnet when a
     # destructive/create tool is being forced (Slice 2) -- forced tool use + a write
     # is a Sonnet job.
-    if force_tool or (user_id and (
+    # S4 (live-smoke 2026-08-02): a clear "remember"/"forget note" PREVIEW-turn
+    # command also forces Sonnet -- Haiku live-fabricated preview-shaped text
+    # with zero tool_use on this exact phrasing (no stash minted, buttonless
+    # card). has_pending_remember/has_pending_forget_note close the matching
+    # CONFIRM-turn gap: remember/forget have no deterministic confirm
+    # interceptor (unlike Asana/Shopify), so their bare-"yes" follow-up
+    # previously could not join this escalation at all.
+    remember_intent = _remember_or_forget_intent(user_message) if user_id else False
+    if force_tool or remember_intent or (user_id and (
         _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
         or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
         or _tool_dispatch.has_pending_asana_write(user_id, channel_name)
         or _tool_dispatch.has_pending_delegated_write(user_id, channel_name)
+        or _tool_dispatch.has_pending_remember(user_id, channel_name)
+        or _tool_dispatch.has_pending_forget_note(user_id, channel_name)
     )):
         chosen_model = model_router.MODEL_SONNET
     log.info(
@@ -3309,7 +3367,15 @@ def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: l
                         outcome_text: str) -> None:
     """Edit a confirm/picker card to a terminal state: keep the original
     preview/question section(s), append the outcome, drop the actions block
-    (buttons gone -- revops/code-queue precedent)."""
+    (buttons gone -- revops/code-queue precedent).
+
+    Callers MUST be the unique claim winner for this message (S2 fix,
+    live-smoke 2026-08-02 + D-051 re-review): a same-card race-LOSER outcome
+    (already_handled for Confirm/Cancel, superseded for the picker) must
+    never call this -- it should go ephemeral-only instead, since there is no
+    way to order two independent chat_update calls against each other, and
+    the loser's edit is never necessary (the winner always edits the card
+    with the real outcome)."""
     section_blocks = [b for b in orig_blocks if b.get("type") == "section"]
     new_blocks = section_blocks + confirm_cards.terminal_blocks(outcome_text)
     try:
@@ -3361,6 +3427,17 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     if not stash_id or not tapping_user or not channel_id or not message_ts:
         return
 
+    # D-051 review (defense-in-depth): a re-preview minted below (e.g. Shopify
+    # drift) is attached via its EXPLICIT returned stash_id, never through
+    # freshest_changed_stash's turn-ownership diff, so this doesn't change
+    # behavior today -- but Bolt's socket-mode transport reuses worker
+    # threads across unrelated events, and confirm_cards._TURN_ID is a plain
+    # per-thread contextvar (not scoped via Context.run() here), so without
+    # this a reused thread could carry a stale turn_id from whatever
+    # _dispatch_qa turn last ran on it. Establishing a fresh scope here makes
+    # the invariant "a mint's turn_id reflects ITS OWN triggering event" true
+    # by construction rather than true-by-coincidence.
+    confirm_cards.begin_turn()
     result = _tool_dispatch.resolve_and_claim_stash(stash_id, tapping_user, action)
     outcome = result.get("outcome")
 
@@ -3384,13 +3461,39 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
             pass
         return
 
+    if outcome == "already_handled":
+        # S2 fix (REDESIGNED, D-051 review 2026-08-02): a racing SECOND tap on
+        # the same card always resolves to already_handled -- but the winner's
+        # own edit can be arbitrarily slower than this one (it does real work
+        # in _execute_claimed_stash first; this path is a fast lock-miss with
+        # no I/O). A "claim a slot, whoever writes first wins" scheme was tried
+        # and REJECTED: it only blocks the clobber in ONE arrival order (an
+        # informative claim already recorded before this one checks) -- if
+        # already_handled's OWN chat_update fires first (the common case,
+        # since it is faster) and the winner's slower edit arrives after, BOTH
+        # calls still fire and the outcome depends on whichever chat_update
+        # Slack applies last, which is exactly the original clobber. The only
+        # actually race-free fix is for already_handled to NEVER touch the
+        # shared card at all -- there is always a legitimate winner (that's
+        # the definition of already_handled) who will edit it with the real
+        # outcome, so nothing is lost by leaving the card alone here.
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=tapping_user,
+                                      text="Already handled -- no action needed.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     if outcome == "re_previewed":
         # The claim succeeded but execute itself declined to write and
         # re-stashed a FRESH preview instead (e.g. Shopify live-inventory
         # drift/floor-guard detected between preview and confirm) -- close
         # THIS card honestly, then post a NEW Confirm/Cancel card for the
         # fresh stash so the user isn't left with a dead-looking card and an
-        # un-actionable pending underneath it (D-051 review finding).
+        # un-actionable pending underneath it (D-051 review finding). This
+        # outcome is only ever reached by the unique claim winner (see
+        # resolve_and_claim_stash), so it can never race another edit of the
+        # SAME message_ts.
         text = result.get("message") or "The count moved -- here's an updated preview."
         _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
         fresh_stash_id = result.get("stash_id")
@@ -3398,9 +3501,7 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
             _post_followup_confirm_card(client, channel_id, text, fresh_stash_id)
         return
 
-    if outcome == "already_handled":
-        text = "Already handled -- no action needed."
-    elif outcome == "superseded":
+    if outcome == "superseded":
         text = "This preview was replaced by a newer one -- check your latest message."
     elif outcome == "expired":
         label = result.get("label", "that request")
@@ -3417,6 +3518,11 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     else:
         text = "Something went wrong -- nothing was changed."
 
+    # Every outcome reaching here (superseded/expired/cancelled/indeterminate/
+    # executed/unrecognized) is the UNIQUE claim winner's own result -- at most
+    # one caller ever reaches "claimed" for a given stash_id (the lock inside
+    # _claim_stash_by_id), so none of these can race another edit of the SAME
+    # message_ts. already_handled is handled above and never reaches here.
     _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
 
 
@@ -3457,6 +3563,11 @@ def _handle_pick_tap(body: dict, client) -> None:
         return
     ask_id, candidate_key = raw_value.split(":", 1)
 
+    # D-051 review (defense-in-depth): see the matching comment in
+    # _handle_confirm_tap -- the fresh preview this may mint is attached via
+    # its EXPLICIT stash_id, never the turn-ownership diff, so this is
+    # belt-and-suspenders against thread-reuse carrying a stale turn_id.
+    confirm_cards.begin_turn()
     outcome, message, stash_id = _tool_dispatch.resolve_shopify_ask_pick(
         ask_id, tapping_user, candidate_key)
 
@@ -3477,10 +3588,24 @@ def _handle_pick_tap(body: dict, client) -> None:
             pass
         return
     if outcome == "superseded":
-        _edit_card_terminal(client, channel_id, message_ts, orig_blocks,
-                            "This question was replaced by a newer one.")
+        # D-051 re-review finding: resolve_shopify_ask_pick's atomic claim
+        # (_take_pending_ask) means "superseded" can be a SAME-card race loser
+        # (a second tap on the exact ask_id the winner just claimed), not only
+        # a genuinely-different newer ask replacing a stale one -- same
+        # fast-loser/slow-winner shape as _handle_confirm_tap's
+        # already_handled, so it must never edit the shared card either
+        # (ephemeral-only; the winner's own edit, if any, is authoritative).
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id, user=tapping_user,
+                text="This question was replaced by a newer one -- check your latest message.")
+        except Exception:  # noqa: BLE001
+            pass
         return
     if outcome == "invalid_candidate":
+        # Only reachable AFTER this caller's OWN atomic claim already
+        # succeeded (unique per ask_id) -- cannot race another edit of the
+        # SAME message_ts, so a direct card edit is safe here.
         _edit_card_terminal(client, channel_id, message_ts, orig_blocks,
                             "That option didn't resolve cleanly -- restate the item and I'll ask again.")
         return

@@ -58,7 +58,10 @@ class TestMintStashId:
     def test_index_lookup_returns_kind_user_channel(self):
         sid = cc.mint_stash_id("shopify", "U1", "c1")
         entry = cc.index_lookup(sid)
-        assert entry == {"kind": "shopify", "user": "U1", "channel": "c1", "ts": entry["ts"]}
+        # turn_id is None outside any begin_turn() scope (S1 fix) -- see
+        # TestTurnProvenance below for the turn-tagging behavior itself.
+        assert entry == {"kind": "shopify", "user": "U1", "channel": "c1", "ts": entry["ts"],
+                         "turn_id": None}
 
     def test_index_lookup_unknown_id_is_none(self):
         assert cc.index_lookup("0" * 16) is None
@@ -162,3 +165,32 @@ class TestTerminalBlocks:
         blocks = cc.terminal_blocks("Cancelled -- nothing was changed.")
         assert all(b.get("type") != "actions" for b in blocks)
         assert blocks[0]["text"]["text"] == "Cancelled -- nothing was changed."
+
+
+class TestTurnProvenance:
+    """S1 fix (cq-883878e81274): mint_stash_id/mint_ask_id tag every entry
+    with the currently-active turn (begin_turn/current_turn_id)."""
+
+    def test_no_active_turn_stamps_none(self):
+        sid = cc.mint_stash_id("asana", "U1", "c1")
+        assert cc.index_lookup(sid)["turn_id"] is None
+
+    def test_begin_turn_stamps_the_fresh_id(self):
+        cc.begin_turn()
+        tid = cc.current_turn_id()
+        assert tid is not None
+        sid = cc.mint_stash_id("asana", "U1", "c1")
+        assert cc.index_lookup(sid)["turn_id"] == tid
+
+    def test_begin_turn_mints_a_fresh_id_each_call(self):
+        cc.begin_turn()
+        first = cc.current_turn_id()
+        cc.begin_turn()
+        second = cc.current_turn_id()
+        assert first != second
+
+    def test_ask_id_also_stamped(self):
+        cc.begin_turn()
+        tid = cc.current_turn_id()
+        aid = cc.mint_ask_id("U1", "c1")
+        assert cc.ask_index_lookup(aid)["turn_id"] == tid

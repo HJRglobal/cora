@@ -121,6 +121,17 @@ class TestConfirmTap:
         assert len(fake.ephemeral) == 1
 
     def test_double_tap_second_reads_already_handled(self):
+        # S2 fix, REDESIGNED on D-051 re-review (live-smoke 2026-08-02,
+        # cq-056a3a4de2f7): a first "claim a slot, whoever writes first wins"
+        # design was rejected -- it only blocked the clobber in ONE arrival
+        # order, and the live incident's actual ordering (the fast
+        # already_handled loser's chat_update reaching Slack AFTER the slow
+        # winner's) is the one it could not close, since there is no way to
+        # order two independent HTTP calls after the fact. The real fix:
+        # already_handled NEVER calls chat_update on the shared card at all --
+        # the FIRST tap's real outcome is the only card edit, unconditionally,
+        # and the second (redundant) tap always gets an ephemeral instead,
+        # regardless of relative timing.
         sid = _stash_asana_delete()
         fake = _FakeClient()
         with patch.object(td.asana_client, "delete_task", return_value=None):
@@ -128,8 +139,27 @@ class TestConfirmTap:
                                      fake, action="confirm")
             capp._handle_confirm_tap(_confirm_body(HARRISON, sid, cc.ACTION_CONFIRM),
                                      fake, action="confirm")
-        assert len(fake.updated) == 2
-        assert "Already handled" in fake.updated[1]["text"]
+        assert len(fake.updated) == 1
+        assert "deleted" in fake.updated[0]["text"].lower()
+        assert len(fake.ephemeral) == 1
+        assert fake.ephemeral[0]["user"] == HARRISON
+        assert "Already handled" in fake.ephemeral[0]["text"]
+
+    def test_already_handled_never_calls_chat_update_even_as_the_first_tap(self):
+        # Belt-and-suspenders: even when already_handled is reached WITHOUT a
+        # preceding winner tap in this test process (e.g. the typed-confirm
+        # path already consumed the pending, so the FIRST button tap anyone
+        # makes reads already_handled) -- it still must never edit the shared
+        # card, only ever post ephemeral.
+        sid = _stash_asana_delete()
+        _tool_dispatch_claim = td._claim_pending_asana(HARRISON, _CH, "delete")
+        assert _tool_dispatch_claim is not None  # the "typed path" claim
+        fake = _FakeClient()
+        capp._handle_confirm_tap(_confirm_body(HARRISON, sid, cc.ACTION_CONFIRM),
+                                 fake, action="confirm")
+        assert not fake.updated
+        assert len(fake.ephemeral) == 1
+        assert "Already handled" in fake.ephemeral[0]["text"]
 
     def test_flag_off_never_mutates_card_ephemeral_nudge_only(self, monkeypatch):
         monkeypatch.setenv("CORA_CONFIRM_BUTTONS", "off")
@@ -262,6 +292,23 @@ class TestPickTap:
         body = self._pick_body(HARRISON, f"{aid}:1")
         raw_value = body["actions"][0]["value"]
         assert "Pure" not in raw_value and "SKU" not in raw_value
+
+    def test_superseded_pick_is_ephemeral_only_never_edits_shared_card(self):
+        # D-051 re-review finding: resolve_shopify_ask_pick's "superseded" can
+        # be a SAME-card race loser (a second tap on the ask_id the winner
+        # just claimed), same fast-loser/slow-winner shape as
+        # _handle_confirm_tap's already_handled -- must never edit the shared
+        # card (no way to order two independent chat_update calls after the
+        # fact), only ever post ephemeral.
+        aid = self._stash_variant_ask()
+        fake = _FakeClient()
+        with patch.object(td, "resolve_shopify_ask_pick",
+                          return_value=("superseded", None, None)):
+            capp._handle_pick_tap(self._pick_body(HARRISON, f"{aid}:0"), fake)
+        assert not fake.updated
+        assert len(fake.ephemeral) == 1
+        assert fake.ephemeral[0]["user"] == HARRISON
+        assert "replaced by a newer one" in fake.ephemeral[0]["text"]
 
     def test_cross_user_pick_refused(self):
         aid = self._stash_variant_ask(user=HARRISON)

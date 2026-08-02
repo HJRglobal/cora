@@ -231,6 +231,14 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
             _cc._INDEX.clear()
         with _cc._ASK_INDEX_LOCK:
             _cc._ASK_INDEX.clear()
+        # S1 fix (v1.1, 2026-08-02): _TURN_ID is a contextvars.ContextVar set via
+        # begin_turn(). A test that calls it directly (not scoped to its own
+        # copied Context) mutates pytest's single shared default context, which
+        # otherwise leaks into every later test in the session (observed: it
+        # made an unrelated test_confirm_cards.py assertion about a FRESH mint's
+        # turn_id see a stale non-None value left by a test_confirm_dispatcher.py
+        # test that ran earlier in the same process). Reset before AND after.
+        _cc._TURN_ID.set(None)
     except Exception:
         pass
     # Slice 5 (2026-07-29 audit): the two rollout flags live in .env
@@ -325,6 +333,7 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
             _cc._INDEX.clear()
         with _cc._ASK_INDEX_LOCK:
             _cc._ASK_INDEX.clear()
+        _cc._TURN_ID.set(None)
     except Exception:
         pass
 

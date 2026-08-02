@@ -11,6 +11,7 @@ executed/indeterminate), CORA_EVAL_MODE never executes, bulk Shopify batch is
 one stash/one card/one confirm.
 """
 
+import contextvars
 import time
 from unittest.mock import patch
 
@@ -445,6 +446,7 @@ class TestSnapshotDiff:
 
     def test_fresh_asana_preview_detected(self):
         before = td.snapshot_stash_ids(HARRISON, _CH)
+        cc.begin_turn()  # S1 fix: a stash only counts as "this turn's" if minted within one
         sid = _stash_asana_delete()
         changed = td.freshest_changed_stash(before, HARRISON, _CH)
         assert changed == ("asana", sid)
@@ -468,6 +470,7 @@ class TestSnapshotDiff:
 
     def test_fresh_ask_detected_as_pseudo_kind(self):
         before = td.snapshot_stash_ids(HARRISON, _CH)
+        cc.begin_turn()  # S1 fix: a stash only counts as "this turn's" if minted within one
         aid = cc.mint_ask_id(HARRISON, _CH)
         td._store_pending_ask(HARRISON, _CH, {
             "ask_id": aid, "ask_kind": "variant", "loc_id": "l1", "loc_name": "Office",
@@ -476,3 +479,200 @@ class TestSnapshotDiff:
         })
         changed = td.freshest_changed_stash(before, HARRISON, _CH)
         assert changed == ("ask", aid)
+
+
+class TestConcurrentTurnIsolation:
+    """S1 fix (cq-883878e81274, HIGH): the exact live-smoke repro -- 3
+    concurrent turns in the SAME (user, channel), each triggering a DIFFERENT
+    staged-write kind, with overlapping snapshot/diff windows (multiple
+    @mentions landing within a couple seconds). Simulated with real
+    contextvars.Context objects (one per turn) rather than sequential
+    begin_turn() calls on one thread, so the isolation is faithful to what
+    actually happens across concurrent Bolt worker threads / claude_client's
+    per-tool-call copied contexts -- not just "whichever begin_turn() ran
+    last on a shared thread"."""
+
+    def _turn_ctx(self):
+        ctx = contextvars.copy_context()
+        ctx.run(cc.begin_turn)
+        return ctx
+
+    def test_three_concurrent_kinds_each_bind_their_own_turn(self):
+        # All 3 turns' "before" snapshots predate ALL 3 mints (the live-smoke
+        # window: 3 previews land within ~2s of each other).
+        ctx_a, ctx_b, ctx_c = self._turn_ctx(), self._turn_ctx(), self._turn_ctx()
+        before_a = ctx_a.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        before_b = ctx_b.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        before_c = ctx_c.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+
+        # Turn A's own tool call: an Asana delete preview.
+        sid_a = ctx_a.run(lambda: cc.mint_stash_id("asana", HARRISON, _CH))
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "gA", "label": "Turn A task",
+            "ts": time.time(), "stash_id": sid_a,
+        })
+        # Turn B's own tool call: a calendar delete preview.
+        sid_b = ctx_b.run(lambda: cc.mint_stash_id("calendar", HARRISON, _CH))
+        td._store_pending_calendar_write(HARRISON, _CH, {
+            "action": "delete", "event_id": "evtB", "summary": "Turn B event",
+            "user_email": "h@x.com", "ts": time.time(), "stash_id": sid_b,
+        })
+        # Turn C's own tool call: a remember (personal note) preview.
+        sid_c = ctx_c.run(lambda: cc.mint_stash_id("remember", HARRISON, _CH))
+        td._store_pending_remember(HARRISON, _CH, {
+            "note_text": "Turn C note", "entity": "F3E", "sub_entity": None,
+            "share_requested": False, "channel_name": _CH, "ts": time.time(),
+            "stash_id": sid_c,
+        })
+
+        # By now all 3 kinds have changed in the SHARED (user, channel)
+        # store. Each turn's OWN diff must bind to ITS OWN mint only.
+        changed_a = ctx_a.run(lambda: td.freshest_changed_stash(before_a, HARRISON, _CH))
+        changed_b = ctx_b.run(lambda: td.freshest_changed_stash(before_b, HARRISON, _CH))
+        changed_c = ctx_c.run(lambda: td.freshest_changed_stash(before_c, HARRISON, _CH))
+
+        assert changed_a == ("asana", sid_a)
+        assert changed_b == ("calendar", sid_b)
+        assert changed_c == ("remember", sid_c)
+
+    def test_tombstone_label_provenance_never_leaks_a_sibling_turns_kind(self):
+        # End-to-end: mint -> bind (via freshest_changed_stash) -> resolve.
+        # Each turn's bound stash_id, once cancelled, must produce a label
+        # that reflects ITS OWN kind -- never a concurrent sibling's.
+        ctx_a, ctx_b, ctx_c = self._turn_ctx(), self._turn_ctx(), self._turn_ctx()
+        before_a = ctx_a.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        before_b = ctx_b.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        before_c = ctx_c.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+
+        sid_a = ctx_a.run(lambda: cc.mint_stash_id("asana", HARRISON, _CH))
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "gA", "label": "Asana task A",
+            "ts": time.time(), "stash_id": sid_a,
+        })
+        sid_b = ctx_b.run(lambda: cc.mint_stash_id("calendar", HARRISON, _CH))
+        td._store_pending_calendar_write(HARRISON, _CH, {
+            "action": "delete", "event_id": "evtB", "summary": "Calendar event B",
+            "user_email": "h@x.com", "ts": time.time(), "stash_id": sid_b,
+        })
+        sid_c = ctx_c.run(lambda: cc.mint_stash_id("remember", HARRISON, _CH))
+        td._store_pending_remember(HARRISON, _CH, {
+            "note_text": "Note C", "entity": "F3E", "sub_entity": None,
+            "share_requested": False, "channel_name": _CH, "ts": time.time(),
+            "stash_id": sid_c,
+        })
+
+        bound_a = ctx_a.run(lambda: td.freshest_changed_stash(before_a, HARRISON, _CH))
+        bound_b = ctx_b.run(lambda: td.freshest_changed_stash(before_b, HARRISON, _CH))
+        bound_c = ctx_c.run(lambda: td.freshest_changed_stash(before_c, HARRISON, _CH))
+
+        result_a = td.resolve_and_claim_stash(bound_a[1], HARRISON, "cancel")
+        result_b = td.resolve_and_claim_stash(bound_b[1], HARRISON, "cancel")
+        result_c = td.resolve_and_claim_stash(bound_c[1], HARRISON, "cancel")
+
+        # All 3 cancel cleanly (each claim is against its OWN, correctly-
+        # bound stash_id) -- no cross-kind "superseded"/"already_handled".
+        assert result_a == {"outcome": "cancelled"}
+        assert result_b == {"outcome": "cancelled"}
+        assert result_c == {"outcome": "cancelled"}
+        # And each bound id really was its own turn's own kind (the pre-fix
+        # bug: a max-ts tiebreak could hand ALL THREE turns the SAME id).
+        assert {bound_a[0], bound_b[0], bound_c[0]} == {"asana", "calendar", "remember"}
+        assert len({bound_a[1], bound_b[1], bound_c[1]}) == 3
+
+    def test_no_active_turn_context_fails_closed_to_no_card(self):
+        # A change with NO turn context at all (turn_id=None, e.g. a stash
+        # minted outside of _dispatch_qa's begin_turn scope) must never be
+        # guessed as "this turn's own" -- fail closed to no card.
+        before = td.snapshot_stash_ids(HARRISON, _CH)
+        _stash_asana_delete()  # minted with no begin_turn() call at all
+        assert td.freshest_changed_stash(before, HARRISON, _CH) is None
+
+    def test_sibling_turns_mint_never_reattaches_to_a_turn_with_no_mint_of_its_own(self):
+        # Turn A takes its snapshot, then does nothing itself; turn B (a
+        # concurrent, unrelated ask in the same channel) mints a fresh
+        # pending. Turn A's own reply must NOT get a card for turn B's stash.
+        ctx_a, ctx_b = self._turn_ctx(), self._turn_ctx()
+        before_a = ctx_a.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        ctx_b.run(lambda: td.snapshot_stash_ids(HARRISON, _CH))
+        sid_b = ctx_b.run(lambda: cc.mint_stash_id("asana", HARRISON, _CH))
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "delete", "gid": "gB", "label": "Turn B task",
+            "ts": time.time(), "stash_id": sid_b,
+        })
+        assert ctx_a.run(lambda: td.freshest_changed_stash(before_a, HARRISON, _CH)) is None
+
+
+class TestHasPendingRememberForgetNote:
+    """S4 fix (cq-08166dcf283d): has_pending_remember/has_pending_forget_note
+    close the CONFIRM-turn escalation gap -- these two kinds previously had no
+    wrapper at all, so a pending remember/forget's bare-"yes" follow-up could
+    never force Sonnet the way Asana/Shopify/calendar/delegated already do."""
+
+    def test_has_pending_remember_false_when_nothing_stashed(self):
+        assert td.has_pending_remember(HARRISON, _CH) is False
+
+    def test_has_pending_remember_true_after_stash(self):
+        _stash_remember()
+        assert td.has_pending_remember(HARRISON, _CH) is True
+
+    def test_has_pending_remember_isolated_by_user_and_channel(self):
+        _stash_remember(user=HARRISON, channel=_CH)
+        assert td.has_pending_remember(OTHER, _CH) is False
+        assert td.has_pending_remember(HARRISON, "different-channel") is False
+
+    def test_has_pending_forget_note_false_when_nothing_stashed(self):
+        assert td.has_pending_forget_note(HARRISON, _CH) is False
+
+    def test_has_pending_forget_note_true_after_stash(self):
+        sid = cc.mint_stash_id("forget_note", HARRISON, _CH)
+        td._store_pending_forget_note(HARRISON, _CH, {
+            "note_id": "note:1", "ts": time.time(), "stash_id": sid,
+        })
+        assert td.has_pending_forget_note(HARRISON, _CH) is True
+
+
+class TestDispatchPropagatesTurnContext:
+    """D-051 re-review finding (CRITICAL): td.dispatch() has its OWN internal
+    per-tool timeout executor (tool_dispatch.py, inside dispatch()) -- a
+    SEPARATE thread-hop from claude_client._dispatch_tools_parallel's outer
+    one. It was ALSO doing a bare executor.submit(fn, ...) with no context
+    copy, so EVERY real tool call (not just concurrent ones -- the single-
+    tool path goes through this exact executor too) minted a stash with
+    turn_id=None, and freshest_changed_stash's turn-ownership filter NEVER
+    matched -- NO confirm card would EVER attach, for ANY reply. Two
+    independent review agents found this by static reading; this test drives
+    the REAL, unmocked dispatch() end-to-end (not a patched stand-in the way
+    test_parallel_tool_dispatch.py's S1 tests do) to prove the fix holds at
+    the exact layer where it was broken."""
+
+    def test_real_tool_call_through_dispatch_sees_the_turn_id(self, monkeypatch):
+        def _probe_tool(slack_user_id, _entity, _input):
+            return cc.mint_stash_id("asana", slack_user_id, _input.get("_channel_name", ""))
+
+        monkeypatch.setitem(td._TOOL_FUNCTIONS, "_test_probe_tool", _probe_tool)
+        cc.begin_turn()
+        tid = cc.current_turn_id()
+        returned_sid = td.dispatch("_test_probe_tool", {}, HARRISON, "FNDR", _CH, "C1", None)
+        entry = cc.index_lookup(returned_sid)
+        assert entry is not None
+        assert entry["turn_id"] == tid
+
+    def test_freshest_changed_stash_sees_a_mint_from_inside_a_real_dispatch_call(self, monkeypatch):
+        # The end-to-end version of the bug: mint via the REAL dispatch()
+        # path (not a direct cc.mint_stash_id call), then confirm the SAME
+        # snapshot/diff mechanism app.py uses actually attaches it.
+        def _probe_tool(slack_user_id, _entity, _input):
+            sid = cc.mint_stash_id("asana", slack_user_id, _input.get("_channel_name", ""))
+            td._store_pending_asana_write(slack_user_id, _CH, {
+                "action": "delete", "gid": "gProbe", "label": "Probe task",
+                "ts": time.time(), "stash_id": sid,
+            })
+            return "preview text"
+
+        monkeypatch.setitem(td._TOOL_FUNCTIONS, "_test_probe_tool", _probe_tool)
+        cc.begin_turn()
+        before = td.snapshot_stash_ids(HARRISON, _CH)
+        td.dispatch("_test_probe_tool", {}, HARRISON, "FNDR", _CH, "C1", None)
+        changed = td.freshest_changed_stash(before, HARRISON, _CH)
+        assert changed is not None
+        assert changed[0] == "asana"

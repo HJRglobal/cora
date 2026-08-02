@@ -13,6 +13,7 @@ that entity. FNDR channels (founder-level + catch-all) see everything.
 """
 
 import concurrent.futures
+import contextvars
 import logging
 import os
 import re
@@ -4938,6 +4939,27 @@ _CONFIRM_ACTION_VERBS = {
 }
 
 
+# Cowork/Slack connector noise that must not defeat confirm classification: the
+# Cowork connector appends a trailing "*Sent using* <@U...>" footer to every
+# message it relays, so a connector-posted "@Cora confirm" carries this footer
+# just like any other message and the RAW "sent"/"using"/user-id tokens would
+# otherwise fail _confirm_intent's every-token-must-be-recognized gate (S3 fix,
+# live-smoke 2026-08-02, cq-4c9306652bb5). Mirrors code_queue.py's _normalize
+# (same day-one defect class): anchored to the END of the message only -- an
+# unanchored "sent using .*" strip would eat legitimate content like "the
+# invoices sent using the old template", so this is deliberately end-anchored,
+# not DOTALL, not applied mid-message.
+_CONFIRM_MENTION_RE = re.compile(r"<[@#!][^>]*>")
+_CONFIRM_SENT_USING_RE = re.compile(r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$", re.IGNORECASE)
+
+
+def _strip_connector_noise(message: str) -> str:
+    """Strip the Cowork 'Sent using <@user>' footer + any Slack mention tokens
+    before confirm-intent classification."""
+    t = _CONFIRM_SENT_USING_RE.sub("", message or "")
+    return _CONFIRM_MENTION_RE.sub(" ", t)
+
+
 def _confirm_intent(message: str, pending_action: str | None) -> str | None:
     """Classify a message as a bare confirm ("affirm") / cancel ("negate") of a staged
     write, or None (not a clear bare confirm -> fall through to the model).
@@ -4949,6 +4971,7 @@ def _confirm_intent(message: str, pending_action: str | None) -> str | None:
     verb as a plain go (used for the broaden signal, where the action is irrelevant)."""
     if not message:
         return None
+    message = _strip_connector_noise(message)
     # A question is never a bare confirm. Guard BEFORE tokenizing (the tokenizer drops
     # '?', so "done?" / "delete it?" would otherwise read as an affirm -- review MED #6).
     if "?" in message:
@@ -5149,6 +5172,15 @@ def try_confirm_pending_write(
         return None
     if not slack_user_id:
         return None
+    # S3 fix, D-051 re-review (2026-08-02): strip Cowork-connector footer/
+    # mention noise ONCE here so every "?" check and _confirm_intent call
+    # below sees the SAME text -- previously only _confirm_intent's OWN
+    # internal "?" guard used the stripped text while this function's two
+    # local "?" checks read the raw `message` param, a latent divergence
+    # (never practically triggerable, since neither the footer nor a mention
+    # token can itself contain "?", but a real gap if that ever changes).
+    # _confirm_intent's own strip becomes a harmless no-op on already-clean text.
+    message = _strip_connector_noise(message)
     asana = _peek_pending_asana(slack_user_id, channel_name)
     shopify = _peek_pending_shopify(slack_user_id, channel_name)
     calendar = _peek_pending_calendar(slack_user_id, channel_name)
@@ -5934,6 +5966,14 @@ def _peek_pending_remember(slack_user: str, channel: str) -> dict | None:
     return None
 
 
+def has_pending_remember(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe (S4, live-smoke 2026-08-02) -- app.py forces
+    Sonnet on the confirm turn, matching has_pending_asana_write/etc. Closes a
+    gap remember/forget_note had: with no wrapper, a pending remember's
+    confirm turn could never join that escalation at all."""
+    return _peek_pending_remember(slack_user, channel) is not None
+
+
 def _execute_claimed_remember(pending: dict, slack_user_id: str) -> str:
     """Execute an ALREADY-CLAIMED (popped) cora_remember pending entry. Shared by
     the tool's own confirmed=true call and the confirm-button tap handler."""
@@ -6117,6 +6157,12 @@ def _peek_pending_forget_note(slack_user: str, channel: str) -> dict | None:
     if entry and (time.time() - float(entry.get("ts", 0))) <= _FORGET_NOTE_PENDING_TTL_SECONDS:
         return entry
     return None
+
+
+def has_pending_forget_note(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe (S4, live-smoke 2026-08-02) -- app.py forces
+    Sonnet on the confirm turn, matching has_pending_asana_write/etc."""
+    return _peek_pending_forget_note(slack_user, channel) is not None
 
 
 def _execute_claimed_forget_note(pending: dict, slack_user_id: str) -> str:
@@ -10170,15 +10216,40 @@ def freshest_changed_stash(before: dict, slack_user_id: str, channel_name: str) 
     """Return (kind, id) for the stash whose id changed vs `before` (a fresh
     preview/re-preview/ask was minted this turn), or None. 'ask' is a distinct
     pseudo-kind (id is an ask_id, not a confirm stash_id) -- the caller renders
-    a picker card for it, a Confirm/Cancel card for every other kind. Prefers
-    the entry with the newest ts if more than one kind changed (rare: more
-    than one tool call landed in a single turn)."""
+    a picker card for it, a Confirm/Cancel card for every other kind.
+
+    S1 fix (live-smoke 2026-08-02, cq-883878e81274): a raw before/after diff
+    over the shared (user, channel) stores is racy under CONCURRENT turns --
+    multiple @mentions landing within a couple seconds all diff against
+    overlapping windows, so a change caused by a SIBLING turn's own tool call
+    could get attributed here and cross-bound to THIS turn's reply (the old
+    "prefer the newest ts" tiebreak made this worse: it could hand every
+    concurrent turn's card to whichever turn's mint happened to be freshest).
+    Every changed candidate is now filtered down to ones this turn's OWN
+    begin_turn() id actually minted (confirm_cards._TURN_ID, propagated via
+    contextvars through claude_client's parallel tool dispatch) -- a change
+    with no matching turn_id (a concurrent sibling turn's mint, or no active
+    turn context at all) is never eligible. No eligible candidate -> None
+    (fail closed to a buttonless text reply; the typed confirm path still
+    works), never a guess."""
     after = snapshot_stash_ids(slack_user_id, channel_name)
     changed = [k for k, v in after.items() if v and v != before.get(k)]
     if not changed:
         return None
-    if len(changed) == 1:
-        k = changed[0]
+    turn_id = confirm_cards.current_turn_id()
+    if not turn_id:
+        return None
+
+    def _owned_by_this_turn(k: str) -> bool:
+        cid = after[k]
+        idx = confirm_cards.ask_index_lookup(cid) if k == "ask" else confirm_cards.index_lookup(cid)
+        return bool(idx) and idx.get("turn_id") == turn_id
+
+    owned = [k for k in changed if _owned_by_this_turn(k)]
+    if not owned:
+        return None
+    if len(owned) == 1:
+        k = owned[0]
         return k, after[k]
     specs = _stash_kind_specs()
 
@@ -10187,7 +10258,7 @@ def freshest_changed_stash(before: dict, slack_user_id: str, channel_name: str) 
             else specs[k]["peek"](slack_user_id, channel_name)
         return float((entry or {}).get("ts", 0))
 
-    k = max(changed, key=_ts_for)
+    k = max(owned, key=_ts_for)
     return k, after[k]
 
 
@@ -10777,9 +10848,20 @@ def dispatch(
         # hung tool leaks one worker thread until it returns on its own, which is
         # far better than blocking every request and is cleared on the next
         # supervisor restart.
+        # D-051 review finding (CRITICAL, live-smoke 2026-08-02): a bare
+        # executor.submit(fn, ...) does NOT propagate contextvars into the
+        # worker thread, so confirm_cards._TURN_ID (set by app._dispatch_qa's
+        # begin_turn(), needed by every staged-write tool's mint_stash_id call
+        # deep inside `fn`) would always read as the ContextVar's default
+        # here -- silently breaking EVERY confirm-button card attach, not just
+        # under concurrency, since ALL tool calls (single or parallel) funnel
+        # through this one executor. claude_client._dispatch_tools_parallel's
+        # OWN copy_context() fix only gets the turn id as far as dispatch()'s
+        # stack frame; this is the SECOND, deeper thread-hop that also needs
+        # it, mirroring the identical fix there.
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            future = executor.submit(fn, slack_user_id, entity, injected)
+            future = executor.submit(contextvars.copy_context().run, fn, slack_user_id, entity, injected)
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             log.warning("Tool %s timed out after %ds for user=%s entity=%s", tool_name, timeout, slack_user_id, entity)

@@ -22,6 +22,7 @@ index / render -- nothing about what a stash_id actually authorizes.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import secrets
 import time
@@ -45,14 +46,45 @@ STASH_TTL_SECONDS = 600
 INDEX_GRACE_SECONDS = 6 * 3600
 
 _INDEX_LOCK = Lock()
-# stash_id -> {"kind": str, "user": str, "channel": str, "ts": float}
+# stash_id -> {"kind": str, "user": str, "channel": str, "ts": float, "turn_id": str | None}
 _INDEX: dict[str, dict] = {}
 
-# ask_id -> {"user": str, "channel": str, "ts": float} (ask-stash owner index;
-# separate namespace from confirm/cancel stash ids -- a picker answers a
+# ask_id -> {"user": str, "channel": str, "ts": float, "turn_id": str | None} (ask-stash
+# owner index; separate namespace from confirm/cancel stash ids -- a picker answers a
 # question, it never itself authorizes a write).
 _ASK_INDEX_LOCK = Lock()
 _ASK_INDEX: dict[str, dict] = {}
+
+# ── Turn-scoped provenance (S1 fix, live-smoke 2026-08-02) ──────────────────
+# app._dispatch_qa calls begin_turn() once, before the confirm interceptor and
+# before the model's tool loop. Every stash minted from then on -- on the SAME
+# logical call chain (this thread, or a context explicitly copied via
+# contextvars.copy_context(), which claude_client._dispatch_tools_parallel does
+# for each parallel tool call) -- is tagged with that turn's id. This lets
+# tool_dispatch.freshest_changed_stash() tell "a stash THIS turn's own tool
+# call minted" apart from "some stash changed in the shared (user, channel)
+# store while my turn was in flight" -- the latter is a CONCURRENT turn's own
+# mint under overlapping snapshot/diff windows (multiple @mentions within a
+# couple seconds all landed on the SAME (user, channel), each triggering a
+# different staged-write kind), which the old marker-free ts-tiebreak could
+# cross-bind to the wrong reply's card. A stash minted with no active turn
+# (turn_id=None -- e.g. a unit test that calls mint_stash_id directly) never
+# matches any turn's ownership check by construction (None is never treated
+# as equal to another None "current turn" -- see current_turn_id()'s callers).
+_TURN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "cora_confirm_turn_id", default=None,
+)
+
+
+def begin_turn() -> None:
+    """Mark the start of a fresh turn's confirm-card provenance scope. Cheap
+    (one token_hex mint); call unconditionally at the top of _dispatch_qa."""
+    _TURN_ID.set(secrets.token_hex(8))
+
+
+def current_turn_id() -> str | None:
+    """The active turn's id, or None outside any turn scope."""
+    return _TURN_ID.get()
 
 
 def confirm_buttons_enabled() -> bool:
@@ -79,7 +111,8 @@ def mint_stash_id(kind: str, user: str, channel: str) -> str:
         sid = secrets.token_hex(8)
         while sid in _INDEX:  # astronomically unlikely; cheap to guard
             sid = secrets.token_hex(8)
-        _INDEX[sid] = {"kind": kind, "user": user, "channel": channel, "ts": time.time()}
+        _INDEX[sid] = {"kind": kind, "user": user, "channel": channel, "ts": time.time(),
+                       "turn_id": _TURN_ID.get()}
     return sid
 
 
@@ -121,7 +154,8 @@ def mint_ask_id(user: str, channel: str) -> str:
         aid = secrets.token_hex(8)
         while aid in _ASK_INDEX:
             aid = secrets.token_hex(8)
-        _ASK_INDEX[aid] = {"user": user, "channel": channel, "ts": time.time()}
+        _ASK_INDEX[aid] = {"user": user, "channel": channel, "ts": time.time(),
+                          "turn_id": _TURN_ID.get()}
     return aid
 
 
@@ -191,3 +225,27 @@ def build_picker_blocks(prompt_text: str, ask_id: str, candidates: list[tuple[st
 def terminal_blocks(outcome_text: str) -> list[dict]:
     """A resolved card: outcome text, no actions block (buttons dropped)."""
     return [{"type": "section", "text": {"type": "mrkdwn", "text": outcome_text}}]
+
+
+# ── Terminal-edit race (S2, live-smoke 2026-08-02 + D-051 re-review) ────────
+# resolve_and_claim_stash's atomic pop already guarantees at most ONE caller
+# ever sees a genuine outcome for a given stash_id -- but two racing taps on
+# the SAME card each independently call client.chat_update, and nothing
+# orders those two HTTP round-trips. Live: a slow winner's real "Done: ..."
+# edit landed first, then a fast loser's "Already handled" edit (dispatched
+# on its own thread, no execute() to wait for) landed SECOND and clobbered
+# it. A first attempt at a fix here used a "claim a slot, whoever writes
+# first wins" registry -- REJECTED on D-051 re-review: it only blocks the
+# clobber in ONE arrival order (a winner's claim already recorded before the
+# loser checks). If the FASTER, non-informative "already_handled" caller
+# reaches the registry first (the common case, since it has no real work to
+# wait for), it still gets to fire its OWN chat_update, and the slower
+# winner's edit arriving afterward provides no guarantee of being APPLIED
+# last by Slack's servers -- the original clobber, just with the roles that
+# happen to race swapped. There is no registry/locking scheme that can order
+# two independent HTTP calls after the fact. The actual fix lives in app.py:
+# an "already_handled" (or same-card-race-loser) outcome NEVER calls
+# chat_update on the shared card at all -- ephemeral-only. There is always a
+# legitimate winner (that is what makes an outcome "already handled" in the
+# first place) who will edit the card with the real result, so nothing is
+# lost by the loser leaving it alone.

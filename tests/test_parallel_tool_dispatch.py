@@ -1,10 +1,12 @@
 """Unit tests for _dispatch_tools_parallel in claude_client — parallel tool
 execution preserves result order and handles per-tool failures cleanly."""
 
+import contextvars
 import time
 from unittest.mock import MagicMock, patch
 
 import cora.claude_client as cc
+from cora import confirm_cards
 
 
 def _make_block(tool_id: str, name: str, input_dict: dict | None = None):
@@ -141,3 +143,100 @@ def test_worker_count_capped_at_max():
     # ThreadPoolExecutor should be called with max_workers <= _TOOL_DISPATCH_MAX_WORKERS
     call_kwargs = mock_executor.call_args.kwargs
     assert call_kwargs["max_workers"] == cc._TOOL_DISPATCH_MAX_WORKERS
+
+
+# ---- Contextvar propagation (S1 fix, live-smoke 2026-08-02) ----
+# confirm_cards.mint_stash_id reads confirm_cards._TURN_ID (a contextvars.
+# ContextVar) to tag a fresh stash with the calling turn's id. A bare
+# executor.submit(dispatch, ...) does NOT propagate the submitting thread's
+# contextvars into the worker thread (verified empirically: a plain
+# ThreadPoolExecutor worker sees the ContextVar's default, not the caller's
+# value) -- these tests pin that _dispatch_tools_parallel's per-call
+# contextvars.copy_context().run(...) wrapper fixes this for BOTH the single-
+# tool direct-dispatch path and the 2+-tool parallel path, and that reusing
+# ONE copied context across concurrent submissions does not crash.
+
+
+def test_single_tool_dispatch_sees_the_calling_threads_turn_id():
+    confirm_cards.begin_turn()
+    tid = confirm_cards.current_turn_id()
+    seen = {}
+
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+        seen["turn_id"] = confirm_cards.current_turn_id()
+        return "ok"
+
+    with patch.object(cc, "dispatch", side_effect=fake_dispatch):
+        cc._dispatch_tools_parallel(
+            [_make_block("toolu_1", "cora_remember")], slack_user_id="U", entity="FNDR", iteration=0,
+        )
+    assert seen["turn_id"] == tid
+
+
+def test_parallel_tool_dispatch_each_worker_sees_the_calling_threads_turn_id():
+    confirm_cards.begin_turn()
+    tid = confirm_cards.current_turn_id()
+    seen = {}
+
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+        seen[name] = confirm_cards.current_turn_id()
+        return f"result for {name}"
+
+    blocks = [
+        _make_block("toolu_a", "asana_create_task"),
+        _make_block("toolu_b", "calendar_schedule_meeting"),
+        _make_block("toolu_c", "cora_remember"),
+    ]
+    with patch.object(cc, "dispatch", side_effect=fake_dispatch):
+        cc._dispatch_tools_parallel(blocks, slack_user_id="U", entity="FNDR", iteration=0)
+
+    assert seen == {"asana_create_task": tid, "calendar_schedule_meeting": tid, "cora_remember": tid}
+
+
+def test_a_workers_own_turn_id_mutation_never_leaks_to_siblings_or_caller():
+    confirm_cards.begin_turn()
+    caller_tid = confirm_cards.current_turn_id()
+    seen = {}
+
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+        # Simulate a worker minting its OWN fresh turn (should never happen in
+        # production -- begin_turn only runs once per _dispatch_qa turn -- but
+        # proves copy_context() isolation holds even if it did).
+        confirm_cards.begin_turn()
+        seen[name] = confirm_cards.current_turn_id()
+        return "ok"
+
+    blocks = [_make_block("toolu_a", "tool_a"), _make_block("toolu_b", "tool_b")]
+    with patch.object(cc, "dispatch", side_effect=fake_dispatch):
+        cc._dispatch_tools_parallel(blocks, slack_user_id="U", entity="FNDR", iteration=0)
+
+    assert seen["tool_a"] != caller_tid
+    assert seen["tool_b"] != caller_tid
+    assert seen["tool_a"] != seen["tool_b"]
+    assert confirm_cards.current_turn_id() == caller_tid  # the calling thread is untouched
+
+
+def test_reusing_one_copied_context_across_concurrent_submissions_would_crash():
+    # Documents WHY the fix copies context per-submission rather than once for
+    # the whole batch: contextvars.Context.run() raises if the SAME Context
+    # object is entered from more than one OS thread concurrently.
+    var = contextvars.ContextVar("probe", default=None)
+    var.set("SET")
+    ctx = contextvars.copy_context()
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(ctx.run, time.sleep, 0.05) for _ in range(4)]
+        results = [
+            "ok" if _safe_result(f) else "error"
+            for f in futures
+        ]
+    assert results.count("error") >= 1
+
+
+def _safe_result(future):
+    try:
+        future.result()
+        return True
+    except RuntimeError:
+        return False

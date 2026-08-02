@@ -82,6 +82,51 @@ class TestConfirmIntent:
         assert td.is_bare_affirmative("what's on my plate") is False
 
 
+# ── S3 fix (cq-4c9306652bb5): Cowork connector footer must not defeat
+# classification -- a connector-relayed "@Cora confirm" carries a trailing
+# "*Sent using* <@U...>" footer just like any other message.
+class TestConnectorFooterStrip:
+    @pytest.mark.parametrize("msg", [
+        "confirm\n\n*Sent using* <@U0123ABCD>",
+        "confirm\n*Sent using* <@U0123ABCD>",
+        "confirm\n\nSent using <@U0123ABCD>",  # no asterisks
+        "yes\n\n*Sent using* <@U0123ABCD>",
+        "delete it\n\n*Sent using* <@U0123ABCD>",
+    ])
+    def test_footer_does_not_block_affirm(self, msg):
+        assert td._confirm_intent(msg, "delete") == "affirm"
+
+    def test_footer_does_not_block_negate(self):
+        msg = "cancel\n\n*Sent using* <@U0123ABCD>"
+        assert td._confirm_intent(msg, "delete") == "negate"
+
+    def test_is_bare_affirmative_also_sees_through_the_footer(self):
+        # is_bare_affirmative (app.py's phantom-write-guard broaden signal)
+        # calls _confirm_intent internally -- must benefit from the same fix.
+        msg = "yes, delete it permanently\n\n*Sent using* <@U0123ABCD>"
+        assert td.is_bare_affirmative(msg) is True
+
+    def test_footer_strip_does_not_defeat_the_question_guard(self):
+        # A genuine question with a footer must still fall through -- the
+        # strip must not accidentally consume a REAL trailing "?".
+        msg = "are you sure?\n\n*Sent using* <@U0123ABCD>"
+        assert td._confirm_intent(msg, "delete") is None
+
+    def test_footer_strip_does_not_eat_legitimate_mid_message_content(self):
+        # Mirrors code_queue.py's own anchored-strip rationale: an unanchored
+        # "sent using .*" would eat legitimate content mid-sentence. This
+        # message is a content word ("invoices") regardless, so it must still
+        # fall through to the model either way.
+        msg = "the invoices sent using the old template are wrong"
+        assert td._confirm_intent(msg, "delete") is None
+
+    def test_bare_mention_token_alone_does_not_block_classification(self):
+        # A stray mention with no "sent using" wrapper (e.g. a plain cc'd
+        # user) is still just noise -- stripped to a space, not a content word.
+        msg = "confirm <@U0999ZZZZ>"
+        assert td._confirm_intent(msg, "delete") == "affirm"
+
+
 # ── _strip_write_sentinel ───────────────────────────────────────────────────
 class TestStripSentinel:
     def test_strips_confirmed(self):
@@ -159,6 +204,21 @@ class TestInterceptorAsana:
         assert out is None
         mock.assert_not_called()
         assert not td.has_pending_asana_write(HARRISON, _CH)  # abandoned
+
+    def test_connector_footer_executes_the_full_interceptor_path(self):
+        # S3 fix, end-to-end: a Cowork-relayed "confirm" (with its trailing
+        # footer) must execute a destructive Asana pending through the FULL
+        # try_confirm_pending_write path, not just the isolated _confirm_intent
+        # classifier -- this is what a real connector-posted "@Cora confirm"
+        # looks like on the wire.
+        self._stash_delete()
+        with patch.object(td.asana_client, "delete_task", return_value=None) as mock:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR",
+                message="confirm\n\n*Sent using* <@U0123ABCD>",
+            )
+        assert out is not None
+        mock.assert_called_once()
 
     def test_unclassified_non_question_does_not_abandon_pending(self):
         # cq-2af049327848 regression: a genuine confirm ATTEMPT that merely falls

@@ -7,6 +7,7 @@ Two public entry points:
                                     or surface partial output elsewhere
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -768,12 +769,19 @@ def _dispatch_tools_parallel(
             "content": result_str,
         }]
 
-    # 2+ tool calls — run concurrently
+    # 2+ tool calls — run concurrently. Each submission gets its OWN copied
+    # context (contextvars.Context.run() raises RuntimeError if the SAME
+    # Context object is entered from more than one OS thread at once --
+    # verified empirically; sharing one copy across the batch would crash
+    # every 2+-tool turn) so a staged-write tool's mint_stash_id sees the
+    # ORIGINAL calling thread's confirm-card turn id (S1 fix, confirm_cards.
+    # begin_turn/_TURN_ID) inside the worker thread, instead of the
+    # executor's always-empty default context.
     max_workers = min(len(tool_use_blocks), _TOOL_DISPATCH_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cora-tool") as executor:
         futures = [
-            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity,
-                            channel_name, channel_id, thread_ts)
+            executor.submit(contextvars.copy_context().run, dispatch, b.name, b.input or {},
+                            slack_user_id, entity, channel_name, channel_id, thread_ts)
             for b in tool_use_blocks
         ]
         results = [f.result() for f in futures]
