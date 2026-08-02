@@ -17,6 +17,7 @@ from .claude_client import (
 from . import active_thread_store
 from . import channel_classifier
 from . import channel_content_guard
+from . import confirm_cards
 from . import user_access
 from . import lex_phi_access
 from .config import config
@@ -561,6 +562,36 @@ def _dispatch_qa(
         )
         return guarded
 
+    # ── Confirm-button turn snapshot (S1/S2, design 2026-08-02) ─────────────
+    # Captured BEFORE the confirm interceptor (which can itself mint a fresh
+    # re-preview, e.g. Shopify drift) and before the model's tool loop.
+    # Compared against a second snapshot at each reply site via
+    # _confirm_card_for_reply() to detect "a fresh preview (or ambiguity ask)
+    # was minted THIS turn" -- the trigger for attaching a Confirm/Cancel (or
+    # picker) button card. Marker-free by design: works whether a kind's
+    # preview text is code-enforced verbatim or model-mediated.
+    _confirm_before_snapshot = (
+        _tool_dispatch.snapshot_stash_ids(user_id, channel_name) if user_id else {}
+    )
+
+    def _confirm_card_for_reply(text: str) -> list[dict] | None:
+        if not user_id or not text or not confirm_cards.confirm_buttons_enabled():
+            return None
+        changed = _tool_dispatch.freshest_changed_stash(
+            _confirm_before_snapshot, user_id, channel_name)
+        if changed is None:
+            return None
+        kind, cid = changed
+        if kind == "ask":
+            ask_entry = _tool_dispatch.get_pending_ask(user_id, channel_name)
+            if not ask_entry or ask_entry.get("ask_id") != cid:
+                return None
+            candidates = [(key, label) for key, label, _value in ask_entry.get("candidates", [])]
+            if not candidates:
+                return None
+            return confirm_cards.build_picker_blocks(text, cid, candidates)
+        return confirm_cards.build_confirm_blocks(text, cid)
+
     # ── Deterministic staged-write confirm interceptor (F-23, 2026-07-12) ──────
     # A fresh pending Asana/Shopify write for this (user, channel) + a clear bare
     # affirmative executes the write IN CODE via the tool's own confirm executor
@@ -599,8 +630,9 @@ def _dispatch_qa(
             log.info(
                 "confirm_interceptor served channel=#%s user=%s", channel_name, user_id,
             )
-            say(text=_guard_content(confirm_reply), thread_ts=reply_thread_ts,
-                unfurl_links=False, unfurl_media=False)
+            guarded_reply = _guard_content(confirm_reply)
+            say(text=guarded_reply, blocks=_confirm_card_for_reply(guarded_reply),
+                thread_ts=reply_thread_ts, unfurl_links=False, unfurl_media=False)
             active_thread_store.register(channel_id, register_ts)
             return
 
@@ -959,6 +991,7 @@ def _dispatch_qa(
         )
         say(
             text=response_text,
+            blocks=_confirm_card_for_reply(response_text),
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
@@ -1081,11 +1114,13 @@ def _dispatch_qa(
     )
 
     throttle.force_acquire(stream_id + "-final")
+    confirm_blocks = _confirm_card_for_reply(response_text)
     try:
         client.chat_update(
             channel=placeholder_channel,
             ts=placeholder_ts,
             text=response_text,
+            blocks=confirm_blocks,
         )
     except Exception as exc:  # noqa: BLE001
         log.error(
@@ -1094,6 +1129,7 @@ def _dispatch_qa(
         )
         say(
             text=response_text,
+            blocks=confirm_blocks,
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
@@ -3267,6 +3303,171 @@ def handle_cq_edit_submit(ack, body, client, view) -> None:
                     pass
     except Exception:  # noqa: BLE001
         log.warning("code-queue edit-submit handler error (non-fatal)", exc_info=True)
+
+
+def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: list[dict],
+                        outcome_text: str) -> None:
+    """Edit a confirm/picker card to a terminal state: keep the original
+    preview/question section(s), append the outcome, drop the actions block
+    (buttons gone -- revops/code-queue precedent)."""
+    section_blocks = [b for b in orig_blocks if b.get("type") == "section"]
+    new_blocks = section_blocks + confirm_cards.terminal_blocks(outcome_text)
+    try:
+        client.chat_update(channel=channel_id, ts=message_ts, text=outcome_text, blocks=new_blocks)
+    except Exception:  # noqa: BLE001
+        log.warning("confirm-button card edit failed (non-fatal) channel=%s ts=%s",
+                    channel_id, message_ts, exc_info=True)
+
+
+def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
+    """Shared Confirm/Cancel tap handler for all 9 stash kinds (S2, design
+    2026-08-02). Requester-only, atomic claim, honest terminal states for
+    every lifecycle case (superseded/expired/orphaned/indeterminate/already-
+    handled) -- see tool_dispatch.resolve_and_claim_stash for the security
+    invariants."""
+    tapping_user = (body.get("user") or {}).get("id", "")
+    channel_id = (body.get("channel") or {}).get("id", "")
+    message_ts = (body.get("message") or {}).get("ts", "")
+    orig_blocks = (body.get("message") or {}).get("blocks") or []
+    actions = body.get("actions") or [{}]
+    stash_id = str(actions[0].get("value") or "")
+
+    if not confirm_cards.confirm_buttons_enabled():
+        # Kill switch: a stale card tapped after a flag flip to off. Never
+        # mutate the card (its stash may still be live for the typed path) --
+        # just redirect the tapper to the typed path.
+        if tapping_user and channel_id:
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=tapping_user,
+                    text="Buttons are turned off right now -- reply with a typed confirm instead.")
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
+    if not stash_id or not tapping_user or not channel_id or not message_ts:
+        return
+
+    result = _tool_dispatch.resolve_and_claim_stash(stash_id, tapping_user, action)
+    outcome = result.get("outcome")
+
+    if outcome == "unauthorized":
+        owner = result.get("owner", "")
+        owner_disp = f"<@{owner}>" if owner else "the requester"
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=tapping_user,
+                                      text=f"Only {owner_disp} can act on this.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if outcome == "orphaned":
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id, user=tapping_user,
+                text=("I don't have a record of that request anymore (maybe I "
+                      "restarted) -- ask again if you still want this."))
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if outcome == "superseded":
+        text = "This preview was replaced by a newer one -- check your latest message."
+    elif outcome == "expired":
+        label = result.get("label", "that request")
+        text = (f"That {label} expired before you confirmed. Nothing was "
+                f"changed -- tell me again and I'll re-preview it.")
+    elif outcome == "cancelled":
+        text = "Cancelled -- nothing was changed."
+    elif outcome == "indeterminate":
+        text = ("Something may have gone through, but I hit an error right "
+                "after -- I can't confirm either way. Check before retrying; "
+                "this card is closed and will not retry.")
+    elif outcome == "executed":
+        text = result.get("message") or "Done."
+    else:
+        text = "Something went wrong -- nothing was changed."
+
+    _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
+
+
+@app.action(confirm_cards.ACTION_CONFIRM)
+def handle_confirm_write(ack, body, client) -> None:
+    ack()
+    _handle_confirm_tap(body, client, action="confirm")
+
+
+@app.action(confirm_cards.ACTION_CANCEL)
+def handle_cancel_write(ack, body, client) -> None:
+    ack()
+    _handle_confirm_tap(body, client, action="cancel")
+
+
+@app.action(confirm_cards.ACTION_PICK)
+def handle_pick_candidate(ack, body, client) -> None:
+    """Ambiguity-picker tap (S4): bind the chosen candidate server-side and
+    post the resulting preview as a fresh Confirm/Cancel card -- the term
+    never round-trips through the model."""
+    ack()
+    tapping_user = (body.get("user") or {}).get("id", "")
+    channel_id = (body.get("channel") or {}).get("id", "")
+    message_ts = (body.get("message") or {}).get("ts", "")
+    orig_blocks = (body.get("message") or {}).get("blocks") or []
+    actions = body.get("actions") or [{}]
+    raw_value = str(actions[0].get("value") or "")
+
+    if not confirm_cards.confirm_buttons_enabled():
+        if tapping_user and channel_id:
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=tapping_user,
+                    text="Buttons are turned off right now -- reply with the option name instead.")
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
+    if ":" not in raw_value or not tapping_user or not channel_id or not message_ts:
+        return
+    ask_id, candidate_key = raw_value.split(":", 1)
+
+    outcome, message, stash_id = _tool_dispatch.resolve_shopify_ask_pick(
+        ask_id, tapping_user, candidate_key)
+
+    if outcome == "unauthorized":
+        owner_disp = f"<@{message}>" if message else "the requester"
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=tapping_user,
+                                      text=f"Only {owner_disp} can act on this.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if outcome == "orphaned":
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id, user=tapping_user,
+                text="I don't have a record of that question anymore -- ask again.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if outcome == "superseded":
+        _edit_card_terminal(client, channel_id, message_ts, orig_blocks,
+                            "This question was replaced by a newer one.")
+        return
+    if outcome == "invalid_candidate":
+        _edit_card_terminal(client, channel_id, message_ts, orig_blocks,
+                            "That option didn't resolve cleanly -- restate the item and I'll ask again.")
+        return
+
+    # outcome == "preview": close the picker card, then post the fresh
+    # preview as ITS OWN Confirm/Cancel card (pick -> preview -> confirm).
+    _edit_card_terminal(client, channel_id, message_ts, orig_blocks, "Picked.")
+    clean_text = message or ""
+    blocks = confirm_cards.build_confirm_blocks(clean_text, stash_id) if stash_id else None
+    try:
+        client.chat_postMessage(channel=channel_id, text=clean_text, blocks=blocks)
+    except Exception:  # noqa: BLE001
+        log.warning("picker follow-up preview post failed (non-fatal) channel=%s",
+                    channel_id, exc_info=True)
 
 
 @app.event("channel_created")
