@@ -1,0 +1,21 @@
+# Revenue-ops owner routing (design section 5, locked 2026-08-01).
+#
+# Owners get FYI cards for their lane and can mark threads replied/closed.
+# ONLY Harrison can fire a Tier-1 send in v1 (approvers live in send-trust.yaml).
+# Owner-approve is the designed v2, unlocked per lane via send-trust.yaml.
+#
+# Any workstream not listed here routes to the default owner (Harrison).
+# The deterministic escalation keyword screen overrides everything: a tripped
+# thread gets owner=Harrison + state=escalated regardless of this map.
+
+default_owner: U0B2RM2JYJ1    # Harrison
+
+workstreams:
+  Retail: U0B3RU5Q55G          # Tommy Anderson (retail lane FYI)
+  Press: U0B2RM2JYJ1           # Harrison
+  Suppliers: U0B2RM2JYJ1       # Harrison
+  Sponsors: U0B2RM2JYJ1        # Harrison
+  Finance-Legal: U0B2RM2JYJ1   # Harrison (finance firewall posture)
+  Leasing-Property: U0B2RM2JYJ1
+  Support: U0B3VGWJTMJ         # Alex (external-inbox digest owner, R5)
+  Other: U0B2RM2JYJ1
