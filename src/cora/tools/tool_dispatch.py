@@ -3968,6 +3968,147 @@ def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
         resolved_from=data.get("resolved_from") or ""))
 
 
+# ── Company-lexicon teach tool (Lexicon Flywheel S6; F-23 parity) ─────────────
+# Two-call staged write: phase 1 validates + stashes the entry SERVER-SIDE keyed
+# on (slack_user, channel) and returns a NOT-SAVED preview; confirmed=true
+# executes the STASHED payload -- never a model echo. Founder fast-path applies
+# directly (his confirm IS the D-011 gate) with an audit trail; a teammate's
+# confirm files a PROPOSAL into the 7am knowledge-review queue with their id as
+# contributor (allowlist-type teaches can clear Tier 0/1 under existing rules).
+
+_PENDING_LEXICON_ADDS: dict[tuple[str, str], dict] = {}
+_LEXICON_PENDING_TTL_SECONDS = 600
+
+
+def _store_pending_lexicon_add(slack_user: str, channel: str, entry: dict) -> None:
+    with _SHOPIFY_PENDING_LOCK:  # low-traffic; shares the lock, not the store
+        _PENDING_LEXICON_ADDS[_shopify_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_lexicon_add(slack_user: str, channel: str) -> dict | None:
+    with _SHOPIFY_PENDING_LOCK:
+        entry = _PENDING_LEXICON_ADDS.pop(_shopify_pending_key(slack_user, channel), None)
+    if entry and time.time() - entry.get("ts", 0) > _LEXICON_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _lexicon_slug(term: str) -> str:
+    from ..lexicon import norm_term
+    return "-".join(norm_term(term).replace("&", "and").split()).upper() or "TERM"
+
+
+def _lexicon_teach_uid(payload: dict) -> str:
+    import hashlib
+    key = f"{payload.get('term', '')}|{payload.get('canonical', '')}"
+    return f"lexicon-taught-{hashlib.md5(key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) -> str:
+    channel = str(input_data.get("_channel_name") or "").strip()
+    try:
+        from .. import lexicon as _lexicon
+        if _lexicon.lexicon_level() != "full":
+            return ("NOT SAVED. The company-lexicon teach tool isn't enabled yet -- "
+                    "I noted nothing. (Rollout is staged; Harrison controls the flip.)")
+    except Exception:  # noqa: BLE001
+        return "NOT SAVED. The lexicon is unavailable right now -- I noted nothing."
+
+    confirmed = input_data.get("confirmed", False) in (True, "true", "True")
+    if confirmed:
+        pending = _take_pending_lexicon_add(slack_user_id, channel)
+        if pending is None:
+            # F-23 doctrine: a no-pending confirm is honest, never a fabricated save.
+            return ("NOT SAVED. I don't have a pending lexicon entry from you to "
+                    "confirm -- it may have expired. State the term and meaning again.")
+        payload = pending["payload"]
+        if slack_user_id == _HARRISON_SLACK_ID:
+            from ..lexicon_writer import apply_lexicon_update
+            ok, summary = apply_lexicon_update(payload)
+            if not ok:
+                return f"NOT SAVED. {summary}"
+            # Audit + conversion trail: a founder teach records an APPROVED
+            # proposal row (fail-soft) so the flywheel lane counts it, plus a
+            # golden-set case (parity with the review-rail apply).
+            try:
+                from ..knowledge_review import propose_update, resolve_update
+                uid = _lexicon_teach_uid(payload)
+                if propose_update(update_id=uid, update_type="lexicon",
+                                  description=f"Founder-taught lexicon term: {payload['term']}",
+                                  payload=payload):
+                    resolve_update(uid, "APPROVED", reason="founder_teach")
+            except Exception:  # noqa: BLE001
+                log.warning("lexicon teach: audit proposal failed (write ok)", exc_info=True)
+            try:
+                from ..golden_set import append_case_from_lexicon
+                append_case_from_lexicon(payload)
+            except Exception:  # noqa: BLE001
+                pass
+            return (f"Saved to the {payload['entity']} lexicon: \"{payload['term']}\" = "
+                    f"{payload['canonical_name']} [{payload['type']}]. ({summary})")
+        # Teammate: Harrison-gated proposal with the teacher as contributor.
+        try:
+            from ..knowledge_review import propose_update
+            uid = _lexicon_teach_uid(payload)
+            propose_update(
+                update_id=uid, update_type="lexicon",
+                description=(f"Teammate-taught lexicon term: \"{payload['term']}\" = "
+                             f"{payload['canonical_name']}"),
+                payload=payload,
+                source_evidence=f"taught in #{channel or '?'} by <@{slack_user_id}>",
+                confidence="HIGH")
+        except Exception as exc:  # noqa: BLE001
+            log.error("lexicon teach: propose failed: %s", exc, exc_info=True)
+            return "NOT SAVED. I couldn't queue that for review -- try again shortly."
+        return (f"Queued for Harrison's review: \"{payload['term']}\" = "
+                f"{payload['canonical_name']} [{payload['type']}, {payload['entity']}]. "
+                f"It lands in the next weekday-morning knowledge review; it takes "
+                f"effect once approved.")
+
+    # Phase 1: validate + stash + NOT-SAVED preview.
+    term = str(input_data.get("term") or "").strip()
+    meaning = str(input_data.get("meaning") or "").strip()
+    if not term or not meaning:
+        return "NOT SAVED. I need both the term and what it means."
+    etype = str(input_data.get("type") or "process").strip().lower()
+    if etype not in ("location", "project", "acronym", "vendor", "channel",
+                     "process", "product", "person"):
+        etype = "process"
+    target_entity = str(input_data.get("entity") or entity or "").strip().upper()
+    aliases = [str(a).strip() for a in (input_data.get("aliases") or []) if str(a).strip()]
+    try:
+        from ..phi_guard import is_any_phi
+        if any(is_any_phi(t) for t in (term, meaning, *aliases)):
+            return ("NOT SAVED. That looks like it references an individual's "
+                    "health/billing/authorization status -- the lexicon holds "
+                    "staff/ops terms only, never client information.")
+    except Exception:  # noqa: BLE001 -- screen unavailable = refuse (fail closed)
+        return "NOT SAVED. The content screen is unavailable -- I noted nothing."
+    if etype == "person":
+        try:
+            from ..lexicon_writer import _roster_names
+            if meaning.lower() not in _roster_names():
+                return (f"NOT SAVED. \"{meaning}\" isn't on the staff roster -- "
+                        f"person shorthand can only point at a teammate.")
+        except Exception:  # noqa: BLE001
+            return "NOT SAVED. The staff roster is unavailable -- I noted nothing."
+    canonical = str(input_data.get("canonical") or "").strip() or (
+        meaning if etype == "person" else _lexicon_slug(term))
+    payload = {
+        "term": term, "aliases": aliases, "type": etype, "entity": target_entity,
+        "canonical": canonical, "canonical_name": meaning, "lane": "taught",
+        "contributor_id": slack_user_id,
+    }
+    _store_pending_lexicon_add(slack_user_id, channel, {"payload": payload,
+                                                        "ts": time.time()})
+    gate_note = ("I'll save it" if slack_user_id == _HARRISON_SLACK_ID
+                 else "I'll queue it for Harrison's review")
+    return (f"NOT SAVED yet. Adding to the {target_entity} lexicon: \"{term}\" = "
+            f"{meaning} [{etype}]"
+            + (f" (aliases: {', '.join(aliases)})" if aliases else "")
+            + f". @mention me and say \"confirm\" and {gate_note}.")
+
+
 def _log_lexicon_confirmed(lex: dict | None, slack_user_id: str, channel: str) -> None:
     """Lane-A confirm capture: an executed write whose target came from a lexicon
     resolution logs a resolution_confirmed event carrying the CONFIRMING user's
@@ -8525,6 +8666,67 @@ TOOL_DEFINITIONS = [
             "required": ["note_text", "confirmed"],
         },
     },
+    # --- Company-lexicon teach tool (Lexicon Flywheel S6) ---
+    {
+        "name": "cora_lexicon_add",
+        "description": (
+            "Teach Cora a COMPANY-WIDE shorthand term. Use ONLY for definitional "
+            "phrasing about org vocabulary: \"'X' means Y\", \"X refers to Y\", "
+            "\"X is short for Y\", \"we call Y 'X'\", \"X aka Y\".\n"
+            "\n"
+            "Do NOT use this for: personal notes or preferences ('remember that I "
+            "...', 'note that my ...' -> cora_remember); anything scheduling-related "
+            "('submit availability', 'my shifts'); task operations ('close the X "
+            "task'); or QUESTIONS about what a term means (just answer those). When "
+            "it is unclear whether the user wants an org-wide term or a personal "
+            "note, use cora_remember -- org-wide sharing goes through review anyway.\n"
+            "\n"
+            "REQUIRED PATTERN (staged-write, two calls):\n"
+            "1. First call WITHOUT confirmed: the tool validates, stashes the entry "
+            "   server-side, and returns a NOT-SAVED preview -- relay it verbatim.\n"
+            "2. On the user's explicit yes, call again with confirmed=true. The tool "
+            "   executes its own STASHED entry; other fields are ignored on the "
+            "   confirm turn, so never re-invent them.\n"
+            "\n"
+            "Gating: Harrison's confirm saves directly; anyone else's confirm queues "
+            "the term for Harrison's weekday-morning knowledge review -- tell them "
+            "that. LEX channels: staff/ops terms only; anything referencing an "
+            "individual's health/billing/authorization is refused -- relay the "
+            "refusal verbatim."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "term": {
+                    "type": "string",
+                    "description": "The shorthand term exactly as teammates say it (e.g. 'the cage', 'BCB').",
+                },
+                "meaning": {
+                    "type": "string",
+                    "description": "What the term refers to, as a self-contained canonical name (e.g. 'the UFL octagon set').",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["location", "project", "acronym", "vendor", "channel", "process", "product", "person"],
+                    "description": "Kind of referent. Default process. person requires the meaning to be a staff roster name.",
+                },
+                "entity": {
+                    "type": "string",
+                    "description": "Entity code the term belongs to (F3E/OSN/LEX/...). Defaults to the channel's entity. SHARED for org-wide terms.",
+                },
+                "aliases": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional alternate spellings teammates also use.",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Set true ONLY on the confirm turn, after the user approved the NOT-SAVED preview.",
+                },
+            },
+            "required": ["term", "meaning"],
+        },
+    },
     {
         "name": "cora_queue_code_session",
         "description": (
@@ -8977,6 +9179,7 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "cora_remember",
     "cora_my_notes",
     "cora_forget_note",
+    "cora_lexicon_add",
     "asana_get_my_tasks",
     "asana_get_user_tasks",
     "asana_create_task",
@@ -9166,6 +9369,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "whats_on_my_plate": _tool_whats_on_my_plate,
     # Org Synthesis Phase 5: personal notes (owner-only, blast-radius-1)
     "cora_remember": _tool_cora_remember,
+    "cora_lexicon_add": _tool_cora_lexicon_add,
     "cora_my_notes": _tool_cora_my_notes,
     "cora_forget_note": _tool_cora_forget_note,
     "cora_queue_code_session": _tool_queue_code_session,
@@ -9273,6 +9477,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # Personal notes: remember = embed + conflict probe + upsert (default 15s
     # tier is right); list/delete are local SQL.
     "cora_remember": 15,
+    "cora_lexicon_add": 15,   # local file writes + a proposal append only
     "cora_my_notes": 8,
     "cora_forget_note": 8,
     "cora_self_check": 8,
