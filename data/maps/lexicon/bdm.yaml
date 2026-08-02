@@ -1,0 +1,4 @@
+version: 1
+entity: BDM
+terms:
+  - {term: "big d", type: project, canonical: "BDM", canonical_name: "Big D Media (in-house agency)", source: seed}

@@ -1,0 +1,5 @@
+version: 1
+entity: UFL
+terms:
+  - {term: "ffn", type: project, canonical: "UFL-FFN", canonical_name: "Freedom Fight Night (UFL event brand)", source: seed}
+  - {term: "the league", type: project, canonical: "UFL", canonical_name: "United Fight League", source: seed}

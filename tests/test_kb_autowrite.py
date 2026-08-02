@@ -121,7 +121,8 @@ def kadir(tmp_path, monkeypatch):
     target.write_text("# F3E known answers\n\n## Known facts\n\n", encoding="utf-8")
     audit = tmp_path / "cora-autowrite-audit.jsonl"
     monkeypatch.setattr(kr, "_AUTOWRITE_AUDIT_PATH", audit)
-    monkeypatch.setattr(kr, "_autowrite_target_files", lambda: [target])
+    # Accepts the optional `update` arg (lexicon snapshot-scoping, D-051 F11).
+    monkeypatch.setattr(kr, "_autowrite_target_files", lambda update=None: [target])
     resolved = []
     monkeypatch.setattr(kr, "resolve_update", lambda uid, state, reason="": resolved.append((uid, state, reason)) or True)
     return target, audit, resolved

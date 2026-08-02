@@ -1,0 +1,8 @@
+version: 1
+entity: HJRPROD
+terms:
+  - {term: "pod", aliases: ["the podcast"], type: project, canonical: "POD", canonical_name: "The HJR Podcast", source: seed}
+  - {term: "ff", aliases: ["falling forward"], type: project, canonical: "FF", canonical_name: "Falling Forward (book)", source: seed}
+  - {term: "watchtower", type: project, canonical: "HJRPROD-WATCHTOWER", canonical_name: "The Watchtower (film project, Watchtower Movie LLC)", source: seed}
+  - {term: "chk", aliases: ["chokehold"], type: project, canonical: "CHK", canonical_name: "Chokehold (future film)", source: seed}
+  - {term: "chb", aliases: ["clouthub"], type: project, canonical: "CHB", canonical_name: "CloutHub (legacy)", source: seed}

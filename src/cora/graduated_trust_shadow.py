@@ -83,7 +83,13 @@ DECISION_HARRISON = "harrison"            # Tier 2
 
 ALLOWLIST_CATEGORIES = frozenset(
     {"operational", "sop", "ownership", "contacts", "logistics", "addresses",
-     "product_inventory"}
+     "product_inventory",
+     # Lexicon Flywheel S4: shorthand->canonical terms by type. person and
+     # vendor are DELIBERATELY absent (people are identity-adjacent, vendors
+     # are money-adjacent) -> they can never clear Tier 0/1 and always land on
+     # Harrison. classify_tier itself is reused verbatim.
+     "lexicon_location", "lexicon_project", "lexicon_acronym",
+     "lexicon_channel", "lexicon_process", "lexicon_product"}
 )
 DENYLIST_CATEGORIES = frozenset(
     {"money", "contracts", "legal", "equity", "comp", "strategy"}
@@ -353,6 +359,12 @@ def claim_text(update: dict[str, Any]) -> str:
         parts = [str(payload.get("title") or ""), str(payload.get("recommendation") or "")]
         joined = " ".join(p for p in parts if p).strip()
         return joined or str(update.get("description") or "")
+    if utype == "lexicon":
+        term = str(payload.get("term") or "").strip()
+        if term:
+            return (f'"{term}" means {payload.get("canonical_name", "?")} '
+                    f'({payload.get("type", "?")}, {payload.get("entity", "?")})')
+        return str(update.get("description") or "")
     return (str(payload.get("text") or "") or str(payload.get("answer") or "")
             or str(update.get("description") or "")).strip()
 
@@ -370,6 +382,11 @@ def contributor_id(update: dict[str, Any]) -> str:
         return str(payload.get("answered_by") or "").strip()
     if utype == "generic":
         return str(payload.get("author_id") or "").strip()
+    if utype == "lexicon":
+        # Lane A carries the CONFIRMING teammate's Slack event id (unspoofable,
+        # F-23 stash key) -> Tier 0 reachable. Lane B is machine-mined and
+        # ships an empty contributor_id -> Tier 2 by construction.
+        return str(payload.get("contributor_id") or "").strip()
     return ""
 
 
@@ -471,7 +488,15 @@ def build_shadow_record(
     text = claim_text(update)
     entities = _entities_list(update)
     contributor = contributor_id(update)
-    category = categorize(text)
+    if utype == "lexicon":
+        # A lexicon item's category comes from its structured payload type
+        # ("lexicon_location", ..., "lexicon_person"), not the text regexes --
+        # person/vendor map to non-allowlisted categories so classify_tier
+        # (unchanged) routes them to Harrison via category_not_allowlisted.
+        ltype = str(payload.get("type") or "").strip().lower()
+        category = f"lexicon_{ltype}" if ltype else "other"
+    else:
+        category = categorize(text)
     verdict = (coras_read_verdict or "").strip().upper()
     if verdict not in _KNOWN_VERDICTS:
         verdict = ""  # normalize unknown / unavailable to ""

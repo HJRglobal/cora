@@ -1,0 +1,4 @@
+version: 1
+entity: F3C
+terms:
+  - {term: "the nonprofit", type: project, canonical: "F3C", canonical_name: "F3 Community (nonprofit arm)", source: seed}

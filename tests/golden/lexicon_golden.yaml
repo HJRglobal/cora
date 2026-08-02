@@ -1,0 +1,108 @@
+# Lexicon golden set (Lexicon Flywheel S7). Runs inside pytest FOREVER via
+# tests/test_lexicon_golden.py, and scripts/eval_lexicon.py reads it for the
+# baseline/post readout.
+#
+# expect semantics:
+#   exact      -> resolve() MUST return status=exact with the given canonical
+#   ask        -> MUST return status=ambiguous with EXACTLY the given candidate
+#                 canonicals (never a silent pick)
+#   suggestion -> MUST return status=suggestion (never exact/ambiguous)
+#   miss       -> MUST NOT resolve: status must be miss OR suggestion (a
+#                 suggestion is allowed because it never auto-applies)
+#
+# capture_cases run through lexicon_writer.apply_lexicon_update against tmp
+# stores in the harness: expect refused = (ok is False).
+version: 1
+resolve_cases:
+  # --- F3E seeds ---
+  - {id: f3e-bcb,          utterance: "bcb",                entity: F3E, expect: exact, canonical: BLUE-CHIP-BEVERAGE}
+  - {id: f3e-bluechip,     utterance: "Blue Chip",          entity: F3E, expect: exact, canonical: BLUE-CHIP-BEVERAGE}
+  - {id: f3e-bcb-punct,    utterance: "  BCB!! ",           entity: F3E, expect: exact, canonical: BLUE-CHIP-BEVERAGE}
+  - {id: f3e-nimbl,        utterance: "nimbl",              entity: F3E, expect: exact, canonical: NIMBL-3PL}
+  - {id: f3e-mood-run,     utterance: "the mood run",       entity: F3E, expect: exact, canonical: F3E-RUN2-MOOD}
+  - {id: f3e-run2,         utterance: "run 2",              entity: F3E, expect: exact, canonical: F3E-RUN2}
+  - {id: f3e-run2-hyphen,  utterance: "run-2",              entity: F3E, expect: exact, canonical: F3E-RUN2}
+  - {id: f3e-fbt,          utterance: "fbt",                entity: F3E, expect: exact, canonical: FBT}
+  - {id: f3e-wfs,          utterance: "wfs",                entity: F3E, expect: exact, canonical: WFS}
+  - {id: f3e-gmvmax,       utterance: "gmv max",            entity: F3E, expect: exact, canonical: TIKTOK-GMV-MAX}
+  - {id: f3e-nip,          utterance: "nip",                entity: F3E, expect: exact, canonical: SPROUTS-NIP}
+  - {id: f3e-wsh,          utterance: "wsh",                entity: F3E, expect: exact, canonical: WSH}
+  - {id: f3e-wpd,          utterance: "wpd",                entity: F3E, expect: exact, canonical: WPD}
+  - {id: f3e-vine,         utterance: "vine",               entity: F3E, expect: exact, canonical: AMAZON-VINE}
+  - {id: f3e-sku-alias,    utterance: "energy variety pack", entity: F3E, expect: exact, canonical: F3VPE4}
+  - {id: f3e-sku-alias2,   utterance: "pure variety",       entity: F3E, expect: exact, canonical: F3-PureE-V4F}
+  # MUST-ASK: the deliberate 3-way product ambiguity
+  - {id: f3e-variety-ask,  utterance: "variety pack",       entity: F3E, expect: ask, candidates: [F3VPE4, F3VPM4, F3-PureE-V4F]}
+  # --- OSN seeds ---
+  - {id: osn-gw,           utterance: "gilbert and warner", entity: OSN, expect: exact, canonical: OSNGW}
+  - {id: osn-gw-alias,     utterance: "gw store",           entity: OSN, expect: exact, canonical: OSNGW}
+  - {id: osn-gw-alias2,    utterance: "g warner",           entity: OSN, expect: exact, canonical: OSNGW}
+  - {id: osn-gm,           utterance: "gm store",           entity: OSN, expect: exact, canonical: OSNGM}
+  - {id: osn-gm-alias,     utterance: "mckellips",          entity: OSN, expect: exact, canonical: OSNGM}
+  - {id: osn-gf,           utterance: "greenfield",         entity: OSN, expect: exact, canonical: OSNGF}
+  - {id: osn-gf-alias,     utterance: "greenfield and 60",  entity: OSN, expect: exact, canonical: OSNGF}
+  - {id: osn-vv,           utterance: "val vista",          entity: OSN, expect: exact, canonical: OSNVV}
+  - {id: osn-franchisor,   utterance: "the franchisor",     entity: OSN, expect: exact, canonical: OSN-VENTURES}
+  - {id: osn-cbsns,        utterance: "cbs northstar",      entity: OSN, expect: exact, canonical: CBS-NORTHSTAR}
+  - {id: osn-dna,          utterance: "dna",                entity: OSN, expect: exact, canonical: DNA-ACCOUNT}
+  # MUST-ASK: the deliberate two-store ambiguity
+  - {id: osn-gilbert-ask,  utterance: "the gilbert store",  entity: OSN, expect: ask, candidates: [OSNGW, OSNGM]}
+  # --- LEX seeds (staff/ops terms; parent collapse from sub-entities) ---
+  - {id: lex-ddd,          utterance: "ddd",                entity: LEX, expect: exact, canonical: AZ-DDD}
+  - {id: lex-evv-sub,      utterance: "evv",                entity: LEX-LLC, expect: exact, canonical: EVV}
+  - {id: lex-ahcccs,       utterance: "ahcccs",             entity: LEX, expect: exact, canonical: AHCCCS}
+  - {id: lex-dump,         utterance: "the dump folder",    entity: LEX, expect: exact, canonical: LEX-DUMP-FOLDER}
+  # --- other entities ---
+  - {id: hjrp-ranch,       utterance: "the ranch",          entity: HJRP, expect: exact, canonical: HJRP-RR}
+  - {id: hjrp-ranch-sub,   utterance: "rogers ranch",       entity: HJRP-1337, expect: exact, canonical: HJRP-RR}
+  - {id: hjrp-vnb,         utterance: "vine and branches",  entity: HJRP, expect: exact, canonical: VINE-AND-BRANCHES}
+  - {id: ufl-ffn,          utterance: "ffn",                entity: UFL, expect: exact, canonical: UFL-FFN}
+  - {id: ufl-league,       utterance: "the league",         entity: UFL, expect: exact, canonical: UFL}
+  - {id: hjrprod-pod,      utterance: "the podcast",        entity: HJRPROD, expect: exact, canonical: POD}
+  - {id: hjrprod-chk,      utterance: "chokehold",          entity: HJRPROD, expect: exact, canonical: CHK}
+  - {id: bdm-bigd,         utterance: "big d",              entity: BDM, expect: exact, canonical: BDM}
+  - {id: f3c-nonprofit,    utterance: "the nonprofit",      entity: F3C, expect: exact, canonical: F3C}
+  # --- shared terms resolve in any entity scope ---
+  - {id: shared-holdco,    utterance: "the holdco",         entity: OSN, expect: exact, canonical: HJRG}
+  - {id: shared-visibility, utterance: "visibility",        entity: F3E, expect: exact, canonical: VISIBILITY-CPA}
+  - {id: shared-founderos, utterance: "founder os",         entity: HJRP, expect: exact, canonical: HJR-FOUNDER-OS}
+  # tom = the TOM acronym AND a person alias for Tommy Anderson: MUST ask.
+  - {id: shared-tom-ask,   utterance: "tom",                entity: F3E, expect: ask, candidates: [TOM, "Tommy Anderson"]}
+  # --- FNDR/HJRG aggregator union ---
+  - {id: fndr-union-bcb,   utterance: "bcb",                entity: FNDR, expect: exact, canonical: BLUE-CHIP-BEVERAGE}
+  - {id: fndr-union-ask,   utterance: "the gilbert store",  entity: FNDR, expect: ask, candidates: [OSNGW, OSNGM]}
+  - {id: hjrg-union-gw,    utterance: "gw store",           entity: HJRG, expect: exact, canonical: OSNGW}
+  # --- wrong-entity MUST-MISS (homonym isolation) ---
+  - {id: neg-vine-hjrp,    utterance: "vine",               entity: HJRP, expect: miss}
+  - {id: neg-vnb-f3e,      utterance: "vine and branches",  entity: F3E, expect: miss}
+  - {id: neg-gm-lex,       utterance: "gm store",           entity: LEX, expect: miss}
+  - {id: neg-bcb-osn,      utterance: "bcb",                entity: OSN, expect: miss}
+  - {id: neg-ranch-f3e,    utterance: "the ranch",          entity: F3E, expect: miss}
+  - {id: neg-scope-lts,    utterance: "gilbert and warner", entity: LEX-LTS, expect: miss}
+  # --- unknown terms MUST miss (at most a suggestion) ---
+  - {id: neg-unknown-1,    utterance: "zzqx flurble",       entity: F3E, expect: miss}
+  - {id: neg-unknown-2,    utterance: "the whatsit",        entity: OSN, expect: miss}
+  - {id: neg-unknown-ent,  utterance: "bcb",                entity: NOT-AN-ENTITY, expect: miss}
+  # --- fuzzy is SUGGESTION only, never a resolution ---
+  - {id: fuzzy-gw,         utterance: "gilbert warner",     entity: OSN, expect: suggestion}
+  - {id: fuzzy-bluechip,   utterance: "blu chip",           entity: F3E, expect: suggestion}
+capture_cases:
+  # LEX client-name-shaped payloads MUST be refused at capture (applier screen).
+  - id: cap-lex-client-billing
+    expect: refused
+    payload: {term: "bob's auth", type: process, entity: LEX, canonical: "X",
+              canonical_name: "Bob Smith's billing authorization is pending"}
+  - id: cap-lex-clinical
+    expect: refused
+    payload: {term: "the diagnosis note", type: process, entity: LEX, canonical: "X",
+              canonical_name: "Marcus Webb's seizure medication schedule"}
+  # A person canonical off the staff roster MUST be refused, not gated.
+  - id: cap-person-off-roster
+    expect: refused
+    payload: {term: "jm", type: person, entity: SHARED,
+              canonical: "Random Stranger", canonical_name: "Random Stranger"}
+  # A clean staff/ops term applies.
+  - id: cap-clean-ops-term
+    expect: applied
+    payload: {term: "the new dock", type: location, entity: OSN,
+              canonical: "OSN-DOCK", canonical_name: "OSN receiving dock (Gilbert)"}

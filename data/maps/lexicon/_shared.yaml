@@ -1,0 +1,7 @@
+version: 1
+entity: SHARED
+terms:
+  - {term: "the holdco", type: acronym, canonical: "HJRG", canonical_name: "HJR Global (holdco / shared services)", source: seed}
+  - {term: "visibility", type: vendor, canonical: "VISIBILITY-CPA", canonical_name: "Visibility CPA (external accounting firm; Justin/Hayden)", source: seed}
+  - {term: "founder os", type: process, canonical: "HJR-FOUNDER-OS", canonical_name: "HJR-Founder-OS Drive workspace (G:)", source: seed}
+  - {term: "tom", type: acronym, canonical: "TOM", canonical_name: "Top of Mind (founder CLAUDE.md dynamic section)", notes: "not the person Tommy", source: seed}

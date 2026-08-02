@@ -372,6 +372,10 @@ def _collect_wave1_conversion_metrics(
         # own dedicated session ships; kept here so the shape is stable for the
         # 2-week review from day one.
         "decision_staged": 0,
+        # Lexicon Flywheel (2026-08-01): mined = lane A/B proposals approved;
+        # taught = cora_lexicon_add teaches (incl. founder fast-path, which
+        # records an APPROVED row). Keys present from day one (stable shape).
+        "lexicon_mined": 0, "lexicon_taught": 0,
     }
     try:
         for path in (p["ledger_live"], p["ledger_archive"]):
@@ -390,9 +394,26 @@ def _collect_wave1_conversion_metrics(
                         conversions["known_answer_mined"] += 1
                 elif ut == "efficiency":
                     conversions["friction_efficiency"] += 1
+                elif ut == "lexicon":
+                    payload = rec.get("payload") or {}
+                    if (payload.get("lane") or "") == "taught":
+                        conversions["lexicon_taught"] += 1
+                    else:
+                        conversions["lexicon_mined"] += 1
         out["conversions_by_lane_7d"] = conversions
     except Exception:  # noqa: BLE001
         out["conversions_by_lane_7d"] = conversions
+
+    # Lexicon inflow + resolver telemetry, 7d (leading indicators; None = source
+    # unreadable, and the render line is suppressed -- never a fake zero).
+    try:
+        out["lexicon_candidates_7d"] = _lexicon_candidates_7d(cutoff)
+    except Exception:  # noqa: BLE001
+        out["lexicon_candidates_7d"] = None
+    try:
+        out["lexicon_resolver_7d"] = _lexicon_resolver_7d(cutoff)
+    except Exception:  # noqa: BLE001
+        out["lexicon_resolver_7d"] = None
 
     # Code-queue routing, 7d -- a SEPARATE denominator (routing-completeness),
     # never folded into the knowledge numerator above.
@@ -450,6 +471,40 @@ def _collect_wave1_conversion_metrics(
         out["quality_rejections_14d"] = None
 
     return out
+
+
+def _lexicon_candidates_7d(cutoff: datetime) -> int:
+    """Lexicon inflow gauge: NEW candidate rows (lane-B no-canonical ledger) +
+    NEW proposal fingerprints within the window."""
+    from .lexicon_mining import _candidates_path, _fingerprints_path
+    cutoff_epoch = cutoff.timestamp()
+    count = 0
+    for path, key in ((_candidates_path(), "seen_at"),
+                      (_fingerprints_path(), "proposed_at")):
+        for rec in _iter_jsonl(path):
+            try:
+                stamp = datetime.strptime(str(rec.get(key) or ""),
+                                          "%Y-%m-%dT%H:%M:%S")
+                if stamp.timestamp() >= cutoff_epoch:
+                    count += 1
+            except Exception:  # noqa: BLE001
+                continue
+    return count
+
+
+def _lexicon_resolver_7d(cutoff: datetime) -> dict:
+    """Resolver chokepoint telemetry counts by status within the window."""
+    from .lexicon import _log_path
+    cutoff_epoch = cutoff.timestamp()
+    counts = {"exact": 0, "ambiguous": 0, "suggestion": 0, "miss": 0,
+              "confirmed": 0}
+    for rec in _iter_jsonl(_log_path()):
+        if rec.get("ts", 0) < cutoff_epoch:
+            continue
+        status = str(rec.get("status") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
 
 
 def _resolved_ids_from(path: Path) -> set[str]:
@@ -539,6 +594,18 @@ def format_lines(metrics: dict) -> list[str]:
         lines.append(
             f"eligible-signal inflow, 7d: {metrics.get('eligible_signal_inflow_7d', '?')} "
             f"| knowledge conversions by lane, 7d: {conv_str}"
+        )
+    # Lexicon Flywheel: resolver traffic + candidate inflow (suppressed when
+    # the sources are unreadable -- Fork 5 rules: a quiet week renders zeros,
+    # never STARVED; a broken source renders nothing, never a fake zero).
+    lex_res = metrics.get("lexicon_resolver_7d")
+    lex_cand = metrics.get("lexicon_candidates_7d")
+    if lex_res is not None or lex_cand is not None:
+        res_str = (", ".join(f"{k}={v}" for k, v in lex_res.items())
+                   if lex_res is not None else "n/a")
+        lines.append(
+            f"lexicon, 7d: resolver [{res_str}] | candidate inflow: "
+            f"{lex_cand if lex_cand is not None else 'n/a'}"
         )
     cq_routed = metrics.get("code_queue_capability_routed_7d")
     if cq_routed is not None:

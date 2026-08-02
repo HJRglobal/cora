@@ -1,0 +1,17 @@
+version: 1
+entity: F3E
+terms:
+  - {term: "bcb", aliases: ["blue chip"], type: vendor, canonical: "BLUE-CHIP-BEVERAGE", canonical_name: "Blue Chip Beverage / Blue Chip Group LLC (co-packer, SLC UT)", source: seed}
+  - {term: "nimbl", type: vendor, canonical: "NIMBL-3PL", canonical_name: "Nimbl (3PL, Salt Lake City)", source: seed}
+  - {term: "the mood run", type: project, canonical: "F3E-RUN2-MOOD", canonical_name: "Production Run 2, Mood leg (July 2026)", source: seed}
+  - {term: "run 2", aliases: ["run-2"], type: project, canonical: "F3E-RUN2", canonical_name: "2026 Production Run 2 (Mood July + Energy August)", source: seed}
+  - {term: "fbt", type: acronym, canonical: "FBT", canonical_name: "Fulfilled by TikTok (TikTok Shop fulfillment)", source: seed}
+  - {term: "wfs", type: acronym, canonical: "WFS", canonical_name: "Walmart Fulfillment Services", source: seed}
+  - {term: "gmv max", type: process, canonical: "TIKTOK-GMV-MAX", canonical_name: "TikTok GMV Max campaign (Seller Center ads)", source: seed}
+  - {term: "nip", type: acronym, canonical: "SPROUTS-NIP", canonical_name: "Sprouts New Item Portal", source: seed}
+  - {term: "wsh", type: acronym, canonical: "WSH", canonical_name: "Wholesale Suite Helper app (Shopify wholesale pricing)", source: seed}
+  - {term: "wpd", type: acronym, canonical: "WPD", canonical_name: "WSH wholesale pricing/discount theme integration", source: seed}
+  - {term: "vine", type: process, canonical: "AMAZON-VINE", canonical_name: "Amazon Vine review program", notes: "homonym: HJRP 'Vine & Branches' is a former tenant", source: seed}
+  - {term: "variety pack", type: product, canonical: "F3VPE4", canonical_name: "F3 ENERGY Variety 12-pack (F3VPE4)", notes: "ambiguous with Mood/Pure entries below; resolver asks which line", source: seed}
+  - {term: "variety pack", type: product, canonical: "F3VPM4", canonical_name: "F3 MOOD Variety 12-pack (F3VPM4)", source: seed}
+  - {term: "variety pack", type: product, canonical: "F3-PureE-V4F", canonical_name: "F3 PURE Variety 12-pack (F3-PureE-V4F)", source: seed}

@@ -332,6 +332,46 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 log.warning("gap-executor: known_answer failed uid=%s: %s", uid_short, summary)
             _post_to_slack(slack_token, notify_ch, msg)
 
+        elif update_type == "lexicon":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from cora.lexicon_writer import apply_lexicon_update
+            ok, summary = apply_lexicon_update(payload)
+            term_short = (payload.get("term") or desc)[:120]
+            if ok:
+                msg = (
+                    f":book: *Gap executor* `[{uid_short}]` lexicon term approved "
+                    f"({summary}):\n> \"{term_short}\" -> "
+                    f"{(payload.get('canonical_name') or '')[:160]} "
+                    f"[{payload.get('type', '?')}, {payload.get('entity', '?')}]"
+                )
+                log.info("gap-executor: lexicon applied uid=%s", uid_short)
+                # Golden-set auto-growth (parity with known_answer): fail-soft,
+                # id-idempotent, fires only on ok=True (applier PHI screen passed).
+                try:
+                    from cora.golden_set import append_case_from_lexicon
+                    append_case_from_lexicon(payload)
+                except Exception:  # noqa: BLE001
+                    log.warning("golden-set auto-growth failed (non-fatal)",
+                                exc_info=True)
+            else:
+                success = False
+                msg = f":warning: *Gap executor* `[{uid_short}]` lexicon apply failed: {summary}"
+                log.warning("gap-executor: lexicon failed uid=%s: %s", uid_short, summary)
+            # Render screen at THIS egress (#hjrg-leadership is a multi-person
+            # channel; the read side never trusts write-side redaction -- D-051
+            # remediation F1). Fail-closed: a screen error also withholds.
+            try:
+                from cora.phi_guard import is_any_phi
+                if is_any_phi(msg):
+                    msg = (f":book: *Gap executor* `[{uid_short}]` lexicon item "
+                           f"{'applied' if ok else 'failed'} -- details withheld "
+                           f"(PHI-shaped); see the local executor log.")
+            except Exception:  # noqa: BLE001
+                msg = (f":book: *Gap executor* `[{uid_short}]` lexicon item "
+                       f"{'applied' if ok else 'failed'} -- details withheld "
+                       f"(screen unavailable).")
+            _post_to_slack(slack_token, notify_ch, msg)
+
         elif update_type == "efficiency":
             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
             from cora.friction_mining import apply_efficiency

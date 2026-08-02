@@ -224,6 +224,13 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # logs/cora-autowrite-audit.jsonl + data/state/code-session-queue*.jsonl.
     monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
     monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    # Lexicon flag: the live .env will carry CORA_LEXICON=resolve after rollout;
+    # pin every test to "off" (legacy behavior) -- a test that needs a level sets
+    # it explicitly. Telemetry path redirected to tmp as a belt (the writer is
+    # fail-soft per-call env-read, same class as the flags above).
+    monkeypatch.setenv("CORA_LEXICON", "off")
+    monkeypatch.setenv("LEXICON_RESOLUTIONS_PATH",
+                       str(tmp_path / "lexicon-resolutions.jsonl"))
     # Web-tools knobs are read per-call from the environment; a live .env flip
     # (CORA_WEB_TOOLS=off, a custom cap) would otherwise redden web_guard tests.
     # Delete them so every test starts from the code defaults (tools ON, cap 40).
@@ -307,6 +314,12 @@ _GUARDED_LEDGERS = (
     "data/state/fireflies-dedup-ledger.json",
     "data/state/meeting_action_watermark.json",
     "data/state/web-search-usage.jsonl",
+    # Lexicon Flywheel: the chokepoint telemetry ledger + the three files of
+    # record the review-rail writer may append to (writer tests must redirect
+    # via LEXICON_* env vars; a mutation here means a test escaped isolation).
+    "logs/lexicon-resolutions.jsonl",
+    "data/maps/f3e-sku-aliases.yaml",
+    "data/maps/user-aliases.yaml",
 )
 
 
@@ -339,6 +352,9 @@ def _guard_logs_untouched():
     # the Drive files are simply not guarded this session.
     guarded.extend(sorted((root / "design" / "known-answers").glob("*.md")))
     guarded.append(root / "design" / "known-answers" / ".resolved-gaps.jsonl")
+    # Lexicon stores: every data/maps/lexicon/*.yaml is a review-rail write
+    # target; a suite-run mutation means a writer test escaped its tmp redirect.
+    guarded.extend(sorted((root / "data" / "maps" / "lexicon").glob("*.yaml")))
     try:
         from cora import drive_io as _dio
         env_text = (root / ".env").read_text(encoding="utf-8", errors="replace")

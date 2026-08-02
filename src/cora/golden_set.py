@@ -145,6 +145,36 @@ def append_case_from_known_answer(payload: dict[str, Any]) -> bool:
         return False
 
 
+def append_case_from_lexicon(payload: dict[str, Any]) -> bool:
+    """Auto-grow from an approved lexicon term (Lexicon Flywheel S4): the case
+    asks what the shorthand refers to and expects the canonical name. Never
+    raises. LEX entities + PHI-shaped content are skipped by _screen (so LEX
+    staff terms never enter the eval corpus -- the corpus is LEX-clean by
+    invariant, see test_kb_evals)."""
+    try:
+        entity = (payload.get("entity") or "FNDR").strip().upper()
+        term = (payload.get("term") or "").strip()
+        canonical_name = (payload.get("canonical_name") or "").strip()
+        if not term or not canonical_name:
+            return False
+        reason = _screen([term, canonical_name], entity)
+        if reason:
+            log.info("golden_set: lexicon case skipped -- %s", reason)
+            return False
+        digest = hashlib.md5(
+            f"{term}|{payload.get('canonical') or ''}".encode("utf-8")).hexdigest()[:12]
+        return _append_case({
+            "id": f"auto-lex-{digest}",
+            "entity": entity,
+            "question": f'What does "{term}" refer to?'[:300],
+            "expect_substring": _normalize_snippet(canonical_name),
+            "source": "lexicon_approval",
+        })
+    except Exception:  # noqa: BLE001 -- executor safety
+        log.warning("golden_set: append_case_from_lexicon failed", exc_info=True)
+        return False
+
+
 def append_case_from_note(payload: dict[str, Any]) -> bool:
     """Auto-grow from an approved #info-for-cora / folded team note.
 

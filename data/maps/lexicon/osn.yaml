@@ -1,0 +1,12 @@
+version: 1
+entity: OSN
+terms:
+  - {term: "gilbert and warner", aliases: ["g warner", "gw store"], type: location, canonical: "OSNGW", canonical_name: "OSN Gilbert & Warner store (OSNGW)", source: seed}
+  - {term: "gilbert and mckellips", aliases: ["gm store", "mckellips"], type: location, canonical: "OSNGM", canonical_name: "OSN Gilbert & McKellips store (OSNGM)", source: seed}
+  - {term: "the gilbert store", type: location, canonical: "OSNGW", canonical_name: "OSN Gilbert & Warner store (OSNGW)", notes: "deliberately ambiguous; resolver asks", source: seed}
+  - {term: "the gilbert store", type: location, canonical: "OSNGM", canonical_name: "OSN Gilbert & McKellips store (OSNGM)", source: seed}
+  - {term: "greenfield", aliases: ["greenfield and 60"], type: location, canonical: "OSNGF", canonical_name: "OSN Greenfield & 60 store (OSNGF)", source: seed}
+  - {term: "val vista", aliases: ["val vista and pecos"], type: location, canonical: "OSNVV", canonical_name: "OSN Val Vista & Pecos store (OSNVV)", source: seed}
+  - {term: "the franchisor", type: vendor, canonical: "OSN-VENTURES", canonical_name: "OSN Ventures (franchisor; Jennie Kerry)", source: seed}
+  - {term: "cbsns", aliases: ["cbs northstar"], type: vendor, canonical: "CBS-NORTHSTAR", canonical_name: "CBS NorthStar (POS vendor)", source: seed}
+  - {term: "dna", type: vendor, canonical: "DNA-ACCOUNT", canonical_name: "DNA (OSN AR counterparty account)", source: seed}

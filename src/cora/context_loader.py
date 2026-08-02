@@ -480,6 +480,21 @@ def _build_static_context(entity: str, now: float) -> str:
     if dynamic:
         parts.append(f"{DYNAMIC_ANSWERS_SECTION_HEADER}\n\n" + dynamic)
 
+    # Company lexicon block (Lexicon Flywheel S3, flag-gated at CORA_LEXICON=full).
+    # Rides the SAME cached static block as known-answers; format_lexicon_context
+    # itself enforces the caps, the is_any_phi render screen, and the LEX GM-only
+    # rule (LEX sub-entity channels get NO block -- they keep scope-filtered
+    # programmatic resolution only). Fail-soft: a lexicon failure never costs the
+    # rest of the static context. LOCAL (repo) reads, unaffected by a G: outage.
+    try:
+        from . import lexicon as _lexicon
+        if _lexicon.lexicon_level() == "full":
+            lex_block = _lexicon.format_lexicon_context(entity)
+            if lex_block:
+                parts.append(lex_block)
+    except Exception:  # noqa: BLE001 -- ADDITIVE: no block on any failure
+        log.warning("lexicon context render failed (non-fatal)", exc_info=True)
+
     text = "\n\n---\n\n".join(parts)
     ka_mtime = _known_answers_mtime(entity)
     _cache[entity] = (text, now, ka_mtime)
