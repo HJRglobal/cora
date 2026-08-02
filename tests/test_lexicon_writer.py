@@ -292,7 +292,8 @@ class TestReviewRail:
         card = kr.format_single_item_dm(_update(_payload()))
         assert "Lexicon term" in card
         assert "`gw store` -> OSN Gilbert & Warner store (OSNGW)" in card
-        assert "[location, OSN]" in card
+        # Remediation F0: the load-bearing canonical is shown to the reviewer.
+        assert "[location, OSN, canonical: OSNGW]" in card
         assert "lane: mined" in card
 
     def test_card_renderer_withholds_phi_shaped_detail(self):
@@ -363,6 +364,71 @@ class TestAutowriteRevertRoundTrip:
                      canonical="Jennifer Mortensen",
                      canonical_name="Jennifer Mortensen"),
             stores["users"])
+
+    def test_f9_revert_refused_when_it_would_orphan_later_rows(
+            self, stores, monkeypatch, tmp_path):
+        """Reverting the header-carrying FIRST learned append after a SECOND
+        row landed must REFUSE (reparse guard) instead of corrupting the store
+        (remediation F9, HIGH)."""
+        monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "pending.jsonl")
+        monkeypatch.setattr(kr, "_ARCHIVE_PATH", tmp_path / "archive.jsonl")
+        monkeypatch.setattr(kr, "_AUTOWRITE_AUDIT_PATH", tmp_path / "audit.jsonl")
+        monkeypatch.setenv("GOLDEN_SET_AUTO_PATH", str(tmp_path / "golden.yaml"))
+        p1 = _payload(term="office original", type="product", entity="F3E",
+                      canonical="F3-Original", canonical_name="F3 Original 12-pack")
+        p2 = _payload(term="office energy", type="product", entity="F3E",
+                      canonical="F3VPE4", canonical_name="F3 Energy Variety")
+        for uid, pl in (("lex-f9-a", p1), ("lex-f9-b", p2)):
+            kr.propose_update(update_id=uid, update_type="lexicon",
+                              description="f9", payload=pl)
+            ok, summary = kr.apply_autowrite(
+                {"update_id": uid, "update_type": "lexicon", "payload": pl},
+                tier=0, reason="test", contributor="U1")
+            assert ok, summary
+        before = stores["sku"].read_text(encoding="utf-8")
+        outcome, msg = kr.process_autowrite_revert("lex-f9-a", self._HARRISON)
+        assert outcome == "content_changed", (outcome, msg)
+        assert stores["sku"].read_text(encoding="utf-8") == before  # untouched
+        # The SECOND (row-only) block still reverts cleanly.
+        outcome2, _ = kr.process_autowrite_revert("lex-f9-b", self._HARRISON)
+        assert outcome2 == "reverted"
+
+    def test_f11_lexicon_update_snapshot_scoped_to_routed_file(self, stores):
+        files = kr._autowrite_target_files(
+            {"update_type": "lexicon",
+             "payload": _payload(term="x", type="location", entity="OSN")})
+        assert files == [stores["dir"] / "osn.yaml"]
+        files = kr._autowrite_target_files(
+            {"update_type": "lexicon",
+             "payload": _payload(term="x", type="product", entity="F3E")})
+        assert files == [stores["sku"]]
+        files = kr._autowrite_target_files(
+            {"update_type": "lexicon",
+             "payload": _payload(term="x", type="person", entity="SHARED")})
+        assert files == [stores["users"]]
+
+    def test_f1_roster_refusal_never_echoes_the_name(self, stores):
+        ok, summary = lexicon_writer.apply_lexicon_update(_payload(
+            term="jm", type="person", entity="SHARED",
+            canonical="Randall Offroster", canonical_name="Randall Offroster"))
+        assert not ok
+        assert "Randall" not in summary and "Offroster" not in summary
+        assert "roster" in summary
+
+    def test_f3_combination_phi_refused(self, stores, monkeypatch):
+        """term + canonical_name PHI-shaped only in COMBINATION must refuse."""
+        import cora.lexicon_writer as lw
+        calls = []
+        def _screen(text):
+            calls.append(text)
+            return "billing authorization" in text and "smith's" in text.lower()
+        monkeypatch.setattr(lw, "_phi_screen",
+                            lw._phi_screen)  # keep real; probe via phi stub below
+        from cora import phi_guard
+        monkeypatch.setattr(phi_guard, "is_any_phi", _screen)
+        ok, summary = lexicon_writer.apply_lexicon_update(_payload(
+            term="Smith's folder", canonical_name="billing authorization tracker"))
+        assert not ok and "REFUSED" in summary
 
     def test_known_answers_targets_still_listed_first(self, stores, monkeypatch, tmp_path):
         """The _autowrite_target_files extension appends lexicon stores AFTER the

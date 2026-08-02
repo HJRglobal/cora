@@ -311,6 +311,22 @@ class TestRunContract:
         assert summary["already_proposed"] == 1
         assert summary["candidates"] == []
 
+    def test_f14_write_at_off_is_fully_inert(self, stores, monkeypatch):
+        """--write at CORA_LEXICON=off short-circuits before ANY lane work: no
+        corpus scan, no ledger writes (D-051 remediation F14)."""
+        monkeypatch.delenv("CORA_LEXICON", raising=False)
+        self._seed_lane_a(stores)
+        scanned = []
+        monkeypatch.setattr(lexicon_mining, "mine_lane_a",
+                            lambda **k: scanned.append("a") or [])
+        monkeypatch.setattr(lexicon_mining, "mine_lane_b",
+                            lambda **k: scanned.append("b") or ([], []))
+        summary = run_mining(dry_run=False, lane="both")
+        assert "fully inert" in summary["note"]
+        assert scanned == []  # lanes never ran
+        assert not (stores / "fingerprints.jsonl").exists()
+        assert not (stores / "candidates.jsonl").exists()
+
 
 # ── Doctrine guards ──────────────────────────────────────────────────────────
 

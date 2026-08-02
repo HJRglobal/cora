@@ -173,6 +173,23 @@ class TestInventoryProvenance:
             ])
             assert 'resolved from "energy variety pack"' in r
 
+    def test_f6_new_target_repreview_keeps_provenance_and_confirm_link(
+            self, monkeypatch, tmp_path):
+        """A 'yes, but make it N' confirm-turn re-preview keeps the lexicon
+        provenance line AND the confirm-capture link (D-051 remediation F6)."""
+        monkeypatch.setenv("CORA_LEXICON", "resolve")
+        log_path = tmp_path / "res.jsonl"
+        monkeypatch.setenv("LEXICON_RESOLUTIONS_PATH", str(log_path))
+        with ExitStack() as s:
+            _stub(s)
+            _preview(product="energy variety pack", location="office", quantity=203)
+            r = _confirm(quantity=210)  # new target -> re-preview, no write
+            assert 'resolved from "energy variety pack"' in r
+            r2 = _confirm()             # confirm the re-previewed target
+            assert r2.startswith("WRITE_CONFIRMED")
+        rows = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+        assert any(x.get("event") == "resolution_confirmed" for x in rows)
+
 
 class TestConfirmCapture:
     def test_executed_lexicon_write_logs_resolution_confirmed(self, monkeypatch, tmp_path):

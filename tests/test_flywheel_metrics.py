@@ -357,6 +357,28 @@ class TestWave1ConversionMetrics:
             "lexicon_mined": 0, "lexicon_taught": 0,
         }
 
+    def test_lexicon_conversions_split_taught_vs_mined(self, tmp_path, monkeypatch):
+        recent = NOW - timedelta(days=2)
+        _write_jsonl(tmp_path / "data" / "cora-proposed-memory-updates.jsonl", [
+            {"update_id": "lexicon-a", "update_type": "lexicon",
+             "state": "APPROVED", "resolved_at": recent.isoformat(),
+             "payload": {"lane": "taught"}},
+            {"update_id": "lexicon-b", "update_type": "lexicon",
+             "state": "APPROVED", "resolved_at": recent.isoformat(),
+             "payload": {"lane": "mined"}},
+            {"update_id": "lexicon-c", "update_type": "lexicon",
+             "state": "APPROVED", "resolved_at": recent.isoformat(),
+             "payload": {"lane": "resolver"}},   # lane A -> counts as mined
+            {"update_id": "lexicon-old", "update_type": "lexicon",
+             "state": "APPROVED",
+             "resolved_at": (NOW - timedelta(days=20)).isoformat(),
+             "payload": {"lane": "taught"}},     # outside window
+        ])
+        m = fm.collect(now=NOW, repo_root=tmp_path)
+        conv = m["conversions_by_lane_7d"]
+        assert conv["lexicon_taught"] == 1
+        assert conv["lexicon_mined"] == 2
+
     def test_code_queue_routings_tracked_separately_not_in_knowledge_numerator(
             self, tmp_path):
         recent = NOW - timedelta(days=2)

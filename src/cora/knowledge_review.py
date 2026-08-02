@@ -572,9 +572,12 @@ def _lexicon_card_detail(update: dict[str, Any]) -> str:
     entity, lane, evidence counts). Re-screened with is_any_phi at THIS egress
     (the read side never trusts write-side redaction); fail-closed withheld."""
     payload = update.get("payload") or {}
+    canonical = str(payload.get("canonical") or "")
+    canon_note = (f", canonical: {canonical}"
+                  if canonical and canonical != payload.get("canonical_name") else "")
     detail = (
         f"`{payload.get('term', '?')}` -> {payload.get('canonical_name', '?')} "
-        f"[{payload.get('type', '?')}, {payload.get('entity', '?')}] "
+        f"[{payload.get('type', '?')}, {payload.get('entity', '?')}{canon_note}] "
         f"(lane: {payload.get('lane', '?')}"
         + (f", evidence: {payload.get('evidence')}" if payload.get("evidence") else "")
         + ")"
@@ -1037,9 +1040,21 @@ def autowrite_level() -> str:
     return v if v in ("off", "tier0", "all") else "off"
 
 
-def _autowrite_target_files() -> list[Path]:
-    """The .md files an auto-write appends to (env-aware), snapshotted around an
-    apply so the revert payload is the exact inserted block."""
+def _autowrite_target_files(update: dict[str, Any] | None = None) -> list[Path]:
+    """The files an auto-write may append to (env-aware), snapshotted around an
+    apply so the revert payload is the exact inserted block.
+
+    When the update is a LEXICON item, the target is DETERMINISTIC (payload
+    type/entity routing) -- return just that one file so a concurrent write to
+    any other target inside the snapshot window can never be misattributed as
+    this apply's revert payload (D-051 remediation F11). Fail-soft to the full
+    set if the routing is unavailable."""
+    if (update or {}).get("update_type") == UPDATE_TYPE_LEXICON:
+        try:
+            from .lexicon_writer import target_path_for
+            return [target_path_for((update or {}).get("payload") or {})]
+        except Exception:  # noqa: BLE001
+            pass
     files: list[Path] = []
     try:
         from .gap_autofill import _known_answers_dir
@@ -1158,7 +1173,7 @@ def apply_autowrite(update: dict[str, Any], *, tier: int, reason: str,
     # but the invariant is load-bearing enough to state at this chokepoint too.
     if (update or {}).get("update_type") == UPDATE_TYPE_DECISION:
         return False, "decision_capture is never autowrite-eligible (by type)"
-    targets = _autowrite_target_files()
+    targets = _autowrite_target_files(update)
     before = _snapshot(targets)
     try:
         ok, summary = apply_knowledge_update(update)
@@ -1166,7 +1181,7 @@ def apply_autowrite(update: dict[str, Any], *, tier: int, reason: str,
         return False, f"apply failed: {exc}"
     if not ok:
         return ok, summary
-    after = _snapshot(_autowrite_target_files())
+    after = _snapshot(_autowrite_target_files(update))
     target_file = ""
     added: list[str] = []
     for path, aft in after.items():
@@ -1237,6 +1252,21 @@ def process_autowrite_revert(update_id: str, actor_id: str) -> tuple[str, str]:
                 return ("content_changed",
                         f"{Path(tf).name} was edited since the auto-write -- I could not find the "
                         "exact block to remove. Left it un-reverted; please remove it manually.")
+            # Post-revert reparse guard (lexicon D-051 remediation F9, HIGH): a
+            # block that CREATED a YAML section (learned:/learned_aliases:/a
+            # terms: re-open) may have later rows appended under it -- removing
+            # the header would orphan them and yaml.safe_load of the whole store
+            # would start failing (fail-soft loaders then blank the alias map).
+            # Refuse the revert instead of corrupting the file.
+            if tf.endswith((".yaml", ".yml")):
+                try:
+                    import yaml
+                    yaml.safe_load("\n".join(new_lines) + "\n")
+                except Exception:  # noqa: BLE001
+                    return ("content_changed",
+                            f"Reverting this block would leave {Path(tf).name} unparseable "
+                            "(a later entry depends on it). Left it un-reverted; remove the "
+                            "lines manually.")
             try:
                 p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
                 removed = len(added)

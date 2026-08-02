@@ -303,6 +303,19 @@ class TestTelemetry:
         row = json.loads((fixture_dir / "resolutions.jsonl").read_text(encoding="utf-8"))
         assert row["query_display"] == "some plain phrase"
 
+    def test_f2_phi_shaped_display_withheld_on_any_entity(self, fixture_dir):
+        """The at-rest screen keys on CONTENT, not the entity tag: PHI-shaped
+        text logged under HJRG (e.g. #hjr-finance cross-mailbox LEX billing
+        work) or an empty entity is withheld too (D-051 remediation F2)."""
+        for ent in ("HJRG", "F3E", ""):
+            lexicon.log_event(entity=ent, status="miss",
+                              query="Bob Smith's billing authorization follow-up",
+                              consumer="test")
+        rows = [json.loads(l) for l in
+                (fixture_dir / "resolutions.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert all(r["query_display"] == "[withheld]" for r in rows)
+        assert all(len(r["query_hash"]) == 64 for r in rows)
+
     def test_telemetry_failure_never_raises(self, fixture_dir, monkeypatch):
         blocker = fixture_dir / "blocker"
         blocker.write_text("a plain file where a directory must go", encoding="utf-8")

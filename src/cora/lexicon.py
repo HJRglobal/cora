@@ -472,18 +472,21 @@ def log_event(
     """Append one row to logs/lexicon-resolutions.jsonl. FAIL-SOFT: telemetry
     failure never breaks a reply (the _audit_shopify_write idiom).
 
-    PHI at rest: LEX-scoped rows persist the sha256 hash of the normalized
-    query plus a display form ONLY if it passes is_any_phi -- else the literal
-    "[withheld]" (pm_metrics / code-queue hashed-ledger doctrine).
+    PHI at rest: EVERY row's display form is screened with is_any_phi and
+    persists the literal "[withheld]" on a hit or a screen error -- not only
+    LEX-tagged rows, because PHI-shaped text legitimately flows under non-LEX
+    entity tags (a DM resolves to the asker's primary entity; #hjr-finance is
+    HJRG-scoped yet handles cross-mailbox LEX billing work -- D-051 remediation
+    F2). The sha256 hash is always persisted, so lane-A pairing still works.
     """
     try:
         ent = (entity or "").strip().upper()
         norm_q = norm_term(query)
         display = (query or "").strip()
-        if ent.startswith("LEX"):
+        if display:
             try:
                 from .phi_guard import is_any_phi
-                if display and is_any_phi(display):
+                if is_any_phi(display):
                     display = "[withheld]"
             except Exception:  # noqa: BLE001 -- fail closed on screen error
                 display = "[withheld]"

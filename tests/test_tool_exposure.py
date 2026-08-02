@@ -6,10 +6,21 @@ unrelated tools; aggregators + the founder see everything; sub-entities resolve
 to their parent; and the map never references a non-existent tool.
 """
 
+import pytest
+
 import cora.claude_client as cc
 import cora.tools.tool_dispatch as td
 
 ALL_NAMES = {t["name"] for t in td.TOOL_DEFINITIONS}
+
+
+@pytest.fixture(autouse=True)
+def _lexicon_full(monkeypatch):
+    """cora_lexicon_add is exposure-gated on CORA_LEXICON=full (D-051 F15) and
+    the suite-wide conftest pins the flag off. These tests assert the MAXIMUM
+    exposure surface, so pin full here; the hidden-below-full behavior has its
+    own pins in test_lexicon_teach.py::test_f15_tool_hidden_below_full."""
+    monkeypatch.setenv("CORA_LEXICON", "full")
 
 
 def _names(entity, cross_entity=False):

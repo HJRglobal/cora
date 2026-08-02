@@ -357,6 +357,19 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` lexicon apply failed: {summary}"
                 log.warning("gap-executor: lexicon failed uid=%s: %s", uid_short, summary)
+            # Render screen at THIS egress (#hjrg-leadership is a multi-person
+            # channel; the read side never trusts write-side redaction -- D-051
+            # remediation F1). Fail-closed: a screen error also withholds.
+            try:
+                from cora.phi_guard import is_any_phi
+                if is_any_phi(msg):
+                    msg = (f":book: *Gap executor* `[{uid_short}]` lexicon item "
+                           f"{'applied' if ok else 'failed'} -- details withheld "
+                           f"(PHI-shaped); see the local executor log.")
+            except Exception:  # noqa: BLE001
+                msg = (f":book: *Gap executor* `[{uid_short}]` lexicon item "
+                       f"{'applied' if ok else 'failed'} -- details withheld "
+                       f"(screen unavailable).")
             _post_to_slack(slack_token, notify_ch, msg)
 
         elif update_type == "efficiency":

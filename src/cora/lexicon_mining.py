@@ -573,9 +573,19 @@ def run_mining(
     embed_fn: Callable | None = None,
 ) -> dict[str, Any]:
     """One mining pass. dry_run writes NOTHING (no proposals, no ledgers).
-    With writes enabled: ledger-only candidates always persist; PROPOSALS are
-    additionally gated on CORA_LEXICON=full (at 'resolve' the run is
-    candidates-ledger-only by design -- the rollout brake)."""
+    With writes enabled: at CORA_LEXICON=off the run is FULLY INERT -- it
+    short-circuits before any lane work (no corpus scan, no embedding spend,
+    no ledger writes; D-051 remediation F14); at 'resolve' the candidates
+    ledger persists but PROPOSALS stay gated on 'full' (the rollout brake).
+    An explicit human dry-run still works at any level (writes nothing)."""
+    if not dry_run and lexicon.lexicon_level() == "off":
+        return {
+            "lane_a_candidates": 0, "lane_b_candidates": 0,
+            "lane_b_ledger_only": 0, "already_proposed": 0,
+            "capped_at": max_proposals, "proposed": 0, "dry_run": dry_run,
+            "lexicon_level": "off", "candidates": [],
+            "note": "CORA_LEXICON=off -- fully inert, nothing scanned or written",
+        }
     lane_a = mine_lane_a() if lane in ("a", "both") else []
     lane_b: list[LexCandidate] = []
     ledger_only: list[dict[str, Any]] = []

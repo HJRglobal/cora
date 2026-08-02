@@ -3993,6 +3993,17 @@ def _take_pending_lexicon_add(slack_user: str, channel: str) -> dict | None:
     return entry
 
 
+def _peek_pending_lexicon(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe for the confirm interceptor (D-051
+    remediation F4: a bare 'confirm' answering a lexicon teach preview must
+    never fire a staler Shopify/Asana write instead)."""
+    with _SHOPIFY_PENDING_LOCK:
+        entry = _PENDING_LEXICON_ADDS.get(_shopify_pending_key(slack_user, channel))
+    if entry and time.time() - entry.get("ts", 0) <= _LEXICON_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
 def _lexicon_slug(term: str) -> str:
     from ..lexicon import norm_term
     return "-".join(norm_term(term).replace("&", "and").split()).upper() or "TERM"
@@ -4045,7 +4056,8 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
             except Exception:  # noqa: BLE001
                 pass
             return (f"Saved to the {payload['entity']} lexicon: \"{payload['term']}\" = "
-                    f"{payload['canonical_name']} [{payload['type']}]. ({summary})")
+                    f"{payload['canonical_name']} [{payload['type']}, "
+                    f"canonical {payload['canonical']}]. ({summary})")
         # Teammate: Harrison-gated proposal with the teacher as contributor.
         try:
             from ..knowledge_review import propose_update
@@ -4076,24 +4088,42 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
         etype = "process"
     target_entity = str(input_data.get("entity") or entity or "").strip().upper()
     aliases = [str(a).strip() for a in (input_data.get("aliases") or []) if str(a).strip()]
+    canonical = str(input_data.get("canonical") or "").strip() or (
+        meaning if etype == "person" else _lexicon_slug(term))
+    # PHI screen covers EVERY field that can reach disk, incl. the canonical
+    # (D-051 remediation F0: the canonical was unscreened + invisible on every
+    # review surface) -- and the JOINED text, so a pair PHI-shaped only in
+    # combination is caught too (F3).
     try:
         from ..phi_guard import is_any_phi
-        if any(is_any_phi(t) for t in (term, meaning, *aliases)):
+        screened = (term, meaning, canonical, *aliases)
+        if any(is_any_phi(t) for t in screened) or is_any_phi(" ".join(screened)):
             return ("NOT SAVED. That looks like it references an individual's "
                     "health/billing/authorization status -- the lexicon holds "
                     "staff/ops terms only, never client information.")
     except Exception:  # noqa: BLE001 -- screen unavailable = refuse (fail closed)
         return "NOT SAVED. The content screen is unavailable -- I noted nothing."
     if etype == "person":
+        # Both the display meaning AND the canonical must be roster names
+        # (an explicit canonical param must not bypass the gate, F0).
         try:
             from ..lexicon_writer import _roster_names
-            if meaning.lower() not in _roster_names():
+            roster = _roster_names()
+            if not roster or meaning.lower() not in roster or canonical.lower() not in roster:
                 return (f"NOT SAVED. \"{meaning}\" isn't on the staff roster -- "
                         f"person shorthand can only point at a teammate.")
         except Exception:  # noqa: BLE001
             return "NOT SAVED. The staff roster is unavailable -- I noted nothing."
-    canonical = str(input_data.get("canonical") or "").strip() or (
-        meaning if etype == "person" else _lexicon_slug(term))
+    if etype == "product" and target_entity == "F3E":
+        # A product canonical must be a REAL SKU already in the alias map --
+        # never a fabricated slug or an unvalidated model echo (D-051 F5: a
+        # wrong canonical here would bind future inventory writes to a
+        # nonexistent or WRONG SKU).
+        known_skus = set(_load_sku_aliases()[0].values())
+        if canonical not in known_skus:
+            return (f"NOT SAVED. \"{canonical or term}\" isn't a SKU I know -- for a "
+                    f"product alias, give me the exact SKU (e.g. F3VPE4) and I'll "
+                    f"attach the shorthand to it.")
     payload = {
         "term": term, "aliases": aliases, "type": etype, "entity": target_entity,
         "canonical": canonical, "canonical_name": meaning, "lane": "taught",
@@ -4103,8 +4133,9 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
                                                         "ts": time.time()})
     gate_note = ("I'll save it" if slack_user_id == _HARRISON_SLACK_ID
                  else "I'll queue it for Harrison's review")
+    canon_note = f" (canonical: {canonical})" if canonical != meaning else ""
     return (f"NOT SAVED yet. Adding to the {target_entity} lexicon: \"{term}\" = "
-            f"{meaning} [{etype}]"
+            f"{meaning} [{etype}]{canon_note}"
             + (f" (aliases: {', '.join(aliases)})" if aliases else "")
             + f". @mention me and say \"confirm\" and {gate_note}.")
 
@@ -4240,12 +4271,17 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
         "inventory_item_id": item_id, "location_id": loc_id, "target_qty": new_qty,
         "preview_qty": live, "delta": None, "unit": unit,
         "variant_label": variant_label, "location_label": loc_name,
+        # Lexicon provenance + confirm-capture link survive a new-target
+        # re-preview (D-051 remediation F6) -- same server-resolved identity.
+        "resolved_from": pending.get("resolved_from") or "",
+        "lex": pending.get("lex"),
         "ts": time.time(),
     })
     log.info("f3e_shopify_set_inventory RE-PREVIEW(new target) user=%s item=%s loc=%s cur=%s -> %s",
              slack_user_id, item_id, loc_id, live, new_qty)
     return _shopify_write_blocked(_shopify_preview_text(
-        variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty, unit=unit))
+        variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty, unit=unit,
+        resolved_from=pending.get("resolved_from") or ""))
 
 
 def _short_block_reason(blocked: str) -> str:
@@ -4809,6 +4845,7 @@ def try_confirm_pending_write(
     asana = _peek_pending_asana(slack_user_id, channel_name)
     shopify = _peek_pending_shopify(slack_user_id, channel_name)
     calendar = _peek_pending_calendar(slack_user_id, channel_name)
+    lexadd = _peek_pending_lexicon(slack_user_id, channel_name)
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -4817,6 +4854,13 @@ def try_confirm_pending_write(
         entries.append((float(shopify.get("ts", 0)), "shopify", "set"))
     if calendar:
         entries.append((float(calendar.get("ts", 0)), "calendar", calendar.get("action")))
+    if lexadd:
+        # A fresh lexicon teach pending participates in the freshest-first
+        # arbitration but always DEFERS to the model (the calendar pattern) --
+        # so the user's 'confirm' answering the teach preview reaches
+        # cora_lexicon_add(confirmed=true) instead of firing a staler
+        # Shopify/Asana write (D-051 remediation F4, HIGH).
+        entries.append((float(lexadd.get("ts", 0)), "lexicon", "teach"))
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
         # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
@@ -4877,8 +4921,10 @@ def try_confirm_pending_write(
         log.info("confirm_interceptor ABANDON stale destructive asana user=%s action=%s (superseded)",
                  slack_user_id, asana.get("action"))
 
-    if kind == "calendar":
-        return None  # deferred to the model; never fire a staler write on a calendar confirm
+    if kind in ("calendar", "lexicon"):
+        # Deferred to the model; never fire a staler write on a confirm meant
+        # for a calendar booking or a lexicon teach.
+        return None
 
     intent = _confirm_intent(message, action)
     if intent is None:
@@ -8714,6 +8760,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Entity code the term belongs to (F3E/OSN/LEX/...). Defaults to the channel's entity. SHARED for org-wide terms.",
                 },
+                "canonical": {
+                    "type": "string",
+                    "description": "Canonical code/ID the term maps to, ONLY when the user stated one (a product alias REQUIRES the real SKU). Omit otherwise -- the tool derives it.",
+                },
                 "aliases": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -9296,11 +9346,27 @@ def tools_for_entity(entity: str, cross_entity: bool = False) -> list[dict]:
     # sets this env var. dispatch() carries the belt-and-braces refusal.
     if os.environ.get("CORA_EVAL_MODE") == "1":
         return []
+    # The lexicon teach tool is OFFERED only at CORA_LEXICON=full (D-051
+    # remediation F15): below full, teach-shaped phrasing must keep routing to
+    # cora_remember exactly as pre-branch -- a visible-but-refusing tool would
+    # be a behavior change while the feature is off. Read at call time; the bot
+    # snapshots .env, so the set is stable within a process (stable cache key).
+    hidden: frozenset[str] = frozenset()
+    if _lexicon_full_level() != "full":
+        hidden = frozenset({"cora_lexicon_add"})
     if cross_entity or entity in _FULL_ACCESS_ENTITIES:
-        return list(TOOL_DEFINITIONS)
+        return [t for t in TOOL_DEFINITIONS if t["name"] not in hidden]
     canon = _SUBENTITY_PARENT.get(entity, entity)
-    allowed = _GLOBAL_CORE_TOOLS | _ENTITY_TOOLS.get(canon, frozenset())
+    allowed = (_GLOBAL_CORE_TOOLS | _ENTITY_TOOLS.get(canon, frozenset())) - hidden
     return [t for t in TOOL_DEFINITIONS if t["name"] in allowed]
+
+
+def _lexicon_full_level() -> str:
+    try:
+        from .. import lexicon as _lexicon
+        return _lexicon.lexicon_level()
+    except Exception:  # noqa: BLE001 -- unavailable reads as off (hidden)
+        return "off"
 
 
 # Name -> callable. The callable takes (slack_user_id, entity, input_dict) and returns a string.

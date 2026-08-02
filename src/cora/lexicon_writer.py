@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,49 @@ log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WRITE_LOCK = threading.Lock()
+
+# Cross-PROCESS mutual exclusion (D-051 remediation F10): apply_lexicon_update
+# runs from BOTH the always-on bot (one-tap approve) and the 7am review script
+# (executor + autowrite drain). A threading lock cannot serialize those; two
+# concurrent read->validate->replace windows would silently drop one append
+# (last os.replace wins). O_CREAT|O_EXCL sentinel with a short retry; FAIL
+# CLOSED on timeout -- the item stays PENDING and retries at the next run.
+_LOCK_SENTINEL_TIMEOUT = 5.0
+_LOCK_STALE_SECONDS = 120.0
+
+
+class _StoreLock:
+    def __init__(self, lock_path: Path):
+        self._path = lock_path
+        self._acquired = False
+
+    def __enter__(self):
+        deadline = time.monotonic() + _LOCK_SENTINEL_TIMEOUT
+        while True:
+            try:
+                fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self._acquired = True
+                return self
+            except FileExistsError:
+                try:  # clear a stale sentinel (crashed holder)
+                    if time.time() - self._path.stat().st_mtime > _LOCK_STALE_SECONDS:
+                        self._path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("lexicon store lock busy")
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        if self._acquired:
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
 
 _WRITABLE_TYPES = frozenset(
     {"location", "project", "acronym", "vendor", "channel", "process", "product", "person"}
@@ -80,10 +124,14 @@ def _roster_names() -> set[str]:
 
 
 def _phi_screen(*texts: str) -> bool:
-    """True when ANY text is PHI-shaped OR the screen itself fails (fail-closed)."""
+    """True when ANY text is PHI-shaped OR the screen itself fails (fail-closed).
+    Also screens the JOINED text: a term/canonical_name pair that is PHI-shaped
+    only in combination (possessive name in one field, admin term in the other)
+    must not clear per-field checks (D-051 remediation F3)."""
     try:
         from .phi_guard import is_any_phi
-        return any(is_any_phi(t) for t in texts if t)
+        present = [t for t in texts if t]
+        return any(is_any_phi(t) for t in present) or is_any_phi(" ".join(present))
     except Exception:  # noqa: BLE001 -- an erroring screen refuses the write
         return True
 
@@ -275,9 +323,15 @@ def _append_person_alias(payload: dict[str, Any]) -> tuple[bool, str]:
     if not roster:
         return False, "staff roster unavailable -- person write refused (fail-closed)"
     if canonical.lower() not in roster:
-        return False, (f"person canonical {canonical!r} is not on the staff roster "
-                       f"-- REFUSED (roster validation; a non-staff name can never "
-                       f"become a lexicon canonical)")
+        # Structural refusal WITHOUT echoing the name: this summary rides Slack
+        # egress surfaces (#hjrg-leadership executor line) and the refused
+        # canonical is exactly the string the gate exists to contain (D-051
+        # remediation F1). The name stays in the local log only.
+        log.warning("lexicon_writer: person canonical not on roster -- refused "
+                    "(term=%r)", str(payload.get("term") or "")[:80])
+        return False, ("the proposed person canonical is not on the staff roster "
+                       "-- REFUSED (roster validation; a non-staff name can never "
+                       "become a lexicon canonical)")
     path = lexicon._user_aliases_path()
     if not path.exists():
         return False, "user-aliases.yaml missing -- refused"
@@ -316,6 +370,23 @@ def _append_person_alias(payload: dict[str, Any]) -> tuple[bool, str]:
 # ── Public executor ──────────────────────────────────────────────────────────
 
 
+def target_path_for(payload: dict[str, Any]) -> Path:
+    """The single file of record this payload routes to (deterministic). Used
+    by apply_autowrite to scope its before/after snapshot to the ONE file a
+    lexicon apply can touch (D-051 remediation F11: a full-target-set snapshot
+    misattributes the revert payload when a concurrent process changes an
+    earlier-sorted file inside the window)."""
+    etype = str((payload or {}).get("type") or "").strip().lower()
+    entity = str((payload or {}).get("entity") or "").strip().upper()
+    if etype == "person":
+        return lexicon._user_aliases_path()
+    if etype == "product" and entity == "F3E":
+        return lexicon._sku_aliases_path()
+    parent, _scope = lexicon._collapse_entity(entity)
+    fname = "_shared.yaml" if parent == "SHARED" else f"{parent.lower()}.yaml"
+    return lexicon._lexicon_dir() / fname
+
+
 def apply_lexicon_update(payload: dict[str, Any]) -> tuple[bool, str]:
     """Apply one approved lexicon proposal. Returns (ok, summary); never raises.
 
@@ -347,13 +418,18 @@ def apply_lexicon_update(payload: dict[str, Any]) -> tuple[bool, str]:
             return False, ("REFUSED: PHI-shaped content in a lexicon payload "
                            "(fail-closed applier screen)")
 
-        with _WRITE_LOCK:
-            if etype == "person":
-                ok, summary = _append_person_alias(payload)
-            elif etype == "product" and entity == "F3E":
-                ok, summary = _append_sku_alias(payload)
-            else:
-                ok, summary = _append_lexicon_term(payload)
+        lock_path = target_path_for(payload).with_suffix(".lock")
+        try:
+            with _WRITE_LOCK, _StoreLock(lock_path):
+                if etype == "person":
+                    ok, summary = _append_person_alias(payload)
+                elif etype == "product" and entity == "F3E":
+                    ok, summary = _append_sku_alias(payload)
+                else:
+                    ok, summary = _append_lexicon_term(payload)
+        except TimeoutError:
+            return False, ("lexicon store is busy (another writer holds the lock) "
+                           "-- left pending, retried at the next run")
         if ok:
             lexicon.invalidate_cache()
         return ok, summary

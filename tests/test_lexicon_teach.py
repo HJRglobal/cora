@@ -176,3 +176,89 @@ class TestPreviewRefusals:
         with patch.object(lw, "_roster_names", return_value={"jennifer mortensen"}):
             r = _call(term="jm", meaning="Jennifer Mortensen", type="person")
         assert r.startswith("NOT SAVED yet")
+
+    # ── D-051 remediation pins ────────────────────────────────────────────────
+
+    def test_f0_canonical_field_is_phi_screened(self, monkeypatch):
+        """The explicit canonical param goes through the phase-1 PHI screen --
+        a client-name canonical can never reach the stash (remediation F0)."""
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        r = _call(term="the gilbert house", meaning="LEX Gilbert group home",
+                  type="location", entity="LEX",
+                  canonical="Bob Smith's billing authorization")
+        assert r.startswith("NOT SAVED")
+        assert not _PENDING_LEXICON_ADDS
+
+    def test_f0_person_explicit_canonical_roster_checked(self, monkeypatch):
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        import cora.lexicon_writer as lw
+        with patch.object(lw, "_roster_names", return_value={"jennifer mortensen"}):
+            r = _call(term="jm", meaning="Jennifer Mortensen", type="person",
+                      canonical="Random Stranger")
+        assert r.startswith("NOT SAVED")
+        assert not _PENDING_LEXICON_ADDS
+
+    def test_f5_product_requires_a_real_sku(self, monkeypatch):
+        """A product teach must bind to an EXISTING SKU -- a fabricated slug or
+        hallucinated canonical is refused at preview (remediation F5)."""
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        r = _call(term="office fridge", meaning="F3 Pure 12-pack",
+                  type="product", entity="F3E")
+        assert r.startswith("NOT SAVED")
+        assert "isn't a SKU I know" in r
+        r2 = _call(term="office fridge", meaning="F3 ENERGY Variety 12-pack",
+                   type="product", entity="F3E", canonical="F3VPE4")
+        assert r2.startswith("NOT SAVED yet")
+        assert "canonical: F3VPE4" in r2  # rendered on the preview (F0)
+
+    def test_f4_interceptor_defers_when_lexicon_pending_is_freshest(self, monkeypatch):
+        """A bare 'confirm' answering a lexicon teach preview must NOT fire a
+        staler pending Shopify write (remediation F4, HIGH)."""
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        import time as _time
+        tool_dispatch._store_pending_shopify_write(_ALEX, _CHAN, {
+            "inventory_item_id": 1, "location_id": 2, "target_qty": 40,
+            "preview_qty": 30, "delta": None, "unit": "units",
+            "variant_label": "F3 PURE Original", "location_label": "office",
+            "ts": _time.time() - 300,
+        })
+        _call(term="the cage", meaning="the UFL octagon set")  # fresher stash
+        executed = []
+        monkeypatch.setattr(tool_dispatch, "_run_confirm_execute",
+                            lambda *a, **k: executed.append(a) or "WROTE")
+        out = tool_dispatch.try_confirm_pending_write(
+            slack_user_id=_ALEX, channel_name=_CHAN, entity="F3E", message="confirm")
+        assert out is None          # deferred to the model (calendar pattern)
+        assert executed == []       # the Shopify write did NOT fire
+        # And the Shopify pending is untouched for a later real confirm.
+        assert tool_dispatch.has_pending_shopify_write(_ALEX, _CHAN)
+
+    def test_f4_shopify_still_fires_when_it_is_freshest(self, monkeypatch):
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        import time as _time
+        _call(term="the cage", meaning="the UFL octagon set")
+        with tool_dispatch._SHOPIFY_PENDING_LOCK:
+            key = tool_dispatch._shopify_pending_key(_ALEX, _CHAN)
+            tool_dispatch._PENDING_LEXICON_ADDS[key]["ts"] = _time.time() - 300
+        tool_dispatch._store_pending_shopify_write(_ALEX, _CHAN, {
+            "inventory_item_id": 1, "location_id": 2, "target_qty": 40,
+            "preview_qty": 30, "delta": None, "unit": "units",
+            "variant_label": "F3 PURE Original", "location_label": "office",
+            "ts": _time.time(),
+        })
+        executed = []
+        monkeypatch.setattr(tool_dispatch, "_run_confirm_execute",
+                            lambda *a, **k: executed.append(a) or "WROTE")
+        out = tool_dispatch.try_confirm_pending_write(
+            slack_user_id=_ALEX, channel_name=_CHAN, entity="F3E", message="confirm")
+        assert out == "WROTE" and len(executed) == 1
+
+    def test_f15_tool_hidden_below_full(self, monkeypatch):
+        from cora.tools.tool_dispatch import tools_for_entity
+        monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+        for level, expected in (("off", False), ("resolve", False), ("full", True)):
+            monkeypatch.setenv("CORA_LEXICON", level)
+            names = {t["name"] for t in tools_for_entity("F3E")}
+            assert ("cora_lexicon_add" in names) is expected, level
+            names_full = {t["name"] for t in tools_for_entity("FNDR", cross_entity=True)}
+            assert ("cora_lexicon_add" in names_full) is expected, level
