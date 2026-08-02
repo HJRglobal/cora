@@ -2,12 +2,15 @@
 
 Exposes Cora's read-only(+1) MCP surface (`src/cora/mcp_server.py`, D-092) as NATIVE tools in
 every Cowork session, by having the Cowork desktop app spawn the stdio server on demand.
-Proven live 2026-07-30 (session-comms spike: all 6 tools connected + full kb_search round trip
+Proven live 2026-07-30 (session-comms spike: all tools connected + full kb_search round trip
 incl. OpenAI embed + PHI scrub, spawned host-side from the Windows venv).
 
-Tools (prefix `mcp__plugin_cora-tools_cora__`):
+Tools (7; prefix `mcp__plugin_cora-tools_cora__`):
 cora_kb_search · cora_decisions_search · cora_known_answers · cora_code_queue ·
-cora_health · cora_code_queue_seed (the ONE gated write — backlog only, never canon; D-011).
+cora_health · cora_delegated_jobs (delegated-work overview: ids/state/cost only, never
+titles/briefs) · cora_code_queue_seed (the ONE gated write — backlog only, never canon; D-011).
+Tools are discovered at runtime from `_TOOL_SPECS`, so a server-side tool addition needs NO
+plugin reinstall.
 
 ## Install / update
 1. Package (any Linux/WSL/sandbox shell with zip):

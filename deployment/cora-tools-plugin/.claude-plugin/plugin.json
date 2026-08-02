@@ -1,6 +1,6 @@
 {
   "name": "cora-tools",
   "version": "1.0.0",
-  "description": "Cora's read surface as native tools in every Cowork session: KB semantic search, decision-log search, known-answers, code-session backlog, health - served by the local D-092 stdio MCP server. Read-only + one gated code-queue seed write. Proven live 2026-07-30 (session-comms spike).",
+  "description": "Cora's read surface as native tools in every Cowork session: KB semantic search, decision-log search, known-answers, code-session backlog, delegated-work job status, health - served by the local D-092 stdio MCP server. Read-only + one gated code-queue seed write. Proven live 2026-07-30 (session-comms spike).",
   "author": { "name": "Harrison Rogers" }
 }

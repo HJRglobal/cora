@@ -487,7 +487,8 @@ def test_task_results_are_ttl_cached(monkeypatch):
 def test_spec_catalog_is_complete_and_described():
     names = {s["name"] for s in ss._SPECS}
     assert names == {"status.json", "code-queue.json", "flywheel.json",
-                     "known-answers-index.json", "revops-ledger.json"}
+                     "known-answers-index.json", "revops-ledger.json",
+                     "delegated-jobs.json"}
     for spec in ss._SPECS:
         assert spec["description"]
         assert isinstance(spec["cadence"], int)
@@ -518,6 +519,7 @@ def test_full_tick_with_real_specs(tmp_path, monkeypatch):
     results = ss.tick(force=True)
     assert set(results) == {"status.json", "code-queue.json", "flywheel.json",
                             "known-answers-index.json", "revops-ledger.json",
+                            "delegated-jobs.json",
                             "index.json"}
     assert all(v == "written" for v in results.values())
     d = ss._snapshot_dir()

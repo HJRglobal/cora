@@ -446,6 +446,35 @@ def code_queue_seed(
     }
 
 
+def delegated_jobs() -> dict[str, Any]:
+    """Delegated-work observability view (2026-08-01, Phase 1). Renders
+    job_id/archetype/entity/state/cost + MTD spend ONLY -- never title or brief
+    text (briefs typed in private channels must not surface on org-readable
+    mirrors; the _lex_safe_view never-trust-write-side lesson applied forward).
+    The suppression lives in delegated_work.jobs_summary() by construction."""
+    from cora import delegated_work
+
+    try:
+        summary = delegated_work.jobs_summary()
+    except Exception as exc:  # noqa: BLE001 -- observability never crashes the server
+        log.warning("MCP delegated_jobs failed: %s", exc)
+        return {"error": f"delegated-jobs view failed: {exc}", "text": ""}
+    lines = [
+        "# Delegated work (ids only -- titles/briefs never surface here)",
+        f"- level: {summary.get('level')}",
+        f"- open jobs: {summary.get('open_jobs')}",
+        f"- MTD est spend: ${summary.get('mtd_est_usd', 0):.2f} of "
+        f"${summary.get('monthly_cap_usd', 0):.2f}",
+        f"- counts: {summary.get('counts_by_state')}",
+    ]
+    for r in summary.get("recent", []):
+        lines.append(f"    - {r.get('job_id')} {r.get('archetype')} "
+                     f"[{r.get('entity')}] {r.get('state')} "
+                     f"${r.get('est_usd', 0):.2f}")
+    summary["text"] = "\n".join(lines)
+    return summary
+
+
 def health() -> dict[str, Any]:
     """Cora liveness snapshot — heartbeat age, uptime, and recent scheduled-task
     fire results. READ-ONLY: unlike the nightly health check, this NEVER restarts
@@ -702,6 +731,16 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         "fn": lambda a: health(),
+    },
+    {
+        "name": "cora_delegated_jobs",
+        "description": (
+            "Delegated-work job overview: counts by state, recent jobs (id/archetype/"
+            "entity/state/cost), and month-to-date estimated spend vs the envelope. "
+            "Read-only; job titles and briefs are never exposed on this surface."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "fn": lambda a: delegated_jobs(),
     },
 ]
 

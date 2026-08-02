@@ -168,6 +168,16 @@ def _render_flywheel() -> dict[str, Any]:
     return {"metrics": flywheel_metrics.collect()}
 
 
+def _render_delegated_jobs() -> dict[str, Any]:
+    """Delegated-work overview (2026-08-01, Phase 1) -- the SAME ids-not-titles
+    view the MCP cora_delegated_jobs tool serves (delegated_work.jobs_summary
+    suppresses titles/briefs by construction; briefs typed in private channels
+    must never surface on org-readable mirrors)."""
+    from cora import delegated_work
+
+    return {"summary": delegated_work.jobs_summary()}
+
+
 def _render_known_answers_index() -> dict[str, Any]:
     """entity -> known-answers file mtime/size — an INDEX only, never contents.
     LEX sub-entities are excluded, matching the MCP known_answers exposure rule
@@ -294,6 +304,13 @@ _SPECS: list[dict[str, Any]] = [
                         "bodies; Finance-Legal rows = counterparty + state only)"),
         "cadence": 300,
         "render": _render_revops_ledger,
+    },
+    {
+        "name": "delegated-jobs.json",
+        "description": ("delegated-work job overview (ids/archetype/entity/state/"
+                        "cost + MTD spend; titles and briefs never surface)"),
+        "cadence": 300,
+        "render": _render_delegated_jobs,
     },
 ]
 

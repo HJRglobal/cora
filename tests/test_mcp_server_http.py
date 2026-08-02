@@ -300,7 +300,7 @@ def test_http_lists_same_six_tools_as_stdio(monkeypatch):
     import cora.mcp_server as mcp_server
 
     stdio_names = {s["name"] for s in mcp_server._TOOL_SPECS}
-    assert len(stdio_names) == 6
+    assert len(stdio_names) == 7  # +cora_delegated_jobs (2026-08-01)
 
     with _make_client(monkeypatch, None) as client:
         r = client.post("/mcp", json=_LIST_TOOLS, headers=_HEADERS)
@@ -335,7 +335,7 @@ def test_stdio_entrypoint_unaffected():
 
     import cora.mcp_server as mcp_server
     importlib.reload(mcp_server)
-    assert len(mcp_server._TOOL_SPECS) == 6
+    assert len(mcp_server._TOOL_SPECS) == 7  # +cora_delegated_jobs (2026-08-01)
     srv = mcp_server.build_server()
     assert srv is not None
 

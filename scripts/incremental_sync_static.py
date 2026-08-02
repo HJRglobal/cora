@@ -124,6 +124,12 @@ def is_phi_path(path: Path) -> bool:
     return bool(parts_lower & PHI_BLACKLIST_SEGMENTS)
 
 
+def is_delegated_work_path(path: Path) -> bool:
+    """True when the file lives under an entity's `_delegated-work/` tree
+    (delegated-work artifacts -- AI-authored, tagged bot_authored at ingest)."""
+    return any(p.lower() == "_delegated-work" for p in path.parts)
+
+
 # is_swept_path now lives in cora.kb_exclusions (shared with migrate_static_md so a
 # third static walk can never drift). Imported above.
 
@@ -169,6 +175,19 @@ def file_to_document(path: Path) -> Document | None:
         else str(path)
     )
 
+    metadata: dict = {"path": rel_path, "size_bytes": stat.st_size}
+    # Delegated-work artifacts (2026-08-01, D-096 lesson): anything under an
+    # entity's _delegated-work/ tree is AI-authored output. Tag it
+    # bot_authored so the existing machinery applies for free -- the "not
+    # canon" retrieval label on every chunk (context_loader) and exclusion
+    # from gap/friction/reconciliation mining. Without this, an AI draft
+    # containing decision-shaped language could fuzzy-suppress a real
+    # uncaptured decision and delegated outputs would re-enter retrieval
+    # indistinguishable from canon (the self-poisoning class D-096 closed
+    # for Cora's own Slack replies).
+    if is_delegated_work_path(path):
+        metadata["bot_authored"] = True
+
     return Document(
         source="static_md",
         source_id=rel_path,
@@ -179,7 +198,7 @@ def file_to_document(path: Path) -> Document | None:
         author="",
         title=path.stem.replace("-", " ").replace("_", " ").title(),
         deep_link=f"computer://{path}",
-        metadata={"path": rel_path, "size_bytes": stat.st_size},
+        metadata=metadata,
     )
 
 

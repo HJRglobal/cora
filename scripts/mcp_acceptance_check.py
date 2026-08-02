@@ -40,6 +40,8 @@ async def _run() -> int:
             expected = {
                 "cora_kb_search", "cora_decisions_search", "cora_known_answers",
                 "cora_code_queue", "cora_health",
+                # Delegated-work observability (2026-08-01): ids/state/cost only.
+                "cora_delegated_jobs",
                 # Listed but deliberately NOT called below: it is the surface's one
                 # gated WRITE tool and an acceptance check must never write.
                 "cora_code_queue_seed",
@@ -54,6 +56,7 @@ async def _run() -> int:
                 ("cora_decisions_search", {"query": "QBO primary financial source", "limit": 3}),
                 ("cora_known_answers", {"entity": "F3E"}),
                 ("cora_code_queue", {}),
+                ("cora_delegated_jobs", {}),
             ]
             for name, args in checks:
                 r = await session.call_tool(name, args)

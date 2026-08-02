@@ -126,6 +126,7 @@ def test_exactly_one_write_tool_is_exposed():
     assert names == {
         "cora_kb_search", "cora_decisions_search", "cora_known_answers",
         "cora_code_queue", "cora_code_queue_seed", "cora_health",
+        "cora_delegated_jobs",  # 2026-08-01: read-only ids/state/cost view
     }
     forbidden = ("create", "update", "delete", "set", "write", "upsert", "remove", "add")
     read_only_names = names - {"cora_code_queue_seed"}
@@ -441,7 +442,7 @@ def test_build_server_ok():
     pytest.importorskip("mcp")
     srv = mcp_server.build_server()
     assert srv is not None
-    assert len(mcp_server._TOOL_SPECS) == 6
+    assert len(mcp_server._TOOL_SPECS) == 7  # +cora_delegated_jobs (2026-08-01)
 
 
 # ── K. cora_code_queue_seed — the ONE write tool ─────────────────────────────
