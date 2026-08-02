@@ -3881,12 +3881,25 @@ def _store_pending_ask(slack_user: str, channel: str, entry: dict) -> None:
         _PENDING_ASK_STASH[_ask_stash_key(slack_user, channel)] = entry
 
 
-def _take_pending_ask(slack_user: str, channel: str) -> dict | None:
+def _take_pending_ask(slack_user: str, channel: str, *, expected_ask_id: str | None = None) -> dict | None:
+    """Pop-and-return the (user, channel) ask slot. When `expected_ask_id` is
+    given (the button-tap path), the id-match check runs INSIDE the same lock
+    as the pop -- so a STALE tap (an older ask overwritten by a newer one in
+    this single-slot store) can only ever detect the mismatch and return None,
+    NEVER destroy the newer ask that's actually there (D-051 adversarial
+    review finding: the old unconditional pop-then-check-after let a stale
+    tap silently clobber a DIFFERENT, still-valid, never-tapped ask -- mirrors
+    the fix already applied to _claim_stash_by_id for the confirm/cancel
+    stashes). Omit `expected_ask_id` only for callers that already hold no
+    other claim to protect (none remain after this fix)."""
     key = _ask_stash_key(slack_user, channel)
     with _ASK_STASH_LOCK:
-        entry = _PENDING_ASK_STASH.pop(key, None)
-    if not entry:
-        return None
+        entry = _PENDING_ASK_STASH.get(key)
+        if not entry:
+            return None
+        if expected_ask_id is not None and entry.get("ask_id") != expected_ask_id:
+            return None
+        _PENDING_ASK_STASH.pop(key, None)
     if (time.time() - float(entry.get("ts", 0))) > _ASK_STASH_TTL_SECONDS:
         return None
     return entry
@@ -3952,13 +3965,17 @@ def resolve_shopify_ask_pick(
         return "unauthorized", idx["user"], None
     channel = idx["channel"]
 
-    # Atomic claim: pop under the SAME lock the peek uses, then verify the
-    # popped entry's OWN ask_id still matches the tapped one (a newer ask in
-    # this (user, channel) slot would have overwritten it -- superseded).
-    claimed = _take_pending_ask(tapping_user_id, channel)
-    confirm_cards.ask_index_release(ask_id)
-    if claimed is None or claimed.get("ask_id") != ask_id:
+    # Atomic claim: the id-match check runs INSIDE _take_pending_ask's lock
+    # (expected_ask_id), so a stale tap can only ever fail to match -- it can
+    # never pop and destroy a DIFFERENT, newer ask that overwrote this slot
+    # (D-051 review fix; mirrors _claim_stash_by_id's check-before-pop order).
+    claimed = _take_pending_ask(tapping_user_id, channel, expected_ask_id=ask_id)
+    if claimed is None:
+        # Either truly gone (already answered/expired) or a newer ask is
+        # sitting in the slot untouched -- either way, honest 'superseded'
+        # without ever having touched whatever IS currently there.
         return "superseded", None, None
+    confirm_cards.ask_index_release(ask_id)
 
     candidate = next((c for c in claimed["candidates"] if c[0] == candidate_key), None)
     if candidate is None:
@@ -4457,8 +4474,17 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         target = live + int(delta)
         if target < 0:
             # Keep preview_qty STALE (do not advance to live) so the next confirm still
-            # re-runs this guard; never leave a writable stale target behind.
-            _store_pending_shopify_write(slack_user_id, channel, {**pending, "ts": time.time()})
+            # re-runs this guard; never leave a writable stale target behind. A FRESH
+            # stash_id (D-051 review, confirm-buttons): the OLD id was just claimed +
+            # marked resolved by the button-tap path (or is about to be popped by the
+            # typed path) -- reusing it here would re-stash an entry no button could
+            # ever reach again (permanently 'already_handled' via the confirm_cards
+            # index), even though the typed path (which never checks that index) could
+            # still find it. Minting fresh keeps both paths working identically.
+            _store_pending_shopify_write(slack_user_id, channel, {
+                **pending, "ts": time.time(),
+                "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
+            })
             return _shopify_write_blocked(
                 f"{_NOT_WRITTEN}\n{variant_label} at {loc_name} has {live} {unit} now; removing "
                 f"{abs(int(delta))} would go below zero. The most I can remove is {live}.")
@@ -5100,9 +5126,13 @@ def try_confirm_pending_write(
     Safety invariants from the D-051 review:
     - A DESTRUCTIVE Asana pending (delete/complete) is IMMEDIATE-CONFIRM-ONLY: it fires
       only when it is the freshest pending AND this message is a clear affirmative for it.
-      In every other case (a content message, a negative, or a fresher write superseding
-      it) it is ABANDONED, so a later stray "yes"/"ok thanks" can never fire a stale
-      permanent delete (review HIGH #1).
+      An explicit negative, a genuine QUESTION ("?" in the message), or a fresher write
+      superseding it ABANDONS it, so a later stray "yes"/"ok thanks" can never fire a
+      stale permanent delete (review HIGH #1). A message that merely fails
+      _confirm_intent's narrow vocabulary/token-count classification WITHOUT being a
+      question leaves the pending intact instead (cq-2af049327848 fix, 2026-08-02) --
+      matching every other kind's "ambiguous -> pending intact" contract; bounded by the
+      unchanged 10-min TTL, same as create/Shopify/delegated already were.
     - If the freshest pending is CALENDAR, return None (defer to the model) so a staler
       Asana/Shopify write is never fired on a calendar-meant affirmative (review HIGH #2).
 
@@ -6146,7 +6176,20 @@ def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str
         return "No note of yours matches that id -- nothing was deleted."
 
     resolved_id = match["note_id"]
-    excerpt = (match.get("content") or "").strip().replace("\n", " ")[:120]
+    # D-051 adversarial review finding (MEDIUM): every OTHER staged-write
+    # preview in this file scrubs LEX-scoped content before it can ever reach
+    # a Slack message or a card (_lex_safe_label / _scrub_lex_write_content on
+    # Asana, the PHI gate on cora_remember) -- this NEW excerpt had no
+    # equivalent floor. A LEX-scoped personal note may hold exactly the class
+    # of client billing/authorization content those screens exist to protect;
+    # omit the excerpt for a LEX-scoped note rather than attempt to scrub free
+    # personal-note prose with a scrubber built for Asana task fields. The
+    # note is still confirmable/deletable -- just without a content preview.
+    note_entity = str(match.get("entity") or "").strip().upper()
+    if note_entity.startswith("LEX"):
+        excerpt = ""
+    else:
+        excerpt = (match.get("content") or "").strip().replace("\n", " ")[:120]
     _store_pending_forget_note(slack_user_id, channel, {
         "note_id": resolved_id, "ts": time.time(),
         "stash_id": confirm_cards.mint_stash_id("forget_note", slack_user_id, channel),
@@ -10286,19 +10329,49 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
     if action == "cancel":
         return {"outcome": "cancelled"}
 
-    from ..entity_router import route
-    entity = route(channel)
     try:
+        # The whole post-claim block (not just the execute call) is guarded:
+        # a crash ANYWHERE here (route(), execute, the post-execute freshness
+        # peek) must never propagate out of the Slack action receiver -- there
+        # is no @app.error handler registered anywhere in this codebase, so an
+        # uncaught exception here would surface as a raw Bolt-level error with
+        # the claim already popped and index-resolved (D-051 review defense-
+        # in-depth; none of the wrapped calls are known to raise today, but
+        # the claim's one-shot guarantee must hold regardless).
+        from ..entity_router import route
+        entity = route(channel)
         raw = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
+
+        # D-051 adversarial review finding (HIGH): some kinds' execute can
+        # itself decline to write and re-stash a FRESH preview instead
+        # (Shopify's live-inventory drift / floor-guard re-check, the only
+        # kind that can currently do this) -- that is NOT a completed write,
+        # and falsely labeling it "executed" would drop this card's buttons
+        # while a live, un-carded pending sits underneath with no way to act
+        # on it via a button (the typed path would still find it, but the
+        # card would visibly claim this is over). Detect it generically
+        # (works for any kind, not just Shopify, and doesn't depend on
+        # guessing from a WRITE_BLOCKED/WRITE_CONFIRMED text prefix): if a
+        # FRESH stash_id now exists for this exact (kind, user, channel) slot
+        # -- different from the one just claimed -- surface it so the caller
+        # can post a new Confirm/Cancel card, mirroring exactly what the
+        # ambiguity-picker hand-off (resolve_shopify_ask_pick) already does.
+        spec = _stash_kind_specs().get(kind)
+        fresh_entry = spec["peek"](user, channel) if spec else None
+        fresh_stash_id = (fresh_entry or {}).get("stash_id")
+        clean_message = _strip_write_sentinel(raw)
     except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
         log.exception("confirm-button execute crashed AFTER claim kind=%s user=%s",
                       kind, tapping_user_id)
         return {"outcome": "indeterminate"}
+
+    if fresh_stash_id and fresh_stash_id != stash_id:
+        return {"outcome": "re_previewed", "message": clean_message, "stash_id": fresh_stash_id}
     # Sentinel-strip here (not in app.py): the button path never posts a raw
     # WRITE_CONFIRMED/WRITE_BLOCKED-prefixed string -- app.py gets clean,
     # already-postable text, matching what the typed-confirm interceptor does
     # via _strip_write_sentinel.
-    return {"outcome": "executed", "message": _strip_write_sentinel(raw)}
+    return {"outcome": "executed", "message": clean_message}
 
 
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio

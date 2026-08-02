@@ -93,6 +93,37 @@ class TestVariantAmbiguityStashesAsk:
         assert pending["loc_name"] == _OFFICE
         assert pending["quantity"] == 250
 
+    def test_stale_ask_tap_never_destroys_a_newer_ask_in_the_same_slot(self):
+        # D-051 adversarial review finding: the ask-stash used to pop the
+        # (user, channel) slot UNCONDITIONALLY, checking the ask_id match only
+        # AFTER the pop -- so a stale tap on an OLD ask (AID1) would silently
+        # destroy a DIFFERENT, never-tapped, still-valid ask (AID2) that had
+        # since overwritten the single slot, and AID2's own later tap would
+        # then falsely read "superseded" too. Fixed by checking the id match
+        # INSIDE the same lock as the pop (mirrors _claim_stash_by_id).
+        with ExitStack() as s:
+            _stub(s, variants=_variants(2))
+            _preview(product="pure original")  # AID1
+        aid1 = td._peek_pending_ask(_HARRISON, _CHAN)["ask_id"]
+        with ExitStack() as s:
+            _stub(s, variants=_variants(3))
+            _preview(product="different product")  # AID2 overwrites the slot
+        aid2 = td._peek_pending_ask(_HARRISON, _CHAN)["ask_id"]
+        assert aid1 != aid2
+
+        # Stale tap on AID1: honest superseded, AID2 untouched.
+        outcome1, _msg1, _sid1 = td.resolve_shopify_ask_pick(aid1, _HARRISON, "0")
+        assert outcome1 == "superseded"
+        still_there = td._peek_pending_ask(_HARRISON, _CHAN)
+        assert still_there is not None and still_there["ask_id"] == aid2
+
+        # AID2's own (first, legitimate) tap must still work normally.
+        with patch.object(shopify_client, "get_inventory_level", return_value=50):
+            outcome2, msg2, sid2 = td.resolve_shopify_ask_pick(aid2, _HARRISON, "0")
+        assert outcome2 == "preview"
+        assert sid2 is not None
+        assert "Variant 0" in msg2
+
     def test_pick_end_to_end_from_a_real_stash_executes_correctly(self):
         # Full chain: real _shopify_resolve ambiguity -> real ask_stash ->
         # resolve_shopify_ask_pick -> a fresh, executable Shopify confirm stash.

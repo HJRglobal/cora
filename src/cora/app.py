@@ -3319,6 +3319,19 @@ def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: l
                     channel_id, message_ts, exc_info=True)
 
 
+def _post_followup_confirm_card(client, channel_id: str, text: str, stash_id: str) -> None:
+    """Post a NEW Confirm/Cancel card for a freshly-minted stash_id. Shared by
+    the picker's pick -> preview hand-off AND a confirm-tap whose own execute
+    declined to write and re-stashed a fresh preview instead (D-051 review:
+    both cases need the SAME "a fresh stash appeared, give it a card" step)."""
+    blocks = confirm_cards.build_confirm_blocks(text, stash_id)
+    try:
+        client.chat_postMessage(channel=channel_id, text=text, blocks=blocks)
+    except Exception:  # noqa: BLE001
+        log.warning("confirm-button follow-up card post failed (non-fatal) channel=%s",
+                    channel_id, exc_info=True)
+
+
 def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     """Shared Confirm/Cancel tap handler for all 9 stash kinds (S2, design
     2026-08-02). Requester-only, atomic claim, honest terminal states for
@@ -3369,6 +3382,20 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
                       "restarted) -- ask again if you still want this."))
         except Exception:  # noqa: BLE001
             pass
+        return
+
+    if outcome == "re_previewed":
+        # The claim succeeded but execute itself declined to write and
+        # re-stashed a FRESH preview instead (e.g. Shopify live-inventory
+        # drift/floor-guard detected between preview and confirm) -- close
+        # THIS card honestly, then post a NEW Confirm/Cancel card for the
+        # fresh stash so the user isn't left with a dead-looking card and an
+        # un-actionable pending underneath it (D-051 review finding).
+        text = result.get("message") or "The count moved -- here's an updated preview."
+        _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
+        fresh_stash_id = result.get("stash_id")
+        if fresh_stash_id:
+            _post_followup_confirm_card(client, channel_id, text, fresh_stash_id)
         return
 
     if outcome == "already_handled":
@@ -3459,15 +3486,19 @@ def _handle_pick_tap(body: dict, client) -> None:
         return
 
     # outcome == "preview": close the picker card, then post the fresh
-    # preview as ITS OWN Confirm/Cancel card (pick -> preview -> confirm).
+    # preview as ITS OWN Confirm/Cancel card (pick -> preview -> confirm). A
+    # refusal from the resolution tail (e.g. "not stocked here anymore") has
+    # no stash_id -- nothing to confirm -- so it posts as plain text instead.
     _edit_card_terminal(client, channel_id, message_ts, orig_blocks, "Picked.")
     clean_text = message or ""
-    blocks = confirm_cards.build_confirm_blocks(clean_text, stash_id) if stash_id else None
-    try:
-        client.chat_postMessage(channel=channel_id, text=clean_text, blocks=blocks)
-    except Exception:  # noqa: BLE001
-        log.warning("picker follow-up preview post failed (non-fatal) channel=%s",
-                    channel_id, exc_info=True)
+    if stash_id:
+        _post_followup_confirm_card(client, channel_id, clean_text, stash_id)
+    else:
+        try:
+            client.chat_postMessage(channel=channel_id, text=clean_text)
+        except Exception:  # noqa: BLE001
+            log.warning("picker follow-up text post failed (non-fatal) channel=%s",
+                        channel_id, exc_info=True)
 
 
 @app.action(confirm_cards.ACTION_PICK)

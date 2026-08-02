@@ -144,6 +144,37 @@ class TestConfirmTap:
         # The stash is UNTOUCHED -- the typed path must still work after this.
         assert td._peek_pending_asana(HARRISON, _CH) is not None
 
+    def test_drift_repreview_closes_old_card_and_posts_fresh_confirm_card(self):
+        # D-051 review fix: a confirm tap whose execute re-stashed a fresh
+        # preview (Shopify drift) must close the OLD card honestly AND post a
+        # NEW Confirm/Cancel card -- never leave a live pending un-carded.
+        sid = cc.mint_stash_id("shopify", HARRISON, _CH)
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "inventory_item_id": "i1", "location_id": "l1", "target_qty": 10,
+            "preview_qty": 8, "delta": 2, "unit": "units", "variant_label": "Pure",
+            "location_label": "Office", "resolved_from": "", "lex": None,
+            "ts": time.time(), "stash_id": sid,
+        })
+        fake = _FakeClient()
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=99), \
+             patch.object(td.shopify_client, "set_inventory_level") as mock_set, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            capp._handle_confirm_tap(_confirm_body(HARRISON, sid, cc.ACTION_CONFIRM),
+                                     fake, action="confirm")
+        mock_set.assert_not_called()
+        # Old card closed (terminal, no buttons).
+        assert len(fake.updated) == 1
+        assert all(b.get("type") != "actions" for b in fake.updated[0]["blocks"])
+        # A FRESH Confirm/Cancel card posted for the re-preview.
+        assert len(fake.posted) == 1
+        posted_blocks = fake.posted[0]["blocks"]
+        actions_block = next(b for b in posted_blocks if b["type"] == "actions")
+        action_ids = {el["action_id"] for el in actions_block["elements"]}
+        assert action_ids == {cc.ACTION_CONFIRM, cc.ACTION_CANCEL}
+        new_stash_id = actions_block["elements"][0]["value"]
+        assert new_stash_id != sid
+        assert td._peek_pending_shopify(HARRISON, _CH)["stash_id"] == new_stash_id
+
     def test_indeterminate_shows_check_instruction(self):
         sid = _stash_asana_delete()
         fake = _FakeClient()

@@ -534,6 +534,22 @@ class TestTools:
         out = td._tool_cora_forget_note(OWNER, "F3E", {"confirmed": True})
         assert "NOT DELETED" in out
 
+    def test_forget_preview_omits_excerpt_for_lex_scoped_note(self, td, kb):
+        # D-051 review: a LEX-scoped note's content must never appear in the
+        # forget-note preview (no scrub exists for free personal-note prose,
+        # so omit rather than risk an unscrubbed PHI-shaped excerpt).
+        note_id = _save(kb, text="Bob Smith's billing authorization is pending",
+                        owner=OWNER, entity="LEX-LLC")
+        out = td._tool_cora_forget_note(OWNER, "LEX-LLC", {"note_id": note_id})
+        assert "Bob Smith" not in out
+        assert "billing authorization" not in out
+        assert "confirm" in out.lower()
+
+    def test_forget_preview_keeps_excerpt_for_non_lex_note(self, td, kb):
+        note_id = _save(kb, text="the wifi password is alpha123", owner=OWNER, entity="F3E")
+        out = td._tool_cora_forget_note(OWNER, "F3E", {"note_id": note_id})
+        assert "alpha123" in out
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # The "remember Harrison approved my raise" pin (spec-mandated)

@@ -229,6 +229,56 @@ class TestResolveAndClaimStashSecurity:
         result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
         assert result == {"outcome": "orphaned"}
 
+    def test_drift_during_execute_reports_re_previewed_not_executed(self):
+        # D-051 adversarial review finding (HIGH): Shopify's own live-inventory
+        # re-check inside execute can decline to write and re-stash a FRESH
+        # preview instead. A confirm tap landing here must NOT be reported as
+        # "executed" (which would drop the card's buttons over a live,
+        # un-carded pending) -- it must surface the fresh stash_id instead.
+        sid = _stash_shopify_single()  # preview_qty=8, delta=2 -> target 10
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=99), \
+             patch.object(td.shopify_client, "set_inventory_level") as mock_set, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "re_previewed"
+        mock_set.assert_not_called()
+        fresh_sid = result["stash_id"]
+        assert fresh_sid and fresh_sid != sid
+        # The fresh re-preview is a REAL, live, executable pending.
+        fresh_pending = td._peek_pending_shopify(HARRISON, _CH)
+        assert fresh_pending["stash_id"] == fresh_sid
+        assert fresh_pending["preview_qty"] == 99
+        # The OLD stash_id is dead (claimed) -- a stale tap on it now reads
+        # already_handled, never a second execute.
+        stale_result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert stale_result["outcome"] == "already_handled"
+        # The FRESH stash_id is fully confirmable via the button path.
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=99), \
+             patch.object(td.shopify_client, "set_inventory_level", return_value=101) as mock_set2, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            final = td.resolve_and_claim_stash(fresh_sid, HARRISON, "confirm")
+        assert final["outcome"] == "executed"
+        mock_set2.assert_called_once()
+
+    def test_floor_guard_during_execute_mints_a_fresh_reachable_id(self):
+        # The floor-guard branch (delta would go below zero against the FRESH
+        # live count) used to reuse the OLD, already-claimed stash_id --
+        # permanently unreachable by any future button tap. Must mint fresh.
+        sid = cc.mint_stash_id("shopify", HARRISON, _CH)
+        td._store_pending_shopify_write(HARRISON, _CH, {
+            "inventory_item_id": "i1", "location_id": "l1", "target_qty": 5,
+            "preview_qty": 8, "delta": -3, "unit": "units", "variant_label": "Pure",
+            "location_label": "Office", "resolved_from": "", "lex": None,
+            "ts": time.time(), "stash_id": sid,
+        })
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=1), \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "re_previewed"
+        fresh_sid = result["stash_id"]
+        assert fresh_sid and fresh_sid != sid
+        assert cc.index_lookup(fresh_sid) is not None  # reachable by a future tap
+
     def test_cancel_pops_without_executing(self):
         sid = _stash_asana_delete()
         with patch.object(td.asana_client, "delete_task") as mock:
