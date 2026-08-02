@@ -36,34 +36,84 @@ logger = logging.getLogger("cora.revops.email_egress_guard")
 
 # --- class 2: health/disease claims (F3E threads) --------------------------
 
+# Condition nouns are blocked on their own (a nudge never needs them). The
+# ACTION verbs (treat/prevent/heal/cure) only block when they govern a health
+# object -- bare "prevent delays" / "treat you to samples" is ordinary business
+# prose and must not hard-block every F3E nudge (D-051 lens 6).
+_HEALTH_CONDITIONS = (
+    r"disease[s]?|illness(?:es)?|anxiety|depression|insomnia|adhd|diabetes|"
+    r"cancer|inflammation|migraine[s]?|fatigue|hangover[s]?"
+)
 _HEALTH_CLAIMS_RE = re.compile(
-    r"\b(cure[sd]?|curing|treat(?:s|ed|ing|ment)?|prevent(?:s|ed|ion)?|"
-    r"disease[s]?|anxiety|depression|insomnia|adhd|diabetes|cancer|"
-    r"heal(?:s|ing)?|remedy|sleep\s+aid|anxiety\s+relief|"
-    r"clinically\s+proven|fda[\s-]+approved)\b",
+    r"\b(?:"
+    r"cure[sd]?|curing|"
+    r"remed(?:y|ies)|"
+    r"sleep\s+aid|"
+    r"clinically\s+proven|fda[\s-]*approved|"
+    rf"(?:{_HEALTH_CONDITIONS})\s+relief|"
+    rf"(?:{_HEALTH_CONDITIONS})|"
+    rf"(?:treat(?:s|ed|ing|ment[s]?)?|prevent(?:s|ed|ing|ion|ative)?|"
+    rf"heal(?:s|ed|ing)?|reliev(?:e[sd]?|ing))\s+"
+    rf"(?:\w+\s+){{0,2}}(?:{_HEALTH_CONDITIONS})"
+    r")\b",
     re.IGNORECASE,
 )
 
 # --- class 3: NSF context ---------------------------------------------------
 
-_NSF_RE = re.compile(r"\bNSF\b")
+_NSF_RE = re.compile(r"\bNSF\b", re.IGNORECASE)
 
 # --- class 4: press finance figures ----------------------------------------
 
-_DOLLAR_FIGURE_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:[kKmMbB]\b|million|billion)?")
+_DOLLAR_FIGURE_RE = re.compile(
+    r"(?:\$|\bUSD\s*)\s?\d[\d,]*(?:\.\d+)?\s*(?:[kKmMbB]\b|million|billion)?"
+    r"|\b\d[\d,]*(?:\.\d+)?\s*(?:million|billion|m\b|k\b)\s*(?:dollars|USD)?",
+    re.IGNORECASE,
+)
 _PRESS_FINANCE_WORDS_RE = re.compile(
-    r"\b(rais(?:e[sd]?|ing)|valuation|stake|funding|round|invest(?:ment|or|ing)?s?)\b",
+    r"\b(rais(?:e[sd]?|ing)|valuation|valued|stake|funding|round|"
+    r"invest(?:ment|or|ing)?s?|pre-money|post-money)\b",
     re.IGNORECASE,
 )
 
 # --- class 5: founded 2022 ---------------------------------------------------
 
-_FOUNDED_2022_RE = re.compile(r"\bfounded\s+(?:in\s+)?2022\b", re.IGNORECASE)
+_FOUNDED_2022_RE = re.compile(
+    r"\b(?:founded|started|launched|est\.?|established|since)\b"
+    r"(?:\W+\w+){0,3}\W+2022\b",
+    re.IGNORECASE,
+)
 
 # --- class 7: internal paths/links ------------------------------------------
 
 _WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:\\[^\s<>|]+")
 _INTERNAL_SCHEME_RE = re.compile(r"\b(?:computer|slack)://\S+", re.IGNORECASE)
+
+# Google/Asana/Notion/Intuit links that are OURS leak internal artifacts and
+# must block. A counterparty's own doc link, pasted back by us in a reply, is
+# legitimate -- but we cannot tell them apart from the URL alone, so class 7
+# blocks the DOCUMENT-BEARING forms only (a bare docs.google.com host with no
+# document path, e.g. in a signature, is not an internal artifact reference).
+_INTERNAL_DOC_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?"
+    r"(?:docs\.google\.com|drive\.google\.com|app\.asana\.com|notion\.so"
+    r"|(?:[a-z0-9-]+\.){0,3}intuit\.com)"
+    r"/[^\s<>|)]{3,}",
+    re.IGNORECASE,
+)
+
+# Redact any matched substring before it is persisted into a guard reason:
+# thread_events.detail and cora-send-audit.jsonl both carry reasons, and both
+# are contractually body-free (D-051 lens 7).
+_MAX_REASON_EXCERPT = 24
+
+
+def _safe_excerpt(matched: str) -> str:
+    """A shape hint, never the content: length + character class only."""
+    text = (matched or "").strip()
+    if len(text) <= 8:
+        return f"<{len(text)} chars>"
+    return f"<{len(text)} chars, starts {text[0]!r}>"
 
 # --- class 8: canonical retail price set -------------------------------------
 
@@ -145,32 +195,51 @@ def _check_email_inner(
     ent = (entity or "").strip().upper()
     unquoted = _strip_quoted_lines(text)
 
-    # 1. em-dash anywhere (full text, including quoted lines)
+    # 1. em-dash anywhere (full text, including quoted lines). U+2014 is the
+    #    locked BLOCK; U+2013 and the visual lookalikes warn (they read as
+    #    em-dashes to Harrison but are outside the locked hard rule).
     if "—" in text:
         result.block(1, "em_dash", "em-dash (U+2014) present; hard rule, rewrite without it")
     if "–" in text:
         result.warn(1, "en_dash", "en-dash (U+2013) present; prefer a plain hyphen or rewrite")
+    lookalikes = sorted({c for c in ("―", "⸺", "⸻", "﹘", "﹣") if c in text})
+    if lookalikes:
+        result.warn(
+            1,
+            "dash_lookalike",
+            "dash lookalike character(s) present ("
+            + ", ".join(f"U+{ord(c):04X}" for c in lookalikes)
+            + "); rewrite with a plain hyphen",
+        )
 
-    # 2. health/disease claims on F3E threads (unquoted text only)
-    if ent == "F3E":
+    # 2. health/disease claims. Applies to F3E AND to any thread whose entity
+    #    is unknown/unset (fail-closed: an unlabeled thread gets the strictest
+    #    product-claims screen, since the importer may leave entity NULL).
+    if ent in ("F3E", ""):
         m = _HEALTH_CLAIMS_RE.search(unquoted)
         if m:
             result.block(
-                2, "health_claims", f"health/disease claim language: {m.group(0)!r}"
+                2,
+                "health_claims",
+                f"health/disease claim language matched ({_safe_excerpt(m.group(0))})",
             )
 
-    # 3. NSF outside an Energy-product context (unquoted; sentence-scoped)
-    for sentence in _sentences(unquoted):
-        if _NSF_RE.search(sentence):
-            low = sentence.lower()
-            if "pure" in low or "energy" not in low:
-                result.block(
-                    3,
-                    "nsf_context",
-                    "NSF referenced outside an Energy-product context "
-                    "(NSF Certified for Sport = Energy only)",
-                )
-                break
+    # 3. NSF outside an Energy-product context. Evaluated over the sentence AND
+    #    its neighbour (a claim split across two sentences must not evade), and
+    #    'Pure' anywhere in that window disqualifies the Energy attribution.
+    sentences = _sentences(unquoted)
+    for i, sentence in enumerate(sentences):
+        if not _NSF_RE.search(sentence):
+            continue
+        window = " ".join(sentences[max(0, i - 1) : i + 2]).lower()
+        if "pure" in window or "energy" not in window:
+            result.block(
+                3,
+                "nsf_context",
+                "NSF referenced outside an Energy-product context "
+                "(NSF Certified for Sport = Energy only)",
+            )
+            break
 
     # 4. raise/valuation/stake dollar figures on Press threads (unquoted)
     if ws == "Press":
@@ -201,14 +270,14 @@ def _check_email_inner(
 
     # 7. internal paths/links (full text; BLOCK, never silently rewrite a send)
     for pattern, label in (
-        (_BARE_DOC_URL_RE, "internal document link"),
+        (_INTERNAL_DOC_URL_RE, "internal document link"),
         (_DRIVE_PATH_RE, "internal Drive path"),
         (_WINDOWS_PATH_RE, "local file path"),
         (_INTERNAL_SCHEME_RE, "internal link scheme"),
     ):
         m = pattern.search(text)
         if m:
-            result.block(7, "internal_refs", f"{label}: {m.group(0)[:60]!r}")
+            result.block(7, "internal_refs", f"{label} present ({_safe_excerpt(m.group(0))})")
             break
 
     # 8. WARN: non-canonical dollar figure on a Retail thread (unquoted)
@@ -220,7 +289,7 @@ def _check_email_inner(
                 result.warn(
                     8,
                     "retail_price",
-                    f"${figure} is not in the canonical price set; double-check "
-                    "before sending (freight/misc figures are fine)",
+                    "a dollar figure outside the canonical price set is present; "
+                    "double-check it before sending (freight/misc figures are fine)",
                 )
                 break

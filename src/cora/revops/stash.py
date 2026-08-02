@@ -42,6 +42,7 @@ def create_stash(
     subject: Optional[str] = None,
     body_text: str,
     guard_results: Optional[dict[str, Any]] = None,
+    thread_last_msg_id: Optional[str] = None,
 ) -> str:
     stash_id = secrets.token_hex(8)
     now = time.time()
@@ -50,8 +51,8 @@ def create_stash(
         INSERT INTO send_stashes (
             stash_id, thread_key, mailbox, playbook_id, gmail_thread_id,
             recipients, cc, subject, body_text, body_sha256, guard_results,
-            status, created_ts, expires_ts
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'staged',?,?)
+            status, created_ts, expires_ts, thread_last_msg_id
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'staged',?,?,?)
         """,
         (
             stash_id,
@@ -67,6 +68,7 @@ def create_stash(
             json.dumps(guard_results or {}),
             now,
             now + STASH_TTL_SECONDS,
+            thread_last_msg_id,
         ),
     )
     conn.commit()
@@ -82,11 +84,17 @@ def get_stash(conn: sqlite3.Connection, stash_id: str) -> Optional[sqlite3.Row]:
 def get_staged_for_thread(
     conn: sqlite3.Connection, thread_key: str, now: Optional[float] = None
 ) -> Optional[sqlite3.Row]:
-    """The live (staged, unexpired) stash for a thread, if any."""
+    """The live stash for a thread, if any.
+
+    'sending' counts as LIVE: a stash claimed for send is in flight in the bot
+    process, and the sweep (a separate process) must not read it as dead and
+    stage a duplicate card mid-send (D-051 lens 2).
+    """
     ts = now if now is not None else time.time()
     return conn.execute(
-        "SELECT * FROM send_stashes WHERE thread_key = ? AND status = 'staged' "
-        "AND expires_ts > ? ORDER BY created_ts DESC LIMIT 1",
+        "SELECT * FROM send_stashes WHERE thread_key = ? "
+        "AND status IN ('staged','sending') AND expires_ts > ? "
+        "ORDER BY created_ts DESC LIMIT 1",
         (thread_key, ts),
     ).fetchone()
 
@@ -134,19 +142,28 @@ def claim_for_send(
 
 
 def finalize_sent(conn: sqlite3.Connection, stash_id: str) -> None:
+    """sending -> sent, PURGING the body (the sha256 is the durable record).
+
+    Terminal rows keep no message text: the 48h body-purge contract is about
+    bodies at rest, not just about expiry (D-051 lens 7)."""
     conn.execute(
-        "UPDATE send_stashes SET status='sent', sent_ts=? "
+        "UPDATE send_stashes SET status='sent', sent_ts=?, body_text=NULL "
         "WHERE stash_id = ? AND status = 'sending'",
         (time.time(), stash_id),
     )
     conn.commit()
 
 
-def mark_send_failed(conn: sqlite3.Connection, stash_id: str) -> None:
+def mark_send_failed(conn: sqlite3.Connection, stash_id: str, *, indeterminate: bool = False) -> None:
+    """sending -> send_failed (body purged; the stash can never re-fire).
+
+    indeterminate=True records that the Gmail call may have been accepted
+    before the error surfaced, so the outcome is UNKNOWN rather than 'not sent'.
+    """
     conn.execute(
-        "UPDATE send_stashes SET status='send_failed' "
+        "UPDATE send_stashes SET status=?, body_text=NULL "
         "WHERE stash_id = ? AND status = 'sending'",
-        (stash_id,),
+        ("send_indeterminate" if indeterminate else "send_failed", stash_id),
     )
     conn.commit()
 

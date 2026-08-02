@@ -49,6 +49,9 @@ class ThreadContext:
     last_rfc_message_id: Optional[str] = None
     references: Optional[str] = None
     subject: Optional[str] = None
+    last_message_id: Optional[str] = None
+    last_is_inbound: bool = False
+    message_count: int = 0
 
 
 def _extract_header(headers: list[dict[str, str]], name: str) -> Optional[str]:
@@ -78,6 +81,9 @@ def fetch_thread_context(mailbox: str, gmail_thread_id: str) -> ThreadContext:
         )
         .execute()
     )
+    # Gmail returns thread messages in internalDate order (server receipt),
+    # NOT by the sender-controlled Date header -- so "last" here is the real
+    # last message even against a backdated reply (D-051 lens 4).
     ctx = ThreadContext()
     messages = thread.get("messages") or []
     for msg in messages:
@@ -94,8 +100,10 @@ def fetch_thread_context(mailbox: str, gmail_thread_id: str) -> ThreadContext:
             subj = _extract_header(headers, "Subject")
             if subj:
                 ctx.subject = subj
+    ctx.message_count = len(messages)
     if messages:
-        last_headers = (messages[-1].get("payload") or {}).get("headers") or []
+        last = messages[-1]
+        last_headers = (last.get("payload") or {}).get("headers") or []
         ctx.last_rfc_message_id = _extract_header(last_headers, "Message-ID")
         prior_refs = _extract_header(last_headers, "References") or ""
         if ctx.last_rfc_message_id:
@@ -103,6 +111,10 @@ def fetch_thread_context(mailbox: str, gmail_thread_id: str) -> ThreadContext:
         last_subj = _extract_header(last_headers, "Subject")
         if last_subj:
             ctx.subject = last_subj
+        ctx.last_message_id = last.get("id")
+        # Gmail's own SENT label is the trustworthy direction signal; a From
+        # header can be spoofed, a label cannot (D-051 lens 4).
+        ctx.last_is_inbound = "SENT" not in (last.get("labelIds") or [])
     return ctx
 
 
@@ -164,6 +176,8 @@ def create_reply_draft(
     from ..tools import gmail_client  # lazy
 
     ctx = fetch_thread_context(mailbox, gmail_thread_id)
+    # Tier-0 only: a human reviews and sends this draft in Gmail, so resolving
+    # the subject live is safe here (the Tier-1 path pins it at stage time).
     raw = _build_reply_mime(
         to=to,
         cc=list(cc or []),
@@ -321,6 +335,25 @@ def _send_stashed_inner(conn, stash_id: str, approver_id: str) -> tuple[str, str
             "thread_verify_failed",
             "Could not verify the live thread; nothing was sent (fail-closed).",
         )
+    # Staleness re-check: the card was approved against a state of the world.
+    # If the counterparty has replied since it was staged, the nudge is wrong
+    # to send -- refuse and let the sweep reclassify (D-051 lens 4).
+    if ctx.last_is_inbound and ctx.last_message_id != row["thread_last_msg_id"]:
+        stash.cancel_stash(conn, stash_id)
+        ledger.add_event(
+            conn,
+            row["thread_key"],
+            event_type="send_stale",
+            actor=approver_id,
+            source="send_gate",
+            detail={"stash_id": stash_id},
+        )
+        return (
+            "stale_thread",
+            "The counterparty replied after this card was staged, so the nudge "
+            "was NOT sent. The thread is back in the queue as replied.",
+        )
+
     outsiders = [
         a for a in (*recipients, *cc) if a.strip().lower() not in ctx.participants
     ]
@@ -348,10 +381,21 @@ def _send_stashed_inner(conn, stash_id: str, approver_id: str) -> tuple[str, str
     if not stash.claim_for_send(conn, stash_id, approved_by=approver_id):
         return ("already_resolved", "This card was already handled; nothing more was sent.")
 
+    # The subject is PINNED at stage time (shown on the card). There is no
+    # live-thread fallback: that would let a counterparty change what we send
+    # after approval. An unpinned subject is a staging bug, so refuse rather
+    # than guess (D-051 lens 3/4).
+    if not (row["subject"] or "").strip():
+        stash.cancel_stash(conn, stash_id)
+        return (
+            "stage_incomplete",
+            "This card has no pinned subject, so I refuse to guess one; nothing "
+            "was sent. The next sweep will stage a fresh card.",
+        )
     raw = _build_reply_mime(
         to=recipients,
         cc=cc,
-        subject=row["subject"] or ctx.subject or "",
+        subject=row["subject"] or "",
         body_text=body_text,
         in_reply_to=ctx.last_rfc_message_id,
         references=ctx.references,
@@ -359,11 +403,14 @@ def _send_stashed_inner(conn, stash_id: str, approver_id: str) -> tuple[str, str
     try:
         resp = _gmail_send_raw(mailbox, raw, row["gmail_thread_id"])
     except Exception as exc:  # noqa: BLE001
+        # A timeout/connection error can surface AFTER Gmail accepted the
+        # message: the honest outcome is UNKNOWN, never "nothing was sent".
+        indeterminate = isinstance(exc, (TimeoutError, OSError)) or "timeout" in str(exc).lower()
         logger.exception("gmail send failed for stash %s", stash_id)
-        stash.mark_send_failed(conn, stash_id)
+        stash.mark_send_failed(conn, stash_id, indeterminate=indeterminate)
         _audit(
             {
-                "outcome": "send_failed",
+                "outcome": "send_indeterminate" if indeterminate else "send_failed",
                 "stash_id": stash_id,
                 "approver": approver_id,
                 "mailbox": mailbox,
@@ -373,21 +420,27 @@ def _send_stashed_inner(conn, stash_id: str, approver_id: str) -> tuple[str, str
                 "error": str(exc)[:200],
             }
         )
+        ledger.add_event(
+            conn,
+            row["thread_key"],
+            event_type="send_indeterminate" if indeterminate else "send_failed",
+            actor=approver_id,
+            source="send",
+            detail={"stash_id": stash_id},
+        )
+        if indeterminate:
+            return (
+                "send_indeterminate",
+                "The Gmail call errored after the message may already have been "
+                "accepted, so I cannot confirm either way. CHECK THE THREAD in "
+                "Gmail before re-sending; this card is closed and will not retry.",
+            )
         return ("send_failed", "Gmail send failed; the stash is closed, nothing sent.")
 
-    stash.finalize_sent(conn, stash_id)
+    # Past this point the email IS delivered. Bookkeeping must never report a
+    # false negative, so each step is independently fail-soft and the audit
+    # line is written FIRST (it is the durable record).
     message_id = (resp or {}).get("id")
-    ledger.record_nudge_sent(
-        conn,
-        row["thread_key"],
-        actor=approver_id,
-        detail={
-            "stash_id": stash_id,
-            "gmail_message_id": message_id,
-            "sha256": row["body_sha256"],
-            "playbook": playbook_id,
-        },
-    )
     _audit(
         {
             "outcome": "sent",
@@ -404,6 +457,26 @@ def _send_stashed_inner(conn, stash_id: str, approver_id: str) -> tuple[str, str
             "cc": cc,
         }
     )
+    try:
+        stash.finalize_sent(conn, stash_id)
+        ledger.record_nudge_sent(
+            conn,
+            row["thread_key"],
+            actor=approver_id,
+            detail={
+                "stash_id": stash_id,
+                "gmail_message_id": message_id,
+                "sha256": row["body_sha256"],
+                "playbook": playbook_id,
+            },
+        )
+    except Exception:  # noqa: BLE001 - the send already happened; say so
+        logger.exception("post-send bookkeeping failed for stash %s", stash_id)
+        return (
+            "sent_bookkeeping_failed",
+            "SENT (the email went out and is in the audit log), but the ledger "
+            "update failed. The thread state may be stale until the next sweep.",
+        )
     return (
         "sent",
         f"Sent. Reply went to {', '.join(recipients)} on the existing thread; "

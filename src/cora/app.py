@@ -575,7 +575,9 @@ def _dispatch_qa(
     # (kill switch, stash claim, guard re-run, recipient subset all inside).
     # Deliberately narrow: uppercase SEND + a 16-hex stash id, nothing else --
     # ordinary sentences can never match, and non-approvers get the gate refusal.
-    if user_id:
+    # DM-ONLY: the receipt names counterparty addresses, which must never land
+    # in a shared channel just because the approver typed there (D-051 lens 7).
+    if user_id and channel_name == "dm":
         m_send = re.match(r"^\s*SEND\s+([0-9a-f]{16})\s*$", user_message or "")
         if m_send:
             outcome, send_msg = revops_cards.process_send_action(
@@ -2904,14 +2906,19 @@ def _handle_revops_send_tap(body: dict, client, *, action: str) -> None:
                 pass
             return
 
-        # Terminal outcomes drop the buttons; non-terminal refusals (env_off,
-        # guard trouble) keep the card tappable for after the env flip.
-        keep_buttons = outcome in ("env_off",)
+        # Terminal outcomes drop the buttons. RETRYABLE refusals leave the
+        # stash staged, so the card must stay tappable AND keep its typed-SEND
+        # context line -- otherwise a transient Gmail blip strands an approved
+        # nudge until the 48h expiry (D-051 lens 1/2).
+        keep_buttons = outcome in (
+            "env_off", "thread_verify_failed", "tier_denied", "mailbox_denied", "error",
+        )
         if channel_id and message_ts:
             orig = (body.get("message") or {}).get("blocks") or []
             kept = [
                 b for b in orig
-                if b.get("type") == "section" or (keep_buttons and b.get("type") == "actions")
+                if b.get("type") == "section"
+                or (keep_buttons and b.get("type") in ("actions", "context"))
             ]
             new_blocks = kept + [
                 {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}

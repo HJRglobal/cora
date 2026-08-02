@@ -177,8 +177,10 @@ def _advance_thread(
     own = set(OWN_ALIASES) | {mailbox}
     last = messages[-1]
     last_from = _addr_of(last.get("sender"))
-    last_ts = float(last.get("date_ts") or 0)
-    outbound = last_from in own
+    # Clamp a future-dated Date header: a backdated/postdated reply must not be
+    # able to fake silence or freshness (D-051 lens 4).
+    last_ts = min(float(last.get("date_ts") or 0), ts_now)
+    outbound = _is_outbound(last, own)
 
     # Observed participant emails (metadata) refresh the counterparty set.
     participants: set[str] = set()
@@ -240,10 +242,18 @@ def _advance_thread(
     if not dry_run:
         ledger.update_observed_ts(conn, key, last_inbound_ts=last_ts)
     if any(last_from.startswith(b) for b in _BOUNCE_SENDERS):
+        # 'bounced' is a NON-terminal review state, deliberately: the From
+        # prefix is attacker-shaped, so a forged mailer-daemon reply parks the
+        # thread for human review rather than silently retiring it. It is
+        # surfaced in the sweep report every run (D-051 lens 8).
         if not dry_run and ledger.transition(
-            conn, key, "bounced", actor="system", source="sweep"
+            conn, key, "bounced", actor="system", source="sweep",
+            detail={"observed_sender_prefix": last_from.split("@")[0][:20]},
         ):
             report["advanced"]["bounced"] += 1
+        report.setdefault("bounced_for_review", []).append(
+            {"thread_key": key, "counterparty": row["counterparty_name"]}
+        )
         return
 
     # Deterministic escalation screen: content may only move a thread TOWARD
@@ -273,24 +283,51 @@ def _advance_thread(
             report["advanced"]["replied"] += 1
 
 
+def _thread_subject(messages: Optional[list[dict[str, Any]]]) -> Optional[str]:
+    for msg in reversed(messages or []):
+        subj = (msg.get("subject") or "").strip()
+        if subj:
+            return subj
+    return None
+
+
+def _is_outbound(msg: dict[str, Any], own: set[str]) -> bool:
+    """Direction from Gmail's own SENT label when present, From header only as
+    a fallback for fixtures/readers that omit labels.
+
+    A From header is attacker-spoofable; a Gmail label is not. This matters
+    twice: silence detection, and (below) which message's recipient list seeds
+    a nudge (D-051 lens 4/8).
+    """
+    # An EMPTY label list is still authoritative ("Gmail says not sent"), so
+    # test for presence of the key, never truthiness -- `[] or fallback` would
+    # hand a spoofed From header the decision.
+    labels = msg.get("label_ids")
+    if labels is None:
+        labels = msg.get("labelIds")
+    if labels is not None:
+        return "SENT" in labels
+    return _addr_of(msg.get("sender")) in own
+
+
 def _nudge_recipients(
     conn: sqlite3.Connection, row: sqlite3.Row, messages: Optional[list[dict[str, Any]]]
 ) -> tuple[list[str], list[str]]:
-    """To/Cc for the nudge: the non-own recipients of OUR last outbound
-    message (guaranteed subset of thread participants by construction)."""
-    import json as _json
+    """To/Cc for the nudge: the non-own recipients of OUR last genuinely
+    outbound message.
 
+    There is deliberately NO fallback to the stored counterparty_emails set:
+    that set is built from all thread headers, so an address injected by an
+    inbound message could otherwise become a nudge recipient. No verifiable
+    outbound recipient means no nudge (D-051 lens 4/8).
+    """
     mailbox = (row["mailbox"] or "").lower()
     own = set(OWN_ALIASES) | {mailbox}
-    if messages:
-        for msg in reversed(messages):
-            if _addr_of(msg.get("sender")) in own:
-                to = [a for a in _addrs_of(msg.get("recipients")) if a not in own]
-                if to:
-                    return [to[0]], to[1:]
-    stored = [a for a in _json.loads(row["counterparty_emails"] or "[]") if a]
-    if stored:
-        return [stored[0]], stored[1:]
+    for msg in reversed(messages or []):
+        if _is_outbound(msg, own):
+            to = [a for a in _addrs_of(msg.get("recipients")) if a not in own]
+            if to:
+                return [to[0]], to[1:]
     return [], []
 
 
@@ -357,6 +394,10 @@ def _stage_nudges(
 
         tier = send_trust.effective_tier(PLAYBOOK_ID)
         if tier == 1 and cfg is not None:
+            # Pin the subject and the thread's last-message id AT STAGE TIME so
+            # the card shows exactly what will send and a later counterparty
+            # reply cannot change it (D-051 lens 3/4).
+            subject = _thread_subject(messages)
             sid = stash.create_stash(
                 conn,
                 thread_key=key,
@@ -365,9 +406,10 @@ def _stage_nudges(
                 gmail_thread_id=row["gmail_thread_id"],
                 recipients=to,
                 cc=cc,
-                subject=None,  # reply subject comes from the live thread at send
+                subject=subject,
                 body_text=body,
                 guard_results=guard.to_dict(),
+                thread_last_msg_id=(messages[-1].get("message_id") if messages else None),
             )
             ledger.transition(
                 conn,

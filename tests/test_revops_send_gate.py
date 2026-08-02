@@ -44,6 +44,9 @@ def _ctx(participants=None):
         last_rfc_message_id="<orig-123@mail.gmail.com>",
         references="<orig-123@mail.gmail.com>",
         subject="WHAM FOODS CLOSEOUT",
+        last_message_id="m-last",
+        last_is_inbound=False,
+        message_count=2,
     )
 
 
@@ -67,8 +70,9 @@ def staged(conn, monkeypatch):
         gmail_thread_id="gt1",
         recipients=[COUNTERPARTY],
         cc=[],
-        subject=None,
+        subject="WHAM FOODS CLOSEOUT",  # pinned at stage time (never live-resolved)
         body_text=BODY,
+        thread_last_msg_id="m-last",
     )
     sent_calls: list[dict] = []
 

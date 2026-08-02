@@ -65,8 +65,13 @@ TERMINAL_STATES = frozenset(
 # threads never become nudge_due.
 NUDGE_ELIGIBLE_STATES = frozenset({"awaiting_reply", "replied", "nudge_due"})
 
-# Sources whose state writes the importer/sweep must never regress.
+# Sources whose state writes the importer must never regress.
 PROTECTED_SOURCES = frozenset({"send", "approval"})
+
+# States the IMPORTER may never move a thread out of. escalated/hold are
+# safety decisions (keyword screen, Harrison's flag); B2's JSON has no notion
+# of either, so an import must never silently de-escalate one (D-051 lens 5/8).
+IMPORT_PROTECTED_STATES = frozenset({"escalated", "hold"})
 
 WORKSTREAMS = frozenset(
     {
@@ -227,16 +232,24 @@ def init_db(conn: sqlite3.Connection) -> None:
             body_text       TEXT,              -- the exact bytes to send (purged on expiry)
             body_sha256     TEXT NOT NULL,
             guard_results   TEXT,              -- JSON {blocks:[], warns:[]}
-            status          TEXT NOT NULL,     -- staged|sent|expired|cancelled
+            status          TEXT NOT NULL,     -- staged|sending|sent|send_failed|send_indeterminate|expired|cancelled
             created_ts      REAL NOT NULL,
             expires_ts      REAL NOT NULL,
             approved_by     TEXT,
             sent_ts         REAL,
             card_channel    TEXT,
-            card_ts         TEXT
+            card_ts         TEXT,
+            -- Gmail message id of the thread's last message AT STAGE TIME.
+            -- The send-time staleness check compares against it, so a card
+            -- approved before a counterparty reply cannot fire.
+            thread_last_msg_id TEXT
         );
         """
     )
+    # Additive migration for DBs created before the staleness anchor existed.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(send_stashes)")}
+    if "thread_last_msg_id" not in cols:
+        conn.execute("ALTER TABLE send_stashes ADD COLUMN thread_last_msg_id TEXT")
     conn.commit()
 
 
@@ -371,6 +384,11 @@ def upsert_thread(
         return key
 
     # ---- update path (field-level last-write-wins; never regress protected) ----
+    # An import may not touch the owner or the state of a thread the safety
+    # machinery owns (escalated/hold): those were set by the keyword screen or
+    # by Harrison, and B2's feed has no knowledge of either.
+    safety_owned = existing["state"] in IMPORT_PROTECTED_STATES and source == "import"
+
     sets: list[str] = []
     params: list[Any] = []
 
@@ -382,13 +400,13 @@ def upsert_thread(
         _set("counterparty_name", counterparty_name)
     if counterparty_emails:
         _set("counterparty_emails", emails_json)
-    if owner:
+    if owner and not safety_owned:
         _set("owner", owner)
     if playbook_id:
         _set("playbook_id", playbook_id)
     if hubspot_deal_id:
         _set("hubspot_deal_id", hubspot_deal_id)
-    if notes:
+    if notes and notes != (existing["notes"] or ""):
         _set("notes", notes)
     if hold_reason:
         _set("hold_reason", hold_reason)
@@ -402,6 +420,7 @@ def upsert_thread(
     if (
         state != existing["state"]
         and not state_protected
+        and not safety_owned
         and state_is_newer
         and source not in PROTECTED_SOURCES
     ):
@@ -410,6 +429,9 @@ def upsert_thread(
             _set("state", state)
             _set("state_source", source)
             _set("state_event_ts", obs_ts)
+            # Leaving hold clears its now-meaningless reason.
+            if existing["state"] == "hold" and state != "hold" and not hold_reason:
+                _set("hold_reason", None)
             _write_event(
                 conn,
                 key,
@@ -497,27 +519,49 @@ def record_nudge_sent(
     actor: str,
     detail: Optional[dict[str, Any]] = None,
 ) -> bool:
-    """Post-send bookkeeping: nudge_count += 1, state -> awaiting_reply."""
+    """Post-send bookkeeping: nudge_count += 1, state -> awaiting_reply.
+
+    A send that happened is ALWAYS recorded: the 'send' event row and the
+    nudge_count increment are written in ONE transaction even when the state
+    move is refused (e.g. the thread went terminal between staging and send),
+    so the audit trail can never silently lose a delivered email and the
+    max_nudges cap can never drift (D-051 lens 5).
+    """
     row = get_thread(conn, thread_key)
     if row is None:
         return False
-    ok = transition(
+    now = time.time()
+    moved = row["state"] not in TERMINAL_STATES
+    if moved:
+        conn.execute(
+            """
+            UPDATE threads
+               SET state = 'awaiting_reply', state_source = 'send',
+                   state_event_ts = ?, nudge_count = nudge_count + 1,
+                   last_outbound_ts = ?, updated_at = ?
+             WHERE thread_key = ?
+            """,
+            (now, now, now, thread_key),
+        )
+    else:
+        conn.execute(
+            "UPDATE threads SET nudge_count = nudge_count + 1, "
+            "last_outbound_ts = ?, updated_at = ? WHERE thread_key = ?",
+            (now, now, thread_key),
+        )
+    _write_event(
         conn,
         thread_key,
-        "awaiting_reply",
+        event_ts=now,
+        event_type="send",
+        from_state=row["state"],
+        to_state="awaiting_reply" if moved else row["state"],
         actor=actor,
         source="send",
-        detail=detail,
-        event_type="send",
+        detail={**(detail or {}), **({} if moved else {"thread_was_terminal": True})},
     )
-    if ok:
-        conn.execute(
-            "UPDATE threads SET nudge_count = nudge_count + 1, last_outbound_ts = ? "
-            "WHERE thread_key = ?",
-            (time.time(), thread_key),
-        )
-        conn.commit()
-    return ok
+    conn.commit()
+    return moved
 
 
 def add_event(

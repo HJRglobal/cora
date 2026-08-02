@@ -1707,7 +1707,11 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
     # still reviews + sends Tier-0 drafts, so annotation suffices).
     from ..revops import email_egress_guard as _email_guard
 
-    _guard_result = _email_guard.check_email(body, workstream=None, entity=entity)
+    # Screen the SUBJECT too: PHI in a subject line is still PHI leaving the
+    # building, and the subject is the part a recipient sees first (lens 8).
+    _guard_result = _email_guard.check_email(
+        f"{subject}\n{body}", workstream=None, entity=entity
+    )
     _phi_blocked = any(b.get("class") == "phi" for b in _guard_result.blocks)
     if _phi_blocked:
         log.warning(
@@ -8893,12 +8897,15 @@ def _tool_revops_ledger_status(slack_user_id: str, entity: str, _input: dict) ->
         return "The revenue-ops ledger is unavailable right now."
 
     if not is_harrison:
-        canon = _SUBENTITY_PARENT.get(entity, entity)
+        # Fail-closed: an EXACT entity match only. A NULL/unset entity is not
+        # "everyone's thread" -- an unlabeled row must never surface in an
+        # arbitrary channel (incl. LEX channels) (D-051 lens 7).
+        canon = _SUBENTITY_PARENT.get(entity, entity).upper()
         rows = [
             r
             for r in rows
             if r["workstream"] != "Finance-Legal"
-            and (r["entity"] or "").upper() in {canon.upper(), ""}
+            and (r["entity"] or "").strip().upper() == canon
         ]
     if not rows:
         return "No tracked revenue-ops threads in scope for this channel."

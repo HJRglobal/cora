@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -30,6 +31,13 @@ _ONE_TAP_LOCK = threading.Lock()
 
 _SKIP_REVIEW_PUSH_DAYS = 7
 _MAX_CARD_BODY_CHARS = 2600
+
+
+def _fence_safe(text: str) -> str:
+    """Neutralize backtick runs so a body can never break out of the ``` fence
+    and render as something other than the bytes that will send (D-051 lens 3).
+    Display-only: the stash bytes are untouched."""
+    return re.sub(r"`{3,}", lambda m: "`​" * len(m.group(0)), text or "")
 
 
 def _days_silent(thread_row: Optional[sqlite3.Row], now: Optional[float] = None) -> int:
@@ -57,17 +65,23 @@ def build_send_card(
     note = (thread_row["notes"] if thread_row else None) or ""
 
     body = stash_row["body_text"] or ""
-    display_body = body
+    display_body = _fence_safe(body)
     truncated = ""
     if len(display_body) > _MAX_CARD_BODY_CHARS:
         display_body = display_body[:_MAX_CARD_BODY_CHARS]
         truncated = "\n(display truncated; the send is the full stashed bytes, hash-pinned)"
+    if display_body != body:
+        truncated += (
+            "\n(display-only: backtick runs shown escaped so the preview cannot "
+            "break out of the code block; the SENT bytes are unmodified)"
+        )
 
+    subject = stash_row["subject"] or "(reply subject from the thread)"
     header = (
         f"*Silence nudge ready: {counterparty}*\n"
         f"{workstream} | {entity} | {days}d silent | nudge {nudge_count + 1}\n"
         f"From: {stash_row['mailbox']}\n"
-        f"To: {recipients}" + (f"\nCc: {cc}" if cc else "")
+        f"To: {recipients}" + (f"\nCc: {cc}" if cc else "") + f"\nSubject: Re: {subject}"
     )
     if note:
         header += f"\nThread note: {note[:200]}"

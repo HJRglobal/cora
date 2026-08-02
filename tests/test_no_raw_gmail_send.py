@@ -19,10 +19,35 @@ _SCAN_DIRS = (_REPO_ROOT / "src" / "cora", _REPO_ROOT / "scripts")
 # The single sanctioned send call site.
 _ALLOWED = {(_REPO_ROOT / "src" / "cora" / "revops" / "sender.py").resolve()}
 
+# Broad by design (D-051 lens 1): the two-line form
+#   msgs = service.users().messages()
+#   msgs.send(userId=..., body=...)
+# must not evade the guard, so ANY `.send(` carrying a Gmail-shaped argument
+# counts, as does any mention of the collection accessors near a send.
 _GMAIL_SEND_RE = re.compile(
-    r"\.messages\(\)\s*\.send\(|\.drafts\(\)\s*\.send\(|users\.messages\.send|users\.drafts\.send"
+    r"\.messages\(\)\s*\.send\("
+    r"|\.drafts\(\)\s*\.send\("
+    r"|users\.(?:messages|drafts)\.send"
+    r"|\.send\(\s*userId\s*="
+    r"|\.send\(\s*\*\*"
 )
-_SMTP_RE = re.compile(r"^\s*(?:import|from)\s+(?:smtplib|sendgrid|mailgun|postmarker)\b", re.M)
+# Any mailer/ESP client, static or dynamic. Matched in IMPORT/CLIENT position
+# only -- a bare word list also hits ordinary prose ("please resend the note")
+# and domain blocklists ("sendgrid.net"), which are not send paths.
+_MAILER_LIBS = (
+    r"smtplib|aiosmtplib|yagmail|sendgrid|mailgun|postmarker|resend|mailjet|sparkpost"
+)
+_SMTP_RE = re.compile(
+    rf"^\s*(?:import|from)\s+(?:{_MAILER_LIBS})\b"
+    rf"|import_module\(\s*[\"'](?:{_MAILER_LIBS})"
+    r"|boto3\.client\(\s*[\"']ses",
+    re.M,
+)
+_ESP_HTTP_RE = re.compile(
+    r"https?://[^\s\"']*(?:api\.sendgrid\.com|api\.mailgun\.net|api\.resend\.com|"
+    r"api\.postmarkapp\.com)[^\s\"']*",
+    re.IGNORECASE,
+)
 
 
 def _py_files():
@@ -48,11 +73,13 @@ def test_gmail_send_only_from_the_sanctioned_chokepoint():
 def test_no_smtp_or_esp_clients_anywhere():
     offenders = []
     for path in _py_files():
+        if path.resolve() == Path(__file__).resolve():
+            continue  # this guard names the libraries it forbids
         text = path.read_text(encoding="utf-8", errors="replace")
-        if _SMTP_RE.search(text):
+        if _SMTP_RE.search(text) or _ESP_HTTP_RE.search(text):
             offenders.append(str(path))
     assert offenders == [], (
-        f"SMTP/ESP client import found (send-path bypass): {offenders}"
+        f"SMTP/ESP client or endpoint found (send-path bypass): {offenders}"
     )
 
 
