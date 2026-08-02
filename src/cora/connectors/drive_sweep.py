@@ -970,6 +970,12 @@ _FOUNDERS_OS_SKIP_FOLDERS = frozenset({
     # already unmapped here (no entity -> skipped), so this is defense-in-depth in case
     # _brain is ever mapped; it must NEVER feed back into the KB.
     "swept",
+    # Delegated-work artifacts (2026-08-01, D-051 LEX lens HIGH): AI-authored
+    # outputs live under {entity}/_delegated-work/. The static_md sync ingests
+    # them TAGGED bot_authored; this Drive-API sweep would ingest a second,
+    # UNTAGGED copy (and the .xlsx artifacts carry no in-file banner at all) --
+    # re-opening the D-096 self-poisoning class. Skip the whole subtree here.
+    "_delegated-work",
 })
 
 _LEX_SCORE_THRESHOLD = 6

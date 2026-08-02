@@ -38,7 +38,15 @@ _spec = importlib.util.spec_from_file_location(
     "run_delegated_work_runner",
     _REPO_ROOT / "scripts" / "run_delegated_work_runner.py")
 runner = importlib.util.module_from_spec(_spec)
+# The runner's top-level load_dotenv(.env, override=True) must NOT leak the
+# REAL .env (live tokens, live CORA_DELEGATED_WORK) into the pytest process
+# for the rest of the session (D-051 test lens) -- snapshot + restore.
+import os as _os  # noqa: E402
+
+_env_before = dict(_os.environ)
 _spec.loader.exec_module(runner)
+_os.environ.clear()
+_os.environ.update(_env_before)
 
 
 # ---------------------------------------------------------------------------
@@ -52,12 +60,23 @@ def _usage(inp=100, out=50, cc=0, cr=0, searches=0, fetches=0):
                            cache_read_input_tokens=cr, server_tool_use=stu)
 
 
+class _Block(SimpleNamespace):
+    """SDK-content-block stand-in WITH model_dump, so the pause_turn
+    serialization path (_serialize_blocks) is exercised for real."""
+
+    def model_dump(self, exclude_none=False):
+        d = dict(vars(self))
+        if exclude_none:
+            d = {k: v for k, v in d.items() if v is not None}
+        return d
+
+
 def _text_block(text):
-    return SimpleNamespace(type="text", text=text, citations=[])
+    return _Block(type="text", text=text, citations=[])
 
 
 def _tool_block(name, tool_input=None, tid="toolu_1"):
-    return SimpleNamespace(type="tool_use", name=name, input=tool_input or {}, id=tid)
+    return _Block(type="tool_use", name=name, input=tool_input or {}, id=tid)
 
 
 def _resp(blocks, stop_reason="end_turn", usage=None):
@@ -363,8 +382,14 @@ def test_run_job_xlsx_malformed_spec_falls_back_to_md_honestly():
 
 
 def test_run_job_lex_belt():
-    out = worker.run_job(_job(entity="LEX-LLC"), anthropic_client=FakeClient([]))
+    # Bind the BELT, not just "failed somehow" (D-051 test lens): the refusal
+    # must fire BEFORE any model call, with the LEX-specific classification.
+    client = FakeClient([])
+    out = worker.run_job(_job(entity="LEX-LLC"), anthropic_client=client)
     assert out["ok"] is False
+    assert out["failure_class"] == "error"
+    assert "LEX" in out["message"]
+    assert client.calls == []  # no model call ever fired for a LEX job
 
 
 # ---------------------------------------------------------------------------
@@ -866,3 +891,250 @@ def test_ps1_is_ascii_only():
     text = raw.decode("ascii")
     assert ".venv\\Scripts\\python.exe" in text or ".venv\\\\Scripts" in text or ".venv" in text
     assert "cowork-cora-delegated-work" in text
+
+
+# ---------------------------------------------------------------------------
+# D-051 remediation bindings (2026-08-01 review)
+# ---------------------------------------------------------------------------
+
+def test_phase_a_continuation_carries_moving_cache_breakpoint():
+    """The Phase-A pause_turn continuation must re-read the accumulated web
+    content from CACHE: the serialized assistant tail block carries the moving
+    breakpoint (D-051 cost lens, HIGH -- annotating only user turns parked the
+    breakpoint on the tiny brief forever)."""
+    text = "## Summary\ns\n" + arch.ARTIFACT_MARKER + "\nbody"
+    client = FakeClient([
+        _resp([_text_block("searching...")], stop_reason="pause_turn",
+              usage=_usage(searches=2)),
+        _resp([_text_block("found")], stop_reason="end_turn"),
+        _resp([_text_block(text)]),  # phase B
+    ])
+    with patch.object(worker, "web_withheld_reason", return_value=None), \
+         patch.object(worker.web_guard, "record_usage"):
+        out = worker.run_job(_job(archetype="research_brief"),
+                             anthropic_client=client,
+                             kb_search_fn=lambda q, l=None: "x",
+                             dispatch_fn=MagicMock(return_value="y"))
+    assert out["ok"]
+    cont = client.calls[1]["messages"]
+    assert cont[-1]["role"] == "assistant"
+    tail = cont[-1]["content"][-1]
+    assert isinstance(tail, dict)  # serialized, not an SDK object
+    assert tail.get("cache_control") == {"type": "ephemeral"}
+
+
+def test_apply_conversation_cache_strips_stale_breakpoints():
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": "c",
+             "cache_control": {"type": "ephemeral"}}]},
+    ]
+    worker._apply_conversation_cache(msgs)
+    marked = [b for m in msgs for b in m["content"] if "cache_control" in b]
+    assert len(marked) == 1  # only the tail of the LAST message (max-4 budget)
+    assert msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_worker_timeout_is_not_retryable():
+    import anthropic
+    assert worker._is_retryable(anthropic.APITimeoutError(request=MagicMock())) is False
+
+
+def test_all_allowlist_names_exist_in_tool_definitions():
+    """A renamed tool must not silently empty an allowlist via the
+    tools_for_entity intersection."""
+    from cora.tools import tool_dispatch as td
+    catalog = {t["name"] for t in td.TOOL_DEFINITIONS}
+    for name, spec in arch.ARCHETYPE_SPECS.items():
+        missing = (spec["allowlist"] - {"kb_search"}) - catalog
+        assert not missing, f"{name} allowlist names not in TOOL_DEFINITIONS: {missing}"
+
+
+def test_pid_alive_real_semantics():
+    """The Windows probe must be REAL (os.kill(pid,0) is not a liveness check
+    on this OS -- D-051 state lens HIGH): our own pid reads alive; a spawned-
+    then-exited child's pid reads dead."""
+    import os as os_mod
+    assert runner._pid_alive(os_mod.getpid()) is True
+    child = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"],
+                           capture_output=True, text=True, timeout=60)
+    dead_pid = int(child.stdout.strip())
+    assert runner._pid_alive(dead_pid) is False
+    assert runner._pid_alive(0) is False
+    assert runner._pid_alive("garbage") is False
+
+
+def test_release_lock_never_unlinks_another_pids_lock():
+    runner.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    runner.LOCK_PATH.write_text(json.dumps({"pid": 424242, "ts": time.time()}),
+                                encoding="utf-8")
+    runner.release_lock()
+    assert runner.LOCK_PATH.exists()  # not ours -- left alone
+    runner.refresh_lock()  # now ours
+    runner.release_lock()
+    assert not runner.LOCK_PATH.exists()
+
+
+def test_requested_orphan_expires_and_frees_reservation():
+    """A crash between the `requested` and `queued` appends leaves a REQUESTED
+    orphan: never claimable, but it held an envelope reservation + a dedup
+    block forever until the reaper (D-051 state lens)."""
+    jid = "dw-orphan1111111"
+    old = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+    dw.append_bot_event({"event": "requested", "ts": old, "job_id": jid,
+                         **{k: v for k, v in _job(job_id=jid).items() if k != "job_id"},
+                         "fingerprint": "fp-orphan"})
+    assert dw.get_job(jid)["state"] == "REQUESTED"
+    before = dw.open_job_count()
+    monkey_posts = MagicMock(return_value=True)
+    with patch.object(runner, "post_threaded", monkey_posts), \
+         patch.object(runner, "post_sessions_line", lambda c, t: None):
+        runner.expiry_pass(None)
+    assert dw.get_job(jid)["state"] == dw.STATE_EXPIRED
+    assert dw.open_job_count() == before - 1
+
+
+def test_deliver_verify_failed_repost_leaves_marker(monkeypatch, tmp_path):
+    """Deliver-verify must NOT append `delivered` when its recovery re-post
+    fails -- that would terminally never-notify the requester."""
+    _seed_job(age_hours=2)
+    art_file = tmp_path / "artifact.md"
+    art_file.write_text("body", encoding="utf-8")
+    _age_event("dw-abc123def456", "started", 1)
+    _age_event("dw-abc123def456", "delivering", 1,
+               artifact={"local_path": str(art_file), "target_path": "",
+                         "mis_homed": False},
+               cost={"est_usd": 0.3})
+    monkeypatch.setattr(runner, "post_threaded", lambda c, j, t: False)  # Slack down
+    monkeypatch.setattr(runner, "post_sessions_line", lambda c, t: None)
+    runner.crash_recovery_pass(None)
+    rec = dw.get_job("dw-abc123def456")
+    assert rec["state"] == dw.STATE_RUNNING  # marker left for a later pass
+    # Slack recovers -> the next pass completes the delivery.
+    monkeypatch.setattr(runner, "post_threaded", lambda c, j, t: True)
+    runner.crash_recovery_pass(None)
+    assert dw.get_job("dw-abc123def456")["state"] == dw.STATE_DELIVERED
+
+
+def test_crash_recovery_delivering_but_artifact_missing_fails(monkeypatch):
+    _seed_job(age_hours=2)
+    _age_event("dw-abc123def456", "started", 1)
+    _age_event("dw-abc123def456", "delivering", 1,
+               artifact={"local_path": "Z:/nowhere/gone.md", "target_path": "",
+                         "mis_homed": False},
+               cost={"est_usd": 0.3})
+    posts = []
+    monkeypatch.setattr(runner, "post_threaded",
+                        lambda c, j, t: posts.append(t) or True)
+    monkeypatch.setattr(runner, "post_sessions_line", lambda c, t: posts.append(t))
+    runner.crash_recovery_pass(None)
+    rec = dw.get_job("dw-abc123def456")
+    assert rec["state"] == dw.STATE_FAILED
+    assert rec["failure"]["class"] == "interrupted"
+
+
+def test_staging_sweep_never_purges_mis_homed_artifact(monkeypatch):
+    _seed_job(age_hours=1000)
+    jid = "dw-abc123def456"
+    d = dw.staging_dir(jid)
+    d.mkdir(parents=True)
+    (d / "artifact.md").write_text("the only copy", encoding="utf-8")
+    old = time.time() - 40 * 86400
+    import os as os_mod
+    os_mod.utime(d, (old, old))
+    dw.append_runner_event({"event": "started", "ts": dw._now_iso(), "job_id": jid})
+    dw.append_runner_event({"event": "delivering", "ts": dw._now_iso(), "job_id": jid,
+                            "artifact": {"local_path": str(d / "artifact.md"),
+                                         "target_path": "G:/x.md", "mis_homed": True},
+                            "cost": {}})
+    dw.append_runner_event({"event": "delivered", "ts": dw._now_iso(), "job_id": jid,
+                            "cost": {}, "artifact": {"mis_homed": True}})
+    runner.staging_sweep()
+    assert (d / "artifact.md").exists()  # the only copy survives, however old
+
+
+def test_overflow_digest_sends_once_with_buttons_and_flushes():
+    with patch.object(dw, "user_daily_quota", return_value=0):
+        _submit_via_dw(client_factory=lambda: None)  # HELD + card_held (no client)
+    held = dw.held_jobs_awaiting_card()
+    assert len(held) == 1
+    client = MagicMock()
+    client.conversations_open.return_value = {"channel": {"id": "D_H"}}
+    runner.overflow_digest_pass(client)
+    client.chat_postMessage.assert_called_once()
+    blocks = client.chat_postMessage.call_args.kwargs["blocks"]
+    action_ids = [e["action_id"] for b in blocks if b.get("type") == "actions"
+                  for e in b["elements"]]
+    assert dw.ACTION_RELEASE in action_ids and dw.ACTION_DISMISS in action_ids
+    assert dw.held_jobs_awaiting_card() == []  # card_flushed rode the runner ledger
+    client.chat_postMessage.reset_mock()
+    runner.overflow_digest_pass(client)  # second pass: nothing left
+    client.chat_postMessage.assert_not_called()
+
+
+def _submit_via_dw(client_factory):
+    import cora.org_roles as org_roles
+    import cora.user_access as user_access
+    import cora.sibling_guard as sibling_guard
+    import cora.cross_entity_guard as cross_entity_guard
+    import cora.phi_guard as phi_guard
+    with patch.object(org_roles, "get_role",
+                      lambda uid: SimpleNamespace(entity="F3E", external=False,
+                                                  name="T")), \
+         patch.object(user_access, "check_access", lambda *a, **k: None), \
+         patch.object(sibling_guard, "check_redirect", lambda *a, **k: None), \
+         patch.object(cross_entity_guard, "check_cross_entity", lambda *a, **k: None), \
+         patch.object(phi_guard, "is_any_phi", lambda t: False):
+        return dw.submit_job("U_REQ", "F3E", "C_SRC", "f3e-leadership", "1.2",
+                             "doc_draft", "an overflow digest test brief long enough",
+                             "md", client_factory=client_factory)
+
+
+def test_dispatch_end_to_end_persists_channel_and_thread():
+    """The channel_id/thread_ts plumbing must hold through the REAL dispatch()
+    injection -- not just hand-fed tool inputs (D-051 test lens)."""
+    from cora.tools import tool_dispatch as td
+    import cora.org_roles as org_roles
+    import cora.user_access as user_access
+    import cora.sibling_guard as sibling_guard
+    import cora.cross_entity_guard as cross_entity_guard
+    import cora.phi_guard as phi_guard
+    with patch.object(org_roles, "get_role",
+                      lambda uid: SimpleNamespace(entity="F3E", external=False,
+                                                  name="T")), \
+         patch.object(user_access, "check_access", lambda *a, **k: None), \
+         patch.object(sibling_guard, "check_redirect", lambda *a, **k: None), \
+         patch.object(cross_entity_guard, "check_cross_entity", lambda *a, **k: None), \
+         patch.object(phi_guard, "is_any_phi", lambda t: False):
+        out = td.dispatch("cora_delegate_work",
+                          {"action": "request", "archetype": "doc_draft",
+                           "brief": "end to end plumbing brief long enough"},
+                          "U_REQ", "F3E", "f3e-leadership", "C_REAL", "111.222")
+        assert "WRITE_BLOCKED" in out
+        out = td.dispatch("cora_delegate_work", {"confirmed": True},
+                          "U_REQ", "F3E", "f3e-leadership", "C_REAL", "111.222")
+        assert "WRITE_CONFIRMED" in out
+    job = dw.load_jobs()[0]
+    assert job["channel_id"] == "C_REAL"
+    assert job["thread_ts"] == "111.222"
+
+
+def test_runner_script_subprocess_pulls_no_bot_process():
+    """D-047 for the runner SCRIPT itself (module-level imports incl. its
+    load_dotenv) -- not just the worker modules."""
+    script = _REPO_ROOT / "scripts" / "run_delegated_work_runner.py"
+    code = (
+        "import sys, importlib.util; "
+        "sys.path.insert(0, r'%s'); "
+        "spec = importlib.util.spec_from_file_location('rnr', r'%s'); "
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
+        "bad = [x for x in ('cora.app', 'cora.main') if x in sys.modules]; "
+        "assert not bad, f'bot-process modules imported: {bad}'"
+    ) % (str(_REPO_ROOT / "src"), str(script))
+    result = subprocess.run([sys.executable, "-c", code],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr

@@ -1110,12 +1110,18 @@ def pass5_drive_insights(
         conn.row_factory = sqlite3.Row
         # Content-date window (same rule as _query_kb_chunks): a backfill's
         # ingestion burst must not read as "recent Drive activity".
+        # bot_authored exclusion (2026-08-01, delegated-work D-051): this pass
+        # has its OWN query (not _query_kb_chunks, which already carries the
+        # clause), so an AI-authored artifact chunk would otherwise be mined as
+        # "recent Drive activity" -- the D-096 self-poisoning class.
         rows = conn.execute(
             """
             SELECT source_id, entity, sub_entity, content, metadata
             FROM knowledge_chunks
             WHERE source = 'drive_sweep'
               AND COALESCE(date_modified, date_created, ingested_at) >= ?
+              AND (metadata IS NULL
+                   OR json_extract(metadata, '$.bot_authored') IS NOT 1)
             ORDER BY COALESCE(date_modified, date_created, ingested_at) DESC
             LIMIT 200
             """,

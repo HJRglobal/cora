@@ -260,8 +260,16 @@ def make_kb_search(job: dict[str, Any]) -> Callable[[str, int | None], str]:
 # Model-call plumbing (retry + usage metering + mandatory prompt caching)
 # ─────────────────────────────────────────────────────────────────────────────
 def _is_retryable(exc: Exception) -> bool:
+    """Worker retry policy. Deliberately STRICTER than the interactive client:
+    a client-side TIMEOUT is NOT retryable here -- the server may still have
+    completed and billed the request (tokens AND server-side searches) with no
+    response object for the meter, so retrying multiplies unmetered spend and
+    erodes the per-job search clamp (D-051 cost lens, MEDIUM). A timed-out
+    create fails the job honestly instead."""
     import anthropic
-    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+    if isinstance(exc, anthropic.APITimeoutError):
+        return False
+    if isinstance(exc, anthropic.APIConnectionError):
         return True
     if isinstance(exc, anthropic.RateLimitError):
         return True
@@ -282,27 +290,50 @@ def _cache_tools(tools: list[dict]) -> list[dict]:
     return tools
 
 
+def _serialize_blocks(content: Any) -> list:
+    """SDK content blocks -> plain dicts (pause_turn appends). A dict tail is
+    what lets the moving cache breakpoint annotate an ASSISTANT continuation --
+    Phase A appends only assistant messages, so annotating just user turns left
+    the breakpoint parked on the tiny brief and re-billed the accumulated web
+    content at full rate every continuation (D-051 cost lens, HIGH)."""
+    out = []
+    for block in content or []:
+        if isinstance(block, dict):
+            out.append(dict(block))
+        elif hasattr(block, "model_dump"):
+            try:
+                out.append(block.model_dump(exclude_none=True))
+            except Exception:  # noqa: BLE001 -- mocks / unexpected shapes
+                out.append(block)
+        else:
+            out.append(block)
+    return out
+
+
 def _apply_conversation_cache(messages: list[dict]) -> None:
-    """Move the conversation-prefix cache breakpoint to the LAST user-role
-    message (in place). Anthropic caches everything before a breakpoint, so
-    each turn re-reads the whole prior conversation from cache instead of
-    re-billing it. Only user-role messages are annotated (assistant turns hold
-    SDK objects); string content is promoted to a block list."""
-    last_user = None
+    """Move the conversation-prefix cache breakpoint to the tail block of the
+    LAST message, any role (in place). Anthropic caches everything before a
+    breakpoint, so each turn re-reads the whole prior conversation from cache
+    instead of re-billing it. String content is promoted to a block list;
+    non-dict (SDK-object) tails are skipped -- pause_turn appends serialize to
+    dicts via _serialize_blocks so Phase A's assistant tail IS annotatable
+    (the web-search docs' documented pattern: cache_control on the final
+    conversation block, including server tool result blocks)."""
     for m in messages:
-        if isinstance(m, dict) and m.get("role") == "user":
-            last_user = m
         # Strip stale breakpoints (max 4 allowed per request).
         content = m.get("content") if isinstance(m, dict) else None
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
                     block.pop("cache_control", None)
-    if last_user is None:
+    if not messages:
         return
-    content = last_user.get("content")
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return
+    content = last.get("content")
     if isinstance(content, str):
-        last_user["content"] = [
+        last["content"] = [
             {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
         ]
     elif isinstance(content, list) and content:
@@ -432,8 +463,11 @@ def run_job(job: dict[str, Any], *, anthropic_client: Any = None,
 
     if anthropic_client is None:
         import anthropic
+        # max_retries=0: the SDK's silent internal retries would bill requests
+        # the meter never sees (each abandoned attempt may still complete
+        # server-side). _create_with_retry is the ONLY retry layer here.
         anthropic_client = anthropic.Anthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            api_key=os.environ.get("ANTHROPIC_API_KEY", ""), max_retries=0)
     model = worker_model()
     caller = f"delegated_work.{archetype}"
     brief = str(job.get("brief") or "")
@@ -567,7 +601,10 @@ def _run_phase_a(client: Any, model: str, caller: str, job: dict[str, Any],
             if chunk:
                 text_parts.append(chunk)
             if getattr(response, "stop_reason", None) == "pause_turn":
-                messages.append({"role": "assistant", "content": response.content})
+                # Serialize to dicts so the moving cache breakpoint can ride
+                # this assistant tail (see _serialize_blocks).
+                messages.append({"role": "assistant",
+                                 "content": _serialize_blocks(response.content)})
                 continue
             break
     except Exception as exc:  # noqa: BLE001 -- Phase A is best-effort

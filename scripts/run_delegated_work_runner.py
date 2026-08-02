@@ -64,14 +64,51 @@ log = logging.getLogger("delegated-work-runner")
 # Lockfile (30-min stale + pid-liveness + FAIL CLOSED)
 # ─────────────────────────────────────────────────────────────────────────────
 def _pid_alive(pid: int) -> bool:
+    """REAL liveness probe. On Windows, ``os.kill(pid, 0)`` is NOT one -- sig 0
+    maps to GenerateConsoleCtrlEvent whose result tracks console groups, not
+    liveness (wrong in BOTH directions; D-051 state lens, HIGH, verified on
+    this host). Use OpenProcess + GetExitCodeProcess; access-denied counts as
+    ALIVE (fail closed -- never override a lock we can't inspect)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # can't tell -- treat as alive (fail closed)
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except PermissionError:
         return True
     except OSError:
         return False
-    except (TypeError, ValueError):
+    return True
+
+
+def _try_create_lock() -> bool:
+    """Atomic O_CREAT|O_EXCL creation -- two near-simultaneous starts cannot
+    both pass a check-then-write (D-051 state lens)."""
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
         return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"pid": os.getpid(), "ts": time.time()}))
     return True
 
 
@@ -81,27 +118,33 @@ def acquire_lock() -> bool:
     a doubled runner double-delivers, a skipped pass self-heals in 15 min)."""
     try:
         LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if LOCK_PATH.exists():
-            try:
-                data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-                age = time.time() - float(data.get("ts", 0))
-                holder_pid = int(data.get("pid", 0) or 0)
-            except Exception:  # noqa: BLE001 -- unreadable lock: refuse (fail closed)
-                log.error("Lockfile unreadable -- FAIL CLOSED, skipping this pass.")
-                return False
-            if age < LOCK_STALE_SECONDS:
-                log.warning("Another runner holds the lock (pid=%s age=%ds) -- exiting.",
-                            holder_pid, int(age))
-                return False
-            # Stale by age -- but only override if the holder pid is DEAD.
-            if holder_pid and _pid_alive(holder_pid):
-                log.warning("Lock is stale by age but pid %s is alive -- FAIL "
-                            "CLOSED, skipping this pass.", holder_pid)
-                return False
-            log.warning("Overriding stale lock (age=%ds, pid=%s dead).",
-                        int(age), holder_pid)
-        refresh_lock()
-        return True
+        if _try_create_lock():
+            return True
+        try:
+            data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+            age = time.time() - float(data.get("ts", 0))
+            holder_pid = int(data.get("pid", 0) or 0)
+        except Exception:  # noqa: BLE001 -- unreadable lock: refuse (fail closed)
+            log.error("Lockfile unreadable -- FAIL CLOSED, skipping this pass.")
+            return False
+        if age < LOCK_STALE_SECONDS:
+            log.warning("Another runner holds the lock (pid=%s age=%ds) -- exiting.",
+                        holder_pid, int(age))
+            return False
+        # Stale by age -- but only override if the holder pid is DEAD.
+        if holder_pid and _pid_alive(holder_pid):
+            log.warning("Lock is stale by age but pid %s is alive -- FAIL "
+                        "CLOSED, skipping this pass.", holder_pid)
+            return False
+        log.warning("Overriding stale lock (age=%ds, pid=%s dead).",
+                    int(age), holder_pid)
+        try:
+            LOCK_PATH.unlink()
+        except OSError:
+            pass
+        # Another racer may claim between the unlink and this create -- if so,
+        # it won; skip this pass (fail closed).
+        return _try_create_lock()
     except Exception:  # noqa: BLE001 -- FAIL CLOSED on any lock infra error
         log.exception("Lock acquire errored -- FAIL CLOSED, skipping this pass.")
         return False
@@ -113,9 +156,18 @@ def refresh_lock() -> None:
 
 
 def release_lock() -> None:
+    """Unlink ONLY a lock this process owns -- an overridden zombie's finally
+    must not delete its successor's lock (D-051 state lens)."""
     try:
-        if LOCK_PATH.exists():
-            LOCK_PATH.unlink()
+        if not LOCK_PATH.exists():
+            return
+        try:
+            data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+            if int(data.get("pid", 0) or 0) != os.getpid():
+                return
+        except Exception:  # noqa: BLE001 -- unreadable: leave it for staleness
+            return
+        LOCK_PATH.unlink()
     except OSError:
         pass
 
@@ -229,10 +281,17 @@ def crash_recovery_pass(client) -> None:
                 exists = Path(local).exists()
             if exists:
                 log.info("deliver-verify: %s crashed post-artifact -- re-posting once", jid)
-                post_threaded(client, rec,
-                              f"Your delegated job `{jid}` finished earlier but "
-                              "the confirmation may not have posted (recovered "
-                              f"after a crash). The artifact is at: {target or local}")
+                posted = post_threaded(client, rec,
+                                       f"Your delegated job `{jid}` finished earlier but "
+                                       "the confirmation may not have posted (recovered "
+                                       f"after a crash). The artifact is at: {target or local}")
+                if not posted:
+                    # Slack still down: leave the delivering marker so a LATER
+                    # pass re-verifies -- appending delivered here would
+                    # terminally never-notify the requester (D-051 state lens).
+                    log.warning("deliver-verify re-post failed for %s -- "
+                                "marker left for the next pass", jid)
+                    continue
                 dw.append_runner_event({"event": "delivered", "ts": dw._now_iso(),
                                         "job_id": jid, "cost": rec.get("cost") or {},
                                         "artifact": art})
@@ -250,12 +309,21 @@ def crash_recovery_pass(client) -> None:
 def expiry_pass(client) -> None:
     """QUEUED jobs unclaimed for 48h expire with a threaded notice. The clock
     runs from the event that ENTERED the job into QUEUED (queued or released),
-    so a late release gets its full window. HELD never expires."""
+    so a late release gets its full window. HELD never expires.
+
+    REQUESTED orphans (a crash between the `requested` and `queued`/`held`
+    appends) are reaped on the same window -- they are never claimable, yet
+    count as open (a permanent envelope reservation + a permanent dedup block
+    on the requester's identical brief) until expired (D-051 state lens)."""
     now = datetime.now(timezone.utc)
     for rec in dw.load_jobs():
-        if rec.get("state") != dw.STATE_QUEUED:
+        state = rec.get("state")
+        if state == dw.STATE_QUEUED:
+            entered = dw._parse_ts(rec.get("queued_at"))
+        elif state == "REQUESTED":
+            entered = dw._parse_ts(rec.get("requested_at"))
+        else:
             continue
-        entered = dw._parse_ts(rec.get("queued_at"))
         if entered is None or (now - entered).total_seconds() < EXPIRE_SECONDS:
             continue
         jid = rec.get("job_id", "")
@@ -343,6 +411,12 @@ def staging_sweep() -> None:
             continue
         rec = jobs.get(d.name)
         state = rec.get("state") if rec else None
+        # A mis-homed DELIVERED job's staging dir is the ONLY copy of its
+        # artifact until it homes -- never purge it, however old (a >30d G:
+        # outage must not silently destroy a promised file; D-051 state lens).
+        if (rec and state == dw.STATE_DELIVERED
+                and (rec.get("artifact") or {}).get("mis_homed")):
+            continue
         terminal_or_unknown = rec is None or state in dw.TERMINAL_STATES
         try:
             if terminal_or_unknown and d.stat().st_mtime < cutoff:
@@ -361,11 +435,23 @@ def _clean_staging(job_id: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Claim + execute + deliver
 # ─────────────────────────────────────────────────────────────────────────────
-def next_queued_job() -> dict | None:
-    """Oldest-queued first (FIFO)."""
+def next_claimable_job() -> dict | None:
+    """Oldest-queued first (FIFO), skipping envelope-blocked jobs. A Harrison-
+    released job carries his explicit override and is claimable even when the
+    envelope is exhausted -- and must not be STARVED behind a non-released
+    FIFO head (D-051 cost lens: break-on-first-blocked left the override
+    partially dead)."""
     queued = [r for r in dw.load_jobs() if r.get("state") == dw.STATE_QUEUED]
     queued.sort(key=lambda r: str(r.get("queued_at") or ""))
-    return queued[0] if queued else None
+    if not queued:
+        return None
+    envelope_ok = dw.envelope_headroom() >= 0
+    for cand in queued:
+        if envelope_ok or cand.get("released_at"):
+            return cand
+        log.warning("envelope exhausted -- leaving %s queued this pass",
+                    cand.get("job_id"))
+    return None
 
 
 def _duration_label(rec: dict) -> str:
@@ -501,15 +587,12 @@ def run_pass(time_budget_min: float, dry_run: bool) -> int:
 
     jobs_run = 0
     while time.monotonic() < deadline:
-        job = next_queued_job()
+        # Envelope re-check at claim happens inside next_claimable_job
+        # (design section 10; released jobs = Harrison's explicit override).
+        job = next_claimable_job()
         if job is None:
             break
         jid = str(job.get("job_id") or "")
-        # Envelope re-check at claim (design section 10). A Harrison-released
-        # job carries his explicit override and runs regardless.
-        if dw.envelope_headroom() < 0 and not job.get("released_at"):
-            log.warning("envelope exhausted -- leaving %s queued this pass", jid)
-            break
         refresh_lock()
         dw.append_runner_event({"event": "started", "ts": dw._now_iso(), "job_id": jid})
         post_sessions_line(client, f"DW START {jid} {job.get('archetype', '?')} "

@@ -4665,6 +4665,11 @@ _CONFIRM_ACTION_VERBS = {
     "complete": "complete", "completing": "complete", "finish": "complete",
     "finished": "complete", "close": "complete", "done": "complete",
     "create": "create", "creating": "create", "make": "create",
+    # Delegated work (2026-08-01, D-051): "yes delegate it" / "yes queue it"
+    # confirms a pending job preview deterministically instead of falling to
+    # the model (where a narrated-but-never-queued phantom is possible). The
+    # canon conflicts correctly with every other store's pending action.
+    "delegate": "delegate", "queue": "delegate",
 }
 
 
@@ -9501,8 +9506,12 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
     if confirmed:
         pending = _claim_pending_delegated(slack_user_id, channel)
         if pending:
+            # Stash purity: EVERY executed field comes from the stash, incl.
+            # the entity the preview showed (D-051: a channel-routing edit
+            # between preview and confirm must not silently change scope).
             job, outcome, msg = delegated_work.submit_job(
-                slack_user_id, entity,
+                slack_user_id,
+                str(pending.get("entity") or entity),
                 str(pending.get("channel_id") or ""),
                 str(pending.get("channel_name") or channel),
                 str(pending.get("thread_ts") or ""),
@@ -9521,6 +9530,14 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
             return _write_confirmed_contract(msg)
         # No fresh server-side pending -> never trust the model-echoed
         # confirmed=true; fall through to re-preview against a fresh stash.
+        # A bare confirm with NO re-preview material (the interceptor path
+        # passes no args) gets an honest expiry reply, not a raw
+        # "Unknown archetype ''" validation error (D-051 staged-write lens).
+        if (not str(input_data.get("archetype") or "").strip()
+                and not str(input_data.get("brief") or "").strip()):
+            return _write_blocked_contract(
+                "That job preview expired before you confirmed -- nothing was "
+                "queued. Tell me the job again and I'll re-preview it.")
 
     archetype = str(input_data.get("archetype") or "").strip().lower()
     brief = str(input_data.get("brief") or "").strip()[:delegated_work.BRIEF_MAX_CHARS]

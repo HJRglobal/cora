@@ -760,3 +760,115 @@ def test_lex_prompts_do_not_offer_the_tool():
     for name in ("lex.md", "llc.md", "lts.md", "lbhs.md", "lla.md"):
         text = (prompts_dir / name).read_text(encoding="utf-8")
         assert "do not call the tool" in text
+
+
+# ---------------------------------------------------------------------------
+# D-051 remediation bindings (2026-08-01 review)
+# ---------------------------------------------------------------------------
+
+def test_confirm_rescreens_phi_flip_between_preview_and_confirm(monkeypatch):
+    """The stale-stash TOCTOU defense MUST bind: a guard that starts blocking
+    within the pending TTL refuses the confirm (D-051 test lens, HIGH)."""
+    import cora.phi_guard as phi_guard
+    _tool(action="request", archetype="doc_draft",
+          brief="benign at preview time, flagged at confirm long enough")
+    monkeypatch.setattr(phi_guard, "is_any_phi", lambda text: True)
+    out = _tool(confirmed=True)
+    assert out.startswith("WRITE_BLOCKED")
+    assert dw.load_jobs() == []  # the stale stash never executed
+
+
+def test_confirm_rescreens_access_flip_between_preview_and_confirm(monkeypatch):
+    import cora.user_access as user_access
+    _tool(action="request", archetype="doc_draft",
+          brief="benign access at preview time long enough")
+    monkeypatch.setattr(user_access, "check_access",
+                        lambda *a, **k: "Access revoked mid-flight.")
+    out = _tool(confirmed=True)
+    assert out.startswith("WRITE_BLOCKED")
+    assert "Access revoked" in out
+    assert dw.load_jobs() == []
+
+
+def test_held_card_send_failure_leaves_durable_marker():
+    """A HELD job whose card DM fails must still surface via the overflow
+    digest -- three review lenses found the silent-orphan arm independently."""
+    client = MagicMock()
+    client.conversations_open.side_effect = RuntimeError("slack 500")
+    with patch.object(dw, "user_daily_quota", return_value=0):
+        job, outcome, _ = _submit(brief="card send failure brief long enough",
+                                  client_factory=lambda: client)
+    assert outcome == "held"
+    overflow = dw.held_jobs_awaiting_card()
+    assert [r["job_id"] for r in overflow] == [job["job_id"]]
+
+
+def test_held_card_no_client_leaves_durable_marker():
+    with patch.object(dw, "user_daily_quota", return_value=0):
+        job, outcome, _ = _submit(brief="no client card brief long enough",
+                                  client_factory=lambda: None)
+    assert outcome == "held"
+    assert [r["job_id"] for r in dw.held_jobs_awaiting_card()] == [job["job_id"]]
+
+
+def test_bare_confirm_after_expiry_gets_honest_reply():
+    """The interceptor path passes NO args on confirm; a claim miss must not
+    surface a raw 'Unknown archetype' validation error."""
+    out = _tool(confirmed=True)  # no pending, no archetype, no brief
+    assert out.startswith("WRITE_BLOCKED")
+    assert "expired" in out
+    assert "Unknown job archetype" not in out
+
+
+def test_interceptor_yes_delegate_it_confirms():
+    """'yes delegate it' / 'queue it' are deterministic confirms for a pending
+    job preview -- never a model fall-through (phantom-queue class)."""
+    _tool(action="request", archetype="research_brief",
+          brief="delegate-verb confirm brief long enough")
+    reply = td.try_confirm_pending_write(
+        slack_user_id=USER, channel_name=CHANNEL, entity="F3E",
+        message="yes delegate it")
+    assert reply is not None and "Queued (dw-" in reply
+
+    td._PENDING_DELEGATED_WORK.clear()
+    _tool(action="request", archetype="doc_draft",
+          brief="queue-verb confirm brief long enough")
+    reply = td.try_confirm_pending_write(
+        slack_user_id=USER, channel_name=CHANNEL, entity="F3E",
+        message="queue it")
+    assert reply is not None and "Queued (dw-" in reply
+
+
+def test_queue_verb_conflicts_with_other_stores():
+    """'queue it' while a Shopify write is pending names a DIFFERENT action ->
+    ambiguous -> model fall-through (never fires the staler write)."""
+    td._PENDING_SHOPIFY_WRITES[td._shopify_pending_key(USER, CHANNEL)] = {
+        "ts": time.time(), "variant_label": "x",
+    }
+    try:
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHANNEL, entity="F3E",
+            message="queue it")
+        assert reply is None
+    finally:
+        td._PENDING_SHOPIFY_WRITES.clear()
+
+
+def test_confirm_executes_stashed_entity_not_live_entity():
+    """Stash purity: the entity the preview showed is the entity that runs."""
+    _tool(action="request", archetype="doc_draft", entity="F3E",
+          brief="stashed entity purity brief long enough")
+    out = td._tool_cora_delegate_work(USER, "OSN", {
+        "confirmed": True, "_channel_name": CHANNEL, "_channel_id": CHANNEL_ID,
+    })
+    assert out.startswith("WRITE_CONFIRMED")
+    assert dw.load_jobs()[0]["entity"] == "F3E"  # the previewed scope, not OSN
+
+
+def test_render_job_list_filters_to_requester():
+    _submit(user=USER, brief="my own listed job brief long enough")
+    _submit(user=OTHER, brief="someone elses job brief long enough")
+    mine = dw.render_job_list(USER, CHANNEL_ID)
+    other_job = [r for r in dw.load_jobs() if r["requester"] == OTHER][0]
+    assert other_job["job_id"] not in mine
+    assert mine.count("dw-") == 1

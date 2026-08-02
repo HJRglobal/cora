@@ -707,7 +707,9 @@ def _release_card_slot() -> None:
 
 
 def build_held_card(job: dict[str, Any], reason: str) -> tuple[str, list[dict[str, Any]]]:
-    """(fallback_text, blocks) for one HELD-job release/dismiss card."""
+    """(fallback_text, blocks) for one HELD-job release/dismiss card. The text
+    (title = the brief's head) is sanitize_text-wrapped -- Block Kit bodies
+    bypass the class-level WebClient egress patch, which only covers `text=`."""
     jid = str(job.get("job_id", ""))
     text = (
         f"*Delegated work -- HELD* ({reason})\n"
@@ -716,6 +718,11 @@ def build_held_card(job: dict[str, Any], reason: str) -> tuple[str, list[dict[st
         f"#{job.get('channel_name', '?')}\n"
         f"*{job.get('title', '(untitled)')}*"
     )
+    try:
+        from .slack_egress import sanitize_text
+        text = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
+        pass
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
         {"type": "actions", "block_id": f"dw_actions_{jid}"[:255], "elements": [
@@ -728,22 +735,30 @@ def build_held_card(job: dict[str, Any], reason: str) -> tuple[str, list[dict[st
     return text, blocks
 
 
+def _append_card_held(jid: str) -> None:
+    try:
+        append_bot_event({"event": "card_held", "ts": _now_iso(), "job_id": jid})
+    except Exception:  # noqa: BLE001
+        log.warning("delegated_work: card_held append failed", exc_info=True)
+
+
 def _send_held_card(job: dict[str, Any], reason: str,
                     client_factory: Callable | None) -> None:
-    """DM Harrison one HELD card, respecting the daily cap. Over cap -> a
-    durable card_held marker; the runner's overflow digest surfaces it later.
-    Best-effort: a send failure never raises into the confirm ack."""
+    """DM Harrison one HELD card, respecting the daily cap. EVERY non-sent arm
+    (over cap, no client, send failure) leaves a durable card_held marker so
+    the runner's overflow digest surfaces the job later -- a HELD job with
+    neither card_sent nor card_held would be invisible forever (HELD never
+    expires; D-051, found by three lenses independently). Best-effort: a send
+    failure never raises into the confirm ack."""
     jid = str(job.get("job_id", ""))
     if not _reserve_card_slot():
-        try:
-            append_bot_event({"event": "card_held", "ts": _now_iso(), "job_id": jid})
-        except Exception:  # noqa: BLE001
-            log.warning("delegated_work: card_held append failed", exc_info=True)
+        _append_card_held(jid)
         log.info("delegated_work: HELD-card cap hit -- %s rides the overflow digest", jid)
         return
     try:
         client = (client_factory or _default_client_factory)()
         if client is None:
+            _append_card_held(jid)
             return
         open_resp = client.conversations_open(users=[HARRISON_ID])
         dm_channel = open_resp["channel"]["id"]
@@ -756,8 +771,9 @@ def _send_held_card(job: dict[str, Any], reason: str,
             "event": "card_sent", "ts": _now_iso(), "job_id": jid,
             "card_channel_id": dm_channel, "card_message_ts": resp.get("ts", ""),
         })
-    except Exception:  # noqa: BLE001 -- best-effort
+    except Exception:  # noqa: BLE001 -- best-effort; the durable marker keeps it visible
         log.warning("delegated_work: HELD card send failed (non-fatal)", exc_info=True)
+        _append_card_held(jid)
     finally:
         _release_card_slot()
 
