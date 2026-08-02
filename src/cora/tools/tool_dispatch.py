@@ -4438,10 +4438,19 @@ def _log_lexicon_confirmed(lex: dict | None, slack_user_id: str, channel: str) -
         pass
 
 
-def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) -> str:
+def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) -> tuple[str, str | None]:
     """Phase 2 executor: FRESH live-qty re-check, then WRITE the caller's pending
     entry (identity = the tool's server-resolved ids). Re-previews on drift; never
-    a blind write."""
+    a blind write.
+
+    Returns (message, fresh_stash_id). fresh_stash_id is the id of a NEW pending
+    THIS call itself just stashed (drift or floor-guard re-preview) -- or None
+    when nothing was re-stashed (a real write, or a terminal refusal that leaves
+    nothing pending). The button-tap caller (resolve_and_claim_stash) reads this
+    value directly rather than re-peeking the shared (kind, user, channel) slot
+    afterward -- an ambient peek can't distinguish this call's OWN re-stash from
+    an unrelated write the same user fires into the same slot while this call is
+    still in flight (D-051 fix, 2026-08-02 second review)."""
     item_id = pending["inventory_item_id"]
     loc_id = pending["location_id"]
     target = int(pending["target_qty"])
@@ -4457,16 +4466,16 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     if loc_name.strip().lower() not in allowed:
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\nI can't set inventory at {loc_name} -- that location is kept in sync "
-            f"automatically. Changing it is a call for Harrison.")
+            f"automatically. Changing it is a call for Harrison."), None
 
     try:
         live = shopify_client.get_inventory_level(item_id, loc_id)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
         log.warning("f3e_shopify_set_inventory confirm level read error user=%s: %s", slack_user_id, exc)
-        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI couldn't read the current count just now -- try again in a moment.")
+        return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI couldn't read the current count just now -- try again in a moment."), None
     if live is None:
         return _shopify_write_blocked(
-            f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there.")
+            f"{_NOT_WRITTEN}\n{variant_label} isn't stocked at {loc_name} anymore, so I can't set a count there."), None
     # A DELTA op re-applies to the FRESH live count on EVERY confirm (never a stale
     # absolute) and re-runs the floor guard HERE -- so a downward drift after a prior
     # floor-refuse can never slip a stale target past the guard (D-051 fix). An
@@ -4482,26 +4491,27 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
             # ever reach again (permanently 'already_handled' via the confirm_cards
             # index), even though the typed path (which never checks that index) could
             # still find it. Minting fresh keeps both paths working identically.
+            fresh_id = confirm_cards.mint_stash_id("shopify", slack_user_id, channel)
             _store_pending_shopify_write(slack_user_id, channel, {
-                **pending, "ts": time.time(),
-                "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
+                **pending, "ts": time.time(), "stash_id": fresh_id,
             })
             return _shopify_write_blocked(
                 f"{_NOT_WRITTEN}\n{variant_label} at {loc_name} has {live} {unit} now; removing "
-                f"{abs(int(delta))} would go below zero. The most I can remove is {live}.")
+                f"{abs(int(delta))} would go below zero. The most I can remove is {live}."), fresh_id
 
     if live != preview_qty:
         # The live number moved between preview and confirm -> re-preview (NO write);
         # `target` already reflects the fresh count for a delta op.
+        fresh_id = confirm_cards.mint_stash_id("shopify", slack_user_id, channel)
         _store_pending_shopify_write(slack_user_id, channel,
                                      {**pending, "target_qty": target, "preview_qty": live, "ts": time.time(),
-                                      "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel)})
+                                      "stash_id": fresh_id})
         log.info("f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s preview=%s live=%s delta=%s",
                  slack_user_id, item_id, preview_qty, live, delta)
         return _shopify_write_blocked(_shopify_preview_text(
             variant_label=variant_label, location_name=loc_name,
             current=live, quantity=target, moved_from=preview_qty, unit=unit,
-            resolved_from=pending.get("resolved_from") or ""))
+            resolved_from=pending.get("resolved_from") or "")), fresh_id
 
     # Belt-and-suspenders (Slice 1): resolve/re-preview already guard every absolute
     # stash path, so this should never fire -- but never WRITE an absurd absolute even
@@ -4510,7 +4520,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
     if delta is None and _inv_absurd_absolute(live, target):
         log.warning("f3e_shopify_set_inventory absurd absolute at EXECUTE (blocked) user=%s "
                     "item=%s cur=%s -> %s", slack_user_id, item_id, live, target)
-        return _inv_absurd_block_text(variant_label, loc_name, live, target, unit)
+        return _inv_absurd_block_text(variant_label, loc_name, live, target, unit), None
 
     try:
         new_available = shopify_client.set_inventory_level(item_id, loc_id, target)
@@ -4518,7 +4528,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         log.warning("f3e_shopify_set_inventory WRITE FAILED user=%s item=%s loc=%s: %s",
                     slack_user_id, item_id, loc_id, exc)
         return _shopify_write_blocked(
-            f"{_NOT_WRITTEN}\nThat DTC inventory update didn't go through -- try again shortly.")
+            f"{_NOT_WRITTEN}\nThat DTC inventory update didn't go through -- try again shortly."), None
 
     _audit_shopify_write(slack_user=slack_user_id, channel=channel,
                          variant=variant_label, location=loc_name, old=live, new=new_available)
@@ -4529,7 +4539,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         f"WRITE_CONFIRMED -- post the line after the blank as your entire response "
         f"(no preamble, no meta-commentary, do not name the store or platform):\n\n"
         f"DTC inventory updated -- {variant_label} at {loc_name}: {live} -> {new_available} {unit}."
-    )
+    ), None
 
 
 def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dict, new_qty: int) -> str:
@@ -4703,12 +4713,17 @@ def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) ->
     return _shopify_write_blocked(_shopify_bulk_preview_text(resolved, skipped))
 
 
-def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: dict) -> str:
+def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: dict) -> tuple[str, str | None]:
     """Phase 2 (bulk): FRESH per-row live re-check (delta rows re-apply to the fresh
     count, floor-guarded), then WRITE every stable+valid row. Mirrors the single-item
     contract: if ANY row drifted or turned invalid, RE-PREVIEW the whole batch and
     write NOTHING; only an all-stable batch writes. Identity per row = the tool's
-    server-resolved ids, never an LLM echo."""
+    server-resolved ids, never an LLM echo.
+
+    Returns (message, fresh_stash_id) -- same contract as _shopify_execute_pending:
+    fresh_stash_id is this call's OWN freshly-minted re-preview id, or None. See
+    that function's docstring for why the caller must never substitute an ambient
+    peek for this value."""
     rows = pending.get("rows") or []
     allowed, _ = _load_shopify_write_config()
     refreshed: list[dict] = []
@@ -4726,7 +4741,7 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
             log.warning("f3e_shopify_set_inventory BATCH re-read error user=%s: %s", slack_user_id, exc)
             return _shopify_write_blocked(
                 f"{_NOT_WRITTEN}\nI couldn't read the current counts just now -- nothing was changed. "
-                f"Try again in a moment.")
+                f"Try again in a moment."), None
         if live is None:
             invalid.append({"product": r["variant_label"], "reason": "not stocked here anymore"})
             continue
@@ -4746,16 +4761,17 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
     if drift or invalid:
         # Re-preview the still-valid rows (recomputed); write NOTHING (all counts
         # must be exactly as previewed before a write -- same rule as single-item).
+        fresh_id = None
         if refreshed:
+            fresh_id = confirm_cards.mint_stash_id("shopify", slack_user_id, channel)
             _store_pending_shopify_write(slack_user_id, channel, {
-                "rows": refreshed, "ts": time.time(),
-                "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
+                "rows": refreshed, "ts": time.time(), "stash_id": fresh_id,
             })
         else:
             _take_pending_shopify_write(slack_user_id, channel)  # nothing valid left -> clear
         log.info("f3e_shopify_set_inventory BATCH re-preview user=%s valid=%d invalid=%d drift=%s",
                  slack_user_id, len(refreshed), len(invalid), drift)
-        return _shopify_write_blocked(_shopify_bulk_preview_text(refreshed, invalid, moved=True))
+        return _shopify_write_blocked(_shopify_bulk_preview_text(refreshed, invalid, moved=True)), fresh_id
 
     # All rows stable + valid -> write every row.
     ok_lines: list[str] = []
@@ -4779,7 +4795,7 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
              slack_user_id, len(ok_lines), len(failed))
     if not ok_lines:
         return _shopify_write_blocked(
-            f"{_NOT_WRITTEN}\nThose DTC inventory updates didn't go through -- try again shortly.")
+            f"{_NOT_WRITTEN}\nThose DTC inventory updates didn't go through -- try again shortly."), None
     body = f"DTC inventory updated ({len(ok_lines)} item(s)):\n" + "\n".join(ok_lines)
     if failed:
         body += "\nCould not update (try again): " + ", ".join(failed)
@@ -4787,7 +4803,7 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
         "WRITE_CONFIRMED -- post the lines after the blank as your entire response "
         "(no preamble, no meta-commentary, do not name the store or platform):\n\n"
         f"{body}"
-    )
+    ), None
 
 
 def _tool_f3e_shopify_set_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -4844,8 +4860,11 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             if pending.get("rows"):
                 # A batch was previewed -> execute the whole batch. A confirm-turn
                 # quantity edit is ambiguous across rows, so it is ignored here; the
-                # user restates the message to change a row.
-                return _shopify_execute_pending_batch(slack_user_id, channel, pending)
+                # user restates the message to change a row. The typed path doesn't
+                # need the fresh-restash id (freshest_changed_stash's own turn-scoped
+                # before/after snapshot already covers it) -- just the message.
+                msg, _fresh_id = _shopify_execute_pending_batch(slack_user_id, channel, pending)
+                return msg
             # Did the model pass a DIFFERENT target than was previewed?
             new_qty = None
             q_raw = input_data.get("quantity")
@@ -4855,7 +4874,8 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
                 except (TypeError, ValueError):
                     new_qty = None
             if new_qty is None or new_qty == int(pending["target_qty"]):
-                return _shopify_execute_pending(slack_user_id, channel, pending)
+                msg, _fresh_id = _shopify_execute_pending(slack_user_id, channel, pending)
+                return msg
             if new_qty < 0:
                 # Keep the (unchanged) pending alive; just ask for a valid number.
                 _store_pending_shopify_write(slack_user_id, channel, {**pending, "ts": time.time()})
@@ -10314,27 +10334,39 @@ def _stash_expired_label(kind: str, entry: dict) -> str:
     return labels.get(kind, "that request")
 
 
-def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity: str, channel: str) -> str:
+def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity: str,
+                           channel: str) -> tuple[str, str | None]:
     """Dispatch an ALREADY-CLAIMED stash entry to its kind's own execute
-    function -- the identical function the typed-confirm path calls."""
+    function -- the identical function the typed-confirm path calls.
+
+    Returns (message, fresh_stash_id). fresh_stash_id is non-None ONLY when
+    THIS call itself minted a new pending -- currently possible only for
+    "shopify" (live-inventory drift / floor-guard re-check), whose executors
+    return that id directly as part of their own return value. Every other
+    kind's executor never re-stashes, so it is wrapped with a hard None here:
+    the caller (resolve_and_claim_stash) must never derive this signal by
+    re-peeking the shared (kind, user, channel) slot after the fact, because
+    an ambient peek cannot tell "this call re-stashed" apart from "a totally
+    unrelated write landed in the same slot while this call was in flight"
+    (D-051 fix, 2026-08-02 second review)."""
     if kind == "asana":
-        return _execute_claimed_asana(entry.get("action", ""), entry, tapping_user_id, entity)
+        return _execute_claimed_asana(entry.get("action", ""), entry, tapping_user_id, entity), None
     if kind == "shopify":
         if entry.get("rows"):
             return _shopify_execute_pending_batch(tapping_user_id, channel, entry)
         return _shopify_execute_pending(tapping_user_id, channel, entry)
     if kind == "calendar":
-        return _execute_claimed_calendar(entry.get("action", ""), entry, tapping_user_id)
+        return _execute_claimed_calendar(entry.get("action", ""), entry, tapping_user_id), None
     if kind == "lexicon":
-        return _execute_claimed_lexicon(entry, tapping_user_id, channel)
+        return _execute_claimed_lexicon(entry, tapping_user_id, channel), None
     if kind == "code_queue":
-        return _execute_claimed_code_queue(entry, tapping_user_id, entity)
+        return _execute_claimed_code_queue(entry, tapping_user_id, entity), None
     if kind == "delegated":
-        return _execute_claimed_delegated(entry, tapping_user_id, entity)
+        return _execute_claimed_delegated(entry, tapping_user_id, entity), None
     if kind == "remember":
-        return _execute_claimed_remember(entry, tapping_user_id)
+        return _execute_claimed_remember(entry, tapping_user_id), None
     if kind == "forget_note":
-        return _execute_claimed_forget_note(entry, tapping_user_id)
+        return _execute_claimed_forget_note(entry, tapping_user_id), None
     if kind == "schedule_meeting":
         # The Confirm button always books the FIRST (soonest) offered slot --
         # design section 4.1's single Confirm/Cancel pair, not a 3-way picker
@@ -10343,10 +10375,10 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
         # iso strings, exactly as before this feature existed).
         slots = entry.get("slots") or []
         if not slots:
-            return "calendar_schedule_meeting: no slot was available to book."
+            return "calendar_schedule_meeting: no slot was available to book.", None
         start, end = slots[0]
-        return _execute_claimed_schedule_meeting(entry, tapping_user_id, start, end)
-    return "Internal error -- unrecognized stash kind. Nothing changed."
+        return _execute_claimed_schedule_meeting(entry, tapping_user_id, start, end), None
+    return "Internal error -- unrecognized stash kind. Nothing changed.", None
 
 
 def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) -> dict:
@@ -10414,16 +10446,15 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
 
     try:
         # The whole post-claim block (not just the execute call) is guarded:
-        # a crash ANYWHERE here (route(), execute, the post-execute freshness
-        # peek) must never propagate out of the Slack action receiver -- there
-        # is no @app.error handler registered anywhere in this codebase, so an
-        # uncaught exception here would surface as a raw Bolt-level error with
-        # the claim already popped and index-resolved (D-051 review defense-
-        # in-depth; none of the wrapped calls are known to raise today, but
-        # the claim's one-shot guarantee must hold regardless).
+        # a crash ANYWHERE here (route() or execute) must never propagate out
+        # of the Slack action receiver -- there is no @app.error handler
+        # registered anywhere in this codebase, so an uncaught exception here
+        # would surface as a raw Bolt-level error with the claim already
+        # popped and index-resolved (D-051 review defense-in-depth; none of
+        # the wrapped calls are known to raise today, but the claim's
+        # one-shot guarantee must hold regardless).
         from ..entity_router import route
         entity = route(channel)
-        raw = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
 
         # D-051 adversarial review finding (HIGH): some kinds' execute can
         # itself decline to write and re-stash a FRESH preview instead
@@ -10432,23 +10463,35 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
         # and falsely labeling it "executed" would drop this card's buttons
         # while a live, un-carded pending sits underneath with no way to act
         # on it via a button (the typed path would still find it, but the
-        # card would visibly claim this is over). Detect it generically
-        # (works for any kind, not just Shopify, and doesn't depend on
-        # guessing from a WRITE_BLOCKED/WRITE_CONFIRMED text prefix): if a
-        # FRESH stash_id now exists for this exact (kind, user, channel) slot
-        # -- different from the one just claimed -- surface it so the caller
-        # can post a new Confirm/Cancel card, mirroring exactly what the
-        # ambiguity-picker hand-off (resolve_shopify_ask_pick) already does.
-        spec = _stash_kind_specs().get(kind)
-        fresh_entry = spec["peek"](user, channel) if spec else None
-        fresh_stash_id = (fresh_entry or {}).get("stash_id")
+        # card would visibly claim this is over).
+        #
+        # SECOND D-051 review (2026-08-02) found the first fix's detection
+        # unsound: it re-peeked the shared (kind, user, channel) slot AFTER
+        # execute() returned, with no check that the entry sitting there now
+        # came from THIS round. If the SAME user fires a second, unrelated
+        # staged write of the SAME kind while this execute() call is still in
+        # flight (e.g. confirms "delete task Foo", and while the Asana call
+        # is running, asks to "create a task called Bar"), that peek would
+        # see Bar's fresh id in the now-empty slot and misreport Foo's
+        # confirm as "re_previewed" with Bar's id -- app.py would then post a
+        # brand-new card captioned "Deleted Foo" wired to Bar's unrelated,
+        # not-yet-created task; a tapped Cancel on it would silently cancel
+        # Bar instead of dismissing stale noise.
+        #
+        # Fixed by sourcing fresh_stash_id directly from THIS execute() call's
+        # own return value instead of an ambient peek -- _execute_claimed_stash
+        # always returns (message, fresh_stash_id), where fresh_stash_id is
+        # populated ONLY by the same call that minted it (Shopify's executors
+        # thread it straight through; every other kind hard-codes None since
+        # none of them can re-stash). There is no shared state left to race.
+        raw, fresh_stash_id = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
         clean_message = _strip_write_sentinel(raw)
     except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
         log.exception("confirm-button execute crashed AFTER claim kind=%s user=%s",
                       kind, tapping_user_id)
         return {"outcome": "indeterminate"}
 
-    if fresh_stash_id and fresh_stash_id != stash_id:
+    if fresh_stash_id:
         return {"outcome": "re_previewed", "message": clean_message, "stash_id": fresh_stash_id}
     # Sentinel-strip here (not in app.py): the button path never posts a raw
     # WRITE_CONFIRMED/WRITE_BLOCKED-prefixed string -- app.py gets clean,

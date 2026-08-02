@@ -310,6 +310,142 @@ class TestResolveAndClaimStashSecurity:
         assert fresh_sid and fresh_sid != sid
         assert cc.index_lookup(fresh_sid) is not None  # reachable by a future tap
 
+    def test_concurrent_unrelated_asana_write_during_execute_is_not_misreported(self):
+        # D-051 second review (2026-08-02): the post-execute freshness check used
+        # to re-PEEK the shared (kind, user, channel) slot after execute() returned,
+        # with no check that whatever landed there came from THIS round. Simulate
+        # Harrison confirming "delete task Foo"; WHILE the Asana delete call is in
+        # flight, an unrelated "create a task called Bar" request (same user, same
+        # channel, same kind) mints its own fresh stash into the now-empty slot.
+        # The old ambient peek would see Bar's id sitting there and misreport
+        # Foo's confirm as "re_previewed" with Bar's id -- app.py would then post a
+        # brand-new card captioned "Deleted Foo" wired to Bar's unrelated,
+        # not-yet-created task; tapping Cancel on it would silently cancel Bar
+        # instead of dismissing stale noise. Asana's own executor never re-stashes
+        # anything, so the fix must report this as a clean "executed" for Foo,
+        # with Bar's concurrent pending left completely untouched.
+        foo_sid = _stash_asana_delete(label="Foo")
+        bar_sid = cc.mint_stash_id("asana", HARRISON, _CH)
+
+        def _delete_side_effect(_gid):
+            # The "concurrent" unrelated request lands in the same slot while
+            # THIS call is still in flight -- before the post-execute check runs.
+            td._store_pending_asana_write(HARRISON, _CH, {
+                "action": "create", "title": "Bar", "assignee_gid": "g",
+                "assignee_display": "H", "project_gid": None, "notes": None,
+                "due_on": None, "notices": [], "follower_gids": [],
+                "follower_displays": [], "ts": time.time(), "stash_id": bar_sid,
+            })
+
+        with patch.object(td.asana_client, "delete_task", side_effect=_delete_side_effect):
+            result = td.resolve_and_claim_stash(foo_sid, HARRISON, "confirm")
+
+        assert result["outcome"] == "executed"
+        assert "Foo" in result["message"]
+        assert "stash_id" not in result
+        # Bar's own pending must survive completely untouched -- confirming Foo's
+        # delete must never claim, consume, or otherwise disturb an unrelated
+        # concurrent request that happens to share its (kind, user, channel) slot.
+        bar_pending = td._peek_pending_asana(HARRISON, _CH)
+        assert bar_pending is not None
+        assert bar_pending["stash_id"] == bar_sid
+        assert bar_pending["title"] == "Bar"
+        # Bar's index record must NOT have been marked resolved by Foo's confirm
+        # (index_mark_resolved is keyed on the exact stash_id being claimed --
+        # this pins that Foo's claim never touches Bar's entry).
+        bar_idx = cc.index_lookup(bar_sid)
+        assert bar_idx is not None
+        assert not bar_idx.get("resolved")
+        # Bar is fully, independently confirmable end-to-end -- not just "still
+        # present in the store", but actually actionable via its own button tap.
+        fake_created = {"gid": "999888777", "name": "Bar", "permalink_url": "",
+                        "assignee": {"name": "H"}, "due_on": None, "projects": []}
+        with patch.object(td.asana_client, "create_task", return_value=fake_created) as mock_create:
+            bar_result = td.resolve_and_claim_stash(bar_sid, HARRISON, "confirm")
+        assert bar_result["outcome"] == "executed"
+        mock_create.assert_called_once()
+
+    def test_concurrent_unrelated_shopify_write_during_execute_is_not_misreported(self):
+        # Same defect, reproduced within Shopify itself -- the ONE kind whose own
+        # executor can legitimately re-stash (drift/floor-guard). The fix must
+        # still tell "MY OWN re-stash" apart from "an unrelated write landed in
+        # the same slot" even when both are possible for this kind: a STABLE
+        # (non-drifting) confirm that genuinely writes must never be misreported
+        # as re_previewed just because a second, unrelated Shopify preview for a
+        # different item was minted into the same slot while the live write call
+        # was in flight.
+        sid = _stash_shopify_single()  # preview_qty=8, delta=2 -> target 10
+        other_sid = cc.mint_stash_id("shopify", HARRISON, _CH)
+
+        def _set_inventory_side_effect(_item_id, _loc_id, _target):
+            # The "concurrent" unrelated request (a different item) lands in the
+            # same (user, channel) slot while THIS write is still in flight.
+            td._store_pending_shopify_write(HARRISON, _CH, {
+                "inventory_item_id": "i-other", "location_id": "l1", "target_qty": 20,
+                "preview_qty": 15, "delta": 5, "unit": "units", "variant_label": "Other Variant",
+                "location_label": "Office", "resolved_from": "", "lex": None,
+                "ts": time.time(), "stash_id": other_sid,
+            })
+            return 10  # the new available count for THIS (unrelated) write
+
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=8), \
+             patch.object(td.shopify_client, "set_inventory_level",
+                          side_effect=_set_inventory_side_effect), \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+
+        assert result["outcome"] == "executed"
+        assert "stash_id" not in result
+        # The unrelated concurrent preview survives untouched and independently
+        # confirmable -- it must never be silently claimed, edited, or dropped by
+        # a different item's confirm tap.
+        other_pending = td._peek_pending_shopify(HARRISON, _CH)
+        assert other_pending is not None
+        assert other_pending["stash_id"] == other_sid
+        assert other_pending["variant_label"] == "Other Variant"
+        other_idx = cc.index_lookup(other_sid)
+        assert other_idx is not None
+        assert not other_idx.get("resolved")
+        # And it's fully, independently confirmable end-to-end -- not just
+        # "still present in the store".
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=15), \
+             patch.object(td.shopify_client, "set_inventory_level", return_value=20) as mock_set2, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            other_result = td.resolve_and_claim_stash(other_sid, HARRISON, "confirm")
+        assert other_result["outcome"] == "executed"
+        mock_set2.assert_called_once()
+
+    def test_shopify_batch_drift_during_execute_reports_re_previewed_via_button_path(self):
+        # The batch executor (_shopify_execute_pending_batch) got the SAME
+        # (message, fresh_stash_id) migration as the single-item executor, but
+        # no existing test drove its own re-preview branch through the button
+        # path (resolve_and_claim_stash) -- only through the typed-confirm path,
+        # which discards the fresh id entirely. Pin it directly, mirroring
+        # test_drift_during_execute_reports_re_previewed_not_executed's rigor
+        # (re-confirm the fresh batch id end-to-end).
+        sid = _stash_shopify_batch(n=2)  # both rows preview_qty=8
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=5), \
+             patch.object(td.shopify_client, "set_inventory_level") as mock_set, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "re_previewed"
+        mock_set.assert_not_called()
+        fresh_sid = result["stash_id"]
+        assert fresh_sid and fresh_sid != sid
+        fresh_pending = td._peek_pending_shopify(HARRISON, _CH)
+        assert fresh_pending["stash_id"] == fresh_sid
+        assert all(r["preview_qty"] == 5 for r in fresh_pending["rows"])
+        # The OLD stash_id is dead -- a stale tap on it reads already_handled.
+        stale_result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert stale_result["outcome"] == "already_handled"
+        # The FRESH batch stash_id is fully confirmable via the button path.
+        with patch.object(td.shopify_client, "get_inventory_level", return_value=5), \
+             patch.object(td.shopify_client, "set_inventory_level", return_value=5) as mock_set2, \
+             patch.object(td, "_load_shopify_write_config", return_value=({"office"}, {})):
+            final = td.resolve_and_claim_stash(fresh_sid, HARRISON, "confirm")
+        assert final["outcome"] == "executed"
+        assert mock_set2.call_count == 2
+
     def test_cancel_pops_without_executing(self):
         sid = _stash_asana_delete()
         with patch.object(td.asana_client, "delete_task") as mock:
