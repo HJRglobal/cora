@@ -10289,8 +10289,20 @@ def _stash_expired_label(kind: str, entry: dict) -> str:
     """Short human label for an expired-tombstone reply, per kind."""
     if kind == "shopify":
         return _expired_pending_label(entry)
+    if kind == "asana":
+        # Asana's pending-entry shape varies by sub-action: complete/delete/
+        # update/comment carry "label", create carries "title" (no "label"
+        # key at all), and subtask carries its own name under "name"
+        # ("parent_label" is the PARENT task's label, a different thing).
+        action = entry.get("action")
+        if action == "create":
+            name = entry.get("title") or "that task"
+        elif action == "subtask":
+            name = entry.get("name") or "that task"
+        else:
+            name = entry.get("label") or "that task"
+        return f'"{name}"'
     labels = {
-        "asana": f'"{entry.get("label", "that task")}"',
         "calendar": f'"{entry.get("summary", "that event")}"',
         "code_queue": "that queue request",
         "delegated": "that job request",
