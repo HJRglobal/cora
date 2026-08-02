@@ -354,6 +354,7 @@ class TestWave1ConversionMetrics:
         assert m["conversions_by_lane_7d"] == {
             "known_answer_mined": 1, "known_answer_escalation_asker": 1,
             "friction_efficiency": 1, "decision_staged": 0,
+            "lexicon_mined": 0, "lexicon_taught": 0,
         }
 
     def test_code_queue_routings_tracked_separately_not_in_knowledge_numerator(
