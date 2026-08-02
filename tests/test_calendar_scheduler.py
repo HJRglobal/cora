@@ -444,6 +444,13 @@ def _resolve_name_stub(name: str, entity: str):
 class TestToolCalendarScheduleMeeting:
     """Unit tests for the tool handler.  All external calls mocked."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_schedule_meeting_pending(self):
+        from src.cora.tools import tool_dispatch as td
+        td._PENDING_SCHEDULE_MEETING.clear()
+        yield
+        td._PENDING_SCHEDULE_MEETING.clear()
+
     def _call(self, slack_user_id: str, input_data: dict):
         from src.cora.tools.tool_dispatch import _tool_calendar_schedule_meeting
         return _tool_calendar_schedule_meeting(slack_user_id, "FNDR", input_data)
@@ -478,6 +485,9 @@ class TestToolCalendarScheduleMeeting:
         assert "confirmed" in result.lower()
 
     def test_phase2_missing_proposed_times_returns_error(self):
+        # F-23: confirmed=true with no prior phase-1 stash gets the honest
+        # no-pending refusal -- there is nothing to re-derive from confirm-turn
+        # fields, so this never reaches the "proposed_start missing" branch.
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])):
             result = self._call("U_HARRISON", {
@@ -485,6 +495,18 @@ class TestToolCalendarScheduleMeeting:
                 "confirmed": True,
                 # proposed_start and proposed_end deliberately omitted
             })
+        assert "pending" in result.lower() or "expired" in result.lower()
+
+    def test_phase2_missing_proposed_times_after_stash_returns_error(self):
+        # With a real stash in place, omitting proposed_start/end on the confirm
+        # turn still refuses cleanly (never books a guessed slot).
+        slot_start = az(2026, 6, 2, 9, 0).astimezone(UTC)
+        slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
+        with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
+             patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]):
+            self._call("U_HARRISON", {"participants": ["Larry"]})
+            result = self._call("U_HARRISON", {"participants": ["Larry"], "confirmed": True})
         assert "proposed_start" in result.lower() or "missing" in result.lower()
 
     def test_phase2_books_event(self):
@@ -496,9 +518,13 @@ class TestToolCalendarScheduleMeeting:
             "end":   {"dateTime": "2026-06-02T09:30:00-07:00"},
             "attendees": [],
         }
+        slot_start = az(2026, 6, 2, 9, 0).astimezone(UTC)
+        slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]), \
              patch("src.cora.tools.tool_dispatch.calendar_client.create_event", return_value=fake_event):
+            self._call("U_HARRISON", {"participants": ["Larry"], "title": "Sync"})
             result = self._call("U_HARRISON", {
                 "participants": ["Larry"],
                 "confirmed": True,
@@ -509,11 +535,35 @@ class TestToolCalendarScheduleMeeting:
         # format_created_event_for_llm returns a string with a calendar link
         assert "calendar.google.com" in result or "Sync" in result
 
-    def test_phase2_api_error_returns_friendly_message(self):
+    def test_phase2_unmatched_slot_refuses_without_booking(self):
+        # F-23 parity: a confirm-turn time that does NOT match one of the
+        # stashed slots is refused, never booked (closes the model-echoed-
+        # slot risk -- a hallucinated/edited time can't silently book).
+        slot_start = az(2026, 6, 2, 9, 0).astimezone(UTC)
+        slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
         with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
              patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]), \
+             patch("src.cora.tools.tool_dispatch.calendar_client.create_event") as mock_create:
+            self._call("U_HARRISON", {"participants": ["Larry"]})
+            result = self._call("U_HARRISON", {
+                "participants": ["Larry"],
+                "confirmed": True,
+                "proposed_start": "2099-01-01T09:00:00-07:00",
+                "proposed_end":   "2099-01-01T09:30:00-07:00",
+            })
+        mock_create.assert_not_called()
+        assert "doesn't match" in result.lower() or "match" in result.lower()
+
+    def test_phase2_api_error_returns_friendly_message(self):
+        slot_start = az(2026, 6, 2, 9, 0).astimezone(UTC)
+        slot_end   = az(2026, 6, 2, 9, 30).astimezone(UTC)
+        with patch("src.cora.tools.tool_dispatch._load_slack_asana_map", return_value=_FAKE_USER_MAP), \
+             patch("src.cora.tools.tool_dispatch.resolve_name_to_slack_user_id", return_value=("U_LARRY", _FAKE_USER_MAP["U_LARRY"])), \
+             patch("src.cora.tools.tool_dispatch.calendar_client.find_meeting_slots", return_value=[(slot_start, slot_end)]), \
              patch("src.cora.tools.tool_dispatch.calendar_client.create_event",
                    side_effect=cc.CalendarClientError("403 DWD")):
+            self._call("U_HARRISON", {"participants": ["Larry"]})
             result = self._call("U_HARRISON", {
                 "participants": ["Larry"],
                 "confirmed": True,

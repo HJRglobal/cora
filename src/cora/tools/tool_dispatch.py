@@ -20,13 +20,13 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Any, Callable
 
 import yaml
 
 from . import ads_client, asana_client, brand_voice_client, calendar_client, completion_detector, fighter_tracker_client, financial_client, generate_image, gmail_client, hjrp_client, hubspot_client, influencer_client, inventory_client, lex_client, notion_client, qbo_client, sales_deck_client
-from .. import dashboard_access, org_roles, pm_metrics
+from .. import confirm_cards, dashboard_access, org_roles, pm_metrics
 from ..connectors import airtable_client, dashboard_drive_reader, gmail_reader, photoroom_client, qbo_oauth, shopify_client
 from ..channel_classifier import classify_function as _classify_channel_function, is_tier_1 as _channel_is_tier1
 
@@ -785,6 +785,7 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
     # preview verbatim.
     _store_pending_asana_write(slack_user_id, channel, {
         "action": "create", **resolved, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(_asana_create_preview_text(resolved))
 
@@ -1199,7 +1200,7 @@ def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entit
 #       (generalized to a tool SET) posts the tool's own outcome text and, when NO
 #       destructive-Asana WRITE_CONFIRMED fired, a phantom-claim guard rewrites a
 #       fabricated "deleted/completed" success. The tool owns the outcome text.
-_ASANA_PENDING_LOCK = Lock()
+_ASANA_PENDING_LOCK = RLock()
 _ASANA_PENDING_TTL_SECONDS = 600  # 10 min
 _PENDING_ASANA_WRITES: dict[tuple[str, str], dict] = {}
 
@@ -1279,19 +1280,7 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "complete")
         if pending:
-            try:
-                asana_client.complete_task(pending["gid"])
-            except asana_client.AsanaClientError as exc:
-                return _write_blocked_contract(
-                    f'NOT DONE -- couldn\'t complete "{pending["label"]}" ({exc}). '
-                    f"It was NOT marked done."
-                )
-            log.info("asana_complete_task actor=%s gid=%s", slack_user_id, pending["gid"])
-            pm_metrics.log_pm_action("complete", slack_user_id, entity, pending["gid"],
-                                     title=pending.get("label"))
-            return _write_confirmed_contract(
-                f'Done -- marked "{pending["label"]}" complete in Asana.'
-            )
+            return _execute_claimed_asana("complete", pending, slack_user_id, entity)
         # No fresh pending complete -> re-preview (never complete blind).
 
     gid, label, err = _resolve_asker_task(
@@ -1305,6 +1294,7 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
     label = _lex_safe_label(label, entity)
     _store_pending_asana_write(slack_user_id, channel, {
         "action": "complete", "gid": gid, "label": label, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
         f'Not done yet -- reply to confirm and I\'ll mark "{label}" complete in Asana. '
@@ -1321,18 +1311,7 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "delete")
         if pending:
-            try:
-                asana_client.delete_task(pending["gid"])
-            except asana_client.AsanaClientError as exc:
-                return _write_blocked_contract(
-                    f'NOT DELETED -- couldn\'t delete "{pending["label"]}" ({exc}). '
-                    f"It was NOT deleted."
-                )
-            log.info("asana_delete_task actor=%s gid=%s label=%r",
-                     slack_user_id, pending["gid"], pending["label"])
-            pm_metrics.log_pm_action("delete", slack_user_id, entity, pending["gid"],
-                                     title=pending.get("label"))
-            return _write_confirmed_contract(f'Deleted "{pending["label"]}" from Asana.')
+            return _execute_claimed_asana("delete", pending, slack_user_id, entity)
         # No fresh pending delete -> re-preview (NEVER delete blind).
 
     gid, label, err = _resolve_asker_task(
@@ -1346,6 +1325,7 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     label = _lex_safe_label(label, entity)
     _store_pending_asana_write(slack_user_id, channel, {
         "action": "delete", "gid": gid, "label": label, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
         f'Not deleted yet -- deleting is PERMANENT (completing is usually better). '
@@ -1405,45 +1385,7 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "update")
         if pending:
-            gid = pending["gid"]
-            fields = pending.get("fields") or {}
-            custom = pending.get("custom_fields") or {}
-            change_desc = list(pending.get("change_desc") or [])
-            failed: list[str] = []
-            if fields:
-                try:
-                    asana_client.update_task(gid, fields)
-                except asana_client.AsanaClientError as exc:
-                    return _write_blocked_contract(
-                        f'NOT UPDATED -- couldn\'t update "{pending["label"]}" ({exc}). '
-                        f"No change was made."
-                    )
-            if custom:
-                ok = asana_client.set_task_custom_fields(gid, custom)
-                if not ok:
-                    cdesc = " and ".join(pending.get("custom_desc") or ["status/priority"])
-                    if not fields:
-                        # nothing else changed -> nothing was written; do NOT claim success.
-                        return _write_blocked_contract(
-                            f'NOT UPDATED -- couldn\'t set {cdesc} on "{pending["label"]}" '
-                            f"(that field may not be enabled on its project). No change was made."
-                        )
-                    failed = list(pending.get("custom_desc") or ["status/priority"])
-            log.info("asana_update_task actor=%s gid=%s fields=%s custom=%s custom_ok=%s",
-                     slack_user_id, gid, sorted(fields.keys()), sorted(custom.keys()), not failed)
-            pm_metrics.log_pm_action(
-                "update", slack_user_id, entity, gid, title=pending.get("label"),
-                extra={"fields": sorted(fields.keys()) + list(pending.get("custom_desc") or [])},
-            )
-            msg = f'Updated "{pending["label"]}" in Asana'
-            if change_desc:
-                msg += " -- " + "; ".join(change_desc)
-            msg += "."
-            if failed:
-                msg += (" (Couldn't set " + " and ".join(failed) +
-                        " -- that field may not be enabled on this task's project; set it "
-                        "directly in Asana.)")
-            return _write_confirmed_contract(msg)
+            return _execute_claimed_asana("update", pending, slack_user_id, entity)
         # No fresh pending update -> re-preview (never write blind).
 
     # ── Phase 1: resolve target + change-set SERVER-SIDE, stash, WRITE_BLOCKED preview.
@@ -1551,6 +1493,7 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
         "action": "update", "gid": gid, "label": label,
         "fields": fields, "custom_fields": custom,
         "change_desc": change_desc, "custom_desc": custom_desc, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     preview = (
         f'Not updated yet -- reply to confirm and I\'ll update "{label}": '
@@ -1571,17 +1514,7 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "comment")
         if pending:
-            try:
-                asana_client.create_task_comment(pending["gid"], pending["text"])
-            except asana_client.AsanaClientError as exc:
-                return _write_blocked_contract(
-                    f'NOT ADDED -- couldn\'t comment on "{pending["label"]}" ({exc}). '
-                    f"No comment was posted."
-                )
-            log.info("asana_add_comment actor=%s gid=%s", slack_user_id, pending["gid"])
-            pm_metrics.log_pm_action("comment", slack_user_id, entity, pending["gid"],
-                                     title=pending.get("label"))
-            return _write_confirmed_contract(f'Comment added to "{pending["label"]}" in Asana.')
+            return _execute_claimed_asana("comment", pending, slack_user_id, entity)
         # No fresh pending comment -> re-preview.
 
     text = (input_data.get("text") or "").strip()
@@ -1604,6 +1537,7 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
         )
     _store_pending_asana_write(slack_user_id, channel, {
         "action": "comment", "gid": gid, "label": label, "text": scrubbed, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
         f'Not added yet -- reply to confirm and I\'ll post this comment on "{label}": '
@@ -1622,31 +1556,7 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
     if confirmed:
         pending = _claim_pending_asana(slack_user_id, channel, "subtask")
         if pending:
-            try:
-                created = asana_client.create_subtask(
-                    pending["parent_gid"],
-                    name=pending["name"],
-                    assignee_gid=pending.get("assignee_gid") or None,
-                    notes=pending.get("notes") or None,
-                    due_on=pending.get("due_on") or None,
-                )
-            except asana_client.AsanaClientError as exc:
-                return _write_blocked_contract(
-                    f'NOT ADDED -- couldn\'t add the subtask under "{pending["parent_label"]}" '
-                    f"({exc}). Nothing was created."
-                )
-            log.info("asana_add_subtask actor=%s parent=%s sub=%s",
-                     slack_user_id, pending["parent_gid"], created.get("gid", ""))
-            pm_metrics.log_pm_action(
-                "subtask", slack_user_id, entity, created.get("gid", "") or pending["parent_gid"],
-                title=pending.get("name"), extra={"parent": pending["parent_gid"]},
-            )
-            link = created.get("permalink_url") or ""
-            name_disp = f'<{link}|{pending["name"]}>' if link else f'"{pending["name"]}"'
-            return _write_confirmed_contract(
-                f'Added subtask {name_disp} under "{pending["parent_label"]}" '
-                f'(assignee: {pending.get("assignee_display", "you")}).'
-            )
+            return _execute_claimed_asana("subtask", pending, slack_user_id, entity)
         # No fresh pending subtask -> re-preview.
 
     name = (input_data.get("title") or "").strip()
@@ -1699,12 +1609,135 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
         "action": "subtask", "parent_gid": gid, "parent_label": parent_label,
         "name": name_scrubbed, "notes": notes_scrubbed, "due_on": due_on,
         "assignee_gid": assignee_gid, "assignee_display": assignee_display, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
         f'Not added yet -- reply to confirm and I\'ll add subtask "{name_scrubbed}" '
         f'(assignee: {assignee_display}) under "{parent_label}". '
         f"Nothing is created until you confirm."
     )
+
+
+def _execute_claimed_asana(action: str, pending: dict, slack_user_id: str, entity: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) Asana pending entry and return the
+    sentinel-wrapped outcome text. Shared by each tool's own confirmed=true call
+    (claims via _claim_pending_asana) and the confirm-button tap handler (claims
+    via the generic by-stash-id claim, tool_dispatch._claim_stash_by_id) -- so
+    there is exactly one claim per confirm and no double-pop risk either way."""
+    if action == "complete":
+        try:
+            asana_client.complete_task(pending["gid"])
+        except asana_client.AsanaClientError as exc:
+            return _write_blocked_contract(
+                f'NOT DONE -- couldn\'t complete "{pending["label"]}" ({exc}). '
+                f"It was NOT marked done."
+            )
+        log.info("asana_complete_task actor=%s gid=%s", slack_user_id, pending["gid"])
+        pm_metrics.log_pm_action("complete", slack_user_id, entity, pending["gid"],
+                                 title=pending.get("label"))
+        return _write_confirmed_contract(
+            f'Done -- marked "{pending["label"]}" complete in Asana.'
+        )
+
+    if action == "delete":
+        try:
+            asana_client.delete_task(pending["gid"])
+        except asana_client.AsanaClientError as exc:
+            return _write_blocked_contract(
+                f'NOT DELETED -- couldn\'t delete "{pending["label"]}" ({exc}). '
+                f"It was NOT deleted."
+            )
+        log.info("asana_delete_task actor=%s gid=%s label=%r",
+                 slack_user_id, pending["gid"], pending["label"])
+        pm_metrics.log_pm_action("delete", slack_user_id, entity, pending["gid"],
+                                 title=pending.get("label"))
+        return _write_confirmed_contract(f'Deleted "{pending["label"]}" from Asana.')
+
+    if action == "create":
+        return _execute_asana_create(slack_user_id, pending, entity)
+
+    if action == "update":
+        gid = pending["gid"]
+        fields = pending.get("fields") or {}
+        custom = pending.get("custom_fields") or {}
+        change_desc = list(pending.get("change_desc") or [])
+        failed: list[str] = []
+        if fields:
+            try:
+                asana_client.update_task(gid, fields)
+            except asana_client.AsanaClientError as exc:
+                return _write_blocked_contract(
+                    f'NOT UPDATED -- couldn\'t update "{pending["label"]}" ({exc}). '
+                    f"No change was made."
+                )
+        if custom:
+            ok = asana_client.set_task_custom_fields(gid, custom)
+            if not ok:
+                cdesc = " and ".join(pending.get("custom_desc") or ["status/priority"])
+                if not fields:
+                    # nothing else changed -> nothing was written; do NOT claim success.
+                    return _write_blocked_contract(
+                        f'NOT UPDATED -- couldn\'t set {cdesc} on "{pending["label"]}" '
+                        f"(that field may not be enabled on its project). No change was made."
+                    )
+                failed = list(pending.get("custom_desc") or ["status/priority"])
+        log.info("asana_update_task actor=%s gid=%s fields=%s custom=%s custom_ok=%s",
+                 slack_user_id, gid, sorted(fields.keys()), sorted(custom.keys()), not failed)
+        pm_metrics.log_pm_action(
+            "update", slack_user_id, entity, gid, title=pending.get("label"),
+            extra={"fields": sorted(fields.keys()) + list(pending.get("custom_desc") or [])},
+        )
+        msg = f'Updated "{pending["label"]}" in Asana'
+        if change_desc:
+            msg += " -- " + "; ".join(change_desc)
+        msg += "."
+        if failed:
+            msg += (" (Couldn't set " + " and ".join(failed) +
+                    " -- that field may not be enabled on this task's project; set it "
+                    "directly in Asana.)")
+        return _write_confirmed_contract(msg)
+
+    if action == "comment":
+        try:
+            asana_client.create_task_comment(pending["gid"], pending["text"])
+        except asana_client.AsanaClientError as exc:
+            return _write_blocked_contract(
+                f'NOT ADDED -- couldn\'t comment on "{pending["label"]}" ({exc}). '
+                f"No comment was posted."
+            )
+        log.info("asana_add_comment actor=%s gid=%s", slack_user_id, pending["gid"])
+        pm_metrics.log_pm_action("comment", slack_user_id, entity, pending["gid"],
+                                 title=pending.get("label"))
+        return _write_confirmed_contract(f'Comment added to "{pending["label"]}" in Asana.')
+
+    if action == "subtask":
+        try:
+            created = asana_client.create_subtask(
+                pending["parent_gid"],
+                name=pending["name"],
+                assignee_gid=pending.get("assignee_gid") or None,
+                notes=pending.get("notes") or None,
+                due_on=pending.get("due_on") or None,
+            )
+        except asana_client.AsanaClientError as exc:
+            return _write_blocked_contract(
+                f'NOT ADDED -- couldn\'t add the subtask under "{pending["parent_label"]}" '
+                f"({exc}). Nothing was created."
+            )
+        log.info("asana_add_subtask actor=%s parent=%s sub=%s",
+                 slack_user_id, pending["parent_gid"], created.get("gid", ""))
+        pm_metrics.log_pm_action(
+            "subtask", slack_user_id, entity, created.get("gid", "") or pending["parent_gid"],
+            title=pending.get("name"), extra={"parent": pending["parent_gid"]},
+        )
+        link = created.get("permalink_url") or ""
+        name_disp = f'<{link}|{pending["name"]}>' if link else f'"{pending["name"]}"'
+        return _write_confirmed_contract(
+            f'Added subtask {name_disp} under "{pending["parent_label"]}" '
+            f'(assignee: {pending.get("assignee_display", "you")}).'
+        )
+
+    return _write_blocked_contract("Internal error -- unrecognized staged Asana action.")
 
 
 def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -1974,7 +2007,7 @@ def _tool_get_my_events(slack_user_id: str, entity: str, _input: dict) -> str:
 # honor-system gate (F-05: a first-call confirmed=true booked an event + SENT
 # Google invites with NO preview). Shared by create + delete; each tool checks the
 # stashed `action` and re-previews on mismatch/no-pending (never a blind write).
-_CALENDAR_PENDING_LOCK = Lock()
+_CALENDAR_PENDING_LOCK = RLock()
 _CALENDAR_PENDING_TTL_SECONDS = 600  # 10 min
 _PENDING_CALENDAR_WRITES: dict[tuple[str, str], dict] = {}
 
@@ -2027,6 +2060,59 @@ def _calendar_resolve_email(slack_user_id: str) -> tuple[str | None, str | None]
     return user_email, None
 
 
+def _execute_claimed_calendar(action: str, pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) calendar pending entry and return a
+    clean, human-postable outcome (no 'tell the user' framing -- this text is
+    posted BOTH as a tool_result for the model to relay AND, on the button path,
+    directly to Slack by the confirm-button tap handler with no model in the
+    loop at all). Shared by the tool's own confirmed=true call (claims via
+    _take_pending_calendar_write) and the button tap handler (claims via the
+    generic by-stash-id claim) -- exactly one claim per confirm."""
+    if action == "create":
+        try:
+            event = calendar_client.create_event(
+                user_email=pending["user_email"],
+                summary=pending["summary"],
+                start=pending["start"],
+                end=pending["end"],
+                attendees=pending.get("attendees"),
+                description=pending.get("description"),
+                location=pending.get("location"),
+                time_zone=pending.get("time_zone") or calendar_client._DEFAULT_TZ,
+            )
+        except calendar_client.CalendarClientError as exc:
+            log.warning("calendar_create_event BOOK FAILED asker=%s exc=%s", slack_user_id, exc)
+            return (
+                f"Calendar event error: {exc}. The event wasn't created. "
+                f"If the error mentions a missing DWD scope, Harrison needs to update "
+                f"Domain-wide Delegation in admin.google.com."
+            )
+        log.info(
+            "calendar_create_event CREATED asker=%s email=%s event_id=%s attendee_count=%d",
+            slack_user_id, pending["user_email"], event.get("id", ""),
+            len(pending.get("attendees") or []),
+        )
+        return calendar_client.format_created_event_for_llm(
+            event, user_email=pending["user_email"]
+        )
+
+    if action == "delete":
+        try:
+            calendar_client.delete_event(
+                user_email=pending["user_email"], event_id=pending["event_id"]
+            )
+        except calendar_client.CalendarClientError as exc:
+            log.warning("calendar_delete_event FAILED asker=%s exc=%s", slack_user_id, exc)
+            return f"Calendar delete error: {exc}. The event was NOT cancelled."
+        log.info(
+            "calendar_delete_event DELETED asker=%s email=%s event_id=%s",
+            slack_user_id, pending["user_email"], pending["event_id"],
+        )
+        return f"Cancelled '{pending['summary']}'. Google notified any attendees."
+
+    return "Internal error -- unrecognized staged calendar action. Nothing changed."
+
+
 def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -> str:
     """Create a Calendar event in the asker's own primary calendar (staged write).
 
@@ -2045,32 +2131,7 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
     if confirmed:
         pending = _take_pending_calendar_write(slack_user_id, channel)
         if pending and pending.get("action") == "create":
-            try:
-                event = calendar_client.create_event(
-                    user_email=pending["user_email"],
-                    summary=pending["summary"],
-                    start=pending["start"],
-                    end=pending["end"],
-                    attendees=pending.get("attendees"),
-                    description=pending.get("description"),
-                    location=pending.get("location"),
-                    time_zone=pending.get("time_zone") or calendar_client._DEFAULT_TZ,
-                )
-            except calendar_client.CalendarClientError as exc:
-                log.warning("calendar_create_event BOOK FAILED asker=%s exc=%s", slack_user_id, exc)
-                return (
-                    f"Calendar event error: {exc}. Tell the user the event wasn't created. "
-                    f"If the error mentions a missing DWD scope, Harrison needs to update "
-                    f"Domain-wide Delegation in admin.google.com."
-                )
-            log.info(
-                "calendar_create_event CREATED asker=%s email=%s event_id=%s attendee_count=%d",
-                slack_user_id, pending["user_email"], event.get("id", ""),
-                len(pending.get("attendees") or []),
-            )
-            return calendar_client.format_created_event_for_llm(
-                event, user_email=pending["user_email"]
-            )
+            return _execute_claimed_calendar("create", pending, slack_user_id)
         # No fresh pending create (first-call-confirmed, stale, or restart-cleared)
         # -> fall through to Phase 1 and RE-PREVIEW. Never book blind.
 
@@ -2113,6 +2174,7 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
         "location": location,
         "time_zone": time_zone,
         "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("calendar", slack_user_id, channel),
     })
     attendee_note = (
         f" Google will send invites to {len(attendee_list)} attendee(s) on confirm."
@@ -2151,24 +2213,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
     if confirmed:
         pending = _take_pending_calendar_write(slack_user_id, channel)
         if pending and pending.get("action") == "delete":
-            try:
-                calendar_client.delete_event(
-                    user_email=pending["user_email"], event_id=pending["event_id"]
-                )
-            except calendar_client.CalendarClientError as exc:
-                log.warning("calendar_delete_event FAILED asker=%s exc=%s", slack_user_id, exc)
-                return (
-                    f"Calendar delete error: {exc}. Tell the user the event was NOT "
-                    f"cancelled."
-                )
-            log.info(
-                "calendar_delete_event DELETED asker=%s email=%s event_id=%s",
-                slack_user_id, pending["user_email"], pending["event_id"],
-            )
-            return (
-                f"Cancelled '{pending['summary']}'. Google notified any attendees. Tell "
-                f"the user it's off their calendar."
-            )
+            return _execute_claimed_calendar("delete", pending, slack_user_id)
         # No fresh pending delete -> fall through to Phase 1 and RE-PREVIEW.
 
     # ── Phase 1: resolve the target + stash + preview ─────────────────────────
@@ -2181,6 +2226,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
         _store_pending_calendar_write(slack_user_id, channel, {
             "action": "delete", "event_id": event_id, "summary": summary,
             "user_email": user_email, "ts": time.time(),
+            "stash_id": confirm_cards.mint_stash_id("calendar", slack_user_id, channel),
         })
         return (
             f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{summary}'. "
@@ -2214,6 +2260,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
     _store_pending_calendar_write(slack_user_id, channel, {
         "action": "delete", "event_id": ev.get("id", ""), "summary": ev_summary,
         "user_email": user_email, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("calendar", slack_user_id, channel),
     })
     return (
         f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{ev_summary}' ({label}). "
@@ -3685,7 +3732,7 @@ def _resolve_shopify_location(query: str) -> tuple[int | None, str, list[str]]:
 # OWN pending entry after a FRESH live-qty re-check. Single process, in-memory,
 # TTL-bounded, single slot per key (a new preview overwrites); a restart clearing it
 # is fine (the user just re-previews). Thread guard mirrors the _ONE_TAP_LOCK idiom.
-_SHOPIFY_PENDING_LOCK = Lock()
+_SHOPIFY_PENDING_LOCK = RLock()
 _SHOPIFY_PENDING_TTL_SECONDS = 600  # 10 min
 _PENDING_SHOPIFY_WRITES: dict[tuple[str, str], dict] = {}
 
@@ -3989,6 +4036,7 @@ def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
         "resolved_from": data.get("resolved_from") or "",
         "lex": data.get("lex"),       # lexicon provenance for the confirm-capture event
         "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
     })
     log.info("f3e_shopify_set_inventory PREVIEW user=%s item=%s loc=%s cur=%s -> %s (delta=%s)",
              slack_user_id, match.inventory_item_id, data["loc_id"], data["current"], data["quantity"], data.get("delta"))
@@ -4045,6 +4093,57 @@ def _lexicon_teach_uid(payload: dict) -> str:
     return f"lexicon-taught-{hashlib.md5(key.encode('utf-8')).hexdigest()[:12]}"
 
 
+def _execute_claimed_lexicon(pending: dict, slack_user_id: str, channel: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) lexicon-teach pending entry. Shared by
+    the tool's own confirmed=true call (claims via _take_pending_lexicon_add) and
+    the confirm-button tap handler (claims via the generic by-stash-id claim) --
+    exactly one claim per confirm, zero double-pop risk."""
+    payload = pending["payload"]
+    if slack_user_id == _HARRISON_SLACK_ID:
+        from ..lexicon_writer import apply_lexicon_update
+        ok, summary = apply_lexicon_update(payload)
+        if not ok:
+            return f"NOT SAVED. {summary}"
+        # Audit + conversion trail: a founder teach records an APPROVED
+        # proposal row (fail-soft) so the flywheel lane counts it, plus a
+        # golden-set case (parity with the review-rail apply).
+        try:
+            from ..knowledge_review import propose_update, resolve_update
+            uid = _lexicon_teach_uid(payload)
+            if propose_update(update_id=uid, update_type="lexicon",
+                              description=f"Founder-taught lexicon term: {payload['term']}",
+                              payload=payload):
+                resolve_update(uid, "APPROVED", reason="founder_teach")
+        except Exception:  # noqa: BLE001
+            log.warning("lexicon teach: audit proposal failed (write ok)", exc_info=True)
+        try:
+            from ..golden_set import append_case_from_lexicon
+            append_case_from_lexicon(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        return (f"Saved to the {payload['entity']} lexicon: \"{payload['term']}\" = "
+                f"{payload['canonical_name']} [{payload['type']}, "
+                f"canonical {payload['canonical']}]. ({summary})")
+    # Teammate: Harrison-gated proposal with the teacher as contributor.
+    try:
+        from ..knowledge_review import propose_update
+        uid = _lexicon_teach_uid(payload)
+        propose_update(
+            update_id=uid, update_type="lexicon",
+            description=(f"Teammate-taught lexicon term: \"{payload['term']}\" = "
+                         f"{payload['canonical_name']}"),
+            payload=payload,
+            source_evidence=f"taught in #{channel or '?'} by <@{slack_user_id}>",
+            confidence="HIGH")
+    except Exception as exc:  # noqa: BLE001
+        log.error("lexicon teach: propose failed: %s", exc, exc_info=True)
+        return "NOT SAVED. I couldn't queue that for review -- try again shortly."
+    return (f"Queued for Harrison's review: \"{payload['term']}\" = "
+            f"{payload['canonical_name']} [{payload['type']}, {payload['entity']}]. "
+            f"It lands in the next weekday-morning knowledge review; it takes "
+            f"effect once approved.")
+
+
 def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) -> str:
     channel = str(input_data.get("_channel_name") or "").strip()
     try:
@@ -4062,50 +4161,7 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
             # F-23 doctrine: a no-pending confirm is honest, never a fabricated save.
             return ("NOT SAVED. I don't have a pending lexicon entry from you to "
                     "confirm -- it may have expired. State the term and meaning again.")
-        payload = pending["payload"]
-        if slack_user_id == _HARRISON_SLACK_ID:
-            from ..lexicon_writer import apply_lexicon_update
-            ok, summary = apply_lexicon_update(payload)
-            if not ok:
-                return f"NOT SAVED. {summary}"
-            # Audit + conversion trail: a founder teach records an APPROVED
-            # proposal row (fail-soft) so the flywheel lane counts it, plus a
-            # golden-set case (parity with the review-rail apply).
-            try:
-                from ..knowledge_review import propose_update, resolve_update
-                uid = _lexicon_teach_uid(payload)
-                if propose_update(update_id=uid, update_type="lexicon",
-                                  description=f"Founder-taught lexicon term: {payload['term']}",
-                                  payload=payload):
-                    resolve_update(uid, "APPROVED", reason="founder_teach")
-            except Exception:  # noqa: BLE001
-                log.warning("lexicon teach: audit proposal failed (write ok)", exc_info=True)
-            try:
-                from ..golden_set import append_case_from_lexicon
-                append_case_from_lexicon(payload)
-            except Exception:  # noqa: BLE001
-                pass
-            return (f"Saved to the {payload['entity']} lexicon: \"{payload['term']}\" = "
-                    f"{payload['canonical_name']} [{payload['type']}, "
-                    f"canonical {payload['canonical']}]. ({summary})")
-        # Teammate: Harrison-gated proposal with the teacher as contributor.
-        try:
-            from ..knowledge_review import propose_update
-            uid = _lexicon_teach_uid(payload)
-            propose_update(
-                update_id=uid, update_type="lexicon",
-                description=(f"Teammate-taught lexicon term: \"{payload['term']}\" = "
-                             f"{payload['canonical_name']}"),
-                payload=payload,
-                source_evidence=f"taught in #{channel or '?'} by <@{slack_user_id}>",
-                confidence="HIGH")
-        except Exception as exc:  # noqa: BLE001
-            log.error("lexicon teach: propose failed: %s", exc, exc_info=True)
-            return "NOT SAVED. I couldn't queue that for review -- try again shortly."
-        return (f"Queued for Harrison's review: \"{payload['term']}\" = "
-                f"{payload['canonical_name']} [{payload['type']}, {payload['entity']}]. "
-                f"It lands in the next weekday-morning knowledge review; it takes "
-                f"effect once approved.")
+        return _execute_claimed_lexicon(pending, slack_user_id, channel)
 
     # Phase 1: validate + stash + NOT-SAVED preview.
     term = str(input_data.get("term") or "").strip()
@@ -4159,8 +4215,10 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
         "canonical": canonical, "canonical_name": meaning, "lane": "taught",
         "contributor_id": slack_user_id,
     }
-    _store_pending_lexicon_add(slack_user_id, channel, {"payload": payload,
-                                                        "ts": time.time()})
+    _store_pending_lexicon_add(slack_user_id, channel, {
+        "payload": payload, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("lexicon", slack_user_id, channel),
+    })
     gate_note = ("I'll save it" if slack_user_id == _HARRISON_SLACK_ID
                  else "I'll queue it for Harrison's review")
     canon_note = f" (canonical: {canonical})" if canonical != meaning else ""
@@ -4234,7 +4292,8 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         # The live number moved between preview and confirm -> re-preview (NO write);
         # `target` already reflects the fresh count for a delta op.
         _store_pending_shopify_write(slack_user_id, channel,
-                                     {**pending, "target_qty": target, "preview_qty": live, "ts": time.time()})
+                                     {**pending, "target_qty": target, "preview_qty": live, "ts": time.time(),
+                                      "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel)})
         log.info("f3e_shopify_set_inventory CONCURRENCY re-preview user=%s item=%s preview=%s live=%s delta=%s",
                  slack_user_id, item_id, preview_qty, live, delta)
         return _shopify_write_blocked(_shopify_preview_text(
@@ -4306,6 +4365,7 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
         "resolved_from": pending.get("resolved_from") or "",
         "lex": pending.get("lex"),
         "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
     })
     log.info("f3e_shopify_set_inventory RE-PREVIEW(new target) user=%s item=%s loc=%s cur=%s -> %s",
              slack_user_id, item_id, loc_id, live, new_qty)
@@ -4434,7 +4494,8 @@ def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) ->
             f"{_NOT_WRITTEN}\nI couldn't resolve any of those, so nothing is staged:\n{detail}")
 
     _store_pending_shopify_write(slack_user_id, channel,
-                                 {"rows": resolved, "skipped": skipped, "ts": time.time()})
+                                 {"rows": resolved, "skipped": skipped, "ts": time.time(),
+                                  "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel)})
     log.info("f3e_shopify_set_inventory BATCH PREVIEW user=%s rows=%d skipped=%d",
              slack_user_id, len(resolved), len(skipped))
     return _shopify_write_blocked(_shopify_bulk_preview_text(resolved, skipped))
@@ -4484,7 +4545,10 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
         # Re-preview the still-valid rows (recomputed); write NOTHING (all counts
         # must be exactly as previewed before a write -- same rule as single-item).
         if refreshed:
-            _store_pending_shopify_write(slack_user_id, channel, {"rows": refreshed, "ts": time.time()})
+            _store_pending_shopify_write(slack_user_id, channel, {
+                "rows": refreshed, "ts": time.time(),
+                "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel),
+            })
         else:
             _take_pending_shopify_write(slack_user_id, channel)  # nothing valid left -> clear
         log.info("f3e_shopify_set_inventory BATCH re-preview user=%s valid=%d invalid=%d drift=%s",
@@ -4947,15 +5011,35 @@ def try_confirm_pending_write(
         intent = _confirm_intent(message, action)
         if intent == "affirm":
             return _run_confirm_execute("asana", action, slack_user_id, entity, channel_name)
-        # Negative OR content: abandon it (immediate-confirm-only). A negative also gets
-        # the explicit cancel reply; a content message silently defers to the model.
-        _take_pending_asana_write(slack_user_id, channel_name)
         if intent == "negate":
+            _take_pending_asana_write(slack_user_id, channel_name)
             log.info("confirm_interceptor CANCEL user=%s kind=asana action=%s",
                      slack_user_id, action)
             return _CONFIRM_CANCELLED_REPLY
-        log.info("confirm_interceptor ABANDON destructive asana user=%s action=%s (non-confirm msg)",
-                 slack_user_id, action)
+        # intent is None: not a recognized affirm/negate. cq-2af049327848 fix -- the
+        # old code unconditionally ABANDONED (popped) the pending here on ANY non-
+        # affirm classification, making a genuine confirm attempt that merely fell
+        # outside _confirm_intent's narrow vocabulary/10-token cap (e.g. a longer,
+        # natural confirm sentence) indistinguishable from an explicit new topic:
+        # the pending silently vanished and the user saw an honest-looking no-op,
+        # with nothing actually deleted ("reproduced 2x on 7/29 live smokes" --
+        # create/Shopify confirms on the same path were unaffected because THEY
+        # never popped on a bare None). A genuine QUESTION ("?" in the message) is
+        # still a clear enough "this isn't a confirm attempt" signal to abandon
+        # (review HIGH #1 -- a later unrelated "ok thanks" must never fire a stale
+        # delete); every existing HIGH #1 / interrogative test uses a "?"-bearing
+        # message, so this is unchanged for them. A non-question message that
+        # merely failed classification now leaves the pending intact (matching the
+        # module docstring's general "ambiguous -> pending intact" contract, and
+        # matching create/Shopify/delegated's existing behavior) and defers to the
+        # model, which still sees the fresh pending and can act on a follow-up.
+        if "?" in message:
+            _take_pending_asana_write(slack_user_id, channel_name)
+            log.info("confirm_interceptor ABANDON destructive asana user=%s action=%s (question)",
+                     slack_user_id, action)
+        else:
+            log.info("confirm_interceptor DEFER destructive asana user=%s action=%s "
+                     "(unclassified non-question, pending KEPT)", slack_user_id, action)
         return None
 
     # ── Case 2: freshest is Shopify / Calendar / an Asana CREATE ────────────────────
@@ -4990,23 +5074,127 @@ def try_confirm_pending_write(
 # --- Calendar meeting scheduling ---
 
 
+_SCHEDULE_MEETING_PENDING_LOCK = RLock()
+_SCHEDULE_MEETING_PENDING_TTL_SECONDS = 600
+_PENDING_SCHEDULE_MEETING: dict[tuple[str, str], dict] = {}
+
+
+def _schedule_meeting_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_schedule_meeting(slack_user: str, channel: str, entry: dict) -> None:
+    with _SCHEDULE_MEETING_PENDING_LOCK:
+        _PENDING_SCHEDULE_MEETING[_schedule_meeting_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_schedule_meeting(slack_user: str, channel: str) -> dict | None:
+    key = _schedule_meeting_pending_key(slack_user, channel)
+    with _SCHEDULE_MEETING_PENDING_LOCK:
+        entry = _PENDING_SCHEDULE_MEETING.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _SCHEDULE_MEETING_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _peek_pending_schedule_meeting(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe (confirm-button snapshot/diff)."""
+    key = _schedule_meeting_pending_key(slack_user, channel)
+    with _SCHEDULE_MEETING_PENDING_LOCK:
+        entry = _PENDING_SCHEDULE_MEETING.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _SCHEDULE_MEETING_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _execute_claimed_schedule_meeting(
+    pending: dict, slack_user_id: str, proposed_start: str, proposed_end: str,
+) -> str:
+    """Execute an ALREADY-CLAIMED schedule_meeting pending entry. Books ONLY a
+    slot that matches one the stash actually offered -- never an arbitrary
+    confirm-turn-echoed time (the model-echoed-slot risk this F-23 migration
+    closes). Title/participants come from the STASH, never the confirm turn."""
+    slots = pending.get("slots") or []
+    match = next(
+        (s for s in slots if s[0] == proposed_start and s[1] == proposed_end), None,
+    )
+    if match is None:
+        return (
+            "calendar_schedule_meeting: that time doesn't match one of the slots "
+            "I offered. Re-run with confirmed=false to see the options again, "
+            "then pass one of those exact times."
+        )
+    try:
+        event = calendar_client.create_event(
+            user_email=pending["requester_email"],
+            summary=pending["title"],
+            start=proposed_start,
+            end=proposed_end,
+            attendees=pending["emails"],
+            description=f"Scheduled by Cora on behalf of {pending['requester_name']}.",
+            time_zone=calendar_client._DEFAULT_TZ,
+        )
+    except calendar_client.CalendarClientError as exc:
+        log.warning(
+            "calendar_schedule_meeting BOOK FAILED requester=%s title=%r exc=%s",
+            slack_user_id, pending["title"], exc,
+        )
+        return (
+            f"Meeting booking failed: {exc}. The event was NOT created. "
+            f"If the error mentions a missing DWD scope, Harrison needs to update "
+            f"Domain-wide Delegation in admin.google.com to include "
+            f"https://www.googleapis.com/auth/calendar.events."
+        )
+    log.info(
+        "calendar_schedule_meeting BOOKED requester=%s event_id=%s title=%r "
+        "attendee_count=%d start=%s",
+        slack_user_id, event.get("id", ""), pending["title"], len(pending["emails"]), proposed_start,
+    )
+    return calendar_client.format_created_event_for_llm(event, user_email=pending["requester_email"])
+
+
 def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dict) -> str:
     """Find the next available slot for all participants and propose or book a meeting.
 
-    Two-phase staged-write:
-    Phase 1 (confirmed=False): resolves participants, calls freebusy, finds the
-    next common open slot in the next 7 working days (Mon-Fri 9am-5pm AZ), and
-    returns a preview block for the user to confirm.
-    Phase 2 (confirmed=True): creates the Google Calendar event using the
-    proposed_start and proposed_end passed by Claude from Phase 1, sends invites.
+    F-23 staged-write, server-side pending store:
+    Phase 1 (confirmed=False): resolves participants, calls freebusy, finds up
+    to 3 candidate slots, STASHES the resolved proposal (requester/title/
+    participants/slots) server-side, and returns a preview for the user to
+    confirm.
+    Phase 2 (confirmed=True): books ONLY a slot matching one from the STASH
+    (never an arbitrary confirm-turn-echoed time) using the stash's own
+    title/participants -- a confirm-turn "DIFFERENT" title/participant edit
+    cannot silently retarget what gets booked.
 
     Participant names are resolved via the same alias system as other tools.
     The requester is always included automatically.
     """
     input_data       = _input or {}
-    confirmed        = input_data.get("confirmed", False)
+    channel          = str(input_data.get("_channel_name", "") or "")
+    confirmed        = _confirmed_flag(input_data)
     duration_minutes = max(15, int(input_data.get("duration_minutes") or 30))
     title            = (input_data.get("title") or "").strip() or "Meeting"
+
+    # -- Phase 2: confirm turn -- execute ONLY the caller's own stashed proposal --
+    if confirmed:
+        pending = _take_pending_schedule_meeting(slack_user_id, channel)
+        if pending is None:
+            return (
+                "calendar_schedule_meeting: I don't have a pending meeting proposal "
+                "to confirm -- it may have expired. Ask me to find a time again."
+            )
+        proposed_start = (input_data.get("proposed_start") or "").strip()
+        proposed_end   = (input_data.get("proposed_end") or "").strip()
+        if not proposed_start or not proposed_end:
+            return (
+                "calendar_schedule_meeting: confirmed=true but proposed_start or "
+                "proposed_end is missing. Pass the exact start/end strings from "
+                "the proposal you showed the user."
+            )
+        return _execute_claimed_schedule_meeting(
+            pending, slack_user_id, proposed_start, proposed_end)
 
     # --- Resolve requester ---
     user_map  = _load_slack_asana_map()
@@ -5075,45 +5263,6 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
     names  = [n for n, _ in resolved]
     emails = [e for _, e in resolved]
 
-    # -- Phase 2: Book the confirmed slot -------------------------------------
-    if confirmed is True:
-        proposed_start = (input_data.get("proposed_start") or "").strip()
-        proposed_end   = (input_data.get("proposed_end") or "").strip()
-        if not proposed_start or not proposed_end:
-            return (
-                "calendar_schedule_meeting: confirmed=true but proposed_start or "
-                "proposed_end is missing. Re-run with confirmed=false first to find a "
-                "slot, then pass the exact start/end strings from that proposal."
-            )
-        try:
-            event = calendar_client.create_event(
-                user_email=requester_email,
-                summary=title,
-                start=proposed_start,
-                end=proposed_end,
-                attendees=emails,
-                description=f"Scheduled by Cora on behalf of {requester_name}.",
-                time_zone=calendar_client._DEFAULT_TZ,
-            )
-        except calendar_client.CalendarClientError as exc:
-            log.warning(
-                "calendar_schedule_meeting BOOK FAILED requester=%s title=%r exc=%s",
-                slack_user_id, title, exc,
-            )
-            return (
-                f"Meeting booking failed: {exc}. "
-                f"Tell the user the event was not created. "
-                f"If the error mentions a missing DWD scope, Harrison needs to update "
-                f"Domain-wide Delegation in admin.google.com to include "
-                f"https://www.googleapis.com/auth/calendar.events."
-            )
-        log.info(
-            "calendar_schedule_meeting BOOKED requester=%s event_id=%s title=%r "
-            "attendee_count=%d start=%s",
-            slack_user_id, event.get("id", ""), title, len(emails), proposed_start,
-        )
-        return calendar_client.format_created_event_for_llm(event, user_email=requester_email)
-
     # -- Phase 1: Find up to 3 available slots --------------------------------
     try:
         slots = calendar_client.find_meeting_slots(
@@ -5139,6 +5288,18 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
         "calendar_schedule_meeting SLOTS FOUND requester=%s participants=%s slots=%d dur=%dmin",
         slack_user_id, emails, len(slots), duration_minutes,
     )
+    if slots:
+        # Stash the SAME iso strings format_slot_proposals_for_llm embeds in the
+        # passback text, so a confirm-turn echo can be validated against exactly
+        # what was offered (never an arbitrary/hallucinated time).
+        iso_slots = [(calendar_client._fmt_slot(s, e)[3], calendar_client._fmt_slot(s, e)[4])
+                     for s, e in slots[:3]]
+        _store_pending_schedule_meeting(slack_user_id, channel, {
+            "requester_email": requester_email, "requester_name": requester_name,
+            "title": title, "names": names, "emails": emails, "slots": iso_slots,
+            "ts": time.time(),
+            "stash_id": confirm_cards.mint_stash_id("schedule_meeting", slack_user_id, channel),
+        })
     return calendar_client.format_slot_proposals_for_llm(slots, names, title=title)
 
 
@@ -5525,78 +5686,83 @@ def _notes_kb():
     return context_loader.get_shared_kb(), context_loader._SHARED_KB_LOCK
 
 
-def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Save a personal note for the asking user (staged-write, confirmed gate).
+# ── cora_remember: F-23 staged-write (Class B stash migration, 2026-08-02) ────
+# Phase 1 runs the PHI/scope gate + resolves the save target, then STASHES the
+# resolved payload server-side and returns a WRITE_BLOCKED preview; confirmed=true
+# executes the STASH, never a confirm-turn re-echo of note_text/share_requested
+# (closing a real fragility: the old honor-system design re-read share_requested
+# from the confirm-turn's own input, so a model that forgot to re-pass it on the
+# second call silently dropped the org-wide-share flag). Mirrors the lexicon-add
+# stash pattern exactly (own dict, 10-min TTL, own lock, store/take/peek).
+_REMEMBER_PENDING_LOCK = RLock()
+_REMEMBER_PENDING_TTL_SECONDS = 600
+_PENDING_REMEMBER: dict[tuple[str, str], dict] = {}
 
-    PHI save matrix (deterministic, user_notes.resolve_save_scope): PHI-flagged
-    text saves only for a LEX PHI custodian in LEX scope or DM (forced into
-    LEX scope); everyone else gets the standard PHI refusal. Save-time conflict
-    check probes the canonical KB and appends a heads-up — never blocks.
-    """
+
+def _remember_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_remember(slack_user: str, channel: str, entry: dict) -> None:
+    with _REMEMBER_PENDING_LOCK:
+        _PENDING_REMEMBER[_remember_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_remember(slack_user: str, channel: str) -> dict | None:
+    key = _remember_pending_key(slack_user, channel)
+    with _REMEMBER_PENDING_LOCK:
+        entry = _PENDING_REMEMBER.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _REMEMBER_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _peek_pending_remember(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe (confirm-button snapshot/diff)."""
+    key = _remember_pending_key(slack_user, channel)
+    with _REMEMBER_PENDING_LOCK:
+        entry = _PENDING_REMEMBER.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _REMEMBER_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _execute_claimed_remember(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) cora_remember pending entry. Shared by
+    the tool's own confirmed=true call and the confirm-button tap handler."""
     from cora import user_notes
 
-    input_data = _input or {}
-    note_text = str(input_data.get("note_text", "") or "").strip()
-    if not note_text:
-        return "cora_remember: note_text is required and cannot be empty."
-    is_dm = str(input_data.get("_channel_id", "") or "").startswith("D")
-
-    # PHI / scope gate runs BEFORE the staged-write confirm gate. A save that
-    # PHI policy will refuse (e.g. a non-custodian saving a named individual's
-    # billing/authorization in a LEX channel) is rejected on the FIRST tool
-    # call -- never staged as a "Saving to YOUR notes..." preview, never
-    # confirmed. Deterministic, code-layer (D-034); the preview/confirm round
-    # trip below is reached only for an allowed save.
-    decision = user_notes.resolve_save_scope(note_text, entity, slack_user_id, is_dm)
-    if not decision.allowed:
-        log.info(
-            "cora_remember PHI-REFUSED owner=%s entity=%s is_dm=%s",
-            slack_user_id, entity, is_dm,
-        )
-        return decision.reason
-
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "cora_remember refused: `confirmed` must be set to true ONLY after "
-            "you have shown the user a preview of the note — format it as "
-            "\"Saving to YOUR notes (only you can retrieve this): <note text>\" — "
-            "and received explicit approval. Show the preview, wait for their "
-            "yes, then call again with confirmed=true."
-        )
-
-    share_requested = bool(input_data.get("share_requested", False))
     kb, kb_lock = _notes_kb()
     if kb is None:
         return (
-            "Notes storage is unavailable right now — tell the user the note "
+            "Notes storage is unavailable right now -- tell the user the note "
             "was NOT saved and to try again shortly."
         )
-
+    note_text = pending["note_text"]
     owner_email = str(
         (_load_slack_asana_map().get(slack_user_id) or {}).get("asana_email", "") or ""
     ).strip()
-
     with kb_lock:
-        conflict = user_notes.conflict_excerpt(kb, note_text, decision.entity)
+        conflict = user_notes.conflict_excerpt(kb, note_text, pending["entity"])
         note_id = user_notes.save_note(
             kb,
             note_text=note_text,
             owner_slack=slack_user_id,
             owner_email=owner_email,
-            entity=decision.entity,
-            sub_entity=decision.sub_entity,
-            share_requested=share_requested,
-            channel_name=str(input_data.get("_channel_name", "") or ""),
+            entity=pending["entity"],
+            sub_entity=pending.get("sub_entity"),
+            share_requested=bool(pending.get("share_requested", False)),
+            channel_name=pending.get("channel_name", ""),
         )
-
     lines = [
         "WRITE_CONFIRMED -- post the following as your entire response "
         "(no preamble, no meta-commentary):",
         "",
         "Saved to your notes. Only you can retrieve it -- ask me about it any time.",
     ]
-    if share_requested:
+    if pending.get("share_requested"):
         lines.append(
             "You asked to share it org-wide: org-wide sharing goes through "
             "Harrison's review, which isn't wired up yet -- for now the note "
@@ -5608,9 +5774,70 @@ def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
         )
     log.info(
         "cora_remember SAVED owner=%s id=%s entity=%s conflict=%s",
-        slack_user_id, note_id, decision.entity, bool(conflict),
+        slack_user_id, note_id, pending["entity"], bool(conflict),
     )
     return "\n".join(lines)
+
+
+def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Save a personal note for the asking user (F-23 staged-write, server-side
+    pending store).
+
+    PHI save matrix (deterministic, user_notes.resolve_save_scope): PHI-flagged
+    text saves only for a LEX PHI custodian in LEX scope or DM (forced into
+    LEX scope); everyone else gets the standard PHI refusal. Save-time conflict
+    check probes the canonical KB and appends a heads-up — never blocks.
+    """
+    from cora import user_notes
+
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
+    confirmed = _confirmed_flag(input_data)
+
+    if confirmed:
+        pending = _take_pending_remember(slack_user_id, channel)
+        if pending is None:
+            # F-23 doctrine: a no-pending confirm is honest, never a fabricated save.
+            return (
+                "NOT SAVED. I don't have a pending note to confirm -- it may have "
+                "expired. Tell me what to remember again."
+            )
+        return _execute_claimed_remember(pending, slack_user_id)
+
+    # Phase 1: validate + PHI/scope-gate + stash + WRITE_BLOCKED preview.
+    note_text = str(input_data.get("note_text", "") or "").strip()
+    if not note_text:
+        return "cora_remember: note_text is required and cannot be empty."
+    is_dm = str(input_data.get("_channel_id", "") or "").startswith("D")
+
+    # PHI / scope gate runs BEFORE the stash. A save that PHI policy will refuse
+    # (e.g. a non-custodian saving a named individual's billing/authorization in
+    # a LEX channel) is rejected on the FIRST tool call -- never staged, never
+    # confirmable. Deterministic, code-layer (D-034).
+    decision = user_notes.resolve_save_scope(note_text, entity, slack_user_id, is_dm)
+    if not decision.allowed:
+        log.info(
+            "cora_remember PHI-REFUSED owner=%s entity=%s is_dm=%s",
+            slack_user_id, entity, is_dm,
+        )
+        return decision.reason
+
+    share_requested = bool(input_data.get("share_requested", False))
+    _store_pending_remember(slack_user_id, channel, {
+        "note_text": note_text, "entity": decision.entity, "sub_entity": decision.sub_entity,
+        "share_requested": share_requested,
+        "channel_name": str(input_data.get("_channel_name", "") or ""),
+        "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("remember", slack_user_id, channel),
+    })
+    share_note = (
+        " You also asked to share it org-wide -- that goes through Harrison's review."
+        if share_requested else ""
+    )
+    return _write_blocked_contract(
+        f"Saving to your notes (only you can retrieve this): \"{note_text}\".{share_note} "
+        "Nothing is saved until you confirm."
+    )
 
 
 def _tool_cora_my_notes(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -5648,34 +5875,51 @@ def _tool_cora_my_notes(slack_user_id: str, entity: str, _input: dict) -> str:
     return "\n".join(lines)
 
 
-def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str:
-    """Delete one of the asking user's own notes (staged-write, owner-only)."""
-    input_data = _input or {}
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "cora_forget_note refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user WHICH note will be deleted (use "
-            "cora_my_notes to find it) and received explicit approval."
-        )
-    note_id = str(input_data.get("note_id", "") or "").strip()
-    if not note_id:
-        return "cora_forget_note: note_id is required (find it via cora_my_notes)."
+# ── cora_forget_note: F-23 staged-write (Class B stash migration, 2026-08-02) ─
+# Phase 1 resolves note_id (short or full token from cora_my_notes) against the
+# ASKER'S OWN notes only, stashes the RESOLVED full id, and returns a preview;
+# confirmed=true deletes the STASHED id, never a confirm-turn re-echo.
+_FORGET_NOTE_PENDING_LOCK = RLock()
+_FORGET_NOTE_PENDING_TTL_SECONDS = 600
+_PENDING_FORGET_NOTE: dict[tuple[str, str], dict] = {}
 
+
+def _forget_note_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_forget_note(slack_user: str, channel: str, entry: dict) -> None:
+    with _FORGET_NOTE_PENDING_LOCK:
+        _PENDING_FORGET_NOTE[_forget_note_pending_key(slack_user, channel)] = entry
+
+
+def _take_pending_forget_note(slack_user: str, channel: str) -> dict | None:
+    key = _forget_note_pending_key(slack_user, channel)
+    with _FORGET_NOTE_PENDING_LOCK:
+        entry = _PENDING_FORGET_NOTE.pop(key, None)
+    if not entry:
+        return None
+    if (time.time() - float(entry.get("ts", 0))) > _FORGET_NOTE_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _peek_pending_forget_note(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe (confirm-button snapshot/diff)."""
+    key = _forget_note_pending_key(slack_user, channel)
+    with _FORGET_NOTE_PENDING_LOCK:
+        entry = _PENDING_FORGET_NOTE.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _FORGET_NOTE_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _execute_claimed_forget_note(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) cora_forget_note pending entry."""
     kb, kb_lock = _notes_kb()
     if kb is None:
         return "Notes storage is unavailable right now -- the note was NOT deleted."
-
-    # Accept either the full id ("note:U123:abcdef1234") or the short token
-    # shown by cora_my_notes — resolved against the ASKER'S OWN notes only.
-    if not note_id.startswith("note:"):
-        with kb_lock:
-            notes = kb.list_user_notes(slack_user_id)
-        matches = [n["note_id"] for n in notes if n["note_id"].rsplit(":", 1)[-1] == note_id]
-        if not matches:
-            return "No note of yours matches that id -- nothing was deleted."
-        note_id = matches[0]
-
+    note_id = pending["note_id"]
     with kb_lock:
         deleted = kb.delete_user_note(note_id, owner_slack=slack_user_id)
     if deleted == 0:
@@ -5687,6 +5931,55 @@ def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str
         "WRITE_CONFIRMED -- post the following as your entire response "
         "(no preamble, no meta-commentary):\n\n"
         "Note deleted."
+    )
+
+
+def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delete one of the asking user's own notes (F-23 staged-write, server-side
+    pending store, owner-only)."""
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
+    confirmed = _confirmed_flag(input_data)
+
+    if confirmed:
+        pending = _take_pending_forget_note(slack_user_id, channel)
+        if pending is None:
+            return (
+                "NOT DELETED. I don't have a pending note-deletion to confirm -- "
+                "it may have expired. Tell me which note again."
+            )
+        return _execute_claimed_forget_note(pending, slack_user_id)
+
+    # Phase 1: resolve note_id (short or full) against the ASKER'S OWN notes only.
+    note_id = str(input_data.get("note_id", "") or "").strip()
+    if not note_id:
+        return "cora_forget_note: note_id is required (find it via cora_my_notes)."
+
+    kb, kb_lock = _notes_kb()
+    if kb is None:
+        return "Notes storage is unavailable right now -- the note was NOT deleted."
+
+    with kb_lock:
+        notes = kb.list_user_notes(slack_user_id)
+    if note_id.startswith("note:"):
+        match = next((n for n in notes if n["note_id"] == note_id), None)
+    else:
+        match = next((n for n in notes if n["note_id"].rsplit(":", 1)[-1] == note_id), None)
+    if match is None:
+        # Missing and not-yours are deliberately indistinguishable (no
+        # existence leak) -- resolved against the asker's OWN list only.
+        return "No note of yours matches that id -- nothing was deleted."
+
+    resolved_id = match["note_id"]
+    excerpt = (match.get("content") or "").strip().replace("\n", " ")[:120]
+    _store_pending_forget_note(slack_user_id, channel, {
+        "note_id": resolved_id, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("forget_note", slack_user_id, channel),
+    })
+    excerpt_note = f' ("{excerpt}...")' if excerpt else ""
+    return _write_blocked_contract(
+        f"Not deleted yet -- reply to confirm and I'll delete that note{excerpt_note}. "
+        "Nothing is deleted until you confirm."
     )
 
 
@@ -9234,7 +9527,7 @@ TOOL_DEFINITIONS = [
 # confirmed=True with a paraphrased request and no matching stash, minting a duplicate.
 # Doctrine parity: Shopify inventory hotfix ("staged-write identity binds SERVER-SIDE,
 # never an LLM echo") + F-23 ("a confirm executes the STASHED payload or nothing").
-_CODE_QUEUE_PENDING_LOCK = Lock()
+_CODE_QUEUE_PENDING_LOCK = RLock()
 _CODE_QUEUE_PENDING_TTL_SECONDS = 600  # 10 min (matches the other pending stores)
 _PENDING_CODE_QUEUE: dict[tuple[str, str], dict] = {}
 
@@ -9267,6 +9560,47 @@ def _claim_pending_code_queue(slack_user: str, channel: str) -> dict | None:
     return entry
 
 
+def _peek_pending_code_queue(slack_user: str, channel: str) -> dict | None:
+    """Non-destructive fresh-pending probe (confirm-button snapshot/diff)."""
+    key = _cq_pending_key(slack_user, channel)
+    with _CODE_QUEUE_PENDING_LOCK:
+        entry = _PENDING_CODE_QUEUE.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _CODE_QUEUE_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) code-queue pending entry and return the
+    sentinel-wrapped outcome text. Shared by the tool's own confirmed=true call
+    (claims via _claim_pending_code_queue) and the confirm-button tap handler
+    (claims via the generic by-stash-id claim)."""
+    from cora import code_queue
+
+    req = str(pending.get("request") or "").strip()
+    is_founder = slack_user_id == code_queue.HARRISON_ID
+    cq_id, outcome = code_queue.queue_explicit(
+        slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
+    if outcome == "empty":
+        return ("cora_queue_code_session: there was nothing to file -- ask the user "
+                "to restate the bug or feature in a sentence.")
+    if outcome == "dropped" or cq_id is None:
+        return ("I couldn't file that -- it looked like it contained protected "
+                "info. Tell the user it wasn't queued and to rephrase without "
+                "any client/patient details.")
+    if is_founder:
+        return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
+                "code-session queue (APPROVED). Tap \"Stage prompt\" on the card "
+                "when you want the kickoff written.")
+    if outcome == "held":
+        return ("WRITE_CONFIRMED -- post as your entire response: You've hit "
+                "today's code-queue limit (3/day, resets midnight AZ), but I "
+                "still logged this for Harrison -- it'll surface in his next "
+                "queue digest for review.")
+    return ("WRITE_CONFIRMED -- post as your entire response: Queued for "
+            "Harrison's review -- he'll approve it from his queue.")
+
+
 def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> str:
     """Queue a build idea or bug report to Harrison's code-session queue.
 
@@ -9290,35 +9624,7 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
         pending = _claim_pending_code_queue(slack_user_id, channel)
         if pending:
             # Execute the STASHED request (server-side), NOT the model echo.
-            req = str(pending.get("request") or "").strip()
-            # is_founder is derived from the REAL Slack event user id, never a
-            # model-supplied field -- the throttle exemption can't be spoofed (1g).
-            is_founder = slack_user_id == code_queue.HARRISON_ID
-            cq_id, outcome = code_queue.queue_explicit(
-                slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
-            if outcome == "empty":
-                # Nothing to file (blank stashed request) -- never voice this as a PHI
-                # refusal (the "dropped" branch below). Unreachable via the live two-call
-                # path (the stash is guarded non-empty), but correct if any caller passes "".
-                return ("cora_queue_code_session: there was nothing to file -- ask the user "
-                        "to restate the bug or feature in a sentence.")
-            if outcome == "dropped" or cq_id is None:
-                return ("I couldn't file that -- it looked like it contained protected "
-                        "info. Tell the user it wasn't queued and to rephrase without "
-                        "any client/patient details.")
-            if is_founder:
-                return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
-                        "code-session queue (APPROVED). Tap \"Stage prompt\" on the card "
-                        "when you want the kickoff written.")
-            if outcome == "held":
-                # Confirmed ask, over the teammate daily cap -> captured (never lost)
-                # but held from Harrison's DM; it surfaces in his next queue digest (1g).
-                return ("WRITE_CONFIRMED -- post as your entire response: You've hit "
-                        "today's code-queue limit (3/day, resets midnight AZ), but I "
-                        "still logged this for Harrison -- it'll surface in his next "
-                        "queue digest for review.")
-            return ("WRITE_CONFIRMED -- post as your entire response: Queued for "
-                    "Harrison's review -- he'll approve it from his queue.")
+            return _execute_claimed_code_queue(pending, slack_user_id, entity)
         # No fresh server-side pending -> DO NOT trust the model-echoed confirmed=True
         # (F-23: a confirm executes the STASHED payload or nothing). Fall through to
         # re-preview so the human confirms against a freshly stashed request.
@@ -9328,6 +9634,7 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
                 "describing the bug or the feature to build.")
     _store_pending_code_queue(slack_user_id, channel, {
         "request": request, "channel_id": channel_id, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("code_queue", slack_user_id, channel),
     })
     return _write_blocked_contract(
         f'Queueing to the code-session queue: "{request[:200]}". Reply to confirm and '
@@ -9407,7 +9714,7 @@ def _tool_revops_ledger_status(slack_user_id: str, entity: str, _input: dict) ->
 # with the F-23 bare-"yes" interceptor (try_confirm_pending_write) + the
 # has-pending Sonnet-force probes in app.py -- without that, a "yes" aimed at a
 # job preview could fire a STALE staged write from another store.
-_DELEGATED_PENDING_LOCK = Lock()
+_DELEGATED_PENDING_LOCK = RLock()
 _DELEGATED_PENDING_TTL_SECONDS = 600  # 10 min (matches the other pending stores)
 _PENDING_DELEGATED_WORK: dict[tuple[str, str], dict] = {}
 
@@ -9468,6 +9775,36 @@ def _delegated_preview_text(entry: dict, quota_line: str) -> str:
     )
 
 
+def _execute_claimed_delegated(pending: dict, slack_user_id: str, entity: str) -> str:
+    """Execute an ALREADY-CLAIMED (popped) delegated-work pending entry. Shared by
+    the tool's own confirmed=true call (claims via _claim_pending_delegated) and
+    the confirm-button tap handler (claims via the generic by-stash-id claim)."""
+    from cora import delegated_work
+
+    # Stash purity: EVERY executed field comes from the stash, incl. the entity
+    # the preview showed (D-051: a channel-routing edit between preview and
+    # confirm must not silently change scope).
+    job, outcome, msg = delegated_work.submit_job(
+        slack_user_id,
+        str(pending.get("entity") or entity),
+        str(pending.get("channel_id") or ""),
+        str(pending.get("channel_name") or ""),
+        str(pending.get("thread_ts") or ""),
+        str(pending.get("archetype") or ""),
+        str(pending.get("brief") or ""),
+        str(pending.get("deliverable") or "md"),
+    )
+    if outcome == "refused":
+        return _write_blocked_contract(msg)
+    if delegated_work.delegated_level() == "log":
+        # Log-mode honesty (design 3): a real ask must never get a silent
+        # SIMULATED terminal without being told.
+        msg += (" NOTE: delegated work is in TRIAL MODE right now -- "
+                "your job was recorded for validation but will NOT "
+                "execute or deliver yet.")
+    return _write_confirmed_contract(msg)
+
+
 def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> str:
     """Delegate a bounded multi-step background job to Cora (Phase 1).
 
@@ -9506,28 +9843,7 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
     if confirmed:
         pending = _claim_pending_delegated(slack_user_id, channel)
         if pending:
-            # Stash purity: EVERY executed field comes from the stash, incl.
-            # the entity the preview showed (D-051: a channel-routing edit
-            # between preview and confirm must not silently change scope).
-            job, outcome, msg = delegated_work.submit_job(
-                slack_user_id,
-                str(pending.get("entity") or entity),
-                str(pending.get("channel_id") or ""),
-                str(pending.get("channel_name") or channel),
-                str(pending.get("thread_ts") or ""),
-                str(pending.get("archetype") or ""),
-                str(pending.get("brief") or ""),
-                str(pending.get("deliverable") or "md"),
-            )
-            if outcome == "refused":
-                return _write_blocked_contract(msg)
-            if delegated_work.delegated_level() == "log":
-                # Log-mode honesty (design 3): a real ask must never get a
-                # silent SIMULATED terminal without being told.
-                msg += (" NOTE: delegated work is in TRIAL MODE right now -- "
-                        "your job was recorded for validation but will NOT "
-                        "execute or deliver yet.")
-            return _write_confirmed_contract(msg)
+            return _execute_claimed_delegated(pending, slack_user_id, entity)
         # No fresh server-side pending -> never trust the model-echoed
         # confirmed=true; fall through to re-preview against a fresh stash.
         # A bare confirm with NO re-preview material (the interceptor path
@@ -9555,6 +9871,7 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
         "archetype": archetype, "brief": brief, "deliverable": deliverable,
         "entity": entity, "channel_id": channel_id, "channel_name": channel,
         "thread_ts": thread_ts, "ts": time.time(),
+        "stash_id": confirm_cards.mint_stash_id("delegated", slack_user_id, channel),
     }
     _store_pending_delegated(slack_user_id, channel, entry)
     remaining = delegated_work.quota_remaining(slack_user_id)

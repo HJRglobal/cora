@@ -146,8 +146,10 @@ class TestInterceptorAsana:
 
     def test_content_message_abandons_destructive_pending(self):
         # F-23 review HIGH #1: a destructive Asana pending is IMMEDIATE-CONFIRM-ONLY. A
-        # content message (not a confirm) ABANDONS it so a later stray "yes"/"ok thanks"
-        # cannot fire a stale permanent delete.
+        # genuine QUESTION (not a confirm) ABANDONS it so a later stray "yes"/"ok thanks"
+        # cannot fire a stale permanent delete. (cq-2af049327848 narrowed this to
+        # question-shaped messages specifically -- see test_unclassified_non_question_
+        # does_not_abandon_pending below for the message shape that must NOT abandon.)
         self._stash_delete()
         with patch.object(td.asana_client, "delete_task") as mock:
             out = td.try_confirm_pending_write(
@@ -157,6 +159,35 @@ class TestInterceptorAsana:
         assert out is None
         mock.assert_not_called()
         assert not td.has_pending_asana_write(HARRISON, _CH)  # abandoned
+
+    def test_unclassified_non_question_does_not_abandon_pending(self):
+        # cq-2af049327848 regression: a genuine confirm ATTEMPT that merely falls
+        # outside _confirm_intent's narrow vocabulary/10-token cap (here: 11 tokens)
+        # must NOT silently destroy an otherwise-valid destructive pending. Reproduced
+        # live as "confirming a staged Asana delete produces an honest no-op and the
+        # pending vanishes, nothing deleted." Root cause: Case 1 used to pop
+        # unconditionally on ANY non-affirm classification; the fix only abandons on
+        # an explicit negate or a genuine question (see the test above), matching
+        # every other staged-write kind's "ambiguous -> pending intact" contract.
+        self._stash_delete()
+        long_msg = "Yes go ahead and please permanently delete that task now, thanks"
+        assert len(long_msg.split()) == 11  # confirm this trips the >10-token cap
+        assert td._confirm_intent(long_msg, "delete") is None  # sanity: classifier misses it
+        with patch.object(td.asana_client, "delete_task") as mock:
+            out = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message=long_msg,
+            )
+        assert out is None                                        # deferred to the model
+        mock.assert_not_called()                                  # not (yet) deleted
+        assert td.has_pending_asana_write(HARRISON, _CH)           # pending SURVIVED
+
+        # A subsequent clean confirm still fires the delete -- the whole point.
+        with patch.object(td.asana_client, "delete_task", return_value={}) as mock2:
+            out2 = td.try_confirm_pending_write(
+                slack_user_id=HARRISON, channel_name=_CH, entity="FNDR", message="yes",
+            )
+        mock2.assert_called_once()
+        assert "deleted" in out2.lower()
 
     def test_stale_pending_then_ack_does_not_fire(self):
         # The live scenario: delete preview -> clarifying question -> "ok thanks".

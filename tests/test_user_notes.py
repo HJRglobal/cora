@@ -421,16 +421,20 @@ class TestTools:
         return td_mod
 
     def test_remember_refuses_without_confirmed(self, td, kb):
+        # F-23: the first (unconfirmed) call previews + stashes -- it does NOT
+        # save yet, and nothing is a bare "refused" any more (there is a real
+        # preview to show the user, matching every other staged-write tool).
         out = td._tool_cora_remember(OWNER, "F3E", {"note_text": "alpha fact"})
-        assert "refused" in out and "preview" in out
+        assert "confirm" in out.lower()
         assert kb.list_user_notes(OWNER) == []
 
     def test_remember_saves_and_owner_only(self, td, kb):
-        out = td._tool_cora_remember(
+        preview = td._tool_cora_remember(
             OWNER, "F3E",
-            {"note_text": "the wifi password is alpha123", "confirmed": True,
-             "_channel_id": "C123"},
+            {"note_text": "the wifi password is alpha123", "_channel_id": "C123"},
         )
+        assert "confirm" in preview.lower()
+        out = td._tool_cora_remember(OWNER, "F3E", {"confirmed": True, "_channel_id": "C123"})
         assert "WRITE_CONFIRMED" in out
         assert "only you can retrieve" in out.lower()
         assert len(kb.search_user_notes("alpha wifi", owner_slack=OWNER)) == 1
@@ -438,42 +442,55 @@ class TestTools:
         assert kb.search("the wifi password is alpha123", entity="F3E") == []
 
     def test_remember_share_requested_mentions_harrison_review(self, td, kb):
-        out = td._tool_cora_remember(
+        # share_requested is captured on the FIRST (preview) call and STASHED --
+        # the confirm turn no longer needs to re-pass it (closes the old
+        # fragility where a model that forgot to re-echo it silently dropped
+        # the org-wide-share flag).
+        td._tool_cora_remember(
             OWNER, "F3E",
-            {"note_text": "alpha team process", "confirmed": True,
-             "share_requested": True, "_channel_id": "C123"},
+            {"note_text": "alpha team process", "share_requested": True,
+             "_channel_id": "C123"},
         )
+        out = td._tool_cora_remember(OWNER, "F3E", {"confirmed": True, "_channel_id": "C123"})
         assert "Harrison" in out and "review" in out
         notes = kb.list_user_notes(OWNER)
         assert notes[0]["metadata"]["share_requested"] is True
 
     def test_remember_appends_conflict_heads_up(self, td, kb):
         _seed_canonical(kb, content="alpha canonical wifi fact")
-        out = td._tool_cora_remember(
+        td._tool_cora_remember(
             OWNER, "F3E",
-            {"note_text": "alpha wifi note that contradicts canon", "confirmed": True,
-             "_channel_id": "C123"},
+            {"note_text": "alpha wifi note that contradicts canon", "_channel_id": "C123"},
         )
+        out = td._tool_cora_remember(OWNER, "F3E", {"confirmed": True, "_channel_id": "C123"})
         assert "may conflict" in out
         assert "alpha canonical wifi fact" in out
         # The save still happened (conflict never blocks).
         assert len(kb.list_user_notes(OWNER)) == 1
 
     def test_remember_phi_refusal(self, td, kb, monkeypatch):
+        # PHI gate runs at phase 1, unconditionally, before any stash exists --
+        # a PHI-flagged save is refused on the FIRST call, never staged.
         monkeypatch.setattr(user_notes, "is_phi_risk", lambda t: True)
         monkeypatch.setattr(user_notes.lex_phi_access, "phi_allowed",
                             lambda *a, **k: False)
         out = td._tool_cora_remember(
             OTHER, "F3E",
-            {"note_text": "client diagnosis detail", "confirmed": True,
-             "_channel_id": "C123"},
+            {"note_text": "client diagnosis detail", "_channel_id": "C123"},
         )
         assert out == user_notes.PHI_REFUSAL
         assert kb.list_user_notes(OTHER) == []
 
     def test_remember_empty_text_rejected(self, td, kb):
-        out = td._tool_cora_remember(OWNER, "F3E", {"note_text": "  ", "confirmed": True})
+        out = td._tool_cora_remember(OWNER, "F3E", {"note_text": "  "})
         assert "required" in out
+        assert kb.list_user_notes(OWNER) == []
+
+    def test_remember_confirmed_with_no_pending_is_honest(self, td, kb):
+        # F-23 doctrine: a confirm with nothing staged is an honest refusal,
+        # never a fabricated save (e.g. a stray "yes" after the 10-min TTL).
+        out = td._tool_cora_remember(OWNER, "F3E", {"confirmed": True})
+        assert "NOT SAVED" in out
         assert kb.list_user_notes(OWNER) == []
 
     def test_my_notes_lists_only_own(self, td, kb):
@@ -488,28 +505,34 @@ class TestTools:
         assert "no saved personal notes" in out.lower()
 
     def test_forget_refuses_without_confirmed(self, td, kb):
+        # F-23: the first (unconfirmed) call RESOLVES + stashes + previews --
+        # it does not delete yet.
         note_id = _save(kb)
         out = td._tool_cora_forget_note(OWNER, "F3E", {"note_id": note_id})
-        assert "refused" in out
+        assert "confirm" in out.lower()
         assert len(kb.list_user_notes(OWNER)) == 1
 
     def test_forget_short_id_owner_only(self, td, kb):
         note_id = _save(kb)
         short = note_id.rsplit(":", 1)[-1]
-        # Another user cannot delete it via the short id (resolved against
-        # THEIR notes) or the full id (SQL owner check).
-        out_other = td._tool_cora_forget_note(OTHER, "F3E",
-                                              {"note_id": short, "confirmed": True})
+        # Another user cannot even RESOLVE it at phase 1 -- via the short id
+        # (scoped to THEIR own notes) or the full id (existence check scoped
+        # the same way) -- refused before any stash exists (no existence leak).
+        out_other = td._tool_cora_forget_note(OTHER, "F3E", {"note_id": short})
         assert "nothing was deleted" in out_other
-        out_other_full = td._tool_cora_forget_note(OTHER, "F3E",
-                                                   {"note_id": note_id, "confirmed": True})
+        out_other_full = td._tool_cora_forget_note(OTHER, "F3E", {"note_id": note_id})
         assert "nothing was deleted" in out_other_full
         assert len(kb.list_user_notes(OWNER)) == 1
-        # Owner can.
-        out_owner = td._tool_cora_forget_note(OWNER, "F3E",
-                                              {"note_id": short, "confirmed": True})
+        # Owner can, via the two-call staged flow.
+        preview = td._tool_cora_forget_note(OWNER, "F3E", {"note_id": short})
+        assert "confirm" in preview.lower()
+        out_owner = td._tool_cora_forget_note(OWNER, "F3E", {"confirmed": True})
         assert "WRITE_CONFIRMED" in out_owner
         assert kb.list_user_notes(OWNER) == []
+
+    def test_forget_confirmed_with_no_pending_is_honest(self, td, kb):
+        out = td._tool_cora_forget_note(OWNER, "F3E", {"confirmed": True})
+        assert "NOT DELETED" in out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
