@@ -216,29 +216,34 @@ def _parse_lexicon_file(path: Path) -> list[LexEntry]:
 
 def _parse_sku_store(path: Path) -> list[LexEntry]:
     """Load f3e-sku-aliases.yaml as F3E product entries. Reads the seed 'skus'
-    mapping plus the append-only 'learned' mapping (same shape) that approved
-    lexicon proposals write to. Read-only here; the file's own consumer
+    mapping plus the append-only 'learned' LIST (rows of {sku, aliases}) that
+    approved lexicon proposals write to -- a list so a second alias for the same
+    SKU is a NEW appended row, never an edit of an existing line (revert
+    integrity). Read-only here; the file's own consumer
     (tool_dispatch._load_sku_aliases) keeps its exact semantics."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("f3e-sku-aliases.yaml is not a mapping")
     out: list[LexEntry] = []
-    for section in ("skus", "learned"):
-        mapping = raw.get(section) or {}
-        if not isinstance(mapping, dict):
-            continue
-        for sku, aliases in mapping.items():
-            sku = str(sku).strip()
-            if not sku:
-                continue
-            alias_list = tuple(str(a).strip() for a in (aliases or []) if str(a).strip())
-            if not alias_list:
-                continue
-            out.append(LexEntry(
-                term=alias_list[0], type="product", canonical=sku,
-                canonical_name=f"{alias_list[0]} (SKU {sku})", entity="F3E",
-                aliases=alias_list[1:], source="sku-map", source_file=str(path),
-            ))
+
+    def _add(sku: str, aliases, source: str) -> None:
+        sku = str(sku).strip()
+        alias_list = tuple(str(a).strip() for a in (aliases or []) if str(a).strip())
+        if not sku or not alias_list:
+            return
+        out.append(LexEntry(
+            term=alias_list[0], type="product", canonical=sku,
+            canonical_name=f"{alias_list[0]} (SKU {sku})", entity="F3E",
+            aliases=alias_list[1:], source=source, source_file=str(path),
+        ))
+
+    skus = raw.get("skus") or {}
+    if isinstance(skus, dict):
+        for sku, aliases in skus.items():
+            _add(sku, aliases, "sku-map")
+    for row in (raw.get("learned") or []):
+        if isinstance(row, dict):
+            _add(row.get("sku") or "", row.get("aliases"), "learned")
     return out
 
 
@@ -252,19 +257,26 @@ def _parse_person_store(path: Path) -> list[LexEntry]:
     if not isinstance(raw, dict):
         raise ValueError("user-aliases.yaml is not a mapping")
     merged: dict[str, list[str]] = {}
-    for section in ("aliases", "learned_aliases"):
-        mapping = raw.get(section) or {}
-        if not isinstance(mapping, dict):
-            continue
+
+    def _fold(name: str, aliases) -> None:
+        name = str(name).strip()
+        if not name:
+            return
+        merged.setdefault(name, [])
+        for a in (aliases or []):
+            a = str(a).strip()
+            if a and a not in merged[name]:
+                merged[name].append(a)
+
+    mapping = raw.get("aliases") or {}
+    if isinstance(mapping, dict):
         for name, aliases in mapping.items():
-            name = str(name).strip()
-            if not name:
-                continue
-            merged.setdefault(name, [])
-            for a in (aliases or []):
-                a = str(a).strip()
-                if a and a not in merged[name]:
-                    merged[name].append(a)
+            _fold(name, aliases)
+    # 'learned_aliases' is an append-only LIST of {name, aliases} rows (a list so
+    # a second alias for the same person is a NEW row, never a line edit).
+    for row in (raw.get("learned_aliases") or []):
+        if isinstance(row, dict):
+            _fold(row.get("name") or "", row.get("aliases"))
     out: list[LexEntry] = []
     for name, aliases in merged.items():
         out.append(LexEntry(

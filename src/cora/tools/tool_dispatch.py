@@ -204,13 +204,56 @@ def _load_user_aliases() -> dict[str, Any]:
         return {"aliases": {}, "disambiguation_rules": []}
     with open(_ALIASES_PATH, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    aliases: dict[str, list] = {k: list(v or []) for k, v in (data.get("aliases") or {}).items()}
+    # Merge the append-only 'learned_aliases' LIST of {name, aliases} rows
+    # (written only by the Harrison-gated lexicon review rail; the key is absent
+    # until an approved person alias lands, so this is a no-op today). Additive:
+    # learned variants extend a canonical's list, never replace it.
+    for row in (data.get("learned_aliases") or []):
+        if not isinstance(row, dict):
+            continue
+        cur = aliases.setdefault(str(row.get("name") or "").strip(), [])
+        for v in (row.get("aliases") or []):
+            if v and v not in cur:
+                cur.append(v)
+    aliases.pop("", None)
     return {
-        "aliases": data.get("aliases") or {},
+        "aliases": aliases,
         "disambiguation_rules": data.get("disambiguation_rules") or [],
     }
 
 
+def _lexicon_active() -> bool:
+    """True when CORA_LEXICON is 'resolve' or 'full'. ADDITIVE by construction:
+    any import/lookup failure reads as inactive, so every consumer falls back to
+    its legacy path (the lexicon is never a gate)."""
+    try:
+        from .. import lexicon as _lexicon
+        return _lexicon.lexicon_level() in ("resolve", "full")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def resolve_name_to_slack_user_id(name: str, channel_entity: str | None = None) -> tuple[str | None, str | None]:
+    """Lexicon read-through shim (S2): person lookups keep their EXACT existing
+    behavior (anchored matching, disambiguation rules -- zero change, test-pinned);
+    when the lexicon flag is on, the lookup outcome is additionally logged at the
+    chokepoint (telemetry only, fail-soft)."""
+    sid, display = _resolve_name_to_slack_user_id_impl(name, channel_entity)
+    if _lexicon_active():
+        try:
+            from .. import lexicon as _lexicon
+            _lexicon.log_event(
+                entity=(channel_entity or ""), status=("exact" if sid else "miss"),
+                query=(name or ""), consumer="person_lookup",
+                canonical=(display if sid else "") or "",
+            )
+        except Exception:  # noqa: BLE001 -- telemetry never affects the lookup
+            pass
+    return sid, display
+
+
+def _resolve_name_to_slack_user_id_impl(name: str, channel_entity: str | None = None) -> tuple[str | None, str | None]:
     """Resolve a free-text name ("Sean", "Shaun Hawkins", "Tommy Anderson") to a slack_user_id.
 
     Returns: (slack_user_id, canonical_display_name) tuple.
@@ -1115,6 +1158,23 @@ def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entit
     matches = [t for t in opent if _norm_task_key(t.get("name") or "") == key]
     if not matches:
         matches = [t for t in opent if key and key in _norm_task_key(t.get("name") or "")]
+    if not matches and _lexicon_active():
+        # Lexicon QUERY EXPANSION (S2): consulted ONLY when the user's own phrase
+        # matched nothing -- an already-selected task is never retargeted (pinned).
+        # An unambiguous lexicon term re-runs the SAME match ladder with its
+        # canonical_name as the search synonym; an ambiguous/miss/suggestion
+        # result changes nothing (fuzzy never applies, ambiguity never guesses).
+        try:
+            from .. import lexicon as _lexicon
+            _res = _lexicon.resolve(task_name, entity or "", consumer="asana_task_match",
+                                    user=slack_user_id)
+            if _res.status == "exact" and _res.canonical_name:
+                syn = _norm_task_key(_res.canonical_name)
+                matches = [t for t in opent if syn and syn == _norm_task_key(t.get("name") or "")]
+                if not matches:
+                    matches = [t for t in opent if syn and syn in _norm_task_key(t.get("name") or "")]
+        except Exception:  # noqa: BLE001 -- ADDITIVE: expansion failure = plain miss
+            matches = []
     if not matches:
         return None, None, f"No open task of yours matches {task_name!r}."
     if len(matches) > 1:
@@ -3452,19 +3512,30 @@ def _load_sku_aliases() -> tuple[dict[str, str], list[str]]:
             return {}, []
         with open(_SHOPIFY_SKU_ALIAS_PATH, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        skus = data.get("skus") or {}
         alias_to_sku: dict[str, str] = {}
         display: list[str] = []
-        for sku, aliases in skus.items():
+
+        def _add(sku, aliases) -> None:
             sku = str(sku).strip()
             if not sku:
-                continue
+                return
             for alias in (aliases or []):
                 a = str(alias).strip()
                 if not a:
                     continue
-                display.append(a)
-                alias_to_sku[_norm_alias(a)] = sku
+                if _norm_alias(a) not in alias_to_sku:
+                    display.append(a)
+                alias_to_sku.setdefault(_norm_alias(a), sku)
+
+        # 'skus' = the curated seed map; 'learned' = the append-only LIST of
+        # {sku, aliases} rows the Harrison-gated lexicon review rail writes.
+        # Seed wins on a normalized collision (setdefault), so a learned alias
+        # can never silently retarget a curated one.
+        for sku, aliases in (data.get("skus") or {}).items():
+            _add(sku, aliases)
+        for row in (data.get("learned") or []):
+            if isinstance(row, dict):
+                _add(row.get("sku") or "", row.get("aliases"))
         return alias_to_sku, display
     except Exception as exc:  # noqa: BLE001 -- fail soft; the alias map is additive
         log.warning("f3e sku-alias map load failed (%s) -- falling back to live resolve", exc)
@@ -3647,17 +3718,22 @@ def _shopify_write_blocked(user_text: str) -> str:
 
 def _shopify_preview_text(
     *, variant_label: str, location_name: str, current: int, quantity: int,
-    moved_from: int | None = None, unit: str = "units",
+    moved_from: int | None = None, unit: str = "units", resolved_from: str = "",
 ) -> str:
     """Source-opaque NOT-WRITTEN preview line the net posts to the user. `unit`
     labels the count ('cases' for the office channel) -- the tool NEVER converts;
-    this just makes the number unambiguous and kills the cans/cases wobble."""
+    this just makes the number unambiguous and kills the cans/cases wobble.
+    `resolved_from` (lexicon provenance, D-051 write-path rule): when the target
+    was resolved from company shorthand, the preview names the resolution so the
+    human confirms the RESOLUTION, not just the action."""
     unit = (unit or "units").strip() or "units"
     moved = (f" The count moved since I checked (now {current}, was {moved_from})."
              if moved_from is not None else "")
+    provenance = (f"\n{variant_label} -- resolved from \"{resolved_from}\"."
+                  if resolved_from else "")
     return (
         f"{_NOT_WRITTEN}{moved}\n"
-        f"{variant_label} at {location_name}: {current} -> {quantity} {unit}. "
+        f"{variant_label} at {location_name}: {current} -> {quantity} {unit}.{provenance} "
         # F-18: a bare in-thread reply may not reach Cora (Path-2 delivery, F-19),
         # so instruct the reliable path -- @mention + confirm -- which pops the
         # (user, channel) pending entry regardless of thread.
@@ -3776,7 +3852,37 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
     # Deterministic-first product resolution: an alias hit rewrites to the canonical
     # SKU (which resolve_variants treats as authoritative); otherwise the raw query
     # goes to the live title/fuzzy resolver unchanged. Additive, never a gate.
-    resolved_query, _alias_hit = _resolve_sku_alias(product_query)
+    # At CORA_LEXICON=resolve|full the alias step reads THROUGH lexicon.resolve
+    # (the SKU map is the F3E product source): an exact hit is behavior-identical
+    # to _resolve_sku_alias (test-pinned); an AMBIGUOUS lexicon term asks with
+    # candidates (the which-line UX); anything else falls back to the legacy
+    # alias step verbatim, so a lexicon load failure changes nothing (ADDITIVE).
+    resolved_from = ""
+    lex_meta: dict | None = None
+    lex_res = None
+    if _lexicon_active():
+        try:
+            from .. import lexicon as _lexicon
+            lex_res = _lexicon.resolve(
+                product_query, "F3E", types=("product",),
+                consumer="f3e_shopify_set_inventory", channel=channel,
+                user=slack_user_id)
+        except Exception as exc:  # noqa: BLE001 -- ADDITIVE: degrade to legacy
+            log.warning("f3e_shopify_set_inventory lexicon resolve degraded: %s", exc)
+            lex_res = None
+    if lex_res is not None and lex_res.status == "ambiguous":
+        listing = "; ".join(
+            dict.fromkeys(f"{c.canonical_name}" for c in lex_res.candidates[:6]))
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\n'{product_query}' could mean {len(lex_res.candidates)} "
+            f"different products: {listing}. Which one?"), None
+    if lex_res is not None and lex_res.status == "exact":
+        resolved_query, _alias_hit = lex_res.canonical, True
+        resolved_from = product_query
+        lex_meta = {"query": product_query, "canonical": lex_res.canonical,
+                    "matched_term": lex_res.matched_term}
+    else:
+        resolved_query, _alias_hit = _resolve_sku_alias(product_query)
     try:
         matches = shopify_client.resolve_variants(resolved_query)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
@@ -3831,7 +3937,8 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
                  slack_user_id, exp_item, match.label)
 
     return None, {"match": match, "loc_id": loc_id, "loc_name": loc_name,
-                  "current": current, "quantity": target, "delta": delta, "unit": unit}
+                  "current": current, "quantity": target, "delta": delta, "unit": unit,
+                  "resolved_from": resolved_from, "lex": lex_meta}
 
 
 def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
@@ -3849,13 +3956,33 @@ def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
         "unit": unit,
         "variant_label": match.label,
         "location_label": data["loc_name"],
+        "resolved_from": data.get("resolved_from") or "",
+        "lex": data.get("lex"),       # lexicon provenance for the confirm-capture event
         "ts": time.time(),
     })
     log.info("f3e_shopify_set_inventory PREVIEW user=%s item=%s loc=%s cur=%s -> %s (delta=%s)",
              slack_user_id, match.inventory_item_id, data["loc_id"], data["current"], data["quantity"], data.get("delta"))
     return _shopify_write_blocked(_shopify_preview_text(
         variant_label=match.label, location_name=data["loc_name"],
-        current=data["current"], quantity=data["quantity"], moved_from=moved_from, unit=unit))
+        current=data["current"], quantity=data["quantity"], moved_from=moved_from, unit=unit,
+        resolved_from=data.get("resolved_from") or ""))
+
+
+def _log_lexicon_confirmed(lex: dict | None, slack_user_id: str, channel: str) -> None:
+    """Lane-A confirm capture: an executed write whose target came from a lexicon
+    resolution logs a resolution_confirmed event carrying the CONFIRMING user's
+    Slack event id (unspoofable -- the F-23 stash key). Fail-soft."""
+    if not lex or not isinstance(lex, dict):
+        return
+    try:
+        from .. import lexicon as _lexicon
+        _lexicon.log_event(
+            entity="F3E", status="confirmed", event="resolution_confirmed",
+            query=str(lex.get("query") or ""), canonical=str(lex.get("canonical") or ""),
+            matched_term=str(lex.get("matched_term") or ""),
+            user=slack_user_id, channel=channel, consumer="f3e_shopify_set_inventory")
+    except Exception:  # noqa: BLE001 -- telemetry never affects the write reply
+        pass
 
 
 def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) -> str:
@@ -3910,7 +4037,8 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
                  slack_user_id, item_id, preview_qty, live, delta)
         return _shopify_write_blocked(_shopify_preview_text(
             variant_label=variant_label, location_name=loc_name,
-            current=live, quantity=target, moved_from=preview_qty, unit=unit))
+            current=live, quantity=target, moved_from=preview_qty, unit=unit,
+            resolved_from=pending.get("resolved_from") or ""))
 
     # Belt-and-suspenders (Slice 1): resolve/re-preview already guard every absolute
     # stash path, so this should never fire -- but never WRITE an absurd absolute even
@@ -3931,6 +4059,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
 
     _audit_shopify_write(slack_user=slack_user_id, channel=channel,
                          variant=variant_label, location=loc_name, old=live, new=new_available)
+    _log_lexicon_confirmed(pending.get("lex"), slack_user_id, channel)
     log.info("f3e_shopify_set_inventory WROTE user=%s item=%s loc=%s %s -> %s",
              slack_user_id, item_id, loc_id, live, new_available)
     return (
@@ -3995,8 +4124,10 @@ def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: 
              f"Batch preview -- {len(rows)} item(s) to set (nothing written yet):"]
     for r in rows:
         unit = r.get("unit", "units")
+        provenance = (f" (resolved from \"{r['resolved_from']}\")"
+                      if r.get("resolved_from") else "")
         lines.append(f"  - {r['variant_label']} at {r['location_label']}: "
-                     f"{r['preview_qty']} -> {r['target_qty']} {unit}")
+                     f"{r['preview_qty']} -> {r['target_qty']} {unit}{provenance}")
     if skipped:
         lines.append(f"Skipped ({len(skipped)}, NOT applied):")
         for sk in skipped:
@@ -4081,6 +4212,8 @@ def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) ->
             "unit": data.get("unit", "units"),
             "variant_label": m.label,
             "location_label": data["loc_name"],
+            "resolved_from": data.get("resolved_from") or "",
+            "lex": data.get("lex"),
         })
 
     # Fold/refuse duplicate (item, location) rows so two rows for one variant can't
@@ -4166,6 +4299,7 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
         _audit_shopify_write(slack_user=slack_user_id, channel=channel,
                              variant=r["variant_label"], location=r["location_label"],
                              old=int(r["preview_qty"]), new=new_avail)
+        _log_lexicon_confirmed(r.get("lex"), slack_user_id, channel)
         ok_lines.append(f"  - {r['variant_label']} at {r['location_label']}: "
                         f"{r['preview_qty']} -> {new_avail} {r.get('unit', 'units')}")
     log.info("f3e_shopify_set_inventory BATCH WROTE user=%s ok=%d failed=%d",

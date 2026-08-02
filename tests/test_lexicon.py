@@ -115,7 +115,7 @@ class TestLoader:
             "skus:\n"
             '  F3-Original: ["original energy", "f3 original energy"]\n'
             "learned:\n"
-            '  F3SL: ["office strawberry"]\n'
+            '  - {sku: F3SL, aliases: ["office strawberry"]}\n'
         ))
         r = lexicon.resolve("original energy", "F3E")
         assert (r.status, r.canonical, r.type) == ("exact", "F3-Original", "product")
@@ -127,7 +127,7 @@ class TestLoader:
             "aliases:\n"
             '  Jennifer Mortensen: ["Jen", "Jenn"]\n'
             "learned_aliases:\n"
-            '  Jennifer Mortensen: ["Jenny M"]\n'
+            '  - {name: "Jennifer Mortensen", aliases: ["Jenny M"]}\n'
         ))
         r = lexicon.resolve("jen", "OSN", types=["person"])
         assert (r.status, r.canonical) == ("exact", "Jennifer Mortensen")
