@@ -29,3 +29,10 @@ _Harrison-approved findings from the weekly friction-mining pass (Org Synthesis 
 - Route: process_change
 - Recommendation: Harrison is receiving repetitive "Getting too many emails?" notifications (10x in 14 days), suggesting either misconfigured alert settings or a notification system generating duplicate messages. Audit the notification rules triggering these alerts and either disable redundant ones or consolidate them into a single daily digest. This is a quick configuration fix that will reduce cognitive friction.
 - Evidence: Getting too many emails?; Getting too many emails?
+
+## [2026-07-27] Consolidate Asana notification preferences across FNDR entities
+
+- Signal: repeated_question | Entity: FNDR | observed 13x in the last 14 days
+- Route: doc
+- Recommendation: The founder and ops manager are receiving 13 notification-preference-change prompts in 14 days across multiple Asana notification categories (work updates, overdue tasks, upcoming tasks). This suggests either misconfigured default settings or incomplete initial setup. Create a shared known-answer doc or playbook documenting optimal Asana notification settings for the FNDR team, then apply those settings uniformly to prevent repeated friction.
+- Evidence: Change what Asana sends you (https://app.asana.com/-/confirm_change_notification_category_setting?domain=682743441507584; Change what Asana sends you (https://app.asana.com/-/confirm_change_notification_category_setting?domain=682743441507584
