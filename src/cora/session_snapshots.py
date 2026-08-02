@@ -207,6 +207,56 @@ def _render_known_answers_index() -> dict[str, Any]:
     }
 
 
+def _render_revops_ledger() -> dict[str, Any]:
+    """Revenue-ops cadence ledger mirror (D-094 lane, design 2026-08-01 section 4).
+
+    Metadata only by construction: the ledger stores no body content, and this
+    render additionally reduces Finance-Legal rows to counterparty + state
+    (no notes/hold_reason/owner). LEX rows cannot exist (rejected at ingest)."""
+    from cora.revops import ledger as revops_ledger
+
+    conn = revops_ledger.connect()
+    try:
+        rows = revops_ledger.list_threads(conn)
+    finally:
+        conn.close()
+    threads: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+        if r["workstream"] == "Finance-Legal":
+            threads.append(
+                {
+                    "thread_key": r["thread_key"],
+                    "counterparty": r["counterparty_name"],
+                    "workstream": r["workstream"],
+                    "state": r["state"],
+                }
+            )
+            continue
+        threads.append(
+            {
+                "thread_key": r["thread_key"],
+                "counterparty": r["counterparty_name"],
+                "workstream": r["workstream"],
+                "entity": r["entity"],
+                "owner": r["owner"],
+                "state": r["state"],
+                "last_outbound_ts": r["last_outbound_ts"],
+                "last_inbound_ts": r["last_inbound_ts"],
+                "nudge_count": r["nudge_count"],
+                "next_review_date": r["next_review_date"],
+                "hold_reason": r["hold_reason"],
+            }
+        )
+    return {
+        "note": ("Cadence ledger snapshot -- no message bodies anywhere by "
+                 "construction; Finance-Legal rows carry counterparty + state only."),
+        "counts_by_state": counts,
+        "threads": threads,
+    }
+
+
 # Catalog of everything this writer maintains. Cadences are minimum refresh
 # intervals, evaluated on the ~60s tick; 0 = every tick. index.json is not
 # listed — it is rewritten at the end of every tick to reflect fresh stamps.
@@ -237,6 +287,13 @@ _SPECS: list[dict[str, Any]] = [
                         "LEX sub-entities excluded)"),
         "cadence": 300,
         "render": _render_known_answers_index,
+    },
+    {
+        "name": "revops-ledger.json",
+        "description": ("Revenue-ops cadence ledger (thread states/counts; no message "
+                        "bodies; Finance-Legal rows = counterparty + state only)"),
+        "cadence": 300,
+        "render": _render_revops_ledger,
     },
 ]
 

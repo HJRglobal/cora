@@ -26,6 +26,7 @@ from . import feedback_log
 from . import help_responder
 from . import knowledge_review
 from . import missed_message_catchup as missed_catchup
+from .revops import cards as revops_cards
 from . import intent_classifier as ic
 from . import knowledge_gaps
 from . import gap_detection
@@ -569,6 +570,23 @@ def _dispatch_qa(
     # write-escalation below still covers the ambiguous case). Runs downstream of
     # the DM gap-ask + OSN-scheduler routing in handle_message_event, so a "yes"
     # meant for those never reaches here.
+    # Typed-SEND fallback for revops Tier-1 cards (design 2026-08-01): an exact
+    # `SEND <stash_id>` from the approver routes to the SAME gate as the ✅ tap
+    # (kill switch, stash claim, guard re-run, recipient subset all inside).
+    # Deliberately narrow: uppercase SEND + a 16-hex stash id, nothing else --
+    # ordinary sentences can never match, and non-approvers get the gate refusal.
+    if user_id:
+        m_send = re.match(r"^\s*SEND\s+([0-9a-f]{16})\s*$", user_message or "")
+        if m_send:
+            outcome, send_msg = revops_cards.process_send_action(
+                m_send.group(1), user_id, action="send"
+            )
+            log.info("revops typed-SEND outcome=%s user=%s", outcome, user_id)
+            say(text=_guard_content(send_msg), thread_ts=reply_thread_ts,
+                unfurl_links=False, unfurl_media=False)
+            active_thread_store.register(channel_id, register_ts)
+            return
+
     if user_id:
         confirm_reply = _tool_dispatch.try_confirm_pending_write(
             slack_user_id=user_id, channel_name=channel_name, entity=entity,
@@ -2861,6 +2879,164 @@ def handle_catchup_edit_submit(ack, body, client, view) -> None:
                 pass
     except Exception:  # noqa: BLE001
         log.warning("catchup edit-submit handler error (non-fatal)", exc_info=True)
+
+
+# ── Revenue-ops Tier-1 send cards (R2, D-081 pattern; design 2026-08-01) ────────
+# ack() first, delegate; ALL correctness (approver gate, kill switch, byte-exact
+# stash, guard re-run, recipient subset, single-shot claim) lives in
+# revops.cards.process_send_action -> revops.sender.send_stashed. Ships DARK:
+# with CORA_SEND_LIVE=off (the default) an approved tap refuses in the gate.
+
+def _handle_revops_send_tap(body: dict, client, *, action: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        sid = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        outcome, msg = revops_cards.process_send_action(sid, actor_id, action=action)
+
+        if outcome == "not_authorized":
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # Terminal outcomes drop the buttons; non-terminal refusals (env_off,
+        # guard trouble) keep the card tappable for after the env flip.
+        keep_buttons = outcome in ("env_off",)
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            kept = [
+                b for b in orig
+                if b.get("type") == "section" or (keep_buttons and b.get("type") == "actions")
+            ]
+            new_blocks = kept + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not kept:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("revops send-card chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("revops send-card handler error (non-fatal)", exc_info=True)
+
+
+@app.action(revops_cards.ACTION_SEND)
+def handle_revops_send(ack, body, client) -> None:
+    ack()
+    _handle_revops_send_tap(body, client, action="send")
+
+
+@app.action(revops_cards.ACTION_SKIP)
+def handle_revops_skip(ack, body, client) -> None:
+    ack()
+    _handle_revops_send_tap(body, client, action="skip")
+
+
+@app.action(revops_cards.ACTION_CLOSE)
+def handle_revops_close(ack, body, client) -> None:
+    ack()
+    _handle_revops_send_tap(body, client, action="close")
+
+
+@app.action(revops_cards.ACTION_EDIT)
+def handle_revops_edit(ack, body, client) -> None:
+    """Open a modal prefilled with the staged body; submit restages a NEW card."""
+    ack()
+    try:
+        actions = body.get("actions") or []
+        sid = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+        trigger_id = body.get("trigger_id", "")
+
+        from .revops import ledger as revops_ledger, stash as revops_stash
+
+        conn = revops_ledger.connect()
+        try:
+            row = revops_stash.get_stash(conn, sid)
+        finally:
+            conn.close()
+        if (
+            row is None
+            or row["status"] != "staged"
+            or not revops_cards.send_trust.is_approver(row["playbook_id"], actor_id)
+        ):
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=actor_id,
+                    text="That send card is no longer editable.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        view = revops_cards.edit_modal_view(sid, channel_id, message_ts, row["body_text"] or "")
+        client.views_open(trigger_id=trigger_id, view=view)
+    except Exception:  # noqa: BLE001
+        log.warning("revops edit-modal open failed (non-fatal)", exc_info=True)
+
+
+@app.view(revops_cards.VIEW_EDIT_SUBMIT)
+def handle_revops_edit_submit(ack, body, client, view) -> None:
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        sid = meta.get("stash_id", "")
+        dm_channel = meta.get("dm_channel", "")
+        dm_ts = meta.get("dm_ts", "")
+        actor_id = (body.get("user") or {}).get("id", "")
+        state = (view.get("state") or {}).get("values") or {}
+        edited = (
+            (state.get("revops_edit_block") or {})
+            .get("revops_edit_input", {})
+            .get("value", "")
+        ) or ""
+
+        outcome, msg, new_sid = revops_cards.restage_with_edit(sid, actor_id, edited)
+
+        if outcome == "restaged" and new_sid:
+            from .revops import email_egress_guard as revops_guard
+            from .revops import ledger as revops_ledger, stash as revops_stash
+
+            conn = revops_ledger.connect()
+            try:
+                new_row = revops_stash.get_stash(conn, new_sid)
+                thread_row = (
+                    revops_ledger.get_thread(conn, new_row["thread_key"]) if new_row else None
+                )
+                if new_row is not None:
+                    guard = revops_guard.check_email(
+                        new_row["body_text"] or "",
+                        workstream=thread_row["workstream"] if thread_row else None,
+                        entity=thread_row["entity"] if thread_row else None,
+                    )
+                    fallback, blocks = revops_cards.build_send_card(new_row, thread_row, guard)
+                    resp = client.chat_postMessage(
+                        channel=dm_channel or actor_id, text=fallback[:2900],
+                        blocks=blocks, unfurl_links=False,
+                    )
+                    revops_stash.set_card_ref(
+                        conn, new_sid, channel=resp["channel"], ts=resp["ts"]
+                    )
+            finally:
+                conn.close()
+
+        if dm_channel and dm_ts and outcome != "not_authorized":
+            try:
+                client.chat_update(
+                    channel=dm_channel, ts=dm_ts, text=msg,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        log.warning("revops edit-submit handler error (non-fatal)", exc_info=True)
 
 
 # ── Code-session queue one-tap (Queue / Edit / Dismiss / Later / Stage / etc.) ───

@@ -487,7 +487,7 @@ def test_task_results_are_ttl_cached(monkeypatch):
 def test_spec_catalog_is_complete_and_described():
     names = {s["name"] for s in ss._SPECS}
     assert names == {"status.json", "code-queue.json", "flywheel.json",
-                     "known-answers-index.json"}
+                     "known-answers-index.json", "revops-ledger.json"}
     for spec in ss._SPECS:
         assert spec["description"]
         assert isinstance(spec["cadence"], int)
@@ -512,11 +512,13 @@ def test_full_tick_with_real_specs(tmp_path, monkeypatch):
     ka_dir = tmp_path / "ka"
     ka_dir.mkdir()
     monkeypatch.setattr(cl, "_KNOWN_ANSWERS_DIR", ka_dir)
+    monkeypatch.setenv("CORA_REVOPS_DB", str(tmp_path / "revops_ledger.db"))
     cq._EVENT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
 
     results = ss.tick(force=True)
     assert set(results) == {"status.json", "code-queue.json", "flywheel.json",
-                            "known-answers-index.json", "index.json"}
+                            "known-answers-index.json", "revops-ledger.json",
+                            "index.json"}
     assert all(v == "written" for v in results.values())
     d = ss._snapshot_dir()
     for name in results:
