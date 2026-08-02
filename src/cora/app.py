@@ -3371,7 +3371,9 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
             pass
         return
 
-    if outcome == "superseded":
+    if outcome == "already_handled":
+        text = "Already handled -- no action needed."
+    elif outcome == "superseded":
         text = "This preview was replaced by a newer one -- check your latest message."
     elif outcome == "expired":
         label = result.get("label", "that request")
@@ -3403,12 +3405,10 @@ def handle_cancel_write(ack, body, client) -> None:
     _handle_confirm_tap(body, client, action="cancel")
 
 
-@app.action(confirm_cards.ACTION_PICK)
-def handle_pick_candidate(ack, body, client) -> None:
+def _handle_pick_tap(body: dict, client) -> None:
     """Ambiguity-picker tap (S4): bind the chosen candidate server-side and
     post the resulting preview as a fresh Confirm/Cancel card -- the term
     never round-trips through the model."""
-    ack()
     tapping_user = (body.get("user") or {}).get("id", "")
     channel_id = (body.get("channel") or {}).get("id", "")
     message_ts = (body.get("message") or {}).get("ts", "")
@@ -3468,6 +3468,12 @@ def handle_pick_candidate(ack, body, client) -> None:
     except Exception:  # noqa: BLE001
         log.warning("picker follow-up preview post failed (non-fatal) channel=%s",
                     channel_id, exc_info=True)
+
+
+@app.action(confirm_cards.ACTION_PICK)
+def handle_pick_candidate(ack, body, client) -> None:
+    ack()
+    _handle_pick_tap(body, client)
 
 
 @app.event("channel_created")

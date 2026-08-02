@@ -213,6 +213,26 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         _td._PENDING_SHOPIFY_WRITES.clear()
     except Exception:
         pass
+    # Confirm-buttons (2026-08-02): the 3 Class-B stashes + the ask_stash are
+    # ALSO global, process-wide, in-memory dicts (same class of test-pollution
+    # risk as the shopify/delegated stores above -- common test user ids like
+    # HARRISON recur across many files). Clear before AND after every test.
+    try:
+        import cora.tools.tool_dispatch as _td2
+        _td2._PENDING_REMEMBER.clear()
+        _td2._PENDING_FORGET_NOTE.clear()
+        _td2._PENDING_SCHEDULE_MEETING.clear()
+        _td2._PENDING_ASK_STASH.clear()
+    except Exception:
+        pass
+    try:
+        from cora import confirm_cards as _cc
+        with _cc._INDEX_LOCK:
+            _cc._INDEX.clear()
+        with _cc._ASK_INDEX_LOCK:
+            _cc._ASK_INDEX.clear()
+    except Exception:
+        pass
     # Slice 5 (2026-07-29 audit): the two rollout flags live in .env
     # (CORA_AUTOWRITE_LIVE=all, CORA_CODE_QUEUE=live) and config.py's import-time
     # load_dotenv() pulls them into the test process. Both writers read their flag
@@ -293,6 +313,18 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         import cora.tools.tool_dispatch as _td
         _td._PENDING_SHOPIFY_WRITES.clear()
         _td._PENDING_DELEGATED_WORK.clear()
+        _td._PENDING_REMEMBER.clear()
+        _td._PENDING_FORGET_NOTE.clear()
+        _td._PENDING_SCHEDULE_MEETING.clear()
+        _td._PENDING_ASK_STASH.clear()
+    except Exception:
+        pass
+    try:
+        from cora import confirm_cards as _cc
+        with _cc._INDEX_LOCK:
+            _cc._INDEX.clear()
+        with _cc._ASK_INDEX_LOCK:
+            _cc._ASK_INDEX.clear()
     except Exception:
         pass
 

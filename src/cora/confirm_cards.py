@@ -91,11 +91,28 @@ def index_lookup(stash_id: str) -> dict | None:
 
 
 def index_release(stash_id: str) -> None:
-    """Best-effort hygiene: drop the index entry once its stash is claimed or
-    cancelled. Not required for correctness (the grace-window prune is the
-    backstop for entries nobody ever taps)."""
+    """Best-effort hygiene: drop the index entry outright. Not required for
+    correctness (the grace-window prune is the backstop for entries nobody
+    ever taps). Prefer index_mark_resolved() for a stash_id that reached a
+    terminal claim/cancel outcome -- a hard pop here makes a racing SECOND
+    tap read as 'orphaned' (implying nothing happened, ask again) instead of
+    the more accurate 'already handled' (idempotent ack)."""
     with _INDEX_LOCK:
         _INDEX.pop(stash_id, None)
+
+
+def index_mark_resolved(stash_id: str) -> None:
+    """Mark a stash_id resolved (claimed/cancelled) WITHOUT deleting the index
+    entry, so a racing second tap -- or a tap that arrives after the user
+    typed a confirm instead (the typed path never touches this index at all,
+    so it can't mark anything itself; the per-kind store simply has nothing
+    left, which the caller treats the same way) -- reads as 'already handled'
+    rather than 'orphaned'. The entry still ages out via the normal
+    grace-window prune."""
+    with _INDEX_LOCK:
+        entry = _INDEX.get(stash_id)
+        if entry is not None:
+            entry["resolved"] = True
 
 
 def mint_ask_id(user: str, channel: str) -> str:

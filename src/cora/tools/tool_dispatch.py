@@ -10227,7 +10227,9 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
     """Resolve + authorize + atomically claim a Confirm/Cancel button tap.
     `action` is 'confirm' or 'cancel'. Returns a result dict:
       {'outcome': 'unauthorized', 'owner': <slack id>}
-      {'outcome': 'orphaned' | 'superseded'}
+      {'outcome': 'orphaned'}
+      {'outcome': 'already_handled'}
+      {'outcome': 'superseded'}
       {'outcome': 'expired', 'label': <str>}
       {'outcome': 'cancelled'}
       {'outcome': 'executed', 'message': <str>}
@@ -10239,29 +10241,48 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
     tapping user id from the Slack action payload, BEFORE any state is
     touched; the claim is a single atomic pop keyed on an EXACT stash_id
     match, so a double-tap or a tap racing a typed confirm can win at most
-    once. CORA_EVAL_MODE=1 refuses everything (catch-up reconstruction must
-    never fire a write) -- same gate as the typed-confirm interceptor."""
+    once -- the loser is told 'already_handled' (idempotent), never a false
+    'orphaned' (which would wrongly imply nothing happened). CORA_EVAL_MODE=1
+    refuses everything (catch-up reconstruction must never fire a write) --
+    same gate as the typed-confirm interceptor."""
     if os.environ.get("CORA_EVAL_MODE") == "1":
         return {"outcome": "orphaned"}
     idx = confirm_cards.index_lookup(stash_id)
     if idx is None:
+        # No index record at all: forged/never-existed, or the grace window
+        # (6h) has fully aged it out, or a restart wiped in-memory state.
         return {"outcome": "orphaned"}
+    if idx.get("resolved"):
+        # A PRIOR tap on this exact stash_id already reached a terminal
+        # claim/cancel outcome (index_mark_resolved), and the entry hasn't
+        # aged out yet -- an idempotent ack, not an alarm.
+        return {"outcome": "already_handled"}
     if idx["user"] != tapping_user_id:
         return {"outcome": "unauthorized", "owner": idx["user"]}
     kind, user, channel = idx["kind"], idx["user"], idx["channel"]
 
     status, entry = _claim_stash_by_id(kind, user, channel, stash_id)
-    confirm_cards.index_release(stash_id)
     if status == "not_found":
-        return {"outcome": "orphaned"}
+        # The index still has a (not-yet-resolved) record, but the per-kind
+        # store has nothing at that key -- almost always means the user
+        # confirmed via the TYPED path instead (which consumes the store
+        # entry but never touches this index at all). Sync the index so a
+        # THIRD tap also reads 'already_handled' instead of re-deriving.
+        confirm_cards.index_mark_resolved(stash_id)
+        return {"outcome": "already_handled"}
     if status == "superseded":
         return {"outcome": "superseded"}
     if status == "expired":
+        confirm_cards.index_mark_resolved(stash_id)
         return {"outcome": "expired", "label": _stash_expired_label(kind, entry)}
 
     # status == "claimed" -- exactly one caller (this one) reaches here for
     # this stash_id; the lock inside _claim_stash_by_id already resolved any
-    # concurrent race.
+    # concurrent race. Mark resolved BEFORE executing so a concurrent SECOND
+    # tap (which can only reach this point after the lock releases, by which
+    # time the per-kind store is already empty) reads 'already_handled' via
+    # the index rather than racing the "not_found" sync path above.
+    confirm_cards.index_mark_resolved(stash_id)
     if action == "cancel":
         return {"outcome": "cancelled"}
 
