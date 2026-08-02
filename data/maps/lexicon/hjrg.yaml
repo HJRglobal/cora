@@ -1,0 +1,5 @@
+version: 1
+entity: HJRG
+terms:
+  - {term: "the binder", type: process, canonical: "VISIBILITY-BINDER", canonical_name: "Visibility CPA shared binder (01-HJR-Global/accounting/visibility-binder)", source: seed}
+  - {term: "payables mailbox", aliases: ["ap ar mailbox"], type: channel, canonical: "payables@hjrglobal.com", canonical_name: "AP/AR shared mailbox (payables@hjrglobal.com)", source: seed}

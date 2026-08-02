@@ -1,0 +1,4 @@
+version: 1
+entity: FNDR
+terms: []
+# FNDR resolves against the union of all entity files; keep this file for future founder-only terms.

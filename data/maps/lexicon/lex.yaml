@@ -1,0 +1,9 @@
+# LEX lexicon: staff/ops/program terms ONLY; no client references, ever (D-050/D-082 posture).
+version: 1
+entity: LEX
+terms:
+  - {term: "ddd", type: acronym, canonical: "AZ-DDD", canonical_name: "AZ DES Division of Developmental Disabilities", source: seed}
+  - {term: "evv", type: acronym, canonical: "EVV", canonical_name: "Electronic Visit Verification", source: seed}
+  - {term: "ahcccs", type: acronym, canonical: "AHCCCS", canonical_name: "Arizona Health Care Cost Containment System (AZ Medicaid agency)", source: seed}
+  - {term: "hcbs", type: acronym, canonical: "HCBS", canonical_name: "Home and Community Based Services", source: seed}
+  - {term: "the dump folder", type: process, canonical: "LEX-DUMP-FOLDER", canonical_name: "Lexington Drive dump folder (DDD policies/manuals; nightly sync)", source: seed}

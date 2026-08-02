@@ -1,0 +1,7 @@
+version: 1
+entity: HJRP
+terms:
+  - {term: "the ranch", aliases: ["rogers ranch"], type: location, canonical: "HJRP-RR", canonical_name: "Rogers Ranch (Payson; HJRP-RR)", source: seed}
+  - {term: "cinema lanes", type: location, canonical: "HJRP-CL", canonical_name: "Cinema Lanes (HJRP-CL)", source: seed}
+  - {term: "lci", type: location, canonical: "HJRP-LCI", canonical_name: "LCI Realty (HJRP-LCI)", source: seed}
+  - {term: "vine and branches", type: vendor, canonical: "VINE-AND-BRANCHES", canonical_name: "Vine & Branches (former tenant, suite 121; lease ended 2026-06-30)", notes: "homonym: F3E 'Vine' is the Amazon review program", source: seed}
