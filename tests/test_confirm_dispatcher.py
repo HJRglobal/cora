@@ -219,6 +219,36 @@ class TestResolveAndClaimStashSecurity:
         assert result["outcome"] == "expired"
         assert "Old Task" in result["label"]
 
+    def test_expired_tap_gets_tombstone_label_create(self):
+        # create's pending entry has NO "label" key at all -- the name lives
+        # under "title" (D-051 8-02 review finding: this used to fall back
+        # to the generic "that task").
+        sid = cc.mint_stash_id("asana", HARRISON, _CH)
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "create", "title": "Brand New Task", "assignee_gid": "g",
+            "assignee_display": "H", "project_gid": None, "notes": None,
+            "due_on": None, "notices": [], "follower_gids": [], "follower_displays": [],
+            "ts": time.time() - td._ASANA_PENDING_TTL_SECONDS - 5, "stash_id": sid,
+        })
+        result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "expired"
+        assert "Brand New Task" in result["label"]
+
+    def test_expired_tap_gets_tombstone_label_subtask(self):
+        # subtask's own name lives under "name"; "parent_label" names the
+        # PARENT task, a different field -- the tombstone must name the
+        # subtask itself, not fall back to the generic "that task".
+        sid = cc.mint_stash_id("asana", HARRISON, _CH)
+        td._store_pending_asana_write(HARRISON, _CH, {
+            "action": "subtask", "parent_gid": "g1", "parent_label": "Parent Task",
+            "name": "Follow up with client", "notes": None, "due_on": None,
+            "assignee_gid": "", "assignee_display": "unassigned",
+            "ts": time.time() - td._ASANA_PENDING_TTL_SECONDS - 5, "stash_id": sid,
+        })
+        result = td.resolve_and_claim_stash(sid, HARRISON, "confirm")
+        assert result["outcome"] == "expired"
+        assert "Follow up with client" in result["label"]
+
     def test_orphaned_after_simulated_restart(self):
         # A "restart" clears BOTH the index and every pending store (both are
         # in-memory) -- a tap on a stash_id from before must read orphaned.
