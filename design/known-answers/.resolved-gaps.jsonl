@@ -17,3 +17,4 @@
 {"id": "2026-07-30T04:58:49.176210+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
 {"id": "2026-07-30T05:01:15.827097+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
 {"id": "2026-07-30T05:24:01.404247+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
+{"id": "2026-07-03T05:53:08.435531+00:00", "action": "expired", "timestamp": "2026-08-02T13:10:02.159648+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_ttl"}
