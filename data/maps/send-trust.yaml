@@ -1,0 +1,30 @@
+# Send-trust ladder config -- THE governance surface for outbound email (D-034 class).
+#
+# Locked design 2026-08-01 (revenue-ops-loop-design.md section 3):
+# - Tier 0 = draft-only (default for everything not listed here).
+# - Tier 1 = approve-then-send. v1 holds exactly ONE tier-1 playbook: silence_nudge.
+# - Tier 2 = pre-approved playbook sends. OUT of v1: the loader HARD-REJECTS any
+#   playbook configured tier 2. The schema exists so a later promotion is a
+#   one-line diff Harrison merges, not a build.
+# - Promotion of any playbook, mailbox, approver, or tier happens ONLY by
+#   Harrison merging a change to this file (plus, for mailboxes, the code-level
+#   v1 mailbox universe in src/cora/revops/send_trust.py).
+# - The global kill switch CORA_SEND_LIVE (off|tier1, default off) beats
+#   everything in this file, including an already-approved card.
+#
+# Tier-2 entry criteria (pre-agreed, mechanical): 10 consecutive clean tier-1
+# sends (no edit, zero guard blocks, zero post-hoc corrections) per playbook,
+# counted by the weekly digest. Eligibility never auto-promotes.
+
+playbooks:
+  silence_nudge:
+    tier: 1
+    mailbox_allowlist:
+      - harrison@hjrglobal.com
+    approvers:
+      - U0B2RM2JYJ1          # Harrison -- sole approver in v1
+    recipient_class: thread_participants_only
+    template_ref: design/playbooks/revops
+    nudge:
+      min_silence_days: 7
+      max_nudges: 2

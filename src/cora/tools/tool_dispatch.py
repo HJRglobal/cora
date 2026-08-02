@@ -1762,6 +1762,30 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
             f"no asana_email in the user map. Tell the user there's a configuration issue."
         )
 
+    # Email egress guard (R2, design 2026-08-01 section 7): PHI hard-blocks the
+    # draft entirely; every other class annotates the notification (a human
+    # still reviews + sends Tier-0 drafts, so annotation suffices).
+    from ..revops import email_egress_guard as _email_guard
+
+    # Screen the SUBJECT too: PHI in a subject line is still PHI leaving the
+    # building, and the subject is the part a recipient sees first (lens 8).
+    _guard_result = _email_guard.check_email(
+        f"{subject}\n{body}", workstream=None, entity=entity
+    )
+    _phi_blocked = any(b.get("class") == "phi" for b in _guard_result.blocks)
+    if _phi_blocked:
+        log.warning(
+            "gmail_create_draft PHI-BLOCKED asker=%s sender=%s", slack_user_id, sender_email
+        )
+        return (
+            "gmail_create_draft refused: the body tripped the PHI screen, so no "
+            "draft was written. Tell the user the draft was blocked for containing "
+            "possible PHI/LEX-sensitive content and cannot be created."
+        )
+    _guard_notes = [b["reason"] for b in _guard_result.blocks] + [
+        w["reason"] for w in _guard_result.warns
+    ]
+
     try:
         draft = gmail_client.create_draft(
             sender_email=sender_email,
@@ -1796,13 +1820,19 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
         len(cc_list) if cc_list else 0,
     )
 
-    return gmail_client.format_created_draft_for_llm(
+    result = gmail_client.format_created_draft_for_llm(
         draft,
         sender_email=sender_email,
         to=to_list,
         subject=subject,
         cc=cc_list,
     )
+    if _guard_notes:
+        result += (
+            "\n\nEMAIL GUARD NOTES (surface these to the user so they fix the "
+            "draft before sending):\n- " + "\n- ".join(_guard_notes[:6])
+        )
+    return result
 
 
 def _tool_gmail_inbox(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -9090,6 +9120,18 @@ TOOL_DEFINITIONS = [
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "revops_ledger_status",
+        "description": (
+            "Read-only status of the revenue-ops cadence ledger: outreach threads "
+            "being tracked for replies/silence (states like awaiting_reply, "
+            "nudge_due, escalated, hold), counts and per-thread ages. Use when "
+            "someone asks about outreach follow-ups, 'who hasn't replied', nudge "
+            "queue status, or the revenue-ops loop. Results are already scoped to "
+            "what this channel may see; it contains NO email content."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -9220,10 +9262,75 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
     )
 
 
+def _tool_revops_ledger_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Read-only view of the revenue-ops cadence ledger (R1, design 2026-08-01).
+
+    Scoping (fail-closed): Harrison sees everything; every other asker sees
+    only their channel entity's threads and NEVER the Finance-Legal workstream
+    (finance firewall posture). No message bodies exist in the ledger at all.
+    """
+    from ..revops import ledger as _revops_ledger
+
+    is_harrison = slack_user_id == _FOUNDER_SLACK_ID
+    try:
+        conn = _revops_ledger.connect()
+        try:
+            rows = _revops_ledger.list_threads(conn)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("revops_ledger_status failed: %s", exc)
+        return "The revenue-ops ledger is unavailable right now."
+
+    if not is_harrison:
+        # Fail-closed: an EXACT entity match only. A NULL/unset entity is not
+        # "everyone's thread" -- an unlabeled row must never surface in an
+        # arbitrary channel (incl. LEX channels) (D-051 lens 7).
+        canon = _SUBENTITY_PARENT.get(entity, entity).upper()
+        rows = [
+            r
+            for r in rows
+            if r["workstream"] != "Finance-Legal"
+            and (r["entity"] or "").strip().upper() == canon
+        ]
+    if not rows:
+        return "No tracked revenue-ops threads in scope for this channel."
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+    now = time.time()
+
+    def _days(ts) -> str:
+        return f"{int((now - ts) / 86400)}d" if ts else "?"
+
+    lines = ["REVENUE-OPS LEDGER -- " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))]
+    order = {"escalated": 0, "nudge_due": 1, "nudge_staged": 2, "awaiting_reply": 3,
+             "replied": 4, "hold": 5, "draft_staged": 6, "bounced": 7}
+    listed = sorted(
+        (r for r in rows if r["state"] not in _revops_ledger.TERMINAL_STATES),
+        key=lambda r: (order.get(r["state"], 9), -(r["last_outbound_ts"] or 0)),
+    )
+    for r in listed[:40]:
+        line = (
+            f"- [{r['state']}] {r['counterparty_name'] or r['thread_key']} "
+            f"({r['workstream']}, {r['entity'] or '?'}) -- "
+            f"{_days(r['last_outbound_ts'])} since last outbound, "
+            f"nudges {r['nudge_count'] or 0}"
+        )
+        if r["hold_reason"]:
+            line += f", hold: {r['hold_reason'][:60]}"
+        lines.append(line)
+    if len(listed) > 40:
+        lines.append(f"...and {len(listed) - 40} more open threads.")
+    return "\n".join(lines)
+
+
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "cora_queue_code_session",
+    "revops_ledger_status",
     "whats_on_my_plate",
     "meeting_action_items",
     "cora_remember",
@@ -9454,6 +9561,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_cultural_radar": _tool_f3e_cultural_radar,
     "personal_travel_points": _tool_personal_travel_points,
     "cowork_dashboards_index": _tool_cowork_dashboards_index,
+    # Revenue-ops loop (2026-08-02): read-only cadence-ledger view
+    "revops_ledger_status": _tool_revops_ledger_status,
 }
 
 
@@ -9477,6 +9586,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "influencer_list_handles": 8,
     "influencer_get_status": 8,
     "f3e_ai_visibility": 8,
+    "revops_ledger_status": 8,
     # Normal — single external API call
     "asana_create_task": 12,
     "asana_complete_task": 12,
