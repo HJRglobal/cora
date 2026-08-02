@@ -295,6 +295,21 @@ class TestCapAndLedger:
         assert "2000-01-01" not in raw
         assert web_guard.searches_today() == 1
 
+    def test_gate_skipped_reason_is_ledgered(self):
+        # cq-49a7835f081c observability: a deterministic app-gate exclusion on a
+        # web-actionable turn is recorded as a block row (not silently dropped
+        # like no_intent/disabled).
+        web_guard.record_decision(
+            WebDecision(False, "gate_skipped:phi_custodian"),
+            entity="LEX-LLC", channel_name="dm", user_id="U1",
+        )
+        rows = [
+            json.loads(line)
+            for line in web_guard._USAGE_LEDGER.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows and rows[-1]["event"] == "block"
+        assert rows[-1]["reason"] == "gate_skipped:phi_custodian"
+
 
 # ---------------------------------------------------------------------------
 # Sources line rendering
@@ -587,12 +602,46 @@ class TestAppWiring:
 
     def test_web_gate_excludes_confirm_grant_and_personal_context(self):
         src = self._src()
-        # Forced-tool / confirm / retrieval-grant / custodian / personal exclusions.
-        assert "force_tool is None" in src
-        assert "not assume_confirm" in src
-        assert "retrieval_grant is None" in src
-        assert "not phi_custodian" in src
-        assert 'not kb_meta.get("unstripped_personal")' in src
+        # Forced-tool / confirm / retrieval-grant / custodian / personal
+        # exclusions survive as the web_gate_skip reason chain (cq-49a7835f081c
+        # made them observable instead of silent).
+        assert 'web_gate_skip = "forced_tool"' in src
+        assert 'web_gate_skip = "assume_confirm"' in src
+        assert 'web_gate_skip = "retrieval_grant"' in src
+        assert 'web_gate_skip = "phi_custodian"' in src
+        assert 'web_gate_skip = "unstripped_personal"' in src
+        # Attach happens ONLY when no exclusion fired — pin the NESTING, not
+        # just line existence (D-051 spec lens: a hoisted attach assignment
+        # would keep bare string pins green while breaking all 5 exclusions).
+        gate_idx = src.index("if web_gate_skip is None:")
+        assert src.index('web_gate_skip = "forced_tool"') < gate_idx
+        assert src.count("web_on = web_decision.attach") == 1
+        assert src.index("web_on = web_decision.attach") > gate_idx
+        # The belt reads the SAME kb_meta the load populated: the dict is
+        # initialized once and never rebound between load and gate.
+        assert src.count("kb_meta: dict = {}") == 1
+        assert " kb_meta = " not in src
+
+    def test_web_clean_load_wired(self):
+        # cq-49a7835f081c: an explicit-web-intent turn that WILL attach loads a
+        # web-clean context (notes/unstripped-personal absent by construction);
+        # custodian/LEX/blocked/capped/disabled turns keep their full context
+        # (they never attach, so degrading them is pure loss — D-051 review).
+        src = self._src()
+        seg = src[src.index("web_clean = ("):src.index("static_text, kb_text = load_context_parts")]
+        assert "web_intent" in seg
+        assert "not phi_custodian" in seg
+        assert "not web_guard.is_lex_scope(entity)" in seg
+        assert ").attach" in seg  # pre-flight evaluate: degrade only on real attach
+        assert "kb_meta=None," in seg  # explicit leg is kb_meta-independent
+        assert "web_clean=web_clean," in src
+
+    def test_gate_skips_are_observable(self):
+        # A deterministic exclusion swallowing a web-actionable turn must leave
+        # ledger + log evidence (the original failure was three silent asks).
+        src = self._src()
+        assert 'f"gate_skipped:{web_gate_skip}"' in src
+        assert "web_tools gate_skipped" in src
 
     def test_web_gate_passes_skip_kb_and_model(self):
         src = self._src()
@@ -615,3 +664,145 @@ class TestAppWiring:
 
         for fn in (claude_client.generate_response, claude_client.generate_response_streaming):
             assert "web_tools" in inspect.signature(fn).parameters
+
+
+# ---------------------------------------------------------------------------
+# Web-clean context load (cq-49a7835f081c): a turn that may carry web tools is
+# built with NO unstripped personal content, so the D-051 personal-context
+# exclusion is satisfied by construction instead of silently degrading.
+# ---------------------------------------------------------------------------
+
+
+class TestLexScopePublic:
+    def test_is_lex_scope_public_name(self):
+        # app.py scopes the web-clean load on this public predicate.
+        assert web_guard.is_lex_scope("LEX")
+        assert web_guard.is_lex_scope("LEX-LLC")
+        assert web_guard.is_lex_scope("lex-lts")
+        assert not web_guard.is_lex_scope("F3E")
+        assert not web_guard.is_lex_scope("")
+
+
+class TestWebCleanContextLoad:
+    def _mk(self, distance, source="asana", chunk_id="c1", content="benign fact",
+            metadata=None, source_id="s1", title="t"):
+        from cora.knowledge_base.store import SearchResult
+
+        return SearchResult(
+            chunk_id=chunk_id, source=source, source_id=source_id, entity="F3E",
+            title=title, content=content, deep_link="", date_modified=None,
+            distance=distance, author="", metadata=metadata,
+        )
+
+    def _wire(self, monkeypatch, results):
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        import cora.context_loader as cl
+
+        notes_calls: list = []
+
+        def _notes(*a, **k):
+            notes_calls.append(1)
+            return []
+
+        monkeypatch.setattr(cl, "_KB_DB_PATH", Path(__file__).resolve().parent)
+        fake_kb = SimpleNamespace(
+            search=lambda *a, **k: list(results), search_user_notes=_notes,
+        )
+        monkeypatch.setattr(cl, "get_shared_kb", lambda: fake_kb)
+        return cl, notes_calls
+
+    def test_web_clean_never_queries_notes(self, monkeypatch):
+        cl, notes_calls = self._wire(monkeypatch, [self._mk(1.10)])
+        meta: dict = {}
+        block = cl._try_kb_retrieve(
+            "F3E", "search the web for ddr5 prices",
+            asker_slack_id="U0B2RM2JYJ1", asker_unrestricted=True,
+            kb_meta=meta, web_clean=True,
+        )
+        assert notes_calls == []
+        assert block and "benign fact" in block
+        assert "unstripped_personal" not in meta
+        assert meta.get("kb_notes_hit") is False
+
+    def test_default_load_still_queries_notes(self, monkeypatch):
+        cl, notes_calls = self._wire(monkeypatch, [self._mk(1.10)])
+        cl._try_kb_retrieve(
+            "F3E", "search the web for ddr5 prices",
+            asker_slack_id="U0B2RM2JYJ1", kb_meta={},
+        )
+        assert notes_calls == [1]
+
+    def test_web_clean_strips_unrestricted_gmail_chunk(self, monkeypatch):
+        gmail = self._mk(
+            1.05, source="gmail", chunk_id="g1",
+            source_id="gmail:teammate@hjrglobal.com:m1",
+            title="Vendor quote thread",
+            content="From: teammate@hjrglobal.com\nSubject: quote\n\nvendor quote body fact",
+            metadata={"user_email": "teammate@hjrglobal.com"},
+        )
+        cl, _ = self._wire(monkeypatch, [gmail])
+        meta: dict = {}
+        block = cl._try_kb_retrieve(
+            "F3E", "search the web for vendor pricing",
+            asker_slack_id="U0B2RM2JYJ1", asker_unrestricted=True,
+            kb_meta=meta, web_clean=True,
+        )
+        # The stripped BODY survives as institutional knowledge; the identity
+        # surface (owner mailbox / From header) and the unstripped flag do not.
+        assert block and "vendor quote body fact" in block
+        assert "teammate@hjrglobal.com" not in block
+        assert "unstripped_personal" not in meta
+
+    def test_default_load_unrestricted_gmail_sets_flag(self, monkeypatch):
+        gmail = self._mk(
+            1.05, source="gmail", chunk_id="g1",
+            source_id="gmail:teammate@hjrglobal.com:m1",
+            content="From: teammate@hjrglobal.com\n\nvendor quote body fact",
+            metadata={"user_email": "teammate@hjrglobal.com"},
+        )
+        cl, _ = self._wire(monkeypatch, [gmail])
+        meta: dict = {}
+        cl._try_kb_retrieve(
+            "F3E", "vendor pricing question",
+            asker_slack_id="U0B2RM2JYJ1", asker_unrestricted=True,
+            kb_meta=meta,
+        )
+        assert meta.get("unstripped_personal") is True
+
+    def test_web_clean_skips_cross_entity_fallback(self, monkeypatch):
+        cl, _ = self._wire(monkeypatch, [])  # nothing relevant -> fallback branch
+        fallback = MagicMock(return_value="CROSS-ENTITY BLOCK")
+        monkeypatch.setattr(cl, "_try_cross_entity_fallback", fallback)
+        meta: dict = {}
+        block = cl._try_kb_retrieve(
+            "FNDR", "search the web for that vendor",
+            asker_slack_id="U0B2RM2JYJ1", asker_unrestricted=True,
+            kb_meta=meta, web_clean=True,
+        )
+        assert block is None
+        fallback.assert_not_called()
+        assert "unstripped_personal" not in meta
+
+    def test_default_load_keeps_cross_entity_fallback(self, monkeypatch):
+        cl, _ = self._wire(monkeypatch, [])
+        fallback = MagicMock(return_value="CROSS-ENTITY BLOCK")
+        monkeypatch.setattr(cl, "_try_cross_entity_fallback", fallback)
+        meta: dict = {}
+        block = cl._try_kb_retrieve(
+            "FNDR", "who is that vendor again",
+            asker_slack_id="U0B2RM2JYJ1", asker_unrestricted=True,
+            kb_meta=meta,
+        )
+        assert block == "CROSS-ENTITY BLOCK"
+        assert meta.get("unstripped_personal") is True
+
+    def test_load_context_parts_threads_web_clean(self):
+        import inspect
+
+        import cora.context_loader as cl
+
+        assert "web_clean" in inspect.signature(cl.load_context_parts).parameters
+        src = inspect.getsource(cl.load_context_parts)
+        assert "web_clean=web_clean" in src

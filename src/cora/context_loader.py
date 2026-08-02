@@ -291,6 +291,7 @@ def load_context_parts(
     asker_slack_id: str | None = None,
     asker_is_dm: bool = False,
     phi_custodian: bool = False,
+    web_clean: bool = False,
 ) -> tuple[str, str]:
     """Return (static_text, kb_text) for the entity, kept as separate strings.
 
@@ -327,6 +328,15 @@ def load_context_parts(
     asker_is_dm widens the note scope to ALL the asker's notes; channel asks
     only see notes saved in the channel's entity scope (a LEX-scoped note can
     never surface in a non-LEX channel reply).
+
+    web_clean (cq-49a7835f081c): a turn that may carry the server-side web
+    tools must contain NO unstripped personal content — the model composes
+    search queries from its full context, so anything private in context could
+    ride into an egressed query (D-051 posture). web_clean=True builds that
+    context BY CONSTRUCTION: the personal-note overlay is suppressed entirely,
+    Tier-1 runs in the fail-closed stripped posture (as if the asker were
+    unknown), and the asker-scoped cross-entity fallback is skipped. On a
+    web-clean load kb_meta["unstripped_personal"] can therefore never be set.
     """
     static_text = _load_static_context(entity)
 
@@ -338,7 +348,7 @@ def load_context_parts(
         entity, query, k=effective_k, query_vec=query_vec,
         asker_emails=asker_emails, asker_unrestricted=asker_unrestricted,
         kb_meta=kb_meta, asker_slack_id=asker_slack_id, asker_is_dm=asker_is_dm,
-        phi_custodian=phi_custodian,
+        phi_custodian=phi_custodian, web_clean=web_clean,
     ) or ""
     return static_text, kb_section
 
@@ -575,6 +585,7 @@ def _try_kb_retrieve(
     asker_slack_id: str | None = None,
     asker_is_dm: bool = False,
     phi_custodian: bool = False,
+    web_clean: bool = False,
 ) -> str | None:
     """Search the KB and return a formatted context block. Returns None on any failure.
 
@@ -595,6 +606,19 @@ def _try_kb_retrieve(
     kb = get_shared_kb()
     if kb is None:
         return None
+
+    if web_clean:
+        # Web-clean posture (cq-49a7835f081c): this turn may carry the web tools,
+        # so nothing unstripped-personal may enter context. Demote the asker to
+        # the fail-closed stranger posture for THIS load only: no note overlay,
+        # Tier-1 strips every personal chunk (the header-stripped body is the
+        # same institutional-knowledge form any other asker gets), and the
+        # asker-scoped cross-entity fallback below is skipped. Every
+        # unstripped_personal setter in this function is downstream of these
+        # three locals, so the flag stays unset by construction.
+        asker_slack_id = None
+        asker_emails = frozenset()
+        asker_unrestricted = False
 
     try:
         # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX"
@@ -664,7 +688,10 @@ def _try_kb_retrieve(
         # founder, or a founder-channel asker) looking for a shared vendor/contact
         # tagged to a DIFFERENT entity. Replaces a confident "no record" with a
         # confidence-labeled wider-portfolio result. LEX excluded for non-custodians.
-        fallback = _try_cross_entity_fallback(
+        # Skipped on a web-clean load: the fallback block is asker-scoped
+        # (unconditionally sets unstripped_personal) and a web turn answers from
+        # the live web, not a wider internal dredge.
+        fallback = None if web_clean else _try_cross_entity_fallback(
             query, query_vec, kb_entity, asker_emails, asker_unrestricted, phi_custodian,
         )
         if fallback:

@@ -26,7 +26,14 @@ dropped in claude_client. A live-web question never needs an internal tool, so
 this removes the surface a hostile fetched page could use to pull internal data
 into a later search query or trigger a write (D-051 review 2026-07-31). The
 callers also withhold web tools whenever unscrubbed personal/LEX/custodian
-content is already in context (app.py gate) so it can never ride into a query.
+content rides in THIS TURN'S KB LOAD (app.py gate; prior thread turns are a
+separate, prompt-governed surface -- see the residual note below).
+On an explicit-web-intent turn app.py instead loads a WEB-CLEAN context
+(context_loader web_clean=True: no personal-note overlay, Tier-1 stripped
+posture, no cross-entity fallback) so that exclusion is satisfied by
+construction rather than silently degrading the founder's every web ask
+(cq-49a7835f081c); custodian/LEX turns keep their full context and simply
+never attach. Every skipped-gate web ask is ledgered as gate_skipped:<reason>.
 
 The usage ledger records decisions and per-call search counts. Raw query text
 is NEVER persisted (D-082 posture) -- only the decision reason and scope. It is
@@ -34,7 +41,9 @@ self-bounding (size-gated 7-day self-trim) since data/state/*.jsonl is outside
 the compact_logs non-recursive scan.
 
 Residual (documented, accepted for v1): once tools are attached, the MODEL
-composes the actual search strings from its full context; that layer is
+composes the actual search strings from its full context — including PRIOR
+THREAD/DM TURNS, which no deterministic belt inspects (D-051 injection lens
+2026-08-01; follow-up seeded to the code queue); that layer is
 governed by the WEB_MODE_CONTEXT prompt rules (incl. the untrusted-content and
 no-internal-in-query rules) plus the blocked-domains list, not by this
 deterministic gate. LEX-off + the query screen + the personal/custodian-context
@@ -276,9 +285,17 @@ def _screen_query(text: str) -> str | None:
     return None
 
 
-def _is_lex_scope(entity: str) -> bool:
+def is_lex_scope(entity: str) -> bool:
+    """LEX or any LEX-* sub-entity — the scope that never carries web tools.
+
+    Public so app.py can scope the web-clean context load to turns that could
+    actually attach (a LEX web ask is blocked by evaluate() anyway, so its
+    context must not be degraded by the clean posture)."""
     ent = (entity or "").upper()
     return ent == "LEX" or ent.startswith("LEX-")
+
+
+_is_lex_scope = is_lex_scope  # internal call sites (evaluate)
 
 
 # ---------------------------------------------------------------------------

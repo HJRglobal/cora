@@ -355,6 +355,60 @@ class TestContextLoaderOverlay:
         assert "ASKER'S PERSONAL NOTE" in block
 
 
+class TestWebCleanLoad:
+    """cq-49a7835f081c: an explicit-web-intent turn loads a WEB-CLEAN context.
+
+    The live failure: the owner's note overlay set unstripped_personal on
+    nearly every founder ask, so the app.py web gate silently skipped and web
+    tools never attached. The fix keeps the D-051 invariant (no personal note
+    content in a web-enabled turn's context) by excluding the note from the
+    LOAD instead of excluding the turn from the WEB."""
+
+    @pytest.fixture
+    def ctx(self, kb, monkeypatch):
+        from cora import context_loader as ctx_mod
+        monkeypatch.setattr(ctx_mod, "get_shared_kb", lambda: kb)
+        monkeypatch.setattr(ctx_mod, "_KB_DB_PATH", kb.db_path)
+        return ctx_mod
+
+    def test_web_clean_excludes_owner_note_and_flag(self, ctx, kb):
+        # Adversarial framing: the note WOULD fire on this exact query (the
+        # default-load control below proves it) — web_clean must exclude it.
+        _save(kb)
+        kb_meta: dict = {}
+        block = ctx._try_kb_retrieve(
+            "F3E", "the wifi password is alpha123",
+            asker_slack_id=OWNER, kb_meta=kb_meta, web_clean=True,
+        )
+        assert block is None  # no canonical chunks + note suppressed
+        assert "unstripped_personal" not in kb_meta
+        assert kb_meta.get("kb_notes_hit") is False
+
+    def test_web_clean_default_control_note_fires(self, ctx, kb):
+        _save(kb)
+        kb_meta: dict = {}
+        block = ctx._try_kb_retrieve(
+            "F3E", "the wifi password is alpha123",
+            asker_slack_id=OWNER, kb_meta=kb_meta,
+        )
+        assert block is not None and "ASKER'S PERSONAL NOTE" in block
+        assert kb_meta.get("unstripped_personal") is True
+
+    def test_web_clean_keeps_canonical_drops_note(self, ctx, kb):
+        _save(kb)
+        _seed_canonical(kb)
+        kb_meta: dict = {}
+        block = ctx._try_kb_retrieve(
+            "F3E", "the wifi password is alpha123",
+            asker_slack_id=OWNER, kb_meta=kb_meta, web_clean=True,
+        )
+        assert block is not None
+        assert "alpha canonical fact" in block          # org knowledge kept
+        assert "ASKER'S PERSONAL NOTE" not in block     # note absent
+        assert "alpha123" not in block                  # note CONTENT absent
+        assert "unstripped_personal" not in kb_meta
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Tool layer — staged gates, PHI refusal, conflict append, owner-only mgmt
 # ──────────────────────────────────────────────────────────────────────────────

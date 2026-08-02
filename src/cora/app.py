@@ -659,6 +659,28 @@ def _dispatch_qa(
         phi_custodian = (
             lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm) if user_id else False
         )
+        # Web-clean load (cq-49a7835f081c): on an explicit-web-intent turn that
+        # WILL actually attach web tools, build the context WITHOUT unstripped
+        # personal content (no note overlay, Tier-1 stripped posture, no
+        # asker-scoped cross-entity fallback) so the D-051 personal-context
+        # exclusion in the gate below is satisfied by construction instead of
+        # silently swallowing the web ask. The pre-flight evaluate() is
+        # kb_meta-independent on the explicit leg (web_intent=True short-circuits
+        # the fallback leg), so a disabled/LEX/screened/capped/unsupported-model
+        # turn — and every custodian turn — keeps its FULL context and simply
+        # never attaches (D-051 review: degrading context on a turn that cannot
+        # attach is pure loss). Residual: a daily-cap race between this
+        # pre-flight and the authoritative post-load evaluate can yield one
+        # degraded KB-only reply — accepted (ms window, fail-safe direction).
+        web_clean = (
+            web_intent
+            and not phi_custodian
+            and not web_guard.is_lex_scope(entity)
+            and web_guard.evaluate(
+                user_message, entity, kb_meta=None,
+                skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
+            ).attach
+        )
         static_text, kb_text = load_context_parts(
             entity,
             query=user_message,
@@ -674,6 +696,7 @@ def _dispatch_qa(
             asker_slack_id=user_id or "",
             asker_is_dm=is_dm,
             phi_custodian=phi_custodian,
+            web_clean=web_clean,
         )
     # A response built on UNSTRIPPED personal chunks (owner's own mail, or an
     # unrestricted asker) must not enter the shared semantic cache. Nor may a
@@ -741,20 +764,31 @@ def _dispatch_qa(
     #    content is already in this turn's context (custodian DM, cross-entity
     #    fallback, personal-notes overlay), and could ride into a model-composed
     #    search query — mirror the cache_storable exclusion (D-051 remediation).
+    #    The web-clean load above makes unstripped_personal unreachable on an
+    #    explicit-intent turn (cq-49a7835f081c); the check stays as a fail-closed
+    #    belt for the time-sensitive fallback path and any future setter.
     web_on = False
-    if (
-        force_tool is None
-        and not assume_confirm
-        and retrieval_grant is None
-        and not phi_custodian
-        and not kb_meta.get("unstripped_personal")
-    ):
-        # Web attach forces Sonnet, so screen the model that will actually run
-        # (soft-degrades to KB-only if it can't accept the 20260209 tool types).
-        web_decision = web_guard.evaluate(
-            user_message, entity, kb_meta=kb_meta,
-            skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
-        )
+    web_gate_skip: str | None = None
+    if force_tool is not None:
+        web_gate_skip = "forced_tool"
+    elif assume_confirm:
+        web_gate_skip = "assume_confirm"
+    elif retrieval_grant is not None:
+        web_gate_skip = "retrieval_grant"
+    elif phi_custodian:
+        web_gate_skip = "phi_custodian"
+    elif kb_meta.get("unstripped_personal"):
+        web_gate_skip = "unstripped_personal"
+    # evaluate() runs even on excluded turns (it is read-only and fail-closed):
+    # a withheld web ask must ALWAYS leave ledger/log evidence — the original
+    # cq-49a7835f081c failure was three explicit web asks degrading silently.
+    # Web attach forces Sonnet, so screen the model that will actually run
+    # (soft-degrades to KB-only if it can't accept the 20260209 tool types).
+    web_decision = web_guard.evaluate(
+        user_message, entity, kb_meta=kb_meta,
+        skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
+    )
+    if web_gate_skip is None:
         web_on = web_decision.attach
         web_guard.record_decision(
             web_decision, entity=entity, channel_name=channel_name, user_id=user_id or "",
@@ -776,6 +810,18 @@ def _dispatch_qa(
                 "web_tools withheld channel=#%s user=%s reason=%s",
                 channel_name, user_id, web_decision.reason,
             )
+    elif web_decision.attach or web_decision.reason not in ("no_intent", "disabled"):
+        # The gate never ran, but web_guard would have acted on this turn
+        # (attach, or a live block reason). Record the skip so a deterministic
+        # exclusion can never again swallow a web ask invisibly.
+        web_guard.record_decision(
+            web_guard.WebDecision(False, f"gate_skipped:{web_gate_skip}"),
+            entity=entity, channel_name=channel_name, user_id=user_id or "",
+        )
+        log.info(
+            "web_tools gate_skipped channel=#%s user=%s skip=%s would=%s",
+            channel_name, user_id, web_gate_skip, web_decision.reason,
+        )
 
     # ── Streaming: post placeholder, then update it as Claude streams ──────
     # A web turn spends its first seconds in the server-side search/fetch phase
