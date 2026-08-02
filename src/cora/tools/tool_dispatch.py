@@ -3922,20 +3922,34 @@ def _stash_shopify_ask(
     return ask_id
 
 
+def get_pending_ask(slack_user_id: str, channel_name: str) -> dict | None:
+    """Public read accessor (app.py): the ask-stash entry for (user, channel),
+    or None. Used to render a picker card after freshest_changed_stash()
+    reports a fresh 'ask' -- app.py needs the candidates' (key, label) pairs,
+    never the raw `value` (a lexicon canonical or a VariantMatch field dict),
+    which stays internal to tool_dispatch."""
+    return _peek_pending_ask(slack_user_id, channel_name)
+
+
 def resolve_shopify_ask_pick(
     ask_id: str, tapping_user_id: str, candidate_key: str,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     """Bind a picker tap's chosen candidate into the stashed resolve context
     and re-enter _shopify_resolve_from_match directly -- the disambiguated
-    term never round-trips through the model. Returns (outcome, text):
-    outcome in 'orphaned' / 'unauthorized' / 'superseded' / 'invalid_candidate'
-    / 'preview'; `text` is the owner display name for 'unauthorized', or the
-    fresh WRITE_BLOCKED preview text for 'preview'."""
+    term never round-trips through the model. Returns (outcome, text,
+    stash_id): outcome in 'orphaned' / 'unauthorized' / 'superseded' /
+    'invalid_candidate' / 'preview'; `text` is the owner display name for
+    'unauthorized', or the fresh WRITE_BLOCKED preview text for 'preview';
+    `stash_id` is the freshly-minted Shopify confirm stash_id when a clean
+    preview resulted (None otherwise), so the caller can attach a Confirm/
+    Cancel card to it -- the pick -> preview -> confirm chain."""
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return "orphaned", None, None
     idx = confirm_cards.ask_index_lookup(ask_id)
     if idx is None:
-        return "orphaned", None
+        return "orphaned", None, None
     if idx["user"] != tapping_user_id:
-        return "unauthorized", idx["user"]
+        return "unauthorized", idx["user"], None
     channel = idx["channel"]
 
     # Atomic claim: pop under the SAME lock the peek uses, then verify the
@@ -3944,11 +3958,11 @@ def resolve_shopify_ask_pick(
     claimed = _take_pending_ask(tapping_user_id, channel)
     confirm_cards.ask_index_release(ask_id)
     if claimed is None or claimed.get("ask_id") != ask_id:
-        return "superseded", None
+        return "superseded", None, None
 
     candidate = next((c for c in claimed["candidates"] if c[0] == candidate_key), None)
     if candidate is None:
-        return "invalid_candidate", None
+        return "invalid_candidate", None, None
     _key, label, value = candidate
     loc_id, loc_name, unit = claimed["loc_id"], claimed["loc_name"], claimed["unit"]
     quantity, delta = claimed.get("quantity"), claimed.get("delta")
@@ -3959,9 +3973,9 @@ def resolve_shopify_ask_pick(
         try:
             matches = shopify_client.resolve_variants(value)
         except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError):
-            return "invalid_candidate", None
+            return "invalid_candidate", None, None
         if len(matches) != 1:
-            return "invalid_candidate", None
+            return "invalid_candidate", None, None
         match = matches[0]
         lex_meta = {"query": claimed.get("product_query", ""), "canonical": value,
                     "matched_term": label}
@@ -3976,9 +3990,11 @@ def resolve_shopify_ask_pick(
         )
 
     if blocked:
-        return "preview", blocked
+        return "preview", _strip_write_sentinel(blocked), None
     preview = _store_and_preview_shopify(tapping_user_id, channel, data)
-    return "preview", preview
+    fresh = _peek_pending_shopify(tapping_user_id, channel)
+    fresh_stash_id = (fresh or {}).get("stash_id")
+    return "preview", _strip_write_sentinel(preview), fresh_stash_id
 
 
 def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = ""):
@@ -10252,12 +10268,16 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
     from ..entity_router import route
     entity = route(channel)
     try:
-        message = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
+        raw = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
     except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
         log.exception("confirm-button execute crashed AFTER claim kind=%s user=%s",
                       kind, tapping_user_id)
         return {"outcome": "indeterminate"}
-    return {"outcome": "executed", "message": message}
+    # Sentinel-strip here (not in app.py): the button path never posts a raw
+    # WRITE_CONFIRMED/WRITE_BLOCKED-prefixed string -- app.py gets clean,
+    # already-postable text, matching what the typed-confirm interceptor does
+    # via _strip_write_sentinel.
+    return {"outcome": "executed", "message": _strip_write_sentinel(raw)}
 
 
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
