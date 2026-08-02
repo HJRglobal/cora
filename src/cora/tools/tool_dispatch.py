@@ -4830,6 +4830,8 @@ def _run_confirm_execute(
                 return None
         elif kind == "shopify":
             raw = _tool_f3e_shopify_set_inventory(slack_user_id, entity, inp)
+        elif kind == "delegated":
+            raw = _tool_cora_delegate_work(slack_user_id, entity, inp)
         else:
             return None
     except Exception:  # noqa: BLE001 -- never crash the serve path; the write is not lost silently
@@ -4847,8 +4849,9 @@ def try_confirm_pending_write(
     """Deterministic pre-model confirm/cancel of a staged write (F-23). Returns the
     user-facing reply string to post, or None to fall through to the model.
 
-    Peeks the freshest pending across Asana + Shopify + Calendar. Executes only Asana +
-    Shopify confirms (verbatim-clean outcome text); calendar defers to the model.
+    Peeks the freshest pending across Asana + Shopify + Calendar + Delegated-work.
+    Executes Asana + Shopify + Delegated-work confirms (verbatim-clean outcome text);
+    calendar defers to the model.
 
     Safety invariants from the D-051 review:
     - A DESTRUCTIVE Asana pending (delete/complete) is IMMEDIATE-CONFIRM-ONLY: it fires
@@ -4876,6 +4879,7 @@ def try_confirm_pending_write(
     shopify = _peek_pending_shopify(slack_user_id, channel_name)
     calendar = _peek_pending_calendar(slack_user_id, channel_name)
     lexadd = _peek_pending_lexicon(slack_user_id, channel_name)
+    delegated = _peek_pending_delegated(slack_user_id, channel_name)
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -4891,6 +4895,12 @@ def try_confirm_pending_write(
         # cora_lexicon_add(confirmed=true) instead of firing a staler
         # Shopify/Asana write (D-051 remediation F4, HIGH).
         entries.append((float(lexadd.get("ts", 0)), "lexicon", "teach"))
+    if delegated:
+        # A pending delegated-work job preview. The action token "delegate" is
+        # not a _CONFIRM_ACTION_VERBS canon value, so an action-verb message
+        # ("delete that task") conflicts and falls through to the model rather
+        # than starting a job.
+        entries.append((float(delegated.get("ts", 0)), "delegated", "delegate"))
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
         # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
@@ -4964,6 +4974,8 @@ def try_confirm_pending_write(
             _take_pending_asana_write(slack_user_id, channel_name)
         elif kind == "shopify":
             _take_pending_shopify_write(slack_user_id, channel_name)
+        elif kind == "delegated":
+            _claim_pending_delegated(slack_user_id, channel_name)
         log.info("confirm_interceptor CANCEL user=%s kind=%s action=%s",
                  slack_user_id, kind, action)
         return _CONFIRM_CANCELLED_REPLY
@@ -9132,6 +9144,62 @@ TOOL_DEFINITIONS = [
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "cora_delegate_work",
+        "description": (
+            "Delegate a bounded multi-step BACKGROUND job to Cora that produces a file "
+            "(Drive artifact + threaded summary). Four archetypes: research_brief (a "
+            "one-pager on a market/company/topic -- e.g. 'put together a brief on Sprouts' "
+            "energy-drink resets'), spreadsheet_build (an .xlsx assembled from internal "
+            "data -- e.g. 'build me a spreadsheet of Q2 expenses by vendor'), "
+            "creator_shortlist (a vetted creator/influencer list -- NO outreach), and "
+            "doc_draft (a first-draft document -- SOP, memo, announcement). Use when "
+            "someone asks Cora to 'research', 'put together', 'draft', or 'build' "
+            "something multi-step -- NOT for quick questions answerable in-thread. "
+            "action='request' (default) previews the job for the requester to confirm "
+            "(two-call staged write: preview first, then confirmed=true after the user "
+            "says yes); action='list' shows the asker's jobs; action='cancel' with "
+            "job_id cancels their queued job. Jobs run asynchronously (~15-min pickup) "
+            "and deliver back to the requesting thread. Not available in LEX scope."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["request", "list", "cancel"],
+                    "description": "request (default) / list / cancel",
+                },
+                "archetype": {
+                    "type": "string",
+                    "enum": ["research_brief", "spreadsheet_build",
+                             "creator_shortlist", "doc_draft"],
+                    "description": "Which job template to run (required for request).",
+                },
+                "brief": {
+                    "type": "string",
+                    "description": ("The requester's ask in their own words -- what to "
+                                    "research/build, for whom, any constraints."),
+                },
+                "deliverable": {
+                    "type": "string",
+                    "enum": ["md", "xlsx"],
+                    "description": ("Output format: md (default) or xlsx "
+                                    "(spreadsheet_build defaults to xlsx)."),
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "dw-... id (for action=cancel).",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": ("false previews; true ONLY after the user explicitly "
+                                    "confirmed the previewed job."),
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -9326,11 +9394,168 @@ def _tool_revops_ledger_status(slack_user_id: str, entity: str, _input: dict) ->
     return "\n".join(lines)
 
 
+# ── Delegated work (Phase 1): F-23 staged intake ─────────────────────────────
+# Design of record: _shared/projects/cora/2026-08-01_fndr_cora-delegated-work-
+# phase1-design.md (LOCKED). The unconfirmed call runs ALL intake screens FIRST
+# (PHI before stash/preview), stashes the spec SERVER-SIDE, and previews; the
+# confirmed call executes the STASH, never the model echo. The store registers
+# with the F-23 bare-"yes" interceptor (try_confirm_pending_write) + the
+# has-pending Sonnet-force probes in app.py -- without that, a "yes" aimed at a
+# job preview could fire a STALE staged write from another store.
+_DELEGATED_PENDING_LOCK = Lock()
+_DELEGATED_PENDING_TTL_SECONDS = 600  # 10 min (matches the other pending stores)
+_PENDING_DELEGATED_WORK: dict[tuple[str, str], dict] = {}
+
+
+def _delegated_pending_key(slack_user: str, channel: str) -> tuple[str, str]:
+    return (slack_user or "", (channel or "").strip().lower())
+
+
+def _store_pending_delegated(slack_user: str, channel: str, entry: dict) -> None:
+    with _DELEGATED_PENDING_LOCK:
+        _PENDING_DELEGATED_WORK[_delegated_pending_key(slack_user, channel)] = entry
+
+
+def _claim_pending_delegated(slack_user: str, channel: str) -> dict | None:
+    """Atomically pop-and-return the caller's pending job spec IFF fresh. None
+    when absent/expired -- the confirmed call then re-previews instead of
+    trusting the model echo (F-23)."""
+    key = _delegated_pending_key(slack_user, channel)
+    with _DELEGATED_PENDING_LOCK:
+        entry = _PENDING_DELEGATED_WORK.get(key)
+        if not entry:
+            return None
+        _PENDING_DELEGATED_WORK.pop(key, None)
+    if (time.time() - float(entry.get("ts", 0))) > _DELEGATED_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _peek_pending_delegated(slack_user: str, channel: str) -> dict | None:
+    """Read-only fresh-pending peek (does NOT pop) for the delegated-work store."""
+    key = _delegated_pending_key(slack_user, channel)
+    with _DELEGATED_PENDING_LOCK:
+        entry = _PENDING_DELEGATED_WORK.get(key)
+    if entry and (time.time() - float(entry.get("ts", 0))) <= _DELEGATED_PENDING_TTL_SECONDS:
+        return entry
+    return None
+
+
+def has_pending_delegated_write(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe -- app.py forces Sonnet on the confirm turn
+    (a bare 'yes' is undetectable from content)."""
+    return _peek_pending_delegated(slack_user, channel) is not None
+
+
+def _delegated_preview_text(entry: dict, quota_line: str) -> str:
+    """Render the WRITE_BLOCKED preview. The brief is rendered VERBATIM so any
+    drift between what the user said and what will run is visible (design 3)."""
+    from cora import delegated_work
+
+    return (
+        f"Delegating to Cora -- *{entry['archetype']}* job for "
+        f"[{entry.get('entity', '?')}], delivered as .{entry['deliverable']} back "
+        "to this thread.\n\n"
+        f"Brief (runs verbatim):\n> {entry['brief']}\n\n"
+        f"{quota_line} Cost: capped at ${delegated_work.job_usd_cap():.2f}/job. "
+        "Turnaround: async -- the runner picks jobs up about every 15 minutes.\n\n"
+        "Reply to confirm and I'll queue it. Nothing runs until you confirm."
+    )
+
+
+def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Delegate a bounded multi-step background job to Cora (Phase 1).
+
+    Two-call staged write (F-23): unconfirmed call = screens + server-side stash
+    + preview; confirmed call = executes the STASHED spec. Actions: request
+    (default), list (cross-channel title suppression), cancel (own QUEUED job;
+    Harrison any). All correctness lives in cora.delegated_work."""
+    from cora import delegated_work
+
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name") or "")
+    channel_id = str(input_data.get("_channel_id") or "")
+    thread_ts = str(input_data.get("_thread_ts") or "")
+    action = str(input_data.get("action") or "request").strip().lower()
+
+    if action == "list":
+        return _write_blocked_contract(delegated_work.render_job_list(
+            slack_user_id, channel_id))
+
+    if action == "cancel":
+        job_id = str(input_data.get("job_id") or "").strip()
+        if not job_id:
+            return _write_blocked_contract(
+                "Tell me which job to cancel (e.g. cancel dw-abc123).")
+        outcome, msg = delegated_work.cancel_job(job_id, slack_user_id)
+        if outcome == "cancelled":
+            return _write_confirmed_contract(msg)
+        return _write_blocked_contract(msg)
+
+    # ── action == "request" ──────────────────────────────────────────────────
+    if delegated_work.delegated_level() == "off":
+        return _write_blocked_contract(
+            "Delegated work is currently turned off -- nothing was queued.")
+
+    confirmed = _confirmed_flag(input_data)
+    if confirmed:
+        pending = _claim_pending_delegated(slack_user_id, channel)
+        if pending:
+            job, outcome, msg = delegated_work.submit_job(
+                slack_user_id, entity,
+                str(pending.get("channel_id") or ""),
+                str(pending.get("channel_name") or channel),
+                str(pending.get("thread_ts") or ""),
+                str(pending.get("archetype") or ""),
+                str(pending.get("brief") or ""),
+                str(pending.get("deliverable") or "md"),
+            )
+            if outcome == "refused":
+                return _write_blocked_contract(msg)
+            if delegated_work.delegated_level() == "log":
+                # Log-mode honesty (design 3): a real ask must never get a
+                # silent SIMULATED terminal without being told.
+                msg += (" NOTE: delegated work is in TRIAL MODE right now -- "
+                        "your job was recorded for validation but will NOT "
+                        "execute or deliver yet.")
+            return _write_confirmed_contract(msg)
+        # No fresh server-side pending -> never trust the model-echoed
+        # confirmed=true; fall through to re-preview against a fresh stash.
+
+    archetype = str(input_data.get("archetype") or "").strip().lower()
+    brief = str(input_data.get("brief") or "").strip()[:delegated_work.BRIEF_MAX_CHARS]
+    default_deliverable = "xlsx" if archetype == "spreadsheet_build" else "md"
+    deliverable = str(input_data.get("deliverable") or default_deliverable).strip().lower()
+
+    # ALL intake screens run BEFORE the stash and before the preview; a PHI-
+    # shaped brief is never held in memory or echoed (design 3).
+    refusal = delegated_work.screen_request(
+        slack_user_id, entity, channel, archetype, brief, deliverable)
+    if refusal:
+        return _write_blocked_contract(refusal)
+
+    entry = {
+        "archetype": archetype, "brief": brief, "deliverable": deliverable,
+        "entity": entity, "channel_id": channel_id, "channel_name": channel,
+        "thread_ts": thread_ts, "ts": time.time(),
+    }
+    _store_pending_delegated(slack_user_id, channel, entry)
+    remaining = delegated_work.quota_remaining(slack_user_id)
+    quota_line = (f"Quota: {remaining} of {delegated_work.user_daily_quota()} "
+                  "jobs left today.")
+    preview = _delegated_preview_text(entry, quota_line)
+    if delegated_work.delegated_level() == "log":
+        preview += ("\n(TRIAL MODE: confirmed jobs are recorded for validation "
+                    "but not executed yet.)")
+    return _write_blocked_contract(preview)
+
+
 # Tools every channel gets: task/calendar/comms/cashflow + the portfolio
 # decisions queue (referenced by the OSN/LEX/HJRP prompts, not FNDR-only).
 _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "cora_queue_code_session",
     "revops_ledger_status",
+    "cora_delegate_work",
     "whats_on_my_plate",
     "meeting_action_items",
     "cora_remember",
@@ -9546,6 +9771,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_my_notes": _tool_cora_my_notes,
     "cora_forget_note": _tool_cora_forget_note,
     "cora_queue_code_session": _tool_queue_code_session,
+    "cora_delegate_work": _tool_cora_delegate_work,
     # Read-only operational self-status (heartbeat + KB size + sync watermarks)
     "cora_self_check": _tool_cora_self_check,
     # Per-person involvement dossier (founder-or-self; North Star pillar 4)
@@ -9663,6 +9889,8 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # single slow Drive write, yielding "Tool timed out" while the abandoned
     # worker usually still filed the item (filed-but-reported-failed).
     "cora_queue_code_session": 20,
+    # Delegated-work intake: ledger fold + (on HELD) a synchronous DM card send.
+    "cora_delegate_work": 20,
     # Dashboard read layer: Drive/Airtable network reads.
     "personal_oneamerica_portfolio": 20,   # Drive JSON download
     "personal_capital_program_state": 15,  # folder list + newest JSON download

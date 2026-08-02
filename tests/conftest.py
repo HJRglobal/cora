@@ -271,6 +271,9 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.connectors.fireflies_action_extractor", "_WATERMARK_PATH",
          "meeting_action_watermark.json"),
         ("cora.web_guard", "_USAGE_LEDGER", "web-search-usage.jsonl"),
+        ("cora.delegated_work", "_BOT_LEDGER", "delegated-work.jsonl"),
+        ("cora.delegated_work", "_RUNNER_LEDGER", "delegated-work-runner.jsonl"),
+        ("cora.delegated_work", "_STAGING_ROOT", "delegated-work-staging"),
     ]
     for _mod_name, _attr, _fname in _LEDGER_CONSTS:
         try:
@@ -289,6 +292,7 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     try:
         import cora.tools.tool_dispatch as _td
         _td._PENDING_SHOPIFY_WRITES.clear()
+        _td._PENDING_DELEGATED_WORK.clear()
     except Exception:
         pass
 
@@ -320,6 +324,8 @@ _GUARDED_LEDGERS = (
     "logs/lexicon-resolutions.jsonl",
     "data/maps/f3e-sku-aliases.yaml",
     "data/maps/user-aliases.yaml",
+    "data/state/delegated-work.jsonl",
+    "data/state/delegated-work-runner.jsonl",
 )
 
 

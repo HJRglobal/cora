@@ -32,6 +32,7 @@ from . import knowledge_gaps
 from . import gap_detection
 from . import gap_autofill
 from . import code_queue
+from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
@@ -748,6 +749,7 @@ def _dispatch_qa(
             _tool_dispatch.has_pending_asana_write(user_id, channel_name)
             or _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
             or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
+            or _tool_dispatch.has_pending_delegated_write(user_id, channel_name)
         )
     )
     # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory/calendar/
@@ -760,6 +762,7 @@ def _dispatch_qa(
         _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
         or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
         or _tool_dispatch.has_pending_asana_write(user_id, channel_name)
+        or _tool_dispatch.has_pending_delegated_write(user_id, channel_name)
     )):
         chosen_model = model_router.MODEL_SONNET
     log.info(
@@ -887,6 +890,8 @@ def _dispatch_qa(
                 force_tool=force_tool,
                 assume_confirm=assume_confirm,
                 web_tools=web_on,
+                channel_id=channel_id,
+                thread_ts=reply_thread_ts,
             )
         except ClaudeClientError as exc:
             log.error("ClaudeClientError for entity=%s user=%s: %s", entity, user_id, exc)
@@ -1001,6 +1006,8 @@ def _dispatch_qa(
             force_tool=force_tool,
             assume_confirm=assume_confirm,
             web_tools=web_on,
+            channel_id=channel_id,
+            thread_ts=reply_thread_ts,
         )
     except ClaudeClientError as exc:
         log.error("ClaudeClientError (streaming) for entity=%s user=%s: %s", entity, user_id, exc)
@@ -3140,6 +3147,41 @@ def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
         _cq_ack_in_message(client, body, msg)
     except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
         log.warning("code-queue button handler error (non-fatal)", exc_info=True)
+
+
+# ── Delegated work HELD-card one-tap (Release / Dismiss) ────────────────────
+# Same contract as the code-queue buttons: ack() first, delegate; ALL
+# correctness (Harrison gate, idempotency) lives in delegated_work.
+# process_job_action. This wrapper is Slack I/O only.
+
+def _handle_delegated_work_button(body: dict, client, action_id: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        value = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        outcome, msg = delegated_work.process_job_action(action_id, value, actor_id)
+        if outcome == "not_authorized":
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        _cq_ack_in_message(client, body, msg)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("delegated-work button handler error (non-fatal)", exc_info=True)
+
+
+@app.action(delegated_work.ACTION_RELEASE)
+def handle_dw_release(ack, body, client) -> None:
+    ack()
+    _handle_delegated_work_button(body, client, delegated_work.ACTION_RELEASE)
+
+
+@app.action(delegated_work.ACTION_DISMISS)
+def handle_dw_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_delegated_work_button(body, client, delegated_work.ACTION_DISMISS)
 
 
 @app.action(code_queue.ACTION_APPROVE)

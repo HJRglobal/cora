@@ -735,6 +735,8 @@ def _dispatch_tools_parallel(
     iteration: int,
     log_prefix: str = "tool_use",
     channel_name: str = "",
+    channel_id: str = "",
+    thread_ts: str | None = None,
 ) -> list[dict]:
     """Dispatch a batch of tool_use blocks, in parallel when there are 2+.
 
@@ -758,7 +760,8 @@ def _dispatch_tools_parallel(
 
     if len(tool_use_blocks) == 1:
         block = tool_use_blocks[0]
-        result_str = dispatch(block.name, block.input or {}, slack_user_id, entity, channel_name)
+        result_str = dispatch(block.name, block.input or {}, slack_user_id, entity,
+                              channel_name, channel_id, thread_ts)
         return [{
             "type": "tool_result",
             "tool_use_id": block.id,
@@ -769,7 +772,8 @@ def _dispatch_tools_parallel(
     max_workers = min(len(tool_use_blocks), _TOOL_DISPATCH_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cora-tool") as executor:
         futures = [
-            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity, channel_name)
+            executor.submit(dispatch, b.name, b.input or {}, slack_user_id, entity,
+                            channel_name, channel_id, thread_ts)
             for b in tool_use_blocks
         ]
         results = [f.result() for f in futures]
@@ -827,6 +831,9 @@ _CONTRACT_WRITE_TOOLS = frozenset({
     # WRITE_CONFIRMED / WRITE_BLOCKED contract; their verbatim payload is source-opaque
     # (the asker's own task name + own workspace permalink), safe to post verbatim.
     "asana_update_task", "asana_add_comment", "asana_add_subtask",
+    # Delegated work (2026-08-01): the preview must render the stashed brief
+    # VERBATIM so drift is visible (design 3) -- model paraphrase would defeat it.
+    "cora_delegate_work",
 })
 # The net ONLY overrides narration when the tool result carries one of these
 # contract sentinels. A result WITHOUT one (e.g. dispatch()'s "Tool ... crashed:"
@@ -989,8 +996,15 @@ def generate_response(
     force_tool: str | None = None,
     assume_confirm: bool = False,
     web_tools: bool = False,
+    channel_id: str = "",
+    thread_ts: str | None = None,
 ) -> str:
     """Call Claude (with tool-use loop) and return the final response text.
+
+    channel_id / thread_ts: the requesting Slack channel id + thread root ts,
+    injected into every dispatched tool as _channel_id / _thread_ts (delegated
+    work needs both for its threaded async delivery -- 2026-08-01). Optional;
+    "" / None preserve the historical behavior.
 
     web_tools: attach the server-side web_search/web_fetch tools for THIS call
     (gated upstream by web_guard.evaluate — LEX-off, egress screen, daily cap).
@@ -1140,6 +1154,7 @@ def generate_response(
         tool_results = _dispatch_tools_parallel(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use", channel_name=channel_name,
+            channel_id=channel_id, thread_ts=thread_ts,
         )
 
         messages.append({"role": "user", "content": tool_results})
@@ -1200,10 +1215,13 @@ def generate_response_streaming(
     force_tool: str | None = None,
     assume_confirm: bool = False,
     web_tools: bool = False,
+    channel_id: str = "",
+    thread_ts: str | None = None,
 ) -> str:
     """Streaming variant of generate_response.
 
-    force_tool / assume_confirm / web_tools: see generate_response.
+    force_tool / assume_confirm / web_tools / channel_id / thread_ts: see
+    generate_response.
 
     meta: optional caller-owned dict for out-of-band response metadata — sets
     meta["used_tools"] (bool) exactly like generate_response (D-032 bypass signal).
@@ -1395,6 +1413,7 @@ def generate_response_streaming(
         tool_results = _dispatch_tools_parallel(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use (stream)", channel_name=channel_name,
+            channel_id=channel_id, thread_ts=thread_ts,
         )
 
         messages.append({"role": "user", "content": tool_results})
