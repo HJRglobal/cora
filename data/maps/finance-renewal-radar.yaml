@@ -1,0 +1,41 @@
+# Renewal / payment radar -- known recurring subscriptions and renewals.
+#
+# Consumed by src/cora/finance_close.py (the weekly close-support pack, section 5)
+# to surface anything due or past due within RENEWAL_HORIZON_DAYS (45).
+#
+# READ-ONLY for Cora: she reads this file and reports; she never edits it.
+# Harrison / Justin maintain it. If this file is missing, unreadable, or has no
+# `renewals:` list, the radar section renders as an honest STUB -- never as a
+# silently empty "nothing due" (a blank radar reads as all-clear, which is the
+# exact failure mode the Standing-ACTUALS label doctrine warns about).
+#
+# Fields per entry:
+#   name      (required) what it is -- shown verbatim
+#   entity    (optional) which entity pays it; shown as a [TAG]
+#   amount    (optional) numeric USD, no currency symbol or commas
+#   cadence   (optional) free text, e.g. "monthly", "annual"
+#   next_due  (optional) ISO date YYYY-MM-DD. An entry with no parseable
+#             next_due is NOT assessed and is reported as such by name --
+#             it is never silently dropped.
+#   notes     (optional) free text for humans; not rendered
+#
+# UPDATE next_due AFTER EACH RENEWAL. A stale past date renders as PAST DUE,
+# which is the intended nag -- but if it stays stale it becomes noise, so the
+# weekly pack is the reminder to roll the date forward.
+
+renewals:
+  - name: Meta Verified (F3 Energy)
+    entity: F3E
+    cadence: monthly
+    next_due: 2026-08-15
+    notes: >-
+      Seeded 2026-08-04 from the close-support kickoff. CONFIRM the amount and
+      the true renewal date with Justin, then set `amount:` here.
+
+  - name: Judge.me (F3 Energy reviews)
+    entity: F3E
+    cadence: monthly
+    next_due: 2026-08-15
+    notes: >-
+      Seeded 2026-08-04 from the close-support kickoff. CONFIRM the amount and
+      the true renewal date with Justin, then set `amount:` here.
