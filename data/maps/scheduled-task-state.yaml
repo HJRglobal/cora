@@ -74,3 +74,10 @@ enabled:
   - Cora - LEX Swept PHI Check
   # Weekly Mon 09:05 AZ golden-set evals -> #cora-health. Added 2026-07-02 (D-066).
   - Cora - KB Evals
+  # Weekly Mon 08:15 AZ finance SOP adherence check (A1-A3) -> facts block read by
+  # the 09:00 close pack + the 13:00 Cowork weekly finance review. Added 2026-08-04.
+  - cowork-cora-finance-adherence
+  # Weekly Mon 09:00 AZ finance close-support pack -> #hjrg-finance + DM Justin +
+  # #founder-finance founder cut. Added 2026-08-04 (G7). NOTE: #hjr-finance
+  # C0BAK65N4TA is ARCHIVED -- do not repoint this job back to it.
+  - cowork-cora-finance-close-pack
