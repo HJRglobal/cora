@@ -17,7 +17,12 @@
 #   next_due  (optional) ISO date YYYY-MM-DD. An entry with no parseable
 #             next_due is NOT assessed and is reported as such by name --
 #             it is never silently dropped.
-#   notes     (optional) free text for humans; not rendered
+#   confirmed (optional) set `false` while the date/amount is an unverified seed.
+#             A false entry renders "UNCONFIRMED date/amount, verify before
+#             acting" and the section footer says the radar is a partial list.
+#             OMIT the key (or set true) once Justin has verified the entry.
+#   notes     (optional) free text for humans; NOT rendered anywhere -- put
+#             anything a reader must see in `name` or use `confirmed: false`
 #
 # UPDATE next_due AFTER EACH RENEWAL. A stale past date renders as PAST DUE,
 # which is the intended nag -- but if it stays stale it becomes noise, so the
@@ -28,14 +33,18 @@ renewals:
     entity: F3E
     cadence: monthly
     next_due: 2026-08-15
+    confirmed: false
     notes: >-
       Seeded 2026-08-04 from the close-support kickoff. CONFIRM the amount and
-      the true renewal date with Justin, then set `amount:` here.
+      the true renewal date with Justin, then set `amount:` and flip
+      `confirmed: true`.
 
   - name: Judge.me (F3 Energy reviews)
     entity: F3E
     cadence: monthly
     next_due: 2026-08-15
+    confirmed: false
     notes: >-
       Seeded 2026-08-04 from the close-support kickoff. CONFIRM the amount and
-      the true renewal date with Justin, then set `amount:` here.
+      the true renewal date with Justin, then set `amount:` and flip
+      `confirmed: true`.

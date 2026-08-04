@@ -15,9 +15,12 @@
 #   G:\My Drive\HJR-Founder-OS\01-HJR-Global\accounting\finance-adherence-facts.md
 #
 # Schedule: Monday 08:15 AZ. The facts block must exist BEFORE both consumers run
-# (09:00 close pack, 13:00 weekly review), so both read facts computed that morning.
-# Slot check (2026-08-04): 08:15 is free -- the Fireflies coverage monitor is 08:10
-# and the finance weekly recap is 07:30.
+# (the 09:00 close pack and the Cowork weekly finance review), so both read facts
+# computed that morning.
+# Slot check against the LIVE registry (2026-08-04): 08:15 is unused. Neighbours are
+# cowork-cora-fireflies-coverage 08:10 and cowork-cora-pm-adoption-digest 08:20.
+# 08:15 falls inside the 03:00-09:00 window the weekly health metric watches, but it
+# is unique there, so max-concurrent stays 1 against a threshold of >2 -- no new alarm.
 #
 # NOTE: --post-summary is deliberately OMITTED from the registered action. The
 # summary line is finance-safe (no dollar figure by construction) but the facts

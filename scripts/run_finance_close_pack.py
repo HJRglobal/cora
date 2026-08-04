@@ -41,6 +41,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -49,6 +50,16 @@ from dotenv import load_dotenv
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+# Windows consoles default to cp1252, which cannot encode several characters the
+# pack renders -- so `--dry-run` died with UnicodeEncodeError on real data (any
+# aged-tail line). The dry run is the ONLY pre-flight gate before the first live
+# post to a finance channel and Justin's DM, so it must not be the thing that breaks.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # pragma: no cover -- non-reconfigurable stream
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +84,10 @@ FOUNDER_FINANCE_CHANNEL = "C0BCXPJDP42"
 # Justin Moran -- full pack by DM.
 JUSTIN_SLACK_ID = "U0B3AEJCYGP"
 
+# A single Slack USER id. Enforced in dm_user so a comma (-> MPIM) or a channel id
+# can never widen the DM audience.
+_USER_ID_RE = re.compile(r"U[A-Z0-9]{6,}")
+
 # The closed allowlist. A channel id absent from this set can never receive pack
 # content -- see _assert_finance_surface. Keyed by id AND carrying the name so the
 # guard test can assert the name classifies TIER_1.
@@ -86,6 +101,12 @@ FINANCE_SURFACES: dict[str, str] = {
 ARCHIVED_HJR_FINANCE = "C0BAK65N4TA"
 
 _DEDUP_PATH = _REPO_ROOT / "data" / "cache" / "finance-close-pack-sent.json"
+
+# Delivery target names, used as the per-target dedup keys.
+TARGET_HJRG = "#hjrg-finance"
+TARGET_DM = "DM Justin"
+TARGET_FOUNDER = "#founder-finance"
+_ALL_TARGETS = (TARGET_HJRG, TARGET_DM, TARGET_FOUNDER)
 
 
 class DeliveryTargetError(RuntimeError):
@@ -116,42 +137,70 @@ def _ops_alert_channel() -> str:
 
 # ── founder cut ──────────────────────────────────────────────────────────────
 
+_FLAG_MARKERS = (":triangular_flag_on_post:", ":rotating_light:", ":warning:")
+
+
 def build_founder_cut(pack) -> str:
     """Flagged-items-only view for #founder-finance.
 
     Deterministic slice of the same computed lines -- it re-renders nothing and
-    recomputes nothing. Section headings are kept so a flag is always attributable,
-    and unavailable sections are named so "no flags" can never be mistaken for
-    "everything checked out".
-    """
-    from cora.finance_close import Section  # noqa: PLC0415
+    recomputes nothing.
 
+    COVERAGE IS NOT OPTIONAL HERE. Filtering to flag-emoji lines alone dropped the
+    per-entity "unavailable" lines and the "N of M" footers, so a run where 9 of 10
+    QBO realms 401'd rendered a flat "No item crossed a flag threshold this week" to
+    the one reader who sees only this cut. An all-clear is therefore claimable ONLY
+    when every section reported full coverage.
+    """
     lines = [
         ":ledger: *Finance close-support — founder cut*",
-        f"_Generated {pack.generated_at}. Flagged items only; "
+        f"_Generated {pack.generated_at}. Flagged items and coverage gaps; "
         "the full pack is in #hjrg-finance._",
         "",
     ]
     flagged_any = False
+    partial_any = False
     for section in pack.sections:
-        if not isinstance(section, Section):
+        # Duck-typed deliberately. An isinstance() check against one import path
+        # silently SKIPS a section built under the other (this repo runs both
+        # `cora.*` and `src.cora.*` as distinct module objects), converting a type
+        # mismatch into a false clean bill of health.
+        title = getattr(section, "title", None)
+        if title is None:
             continue
-        if not section.available:
-            lines.append(f"*{section.title}* — _unavailable: {section.stub_reason}_")
+        if not getattr(section, "available", True):
+            partial_any = True
+            lines.append(f"*{title}* — _unavailable: {getattr(section, 'stub_reason', '')}_")
             continue
-        hits = [
-            ln for ln in section.lines
-            if ":triangular_flag_on_post:" in ln or ":rotating_light:" in ln or ":warning:" in ln
-        ]
-        if not hits:
+        body = list(getattr(section, "lines", []))
+        hits = [ln for ln in body if any(m in ln for m in _FLAG_MARKERS)]
+        # Coverage lines carry no emoji, so they are collected explicitly.
+        gaps = [ln for ln in body if "unavailable —" in ln or "NOT cross-checked" in ln]
+        is_partial = bool(getattr(section, "is_partial", False)) or bool(gaps)
+        footer = [ln for ln in body if ln.startswith("_") and " of " in ln] if is_partial else []
+        if is_partial:
+            partial_any = True
+        if not (hits or gaps or footer):
             continue
-        flagged_any = True
-        lines.append(f"*{section.title}*")
+        if hits:
+            flagged_any = True
+        lines.append(f"*{title}*")
         lines.extend(f"  {h}" for h in hits)
-    if not flagged_any:
-        lines.append("_No item crossed a flag threshold this week._")
+        lines.extend(f"  {g}" for g in gaps)
+        lines.extend(f"  {f}" for f in footer)
+
+    if not flagged_any and not partial_any:
+        lines.append("_No item crossed a flag threshold this week, and every section had full coverage._")
+    elif not flagged_any:
+        lines.append(
+            "_No item crossed a flag threshold — but coverage was INCOMPLETE (see above), "
+            "so this is not an all-clear._"
+        )
     lines.append("")
-    lines.append(f"_{pack.total_flags} item(s) flagged across {len(pack.sections)} section(s)._")
+    footer_note = f"_{pack.total_flags} item(s) flagged across {len(pack.sections)} section(s)."
+    if partial_any:
+        footer_note += " One or more sections could not cover everything."
+    lines.append(footer_note + "_")
     return "\n".join(lines)
 
 
@@ -181,18 +230,41 @@ def _iso_week(today: datetime.date | None = None) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _already_sent(week: str) -> bool:
+def _sent_targets(week: str) -> set[str]:
+    """Targets already delivered this ISO week.
+
+    PER-TARGET, not a single week scalar. With one flag for the whole run, a kill
+    after #hjrg-finance succeeded but before #founder-finance left nothing recorded,
+    so the retry re-posted the full pack to #hjrg-finance and re-DM'd Justin.
+    """
     try:
         data = json.loads(_DEDUP_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and data.get("last_week") == week
+        return set()
+    if not isinstance(data, dict) or data.get("last_week") != week:
+        return set()
+    targets = data.get("targets")
+    if isinstance(targets, list):
+        return {str(t) for t in targets}
+    # Legacy scalar-only record from before per-target tracking: a marked week means
+    # the whole run completed.
+    return set(_ALL_TARGETS)
 
 
-def _mark_sent(week: str) -> None:
+def _already_sent(week: str) -> bool:
+    """True only when EVERY target has been delivered for this week."""
+    return set(_ALL_TARGETS).issubset(_sent_targets(week))
+
+
+def _mark_sent(week: str, targets: set[str] | None = None) -> None:
+    delivered = sorted(set(targets) if targets is not None else set(_ALL_TARGETS))
     _DEDUP_PATH.parent.mkdir(parents=True, exist_ok=True)
     _DEDUP_PATH.write_text(
-        json.dumps({"last_week": week, "sent_at": datetime.datetime.now().isoformat()}),
+        json.dumps({
+            "last_week": week,
+            "targets": delivered,
+            "sent_at": datetime.datetime.now().isoformat(),
+        }),
         encoding="utf-8",
     )
 
@@ -227,7 +299,16 @@ def post_to_channel(client, channel_id: str, text: str) -> bool:
 
 
 def dm_user(client, user_id: str, text: str) -> bool:
-    """DM the full pack. A DM is the user's own private surface, not a channel."""
+    """DM the full pack. A DM is the user's own private surface, not a channel.
+
+    Shape-guarded: channels get a closed allowlist, so the DM target gets at least a
+    format check. A comma in the id would make ``conversations.open`` create an MPIM
+    and deliver the full pack to an unintended additional recipient.
+    """
+    if not _USER_ID_RE.fullmatch(user_id or ""):
+        raise DeliveryTargetError(
+            f"refusing to DM finance content to {user_id!r}: not a single Slack user id"
+        )
     try:
         opened = client.conversations_open(users=[user_id])
         dm_channel = opened["channel"]["id"]
@@ -240,6 +321,30 @@ def dm_user(client, user_id: str, text: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.error("close-pack: DM to %s failed: %s", user_id, exc)
         return False
+
+
+def _alert_build_failure(exc_name: str) -> None:
+    """Metadata-only notice that the pack could not be BUILT. Never raises."""
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.error("close-pack: no SLACK_BOT_TOKEN -- build-failure alert not sent")
+        return
+    notice = (
+        ":rotating_light: *Weekly finance close-support pack FAILED to build* "
+        f"({exc_name}) — no pack was posted to any finance surface this week. "
+        "Silence would otherwise read as 'no problems'. *Next step:* run "
+        "`scripts\\run_finance_close_pack.py --dry-run` and read "
+        "`logs/finance-close-pack-<date>.log`. No figures are included in this notice."
+    )
+    try:
+        from slack_sdk import WebClient  # noqa: PLC0415
+        WebClient(token=token).chat_postMessage(
+            channel=_ops_alert_channel(), text=_sanitized(notice),
+            unfurl_links=False, unfurl_media=False,
+        )
+        log.info("close-pack: build-failure alert posted to #%s", _ops_alert_channel())
+    except Exception as exc:  # noqa: BLE001
+        log.error("close-pack: build-failure alert ALSO failed: %s", exc)
 
 
 def post_ops_alert(client, failed: list[str], n_flags: int) -> None:
@@ -278,17 +383,35 @@ def main() -> int:
 
     entities = [e.strip().upper() for e in args.entities.split(",") if e.strip()] or None
 
-    pack = finance_close.build_pack(
-        entities=entities,
-        # A dry run must not advance the WoW baseline, or the next real run would
-        # diff against a snapshot nobody ever saw and report zero movement.
-        persist_snapshot=not args.dry_run,
-    )
+    try:
+        pack = finance_close.build_pack(
+            entities=entities,
+            # A dry run must not advance the WoW baseline, or the next real run would
+            # diff against a snapshot nobody ever saw and report zero movement.
+            persist_snapshot=not args.dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A total build failure was previously complete silence to all three readers,
+        # and "no pack this Monday" reads as "no problems". Make it loud.
+        log.exception("close-pack: build FAILED: %s", exc)
+        if not args.dry_run:
+            _alert_build_failure(type(exc).__name__)
+        return 1
+
     full = pack.render()
     narration = finance_close.narrate(pack)
     if narration:
-        full = f"_{narration}_\n\n{full}"
+        full = (
+            f"_Summary (restatement of the facts below):_ {narration}\n\n{full}"
+        )
     founder = build_founder_cut(pack)
+
+    if entities:
+        banner = (
+            f":warning: *SCOPED RUN* — this pack covers only {', '.join(entities)}, "
+            "not the full portfolio.\n\n"
+        )
+        full, founder = banner + full, banner + founder
 
     log.info("close-pack: built -- %d flag(s), %d unavailable section(s)",
              pack.total_flags, len(pack.unavailable_sections))
@@ -312,25 +435,40 @@ def main() -> int:
     from slack_sdk import WebClient  # noqa: PLC0415
     client = WebClient(token=bot_token)
 
+    # Skip anything a previous (killed) attempt already delivered this week.
+    already = set() if args.force else _sent_targets(week)
+    if already:
+        log.info("close-pack: skipping already-delivered target(s): %s", sorted(already))
+
+    delivered: set[str] = set(already)
     failed: list[str] = []
-    if not post_to_channel(client, HJRG_FINANCE_CHANNEL, full):
-        failed.append("#hjrg-finance")
-    if not dm_user(client, JUSTIN_SLACK_ID, full):
-        failed.append("DM Justin")
-    if not post_to_channel(client, FOUNDER_FINANCE_CHANNEL, founder):
-        failed.append("#founder-finance")
+
+    def deliver(target: str, fn) -> None:
+        if target in already:
+            return
+        if fn():
+            delivered.add(target)
+        else:
+            failed.append(target)
+
+    deliver(TARGET_HJRG, lambda: post_to_channel(client, HJRG_FINANCE_CHANNEL, full))
+    deliver(TARGET_DM, lambda: dm_user(client, JUSTIN_SLACK_ID, full))
+    deliver(TARGET_FOUNDER, lambda: post_to_channel(client, FOUNDER_FINANCE_CHANNEL, founder))
 
     if failed:
         post_ops_alert(client, failed, pack.total_flags)
 
-    # Dedup marks on ANY successful delivery: a partial success plus a re-run would
-    # double-post to the surfaces that already worked. The ops notice is the signal
-    # for the ones that did not.
-    if len(failed) < 3:
-        _mark_sent(week)
+    # Record exactly which targets are done, so a retry resumes rather than
+    # re-posting. A scoped (--entities) run is NOT the week's pack, so it never
+    # records anything -- otherwise it would suppress the real Monday run.
+    if delivered and not entities:
+        _mark_sent(week, delivered)
+    elif entities:
+        log.info("close-pack: scoped run -- dedup NOT marked, the full weekly run still owes")
 
-    log.info("=== finance close-support pack complete (%d/3 delivered) ===", 3 - len(failed))
-    return 1 if len(failed) == 3 else 0
+    log.info("=== finance close-support pack complete (%d/%d delivered) ===",
+             len(delivered), len(_ALL_TARGETS))
+    return 1 if not delivered else 0
 
 
 if __name__ == "__main__":

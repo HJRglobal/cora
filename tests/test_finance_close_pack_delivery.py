@@ -386,8 +386,8 @@ def test_total_delivery_failure_returns_nonzero_and_does_not_mark_sent(
     assert script._already_sent(script._iso_week()) is False
 
 
-def test_partial_failure_raises_ops_alert_and_marks_sent(script, monkeypatch, tmp_path):
-    """A partial success must mark sent, or a retry double-posts the live surfaces."""
+def test_partial_failure_records_only_the_delivered_targets(script, monkeypatch, tmp_path):
+    """Per-target dedup: the two that worked are recorded, the failure is not."""
     from cora import finance_close
 
     client = _FakeClient(fail_channels={script.FOUNDER_FINANCE_CHANNEL})
@@ -400,10 +400,47 @@ def test_partial_failure_raises_ops_alert_and_marks_sent(script, monkeypatch, tm
     monkeypatch.setattr(sys, "argv", ["run_finance_close_pack.py"])
 
     assert script.main() == 0
-    assert script._already_sent(script._iso_week()) is True
+    sent = script._sent_targets(script._iso_week())
+    assert sent == {script.TARGET_HJRG, script.TARGET_DM}
+    # Not fully sent, so a retry is still allowed -- for the failed target only.
+    assert script._already_sent(script._iso_week()) is False
     ops = [t for c, t in client.posts if c == "hjrg-leadership"]
     assert ops and "could not be fully delivered" in ops[0]
     assert "#founder-finance" in ops[0]
+
+
+def test_retry_after_partial_failure_only_posts_the_missing_target(
+    script, monkeypatch, tmp_path,
+):
+    """A kill mid-delivery must not re-post the pack to surfaces that already got it."""
+    from cora import finance_close
+
+    monkeypatch.setattr(finance_close, "build_pack", lambda **_k: _pack(flags=1))
+    monkeypatch.setattr(finance_close, "narrate", lambda _p: None)
+    monkeypatch.setattr(script, "_DEDUP_PATH", tmp_path / "sent.json")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setattr(sys, "argv", ["run_finance_close_pack.py"])
+
+    # First attempt: #founder-finance is dead.
+    first = _FakeClient(fail_channels={script.FOUNDER_FINANCE_CHANNEL})
+    monkeypatch.setitem(sys.modules, "slack_sdk", type(sys)("slack_sdk"))
+    sys.modules["slack_sdk"].WebClient = lambda token: first
+    script.main()
+
+    # Retry: everything healthy. Only the previously-failed target should post.
+    second = _FakeClient()
+    sys.modules["slack_sdk"].WebClient = lambda token: second
+    assert script.main() == 0
+    assert [c for c, _ in second.posts] == [script.FOUNDER_FINANCE_CHANNEL]
+    assert script._already_sent(script._iso_week()) is True
+
+
+def test_legacy_scalar_dedup_record_is_treated_as_fully_sent(script, tmp_path, monkeypatch):
+    """A pre-per-target state file must not cause a re-post of the whole pack."""
+    path = tmp_path / "sent.json"
+    path.write_text('{"last_week": "2026-W32"}', encoding="utf-8")
+    monkeypatch.setattr(script, "_DEDUP_PATH", path)
+    assert script._already_sent("2026-W32") is True
 
 
 def test_narration_is_prefixed_when_present(script, monkeypatch, tmp_path, capsys):

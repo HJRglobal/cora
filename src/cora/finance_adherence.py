@@ -168,14 +168,20 @@ def _rollup_line(group: str, status: str, members: list[Fact]) -> str:
     """One line standing in for ``members``, preserving the status token.
 
     The status word is kept verbatim (MISSING / STALE / ...) because downstream
-    consumers -- notably the close pack's close-prep section -- decide whether to
-    flag a line by looking for exactly those tokens.
+    consumers surface it to a human.
+
+    The ``detail`` clause MUST branch on status. An UNKNOWN group has no ages (the
+    folders were never opened), and defaulting to "no files found" would state a
+    factual absence about folders nobody could look inside -- a false alarm about
+    someone else's work, which is exactly what this module promises never to emit.
     """
     names = ", ".join(m.label or m.key for m in members)
     ages = sorted(a for a in (m.age_days for m in members) if a is not None)
     if ages:
         span = f"{ages[0]}d" if ages[0] == ages[-1] else f"{ages[0]}-{ages[-1]}d"
         detail = f"newest file {span} old"
+    elif status == STATUS_UNKNOWN:
+        detail = "could not be read"
     else:
         detail = "no files found"
     return (
@@ -197,16 +203,22 @@ class AdherenceReport:
     def unknowns(self) -> list[Fact]:
         return [f for f in self.facts if f.status == STATUS_UNKNOWN]
 
-    def compact_facts(self) -> list[str]:
-        """Facts lines with large same-status groups rolled up to one line each.
+    def compact_pairs(self) -> list[tuple[str, str]]:
+        """``(line, status)`` pairs with large same-status groups rolled up.
 
         This is what goes DOWNSTREAM (the close pack, and from there Slack). The
         first live run found all 13 bank-statement folders stale within a 3-day
         spread -- one cause, not 13 findings -- so 13 near-identical lines would
         bury the two facts that differ. The full per-folder list stays in the
         markdown block, which is the audit record.
+
+        The STATUS travels with each line so a consumer never has to infer severity
+        by matching words in the prose. A rolled-up line's key is synthetic
+        ("bank_statements (13 folders)") and matches no per-folder status key, so
+        key-lookup alone would silently under-flag the very group the roll-up exists
+        to surface.
         """
-        out: list[str] = []
+        out: list[tuple[str, str]] = []
         groups: dict[tuple[str, str], list[Fact]] = {}
         order: list[Any] = []
 
@@ -222,21 +234,29 @@ class AdherenceReport:
 
         for item in order:
             if isinstance(item, Fact):
-                out.append(item.line())
+                out.append((item.line(), item.status))
                 continue
             members = groups[item]
             group, status = item
             if len(members) >= ROLLUP_MIN_MEMBERS:
-                out.append(_rollup_line(group, status, members))
+                out.append((_rollup_line(group, status, members), status))
             else:
-                out.extend(m.line() for m in members)
+                out.extend((m.line(), m.status) for m in members)
         return out
+
+    def compact_facts(self) -> list[str]:
+        """Just the lines from :meth:`compact_pairs`."""
+        return [line for line, _status in self.compact_pairs()]
 
     def to_json(self) -> dict[str, Any]:
         """Payload shape consumed by finance_close.build_close_prep_section."""
+        pairs = self.compact_pairs()
         return {
             "generated_date": self.generated_date,
-            "facts": self.compact_facts(),
+            "facts": [line for line, _ in pairs],
+            # Parallel to `facts`, one status per line -- the authoritative severity
+            # signal for the consumer.
+            "facts_status": [status for _, status in pairs],
             "facts_full": [f.line() for f in self.facts],
             "statuses": {f.key: f.status for f in self.facts},
             "problem_count": len(self.problems),
@@ -269,16 +289,23 @@ class AdherenceReport:
         return "\n".join(lines)
 
     def summary_line(self) -> str:
-        """One finance-safe Slack line. Contains no dollar figure by construction."""
+        """One finance-safe Slack line. Contains no dollar figure by construction.
+
+        "all clear" is claimable ONLY when nothing was also unreadable. Zero problems
+        across checks that could not run is not an all-clear -- it is an absence of
+        information, and this line is the most-read artifact of the job.
+        """
         if not self.facts:
             return "Finance SOP adherence: no checks ran."
         bits = [f"{len(self.facts)} check(s)"]
         if self.problems:
             bits.append(f":triangular_flag_on_post: {len(self.problems)} need attention")
+        elif self.unknowns:
+            bits.append("no problems in what could be read")
         else:
             bits.append("all clear")
         if self.unknowns:
-            bits.append(f"{len(self.unknowns)} unreadable")
+            bits.append(f":warning: {len(self.unknowns)} could NOT be read")
         return "Finance SOP adherence — " + ", ".join(bits) + "."
 
 
@@ -287,41 +314,64 @@ class AdherenceReport:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _age_days(mtime: float, today: datetime.date) -> int:
+    """Age in whole days, floored at 0.
+
+    A future mtime (clock skew, or a Drive sync stamping ahead) would otherwise
+    render as a negative age -- "-3d old" -- inside a roll-up span.
+    """
     modified = datetime.datetime.fromtimestamp(mtime).date()
-    return (today - modified).days
+    return max(0, (today - modified).days)
 
 
 def _content_entries(directory: Path) -> list[Path] | None:
-    """Non-ignored entries in ``directory``, or None if the mount is unreachable.
+    """Non-ignored entries in ``directory``, or None if the read could not be done.
 
-    An empty LIST means the folder exists but holds nothing that counts. That is
-    materially different from None (could not look) and the callers keep them apart.
+    An empty LIST means the folder exists but holds nothing that counts. None means
+    "could not look" -- and EVERY read failure returns None, not just a vanished
+    mount. Collapsing a PermissionError or an unstattable Drive placeholder into
+    "nothing there" would report a filed month as MISSING, which is the false-alarm
+    class this module exists to avoid. ``Path.glob`` on an absent directory yields
+    nothing WITHOUT raising, so a genuinely missing folder still gets its ``[]``
+    from the success path.
     """
     try:
         entries = drive_io.glob(directory, "*")
     except drive_io.DriveUnavailable:
         return None
-    except OSError:
-        return []
+    except OSError as exc:
+        log.warning("finance_adherence: could not list %s: %s", directory, exc)
+        return None
     return [p for p in entries if p.name.strip().lower() not in IGNORED_NAMES]
 
 
-def _newest_age_days(directory: Path, today: datetime.date) -> tuple[int | None, int, bool]:
-    """(age of newest file in days, files counted, mount_ok).
+def _newest_age_days(
+    directory: Path, today: datetime.date,
+) -> tuple[int | None, int, bool, bool]:
+    """(age of newest file in days, files counted, read_ok, truncated).
 
-    ``mount_ok=False`` means the read could not be performed -- reported as
+    ``read_ok=False`` means the read could not be performed -- reported as
     ``unknown``, never as a missing filing.
+
+    The stat budget is applied to entries sorted NEWEST-NAME-FIRST. ``Path.glob``
+    returns directory (≈ name) order, so capping the raw list and then taking the
+    max mtime would keep the 80 oldest-named files and report a perfectly current
+    folder as STALE once it passed the cap -- a false alarm that gets louder the
+    longer the folder is maintained. Statement filenames are date-bearing, so
+    reverse-name order puts the newest first; ``truncated`` is surfaced in the fact
+    text so a capped read can never pass silently either.
     """
     entries = _content_entries(directory)
     if entries is None:
-        return None, 0, False
+        return None, 0, False, False
+    entries = sorted(entries, key=lambda p: p.name, reverse=True)
+    truncated = len(entries) > MAX_FILES_STATTED
     newest: float | None = None
     counted = 0
     for path in entries[:MAX_FILES_STATTED]:
         try:
             info = drive_io.stat_info(path, retry_seconds=0)
         except drive_io.DriveUnavailable:
-            return None, counted, False
+            return None, counted, False, truncated
         except OSError:
             continue
         if info is None:
@@ -330,8 +380,8 @@ def _newest_age_days(directory: Path, today: datetime.date) -> tuple[int | None,
         if newest is None or info[0] > newest:
             newest = info[0]
     if newest is None:
-        return None, counted, True
-    return _age_days(newest, today), counted, True
+        return None, counted, True, truncated
+    return _age_days(newest, today), counted, True, truncated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,15 +416,24 @@ def check_cash_sheet(
         )
 
     if info is None:
-        # Genuine absence with the mount UP -- a rename or a move. Say exactly which
-        # path was expected so the fix is a one-liner.
+        # Genuine absence with the mount UP -- a rename or a move.
+        #
+        # Deliberately does NOT echo the sheet's filename. This facts block is
+        # written under 01-HJR-Global/accounting/ and IS KB-ingested, and
+        # gsheets_financials locks a source-opaque contract ("never log or surface
+        # file IDs, sheet names, or Drive links"). The exact path goes to the local
+        # log instead, which is where whoever fixes it will be looking anyway.
+        log.error(
+            "finance_adherence: cash sheet absent at expected path %s", target,
+        )
         return Fact(
             key="cash_sheet",
             status=STATUS_MISSING,
             text=(
-                f"MISSING — no file at the expected path `{target.name}` under "
-                f"`{target.parent.name}/`. It was renamed, moved, or deleted; the "
-                "weekly cash cross-check reads this exact file."
+                "MISSING — the live Standing-ACTUALS cash sheet is not at its expected "
+                "location under the accounting live-sheets folder. It was renamed, "
+                "moved, or deleted; the weekly cash cross-check reads that exact file. "
+                "The full path is in this run's log."
             ),
         )
 
@@ -511,7 +570,11 @@ def check_bank_statements(
     for name in names:
         key = f"bank_statements {name}"
         folder = base / name
-        age, counted, mount_ok = _newest_age_days(folder, day)
+        age, counted, mount_ok, truncated = _newest_age_days(folder, day)
+        cap_note = (
+            f" (only the {MAX_FILES_STATTED} newest-named files were checked)"
+            if truncated else ""
+        )
 
         if not mount_ok:
             facts.append(Fact(
@@ -555,14 +618,17 @@ def check_bank_statements(
                 key=key, status=STATUS_STALE,
                 text=(
                     f"STALE — newest statement is {age}d old (threshold {max_age_days}d), "
-                    f"{counted} file(s) present."
+                    f"{counted} file(s) present.{cap_note}"
                 ),
                 group="bank_statements", label=name, age_days=age,
             ))
         else:
             facts.append(Fact(
                 key=key, status=STATUS_OK,
-                text=f"current — newest statement {age}d old, {counted} file(s) present.",
+                text=(
+                    f"current — newest statement {age}d old, "
+                    f"{counted} file(s) present.{cap_note}"
+                ),
                 group="bank_statements", label=name, age_days=age,
             ))
     return facts

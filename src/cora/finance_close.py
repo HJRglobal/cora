@@ -43,6 +43,7 @@ import datetime
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -86,7 +87,23 @@ PNL_SWING_PCT = 0.25
 RENEWAL_HORIZON_DAYS = 45
 
 # An adherence facts block older than this is reported as stale rather than current.
-ADHERENCE_MAX_AGE_DAYS = 10
+# The producer is WEEKLY and fires 45 minutes before this pack, so anything beyond a
+# couple of days means the adherence job did not run this morning. A 10-day window
+# let a fully-missed week (7-day-old facts) present as current.
+ADHERENCE_MAX_AGE_DAYS = 3
+
+# Adherence statuses that mean "a human should look". Mirrors
+# ``finance_adherence.PROBLEM_STATUSES`` -- duplicated as literals rather than
+# imported so this consumer never depends on the producer module being present.
+_ADHERENCE_PROBLEM_STATUSES = frozenset({"missing", "stale"})
+
+# Cap on adherence fact lines rendered into the pack. An unbounded producer would
+# push the Slack post past the 40k text limit, which fails delivery outright.
+_MAX_ADHERENCE_LINES = 40
+
+# Any money-shaped token. Used to CODE-enforce that the optional narration restates
+# only figures this module computed -- see narrate().
+_MONEY_TOKEN_RE = re.compile(r"\$\s?[\d,]+(?:\.\d+)?")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,13 +133,20 @@ QBO_TO_SHEET_ENTITY: dict[str, str] = {
     "OSNVV": "OSN-VV",
 }
 
-# QBO realms deliberately EXCLUDED from the cash cross-check, with the reason.
+# QBO realms deliberately EXCLUDED from the ENTIRE pack, with the reason.
+#
 # HRLLC is personal expense tracking, not business data -- gsheets_financials
-# excludes its CF_HR LLC tab for the same reason (locked 2026-05-24). Excluded
-# entities still appear in the AR/AP and P&L sections, which are QBO-only and
-# need no sheet counterpart.
-CASH_CHECK_EXCLUDED: dict[str, str] = {
-    "HRLLC": "personal expense tracking, not business data (no cash-sheet tab)",
+# excludes its CF_HR LLC tab for that reason (locked 2026-05-24), and the
+# Cross-Entity Cash Pulse omits it too. The exclusion is therefore about
+# SENSITIVITY, not about which sources happen to carry the entity -- so it must
+# apply pack-wide. Scoping it to the cash cross-check alone (because that is the
+# section needing a sheet counterpart) still posted HR LLC's AR/AP totals, aged
+# tails and P&L to a multi-member finance channel and Justin's DM every Monday.
+#
+# The exclusion is stated in the cash section's footer rather than being silent, so
+# reinstating an entity is a visible decision either way.
+PACK_EXCLUDED_ENTITIES: dict[str, str] = {
+    "HRLLC": "personal expense tracking, not business data",
 }
 
 # Display labels. Falls back to the raw code, so a newly provisioned realm is
@@ -159,6 +183,19 @@ class Section:
     available: bool = True
     stub_reason: Optional[str] = None
     flags: int = 0
+    # Coverage, as STRUCTURE rather than only as footer prose. The founder cut and
+    # the close-prep summary both need to know that a section ran on 1 of 10
+    # entities, and neither can be asked to parse an italic footer to find out --
+    # that is how "0 items flagged" ends up meaning "nothing was checked".
+    covered: Optional[int] = None
+    expected: Optional[int] = None
+
+    @property
+    def is_partial(self) -> bool:
+        """True when the section ran, but not on everything it was asked to cover."""
+        if not self.available or self.covered is None or self.expected is None:
+            return False
+        return self.covered < self.expected
 
     def render(self) -> list[str]:
         out = [f"*{self.title}*"]
@@ -218,6 +255,23 @@ class ClosePack:
 # Formatting primitives
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _scrub_external(text: str, cap: int = 120) -> str:
+    """Neutralize Slack control syntax in a string this module did not author.
+
+    ``slack_egress.sanitize_text`` deliberately PRESERVES ``<...>`` tokens -- they
+    are the sanctioned citation form -- so a value carried in from a human-maintained
+    YAML file or from the adherence facts block can render a live ``<url|label>``
+    link or an ``<!channel>`` ping inside a finance channel, in a message signed by
+    Cora. The finance surfaces are exactly where a payment link is most likely to be
+    trusted, so every externally-sourced string is stripped of the angle brackets,
+    collapsed to one line, and length-capped before it reaches a renderer.
+    """
+    if not text:
+        return ""
+    flattened = " ".join(str(text).split())
+    return flattened.replace("<", "").replace(">", "")[:cap]
+
+
 def fmt_money(value: float | None) -> str:
     """Currency, or an explicit ``n/a`` -- never an empty string.
 
@@ -242,14 +296,21 @@ def _crosses(delta: float | None, base: float | None, abs_thr: float, pct_thr: f
     Absolute arm alone is enough. The relative arm additionally requires the
     absolute delta to clear a tenth of the absolute floor, so a 100% swing on a
     $12 base never flags.
+
+    A zero (or missing) base is the MOST extreme relative move -- the percentage is
+    undefined, not small -- so it must not fall through to "no flag". Treating
+    ``base == 0`` as unflaggable made two identically-rendered rows behave
+    oppositely: sheet $0 vs books $4,900 stayed silent while sheet $0.01 vs books
+    $600 flagged. Zero balances are live in this portfolio, so the floor-only arm
+    applies instead.
     """
     if delta is None:
         return False
     if abs(delta) >= abs_thr:
         return True
-    if base:
-        return abs(delta) / abs(base) >= pct_thr and abs(delta) >= abs_thr / 10.0
-    return False
+    if not base:
+        return abs(delta) >= abs_thr / 10.0
+    return abs(delta) / abs(base) >= pct_thr and abs(delta) >= abs_thr / 10.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,15 +345,11 @@ def _summary_cells(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in cells if isinstance(c, dict)]
 
 
-def extract_bank_balance(report: dict[str, Any]) -> float | None:
-    """Total cash in bank accounts from a QBO BalanceSheet, as float USD.
+def _named_section_total(report: dict[str, Any], names: set[str]) -> float | None:
+    """Amount from the first section whose header OR summary label is in ``names``.
 
-    Targets the ``Bank Accounts`` section (ASSETS -> Current Assets -> Bank
-    Accounts) by name, matching either the section header or its summary label,
-    and reads the LAST summary column (the amount). Returns None when no such
-    section exists so the caller reports the entity unavailable rather than
-    substituting total assets -- which would silently include AR and fixed assets
-    and make every cash delta wrong.
+    Reads the LAST summary column. Returns None when no such section exists, so a
+    caller can distinguish "absent" from "zero".
     """
     from .tools.qbo_client import _parse_money  # noqa: PLC0415
 
@@ -300,12 +357,41 @@ def extract_bank_balance(report: dict[str, Any]) -> float | None:
         cells = _summary_cells(row)
         if not cells:
             continue
-        name = _section_name(row)
-        summary_label = str(cells[0].get("value") or "").strip()
-        candidates = {name.lower(), summary_label.lower()}
-        if candidates & {"bank accounts", "total bank accounts"}:
+        candidates = {
+            _section_name(row).lower(),
+            str(cells[0].get("value") or "").strip().lower(),
+        }
+        if candidates & names:
             return _parse_money(str(cells[-1].get("value") or ""))
     return None
+
+
+def extract_bank_balance(report: dict[str, Any]) -> float | None:
+    """Total cash in bank accounts from a QBO BalanceSheet, as float USD.
+
+    Targets the ``Bank Accounts`` section (ASSETS -> Current Assets -> Bank
+    Accounts) only. Returns None when no such section exists so the caller reports
+    the entity unavailable rather than substituting total assets -- which would
+    silently include AR and fixed assets and make every cash delta wrong.
+    """
+    return _named_section_total(report, {"bank accounts", "total bank accounts"})
+
+
+def extract_credit_card_balance(report: dict[str, Any]) -> float | None:
+    """Total credit-card liability from a QBO BalanceSheet, as float USD.
+
+    Needed because the cash sheet's row is literally
+    ``Ending Cash/CC Book Balance`` -- cash NET OF credit cards -- while QBO reports
+    cards in their own ``Credit Cards`` section under liabilities, invisible to
+    :func:`extract_bank_balance`. Comparing Bank-Accounts-only against a Cash/CC row
+    yields a delta equal to the card balance for every card-carrying entity (F3E ad
+    spend, BDM media buying, the OSN stores), against a $5,000 threshold -- a
+    recurring false "unreconciled-looking" flag on the pack's headline section.
+
+    Returns None when the section is absent, which the caller treats as $0 and says
+    so rather than silently assuming it.
+    """
+    return _named_section_total(report, {"credit cards", "total credit cards"})
 
 
 def _column_titles(report: dict[str, Any]) -> list[str]:
@@ -338,19 +424,25 @@ def extract_aging(report: dict[str, Any]) -> dict[str, Any] | None:
 
     total = _parse_money(str(best[-1].get("value") or ""))
     if total is None:
-        return None
+        # A grand-total row EXISTS but its amount cell is blank. For an aging report
+        # that is how QBO renders "nothing outstanding" -- so returning None here
+        # made clean books ($0 AR and $0 AP) render as
+        # "unavailable — no aging totals returned" and drop out of the coverage
+        # count. Structure present + blank amount is a truthful zero; NO structure
+        # at all still returns None above.
+        total = 0.0
 
-    # Oldest bucket = last data column before the Total column. Column 0 is the
-    # customer/vendor name. Require at least name + one bucket + total.
+    # Oldest bucket = last data column before the Total column. Read the label
+    # positionally from ``Columns`` -- but ONLY when the summary row and the column
+    # header row are index-aligned. On a short summary row the same index lands on
+    # a different column, which once labelled the NEWEST bucket ("Current") as the
+    # aged tail. Misaligned -> omit the callout rather than mislabel it.
     oldest_label = ""
     oldest_amount: float | None = None
-    if len(best) >= 3:
+    if len(best) >= 3 and len(titles) == len(best):
         idx = len(best) - 2
         oldest_amount = _parse_money(str(best[idx].get("value") or ""))
-        if idx < len(titles) and titles[idx]:
-            oldest_label = titles[idx]
-        else:
-            oldest_label = "oldest bucket"
+        oldest_label = titles[idx] or "oldest bucket"
 
     return {
         "total": total,
@@ -467,7 +559,25 @@ class Sources:
         return list_provisioned_entities()
 
     def get_cash_closing(self, sheet_entity: str) -> dict[str, Any]:
-        """``{"closing": float|None, "week_label": str, "stale": bool, "age_days": int|None}``."""
+        """``{"closing", "is_actual", "week_label", "stale", "age_days"}``.
+
+        Reads the ACTUAL-first ending cash, NOT ``CashflowSummary.closing_balance``.
+
+        This distinction is the whole validity of the cross-check.
+        ``closing_balance`` is FORECAST-first
+        (``gsheets_financials``: ``forecast if forecast is not None else actual``),
+        while ``ending_cash_series`` / ``ending_cash_outlook`` is actual-first. A
+        D-051 review already found and fixed exactly this divergence in
+        ``scripts/write_cashflow_snapshot.py`` -- "they disagreed mid-week".
+        Comparing the sheet's FORECAST against the books' ACTUAL would report the
+        sheet's own forecast variance (which the sheet already has a DIFF column
+        for) as a books-vs-sheet reconciliation break: reconciled entities would
+        flag every week and genuinely broken ones could read clean.
+
+        ``is_actual`` travels with the figure so the caller can label a
+        forecast-only week and decline to flag it -- a forecast is not a
+        reconciliation signal in either direction.
+        """
         if self.cash_closing:
             return self.cash_closing(sheet_entity)
         from .connectors.gsheets_financials import (  # noqa: PLC0415
@@ -475,8 +585,19 @@ class Sources:
             get_cashflow,
         )
         summary = get_cashflow(tab_name=entity_to_tab(sheet_entity))
+        outlook = summary.ending_cash_outlook(weeks=0)
+        if outlook:
+            closing = outlook[0].get("ending_cash")
+            is_actual = bool(outlook[0].get("is_actual"))
+        else:
+            # Target week absent from the series: fall back to the forecast-first
+            # value and mark it not-actual, so it is LABELLED rather than silently
+            # compared as though it were an actual.
+            closing = summary.closing_balance
+            is_actual = False
         return {
-            "closing": summary.closing_balance,
+            "closing": closing,
+            "is_actual": is_actual,
             "week_label": summary.week_label,
             "stale": summary.is_stale(),
             "age_days": summary.data_age_days(),
@@ -605,6 +726,11 @@ def build_cash_section(
     snap: dict[str, Any] = {}
 
     checkable = [e for e in entities if e in QBO_TO_SHEET_ENTITY]
+    # An entity with no cash-sheet mapping must be NAMED, not filtered into
+    # invisibility. Dropping it made the footer claim "2 of 2" while a third
+    # provisioned realm was never cross-checked at all -- full coverage asserted
+    # over a silently shrunk denominator.
+    unmapped = [e for e in entities if e not in QBO_TO_SHEET_ENTITY]
     if not checkable:
         section.available = False
         section.stub_reason = "no provisioned entity maps to a cash-sheet tab"
@@ -618,9 +744,11 @@ def build_cash_section(
         sheet_entity = QBO_TO_SHEET_ENTITY[entity]
         closing = week_label = age_days = None
         stale = False
+        is_actual = False
         try:
             cash = sources.get_cash_closing(sheet_entity)
             closing = cash.get("closing")
+            is_actual = bool(cash.get("is_actual"))
             week_label = cash.get("week_label") or ""
             stale = bool(cash.get("stale"))
             age_days = cash.get("age_days")
@@ -631,18 +759,28 @@ def build_cash_section(
             log.warning("finance_close: cash sheet read failed for %s: %s", sheet_entity, exc)
 
         as_of, exact = _week_close_as_of(week_label or "", today=today)
-        bank = None
+        bank = cards = None
         try:
             report = sources.get_balance_sheet(entity, as_of)
             bank = extract_bank_balance(report)
+            cards = extract_credit_card_balance(report)
         except Exception as exc:  # noqa: BLE001 -- per-entity fail-soft
             log.warning("finance_close: balance sheet failed for %s: %s", entity, exc)
 
-        delta = None if (bank is None or closing is None) else bank - closing
+        # The sheet row is "Ending Cash/CC Book Balance" -- cash NET of cards -- so
+        # the books leg must net the card liability out too. An absent Credit Cards
+        # section means the entity carries none; that is reported, not assumed.
+        cards_present = cards is not None
+        books_net = None if bank is None else bank - (cards or 0.0)
+        delta = None if (books_net is None or closing is None) else books_net - closing
         rows.append({
             "entity": entity,
             "sheet_closing": closing,
+            "is_actual": is_actual,
             "bank": bank,
+            "cards": cards,
+            "cards_present": cards_present,
+            "books_net": books_net,
             "delta": delta,
             "week_label": week_label,
             "as_of": as_of,
@@ -651,11 +789,18 @@ def build_cash_section(
             "age_days": age_days,
         })
 
-    # Label-drift detector (2026-06-04 doctrine). Every closing balance None
-    # while reads themselves SUCCEEDED is the signature of a renamed row, not of
-    # an outage -- and it is exactly the state that once rendered as a wall of
-    # '--' reading like zeros. Degrade the whole section.
-    if sheet_values_seen == 0 and sheet_read_failures == 0:
+    none_count = sum(1 for r in rows if r["sheet_closing"] is None) - sheet_read_failures
+
+    # Label-drift detector (2026-06-04 doctrine). Closing balances coming back None
+    # from reads that SUCCEEDED is the signature of a renamed row, not of an outage
+    # -- and it is exactly the state that once rendered as a wall of '--' reading
+    # like zeros. Degrade the whole section, and keep the drift diagnosis even when
+    # a minority of reads also errored: one transient failure must not replace the
+    # actionable "row labels renamed" message (the diagnosis the 2026-06-04 incident
+    # cost a day to find) with a generic "unreadable".
+    if sheet_values_seen == 0 and (
+        sheet_read_failures == 0 or none_count >= max(2 * sheet_read_failures, 1)
+    ):
         section.available = False
         section.stub_reason = (
             "Standing ACTUALS returned no closing balance for any entity — the "
@@ -673,56 +818,111 @@ def build_cash_section(
         return section, snap
 
     week_label = next((r["week_label"] for r in rows if r["week_label"]), "")
+    week_labels = {r["week_label"] for r in rows if r["week_label"]}
     if week_label:
-        section.lines.append(f"Cash-sheet week: {week_label}")
+        multi = (
+            f" (NOTE: entities report {len(week_labels)} different weeks; each row is "
+            "as-of its own tab's latest-actual week)"
+            if len(week_labels) > 1 else ""
+        )
+        section.lines.append(f"Cash-sheet week: {week_label}{multi}")
     stale_rows = [r for r in rows if r["stale"]]
     if stale_rows:
         ages = [r["age_days"] for r in stale_rows if r["age_days"] is not None]
         age_note = f" (~{max(ages)}d old)" if ages else ""
+        names = ", ".join(entity_label(r["entity"]) for r in stale_rows)
         section.lines.append(
-            f":warning: cash sheet appears BEHIND for {len(stale_rows)} entity(ies){age_note} "
-            "— figures below are as-of that week, not today."
+            f":warning: cash sheet appears BEHIND for {len(stale_rows)} entity(ies)"
+            f"{age_note} — {names}. Those figures are as-of that week, not today."
+        )
+
+    # Most-entities-None while a minority returned values: the section is usable but
+    # drift is still the likely story, so say it on the AVAILABLE path too.
+    if none_count >= max(2 * sheet_values_seen, 2):
+        section.lines.append(
+            f":warning: {none_count} of {len(checkable)} entities returned NO closing "
+            "balance from the cash sheet — suspect row-label drift, not an outage."
         )
 
     complete = 0
+    forecast_only = 0
     for row in rows:
         label = entity_label(row["entity"])
-        if row["sheet_closing"] is None or row["bank"] is None:
+        if row["sheet_closing"] is None or row["books_net"] is None:
             missing = []
             if row["sheet_closing"] is None:
                 missing.append("cash sheet")
-            if row["bank"] is None:
+            if row["books_net"] is None:
                 missing.append("books")
             section.lines.append(
                 f"• {label}: unavailable — no figure from {' and '.join(missing)}"
             )
             continue
         complete += 1
-        flagged = _crosses(row["delta"], row["sheet_closing"], CASH_DELTA_ABS, CASH_DELTA_PCT)
-        mark = ":triangular_flag_on_post: " if flagged else ""
-        if flagged:
-            section.flags += 1
         as_of_note = "" if row["as_of_exact"] else f" [books as of {row['as_of']}, week date unparsed]"
-        section.lines.append(
-            f"• {mark}{label}: sheet {fmt_money(row['sheet_closing'])} vs books "
-            f"{fmt_money(row['bank'])} — delta {fmt_delta(row['delta'])}{as_of_note}"
-        )
+        if not row["cards_present"]:
+            books_note = " (no credit-card section in the books)"
+        elif row["cards"]:
+            books_note = f" (cash {fmt_money(row['bank'])} less cards {fmt_money(row['cards'])})"
+        else:
+            books_note = ""
+
+        if not row["is_actual"]:
+            # The sheet has no ACTUAL for this week (or the week fell outside the
+            # series). Forecast-vs-books is not a reconciliation signal in either
+            # direction, so it is labelled and deliberately NOT flagged.
+            forecast_only += 1
+            section.lines.append(
+                f"• {label}: sheet {fmt_money(row['sheet_closing'])} (FORECAST — no "
+                f"actual for this week) vs books {fmt_money(row['books_net'])}"
+                f"{books_note} — difference {fmt_delta(row['delta'])}, not a "
+                f"reconciliation comparison{as_of_note}"
+            )
+        else:
+            flagged = _crosses(
+                row["delta"], row["sheet_closing"], CASH_DELTA_ABS, CASH_DELTA_PCT,
+            )
+            mark = ":triangular_flag_on_post: " if flagged else ""
+            if flagged:
+                section.flags += 1
+            section.lines.append(
+                f"• {mark}{label}: sheet {fmt_money(row['sheet_closing'])} (actual) vs "
+                f"books {fmt_money(row['books_net'])}{books_note} — delta "
+                f"{fmt_delta(row['delta'])}{as_of_note}"
+            )
         snap[row["entity"]] = {
             "sheet_closing": row["sheet_closing"],
             "bank": row["bank"],
+            "cards": row["cards"],
+            "books_net": row["books_net"],
             "delta": row["delta"],
+            "is_actual": row["is_actual"],
         }
 
-    excluded = [e for e in entities if e in CASH_CHECK_EXCLUDED]
-    section.lines.append(
-        f"_Cross-checked {complete} of {len(checkable)} mapped entity(ies)."
-        + (
-            f" Excluded: {', '.join(f'{entity_label(e)} ({CASH_CHECK_EXCLUDED[e]})' for e in excluded)}."
-            if excluded
-            else ""
+    for entity in unmapped:
+        if entity in PACK_EXCLUDED_ENTITIES:
+            continue
+        section.lines.append(
+            f"• {entity_label(entity)}: NOT cross-checked — no cash-sheet mapping for "
+            f"this accounting entity"
         )
-        + "_"
+
+    excluded = [e for e in entities if e in PACK_EXCLUDED_ENTITIES]
+    # Denominator spans every entity offered, so an unmapped realm cannot shrink it.
+    section.expected = len([e for e in entities if e not in PACK_EXCLUDED_ENTITIES])
+    section.covered = complete
+    footer = (
+        f"_Cross-checked {complete} of {section.expected} entity(ies)"
+        + (f"; {forecast_only} compared against a FORECAST week" if forecast_only else "")
+        + "."
     )
+    if excluded:
+        footer += (
+            " Excluded: "
+            + ", ".join(f"{entity_label(e)} ({PACK_EXCLUDED_ENTITIES[e]})" for e in excluded)
+            + "."
+        )
+    section.lines.append(footer + "_")
     return section, snap
 
 
@@ -730,10 +930,20 @@ def build_cash_section(
 # Section 2 — AR/AP aging, week-over-week
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _snapshot_gap_days(baseline: str, today: datetime.date | None = None) -> int | None:
+    """Days between the baseline snapshot date and ``today``, or None if unparseable."""
+    try:
+        return ((today or _today()) - datetime.date.fromisoformat(baseline)).days
+    except (TypeError, ValueError):
+        return None
+
+
 def build_aging_section(
     entities: list[str],
     sources: Sources,
     prior: dict[str, Any] | None,
+    *,
+    today: datetime.date | None = None,
 ) -> tuple[Section, dict[str, Any]]:
     section = Section(key="aging", title=":inbox_tray: AR / AP aging — week over week")
     snap: dict[str, Any] = {}
@@ -758,9 +968,29 @@ def build_aging_section(
         )
         return section, snap
 
-    if not prior_aging:
-        section.lines.append("_First run — no prior snapshot, so no week-over-week deltas yet._")
+    # Aging is always as-of the RUN date (the QBO aging endpoints take no date),
+    # unlike the cash section's balance sheet which is as-of the cash-sheet week.
+    # Unstated, that difference reads as an unexplained gap between two sections of
+    # the same pack.
+    section.lines.append(f"Aging is as of today ({(today or _today()).isoformat()}).")
 
+    # Name the comparison baseline. "WoW" asserted against an unknown-age snapshot
+    # is a claim the data may not support: a missed week or an aborted run leaves a
+    # much older baseline while the thresholds are calibrated for seven days.
+    baseline = str((prior or {}).get("_snapshot_date") or "") if prior else ""
+    if not prior_aging:
+        section.lines.append(
+            "_First run (no prior snapshot with aging), so no week-over-week deltas yet._"
+        )
+    elif baseline:
+        gap = _snapshot_gap_days(baseline, today)
+        note = (
+            f" :warning: that is {gap}d ago, not one week — deltas below span that gap"
+            if gap is not None and gap > 10 else ""
+        )
+        section.lines.append(f"Compared against the {baseline} snapshot.{note}")
+
+    metric_reads = {"ar": 0, "ap": 0}
     for row in rows:
         entity = row["entity"]
         label = entity_label(entity)
@@ -770,28 +1000,33 @@ def build_aging_section(
 
         parts: list[str] = []
         snap_entry: dict[str, Any] = {}
-        flagged_here = False
+        crossed: list[str] = []
         for kind in ("ar", "ap"):
             data = row.get(kind)
             if not data:
                 parts.append(f"{kind.upper()} n/a")
                 continue
+            metric_reads[kind] += 1
             total = data["total"]
             snap_entry[kind] = total
             prior_total = (prior_aging.get(entity) or {}).get(kind)
             delta = None if prior_total is None else total - prior_total
+            if delta is None:
+                # No prior figure for THIS entity. Without the qualifier a bare total
+                # sits beside a neighbour's "(+$30,000 WoW)" and reads as no change.
+                parts.append(f"{kind.upper()} {fmt_money(total)} (no prior)")
+                continue
             if _crosses(delta, prior_total, AGING_DELTA_ABS, AGING_DELTA_PCT):
-                flagged_here = True
-                parts.append(f"{kind.upper()} {fmt_money(total)} ({fmt_delta(delta)} WoW)")
-            elif delta is not None:
-                parts.append(f"{kind.upper()} {fmt_money(total)} ({fmt_delta(delta)} WoW)")
-            else:
-                parts.append(f"{kind.upper()} {fmt_money(total)}")
+                crossed.append(kind.upper())
+            parts.append(f"{kind.upper()} {fmt_money(total)} ({fmt_delta(delta)})")
 
-        mark = ":triangular_flag_on_post: " if flagged_here else ""
-        if flagged_here:
+        mark = ":triangular_flag_on_post: " if crossed else ""
+        if crossed:
             section.flags += 1
-        section.lines.append(f"• {mark}{label}: " + ", ".join(parts))
+        # Name WHICH metric crossed -- both branches previously rendered the same
+        # string, so a line-level flag was not attributable.
+        crossed_note = f" [{'/'.join(crossed)} moved materially]" if crossed else ""
+        section.lines.append(f"• {mark}{label}: " + ", ".join(parts) + crossed_note)
 
         # Oldest-bucket callout: the aged tail is the close-prep signal, so it is
         # surfaced separately from the total rather than folded into it.
@@ -804,12 +1039,20 @@ def build_aging_section(
                 continue
             bucket = data.get("oldest_label") or "oldest bucket"
             section.lines.append(
-                f"    ↳ {kind.upper()} aged tail — {bucket}: {fmt_money(amount)}"
+                f"    -> {kind.upper()} aged tail — {bucket}: {fmt_money(amount)}"
             )
         if snap_entry:
             snap[entity] = snap_entry
 
-    section.lines.append(f"_Aging read for {len(with_data)} of {len(entities)} entity(ies)._")
+    # Coverage PER METRIC. An entity-level count let every AP read in the portfolio
+    # fail while the footer still claimed full coverage, because "either leg" was
+    # enough to count the entity as read.
+    section.covered = min(metric_reads["ar"], metric_reads["ap"])
+    section.expected = len(entities)
+    section.lines.append(
+        f"_AR read for {metric_reads['ar']} of {len(entities)} entity(ies); "
+        f"AP read for {metric_reads['ap']} of {len(entities)}._"
+    )
     return section, snap
 
 
@@ -831,6 +1074,7 @@ def build_pnl_section(
 
     section.lines.append(f"Comparing {cur_label} vs {prior_label} (full calendar months).")
 
+    metric_reads = {"revenue": 0, "expenses": 0}
     rows: list[dict[str, Any]] = []
     for entity in entities:
         entry: dict[str, Any] = {"entity": entity}
@@ -873,7 +1117,7 @@ def build_pnl_section(
         basis_mismatch = bool(basis and prior_basis and basis != prior_basis)
 
         parts: list[str] = []
-        flagged_here = False
+        crossed: list[str] = []
         for kind, cur_key, prior_key in (
             ("revenue", "cur_revenue", "prior_revenue"),
             ("expenses", "cur_expenses", "prior_expenses"),
@@ -882,21 +1126,24 @@ def build_pnl_section(
             if cur is None:
                 parts.append(f"{kind} n/a")
                 continue
+            metric_reads[kind] += 1
             delta = None if prev is None else cur - prev
             if delta is None:
                 parts.append(f"{kind} {fmt_money(cur)} (no prior month)")
                 continue
             if not basis_mismatch and _crosses(delta, prev, PNL_SWING_ABS, PNL_SWING_PCT):
-                flagged_here = True
+                crossed.append(kind)
             parts.append(f"{kind} {fmt_money(cur)} ({fmt_delta(delta)} MoM)")
 
+        flagged_here = bool(crossed)
         mark = ":triangular_flag_on_post: " if flagged_here else ""
         if flagged_here:
             section.flags += 1
+            basis_note = f" [{'/'.join(crossed)} moved materially]" + basis_note
         section.lines.append(f"• {mark}{label}: " + ", ".join(parts) + basis_note)
         if basis_mismatch:
             section.lines.append(
-                f"    ↳ basis changed between months ({prior_basis} → {basis}); "
+                f"    -> basis changed between months ({prior_basis} to {basis}); "
                 "swing is not comparable and was not flagged"
             )
         snap[entity] = {
@@ -905,7 +1152,13 @@ def build_pnl_section(
             "period": cur_range[0],
         }
 
-    section.lines.append(f"_P&L read for {len(usable)} of {len(entities)} entity(ies)._")
+    # Coverage PER METRIC -- see the same fix in build_aging_section.
+    section.covered = min(metric_reads["revenue"], metric_reads["expenses"])
+    section.expected = len(entities)
+    section.lines.append(
+        f"_Revenue read for {metric_reads['revenue']} of {len(entities)} entity(ies); "
+        f"expenses read for {metric_reads['expenses']} of {len(entities)}._"
+    )
     return section, snap
 
 
@@ -927,8 +1180,10 @@ def build_close_prep_section(
     section = Section(key="close_prep", title=":clipboard: Close-prep notes")
     day = today or _today()
 
-    # Unreconciled-looking: a material cash delta IS the reconciliation signal,
-    # so it is restated here (as a count) instead of being independently derived.
+    # Unreconciled-looking: a material cash delta IS the reconciliation signal, so
+    # it is RESTATED here (as a count) rather than independently derived -- and a
+    # restatement must not add to the pack's flag total, or three cash findings
+    # would be reported as four.
     if cash_section.available:
         if cash_section.flags:
             section.lines.append(
@@ -936,11 +1191,29 @@ def build_close_prep_section(
                 f"delta over threshold (>{fmt_money(CASH_DELTA_ABS)} or "
                 f"{CASH_DELTA_PCT:.0%}) — unreconciled-looking; review before close."
             )
-            section.flags += 1
         else:
-            section.lines.append("• Cash sheet and books agree within threshold for every checked entity.")
+            section.lines.append(
+                "• Cash sheet and books agree within threshold for every entity that "
+                "COULD be checked."
+            )
+        # Partial coverage is its own finding. Without this, the run where 9 of 10
+        # QBO realms 401 (token lifetimes are ~100 days and there is a monitor for
+        # exactly that) summarised as "agree within threshold" and the founder cut
+        # said "no item crossed a flag threshold".
+        if cash_section.is_partial:
+            gap = (cash_section.expected or 0) - (cash_section.covered or 0)
+            section.lines.append(
+                f"• :triangular_flag_on_post: reconciliation status UNKNOWN for {gap} of "
+                f"{cash_section.expected} entity(ies) — a source was unreadable, so those "
+                "were never cross-checked. Not an all-clear."
+            )
+            section.flags += 1
     else:
-        section.lines.append("• Cash cross-check unavailable this run — reconciliation status unknown.")
+        section.lines.append(
+            "• :triangular_flag_on_post: Cash cross-check unavailable this run — "
+            "reconciliation status unknown for every entity."
+        )
+        section.flags += 1
 
     facts = None
     try:
@@ -950,10 +1223,11 @@ def build_close_prep_section(
 
     if not facts:
         section.lines.append(
-            "• _Adherence facts unavailable_ — the finance-adherence check has not "
-            "produced a facts block (cash-sheet freshness, monthly-filing presence and "
-            "bank-statement staleness are therefore unknown this run)."
+            "• :triangular_flag_on_post: _Adherence facts unavailable_ — the "
+            "finance-adherence check produced no facts block, so cash-sheet freshness, "
+            "monthly-filing presence and bank-statement staleness are unknown this run."
         )
+        section.flags += 1
         return section
 
     generated = str(facts.get("generated_date") or facts.get("generated_at") or "")[:10]
@@ -962,24 +1236,82 @@ def build_close_prep_section(
         age_days = (day - datetime.date.fromisoformat(generated)).days
     except ValueError:
         pass
-    if age_days is not None and age_days > ADHERENCE_MAX_AGE_DAYS:
+    if age_days is None:
+        # Absent or unparseable date. Previously BOTH branches were skipped, so
+        # arbitrarily old facts rendered with no as-of line at all.
         section.lines.append(
-            f"• :warning: Adherence facts are STALE (generated {generated}, {age_days}d ago) "
-            "— treat the items below as historical, not current."
+            "• :warning: Adherence facts carry no readable generation date — their age "
+            "cannot be established, so treat them as possibly stale."
         )
         section.flags += 1
-    elif generated:
+    elif age_days > ADHERENCE_MAX_AGE_DAYS:
+        section.lines.append(
+            f"• :triangular_flag_on_post: Adherence facts are STALE (generated {generated}, "
+            f"{age_days}d ago; the check runs weekly, 45 min before this pack) — the "
+            "adherence job did not run this morning. Treat the items below as historical."
+        )
+        section.flags += 1
+    else:
         section.lines.append(f"• Adherence facts as of {generated}.")
 
-    for line in facts.get("facts") or []:
-        if not isinstance(line, str) or not line.strip():
-            continue
-        flagged = any(
-            token in line.lower() for token in ("missing", "stale", "overdue", "absent", "no_content")
+    # An all-unknown facts block (e.g. the G: mount was down at 08:15) otherwise
+    # rendered zero flags and read as checked-and-clear, while the previous good
+    # block had already been overwritten.
+    unknown_count = facts.get("unknown_count")
+    if isinstance(unknown_count, int) and unknown_count > 0:
+        section.lines.append(
+            f"• :warning: {unknown_count} adherence check(s) could NOT be read this run "
+            "(Drive unreachable or unreadable) — their status is unknown, not clear."
         )
+        section.flags += 1
+
+    fact_lines = [
+        ln.strip() for ln in (facts.get("facts") or [])
+        if isinstance(ln, str) and ln.strip()
+    ]
+    if not fact_lines:
+        section.lines.append(
+            "• :warning: the adherence facts block contained no fact lines — nothing was "
+            "actually checked."
+        )
+        section.flags += 1
+        return section
+
+    # Severity comes from the producer's PARALLEL status list when supplied. Prose
+    # matching is brittle in both directions -- the earlier "no_content" token never
+    # matched the real "(no content)" text -- and a rolled-up line's synthetic key
+    # matches no per-check status key, so key lookup alone under-flags exactly the
+    # grouped findings the roll-up exists to surface. Token matching remains only as
+    # the fallback for a producer that supplies no statuses.
+    raw_status = facts.get("facts_status")
+    statuses: list[str] = (
+        [str(s).lower() for s in raw_status]
+        if isinstance(raw_status, list) and len(raw_status) == len(fact_lines)
+        else []
+    )
+
+    # Cap the rendered lines: this is the one place the pack renders text it did not
+    # compute, and an unbounded producer would push the post past Slack's 40k limit
+    # (a delivery failure, i.e. nobody sees the pack at all).
+    shown = fact_lines[:_MAX_ADHERENCE_LINES]
+    for idx, line in enumerate(shown):
+        if statuses:
+            flagged = statuses[idx] in _ADHERENCE_PROBLEM_STATUSES
+        else:
+            flagged = any(
+                token in line.lower()
+                for token in ("missing", "stale", "overdue", "absent", "no content")
+            )
         if flagged:
             section.flags += 1
-        section.lines.append(f"• {':triangular_flag_on_post: ' if flagged else ''}{line.strip()}")
+        section.lines.append(
+            f"• {':triangular_flag_on_post: ' if flagged else ''}{_scrub_external(line, 300)}"
+        )
+    if len(fact_lines) > len(shown):
+        section.lines.append(
+            f"• _{len(fact_lines) - len(shown)} further adherence line(s) not shown "
+            "(see the facts block in the accounting folder)._"
+        )
 
     return section
 
@@ -1028,18 +1360,29 @@ def build_renewal_section(
 
     dated.sort(key=lambda pair: pair[0])
     shown = 0
+    unconfirmed = 0
     for days_out, item in dated:
         if days_out > horizon_days:
             continue
         shown += 1
-        name = str(item.get("name") or "unnamed")
-        ent = str(item.get("entity") or "").strip()
+        # Every field below comes from a human-maintained YAML file -- scrubbed so a
+        # typo'd or crafted value cannot inject Slack control syntax into a finance
+        # channel (see _scrub_external).
+        name = _scrub_external(item.get("name") or "unnamed")
+        ent = _scrub_external(item.get("entity") or "", 24)
         ent_tag = f" [{ent}]" if ent else ""
         amount = item.get("amount")
         amount_val = float(amount) if isinstance(amount, (int, float)) else None
         cost = f" — {fmt_money(amount_val)}" if amount_val is not None else ""
-        cadence = str(item.get("cadence") or "").strip()
+        cadence = _scrub_external(item.get("cadence") or "", 32)
         cadence_tag = f" ({cadence})" if cadence else ""
+        # A seeded placeholder date must not masquerade as a verified renewal date --
+        # otherwise the radar fires PAST DUE into the founder cut every week off a
+        # date nobody confirmed.
+        confirmed = item.get("confirmed")
+        provisional = " — UNCONFIRMED date/amount, verify before acting" if confirmed is False else ""
+        if confirmed is False:
+            unconfirmed += 1
         if days_out < 0:
             section.flags += 1
             when = f":rotating_light: PAST DUE {abs(days_out)}d"
@@ -1048,20 +1391,24 @@ def build_renewal_section(
             when = f":warning: due in {days_out}d"
         else:
             when = f"due in {days_out}d"
-        section.lines.append(f"• {when} — {name}{ent_tag}{cost}{cadence_tag}")
+        section.lines.append(f"• {when} — {name}{ent_tag}{cost}{cadence_tag}{provisional}")
 
     if not shown:
         section.lines.append(f"• Nothing due or past due within {horizon_days} days.")
     if undated:
-        names = ", ".join(str(i.get("name") or "unnamed") for i in undated[:5])
+        names = ", ".join(_scrub_external(i.get("name") or "unnamed", 60) for i in undated[:5])
         more = f" (+{len(undated) - 5} more)" if len(undated) > 5 else ""
         section.lines.append(
             f"• _{len(undated)} entry(ies) have no parseable next_due and were not "
             f"assessed: {names}{more}_"
         )
-    section.lines.append(
-        f"_Radar covers {len(items)} tracked item(s); {shown} within {horizon_days}d._"
-    )
+    footer = f"_Radar covers {len(items)} tracked item(s); {shown} within {horizon_days}d."
+    if unconfirmed:
+        footer += (
+            f" {unconfirmed} shown entry(ies) are UNCONFIRMED seeds — this radar is a "
+            "partial list, not full subscription coverage."
+        )
+    section.lines.append(footer + "_")
     return section
 
 
@@ -1086,10 +1433,25 @@ def build_pack(
     day = today or _today()
 
     try:
-        provisioned = entities if entities is not None else src.get_provisioned()
+        offered = entities if entities is not None else src.get_provisioned()
     except Exception as exc:  # noqa: BLE001
         log.error("finance_close: could not list provisioned entities: %s", exc)
-        provisioned = []
+        offered = []
+
+    # Pack-wide sensitivity exclusion, applied ONCE here so it governs every
+    # section. The cash section still receives the full list so it can report the
+    # exclusion in its footer.
+    provisioned = [e for e in offered if e not in PACK_EXCLUDED_ENTITIES]
+
+    def guarded_simple(key: str, title: str, fn: Callable[[], Section]) -> Section:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 -- section-level fail-soft
+            log.error("finance_close: section %s raised: %s", key, exc)
+            return Section(
+                key=key, title=title, available=False,
+                stub_reason=f"section builder failed ({type(exc).__name__})",
+            )
 
     pack = ClosePack(generated_at=day.isoformat())
     if not provisioned:
@@ -1102,10 +1464,16 @@ def build_pack(
                 key=key, title=title, available=False,
                 stub_reason="no provisioned accounting entities could be listed",
             ))
-        pack.sections.append(build_close_prep_section(
-            src, cash_section=pack.sections[0], today=day,
+        # These two were previously called UNGUARDED on this path, so an exception
+        # here lost the whole pack instead of stubbing one section.
+        pack.sections.append(guarded_simple(
+            "close_prep", ":clipboard: Close-prep notes",
+            lambda: build_close_prep_section(src, cash_section=pack.sections[0], today=day),
         ))
-        pack.sections.append(build_renewal_section(src, today=day))
+        pack.sections.append(guarded_simple(
+            "renewals", ":calendar: Renewal / payment radar",
+            lambda: build_renewal_section(src, today=day),
+        ))
         return pack
 
     prior = load_prior_snapshot(today=day, snapshot_dir=snapshot_dir)
@@ -1126,41 +1494,42 @@ def build_pack(
 
     cash_section = guarded(
         "cash", ":bank: Cash — cash sheet vs books",
-        lambda: build_cash_section(provisioned, src, today=day),
+        lambda: build_cash_section(offered, src, today=day),
     )
     aging_section = guarded(
         "aging", ":inbox_tray: AR / AP aging — week over week",
-        lambda: build_aging_section(provisioned, src, prior),
+        lambda: build_aging_section(provisioned, src, prior, today=day),
     )
     pnl_section = guarded(
         "pnl", ":bar_chart: P&L sanity — month over month",
         lambda: build_pnl_section(provisioned, src, today=day),
     )
-
-    try:
-        close_prep = build_close_prep_section(src, cash_section=cash_section, today=day)
-    except Exception as exc:  # noqa: BLE001
-        log.error("finance_close: close-prep section raised: %s", exc)
-        close_prep = Section(
-            key="close_prep", title=":clipboard: Close-prep notes", available=False,
-            stub_reason=f"section builder failed ({type(exc).__name__})",
-        )
-    try:
-        renewals = build_renewal_section(src, today=day)
-    except Exception as exc:  # noqa: BLE001
-        log.error("finance_close: renewal section raised: %s", exc)
-        renewals = Section(
-            key="renewals", title=":calendar: Renewal / payment radar", available=False,
-            stub_reason=f"section builder failed ({type(exc).__name__})",
-        )
+    close_prep = guarded_simple(
+        "close_prep", ":clipboard: Close-prep notes",
+        lambda: build_close_prep_section(src, cash_section=cash_section, today=day),
+    )
+    renewals = guarded_simple(
+        "renewals", ":calendar: Renewal / payment radar",
+        lambda: build_renewal_section(src, today=day),
+    )
 
     pack.sections = [cash_section, aging_section, pnl_section, close_prep, renewals]
 
-    if persist_snapshot:
+    # Only persist a snapshot that actually carries data. A run where every section
+    # stubbed would otherwise become next week's "most recent prior snapshot" --
+    # losing the real week-over-week baseline AND mislabelling the result
+    # "First run - no prior snapshot".
+    has_data = any(k in snapshot for k in ("cash", "aging", "pnl"))
+    if persist_snapshot and has_data:
         try:
             write_snapshot(snapshot, today=day, snapshot_dir=snapshot_dir)
         except OSError as exc:
             log.warning("finance_close: snapshot write failed: %s", exc)
+    elif persist_snapshot:
+        log.warning(
+            "finance_close: every section stubbed -- NOT persisting an empty snapshot "
+            "(it would become next week's WoW baseline)"
+        )
 
     return pack
 
@@ -1219,7 +1588,21 @@ def narrate(pack: ClosePack, *, api_key: str | None = None) -> str | None:
         )
         log_usage(msg, caller="finance_close_pack", model=model)
         text = (msg.content[0].text or "").strip() if msg.content else ""
-        return text or None
+        if not text:
+            return None
+        # CODE-enforce the "no figure Python did not compute" rule. Prompting alone
+        # left the model free to sum two deltas or invent a portfolio total, and the
+        # narration is prefixed ABOVE the "every figure is a direct source read"
+        # line, so it visually inherits that guarantee. Any money token absent from
+        # the facts text drops the narration entirely.
+        invented = [tok for tok in _MONEY_TOKEN_RE.findall(text) if tok not in facts]
+        if invented:
+            log.warning(
+                "finance_close: narration contained %d figure(s) not present in the "
+                "facts block -- dropping narration", len(invented),
+            )
+            return None
+        return text
     except Exception as exc:  # noqa: BLE001 -- narration is never load-bearing
         log.warning("finance_close: narration failed, posting facts only: %s", exc)
         return None

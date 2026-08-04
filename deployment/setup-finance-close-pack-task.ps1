@@ -12,10 +12,13 @@
 # a post there fails is_archived and reaches nobody. #hjrg-finance is live and
 # classifies TIER_1 (function "finance"), so the finance firewall is preserved.
 #
-# Schedule: Monday 09:00 AZ -- after the weekly cash flow refresh, and outside the
-# crowded 03:00-09:00 sync window that the weekly health metric alarms on.
-# Slot check (2026-08-04): the finance receipt digest is Mon 10:30 and the finance
-# weekly recap is Mon 07:30, so 09:00 collides with neither.
+# Schedule: Monday 09:00 AZ -- after the weekly cash flow refresh, and just outside
+# the crowded 03:00-09:00 sync window the weekly health metric alarms on (the
+# detector window is 3 <= hour < 9, so 09:00 is outside it entirely).
+# Slot check against the LIVE registry (2026-08-04): no other Monday-weekly task
+# fires at 09:00. Neighbours are cowork-cora-finance-adherence 08:15 (this bundle),
+# Cora - KB Evals 09:05, cowork-cora-finance-receipt-digest Mon 10:30, and
+# cowork-cora-finance-weekly Mon 14:30.
 #
 # Run from elevated PowerShell:
 #     cd C:\Users\Harri\code\cora
@@ -50,21 +53,26 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# D-005: absolute .venv python + absolute script path + WorkingDirectory = repo root.
-# Never uv in a scheduled task.
+# D-005: absolute .venv python; script path is relative to WorkingDirectory, which
+# is pinned to the repo root. Never uv in a scheduled task.
 $Action = New-ScheduledTaskAction -Execute $PythonExe `
     -Argument "scripts\run_finance_close_pack.py" `
     -WorkingDirectory $RepoRoot
 
 $Trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At $HourMin
 
-# 55 QBO report calls at up to 30s each is the worst case, so the limit is generous.
-# The script has no internal wall-clock budget; this is the only backstop.
+# Limit sized for the real TAIL, not the measured case. Measured: 1-3 min. Tail:
+# 54 QBO report GETs at a 30s client timeout, each able to retry once on a 401
+# (~54 min), plus ~10 OAuth token refreshes at 30s (most access tokens have expired
+# by Monday morning), plus 10 Sheets values.get bounded at the httplib2 default 60s
+# (~10 min) => ~69 min, which would have been killed by a 1-hour limit mid-delivery.
+# Per-target dedup makes a kill recoverable, but the limit should not be the thing
+# that causes one.
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
 Register-ScheduledTask -TaskName $TaskName `
     -Action $Action `

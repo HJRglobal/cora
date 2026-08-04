@@ -48,6 +48,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+# Windows consoles default to cp1252; the facts block renders characters it cannot
+# encode. Harden stdout so --dry-run (the pre-flight gate) can never die on output.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # pragma: no cover
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",

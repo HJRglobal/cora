@@ -91,8 +91,8 @@ def _sources(**over) -> fc.Sources:
     base = dict(
         provisioned_entities=lambda: ["F3E", "OSNGW"],
         cash_closing=lambda e: {
-            "closing": 100_000.0, "week_label": "Week of 7/27/2026",
-            "stale": False, "age_days": 3,
+            "closing": 100_000.0, "is_actual": True,
+            "week_label": "Week of 7/27/2026", "stale": False, "age_days": 3,
         },
         balance_sheet=lambda e, a: _bs(100_500.0),
         ar_aging=lambda e: _aging(50_000.0, 5_000.0),
@@ -238,7 +238,7 @@ def test_every_provisioned_realm_is_mapped_or_explicitly_excluded():
 
     for entity in list_provisioned_entities():
         assert (
-            entity in fc.QBO_TO_SHEET_ENTITY or entity in fc.CASH_CHECK_EXCLUDED
+            entity in fc.QBO_TO_SHEET_ENTITY or entity in fc.PACK_EXCLUDED_ENTITIES
         ), f"QBO realm {entity} is neither cash-check-mapped nor explicitly excluded"
 
 
@@ -262,8 +262,8 @@ def test_osngm_maps_to_mckellips():
 
 
 def test_hrllc_excluded_with_a_reason():
-    assert "HRLLC" in fc.CASH_CHECK_EXCLUDED
-    assert fc.CASH_CHECK_EXCLUDED["HRLLC"].strip()
+    assert "HRLLC" in fc.PACK_EXCLUDED_ENTITIES
+    assert fc.PACK_EXCLUDED_ENTITIES["HRLLC"].strip()
 
 
 # ── cash section: the label-drift acceptance criterion ───────────────────────
@@ -278,8 +278,8 @@ def test_cash_section_all_none_closing_becomes_stub_not_blanks():
     section, snap = fc.build_cash_section(
         ["F3E", "OSNGW"],
         _sources(cash_closing=lambda e: {
-            "closing": None, "week_label": "Week of 7/27/2026",
-            "stale": False, "age_days": 3,
+            "closing": None, "is_actual": True,
+            "week_label": "Week of 7/27/2026", "stale": False, "age_days": 3,
         }),
         today=MONDAY,
     )
@@ -305,10 +305,10 @@ def test_cash_section_partial_failure_still_lists_the_entity():
     """No silent partials: a per-entity failure must appear AND be counted."""
     def one_ok(entity):
         if entity == "F3E":
-            return {"closing": 100_000.0, "week_label": "Week of 7/27/2026",
-                    "stale": False, "age_days": 3}
-        return {"closing": None, "week_label": "Week of 7/27/2026",
-                "stale": False, "age_days": 3}
+            return {"closing": 100_000.0, "is_actual": True,
+                    "week_label": "Week of 7/27/2026", "stale": False, "age_days": 3}
+        return {"closing": None, "is_actual": True,
+                "week_label": "Week of 7/27/2026", "stale": False, "age_days": 3}
 
     section, _ = fc.build_cash_section(
         ["F3E", "OSNGW"], _sources(cash_closing=one_ok), today=MONDAY,
@@ -341,8 +341,8 @@ def test_cash_section_surfaces_stale_sheet():
     section, _ = fc.build_cash_section(
         ["F3E"],
         _sources(cash_closing=lambda e: {
-            "closing": 100_000.0, "week_label": "Week of 6/1/2026",
-            "stale": True, "age_days": 63,
+            "closing": 100_000.0, "is_actual": True,
+            "week_label": "Week of 6/1/2026", "stale": True, "age_days": 63,
         }),
         today=MONDAY,
     )
@@ -366,8 +366,8 @@ def test_cash_section_labels_unparsed_week_date():
     section, _ = fc.build_cash_section(
         ["F3E"],
         _sources(cash_closing=lambda e: {
-            "closing": 100_000.0, "week_label": "no date here",
-            "stale": False, "age_days": None,
+            "closing": 100_000.0, "is_actual": True,
+            "week_label": "no date here", "stale": False, "age_days": None,
         }),
         today=MONDAY,
     )
@@ -398,7 +398,7 @@ def test_aging_section_computes_wow_delta_and_flags():
     prior = {"aging": {"F3E": {"ar": 20_000.0, "ap": 20_000.0}}}
     section, _ = fc.build_aging_section(["F3E"], _sources(), prior)
     body = "\n".join(section.lines)
-    assert "+$30,000 WoW" in body
+    assert "+$30,000" in body
     assert section.flags == 1
 
 

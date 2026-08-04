@@ -104,7 +104,11 @@ def test_cash_sheet_renamed_is_missing_not_blank(tmp_path):
     )
     assert fact.status == fa.STATUS_MISSING
     assert "MISSING" in fact.text
-    assert fa.CASH_SHEET_PATH.name in fact.text     # names what it looked for
+    # Names WHAT it looked for without echoing the filename: the facts block is
+    # KB-ingested and gsheets_financials locks a source-opaque contract.
+    assert "Standing-ACTUALS cash sheet" in fact.text
+    assert "renamed" in fact.text
+    assert fa.CASH_SHEET_PATH.name not in fact.text
     assert fact.text.strip()                        # never a blank
 
 
