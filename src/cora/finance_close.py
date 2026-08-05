@@ -133,6 +133,26 @@ QBO_TO_SHEET_ENTITY: dict[str, str] = {
     "OSNVV": "OSN-VV",
 }
 
+# Sheet rows that are CONSOLIDATIONS of several QBO realms rather than the books
+# of a realm that holds cash itself (cq-6fbb9d717512).
+#
+# Verified live 2026-08-04: the sheet's "OSN" row is the tab "OSN Consolidated"
+# and closed the week at $37,605 -- exactly the four store tabs summed
+# (Warner 4,722 + McKellips 6,936 + Greenfield 4,365 + Val Vista 21,581). The QBO
+# realm OSN, meanwhile, is a cash-less holding shell: ONE bank account at $0.00
+# and no credit cards.
+#
+# So comparing sheet-OSN against realm-OSN's books compared a consolidation against
+# an empty shell and flagged a phantom ~$37.6K delta EVERY week. Re-based here to
+# the sum of the member realms' books, which is the comparison the sheet row
+# actually describes -- and a genuinely useful check that the consolidation ties.
+#
+# The member realms are still cross-checked individually against their own tabs;
+# this row additionally checks that the roll-up agrees.
+SHEET_ROLLUPS: dict[str, tuple[str, ...]] = {
+    "OSN": ("OSNGF", "OSNGM", "OSNGW", "OSNVV"),
+}
+
 # QBO realms deliberately EXCLUDED from the ENTIRE pack, with the reason.
 #
 # HRLLC is personal expense tracking, not business data -- gsheets_financials
@@ -551,6 +571,7 @@ class Sources:
     profit_loss: Callable[[str, str, str], dict[str, Any]] | None = None
     renewals: Callable[[], list[dict[str, Any]] | None] | None = None
     adherence_facts: Callable[[], dict[str, Any] | None] | None = None
+    bank_snapshot: Callable[[], dict[str, Any] | None] | None = None
 
     def get_provisioned(self) -> list[str]:
         if self.provisioned_entities:
@@ -641,6 +662,19 @@ class Sources:
         if self.adherence_facts:
             return self.adherence_facts()
         return load_adherence_facts()
+
+    def get_bank_snapshot(self) -> dict[str, Any] | None:
+        """Daily QBO bank snapshot, or None when it has not run.
+
+        A FILE read, not a live QBO sweep -- same reasoning as get_adherence():
+        the snapshot job runs on its own cadence earlier the same morning, and the
+        pack must degrade to an honest stub rather than recompute 55 API calls
+        inside the pack build.
+        """
+        if self.bank_snapshot:
+            return self.bank_snapshot()
+        from .qbo_bank_snapshot import load_snapshot  # noqa: PLC0415
+        return load_snapshot()
 
 
 def load_renewals(path: Path | None = None) -> list[dict[str, Any]] | None:
@@ -789,6 +823,33 @@ def build_cash_section(
             "age_days": age_days,
         })
 
+    # ── Roll-up re-basing (cq-6fbb9d717512) ─────────────────────────────────
+    # Done as a SECOND PASS over the rows already built, so the member realms'
+    # balance sheets are reused rather than re-fetched.
+    by_entity = {r["entity"]: r for r in rows}
+    for row in rows:
+        members = SHEET_ROLLUPS.get(QBO_TO_SHEET_ENTITY.get(row["entity"], ""))
+        if not members:
+            continue
+        row["rollup_members"] = members
+        member_rows = [by_entity.get(m) for m in members]
+        usable = [m for m in member_rows if m and m["books_net"] is not None]
+        if len(usable) != len(members):
+            # A PARTIAL sum against a FULL consolidated sheet row would understate
+            # the books leg and manufacture exactly the false flag this fix removes.
+            row["bank"] = row["cards"] = row["books_net"] = row["delta"] = None
+            row["rollup_incomplete"] = True
+            continue
+        row["bank"] = round(sum(m["bank"] for m in usable if m["bank"] is not None), 2)
+        card_values = [m["cards"] for m in usable if m["cards"] is not None]
+        row["cards"] = round(sum(card_values), 2) if card_values else None
+        row["cards_present"] = bool(card_values)
+        row["books_net"] = round(sum(m["books_net"] for m in usable), 2)
+        row["delta"] = (
+            None if row["sheet_closing"] is None
+            else round(row["books_net"] - row["sheet_closing"], 2)
+        )
+
     none_count = sum(1 for r in rows if r["sheet_closing"] is None) - sheet_read_failures
 
     # Label-drift detector (2026-06-04 doctrine). Closing balances coming back None
@@ -848,18 +909,30 @@ def build_cash_section(
     forecast_only = 0
     for row in rows:
         label = entity_label(row["entity"])
+        members = row.get("rollup_members")
+        rollup_note = ""
+        if members:
+            member_names = ", ".join(entity_label(m) for m in members)
+            rollup_note = (
+                f" [consolidated row: books leg is the sum of {member_names}; "
+                f"the {label} realm itself holds no cash]"
+            )
         if row["sheet_closing"] is None or row["books_net"] is None:
             missing = []
             if row["sheet_closing"] is None:
                 missing.append("cash sheet")
             if row["books_net"] is None:
-                missing.append("books")
+                missing.append(
+                    "books for every consolidated member" if row.get("rollup_incomplete")
+                    else "books"
+                )
             section.lines.append(
                 f"• {label}: unavailable — no figure from {' and '.join(missing)}"
             )
             continue
         complete += 1
         as_of_note = "" if row["as_of_exact"] else f" [books as of {row['as_of']}, week date unparsed]"
+        as_of_note += rollup_note
         if not row["cards_present"]:
             books_note = " (no credit-card section in the books)"
         elif row["cards"]:
@@ -923,6 +996,158 @@ def build_cash_section(
             + "."
         )
     section.lines.append(footer + "_")
+    return section, snap
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1b — QBO bank & books freshness (A5 S2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Method-difference disclosure. NOT a "tolerance": the design anticipated naming an
+# expected tolerance between this section and the cash cross-check above, and the
+# 2026-08-04 live probe REFUTED that framing. The two surfaces disagreed by more
+# than 100% and with OPPOSITE SIGNS on the same account at the same instant (BDM
+# "Big D Media Chase": register +11,758.94 vs report -8,483.22; HJRP bank register
+# 128,128.02 vs report 26,879.52). Not clock skew and not future-dated activity --
+# the BDM report figure is identical at as-of dates through 2030. They are
+# different measures, so no tolerance band would be honest.
+_BANK_METHOD_FOOTER = (
+    "_Balances above are ACCOUNT REGISTER figures read from the QBO Account API. "
+    "The cash cross-check section reads the BalanceSheet REPORT instead — a "
+    "different endpoint and a different measure, which can differ by large amounts "
+    "and even in sign on the same account. A gap between the two sections is NOT a "
+    "reconciliation break and is deliberately not flagged._"
+)
+
+
+def build_bank_section(
+    entities: list[str],
+    sources: Sources,
+    *,
+    today: datetime.date | None = None,
+) -> tuple[Section, dict[str, Any]]:
+    """QBO bank balances + books-freshness. Returns (section, snapshot fragment)."""
+    from .qbo_bank_snapshot import (  # noqa: PLC0415
+        BALANCE_BASIS, DEFAULT_MAX_AGE_HOURS, snapshot_age_hours, stale_txn_days, txn_age_days,
+    )
+
+    section = Section(key="qbo_bank", title=":bank: QBO bank & books freshness")
+    snap: dict[str, Any] = {}
+    day = today or _today()
+
+    data = sources.get_bank_snapshot()
+    if not data:
+        section.available = False
+        section.stub_reason = (
+            "the daily QBO bank snapshot has not run yet "
+            "(cowork-cora-bank-snapshot, daily 07:05 AZ)"
+        )
+        return section, snap
+
+    # Staleness is reported, never silently tolerated: a snapshot from three days
+    # ago presented as "current cash" is the exact failure this label prevents.
+    age_h = snapshot_age_hours(data)
+    if age_h is None:
+        section.lines.append(
+            ":warning: snapshot carries no usable timestamp — treat these figures as "
+            "of UNKNOWN age, not as current."
+        )
+    elif age_h > DEFAULT_MAX_AGE_HOURS:
+        section.lines.append(
+            f":warning: snapshot is ~{age_h:.0f}h old (generated "
+            f"{data.get('generated_at_utc')}) — figures are as of then, not today."
+        )
+    else:
+        section.lines.append(
+            f"Snapshot generated {data.get('generated_at_utc')} (~{age_h:.0f}h ago); "
+            f"basis: {data.get('basis') or BALANCE_BASIS}."
+        )
+
+    realms = data.get("realms") or {}
+    threshold = stale_txn_days()
+
+    # The snapshot spans EVERY provisioned realm, including pack-excluded ones. The
+    # pack's exclusions are about sensitivity, so they must hold here too -- and
+    # that is also why the snapshot's own portfolio total is NOT reused below: it
+    # includes HR LLC, whose balance must not reach a multi-member finance channel.
+    renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
+    covered = 0
+    totals_usable = True
+    contributing: list[str] = []
+
+    for entity in renderable:
+        label = entity_label(entity)
+        block = realms.get(entity)
+        if not block:
+            totals_usable = False
+            section.lines.append(f"• {label}: unavailable — not present in the snapshot")
+            continue
+        if block.get("status") != "ok":
+            totals_usable = False
+            # D-118: the error string originates outside this module (QBO / httpx),
+            # so it is scrubbed before it reaches a Slack surface.
+            reason = _scrub_external(str(block.get("error") or "read failed"), 100)
+            section.lines.append(f"• {label}: unavailable — {reason}")
+            continue
+
+        covered += 1
+        if block.get("shell"):
+            # A shell realm is a footnote, not a balance row (design 3 S1).
+            section.lines.append(
+                f"• {label}: cash-less holding shell — no bank accounts to report."
+            )
+            continue
+        if not block.get("balances_complete", True):
+            totals_usable = False
+        contributing.append(entity)
+
+        bank = block.get("bank_total")
+        cards = block.get("cc_total")
+        net = block.get("cash_net_of_cards")
+        newest = block.get("newest_bank_txn_date")
+        age_d = txn_age_days(newest, today=day)
+
+        flagged = age_d is not None and age_d > threshold
+        if flagged:
+            section.flags += 1
+        mark = ":triangular_flag_on_post: " if flagged else ""
+
+        if newest is None:
+            fresh_txt = "newest posted bank-side txn: UNKNOWN"
+        else:
+            fresh_txt = f"newest posted bank-side txn {newest} ({age_d}d ago)"
+            if flagged:
+                fresh_txt += f" — over the {threshold}d threshold"
+
+        cards_txt = "" if not cards else f", cards {fmt_money(cards)}"
+        section.lines.append(
+            f"• {mark}{label}: bank {fmt_money(bank)}{cards_txt}, net of cards "
+            f"{fmt_money(net)} — {fresh_txt}"
+        )
+        snap[entity] = {
+            "bank_total": bank, "cc_total": cards, "cash_net_of_cards": net,
+            "newest_bank_txn_date": newest, "txn_age_days": age_d,
+        }
+
+    # Section total over exactly the rows rendered above -- never the snapshot's
+    # own portfolio figure, which spans pack-excluded realms.
+    if contributing and totals_usable:
+        section.lines.append(
+            f"Total across {len(contributing)} realm(s): net of cards "
+            + fmt_money(round(sum(realms[e]["cash_net_of_cards"] for e in contributing), 2))
+        )
+    elif contributing:
+        section.lines.append(
+            "Total withheld — at least one realm is unavailable or carries an "
+            "unknown balance, so a sum would understate the portfolio."
+        )
+
+    section.covered = covered
+    section.expected = len(renderable)
+    section.lines.append(
+        f"_Read {covered} of {section.expected} realm(s) from the snapshot._"
+    )
+    section.lines.append(_BANK_METHOD_FOOTER)
     return section, snap
 
 
@@ -1457,6 +1682,7 @@ def build_pack(
     if not provisioned:
         for key, title in (
             ("cash", ":bank: Cash — cash sheet vs books"),
+            ("qbo_bank", ":bank: QBO bank & books freshness"),
             ("aging", ":inbox_tray: AR / AP aging — week over week"),
             ("pnl", ":bar_chart: P&L sanity — month over month"),
         ):
@@ -1496,6 +1722,10 @@ def build_pack(
         "cash", ":bank: Cash — cash sheet vs books",
         lambda: build_cash_section(offered, src, today=day),
     )
+    bank_section = guarded(
+        "qbo_bank", ":bank: QBO bank & books freshness",
+        lambda: build_bank_section(provisioned, src, today=day),
+    )
     aging_section = guarded(
         "aging", ":inbox_tray: AR / AP aging — week over week",
         lambda: build_aging_section(provisioned, src, prior, today=day),
@@ -1513,7 +1743,9 @@ def build_pack(
         lambda: build_renewal_section(src, today=day),
     )
 
-    pack.sections = [cash_section, aging_section, pnl_section, close_prep, renewals]
+    pack.sections = [
+        cash_section, bank_section, aging_section, pnl_section, close_prep, renewals,
+    ]
 
     # Only persist a snapshot that actually carries data. A run where every section
     # stubbed would otherwise become next week's "most recent prior snapshot" --
