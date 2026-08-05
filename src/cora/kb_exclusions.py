@@ -105,6 +105,28 @@ def is_excluded_folder(folder_id: str) -> bool:
     return bool(folder_id) and folder_id in KB_EXCLUDED_FOLDER_IDS
 
 
+# Weekly finance WORKSHEETS Cora generates for Justin (A5 S2b). These are
+# working documents, not knowledge: a cross-portfolio cash-forecast .md written
+# every Monday would static_md-ingest as HJRG chunks. Those chunks are
+# unreachable from every Slack channel (no channel routes to HJRG) but ARE
+# reachable from founder-scoped surfaces (D-092 MCP, interactive sessions), and
+# accreting near-duplicate finance chunks weekly is KB pollution regardless.
+#
+# Segment-based rather than folder-id-based on purpose: the folder is created by
+# the first run, so there is no id to pin at build time, and this predicate is
+# wired at the STORE chokepoint, which covers every connector including
+# static_md. Add the folder id to KB_EXCLUDED_FOLDER_IDS once it exists, as
+# belt-and-braces for the enumeration-time drive_sweep path.
+_FINANCE_WORKSHEET_SEGMENTS: frozenset[str] = frozenset({"forecast-assist"})
+
+
+def is_finance_worksheet_path(path_or_source_id: str) -> bool:
+    """True if a path sits inside a generated finance-worksheet folder that must
+    never be KB-ingested. Segment-based, case-insensitive, handles ``/`` and ``\\``."""
+    segs = {s.lower() for s in _segments(str(path_or_source_id or ""))}
+    return bool(segs & _FINANCE_WORKSHEET_SEGMENTS)
+
+
 def is_dashboard_store_path(path_or_source_id: str) -> bool:
     """True if a filesystem path, Drive path, or path-shaped source_id sits inside
     a personal / highly-confidential dashboard store (capital-raise, oneamerica,

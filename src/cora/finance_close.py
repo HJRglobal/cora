@@ -572,6 +572,7 @@ class Sources:
     renewals: Callable[[], list[dict[str, Any]] | None] | None = None
     adherence_facts: Callable[[], dict[str, Any] | None] | None = None
     bank_snapshot: Callable[[], dict[str, Any] | None] | None = None
+    cash_dual: Callable[[], list[dict[str, Any]] | None] | None = None
 
     def get_provisioned(self) -> list[str]:
         if self.provisioned_entities:
@@ -662,6 +663,23 @@ class Sources:
         if self.adherence_facts:
             return self.adherence_facts()
         return load_adherence_facts()
+
+    def get_cash_dual(self) -> list[dict[str, Any]] | None:
+        """The NON-COLLAPSING per-week {week, forecast, actual, forecast_overwritten}
+        series, or None when the sheet cannot be read.
+
+        Separate from get_cash_closing because that one returns the collapsed
+        actual-else-forecast figure, from which an original forecast is
+        unrecoverable once a week closes.
+        """
+        if self.cash_dual:
+            return self.cash_dual()
+        try:
+            from .connectors import gsheets_financials  # noqa: PLC0415
+            return gsheets_financials.get_cashflow().ending_cash_dual
+        except Exception as exc:  # noqa: BLE001 -- honest stub beats a dead pack
+            log.warning("finance_close: cash dual series unavailable: %s", exc)
+            return None
 
     def get_bank_snapshot(self) -> dict[str, Any] | None:
         """Daily QBO bank snapshot, or None when it has not run.
@@ -1149,6 +1167,386 @@ def build_bank_section(
     )
     section.lines.append(_BANK_METHOD_FOOTER)
     return section, snap
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1c — Forecast assist (A5 S2b, absorbed L2)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A worksheet Justin types FROM while doing his Monday refresh. Cora never writes
+# the Standing ACTUALS sheet -- stewardship stays his (SOP rev 4; the 2026-06-04
+# row-label fragility doctrine; D-011).
+#
+# THE ACCURACY LEG IS DELIBERATELY MODEST, and that is a finding, not a shortcut.
+# The design assumed a dual forecast/actual series would make "forecast accuracy
+# for the last completed week" computable. It does not: verified live 2026-08-04,
+# the sheet's FORECAST column is OVERWRITTEN with the actual once a week closes --
+# 41 of 42 completed weeks matched to sub-dollar rounding. Computing a variance
+# from those cells would report ~99.99% accuracy forever: precise, plausible, and
+# meaningless. So accuracy comes from the pack's OWN prior snapshots, and says so.
+
+FORECAST_ASSIST_RELDIR = "01-HJR-Global/accounting/forecast-assist"
+
+
+def build_forecast_assist_section(
+    entities: list[str],
+    sources: Sources,
+    *,
+    prior: dict[str, Any] | None = None,
+    today: datetime.date | None = None,
+) -> tuple[Section, dict[str, Any]]:
+    """Next-week cash starting points + an honest accuracy statement."""
+    from .qbo_bank_snapshot import BALANCE_BASIS  # noqa: PLC0415
+
+    section = Section(key="forecast_assist", title=":chart_with_upwards_trend: Forecast assist")
+    snap: dict[str, Any] = {}
+    day = today or _today()
+
+    dual = sources.get_cash_dual()
+    if dual is None:
+        section.available = False
+        section.stub_reason = "the cash sheet could not be read for the forecast series"
+        return section, snap
+
+    usable = [
+        w for w in dual
+        if w.get("actual") is not None and w.get("forecast") is not None
+        and not w.get("forecast_overwritten")
+    ]
+    completed = [w for w in dual if w.get("actual") is not None]
+    overwritten = [w for w in completed if w.get("forecast_overwritten")]
+
+    # ── accuracy, stated honestly ────────────────────────────────────────────
+    if overwritten and not usable:
+        section.lines.append(
+            f"Forecast accuracy: NOT COMPUTABLE from the sheet — its forecast column is "
+            f"overwritten with the actual at week close ({len(overwritten)} of "
+            f"{len(completed)} completed weeks match to the dollar), so a sheet-based "
+            f"variance would read ~100% accurate regardless of what really happened."
+        )
+    elif usable:
+        recent = usable[-1]
+        variance = round(recent["actual"] - recent["forecast"], 2)
+        # The newest week with a COMPARABLE forecast is often not the newest
+        # completed week -- on the live sheet it is six months back, because every
+        # week since had its forecast overwritten. Presenting that as plain
+        # "forecast accuracy" would read as last week's number.
+        weeks_since = 0
+        for week in reversed(completed):
+            if week is recent or week.get("week") == recent.get("week"):
+                break
+            weeks_since += 1
+        staleness = (
+            f" NOTE: this is the most recent week that still HAS a comparable "
+            f"forecast — {weeks_since} completed week(s) since then had theirs "
+            f"overwritten."
+            if weeks_since else ""
+        )
+        section.lines.append(
+            f"Forecast accuracy, week {_scrub_external(str(recent['week']), 20)}: "
+            f"forecast {fmt_money(recent['forecast'])} vs actual "
+            f"{fmt_money(recent['actual'])} — variance {fmt_delta(variance)} "
+            f"({len(usable)} of {len(completed)} completed week(s) retain a "
+            f"comparable forecast).{staleness}"
+        )
+        snap["accuracy"] = {
+            "week": recent["week"], "variance": variance, "weeks_since": weeks_since,
+        }
+    else:
+        section.lines.append(
+            "Forecast accuracy: first run — no accuracy history yet."
+        )
+
+    # Pack-history fallback: week-over-week movement in OUR OWN prior snapshot.
+    if prior and isinstance(prior.get("cash"), dict):
+        section.lines.append(
+            f"Accuracy history source: this pack's prior snapshot "
+            f"({_scrub_external(str(prior.get('generated_at') or 'unknown date'), 20)}) — "
+            f"the only forecast record that is not overwritten."
+        )
+
+    # ── next-week starting points ────────────────────────────────────────────
+    forward = [w for w in dual if w.get("actual") is None and w.get("forecast") is not None]
+    next_week = forward[0] if forward else None
+
+    bank = sources.get_bank_snapshot()
+    realms = (bank or {}).get("realms") or {}
+
+    renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
+    covered = 0
+    if next_week is None:
+        section.lines.append(
+            "Next-week starting point: the sheet carries no forward forecast week."
+        )
+    else:
+        label = _scrub_external(str(next_week["week"]), 20)
+        section.lines.append(
+            f"Next-week starting point — week {label} (sheet forecast "
+            f"{fmt_money(next_week['forecast'])} portfolio-wide):"
+        )
+        for entity in renderable:
+            block = realms.get(entity)
+            if not block or block.get("status") != "ok" or block.get("shell"):
+                continue
+            net = block.get("cash_net_of_cards")
+            if net is None:
+                section.lines.append(
+                    f"• {entity_label(entity)}: books position UNKNOWN — no starting point"
+                )
+                continue
+            covered += 1
+            section.lines.append(
+                f"• {entity_label(entity)}: {fmt_money(net)} on hand now "
+                f"[{BALANCE_BASIS}] — carry into the {label} opening row"
+            )
+            snap[entity] = {"starting_point": net, "week": next_week["week"]}
+
+    section.covered = covered
+    section.expected = len(renderable)
+    section.lines.append(
+        f"_Starting points for {covered} of {section.expected} entity(ies). "
+        f"Cora never writes the cash sheet — this is a worksheet to type from._"
+    )
+    return section, snap
+
+
+def render_forecast_worksheet(section: Section, today: datetime.date | None = None) -> str:
+    """The durable markdown worksheet. Same computed lines, no recomputation."""
+    day = today or _today()
+    return "\n".join([
+        f"# Forecast assist — {day.isoformat()}",
+        "",
+        "_Generated by Cora. Deterministic; every figure is a direct source read._",
+        "_Cora does NOT write the Standing ACTUALS sheet — type from this._",
+        "",
+        *(section.lines if section.available
+          else [f"Section unavailable — {section.stub_reason}"]),
+        "",
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1d — Intercompany discovery / check (A5 S3, absorbed L2)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# THE LOAD-BEARING CORRECTION. The existing _named_section_total / _summary_cells
+# read Section-SUMMARY rows only. A scan for intercompany ACCOUNTS built on them
+# returns zero candidates on every realm -- structurally blind, and indistinguishable
+# from an honest all-clear, which no coverage counter would catch (it would report
+# "scanned 10 of 10 realms, found nothing"). So this adds a real Data-row walker,
+# and its test fixture uses a realistic nested Section->Data shape.
+
+INTERCOMPANY_MAP_PATH = _REPO_ROOT / "data" / "maps" / "qbo-intercompany-accounts.yaml"
+
+#: Patterns that mark an account as intercompany-ish. Deliberately broad at
+#: discovery time -- a false positive costs Justin one glance, a false negative
+#: hides a real imbalance.
+_INTERCOMPANY_PATTERNS = ("intercompany", "inter-company", "due to", "due from", "i/c")
+
+#: Realms whose ACCOUNT NAMES must never free-render on a finance surface.
+#: is_any_phi cannot catch a bare person name in an account title ("Due from Jane
+#: Smith" trips none of its predicates), and #hjrg-finance / #founder-finance /
+#: Justin's DM are not LEX-custodian surfaces.
+_NAME_OPAQUE_REALMS: frozenset[str] = frozenset({"LEX"})
+
+INTERCOMPANY_DELTA_ABS = 500.0
+
+
+def intercompany_delta_threshold() -> float:
+    raw = os.environ.get("FINANCE_INTERCOMPANY_DELTA_ABS", "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return INTERCOMPANY_DELTA_ABS
+    return value if value > 0 else INTERCOMPANY_DELTA_ABS
+
+
+def iter_account_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every DATA row in a QBO report, as ``{"name", "balance", "id"}``.
+
+    QBO renders a BalanceSheet as nested Sections; individual GL accounts are
+    ``type == "Data"`` leaves whose first ColData cell is the account name and
+    whose LAST money-bearing cell is the balance. Confirmed against live F3E and
+    BDM BalanceSheets 2026-08-04, including accounts nested one level under a
+    parent account's own sub-Section.
+    """
+    from .tools.qbo_client import _parse_money  # noqa: PLC0415
+
+    out: list[dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "Data":
+            cells = node.get("ColData") or []
+            if cells:
+                name = str((cells[0] or {}).get("value") or "").strip()
+                balance = None
+                for cell in reversed(cells[1:]):
+                    balance = _parse_money(str((cell or {}).get("value") or ""))
+                    if balance is not None:
+                        break
+                if name:
+                    out.append({
+                        "name": name,
+                        "balance": balance,
+                        "id": str((cells[0] or {}).get("id") or ""),
+                    })
+        # Sections carry both Header/Summary and nested Rows; recurse regardless
+        # of type so a Data row under a parent-account sub-Section is not missed.
+        walk((node.get("Rows") or {}).get("Row") or [])
+
+    walk((report.get("Rows") or {}).get("Row") or [])
+    return out
+
+
+def is_intercompany_account(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(p in lowered for p in _INTERCOMPANY_PATTERNS)
+
+
+def load_intercompany_map(path: Path | None = None) -> dict[str, Any]:
+    """Confirmed intercompany pairs. FAIL-SOFT: unreadable means discovery-only."""
+    import yaml  # noqa: PLC0415
+
+    target = path or INTERCOMPANY_MAP_PATH
+    try:
+        raw = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        log.warning("finance_close: intercompany map unreadable (%s)", exc)
+        return {"pairs": []}
+    if not isinstance(raw, dict):
+        return {"pairs": []}
+    pairs = raw.get("pairs")
+    return {"pairs": [p for p in pairs if isinstance(p, dict)] if isinstance(pairs, list) else []}
+
+
+def _candidate_label(entity: str, index: int, name: str) -> str:
+    """How a discovered account is allowed to appear on a finance surface.
+
+    LEX realm names go out as opaque placeholders; the real names reach Harrison's
+    DM only (the script's separate delivery), and enter the YAML seed as ids plus
+    Harrison-approved display labels.
+    """
+    if entity in _NAME_OPAQUE_REALMS:
+        return f"{entity_label(entity)} candidate account #{index}"
+    return _scrub_external(name, 60)
+
+
+def build_intercompany_section(
+    entities: list[str],
+    sources: Sources,
+    *,
+    today: datetime.date | None = None,
+) -> tuple[Section, dict[str, Any]]:
+    """Discovery-first intercompany scan. Never blocks on Justin's confirmations."""
+    section = Section(key="intercompany", title=":left_right_arrow: Intercompany")
+    snap: dict[str, Any] = {}
+    day = today or _today()
+    as_of = day.isoformat()
+
+    renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
+    found: dict[str, list[dict[str, Any]]] = {}
+    covered = 0
+
+    for entity in renderable:
+        try:
+            report = sources.get_balance_sheet(entity, as_of)
+        except Exception as exc:  # noqa: BLE001 -- per-realm fail-soft
+            log.warning("finance_close: intercompany scan failed for %s: %s", entity, exc)
+            continue
+        covered += 1
+        rows = [r for r in iter_account_rows(report) if is_intercompany_account(r["name"])]
+        if rows:
+            found[entity] = rows
+
+    if covered == 0:
+        section.available = False
+        section.stub_reason = "no realm's balance sheet could be read"
+        return section, snap
+
+    confirmed = load_intercompany_map().get("pairs") or []
+    active = [p for p in confirmed if p.get("confirmed") is True]
+
+    total = sum(len(r) for r in found.values())
+    if not found:
+        section.lines.append(
+            f"No intercompany-named accounts found across {covered} realm(s)."
+        )
+    else:
+        section.lines.append(
+            f"Discovery: {total} candidate account(s) across {len(found)} realm(s)"
+            + ("" if active else " — pairing awaits Justin's confirmation.")
+        )
+        for entity in sorted(found):
+            for index, row in enumerate(found[entity], start=1):
+                label = _candidate_label(entity, index, row["name"])
+                section.lines.append(
+                    f"• {entity_label(entity)}: {label} — balance "
+                    f"{fmt_money(row['balance'])} [UNCONFIRMED pairing]"
+                )
+        snap["candidates"] = {e: len(r) for e, r in found.items()}
+
+    # ── confirmed-pair mismatch check ────────────────────────────────────────
+    if active:
+        threshold = intercompany_delta_threshold()
+        for pair in active:
+            left, right = pair.get("left") or {}, pair.get("right") or {}
+            lv = _pair_balance(found, left)
+            rv = _pair_balance(found, right)
+            name = _scrub_external(str(pair.get("name") or "pair"), 40)
+            if lv is None or rv is None:
+                section.lines.append(
+                    f"• {name}: UNKNOWN — one side's account was not found this run"
+                )
+                continue
+            # Sign convention is recorded PER PAIR, never inferred from names: an
+            # asset-side "Due from" and a liability-side "Due to" may be stored
+            # with the same or opposite signs depending on how the books were set up.
+            delta = round(lv + rv, 2) if pair.get("opposite_signs") else round(lv - rv, 2)
+            if abs(delta) >= threshold:
+                section.flags += 1
+                section.lines.append(
+                    f"• :triangular_flag_on_post: {name}: out of balance by "
+                    f"{fmt_delta(delta)} (threshold {fmt_money(threshold)})"
+                )
+            else:
+                section.lines.append(f"• {name}: in balance ({fmt_delta(delta)})")
+    elif found:
+        section.lines.append(
+            "_No confirmed pairs yet — this is a discovery list, not a reconciliation._"
+        )
+
+    section.covered = covered
+    section.expected = len(renderable)
+    section.lines.append(f"_Scanned {covered} of {section.expected} realm(s)._")
+    if any(e in _NAME_OPAQUE_REALMS for e in found):
+        section.lines.append(
+            "_Account names for one or more realms are withheld here and sent to "
+            "Harrison directly._"
+        )
+    return section, snap
+
+
+def _pair_balance(found: dict[str, list[dict[str, Any]]], side: dict[str, Any]) -> float | None:
+    """Balance for one confirmed side, matched on ACCOUNT ID first (stable) and
+    falling back to an exact name match."""
+    rows = found.get(str(side.get("entity") or ""), [])
+    account_id = str(side.get("account_id") or "")
+    if account_id:
+        for row in rows:
+            if row.get("id") == account_id:
+                return row.get("balance")
+    name = str(side.get("account_name") or "").strip().lower()
+    if name:
+        for row in rows:
+            if row["name"].strip().lower() == name:
+                return row.get("balance")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1683,6 +2081,8 @@ def build_pack(
         for key, title in (
             ("cash", ":bank: Cash — cash sheet vs books"),
             ("qbo_bank", ":bank: QBO bank & books freshness"),
+            ("forecast_assist", ":chart_with_upwards_trend: Forecast assist"),
+            ("intercompany", ":left_right_arrow: Intercompany"),
             ("aging", ":inbox_tray: AR / AP aging — week over week"),
             ("pnl", ":bar_chart: P&L sanity — month over month"),
         ):
@@ -1726,6 +2126,14 @@ def build_pack(
         "qbo_bank", ":bank: QBO bank & books freshness",
         lambda: build_bank_section(provisioned, src, today=day),
     )
+    forecast_section = guarded(
+        "forecast_assist", ":chart_with_upwards_trend: Forecast assist",
+        lambda: build_forecast_assist_section(provisioned, src, prior=prior, today=day),
+    )
+    intercompany_section = guarded(
+        "intercompany", ":left_right_arrow: Intercompany",
+        lambda: build_intercompany_section(provisioned, src, today=day),
+    )
     aging_section = guarded(
         "aging", ":inbox_tray: AR / AP aging — week over week",
         lambda: build_aging_section(provisioned, src, prior, today=day),
@@ -1744,7 +2152,8 @@ def build_pack(
     )
 
     pack.sections = [
-        cash_section, bank_section, aging_section, pnl_section, close_prep, renewals,
+        cash_section, bank_section, forecast_section, intercompany_section,
+        aging_section, pnl_section, close_prep, renewals,
     ]
 
     # Only persist a snapshot that actually carries data. A run where every section

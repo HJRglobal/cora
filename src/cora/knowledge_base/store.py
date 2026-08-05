@@ -29,7 +29,12 @@ from .lex_sub_entity import (
     restricted_lex_phi_content_drop,
 )
 from ..finance_doc_classifier import is_financial_document
-from ..kb_exclusions import is_copa_bhrf_path, is_copa_meeting_title, is_dashboard_store_path
+from ..kb_exclusions import (
+    is_copa_bhrf_path,
+    is_copa_meeting_title,
+    is_dashboard_store_path,
+    is_finance_worksheet_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -272,6 +277,10 @@ class KnowledgeBase:
                 or is_dashboard_store_path(meta_path)
                 or is_copa_bhrf_path(doc.source_id)
                 or is_copa_bhrf_path(meta_path)
+                # Generated weekly finance worksheets (A5 S2b) -- working
+                # documents, not knowledge. See is_finance_worksheet_path.
+                or is_finance_worksheet_path(doc.source_id)
+                or is_finance_worksheet_path(meta_path)
                 # NDA'd COPA meeting EXPORTS live OUTSIDE copa-bhrf (under
                 # _shared/meetings) and carry no useful path, so key on TITLE -- but
                 # ONLY for the Drive meeting-export sources, so this never drops an

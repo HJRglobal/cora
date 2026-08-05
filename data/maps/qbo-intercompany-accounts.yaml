@@ -1,0 +1,43 @@
+# data/maps/qbo-intercompany-accounts.yaml -- confirmed intercompany account PAIRS
+# across QBO realms (A5 S3).
+#
+# DISCOVERY-FIRST BY DESIGN. The close pack scans every realm's balance sheet for
+# intercompany-named accounts every Monday and lists what it finds as UNCONFIRMED
+# candidates. Nothing in this file is required for that. Pairs are added here only
+# once Justin confirms which account faces which -- and only then does the pack
+# start CHECKING them against each other.
+#
+# WHY PAIRING CANNOT BE INFERRED: "HJRG Due from F3E" and "F3E Due to HJRG" are the
+# two sides of one balance, but whether they are stored with the SAME sign or
+# OPPOSITE signs depends on how each realm's chart of accounts was set up (asset
+# side vs liability side). Guessing produces a confidently-wrong "out of balance by
+# $2x" every week. So `opposite_signs` is recorded EXPLICITLY per pair.
+#
+# LEX NAMES: account names from the LEX realm are NEVER rendered on a finance
+# surface -- an account title can carry a bare person name ("Due from Jane Smith")
+# that the PHI screen cannot detect, and #hjrg-finance / #founder-finance / Justin's
+# DM are not LEX-custodian surfaces. LEX candidates render as opaque placeholders;
+# the real names go to Harrison directly, and enter this file as an account_id plus
+# a Harrison-approved display label.
+#
+# MATCHING: `account_id` is the stable key (QBO account ids do not change when an
+# account is renamed). `account_name` is a fallback and a human aid.
+#
+# Threshold: |delta| >= $500 flags, tunable via FINANCE_INTERCOMPANY_DELTA_ABS.
+
+# Seeded EMPTY on purpose -- placeholders would render as confident pairings
+# (D-118). Add entries below as Justin confirms them.
+#
+# Shape:
+#   pairs:
+#     - name: "HJRG <-> F3E"
+#       confirmed: true            # false / absent -> discovery only, never checked
+#       opposite_signs: true       # MUST be set deliberately; see above
+#       left:  {entity: HJRG, account_id: "123", account_name: "Due from F3 Energy"}
+#       right: {entity: F3E,  account_id: "456", account_name: "Due to HJR Global"}
+#
+# Live discovery 2026-08-04 already surfaced candidates worth pairing, e.g.
+# "Intercompany Clearing" in F3E and both "Intercompany Cash Payment" and
+# "Intercompany Clearing" in HJRP. Those are NOT pre-filled here: an unconfirmed
+# guess that renders as a checked pair is exactly what this file exists to prevent.
+pairs: []

@@ -154,6 +154,23 @@ class CashflowSummary:
     # Each item: {"week": str, "ending_cash": Optional[float], "is_actual": bool}.
     # Empty when the sheet has no recognizable Ending-Cash row.
     ending_cash_series: list[dict] = field(default_factory=list)
+    # NON-COLLAPSING companion to the above (A5 S2b). Each item:
+    # {"week", "forecast", "actual", "forecast_overwritten"}. See
+    # _forecast_overwritten for why that last flag is load-bearing.
+    ending_cash_dual: list[dict] = field(default_factory=list)
+
+    def completed_weeks_with_usable_forecast(self) -> list[dict]:
+        """Dual-series weeks where a forecast-vs-actual comparison is MEANINGFUL.
+
+        On this sheet that is usually the empty list -- see _forecast_overwritten.
+        Callers must handle empty by saying so, never by inventing a variance.
+        """
+        return [
+            w for w in self.ending_cash_dual
+            if w.get("actual") is not None
+            and w.get("forecast") is not None
+            and not w.get("forecast_overwritten")
+        ]
 
     def entity_by_code(self, code: str) -> Optional[EntityRow]:
         """Look up a single entity by canonical code (case-insensitive)."""
@@ -469,6 +486,30 @@ def _is_date_like(val: str) -> bool:
     )
 
 
+# Largest forecast-vs-actual gap still treated as "the forecast was overwritten
+# with the actual" rather than a real variance.
+#
+# WHY THIS EXISTS (verified live 2026-08-04, A5 Section 0 item 5): on the Standing
+# ACTUALS sheet the FORECAST column is overwritten in place once a week closes. Of
+# 43 completed weeks, 42 had FORECAST equal to ACTUAL to sub-dollar rounding
+# (1,626,446.70 vs 1,626,447.00; 875,723.71 vs 875,724.00), and exactly one week
+# (2-6) retained a genuine gap of $10,347.
+#
+# Without this check a "forecast accuracy" figure computed from the dual series
+# would confidently report ~99.99% accuracy every single week -- a plausible,
+# precise, and completely meaningless number. $1.00 cleanly separates the two
+# populations: every observed rounding artifact was under a dollar and the one
+# real variance was four orders of magnitude larger.
+_FORECAST_OVERWRITE_EPSILON = 1.00
+
+
+def _forecast_overwritten(forecast: Optional[float], actual: Optional[float]) -> bool:
+    """True when a week's forecast cell no longer holds a genuine forecast."""
+    if forecast is None or actual is None:
+        return False
+    return abs(actual - forecast) <= _FORECAST_OVERWRITE_EPSILON
+
+
 def _parse_week_date(week_label: str, today: Optional[date] = None) -> Optional[date]:
     """Parse the date out of a week label ("Week of 5-29", "Week of 5/29/2026").
 
@@ -758,6 +799,24 @@ def _parse_cashflow_csv(
                 val = _get_col(ending_cash_row, forecast_cols)
             ending_cash_series.append({"week": wk, "ending_cash": val, "is_actual": is_actual})
 
+    # ── Non-collapsing dual series (A5 S2b) ──────────────────────────────────
+    # ending_cash_series above keeps ONE number per week (actual-if-present, else
+    # forecast), so once a week closes its original forecast is unrecoverable from
+    # it. This series keeps BOTH columns so forecast-vs-actual is expressible.
+    ending_cash_dual: list[dict] = []
+    if ending_cash_row is not None:
+        for wk in _ordered_weeks(col_map):
+            actual_cols = [i for i, (w, ct) in enumerate(col_map) if w == wk and ct == "ACTUAL"]
+            forecast_cols = [i for i, (w, ct) in enumerate(col_map) if w == wk and ct == "FORECAST"]
+            actual = _get_col(ending_cash_row, actual_cols)
+            forecast = _get_col(ending_cash_row, forecast_cols)
+            ending_cash_dual.append({
+                "week": wk,
+                "forecast": forecast,
+                "actual": actual,
+                "forecast_overwritten": _forecast_overwritten(forecast, actual),
+            })
+
     return CashflowSummary(
         week_label=week_label,
         as_of_date=modified_date,
@@ -769,6 +828,7 @@ def _parse_cashflow_csv(
         closing_balance=closing_balance,
         parse_warnings=warnings,
         ending_cash_series=ending_cash_series,
+        ending_cash_dual=ending_cash_dual,
     )
 
 
