@@ -492,6 +492,210 @@ def format_ap_aging_for_llm(report: dict[str, Any], entity: str) -> str:
     return "\n".join(lines)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Account-entity reads (A5 S1) — live per-account balances + books freshness
+#
+# These use the QUERY API, a different surface from the Reports API the rest of
+# this module reads. That distinction is load-bearing and is NOT a rounding
+# detail — see the CC_SIGN and REGISTER_VS_REPORT notes below, both verified
+# live across all 11 realms on 2026-08-04.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Verified live 2026-08-04: `AccountType in ('Bank','Credit Card')` parses;
+# the chained-OR form `AccountType = 'Bank' or AccountType = 'Credit Card'`
+# is REJECTED with HTTP 400 "Encountered <OR>". QBO's query language has no OR.
+_ACCOUNT_TYPES = ("Bank", "Credit Card")
+
+# `Active = true` is load-bearing, not hygiene: an unfiltered Account query
+# returns closed/inactive accounts too, and any residual nonzero balance on one
+# would silently inflate every total built from this list.
+_ACCOUNT_QUERY = (
+    "select Id, Name, AccountType, AccountSubType, CurrentBalance, CurrencyRef "
+    "from Account where AccountType in ('Bank','Credit Card') and Active = true"
+)
+
+_ACCOUNT_PAGE_SIZE = 200
+
+# Transaction types whose posting advances the BANK side of the books. Verified
+# available live on every provisioned realm 2026-08-04.
+#
+# BillPayment is not optional: it is the standard pay-bills workflow, and a realm
+# that pays bills that way (HJRG, HJRP, LEX, all four OSN store realms) would read
+# as permanently stale without it.
+_BANK_SIDE_TXN_TYPES = ("Purchase", "Deposit", "Transfer", "BillPayment")
+
+# Payments are included only when they land DIRECTLY in a bank account. Verified
+# live on F3E 2026-08-04: payments deposit either to a Bank account (id 9,
+# "Tradition F3 8950") or to Undeposited Funds (id 215, an Other Current Asset) —
+# the latter has NOT touched the bank yet, so counting it would report false
+# freshness. `DepositToAccountRef` is NOT a queryable property (HTTP 400
+# "property 'DepositToAccountRef' is not queryable"), so the filter is applied
+# client-side over the newest few payments.
+_PAYMENT_SCAN_LIMIT = 25
+
+
+def _query(entity: str, query: str) -> dict[str, Any]:
+    """Run one QBO query and return the QueryResponse object."""
+    data = _request(
+        entity,
+        "/v3/company/{realm_id}/query",
+        params={"query": query, "minorversion": "65"},
+    )
+    return data.get("QueryResponse") or {}
+
+
+def query_accounts(entity: str) -> list[dict[str, Any]]:
+    """Return this realm's ACTIVE Bank + Credit Card accounts, fully paginated.
+
+    Each item: ``{"id", "name", "type", "subtype", "balance", "currency"}``.
+    ``balance`` is ``Account.CurrentBalance`` — the account REGISTER balance —
+    and is None when QBO omits or returns an unparseable value (never coerced
+    to 0.0, which would read as a real zero balance).
+
+    Paginated deliberately: a silently truncated account list understates every
+    total built from it, which is the D-117 "looks clean, wasn't complete" class.
+    """
+    out: list[dict[str, Any]] = []
+    start = 1
+    while True:
+        page = _query(
+            entity,
+            f"{_ACCOUNT_QUERY} STARTPOSITION {start} MAXRESULTS {_ACCOUNT_PAGE_SIZE}",
+        )
+        rows = page.get("Account") or []
+        for row in rows:
+            raw_balance = row.get("CurrentBalance")
+            out.append({
+                "id": str(row.get("Id") or ""),
+                "name": str(row.get("Name") or ""),
+                "type": str(row.get("AccountType") or ""),
+                "subtype": str(row.get("AccountSubType") or ""),
+                "balance": _coerce_balance(raw_balance),
+                "currency": ((row.get("CurrencyRef") or {}).get("value") or ""),
+            })
+        if len(rows) < _ACCOUNT_PAGE_SIZE:
+            break
+        start += _ACCOUNT_PAGE_SIZE
+    return out
+
+
+def _coerce_balance(raw: Any) -> float | None:
+    """QBO returns CurrentBalance as a JSON number, but be defensive: an absent or
+    unparseable value must stay None so callers can render UNKNOWN, never 0."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return _parse_money(str(raw))
+
+
+def summarize_accounts(accounts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split accounts into bank/credit-card totals plus cash-net-of-cards.
+
+    CC_SIGN (verified live across all 11 realms, 2026-08-04 — the named build
+    gate from the design):
+        Query-API ``Account.CurrentBalance`` reports a credit-card LIABILITY as a
+        NEGATIVE number, while the BalanceSheet report's Credit Cards section
+        reports the same liability POSITIVE. The cleanest proof was OSNVV, where
+        the two surfaces returned the identical magnitude with opposite signs:
+        query -3,945.64 vs report +3,945.64 (F3E -1,300.54 / +627.78 and
+        HJRG -3,463.60 / +15,140.10 agree in direction).
+
+        So cash net of cards is ``bank_total + cc_total`` here — adding a negative
+        SUBTRACTS the card debt. Using the report-side convention's
+        ``bank_total - cc_total`` on these values would ADD card debt to cash,
+        overstating available cash by twice the balance.
+
+    Totals skip accounts whose balance is None, and ``*_unknown`` counts say how
+    many were skipped so a caller can refuse to present a total as complete.
+    """
+    bank = [a for a in accounts if a.get("type") == "Bank"]
+    cards = [a for a in accounts if a.get("type") == "Credit Card"]
+
+    def _total(rows: list[dict[str, Any]]) -> tuple[float, int]:
+        known = [r["balance"] for r in rows if r.get("balance") is not None]
+        return (round(sum(known), 2), len(rows) - len(known))
+
+    bank_total, bank_unknown = _total(bank)
+    cc_total, cc_unknown = _total(cards)
+
+    return {
+        "bank_count": len(bank),
+        "cc_count": len(cards),
+        "bank_total": bank_total,
+        "cc_total": cc_total,
+        # See CC_SIGN above: '+' is correct because cc_total is already negative.
+        "cash_net_of_cards": round(bank_total + cc_total, 2),
+        "bank_unknown": bank_unknown,
+        "cc_unknown": cc_unknown,
+        "balances_complete": (bank_unknown == 0 and cc_unknown == 0),
+    }
+
+
+def newest_bank_side_txn_date(
+    entity: str,
+    bank_account_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Newest posted BANK-SIDE transaction date for a realm.
+
+    Returns ``{"date", "per_type", "types_covered", "types_expected", "errors"}``.
+
+    This measures *what has posted*, not *whether the books are current* — QBO's
+    public API exposes neither bank-feed connection status nor pending-review feed
+    items. Close work done purely as journal entries does not advance this date,
+    so consumers must render it as "newest posted bank-side txn", never as
+    "books are stale", and flag only past a generous threshold.
+
+    Fail-soft per type: one type erroring degrades coverage (reported through
+    types_covered/types_expected) rather than losing the whole answer.
+    """
+    per_type: dict[str, str | None] = {}
+    errors: dict[str, str] = {}
+
+    for txn_type in _BANK_SIDE_TXN_TYPES:
+        try:
+            page = _query(
+                entity,
+                f"select Id, TxnDate from {txn_type} orderby TxnDate desc MAXRESULTS 1",
+            )
+            rows = page.get(txn_type) or []
+            per_type[txn_type] = (rows[0].get("TxnDate") if rows else None)
+        except QboClientError as exc:
+            log.warning("newest_bank_side_txn_date: %s failed for %s: %s", txn_type, entity, exc)
+            errors[txn_type] = str(exc)[:200]
+            per_type[txn_type] = None
+
+    # Payment leg — only those deposited straight into a Bank account.
+    if bank_account_ids:
+        try:
+            page = _query(
+                entity,
+                "select Id, TxnDate, DepositToAccountRef from Payment "
+                f"orderby TxnDate desc MAXRESULTS {_PAYMENT_SCAN_LIMIT}",
+            )
+            newest = None
+            for row in page.get("Payment") or []:
+                ref = str((row.get("DepositToAccountRef") or {}).get("value") or "")
+                if ref and ref in bank_account_ids:
+                    newest = row.get("TxnDate")
+                    break  # already ordered newest-first
+            per_type["Payment"] = newest
+        except QboClientError as exc:
+            log.warning("newest_bank_side_txn_date: Payment failed for %s: %s", entity, exc)
+            errors["Payment"] = str(exc)[:200]
+            per_type["Payment"] = None
+
+    dates = [d for d in per_type.values() if d]
+    expected = len(_BANK_SIDE_TXN_TYPES) + (1 if bank_account_ids else 0)
+    return {
+        "date": max(dates) if dates else None,   # ISO YYYY-MM-DD sorts lexically
+        "per_type": per_type,
+        "types_covered": expected - len(errors),
+        "types_expected": expected,
+        "errors": errors,
+    }
+
+
 def format_recent_transactions_for_llm(payload: dict[str, Any], entity: str, days: int) -> str:
     """Render a 'recent activity' digest with counts. Source-opaque (B2 -- see format_pnl)."""
     # QueryResponse keys are the singular capitalized accounting entity names.

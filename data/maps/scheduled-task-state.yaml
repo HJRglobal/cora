@@ -81,3 +81,8 @@ enabled:
   # #founder-finance founder cut. Added 2026-08-04 (G7). NOTE: #hjr-finance
   # C0BAK65N4TA is ARCHIVED -- do not repoint this job back to it.
   - cowork-cora-finance-close-pack
+  # Daily 07:05 AZ QBO bank snapshot -> data/state/qbo-bank-latest.json + the
+  # 01-HJR-Global/accounting/live-snapshots Drive mirror; read by the 09:00 close
+  # pack. Added 2026-08-04 (A5 S1). Exit 1 = a realm errored (snapshot still
+  # written, that realm UNKNOWN); exit 2 = total failure, prior snapshot kept.
+  - cowork-cora-bank-snapshot

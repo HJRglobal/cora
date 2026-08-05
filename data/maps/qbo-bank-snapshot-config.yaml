@@ -1,0 +1,36 @@
+# data/maps/qbo-bank-snapshot-config.yaml -- configuration for the daily QBO bank
+# snapshot (scripts/run_qbo_bank_snapshot.py, A5 S1).
+#
+# WHY THIS FILE EXISTS: summing per-realm balances into a portfolio total is only
+# valid if no realm ROLLS UP another realm's cash -- otherwise the total
+# double-counts. That is a fact about the books, not about the code, so it lives
+# in data where Justin/Harrison can change it without a code session.
+#
+# FAIL-CLOSED: a missing or unparseable file means the portfolio total is
+# WITHHELD (the per-realm rows still render). Absence must never be read as
+# "safe to sum".
+
+portfolio_total:
+  # Flip to false to withhold the portfolio total (per-realm rows are unaffected).
+  enabled: true
+
+  # Verified by data 2026-08-04: realm OSN holds exactly one bank account at
+  # $0.00 and no credit cards -- it is a cash-less shell, so summing the realms
+  # does NOT double-count the four OSN store realms (OSNGW/OSNGM/OSNGF/OSNVV).
+  # Justin's formal confirmation is a formality; if he ever contradicts the data,
+  # set this to false and the total withholds again.
+  roll_up_verified: true
+
+realms:
+  OSN:
+    # A shell realm is rendered as a FOOTNOTE, not a balance row.
+    shell: true
+    note: >-
+      Cash-less holding shell -- the four OSN store realms (OSNGW / OSNGM /
+      OSNGF / OSNVV) carry the actual store cash. Verified 2026-08-04:
+      1 bank account, $0.00, no credit cards.
+
+# SAFETY INVARIANT enforced in code, not here: if a realm marked `shell: true` is
+# ever observed carrying a NONZERO balance, the shell premise has broken and the
+# portfolio total withholds automatically -- because at that point summing may
+# double-count. See qbo_bank_snapshot._portfolio_block.
