@@ -261,6 +261,33 @@ def _inventory_line() -> str:
     return f"- *Inventory:* {len(low)} low/critical -- {named}{suffix}"
 
 
+def _cross_channel_inventory_line() -> str:
+    """Where the stock physically sits, per SALES CHANNEL (A5 Part 2).
+
+    Complements the low-stock line above, which is the DTC alerting signal. Same
+    label discipline as the rest of this brief: channel names are allowed, source
+    and tool names are not. Fail-soft -- a dead store is a stub, never a zero.
+
+    NOTE: this task is currently DISABLED on the host (2026-07-07: the F3E ecom
+    brief was folded into the F3E daily synthesis to avoid double-posting). The
+    equivalent line is wired into channel_synthesis, which is what actually fires
+    daily; this stays correct so re-enabling the brief needs no follow-up edit.
+    """
+    stub = "- *Cross-channel inventory:* not available"
+    try:
+        from cora import inventory_state as inv
+        merged = inv.merge()
+        if not merged.rows:
+            return stub
+        # render_channel_summary returns "- Cross-channel inventory: <body>";
+        # take the body and re-render it in this brief's bold-label style.
+        _, _, body = inv.render_channel_summary(merged).partition(": ")
+        return f"- *Cross-channel inventory:* {body}" if body else stub
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cross-channel inventory unavailable: %s", exc)
+        return stub
+
+
 def _ops_lines(today: date) -> list[str]:
     try:
         tasks = asana_client.get_project_tasks(RUN2_PROJECT_GID, max_tasks=100)
@@ -324,6 +351,8 @@ def build_brief(today: date | None = None) -> str:
     lines.append(_safe(_subs_line, "- *Subscriptions:* not available", today))
     lines.append(_safe(_retail_line, "- *Retail pipeline:* not available"))
     lines.append(_safe(_inventory_line, "- *Inventory:* not available"))
+    lines.append(_safe(_cross_channel_inventory_line,
+                       "- *Cross-channel inventory:* not available"))
     lines.extend(_safe_lines(_ops_lines, ["- *Production (Run-2):* not available"], today))
     lines.append("")
     lines.append("_Cash -> #f3-finance_")

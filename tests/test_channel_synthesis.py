@@ -753,7 +753,11 @@ class TestEcomFold:
         monkeypatch.setattr(asana, "get_project_tasks", boom)
         out = cs.gather_f3e_ecom(today=date(2026, 7, 7))
         assert out["ok"] is True
-        assert len(out["lines"]) == 5
+        # 6 since A5 Part 2 added the cross-channel inventory line.
+        assert len(out["lines"]) == 6
+        # It must fail soft like the rest -- and say UNREAD, never zero.
+        cross = next(ln for ln in out["lines"] if "Cross-channel inventory" in ln)
+        assert "not zero" in cross or "not available" in cross
         assert any("not available" in ln or "not connected" in ln for ln in out["lines"])
 
 

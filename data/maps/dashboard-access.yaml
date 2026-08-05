@@ -86,6 +86,30 @@ dashboards:
     store: {type: drive_json_newest_by_title, folder: "1ySgHEVXcUN3yXZ-jv64fglq5J8ONGnX5", title: "f3-cultural-radar-data.json"}
     tools: [f3e_cultural_radar]
 
+  # Cross-channel F3E inventory state (A5 Part 2, 2026-08-05). ENTITY (F3E +
+  # founder). ONE FILE PER WRITER -- single-writer-per-file kills clobber races by
+  # construction (D-102), and the merge layer treats the two Cowork-written files
+  # as UNTRUSTED input (parse failure -> UNKNOWN + .last-good fallback).
+  #
+  # Read via the local G: mount through drive_io (the same path the writers use),
+  # not the Drive API -- there are no stable file ids to pin, and drive_io already
+  # timeout-bounds every mount read so a G: blip degrades instead of hanging.
+  f3e-channel-inventory:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [founder-operations]
+    allow_entities: [F3E, FNDR, HJRG]
+    store:
+      type: drive_json
+      read_via: drive_io_mount
+      folder_relpath: "02-F3-Energy/inventory-state"
+      files:
+        shopify: f3e-inventory-shopify.json      # writer: Cora run_inventory_state_sync.py
+        channels: f3e-inventory-channels.json    # writer: Cowork f3e-channel-inventory-sweep
+        manual: f3e-inventory-manual.json        # writer: Cowork TikTok digest (Airtable)
+    tools: [f3e_channel_inventory]
+
   # RESERVED (registration + sensitivity only). claude-cost-review is a STATIC
   # snapshot baked into the artifact HTML -- there is no live backing store to read,
   # so no reader tool is wired. Registered here so the drift check treats it as

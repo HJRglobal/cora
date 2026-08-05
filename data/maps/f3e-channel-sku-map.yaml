@@ -1,0 +1,102 @@
+# data/maps/f3e-channel-sku-map.yaml -- canonical F3E beverage SKU <-> per-channel
+# identifiers, for the cross-channel inventory merge (A5 Part 2).
+#
+# THE CANONICAL KEY IS THE SHOPIFY SKU. Every channel row hangs off it, because
+# that is the only identifier that exists in all four systems today (the Walmart
+# bulk feed was itself compiled from live Shopify SKUs and matches on SKU/UPC).
+#
+# `confirmed: true|false` per channel block is load-bearing (D-118): an
+# UNCONFIRMED identifier renders as provisional wherever it is shown, never as a
+# confident fact. A channel item that has NO row here renders UNMAPPED -- it is
+# never silently dropped, because a dropped SKU reads as "we hold none".
+#
+# VERIFICATION STATE (2026-08-04/05, at build):
+#   shopify  -- VERIFIED LIVE. All 15 beverage SKUs read back from the Shopify
+#               Admin API at the Nimbl location.
+#   amazon   -- CONFIRMED from canon, three independent corroborating documents
+#               (pure-variation-family-feed-INSTRUCTIONS, amazon-pure-listing-
+#               optimization-playbook, pure-aplus-content-build-spec). Not
+#               re-verified in Seller Central: the Amazon lane is manual-only as
+#               of 2026-08-02.
+#   tiktok   -- CONFIRMED from canon (memory/decisions.md, 2026-07-13 FBT incident
+#               resolution). Those goods IDs were each read inside the
+#               authenticated FBT console while resolving 10 barcode incidents,
+#               and cross-checked against FBT goods reference codes.
+#   walmart  -- UNCONFIRMED. The bulk feed matches on SKU, so the Walmart seller
+#               SKU is believed identical to the Shopify SKU, but Walmart Seller
+#               Center login has been dead since ~2026-07-27 so nothing could be
+#               read back. WFS was also 0 items / 0 inbound at the 2026-07-06
+#               audit -- there may be no WFS stock to report at all yet.
+#
+# Energy and Mood carry no Amazon/TikTok identifiers on purpose: only the 5 Pure
+# SKUs are listed on those channels today. Rows get added at the Run-2 relisting.
+
+channels:
+  # Display labels for rendered output. These are sales-CHANNEL names, which are
+  # operationally necessary and allowed on Slack surfaces. Data-SOURCE and tool
+  # names (Shopify, Seller Central/Center, Polar) are NOT -- see the label
+  # discipline test in tests/test_inventory_state.py.
+  office:      "Office / HQ"
+  dtc_3pl:     "DTC 3PL"
+  unis:        "UNIS (Cotton)"
+  tiktok_fbt:  "TikTok FBT"
+  amazon_fba:  "Amazon FBA"
+  walmart_wfs: "Walmart WFS"
+  manual:      "Manual count"
+
+skus:
+  # ── F3 PURE (the only line listed on Amazon / TikTok today) ────────────────
+  PURE-Original:
+    display_name: "F3 PURE Original"
+    line: Pure
+    amazon:  {sku: F3-PURE-ORIG,   asin: B0GG4ZTDK9, confirmed: true}
+    tiktok:  {goods_id: "2084043295299590", confirmed: true}
+    walmart: {sku: PURE-Original, confirmed: false}
+  PURE-Citrus:
+    display_name: "F3 PURE Citrus Clarity"
+    line: Pure
+    amazon:  {sku: F3-PURE-CITRUS, asin: B0GG4W9KK4, confirmed: true}
+    tiktok:  {goods_id: "2084041280198662", confirmed: true}
+    walmart: {sku: PURE-Citrus, confirmed: false}
+  PURE-Tropical:
+    display_name: "F3 PURE Tropical Theory"
+    line: Pure
+    amazon:  {sku: F3-PURE-TROP,   asin: B0GG4T8NLJ, confirmed: true}
+    tiktok:  {goods_id: "2084034863175686", confirmed: true}
+    walmart: {sku: PURE-Tropical, confirmed: false}
+  PURESL:
+    display_name: "F3 PURE Strawberry Lemonade"
+    line: Pure
+    amazon:  {sku: F3-PURE-SL,     asin: B0GG4MKHY3, confirmed: true}
+    tiktok:  {goods_id: "2084041279936518", confirmed: true}
+    walmart: {sku: PURESL, confirmed: false}
+  F3-PureE-V4F:
+    display_name: "F3 PURE Variety Pack"
+    line: Pure
+    # STANDALONE on Amazon -- not a flavor child of the B0H85J1XG9 parent.
+    amazon:  {sku: F3-PureE-V4F,   asin: B0H73G8QFR, confirmed: true}
+    tiktok:  {goods_id: "2084018935044102", confirmed: true}
+    walmart: {sku: F3-PureE-V4F, confirmed: false}
+
+  # ── F3 ENERGY ─────────────────────────────────────────────────────────────
+  # Near-expiry stock is barred from both FBA and WFS, so these carry no
+  # marketplace identifiers. Add them at the Run-2 relisting.
+  F3-Original:   {display_name: "F3 Original Energy",            line: Energy}
+  F3-Citrus:     {display_name: "F3 Citrus Clarity Energy",      line: Energy}
+  F3SL:          {display_name: "F3 Strawberry Lemonade Energy", line: Energy}
+  F3-Tropical:   {display_name: "F3 Tropical Theory Energy",     line: Energy}
+  F3VPE4:        {display_name: "F3 Energy Variety Pack",        line: Energy}
+
+  # ── F3 MOOD ───────────────────────────────────────────────────────────────
+  F3-Orange:     {display_name: "F3 Orangesicle Mood",           line: Mood}
+  F3-Peach:      {display_name: "F3 Peach Paradise Mood",        line: Mood}
+  F3PC:          {display_name: "F3 Pina Colada Mood",           line: Mood}
+  F3SC:          {display_name: "F3 Strawberries & Cream Mood",  line: Mood}
+  F3VPM4:        {display_name: "F3 Mood Variety Pack",          line: Mood}
+
+# Not a sellable SKU -- the Amazon variation-family parent (B0H85J1XG9 /
+# F3-PURE-PARENT). Recorded so a channel sweep that surfaces it renders it as a
+# known non-stock row rather than an UNMAPPED mystery.
+non_stock_identifiers:
+  amazon_parent_asin: B0H85J1XG9
+  amazon_parent_sku: F3-PURE-PARENT

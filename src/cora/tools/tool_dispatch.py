@@ -114,6 +114,7 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "personal_capital_program_state",
     "f3e_creator_crm",
     "fndr_content_pipeline",
+    "f3e_channel_inventory",
     "f3e_rangeme_status",
     "f3e_cultural_radar",
     "personal_travel_points",
@@ -6648,6 +6649,7 @@ _DASH_CONTENT = "f3-content-pipeline"
 _DASH_TRAVEL = "travel-points-command-center"
 _DASH_RANGEME = "f3-retail-rangeme"
 _DASH_CULTURAL = "f3-cultural-radar"
+_DASH_CHANNEL_INVENTORY = "f3e-channel-inventory"
 
 
 # Source-opacity scrub for pass-through free-text field values. These tools are
@@ -7172,6 +7174,54 @@ def _format_rangeme(data: dict) -> str:
             note = f" -- {note[:140]}" if note else ""
             lines.append(f"  - {o.get('name', '?')} [{o.get('status')}]{note}")
     return _dash_scrub("\n".join(lines))
+
+
+def _tool_f3e_channel_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Cross-channel F3E inventory (A5 Part 2).
+
+    LABEL DISCIPLINE: this renders sales-CHANNEL names only (Amazon FBA, Walmart
+    WFS, TikTok FBT, DTC 3PL). Data-SOURCE and tool names never appear -- see
+    tests/test_inventory_state.py::TestLabelDiscipline.
+    """
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_CHANNEL_INVENTORY, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+
+    from ..inventory_state import load_sku_map, merge, render_rows  # noqa: PLC0415
+
+    sku_map = load_sku_map()
+    merged = merge(sku_map)
+    if not merged.rows:
+        return (
+            "I couldn't read the cross-channel inventory store just now -- the SKU map "
+            "is empty or unreadable. Nothing has been reported as zero."
+        )
+
+    wanted: list[str] | None = None
+    raw_filter = str(inp.get("sku_filter") or "").strip()
+    if raw_filter:
+        needle = raw_filter.lower()
+        entries = sku_map.get("skus") or {}
+        wanted = [
+            sku for sku in entries
+            if needle == sku.lower()
+            or needle == str((entries[sku] or {}).get("line", "")).lower()
+            or needle in str((entries[sku] or {}).get("display_name", "")).lower()
+        ]
+        if not wanted:
+            return (
+                f"I don't have a SKU or product line matching \"{raw_filter[:40]}\" in the "
+                "cross-channel map. Ask without a filter to see everything I do track."
+            )
+
+    log.info("f3e_channel_inventory user=%s filter=%s", slack_user_id, raw_filter or "-")
+    header = "*F3 inventory across channels*"
+    if not merged.complete:
+        header += " -- partial coverage; unread channels show UNKNOWN, not zero."
+    return "\n".join([header, *render_rows(merged, sku_map, wanted)])
 
 
 def _tool_f3e_rangeme_status(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -9684,6 +9734,32 @@ TOOL_DEFINITIONS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "f3e_channel_inventory",
+        "description": (
+            "F3 Energy inventory ACROSS ALL SALES CHANNELS in one view: office/HQ, the "
+            "DTC 3PL, UNIS, TikTok FBT, Amazon FBA and Walmart WFS, per SKU, each with "
+            "when it was last read. Use for cross-channel questions -- 'where is our Pure "
+            "inventory', 'how much Pure do we have everywhere', 'what's in FBA / WFS / "
+            "FBT', 'do we have stock on Amazon'. For the WAREHOUSE view alone (DTC "
+            "fulfillment stock and low-stock alerts) use f3e_shopify_inventory instead. "
+            "Channels not yet swept report honestly as UNKNOWN, never as zero. Available "
+            "in F3E + founder channels and Harrison's DM (refuses elsewhere)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku_filter": {
+                    "type": "string",
+                    "description": (
+                        "Optional product-line or SKU filter, e.g. 'Pure', 'Mood', "
+                        "'Energy', or an exact SKU. Omit for every SKU."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "f3e_cultural_radar",
         "description": (
             "The weekly F3 cultural radar: the latest run's headline + pulse and the top "
@@ -10569,6 +10645,7 @@ _F3_IMAGE_TOOLS: frozenset[str] = frozenset({
 _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
         "f3e_creator_crm",
+        "f3e_channel_inventory",
         "f3e_rangeme_status",
         "f3e_cultural_radar",
         "f3e_shopify_sales_pulse",
@@ -10733,6 +10810,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "personal_capital_program_state": _tool_personal_capital_program_state,
     "f3e_creator_crm": _tool_f3e_creator_crm,
     "fndr_content_pipeline": _tool_fndr_content_pipeline,
+    "f3e_channel_inventory": _tool_f3e_channel_inventory,
     "f3e_rangeme_status": _tool_f3e_rangeme_status,
     "f3e_cultural_radar": _tool_f3e_cultural_radar,
     "personal_travel_points": _tool_personal_travel_points,
@@ -10762,6 +10840,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "influencer_list_handles": 8,
     "influencer_get_status": 8,
     "f3e_ai_visibility": 8,
+    "f3e_channel_inventory": 12,
     "revops_ledger_status": 8,
     # Normal — single external API call
     "asana_create_task": 12,

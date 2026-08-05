@@ -978,6 +978,19 @@ def gather_f3e_ecom(*, today: date | None = None) -> dict:
         log.warning("channel_synthesis: F3E inventory section unavailable: %s", exc)
         lines.append("- Inventory: not available")
 
+    # Cross-channel roll-up (A5 Part 2). Complements the low-stock line above --
+    # that one is the DTC alerting signal, this one says where the stock physically
+    # sits across sales channels. Channel names only, never source/tool names.
+    # Fail-soft: a dead store degrades to a stub, never a zero.
+    try:
+        from . import inventory_state as _inv
+        _merged = _inv.merge()
+        if _merged.rows:
+            lines.append(_inv.render_channel_summary(_merged))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E cross-channel inventory unavailable: %s", exc)
+        lines.append("- Cross-channel inventory: not available")
+
     # Production (Run-2)
     try:
         from .tools import asana_client
