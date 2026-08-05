@@ -98,8 +98,13 @@ dashboards:
     sensitivity: ENTITY
     entity: F3E
     dm_users: ["U0B2RM2JYJ1"]        # Harrison
-    allow_channels: [founder-operations]
-    allow_entities: [F3E, FNDR, HJRG]
+    # AUDIENCE NARROWED 2026-08-05 (Harrison, A5 cascade-report judgment call):
+    # per-SKU marketplace stock levels are more sensitive than the sibling-dashboard
+    # precedent, and the F3E entity-class allowance reached EVERY f3-* channel incl.
+    # #f3-athletes (external fighters). Internal channels are enumerated explicitly
+    # instead; add a channel here (live-reload) rather than restoring F3E below.
+    allow_channels: [f3e-leadership, f3-hq-inventory-adjustments, f3e-sales, founder-operations]
+    allow_entities: [FNDR, HJRG]
     store:
       type: drive_json
       read_via: drive_io_mount
