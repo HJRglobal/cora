@@ -185,24 +185,88 @@ class TestForecastAssist:
             today=MONDAY)
         assert "first run" in "\n".join(section.lines)
 
-    def test_next_week_starting_points_come_from_the_bank_snapshot(self):
+    def test_next_week_starting_point_is_the_BOOK_balance_not_the_register(self):
+        """D-116: the sheet's opening row is a BOOK balance. Carrying the QBO
+        REGISTER figure in would manufacture the very break the cash section then
+        flags -- live 2026-08-05, HJRP reads $128,128 on the register against
+        $26,880 on the report, and BDM flips sign by ~$20K."""
         section, snap = fc.build_forecast_assist_section(
             ["F3E", "BDM"],
             fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(11750.93),
+                       bank_snapshot=lambda: _bank(F3E=_realm(128128.02),
                                                    BDM=_realm(11758.94))),
+            cash_fragment={"F3E": {"books_net": 26879.52},
+                           "BDM": {"books_net": -8483.22}},
             today=MONDAY)
         body = "\n".join(section.lines)
         assert "week 8-7" in body
-        assert snap["F3E"]["starting_point"] == 11750.93
+        assert snap["F3E"]["starting_point_books"] == 26879.52
+        assert snap["F3E"]["register_reference"] == 128128.02
+        assert "carry $26,880 into the 8-7 opening row" in body
+        assert "different measures" in body
         assert section.covered == 2
+
+    def test_without_a_book_balance_it_refuses_to_name_a_carry_in(self):
+        section, snap = fc.build_forecast_assist_section(
+            ["F3E"],
+            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
+                       bank_snapshot=lambda: _bank(F3E=_realm(128128.02))),
+            cash_fragment={}, today=MONDAY)
+        body = "\n".join(section.lines)
+        assert "reference only" in body
+        assert "not available this run" in body
+        assert snap["F3E"]["starting_point_books"] is None
+
+    def test_a_late_actual_does_not_relabel_a_past_week_as_next(self):
+        """If 7-31's actual is still unfilled on 8-3, "first entry lacking an
+        actual" is a week that already CLOSED -- carrying balances into its
+        opening row would overwrite history. Selection is POSITIONAL: the first
+        forward week AFTER the last week that has an actual."""
+        dual = [
+            {"week": "7-24", "forecast": 1.0, "actual": 1.0, "forecast_overwritten": True},
+            {"week": "7-31", "forecast": 2.0, "actual": None, "forecast_overwritten": False},
+            {"week": "8-7", "forecast": 3.0, "actual": None, "forecast_overwritten": False},
+        ]
+        section, _ = fc.build_forecast_assist_section(
+            ["F3E"],
+            fc.Sources(cash_dual=lambda: dual,
+                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
+            cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
+        body = "\n".join(section.lines)
+        assert "week 7-31" in body
+        assert "week 8-7" not in body
+
+    def test_week_selection_does_not_use_the_backward_looking_date_parser(self):
+        """_parse_week_date resolves a bare "8-7" against a 2026-08-03 run date to
+        2025-08-07, so a date filter would discard EVERY forward week and silently
+        kill this entire leg. Pin that forward weeks still resolve."""
+        section, _ = fc.build_forecast_assist_section(
+            ["F3E"],
+            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
+                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
+            cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
+        assert "no forward forecast week" not in "\n".join(section.lines)
+
+    def test_stale_snapshot_warning_travels_with_this_section(self):
+        """render_forecast_worksheet emits ONLY these lines, so the bank section's
+        warning under a different heading never reaches the worksheet."""
+        section, _ = fc.build_forecast_assist_section(
+            ["F3E"],
+            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
+                       bank_snapshot=lambda: {
+                           "generated_at_utc": "2026-07-01T00:00:00+00:00",
+                           "realms": {"F3E": _realm(1.0)}}),
+            cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
+        body = "\n".join(section.lines)
+        assert ":warning:" in body
+        assert "NOT 'as of now'" in body
 
     def test_shell_realm_contributes_no_starting_point(self):
         section, snap = fc.build_forecast_assist_section(
             ["OSN"],
             fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
                        bank_snapshot=lambda: _bank(OSN=_realm(0.0, shell=True))),
-            today=MONDAY)
+            cash_fragment={"OSN": {"books_net": 0.0}}, today=MONDAY)
         assert "OSN" not in snap
 
     def test_unknown_balance_renders_unknown_not_zero(self):
@@ -493,11 +557,16 @@ class TestConfirmedPairChecking:
         assert "in balance" not in body
         assert "discovery list, not a reconciliation" in body
 
-    def test_missing_side_renders_unknown_not_skipped(self, monkeypatch):
+    def test_missing_side_renders_unavailable_not_skipped(self, monkeypatch):
         pairs = self._pair(True)
         pairs[0]["right"]["account_id"] = "does-not-exist"
         section, _ = self._run(pairs, monkeypatch=monkeypatch)
-        assert "UNKNOWN" in "\n".join(section.lines)
+        body = "\n".join(section.lines)
+        # "unavailable —" is the literal substring build_founder_cut collects
+        # coverage lines by; any other wording hides an unrun reconciliation from
+        # the one view Harrison reads.
+        assert "unavailable —" in body
+        assert "NOT checked" in body
         assert section.flags == 0
 
     def test_threshold_is_env_tunable(self, monkeypatch):

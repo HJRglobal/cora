@@ -82,6 +82,26 @@ MIRROR_DISAGREEMENT_UNITS = 1
 _CONTROL_RE = re.compile(r"[<>|`*_~\[\]]")
 _WS_RE = re.compile(r"\s+")
 
+# Stripping Slack control syntax is NOT sufficient here, and assuming otherwise
+# was a real defect. The tool that renders this text is a VERBATIM_TABLE_TOOL, so
+# `format_reply` is bypassed and only the egress boundary runs downstream -- and
+# egress redacts bare URLs only for an allowlist of hosts (docs.google.com,
+# drive.google.com, app.asana.com, notion.so, *.intuit.com). An arbitrary URL
+# typed into the Airtable "Manual Counts" location field therefore reached an F3E
+# channel as a live, clickable link signed by Cora.
+#
+# Same shape for platform tokens: a channel-sweep block whose status text mentions
+# a data-SOURCE name would print it straight onto a Slack surface, defeating the
+# label discipline the YAML-side test appeared to guarantee.
+#
+# Mirrors tool_dispatch._dash_scrub, which exists for exactly this on the other
+# dashboard readers (D-051, 2026-07-11).
+_URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.IGNORECASE)
+_VENDOR_RE = re.compile(
+    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion)\b",
+    re.IGNORECASE,
+)
+
 
 def founder_os_root() -> Path:
     env = os.environ.get("FOUNDER_OS_ROOT", "").strip()
@@ -101,12 +121,21 @@ def last_good_path(source: str) -> Path:
 
 
 def scrub(text: Any, cap: int = 80) -> str:
-    """Neutralize Slack control syntax in a string this module did not author.
+    """Neutralize a string this module did not author, before it can reach Slack.
 
-    D-118: SKU labels, location names and manual-count notes are all externally
-    authored (YAML seeds, Airtable free text, marketplace catalogs).
+    D-118: SKU labels, location names, block statuses and manual-count notes are
+    all externally authored (YAML seeds, Airtable free text, marketplace
+    catalogs, Cowork-written JSON).
+
+    Strips, in order: whitespace/newlines (so nothing breaks out of a rendered
+    line), URLs (ALL hosts -- see the _URL_RE comment for why egress does not
+    cover this), data-source/platform names, and Slack control syntax. URLs are
+    removed BEFORE the control-char strip so a `<url|label>` form cannot survive
+    as bare label text.
     """
     flat = _WS_RE.sub(" ", str(text or "")).strip()
+    flat = _URL_RE.sub("[link]", flat)
+    flat = _VENDOR_RE.sub("[source]", flat)
     flat = _CONTROL_RE.sub("", flat)
     return flat[:cap]
 
@@ -186,12 +215,34 @@ class SourceLoad:
         return (self.data or {}).get("as_of_utc")
 
 
+# INTERACTIVE mount budget. drive_io's defaults (10s timeout, 90s retry) are sized
+# for scheduled jobs; context_loader overrides them on the request path for the
+# same reason we must here. Without the override a hung G: made ONE load_source
+# take ~98s -- three of those blow the tool's own timeout, so the user got a
+# generic "Tool timed out" instead of the honest all-UNKNOWN render this module
+# works hard to produce. Worse, the long read trips drive_io's PROCESS-WIDE
+# circuit breaker for 90s, fast-failing every other user's CLAUDE.md read.
+_MOUNT_TIMEOUT_SEC = 2.0
+_MOUNT_RETRY_SEC = 0.0
+
+
 def _read_json(path: Path, reader: Any) -> tuple[dict[str, Any] | None, str, str]:
     """(payload, status, detail). Never raises."""
+    # Passed as kwargs so a test double with a simpler signature still works.
+    budget: dict[str, float] = {
+        "timeout": _MOUNT_TIMEOUT_SEC, "retry_seconds": _MOUNT_RETRY_SEC,
+    }
     try:
-        if not reader.exists(path):
+        try:
+            exists = reader.exists(path, **budget)
+        except TypeError:
+            exists = reader.exists(path)
+        if not exists:
             return None, "missing", "not written yet"
-        text = reader.read_text(path)
+        try:
+            text = reader.read_text(path, **budget)
+        except TypeError:
+            text = reader.read_text(path)
     except Exception as exc:  # noqa: BLE001 -- a dead mount must not kill the merge
         return None, "unavailable", f"{type(exc).__name__}: {exc}"[:160]
     try:
@@ -362,7 +413,16 @@ def merge(
 
 
 def _block_is_live(block: dict[str, Any] | None) -> bool:
-    return bool(block) and block.get("status") in (None, "ok")
+    """A channel counts as READ only if it carries an actual SKU mapping.
+
+    A block that is present and status-ok but has no `skus` payload is
+    structurally blind -- counting it toward coverage lets a broken writer report
+    "6 of 6 channels read" while contributing no data at all, which is exactly
+    the all-clear-over-nothing D-117 exists to prevent.
+    """
+    if not block or block.get("status") not in (None, "ok"):
+        return False
+    return isinstance(block.get("skus"), dict) and bool(block["skus"])
 
 
 def _count_from(block: dict[str, Any] | None, sku: str, channel: str) -> ChannelCount:
@@ -438,7 +498,12 @@ def _unmapped(sweep_blocks: dict[str, dict[str, Any]], known: list[str]) -> list
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_units(count: ChannelCount) -> str:
-    if count.unparseable and count.units is None and count.caveat != "":
+    """UNPARSEABLE and UNKNOWN are DIFFERENT operational signals and must stay
+    distinguishable: "the sweep never ran" vs "the sweep ran and wrote garbage".
+    An earlier version also required a non-empty caveat here, which silently
+    collapsed UNPARSEABLE into UNKNOWN on the four channels that carry no caveat
+    -- including both marketplace lanes, where nobody can check by hand."""
+    if count.unparseable:
         return "UNPARSEABLE"
     if count.units is None:
         return "UNKNOWN"
@@ -515,8 +580,16 @@ def render_channel_summary(merged: MergedInventory,
         if bucket["units"] is None:
             unread.append(label)
             continue
-        caveat = CHANNEL_CAVEATS.get(channel, "")
-        suffix = f" ({caveat})" if caveat else ""
+        notes = [n for n in (CHANNEL_CAVEATS.get(channel, ""),) if n]
+        # A channel where SOME skus read and others did not is a PARTIAL total.
+        # Printing it bare makes a SKU that vanished from the feed look identical
+        # to one holding zero.
+        if bucket["unknown_skus"]:
+            notes.append(
+                f"{bucket['known_skus']} of "
+                f"{bucket['known_skus'] + bucket['unknown_skus']} SKUs read"
+            )
+        suffix = f" ({'; '.join(notes)})" if notes else ""
         known_parts.append(f"{label} {bucket['units']:,}{suffix}")
 
     if not known_parts:

@@ -21,6 +21,19 @@ portfolio_total:
   # set this to false and the total withholds again.
   roll_up_verified: true
 
+# Realms NEVER swept into this snapshot.
+#
+# The snapshot is mirrored to 01-HJR-Global/accounting/live-snapshots/, a folder
+# Justin and Hayden work in. HR LLC is Harrison's PERSONAL expense tracking, not
+# business data -- finance_close.PACK_EXCLUDED_ENTITIES already keeps it out of
+# the close pack for exactly that reason, and gsheets_financials excludes its tab.
+# Sweeping it here would have published his personal account names and balances
+# into a shared folder daily, and folded them into the portfolio total.
+#
+# Excluded at the SWEEP, not just at render: what is never collected cannot leak.
+excluded_realms:
+  - HRLLC
+
 realms:
   OSN:
     # A shell realm is rendered as a FOOTNOTE, not a balance row.

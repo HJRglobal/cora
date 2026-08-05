@@ -632,6 +632,79 @@ def summarize_accounts(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _row_account_ids(row: dict[str, Any]) -> set[str]:
+    """Every account id a transaction row references, across the shapes QBO uses.
+
+    Purchase carries `AccountRef` (the paying account); Transfer carries
+    `FromAccountRef`/`ToAccountRef`; BillPayment nests the account under
+    `CheckPayment.BankAccountRef` or `CreditCardPayment.CCAccountRef`; Payment
+    uses `DepositToAccountRef`. Returns an EMPTY set when a row exposes none of
+    them, which the caller treats as "cannot tell" -- not as "not a bank txn".
+    """
+    ids: set[str] = set()
+    for key in ("AccountRef", "FromAccountRef", "ToAccountRef", "DepositToAccountRef"):
+        value = (row.get(key) or {}).get("value") if isinstance(row.get(key), dict) else None
+        if value:
+            ids.add(str(value))
+    for parent, child in (("CheckPayment", "BankAccountRef"),
+                          ("CreditCardPayment", "CCAccountRef")):
+        nested = row.get(parent)
+        if isinstance(nested, dict):
+            value = (nested.get(child) or {}).get("value") if isinstance(
+                nested.get(child), dict) else None
+            if value:
+                ids.add(str(value))
+    return ids
+
+
+def _newest_bank_side(
+    entity: str, txn_type: str, bank_account_ids: set[str], today: str,
+) -> tuple[str | None, bool]:
+    """(newest date that actually touched a BANK account, filtered?).
+
+    WHY THIS FILTERS. A QBO `Purchase` with PaymentType=CreditCard never touches a
+    bank account, and the type was previously counted unfiltered -- verified live
+    2026-08-05 that LEX's newest Purchase sat on `Divvy Card Main` and 40 of its
+    newest 60 Purchases were card-side. On a card-heavy realm that made the
+    "newest posted bank-side txn" date wrong and, worse, meant the staleness flag
+    could never fire: daily card spend kept the date fresh forever while the bank
+    feed sat dead. Same exposure on Transfer and BillPayment.
+
+    FAIL-SAFE: if no row in the window exposes ANY account reference (an unexpected
+    schema, or a field QBO stops returning), fall back to the unfiltered newest
+    date and report filtered=False, so the caller can label it. Losing the signal
+    entirely would be a worse failure than an imprecise one.
+
+    FUTURE-DATED rows are excluded from the max: QBO happily holds postdated
+    entries, and letting one win made a realm render "0d ago" for a date months
+    ahead, suppressing the staleness flag for as long as the date stayed forward.
+    """
+    page = _query(
+        entity,
+        f"select * from {txn_type} orderby TxnDate desc MAXRESULTS {_TXN_SCAN_LIMIT}",
+    )
+    rows = page.get(txn_type) or []
+    posted = [r for r in rows if str(r.get("TxnDate") or "") <= today]
+    if not posted:
+        return None, True
+
+    if not bank_account_ids:
+        return max(str(r.get("TxnDate")) for r in posted), False
+
+    matched = [r for r in posted if _row_account_ids(r) & bank_account_ids]
+    if matched:
+        return max(str(r.get("TxnDate")) for r in matched), True
+    # Distinguish "scanned rows, none were bank-side" from "rows expose no account
+    # reference at all" -- only the latter warrants the unfiltered fallback.
+    if any(_row_account_ids(r) for r in posted):
+        return None, True
+    return max(str(r.get("TxnDate")) for r in posted), False
+
+
+#: Rows scanned per transaction type when filtering to bank-side activity.
+_TXN_SCAN_LIMIT = 50
+
+
 def newest_bank_side_txn_date(
     entity: str,
     bank_account_ids: set[str] | None = None,
@@ -651,48 +724,48 @@ def newest_bank_side_txn_date(
     """
     per_type: dict[str, str | None] = {}
     errors: dict[str, str] = {}
+    unfiltered: list[str] = []
+    ids = bank_account_ids or set()
+    today = datetime.date.today().isoformat()
 
-    for txn_type in _BANK_SIDE_TXN_TYPES:
+    scan_types = list(_BANK_SIDE_TXN_TYPES) + (["Payment"] if ids else [])
+    for txn_type in scan_types:
         try:
-            page = _query(
-                entity,
-                f"select Id, TxnDate from {txn_type} orderby TxnDate desc MAXRESULTS 1",
-            )
-            rows = page.get(txn_type) or []
-            per_type[txn_type] = (rows[0].get("TxnDate") if rows else None)
-        except QboClientError as exc:
+            newest, filtered = _newest_bank_side(entity, txn_type, ids, today)
+            per_type[txn_type] = newest
+            if not filtered:
+                unfiltered.append(txn_type)
+        # Deliberately broad: QboAuthError is a SIBLING of QboClientError, not a
+        # subclass, and _request's 401-retry path re-refreshes outside any guard --
+        # so an auth failure (including a token-lock timeout) would otherwise
+        # escape this per-type fail-soft and discard the balances we already read.
+        except Exception as exc:  # noqa: BLE001
             log.warning("newest_bank_side_txn_date: %s failed for %s: %s", txn_type, entity, exc)
             errors[txn_type] = str(exc)[:200]
             per_type[txn_type] = None
 
-    # Payment leg — only those deposited straight into a Bank account.
-    if bank_account_ids:
-        try:
-            page = _query(
-                entity,
-                "select Id, TxnDate, DepositToAccountRef from Payment "
-                f"orderby TxnDate desc MAXRESULTS {_PAYMENT_SCAN_LIMIT}",
-            )
-            newest = None
-            for row in page.get("Payment") or []:
-                ref = str((row.get("DepositToAccountRef") or {}).get("value") or "")
-                if ref and ref in bank_account_ids:
-                    newest = row.get("TxnDate")
-                    break  # already ordered newest-first
-            per_type["Payment"] = newest
-        except QboClientError as exc:
-            log.warning("newest_bank_side_txn_date: Payment failed for %s: %s", entity, exc)
-            errors["Payment"] = str(exc)[:200]
-            per_type["Payment"] = None
-
     dates = [d for d in per_type.values() if d]
-    expected = len(_BANK_SIDE_TXN_TYPES) + (1 if bank_account_ids else 0)
+    expected = len(scan_types)
+
+    # EVERY type returning zero rows, with no error raised, is far more likely an
+    # API condition than a realm that has genuinely never transacted -- QBO was
+    # observed 2026-08-05 returning an EMPTY QueryResponse (not an HTTP error) for
+    # every transaction type while Account queries kept working. Reporting that as
+    # clean full coverage would be a silent blind spot exactly where this section
+    # is supposed to be watching.
+    all_empty = not dates and not errors and expected > 0
     return {
         "date": max(dates) if dates else None,   # ISO YYYY-MM-DD sorts lexically
         "per_type": per_type,
-        "types_covered": expected - len(errors),
+        "types_covered": 0 if all_empty else expected - len(errors),
         "types_expected": expected,
-        "errors": errors,
+        "errors": (
+            {**errors, "_all_types_empty": "every txn type returned zero rows"}
+            if all_empty else errors
+        ),
+        # Types whose date could NOT be narrowed to bank-side activity, so the date
+        # may reflect card-side spend. Consumers must label it.
+        "unfiltered_types": sorted(unfiltered),
     }
 
 

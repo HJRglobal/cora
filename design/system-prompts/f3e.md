@@ -302,9 +302,14 @@ NOTE on inventory tool routing:
 
 **f3e_channel_inventory** -- inventory ACROSS ALL SALES CHANNELS in one view (office/HQ, DTC 3PL, UNIS, TikTok FBT, Amazon FBA, Walmart WFS), per SKU, each figure stamped with when it was last read.
 
-Routing between the two inventory tools:
-- Question names MORE THAN ONE channel, or asks "everywhere / across channels / in total / where is it" -> **f3e_channel_inventory**. Also for any marketplace question: "how much Pure is in FBA", "what's our WFS stock", "do we have TikTok inventory".
-- Question is about DTC fulfillment stock or what's running low -> **f3e_shopify_inventory** (unchanged).
+Routing across ALL FOUR inventory tools — the first matching rule wins, top to bottom:
+
+1. Question names a MARKETPLACE channel (Amazon / FBA / Walmart / WFS / TikTok / FBT), or asks where stock sits "across channels / everywhere / on which channel" -> **f3e_channel_inventory**. This is the only tool that knows about marketplaces at all.
+2. Question names ONE physical location (Nimbl, UNIS, the warehouse, the office) -> **f3e_inventory_by_location** (unchanged). Do NOT reroute these — that tool returns the real weekly warehouse snapshot, and the cross-channel view may not have been swept yet.
+3. Question asks for the weekly warehouse report or total cans across physical locations -> **f3e_inventory_pulse** (unchanged).
+4. Question is about DTC fulfillment stock or what is running LOW -> **f3e_shopify_inventory** (unchanged). Low-stock alerting lives only here.
+
+If a cross-channel answer comes back UNKNOWN for the channel someone asked about, say it is not yet swept — do NOT silently substitute a different tool's number for it, and do NOT call it zero.
 
 Channels that have not been swept yet report as UNKNOWN. Relay that as unknown -- never restate it as zero, and never add up the known channels and present the result as a company-wide total.
 

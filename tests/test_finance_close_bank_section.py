@@ -85,7 +85,7 @@ class TestUnavailable:
         section, _ = fc.build_bank_section(["F3E", "BDM"], _sources(snap), today=MONDAY)
         body = "\n".join(section.lines)
         assert "Big D Media: unavailable" in body
-        assert "Total withheld" in body
+        assert "Total unavailable —" in body
         assert "$0.00" not in body.split("Big D Media")[1].split("\n")[0]
 
 
@@ -245,44 +245,55 @@ class TestOsnConsolidatedRider:
         )
         assert section.flags == 0
 
-    def test_books_leg_is_the_sum_of_member_realms(self):
+    def test_the_rollup_row_is_a_sheet_consolidation_tie_out(self):
+        """It compares the consolidated sheet row against ITS OWN member rows.
+        Re-basing the BOOKS leg instead re-reported the four member variances as a
+        fifth independent-looking flag: algebraically that equals
+        sum(member deltas) + (sum(member sheet closings) - sheet_consolidated),
+        and only the second term is new information."""
         section, snap = fc.build_cash_section(self.ENTITIES, self._src(), today=MONDAY)
-        assert snap["OSN"]["books_net"] == 37604.0   # the four stores summed
-        assert snap["OSN"]["delta"] == pytest.approx(-1.0)
-
-    def test_row_says_it_is_consolidated_and_the_realm_holds_no_cash(self):
-        section, _ = fc.build_cash_section(self.ENTITIES, self._src(), today=MONDAY)
         osn_line = next(ln for ln in section.lines if "One Stop Nutrition:" in ln)
-        assert "consolidated row" in osn_line
-        assert "holds no cash" in osn_line
-        for store in ("OSN Greenfield", "OSN McKellips", "OSN Warner", "OSN Val Vista"):
-            assert store in osn_line
+        assert "consolidation tie-out" in osn_line
+        assert "$37,605" in osn_line          # the consolidated sheet total
+        assert "$37,604" in osn_line          # its member rows summed
+        assert "holds no cash of its own" in osn_line
 
-    def test_a_real_consolidation_break_still_flags(self):
-        """The fix must not blind the check -- if the stores stop tying to the
-        consolidated row, that is a genuine signal."""
-        def books(entity, as_of):
-            return _bs({"OSN": 0.0, "OSNGF": 4365.0, "OSNGM": 6936.0,
-                        "OSNGW": 4722.0, "OSNVV": 1000.0}[entity])
+    def test_the_rollup_row_does_not_double_count_member_variance(self):
+        """7 distinct entity cash positions must yield 7 flags, not 8 -- the pack
+        forbids a restatement adding to its own flag total."""
+        section, snap = fc.build_cash_section(self.ENTITIES, self._src(), today=MONDAY)
+        assert section.flags == 0
+        # And it contributes no entity cash position to the snapshot, so
+        # close-prep's "N entity(ies) show a cash delta" stays one-per-entity.
+        assert "OSN" not in snap
+
+    def test_a_real_consolidation_break_flags(self):
+        """A member row that stops tying to the consolidated total IS a genuine,
+        non-duplicative signal."""
+        def sheet(sheet_entity):
+            values = {"OSN": 90000.0, "OSN-GF": 4365.0, "OSN-MK": 6936.0,
+                      "OSN-GW": 4722.0, "OSN-VV": 21581.0}
+            return {"closing": values[sheet_entity], "is_actual": True,
+                    "week_label": "Week of 7-31", "stale": False, "age_days": 3}
         section, _ = fc.build_cash_section(
-            self.ENTITIES, fc.Sources(cash_closing=self._sheet, balance_sheet=books),
-            today=MONDAY)
+            self.ENTITIES,
+            fc.Sources(cash_closing=sheet, balance_sheet=self._books), today=MONDAY)
         osn_line = next(ln for ln in section.lines if "One Stop Nutrition:" in ln)
         assert ":triangular_flag_on_post:" in osn_line
 
-    def test_partial_members_render_unknown_never_a_partial_sum(self):
-        """A partial sum against a FULL consolidated sheet row would manufacture
-        exactly the false flag this rider removes."""
-        def books(entity, as_of):
-            if entity == "OSNVV":
-                raise RuntimeError("realm down")
-            return self._books(entity, as_of)
+    def test_a_missing_member_row_renders_unavailable_not_a_partial_tie_out(self):
+        def sheet(sheet_entity):
+            if sheet_entity == "OSN-VV":
+                return {"closing": None, "is_actual": False, "week_label": "Week of 7-31",
+                        "stale": False, "age_days": 3}
+            values = {"OSN": 37605.0, "OSN-GF": 4365.0, "OSN-MK": 6936.0, "OSN-GW": 4722.0}
+            return {"closing": values[sheet_entity], "is_actual": True,
+                    "week_label": "Week of 7-31", "stale": False, "age_days": 3}
         section, snap = fc.build_cash_section(
-            self.ENTITIES, fc.Sources(cash_closing=self._sheet, balance_sheet=books),
-            today=MONDAY)
+            self.ENTITIES,
+            fc.Sources(cash_closing=sheet, balance_sheet=self._books), today=MONDAY)
         osn_line = next(ln for ln in section.lines if "One Stop Nutrition:" in ln)
         assert "unavailable" in osn_line
-        assert "consolidated member" in osn_line
         assert "OSN" not in snap
 
     def test_member_realms_still_checked_individually(self):

@@ -19,13 +19,18 @@
 # Consumers: the f3e_channel_inventory Cora tool, the F3E daily synthesis
 # cross-channel line, and the F3E ecom brief.
 #
-# Schedule: daily 07:20 AZ.
-# Slot check against the LIVE registry (2026-08-04): 07:20 is unused. NOTE 07:10 was
-# the design's suggested minute but is held by "Cora - F3E Daily Ecom Brief" -- that
-# task is currently Disabled (folded into the F3E daily synthesis 2026-07-07), and
-# reusing its minute would create a latent collision if it is ever re-enabled.
-# Neighbours: cowork-cora-decision-capture 07:15, "Cora - Daily Briefing" 07:30.
-# Unique within the 03:00-09:00 window, so the weekly health metric gains no alarm.
+# Schedule: daily 06:20 AZ -- BEFORE its consumers, which is the whole point.
+#
+# The design suggested ~07:10, and a first cut used 07:20. Both are WRONG: the F3E
+# daily synthesis (the live consumer of this file) fires at 06:33, so a 07:xx
+# producer would have left every synthesis reading a ~24h-old file, and the very
+# first one reading no file at all. 06:20 puts the producer ahead of the consumer.
+#
+# Slot check against the LIVE registry (2026-08-05): 06:20 is unused. Neighbours are
+# cowork-cora-gap-autofill 06:10 and cowork-cora-founders-os-sweep 06:30. Unique
+# within the 03:00-09:00 window, so the weekly health metric gains no alarm.
+# (07:10 is separately held by the Disabled "Cora - F3E Daily Ecom Brief" -- reusing
+# it would have created a latent collision if that task is ever re-enabled.)
 #
 # Exit codes: 0 = every location read; 1 = at least one location failed (file still
 # written, those channels UNKNOWN); 2 = total failure, previous file left in place.
@@ -43,7 +48,7 @@ $RepoRoot   = "C:\Users\Harri\code\cora"
 $PythonExe  = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"
 $TaskName   = "cowork-cora-inventory-state-sync"
 $ScriptPath = "C:\Users\Harri\code\cora\scripts\run_inventory_state_sync.py"
-$HourMin    = "07:20"
+$HourMin    = "06:20"
 
 if (-not (Test-Path $PythonExe)) {
     Write-Error "Python not found at $PythonExe. Check the venv."

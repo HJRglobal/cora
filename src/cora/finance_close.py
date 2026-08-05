@@ -777,7 +777,12 @@ def build_cash_section(
     section = Section(key="cash", title=":bank: Cash — cash sheet vs books")
     snap: dict[str, Any] = {}
 
-    checkable = [e for e in entities if e in QBO_TO_SHEET_ENTITY]
+    # PACK_EXCLUDED_ENTITIES must govern here too. build_pack hands this section
+    # the UNFILTERED list so the footer can report the exclusion, but the
+    # cross-check itself must not run on an excluded realm -- HR LLC was kept
+    # out only by the accident of having no sheet mapping.
+    checkable = [e for e in entities
+                 if e in QBO_TO_SHEET_ENTITY and e not in PACK_EXCLUDED_ENTITIES]
     # An entity with no cash-sheet mapping must be NAMED, not filtered into
     # invisibility. Dropping it made the footer claim "2 of 2" while a third
     # provisioned realm was never cross-checked at all -- full coverage asserted
@@ -841,32 +846,41 @@ def build_cash_section(
             "age_days": age_days,
         })
 
-    # ── Roll-up re-basing (cq-6fbb9d717512) ─────────────────────────────────
-    # Done as a SECOND PASS over the rows already built, so the member realms'
-    # balance sheets are reused rather than re-fetched.
+    # ── Roll-up rows become a CONSOLIDATION TIE-OUT (cq-6fbb9d717512) ────────
+    #
+    # First cut re-based the books leg to sum(member books) and compared THAT to
+    # the consolidated sheet row. Algebraically that equals
+    #   sum(member deltas) + (sum(member sheet closings) - sheet_consolidated)
+    # -- so it re-reported the four member variances (already rendered below it)
+    # as a fifth independent-looking flag. Live 2026-08-05: roll-up delta
+    # -$8,026.16 vs sum-of-member-deltas -$8,025.16, i.e. 8 flags for 7 distinct
+    # cash positions, and close-prep then read "8 entity(ies)". The pack forbids
+    # exactly that double-count for restatements; the same rule applies here.
+    #
+    # Only the SECOND term is new information, so that is all this row reports:
+    # does the consolidated sheet row tie to its own member rows? It touches no
+    # books at all -- the realm has none -- which also removes the latent
+    # period-mismatch of summing member balance sheets pulled at each member's
+    # own as_of and comparing them to the consolidated tab's week.
     by_entity = {r["entity"]: r for r in rows}
     for row in rows:
         members = SHEET_ROLLUPS.get(QBO_TO_SHEET_ENTITY.get(row["entity"], ""))
         if not members:
             continue
         row["rollup_members"] = members
-        member_rows = [by_entity.get(m) for m in members]
-        usable = [m for m in member_rows if m and m["books_net"] is not None]
-        if len(usable) != len(members):
-            # A PARTIAL sum against a FULL consolidated sheet row would understate
-            # the books leg and manufacture exactly the false flag this fix removes.
-            row["bank"] = row["cards"] = row["books_net"] = row["delta"] = None
+        row["is_rollup"] = True
+        row["bank"] = row["cards"] = row["books_net"] = None
+        row["cards_present"] = False
+        member_closings = [
+            by_entity[m]["sheet_closing"] for m in members
+            if m in by_entity and by_entity[m]["sheet_closing"] is not None
+        ]
+        if len(member_closings) != len(members) or row["sheet_closing"] is None:
             row["rollup_incomplete"] = True
+            row["delta"] = None
             continue
-        row["bank"] = round(sum(m["bank"] for m in usable if m["bank"] is not None), 2)
-        card_values = [m["cards"] for m in usable if m["cards"] is not None]
-        row["cards"] = round(sum(card_values), 2) if card_values else None
-        row["cards_present"] = bool(card_values)
-        row["books_net"] = round(sum(m["books_net"] for m in usable), 2)
-        row["delta"] = (
-            None if row["sheet_closing"] is None
-            else round(row["books_net"] - row["sheet_closing"], 2)
-        )
+        row["member_sum"] = round(sum(member_closings), 2)
+        row["delta"] = round(row["member_sum"] - row["sheet_closing"], 2)
 
     none_count = sum(1 for r in rows if r["sheet_closing"] is None) - sheet_read_failures
 
@@ -927,14 +941,32 @@ def build_cash_section(
     forecast_only = 0
     for row in rows:
         label = entity_label(row["entity"])
-        members = row.get("rollup_members")
-        rollup_note = ""
-        if members:
-            member_names = ", ".join(entity_label(m) for m in members)
-            rollup_note = (
-                f" [consolidated row: books leg is the sum of {member_names}; "
-                f"the {label} realm itself holds no cash]"
+
+        # A consolidated row is a SHEET-INTERNAL tie-out, not a books comparison.
+        # It gets its own rendering so it can never be read as a fifth cash
+        # position, and it is excluded from `snap` so close-prep's "N entity(ies)
+        # show a cash delta" count stays one-per-entity.
+        if row.get("is_rollup"):
+            member_names = ", ".join(entity_label(m) for m in row["rollup_members"])
+            if row.get("rollup_incomplete"):
+                section.lines.append(
+                    f"• {label}: unavailable — the consolidated row could not be tied "
+                    f"out (a member row or the consolidated total is missing)"
+                )
+                continue
+            crosses = abs(row["delta"]) >= CASH_DELTA_ABS
+            if crosses:
+                section.flags += 1
+            mark = ":triangular_flag_on_post: " if crosses else ""
+            section.lines.append(
+                f"• {mark}{label}: consolidation tie-out — sheet total "
+                f"{fmt_money(row['sheet_closing'])} vs its own member rows summing "
+                f"{fmt_money(row['member_sum'])} ({member_names}) — difference "
+                f"{fmt_delta(row['delta'])}. The {label} realm holds no cash of its "
+                f"own; each store's books comparison is its own row below."
             )
+            continue
+
         if row["sheet_closing"] is None or row["books_net"] is None:
             missing = []
             if row["sheet_closing"] is None:
@@ -950,7 +982,6 @@ def build_cash_section(
             continue
         complete += 1
         as_of_note = "" if row["as_of_exact"] else f" [books as of {row['as_of']}, week date unparsed]"
-        as_of_note += rollup_note
         if not row["cards_present"]:
             books_note = " (no credit-card section in the books)"
         elif row["cards"]:
@@ -1070,6 +1101,15 @@ def build_bank_section(
             ":warning: snapshot carries no usable timestamp — treat these figures as "
             "of UNKNOWN age, not as current."
         )
+    elif age_h < 0:
+        # A future stamp is a broken clock or a hand-edited file, not freshness.
+        # Without this it passes the `> MAX_AGE` test and renders as current with
+        # a nonsense "~-128h ago".
+        section.lines.append(
+            f":warning: snapshot is stamped in the FUTURE "
+            f"({data.get('generated_at_utc')}) — its age cannot be trusted; treat "
+            f"these figures as of UNKNOWN age."
+        )
     elif age_h > DEFAULT_MAX_AGE_HOURS:
         section.lines.append(
             f":warning: snapshot is ~{age_h:.0f}h old (generated "
@@ -1092,6 +1132,7 @@ def build_bank_section(
     covered = 0
     totals_usable = True
     contributing: list[str] = []
+    shell_realms: list[str] = []
 
     for entity in renderable:
         label = entity_label(entity)
@@ -1108,22 +1149,36 @@ def build_bank_section(
             section.lines.append(f"• {label}: unavailable — {reason}")
             continue
 
-        covered += 1
         if block.get("shell"):
-            # A shell realm is a footnote, not a balance row (design 3 S1).
+            # A shell realm is a footnote, not a balance row (design 3 S1). It is
+            # also removed from the DENOMINATOR: a realm with no bank accounts is
+            # not something we failed to read, and counting it as a permanent
+            # coverage gap would make the section report itself partial EVERY week
+            # -- which trains the reader to ignore the one signal that separates a
+            # normal week from a realm that actually 401'd.
+            shell_realms.append(entity)
             section.lines.append(
                 f"• {label}: cash-less holding shell — no bank accounts to report."
             )
             continue
-        if not block.get("balances_complete", True):
-            totals_usable = False
-        contributing.append(entity)
 
         bank = block.get("bank_total")
         cards = block.get("cc_total")
         net = block.get("cash_net_of_cards")
         newest = block.get("newest_bank_txn_date")
         age_d = txn_age_days(newest, today=day)
+
+        # A realm whose balances are INCOMPLETE was not fully read, so it must not
+        # count toward coverage -- otherwise is_partial stays False and the whole
+        # section vanishes from the founder cut (which is a flag/gap filter).
+        bank_unknown = int(block.get("bank_unknown") or 0)
+        cc_unknown = int(block.get("cc_unknown") or 0)
+        complete = bool(block.get("balances_complete", True))
+        if complete:
+            covered += 1
+            contributing.append(entity)
+        else:
+            totals_usable = False
 
         flagged = age_d is not None and age_d > threshold
         if flagged:
@@ -1137,14 +1192,38 @@ def build_bank_section(
             if flagged:
                 fresh_txt += f" — over the {threshold}d threshold"
 
+        # The freshness date is a max() over several transaction surfaces. If some
+        # of those queries failed, the date is a floor, not the answer -- and a
+        # realm can be flagged stale purely because the surfaces that would have
+        # disproved it were never read.
+        f_cov = block.get("freshness_types_covered")
+        f_exp = block.get("freshness_types_expected")
+        if isinstance(f_cov, int) and isinstance(f_exp, int) and f_cov < f_exp:
+            fresh_txt += (
+                f" [only {f_cov} of {f_exp} txn surfaces read — this date is a "
+                f"floor, not a confirmed latest]"
+            )
+
+        # Accounts whose balance QBO did not return are EXCLUDED from the totals
+        # above, so the figure is short by however many. Say so on the row itself;
+        # a portfolio-level withholding line never names the realm.
+        gap_txt = ""
+        if not complete:
+            missing = bank_unknown + cc_unknown
+            gap_txt = (
+                f" — INCOMPLETE: {missing} account(s) returned no balance, so this "
+                f"row understates the realm"
+            )
+
         cards_txt = "" if not cards else f", cards {fmt_money(cards)}"
         section.lines.append(
             f"• {mark}{label}: bank {fmt_money(bank)}{cards_txt}, net of cards "
-            f"{fmt_money(net)} — {fresh_txt}"
+            f"{fmt_money(net)} — {fresh_txt}{gap_txt}"
         )
         snap[entity] = {
             "bank_total": bank, "cc_total": cards, "cash_net_of_cards": net,
             "newest_bank_txn_date": newest, "txn_age_days": age_d,
+            "balances_complete": complete,
         }
 
     # Section total over exactly the rows rendered above -- never the snapshot's
@@ -1155,13 +1234,16 @@ def build_bank_section(
             + fmt_money(round(sum(realms[e]["cash_net_of_cards"] for e in contributing), 2))
         )
     elif contributing:
+        # Phrased with "unavailable —" deliberately: build_founder_cut collects
+        # coverage lines by that literal substring, so any other wording makes the
+        # whole section invisible in the cut Harrison reads.
         section.lines.append(
-            "Total withheld — at least one realm is unavailable or carries an "
-            "unknown balance, so a sum would understate the portfolio."
+            "Total unavailable — at least one realm could not be read or carries "
+            "an unknown balance, so a sum would understate the portfolio."
         )
 
     section.covered = covered
-    section.expected = len(renderable)
+    section.expected = len(renderable) - len(shell_realms)
     section.lines.append(
         f"_Read {covered} of {section.expected} realm(s) from the snapshot._"
     )
@@ -1193,6 +1275,7 @@ def build_forecast_assist_section(
     sources: Sources,
     *,
     prior: dict[str, Any] | None = None,
+    cash_fragment: dict[str, Any] | None = None,
     today: datetime.date | None = None,
 ) -> tuple[Section, dict[str, Any]]:
     """Next-week cash starting points + an honest accuracy statement."""
@@ -1200,7 +1283,6 @@ def build_forecast_assist_section(
 
     section = Section(key="forecast_assist", title=":chart_with_upwards_trend: Forecast assist")
     snap: dict[str, Any] = {}
-    day = today or _today()
 
     dual = sources.get_cash_dual()
     if dual is None:
@@ -1266,13 +1348,43 @@ def build_forecast_assist_section(
         )
 
     # ── next-week starting points ────────────────────────────────────────────
-    forward = [w for w in dual if w.get("actual") is None and w.get("forecast") is not None]
+    # Choosing "the first entry with no actual" relabels a PAST week as next
+    # week's target the moment one actual is late -- Justin is out, 7-31 is still
+    # unfilled when the pack runs on 8-3, and the section then tells everyone to
+    # carry today's balances into the opening row of a week that already closed.
+    #
+    # Anchor on SERIES POSITION, not on parsed dates. The dual series is already
+    # chronological (sheet column order), and the sheet's week labels carry no
+    # year: _parse_week_date is deliberately BACKWARD-looking and resolves "8-7"
+    # against a 2026-08-03 run date to 2025-08-07, so a date filter would have
+    # discarded every forward week and silently killed this whole leg.
+    last_actual_idx = max(
+        (i for i, w in enumerate(dual) if w.get("actual") is not None), default=-1
+    )
+    forward = [
+        w for w in dual[last_actual_idx + 1:]
+        if w.get("actual") is None and w.get("forecast") is not None
+    ]
     next_week = forward[0] if forward else None
 
     bank = sources.get_bank_snapshot()
     realms = (bank or {}).get("realms") or {}
 
+    # The bank section warns about a stale snapshot under its OWN heading; this
+    # section asserts figures are "on hand now" under a different one, and
+    # render_forecast_worksheet emits ONLY these lines -- so the warning has to
+    # travel with them.
+    from .qbo_bank_snapshot import DEFAULT_MAX_AGE_HOURS, snapshot_age_hours  # noqa: PLC0415
+    age_h = snapshot_age_hours(bank) if bank else None
+    if bank and (age_h is None or age_h < 0 or age_h > DEFAULT_MAX_AGE_HOURS):
+        section.lines.append(
+            ":warning: the balances below are from a snapshot of UNKNOWN or stale age"
+            + (f" (~{age_h:.0f}h old)" if age_h and age_h > 0 else "")
+            + " — they are NOT 'as of now'."
+        )
+
     renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
+    shell_realms: list[str] = []
     covered = 0
     if next_week is None:
         section.lines.append(
@@ -1286,23 +1398,61 @@ def build_forecast_assist_section(
         )
         for entity in renderable:
             block = realms.get(entity)
-            if not block or block.get("status") != "ok" or block.get("shell"):
+            # A cash-less shell has no starting point to carry, so it is dropped
+            # from the DENOMINATOR rather than counted as a coverage gap. Leaving
+            # it in made this section report itself partial EVERY week (OSN is
+            # shell-configured and is not pack-excluded), and a permanent
+            # false-partial trains the reader to ignore the real ones.
+            if block and block.get("shell"):
+                shell_realms.append(entity)
+                continue
+            if not block or block.get("status") != "ok":
+                # An unreadable realm must be NAMED, not silently absent. The
+                # "unavailable —" wording is what build_founder_cut collects.
+                section.lines.append(
+                    f"• {entity_label(entity)}: unavailable — no bank snapshot for "
+                    f"this realm, so it has no starting point"
+                )
                 continue
             net = block.get("cash_net_of_cards")
             if net is None:
                 section.lines.append(
-                    f"• {entity_label(entity)}: books position UNKNOWN — no starting point"
+                    f"• {entity_label(entity)}: unavailable — books position UNKNOWN, "
+                    f"so it has no starting point"
                 )
                 continue
             covered += 1
-            section.lines.append(
-                f"• {entity_label(entity)}: {fmt_money(net)} on hand now "
-                f"[{BALANCE_BASIS}] — carry into the {label} opening row"
-            )
-            snap[entity] = {"starting_point": net, "week": next_week["week"]}
+            # BASIS, not decoration (D-116). The sheet's opening row is
+            # "BEGINNING Cash/CC - BOOK Balance", so the number that belongs in it
+            # is the BalanceSheet-report figure the pack's cash section already
+            # computed -- NOT this register balance. Telling Justin to carry the
+            # register in would have manufactured the very break the cash section
+            # then flags: verified live 2026-08-05, HJR Properties reads $128,128
+            # on the register against $26,880 on the report, and Big D Media flips
+            # sign by ~$20K. So the register is shown as a reference only, and the
+            # carry-in names the book figure when we have it.
+            books = (cash_fragment or {}).get(entity, {}).get("books_net")
+            if books is None:
+                section.lines.append(
+                    f"• {entity_label(entity)}: register reads {fmt_money(net)} "
+                    f"[{BALANCE_BASIS}] — reference only; the {label} opening row "
+                    f"takes a BOOK balance, which is not available this run"
+                )
+            else:
+                section.lines.append(
+                    f"• {entity_label(entity)}: carry {fmt_money(books)} into the "
+                    f"{label} opening row [books, BalanceSheet report — the basis "
+                    f"that row uses]. Live register reads {fmt_money(net)} "
+                    f"[{BALANCE_BASIS}]; the two are different measures, so do NOT "
+                    f"substitute one for the other."
+                )
+            snap[entity] = {
+                "starting_point_books": books, "register_reference": net,
+                "week": next_week["week"],
+            }
 
     section.covered = covered
-    section.expected = len(renderable)
+    section.expected = len(renderable) - len(shell_realms)
     section.lines.append(
         f"_Starting points for {covered} of {section.expected} entity(ies). "
         f"Cora never writes the cash sheet — this is a worksheet to type from._"
@@ -1347,7 +1497,18 @@ _INTERCOMPANY_PATTERNS = ("intercompany", "inter-company", "due to", "due from",
 #: is_any_phi cannot catch a bare person name in an account title ("Due from Jane
 #: Smith" trips none of its predicates), and #hjrg-finance / #founder-finance /
 #: Justin's DM are not LEX-custodian surfaces.
+#: Matched by PREFIX after normalizing, not by exact string. An exact allow-list
+#: was the wrong shape for a guard whose whole premise is that a human cannot spot
+#: a bare person name in an account title: a future LEX-LLC / LEXLLC realm (HRLLC
+#: already proves per-sub-entity realms get provisioned), or an operator passing
+#: `--entities lex`, would have fallen straight through to free rendering.
 _NAME_OPAQUE_REALMS: frozenset[str] = frozenset({"LEX"})
+
+
+def is_name_opaque_realm(entity: str) -> bool:
+    """True if this realm's ACCOUNT NAMES must never render on a finance surface."""
+    code = re.sub(r"[^A-Z]", "", str(entity or "").upper())
+    return any(code.startswith(prefix) for prefix in _NAME_OPAQUE_REALMS)
 
 INTERCOMPANY_DELTA_ABS = 500.0
 
@@ -1432,7 +1593,7 @@ def _candidate_label(entity: str, index: int, name: str) -> str:
     DM only (the script's separate delivery), and enter the YAML seed as ids plus
     Harrison-approved display labels.
     """
-    if entity in _NAME_OPAQUE_REALMS:
+    if is_name_opaque_realm(entity):
         return f"{entity_label(entity)} candidate account #{index}"
     return _scrub_external(name, 60)
 
@@ -1451,6 +1612,13 @@ def build_intercompany_section(
 
     renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
     found: dict[str, list[dict[str, Any]]] = {}
+    # EVERY account row per realm, kept separately for confirmed-pair lookup. The
+    # YAML calls account_id "the stable key (ids do not change when an account is
+    # renamed)" -- but searching only the PATTERN-MATCHED candidates defeated
+    # exactly that: rename "Intercompany Clearing" to "IC Clearing" and the row
+    # leaves `found`, so the id could never be located and a live pair silently
+    # stopped reconciling.
+    all_rows: dict[str, list[dict[str, Any]]] = {}
     covered = 0
 
     for entity in renderable:
@@ -1460,7 +1628,9 @@ def build_intercompany_section(
             log.warning("finance_close: intercompany scan failed for %s: %s", entity, exc)
             continue
         covered += 1
-        rows = [r for r in iter_account_rows(report) if is_intercompany_account(r["name"])]
+        every = iter_account_rows(report)
+        all_rows[entity] = every
+        rows = [r for r in every if is_intercompany_account(r["name"])]
         if rows:
             found[entity] = rows
 
@@ -1494,16 +1664,31 @@ def build_intercompany_section(
     # ── confirmed-pair mismatch check ────────────────────────────────────────
     if active:
         threshold = intercompany_delta_threshold()
+        pairs_checked = 0
         for pair in active:
             left, right = pair.get("left") or {}, pair.get("right") or {}
-            lv = _pair_balance(found, left)
-            rv = _pair_balance(found, right)
+            lv = _pair_balance(all_rows, left)
+            rv = _pair_balance(all_rows, right)
             name = _scrub_external(str(pair.get("name") or "pair"), 40)
+            # Defence in depth: _candidate_label opaques discovery rows, but a
+            # confirmed pair rendered its YAML label free-form. That label is
+            # Harrison-authored, yet a pair touching an opaque realm should not
+            # depend on hand-authoring discipline to stay safe.
+            if any(is_name_opaque_realm(str((side or {}).get("entity") or ""))
+                   for side in (left, right)):
+                name = f"pair #{active.index(pair) + 1} (name withheld)"
             if lv is None or rv is None:
+                # "unavailable —" is the literal substring build_founder_cut
+                # collects coverage lines by; any other wording makes an unrun
+                # reconciliation invisible in the cut Harrison reads. The wording
+                # also stays honest about the two distinct causes: the account was
+                # absent, OR it was present with an unreadable balance.
                 section.lines.append(
-                    f"• {name}: UNKNOWN — one side's account was not found this run"
+                    f"• {name}: unavailable — one side's account was not found, or "
+                    f"returned no readable balance, so this pair was NOT checked"
                 )
                 continue
+            pairs_checked += 1
             # Sign convention is recorded PER PAIR, never inferred from names: an
             # asset-side "Due from" and a liability-side "Due to" may be stored
             # with the same or opposite signs depending on how the books were set up.
@@ -1524,7 +1709,7 @@ def build_intercompany_section(
     section.covered = covered
     section.expected = len(renderable)
     section.lines.append(f"_Scanned {covered} of {section.expected} realm(s)._")
-    if any(e in _NAME_OPAQUE_REALMS for e in found):
+    if any(is_name_opaque_realm(e) for e in found):
         section.lines.append(
             "_Account names for one or more realms are withheld here and sent to "
             "Harrison directly._"
@@ -2128,7 +2313,13 @@ def build_pack(
     )
     forecast_section = guarded(
         "forecast_assist", ":chart_with_upwards_trend: Forecast assist",
-        lambda: build_forecast_assist_section(provisioned, src, prior=prior, today=day),
+        # The cash fragment carries each entity's BOOK balance, already computed
+        # above. Passing it means the carry-in figure is on the same basis as the
+        # sheet row it goes into, with no extra API call.
+        lambda: build_forecast_assist_section(
+            provisioned, src, prior=prior,
+            cash_fragment=snapshot.get("cash"), today=day,
+        ),
     )
     intercompany_section = guarded(
         "intercompany", ":left_right_arrow: Intercompany",

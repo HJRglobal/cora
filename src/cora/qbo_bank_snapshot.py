@@ -104,6 +104,17 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
     return raw
 
 
+def excluded_realms(config: dict[str, Any] | None = None) -> set[str]:
+    """Realms never swept. See the config file's own header for why HR LLC is
+    there. FAIL-SAFE: if the config is unreadable the default still excludes it --
+    an unreadable config must not start publishing personal balances."""
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("excluded_realms")
+    if not isinstance(raw, list) or not raw:
+        return {"HRLLC"}
+    return {str(r) for r in raw if r}
+
+
 def _shell_realms(config: dict[str, Any]) -> set[str]:
     realms = config.get("realms") or {}
     if not isinstance(realms, dict):
@@ -143,7 +154,18 @@ def build_realm(
         accounts = query_accounts(entity)
         summary = summarize(accounts)
         bank_ids = {a["id"] for a in accounts if a.get("type") == "Bank" and a.get("id")}
-        fresh = freshness(entity, bank_ids)
+        # Freshness is guarded SEPARATELY from the balance read. They are
+        # independent facts, and letting a freshness failure bubble here would
+        # mark the realm `error` -- discarding balances already read successfully,
+        # and withholding the whole portfolio total on their account.
+        try:
+            fresh = freshness(entity, bank_ids)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("qbo_bank_snapshot: freshness failed for %s: %s", entity, exc)
+            fresh = {
+                "date": None, "per_type": {}, "types_covered": 0,
+                "types_expected": None, "errors": {"freshness": str(exc)[:200]},
+            }
         block.update({
             "accounts": accounts,
             **{k: summary[k] for k in (
@@ -225,10 +247,20 @@ def build_snapshot(
     summarize: Callable[[list[dict[str, Any]]], dict[str, Any]],
     freshness: Callable[[str, set[str]], dict[str, Any]],
     config: dict[str, Any] | None = None,
+    full_scope: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Assemble the full snapshot. Coverage rides the file as STRUCTURE (D-117)."""
+    """Assemble the full snapshot. Coverage rides the file as STRUCTURE (D-117).
+
+    ``full_scope`` is the set of realms this snapshot is SUPPOSED to cover (all
+    non-excluded provisioned realms). When ``entities`` is narrower -- a
+    ``--entities F3E`` debugging run -- the file records the real denominator and
+    marks itself a partial sweep, so it cannot overwrite the daily file with a
+    one-realm payload that self-certifies as complete.
+    """
     cfg = config if config is not None else load_config()
     shells = _shell_realms(cfg)
+    scope = list(full_scope) if full_scope is not None else list(entities)
+    partial_sweep = sorted(set(scope)) != sorted(set(entities))
 
     realms: dict[str, dict[str, Any]] = {}
     for entity in entities:
@@ -243,11 +275,21 @@ def build_snapshot(
     covered = sum(1 for b in realms.values() if b.get("status") == "ok")
     portfolio, withheld = _portfolio_block(realms, cfg)
 
+    # A narrowed sweep cannot claim a portfolio total: the realms it never asked
+    # about are missing, not zero.
+    if partial_sweep and portfolio is not None:
+        missing = sorted(set(scope) - set(entities))
+        portfolio, withheld = None, (
+            f"partial sweep — {len(missing)} realm(s) not requested this run: "
+            f"{', '.join(missing)}"
+        )
+
     return {
         "generated_at_utc": _utc_now_iso(),
         "basis": BALANCE_BASIS,
         "covered": covered,
-        "expected": len(entities),
+        "expected": len(scope),
+        "partial_sweep": partial_sweep,
         "realms": realms,
         "portfolio": portfolio,
         "portfolio_withheld_reason": withheld,

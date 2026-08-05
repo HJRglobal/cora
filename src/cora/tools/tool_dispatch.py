@@ -7212,16 +7212,27 @@ def _tool_f3e_channel_inventory(slack_user_id: str, entity: str, _input: dict) -
             or needle in str((entries[sku] or {}).get("display_name", "")).lower()
         ]
         if not wanted:
+            # ECHOING USER TEXT: this tool is a VERBATIM_TABLE_TOOL, so format_reply
+            # is bypassed, and the egress boundary deliberately PRESERVES `<...>`
+            # (the sanctioned citation form). So a raw echo let any channel member
+            # make Cora post `<!channel>` or a labelled attacker link. Scrub before
+            # interpolation, never after.
+            from ..inventory_state import scrub as _inv_scrub  # noqa: PLC0415
             return (
-                f"I don't have a SKU or product line matching \"{raw_filter[:40]}\" in the "
-                "cross-channel map. Ask without a filter to see everything I do track."
+                f"I don't have a SKU or product line matching "
+                f"\"{_dash_scrub(_inv_scrub(raw_filter, 40))}\" in the cross-channel "
+                "map. Ask without a filter to see everything I do track."
             )
 
     log.info("f3e_channel_inventory user=%s filter=%s", slack_user_id, raw_filter or "-")
     header = "*F3 inventory across channels*"
     if not merged.complete:
         header += " -- partial coverage; unread channels show UNKNOWN, not zero."
-    return "\n".join([header, *render_rows(merged, sku_map, wanted)])
+    # _dash_scrub is what every sibling dashboard reader applies (D-051
+    # 2026-07-11): the store files are Cowork/Airtable-written, and neither
+    # format_reply (bypassed) nor egress (host-allowlisted) strips an arbitrary
+    # URL or a platform token pasted into a free-text field.
+    return _dash_scrub("\n".join([header, *render_rows(merged, sku_map, wanted)]))
 
 
 def _tool_f3e_rangeme_status(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -7343,6 +7354,7 @@ _DASH_INDEX: dict[str, tuple[str, str]] = {
     _DASH_CONTENT: ("The content & freelancer pipeline -- deliverables, budget, events", "what's overdue in content?"),
     _DASH_RANGEME: ("F3 retail submissions on RangeMe -- what's In Review, buyer replies", "where do we stand on RangeMe?"),
     _DASH_CULTURAL: ("The weekly F3 cultural radar -- trending hooks by brand", "what's on the cultural radar?"),
+    _DASH_CHANNEL_INVENTORY: ("F3 inventory across every sales channel -- office, DTC 3PL, UNIS, TikTok FBT, Amazon FBA, Walmart WFS", "what's our cross-channel inventory?"),
 }
 
 
@@ -10840,7 +10852,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "influencer_list_handles": 8,
     "influencer_get_status": 8,
     "f3e_ai_visibility": 8,
-    "f3e_channel_inventory": 12,
+    "f3e_channel_inventory": 15,
     "revops_ledger_status": 8,
     # Normal — single external API call
     "asana_create_task": 12,

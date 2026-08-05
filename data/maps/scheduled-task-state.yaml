@@ -86,3 +86,8 @@ enabled:
   # pack. Added 2026-08-04 (A5 S1). Exit 1 = a realm errored (snapshot still
   # written, that realm UNKNOWN); exit 2 = total failure, prior snapshot kept.
   - cowork-cora-bank-snapshot
+  # Daily 06:20 AZ F3E inventory-state sync -> the cross-channel inventory store in
+  # 02-F3-Energy/inventory-state. Added 2026-08-05 (A5 Part 2). Scheduled BEFORE
+  # the 06:33 F3E daily synthesis that consumes it -- a later slot would leave
+  # every synthesis reading a ~24h-old file.
+  - cowork-cora-inventory-state-sync

@@ -335,9 +335,19 @@ class TestCoverage:
 
     def test_coverage_counts_channels_not_sources(self):
         merged = inv.merge(SKU_MAP, _loads(shopify=_shopify_payload(
-            office={"PURE-Original": 1}, dtc_3pl={}, unis={}, tiktok_fbt={})))
+            office={"PURE-Original": 1}, dtc_3pl={"PURE-Original": 2},
+            unis={"PURE-Original": 3}, tiktok_fbt={"PURE-Original": 4})))
         assert merged.expected_channels == 6
         assert merged.covered_channels == 4
+
+    def test_a_block_with_no_skus_does_not_count_as_read(self):
+        """A present, status-ok block carrying no SKU payload is structurally
+        blind. Counting it let a broken writer report full coverage while
+        contributing no data -- an all-clear over nothing."""
+        merged = inv.merge(SKU_MAP, _loads(shopify=_shopify_payload(
+            office={"PURE-Original": 1}, dtc_3pl={}, unis={}, tiktok_fbt={})))
+        assert merged.covered_channels == 1
+        assert merged.complete is False
 
     def test_channel_summary_names_unread_channels(self):
         merged = inv.merge(SKU_MAP, _loads(shopify=_shopify_payload(

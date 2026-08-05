@@ -34,6 +34,7 @@ from ..kb_exclusions import (
     is_copa_meeting_title,
     is_dashboard_store_path,
     is_finance_worksheet_path,
+    is_finance_worksheet_title,
 )
 
 log = logging.getLogger(__name__)
@@ -281,6 +282,11 @@ class KnowledgeBase:
                 # documents, not knowledge. See is_finance_worksheet_path.
                 or is_finance_worksheet_path(doc.source_id)
                 or is_finance_worksheet_path(meta_path)
+                # drive_sweep stores a bare file id and NO path, so the
+                # segment test above cannot see it -- and sweep_founders_os
+                # walks 01-HJR-Global. Title-keyed, Drive sources only.
+                or (doc.source in ("drive_sweep", "drive_asset")
+                    and is_finance_worksheet_title(doc.title))
                 # NDA'd COPA meeting EXPORTS live OUTSIDE copa-bhrf (under
                 # _shared/meetings) and carry no useful path, so key on TITLE -- but
                 # ONLY for the Drive meeting-export sources, so this never drops an

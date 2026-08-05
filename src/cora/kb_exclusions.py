@@ -127,6 +127,21 @@ def is_finance_worksheet_path(path_or_source_id: str) -> bool:
     return bool(segs & _FINANCE_WORKSHEET_SEGMENTS)
 
 
+def is_finance_worksheet_title(title: str) -> bool:
+    """True if a Drive file's TITLE marks it a generated finance worksheet.
+
+    The path predicate above covers static_md, whose source_id IS the path. It
+    does NOT cover ``drive_sweep``, which sets ``source_id`` to a bare Drive file
+    id and stores no path -- and ``sweep_founders_os`` walks 01-HJR-Global. So the
+    same file would have been ingested as HJRG chunks through the other door.
+    Title-keyed, following the COPA meeting-export precedent, and scoped at the
+    call site to Drive sources only so an ordinary email mentioning the phrase is
+    unaffected.
+    """
+    name = _basename(str(title or "")).lower()
+    return "forecast-assist" in name
+
+
 def is_dashboard_store_path(path_or_source_id: str) -> bool:
     """True if a filesystem path, Drive path, or path-shaped source_id sits inside
     a personal / highly-confidential dashboard store (capital-raise, oneamerica,

@@ -985,8 +985,13 @@ def gather_f3e_ecom(*, today: date | None = None) -> dict:
     try:
         from . import inventory_state as _inv
         _merged = _inv.merge()
-        if _merged.rows:
-            lines.append(_inv.render_channel_summary(_merged))
+        # Always emit a line. Skipping on the empty path made the section vanish
+        # silently rather than say it had nothing to report -- absence of a line
+        # reads as "nothing to flag", which is the opposite of the truth.
+        lines.append(
+            _inv.render_channel_summary(_merged) if _merged.rows
+            else "- Cross-channel inventory: SKU map unreadable — nothing merged"
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("channel_synthesis: F3E cross-channel inventory unavailable: %s", exc)
         lines.append("- Cross-channel inventory: not available")
