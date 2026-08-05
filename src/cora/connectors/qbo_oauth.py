@@ -37,6 +37,7 @@ Token file shape:
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.server
 import json
 import logging
@@ -48,10 +49,23 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Platform file-locking primitives. Exactly one of these exists on any host we
+# run on; both are absent only on exotic builds, where we degrade to the
+# in-process lock (see _lock_fd).
+try:  # pragma: no cover - platform-dependent
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+try:  # pragma: no cover - platform-dependent
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 
@@ -187,10 +201,141 @@ def _get_entity_tokens(entity: str) -> dict[str, Any]:
     return tokens[entity]
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Cross-process write lock (A5 S0)
+#
+# _save_all_tokens has been atomic since 2026-05-19 — a reader never sees a
+# partial JSON. The surviving hazard is the READ-MODIFY-WRITE cycle around it:
+# _load_all_tokens -> mutate one realm -> _save_all_tokens. The whole map lives
+# in one file, so two processes refreshing DIFFERENT realms can each read the
+# same snapshot and the second write silently drops the first realm's ROTATED
+# refresh token. That loss is unrecoverable — Intuit invalidates the old refresh
+# token on rotation, so the dropped realm needs a manual browser re-OAuth.
+#
+# Concurrency is real and rising: the token-refresh task (02:00), the daily bank
+# snapshot's 11-realm burst (07:05), the Monday close pack (09:00) and the
+# always-on bot's conversational QBO tools all refresh independently.
+#
+# RESIDUAL (documented, out of S0 scope): two processes refreshing the SAME realm
+# at the same instant still both POST to Intuit; the second POST fails because
+# the first rotated the token. That is a failed refresh (retried next fire, and
+# the refresh token is valid for 100 days), not silent token loss.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Serializes threads inside ONE process (the bot). A file lock taken twice from
+# the same process does not reliably block on either platform, so in-process
+# ordering has to be established before the file lock is attempted.
+_LOCAL_TOKEN_LOCK = threading.RLock()
+
+_LOCK_POLL_SEC = 0.05
+_DEFAULT_LOCK_TIMEOUT_SEC = 10.0
+
+# One-shot warning when neither platform primitive is importable.
+_lock_degraded_warned = False
+
+
+def _lock_timeout() -> float:
+    """Lock-acquisition budget, env-tunable. Deliberately short: this sits on the
+    conversational QBO path, and a refresh cycle holds the lock for milliseconds."""
+    raw = os.getenv("QBO_TOKEN_LOCK_TIMEOUT_SEC", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LOCK_TIMEOUT_SEC
+    return value if value > 0 else _DEFAULT_LOCK_TIMEOUT_SEC
+
+
+def _lock_path() -> Path:
+    """Sibling lock file, derived from _TOKEN_FILE **at call time**.
+
+    Resolved per-call rather than at import so a test (or any caller) that
+    redirects _TOKEN_FILE also redirects the lock — a module-level constant here
+    would make every test share the real repo lock file.
+    """
+    return _TOKEN_FILE.with_name(_TOKEN_FILE.name + ".lock")
+
+
+def _lock_fd(fd: int) -> None:
+    """Take an exclusive, NON-BLOCKING lock on `fd`. Raises OSError if held.
+
+    Returns normally (unlocked) when neither primitive is available — the
+    in-process lock still applies. Failing every QBO call on such a host would be
+    a worse outcome than the narrow cross-process race.
+    """
+    global _lock_degraded_warned
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        # Locking one byte at offset 0 is legal past EOF on Windows.
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    elif fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif not _lock_degraded_warned:
+        _lock_degraded_warned = True
+        log.warning(
+            "qbo_oauth: no msvcrt/fcntl on this platform - QBO token writes are "
+            "serialized IN-PROCESS ONLY; concurrent processes could clobber a "
+            "rotated refresh token"
+        )
+
+
+def _unlock_fd(fd: int) -> None:
+    if msvcrt is not None:
+        with contextlib.suppress(OSError):
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    elif fcntl is not None:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _token_file_lock(timeout: float | None = None) -> Iterator[None]:
+    """Hold the cross-process token-store lock for the duration of the block.
+
+    FAIL-CLOSED on timeout: raises QboAuthError rather than proceeding unlocked.
+    A skipped refresh is recoverable (retried at the next fire, and the refresh
+    token stays valid ~100 days); a clobbered refresh token is not.
+    """
+    budget = _lock_timeout() if timeout is None else timeout
+    deadline = time.monotonic() + budget
+    lock_file = _lock_path()
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with _LOCAL_TOKEN_LOCK:
+        fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            while True:
+                try:
+                    _lock_fd(fd)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise QboAuthError(
+                            f"Timed out after {budget:g}s waiting for the QBO token "
+                            f"lock ({lock_file}). Another Cora process is refreshing "
+                            f"tokens; this refresh was skipped rather than risk "
+                            f"clobbering a rotated refresh token."
+                        ) from None
+                    time.sleep(_LOCK_POLL_SEC)
+            try:
+                yield
+            finally:
+                _unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+
 def _set_entity_tokens(entity: str, entry: dict[str, Any]) -> None:
-    tokens = _load_all_tokens()
-    tokens[entity] = entry
-    _save_all_tokens(tokens)
+    """Persist ONE realm's token entry, merging into the shared token map.
+
+    The load happens INSIDE the lock so the merge always sees the freshest map —
+    re-reading under the lock is what makes a queued writer safe rather than just
+    delayed. See the section comment above for why this matters.
+    """
+    with _token_file_lock():
+        tokens = _load_all_tokens()
+        tokens[entity] = entry
+        _save_all_tokens(tokens)
 
 
 # ────────────────────────────────────────────────────────────────────────────
