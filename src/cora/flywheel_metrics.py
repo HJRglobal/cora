@@ -139,6 +139,26 @@ def _parse_slack_ts(value) -> datetime | None:
         return None
 
 
+# ── Gap rows that carry their OWN disposition (Slice 5, 2026-08-05) ──────────
+# gap_routing_completeness_7d counts a gap as "routed" when it appears in
+# .resolved-gaps.jsonl or in gap_autofill_state.json. A gap logged by
+# code_queue._route_to_flywheel is neither: the classifier had ALREADY dispositioned
+# it into the code-session queue, and its record lives in the code-queue ledger. So
+# the metric read those rows as silently rotting when they were the one class that
+# was demonstrably handled -- a false negative in the exact gauge meant to make
+# rotting visible. Three of the six rotting rows on 2026-08-06 were this class.
+#
+# Keyed on the DETECTOR (a structural fact of how the row was written), not on the
+# gap text -- the internal string "capability/knowledge ask routed from code-queue
+# classifier" is a message, and messages get reworded.
+_SELF_DISPOSITIONED_DETECTORS = frozenset({"code_queue_route"})
+
+
+def _has_own_disposition(rec: dict) -> bool:
+    """True when this gap row was dispositioned at WRITE time into another lane."""
+    return str(rec.get("detector", "") or "").strip().lower() in _SELF_DISPOSITIONED_DETECTORS
+
+
 # ---------------------------------------------------------------------------
 # Collection
 # ---------------------------------------------------------------------------
@@ -443,7 +463,8 @@ def _collect_wave1_conversion_metrics(
                 continue
             total_over_7d += 1
             gid = rec.get("ts", "")
-            if gid in resolved_ids or gid in state_ids:
+            if (gid in resolved_ids or gid in state_ids
+                    or _has_own_disposition(rec)):
                 routed += 1
         out["gap_routing_completeness_7d"] = {
             "total_over_7d": total_over_7d, "routed": routed,
