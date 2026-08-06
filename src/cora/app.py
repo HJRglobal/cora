@@ -397,6 +397,61 @@ _ASANA_UPDATE_INTENT_RE = re.compile(
     re.IGNORECASE)
 
 
+# ── Explicit code-queue capture intent (cq-a1306f3835f8, 2026-08-05) ─────────
+# THE BUG THIS FIXES: "@Cora queue a code session: <free text>" misrouted to an
+# Asana task op (first seen 7/29 in the D-090 smokes, again in the 8/5 sweep).
+# Root cause is intent PRECEDENCE, not tool selection: _asana_destructive_intent
+# reads the DESCRIPTION text after the colon, and a bug report about tasks
+# ("... marking a task done doesn't work") satisfies its task-referent gate plus a
+# verb branch. It then forces that tool via tool_choice, which makes
+# cora_queue_code_session literally UNREACHABLE for the turn. Six days as the
+# longest-unresolved item in the 8/5 sweep, and it degrades the exact escape hatch
+# people use to report bugs -- so the explicit phrase must WIN.
+#
+# Precision-biased, mirroring the Asana detector's house style:
+#  - GOVERNANCE required: an explicit file-it verb must govern an explicit
+#    code-queue object within 30 chars. A soft complaint ("it's broken", "Cora
+#    should ...") is deliberately NOT here -- those are code_queue._PHRASE_RE
+#    signals that ride the async Harrison-gated classifier, and force-filing a
+#    card on every complaint would flood the queue.
+#  - LEADING: the match must start within the first 60 chars, so the phrase reads
+#    as the message's command rather than an aside buried in a paragraph.
+#  - NEGATION/DELIBERATION before the match disqualifies it ("I don't think we
+#    should queue a code session for that", "instead of queueing a code session").
+_CODE_QUEUE_INTENT_RE = re.compile(
+    r"\b(?:queue|queueing|queuing|log|file|add|put|open)\b[^.\n]{0,30}?\b"
+    r"(?:code[\s-]?session|code[\s-]?queue|build[\s-]?queue|dev(?:eloper)?[\s-]?queue|"
+    r"for the devs?)\b",
+    re.IGNORECASE,
+)
+_CODE_QUEUE_INTENT_MAX_START = 60
+# Anything in the text BEFORE the match that reframes it as hypothetical, negated,
+# or a rejected alternative.
+_CODE_QUEUE_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do not|dont|shouldn'?t|should not|no need|not\s+(?:worth|going|gonna)|"
+    r"instead of|rather than|without|never|why would|nothing to)\b",
+    re.IGNORECASE,
+)
+
+
+def _code_queue_capture_intent(text: str) -> bool:
+    """True for an EXPLICIT "file this to the code queue" command. See the module
+    section above for why this must take precedence over the Asana task-op force.
+
+    A miss is safe in both directions: the tool stays available to the model (this
+    only removes a hard tool_choice hijack and adds a positive force), and a false
+    positive files a Harrison-gated PROPOSED candidate he can dismiss in one tap --
+    never a data write.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    m = _CODE_QUEUE_INTENT_RE.search(t)
+    if not m or m.start() > _CODE_QUEUE_INTENT_MAX_START:
+        return False
+    return not _CODE_QUEUE_NEGATION_RE.search(t[: m.start()])
+
+
 def _asana_destructive_intent(text: str) -> str | None:
     """Return the Asana WRITE tool to force (delete/complete/create/update/comment/
     subtask) for a clear imperative task action, else None. F-23 Slice 2 + PM-hub
@@ -406,6 +461,13 @@ def _asana_destructive_intent(text: str) -> str | None:
     + phantom guard still prevent a fabricated success on the follow-up confirm turn."""
     t = (text or "").strip()
     if not t or _ASANA_INTENT_INTERROGATIVE_RE.search(t):
+        return None
+    # cq-a1306f3835f8: an explicit code-queue capture phrase OUTRANKS every task-op
+    # branch below. The free text of a bug report legitimately contains task verbs
+    # and a "task" referent; without this the report itself gets executed as a task
+    # op. Checked here (not only at the call site) so no future caller of this
+    # detector can reintroduce the hijack.
+    if _code_queue_capture_intent(t):
         return None
     # Subtask first: "subtask" contains no standalone "task" boundary, so the generic
     # task-ref gate would drop it; the verb-anchored regex is its own referent.
@@ -813,7 +875,22 @@ def _dispatch_qa(
     # tool_choice) on the first model turn, so a TOOL preview + server-side pending
     # entry is produced instead of a haiku-fabricated one (the delete-intent turn ran
     # on haiku live and fabricated the preview -- no tool_use, no pending).
-    force_tool = _asana_destructive_intent(user_message) if user_id else None
+    # Precedence (cq-a1306f3835f8): an explicit "queue a code session" command wins
+    # over the Asana task-op force, whose regexes legitimately match the bug report's
+    # own free text. Forcing the capture tool is safe where forcing cora_forget_note
+    # would not be -- cora_queue_code_session needs only a `request` string the model
+    # always has, it is in _GLOBAL_CORE_TOOLS (exposed in every entity + DMs, so
+    # tool_choice can never name an unexposed tool), and its first call files NOTHING:
+    # it returns a preview and stashes server-side, so even a false positive costs one
+    # dismissable Harrison-gated card, never a data write.
+    force_tool = None
+    if user_id:
+        if _code_queue_capture_intent(user_message):
+            force_tool = "cora_queue_code_session"
+            log.info("code_queue capture intent -> forcing tool channel=#%s user=%s",
+                     channel_name, user_id)
+        else:
+            force_tool = _asana_destructive_intent(user_message)
     # F-23 Slice 3: a bare affirmative broadens the phantom-write guard so a fabricated
     # "Confirmed -- task deleted" (with no write sentinel) is corrected. Gated on NO
     # pending write existing (review HIGH #3/#4, MED #5): if a pending exists and a bare
