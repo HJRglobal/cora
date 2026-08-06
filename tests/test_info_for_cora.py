@@ -1,9 +1,19 @@
-"""Tests for the #info-for-cora intake path (D1, 2026-06-13).
+"""Tests for the #info-for-cora message-event intake path (D1, 2026-06-13).
 
 Messages posted in #info-for-cora are routed into the Harrison-gated
 knowledge-review queue (knowledge_review.propose_update) so fed facts surface
 in the next 7am review DM instead of being dropped. No canonical auto-write
-(D-011); PHI is refused; entity = the asker's org-roles primary entity.
+(D-011); PHI is refused.
+
+CONTRACT CHANGE 2026-08-06 (cq-f1236540b61e): this handler now delegates to the
+shared info_intake chokepoint, and entity is derived from the CONTENT, not from
+the asker's org-roles primary entity. #info-for-cora is a cross-entity intake
+surface -- Harrison's primary entity is FNDR but his F3 Pure pricing note is an
+F3E fact and belongs in known-answers/f3e.md. Content naming exactly one entity
+wins; several named, or none, files under FNDR (several also sets an
+ambiguous_entity flag). The PHI screen was also raised from the LEX-asker-scoped
+billing check to an unconditional is_any_phi union -- strictly stricter, and the
+over-refusal guard below still passes.
 """
 
 from unittest.mock import MagicMock, patch
@@ -42,11 +52,64 @@ class TestInfoForCoraIntake:
         assert prop.called
         kw = prop.call_args.kwargs
         assert kw["update_type"] == app_module.knowledge_review.UPDATE_TYPE_GENERIC
-        assert kw["payload"]["entity"] == "F3E"
+        # Content names no entity, so it files portfolio-wide -- NOT the poster's
+        # F3E primary entity. Guessing a business entity from the author is exactly
+        # what the 2026-08-06 contract forbids.
+        assert kw["payload"]["entity"] == "FNDR"
+        assert kw["payload"]["ambiguous_entity"] is False
         assert kw["payload"]["source"] == "info-for-cora"
+        assert kw["payload"]["intake_route"] == "message_event"
         assert kw["confidence"] == "MED"
         assert client.chat_postMessage.called
         assert "review" in client.chat_postMessage.call_args.kwargs["text"].lower()
+
+    def test_entity_comes_from_content_not_author(self):
+        """Harrison (FNDR) posting an F3E fact must file under F3E."""
+        client = MagicMock()
+        harrison = app_module.org_roles.RoleRecord(
+            slack_id="U_H", name="Harrison Rogers", role="Founder", entity="FNDR")
+        with patch.object(app_module.org_roles, "get_role", return_value=harrison), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="F3 Pure retail price is $36.99 everywhere", user="U_H"),
+                client)
+        assert prop.call_args.kwargs["payload"]["entity"] == "F3E"
+
+    def test_connector_post_footer_stripped_and_flagged(self):
+        """The Cowork connector's un-@-mentioned posts carry no bot_id -- they are
+        human contributions and must survive the guard with the footer removed."""
+        client = MagicMock()
+        with patch.object(app_module.org_roles, "get_role", return_value=None), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="F3 Pure retail price is $36.99 *Sent using* <@U0B3V5RHT3P>",
+                       user="U_H"),
+                client)
+        payload = prop.call_args.kwargs["payload"]
+        assert payload["connector_relayed"] is True
+        assert "Sent using" not in payload["text"]
+
+    def test_qa_prefixed_message_quarantined(self):
+        client = MagicMock()
+        with patch.object(app_module.org_roles, "get_role", return_value=None), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="[QA] smoke test -- please ignore"), client)
+        assert not prop.called
+
+    def test_question_is_not_queued_as_a_fact(self):
+        """Every one of Hannah's 5/28-6/17 posts here was a question."""
+        client = MagicMock()
+        with patch.object(app_module.org_roles, "get_role", return_value=None), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="Where are the insurance cards for the new Lariat?"), client)
+        assert not prop.called
+        assert not client.chat_postMessage.called
 
     def test_phi_refused_not_proposed(self):
         client = MagicMock()
@@ -141,3 +204,64 @@ class TestInfoForCoraIntake:
                 client)
         assert not prop.called
         assert "EHR" in client.chat_postMessage.call_args.kwargs["text"]
+
+
+class TestMentionIntakeRoute:
+    """Route 1 of 3 -- the @mention path, the ONLY one that fires in this channel
+    today (channel `message` events never reach the app). Added 2026-08-06."""
+
+    @staticmethod
+    def _run(text, client=None, ts="1700000000.5"):
+        say, client = MagicMock(), client or MagicMock()
+        event = {"channel": app_module.INFO_FOR_CORA_CHANNEL_ID, "user": "U_H",
+                 "ts": ts, "text": f"<@UBOT> {text}"}
+        with patch.object(app_module.rate_limiter, "check", return_value=(True, None)), \
+             patch.object(app_module, "_resolve_channel_name", return_value="info-for-cora"), \
+             patch.object(app_module, "_resolve_bot_user_id"), \
+             patch.object(app_module.org_roles, "get_role", return_value=None), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop, \
+             patch.object(app_module, "_dispatch_qa") as dispatch:
+            app_module.handle_mention(event, say, client)
+        return prop, dispatch, say
+
+    def test_statement_is_queued_and_not_answered(self):
+        prop, dispatch, say = self._run("The Tucson stove vendor is Apex Appliance")
+        assert prop.called
+        assert prop.call_args.kwargs["payload"]["intake_route"] == "mention"
+        assert not dispatch.called          # a contribution is not a question
+        assert say.called                   # contributor gets a threaded ack
+        assert "review" in say.call_args.kwargs["text"].lower()
+
+    def test_question_still_reaches_qa(self):
+        """Hannah's real usage: questions must keep working, never be filed as facts."""
+        prop, dispatch, _ = self._run("Where are the insurance cards for the new Lariat?")
+        assert not prop.called
+        assert dispatch.called
+
+    def test_qa_prefixed_is_quarantined_not_queued_not_answered(self):
+        prop, dispatch, say = self._run("[QA] smoke test -- ignore")
+        assert not prop.called
+        assert not dispatch.called
+        assert "quarantined" in say.call_args.kwargs["text"].lower()
+
+    def test_note_prefix_is_unwrapped(self):
+        prop, _, _ = self._run("note: The Tucson stove vendor is Apex Appliance")
+        assert prop.called
+        assert prop.call_args.kwargs["payload"]["text"].startswith("The Tucson")
+
+    def test_other_channels_are_untouched(self):
+        """The intake branch must be scoped to #info-for-cora only. Asserted on
+        info_intake.ingest directly rather than on _dispatch_qa: reaching dispatch
+        in another channel depends on the whole guard trio, which is not what this
+        test is about -- the claim is simply that intake does not fire elsewhere."""
+        say, client = MagicMock(), MagicMock()
+        event = {"channel": "C_OTHER", "user": "U_H", "ts": "1.1",
+                 "text": "<@UBOT> The Tucson stove vendor is Apex Appliance"}
+        with patch.object(app_module.rate_limiter, "check", return_value=(True, None)), \
+             patch.object(app_module, "_resolve_channel_name", return_value="f3e-sales"), \
+             patch.object(app_module, "_resolve_bot_user_id"), \
+             patch.object(app_module.team_learning, "parse_note", return_value=None), \
+             patch.object(app_module.info_intake, "ingest") as ingest:
+            app_module.handle_mention(event, say, client)
+        assert not ingest.called

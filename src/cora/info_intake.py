@@ -402,7 +402,7 @@ def ingest(
                 detail="dry-run (not written)")
 
         try:
-            knowledge_review.propose_update(
+            appended = knowledge_review.propose_update(
                 update_id=update_id,
                 update_type=knowledge_review.UPDATE_TYPE_GENERIC,
                 description=description,
@@ -413,6 +413,18 @@ def ingest(
         except Exception:  # noqa: BLE001 -- intake must never break the bot
             log.warning("info_intake: propose_update failed route=%s", route, exc_info=True)
             return IntakeResult(ERROR, entity=entity, detail="propose_update failed")
+
+        # propose_update returns False when this id was ALREADY in the ledger. That
+        # is the concurrent-delivery race: two routes can both pass the pending-load
+        # check above before either writes, and propose_update resolves it under its
+        # own lock. Honouring the return value is what keeps the loser SILENT --
+        # otherwise one contribution would draw two "logged for review" acks the
+        # moment the message-event subscription starts firing alongside @mention.
+        if appended is False:
+            log.info("info_intake: id already queued (race) route=%s id=%s", route, update_id)
+            return IntakeResult(DUPLICATE, update_id=update_id, entity=entity,
+                                is_connector=is_connector,
+                                detail="already queued by a concurrent route")
 
         log.info("info_intake: queued route=%s user=%s entity=%s id=%s supersedes=%s",
                  route, author_id, entity, update_id, bool(verdict))

@@ -37,6 +37,7 @@ from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
+from . import info_intake
 from . import historical_access
 from . import finance_receipts
 from . import model_router
@@ -165,7 +166,10 @@ def _validate_channel_links(text: str, client) -> str:
 # #info-for-cora intake channel (D1): user-fed facts here are routed into the
 # Harrison-gated knowledge-review queue instead of being dropped. Patchable in
 # tests via app_module.INFO_FOR_CORA_CHANNEL_ID.
-INFO_FOR_CORA_CHANNEL_ID = "C0B5BNP6YKY"
+#
+# Sourced from info_intake so the event path, the @mention path, and the
+# reconciling sweep cannot drift onto different channel ids (2026-08-06).
+INFO_FOR_CORA_CHANNEL_ID = info_intake.CHANNEL_ID
 _INFO_FOR_CORA_SKIP_SUBTYPES = frozenset({
     "message_changed", "message_deleted", "channel_join", "channel_leave",
     "channel_topic", "channel_purpose", "channel_name", "channel_archive",
@@ -1491,6 +1495,43 @@ def handle_mention(event: dict, say: callable, client) -> None:
     entity = route(channel_name)
     user_message = _MENTION_RE.sub("", raw_text).strip()
 
+    # ── #info-for-cora intake (route 1 of 3) ──────────────────────────────────
+    # This is the ONLY intake route proven to fire in this channel today: channel
+    # `message` events do not reach the app (see info_intake's module docstring),
+    # so the D1 handler below has never run. Placed BEFORE parse_note on purpose --
+    # _handle_note's paraphrase/confirm loop needs a message event to capture the
+    # user's "yes", so in THIS channel it dead-ends (6/06 and 6/30 paraphrases,
+    # neither ever confirmed). parse_note is still used to unwrap an explicit
+    # "note: <fact>" prefix so that phrasing keeps working.
+    #
+    # A QUESTION is not a contribution: every one of Hannah's 5/28-6/17 posts here
+    # was a question, so questions fall through to the normal Q&A path unchanged
+    # and only statements are queued.
+    if channel_id == INFO_FOR_CORA_CHANNEL_ID:
+        contribution = team_learning.parse_note(user_message) or user_message
+        author_name = user_id or ""
+        try:
+            rec = org_roles.get_role(user_id or "")
+            if rec and rec.name:
+                author_name = rec.name
+        except Exception as exc:  # noqa: BLE001 -- naming must not break intake
+            log.warning("info-for-cora: org_roles lookup failed: %s", exc)
+        result = info_intake.ingest(
+            text=contribution, author_id=user_id or "", author_name=author_name,
+            ts=event.get("ts", ""), route="mention",
+            channel_id=channel_id, channel_name=channel_name,
+        )
+        if result.outcome != info_intake.NOT_A_CONTRIBUTION:
+            if result.ack:
+                say(text=result.ack, thread_ts=thread_ts)
+            elif result.outcome == info_intake.ERROR:
+                say(text="Sorry -- I couldn't log that just now. Nothing was saved; "
+                         "please re-post it and I'll try again.",
+                    thread_ts=thread_ts)
+            log.info("info-for-cora: mention intake outcome=%s user=%s",
+                     result.outcome, user_id)
+            return
+
     # ── Write-back interception: @Cora note: <content> ────────────────────────
     note_content = team_learning.parse_note(user_message)
     if note_content:
@@ -1961,11 +2002,21 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
 # Message event handler — correction capture + active-thread follow-up routing.
 # Bolt requires an explicit event listener for "message" events.
 def _handle_info_for_cora(event: dict, client) -> None:
-    """Intake for #info-for-cora: route a user-fed fact into the Harrison-gated
-    knowledge-review queue so it surfaces in the next 7am review DM instead of
-    being silently dropped. NEVER auto-writes canonical memory (D-011) -- the
-    write is gated on Harrison's reaction (a GENERIC update posts to
-    #hjrg-leadership on approval). PHI is refused (it belongs in the EHR)."""
+    """Intake for #info-for-cora, route 2 of 3 -- the ORIGINAL D1 message-event path.
+
+    KEPT DELIBERATELY EVEN THOUGH IT CURRENTLY NEVER FIRES. Channel `message`
+    events do not reach this app (evidence in info_intake's module docstring), so
+    this handler has produced exactly zero items since it shipped 2026-06-13. The
+    moment the Slack app's Event Subscriptions gain message.groups it starts
+    contributing with NO further code change -- and because it derives the same
+    infocora-{ts} id as the @mention and sweep routes, a message delivered by two
+    routes is queued once and acked once.
+
+    The bot/subtype guards stay: Cora's OWN replies carry bot_id (verified on the
+    wire 2026-08-06), so re-ingesting them would reopen the KB self-poisoning class
+    (cq-8d16969e85fb). Cowork-connector posts carry NO bot_id and pass through as
+    ordinary user messages -- which is correct, they ARE human contributions.
+    """
     if event.get("bot_id") or event.get("subtype") in _INFO_FOR_CORA_SKIP_SUBTYPES:
         return
     user_id = event.get("user", "")
@@ -1974,85 +2025,38 @@ def _handle_info_for_cora(event: dict, client) -> None:
     if not user_id or not text or user_id == _CORA_BOT_USER_ID:
         return
 
-    channel = event.get("channel", "")
+    channel = event.get("channel", "") or INFO_FOR_CORA_CHANNEL_ID
     reply_ts = event.get("thread_ts") or ts
 
-    def _ack(msg: str) -> None:
+    author_name = user_id
+    try:
+        rec = org_roles.get_role(user_id)
+        if rec and rec.name:
+            author_name = rec.name
+    except Exception as exc:  # noqa: BLE001
+        log.warning("info-for-cora: org_roles lookup failed: %s", exc)
+
+    # Strip a LEADING @Cora token (this path also sees @mentioned messages) and
+    # unwrap an explicit "note: <fact>" prefix, matching the @mention route.
+    body = _MENTION_RE.sub("", text).strip() or text
+    body = team_learning.parse_note(body) or body
+
+    result = info_intake.ingest(
+        text=body, author_id=user_id, author_name=author_name, ts=ts,
+        route="message_event", channel_id=channel,
+    )
+    if result.outcome == info_intake.NOT_A_CONTRIBUTION:
+        return
+    if result.ack:
         try:
             client.chat_postMessage(
-                channel=channel, text=msg, thread_ts=reply_ts,
+                channel=channel, text=result.ack, thread_ts=reply_ts,
                 unfurl_links=False, unfurl_media=False,
             )
         except Exception as exc:  # noqa: BLE001 -- ack failure must not break intake
             log.warning("info-for-cora: ack post failed: %s", exc)
-
-    # Entity = the asker's org-roles primary entity (advisory; FNDR fallback).
-    # Computed BEFORE the PHI gate so the LEX administrative-PHI augmentation
-    # can be scoped to LEX-entity askers.
-    entity, author_name = "FNDR", user_id
-    try:
-        rec = org_roles.get_role(user_id)
-        if rec:
-            author_name = rec.name or user_id
-            if rec.entity:
-                entity = rec.entity
-    except Exception as exc:  # noqa: BLE001
-        log.warning("info-for-cora: org_roles lookup failed: %s", exc)
-
-    # PHI never enters the canonical pipeline. is_phi_risk + is_clinical_phi ALWAYS
-    # (is_clinical_phi catches the diagnosis/medication class is_phi_risk misses --
-    # WS17-B); for a LEX-entity asker also apply the D-050 administrative-PHI
-    # augmentation (a named person + billing/authorization/eligibility). The
-    # LEX-billing check stays LEX-scoped so an ordinary business fact about a named
-    # buyer's PO authorization in a non-LEX channel is not refused; the unconditional
-    # write gate (apply_contributed_note) is the entity-agnostic backstop.
-    try:
-        is_phi = phi_guard.is_phi_risk(text) or phi_guard.is_clinical_phi(text)
-        if not is_phi and entity.upper().startswith("LEX"):
-            is_phi = phi_guard.is_lex_billing_status_phi(text)
-        if is_phi:
-            log.info("info-for-cora: PHI-flagged contribution refused user=%s", user_id)
-            _ack("Thanks, but that reads like client / PHI information -- I can't capture "
-                 "that here. Client data belongs in the EHR, not in Cora's memory.")
-            return
-    except Exception as exc:  # noqa: BLE001 -- fail safe: drop rather than risk PHI
-        log.warning("info-for-cora: phi check failed (dropping): %s", exc)
-        return
-
-    update_id = f"infocora-{ts or user_id}"
-    # Idempotency: Slack retries can deliver the same message ts more than once.
-    try:
-        if any(u.get("update_id") == update_id
-               for u in knowledge_review.load_proposed_updates()):
-            return
-    except Exception as exc:  # noqa: BLE001
-        log.warning("info-for-cora: dedup check failed (continuing): %s", exc)
-
-    try:
-        knowledge_review.propose_update(
-            update_id=update_id,
-            update_type=knowledge_review.UPDATE_TYPE_GENERIC,
-            description=f"#info-for-cora from {author_name} ({entity}): {text[:240]}",
-            payload={
-                "text": text,
-                "author_id": user_id,
-                "author_name": author_name,
-                "entity": entity,
-                "channel": "info-for-cora",
-                "source": "info-for-cora",
-                "message_ts": ts,
-            },
-            source_evidence=text,
-            confidence="MED",
-        )
-    except Exception as exc:  # noqa: BLE001 -- intake must never break the bot
-        log.warning("info-for-cora: propose_update failed: %s", exc)
-        return
-
-    log.info("info-for-cora: queued contribution user=%s entity=%s id=%s",
-             user_id, entity, update_id)
-    _ack("Got it -- logged for Harrison's review. It won't become shared org "
-         "knowledge until he approves it.")
+    log.info("info-for-cora: message-event intake outcome=%s user=%s entity=%s",
+             result.outcome, user_id, result.entity)
 
 
 @app.event("message")
