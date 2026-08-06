@@ -117,7 +117,9 @@ def main() -> int:
 
     state = ga.load_state()
     n_mined = n_asked = n_left = 0
+    n_ineligible = n_routed = 0
     asks_sent = 0
+    decision_routes = 0
 
     for gap in gaps[: args.max_gaps]:
         gap_ts = gap.get("ts", "?")
@@ -125,6 +127,59 @@ def main() -> int:
 
         # -- Stage 1: mine swept Slack conversations --------------------------
         evidence = ga.search_slack_evidence(kb, gap) if kb else []
+
+        # Slice 3 (cq-5c6ff15610bd + D-128): screen the EXCHANGE before drafting.
+        # Done here as well as inside draft_answer because only the driver can (a)
+        # route a D-128 exchange to the decisions lane and (b) record a DISPOSITION
+        # so an ineligible gap neither re-mines forever nor escalates to a domain
+        # owner -- you cannot teach "what's on my plate" as a fact, and a capability
+        # ask belongs in the code-session queue.
+        eligible, why = ga.mine_eligibility(gap, evidence)
+        if not eligible:
+            n_ineligible += 1
+            routed_id = None
+            if why == ga.MINE_INELIGIBLE_DISPUTED:
+                # Run the SAME LEX/PHI screens the real route runs, so a dry run
+                # never over-promises a route that would be refused (the first live
+                # dry-run said "would route" for a LEX gap -- the dry run IS the
+                # rollout gate, so its report has to be truthful).
+                blocked = ga.decision_route_block_reason(gap)
+                if blocked:
+                    log.info("Gap %s (%s) disputed but NOT routable: %s -- left open "
+                             "(LEX-origin routing is the 8/13-locked fork)",
+                             gap_ts, entity, blocked)
+                    n_left += 1
+                    continue
+                if decision_routes >= ga.MAX_DECISION_ROUTES_PER_RUN:
+                    log.info("Gap %s (%s) disputed but the per-run decision-lane cap "
+                             "(%d) is reached -- left for the next run",
+                             gap_ts, entity, ga.MAX_DECISION_ROUTES_PER_RUN)
+                    n_left += 1
+                    continue
+                if args.dry_run:
+                    log.info("[DRY] gap %s (%s) INELIGIBLE (%s) -> would route to the "
+                             "decisions lane", gap_ts, entity, why)
+                    decision_routes += 1
+                    n_routed += 1
+                    continue
+                routed_id = ga.route_disputed_to_decision_lane(gap, evidence)
+                if routed_id:
+                    decision_routes += 1
+                    n_routed += 1
+            elif args.dry_run:
+                log.info("[DRY] gap %s (%s) INELIGIBLE (%s) -> would record disposition, "
+                         "no known_answer, no escalation", gap_ts, entity, why)
+                continue
+            if not args.dry_run:
+                state[gap_ts] = {"state": "ineligible", "reason": why,
+                                 "decision_update_id": routed_id or "",
+                                 "at": ga._now_iso()}
+                ga.save_state(state)
+            log.info("Gap %s (%s) INELIGIBLE for known_answer: %s%s",
+                     gap_ts, entity, why,
+                     f" -> decisions lane {routed_id}" if routed_id else "")
+            continue
+
         draft = ga.draft_answer(gap, evidence) if evidence else None
 
         if draft:
@@ -171,8 +226,9 @@ def main() -> int:
         log.info("Gap %s (%s) left open -- evidence=%d, age=%.0fh",
                  gap_ts, entity, len(evidence), ga.gap_age_hours(gap))
 
-    log.info("Run complete: %d mined+proposed, %d escalated, %d left open",
-             n_mined, n_asked, n_left)
+    log.info("Run complete: %d mined+proposed, %d escalated, %d ineligible "
+             "(%d routed to the decisions lane), %d left open",
+             n_mined, n_asked, n_ineligible, n_routed, n_left)
     return 0
 
 
