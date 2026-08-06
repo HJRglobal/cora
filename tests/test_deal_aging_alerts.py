@@ -79,11 +79,33 @@ def _make_deal(
     }
 
 
+# CAUTION: these are captured at module IMPORT, which pytest does during
+# COLLECTION -- minutes before a full-suite run reaches the tests below. They are
+# safe ONLY where the test also supplies `_NOW` as the explicit `now_ts`, so both
+# sides of the comparison age together.
+#
+# NEVER pair one of these with a code path that reads a LIVE clock. A near-boundary
+# constant then has a hidden expiry equal to its own margin: `_3_DAYS_AGO_MINUS_1`
+# sits 60s inside the 3-day window, so a test letting `run_aging_alerts` call
+# `time.time()` itself passes only if it executes within 60 SECONDS of collection.
+# That is what made test_throttled_deal_not_re_alerted fail intermittently in
+# full-suite runs (2026-08-05) while passing 100% of the time in isolation --
+# nothing was leaking state; the fixture was simply timing out. Use
+# `_recently_alerted()` below for live-clock paths.
 _NOW = time.time()
 _30_DAYS_AGO = _NOW - (30 * 86400)
 _5_DAYS_AGO = _NOW - (5 * 86400)
 _3_DAYS_AGO_MINUS_1 = _NOW - (3 * 86400 - 60)  # just under 3d -- throttled
 _3_DAYS_AGO_PLUS_1 = _NOW - (3 * 86400 + 60)   # just over 3d -- NOT throttled
+
+
+def _recently_alerted(seconds_ago: float = 60.0) -> float:
+    """A 'last alerted' timestamp anchored to EXECUTION time, not import time.
+
+    For tests that let the code under test read its own clock. Sixty seconds
+    inside a three-day window is unambiguous no matter how long collection took.
+    """
+    return time.time() - seconds_ago
 
 # Convert timestamps to ISO strings for deal properties
 def _ts_to_iso(ts: float) -> str:
@@ -314,9 +336,35 @@ class TestRunAgingAlerts:
     @patch.object(_mod, "_save_throttle")
     def test_throttled_deal_not_re_alerted(self, mock_save, mock_load_throttle,
                                             mock_owner, mock_dm, mock_refresh, mock_get_deals):
-        mock_load_throttle.return_value = {"D1": _3_DAYS_AGO_MINUS_1}
+        # run_aging_alerts reads its OWN clock, so this timestamp must be
+        # anchored to execution time -- see _recently_alerted.
+        mock_load_throttle.return_value = {"D1": _recently_alerted()}
         mock_get_deals.return_value = [self._make_stale_deal("D1")]
         result = _mod.run_aging_alerts(dry_run=False)
+        assert result["throttled"] >= 1
+        mock_dm.assert_not_called()
+
+    @patch.object(_mod, "get_deals_by_pipeline")
+    @patch.object(_mod, "_refresh_pipeline_cache")
+    @patch.object(_mod, "_send_slack_dm", return_value=True)
+    @patch.object(_mod, "_get_slack_id_for_owner", return_value="U_OWNER")
+    @patch.object(_mod, "_load_throttle")
+    @patch.object(_mod, "_save_throttle")
+    def test_throttle_holds_when_the_suite_is_slow(self, mock_save, mock_load_throttle,
+                                                   mock_owner, mock_dm, mock_refresh,
+                                                   mock_get_deals):
+        """Regression guard for the 2026-08-05 intermittent failure.
+
+        pytest imports every test module during COLLECTION and then runs for
+        minutes. Simulate that gap by advancing the clock the code under test
+        reads by an hour: the throttle must still hold, because the fixture is
+        anchored to execution time. Against the old import-time constant (60s
+        inside a 3-day window) this assertion fails.
+        """
+        mock_get_deals.return_value = [self._make_stale_deal("D1")]
+        with patch.object(_mod.time, "time", return_value=_NOW + 3600):
+            mock_load_throttle.return_value = {"D1": _recently_alerted()}
+            result = _mod.run_aging_alerts(dry_run=False)
         assert result["throttled"] >= 1
         mock_dm.assert_not_called()
 
