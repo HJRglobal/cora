@@ -3651,14 +3651,86 @@ def _resolve_sku_alias(product_query: str) -> tuple[str, bool]:
 # probed after that misses, so nothing that resolves today can change. An
 # ambiguous stripped form still ASKS (never a guess): the >1-match branch is
 # untouched, which is the whole safety property.
+#
+# INPUT CONTRACT: this regex is fed _norm_alias OUTPUT ONLY (whitespace already
+# collapsed). D-051 review LOW: the leading `\s*` backtracks across a long
+# whitespace run at every start position, so on RAW text a 50k-space string takes
+# ~22 SECONDS to match -- and CPython holds the GIL for the whole match, which
+# would freeze the entire bot process, not just the tool thread. Never apply it to
+# unnormalized input.
 _PACK_QUALIFIER_RE = re.compile(
     r"\s*(?:"
-    r"pack\s+of\s+\d{1,3}"          # "pack of 12"
-    r"|\d{1,3}\s*(?:packs?|pks?|cts?|counts?)"   # "12 pack" / "12pk" / "12 ct"
-    r"|packs?|cases?|pks?"          # bare "pack" / "case"
+    r"pack\s+of\s+(?P<n2>\d{1,3})"                      # "pack of 12"
+    # "12 pack" / "12pk" / "12 ct" / "12 cases" -- `cases?` belongs in the DIGIT
+    # alternative too (D-051 review MEDIUM): "cases" is the office channel's own
+    # unit, so "original energy 12 cases" is likely phrasing exactly where writes
+    # are allowed, and without it the bare branch stripped only "cases" and left a
+    # dangling "12".
+    r"|(?P<n1>\d{1,3})\s*(?:packs?|pks?|cts?|counts?|cases?)"
+    r"|packs?|cases?|pks?"                              # bare "pack" / "case"
     r")\s*$"
 )
 _PACK_LADDER_MAX_STEPS = 3
+# Pack sizes STATED IN A PRODUCT LABEL. Must key on a digit adjacent to a packaging
+# word, never on bare digits: brand tokens carry digits ("F3", "SOJO 2"), so a bare
+# \d scan read "F3 Original Energy Drink" as a 3-pack and refused every write.
+_LABEL_PACK_SIZE_RE = re.compile(
+    r"(?:(\d{1,3})\s*(?:packs?|pks?|cts?|counts?|cases?)\b|pack\s+of\s+(\d{1,3})\b)"
+)
+
+
+def _named_pack_size(product_query: str) -> int | None:
+    """The pack SIZE the user explicitly named, or None.
+
+    D-051 review HIGH (2026-08-06): the first cut of the ladder CONSUMED the digits
+    and compared them to nothing, so "original energy 24 pack" stripped to
+    "original energy", hit the alias map, and resolved CONFIDENTLY to the 12-pack
+    SKU -- a guess presented as a resolution on a real-money write path, made worse
+    by the new provenance line reading like the 24-pack had been understood. Every
+    seeded alias is a 12-pack today, so any other size the user named was silently
+    coerced. This extracts the size so the caller can verify it against the variant
+    it actually resolved.
+
+    Scans the whole strip ladder, so a size named before a bare packaging word
+    ("pure variety pack 24-pack") is still found.
+    """
+    cur = _norm_alias(product_query)
+    for _ in range(_PACK_LADDER_MAX_STEPS + 1):
+        m = _PACK_QUALIFIER_RE.search(cur)
+        if not m:
+            return None
+        raw = m.group("n1") or m.group("n2")
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        nxt = cur[: m.start()].strip()
+        if not nxt or nxt == cur:
+            return None
+        cur = nxt
+    return None
+
+
+def _pack_size_conflicts(named_size: int | None, variant_label: str) -> bool:
+    """True when the user named a pack size and the resolved variant's label carries
+    a DIFFERENT one.
+
+    Deliberately asymmetric: a label with NO STATED size is unverifiable, not wrong,
+    so it passes (refusing there would break the legitimate "Pure Strawberry Lemonade
+    12-pack" case whenever a title omits the size). A label that states a DIFFERENT
+    size is a real mismatch and the caller must refuse rather than write.
+    """
+    if not named_size:
+        return False
+    sizes = set()
+    for a, b in _LABEL_PACK_SIZE_RE.findall(_norm_alias(variant_label)):
+        raw = a or b
+        if raw:
+            sizes.add(int(raw))
+    if not sizes:
+        return False
+    return named_size not in sizes
 
 
 def _pack_query_ladder(product_query: str) -> list[str]:
@@ -3749,7 +3821,7 @@ def _lexicon_resolve_pack_tolerant(product_query: str, *, channel: str, user: st
 
     ladder = _pack_query_ladder(product_query) or [product_query]
     raw_res = None
-    chosen = None
+    chosen: Any = None
     for i, cand in enumerate(ladder):
         # Probe candidate 0 with the ORIGINAL (unnormalized) text: norm_term is
         # applied inside resolve, and passing the raw string keeps the logged
@@ -3773,6 +3845,23 @@ def _lexicon_resolve_pack_tolerant(product_query: str, *, channel: str, user: st
             canonical=result.canonical or (first.canonical if first else ""),
             matched_term=result.matched_term or (first.term if first else ""),
         )
+        # D-051 lens-5 MEDIUM: when a STRIPPED candidate is what resolved, the raw
+        # surface the user actually typed MISSED -- and that miss is the signal
+        # lexicon_mining reads to propose the surface as a learnable alias. Folding
+        # it into the "exact" row above erased it, so the pack-suffixed form could
+        # never be learned and the ladder would compensate forever. Recorded under a
+        # DISTINCT event name so it cannot inflate the resolver counts (mining and
+        # metrics both filter on event == "resolve").
+        if (chosen is not None and raw_res is not None
+                and raw_res.status in ("miss", "suggestion")):
+            _lexicon.log_event(
+                entity="F3E", channel=channel, user=user,
+                consumer="f3e_shopify_set_inventory", status=raw_res.status,
+                query=product_query,
+                canonical=result.canonical or "",
+                matched_term="",
+                event="resolve_raw_surface",
+            )
     except Exception:  # noqa: BLE001 -- telemetry must never break a reply
         log.debug("f3e lexicon telemetry failed (non-fatal)", exc_info=True)
     return result
@@ -4156,8 +4245,13 @@ def resolve_shopify_ask_pick(
         )
     else:  # ask_kind == "variant" -- value already carries the resolved ids
         match = shopify_client.VariantMatch(**value)
+        # D-051 review MEDIUM: carry the original query through so a pick previews
+        # with its "resolved from" line -- otherwise a dropped pack qualifier is
+        # invisible in the confirm the human actually approves. Legacy stashes have
+        # no product_query and simply render as before.
         blocked, data = _shopify_resolve_from_match(
             match, loc_id, loc_name, unit, quantity, delta, tapping_user_id,
+            resolved_from=claimed.get("product_query", ""),
         )
 
     if blocked:
@@ -4274,8 +4368,15 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
     else:
         resolved_query, _alias_hit, resolved_from = _resolve_sku_alias_tolerant(product_query)
     try:
+        # D-051 review MEDIUM: pass the raw query as a retry source ONLY when nothing
+        # authoritative resolved it. On an alias/lexicon HIT the canonical SKU IS the
+        # answer -- re-probing the user's raw words after a stale canonical returns 0
+        # would silently bind a different variant, contradicting this path's own
+        # "an alias hit is authoritative" contract. A stale canonical now refuses
+        # honestly, as it did before this slice.
+        retry_source = "" if _alias_hit else product_query
         matches, variant_resolved_from = _resolve_variants_pack_tolerant(
-            resolved_query, product_query)
+            resolved_query, retry_source)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
         log.warning("f3e_shopify_set_inventory variant resolve error user=%s: %s", slack_user_id, exc)
         return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI can't reach inventory right now -- try again in a moment."), None
@@ -4293,6 +4394,11 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
             _stash_shopify_ask(
                 slack_user_id, channel, ask_kind="variant", loc_id=loc_id, loc_name=loc_name,
                 unit=unit, quantity=quantity, delta=delta,
+                # D-051 review MEDIUM: the variant branch omitted product_query, so a
+                # picked candidate previewed with NO "resolved from" line -- the human
+                # never saw that a pack qualifier had been dropped. The lexicon branch
+                # already passed it; this makes the two symmetric.
+                product_query=product_query,
                 candidates=[(m.label, {
                     "product_title": m.product_title, "variant_title": m.variant_title,
                     "sku": m.sku, "variant_id": m.variant_id,
@@ -4302,6 +4408,19 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
         return _shopify_write_blocked(
             f"{_NOT_WRITTEN}\n'{product_query}' matches {len(matches)} variants: {listing}. Which one?"), None
     match = matches[0]
+    # PACK-SIZE VERIFICATION (D-051 review HIGH). The ladder strips a pack qualifier
+    # to find the product; it must NOT also throw away the SIZE the user named. If
+    # they said a size and the resolved variant states a DIFFERENT one, this is a
+    # guess, not a resolution -- refuse, per the tool's own "I won't guess" contract.
+    named_size = _named_pack_size(product_query)
+    if _pack_size_conflicts(named_size, match.label):
+        log.warning("f3e_shopify_set_inventory pack-size mismatch REFUSED user=%s "
+                    "query=%r named=%s match=%r",
+                    slack_user_id, product_query, named_size, match.label)
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nYou said a {named_size}-pack, but the closest product I "
+            f"have is {match.label}. I won't assume those are the same thing -- give me "
+            f"the exact name or the SKU."), None
     exp_item = str(input_data.get("expected_item") or "").strip()
     return _shopify_resolve_from_match(
         match, loc_id, loc_name, unit, quantity, delta, slack_user_id,
@@ -5359,6 +5478,7 @@ def try_confirm_pending_write(
     calendar = _peek_pending_calendar(slack_user_id, channel_name)
     lexadd = _peek_pending_lexicon(slack_user_id, channel_name)
     delegated = _peek_pending_delegated(slack_user_id, channel_name)
+    codequeue = _peek_pending_code_queue(slack_user_id, channel_name)
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -5380,6 +5500,10 @@ def try_confirm_pending_write(
         # ("delete that task") conflicts and falls through to the model rather
         # than starting a job.
         entries.append((float(delegated.get("ts", 0)), "delegated", "delegate"))
+    if codequeue:
+        # A fresh code-queue capture preview. Participates in the freshest-first
+        # arbitration and always DEFERS (see the kind check below for why).
+        entries.append((float(codequeue.get("ts", 0)), "code_queue", "capture"))
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
         # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
@@ -5460,9 +5584,19 @@ def try_confirm_pending_write(
         log.info("confirm_interceptor ABANDON stale destructive asana user=%s action=%s (superseded)",
                  slack_user_id, asana.get("action"))
 
-    if kind in ("calendar", "lexicon"):
+    if kind in ("calendar", "lexicon", "code_queue"):
         # Deferred to the model; never fire a staler write on a confirm meant
-        # for a calendar booking or a lexicon teach.
+        # for a calendar booking, a lexicon teach, or a code-queue capture.
+        #
+        # code_queue joined this list on 2026-08-06 (D-051 lens-1 MEDIUM). The
+        # code-queue preview mints a pending in a store this arbitration did not
+        # peek, so a bare "yes" answering IT fired whatever staler Asana/Shopify
+        # pending happened to exist -- the wrong write executes and the capture is
+        # never filed. Latent before, but Slice 2's forced capture makes it
+        # reachable precisely on Asana-shaped messages, i.e. exactly the population
+        # most likely to have a stale Asana pending. Deferring (the calendar/lexicon
+        # pattern) is the minimal fix: the model sees the fresh code-queue pending
+        # and calls the tool with confirmed=true.
         return None
 
     intent = _confirm_intent(message, action)
@@ -10288,6 +10422,18 @@ def has_pending_delegated_write(slack_user: str, channel: str) -> bool:
     """Read-only freshness probe -- app.py forces Sonnet on the confirm turn
     (a bare 'yes' is undetectable from content)."""
     return _peek_pending_delegated(slack_user, channel) is not None
+
+
+def has_pending_code_queue(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe for a pending code-queue capture.
+
+    Added 2026-08-06 (D-051 lens-1 MEDIUM): the code-queue confirm turn is the one
+    staged-write confirm that ran UNESCALATED. It defers to the model by design (see
+    try_confirm_pending_write), and the S4 precedent is explicit -- Haiku live
+    fabricated preview-shaped text with zero tool_use on exactly this shape, which is
+    why remember/forget joined the Sonnet OR-chain. Slice 2's forced capture makes
+    this turn common, so it joins too."""
+    return _peek_pending_code_queue(slack_user, channel) is not None
 
 
 def _delegated_preview_text(entry: dict, quota_line: str) -> str:

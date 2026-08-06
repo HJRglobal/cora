@@ -151,6 +151,121 @@ def test_interrogatives_still_excluded_everywhere(msg):
     assert cora_app._code_queue_capture_intent(msg) is False
 
 
+# ── D-051 lens-1 remediation regressions (2026-08-06) ────────────────────────
+
+# HIGH-1: a bare "for the devs?" object had no code/build noun, so ordinary Asana
+# and calendar requests fired the capture and the user's REAL action was displaced
+# (the subtask/comment was never created). Every string below was confirmed firing
+# on the first cut of this detector.
+HIGH1_DISPLACED = [
+    "add a subtask for the devs under the Pure launch task",
+    "add a comment for the devs on the invoice task",
+    "add a note for the dev team on the COPA task",
+    "add a calendar hold for the devs sync on Thursday",
+    "put together a summary for the devs on the KB purge",
+    "add a task for the dev team to look at the Rita tracking sheet",
+    "log a ticket for the devs in Jira",
+]
+
+
+@pytest.mark.parametrize("msg", HIGH1_DISPLACED)
+def test_high1_for_the_devs_no_longer_swallows_real_work(msg):
+    assert cora_app._code_queue_capture_intent(msg) is False
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("add a subtask for the devs under the Pure launch task", "asana_add_subtask"),
+    ("add a comment for the devs on the invoice task", "asana_add_comment"),
+])
+def test_high1_asana_force_is_restored(msg, expected):
+    """The real damage was the DISPLACED action: suppressing the Asana force meant
+    the subtask/comment was never created. It must be forced again."""
+    assert cora_app._asana_destructive_intent(msg) == expected
+
+
+@pytest.mark.parametrize("msg", [
+    "log this for the devs",
+    "log this for the devs: the confirm no-ops",
+    "please file that for the dev team",
+    "queue it for the devs",
+])
+def test_high1_the_legitimate_for_the_devs_phrasing_survives(msg):
+    """The tool's own description names 'log this for the devs' as a trigger, so it
+    survives as a TIGHT alternative requiring a demonstrative."""
+    assert cora_app._code_queue_capture_intent(msg) is True
+
+
+# HIGH-2: a 60-char leading window was defeated by one clause of ordinary preamble,
+# and on a miss the ORIGINAL bug returned (the Asana force won). The window is gone.
+HIGH2_PREAMBLED = [
+    ("Cora, following up on the thread in #f3e-leadership from yesterday -- "
+     "please queue a code session: marking a task done doesn't work"),
+    ("Following up from the leadership sync this morning, can you please queue a "
+     "code session: the task delete confirm no-ops"),
+    ("sorry for the wall of text but this has happened three times now -- queue a "
+     "code session: marking a task done doesn't work"),
+    ("Hey <@U0B2RM2JYJ1> and <@U0B3AEJCYGP>, per our chat just now please queue a "
+     "code session: marking a task done silently no-ops"),
+    ("In <#C0BAK65N4TA|hjr-finance> we hit this again this morning, so please log "
+     "this for the devs: deleting a task needs two confirms"),
+]
+
+
+@pytest.mark.parametrize("msg", HIGH2_PREAMBLED)
+def test_high2_preamble_no_longer_defeats_detection(msg):
+    assert cora_app._code_queue_capture_intent(msg) is True
+
+
+@pytest.mark.parametrize("msg", HIGH2_PREAMBLED)
+def test_high2_asana_hijack_stays_suppressed_through_a_preamble(msg):
+    assert cora_app._asana_destructive_intent(msg) is None
+
+
+@pytest.mark.parametrize("msg", [
+    "I already queued a code session for that",
+    "we logged this for the devs yesterday",
+    "Harrison filed a code session about it last week",
+    "that was added to the code queue on Monday",
+])
+def test_past_tense_never_refiles(msg):
+    """The imperative-only verb list is the precision lever that REPLACED the
+    positional window: a description of a past filing must not re-file."""
+    assert cora_app._code_queue_capture_intent(msg) is False
+
+
+# MEDIUM-3: deliberative questions forced a card.
+@pytest.mark.parametrize("msg", [
+    "Should we queue a code session for the marking-done bug",
+    "Should I queue a code session for this",
+    "is it worth queueing a code session for a typo",
+    "do we need to file a code session for this",
+    "do you think we should queue a code session",
+    "maybe queue a code session for the inventory thing",
+])
+def test_medium3_deliberative_framings_excluded(msg):
+    assert cora_app._code_queue_capture_intent(msg) is False
+
+
+# The Asana-referent guard: a sentence about a TASK stays about the task.
+@pytest.mark.parametrize("msg", [
+    "create a task to queue a code session for the alias bug",
+    "add a reminder to log this for the devs tomorrow",
+])
+def test_other_referent_before_the_match_excludes(msg):
+    assert cora_app._code_queue_capture_intent(msg) is False
+
+
+def test_documented_residual_trailing_retraction_still_fires():
+    """Documented + accepted, not silently unknown: the disqualifier scan reads only
+    text BEFORE the match, so a TRAILING retraction still fires. Cost is one
+    dismissable card. Guarding it would mean scanning the description text, which is
+    arbitrary bug prose that legitimately contains "unless" / "only if" / "no" -- so
+    the cure would break the primary use case. Pinned so the behavior is a known
+    choice rather than a surprise."""
+    assert cora_app._code_queue_capture_intent(
+        "Queue a code session for that -- actually never mind, I'll do it") is True
+
+
 # ── precedence ordering ──────────────────────────────────────────────────────
 
 def test_precedence_is_queue_then_asana():

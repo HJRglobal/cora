@@ -10,11 +10,30 @@ process_queue_action / set_severity / append_evidence) so the append-only event
 ledger stays the single source of truth -- never a hand-edit of
 ``data/state/code-session-queue.jsonl`` or the generated backlog .md.
 
-What it does (idempotent -- safe to re-run):
+Idempotency: every step is a genuine no-op on re-run. Step 3b relies on
+``append_evidence``'s note dedup, which was ADDED during the D-051 review of this
+bundle -- before that, a second ``--apply`` re-appended the same notes until the
+fold's 10-entry cap silently ate them. Verified 2026-08-06 against the live rows.
+
+Known cosmetic residual: ``_scrub_evidence`` truncates a note to 200 chars, and the
+first ``--apply`` (pre-review) stored both notes below cut mid-word, losing the tails.
+``append_evidence`` now REPORTS truncation instead of falsely succeeding; the notes
+are left as-is on purpose so the dedup above keeps matching, and their full text lives
+in the S0 commit message and the session capture note.
+
+What it does:
   1. SEED the 9-RED-2 true gap (single-item SKU alias rejects a literal "12-pack"
      suffix the batch path tolerates) as a NEW item, then PROPOSED -> APPROVED.
   2. cq-a1306f3835f8 ("queue a code session:" misroute): PROPOSED -> APPROVED,
      severity MEDIUM -> HIGH.
+
+NOTE on the HIGH items and kickoff prompts: this script's ``--apply`` ran while the
+tree was at S0, before S4 taught the approve path that HIGH is P1-class, so
+cq-861ca3630d31 and cq-a1306f3835f8 are APPROVED-with-no-kickoff. That is CORRECT
+here and deliberately not repaired: this branch IS their build, and step 7.5 marks
+them SHIPPED at merge. If the merge slips past
+``code_queue.PRIORITY_KICKOFF_GRACE_HOURS``, the new nightly monitor will name them --
+expected, not a regression.
   3. cq-5c6ff15610bd (gap-autofill known_answer eligibility): PROPOSED ->
      APPROVED, plus two dated real-world evidence notes (NOT a new item, and NOT
      a `recurrence` -- see code_queue.append_evidence for why count must not move).

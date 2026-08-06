@@ -136,8 +136,24 @@ def main() -> int:
         # ask belongs in the code-session queue.
         eligible, why = ga.mine_eligibility(gap, evidence)
         if not eligible:
-            n_ineligible += 1
+            # Emit the CANONICAL rejection line so aggregate_quality_rejections sees
+            # these codes. D-051 lens-2 MEDIUM: registering them in _REASON_CODES was
+            # not enough -- that line lives in draft_answer, which this branch skips,
+            # so in production all seven codes aggregated to zero.
+            ga.log_mine_rejection(gap_ts, why)
             routed_id = None
+            if why == ga.MINE_INELIGIBLE_SCREEN_ERROR:
+                # FAIL-CLOSED, NOT FAIL-FOREVER (D-051 lens-2/5 HIGH). Writing state
+                # here would retire the gap PERMANENTLY -- load_open_gaps drops any ts
+                # present in state and NOTHING ever resets one -- so one bad import
+                # night would silently kill up to --max-gaps gaps with no answer, no
+                # escalation and no retry, ever. The sibling knowledge-review drain
+                # refuses this same pattern by design (a screen error leaves the row
+                # PENDING). Leave it open to retry.
+                log.warning("Gap %s (%s) eligibility screen ERRORED -- left OPEN to "
+                            "retry next run (no disposition written)", gap_ts, entity)
+                n_left += 1
+                continue
             if why == ga.MINE_INELIGIBLE_DISPUTED:
                 # Run the SAME LEX/PHI screens the real route runs, so a dry run
                 # never over-promises a route that would be refused (the first live
@@ -161,23 +177,46 @@ def main() -> int:
                              "decisions lane", gap_ts, entity, why)
                     decision_routes += 1
                     n_routed += 1
+                    n_ineligible += 1
                     continue
                 routed_id = ga.route_disputed_to_decision_lane(gap, evidence)
-                if routed_id:
-                    decision_routes += 1
-                    n_routed += 1
+                if not routed_id:
+                    # A FAILED route must not retire the exchange (D-051 lens-2
+                    # MEDIUM): writing state here would leave it with no card, no
+                    # answer and no escalation -- the exact "rejected conversion that
+                    # vanished" failure this whole slice exists to prevent.
+                    log.warning("Gap %s (%s) disputed but the decisions-lane route "
+                                "FAILED -- left open to retry next run", gap_ts, entity)
+                    n_left += 1
+                    continue
+                decision_routes += 1
+                n_routed += 1
             elif args.dry_run:
-                log.info("[DRY] gap %s (%s) INELIGIBLE (%s) -> would record disposition, "
-                         "no known_answer, no escalation", gap_ts, entity, why)
+                log.info("[DRY] gap %s (%s) INELIGIBLE (%s) -> %s, no known_answer, "
+                         "no escalation", gap_ts, entity, why,
+                         "would record a permanent disposition"
+                         if why in ga.PERMANENT_INELIGIBLE_REASONS
+                         else "would stay OPEN (heuristic class)")
+                n_ineligible += 1
                 continue
-            if not args.dry_run:
+            # Permanent state ONLY for a structurally-dispositioned reason, or a
+            # dispute that actually produced a card (D-051 lens-5). A heuristic
+            # class (retired/QA/ephemeral/capability) skips mining + escalation for
+            # THIS RUN but stays open, so a regex false positive costs one skipped
+            # night instead of permanently burying an answerable gap -- there is no
+            # reset path for a state entry, and expire_stale_gaps still gives these
+            # the normal audited 30-day close.
+            permanent = bool(routed_id) or why in ga.PERMANENT_INELIGIBLE_REASONS
+            if permanent:
                 state[gap_ts] = {"state": "ineligible", "reason": why,
                                  "decision_update_id": routed_id or "",
                                  "at": ga._now_iso()}
                 ga.save_state(state)
-            log.info("Gap %s (%s) INELIGIBLE for known_answer: %s%s",
+            n_ineligible += 1
+            log.info("Gap %s (%s) INELIGIBLE for known_answer: %s -- %s%s",
                      gap_ts, entity, why,
-                     f" -> decisions lane {routed_id}" if routed_id else "")
+                     "disposition recorded" if permanent else "left OPEN (heuristic class)",
+                     f", decisions lane {routed_id}" if routed_id else "")
             continue
 
         draft = ga.draft_answer(gap, evidence) if evidence else None

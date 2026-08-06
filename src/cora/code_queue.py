@@ -85,6 +85,10 @@ SEVERITY_ALIASES = {
 # Everything an explicit re-rate (set_severity) will accept.
 VALID_SEVERITY_INPUTS = tuple(VALID_SEVERITIES) + tuple(sorted(SEVERITY_ALIASES))
 _PRIORITY_LADDER = frozenset({"P0", "P1"})
+# Mirrors _scrub_evidence's own note[:200] cut and the fold's 10-entry cap, so
+# append_evidence can REPORT a truncation/refusal instead of falsely succeeding.
+_EVIDENCE_NOTE_MAX_CHARS = 200
+_EVIDENCE_MAX_ENTRIES = 10
 
 
 def canonical_severity(severity: str | None) -> str:
@@ -1651,6 +1655,11 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
             outcome, detail = ensure_kickoff_staged(cq_id)
             if outcome == "staged":
                 msg = f"✅ Queued + prompt staged: `{detail}`"
+            elif outcome == "inflight":
+                # A benign concurrent stage (e.g. a Monday-menu bundle holding the
+                # reservation) is NOT a failure -- reporting one would send Harrison
+                # chasing a retry the in-flight winner is about to make unnecessary.
+                msg = "✅ Queued (APPROVED) -- a prompt is already being generated."
             elif outcome == "error":
                 # LOUD, never silent: the approve still stands (the ledger event is
                 # already written) but Harrison is told the kickoff did NOT generate,
@@ -1677,13 +1686,15 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         # Shares ensure_kickoff_staged with the approve path (Slice 4) so there is
         # ONE generator implementation and one loud-failure contract. Its reservation
         # guard is what keeps a re-tap from a second Sonnet call / second `staged`
-        # event (defect #3 TOCTOU class).
+        # event (defect #3 TOCTOU class), and its terminal guard is what keeps a
+        # stale Slack button from resurrecting a SHIPPED row (lens-4 HIGH).
         outcome, detail = ensure_kickoff_staged(cq_id)
         if outcome == "staged":
             return "staged", f"📝 Prompt staged: `{detail}`"
         if outcome == "noop":
-            return "noop", f"Already staged: `{detail}`"
-        if detail == "another staging attempt is already in flight for this item":
+            return "noop", (f"Already staged: `{detail}`" if detail.startswith(("/", "G:", "C:", "\\"))
+                            else detail)
+        if outcome == "inflight":
             return "noop", "Already staging -- I'll post the prompt path when it's ready."
         return "error", f"Prompt generation failed -- nothing staged ({detail})."
 
@@ -1730,30 +1741,54 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
 # network-dependent change to every seeding script and the MCP seed tool. Instead it
 # WARNS loudly and the nightly monitor catches the row within 24h.
 
+# A `staged` event on a TERMINAL row RESURRECTS it -- the fold is last-write-wins,
+# so `staged` unconditionally sets status=STAGED. This is the cq-dad80c0011c9 trap,
+# already a live incident once. ACTION_APPROVE has always guarded the terminal
+# triple; ACTION_STAGE never did, and record_staged/ensure_kickoff_staged shipped
+# with the same hole in the first cut of this slice (D-051 lens-4 HIGH). The
+# collision was concrete: step 7.5 marks this bundle's items SHIPPED at merge, and
+# the new nightly WARN's own remediation text says "tap Stage on each" -- a Slack
+# button is permanent, so a later tap on a now-SHIPPED row would spend Sonnet, write
+# a new G: prompt, and flip SHIPPED -> STAGED back into the backlog.
+_TERMINAL_STATUSES = frozenset({"SHIPPED", "DISMISSED", "SUPERSEDED"})
+
+
 def ensure_kickoff_staged(cq_id: str) -> tuple[str, str]:
     """Generate + ledger-record a kickoff prompt for one item. The single
     implementation every approval path shares.
 
     Returns (outcome, detail):
-      "staged"  -> detail is the prompt path
-      "noop"    -> already staged (detail is the existing path)
-      "error"   -> detail is a short human reason; the CALLER must surface it
+      "staged"   -> detail is the prompt path
+      "noop"     -> nothing to do (detail is the existing path, or why)
+      "inflight" -> a concurrent attempt holds the reservation; it will finish
+      "error"    -> detail is a short human reason; the CALLER must surface it
 
     Reservation-guarded (defect #3 TOCTOU class) so a concurrent approve/stage can
-    never double-generate. Losing the race is reported as an ERROR, not silence --
-    the in-flight winner will stage it, but the caller still owes the user a truthful
-    message rather than an implied success.
+    never double-generate. The race is its OWN outcome rather than an error string
+    the callers string-match (D-051 lens-4/5 MEDIUM: comparing prose across two
+    functions meant rewording the message would silently turn a benign race into a
+    reported generation failure, and ACTION_APPROVE never recovered it at all --
+    telling Harrison the kickoff failed while a Monday-menu bundle was about to
+    produce it).
     """
     rec = get_item(cq_id)
     if not rec:
         return "error", "item no longer exists"
-    if rec.get("status") == "STAGED" and rec.get("prompt_path"):
+    if str(rec.get("status", "")).upper() in _TERMINAL_STATUSES:
+        return "noop", f"item is {rec['status']} -- not staging a terminal row"
+    # Key on prompt_path ALONE, not on status==STAGED (D-051 lens-4 MEDIUM):
+    # ACTION_LATER has no status guard, so STAGED -> Later -> Approve left a row
+    # SNOOZED WITH a prompt_path, failed the conjunction, and generated a SECOND
+    # prompt + a second `staged` event -- orphaning the first G: file. prompt_path
+    # truthiness is the real "a prompt already exists" key, and it is what
+    # priority_items_missing_kickoff already used.
+    if rec.get("prompt_path"):
         return "noop", str(rec["prompt_path"])
     if not _begin_staging([cq_id]):
-        return "error", "another staging attempt is already in flight for this item"
+        return "inflight", "another staging attempt is already in flight for this item"
     try:
         fresh = get_item(cq_id) or rec
-        if fresh.get("status") == "STAGED" and fresh.get("prompt_path"):
+        if fresh.get("prompt_path"):
             return "noop", str(fresh["prompt_path"])
         meta: dict[str, Any] = {}
         try:
@@ -1790,40 +1825,57 @@ def priority_items_missing_kickoff(
 
     The structural net behind ensure_kickoff_staged: whatever path approved the item
     -- card tap, Monday menu, a seeding script, or something not yet written -- a
-    dropped priority kickoff becomes visible within a day. Newest-first.
+    dropped priority kickoff becomes visible within a day. Most-aged first.
 
-    Never raises: a ledger read problem yields [] rather than breaking the nightly
-    health check (every other gauge there behaves the same way).
+    RAISES on a ledger read failure (D-051 lens-5 HIGH). The first cut swallowed
+    everything and returned [], which the health check rendered as
+    "No APPROVED P0/P1 item is missing a kickoff prompt" -- empty-because-clean and
+    empty-because-blind were indistinguishable on the one surface Harrison reads. A
+    monitor built because an item sat unnoticed for a week must not have a false
+    all-clear as its own failure mode. The caller wraps this and WARNs.
     """
     out: list[dict[str, Any]] = []
-    try:
-        cutoff = _now() - timedelta(hours=max(0, int(grace_hours)))
-        for rec in load_items():
-            if rec.get("status") != "APPROVED":
+    cutoff = _now() - timedelta(hours=max(0, int(grace_hours)))
+    for rec in load_items():
+        if rec.get("status") != "APPROVED":
+            continue
+        if not is_priority_severity(rec.get("severity")):
+            continue
+        # prompt_path truthiness is not proof the ARTIFACT exists (lens-4 MEDIUM):
+        # the originating incident was a MISSING prompt, and _write_prompt_file
+        # fail-softs to the repo _notes dir while apply_prompt_rehome moves paths
+        # around. Fail OPEN on a stat error -- an unreadable mount must not
+        # manufacture offenders.
+        pp = str(rec.get("prompt_path") or "")
+        if pp:
+            try:
+                if Path(pp).exists():
+                    continue
+            except OSError:
                 continue
-            if not is_priority_severity(rec.get("severity")):
-                continue
-            if rec.get("prompt_path"):
-                continue
-            # Age from the most recent touch we can see: an item approved today but
-            # captured weeks ago must not flag immediately.
-            stamp = (_parse_ts(rec.get("last_touch"))
-                     or _parse_ts(rec.get("approved_at"))
-                     or _parse_ts(rec.get("ts")))
-            if stamp is not None and stamp > cutoff:
-                continue
-            out.append({
-                "id": rec.get("id", ""),
-                "severity": rec.get("severity", ""),
-                "entity": rec.get("entity", ""),
-                "title": str(rec.get("title", ""))[:120],
-                "age_hours": (round((_now() - stamp).total_seconds() / 3600.0, 1)
-                              if stamp is not None else None),
-            })
-    except Exception:  # noqa: BLE001 -- a monitor must never break its caller
-        log.warning("code_queue: priority-kickoff scan failed", exc_info=True)
-        return []
-    out.sort(key=lambda r: (r.get("age_hours") or 0.0), reverse=True)
+        # Age from the APPROVAL, never from `last_touch` (lens-4/5 MEDIUM). The first
+        # cut preferred last_touch, which the `kept` event writes and ACTION_KEEP does
+        # not status-gate -- so tapping Keep on a stale card bought another 24h of
+        # invisibility (re-tappable weekly, hiding a dropped P1 indefinitely), while a
+        # last_touch OLDER than the approval flagged a fresh approve instantly with a
+        # wildly inflated age. "APPROVED for >Nh with no kickoff" only ever meant the
+        # approval clock. Seed-at-APPROVED rows have no `approved` event, so `ts`
+        # (always set by seed_item) is the real fallback.
+        stamp = _parse_ts(rec.get("approved_at")) or _parse_ts(rec.get("ts"))
+        if stamp is not None and stamp > cutoff:
+            continue
+        out.append({
+            "id": rec.get("id", ""),
+            "severity": rec.get("severity", ""),
+            "entity": rec.get("entity", ""),
+            "prompt_path_missing": bool(pp),
+            "age_hours": (round((_now() - stamp).total_seconds() / 3600.0, 1)
+                          if stamp is not None else None),
+        })
+    # Unparseable-timestamp rows are the MOST broken, so they sort FIRST rather than
+    # being the first hidden by the caller's top-N truncation (lens-5 LOW).
+    out.sort(key=lambda r: (r["age_hours"] is not None,
+                            -(r.get("age_hours") or 0.0)))
     return out
 
 
@@ -1932,7 +1984,12 @@ def record_staged(cq_id: str, prompt_path: str, actor_id: str) -> tuple[str, str
     path = str(prompt_path or "").strip()
     if not path:
         return "error", "A staged event needs a prompt path."
-    if rec.get("status") == "STAGED" and rec.get("prompt_path"):
+    # Terminal guard (D-051 lens-4 HIGH): a `staged` event on a SHIPPED/DISMISSED/
+    # SUPERSEDED row RESURRECTS it via the last-write-wins fold -- the
+    # cq-dad80c0011c9 trap. See _TERMINAL_STATUSES.
+    if str(rec.get("status", "")).upper() in _TERMINAL_STATUSES:
+        return "noop", f"Item is {rec['status']} -- not staging a terminal row."
+    if rec.get("prompt_path"):
         return "noop", f"Already staged: `{rec['prompt_path']}`"
     _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
                    "prompt_path": path, "authored": "external"})
@@ -1961,6 +2018,24 @@ def append_evidence(cq_id: str, actor_id: str, note: str,
     note = str(note or "").strip()
     if not note:
         return "error", "Nothing to attach -- the evidence note is empty."
+    # FALSE-SUCCESS FIXES (D-051 lens-4 MEDIUM). The first cut returned "Evidence
+    # attached." for two writes that did not land as given:
+    #   * _scrub_evidence truncates the note to 200 chars with no warning -- and this
+    #     already cost live data: both notes the reconcile script attached to
+    #     cq-5c6ff15610bd are stored cut mid-word at exactly 200 chars, losing the
+    #     substance that followed. Truncation is now REPORTED.
+    #   * the fold caps evidence at 10 entries and silently drops the 11th. Refuse.
+    # Doctrine precedent: the Shopify inventory hotfix ("write-dead + false-success").
+    truncated = len(note) > _EVIDENCE_NOTE_MAX_CHARS
+    if len(rec.get("evidence") or []) >= _EVIDENCE_MAX_ENTRIES:
+        return "error", (f"This item already carries {_EVIDENCE_MAX_ENTRIES} evidence "
+                         f"entries -- the fold drops any more. Edit the summary instead.")
+    # Dedup (lens-4 MEDIUM): the reconcile script's docstring promises idempotency,
+    # but re-running it re-appended the same notes until the cap silently ate them.
+    existing_notes = {str(e.get("note", "")).strip()
+                      for e in (rec.get("evidence") or []) if e.get("note")}
+    if note[:_EVIDENCE_NOTE_MAX_CHARS] in existing_notes:
+        return "noop", "That evidence note is already attached."
     try:
         if phi_guard.is_any_phi(note):
             return "error", "Evidence rejected -- text tripped the PHI guard."
@@ -1978,6 +2053,10 @@ def append_evidence(cq_id: str, actor_id: str, note: str,
     _append_event({"event": "evidence", "ts": _now_iso(), "id": cq_id,
                    "evidence": entry})
     _render_backlog_safe()
+    if truncated:
+        return "evidence", (f"Evidence attached, TRUNCATED to "
+                            f"{_EVIDENCE_NOTE_MAX_CHARS} chars -- shorten the note if "
+                            f"the tail mattered.")
     return "evidence", "Evidence attached."
 
 

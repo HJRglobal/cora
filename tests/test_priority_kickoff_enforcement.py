@@ -93,9 +93,11 @@ class TestEnsureKickoffStaged:
         outcome, detail = cq.ensure_kickoff_staged(cid)
         assert outcome == "error" and "crashed" in detail
 
-    def test_reservation_race_is_an_error_not_silence(self, qenv, monkeypatch):  # noqa: F811
-        """Losing the TOCTOU reservation must be REPORTED. Previously the approve
-        branch skipped generation entirely and still said "Queued (APPROVED)"."""
+    def test_reservation_race_is_its_own_outcome(self, qenv, monkeypatch):  # noqa: F811
+        """Losing the TOCTOU reservation must be REPORTED, and as its OWN outcome
+        rather than an error string the callers string-match (D-051 lens-4/5 MEDIUM:
+        rewording the message would silently turn a benign race into a reported
+        generation failure, and ACTION_APPROVE never recovered it at all)."""
         _fake_generator(monkeypatch)
         cid = _seed()
         assert cq._begin_staging([cid]) is True  # simulate an in-flight winner
@@ -103,7 +105,52 @@ class TestEnsureKickoffStaged:
             outcome, detail = cq.ensure_kickoff_staged(cid)
         finally:
             cq._end_staging([cid])
-        assert outcome == "error" and "in flight" in detail
+        assert outcome == "inflight" and "in flight" in detail
+
+    @pytest.mark.parametrize("terminal", ["shipped", "dismissed", "superseded"])
+    def test_terminal_rows_are_never_staged(self, qenv, monkeypatch, terminal):  # noqa: F811
+        """THE cq-dad80c0011c9 TRAP (D-051 lens-4 HIGH): the fold is last-write-wins,
+        so a `staged` event on a terminal row RESURRECTS it. The collision was
+        concrete -- step 7.5 marks this bundle's items SHIPPED at merge, and the new
+        nightly WARN's own text says "tap Stage on each"; a Slack button is
+        permanent."""
+        _fake_generator(monkeypatch)
+        cid = _seed(severity="P1")
+        cq._append_event({"event": terminal, "ts": cq._now_iso(), "id": cid})
+        status_before = cq.get_item(cid)["status"]
+
+        outcome, detail = cq.ensure_kickoff_staged(cid)
+        assert outcome == "noop" and status_before in detail
+        assert cq.get_item(cid)["status"] == status_before
+
+        outcome2, _ = cq.record_staged(cid, "/some/prompt.md", HARRISON)
+        assert outcome2 == "noop"
+        assert cq.get_item(cid)["status"] == status_before
+
+        outcome3, _ = cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)
+        assert outcome3 == "noop"
+        assert cq.get_item(cid)["status"] == status_before
+        assert not cq.get_item(cid).get("prompt_path")
+
+    def test_idempotency_keys_on_prompt_path_not_status(self, qenv, monkeypatch):  # noqa: F811
+        """STAGED -> Later -> Approve double-generated (D-051 lens-4 MEDIUM):
+        ACTION_LATER has no status guard, so the row went SNOOZED while KEEPING its
+        prompt_path, failed the status==STAGED conjunction, and produced a SECOND
+        prompt file plus a second `staged` event -- orphaning the first."""
+        calls: list[int] = []
+
+        def _gen(items, slug=None, meta_out=None):
+            calls.append(1)
+            return f"/gen/prompt-{len(calls)}.md"
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)
+        cid = _seed(severity="P1")
+        assert cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)[0] == "staged"
+        cq.process_queue_action(cq.ACTION_LATER, cid, HARRISON)
+        assert cq.get_item(cid)["status"] == "SNOOZED"
+        assert cq.get_item(cid)["prompt_path"] == "/gen/prompt-1.md"
+        outcome, _ = cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
+        assert len(calls) == 1, "regenerated a second prompt for one item"
+        assert cq.get_item(cid)["prompt_path"] == "/gen/prompt-1.md"
 
     def test_missing_item(self, qenv):  # noqa: F811
         assert cq.ensure_kickoff_staged("cq-nope")[0] == "error"
@@ -187,6 +234,20 @@ class TestLoudFailure:
             cq._end_staging([cid])
         assert outcome == "noop" and "Already staging" in msg
 
+    def test_approve_reports_a_race_as_benign_not_as_failure(self, qenv, monkeypatch):  # noqa: F811
+        """A Monday-menu bundle holding the reservation must not make a card approve
+        claim the kickoff failed and send Harrison chasing a needless retry."""
+        _fake_generator(monkeypatch)
+        cid = _seed(severity="P1")
+        assert cq._begin_staging([cid]) is True
+        try:
+            outcome, msg = cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
+        finally:
+            cq._end_staging([cid])
+        assert outcome == "approved"
+        assert "did NOT generate" not in msg
+        assert "already being generated" in msg
+
 
 # ── defect 1: the seed-at-APPROVED path ──────────────────────────────────────
 
@@ -264,12 +325,64 @@ class TestPriorityKickoffMonitor:
         assert rec.get("approved_at")
         assert cid not in [o["id"] for o in cq.priority_items_missing_kickoff()]
 
-    def test_staged_item_is_not_flagged(self, qenv, monkeypatch):  # noqa: F811
-        _fake_generator(monkeypatch)
+    def test_staged_item_is_not_flagged(self, qenv, monkeypatch, tmp_path):  # noqa: F811
+        real = tmp_path / "prompt.md"
+        real.write_text("x", encoding="utf-8")
+        _fake_generator(monkeypatch, path=str(real))
         cid = _seed(severity="P1", status="PROPOSED")
         self._age(cid, 72)
         cq.ensure_kickoff_staged(cid)
         assert cid not in [o["id"] for o in cq.priority_items_missing_kickoff()]
+
+    def test_a_prompt_path_pointing_at_nothing_still_flags(self, qenv):  # noqa: F811
+        """prompt_path truthiness is not proof the ARTIFACT exists (D-051 lens-4):
+        the originating incident was a MISSING prompt, _write_prompt_file fail-softs
+        to a different directory, and apply_prompt_rehome moves paths around."""
+        cid = _seed(severity="P1", status="PROPOSED")
+        self._age(cid, 72)
+        cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid,
+                          "prompt_path": "/nonexistent/never/written.md"})
+        # STAGED status is not what the monitor keys on -- a missing artifact is.
+        cq._append_event({"event": "approved", "ts": cq._now_iso(), "id": cid})
+        self._age(cid, 72)
+        rows = [o for o in cq.priority_items_missing_kickoff() if o["id"] == cid]
+        assert rows and rows[0]["prompt_path_missing"] is True
+
+    def test_a_keep_tap_cannot_hide_a_dropped_kickoff(self, qenv):  # noqa: F811
+        """D-051 lens-4/5 MEDIUM: `last_touch` came FIRST in the age chain, and
+        ACTION_KEEP has no status guard -- so tapping Keep on any stale card bought
+        another 24h of invisibility, re-tappable weekly. The clock is the APPROVAL."""
+        cid = _seed(severity="P1", status="PROPOSED")
+        self._age(cid, 200)
+        assert cid in [o["id"] for o in cq.priority_items_missing_kickoff()]
+        cq.process_queue_action(cq.ACTION_KEEP, cid, HARRISON)
+        assert cq.get_item(cid).get("last_touch")
+        assert cid in [o["id"] for o in cq.priority_items_missing_kickoff()]
+
+    def test_unparseable_timestamps_are_included_and_sort_first(self, qenv, monkeypatch):  # noqa: F811
+        """A row with no readable stamp is the MOST broken, so it must be INCLUDED
+        (never skipped) and must sort FIRST -- the caller truncates to the top 5, so
+        sorting it last would hide exactly the rows most worth seeing (lens-5 LOW).
+
+        Reaching stamp=None takes both approved_at AND ts unparseable, which
+        seed_item makes unreachable in practice (it always writes an ISO ts), so the
+        parser is stubbed -- the branch is defensive, and this pins its direction."""
+        broken = _seed(severity="P1", status="PROPOSED", title="broken stamp")
+        aged = _seed(severity="P1", status="PROPOSED", title="aged")
+        self._age(aged, 100)
+        # stamp=None needs BOTH approved_at and ts unreadable for this row only.
+        broken_ts = cq.get_item(broken)["ts"]
+        real_parse = cq._parse_ts
+        unreadable = {"BROKEN-stamp", broken_ts}
+        monkeypatch.setattr(
+            cq, "_parse_ts",
+            lambda v: None if str(v) in unreadable else real_parse(v))
+        cq._append_event({"event": "approved", "ts": "BROKEN-stamp", "id": broken})
+        rows = cq.priority_items_missing_kickoff()
+        ids = [o["id"] for o in rows]
+        assert broken in ids and aged in ids
+        assert ids.index(broken) < ids.index(aged)
+        assert next(o for o in rows if o["id"] == broken)["age_hours"] is None
 
     def test_non_priority_and_terminal_states_not_flagged(self, qenv):  # noqa: F811
         low = _seed(severity="P3", status="PROPOSED", title="low")
@@ -280,10 +393,16 @@ class TestPriorityKickoffMonitor:
         ids = [o["id"] for o in cq.priority_items_missing_kickoff()]
         assert low not in ids and shipped not in ids
 
-    def test_scan_never_raises(self, qenv, monkeypatch):  # noqa: F811
+    def test_scan_RAISES_so_blind_is_never_reported_as_clean(self, qenv, monkeypatch):  # noqa: F811
+        """D-051 lens-5 HIGH: the first cut swallowed everything and returned [],
+        which the health check rendered as "No APPROVED P0/P1 item is missing a
+        kickoff prompt". Empty-because-clean and empty-because-blind were
+        indistinguishable on the one surface Harrison reads -- a false all-clear as
+        the failure mode of the monitor built because an item sat unnoticed a week."""
         monkeypatch.setattr(cq, "load_items",
                             lambda: (_ for _ in ()).throw(RuntimeError("ledger gone")))
-        assert cq.priority_items_missing_kickoff() == []
+        with pytest.raises(RuntimeError):
+            cq.priority_items_missing_kickoff()
 
     def test_newest_offender_ordering_is_oldest_first(self, qenv):  # noqa: F811
         a = _seed(severity="P1", status="PROPOSED", title="older")
@@ -314,7 +433,7 @@ class TestHealthCheckLine:
         mod = self._load()
         monkeypatch.setattr(cq, "priority_items_missing_kickoff", lambda: [
             {"id": "cq-aaa", "severity": "P1", "entity": "FNDR",
-             "title": "intake gap", "age_hours": 170.0},
+             "age_hours": 170.0, "prompt_path_missing": False},
         ])
         r = mod.check_priority_kickoffs()
         assert r.status == "warn"
@@ -322,14 +441,37 @@ class TestHealthCheckLine:
         # Actionable, not just a count -- Harrison needs the WHICH.
         assert "Stage" in r.detail
 
+    def test_detail_carries_no_intake_title(self, monkeypatch):
+        """D-051 lens-4 LOW: this report posts to a MULTI-PERSON channel, and queue
+        titles are user-authored intake text from arbitrary channels. Every other
+        check there emits aggregates or task names; the id is enough to act on."""
+        mod = self._load()
+        monkeypatch.setattr(cq, "priority_items_missing_kickoff", lambda: [
+            {"id": "cq-aaa", "severity": "P1", "entity": "LEX",
+             "title": "some sensitive intake wording", "age_hours": 30.0,
+             "prompt_path_missing": False},
+        ])
+        r = mod.check_priority_kickoffs()
+        assert "sensitive intake wording" not in r.detail
+
     def test_truncates_a_long_list(self, monkeypatch):
         mod = self._load()
         monkeypatch.setattr(cq, "priority_items_missing_kickoff", lambda: [
             {"id": f"cq-{i}", "severity": "P1", "entity": "FNDR",
-             "title": "t", "age_hours": 100.0} for i in range(9)
+             "age_hours": 100.0, "prompt_path_missing": False} for i in range(9)
         ])
         r = mod.check_priority_kickoffs()
         assert r.status == "warn" and "+4 more" in r.detail
+
+    def test_unknown_age_renders_without_crashing(self, monkeypatch):
+        mod = self._load()
+        monkeypatch.setattr(cq, "priority_items_missing_kickoff", lambda: [
+            {"id": "cq-broken", "severity": "P1", "entity": "FNDR",
+             "age_hours": None, "prompt_path_missing": True},
+        ])
+        r = mod.check_priority_kickoffs()
+        assert r.status == "warn"
+        assert "age unknown" in r.detail and "prompt file missing" in r.detail
 
     def test_broken_scan_warns_never_raises(self, monkeypatch):
         mod = self._load()

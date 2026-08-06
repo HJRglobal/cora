@@ -305,7 +305,19 @@ def search_slack_evidence(kb: Any, gap: dict[str, Any]) -> list[Any]:
         if isinstance(meta, dict) and meta.get("bot_authored"):
             continue
         content = getattr(r, "content", "") or ""
-        if is_phi_risk(content):
+        # PHI PARITY-RAISE (D-051 lens-2 HIGH, 2026-08-06): this filter was
+        # single-predicate `is_phi_risk`, which provably misses clinical and named
+        # admin-PHI text that the 3-predicate union catches ("He is nonverbal and on
+        # risperidone", "Bob Smith's billing authorization is pending and his service
+        # units ran out"). That evidence goes into a Haiku prompt, so the union is the
+        # right bar here -- the same raise code_queue took on 2026-07-30. Fail-closed:
+        # a screen error drops the chunk rather than passing it.
+        try:
+            if is_any_phi(content):
+                continue
+        except Exception:  # noqa: BLE001 -- fail closed, never widen the surface
+            log.warning("gap_autofill: evidence PHI screen errored -- dropping chunk",
+                        exc_info=True)
             continue
         out.append(r)
         if len(out) >= EVIDENCE_K:
@@ -583,6 +595,20 @@ MINE_INELIGIBLE_SCREEN_ERROR = "eligibility screen errored (fail-closed)"
 # A gap whose detector already carries its own disposition elsewhere.
 _ALREADY_ROUTED_DETECTORS = frozenset({"code_queue_route"})
 
+# Which ineligibility reasons justify a PERMANENT disposition in
+# gap_autofill_state.json. This matters because there is NO reset path: load_open_gaps
+# excludes any gap ts present in state, forever (D-051 lens-5 HIGH/LOW).
+#
+# So only STRUCTURAL reasons retire a gap -- already_routed (the classifier filed it
+# in the code queue, so it genuinely has a disposition) and disputed (only when a
+# decision card was actually created). The HEURISTIC classes (retired/QA/ephemeral/
+# capability) skip mining and escalation for the run but stay OPEN, so a regex false
+# positive costs one skipped night instead of permanently burying an answerable gap,
+# and expire_stale_gaps still gives them the normal audited 30-day close.
+PERMANENT_INELIGIBLE_REASONS = frozenset({
+    MINE_INELIGIBLE_ALREADY_ROUTED,
+})
+
 _RETIRED_PROCESS_RE = re.compile(
     r"\bclover\b"                                   # D-027, retired from OSN permanently
     r"|\brole-?briefing-?config\b"                  # retired at Phase-2 d2
@@ -594,18 +620,26 @@ _RETIRED_PROCESS_RE = re.compile(
 
 _QA_SCAFFOLDING_RE = re.compile(
     r"\[qa\]"                                       # D-104 test-text convention
-    r"|\bsent using\b"                              # Cowork connector footer
+    # The Cowork connector footer, which is literally "*Sent using* <@U...>". Bare
+    # "sent using" over-fired on ordinary prose (D-051 lens-5 LOW: "Which invoices
+    # were sent using the new template?" is a real durable question); require the
+    # mention token, mirroring tool_dispatch._CONFIRM_SENT_USING_RE.
+    r"|sent using\s*\*?\s*<@"
     r"|\bsmoke ?test\b|\btest message\b|\bignore this\b|\bthis is a test\b"
     r"|\btest locker code\b",
     re.IGNORECASE,
 )
 
 # Point-in-time QUESTIONS (the mirror of _SNAPSHOT_RE, which screens ANSWERS).
+# A TIME-RELATIVE marker is required. D-051 lens-5 LOW: the first cut also matched
+# "(how much|what's our) ... (cash|balance|runway)" with no time qualifier at all,
+# so "What's our cash allocation policy?" -- a durable fact -- read as ephemeral.
 _EPHEMERAL_QUESTION_RE = re.compile(
     r"\bwhat'?s on (?:my|his|her|their) plate\b"
-    r"|\b(?:how much|what'?s our|what is our)\b[^?\n]{0,40}\b(?:cash|balance|runway)\b"
-    r"|\b(?:this|last) (?:week|month|quarter)'?s? (?:numbers|revenue|sales|total)\b"
-    r"|\bright now\b|\bat the moment\b|\bas of (?:today|now)\b"
+    r"|\b(?:this|last) (?:week|month|quarter)'?s? (?:numbers|revenue|sales|total|cash)\b"
+    r"|\bright now\b|\bat the moment\b|\bas of (?:today|now)\b|\bso far (?:today|this)\b"
+    r"|\b(?:how much|what'?s our|what is our)\b[^?\n]{0,40}"
+    r"\b(?:cash|balance|runway)\b[^?\n]{0,30}\b(?:today|now|this week|currently)\b"
     r"|\bwhat'?s (?:my|our) (?:uptime|status)\b",
     re.IGNORECASE,
 )
@@ -635,6 +669,20 @@ _SOURCE_DISAGREEMENT_RE = re.compile(
 )
 
 
+def log_mine_rejection(gap_ts: Any, reason: str) -> None:
+    """Emit the CANONICAL rejection line that aggregate_quality_rejections parses.
+
+    D-051 lens-2 MEDIUM (2026-08-06): registering the new reasons in _REASON_CODES was
+    not enough to make them visible. _REJECTION_LOG_RE matches only the
+    "draft rejected (quality)" line, which is emitted inside draft_answer -- and the
+    driver `continue`s on an ineligible gap BEFORE draft_answer is ever called, so in
+    PRODUCTION all seven new codes would have aggregated to zero forever. Both callers
+    now go through this one function, so the log shape and the parser cannot drift.
+    """
+    log.info("gap_autofill: draft rejected (quality) for gap %s: %s",
+             gap_ts if gap_ts not in (None, "") else "?", reason)
+
+
 def _evidence_text(evidence: list[Any] | None) -> str:
     """Concatenated evidence content, for the D-128 screens. Bounded so a large
     evidence set can't turn a regex sweep into a hot loop."""
@@ -644,15 +692,43 @@ def _evidence_text(evidence: list[Any] | None) -> str:
     return "\n".join(parts)
 
 
+def _cora_attributed_text(evidence: list[Any] | None) -> str:
+    """Evidence text from chunks that actually CONTAIN a Cora reply.
+
+    D-051 lens-5 HIGH (2026-08-06): the first cut screened the ENTIRE evidence set,
+    which is a KB VECTOR SEARCH result -- topically similar chunks, not "the
+    exchange" -- with regexes that carry no speaker attribution. Measured: 9 of 9
+    innocuous single human lines tripped it ("[Justin] I'm not sure who owns that
+    account yet", "[Tommy] Needs your review before I send it", "[Matt] The Shopify
+    count is out of sync"). Stock operational Slack. The double wrong outcome was an
+    ANSWERABLE gap declared disputed -- skipped for mining AND proposed as a
+    never-expiring decision card.
+
+    The ingest already tags the attribution this needs: `has_cora_reply` per chunk
+    (cq-8d16969e85fb). Untagged chunks (pre-tagging rows) are NOT screened -- the
+    safe direction here is toward not-disputed, because a missed dispute still lands
+    in front of Harrison as a gated known_answer proposal, while a false dispute
+    both suppresses a real answer and adds noise to a lane that is already backlogged.
+    """
+    parts = []
+    for c in (evidence or [])[:EVIDENCE_K]:
+        meta = getattr(c, "metadata", None)
+        if not (isinstance(meta, dict) and meta.get("has_cora_reply")):
+            continue
+        parts.append(str(getattr(c, "content", "") or "")[:1200])
+    return "\n".join(parts)
+
+
 def is_disputed_exchange(gap: dict[str, Any], evidence: list[Any] | None = None) -> bool:
     """D-128: True when Cora herself flagged this exchange uncertain, or it encodes
     a live disagreement between two systems of record.
 
-    Screens the gap's own question/gap text AND the mined evidence -- Cora's replies
-    live in the evidence, because search_slack_evidence drops only PURE-bot chunks
-    and deliberately keeps mixed human-ask + Cora-reply chunks (cq-8d16969e85fb).
+    Screens the gap's own question/gap text (that IS the exchange -- the user's
+    message plus Cora's own sentinel output) and ONLY the Cora-ATTRIBUTED evidence
+    chunks. See _cora_attributed_text for why unattributed evidence is excluded.
     """
-    text = f"{gap.get('question', '')}\n{gap.get('gap', '')}\n{_evidence_text(evidence)}"
+    own = f"{gap.get('question', '')}\n{gap.get('gap', '')}"
+    text = f"{own}\n{_cora_attributed_text(evidence)}"
     return bool(_CORA_UNCERTAINTY_RE.search(text)
                 or _SOURCE_DISAGREEMENT_RE.search(text))
 
@@ -671,13 +747,28 @@ def mine_eligibility(gap: dict[str, Any],
         detector = str(gap.get("detector", "") or "").strip().lower()
         combined = f"{question}\n{gap_text}"
 
+        # ORDER MATTERS (D-051 lens-2 MEDIUM, 2026-08-06). The first cut evaluated
+        # D-128 LAST, so a disputed exchange that also matched a cheaper class was
+        # silently DROPPED instead of routed -- losing exactly D-128's motivating
+        # class, a disagreement about a NUMBER ("what's our cash balance right now?"
+        # + "[Cora] I can't reconcile the two sheets" matched _EPHEMERAL_QUESTION_RE
+        # first). D-128 is a HARD rule, so it now outranks every class EXCEPT
+        # already_routed -- that one has a disposition BY CONSTRUCTION (the classifier
+        # already filed it in the code queue), so routing it again would double-handle.
         if detector in _ALREADY_ROUTED_DETECTORS:
             return False, MINE_INELIGIBLE_ALREADY_ROUTED
+        if is_disputed_exchange(gap, evidence):
+            return False, MINE_INELIGIBLE_DISPUTED
         try:
             from .knowledge_gaps import is_capability_ask
             if is_capability_ask(question):
                 return False, MINE_INELIGIBLE_CAPABILITY_ASK
         except Exception:  # noqa: BLE001 -- fail closed on a screen import/None error
+            # Log with the traceback (D-051 lens-5 HIGH): the first cut returned the
+            # code silently, so a systemic screen failure left only a generic reason
+            # and no way to diagnose it.
+            log.warning("gap_autofill: capability-ask screen errored -- fail-closed",
+                        exc_info=True)
             return False, MINE_INELIGIBLE_SCREEN_ERROR
         if _QA_SCAFFOLDING_RE.search(combined):
             return False, MINE_INELIGIBLE_QA
@@ -685,8 +776,6 @@ def mine_eligibility(gap: dict[str, Any],
             return False, MINE_INELIGIBLE_RETIRED
         if _EPHEMERAL_QUESTION_RE.search(question):
             return False, MINE_INELIGIBLE_EPHEMERAL
-        if is_disputed_exchange(gap, evidence):
-            return False, MINE_INELIGIBLE_DISPUTED
         return True, ""
     except Exception:  # noqa: BLE001 -- a bad draft is worse than no draft
         log.warning("gap_autofill: mine eligibility screen errored -- fail-closed",
@@ -694,9 +783,18 @@ def mine_eligibility(gap: dict[str, Any],
         return False, MINE_INELIGIBLE_SCREEN_ERROR
 
 
-# Cap the decisions lane the same way MAX_ASKS_PER_RUN caps owner DMs, so a
-# corpus-wide sweep can never flood Harrison's never-expiring decision cards.
-MAX_DECISION_ROUTES_PER_RUN = 3
+# Cap the decisions lane so a corpus-wide sweep can never flood Harrison's
+# never-expiring decision cards.
+#
+# 1, not 3 (D-051 lens-5 MEDIUM, measured 2026-08-06). The decision pool is ALREADY
+# 65 PENDING with 55 never DM'd and 46 HIGH-and-never-DM'd, oldest 2026-07-16, while
+# the drain sends at most _MAX_DECISION_DMS_PER_RUN=5 Mon-Fri. This task runs DAILY,
+# so a cap of 3 could add 21 never-expiring cards a week against a net drain of ~4 --
+# and because these route at confidence MED they sort BEHIND every HIGH item, making
+# D-128 a write-only sink: durable (the letter of the rule) but not reaching Harrison,
+# while the gap is marked handled. One per run keeps the lane honest until that
+# backlog is triaged (scripts/triage_decision_backlog.py exists for exactly this).
+MAX_DECISION_ROUTES_PER_RUN = 1
 
 
 def decision_route_block_reason(gap: dict[str, Any]) -> str:
@@ -757,20 +855,54 @@ def route_disputed_to_decision_lane(gap: dict[str, Any],
         f"between two systems of record. Deciding which source is authoritative is "
         f"a call, not a fact -- so no known_answer was staged."
     )
+    update_id = f"gap-dispute-{gap_ts}"
+    candidate = {
+        "update_id": update_id,
+        "description": f"[{entity}] Unresolved: {(gap_text or question)[:160]}",
+        "payload": {
+            "entity": entity,
+            "decision_text": decision_text,
+            "source": "gap_autofill_d128",
+            "gap_ts": gap_ts,
+        },
+        # D-051 lens-2 HIGH (2026-08-06): source_evidence is deliberately EMPTY.
+        # The first cut sent _evidence_text(evidence)[:800] -- up to 800 chars of
+        # OTHER PEOPLE'S raw Slack messages -- into
+        # data/cora-proposed-memory-updates.jsonl, which drive_materializer mirrors
+        # to G:\...\_brain\_flywheel\ as a VERBATIM byte copy with no PHI wall (the
+        # wall is on the distillation path only). That was a brand-new durable +
+        # Drive-egress surface for raw mined text: before this diff the only
+        # persisted evidence was Haiku's short citation string. Screening 800 chars
+        # of arbitrary conversation is the wrong shape of fix -- the card does not
+        # need it. The question + gap + provenance already say what is disputed and
+        # why, and this also removes the DM-origin re-broadcast concern that
+        # should_escalate exists to prevent.
+        "source_evidence": "",
+    }
+    # Screen with the SAME function the drain and the durable inbox write use, at
+    # PROPOSE time, so propose-time screening is not strictly weaker than the two
+    # downstream belts (lens-2 MEDIUM: entity-prefix-only screening let a non-LEX-
+    # entity gap naming Lexington/LBHS/LTS reach the ledger, where the drain could
+    # only DISMISS it -- the row itself persists and rides into the archive).
+    try:
+        from .decision_inbox import screen_decision
+        excluded, why = screen_decision(candidate)
+    except Exception:  # noqa: BLE001 -- fail closed
+        log.warning("gap_autofill: D-128 decision screen errored for gap %s -- not routing",
+                    gap_ts, exc_info=True)
+        return None
+    if excluded:
+        log.info("gap_autofill: D-128 route dropped for gap %s (decision screen: %s)",
+                 gap_ts, why)
+        return None
     try:
         from .knowledge_review import UPDATE_TYPE_DECISION, propose_update
-        update_id = f"gap-dispute-{gap_ts}"
         proposed = propose_update(
             update_id=update_id,
             update_type=UPDATE_TYPE_DECISION,
-            description=f"[{entity}] Unresolved: {(gap_text or question)[:160]}",
-            payload={
-                "entity": entity,
-                "decision_text": decision_text,
-                "source": "gap_autofill_d128",
-                "gap_ts": gap_ts,
-            },
-            source_evidence=_evidence_text(evidence)[:800],
+            description=candidate["description"],
+            payload=candidate["payload"],
+            source_evidence="",
             confidence="MED",
         )
     except Exception:  # noqa: BLE001 -- never break the run over a routing failure
@@ -794,8 +926,7 @@ def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | N
     # ineligible exchange never reaches the Haiku call below.
     eligible, why = mine_eligibility(gap, evidence)
     if not eligible:
-        log.info("gap_autofill: draft rejected (quality) for gap %s: %s",
-                 gap.get("ts", "?"), why)
+        log_mine_rejection(gap.get("ts", "?"), why)
         return None
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:

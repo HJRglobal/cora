@@ -410,46 +410,85 @@ _ASANA_UPDATE_INTENT_RE = re.compile(
 #
 # Precision-biased, mirroring the Asana detector's house style:
 #  - GOVERNANCE required: an explicit file-it verb must govern an explicit
-#    code-queue object within 30 chars. A soft complaint ("it's broken", "Cora
+#    CODE-QUEUE NOUN within 30 chars. A soft complaint ("it's broken", "Cora
 #    should ...") is deliberately NOT here -- those are code_queue._PHRASE_RE
 #    signals that ride the async Harrison-gated classifier, and force-filing a
 #    card on every complaint would flood the queue.
-#  - LEADING: the match must start within the first 60 chars, so the phrase reads
-#    as the message's command rather than an aside buried in a paragraph.
-#  - NEGATION/DELIBERATION before the match disqualifies it ("I don't think we
-#    should queue a code session for that", "instead of queueing a code session").
+#  - IMPERATIVE only: the verb list is present-tense/imperative. "I already queued
+#    a code session" / "we logged this for the devs" describe a past action and must
+#    not re-file. This is the precision lever that replaces an earlier positional
+#    window (see the D-051 note below).
+#  - DELIBERATION/NEGATION before the match disqualifies it ("I don't think we
+#    should queue a code session", "instead of queueing one", "should we queue...").
+#  - An ASANA/CALENDAR REFERENT before the match disqualifies it, so "create a task
+#    to queue a code session" stays a task request.
+#
+# D-051 REVIEW REMEDIATION (2026-08-06, two HIGH findings on the first cut):
+#  HIGH-1 -- a bare "for the devs?" object had no code/build noun in it, so
+#    "add a subtask for the devs under the Pure launch task" / "add a comment for
+#    the devs on the invoice task" / "add a calendar hold for the devs sync" all
+#    fired. That SUPPRESSED the Asana force and forced the capture tool instead, so
+#    the user's actual subtask/comment was never created -- a DISPLACED action, which
+#    is worse than the dismissable-card cost the first version reasoned about.
+#    "log this for the devs" is a real trigger from the tool's own description, so it
+#    survives as a TIGHT alternative requiring log/file/queue + a demonstrative.
+#  HIGH-2 -- a 60-char leading window was defeated by one ordinary clause of
+#    preamble ("Following up from the leadership sync this morning, can you please
+#    queue a code session: ..." starts at 67), and on a miss the ORIGINAL bug
+#    returned because the Asana force won. Worse, `_MENTION_RE` strips only ONE
+#    LEADING mention, so another person's `<@U...>` or a `<#C...|channel>` reference
+#    burned the window. The window is REMOVED; the imperative-verb list plus the
+#    before-match guards do the same job without a positional cliff.
 _CODE_QUEUE_INTENT_RE = re.compile(
+    # An explicit code-queue noun, governed by an imperative file-it verb.
     r"\b(?:queue|queueing|queuing|log|file|add|put|open)\b[^.\n]{0,30}?\b"
-    r"(?:code[\s-]?session|code[\s-]?queue|build[\s-]?queue|dev(?:eloper)?[\s-]?queue|"
-    r"for the devs?)\b",
+    r"(?:code[\s-]?session|code[\s-]?queue|build[\s-]?queue|dev(?:eloper)?[\s-]?queue)\b"
+    # ...or the description's own "log this for the devs" phrasing, which needs a
+    # demonstrative so it cannot absorb "add a comment for the devs on the X task".
+    r"|\b(?:log|file|queue)\s+(?:this|that|it)\b[^.\n]{0,20}?\bfor the devs?\b",
     re.IGNORECASE,
 )
-_CODE_QUEUE_INTENT_MAX_START = 60
 # Anything in the text BEFORE the match that reframes it as hypothetical, negated,
-# or a rejected alternative.
+# deliberative, or a rejected alternative.
 _CODE_QUEUE_NEGATION_RE = re.compile(
     r"\b(?:don'?t|do not|dont|shouldn'?t|should not|no need|not\s+(?:worth|going|gonna)|"
-    r"instead of|rather than|without|never|why would|nothing to)\b",
+    r"instead of|rather than|without|never|why would|nothing to|"
+    r"should\s+(?:we|i)|is it worth|do we need|would it help|do you think|"
+    r"maybe|perhaps)\b",
+    re.IGNORECASE,
+)
+# An Asana/calendar referent before the match means the sentence is about that
+# object, not about filing a build ("create a task to queue a code session").
+_CODE_QUEUE_OTHER_REFERENT_RE = re.compile(
+    r"\b(?:sub-?tasks?|tasks?|to-?dos?|comments?|notes?|holds?|invites?|events?|"
+    r"meetings?|reminders?|tickets?)\b",
     re.IGNORECASE,
 )
 
 
 def _code_queue_capture_intent(text: str) -> bool:
     """True for an EXPLICIT "file this to the code queue" command. See the module
-    section above for why this must take precedence over the Asana task-op force.
+    section above for why this must take precedence over the Asana task-op force,
+    and for the two HIGH review findings that shaped the guards.
 
-    A miss is safe in both directions: the tool stays available to the model (this
-    only removes a hard tool_choice hijack and adds a positive force), and a false
-    positive files a Harrison-gated PROPOSED candidate he can dismiss in one tap --
-    never a data write.
+    Known residual (accepted, documented): the disqualifier scan looks only at text
+    BEFORE the match, so a retraction that TRAILS it ("queue a code session for that
+    -- actually never mind") still fires. Cost is one dismissable Harrison-gated card
+    and a wasted turn, never a write. It is deliberately not guarded: the text after
+    a capture phrase is arbitrary bug prose that legitimately contains "unless",
+    "only if", "no" -- scanning it would break the primary use case to fix a
+    cosmetic one.
     """
     t = (text or "").strip()
     if not t:
         return False
     m = _CODE_QUEUE_INTENT_RE.search(t)
-    if not m or m.start() > _CODE_QUEUE_INTENT_MAX_START:
+    if not m:
         return False
-    return not _CODE_QUEUE_NEGATION_RE.search(t[: m.start()])
+    before = t[: m.start()]
+    if _CODE_QUEUE_NEGATION_RE.search(before):
+        return False
+    return not _CODE_QUEUE_OTHER_REFERENT_RE.search(before)
 
 
 def _asana_destructive_intent(text: str) -> str | None:
@@ -930,6 +969,12 @@ def _dispatch_qa(
         or _tool_dispatch.has_pending_delegated_write(user_id, channel_name)
         or _tool_dispatch.has_pending_remember(user_id, channel_name)
         or _tool_dispatch.has_pending_forget_note(user_id, channel_name)
+        # D-051 lens-1 MEDIUM (2026-08-06): the code-queue capture confirm was the
+        # one staged-write confirm turn running unescalated. It DEFERS to the model
+        # by design, and the S4 precedent is that Haiku fabricates preview-shaped
+        # text with zero tool_use on exactly this shape. Slice 2's forced capture
+        # makes this turn common, so it joins the chain.
+        or _tool_dispatch.has_pending_code_queue(user_id, channel_name)
     )):
         chosen_model = model_router.MODEL_SONNET
     log.info(

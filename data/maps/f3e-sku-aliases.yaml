@@ -9,7 +9,20 @@
 # (variety / original / citrus / strawberry lemonade collide across Energy/Mood/
 # Pure) -- the tool must ask "which line?" rather than guess. Matched
 # case-insensitively; punctuation/extra spaces are stripped before compare.
-# Seed = all 15 live 12-packs, pulled 2026-07-21.
+#
+# 2026-08-06 -- THE NON-COLLISION RULE IS NOW WIDER THAN "bare words".
+# The resolver strips a TRAILING pack qualifier and re-probes (tool_dispatch
+# ._pack_query_ladder), so the reachable key space is every pack-word-suffixed
+# PREFIX of a query, not just whole aliases. Before adding an alias, check that its
+# pack-stripped form ("... pack" -> "...", "... 12 pack" -> "...") does not collide
+# with another SKU's alias or stripped form. Adding a bare "variety pack" here, for
+# example, would make "variety pack 12-pack" collapse onto one line instead of
+# asking. Verified 2026-08-06: no cross-SKU collapse exists in the current map --
+# every stripped form maps back to its own SKU.
+#
+# Seed = all 15 live 12-packs, pulled 2026-07-21. Because EVERY alias below is a
+# 12-pack, the resolver refuses (rather than coerces) when a user names a different
+# pack size and the resolved variant states a conflicting one (_pack_size_conflicts).
 skus:
   # --- F3 ENERGY (regular) ---
   F3-Original:   ["original energy", "original energy 12 pack", "f3 original energy"]

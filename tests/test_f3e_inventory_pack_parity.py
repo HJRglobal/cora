@@ -305,6 +305,92 @@ class TestSingleBatchParity:
         assert not has_pending_shopify_write(_ALEX, _CHAN)
 
 
+# ── D-051 review HIGH: the pack SIZE must not be silently discarded ──────────
+
+class TestPackSizeVerification:
+    """The ladder strips a pack qualifier to FIND the product. The first cut also
+    threw away the SIZE: "original energy 24 pack" stripped to "original energy",
+    hit the alias map, and resolved CONFIDENTLY to the 12-pack SKU -- a guess
+    presented as a resolution on a real-money write path, made worse by the new
+    provenance line reading like the 24-pack had been understood. Every seeded alias
+    is a 12-pack, so any other size the user named was coerced."""
+
+    @pytest.mark.parametrize("query,expected", [
+        ("original energy 24 pack", 24),
+        ("tropical energy 24 pack", 24),
+        ("original energy 4 pk", 4),
+        ("orangesicle pack of 24", 24),
+        ("pina colada mood 24ct", 24),
+        ("pure variety pack 24-pack", 24),
+        ("Pure Strawberry Lemonade 12-pack", 12),
+        ("original energy 12 cases", 12),
+        ("pure original", None),
+        ("variety pack", None),
+        ("pure original case", None),
+    ])
+    def test_named_pack_size_extraction(self, query, expected):
+        assert tool_dispatch._named_pack_size(query) == expected
+
+    @pytest.mark.parametrize("named,label,conflicts", [
+        (24, "F3 Original Energy Drink (12 Pack)", True),
+        (4, "F3 Original Energy Drink (12 Pack)", True),
+        (12, "F3 Original Energy Drink (12 Pack)", False),
+        (None, "F3 Original Energy Drink (12 Pack)", False),
+        # Unverifiable is NOT wrong: a label with no size passes, or the legitimate
+        # "... 12-pack" case would break whenever a title omits the size.
+        (12, "F3 Original Energy Drink", False),
+        (24, "F3 Original Energy Drink", False),
+    ])
+    def test_pack_size_conflicts(self, named, label, conflicts):
+        assert tool_dispatch._pack_size_conflicts(named, label) is conflicts
+
+    @pytest.mark.parametrize("query", [
+        "F3 Pure Variety Pack 24-pack",
+        "Pure Strawberry Lemonade 24 pack",
+        "pure strawberry lemonade pack of 6",
+    ])
+    def test_mismatched_size_refuses_and_writes_nothing(self, query):
+        with ExitStack() as s:
+            m_set = _stub_real_matching(s, _VARIETY, _PURESL)
+            out = _single(query)
+        assert out.startswith("WRITE_BLOCKED") and "won't assume" in out
+        assert m_set.call_count == 0
+        assert not has_pending_shopify_write(_ALEX, _CHAN)
+
+    def test_matching_size_still_resolves(self):
+        with ExitStack() as s:
+            _stub_real_matching(s, _VARIETY, _PURESL)
+            out = _single("Pure Strawberry Lemonade 12-pack")
+        assert out.startswith("WRITE_BLOCKED") and "NOT WRITTEN" in out
+        assert has_pending_shopify_write(_ALEX, _CHAN)
+
+
+def test_alias_hit_does_not_reprobe_raw_text():
+    """D-051 review MEDIUM: the retry source was passed on EVERY call, so a stale
+    canonical (renamed/retired SKU) silently re-probed the user's raw words and could
+    bind a different variant -- contradicting this path's own "an alias hit is
+    authoritative" contract. A stale canonical must refuse honestly."""
+    calls: list[str] = []
+
+    def _resolve(query, limit=25):
+        calls.append(query)
+        return []          # the canonical is stale -> nothing matches
+    with ExitStack() as s:
+        s.enter_context(patch.object(shopify_client, "get_active_locations",
+                                     return_value=list(_LOCS)))
+        s.enter_context(patch.object(shopify_client, "resolve_variants",
+                                     side_effect=_resolve))
+        s.enter_context(patch.object(tool_dispatch, "_load_shopify_write_config",
+                                     return_value=_CONFIG))
+        s.enter_context(patch.object(tool_dispatch, "_load_inventory_channel_config",
+                                     return_value={}))
+        s.enter_context(patch.object(tool_dispatch, "_lexicon_active",
+                                     return_value=False))
+        out = _single("pure original")          # exact alias hit -> PURE-Original
+    assert out.startswith("WRITE_BLOCKED") and "couldn't find" in out
+    assert calls == ["PURE-Original"], calls    # no raw re-probe
+
+
 # ── unchanged guardrails (D-079 / F-23 confirm gate, floor, magnitude) ────────
 
 class TestGuardrailsUnchanged:
@@ -359,10 +445,16 @@ class TestLexiconLeg:
         assert res.canonical == "PURESL"
         assert lexicon is not None
 
-    def test_exactly_one_telemetry_event_per_turn(self):
+    def test_exactly_one_resolve_event_per_turn(self):
         """Probing 3 ladder candidates through resolve(consumer=...) would treble
-        the lexicon-resolver counts the flywheel monitor reads -- probes run
-        silent and exactly one event is logged, against the ORIGINAL query."""
+        the lexicon-resolver counts the flywheel monitor reads -- probes run silent
+        and exactly one `resolve` event is logged, against the ORIGINAL query.
+
+        A second row is emitted under the DISTINCT event name resolve_raw_surface
+        (D-051 lens-5 MEDIUM): the raw surface the user typed genuinely MISSED, and
+        that miss is what lexicon_mining reads to learn the pack-suffixed alias.
+        Folding it into the "exact" row erased the learning signal; a distinct event
+        name keeps it out of every count that filters on event == "resolve"."""
         from cora import lexicon
 
         events: list[dict] = []
@@ -371,10 +463,26 @@ class TestLexiconLeg:
                                          side_effect=lambda **kw: events.append(kw)))
             tool_dispatch._lexicon_resolve_pack_tolerant(
                 "Pure Strawberry Lemonade 12-pack", channel=_CHAN, user=_ALEX)
-        assert len(events) == 1
-        assert events[0]["query"] == "Pure Strawberry Lemonade 12-pack"
-        assert events[0]["consumer"] == "f3e_shopify_set_inventory"
-        assert events[0]["status"] == "exact"
+        resolves = [e for e in events if e.get("event", "resolve") == "resolve"]
+        assert len(resolves) == 1
+        assert resolves[0]["query"] == "Pure Strawberry Lemonade 12-pack"
+        assert resolves[0]["consumer"] == "f3e_shopify_set_inventory"
+        assert resolves[0]["status"] == "exact"
+        raw_rows = [e for e in events if e.get("event") == "resolve_raw_surface"]
+        assert len(raw_rows) == 1
+        assert raw_rows[0]["status"] in ("miss", "suggestion")
+        assert raw_rows[0]["query"] == "Pure Strawberry Lemonade 12-pack"
+
+    def test_no_raw_surface_row_when_the_raw_query_resolved(self):
+        from cora import lexicon
+
+        events: list[dict] = []
+        with ExitStack() as s:
+            s.enter_context(patch.object(lexicon, "log_event",
+                                         side_effect=lambda **kw: events.append(kw)))
+            tool_dispatch._lexicon_resolve_pack_tolerant(
+                "pure original", channel=_CHAN, user=_ALEX)
+        assert [e for e in events if e.get("event") == "resolve_raw_surface"] == []
 
     def test_miss_still_logs_the_raw_result(self):
         from cora import lexicon

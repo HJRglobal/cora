@@ -30,13 +30,19 @@ from cora import gap_autofill as ga
 
 
 class _Chunk:
-    """Minimal stand-in for a KB SearchResult (only .content is read here)."""
+    """Minimal stand-in for a KB SearchResult.
 
-    def __init__(self, content: str, source: str = "slack"):
+    `cora` marks the chunk as containing a Cora reply -- the real ingest tags this as
+    metadata.has_cora_reply (cq-8d16969e85fb), and the D-128 screen reads it for
+    speaker ATTRIBUTION. Without it, screening the whole vector-search result set
+    made ordinary human Slack ("I'm not sure who owns that") read as a dispute.
+    """
+
+    def __init__(self, content: str, source: str = "slack", cora: bool = False):
         self.content = content
         self.source = source
         self.distance = 0.5
-        self.metadata: dict = {}
+        self.metadata: dict = {"has_cora_reply": True} if cora else {}
         self.title = "#f3-athletes"
         self.date_modified = None
 
@@ -65,7 +71,8 @@ FIGHTER_EVIDENCE = [
         "Google Sheet they believe is the source of record. The root cause is a "
         "sync/access issue: Cora's compliance tool queries a fixed backend source, "
         "but lacks direct live connector access to verify whether the Google Sheet "
-        "the user shared is actually the same file wired into that backend system."
+        "the user shared is actually the same file wired into that backend system.",
+        cora=True,
     ),
 ]
 
@@ -234,7 +241,42 @@ class TestD128Detection:
         "I can't reconcile the two counts",
     ])
     def test_cora_own_uncertainty_markers(self, cora_reply):
-        assert ga.is_disputed_exchange(self._gap(), [_Chunk(f"[Cora] {cora_reply}")])
+        assert ga.is_disputed_exchange(
+            self._gap(), [_Chunk(f"[Cora] {cora_reply}", cora=True)])
+
+    # D-051 lens-5 HIGH regression: these are stock operational Slack from HUMANS.
+    # Screening the whole vector-search evidence set made 9 of 9 read as disputes,
+    # which both suppressed an answerable gap and minted a never-expiring card.
+    @pytest.mark.parametrize("human_line", [
+        "[Justin] I'm not sure who owns that account yet",
+        "[Tommy] Needs your review before I send it",
+        "[Matt] The Shopify count is out of sync",
+        "[Hannah] there's a discrepancy in the payroll file",
+        "[Larry] those numbers don't match the deck",
+        "[Alex] that is false, the roster changed",
+        "[Shaun] this is still disputed with the state",
+        "[Jen] unresolved as of the last call",
+        "[Justin] which one is correct?",
+    ])
+    def test_unattributed_human_chatter_is_not_a_dispute(self, human_line):
+        assert ga.is_disputed_exchange(self._gap(), [_Chunk(human_line)]) is False
+
+    def test_attribution_is_what_flips_it(self):
+        """Same sentence: unattributed = chatter, Cora-attributed = a dispute."""
+        line = "there's a discrepancy between the sheet and the backend"
+        assert ga.is_disputed_exchange(self._gap(), [_Chunk(line)]) is False
+        assert ga.is_disputed_exchange(self._gap(), [_Chunk(line, cora=True)]) is True
+
+    def test_answerable_gap_survives_one_unrelated_not_sure_line(self):
+        """The measured double-wrong outcome: a gap whose evidence CONTAINS the answer
+        plus one stray human "not sure" was declared disputed -- skipped for mining
+        AND proposed as a decision card."""
+        gap = self._gap(question="What size are the homepage heroes?",
+                        gap="hero specs not in KB")
+        ev = [_Chunk("[Larry] heroes are 2880x1620px, JPG, max 800KB"),
+              _Chunk("[Justin] I'm not sure who owns that account yet")]
+        ok, _why = ga.mine_eligibility(gap, ev)
+        assert ok is True
 
     @pytest.mark.parametrize("text", [
         "there's a discrepancy between the sheet and the backend",
@@ -257,7 +299,8 @@ class TestD128Detection:
                               gap="completion count not in KB")
         assert ga.is_disputed_exchange(clean_gap, None) is False
         assert ga.is_disputed_exchange(
-            clean_gap, [_Chunk("[Cora] I can't tell which figure is right")]) is True
+            clean_gap,
+            [_Chunk("[Cora] I can't tell which figure is right", cora=True)]) is True
 
     def test_clean_exchange_is_not_disputed(self):
         assert ga.is_disputed_exchange(CLEAN_GAP, CLEAN_EVIDENCE) is False
@@ -320,6 +363,32 @@ class TestRejectionsAreVisible:
         gap_id, reason = ga._REJECTION_LOG_RE.search(matched[0]).groups()
         assert gap_id == FIGHTER_GAP["ts"]
         assert ga._REASON_CODES[reason.strip()][0] == "disputed_d128"
+
+    def test_only_structural_reasons_are_permanent(self):
+        """There is NO reset path for a gap_autofill_state entry -- load_open_gaps
+        excludes it forever. So only a STRUCTURALLY dispositioned reason may retire a
+        gap; a heuristic regex false positive must cost one skipped night, not a
+        permanently buried answerable gap (D-051 lens-5 HIGH/LOW)."""
+        assert ga.PERMANENT_INELIGIBLE_REASONS == frozenset({
+            ga.MINE_INELIGIBLE_ALREADY_ROUTED})
+        for heuristic in (ga.MINE_INELIGIBLE_RETIRED, ga.MINE_INELIGIBLE_QA,
+                          ga.MINE_INELIGIBLE_EPHEMERAL,
+                          ga.MINE_INELIGIBLE_CAPABILITY_ASK,
+                          ga.MINE_INELIGIBLE_SCREEN_ERROR):
+            assert heuristic not in ga.PERMANENT_INELIGIBLE_REASONS
+
+    @pytest.mark.parametrize("question", [
+        "What's our cash allocation policy?",
+        "Which invoices were sent using the new template?",
+    ])
+    def test_over_firing_shapes_stay_eligible(self, question):
+        """D-051 lens-5 LOW: bare "(what's our) ... cash" and bare "sent using" made
+        durable questions ineligible. Both now require their real marker (a
+        time-relative word / the connector's <@ mention)."""
+        gap = {"ts": "2026-08-01T00:00:00+00:00", "entity": "FNDR",
+               "detector": "unknown_response", "question": question, "gap": "not in KB"}
+        ok, why = ga.mine_eligibility(gap)
+        assert ok is True, why
 
     def test_reasons_carry_no_raw_gap_text(self):
         """PHI-safety of the log/aggregate path: the reason is always one of the
@@ -398,10 +467,38 @@ class TestRoutingGuards:
                             lambda t: (_ for _ in ()).throw(RuntimeError("down")))
         assert "fail-closed" in ga.decision_route_block_reason(FIGHTER_GAP)
 
-    def test_per_run_cap_exists_and_matches_the_ask_cap(self):
-        """Cap parity with MAX_ASKS_PER_RUN: a corpus-wide sweep must not flood
-        Harrison's never-expiring decision cards."""
-        assert ga.MAX_DECISION_ROUTES_PER_RUN == ga.MAX_ASKS_PER_RUN == 3
+    def test_per_run_cap_is_one(self):
+        """1, not 3 (D-051 lens-5 MEDIUM, measured): the decision pool was already
+        65 PENDING / 46 HIGH-and-never-DM'd against a 5/run weekday drain, and these
+        route at MED so they sort behind every HIGH item. A daily 3/run would make
+        D-128 a write-only sink -- durable but never reaching Harrison, while the gap
+        is marked handled."""
+        assert ga.MAX_DECISION_ROUTES_PER_RUN == 1
+
+    def test_route_persists_no_raw_evidence(self, monkeypatch):
+        """D-051 lens-2 HIGH: source_evidence carried up to 800 chars of OTHER
+        PEOPLE'S raw Slack into a ledger that drive_materializer byte-copies to the
+        org-readable Drive store with no PHI wall."""
+        seen: list[dict] = []
+        import cora.knowledge_review as kr
+        monkeypatch.setattr(kr, "propose_update", lambda **kw: seen.append(kw) or True)
+        ga.route_disputed_to_decision_lane(FIGHTER_GAP, FIGHTER_EVIDENCE)
+        assert seen and seen[0]["source_evidence"] == ""
+        blob = str(seen[0])
+        assert "fighter_compliance tool" not in blob
+
+    def test_route_is_screened_by_the_decision_screen_at_propose_time(self, monkeypatch):
+        """Propose-time screening must not be strictly weaker than the drain's: the
+        drain applies _LEX_TOKEN_RE over description + payload, so an entity-prefix-
+        only check let a non-LEX-tagged gap naming Lexington reach the ledger, where
+        the drain could only DISMISS it (the row itself persists into the archive)."""
+        seen: list[dict] = []
+        import cora.knowledge_review as kr
+        monkeypatch.setattr(kr, "propose_update", lambda **kw: seen.append(kw) or True)
+        lex_texted = {**FIGHTER_GAP, "entity": "F3E",
+                      "gap": "LBHS COPA diligence numbers do not match"}
+        assert ga.route_disputed_to_decision_lane(lex_texted, FIGHTER_EVIDENCE) is None
+        assert seen == []
 
     def test_decision_lane_screens_lex_and_phi_downstream_too(self):
         """Third-belt check: decision_inbox re-screens at the drain and again at the

@@ -1132,6 +1132,16 @@ def check_priority_kickoffs() -> CheckResult:
     or something not yet written -- a dropped priority kickoff surfaces within a day.
 
     WARN, never critical: an unstaged kickoff is a dropped ball, not an outage.
+
+    A scan failure WARNs. priority_items_missing_kickoff deliberately RAISES rather
+    than returning [] so "clean" and "blind" can never render identically here
+    (D-051 lens-5 HIGH) -- a false all-clear is the one failure mode this monitor
+    cannot afford, since it exists because an item sat unnoticed for a week.
+
+    The detail names ids, not TITLES (lens-4 LOW): this report posts to a
+    multi-person channel, and queue titles are user-authored intake text from
+    arbitrary channels. Every other check there emits aggregates or task names. The
+    id is enough to act on.
     """
     try:
         from cora import code_queue
@@ -1145,15 +1155,16 @@ def check_priority_kickoffs() -> CheckResult:
             "No APPROVED P0/P1 item is missing a kickoff prompt.")
     detail = "; ".join(
         f"{o['id']} [{o['severity']}/{o['entity']}] "
-        f"{('%.0fh' % o['age_hours']) if o.get('age_hours') else 'age?'}: {o['title'][:60]}"
+        f"{('%.0fh' % o['age_hours']) if o.get('age_hours') is not None else 'age unknown'}"
+        f"{' (prompt file missing)' if o.get('prompt_path_missing') else ''}"
         for o in offenders[:5]
     )
     more = f" (+{len(offenders) - 5} more)" if len(offenders) > 5 else ""
     return CheckResult(
         "Priority kickoffs", "warn",
         f"{len(offenders)} APPROVED P0/P1 item(s) have NO kickoff prompt after "
-        f"{code_queue.PRIORITY_KICKOFF_GRACE_HOURS}h -- tap Stage on each: "
-        f"{detail}{more}")
+        f"{code_queue.PRIORITY_KICKOFF_GRACE_HOURS}h -- tap Stage on each "
+        f"(a SHIPPED item is refused, so a stale button is safe): {detail}{more}")
 
 
 # ── Report builder ────────────────────────────────────────────────────────────
