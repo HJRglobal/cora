@@ -104,12 +104,100 @@ _SENT_USING_RE = re.compile(
 # contribution ("our [QA] process changed") must NOT silently swallow the fact.
 _QA_PREFIX_RE = re.compile(r"^\s*(?:[*_~`>\s]+)?\[qa\]", re.IGNORECASE)
 
+# ── Durable-knowledge screen ────────────────────────────────────────────────
+# MEASURED against the real channel (38 messages, 2026-04..08): the plain
+# statement-vs-question split queued 17 items of which exactly ONE -- Harrison's
+# F3 Pure pricing note -- was durable organizational knowledge. The other 16 were
+# Asana task feedback aimed at Cora ("This task should have been assigned to
+# Harrison"), conversational replies, and a Slack system message. Queueing those
+# would flood Harrison's review queue and reproduce the known too-loose-eligibility
+# defect class (cq-5c6ff15610bd) on a brand-new surface.
+#
+# So a statement must ALSO look like a durable fact. These screens are heuristic
+# and therefore NON-PERMANENT: a screened message is simply not queued this pass,
+# it is never marked resolved, so a regex false positive costs one skipped post
+# rather than burying a contribution (the gap_autofill PERMANENT_INELIGIBLE
+# doctrine applied to intake).
+
+NOT_DURABLE_TASK_FEEDBACK = "feedback about a specific work item, not a fact"
+NOT_DURABLE_ADDRESSED_TO_CORA = "feedback about Cora's own behaviour, not a fact"
+NOT_DURABLE_SYSTEM = "Slack system/channel-management message"
+NOT_DURABLE_INTERROGATIVE = "contains a question -- conversational, not a stated fact"
+NOT_DURABLE_TOO_THIN = "too short to be a durable fact"
+
+# A specific work item plus corrective/evaluative language. BOTH halves are
+# required: "Tessa is coordinating leasing" (durable) must survive, while "This
+# task should have been assigned to Tessa" (feedback) must not.
+# A DEMONSTRATIVE reference to a work item ("this Asana task", "that task") or an
+# Asana URL. Sufficient on its own: in this channel a demonstrative task reference
+# is always feedback about that item, never a durable fact. The optional ASANA
+# between determiner and noun is load-bearing -- without it the first live dry-run
+# let two "This Asana task ..." critiques through as facts.
+#
+# "the task" is deliberately EXCLUDED from the determiner set: "The task of
+# reconciling AR now belongs to Jerry" is ordinary prose stating a durable fact,
+# whereas "this/that/these/those task" always points at a specific item in context.
+_TASK_REF_RE = re.compile(
+    r"\bapp\.asana\.com\b|\b(?:this|that|these|those)\s+(?:asana\s+)?tasks?\b",
+    re.IGNORECASE)
+
+# A durable fact needs some substance. "invite" (a two-word command to Cora) was
+# queued as a "fact" by the first live dry-run.
+_MIN_FACT_WORDS = 6
+
+# Second person aimed at Cora's own actions ("You assigned me the same tasks
+# three different times"). "Core" is the recurring live misspelling of Cora.
+_ADDRESSED_TO_CORA_RE = re.compile(
+    r"^\s*(?:you|cora|core)\b[^.?!]{0,80}?"
+    r"\b(?:assigned|created|posted|sent|keep|nudg\w*|duplicat\w*)\b",
+    re.IGNORECASE)
+
+# Slack channel-management system prose. These usually carry a subtype (the sweep
+# drops every subtyped message), but "made this channel private" arrived with
+# none, so the text form is screened too.
+_SYSTEM_PROSE_RE = re.compile(
+    r"^\s*(?:made this channel\b|set the channel\b|renamed the channel\b"
+    r"|archived this channel\b|joined the channel\b|left the channel\b"
+    r"|pinned a message\b|added an integration\b)",
+    re.IGNORECASE)
+
+
+def durable_contribution_reason(text: str) -> str:
+    """Empty string when `text` reads as a durable organizational fact, otherwise
+    the reason it does not. Conservative by design -- see the block comment above."""
+    t = strip_leading_mentions(text)
+    if _SYSTEM_PROSE_RE.search(t):
+        return NOT_DURABLE_SYSTEM
+    if _ADDRESSED_TO_CORA_RE.search(t):
+        return NOT_DURABLE_ADDRESSED_TO_CORA
+    if _TASK_REF_RE.search(t):
+        return NOT_DURABLE_TASK_FEEDBACK
+    if len(t.split()) < _MIN_FACT_WORDS:
+        return NOT_DURABLE_TOO_THIN
+    # A statement carrying a question anywhere is a conversational turn. Accepted
+    # residual: a genuine fact appended to a process question (the 6/17 Square POS
+    # note) is skipped. Stating it without the question logs it.
+    if "?" in t:
+        return NOT_DURABLE_INTERROGATIVE
+    return ""
+
+
 # Near-duplicate threshold for the supersession flag. Deliberately high: below
 # this, two facts about the same subject are usually genuinely different facts,
 # and a false "supersedes" costs Harrison a wrong retraction.
 SUPERSEDE_SIM = 0.82
 
 _PROVENANCE_LINE_RE = re.compile(r"^\s*\*\*\[\d{4}-\d{2}-\d{2}\]")
+
+# Leading Slack mention tokens ("<@UCORA> Tessa is staying on ..."). The app
+# routes strip Cora's own leading mention before calling in, but the sweep sees
+# RAW history text, so strip here too -- otherwise the stored fact begins with a
+# raw user id and the ^-anchored durable screens never match.
+_LEADING_MENTIONS_RE = re.compile(r"^(?:\s*<[@#!][^>]*>)+\s*")
+
+
+def strip_leading_mentions(text: str) -> str:
+    return _LEADING_MENTIONS_RE.sub("", text or "")
 
 
 @dataclass(frozen=True)
@@ -308,6 +396,7 @@ def ingest(
     """
     try:
         clean, is_connector = strip_connector_footer(text)
+        clean = strip_leading_mentions(clean)
         if not clean or not author_id or not ts:
             return IntakeResult(SKIPPED, detail="empty text, author, or ts")
 
@@ -324,6 +413,14 @@ def ingest(
             return IntakeResult(NOT_A_CONTRIBUTION, is_connector=is_connector,
                                 detail="reads as a question")
 
+        # PHI is screened on EVERY statement, BEFORE the durable-knowledge screen.
+        # Order matters: if "not durable" ran first, a PHI-bearing statement that
+        # also looks like task feedback would fall through to the caller as
+        # NOT_A_CONTRIBUTION -- and on the @mention route that means Q&A -- instead
+        # of drawing the explicit refusal the D1 path always gave it. Questions are
+        # checked before PHI on purpose: they are never stored here and must keep
+        # reaching the normal Q&A guards (lex_phi_access / user_access), which own
+        # the PHI decision for a QUESTION.
         # PHI: 3-predicate union, unconditional, fail-closed.
         try:
             if phi_guard.is_any_phi(clean):
@@ -338,6 +435,13 @@ def ingest(
         except Exception:  # noqa: BLE001 -- fail closed: drop rather than risk PHI
             log.warning("info_intake: PHI check failed; dropping", exc_info=True)
             return IntakeResult(ERROR, detail="PHI check failed (dropped fail-closed)")
+
+        # A statement that is not durable organizational knowledge is not a fact.
+        not_durable = durable_contribution_reason(clean)
+        if not_durable:
+            log.info("info_intake: not durable route=%s ts=%s (%s)", route, ts, not_durable)
+            return IntakeResult(NOT_A_CONTRIBUTION, is_connector=is_connector,
+                                detail=not_durable)
 
         update_id = intake_update_id(ts)
         norm = normalize_fact(clean)

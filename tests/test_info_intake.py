@@ -191,7 +191,7 @@ class TestIngest:
         kr = _kr()
         with patch.object(ii, "knowledge_review", kr), \
              patch.object(ii.phi_guard, "is_any_phi", side_effect=RuntimeError("boom")):
-            res = ii.ingest(text="some fact", author_id="U1", ts="20.1",
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance", author_id="U1", ts="20.1",
                             route="mention", known_answers_dir=tmp_path)
         assert res.outcome == ii.ERROR
         assert not kr.propose_update.called
@@ -209,7 +209,7 @@ class TestIngest:
                     "payload": {"source": "info-for-cora", "text": "x"}}]
         kr = _kr(pending)
         with patch.object(ii, "knowledge_review", kr):
-            res = ii.ingest(text="The vendor is Apex", author_id="U1", ts="22.1",
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance", author_id="U1", ts="22.1",
                             route="sweep", known_answers_dir=tmp_path)
         assert res.outcome == ii.DUPLICATE
         assert not kr.propose_update.called
@@ -256,7 +256,7 @@ class TestIngest:
     def test_dry_run_writes_nothing(self, tmp_path):
         kr = _kr()
         with patch.object(ii, "knowledge_review", kr):
-            res = ii.ingest(text="The vendor is Apex", author_id="U1", ts="26.1",
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance", author_id="U1", ts="26.1",
                             route="sweep", known_answers_dir=tmp_path, dry_run=True)
         assert res.outcome == ii.QUEUED
         assert not kr.propose_update.called
@@ -265,7 +265,7 @@ class TestIngest:
         kr = _kr()
         kr.propose_update.side_effect = RuntimeError("ledger down")
         with patch.object(ii, "knowledge_review", kr):
-            res = ii.ingest(text="The vendor is Apex", author_id="U1", ts="27.1",
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance", author_id="U1", ts="27.1",
                             route="sweep", known_answers_dir=tmp_path)
         assert res.outcome == ii.ERROR
 
@@ -319,3 +319,90 @@ class TestNeverRaises:
 
     def test_unreadable_known_answers_is_fail_soft(self, tmp_path):
         assert ii.known_answer_facts("F3E", known_answers_dir=tmp_path / "nope") == []
+
+
+# ── Durable-knowledge screen ────────────────────────────────────────────────
+class TestDurableScreen:
+    """Tuned against the REAL channel corpus (38 messages, 2026-04..08). The plain
+    statement/question split queued 17 items of which one was durable; these
+    screens bring that to 2, both genuine."""
+
+    @pytest.mark.parametrize("text,reason", [
+        ("made this channel *private*. Now, it can only be viewed or joined by "
+         "invitation.", ii.NOT_DURABLE_SYSTEM),
+        ("<@UCORA> You assigned me the same tasks three different times in Asana",
+         ii.NOT_DURABLE_ADDRESSED_TO_CORA),
+        ("<@UH> Core assigned me that whole set of tasks from the meeting again",
+         ii.NOT_DURABLE_ADDRESSED_TO_CORA),
+        ('This Asana task "Reach out to Shopify support" is great! It was correctly '
+         'assigned and does not already exist.', ii.NOT_DURABLE_TASK_FEEDBACK),
+        ("This task <https://app.asana.com/1/2/task/3> should have been assigned to "
+         "Harrison and needs rewording", ii.NOT_DURABLE_TASK_FEEDBACK),
+        ("<@UCORA> invite", ii.NOT_DURABLE_TOO_THIN),
+        ("Any annoying ones? They were pretty detailed and correct overall.",
+         ii.NOT_DURABLE_INTERROGATIVE),
+    ])
+    def test_real_channel_noise_is_screened(self, text, reason):
+        assert ii.durable_contribution_reason(text) == reason
+
+    @pytest.mark.parametrize("text", [
+        # The two genuine contributions in the live corpus.
+        "F3 Pure retail price is $36.99 everywhere -- locked 2026-07-08 and "
+        "reconciled across Amazon, TikTok Shop, Walmart and Shopify DTC.",
+        "<@UCORA> Tessa is staying on during the summer for reduced, work-from-home "
+        "hours, keeping non-urgent property management tasks.",
+        # "the task" is ordinary prose, NOT a demonstrative work-item reference.
+        "The task of reconciling AR now belongs to Jerry Reick as of July.",
+    ])
+    def test_genuine_facts_survive(self, text):
+        assert ii.durable_contribution_reason(text) == ""
+
+    def test_leading_mention_is_stripped_from_stored_text(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="<@U0B44MDGC5R> Tessa is staying on during the summer for "
+                           "reduced work-from-home hours",
+                      author_id="U1", ts="30.1", route="sweep",
+                      known_answers_dir=tmp_path)
+        stored = kr.propose_update.call_args.kwargs["payload"]["text"]
+        assert stored.startswith("Tessa is staying on")
+
+    def test_phi_is_screened_before_the_durable_screen(self, tmp_path):
+        """A PHI statement that ALSO looks like task feedback must still draw the
+        explicit refusal, not fall through to the caller as 'not a contribution'
+        (which on the @mention route would mean Q&A)."""
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr), \
+             patch.object(ii.phi_guard, "is_any_phi", return_value=True):
+            res = ii.ingest(text="This task about the client's diagnosis should have "
+                                 "been assigned to the clinical lead",
+                            author_id="U1", ts="31.1", route="mention",
+                            known_answers_dir=tmp_path)
+        assert res.outcome == ii.PHI_REFUSED
+        assert "EHR" in res.ack
+        assert not kr.propose_update.called
+
+    def test_question_is_screened_before_phi(self, tmp_path):
+        """Questions are never stored here and must keep reaching the normal Q&A
+        guards, which own the PHI decision for a question."""
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr), \
+             patch.object(ii.phi_guard, "is_any_phi", return_value=True):
+            res = ii.ingest(text="What is the client's diagnosis?", author_id="U1",
+                            ts="32.1", route="mention", known_answers_dir=tmp_path)
+        assert res.outcome == ii.NOT_A_CONTRIBUTION
+
+
+class TestConcurrentRouteRace:
+    def test_propose_returning_false_is_silent_not_a_second_ack(self, tmp_path):
+        """Two routes can both pass the pending-load check before either writes.
+        propose_update resolves it under its own lock and returns False; the loser
+        must NOT post a second 'logged for review' ack."""
+        kr = _kr()
+        kr.propose_update.return_value = False
+        with patch.object(ii, "knowledge_review", kr):
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                            author_id="U1", ts="33.1", route="message_event",
+                            known_answers_dir=tmp_path)
+        assert res.outcome == ii.DUPLICATE
+        assert res.ack == ""
