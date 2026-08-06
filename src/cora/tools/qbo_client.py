@@ -1017,6 +1017,9 @@ def bank_side_flow(
         "net": None if errors else round(net, 2),
         "per_type": per_type,
         "counts": counts,
+        # So a caller can say "EVERY type came back empty" without reaching into
+        # this module's tables to find the denominator.
+        "types_expected": len(_FLOW_POSTINGS),
         "internal_transfers": round(internal, 2),
         "credit_rows": credit_rows,
         "empty_types": sorted(empty_types),
