@@ -47,6 +47,7 @@ import argparse
 import datetime
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -289,6 +290,176 @@ def _build_one(
     )
 
 
+#: Where the LEX name-confirm artifact lands. logs/ is LOCAL ONLY -- never
+#: mirrored to Drive, never KB-ingested -- because it is the one file in this
+#: build that carries LEX account NAMES, which are confirmed through Harrison by
+#: DM and never rendered on a shared surface (D-124).
+_LEX_CONFIRM_DIR = _REPO_ROOT / "logs"
+
+
+def _write_lex_confirm_artifact(
+    realm: str,
+    accounts: list[dict],
+    candidates: dict[str, dict],
+    today: datetime.date,
+) -> Path:
+    """Stage the Harrison-DM confirm sheet for an opaque realm.
+
+    Two asks in one file: the account->category rows (which the shared map holds
+    only as opaque placeholders), and the BANK-account list -- because those bank
+    accounts are the concrete mechanism that could split the one QBO LEX realm
+    across the sheet's five Lex tabs via the entity map's `filters`, which is the
+    single thing standing between LEX and being readable at all.
+    """
+    path = _LEX_CONFIRM_DIR / f"cashflow-{realm.lower()}-name-confirm-{today}.md"
+    by_id = {str(a["id"]): a for a in accounts if a.get("id")}
+    lines = [
+        f"# {realm} account confirm -- 13WCF category map ({today})",
+        "",
+        "LOCAL ONLY. Not mirrored to Drive, not KB-ingested. These names are "
+        "confirmed through Harrison by DM (D-124); the shared map carries opaque "
+        "placeholders only.",
+        "",
+        "## Bank accounts -- the `filters` candidates for the 1:N split",
+        "",
+        f"QBO exposes ONE {realm} realm against five Lex tabs, so the extractor "
+        f"currently REFUSES to compute for it. Either attest that the company "
+        f"file equals exactly one tab (`scope_attested: true`) or split it with "
+        f"account filters drawn from this list:",
+        "",
+        "| account id | type | name |",
+        "|---|---|---|",
+    ]
+    for account in sorted(accounts, key=lambda a: str(a.get("fqn") or "")):
+        if account.get("type") == "Bank":
+            lines.append(f"| {account['id']} | {account['type']} | "
+                         f"{account.get('fqn') or account.get('name')} |")
+    lines += [
+        "",
+        "## Counterpart accounts seen opposite bank activity",
+        "",
+        "| placeholder | account id | name | type | suggested category | rows | $ moved |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for account_id, entry in candidates.items():
+        account = by_id.get(account_id) or {}
+        lines.append(
+            f"| {entry.get('placeholder')} | {account_id} | "
+            f"{account.get('fqn') or account.get('name') or '?'} | "
+            f"{entry.get('account_type')} | {entry.get('category') or '(none)'} | "
+            f"{entry.get('observed_rows')} | {entry.get('observed_abs_amount')} |")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _discover(args, entity_map: cm.EntityMap, today: datetime.date) -> int:
+    """Populate the category map from what actually moved through the banks."""
+    import yaml  # noqa: PLC0415
+
+    from cora.tools import qbo_client as qc  # noqa: PLC0415
+
+    try:
+        realms, _scope = _resolve_realms(args.realms, entity_map)
+    except SystemExit:
+        return 2
+
+    end = today
+    start = end - datetime.timedelta(days=max(1, args.lookback_days))
+    log.info("discovering category candidates over %s .. %s across %d realm(s)",
+             start, end, len(realms))
+
+    raw = cm._read_yaml(cm.CATEGORY_MAP_PATH)
+    valid_rows = {row for rows in (raw.get("categories") or {}).values()
+                  for row in (rows or [])}
+    expense_rows = {str(r) for r in (raw.get("expense_categories") or [])}
+    if not valid_rows:
+        log.error("the category map carries no category rows to map onto")
+        return 2
+
+    discovered: dict[str, dict[str, dict]] = {}
+    lex_artifacts: list[Path] = []
+    failed: list[str] = []
+
+    for realm in realms:
+        pairing = entity_map.pairing(realm)
+        try:
+            accounts = qc.query_all_accounts(realm)
+            bank = sorted(str(a["id"]) for a in accounts if a.get("type") == "Bank")
+            if not bank:
+                log.warning("%s has no bank accounts -- skipping", realm)
+                continue
+            gl = qc.general_ledger_bank_rows(realm, bank, start.isoformat(),
+                                             end.isoformat())
+        except Exception as exc:  # noqa: BLE001 -- one dead realm must not lose the rest
+            log.error("discovery failed for %s: %s", realm, exc)
+            failed.append(realm)
+            continue
+
+        candidates, skipped = ca.discover_category_candidates(
+            realm, gl.get("rows") or [], accounts, valid_rows,
+            expense_rows=expense_rows)
+        log.info("%s: %d row(s), %d counterpart account(s); not proposable: "
+                 "%d multi-line split, %d perimeter counterpart", realm,
+                 gl.get("row_count", 0), len(candidates),
+                 skipped["multi_line_split"], skipped["perimeter_counterpart"])
+        if candidates:
+            discovered[realm] = candidates
+        # An unresolvable realm is exactly the one whose confirm artifact matters
+        # most -- it cannot be read at all until the split is declared.
+        if cm.realm_names_are_opaque(realm):
+            lex_artifacts.append(_write_lex_confirm_artifact(
+                realm, accounts, candidates, today))
+        elif pairing and not pairing.resolvable:
+            log.warning("%s is unresolvable (%s)", realm, pairing.refusal_reason)
+
+    if not discovered:
+        log.error("nothing discovered -- category map left untouched")
+        return 2
+
+    merged, counts = ca.merge_category_candidates(raw, discovered)
+    log.info("candidates: %d new, %d refreshed, %d confirmed row(s) left "
+             "untouched", counts["added"], counts["refreshed"],
+             counts["kept_confirmed"])
+    for path in lex_artifacts:
+        log.info("LOCAL-ONLY confirm artifact (Harrison DM, never mirrored): %s", path)
+
+    if not args.apply:
+        print(f"\nDISCOVERY (dry run -- {cm.CATEGORY_MAP_PATH.name} NOT written)")
+        for realm in sorted(discovered):
+            print(f"\n  {realm}: {len(discovered[realm])} candidate account(s)")
+            for account_id, entry in list(discovered[realm].items())[:12]:
+                name = entry.get("qbo_account") or entry.get("placeholder")
+                print(f"    {account_id:>10s}  {str(entry.get('category') or '(none)'):38s}"
+                      f"  {entry.get('confidence'):18s}  ${entry['observed_abs_amount']:>12,.2f}"
+                      f"  {name}")
+            if len(discovered[realm]) > 12:
+                print(f"    ... {len(discovered[realm]) - 12} more")
+        print("\n  Re-run with --apply to write them (all confirmed: false).")
+        return 1 if failed else 0
+
+    # Preserve the file's comment header: it carries the cash-perimeter rationale
+    # and the D-124 rule, and yaml.safe_dump would silently drop all of it.
+    original = cm.CATEGORY_MAP_PATH.read_text(encoding="utf-8")
+    header = original.split("\ncategories:", 1)[0]
+    body = yaml.safe_dump(merged, sort_keys=False, allow_unicode=True,
+                          default_flow_style=False, width=100)
+    tmp = cm.CATEGORY_MAP_PATH.with_suffix(f".yaml.{os.getpid()}.tmp")
+    tmp.write_text(f"{header}\n{body}", encoding="utf-8")
+    tmp.replace(cm.CATEGORY_MAP_PATH)
+    log.info("wrote %s", cm.CATEGORY_MAP_PATH)
+
+    try:
+        cm.load_category_map()
+    except cm.MapError as exc:
+        # The loader is the contract. If what we just wrote does not load, say so
+        # loudly -- a map that fails at load is better than one that silently
+        # mis-categorises, but neither should ship unnoticed.
+        log.error("the map we just wrote does NOT load: %s", exc)
+        return 2
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -310,6 +481,15 @@ def main(argv: list[str] | None = None) -> int:
         help=("allow a write that would otherwise be refused as destructive: "
               "replacing a matured FINALIZED week with a preliminary pull, or "
               "overwriting a full file with a narrowed --realms sweep"))
+    parser.add_argument(
+        "--discover", action="store_true",
+        help=("propose account->category rows for the category map from what "
+              "actually moved through the banks over --lookback-days. Prints by "
+              "default; needs --apply to write. Never touches a confirmed row."))
+    parser.add_argument("--apply", action="store_true",
+                        help="with --discover: write the proposals to the map file")
+    parser.add_argument("--lookback-days", type=int, default=90,
+                        help="with --discover: how far back to look (default 90)")
     args = parser.parse_args(argv)
 
     try:
@@ -327,6 +507,11 @@ def main(argv: list[str] | None = None) -> int:
         # attribution -- that is the whole reason the loader validates.
         log.error("map unusable: %s", exc)
         return 2
+
+    if args.discover:
+        # Discovery needs no week grid: it looks at a lookback window, not at the
+        # sheet's week boundaries.
+        return _discover(args, entity_map, today)
 
     try:
         weekday_name, w1, w2 = ca.resolve_windows(today)

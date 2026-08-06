@@ -49,8 +49,23 @@ CC_LIABILITY_TYPES: frozenset[str] = frozenset({"credit card", "creditcard"})
 #: Account types that hold bank cash -- the cash perimeter.
 BANK_TYPES: frozenset[str] = frozenset({"bank"})
 
-#: Realms whose account NAMES must never render on a shared surface (D-124).
-NAME_OPAQUE_REALMS: frozenset[str] = frozenset({"LEX"})
+#: Realm PREFIXES whose account NAMES must never render on a shared surface.
+#:
+#: Prefix-matched, not exact (D-124 corollary): an exact-match gate would let a
+#: future `LEX-LLC` or `LEX2` realm free-render the very names the gate exists to
+#: hide, and the failure would be silent -- the guard would simply not fire.
+#:
+#: Note the asymmetry with HARD_EXCLUDED_REALMS below, which is deliberately
+#: EXACT: prefix-excluding "OSN" would sweep away OSNGF/OSNGM/OSNGW/OSNVV, the
+#: four operating store realms this extractor exists to read. Widening an opacity
+#: gate is fail-safe; widening an exclusion list deletes real coverage.
+NAME_OPAQUE_REALM_PREFIXES: tuple[str, ...] = ("LEX",)
+
+
+def realm_names_are_opaque(realm: str) -> bool:
+    """True when this realm's account names may not leave the module (D-124)."""
+    code = str(realm or "").upper()
+    return code.startswith(NAME_OPAQUE_REALM_PREFIXES)
 
 
 class MapError(Exception):
@@ -252,7 +267,7 @@ class AccountMapping:
         placeholder renders an opaque fallback rather than falling back to the
         real name.
         """
-        if self.realm.upper() in NAME_OPAQUE_REALMS:
+        if realm_names_are_opaque(self.realm):
             return self.placeholder or f"{self.realm} account {self.account_id}"
         return self.qbo_account or f"account {self.account_id}"
 

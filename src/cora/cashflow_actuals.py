@@ -646,6 +646,246 @@ def _window_notes(window_kind: str) -> list[str]:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Category-map discovery
+#
+# The map cannot be written from a chart of accounts alone: most of a realm's 285
+# accounts never appear opposite a bank transaction. Discovery therefore proposes
+# only the accounts that ACTUALLY showed up as the counterpart of bank-side
+# activity over a lookback window, ordered by how much money moved through them,
+# so Justin confirms the rows that matter first.
+#
+# Every proposal lands `confirmed: false`. A guess Justin rubber-stamps is worse
+# than a blank, so the keyword hints below are conservative and a weak match
+# proposes NO category at all rather than a plausible one.
+# ────────────────────────────────────────────────────────────────────────────
+
+#: (needle, category) in PRIORITY order -- first match wins, so the specific
+#: cases sit above the general ones they would otherwise be swallowed by:
+#: "leasehold improvement" before "lease"/"rent", "interest income" before
+#: "interest", "cost of goods" before "cost".
+_CATEGORY_HINTS: tuple[tuple[str, str], ...] = (
+    ("leasehold improv", "Leasehold Improvements"),
+    ("interest income", "Interest Income"),
+    ("payroll", "Payroll and Prof Fees"),
+    ("salaries", "Payroll and Prof Fees"),
+    ("wages", "Payroll and Prof Fees"),
+    ("professional fee", "Payroll and Prof Fees"),
+    ("prof fee", "Payroll and Prof Fees"),
+    ("accounting", "Payroll and Prof Fees"),
+    ("legal", "Payroll and Prof Fees"),
+    ("contract labor", "Payroll and Prof Fees"),
+    ("advertis", "Advertising and Marketing"),
+    ("marketing", "Advertising and Marketing"),
+    ("utilit", "Utilities"),
+    ("electric", "Utilities"),
+    ("water", "Utilities"),
+    ("internet", "Utilities"),
+    ("telephone", "Utilities"),
+    ("cost of goods", "Direct Hard Costs"),
+    ("subcontract", "Direct Hard Costs"),
+    ("direct cost", "Direct Hard Costs"),
+    ("rent", "Rent"),
+    ("furniture", "Large Equipment/Furniture acquisitions"),
+    ("equipment", "Large Equipment/Furniture acquisitions"),
+    ("interest and principal", "Interest and Principal"),
+    ("interest expense", "Interest and Principal"),
+    ("note payable", "Interest and Principal"),
+    ("loan", "Interest and Principal"),
+    ("paid-in", "Contributions/Draws"),
+    ("distribution", "Contributions/Draws"),
+    ("contribution", "Contributions/Draws"),
+    ("draw", "Contributions/Draws"),
+    ("management fee", "Services"),
+)
+
+#: Account TYPE as a fallback signal, used only when no keyword matched. Weaker
+#: than a name match on purpose -- it says which SIDE of the sheet a row belongs
+#: on, not which row.
+_TYPE_HINTS: dict[str, str] = {
+    "Income": "Services",
+    "Other Income": "Interest Income",
+    "Equity": "Contributions/Draws",
+    "Fixed Asset": "Large Equipment/Furniture acquisitions",
+    "Long Term Liability": "Interest and Principal",
+    "Cost of Goods Sold": "Direct Hard Costs",
+}
+
+
+#: Share of a counterpart account's movement that must sit on one side before the
+#: direction check will veto a name match. Below this the account genuinely sees
+#: both directions and the name is the better signal.
+_DIRECTION_DOMINANCE = 0.9
+
+#: Sheet rows that legitimately carry money in BOTH directions, so the direction
+#: check must not veto them. `Contributions/Draws` says so in its own name: a
+#: contribution is money in, a draw is money out, and the sheet keeps them on one
+#: row. Live 2026-08-06 the veto wrongly suppressed two real LEX equity accounts
+#: ($72,000 and $18,000) before this exemption existed -- a check that fires on a
+#: legitimate case is the same failure class it was built to prevent.
+_BIDIRECTIONAL_ROWS: frozenset[str] = frozenset({"Contributions/Draws"})
+
+
+def suggest_category(
+    account: dict,
+    valid_rows: set[str],
+    *,
+    expense_rows: Optional[set[str]] = None,
+    inflow: float = 0.0,
+    outflow: float = 0.0,
+) -> tuple[Optional[str], str]:
+    """(category or None, confidence). Never guesses past the hint tables.
+
+    A category the sheet does not carry is never proposed -- the sheet's row
+    labels are the contract, and inventing one would put money on a row nobody
+    can reconcile against.
+
+    THE DIRECTION CHECK is what stops a plausible-but-backwards mapping. Live
+    2026-08-06 discovery proposed HJRP's `Rents Receivable` for the sheet's *Rent*
+    row on the strength of the word "rent" -- but that account only ever appears
+    opposite DEPOSITS: it is rent COLLECTED, and filing $180,742.98 of income as
+    rent expense would have been a large, confident, wrong number. So an account
+    whose movement sits overwhelmingly on one side cannot be proposed for a row on
+    the other.
+
+    Deliberately NOT done with the account's classification. Accrual bookkeeping
+    puts a LIABILITY opposite most real outflows (a bill payment clears A/P,
+    payroll clears Accrued Payroll), so an "expense rows must be Expense-
+    classified" rule would reject the commonest correct case. The observed
+    direction of money is the signal that survives the accrual structure.
+    """
+    expense_rows = expense_rows or set()
+    total = inflow + outflow
+    mostly_in = total > 0 and (inflow / total) >= _DIRECTION_DOMINANCE
+    mostly_out = total > 0 and (outflow / total) >= _DIRECTION_DOMINANCE
+
+    def _directionally_wrong(category: str) -> bool:
+        if category in _BIDIRECTIONAL_ROWS:
+            return False
+        is_expense_row = category in expense_rows
+        return (mostly_in and is_expense_row) or (mostly_out and not is_expense_row)
+
+    haystack = f"{account.get('fqn') or ''} {account.get('name') or ''}".lower()
+    for needle, category in _CATEGORY_HINTS:
+        if needle in haystack and category in valid_rows:
+            if _directionally_wrong(category):
+                return None, "direction-conflict"
+            return category, "name-match-high"
+
+    by_type = _TYPE_HINTS.get(str(account.get("type") or ""))
+    if by_type and by_type in valid_rows and not _directionally_wrong(by_type):
+        return by_type, "type-match-medium"
+    return None, "unmapped"
+
+
+def discover_category_candidates(
+    realm: str,
+    rows: list[dict],
+    accounts: list[dict],
+    valid_rows: set[str],
+    *,
+    expense_rows: Optional[set[str]] = None,
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """(candidates, skipped counts) for one realm, busiest account first.
+
+    ``rows`` are the bank-side register lines from the lookback window; the
+    COUNTERPART account is what gets mapped. Two kinds of row are excluded rather
+    than proposed:
+
+      * `-Split-` rows -- several counterparts, so no single account to map;
+      * rows whose counterpart is itself a BANK or CREDIT-CARD account. Those are
+        the perimeter, not a category: a bank-to-bank counterpart is an internal
+        move that `split_gross` already keeps out of receipts and disbursements,
+        and giving it a spend category would file a sweep between two of our own
+        accounts as an expense.
+
+    LEX-prefixed realms get an opaque `placeholder` and NO `qbo_account`: those
+    names are confirmed through Harrison by DM, never rendered into a file that
+    lands in a shared folder (D-124).
+    """
+    by_id = {str(a["id"]): a for a in accounts if a.get("id")}
+    perimeter = {str(a["id"]) for a in accounts
+                 if a.get("type") in ("Bank", "Credit Card") and a.get("id")}
+    seen: dict[str, dict] = {}
+    skipped = {"multi_line_split": 0, "perimeter_counterpart": 0}
+
+    for row in rows:
+        account_id = row.get("split_account_id")
+        amount = row.get("amount")
+        if amount is None:
+            continue
+        if not account_id:
+            skipped["multi_line_split"] += 1
+            continue
+        if str(account_id) in perimeter:
+            skipped["perimeter_counterpart"] += 1
+            continue
+        bucket = seen.setdefault(str(account_id),
+                                {"rows": 0, "amount": 0.0, "in": 0.0, "out": 0.0})
+        bucket["rows"] += 1
+        bucket["amount"] = round(bucket["amount"] + abs(amount), 2)
+        bucket["in" if amount > 0 else "out"] += abs(amount)
+
+    opaque = cm.realm_names_are_opaque(realm)
+    out: dict[str, dict] = {}
+    for account_id, stats in sorted(
+        seen.items(), key=lambda kv: (-kv[1]["amount"], kv[0])
+    ):
+        account = by_id.get(account_id) or {}
+        category, confidence = suggest_category(
+            account, valid_rows, expense_rows=expense_rows,
+            inflow=stats["in"], outflow=stats["out"])
+        entry: dict[str, Any] = {
+            "account_type": safe_label(account.get("type")),
+            "category": category,
+            "confidence": confidence,
+            "confirmed": False,
+            "observed_rows": stats["rows"],
+            "observed_abs_amount": stats["amount"],
+            "observed_inflow": round(stats["in"], 2),
+            "observed_outflow": round(stats["out"], 2),
+        }
+        if opaque:
+            entry["placeholder"] = f"{realm} acct {account_id}"
+        else:
+            entry["qbo_account"] = safe_label(account.get("fqn")
+                                             or account.get("name"), 120)
+        out[account_id] = entry
+    return out, skipped
+
+
+def merge_category_candidates(
+    existing: dict,
+    discovered: dict[str, dict[str, dict]],
+) -> tuple[dict, dict[str, int]]:
+    """Fold proposals into the map file's parsed body. Returns (merged, counts).
+
+    A row Justin has CONFIRMED is never touched -- not its category, not its
+    confidence, not its name. Discovery re-runs weekly and a confirm that a later
+    run could silently revert is not a confirm. Everything else is refreshed so
+    the observed counts stay current.
+    """
+    merged = dict(existing or {})
+    realms = dict(merged.get("realms") or {})
+    counts = {"added": 0, "refreshed": 0, "kept_confirmed": 0}
+
+    for realm, candidates in discovered.items():
+        realm_block = dict(realms.get(realm) or {})
+        accounts = dict(realm_block.get("accounts") or {})
+        for account_id, entry in candidates.items():
+            current = accounts.get(account_id)
+            if isinstance(current, dict) and current.get("confirmed"):
+                counts["kept_confirmed"] += 1
+                continue
+            counts["refreshed" if current else "added"] += 1
+            accounts[account_id] = entry
+        realm_block["accounts"] = accounts
+        realms[realm] = realm_block
+
+    merged["realms"] = realms
+    return merged, counts
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Advisory cross-checks -- labelled references, never pass/fail
 # ────────────────────────────────────────────────────────────────────────────
 

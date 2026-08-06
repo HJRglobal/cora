@@ -579,6 +579,52 @@ def query_accounts(entity: str) -> list[dict[str, Any]]:
     return out
 
 
+#: Full chart of accounts. `query_accounts` deliberately narrows to Bank +
+#: Credit Card (the cash perimeter); the category-map discovery pass needs the
+#: OTHER side of a transaction -- the expense and income accounts a bank-side row
+#: points at -- so it reads everything active.
+_ALL_ACCOUNT_QUERY = (
+    "select Id, Name, FullyQualifiedName, AccountType, AccountSubType, "
+    "Classification from Account where Active = true"
+)
+
+
+def query_all_accounts(entity: str) -> list[dict[str, Any]]:
+    """Every ACTIVE account in a realm, fully paginated.
+
+    Each item: ``{"id", "name", "fqn", "type", "subtype", "classification"}``.
+    Names are returned raw; callers rendering them on a shared surface must apply
+    the opacity gate themselves (D-124) -- one realm's account names may not
+    leave the confirm loop.
+    """
+    out: list[dict[str, Any]] = []
+    start = 1
+    while True:
+        page = _query(
+            entity,
+            f"{_ALL_ACCOUNT_QUERY} STARTPOSITION {start} MAXRESULTS {_ACCOUNT_PAGE_SIZE}",
+        )
+        rows, unexpected = query_rows(page, "Account")
+        if unexpected:
+            raise QboClientError(
+                f"Account query for {entity} answered under an unrecognised key "
+                f"({unexpected}) -- refusing to read it as an empty chart"
+            )
+        for row in rows:
+            out.append({
+                "id": str(row.get("Id") or ""),
+                "name": str(row.get("Name") or ""),
+                "fqn": str(row.get("FullyQualifiedName") or ""),
+                "type": str(row.get("AccountType") or ""),
+                "subtype": str(row.get("AccountSubType") or ""),
+                "classification": str(row.get("Classification") or ""),
+            })
+        if len(rows) < _ACCOUNT_PAGE_SIZE:
+            break
+        start += _ACCOUNT_PAGE_SIZE
+    return out
+
+
 def _coerce_balance(raw: Any) -> float | None:
     """QBO returns CurrentBalance as a JSON number, but be defensive: an absent or
     unparseable value must stay None so callers can render UNKNOWN, never 0."""
