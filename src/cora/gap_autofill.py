@@ -836,6 +836,15 @@ def route_disputed_to_decision_lane(gap: dict[str, Any],
 
     A skip is always LOGGED. A rejected conversion that simply vanished is the exact
     failure mode routing-completeness already suffers from.
+
+    `evidence` is accepted but deliberately NOT persisted (see source_evidence below);
+    it is kept in the signature because the caller has it and a future belt may want
+    to screen it rather than drop it.
+
+    KNOWN RESIDUAL (lens-6 LOW): once a route succeeds the driver records a permanent
+    disposition, so if Harrison DISMISSES the resulting card the gap is gone with no
+    answer and no escalation. That is the card being treated as the disposition, which
+    is the intended design -- named here so it is a known choice.
     """
     gap_ts = str(gap.get("ts", "") or "")
     entity = str(gap.get("entity", "FNDR") or "FNDR").strip().upper()

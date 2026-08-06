@@ -438,11 +438,25 @@ def code_queue_seed(
             "message": ("Refused: title/summary tripped the PHI/LEX-sensitivity guard. "
                         "Nothing was written."),
         }
+    # D-051 lens-6 MEDIUM (2026-08-06): seeding straight to APPROVED at a
+    # P0/P1-class severity bypasses the only paths that generate a kickoff prompt, and
+    # seed_item's warning is a log line no MCP caller reads. The whole point of the
+    # P1-at-approval slice is that a priority item must never LOOK fully handled when
+    # it is not, so surface it here too.
+    kickoff_note = ""
+    if status == "APPROVED" and code_queue.is_priority_severity(severity):
+        kickoff_note = (
+            f" NOTE: {severity} is P0/P1-class and this was seeded straight to "
+            "APPROVED, so NO kickoff prompt was generated. Tap Stage on the item, or "
+            "the nightly health check will flag it within "
+            f"{code_queue.PRIORITY_KICKOFF_GRACE_HOURS}h.")
     return {
         "id": cq_id, "seeded": True, "status": status,
+        "kickoff_missing": bool(kickoff_note),
         "message": (f"Seeded {cq_id} (status={status}). This is the code-session "
                     "backlog, not canon — Harrison reviews it in the normal flow. "
-                    "Re-seeding the same title is idempotent (returns this id)."),
+                    "Re-seeding the same title is idempotent (returns this id)."
+                    + kickoff_note),
     }
 
 

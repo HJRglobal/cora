@@ -39,7 +39,15 @@ from cora.tools.tool_dispatch import (
     has_pending_shopify_write,
 )
 
-from test_f3e_shopify_set_inventory import _CHAN, _HQ, _LOCS, _OFFICE, _ALEX, _CONFIG
+from test_f3e_shopify_set_inventory import _CHAN, _HQ, _LOCS, _ALEX, _CONFIG
+
+# NOTE (D-051 lens-6 MEDIUM): TestAliasTolerance / TestLexiconLeg assert against the
+# LIVE data/maps/f3e-sku-aliases.yaml, read fresh with no test hook. That is
+# deliberate -- it doubles as a drift guard on curated canon -- and it is safe for the
+# NEGATIVE pins because the Harrison-gated lexicon rail appends only to `learned:`,
+# where the seed map wins on a normalized collision (`setdefault`), so an ambiguous
+# bare word can never start resolving. If a future edit renames a SKU, these break
+# loudly, which is the intended signal.
 
 # The two products from the live repro, with titles that DO NOT contain the
 # literal "12-pack" token the user typed -- that absence is the bug.

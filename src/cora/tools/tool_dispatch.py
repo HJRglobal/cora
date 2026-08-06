@@ -3833,9 +3833,12 @@ def _lexicon_resolve_pack_tolerant(product_query: str, *, channel: str, user: st
         if res.status in ("exact", "ambiguous"):
             chosen = res
             break
+    # `result` cannot be None: the ladder is non-empty by construction (the `or`
+    # fallback above) so the i==0 iteration always sets raw_res, and lexicon.resolve
+    # always returns a Resolution. Kept as a typed local rather than a defensive
+    # branch (lens-6 LOW: the old `if result is None` was dead code with a comment
+    # that described an unreachable state).
     result = chosen if chosen is not None else raw_res
-    if result is None:  # empty ladder AND empty query -- nothing to log
-        return None
     try:
         first = result.candidates[0] if result.candidates else None
         _lexicon.log_event(
@@ -3877,7 +3880,10 @@ def _closest_alias(product_query: str) -> str | None:
     if not display:
         return None
     by_norm = {_norm_alias(a): a for a in display}
-    for cand in _pack_query_ladder(product_query) or [_norm_alias(product_query)]:
+    # No `or [...]` fallback: an empty ladder means an empty query, and probing "" was
+    # exactly the empty candidate the ladder documents itself as never emitting
+    # (lens-6 LOW).
+    for cand in _pack_query_ladder(product_query):
         m = difflib.get_close_matches(cand, list(by_norm.keys()), n=1, cutoff=0.6)
         if m:
             return by_norm[m[0]]

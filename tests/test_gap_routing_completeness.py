@@ -158,10 +158,11 @@ def test_slice3_ineligible_state_gives_a_disposition(gapenv):
 
 
 def test_metric_is_fail_soft(gapenv):
-    """A None metric suppresses the render line rather than printing a fake zero."""
+    """A missing gaps log must not raise and must not invent offenders. Asserted as
+    ONE outcome, not "either" (lens-6 LOW: `is None or == 0` could not fail)."""
     (gapenv / "logs" / "knowledge-gaps.jsonl").unlink()
     c = _completeness(gapenv)
-    assert c is None or c["total_over_7d"] == 0
+    assert c == {"total_over_7d": 0, "routed": 0, "rotting": 0}
 
 
 # ── the diagnostic script ────────────────────────────────────────────────────

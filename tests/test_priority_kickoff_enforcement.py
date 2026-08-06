@@ -314,16 +314,33 @@ class TestPriorityKickoffMonitor:
         cq._append_event({"event": "approved", "ts": cq._now_iso(), "id": cid})
         assert cid not in [o["id"] for o in cq.priority_items_missing_kickoff()]
 
-    def test_age_is_measured_from_approval_not_capture(self, qenv):  # noqa: F811
+    def test_age_is_measured_from_approval_not_capture(self, qenv, monkeypatch):  # noqa: F811
         """An item captured weeks ago and approved TODAY must not flag -- the
-        dropped-kickoff clock starts at approval."""
+        dropped-kickoff clock starts at approval.
+
+        lens-6 MEDIUM: the first version appended a second `captured` event to age the
+        row, but the fold's `captured` branch REPLACES the record wholesale, so the
+        item lost its severity and was skipped by the priority filter rather than by
+        the approval clock -- it passed even if approved_at were never read. The
+        capture ts is now aged in place via the parser, leaving severity intact."""
         cid = _seed(severity="P1", status="PROPOSED")
-        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        cq._append_event({"event": "captured", "ts": old, "id": cid})  # no-op on fold
+        capture_ts = cq.get_item(cid)["ts"]
+        old = cq._now() - timedelta(days=30)
+        real_parse = cq._parse_ts
+        monkeypatch.setattr(
+            cq, "_parse_ts",
+            lambda v: old if str(v) == str(capture_ts) else real_parse(v))
         cq._append_event({"event": "approved", "ts": cq._now_iso(), "id": cid})
         rec = cq.get_item(cid)
-        assert rec.get("approved_at")
+        assert rec.get("approved_at") and rec.get("severity") == "P1"
+        # The capture ts IS 30d old, so a ts-first clock would flag it.
+        assert cq._parse_ts(rec["ts"]) == old
         assert cid not in [o["id"] for o in cq.priority_items_missing_kickoff()]
+        # ...and with the approval removed, the same row DOES flag -- proving the
+        # assertion above is about the clock, not about being filtered out.
+        monkeypatch.setattr(cq, "load_items",
+                            lambda: [{**rec, "approved_at": None}])
+        assert cid in [o["id"] for o in cq.priority_items_missing_kickoff()]
 
     def test_staged_item_is_not_flagged(self, qenv, monkeypatch, tmp_path):  # noqa: F811
         real = tmp_path / "prompt.md"

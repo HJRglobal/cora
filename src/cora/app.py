@@ -450,20 +450,35 @@ _CODE_QUEUE_INTENT_RE = re.compile(
 )
 # Anything in the text BEFORE the match that reframes it as hypothetical, negated,
 # deliberative, or a rejected alternative.
+# Bare "never" and "without" are deliberately ABSENT: they are stock bug prose ("the
+# comment never posts", "it saves without asking"), and including them made
+# "the invoice task comment never posts, queue a code session" fail (lens-6 second
+# pass). Only request-negating forms belong here.
 _CODE_QUEUE_NEGATION_RE = re.compile(
     r"\b(?:don'?t|do not|dont|shouldn'?t|should not|no need|not\s+(?:worth|going|gonna)|"
-    r"instead of|rather than|without|never|why would|nothing to|"
+    r"instead of|rather than|never ?mind|why would|nothing to|"
     r"should\s+(?:we|i)|is it worth|do we need|would it help|do you think|"
     r"maybe|perhaps)\b",
     re.IGNORECASE,
 )
-# An Asana/calendar referent before the match means the sentence is about that
-# object, not about filing a build ("create a task to queue a code session").
+# An Asana/calendar referent before the match, WITH the capture phrase subordinated
+# by "to", means the sentence is about that object ("create a task TO queue a code
+# session"), not about filing a build.
+#
+# SECOND D-051 PASS (lens 6, 2026-08-06): the first version of this guard was a bare
+# noun scan over the preceding text, which REINTRODUCED cq-a1306f3835f8 for the
+# clause-swapped ordering -- "marking a task done doesn't work -- queue a code session
+# for it" (this branch's own repro sentence with its clauses swapped) disqualified on
+# the word "task", and _asana_destructive_intent then forced asana_complete_task. The
+# committed fixtures only carried the phrase-FIRST ordering, so the suite was green
+# over a re-broken defect. Requiring the subordinating "to" keeps the narrow case it
+# was for and cannot swallow a bug report that merely NAMES a task.
 _CODE_QUEUE_OTHER_REFERENT_RE = re.compile(
     r"\b(?:sub-?tasks?|tasks?|to-?dos?|comments?|notes?|holds?|invites?|events?|"
     r"meetings?|reminders?|tickets?)\b",
     re.IGNORECASE,
 )
+_CODE_QUEUE_SUBORDINATED_RE = re.compile(r"\bto\s+$", re.IGNORECASE)
 
 
 def _code_queue_capture_intent(text: str) -> bool:
@@ -488,7 +503,13 @@ def _code_queue_capture_intent(text: str) -> bool:
     before = t[: m.start()]
     if _CODE_QUEUE_NEGATION_RE.search(before):
         return False
-    return not _CODE_QUEUE_OTHER_REFERENT_RE.search(before)
+    # Both conditions, not either: a bug report legitimately NAMES a task, so the
+    # referent alone must not disqualify (lens-6 HIGH). Only the subordinated shape
+    # ("... a task TO queue a code session") is about the other object.
+    if (_CODE_QUEUE_SUBORDINATED_RE.search(before)
+            and _CODE_QUEUE_OTHER_REFERENT_RE.search(before)):
+        return False
+    return True
 
 
 def _asana_destructive_intent(text: str) -> str | None:

@@ -41,6 +41,17 @@ MISROUTED = [
     "please log this for the devs: completing a task from a DM does nothing",
     "add this to the code queue: deleting a task needs a second confirm",
     "file a code session for the task-close bug",
+    # CLAUSE-SWAPPED orderings (lens-6 HIGH). The original fixture set only carried
+    # phrase-FIRST phrasings, so a referent guard added during remediation
+    # REINTRODUCED the defect for the equally natural describe-then-ask shape -- and
+    # the suite stayed green over it. These are the same reports with their clauses
+    # reversed; every one must still route to capture.
+    "marking a task done doesn't work -- queue a code session for it",
+    "the task completion confirm is broken, please queue a code session for it",
+    "the Rita tracking task keeps reopening, so file a code session for it",
+    "quick note: queue a code session for the inventory alias bug",
+    "From today's leadership meeting: please queue a code session for the digest bug",
+    "deleting a task needs two confirms, add this to the code queue",
 ]
 
 
@@ -55,16 +66,6 @@ def test_queue_phrase_suppresses_the_asana_force(msg):
     HIJACK must be gone -- otherwise tool_choice makes the capture tool
     unreachable and the model has no way to route correctly."""
     assert cora_app._asana_destructive_intent(msg) is None
-
-
-@pytest.mark.parametrize("msg", MISROUTED)
-def test_asana_detector_would_have_hijacked_without_the_guard(msg, monkeypatch):
-    """Pins the DEFECT, not just the fix: with the precedence guard disabled, at
-    least some of these phrasings do get claimed by an Asana write tool. If this
-    ever stops being true the regression test above has gone vacuous."""
-    monkeypatch.setattr(cora_app, "_code_queue_capture_intent", lambda _t: False)
-    # Not every phrasing trips the Asana regexes -- the class is what matters.
-    cora_app._asana_destructive_intent(msg)  # must not raise
 
 
 def test_at_least_one_repro_provably_hijacked(monkeypatch):
@@ -251,8 +252,44 @@ def test_medium3_deliberative_framings_excluded(msg):
     "create a task to queue a code session for the alias bug",
     "add a reminder to log this for the devs tomorrow",
 ])
-def test_other_referent_before_the_match_excludes(msg):
+def test_subordinated_referent_excludes(msg):
+    """The narrow case the referent guard is for: an Asana/calendar object with the
+    capture phrase subordinated by "to"."""
     assert cora_app._code_queue_capture_intent(msg) is False
+
+
+@pytest.mark.parametrize("msg", [
+    # Bug prose that happens to contain a negation word ("never posts", "without
+    # asking") must not read as negating the REQUEST -- bare never/without were in the
+    # disqualifier set and swallowed these (lens-6 second pass).
+    "the invoice task comment never posts, queue a code session",
+    "it deletes the task without asking, queue a code session for that",
+    "the reminder never fires, file a code session",
+])
+def test_bug_prose_negation_words_do_not_disqualify(msg):
+    assert cora_app._code_queue_capture_intent(msg) is True
+
+
+@pytest.mark.parametrize("msg", [
+    "marking a task done doesn't work -- queue a code session for it",
+    "my reminders keep firing twice, file a code session for it",
+])
+def test_a_named_referent_alone_does_not_exclude(msg):
+    """lens-6 HIGH: a bug report legitimately NAMES a task/comment/reminder. Only the
+    subordinated shape is about the other object -- a bare noun scan re-broke the
+    exact defect this slice exists to fix."""
+    assert cora_app._code_queue_capture_intent(msg) is True
+    assert cora_app._asana_destructive_intent(msg) is None
+
+
+def test_every_repro_routes_to_capture_in_both_clause_orderings():
+    """The pin that would have caught lens-6 HIGH: for every repro, BOTH the
+    phrase-first and the describe-first ordering must reach capture and must leave
+    the Asana force suppressed. The forced tool is what _dispatch_qa selects, and a
+    forced tool_choice makes the capture tool unreachable."""
+    for msg in MISROUTED:
+        assert cora_app._code_queue_capture_intent(msg) is True, msg
+        assert cora_app._asana_destructive_intent(msg) is None, msg
 
 
 def test_documented_residual_trailing_retraction_still_fires():
