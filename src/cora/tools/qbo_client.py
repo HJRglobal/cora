@@ -769,6 +769,432 @@ def newest_bank_side_txn_date(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Weekly bank-cash flow (13WCF shadow ledger S2)
+#
+# Two INDEPENDENT computations of the same week, on purpose:
+#
+#   general_ledger_bank_rows()  the account-filtered General Ledger report. QBO
+#                               has already applied double-entry signs, so this
+#                               is the authoritative amount for a bank account.
+#   bank_side_flow()            the same week rebuilt from typed query-API rows
+#                               with signs derived here from scratch.
+#
+# Agreement is the check a failure BREAKS (D-127e). A missed transaction type, a
+# flipped sign, or a bank leg sitting somewhere this code does not look all show
+# up as a non-zero residual instead of a plausible wrong number. Verified live
+# 2026-08-05: 27 realm-weeks, residual $0.00 once both defects the check found
+# were fixed -- see _CC_PAYMENT_ENTITY and _FLOW_POSTINGS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: QueryResponse keys that are metadata, not rows.
+_QUERY_META_KEYS = frozenset({"maxResults", "startPosition", "totalCount"})
+
+#: The one entity whose QueryResponse key is NOT its entity name. Verified live
+#: 2026-08-05: `select * from CreditCardPayment` returns rows under
+#: `CreditCardPaymentTxn`. A plain `page.get("CreditCardPayment")` therefore
+#: returns None, which reads as ZERO ACTIVITY with no error and silently dropped
+#: $11,950.34 of real OSNVV bank outflow in a single week -- six bank->card
+#: payments, which are precisely the cash events this whole module exists to
+#: capture. Kept as a documented alias rather than a bare "first key wins" so a
+#: genuinely unrecognised key stays visible instead of being consumed.
+_CC_PAYMENT_ENTITY = "CreditCardPayment"
+_QUERY_RESPONSE_KEY_ALIASES: dict[str, str] = {
+    _CC_PAYMENT_ENTITY: "CreditCardPaymentTxn",
+}
+
+
+def query_rows(page: dict[str, Any], entity: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Rows out of a QueryResponse WITHOUT assuming the key equals the entity name.
+
+    Returns ``(rows, unexpected_key)``. ``unexpected_key`` is None on the normal
+    path (the entity name or its documented alias carried the rows); it is set
+    when the response held some OTHER data key, which the caller must treat as
+    UNKNOWN rather than as zero rows. A genuinely empty response returns
+    ``([], None)`` -- that is a real "no transactions of this type this week",
+    which for a one-week window is completely ordinary.
+    """
+    for key in (entity, _QUERY_RESPONSE_KEY_ALIASES.get(entity)):
+        if key and key in page:
+            value = page.get(key)
+            rows = value if isinstance(value, list) else ([value] if value else [])
+            return [r for r in rows if isinstance(r, dict)], None
+
+    leftover = sorted(k for k in page if k not in _QUERY_META_KEYS)
+    if not leftover:
+        return [], None
+    # Rows exist under a key nobody taught this module about. Reporting zero here
+    # is the failure mode above; report the key so the window renders UNKNOWN.
+    return [], leftover[0]
+
+
+#: How each queryable transaction type posts to the accounts it references.
+#:
+#:   header:      ((ref path, sign), ...) -- sign applied when a BANK account is
+#:                named at that path. Transfer names two ends with OPPOSITE signs,
+#:                which is why every entry is a per-path pair rather than one sign
+#:                shared across paths.
+#:   lines:       sign for a bank account named on a LINE (None = lines carry no
+#:                account refs, only LinkedTxn pointers)
+#:   credit_flips: a `Credit: true` row reverses every posting (QBO renders these
+#:                as "Credit Card Credit" / vendor refunds)
+#:
+#: Sign convention: +1 = money INTO the bank (a debit), -1 = money OUT (a credit).
+#:
+#: THE LINE COLUMN IS LOAD-BEARING. Verified live 2026-08-05: the monthly
+#: intercompany triple posts a `Purchase` whose HEADER sits on a credit-card
+#: clearing account while its LINE posts to a bank account -- $16,471.82 on LEX,
+#: $3,079.72 on F3E, $2,810.13 on HJRG in one week. A header-only filter misses
+#: the cash leg entirely, and because the transaction looks like card activity it
+#: never draws the eye.
+_FLOW_POSTINGS: dict[str, dict[str, Any]] = {
+    "Purchase":       {"amount": "TotalAmt", "header": (("AccountRef", -1),),
+                       "lines": +1, "credit_flips": True},
+    "Deposit":        {"amount": "TotalAmt", "header": (("DepositToAccountRef", +1),),
+                       "lines": -1, "credit_flips": False},
+    "Transfer":       {"amount": "Amount",
+                       "header": (("FromAccountRef", -1), ("ToAccountRef", +1)),
+                       "lines": None, "credit_flips": False},
+    "BillPayment":    {"amount": "TotalAmt",
+                       "header": (("CheckPayment.BankAccountRef", -1),),
+                       "lines": None, "credit_flips": False},
+    "Payment":        {"amount": "TotalAmt", "header": (("DepositToAccountRef", +1),),
+                       "lines": None, "credit_flips": False},
+    "SalesReceipt":   {"amount": "TotalAmt", "header": (("DepositToAccountRef", +1),),
+                       "lines": -1, "credit_flips": False},
+    "RefundReceipt":  {"amount": "TotalAmt", "header": (("DepositToAccountRef", -1),),
+                       "lines": +1, "credit_flips": False},
+    _CC_PAYMENT_ENTITY: {"amount": "Amount", "header": (("BankAccountRef", -1),),
+                         "lines": None, "credit_flips": False},
+    # JournalEntry carries no header account at all; every line states its own
+    # PostingType. Handled by the "posting_type" line rule below.
+    "JournalEntry":   {"amount": None, "header": (), "lines": "posting_type",
+                       "credit_flips": False},
+}
+
+#: Rows fetched per type per window. A one-week window on the busiest realm ran
+#: 48 register lines, so 1000 is far above any real week -- but it is a CAP, and
+#: hitting it means the window is incomplete, which the caller must surface
+#: rather than quietly under-report.
+_FLOW_PAGE_SIZE = 1000
+
+
+def _nested_ref(node: Any, path: str) -> str | None:
+    """Follow a dotted path to a QBO reference and return its ``value`` as str."""
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    if isinstance(node, dict) and node.get("value"):
+        return str(node["value"])
+    return None
+
+
+def _line_account_ids(line: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """(account id, posting type) for every account a transaction LINE names.
+
+    Scans any ``*Detail`` block for ``AccountRef`` / ``ItemAccountRef`` rather
+    than enumerating detail types, so a detail shape this code has not seen still
+    contributes its account instead of being silently skipped.
+    """
+    out: list[tuple[str, str | None]] = []
+    for key, detail in line.items():
+        if not key.endswith("Detail") or not isinstance(detail, dict):
+            continue
+        posting = detail.get("PostingType")
+        for ref_key in ("AccountRef", "ItemAccountRef"):
+            value = _nested_ref(detail, ref_key)
+            if value:
+                out.append((value, str(posting) if posting else None))
+    return out
+
+
+def _amount(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return _parse_money(str(value)) if value is not None else None
+
+
+def bank_side_flow(
+    entity: str,
+    bank_account_ids: set[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Rebuild a window's net BANK-CASH flow from typed query-API rows.
+
+    This is the CHECK, not the published figure -- ``general_ledger_bank_rows``
+    is the source of record because QBO has already applied the signs there.
+    Both are computed so that disagreement can stamp the window unusable.
+
+    Returns ``{"net", "per_type", "counts", "internal_transfers",
+    "credit_rows", "empty_types", "unexpected_keys", "errors", "capped_types"}``.
+    ``net`` is None when any type errored -- a partial sum is not a net flow.
+    """
+    ids = set(bank_account_ids)
+    net = 0.0
+    per_type: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    empty_types: list[str] = []
+    unexpected: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    capped: list[str] = []
+    internal = 0.0
+    credit_rows = 0
+
+    for txn_type, spec in _FLOW_POSTINGS.items():
+        try:
+            page = _query(
+                entity,
+                f"select * from {txn_type} where TxnDate >= '{start_date}' "
+                f"and TxnDate <= '{end_date}' MAXRESULTS {_FLOW_PAGE_SIZE}",
+            )
+        # Deliberately broad: QboAuthError is a SIBLING of QboClientError (see
+        # newest_bank_side_txn_date) so a token failure would otherwise escape.
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bank_side_flow: %s failed for %s: %s", txn_type, entity, exc)
+            errors[txn_type] = str(exc)[:200]
+            continue
+
+        rows, unexpected_key = query_rows(page, txn_type)
+        if unexpected_key:
+            unexpected[txn_type] = unexpected_key
+            continue
+        if not rows:
+            empty_types.append(txn_type)
+            continue
+        if len(rows) >= _FLOW_PAGE_SIZE:
+            capped.append(txn_type)
+
+        for row in rows:
+            flip = -1 if (spec["credit_flips"] and row.get("Credit") is True) else 1
+            if flip == -1:
+                credit_rows += 1
+            row_total = _amount(row.get(spec["amount"])) if spec["amount"] else None
+            touched = False
+            leg = 0.0
+
+            sides_in_bank: list[str] = []
+            for path, sign in spec["header"]:
+                account_id = _nested_ref(row, path)
+                if account_id and account_id in ids:
+                    sides_in_bank.append(path)
+                    if row_total is not None:
+                        leg += sign * row_total * flip
+                        touched = True
+
+            if len(sides_in_bank) > 1:
+                # Both ends of a transfer are our own bank accounts: the realm's
+                # cash did not change. It nets to zero above; recorded so the
+                # gross receipts/disbursements split can exclude it rather than
+                # inflating both sides by the same internal move.
+                internal += abs(row_total or 0.0)
+
+            line_sign = spec["lines"]
+            if line_sign is not None:
+                for line in (row.get("Line") or []):
+                    if not isinstance(line, dict):
+                        continue
+                    line_amount = _amount(line.get("Amount"))
+                    if line_amount is None:
+                        continue
+                    for account_id, posting in _line_account_ids(line):
+                        if account_id not in ids:
+                            continue
+                        if line_sign == "posting_type":
+                            sign = +1 if posting == "Debit" else -1
+                        else:
+                            sign = line_sign * flip
+                        leg += sign * line_amount
+                        touched = True
+
+            if touched:
+                net += leg
+                per_type[txn_type] = round(per_type.get(txn_type, 0.0) + leg, 2)
+                counts[txn_type] = counts.get(txn_type, 0) + 1
+
+    return {
+        "net": None if errors else round(net, 2),
+        "per_type": per_type,
+        "counts": counts,
+        "internal_transfers": round(internal, 2),
+        "credit_rows": credit_rows,
+        "empty_types": sorted(empty_types),
+        "unexpected_keys": unexpected,
+        "errors": errors,
+        "capped_types": sorted(capped),
+    }
+
+
+#: Column ColTypes the GL parse binds to. Bound by TYPE, never by display title:
+#: titles are localised/renameable, ColTypes are the API contract.
+_GL_AMOUNT_COL = "subt_nat_amount"
+_GL_BALANCE_COL = "rbal_nat_amount"
+_GL_DATE_COL = "tx_date"
+_GL_TYPE_COL = "txn_type"
+_GL_SPLIT_COL = "split_acc"
+
+
+def _gl_money(raw: Any) -> float | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    return _parse_money(str(raw))
+
+
+def general_ledger_bank_rows(
+    entity: str,
+    bank_account_ids: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Register lines for a window, account-filtered to BANK accounts.
+
+    QBO has already applied double-entry signs here, so ``amount`` is the signed
+    effect on the bank account: negative is money out. That is why this is the
+    published figure and ``bank_side_flow`` is only its check.
+
+    Returns ``{"rows", "opening_balance", "row_count", "identity",
+    "duplicate_row_keys", "sections"}``. Each row is
+    ``{"date", "txn_type", "txn_id", "split_account_id", "amount", "section"}``
+    -- deliberately NO memo, name or description. Those fields carry human-typed
+    free text including people's names, and for LEX potentially client names;
+    this payload is mirrored into a shared accounting folder, so the whole class
+    is dropped at COLLECTION rather than filtered per surface (D-124).
+
+    Raises QboClientError when the report's own columns are unrecognisable --
+    guessing column positions on a finance figure is not an option.
+
+    WHY ROWS AND NOT SECTION TOTALS. Verified live 2026-08-05: section header ids
+    are not trustworthy. Filtering to a CHILD account returns an outer wrapper
+    section stamped with the REQUESTED id whose total repeats the child's, so
+    summing section totals double-counts (observed: -375,697.44 for a -187,848.72
+    account). Data rows appear exactly once, so they are what gets summed.
+    """
+    data = _request(
+        entity,
+        "/v3/company/{realm_id}/reports/GeneralLedger",
+        params={
+            "start_date": start_date,
+            "end_date": end_date,
+            "account": ",".join(bank_account_ids),
+            # Pinned, not defaulted: the same realm renders different figures on
+            # Cash vs Accrual and LEX defaults differently from the other ten
+            # (D-120). An unpinned basis makes weeks incomparable to each other.
+            "accounting_method": "Accrual",
+        },
+    )
+
+    columns = (data.get("Columns") or {}).get("Column") or []
+    col_types = [str(c.get("ColType") or "") for c in columns]
+    try:
+        amount_i = col_types.index(_GL_AMOUNT_COL)
+        balance_i = col_types.index(_GL_BALANCE_COL)
+        date_i = col_types.index(_GL_DATE_COL)
+        type_i = col_types.index(_GL_TYPE_COL)
+    except ValueError as exc:
+        raise QboClientError(
+            f"General Ledger report for {entity} did not carry the expected "
+            f"columns (got {col_types}) -- refusing to guess positions"
+        ) from exc
+    split_i = col_types.index(_GL_SPLIT_COL) if _GL_SPLIT_COL in col_types else None
+
+    rows: list[dict[str, Any]] = []
+    sections: dict[str, dict[str, Any]] = {}
+    opening = 0.0
+    opening_seen = False
+
+    def _walk(node: Any, section: str | None) -> None:
+        nonlocal opening, opening_seen
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, section)
+            return
+        if not isinstance(node, dict):
+            return
+
+        current = section
+        header = (node.get("Header") or {}).get("ColData") or []
+        if header:
+            label = (header[0] or {}).get("value")
+            if label:
+                current = str(label)
+
+        col_data = node.get("ColData")
+        if isinstance(col_data, list):
+            values = [c.get("value") for c in col_data]
+            first = str(values[0] or "").strip()
+            lowered = first.lower()
+            if lowered == "beginning balance":
+                balance = _gl_money(values[balance_i]) if balance_i < len(values) else None
+                bucket = sections.setdefault(current or "?", {})
+                if balance is not None and "opening" in bucket:
+                    # Sections can nest, so guard the one way this sum could go
+                    # wrong quietly: the same account's opening counted twice
+                    # would shift the carry-in balance M3 hands Justin.
+                    bucket["opening_conflict"] = True
+                elif balance is not None:
+                    opening += balance
+                    opening_seen = True
+                    bucket["opening"] = balance
+            elif first and not lowered.startswith("total"):
+                amount = _gl_money(values[amount_i]) if amount_i < len(values) else None
+                if amount is not None:
+                    split_id = None
+                    if split_i is not None and split_i < len(col_data):
+                        split_id = (col_data[split_i] or {}).get("id")
+                    rows.append({
+                        "date": str(values[date_i] or "")[:10],
+                        "txn_type": str(values[type_i] or ""),
+                        # The txn id rides the Transaction Type cell -- present on
+                        # 100% of data rows across five realms (2026-08-05).
+                        "txn_id": (col_data[type_i] or {}).get("id"),
+                        "split_account_id": str(split_id) if split_id else None,
+                        "amount": amount,
+                        "section": current,
+                    })
+                    bucket = sections.setdefault(current or "?", {})
+                    bucket["movement"] = round(bucket.get("movement", 0.0) + amount, 2)
+                    balance = _gl_money(values[balance_i]) if balance_i < len(values) else None
+                    if balance is not None:
+                        bucket["last_balance"] = balance
+
+        for key in ("Rows", "Row"):
+            if key in node:
+                _walk(node[key], current)
+
+    _walk(data.get("Rows"), None)
+
+    # INTERNAL IDENTITY: opening + every row in a section == that section's last
+    # running balance. Reads three independently-reported quantities, so a parse
+    # that lost or duplicated rows breaks it (the M1 cash-identity lesson).
+    identity: dict[str, Any] = {"checked": 0, "worst_residual": 0.0, "failed": []}
+    for name, bucket in sections.items():
+        if not all(k in bucket for k in ("opening", "movement", "last_balance")):
+            continue
+        residual = abs(bucket["last_balance"] - (bucket["opening"] + bucket["movement"]))
+        identity["checked"] += 1
+        identity["worst_residual"] = max(identity["worst_residual"], round(residual, 2))
+        if residual > 0.01:
+            identity["failed"].append(name)
+
+    # A repeated (section, txn, date, amount) is usually two genuinely identical
+    # transactions -- verified live: an F3E week held one such pair and still tied
+    # out to $0.00 -- so this is REPORTED, never a gate.
+    seen: dict[tuple, int] = {}
+    for row in rows:
+        key = (row["section"], row["txn_id"], row["date"], row["amount"])
+        seen[key] = seen.get(key, 0) + 1
+
+    return {
+        "rows": rows,
+        "row_count": len(rows),
+        "opening_balance": round(opening, 2) if opening_seen else None,
+        "identity": identity,
+        "duplicate_row_keys": sum(v - 1 for v in seen.values() if v > 1),
+        "sections": sections,
+    }
+
+
 def format_recent_transactions_for_llm(payload: dict[str, Any], entity: str, days: int) -> str:
     """Render a 'recent activity' digest with counts. Source-opaque (B2 -- see format_pnl)."""
     # QueryResponse keys are the singular capitalized accounting entity names.
