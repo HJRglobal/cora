@@ -574,6 +574,71 @@ def check_cashflow_forecast_snapshot(today: date | None = None) -> CheckResult:
         f"{covered}/{expected} tabs).")
 
 
+def check_cashflow_actuals(today: date | None = None) -> CheckResult:
+    """The 13WCF QBO actuals (S2) should fire every Monday.
+
+    URGENCY IS DELIBERATELY LOWER THAN ITS SIBLING ABOVE, and saying so is the
+    point. The forecast snapshot is irreplaceable -- the sheet overwrites the
+    column it reads (D-121). These windows are NOT: QBO is re-readable, which is
+    the whole premise of the finalized re-pull, so a missed Monday is recovered by
+    running the script (this week) or with `--date` (an older week). Warning at
+    the same pitch as an unrecoverable loss is how a reader learns to skip both.
+
+    A dated FILE is not evidence of a banked week, so coverage is read from the
+    payload rather than inferred from the filename (D-127c). `today` is injectable.
+    """
+    today = today or date.today()
+    monday = today - timedelta(days=today.weekday())
+    label = "13wk cashflow actuals"
+
+    try:
+        from cora import cashflow_actuals as ca  # noqa: PLC0415
+
+        weeks = [w for w in ca.list_finalized_weeks() if w <= today]
+        latest = weeks[-1] if weeks else None
+        coverage = ca.window_coverage(latest, ca.WINDOW_FINALIZED) if latest else None
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(label, "warn", f"could not read the actuals store: {exc}")
+
+    if latest is None:
+        return CheckResult(
+            label, "warn",
+            "No finalized actuals window has been banked yet. Register "
+            "'cowork-cora-cashflow-actuals' or run "
+            r"scripts\run_cashflow_actuals.py. Recoverable -- QBO is re-readable.")
+
+    # The finalized window trails the run by two weeks by design, so "current"
+    # means its week-ending sits within ~16 days of this Monday. A looser bound
+    # than the snapshot check because the lag is structural, not a fault.
+    if (monday - latest).days > 16:
+        return CheckResult(
+            label, "warn",
+            f"Newest finalized actuals window is {latest.isoformat()}, more than "
+            "two weeks behind. 'cowork-cora-cashflow-actuals' fires Monday 06:25 "
+            "-- re-run it, or use --date to backfill an older week.")
+
+    if coverage is None:
+        return CheckResult(
+            label, "warn",
+            f"Window {latest.isoformat()} exists but its coverage could not be "
+            "read -- it may be truncated or corrupt.")
+
+    covered, expected = coverage
+    payload = ca.load_finalized(latest) or {}
+    awaiting = payload.get("awaiting_map_confirmation") or []
+    pending = f" ({len(awaiting)} awaiting map confirmation)" if awaiting else ""
+
+    if covered < expected:
+        return CheckResult(
+            label, "warn",
+            f"Window {latest.isoformat()} covers only {covered} of {expected} "
+            f"realms -- the rest have no actuals for that week.{pending}")
+    return CheckResult(
+        label, "ok",
+        f"Finalized actuals current ({latest.isoformat()}, "
+        f"{covered}/{expected} realms){pending}.")
+
+
 _MCP_HTTP_TASK = "cowork-cora-mcp-http"
 
 
@@ -1144,6 +1209,7 @@ def main() -> int:
 
     log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
     all_results.append(check_cashflow_forecast_snapshot())
+    all_results.append(check_cashflow_actuals())
 
     log.info("Checking MCP HTTP bridge (if registered)...")
     all_results.append(check_mcp_http_bridge())

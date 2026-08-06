@@ -111,7 +111,13 @@ def actuals_filename(week_ending: datetime.date, window_kind: str) -> str:
     does not exist in the machine layer.
     """
     suffix = "final" if window_kind == WINDOW_FINALIZED else "prelim"
-    return f"{week_ending.isoformat()}_{suffix}.json"
+    # The "-actuals" tail is load-bearing, not decoration: it is what
+    # kb_exclusions.is_finance_worksheet_title matches on, so these files are
+    # caught by the KB-containment belt as well as by the pinned folder id. A bare
+    # `<date>_final.json` matched neither, and loosening the rule to a bare
+    # "final" would over-match real business documents ("2026-01-15_final.docx")
+    # -- undiagnosably, since the store logs only a count.
+    return f"{week_ending.isoformat()}_{suffix}-actuals.json"
 
 
 def actuals_path(week_ending: datetime.date, window_kind: str) -> Path:
@@ -155,7 +161,7 @@ def list_finalized_weeks() -> list[datetime.date]:
     if not ACTUALS_DIR.exists():
         return []
     out: list[datetime.date] = []
-    for path in ACTUALS_DIR.glob("*_final.json"):
+    for path in ACTUALS_DIR.glob("*_final-actuals.json"):
         try:
             out.append(datetime.date.fromisoformat(path.name.split("_", 1)[0]))
         except ValueError:
@@ -575,7 +581,27 @@ def build_window(
         )
 
     covered = sum(1 for b in blocks.values() if b.get("status") == "ok")
-    expected = len([r for r in scope if not entity_map.is_excluded(r)])
+
+    # COVERAGE DENOMINATOR. A realm whose entity-map scope is not declared yet is
+    # a KNOWN, EXPECTED gap, not a failure -- exactly like a manual-entry tab. It
+    # belongs in neither the numerator NOR the denominator (D-122's corollary,
+    # learned when leaving the OSN shell in `expected` made a pack section report
+    # itself partial every single week and trained the reader to ignore the one
+    # signal that marks a real gap). LEX is unresolvable until Justin declares its
+    # split, so without this the coverage count would read 8 of 9 forever and the
+    # missed-run monitor would WARN every Monday on the healthy state.
+    # Only a realm that HAS a pairing which does not resolve yet -- a tracked,
+    # pending decision. A realm ABSENT from the map entirely is a different thing:
+    # a provisioned realm nobody has mapped, possibly carrying real money, and it
+    # stays IN the denominator so the monitor keeps saying so.
+    awaiting_map = sorted(
+        realm for realm in scope
+        if not entity_map.is_excluded(realm)
+        and (pairing := entity_map.pairing(realm)) is not None
+        and not pairing.resolvable
+    )
+    expected = len([r for r in scope
+                    if not entity_map.is_excluded(r) and r not in awaiting_map])
 
     # COVERAGE FLOOR. A window with no readable realm is not a window: writing
     # one lets a monitor that sees a dated file report green on a total failure
@@ -603,6 +629,9 @@ def build_window(
         "cash_perimeter": PERIMETER_NOTE,
         "covered": covered,
         "expected": expected,
+        # Named, not folded into `expected`: an expected gap must be visible as
+        # itself, so nobody reads it as either coverage or a failure.
+        "awaiting_map_confirmation": awaiting_map,
         "partial_sweep": sorted(set(scope)) != sorted(set(realms)),
         "supersedes": (actuals_filename(week_ending, WINDOW_PRELIMINARY)
                        if window_kind == WINDOW_FINALIZED else None),

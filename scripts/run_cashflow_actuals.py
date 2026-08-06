@@ -106,8 +106,12 @@ def render_dry_run(payload: dict) -> str:
                f"(ends {payload.get('week_ending_weekday')})")
     out.append(f"  week grid from: {payload.get('week_source')}")
     out.append(f"  basis         : {payload.get('basis')}")
+    awaiting = payload.get("awaiting_map_confirmation") or []
     out.append(f"  coverage      : {payload.get('covered')} of "
-               f"{payload.get('expected')} realms")
+               f"{payload.get('expected')} realms"
+               + (f" (+{len(awaiting)} awaiting map confirmation: "
+                  f"{', '.join(awaiting)} -- an expected gap, not a failure)"
+                  if awaiting else ""))
     out.append(f"  entity map    : {payload.get('map_confirmed_pairs')} confirmed pair(s)")
     if payload.get("supersedes"):
         out.append(f"  supersedes    : {payload['supersedes']}")

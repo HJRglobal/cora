@@ -419,7 +419,7 @@ class TestBuildWindow:
 
     def test_finalized_window_declares_what_it_supersedes(self, tmp_path):
         payload = _build_window(["F3E"], kind=ca.WINDOW_FINALIZED, tmp_path=tmp_path)
-        assert payload["supersedes"] == f"{W1.isoformat()}_prelim.json"
+        assert payload["supersedes"] == f"{W1.isoformat()}_prelim-actuals.json"
 
     def test_preliminary_window_supersedes_nothing(self, tmp_path):
         assert _build_window(["F3E"], tmp_path=tmp_path)["supersedes"] is None
@@ -456,6 +456,29 @@ class TestBuildWindow:
         assert payload["partial_sweep"] is True
         assert payload["expected"] == 2
 
+    def test_an_unresolvable_realm_leaves_the_coverage_denominator(self, tmp_path):
+        """D-122's corollary. LEX cannot be read until Justin declares its split,
+        so counting it in `expected` would make every healthy week report itself
+        partial -- training the reader to ignore the one signal that marks a real
+        gap. It is named instead."""
+        emap = _entity_map(F3E={"tab": "CF_F3", "confirmed": True},
+                           LEX={"tab": None, "candidate_tabs": ["CF_LLC", "CF_LBHS"]})
+        payload = _build_window(["F3E", "LEX"], emap=emap, tmp_path=tmp_path)
+        assert payload["expected"] == 1
+        assert payload["covered"] == 1
+        assert payload["awaiting_map_confirmation"] == ["LEX"]
+
+    def test_a_realm_absent_from_the_map_stays_in_the_denominator(self, tmp_path):
+        """Different failure from the one above: a provisioned realm nobody has
+        mapped may be carrying real money, so it must keep reading as a gap rather
+        than quietly leaving the count."""
+        emap = _entity_map(F3E={"tab": "CF_F3", "confirmed": True})
+        payload = _build_window(["F3E", "BDM"], emap=emap, tmp_path=tmp_path)
+        assert payload["expected"] == 2
+        assert payload["covered"] == 1
+        assert payload["awaiting_map_confirmation"] == []
+        assert payload["realms"]["BDM"]["reason_code"] == "realm_not_in_entity_map"
+
     def test_manual_entry_and_derived_tabs_ride_the_payload(self, tmp_path):
         """D-117: a tab with no QBO source is not a failure, and a derived
         roll-up has nothing to map. Both must be distinguishable from a gap."""
@@ -479,7 +502,7 @@ class TestWriteWindow:
     def test_round_trip(self, tmp_path):
         payload = _build_window(["F3E"], tmp_path=tmp_path)
         path = ca.write_window(payload, today=MONDAY)
-        assert path.name == f"{W1.isoformat()}_prelim.json"
+        assert path.name == f"{W1.isoformat()}_prelim-actuals.json"
         assert ca.load_window(W1, ca.WINDOW_PRELIMINARY)["covered"] == 1
 
     def test_preliminary_refuses_to_replace_a_finalized_week(self, tmp_path):
@@ -555,7 +578,7 @@ class TestLoadPreference:
 
     def test_unparseable_filename_is_ignored_not_fatal(self, tmp_path):
         ca.ACTUALS_DIR.mkdir(parents=True, exist_ok=True)
-        (ca.ACTUALS_DIR / "notadate_final.json").write_text("{}", encoding="utf-8")
+        (ca.ACTUALS_DIR / "notadate_final-actuals.json").write_text("{}", encoding="utf-8")
         assert ca.list_finalized_weeks() == []
 
 
@@ -589,7 +612,7 @@ class TestMirrorPaths:
     def test_mirror_lands_under_the_accounting_tree(self, tmp_path):
         path = ca.mirror_actuals_path(W1, ca.WINDOW_FINALIZED)
         assert path.parts[-4:] == ("accounting", "cashflow-ledger", "actuals",
-                                   f"{W1.isoformat()}_final.json")
+                                   f"{W1.isoformat()}_final-actuals.json")
 
     def test_same_ignoring_stamps(self):
         a = json.dumps({"generated_at_utc": "t1", "run_date": "d1", "x": 1})

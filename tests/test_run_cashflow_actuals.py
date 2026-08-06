@@ -232,7 +232,7 @@ class TestRenderDryRun:
         assert "PRELIMINARY" in script.render_dry_run(_payload())
         final = _payload()
         final["window_kind"] = ca.WINDOW_FINALIZED
-        final["supersedes"] = "2026-07-31_prelim.json"
+        final["supersedes"] = "2026-07-31_prelim-actuals.json"
         out = script.render_dry_run(final)
         assert "FINALIZED" in out and "supersedes" in out
 
@@ -378,7 +378,7 @@ class TestMirror:
         monkeypatch.setattr(script.drive_io, "write_text_atomic",
                             lambda target, body: seen.append(target))
         script._mirror(_payload())
-        assert seen[0].parts[-2:] == ("actuals", "2026-07-31_prelim.json")
+        assert seen[0].parts[-2:] == ("actuals", "2026-07-31_prelim-actuals.json")
 
     def test_mirrored_body_carries_no_human_typed_text(self, monkeypatch):
         """D-124/D-127g: memo and name fields never reach the payload, so they

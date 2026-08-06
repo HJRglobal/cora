@@ -82,6 +82,28 @@ class TestLedgerIsKbExcluded:
         assert is_finance_worksheet_title("2026-08-10_final-W2.json")
         assert is_finance_worksheet_title("2026-08-10_prelim-W1.json")
 
+    def test_the_names_the_code_ACTUALLY_generates_are_caught(self):
+        """Pinned on the MECHANISM, not on a hand-copied string.
+
+        The M2 build named its files `<week>_prelim.json` / `<week>_final.json`,
+        which matched NEITHER the `prelim-w\\d` shape this rule was written for nor
+        the `actuals` keyword -- so the belt silently did not cover the new files,
+        which is the "guard simply never fires" class. Deriving the names from
+        cashflow_actuals means a future rename breaks this test instead of the
+        boundary. Loosening the rule to a bare "final" was the wrong fix: it would
+        over-match real business documents.
+        """
+        import datetime
+
+        from cora import cashflow_actuals as ca
+
+        week = datetime.date(2026, 8, 7)
+        for kind in (ca.WINDOW_PRELIMINARY, ca.WINDOW_FINALIZED):
+            name = ca.actuals_filename(week, kind)
+            assert is_finance_worksheet_title(name), name
+            assert is_finance_worksheet_path(
+                f"01-HJR-Global/accounting/cashflow-ledger/actuals/{name}"), name
+
     def test_title_predicate_matches_full_title_not_only_basename(self):
         """A Drive display name may itself contain '/' (a date like 8/11);
         path-splitting it would drop the token we are looking for."""
@@ -301,3 +323,100 @@ class TestSnapshotFreshnessCheck:
         source = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(
             encoding="utf-8")
         assert "all_results.append(check_cashflow_forecast_snapshot())" in source
+
+
+class TestActualsFreshnessCheck:
+    """M2's sibling monitor. Same D-127c mechanics -- payload coverage, not
+    filenames -- but deliberately calmer: these windows ARE recoverable."""
+
+    MON = datetime.date(2026, 8, 10)
+    TUE = datetime.date(2026, 8, 11)
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path, monkeypatch):
+        from cora import cashflow_actuals as ca
+        monkeypatch.setattr(ca, "ACTUALS_DIR", tmp_path / "actuals")
+
+    def _bank(self, *weeks: str, covered: int = 8, expected: int = 8,
+              awaiting: list | None = None):
+        import json
+
+        from cora import cashflow_actuals as ca
+        ca.ACTUALS_DIR.mkdir(parents=True, exist_ok=True)
+        for week in weeks:
+            (ca.ACTUALS_DIR / f"{week}_final-actuals.json").write_text(
+                json.dumps({"week_ending": week, "window_kind": "finalized",
+                            "covered": covered, "expected": expected,
+                            "awaiting_map_confirmation": awaiting or ["LEX"]}))
+
+    def test_never_run_warns_but_says_it_is_recoverable(self):
+        r = health.check_cashflow_actuals(today=self.TUE)
+        assert r.status == "warn"
+        assert "re-readable" in r.detail
+
+    def test_current_finalized_window_is_ok(self):
+        """The finalized window trails by two weeks BY DESIGN, so a two-week-old
+        week-ending is the healthy state, not a miss."""
+        self._bank("2026-07-31")
+        r = health.check_cashflow_actuals(today=self.TUE)
+        assert r.status == "ok"
+        assert "8/8" in r.detail
+        # The expected gap is visible as itself, not as missing coverage.
+        assert "1 awaiting map confirmation" in r.detail
+
+    def test_more_than_two_weeks_behind_warns(self):
+        self._bank("2026-07-10")
+        r = health.check_cashflow_actuals(today=self.TUE)
+        assert r.status == "warn"
+        assert "--date" in r.detail
+
+    def test_hollow_window_is_not_green(self):
+        from cora import cashflow_actuals as ca
+        ca.ACTUALS_DIR.mkdir(parents=True, exist_ok=True)
+        (ca.ACTUALS_DIR / "2026-07-31_final-actuals.json").write_text("{}")
+        r = health.check_cashflow_actuals(today=self.TUE)
+        assert r.status == "warn"
+        assert "coverage could not be read" in r.detail
+
+    def test_partial_coverage_warns_and_names_the_expected_gap(self):
+        self._bank("2026-07-31", covered=3, expected=8)
+        r = health.check_cashflow_actuals(today=self.TUE)
+        assert r.status == "warn"
+        assert "3 of 8" in r.detail
+
+    def test_a_stray_future_window_does_not_blind_the_check(self):
+        self._bank("2026-12-25")
+        assert health.check_cashflow_actuals(today=self.TUE).status == "warn"
+
+    def test_a_preliminary_window_does_not_satisfy_the_check(self):
+        """Accuracy binds to matured weeks; a preliminary file is not evidence
+        that the finalized re-pull ever happened."""
+        import json
+
+        from cora import cashflow_actuals as ca
+        ca.ACTUALS_DIR.mkdir(parents=True, exist_ok=True)
+        (ca.ACTUALS_DIR / "2026-07-31_prelim-actuals.json").write_text(
+            json.dumps({"week_ending": "2026-07-31", "covered": 8, "expected": 9}))
+        assert health.check_cashflow_actuals(today=self.TUE).status == "warn"
+
+    def test_store_read_failure_is_a_warn_not_a_crash(self, monkeypatch):
+        from cora import cashflow_actuals as ca
+
+        def boom():
+            raise OSError("disk gone")
+        monkeypatch.setattr(ca, "list_finalized_weeks", boom)
+        assert health.check_cashflow_actuals(today=self.TUE).status == "warn"
+
+    def test_check_is_registered_in_the_run(self):
+        source = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(
+            encoding="utf-8")
+        assert "all_results.append(check_cashflow_actuals())" in source
+
+    def test_urgency_is_lower_than_the_snapshot_check(self):
+        """Warning at the same pitch as an unrecoverable loss is how a reader
+        learns to skip both. The snapshot check says 'lost permanently'; this one
+        must not."""
+        self._bank("2026-07-10")
+        detail = health.check_cashflow_actuals(today=self.TUE).detail
+        assert "lost permanently" not in detail
+        assert "permanently" not in detail
