@@ -68,6 +68,40 @@ EXPLICIT_THROTTLE_PER_DAY = 3    # per-user cap on the explicit tool
 
 VALID_KINDS = ("bug", "feature", "config")
 VALID_SEVERITIES = ("P0", "P1", "P2", "P3")
+# The queue carries TWO severity vocabularies in live data (Slice 4 verify-first,
+# 2026-08-05): the Haiku classifier emits the P0-P3 ladder above, while every
+# `seed_item` caller (bug-hunt bundles, flywheel audits, the MCP seed tool) has
+# been passing HIGH/MEDIUM/LOW -- and seed_item never validated against
+# VALID_SEVERITIES, so both persisted. Rather than rewrite live rows, the two
+# ladders are mapped onto one PRIORITY notion here; `is_priority_severity` is the
+# single source of truth for "this item is P0/P1-class" (see its docstring for why
+# a silent vocabulary split made the P1-at-approval rule unenforceable).
+SEVERITY_ALIASES = {
+    "CRITICAL": "P0", "URGENT": "P0",
+    "HIGH": "P1",
+    "MED": "P2", "MEDIUM": "P2", "NORMAL": "P2",
+    "LOW": "P3", "MINOR": "P3",
+}
+# Everything an explicit re-rate (set_severity) will accept.
+VALID_SEVERITY_INPUTS = tuple(VALID_SEVERITIES) + tuple(sorted(SEVERITY_ALIASES))
+_PRIORITY_LADDER = frozenset({"P0", "P1"})
+
+
+def canonical_severity(severity: str | None) -> str:
+    """Map either live vocabulary onto the canonical P0-P3 ladder. An unknown or
+    blank value returns "" (never a silent P3 -- callers decide)."""
+    s = str(severity or "").strip().upper()
+    if s in VALID_SEVERITIES:
+        return s
+    return SEVERITY_ALIASES.get(s, "")
+
+
+def is_priority_severity(severity: str | None) -> bool:
+    """True when this severity is P0/P1-class in EITHER vocabulary (so "HIGH"
+    counts). The P1-at-approval rule and the nightly aging monitor both read this
+    one predicate: keying either of them on a bare `in ("P0","P1")` string test is
+    what let HIGH-severity items sit APPROVED-and-unstaged invisibly."""
+    return canonical_severity(severity) in _PRIORITY_LADDER
 
 # Statuses at which an item is still "live" -- a new similar signal should dedup INTO
 # it (used by the embedding paraphrase layer). Terminal statuses are excluded so a
@@ -495,6 +529,21 @@ def _fold_items() -> dict[str, dict[str, Any]]:
                 rec["title"] = ev["title"]
             if ev.get("summary"):
                 rec["summary"] = ev["summary"]
+            # Slice 0 (2026-08-05): a severity re-rate rides the SAME edited event
+            # (last-write-wins on the field, like title/summary) so re-prioritizing
+            # never needs a ledger hand-edit. set_severity validates the vocabulary.
+            if ev.get("severity"):
+                rec["severity"] = ev["severity"]
+        elif et == "evidence":
+            # Append-only extra evidence for an EXISTING occurrence -- deliberately
+            # NOT a `recurrence` (which means "seen again" and bumps `count`).
+            # Attaching a real-world example to an already-filed item must not
+            # inflate the recurrence counter the Monday menu ranks on.
+            note = ev.get("evidence")
+            if note:
+                ev_list = rec.get("evidence") or []
+                if len(ev_list) < 10:
+                    rec["evidence"] = ev_list + [note]
         elif et == "kept":
             rec["last_touch"] = ev.get("ts")
         elif et == "dm_sent":
@@ -1725,6 +1774,97 @@ def apply_edit(cq_id: str, actor_id: str, title: str, summary: str) -> tuple[str
                    "title": title, "summary": summary})
     _render_backlog_safe()
     return "edited", "✏️ Updated."
+
+
+def set_severity(cq_id: str, actor_id: str, severity: str) -> tuple[str, str]:
+    """Re-rate an existing item's severity via the append-only ledger (Slice 0).
+
+    Harrison-only, like every other mutation. Accepts either live vocabulary
+    (VALID_SEVERITY_INPUTS) and stores the value AS GIVEN -- canonicalizing live
+    rows in place would silently rewrite the priorities rendered in the backlog and
+    the Monday menu. `is_priority_severity` is what reads across both ladders.
+    """
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can action the code-session queue."
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "That queue item no longer exists."
+    sev = str(severity or "").strip().upper()
+    if sev not in VALID_SEVERITY_INPUTS:
+        return "error", (f"Unknown severity {severity!r} -- "
+                         f"expected one of: {', '.join(VALID_SEVERITY_INPUTS)}.")
+    if str(rec.get("severity", "")).strip().upper() == sev:
+        return "noop", f"Already {sev}."
+    _append_event({"event": "edited", "ts": _now_iso(), "id": cq_id, "severity": sev})
+    _render_backlog_safe()
+    return "edited", f"Severity set to {sev}."
+
+
+def record_staged(cq_id: str, prompt_path: str, actor_id: str) -> tuple[str, str]:
+    """Record a `staged` event for a kickoff prompt that was authored OUTSIDE the
+    generator (a hand-written or another-session-written prompt file).
+
+    Slice 0 verify-first: cq-f1236540b61e went APPROVED ~7/30 and a Fable session
+    hand-wrote its kickoff file on 8/3, but nothing ever told the ledger -- so the
+    item read as approved-and-unstaged for a week and the Monday menu kept
+    re-offering it. Without this API the only way to close that loop was a ledger
+    hand-edit. Idempotent; Harrison-only.
+    """
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can action the code-session queue."
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "That queue item no longer exists."
+    path = str(prompt_path or "").strip()
+    if not path:
+        return "error", "A staged event needs a prompt path."
+    if rec.get("status") == "STAGED" and rec.get("prompt_path"):
+        return "noop", f"Already staged: `{rec['prompt_path']}`"
+    _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
+                   "prompt_path": path, "authored": "external"})
+    _render_backlog_safe()
+    return "staged", f"📝 Prompt staged: `{path}`"
+
+
+def append_evidence(cq_id: str, actor_id: str, note: str,
+                    *, channel_id: str = "", ts: str = "") -> tuple[str, str]:
+    """Attach one dated real-world example to an EXISTING item (Slice 0).
+
+    Deliberately NOT a `recurrence` event: recurrence means "this signal fired
+    again" and bumps `count`, which the Monday menu ranks on. Adding evidence to an
+    already-filed item must not inflate that counter.
+
+    PHI/LEX safety mirrors the capture + seed paths: the note is screened
+    fail-closed with the 3-predicate union, and a LEX item's note is reduced to a
+    pointer by _scrub_evidence (the note is persisted and egresses via the kickoff
+    prompt + the KB-ingested backlog).
+    """
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can action the code-session queue."
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "That queue item no longer exists."
+    note = str(note or "").strip()
+    if not note:
+        return "error", "Nothing to attach -- the evidence note is empty."
+    try:
+        if phi_guard.is_any_phi(note):
+            return "error", "Evidence rejected -- text tripped the PHI guard."
+    except Exception:  # noqa: BLE001 -- fail closed
+        return "error", "Evidence rejected -- PHI check failed (fail-closed)."
+    is_lex = str(rec.get("entity") or "").strip().upper().startswith("LEX")
+    scrubbed = _scrub_evidence(
+        [{"channel_id": channel_id, "ts": ts, "note": note}], is_lex=is_lex)
+    entry = scrubbed[0] if scrubbed else {}
+    # A LEX item's note is reduced to a pointer; with no channel_id/ts to point AT,
+    # nothing informative survives -- refuse rather than persist an empty stub.
+    if not (entry.get("note") or entry.get("channel_id") or entry.get("ts")):
+        return "error", ("Evidence rejected -- a LEX item's note is reduced to a "
+                        "pointer, and no channel/ts pointer was supplied.")
+    _append_event({"event": "evidence", "ts": _now_iso(), "id": cq_id,
+                   "evidence": entry})
+    _render_backlog_safe()
+    return "evidence", "Evidence attached."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
