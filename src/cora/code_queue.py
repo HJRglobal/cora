@@ -506,6 +506,12 @@ def _fold_items() -> dict[str, dict[str, Any]]:
                     rec["evidence"] = ev_list + [ev_ev]
         elif et == "approved":
             rec["status"] = "APPROVED"
+            # Slice 4: the aging monitor measures "APPROVED for >24h with no
+            # kickoff" from the APPROVAL, not from capture -- an item captured
+            # weeks ago and approved today must not flag immediately. Absent on
+            # legacy rows (and on seed-at-APPROVED rows, which have no `approved`
+            # event at all), where the monitor falls back to `ts`.
+            rec["approved_at"] = ev.get("ts")
         elif et == "dismissed":
             rec["status"] = "DISMISSED"
         elif et == "snoozed":
@@ -1638,25 +1644,19 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         _append_event({"event": "approved", "ts": _now_iso(), "id": cq_id})
         _render_backlog_safe()
         msg = "✅ Queued (APPROVED)."
-        # P0/P1 get a full kickoff prompt immediately -- reservation-guarded so a
-        # concurrent approve can't double-generate (defect #3 TOCTOU class).
-        if str(rec.get("severity", "")).upper() in ("P0", "P1") and _begin_staging([cq_id]):
-            try:
-                fresh = get_item(cq_id) or rec
-                if not (fresh.get("status") == "STAGED" and fresh.get("prompt_path")):
-                    meta: dict[str, Any] = {}
-                    path = generate_kickoff_prompt([fresh], meta_out=meta)
-                    if path:
-                        ev = {"event": "staged", "ts": _now_iso(), "id": cq_id,
-                              "prompt_path": path}
-                        if meta.get("mis_homed"):
-                            ev["mis_homed"] = True
-                        _append_event(ev)
-                        _render_backlog_safe()
-                        _dm_prompt_path(path)
-                        msg = f"✅ Queued + prompt staged: `{path}`"
-            finally:
-                _end_staging([cq_id])
+        # P0/P1-class gets a full kickoff prompt immediately (Slice 4). Delegated to
+        # ensure_kickoff_staged so EVERY approval path shares one implementation and
+        # one loud-failure contract.
+        if is_priority_severity(rec.get("severity")):
+            outcome, detail = ensure_kickoff_staged(cq_id)
+            if outcome == "staged":
+                msg = f"✅ Queued + prompt staged: `{detail}`"
+            elif outcome == "error":
+                # LOUD, never silent: the approve still stands (the ledger event is
+                # already written) but Harrison is told the kickoff did NOT generate,
+                # so a P1 can never look fully handled when it is not.
+                msg = (f"✅ Queued (APPROVED) -- but the kickoff prompt did NOT "
+                       f"generate: {detail}\nUse Stage on the item to retry.")
         return "approved", msg
 
     if action_id == ACTION_DISMISS:
@@ -1674,32 +1674,18 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         return "snoozed", f"⏸ Snoozed {SNOOZE_DAYS}d -- resurfaces in the Monday menu."
 
     if action_id == ACTION_STAGE:
-        if status == "STAGED" and rec.get("prompt_path"):
-            return "noop", f"Already staged: `{rec['prompt_path']}`"
-        # Reservation guard (defect #3): a re-tap while the first tap is still
-        # generating finds the id reserved and returns WITHOUT a second Sonnet call
-        # or a second `staged` event.
-        if not _begin_staging([cq_id]):
-            cur = get_item(cq_id) or rec
-            return "noop", (f"Already staged: `{cur['prompt_path']}`" if cur.get("prompt_path")
-                            else "Already staging -- I'll post the prompt path when it's ready.")
-        try:
-            fresh = get_item(cq_id) or rec
-            if fresh.get("status") == "STAGED" and fresh.get("prompt_path"):
-                return "noop", f"Already staged: `{fresh['prompt_path']}`"
-            meta: dict[str, Any] = {}
-            path = generate_kickoff_prompt([rec], meta_out=meta)
-            if not path:
-                return "error", "Prompt generation failed -- nothing staged."
-            ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path}
-            if meta.get("mis_homed"):
-                ev["mis_homed"] = True
-            _append_event(ev)
-            _render_backlog_safe()
-            _dm_prompt_path(path)
-            return "staged", f"📝 Prompt staged: `{path}`"
-        finally:
-            _end_staging([cq_id])
+        # Shares ensure_kickoff_staged with the approve path (Slice 4) so there is
+        # ONE generator implementation and one loud-failure contract. Its reservation
+        # guard is what keeps a re-tap from a second Sonnet call / second `staged`
+        # event (defect #3 TOCTOU class).
+        outcome, detail = ensure_kickoff_staged(cq_id)
+        if outcome == "staged":
+            return "staged", f"📝 Prompt staged: `{detail}`"
+        if outcome == "noop":
+            return "noop", f"Already staged: `{detail}`"
+        if detail == "another staging attempt is already in flight for this item":
+            return "noop", "Already staging -- I'll post the prompt path when it's ready."
+        return "error", f"Prompt generation failed -- nothing staged ({detail})."
 
     if action_id == ACTION_MARK_SHIPPED:
         _append_event({"event": "shipped", "ts": _now_iso(), "id": cq_id})
@@ -1711,6 +1697,134 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         return "kept", "Kept -- staleness clock reset."
 
     return "error", f"Unknown action: {action_id}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0/P1-at-approval enforcement (Slice 4, pipeline-integrity bundle 2026-08-05)
+# ─────────────────────────────────────────────────────────────────────────────
+# Design (TOM 1fff) says a P0/P1 item gets a full kickoff prompt the moment it is
+# approved. VERIFY-FIRST found three ways that rule was unenforceable:
+#
+#   1. The rule lived ONLY inside process_queue_action(ACTION_APPROVE), so an item
+#      seeded directly at status="APPROVED" never triggered it. That is exactly what
+#      happened to cq-f1236540b61e (P1, #info-for-cora intake): its `captured` event
+#      carries "status": "APPROVED" -- no `approved` event exists at all -- so the
+#      generator never ran, a Fable session hand-wrote the kickoff on 8/3, the ledger
+#      was never told, and it read as approved-and-unstaged for a week.
+#   2. The severity test was a bare `in ("P0","P1")` string check while every
+#      seed_item caller passes HIGH/MEDIUM/LOW (and seed_item never validated), so a
+#      HIGH item -- P1 in every meaningful sense -- was invisible to the rule.
+#      is_priority_severity now reads across both ladders.
+#   3. A generation FAILURE was silent: generate_kickoff_prompt returning falsy left
+#      the plain "Queued (APPROVED)" message, so a P1 looked fully handled when no
+#      prompt existed. Same for losing the _begin_staging reservation race.
+#
+# Fix: one shared ensure_kickoff_staged() with a LOUD failure contract, called by
+# every interactive approval path, plus a nightly aging monitor
+# (priority_items_missing_kickoff) so the "dropped P1 kickoff" class can never be
+# invisible again even on a path nobody anticipated.
+#
+# seed_item deliberately does NOT auto-generate (see its stage_now parameter): it is
+# documented as "no DM, no classifier", and making a data-migration helper fire a
+# Sonnet call + a Drive write as a side effect would be a surprising,
+# network-dependent change to every seeding script and the MCP seed tool. Instead it
+# WARNS loudly and the nightly monitor catches the row within 24h.
+
+def ensure_kickoff_staged(cq_id: str) -> tuple[str, str]:
+    """Generate + ledger-record a kickoff prompt for one item. The single
+    implementation every approval path shares.
+
+    Returns (outcome, detail):
+      "staged"  -> detail is the prompt path
+      "noop"    -> already staged (detail is the existing path)
+      "error"   -> detail is a short human reason; the CALLER must surface it
+
+    Reservation-guarded (defect #3 TOCTOU class) so a concurrent approve/stage can
+    never double-generate. Losing the race is reported as an ERROR, not silence --
+    the in-flight winner will stage it, but the caller still owes the user a truthful
+    message rather than an implied success.
+    """
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "item no longer exists"
+    if rec.get("status") == "STAGED" and rec.get("prompt_path"):
+        return "noop", str(rec["prompt_path"])
+    if not _begin_staging([cq_id]):
+        return "error", "another staging attempt is already in flight for this item"
+    try:
+        fresh = get_item(cq_id) or rec
+        if fresh.get("status") == "STAGED" and fresh.get("prompt_path"):
+            return "noop", str(fresh["prompt_path"])
+        meta: dict[str, Any] = {}
+        try:
+            path = generate_kickoff_prompt([fresh], meta_out=meta)
+        except Exception as exc:  # noqa: BLE001 -- an approve must never crash on this
+            log.exception("code_queue: kickoff generation crashed for %s", cq_id)
+            return "error", f"generator crashed ({type(exc).__name__})"
+        if not path:
+            log.error("code_queue: kickoff generation returned no path for %s "
+                      "(severity=%s) -- APPROVED but UNSTAGED",
+                      cq_id, rec.get("severity"))
+            return "error", "prompt generation produced no file"
+        ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path}
+        if meta.get("mis_homed"):
+            ev["mis_homed"] = True
+        _append_event(ev)
+        _render_backlog_safe()
+        _dm_prompt_path(path)
+        return "staged", path
+    finally:
+        _end_staging([cq_id])
+
+
+# How long an APPROVED priority item may sit without a kickoff before the nightly
+# health check WARNs. 24h per the Slice-4 spec: long enough that an approve late in
+# the evening is not flagged before the next morning's check.
+PRIORITY_KICKOFF_GRACE_HOURS = 24
+
+
+def priority_items_missing_kickoff(
+    grace_hours: int = PRIORITY_KICKOFF_GRACE_HOURS,
+) -> list[dict[str, Any]]:
+    """APPROVED P0/P1-class items older than `grace_hours` with no `staged` event.
+
+    The structural net behind ensure_kickoff_staged: whatever path approved the item
+    -- card tap, Monday menu, a seeding script, or something not yet written -- a
+    dropped priority kickoff becomes visible within a day. Newest-first.
+
+    Never raises: a ledger read problem yields [] rather than breaking the nightly
+    health check (every other gauge there behaves the same way).
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        cutoff = _now() - timedelta(hours=max(0, int(grace_hours)))
+        for rec in load_items():
+            if rec.get("status") != "APPROVED":
+                continue
+            if not is_priority_severity(rec.get("severity")):
+                continue
+            if rec.get("prompt_path"):
+                continue
+            # Age from the most recent touch we can see: an item approved today but
+            # captured weeks ago must not flag immediately.
+            stamp = (_parse_ts(rec.get("last_touch"))
+                     or _parse_ts(rec.get("approved_at"))
+                     or _parse_ts(rec.get("ts")))
+            if stamp is not None and stamp > cutoff:
+                continue
+            out.append({
+                "id": rec.get("id", ""),
+                "severity": rec.get("severity", ""),
+                "entity": rec.get("entity", ""),
+                "title": str(rec.get("title", ""))[:120],
+                "age_hours": (round((_now() - stamp).total_seconds() / 3600.0, 1)
+                              if stamp is not None else None),
+            })
+    except Exception:  # noqa: BLE001 -- a monitor must never break its caller
+        log.warning("code_queue: priority-kickoff scan failed", exc_info=True)
+        return []
+    out.sort(key=lambda r: (r.get("age_hours") or 0.0), reverse=True)
+    return out
 
 
 def _dm_prompt_path(path: str) -> None:
@@ -2240,9 +2354,23 @@ def apply_prompt_rehome(plan: list[dict[str, str]]) -> list[dict[str, Any]]:
 # Seed (migration) helper -- used by scripts/seed_code_queue.py
 # ─────────────────────────────────────────────────────────────────────────────
 def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str,
-              signal: str, status: str, subsystem_guess: str = "") -> str | None:
+              signal: str, status: str, subsystem_guess: str = "",
+              stage_now: bool = False) -> str | None:
     """Directly seed a queue item (no DM, no classifier). Idempotent on fingerprint.
-    Used only by the one-shot seed script. Returns the cq-id."""
+    Used only by the one-shot seed script. Returns the cq-id.
+
+    Slice 4: seeding straight to status="APPROVED" is an approval path that bypasses
+    process_queue_action entirely -- which is how cq-f1236540b61e (P1) went a week
+    APPROVED-and-unstaged. This stays NON-generating by default (the function is
+    documented "no DM, no classifier", and firing a Sonnet call + a Drive write as a
+    side effect of a data-migration helper would surprise every seeding script and the
+    MCP seed tool), but it can no longer be SILENT: a P0/P1-class APPROVED seed logs a
+    WARNING naming the id, and code_queue.priority_items_missing_kickoff surfaces it in
+    the nightly health check within PRIORITY_KICKOFF_GRACE_HOURS.
+
+    Pass stage_now=True to generate the kickoff inline (a seeding script that intends
+    the item to be built immediately).
+    """
     rec = {
         "kind": kind, "severity": severity, "title": title, "summary": summary,
         "subsystem_guess": subsystem_guess or entity, "entity": entity, "signal": signal,
@@ -2307,4 +2435,21 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     rec["fingerprint"] = _fingerprint(signal, title)
     _append_event({"event": "captured", **rec})
     _append_fingerprint(rec["fingerprint"], signal, store_rep, cq_id, class_key=class_key)
+    # Slice 4: a seed-at-APPROVED priority item bypassed process_queue_action's
+    # kickoff rule entirely and did so SILENTLY. Generate on request; otherwise WARN
+    # loudly and let the nightly monitor catch it.
+    if str(status).strip().upper() == "APPROVED" and is_priority_severity(severity):
+        if stage_now:
+            outcome, detail = ensure_kickoff_staged(cq_id)
+            if outcome == "error":
+                log.error("code_queue.seed_item: %s seeded APPROVED (%s) but the "
+                          "kickoff did NOT generate: %s", cq_id, severity, detail)
+            else:
+                log.info("code_queue.seed_item: %s seeded APPROVED (%s), kickoff %s: %s",
+                         cq_id, severity, outcome, detail)
+        else:
+            log.warning("code_queue.seed_item: %s seeded APPROVED at %s (P0/P1-class) "
+                        "with NO kickoff prompt -- stage it, or the nightly health "
+                        "check will WARN after %dh (pass stage_now=True to generate "
+                        "here)", cq_id, severity, PRIORITY_KICKOFF_GRACE_HOURS)
     return cq_id

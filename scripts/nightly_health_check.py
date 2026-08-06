@@ -1120,6 +1120,42 @@ def check_flywheel() -> list[CheckResult]:
                             f"Could not compute flywheel metrics: {exc}")]
 
 
+def check_priority_kickoffs() -> CheckResult:
+    """Slice 4 (pipeline-integrity bundle, 2026-08-05): WARN on any APPROVED
+    P0/P1-class code-queue item older than the grace window with NO `staged` event.
+
+    The structural net behind code_queue.ensure_kickoff_staged. Design (TOM 1fff)
+    says a P0/P1 gets a full kickoff prompt at approval, but the rule lived only
+    inside process_queue_action, so cq-f1236540b61e (P1, seeded straight to
+    status="APPROVED") sat a full week approved-and-unstaged with nothing alarming.
+    Now, whatever path approved an item -- card tap, Monday menu, a seeding script,
+    or something not yet written -- a dropped priority kickoff surfaces within a day.
+
+    WARN, never critical: an unstaged kickoff is a dropped ball, not an outage.
+    """
+    try:
+        from cora import code_queue
+        offenders = code_queue.priority_items_missing_kickoff()
+    except Exception as exc:  # noqa: BLE001 -- a broken gauge never fails the run
+        return CheckResult("Priority kickoffs", "warn",
+                           f"Could not scan the code queue: {exc}")
+    if not offenders:
+        return CheckResult(
+            "Priority kickoffs", "ok",
+            "No APPROVED P0/P1 item is missing a kickoff prompt.")
+    detail = "; ".join(
+        f"{o['id']} [{o['severity']}/{o['entity']}] "
+        f"{('%.0fh' % o['age_hours']) if o.get('age_hours') else 'age?'}: {o['title'][:60]}"
+        for o in offenders[:5]
+    )
+    more = f" (+{len(offenders) - 5} more)" if len(offenders) > 5 else ""
+    return CheckResult(
+        "Priority kickoffs", "warn",
+        f"{len(offenders)} APPROVED P0/P1 item(s) have NO kickoff prompt after "
+        f"{code_queue.PRIORITY_KICKOFF_GRACE_HOURS}h -- tap Stage on each: "
+        f"{detail}{more}")
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 
@@ -1262,6 +1298,9 @@ def main() -> int:
 
     log.info("Checking knowledge-flywheel throughput...")
     all_results.extend(check_flywheel())
+
+    log.info("Checking for APPROVED P0/P1 items missing a kickoff prompt...")
+    all_results.append(check_priority_kickoffs())
 
     run_time = time.time() - t0
 
