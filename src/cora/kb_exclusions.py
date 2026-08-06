@@ -105,30 +105,51 @@ def is_excluded_folder(folder_id: str) -> bool:
     return bool(folder_id) and folder_id in KB_EXCLUDED_FOLDER_IDS
 
 
-# Weekly finance WORKSHEETS Cora generates for Justin (A5 S2b). These are
-# working documents, not knowledge: a cross-portfolio cash-forecast .md written
-# every Monday would static_md-ingest as HJRG chunks. Those chunks are
+# Generated finance WORKING STORES Cora writes into the Founder-OS accounting
+# tree. Two families, one rule:
+#
+#   forecast-assist/  -- the A5 S2b weekly worksheet (superseded at 13WCF M3)
+#   cashflow-ledger/  -- the 13-week shadow ledger (M1+): forecast snapshots,
+#                        QBO actuals, derived outlooks, worksheets, candidates
+#
+# These are working documents, not knowledge: a cross-portfolio cash-forecast
+# written every Monday would static_md-ingest as HJRG chunks. Those chunks are
 # unreachable from every Slack channel (no channel routes to HJRG) but ARE
 # reachable from founder-scoped surfaces (D-092 MCP, interactive sessions), and
-# accreting near-duplicate finance chunks weekly is KB pollution regardless.
+# accreting near-duplicate finance chunks weekly is KB pollution regardless. The
+# ledger adds a sharper reason: its candidates/ files are UNTRUSTED INPUT
+# (D-123) and its founder outlook carries war-chest and portfolio figures that
+# must never become retrievable chunks.
 #
-# Segment-based rather than folder-id-based on purpose: the folder is created by
-# the first run, so there is no id to pin at build time, and this predicate is
-# wired at the STORE chokepoint, which covers every connector including
-# static_md. Add the folder id to KB_EXCLUDED_FOLDER_IDS once it exists, as
+# Segment-based rather than folder-id-based on purpose: the folders are created
+# by their first run, so there is no id to pin at build time, and this predicate
+# is wired at the STORE chokepoint, which covers every connector including
+# static_md. Add each folder id to KB_EXCLUDED_FOLDER_IDS once it exists, as
 # belt-and-braces for the enumeration-time drive_sweep path.
-_FINANCE_WORKSHEET_SEGMENTS: frozenset[str] = frozenset({"forecast-assist"})
+_FINANCE_WORKSHEET_SEGMENTS: frozenset[str] = frozenset({
+    "forecast-assist",
+    "cashflow-ledger",
+})
+
+# Generated finance filenames, for the door the segment rule cannot see.
+#   *_forecast.json          -- 13WCF S1 snapshot mirror
+#   *cashflow-worksheet*.md  -- 13WCF S3 Monday worksheet (M3)
+# Anchored shapes, not bare "forecast": an ordinary business doc called
+# "2026-forecast-model.xlsx" must stay ingestable.
+_FINANCE_SNAPSHOT_NAME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_forecast\.json$", re.IGNORECASE
+)
 
 
 def is_finance_worksheet_path(path_or_source_id: str) -> bool:
-    """True if a path sits inside a generated finance-worksheet folder that must
+    """True if a path sits inside a generated finance working store that must
     never be KB-ingested. Segment-based, case-insensitive, handles ``/`` and ``\\``."""
     segs = {s.lower() for s in _segments(str(path_or_source_id or ""))}
     return bool(segs & _FINANCE_WORKSHEET_SEGMENTS)
 
 
 def is_finance_worksheet_title(title: str) -> bool:
-    """True if a Drive file's TITLE marks it a generated finance worksheet.
+    """True if a Drive file's TITLE marks it a generated finance working file.
 
     The path predicate above covers static_md, whose source_id IS the path. It
     does NOT cover ``drive_sweep``, which sets ``source_id`` to a bare Drive file
@@ -139,7 +160,11 @@ def is_finance_worksheet_title(title: str) -> bool:
     unaffected.
     """
     name = _basename(str(title or "")).lower()
-    return "forecast-assist" in name
+    return (
+        "forecast-assist" in name
+        or "cashflow-worksheet" in name
+        or bool(_FINANCE_SNAPSHOT_NAME_RE.match(name))
+    )
 
 
 def is_dashboard_store_path(path_or_source_id: str) -> bool:

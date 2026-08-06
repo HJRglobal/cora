@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -505,6 +505,52 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
             f"'{_QBO_MONITOR_TASK}' last ran {age_h:.0f}h ago (expected daily) -- "
             "it may have stopped firing.")
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
+
+
+def check_cashflow_forecast_snapshot(today: date | None = None) -> CheckResult:
+    """The 13WCF forecast snapshot (S1) must fire every Monday.
+
+    This is the most loss-critical job in the estate. The Standing ACTUALS sheet
+    overwrites its FORECAST column in place once a week closes (D-121), so a
+    Monday that goes unsnapshotted is forecast history destroyed permanently --
+    no later run can recover it, and forecast accuracy stays unmeasurable for
+    that week forever.
+
+    WARN from TUESDAY onward if this week's Monday has no snapshot (the
+    missed-run pattern from revops). Monday itself is silent: the job fires at
+    06:10 and the health check runs at 08:45, but a same-day WARN would fire for
+    hours on any week the task is merely late. `today` is injectable for tests.
+    """
+    today = today or date.today()
+    monday = today - timedelta(days=today.weekday())
+
+    try:
+        from cora import cashflow_ledger as cl  # noqa: PLC0415
+        dates = cl.list_snapshot_dates()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("13wk cashflow snapshot", "warn",
+                           f"could not read the snapshot store: {exc}")
+
+    if not dates:
+        return CheckResult(
+            "13wk cashflow snapshot", "warn",
+            "No forecast snapshot has ever been banked. Every week without one "
+            "is forecast history lost permanently. Run "
+            r"scripts\run_cashflow_forecast_snapshot.py.")
+
+    latest = dates[-1]
+    if latest >= monday:
+        return CheckResult("13wk cashflow snapshot", "ok",
+                           f"This week's snapshot is banked ({latest.isoformat()}).")
+    if today.weekday() == 0:
+        # Monday, before/around the 06:10 fire -- not yet a finding.
+        return CheckResult("13wk cashflow snapshot", "ok",
+                           f"Last snapshot {latest.isoformat()}; today's is due 06:10.")
+    return CheckResult(
+        "13wk cashflow snapshot", "warn",
+        f"No snapshot for the week of {monday.isoformat()} (latest is "
+        f"{latest.isoformat()}). 'cowork-cora-cashflow-forecast-snapshot' may have "
+        "stopped firing -- this week's forecast history is being lost.")
 
 
 _MCP_HTTP_TASK = "cowork-cora-mcp-http"
@@ -1074,6 +1120,9 @@ def main() -> int:
 
     log.info("Checking dynamic-answers snapshot freshness...")
     all_results.append(check_dynamic_snapshots())
+
+    log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
+    all_results.append(check_cashflow_forecast_snapshot())
 
     log.info("Checking MCP HTTP bridge (if registered)...")
     all_results.append(check_mcp_http_bridge())
