@@ -510,6 +510,188 @@ def _forecast_overwritten(forecast: Optional[float], actual: Optional[float]) ->
     return abs(actual - forecast) <= _FORECAST_OVERWRITE_EPSILON
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Forecast-vector support (13WCF shadow ledger, M1/S1) — ADDITIVE ONLY.
+#
+# Nothing below is read by an existing consumer. The frozensets, _parse_float,
+# _parse_week_date, get_cashflow and CashflowSummary above are untouched on
+# purpose (test-pinned in tests/test_cashflow_forecast_vector.py) — the shadow
+# ledger must not be able to move a figure on a live finance surface.
+# ────────────────────────────────────────────────────────────────────────────
+
+# The Standing ACTUALS tabs write an accounting dash for a FORMATTED ZERO and
+# leave a cell genuinely EMPTY when no value exists. _parse_float collapses both
+# to None, which is right for its callers (they only ever ask "is there a number
+# here") but wrong for the ledger: a real $0 forecast would be stored as UNKNOWN,
+# and the triplet self-check below could never run on a zero week (verified live
+# 2026-08-05 — e.g. CF_LLC "Services" week 10-17 is dash/dash/dash).
+#
+# UNKNOWN is never zero (D-117), so the two cases stay distinct here:
+#   "- " / "$-"  -> 0.0   (the sheet said zero)
+#   ""           -> None  (the sheet said nothing)
+_ACCOUNTING_ZERO_CELLS = frozenset({"-", "$-", "$ -", "- ", "0", "0.00"})
+
+
+def _parse_accounting_cell(val: Optional[str]) -> Optional[float]:
+    """Parse a Standing-ACTUALS money cell, honouring the accounting dash as 0.0.
+
+    Returns None only when the cell is genuinely empty or unparseable.
+    """
+    if val is None:
+        return None
+    s = val.strip()
+    if not s:
+        return None
+    if s in _ACCOUNTING_ZERO_CELLS or s.rstrip() in _ACCOUNTING_ZERO_CELLS:
+        return 0.0
+    return _parse_float(s)
+
+
+# Largest |DIFF - (ACTUAL - FORECAST)| still attributable to display rounding.
+#
+# Cells are read with FORMATTED_VALUE, so FORECAST, ACTUAL and DIFF are each
+# independently rounded to whole dollars -> the residual can reach 0.5*3 = 1.5
+# from rounding alone. $2.00 leaves a margin above that derived bound while
+# staying orders of magnitude below a genuine column misalignment (which moves
+# thousands). Measured live 2026-08-05: 756 checkable weeks across all 18 CF
+# tabs, worst residual under $1.00, zero failures.
+_TRIPLET_RESIDUAL_TOLERANCE = 2.00
+
+# Row labels for the two measures the shadow ledger stores. Ending cash and
+# beginning cash reuse the existing balance frozensets (same rows, same decoy
+# protection); net cash flow needs its own because no existing consumer reads it.
+#
+# The decoy row "Total Liquidity - ENDING Cash/CC - Book Balance-S/B ZERO"
+# (value 0) is excluded by construction: it matches none of these strings.
+_NET_FLOW_LABELS = frozenset({"net cash flow"})
+
+#: Measure key -> label frozenset, in stored order.
+FORECAST_MEASURES: dict[str, frozenset[str]] = {
+    "ending_cash": _CLOSING_BALANCE_LABELS,
+    "net_cash_flow": _NET_FLOW_LABELS,
+    "beginning_cash": _OPENING_BALANCE_LABELS,
+}
+
+#: Basis label for a week whose FORECAST cell still holds a real forecast.
+BASIS_FORECAST = "forecast"
+
+#: Basis label for a completed week's FORECAST cell (D-121). On this sheet the
+#: forecast column is overwritten with the actual once a week closes — 42 of 43
+#: historical weeks matched to sub-dollar rounding (A5 §0.5). Storing such a cell
+#: as "forecast" would replant the exact defect the shadow ledger exists to fix,
+#: so a week that carries an ACTUAL is labelled this instead, always.
+BASIS_POST_CLOSE = "post_close_column_value"
+
+
+class WeekGridError(Exception):
+    """The week grid could not be resolved into absolute, uniform week-endings."""
+
+
+def resolve_week_endings(
+    labels: list[str],
+    *,
+    today: Optional[date] = None,
+) -> tuple[list[date], str]:
+    """Resolve bare "M-D" week labels to absolute dates + the week-ending weekday.
+
+    The sheet's headers carry no year ("10-17", "8-7", "10-30") and the grid spans
+    a year boundary in BOTH directions from today. ``_parse_week_date``'s
+    most-recent-past-occurrence rule is correct for its own callers (which only
+    ever ask about a week that has already happened) but wrong here: on
+    2026-08-05 it maps the forward week "10-30" to 2025-10-30, a year in the past.
+    Since the ledger is keyed by absolute week-ending dates, that would silently
+    corrupt every forward key.
+
+    Columns are strictly chronological left-to-right, so instead we anchor on the
+    LAST label that resolves into the past (safe for the past-occurrence rule) and
+    walk outward, bumping the year whenever the month/day wraps. The week-ending
+    weekday is then DERIVED from the resolved grid rather than assumed (Fin-13),
+    and uniformity is asserted: one weekday, every gap exactly 7 days.
+
+    Raises WeekGridError if the grid is unparseable or non-uniform — the caller
+    renders the tab UNKNOWN rather than storing a guessed calendar.
+    """
+    today = today or date.today()
+    if not labels:
+        raise WeekGridError("no week columns found")
+
+    parsed: list[tuple[int, int]] = []
+    for raw in labels:
+        m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})", raw or "")
+        if not m:
+            raise WeekGridError(f"unparseable week label {raw!r}")
+        parsed.append((int(m.group(1)), int(m.group(2))))
+
+    # Anchor: the LAST label whose CURRENT-YEAR reading has already happened —
+    # i.e. the most recent week that genuinely occurred. The year-1 fallback is
+    # deliberately NOT allowed here: on the live grid "8-7" (a forward week) also
+    # resolves into the past as 2025-08-07 and would steal the anchor from
+    # "7-31", shifting the whole walk back a year.
+    anchor_idx = None
+    anchor_date = None
+    for i, (mo, da) in enumerate(parsed):
+        try:
+            cand = date(today.year, mo, da)
+        except ValueError:
+            continue
+        if cand <= today:
+            anchor_idx, anchor_date = i, cand
+    if anchor_idx is None:
+        # Grid lies entirely ahead of today (no completed week on this tab).
+        # Anchor the first column on its next occurrence and walk forward.
+        mo, da = parsed[0]
+        for year in (today.year, today.year + 1):
+            try:
+                cand = date(year, mo, da)
+            except ValueError:
+                continue
+            if cand >= today:
+                anchor_idx, anchor_date = 0, cand
+                break
+    if anchor_idx is None or anchor_date is None:
+        raise WeekGridError("no week column resolves to a usable date")
+
+    out: list[Optional[date]] = [None] * len(parsed)
+    out[anchor_idx] = anchor_date
+
+    prev = anchor_date
+    for i in range(anchor_idx + 1, len(parsed)):
+        mo, da = parsed[i]
+        try:
+            cand = date(prev.year, mo, da)
+            if cand <= prev:
+                cand = date(prev.year + 1, mo, da)
+        except ValueError as exc:
+            raise WeekGridError(f"invalid week date {mo}-{da}") from exc
+        out[i] = cand
+        prev = cand
+
+    prev = anchor_date
+    for i in range(anchor_idx - 1, -1, -1):
+        mo, da = parsed[i]
+        try:
+            cand = date(prev.year, mo, da)
+            if cand >= prev:
+                cand = date(prev.year - 1, mo, da)
+        except ValueError as exc:
+            raise WeekGridError(f"invalid week date {mo}-{da}") from exc
+        out[i] = cand
+        prev = cand
+
+    resolved = [d for d in out if d is not None]
+    if len(resolved) != len(parsed):  # pragma: no cover -- defensive
+        raise WeekGridError("week grid did not fully resolve")
+
+    weekdays = {d.strftime("%A") for d in resolved}
+    if len(weekdays) != 1:
+        raise WeekGridError(f"week endings span multiple weekdays: {sorted(weekdays)}")
+    gaps = {(resolved[i + 1] - resolved[i]).days for i in range(len(resolved) - 1)}
+    if gaps and gaps != {7}:
+        raise WeekGridError(f"week endings are not uniformly 7 days apart: {sorted(gaps)}")
+
+    return resolved, weekdays.pop()
+
+
 def _parse_week_date(week_label: str, today: Optional[date] = None) -> Optional[date]:
     """Parse the date out of a week label ("Week of 5-29", "Week of 5/29/2026").
 
@@ -893,3 +1075,241 @@ def get_cashflow(
         summary.as_of_date,
     )
     return summary
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Forecast vectors (13WCF shadow ledger, M1/S1) — ADDITIVE public API
+# ────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class WeekPoint:
+    """One week of one measure on one tab."""
+    week_label: str                 # raw sheet header, e.g. "8-14"
+    week_ending: str                # resolved ISO date, e.g. "2026-08-14"
+    forecast: Optional[float]
+    actual: Optional[float]
+    diff: Optional[float]
+    basis: str                      # BASIS_FORECAST | BASIS_POST_CLOSE
+
+    @property
+    def is_closed(self) -> bool:
+        """True once the week carries an ACTUAL — i.e. its forecast cell is gone."""
+        return self.actual is not None
+
+    def as_dict(self) -> dict:
+        return {
+            "week_label": self.week_label,
+            "week_ending": self.week_ending,
+            "forecast": self.forecast,
+            "actual": self.actual,
+            "diff": self.diff,
+            "basis": self.basis,
+        }
+
+
+@dataclass
+class ForecastVector:
+    """A tab's full week grid across the stored measures.
+
+    ``status`` is "ok" or "unknown". An UNKNOWN vector carries no series at all —
+    a tab whose grid or triplet check failed renders as UNKNOWN everywhere rather
+    than contributing a guessed column to a finance surface (Fin-12/D-117).
+    """
+    tab: str
+    status: str = "ok"
+    unknown_reason: str = ""
+    week_ending_weekday: str = ""
+    # measure key -> list[WeekPoint]
+    series: dict[str, list[WeekPoint]] = field(default_factory=dict)
+    last_actual_week_ending: Optional[str] = None
+    forward_week_endings: list[str] = field(default_factory=list)
+    triplet_checked: int = 0
+    triplet_worst_residual: float = 0.0
+    missing_measures: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    def as_dict(self) -> dict:
+        return {
+            "tab": self.tab,
+            "status": self.status,
+            "unknown_reason": self.unknown_reason,
+            "week_ending_weekday": self.week_ending_weekday,
+            "last_actual_week_ending": self.last_actual_week_ending,
+            "forward_week_endings": list(self.forward_week_endings),
+            "forward_weeks": len(self.forward_week_endings),
+            "triplet_checked": self.triplet_checked,
+            "triplet_worst_residual": round(self.triplet_worst_residual, 2),
+            "missing_measures": list(self.missing_measures),
+            "series": {
+                key: [p.as_dict() for p in points]
+                for key, points in self.series.items()
+            },
+        }
+
+
+def _find_measure_row(
+    data_rows: list[list[str]], labels: frozenset[str]
+) -> Optional[list[str]]:
+    """First data row whose column-0 label matches any of ``labels``."""
+    for row in data_rows:
+        if row and row[0].strip() and _label_matches_any(row[0], labels):
+            return row
+    return None
+
+
+def parse_forecast_vector(
+    csv_text: str,
+    tab: str,
+    *,
+    today: Optional[date] = None,
+) -> ForecastVector:
+    """Parse one CF tab's CSV into a ForecastVector. Pure; no I/O.
+
+    Never raises on a data problem — a tab that cannot be trusted comes back
+    ``status="unknown"`` with a reason, so one malformed tab degrades to UNKNOWN
+    instead of killing the weekly sweep or, worse, contributing a guessed figure.
+    """
+    def _unknown(reason: str) -> ForecastVector:
+        log.warning("forecast vector UNKNOWN for tab=%s: %s", tab, reason)
+        return ForecastVector(tab=tab, status="unknown", unknown_reason=reason)
+
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    if not rows:
+        return _unknown("tab returned no rows")
+
+    date_row_idx, col_row_idx = _find_header_rows(rows)
+    if date_row_idx == -1:
+        return _unknown("could not locate the date/column header rows")
+
+    col_map = _build_column_map(
+        rows[date_row_idx],
+        rows[col_row_idx] if col_row_idx < len(rows) else rows[date_row_idx],
+    )
+    week_labels = _ordered_weeks(col_map)
+    if not week_labels:
+        return _unknown("no week columns found")
+
+    try:
+        endings, weekday = resolve_week_endings(week_labels, today=today)
+    except WeekGridError as exc:
+        return _unknown(f"week grid unusable: {exc}")
+
+    data_rows = rows[max(date_row_idx, col_row_idx) + 1:]
+
+    # Pre-index the triplet columns per week so the measure loop stays flat.
+    cols: dict[str, dict[str, list[int]]] = {}
+    for wk in week_labels:
+        cols[wk] = {
+            kind: [i for i, (w, ct) in enumerate(col_map) if w == wk and ct == kind]
+            for kind in ("FORECAST", "ACTUAL", "DIFF")
+        }
+
+    def _cell(row: list[str], idxs: list[int]) -> Optional[float]:
+        for ci in idxs:
+            if ci < len(row):
+                v = _parse_accounting_cell(row[ci])
+                if v is not None:
+                    return v
+        return None
+
+    series: dict[str, list[WeekPoint]] = {}
+    missing: list[str] = []
+    checked = 0
+    worst = 0.0
+
+    for measure, labels in FORECAST_MEASURES.items():
+        row = _find_measure_row(data_rows, labels)
+        if row is None:
+            missing.append(measure)
+            continue
+        points: list[WeekPoint] = []
+        for wk, ending in zip(week_labels, endings):
+            f = _cell(row, cols[wk]["FORECAST"])
+            a = _cell(row, cols[wk]["ACTUAL"])
+            d = _cell(row, cols[wk]["DIFF"])
+            # D-121: once a week closes, its FORECAST cell holds the actual.
+            basis = BASIS_POST_CLOSE if a is not None else BASIS_FORECAST
+            points.append(WeekPoint(
+                week_label=wk,
+                week_ending=ending.isoformat(),
+                forecast=f,
+                actual=a,
+                diff=d,
+                basis=basis,
+            ))
+            # Positional self-check (Fin-12). This does not verify that a column
+            # is *labelled* right — it verifies the three cells we picked for this
+            # week belong to the SAME week. A one-column slip pulls a neighbouring
+            # week's balance in and blows the residual by orders of magnitude.
+            if f is not None and a is not None and d is not None:
+                checked += 1
+                residual = abs(d - (a - f))
+                worst = max(worst, residual)
+                if residual > _TRIPLET_RESIDUAL_TOLERANCE:
+                    return _unknown(
+                        f"triplet self-check failed on {measure} week {wk}: "
+                        f"DIFF {d} != ACTUAL {a} - FORECAST {f} "
+                        f"(residual {residual:.2f} > {_TRIPLET_RESIDUAL_TOLERANCE:.2f})"
+                    )
+        series[measure] = points
+
+    if "ending_cash" not in series:
+        return _unknown("no Ending Cash/CC Book Balance row on this tab")
+
+    anchor = series["ending_cash"]
+    closed = [p for p in anchor if p.is_closed]
+    last_actual = closed[-1].week_ending if closed else None
+    # Forward = every week after the last CLOSED one. Derived per tab on purpose:
+    # verified live 2026-08-05 the boundary is NOT uniform (CF_HJR Prop carried an
+    # actual for 8-7 while all 17 other tabs stopped at 7-31), so a global week-0
+    # would mis-slice this tab every time.
+    forward = [
+        p.week_ending for p in anchor
+        if last_actual is None or p.week_ending > last_actual
+    ]
+
+    return ForecastVector(
+        tab=tab,
+        status="ok",
+        week_ending_weekday=weekday,
+        series=series,
+        last_actual_week_ending=last_actual,
+        forward_week_endings=forward,
+        triplet_checked=checked,
+        triplet_worst_residual=worst,
+        missing_measures=missing,
+    )
+
+
+def build_sheets_service():
+    """Public builder so a batch caller can authenticate once for many tabs.
+
+    Direct SA credentials — the sheet is shared with the SA and DWD stays broken
+    for the spreadsheets scope (see _build_direct_sa_creds).
+    """
+    return _build_sheets_service(_build_direct_sa_creds())
+
+
+def get_forecast_vector(
+    tab_name: str,
+    *,
+    file_id: Optional[str] = None,
+    sheets_service=None,
+    today: Optional[date] = None,
+) -> ForecastVector:
+    """Read one CF tab and return its ForecastVector.
+
+    Deliberately NOT cached: ``get_cashflow``'s 30-minute cache is right for
+    interactive reads, but the weekly snapshot must capture the sheet as it
+    stands at that instant, and a cached grid would silently bank a stale one.
+
+    Raises GsheetsConnectorError on an auth/API failure so the caller can mark
+    that tab unreadable; a *parse* problem comes back as an UNKNOWN vector.
+    """
+    fid = file_id or cashflow_file_id()
+    svc = sheets_service or build_sheets_service()
+    csv_text = _export_sheet_as_csv(svc, fid, tab_name)
+    return parse_forecast_vector(csv_text, tab_name, today=today)
