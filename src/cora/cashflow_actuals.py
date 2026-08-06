@@ -646,6 +646,82 @@ def _window_notes(window_kind: str) -> list[str]:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Advisory cross-checks -- labelled references, never pass/fail
+# ────────────────────────────────────────────────────────────────────────────
+
+def annotate_advisory(
+    payload: dict,
+    *,
+    register_snapshot: Optional[dict] = None,
+    prior_finalized: Optional[dict] = None,
+) -> dict:
+    """Attach the two cross-checks that are REFERENCES, not verdicts.
+
+    Both exist because the design asks for a reconciliation anchor, and both are
+    deliberately toothless (D-120, finance F10): they compare figures that are
+    allowed to differ, so flagging on them would train the reader to ignore the
+    one signal that marks a real gap.
+
+    register_reference -- the A5 daily bank snapshot's register balance. That is
+        a DIFFERENT MEASURE at a DIFFERENT INSTANT: `Account.CurrentBalance` as of
+        whenever the snapshot ran, against a General Ledger closing balance as of
+        the window end. Verified live that register and report figures disagree
+        materially on the same account at the same moment, so this renders as a
+        labelled reference and `comparable` is true only when the snapshot's own
+        as-of date IS the window end. There is no register SERIES to match
+        against: A5 keeps one overwritten `qbo-bank-latest.json`, so the matched
+        as-of pairs the design imagined do not exist yet -- said plainly here
+        rather than faked with the nearest available number.
+
+    chain_check -- the prior FINALIZED window's closing balance against this
+        window's opening balance. Same measure, same source, so a non-zero
+        residual is real information: it means activity was booked INTO a week
+        that had already been finalised (a back-date or a hand edit). Still
+        advisory: the correct response is a human look at the books, not a
+        withheld figure.
+    """
+    finalized = payload.get("window_kind") == WINDOW_FINALIZED
+
+    for realm, block in (payload.get("realms") or {}).items():
+        if block.get("status") != "ok":
+            continue
+
+        if finalized and register_snapshot:
+            snap_realm = ((register_snapshot.get("realms") or {}).get(realm) or {})
+            if snap_realm.get("status") == "ok":
+                as_of = str(snap_realm.get("as_of_utc") or "")[:10]
+                block["register_reference"] = {
+                    "bank_total": snap_realm.get("bank_total"),
+                    "as_of": as_of or None,
+                    "basis": register_snapshot.get("basis"),
+                    "comparable": bool(as_of) and as_of == payload.get("week_ending"),
+                    "note": (
+                        "Account-register balance, a DIFFERENT measure at a "
+                        "different instant from this window's ledger closing "
+                        "balance. A gap is not a reconciliation break (D-120)."
+                    ),
+                }
+
+        if finalized and prior_finalized:
+            prior_block = ((prior_finalized.get("realms") or {}).get(realm) or {})
+            prior_close = prior_block.get("closing_bank_balance")
+            opening = block.get("opening_bank_balance")
+            if prior_close is not None and opening is not None:
+                block["chain_check"] = {
+                    "prior_week_ending": prior_finalized.get("week_ending"),
+                    "prior_closing_balance": prior_close,
+                    "residual": round(opening - prior_close, 2),
+                    "note": (
+                        "Same measure, same source: a non-zero residual means "
+                        "activity was booked into a week already finalised. "
+                        "Advisory -- a human look at the books, not a withheld "
+                        "figure."
+                    ),
+                }
+    return payload
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Persist
 # ────────────────────────────────────────────────────────────────────────────
 
