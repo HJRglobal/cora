@@ -38,6 +38,7 @@ from .knowledge_base import embeddings as kb_embeddings
 from . import sibling_guard
 from . import cross_entity_guard
 from . import info_intake
+from . import qa_scaffolding
 from . import historical_access
 from . import finance_receipts
 from . import model_router
@@ -1726,6 +1727,15 @@ def _handle_note(
     kind: str = "note",
 ) -> None:
     """Paraphrase a contribution and ask the author to confirm before queuing for approval."""
+    # D-104 [QA] quarantine (2026-08-06). The note path is a fourth intake surface
+    # and the only one that spends a Haiku call BEFORE anything is queued, so an
+    # unscreened "@Cora note: [QA] ..." both costs a model call and stages a
+    # confirm. Screened here, at the single entry both callers share.
+    if qa_scaffolding.is_qa_message(content):
+        log.info("team_learning: [QA] smoke note -- not captured user=%s", user_id)
+        say(text="[QA] noted -- treated as test traffic, not captured as knowledge.",
+            thread_ts=original_ts, unfurl_links=False)
+        return
     if not team_learning.is_authorized_contributor(user_id, entity):
         say(
             text=(

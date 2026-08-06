@@ -82,6 +82,9 @@ _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "info-for-cora-watermark.json"
 # bounded window keeps the first run reviewable.
 _DEFAULT_BOOTSTRAP_DAYS = 30
 
+# Hard bound on pagination so a bad cursor loop can never spin.
+_MAX_PAGES = 10
+
 # NOTE: the sweep does not carry a subtype ALLOW list -- see _eligible(), which
 # rejects every subtyped message. The event path keeps its explicit list because
 # it must stay behaviour-compatible with the D1 handler.
@@ -107,20 +110,32 @@ def _fetch_messages(client, oldest: str, limit: int) -> list[dict[str, Any]]:
     advance monotonically and a mid-run failure only costs the unprocessed tail."""
     out: list[dict[str, Any]] = []
     cursor = None
-    while True:
+    pages = 0
+    while pages < _MAX_PAGES:
         resp = client.conversations_history(
             channel=info_intake.CHANNEL_ID, oldest=oldest, limit=200,
             inclusive=False, cursor=cursor,
         )
         out.extend(resp.get("messages") or [])
-        if len(out) >= limit:
-            break
+        pages += 1
         meta = resp.get("response_metadata") or {}
         cursor = meta.get("next_cursor")
         if not cursor:
             break
         time.sleep(1)  # courteous pagination
+    # Slack returns NEWEST-first. Sort ascending and keep the OLDEST `limit`, never
+    # the newest: the cap must trim the FUTURE end of the window, not the past.
+    #
+    # D-038 cap-aware-watermark lesson (the gmail sweep learned this the hard way):
+    # an earlier cut broke pagination as soon as `limit` messages were collected,
+    # which kept the NEWEST ones. The watermark then jumped to the newest processed
+    # message and every older unprocessed message in the window was skipped
+    # FOREVER. Taking the oldest slice keeps the watermark contiguous, so a backlog
+    # larger than the cap simply drains over consecutive runs.
     out.sort(key=lambda m: float(m.get("ts") or 0))
+    if len(out) > limit:
+        log.warning("window holds %d messages; processing the OLDEST %d this run -- "
+                    "the remainder drains on the next run", len(out), limit)
     return out[:limit]
 
 
@@ -208,11 +223,21 @@ def main() -> int:
     counts: dict[str, int] = {}
     names: dict[str, str] = {}
     high_water = ""
+    # Once a message ERRORs, STOP advancing the watermark for the rest of the run.
+    # Marking only the errored message as "not advanced" was not enough: messages
+    # are processed oldest-first, so the very next success moved the watermark past
+    # the failure and the errored message was silently skipped anyway -- the exact
+    # silent-skip failure the cap fix above also guards against. ingest() returns
+    # ERROR only for systemic causes (ledger write failure, PHI checker down),
+    # which affect the whole run, so freezing here costs one deferred run and is
+    # loudly logged rather than losing a contribution.
+    frozen = False
 
     for msg in messages:
         ts = str(msg.get("ts") or "")
         if not _eligible(msg, bot_user_id):
-            high_water = ts or high_water
+            if not frozen:
+                high_water = ts or high_water
             continue
         user = msg.get("user") or ""
         result = info_intake.ingest(
@@ -239,8 +264,14 @@ def main() -> int:
                 log.warning("ack post failed for ts=%s", ts, exc_info=True)
 
         # Advance only over messages we actually finished, so a crash re-reads the
-        # tail rather than skipping it. ERROR does NOT advance (retry next run).
-        if result.outcome != info_intake.ERROR:
+        # tail rather than skipping it.
+        if result.outcome == info_intake.ERROR:
+            if not frozen:
+                log.warning("ts=%s errored -- freezing the watermark here; this run "
+                            "processes the rest but the next run re-reads from %s",
+                            ts, high_water or "the window start")
+            frozen = True
+        elif not frozen:
             high_water = ts or high_water
 
     if args.dry_run:

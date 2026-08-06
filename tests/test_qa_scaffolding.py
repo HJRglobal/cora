@@ -88,3 +88,26 @@ class TestDecisionInboxQuarantine:
             "payload": {"entity": "F3E"},
         })
         assert excluded is False and reason == ""
+
+
+class TestNotePathQuarantine:
+    """The @Cora note: path is a fourth intake surface -- and the only one that
+    spends a Haiku paraphrase call BEFORE anything is queued."""
+
+    def test_qa_note_never_paraphrased_or_staged(self):
+        from unittest.mock import MagicMock
+        import cora.app as app_module
+        say, client = MagicMock(), MagicMock()
+        with patch.object(app_module.team_learning, "is_authorized_contributor") as auth, \
+             patch.object(app_module.team_learning, "paraphrase_note") as para, \
+             patch.object(app_module.team_learning, "store_pending_confirm") as pend:
+            app_module._handle_note(
+                client=client, say=say, entity="F3E", channel_id="C1",
+                channel_name="f3e-sales", user_id="U1",
+                content="[QA] smoke -- the vendor is Apex Appliance",
+                original_ts="1.1")
+        # Screened before the authorization check, so no model call and no stash.
+        assert not auth.called
+        assert not para.called   # no Haiku call
+        assert not pend.called
+        assert "[QA]" in say.call_args.kwargs["text"]
