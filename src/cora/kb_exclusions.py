@@ -85,6 +85,23 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # 00-Founder/travel-points (PERSONAL)
         "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # Downloads/OneAmerica-Handoff dup (PERSONAL, F-09 parked #2)
         "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ",  # 08-Lexington-Services/projects/copa-bhrf (LEX NDA -- 2026-07-21 purge)
+        # 01-HJR-Global/accounting/cashflow-ledger -- the 13WCF shadow-ledger
+        # mirror. Closes the "carried finding" from the M1 cascade report
+        # (_shared/projects/cora/2026-08-05_fndr_13wcf-M1-CASCADE-REPORT.md):
+        # until the first mirror run created this folder there was no id to pin,
+        # so the drive_sweep door rested entirely on is_finance_worksheet_title
+        # -- a FILENAME heuristic carrying the whole boundary. Pinning the folder
+        # makes that door PATH-covered and demotes the title rule to a belt.
+        #
+        # The parent id alone is sufficient AND future-proof: sweep_founders_os
+        # passes this set as skip_folder_ids, and its BFS neither processes a
+        # skipped folder nor enqueues its subfolders, so the whole subtree is
+        # pruned -- today's forecast-snapshots/ and the actuals/, worksheets/,
+        # candidates/ and outlook-entities/ folders M2-M4 will add. The flat
+        # per-user sweep is covered separately by _expanded_excluded_folder_ids.
+        # Verified live 2026-08-05: this id resolves to "cashflow-ledger" under
+        # accounting <- 01-HJR-Global <- HJR-Founder-OS.
+        "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7",  # 01-HJR-Global/accounting/cashflow-ledger (13WCF mirror)
     }
 )
 
@@ -124,8 +141,12 @@ def is_excluded_folder(folder_id: str) -> bool:
 # Segment-based rather than folder-id-based on purpose: the folders are created
 # by their first run, so there is no id to pin at build time, and this predicate
 # is wired at the STORE chokepoint, which covers every connector including
-# static_md. Add each folder id to KB_EXCLUDED_FOLDER_IDS once it exists, as
-# belt-and-braces for the enumeration-time drive_sweep path.
+# static_md. Once a folder EXISTS, pin its id in KB_EXCLUDED_FOLDER_IDS too --
+# that is what makes the enumeration-time drive_sweep path path-covered instead
+# of leaving the title heuristic below load-bearing.
+#   cashflow-ledger  -- PINNED 2026-08-05 (id above)
+#   forecast-assist  -- not pinned; superseded at 13WCF M3, so the segment rule
+#                       carries it out rather than acquiring a new id to retire
 _FINANCE_WORKSHEET_SEGMENTS: frozenset[str] = frozenset({
     "forecast-assist",
     "cashflow-ledger",

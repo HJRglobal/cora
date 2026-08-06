@@ -16,11 +16,19 @@ import pytest
 
 from cora import cashflow_ledger as cl
 from cora.kb_exclusions import (
+    KB_EXCLUDED_FOLDER_IDS,
+    folder_ids_excluded,
+    is_excluded_folder,
     is_finance_worksheet_path,
     is_finance_worksheet_title,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: 01-HJR-Global/accounting/cashflow-ledger -- the 13WCF shadow-ledger mirror.
+#: Verified live 2026-08-05 to resolve to "cashflow-ledger" under
+#: accounting <- 01-HJR-Global <- HJR-Founder-OS.
+CASHFLOW_LEDGER_FOLDER = "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7"
 
 
 # ── path / title exclusion ──────────────────────────────────────────────────
@@ -90,6 +98,75 @@ class TestLedgerIsKbExcluded:
         assert "is_finance_worksheet_path(doc.source_id)" in source
         assert "is_finance_worksheet_path(meta_path)" in source
         assert "is_finance_worksheet_title(doc.title)" in source
+
+
+class TestLedgerFolderIsPinnedOnTheDriveSweepPath:
+    """The `carried finding` from the M1 cascade report, now closed.
+
+    Until the first mirror run created the folder there was no id to pin, so the
+    drive_sweep door rested entirely on `is_finance_worksheet_title` -- a
+    FILENAME heuristic carrying the whole boundary. These pin the id AND the two
+    mechanisms that make it load-bearing, so the coverage cannot silently revert
+    to title-matching.
+    """
+
+    def test_the_folder_id_is_pinned(self):
+        assert CASHFLOW_LEDGER_FOLDER in KB_EXCLUDED_FOLDER_IDS
+        assert is_excluded_folder(CASHFLOW_LEDGER_FOLDER)
+
+    def test_a_file_parented_directly_in_it_is_excluded(self):
+        assert folder_ids_excluded([CASHFLOW_LEDGER_FOLDER])
+        assert folder_ids_excluded(["someOtherFolder", CASHFLOW_LEDGER_FOLDER])
+        assert not folder_ids_excluded(["someOtherFolder"])
+        assert not folder_ids_excluded(None)
+
+    def test_the_founders_os_walk_prunes_the_whole_subtree(self):
+        """The snapshots live in a CHILD folder (forecast-snapshots/), so the
+        parent id only covers them because the BFS skips a folder AND never
+        enqueues its subfolders. M2-M4 add actuals/, worksheets/, candidates/
+        and outlook-entities/ -- all covered by the same prune, which is why one
+        parent id is enough and no child ids need pinning."""
+        source = (_REPO_ROOT / "src" / "cora" / "connectors"
+                  / "drive_sweep.py").read_text(encoding="utf-8")
+        assert "skip_folder_ids=KB_EXCLUDED_FOLDER_IDS" in source
+        assert "current_id in skip_folder_ids" in source
+        assert 'subfolder["id"] not in skip_folder_ids' in source
+
+    def test_the_flat_sweep_expansion_reaches_nested_subfolders(self):
+        """The per-user sweep has no tree context, so it relies on the roots
+        being expanded to their descendants. Fake tree: the ledger folder has a
+        forecast-snapshots child, exactly like the live one."""
+        from cora.connectors import drive_sweep
+
+        tree = {CASHFLOW_LEDGER_FOLDER: [{"id": "forecast-snapshots-child"}]}
+
+        class _Req:
+            def __init__(self, fid):
+                self._fid = fid
+
+            def execute(self):
+                return {"files": tree.get(self._fid, [])}
+
+        class _Files:
+            def list(self, *, q, **k):
+                return _Req(q.split("'")[1])
+
+        class _Service:
+            def files(self):
+                return _Files()
+
+        expanded, complete = drive_sweep._expanded_excluded_folder_ids(_Service())
+        assert complete is True
+        assert CASHFLOW_LEDGER_FOLDER in expanded
+        assert "forecast-snapshots-child" in expanded
+        assert folder_ids_excluded(["forecast-snapshots-child"], expanded)
+
+    def test_the_title_rule_is_now_a_belt_not_the_boundary(self):
+        """Both doors must hold independently -- if pinning the folder ever gets
+        reverted, the title rule alone should still catch the mirror files."""
+        assert is_finance_worksheet_title("2026-08-10_forecast.json")
+        assert is_finance_worksheet_path(
+            "01-HJR-Global/accounting/cashflow-ledger/forecast-snapshots/x.json")
 
 
 class TestJsonMimeInvariantCoversTheLedger:
