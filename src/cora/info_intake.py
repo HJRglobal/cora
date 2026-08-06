@@ -63,7 +63,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import cross_entity_guard, knowledge_review, phi_guard
+from . import cross_entity_guard, knowledge_review, phi_guard, qa_scaffolding
 from .known_answers_map import ENTITY_FILES
 
 log = logging.getLogger(__name__)
@@ -98,11 +98,8 @@ _SENT_USING_RE = re.compile(
     r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$", re.IGNORECASE)
 
 # ── [QA] quarantine (D-104) ─────────────────────────────────────────────────
-# A literal [QA] PREFIX marks smoke-test traffic. Allow leading whitespace and
-# leading Slack formatting characters so "*[QA] ..." or "> [QA] ..." still match.
-# Prefix-anchored on purpose: a mid-sentence mention of "[QA]" inside a genuine
-# contribution ("our [QA] process changed") must NOT silently swallow the fact.
-_QA_PREFIX_RE = re.compile(r"^\s*(?:[*_~`>\s]+)?\[qa\]", re.IGNORECASE)
+# Delegated to qa_scaffolding so this surface, the gap log, the code queue and the
+# decision inbox all honour ONE definition of the marker.
 
 # ── Durable-knowledge screen ────────────────────────────────────────────────
 # MEASURED against the real channel (38 messages, 2026-04..08): the plain
@@ -233,7 +230,7 @@ def strip_connector_footer(text: str) -> tuple[str, bool]:
 
 def is_qa_quarantined(text: str) -> bool:
     """True when the message carries the literal [QA] prefix (D-104 smoke traffic)."""
-    return bool(_QA_PREFIX_RE.match(text or ""))
+    return qa_scaffolding.is_qa_message(text)
 
 
 def intake_update_id(ts: str) -> str:

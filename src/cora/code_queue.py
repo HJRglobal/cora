@@ -898,6 +898,13 @@ def capture_message_signal(text: str, entity: str, channel_id: str, channel_name
     try:
         if code_queue_level() == "off":
             return
+        # D-104 [QA] quarantine (2026-08-06): a smoke-test message must never mint a
+        # capture card. Checked before phrase/deflection detection so neither signal
+        # can carry it through.
+        from . import qa_scaffolding
+        if qa_scaffolding.is_qa_message(text):
+            log.info("code_queue: [QA] smoke message -- signal not captured")
+            return
         clean = _strip_quoted(text or "")
         phrase_hit = bool(_PHRASE_RE.search(clean))
         deflect_hit = bool(_DEFLECTION_RE.search(response_text or ""))

@@ -93,6 +93,15 @@ def log_gap(
     best_distance: float | None = None,
     chunks_returned: int | None = None,
 ) -> None:
+    # D-104 [QA] quarantine (2026-08-06): a smoke-test message must never mint a
+    # knowledge gap. Checked FIRST -- ahead of the capability-ask reroute -- so a
+    # capability-shaped smoke ask ("[QA] can you access X?") does not get filed as a
+    # code-queue feature candidate either. This is the shared sink for all three
+    # log_gap callers, so one check covers every gap producer.
+    from . import qa_scaffolding
+    if qa_scaffolding.is_qa_message(question):
+        log.info("knowledge_gaps: [QA] smoke message -- gap not logged")
+        return
     # Fork 3a (earliest-intercept, shared sink): a capability ask is rerouted to the
     # code-queue as a feature candidate instead of ever landing in this log -- this
     # single check covers all three log_gap callers (gap_detection.maybe_log_gap,

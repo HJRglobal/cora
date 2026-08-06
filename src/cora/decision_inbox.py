@@ -121,7 +121,7 @@ def _screen_text(update: dict[str, Any]) -> str:
 
 def screen_decision(update: dict[str, Any]) -> tuple[bool, str]:
     """(excluded, reason) for a decision_capture item. FAIL-CLOSED: any error in
-    screening counts as excluded. Reasons: lex_entity | lex_token | phi |
+    screening counts as excluded. Reasons: lex_entity | lex_token | phi | qa |
     screen_error | "" (not excluded).
 
     Checked at BOTH chokepoints: the drain before a card renders, and
@@ -133,6 +133,14 @@ def screen_decision(update: dict[str, Any]) -> tuple[bool, str]:
         text = _screen_text(update)
         if _LEX_TOKEN_RE.search(text):
             return True, "lex_token"
+        # D-104 [QA] quarantine (2026-08-06). Uses the ANYWHERE predicate, not the
+        # prefix one: by the time a decision reaches this screen the text is a
+        # derived summary plus a serialized payload, so the original prefix
+        # position is gone. A decision mined out of smoke traffic is never canon,
+        # so over-excluding here is the cheap direction.
+        from . import qa_scaffolding
+        if qa_scaffolding.contains_qa_marker(text):
+            return True, "qa"
         from .phi_guard import is_any_phi
         if is_any_phi(text):
             return True, "phi"
