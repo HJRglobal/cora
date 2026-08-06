@@ -3631,16 +3631,168 @@ def _resolve_sku_alias(product_query: str) -> tuple[str, bool]:
     return (hit, True) if hit else (product_query, False)
 
 
+# ── Pack-qualifier tolerance (9-RED-2 / cq-861ca3630d31, 2026-08-05) ──────────
+# Live defect, reproduced 2x: single-item mode refused "F3 Pure Variety Pack
+# 12-pack" and "Pure Strawberry Lemonade 12-pack" while the identical products
+# resolved on the items[] batch path.
+#
+# VERIFY-FIRST OVERTURNED THE "two code paths" PREMISE: single and batch share
+# ONE resolver (_resolve_and_preview_batch calls _shopify_resolve per row). The
+# asymmetry is in the tool SCHEMA -- the single-item `product` description
+# literally exemplifies 'Pure Original 12-pack' while items[].product carries no
+# description, so the model emits the pack-size suffix only on the single path.
+# The matcher then rejects that suffix at BOTH layers: no alias key carries it,
+# and shopify_client.resolve_variants is an AND-of-tokens substring match, so a
+# "12-pack" token absent from the product title kills every candidate.
+#
+# So the fix is matcher PARITY, not a special case: a redundant trailing
+# pack-size/packaging qualifier is progressively stripped and re-probed. Strictly
+# ADDITIVE -- the raw query is always tried FIRST and a stripped form is only
+# probed after that misses, so nothing that resolves today can change. An
+# ambiguous stripped form still ASKS (never a guess): the >1-match branch is
+# untouched, which is the whole safety property.
+_PACK_QUALIFIER_RE = re.compile(
+    r"\s*(?:"
+    r"pack\s+of\s+\d{1,3}"          # "pack of 12"
+    r"|\d{1,3}\s*(?:packs?|pks?|cts?|counts?)"   # "12 pack" / "12pk" / "12 ct"
+    r"|packs?|cases?|pks?"          # bare "pack" / "case"
+    r")\s*$"
+)
+_PACK_LADDER_MAX_STEPS = 3
+
+
+def _pack_query_ladder(product_query: str) -> list[str]:
+    """[normalized query, then progressively pack-qualifier-stripped forms].
+
+    Element 0 is ALWAYS the raw normalized query, so every consumer that walks
+    this ladder in order preserves exact-first behavior. Stripping stops at an
+    empty string (a bare "12 pack" yields no usable probe) and is bounded so a
+    pathological input cannot loop. "f3 pure variety pack 12 pack" ->
+    [..., "f3 pure variety pack", "f3 pure variety"] -- the second strip is what
+    reaches the seeded "f3 pure variety" alias.
+    """
+    first = _norm_alias(product_query)
+    ladder = [first] if first else []
+    cur = first
+    for _ in range(_PACK_LADDER_MAX_STEPS):
+        m = _PACK_QUALIFIER_RE.search(cur)
+        if not m:
+            break
+        cur = cur[: m.start()].strip()
+        if not cur or cur in ladder:
+            break
+        ladder.append(cur)
+    return ladder
+
+
+def _resolve_sku_alias_tolerant(product_query: str) -> tuple[str, bool, str]:
+    """_resolve_sku_alias, then the pack-stripped forms. Returns
+    (resolved_query, alias_hit, resolved_from) where resolved_from is the
+    ORIGINAL query when a stripped form was what actually matched -- so the
+    preview names the resolution and the human confirms it, not just the action.
+
+    _resolve_sku_alias itself is left exactly as-is (its exact-only contract is
+    test-pinned and shared with the lexicon parity pins); this is the additive
+    wrapper the write path calls.
+    """
+    hit, exact = _resolve_sku_alias(product_query)
+    if exact:
+        return hit, True, ""
+    alias_to_sku, _ = _load_sku_aliases()
+    for cand in _pack_query_ladder(product_query)[1:]:
+        sku = alias_to_sku.get(cand)
+        if sku:
+            return sku, True, product_query
+    return product_query, False, ""
+
+
+def _resolve_variants_pack_tolerant(query: str, original_query: str = ""):
+    """shopify_client.resolve_variants, retried against the pack-stripped forms
+    ONLY when the given query matched nothing. Returns (matches, resolved_from).
+
+    Covers the product that is in Shopify but not (yet) in the alias map: the
+    AND-of-tokens match cannot tolerate a "12-pack" token the title lacks, so a
+    real product read as "couldn't find". Retries are bounded by the ladder (<=2
+    extra reads, on the miss path only) and each keeps resolve_variants' own
+    0/1/many contract -- a retry that returns many still ASKS.
+    """
+    matches = shopify_client.resolve_variants(query)
+    if matches:
+        return matches, ""
+    probe_source = original_query or query
+    tried = {_norm_alias(query)}
+    for cand in _pack_query_ladder(probe_source)[1:]:
+        if cand in tried:
+            continue
+        tried.add(cand)
+        matches = shopify_client.resolve_variants(cand)
+        if matches:
+            return matches, probe_source
+    return [], ""
+
+
+def _lexicon_resolve_pack_tolerant(product_query: str, *, channel: str, user: str):
+    """lexicon.resolve over the pack-qualifier ladder, emitting EXACTLY ONE
+    telemetry event for the turn.
+
+    The lexicon's surfaces come from the same SKU alias file, so a stripped form
+    resolves there too -- but each resolve(consumer=...) call logs a row, and
+    probing 3 candidates would treble the lexicon-resolver counts the flywheel
+    monitor reads. So every probe runs SILENT (consumer="" -- the module's own
+    documented internal-probing mode) and one event is logged at the end for the
+    result actually used, always against the ORIGINAL query.
+
+    Returns the first exact/ambiguous Resolution, else the RAW query's own result
+    (so suggestion/miss semantics are byte-identical to the pre-ladder behavior).
+    """
+    from .. import lexicon as _lexicon
+
+    ladder = _pack_query_ladder(product_query) or [product_query]
+    raw_res = None
+    chosen = None
+    for i, cand in enumerate(ladder):
+        # Probe candidate 0 with the ORIGINAL (unnormalized) text: norm_term is
+        # applied inside resolve, and passing the raw string keeps the logged
+        # query and any suggestion display identical to the pre-ladder path.
+        probe = product_query if i == 0 else cand
+        res = _lexicon.resolve(probe, "F3E", types=("product",))
+        if i == 0:
+            raw_res = res
+        if res.status in ("exact", "ambiguous"):
+            chosen = res
+            break
+    result = chosen if chosen is not None else raw_res
+    if result is None:  # empty ladder AND empty query -- nothing to log
+        return None
+    try:
+        first = result.candidates[0] if result.candidates else None
+        _lexicon.log_event(
+            entity="F3E", channel=channel, user=user,
+            consumer="f3e_shopify_set_inventory", status=result.status,
+            query=product_query,
+            canonical=result.canonical or (first.canonical if first else ""),
+            matched_term=result.matched_term or (first.term if first else ""),
+        )
+    except Exception:  # noqa: BLE001 -- telemetry must never break a reply
+        log.debug("f3e lexicon telemetry failed (non-fatal)", exc_info=True)
+    return result
+
+
 def _closest_alias(product_query: str) -> str | None:
     """The nearest seeded alias to a miss, for a 'did you mean ...' suggestion
-    (never auto-applied -- the tool still refuses + won't guess)."""
+    (never auto-applied -- the tool still refuses + won't guess). Probes the
+    pack-stripped forms too, so a suffix-carrying miss still gets a useful hint
+    instead of a bare refusal."""
     import difflib
     _, display = _load_sku_aliases()
     if not display:
         return None
     by_norm = {_norm_alias(a): a for a in display}
-    m = difflib.get_close_matches(_norm_alias(product_query), list(by_norm.keys()), n=1, cutoff=0.6)
-    return by_norm[m[0]] if m else None
+    for cand in _pack_query_ladder(product_query) or [_norm_alias(product_query)]:
+        m = difflib.get_close_matches(cand, list(by_norm.keys()), n=1, cutoff=0.6)
+        if m:
+            return by_norm[m[0]]
+    return None
 
 
 def _load_inventory_channel_config(channel_name: str) -> dict:
@@ -4097,11 +4249,8 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
     lex_res = None
     if _lexicon_active():
         try:
-            from .. import lexicon as _lexicon
-            lex_res = _lexicon.resolve(
-                product_query, "F3E", types=("product",),
-                consumer="f3e_shopify_set_inventory", channel=channel,
-                user=slack_user_id)
+            lex_res = _lexicon_resolve_pack_tolerant(
+                product_query, channel=channel, user=slack_user_id)
         except Exception as exc:  # noqa: BLE001 -- ADDITIVE: degrade to legacy
             log.warning("f3e_shopify_set_inventory lexicon resolve degraded: %s", exc)
             lex_res = None
@@ -4123,12 +4272,15 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
         lex_meta = {"query": product_query, "canonical": lex_res.canonical,
                     "matched_term": lex_res.matched_term}
     else:
-        resolved_query, _alias_hit = _resolve_sku_alias(product_query)
+        resolved_query, _alias_hit, resolved_from = _resolve_sku_alias_tolerant(product_query)
     try:
-        matches = shopify_client.resolve_variants(resolved_query)
+        matches, variant_resolved_from = _resolve_variants_pack_tolerant(
+            resolved_query, product_query)
     except (shopify_client.ShopifyConfigError, shopify_client.ShopifyConnectorError) as exc:
         log.warning("f3e_shopify_set_inventory variant resolve error user=%s: %s", slack_user_id, exc)
         return _shopify_write_blocked(f"{_NOT_WRITTEN}\nI can't reach inventory right now -- try again in a moment."), None
+    if variant_resolved_from and not resolved_from:
+        resolved_from = variant_resolved_from
     if not matches:
         hint = _closest_alias(product_query)
         suggest = f" Did you mean \"{hint}\"?" if hint else ""
@@ -8548,7 +8700,14 @@ TOOL_DEFINITIONS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product": {"type": "string"},
+                            "product": {
+                                "type": "string",
+                                "description": (
+                                    "Product/variant name or SKU -- same resolution as "
+                                    "single-item mode (aliases + pack-size suffixes both "
+                                    "resolve)."
+                                ),
+                            },
                             "quantity": {"type": "integer", "description": "absolute set (use this OR delta)"},
                             "delta": {"type": "integer", "description": "relative add(+)/remove(-)"},
                             "location": {"type": "string", "description": "optional; falls back to the channel default"},
