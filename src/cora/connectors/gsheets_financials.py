@@ -432,12 +432,16 @@ def _export_sheet_as_csv(sheets_service, file_id: str, sheet_name: str) -> str:
     try:
         # Single-quote the sheet name to handle spaces and special chars
         range_spec = f"'{sheet_name}'"
+        # num_retries: a transient 429/503 on ONE tab permanently costs that
+        # entity's forecast week in the weekly snapshot (the sheet overwrites
+        # its forecast column before the next run). Same posture as the gmail
+        # alias sweep.
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=file_id,
             range=range_spec,
             valueRenderOption="FORMATTED_VALUE",
             dateTimeRenderOption="FORMATTED_STRING",
-        ).execute()
+        ).execute(num_retries=2)
     except HttpError as exc:
         status = exc.resp.status if hasattr(exc, "resp") else "?"
         raise GsheetsConnectorError(
@@ -529,7 +533,13 @@ def _forecast_overwritten(forecast: Optional[float], actual: Optional[float]) ->
 # UNKNOWN is never zero (D-117), so the two cases stay distinct here:
 #   "- " / "$-"  -> 0.0   (the sheet said zero)
 #   ""           -> None  (the sheet said nothing)
-_ACCOUNTING_ZERO_CELLS = frozenset({"-", "$-", "$ -", "- ", "0", "0.00"})
+#
+# Pattern, not a membership set: Sheets' accounting format PADS the dash to
+# align columns, so the same logical zero arrives as "-", "$-", "$   -  " or
+# "  -  " depending on the column width, and en/em dashes appear where someone
+# typed one by hand. An exact-membership set silently degraded every unlisted
+# spelling to UNKNOWN, which then propagated as a missing actual.
+_ACCOUNTING_ZERO_RE = re.compile(r"^\s*\$?\s*[-‐-―]\s*$")
 
 
 def _parse_accounting_cell(val: Optional[str]) -> Optional[float]:
@@ -542,7 +552,7 @@ def _parse_accounting_cell(val: Optional[str]) -> Optional[float]:
     s = val.strip()
     if not s:
         return None
-    if s in _ACCOUNTING_ZERO_CELLS or s.rstrip() in _ACCOUNTING_ZERO_CELLS:
+    if _ACCOUNTING_ZERO_RE.match(s):
         return 0.0
     return _parse_float(s)
 
@@ -556,6 +566,10 @@ def _parse_accounting_cell(val: Optional[str]) -> Optional[float]:
 # thousands). Measured live 2026-08-05: 756 checkable weeks across all 18 CF
 # tabs, worst residual under $1.00, zero failures.
 _TRIPLET_RESIDUAL_TOLERANCE = 2.00
+
+#: Same derivation as above for the three-row cash identity (ending = beginning
+#: + net flow): three independently-rounded FORMATTED_VALUE cells -> 1.5 bound.
+_IDENTITY_RESIDUAL_TOLERANCE = 2.00
 
 # Row labels for the two measures the shadow ledger stores. Ending cash and
 # beginning cash reuse the existing balance frozensets (same rows, same decoy
@@ -587,10 +601,35 @@ class WeekGridError(Exception):
     """The week grid could not be resolved into absolute, uniform week-endings."""
 
 
+#: A resolved anchor further than this from today means the grid was anchored on
+#: the wrong occurrence. Half a year is the natural bound: beyond it the
+#: nearest-occurrence choice would have picked the adjacent year instead.
+_ANCHOR_MAX_DRIFT_DAYS = 183
+
+
+def _nearest_occurrence(mo: int, da: int, today: date) -> Optional[date]:
+    """The occurrence of month/day closest to ``today``, across adjacent years.
+
+    Most-recent-PAST is wrong for an anchor: the live sheet carries tabs whose
+    newest actual sits in a week that has not closed yet (CF_HJR Prop held an
+    8-7 actual on 8-5), and past-only resolution would throw that a year back.
+    """
+    best: Optional[date] = None
+    for year in (today.year - 1, today.year, today.year + 1):
+        try:
+            cand = date(year, mo, da)
+        except ValueError:
+            continue          # 2-29 in a non-leap year
+        if best is None or abs((cand - today).days) < abs((best - today).days):
+            best = cand
+    return best
+
+
 def resolve_week_endings(
     labels: list[str],
     *,
     today: Optional[date] = None,
+    anchor_label: Optional[str] = None,
 ) -> tuple[list[date], str]:
     """Resolve bare "M-D" week labels to absolute dates + the week-ending weekday.
 
@@ -602,64 +641,99 @@ def resolve_week_endings(
     Since the ledger is keyed by absolute week-ending dates, that would silently
     corrupt every forward key.
 
-    Columns are strictly chronological left-to-right, so instead we anchor on the
-    LAST label that resolves into the past (safe for the past-occurrence rule) and
-    walk outward, bumping the year whenever the month/day wraps. The week-ending
-    weekday is then DERIVED from the resolved grid rather than assumed (Fin-13),
-    and uniformity is asserted: one weekday, every gap exactly 7 days.
+    Columns are strictly chronological left-to-right, so we resolve ONE label to
+    an absolute date and walk outward, bumping the year whenever the month/day
+    wraps. The week-ending weekday is then DERIVED from the resolved grid rather
+    than assumed (Fin-13), and uniformity is asserted: one weekday, every gap
+    exactly 7 days.
 
-    Raises WeekGridError if the grid is unparseable or non-uniform — the caller
-    renders the tab UNKNOWN rather than storing a guessed calendar.
+    CHOOSING THE ANCHOR IS THE WHOLE PROBLEM. A calendar heuristic over the
+    labels cannot do it. "The last label whose current-year reading is in the
+    past" looks right and is catastrophically wrong for a quarter of the year:
+    once the 13-week forward horizon crosses New Year, those January labels read
+    as past-this-year, steal the anchor, and shift the ENTIRE grid back 365 days.
+    Both uniformity guards still pass (a uniform shift preserves one weekday and
+    7-day gaps), so it fails silently — ~12 Mondays a year, every year, first
+    biting 2026-10-05. Caught by the D-051 review, not by the suite.
+
+    So the anchor comes from the DATA, not the calendar: ``anchor_label`` should
+    be the last week that carries an ACTUAL, which is necessarily within about a
+    week of today, and is resolved to its NEAREST occurrence. That is
+    unambiguous by construction. Without a hint we fall back to the middle label
+    (furthest from either ambiguity edge) and still assert the result lands near
+    today, so a bad anchor fails LOUDLY instead of shifting the year.
+
+    Raises WeekGridError if the grid is unparseable, non-uniform, or anchors
+    implausibly far from today — the caller renders the tab UNKNOWN rather than
+    storing a guessed calendar.
     """
     today = today or date.today()
     if not labels:
         raise WeekGridError("no week columns found")
 
-    parsed: list[tuple[int, int]] = []
-    for raw in labels:
-        m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})", raw or "")
+    def _split(raw: str) -> tuple[int, int, Optional[int]]:
+        m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", raw or "")
         if not m:
             raise WeekGridError(f"unparseable week label {raw!r}")
-        parsed.append((int(m.group(1)), int(m.group(2))))
+        yr = m.group(3)
+        year = None
+        if yr:
+            year = int(yr)
+            year += 2000 if year < 100 else 0
+        return int(m.group(1)), int(m.group(2)), year
 
-    # Anchor: the LAST label whose CURRENT-YEAR reading has already happened —
-    # i.e. the most recent week that genuinely occurred. The year-1 fallback is
-    # deliberately NOT allowed here: on the live grid "8-7" (a forward week) also
-    # resolves into the past as 2025-08-07 and would steal the anchor from
-    # "7-31", shifting the whole walk back a year.
-    anchor_idx = None
-    anchor_date = None
-    for i, (mo, da) in enumerate(parsed):
-        try:
-            cand = date(today.year, mo, da)
-        except ValueError:
-            continue
-        if cand <= today:
-            anchor_idx, anchor_date = i, cand
-    if anchor_idx is None:
-        # Grid lies entirely ahead of today (no completed week on this tab).
-        # Anchor the first column on its next occurrence and walk forward.
-        mo, da = parsed[0]
-        for year in (today.year, today.year + 1):
+    parsed = [_split(raw) for raw in labels]
+
+    # An explicit year in the header is authoritative — never discard it and
+    # then guess (CF_SUMMARY has historically used M/D/YYYY form).
+    explicit = [(i, date(y, mo, da)) for i, (mo, da, y) in enumerate(parsed) if y]
+
+    anchor_idx: Optional[int] = None
+    anchor_date: Optional[date] = None
+
+    if explicit:
+        anchor_idx, anchor_date = explicit[0]
+    else:
+        hint_idx: Optional[int] = None
+        if anchor_label:
             try:
-                cand = date(year, mo, da)
+                hint_idx = labels.index(anchor_label)
             except ValueError:
-                continue
-            if cand >= today:
-                anchor_idx, anchor_date = 0, cand
-                break
+                # An anchor that is not in the grid means the caller's data and
+                # this grid disagree. Falling back silently would re-open the
+                # guessing this function exists to close.
+                raise WeekGridError(
+                    f"anchor week {anchor_label!r} is not one of the grid's "
+                    "columns -- refusing to guess the year"
+                ) from None
+        if hint_idx is None:
+            # No data anchor (no closed week on this tab). The midpoint is the
+            # label furthest from either nearest-occurrence ambiguity edge.
+            hint_idx = len(parsed) // 2
+        mo, da, _ = parsed[hint_idx]
+        anchor_idx, anchor_date = hint_idx, _nearest_occurrence(mo, da, today)
+
     if anchor_idx is None or anchor_date is None:
         raise WeekGridError("no week column resolves to a usable date")
+
+    # Belt. _nearest_occurrence bounds drift to ~half a year by construction, so
+    # this can only trip on an explicit-year header that is wildly out of range
+    # — a sheet restructure, not a year-guessing slip.
+    if abs((anchor_date - today).days) > _ANCHOR_MAX_DRIFT_DAYS + 366:
+        raise WeekGridError(
+            f"anchor week resolved to {anchor_date}, "
+            f"{abs((anchor_date - today).days)} days from today — refusing"
+        )
 
     out: list[Optional[date]] = [None] * len(parsed)
     out[anchor_idx] = anchor_date
 
     prev = anchor_date
     for i in range(anchor_idx + 1, len(parsed)):
-        mo, da = parsed[i]
+        mo, da, yr = parsed[i]
         try:
-            cand = date(prev.year, mo, da)
-            if cand <= prev:
+            cand = date(yr, mo, da) if yr else date(prev.year, mo, da)
+            if not yr and cand <= prev:
                 cand = date(prev.year + 1, mo, da)
         except ValueError as exc:
             raise WeekGridError(f"invalid week date {mo}-{da}") from exc
@@ -668,10 +742,10 @@ def resolve_week_endings(
 
     prev = anchor_date
     for i in range(anchor_idx - 1, -1, -1):
-        mo, da = parsed[i]
+        mo, da, yr = parsed[i]
         try:
-            cand = date(prev.year, mo, da)
-            if cand >= prev:
+            cand = date(yr, mo, da) if yr else date(prev.year, mo, da)
+            if not yr and cand >= prev:
                 cand = date(prev.year - 1, mo, da)
         except ValueError as exc:
             raise WeekGridError(f"invalid week date {mo}-{da}") from exc
@@ -1124,6 +1198,7 @@ class ForecastVector:
     last_actual_week_ending: Optional[str] = None
     forward_week_endings: list[str] = field(default_factory=list)
     triplet_checked: int = 0
+    identity_checked: int = 0
     triplet_worst_residual: float = 0.0
     missing_measures: list[str] = field(default_factory=list)
 
@@ -1141,6 +1216,7 @@ class ForecastVector:
             "forward_week_endings": list(self.forward_week_endings),
             "forward_weeks": len(self.forward_week_endings),
             "triplet_checked": self.triplet_checked,
+            "identity_checked": self.identity_checked,
             "triplet_worst_residual": round(self.triplet_worst_residual, 2),
             "missing_measures": list(self.missing_measures),
             "series": {
@@ -1192,12 +1268,20 @@ def parse_forecast_vector(
     if not week_labels:
         return _unknown("no week columns found")
 
+    data_rows = rows[max(date_row_idx, col_row_idx) + 1:]
+
+    # Anchor the calendar on DATA, not on a guess: the newest week carrying an
+    # actual is necessarily within about a week of today, so its nearest
+    # occurrence is unambiguous. Without this the January wrap silently shifts
+    # the whole grid a year (see resolve_week_endings).
+    anchor_label = _find_latest_actual_week(col_map, data_rows)
+
     try:
-        endings, weekday = resolve_week_endings(week_labels, today=today)
+        endings, weekday = resolve_week_endings(
+            week_labels, today=today, anchor_label=anchor_label
+        )
     except WeekGridError as exc:
         return _unknown(f"week grid unusable: {exc}")
-
-    data_rows = rows[max(date_row_idx, col_row_idx) + 1:]
 
     # Pre-index the triplet columns per week so the measure loop stays flat.
     cols: dict[str, dict[str, list[int]]] = {}
@@ -1259,6 +1343,37 @@ def parse_forecast_vector(
     if "ending_cash" not in series:
         return _unknown("no Ending Cash/CC Book Balance row on this tab")
 
+    # CROSS-MEASURE IDENTITY. The triplet check above verifies three cells belong
+    # to the same week, but it is provably blind to a whole-GROUP shift: on a
+    # closed week D-121 forces FORECAST == ACTUAL and DIFF == 0, so shifting all
+    # three columns together still satisfies it (a D-051 reviewer reproduced a
+    # $250K error that passed). This identity does not have that blind spot --
+    # ending = beginning + net flow reads THREE DIFFERENT ROWS at the same
+    # column, so a group shift pulls a neighbouring week's balance into one term
+    # and breaks it. It also works on FORWARD weeks, which the triplet check
+    # cannot reach at all (they have no ACTUAL).
+    # Verified live 2026-08-05 on CF_LLC: 104,795 + (51,453) = 53,342.
+    identity_checked = 0
+    for kind in ("forecast", "actual"):
+        beg = {p.week_ending: getattr(p, kind) for p in series.get("beginning_cash", [])}
+        net = {p.week_ending: getattr(p, kind) for p in series.get("net_cash_flow", [])}
+        for point in series["ending_cash"]:
+            b = beg.get(point.week_ending)
+            n = net.get(point.week_ending)
+            e = getattr(point, kind)
+            if b is None or n is None or e is None:
+                continue
+            identity_checked += 1
+            residual = abs(e - (b + n))
+            worst = max(worst, residual)
+            if residual > _IDENTITY_RESIDUAL_TOLERANCE:
+                return _unknown(
+                    f"cash-identity check failed on {kind} week {point.week_label}: "
+                    f"ending {e} != beginning {b} + net flow {n} "
+                    f"(residual {residual:.2f} > {_IDENTITY_RESIDUAL_TOLERANCE:.2f}) "
+                    "-- the week columns are misaligned"
+                )
+
     anchor = series["ending_cash"]
     closed = [p for p in anchor if p.is_closed]
     last_actual = closed[-1].week_ending if closed else None
@@ -1279,6 +1394,7 @@ def parse_forecast_vector(
         last_actual_week_ending=last_actual,
         forward_week_endings=forward,
         triplet_checked=checked,
+        identity_checked=identity_checked,
         triplet_worst_residual=worst,
         missing_measures=missing,
     )

@@ -1,0 +1,88 @@
+# data/maps/qbo-cashflow-category-map.yaml -- QBO account / transaction type ->
+# Standing ACTUALS category row, for the 13-week cashflow shadow ledger (M2/S2).
+#
+# WHY THIS FILE EXISTS. S2 pulls bank-side transactions and has to place each one
+# on the same category rows Justin types into by hand. That mapping is a fact
+# about the chart of accounts, not about the code, and only Justin can confirm
+# it -- so it lives in data, seeded UNCONFIRMED, and he flips rows as he goes.
+# Unlike the entity map this one confirms INCREMENTALLY: an unconfirmed account
+# lands in `uncategorized` and is reported, never silently dropped and never
+# guessed onto a row.
+#
+# ── THE CASH PERIMETER (D-051 finding Fin-3) ────────────────────────────────
+# A "cash event" is a transaction touching a BANK account. That single rule
+# resolves the credit-card double-count:
+#
+#   * Buying $500 of supplies on a company card is NOT a cash event. It posts to
+#     a CC-liability account; no bank balance moves.
+#   * PAYING the card is the cash event -- a bank -> CC transfer, dated when the
+#     money actually leaves.
+#
+# Counting both would double-count every carded dollar; counting only the
+# purchase would date the outflow wrong. So card purchases are excluded BY
+# CONSTRUCTION, and the loader ASSERTS that no CC-liability account is mapped to
+# an expense category -- a mapping mistake fails loudly at load rather than
+# quietly inflating disbursements.
+#
+# Consequence to state on every surface: these flows are BANK-CASH. The sheet's
+# balance rows are Cash/CC (D-120). Reconcile like-for-like only, and label it.
+#
+# ── LEX NAMES (D-124) ───────────────────────────────────────────────────────
+# LEX account names are never free-rendered on a shared surface. LEX rows carry
+# an opaque `placeholder` and are confirmed via Harrison DM only. Any tooling
+# that renders this file must print the placeholder, never `qbo_account`.
+
+# Canonical category rows, verified against the live sheet 2026-08-05. These are
+# the row labels the sheet actually uses -- do not invent new ones; a QBO account
+# that fits none of them belongs in `uncategorized` until Justin adds a row.
+categories:
+  receipts:
+    - Services
+    - Interest Income
+  operating_disbursements:
+    - Payroll and Prof Fees
+    - Direct Hard Costs
+    - Rent
+    - Advertising and Marketing
+    - Utilities
+    - Other Costs
+  capex:
+    - Leasehold Improvements
+    - Large Equipment/Furniture acquisitions
+  debt_service:
+    - Interest and Principal
+  draws_contributions:
+    - Contributions/Draws
+
+# Categories that represent MONEY OUT. The loader uses this set for the
+# CC-liability assertion below.
+expense_categories:
+  - Payroll and Prof Fees
+  - Direct Hard Costs
+  - Rent
+  - Advertising and Marketing
+  - Utilities
+  - Other Costs
+  - Leasehold Improvements
+  - Large Equipment/Furniture acquisitions
+  - Interest and Principal
+
+# Per-realm account mappings. Seeded empty on purpose: `--discover` populates
+# candidates from the live chart of accounts with name-match confidence, and
+# every entry lands `confirmed: false`.
+#
+# Entry shape:
+#   <REALM>:
+#     accounts:
+#       "<qbo account id>":
+#         qbo_account: "<name>"        # omitted for LEX -- see D-124 above
+#         placeholder: "LEX acct 7"    # LEX only; what shared surfaces render
+#         account_type: Bank | Credit Card | Expense | Income | ...
+#         category: "<one of categories above>"
+#         confidence: name-match-high | name-match-medium | unmapped
+#         confirmed: false
+realms: {}
+
+# Transaction-type level fallbacks, applied when no account mapping exists.
+# Deliberately sparse -- a fallback that guesses is worse than an UNKNOWN.
+transaction_types: {}

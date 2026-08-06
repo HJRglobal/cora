@@ -1,0 +1,130 @@
+# data/maps/qbo-cashflow-entity-map.yaml -- QBO realm <-> Standing ACTUALS tab
+# pairing for the 13-week cashflow shadow ledger (13WCF M2 / S2).
+#
+# WHY THIS FILE EXISTS. The actuals extractor pulls bank-side transactions per
+# QBO realm and attributes them to a sheet tab. Which realm corresponds to which
+# tab is a fact about the BOOKS, not about the code, and only Justin can confirm
+# it -- so it lives in data, seeded UNCONFIRMED, and Justin flips each row.
+#
+# FAIL-CLOSED, TWICE:
+#   1. Every pair seeds `confirmed: false`. An unconfirmed pair renders
+#      UNCONFIRMED on every surface (D-118) and never feeds accuracy math.
+#   2. A realm that could map to MORE THAN ONE tab must declare how it is split
+#      before it computes at all. See the LEX block -- QBO has ONE `LEX` realm
+#      while the sheet carries FIVE Lex tabs. Without a declared split, S2
+#      REFUSES to compute for that realm (renders UNKNOWN) rather than
+#      attributing sibling-Lex activity to whichever tab it guessed. UNKNOWN is
+#      never zero and never a wrong number.
+#
+# CONFIRMATION ARTIFACT: `run_cashflow_actuals.py --discover` regenerates the
+# candidate pairs below with name-match confidence so the whole set can be
+# confirmed in one sitting rather than trickled in.
+#
+# TO CONFIRM A ROW: set `confirmed: true` and add `confirmed_by` + `confirmed_on`.
+# Do NOT delete the `confidence` field -- it records how the pair was proposed.
+
+# Realms NEVER read by this extractor. Enforced by the LOADER, not by absence:
+# these must fail loudly if a future edit tries to map them, not silently work.
+#
+#   HRLLC -- Harrison's PERSONAL books (D-124). The ledger mirrors into a folder
+#            Justin and Hayden work in. Excluded at collection, as in
+#            qbo-bank-snapshot-config.yaml.
+#   OSN   -- cash-less holding shell (D-122). Verified by data 2026-08-05: one
+#            bank account, zero credit cards, newest bank-side transaction
+#            2026-07-07 while every operating realm was current to 08-02 or
+#            later. Reading it would add a permanently-stale zero row and
+#            corrupt coverage counts. The sheet's "OSN Consolidated" tab is a
+#            DERIVED roll-up of the four store tabs, not this realm.
+excluded_realms:
+  - HRLLC
+  - OSN
+
+# Tabs that are DERIVED roll-ups inside the sheet, not entity ledgers. They have
+# no QBO counterpart by construction and must never be reported as "uncovered
+# because we have not mapped them yet" -- there is nothing to map.
+derived_tabs:
+  - CF_SUMMARY          # portfolio roll-up across all entity tabs
+  - OSN Consolidated    # roll-up of the four OSN store tabs + Core 4
+  - CF_OSN Core4        # partner-distribution / shared-debt lens, not a bank ledger
+
+pairs:
+  # ── high-confidence name matches (verified realm list, 2026-08-05) ─────────
+  BDM:
+    tab: CF_BigDM
+    confidence: name-match-high
+    confirmed: false
+
+  F3E:
+    tab: CF_F3
+    confidence: name-match-high
+    confirmed: false
+
+  HJRG:
+    tab: CF_HJR GS
+    confidence: name-match-high
+    confirmed: false
+
+  HJRP:
+    tab: CF_HJR Prop
+    confidence: name-match-high
+    confirmed: false
+
+  OSNGF:
+    tab: CF_OSN Greenfield
+    confidence: name-match-high
+    confirmed: false
+
+  OSNGW:
+    tab: CF_OSN Warner
+    confidence: name-match-high
+    confirmed: false
+    note: >-
+      gsheets_financials records OSN-GW as "Gilbert & Warner". Confirm the realm
+      covers the Warner store only, not Warner plus Gilbert.
+
+  OSNVV:
+    tab: CF_OSN ValVista
+    confidence: name-match-high
+    confirmed: false
+
+  OSNGM:
+    tab: CF_OSN McKellips
+    confidence: name-match-medium
+    confirmed: false
+    note: >-
+      "GM" is read as Gilbert-McKellips by elimination (the other three OSN
+      realms pair cleanly). Lowest-confidence OSN row -- confirm explicitly.
+
+  # ── the 1:N case: one realm, five sheet tabs ──────────────────────────────
+  # S2 REFUSES to compute for this realm until either `scope_attested: true`
+  # (Justin attests the company file's scope equals exactly the one named tab)
+  # or `filters:` is populated (account and/or class filters that split the
+  # realm across the tabs below). Guessing here would attribute LBHS/LTS/LLA
+  # activity to LLC, which is worse than reporting UNKNOWN.
+  LEX:
+    tab: null
+    confidence: ambiguous-1-to-many
+    confirmed: false
+    scope_attested: false
+    filters: {}
+    candidate_tabs:
+      - CF_LEXCORP
+      - CF_LLC
+      - CF_LBHS
+      - CF_LTS
+      - CF_LLA_MV
+    note: >-
+      QBO exposes a single LEX realm; the sheet carries five Lex tabs. Justin
+      must either attest that the company file IS exactly one of these tabs, or
+      supply the account/class filters that split it. Until then every Lex tab
+      renders manual-entry and LEX cash-outlook serving stays refused.
+      LEX account names are never free-rendered on a shared surface (D-124) --
+      confirm names via Harrison DM only.
+
+# Tabs with NO QBO source at all. These render "manual-entry (no QBO source)" on
+# every downstream surface and are counted honestly in coverage (D-117) -- they
+# are not failures, they are entities whose books do not live in QuickBooks.
+manual_entry_tabs:
+  - CF_HJR PROD
+  - CF_HJR Podcast
+  - CF_UFL

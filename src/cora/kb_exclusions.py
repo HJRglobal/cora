@@ -131,14 +131,28 @@ _FINANCE_WORKSHEET_SEGMENTS: frozenset[str] = frozenset({
     "cashflow-ledger",
 })
 
-# Generated finance filenames, for the door the segment rule cannot see.
-#   *_forecast.json          -- 13WCF S1 snapshot mirror
-#   *cashflow-worksheet*.md  -- 13WCF S3 Monday worksheet (M3)
-# Anchored shapes, not bare "forecast": an ordinary business doc called
-# "2026-forecast-model.xlsx" must stay ingestable.
-_FINANCE_SNAPSHOT_NAME_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}_forecast\.json$", re.IGNORECASE
+# Generated finance filenames, for the door the segment rule cannot see
+# (drive_sweep stores a bare file id and NO path).
+#
+# EVERY generated ledger artifact is date-prefixed, so the rule anchors on that
+# shape rather than on a bare keyword. Both edges matter:
+#   * A bare "forecast"/"cashflow-worksheet" substring OVER-matches and silently
+#     blocks real business documents forever ("2026-forecast-model.xlsx",
+#     "LLC-cashflow-worksheet-v3.xlsx") -- and the store logs only a count, so
+#     it is near-undiagnosable.
+#   * Anchoring too tightly UNDER-matches Drive-side decoration: a
+#     Drive-for-Desktop conflict copy "…_forecast (1).json" or a "Copy of …"
+#     prefix must still be caught, so the shape is searched, not full-matched.
+_FINANCE_GENERATED_NAME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[_-].*?"
+    r"(forecast|actuals|cashflow-worksheet|prelim-w\d|final-w\d)",
+    re.IGNORECASE,
 )
+
+# The ledger's non-dated generated files.
+_FINANCE_GENERATED_EXACT: frozenset[str] = frozenset({
+    "outlook-founder", "ledger",
+})
 
 
 def is_finance_worksheet_path(path_or_source_id: str) -> bool:
@@ -159,12 +173,21 @@ def is_finance_worksheet_title(title: str) -> bool:
     call site to Drive sources only so an ordinary email mentioning the phrase is
     unaffected.
     """
-    name = _basename(str(title or "")).lower()
-    return (
-        "forecast-assist" in name
-        or "cashflow-worksheet" in name
-        or bool(_FINANCE_SNAPSHOT_NAME_RE.match(name))
-    )
+    raw = str(title or "").lower()
+    if not raw:
+        return False
+    # Match the FULL title as well as its basename: a Drive display name may
+    # itself contain "/" (a date like "8/11"), and path-splitting it would drop
+    # the very token we are looking for. Same reasoning as is_cora_internal_title.
+    base = _basename(raw)
+    for name in (raw, base):
+        if "forecast-assist" in name:
+            return True
+        if _FINANCE_GENERATED_NAME_RE.search(name):
+            return True
+        if name.rsplit(".", 1)[0] in _FINANCE_GENERATED_EXACT:
+            return True
+    return False
 
 
 def is_dashboard_store_path(path_or_source_id: str) -> bool:

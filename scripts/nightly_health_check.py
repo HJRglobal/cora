@@ -516,41 +516,62 @@ def check_cashflow_forecast_snapshot(today: date | None = None) -> CheckResult:
     no later run can recover it, and forecast accuracy stays unmeasurable for
     that week forever.
 
-    WARN from TUESDAY onward if this week's Monday has no snapshot (the
-    missed-run pattern from revops). Monday itself is silent: the job fires at
-    06:10 and the health check runs at 08:45, but a same-day WARN would fire for
-    hours on any week the task is merely late. `today` is injectable for tests.
+    WARNs from MONDAY, not Tuesday. This check runs once daily at 08:45 against
+    a job that fires 06:15 with a 20-minute limit, so by the time it runs the
+    Monday outcome is already final -- and the sheet refresh has been observed
+    landing Monday afternoon. Warning on Monday leaves hours of recovery
+    runway; waiting until Tuesday means every miss is reported only once it is
+    permanently unrecoverable.
+
+    A dated FILE is not evidence of a banked week: a run where every tab failed
+    used to write an empty snapshot that read as green. Coverage is checked too.
+    `today` is injectable for tests.
     """
     today = today or date.today()
     monday = today - timedelta(days=today.weekday())
+    label = "13wk cashflow snapshot"
 
     try:
         from cora import cashflow_ledger as cl  # noqa: PLC0415
-        dates = cl.list_snapshot_dates()
+        # not_after=today: a stray future-dated file must not masquerade as the
+        # newest snapshot and blind this check for months.
+        latest = cl.latest_snapshot_date(not_after=today)
+        coverage = cl.snapshot_coverage(latest) if latest else None
     except Exception as exc:  # noqa: BLE001
-        return CheckResult("13wk cashflow snapshot", "warn",
-                           f"could not read the snapshot store: {exc}")
+        return CheckResult(label, "warn", f"could not read the snapshot store: {exc}")
 
-    if not dates:
+    if latest is None:
         return CheckResult(
-            "13wk cashflow snapshot", "warn",
+            label, "warn",
             "No forecast snapshot has ever been banked. Every week without one "
             "is forecast history lost permanently. Run "
             r"scripts\run_cashflow_forecast_snapshot.py.")
 
-    latest = dates[-1]
-    if latest >= monday:
-        return CheckResult("13wk cashflow snapshot", "ok",
-                           f"This week's snapshot is banked ({latest.isoformat()}).")
-    if today.weekday() == 0:
-        # Monday, before/around the 06:10 fire -- not yet a finding.
-        return CheckResult("13wk cashflow snapshot", "ok",
-                           f"Last snapshot {latest.isoformat()}; today's is due 06:10.")
+    if latest < monday:
+        return CheckResult(
+            label, "warn",
+            f"No snapshot for the week of {monday.isoformat()} (latest is "
+            f"{latest.isoformat()}). 'cowork-cora-cashflow-forecast-snapshot' fires "
+            "Monday 06:15 -- if today is Monday there is still time to run it by "
+            "hand before the sheet is refreshed; this week's forecast history is "
+            "being lost.")
+
+    if coverage is None:
+        return CheckResult(
+            label, "warn",
+            f"Snapshot {latest.isoformat()} exists but its coverage could not be "
+            "read -- it may be truncated or corrupt.")
+
+    covered, expected = coverage
+    if covered < expected:
+        return CheckResult(
+            label, "warn",
+            f"Snapshot {latest.isoformat()} covers only {covered} of {expected} "
+            "tabs -- the missing entities have no forecast banked for this week.")
     return CheckResult(
-        "13wk cashflow snapshot", "warn",
-        f"No snapshot for the week of {monday.isoformat()} (latest is "
-        f"{latest.isoformat()}). 'cowork-cora-cashflow-forecast-snapshot' may have "
-        "stopped firing -- this week's forecast history is being lost.")
+        label, "ok",
+        f"This week's snapshot is banked ({latest.isoformat()}, "
+        f"{covered}/{expected} tabs).")
 
 
 _MCP_HTTP_TASK = "cowork-cora-mcp-http"

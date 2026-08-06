@@ -52,6 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = REPO_ROOT / "logs"
 RESOLVED_FILE = REPO_ROOT / "design" / "known-answers" / ".resolved-gaps.jsonl"
 SNAPSHOTS_DIR = REPO_ROOT / "data" / "snapshots"
+CASHFLOW_LEDGER_DIR = REPO_ROOT / "data" / "state" / "cashflow-ledger"
 DATA_DIR = REPO_ROOT / "data"
 KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 ENV_PATH = REPO_ROOT / ".env"
@@ -140,6 +141,34 @@ def backup_snapshots(dest_dir: Path, dry_run: bool) -> int:
     shutil.copytree(SNAPSHOTS_DIR, snap_dest)
     count = sum(1 for _ in snap_dest.rglob("*") if _.is_file())
     print(f"  Snapshot files backed up: {count}")
+    return count
+
+
+def backup_cashflow_ledger(dest_dir: Path, dry_run: bool) -> int:
+    """Copy data/state/cashflow-ledger/ recursively. Skip if absent.
+
+    This is the one store in data/state/ that is IRREPLACEABLE. The Standing
+    ACTUALS sheet overwrites its forecast column every week (D-121), so a lost
+    snapshot cannot be regenerated from any source -- unlike the rest of
+    data/state/, which is watermarks and throttles that self-heal. It is
+    gitignored, so without this its only redundancy is a fail-soft Drive mirror.
+    """
+    print("[4b/7] Backing up the 13-week cashflow ledger...")
+    if not CASHFLOW_LEDGER_DIR.exists():
+        print(f"  SKIP: {CASHFLOW_LEDGER_DIR} does not exist yet.")
+        return 0
+
+    dest = dest_dir / "cashflow-ledger"
+    if dry_run:
+        count = sum(1 for _ in CASHFLOW_LEDGER_DIR.rglob("*") if _.is_file())
+        print(f"  [dry-run] would copy {count} ledger file(s) to {dest}")
+        return count
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(CASHFLOW_LEDGER_DIR, dest)
+    count = sum(1 for _ in dest.rglob("*") if _.is_file())
+    print(f"  Cashflow-ledger files backed up: {count}")
     return count
 
 
@@ -421,6 +450,7 @@ def main() -> int:
     critical_count = backup_critical_files(dest_dir, args.dry_run)
     main_log_count = backup_recent_main_logs(dest_dir, args.include_main_logs_days, args.dry_run)
     snapshot_count = backup_snapshots(dest_dir, args.dry_run)
+    backup_cashflow_ledger(dest_dir, args.dry_run)
     feature_db_count = backup_feature_dbs(dest_dir, args.dry_run)
     secrets_status = backup_secrets(dest_dir, args.dry_run)
     pruned_count = prune_old_backups(args.backup_root, args.keep_days, args.dry_run)

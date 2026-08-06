@@ -113,25 +113,78 @@ class TestClassifyRollState:
         assert r["roll_signals"] == ["no_prior_snapshot"]
         assert r["post_refresh_suspect"] is False
 
-    def test_actual_boundary_advanced_since_prior(self):
+    def test_post_refresh_is_detected(self):
+        """Boundary already at the week that just closed -> the refresh ran."""
+        r = cl.classify_roll_state(
+            _vector(last_actual="2026-08-07"), None, today=self.MON,
+            boundary="2026-08-07",
+        )
+        assert r["post_refresh_suspect"] is True
+        assert "actuals_for_last_completed_week_present" in r["roll_signals"]
+
+    def test_normal_weekly_advance_is_NOT_suspect(self):
+        """THE regression for the defect that made the ledger useless.
+
+        Between two consecutive CORRECT pre-refresh Mondays exactly one week
+        closes, so a 'did the boundary advance?' rule fires every single week
+        and every snapshot after the first is stamped unusable. Two D-051 lenses
+        found this independently. The advance is normal; only the ABSOLUTE test
+        answers the real question."""
         r = cl.classify_roll_state(
             _vector(last_actual="2026-08-07"),
             {"last_actual_week_ending": "2026-07-31",
              "forward_week_endings": ["2026-08-07", "2026-08-14"]},
-            today=self.MON,
+            today=datetime.date(2026, 8, 17),      # the NEXT pre-refresh Monday
+            boundary="2026-08-07",
+            prior_snapshot_date=datetime.date(2026, 8, 10),
         )
-        assert r["post_refresh_suspect"] is True
-        assert "last_actual_advanced_since_prior" in r["roll_signals"]
+        assert r["post_refresh_suspect"] is False
+        assert "boundary_advanced_normally" in r["roll_signals"]
 
-    def test_window_rolled_since_prior(self):
+    def test_a_bigger_jump_than_elapsed_is_flagged(self):
+        """Three weeks of actuals landing in one week is a backfill or a hand
+        edit, not the weekly rhythm -- worth recording."""
         r = cl.classify_roll_state(
-            _vector(last_actual="2026-07-31", forward=("2026-08-07", "2026-08-21")),
+            _vector(last_actual="2026-08-21"),
             {"last_actual_week_ending": "2026-07-31",
-             "forward_week_endings": ["2026-08-07", "2026-08-14"]},
-            today=self.MON,
+             "forward_week_endings": ["2026-08-07"]},
+            today=datetime.date(2026, 8, 17),
+            boundary="2026-08-21",
+            prior_snapshot_date=datetime.date(2026, 8, 10),
         )
-        assert r["post_refresh_suspect"] is True
-        assert "week_grid_rolled_since_prior" in r["roll_signals"]
+        assert "boundary_jumped_more_than_elapsed" in r["roll_signals"]
+
+    def test_a_tab_running_ahead_is_not_stamped_suspect(self):
+        """CF_HJR Prop carries an actual for a week that has not closed. Judged
+        per tab it would be suspect EVERY week forever and its accuracy could
+        never be measured. The refresh is a WORKBOOK event."""
+        r = cl.classify_roll_state(
+            _vector(last_actual="2026-08-07"),   # this tab runs a week ahead
+            None, today=self.MON,
+            boundary="2026-07-31",               # ...but the workbook does not
+        )
+        assert r["post_refresh_suspect"] is False
+        assert "tab_runs_ahead_of_workbook" in r["roll_signals"]
+
+
+class TestWorkbookBoundary:
+    def test_mode_wins_over_an_outlier(self):
+        vs = {
+            "a": _vector("a", last_actual="2026-07-31"),
+            "b": _vector("b", last_actual="2026-07-31"),
+            "c": _vector("c", last_actual="2026-08-07"),   # runs ahead
+        }
+        assert cl.workbook_boundary(vs) == "2026-07-31"
+
+    def test_ties_go_to_the_newest(self):
+        vs = {
+            "a": _vector("a", last_actual="2026-07-31"),
+            "b": _vector("b", last_actual="2026-08-07"),
+        }
+        assert cl.workbook_boundary(vs) == "2026-08-07"
+
+    def test_no_actuals_anywhere(self):
+        assert cl.workbook_boundary({}) is None
 
 
 # ── snapshot build ──────────────────────────────────────────────────────────
@@ -174,7 +227,40 @@ class TestBuildSnapshot:
             ["CF_LLC", "CF_UFL"], read_vector=read, today=self.TODAY
         )
         assert snap["covered"] == 1
-        assert "HTTP 500" in snap["unreadable_tabs"]["CF_UFL"]
+        assert snap["unreadable_tabs"]["CF_UFL"] == "api_error"
+
+    def test_mirrored_reasons_are_codes_not_raw_exception_text(self):
+        """The raw googleapiclient error carries the spreadsheet id and the
+        request URI, and a triplet-mismatch reason carries three raw cash
+        figures -- and this payload is mirrored into a shared folder."""
+        def read(tab):
+            if tab == "CF_UFL":
+                raise RuntimeError(
+                    "HTTP 403 https://sheets.googleapis.com/v4/spreadsheets/"
+                    "1bkMFetsIW-SECRETID/values/CF_UFL")
+            if tab == "CF_LBHS":
+                v = _vector(tab, status="unknown")
+                v.unknown_reason = ("triplet self-check failed on ending_cash week "
+                                    "7-31: DIFF 0.0 != ACTUAL 531630.0 - FORECAST 12.0")
+                return v
+            return _vector(tab)
+
+        snap = cl.build_snapshot(
+            ["CF_LLC", "CF_LBHS", "CF_UFL"], read_vector=read, today=self.TODAY
+        )
+        blob = json.dumps(snap)
+        assert "SECRETID" not in blob and "531630" not in blob
+        assert snap["unreadable_tabs"]["CF_UFL"] == "api_error"
+        assert snap["unreadable_tabs"]["CF_LBHS"] == "triplet_mismatch"
+
+    def test_zero_coverage_refuses_to_write_a_hollow_snapshot(self):
+        """An all-failed run used to write an empty file that the health check
+        read as a banked week."""
+        def read(tab):
+            raise RuntimeError("boom")
+
+        with pytest.raises(cl.LedgerError, match="refusing to write an empty"):
+            cl.build_snapshot(["CF_LLC", "CF_UFL"], read_vector=read, today=self.TODAY)
 
     def test_excluded_tab_is_never_collected(self):
         """CF_HR LLC is personal books and the mirror is a shared folder."""
@@ -191,33 +277,33 @@ class TestBuildSnapshot:
         assert "CF_HR LLC" not in snap["tabs"]
         assert snap["expected"] == 1
 
-    def test_disagreeing_weekdays_refuse(self):
+    def test_weekday_outlier_is_quarantined_not_fatal(self):
+        """Refusing the whole week would throw away every good tab permanently
+        -- the opposite of what a loss-critical archive should do."""
         def read(tab):
             return _vector(tab, weekday="Thursday" if tab == "CF_UFL" else "Friday")
 
-        with pytest.raises(cl.LedgerError, match="week-ending weekday"):
-            cl.build_snapshot(["CF_LLC", "CF_UFL"], read_vector=read, today=self.TODAY)
+        snap = cl.build_snapshot(
+            ["CF_LLC", "CF_LBHS", "CF_UFL"], read_vector=read, today=self.TODAY
+        )
+        assert snap["week_ending_weekday"] == "Friday"
+        assert set(snap["tabs"]) == {"CF_LLC", "CF_LBHS"}
+        assert snap["unreadable_tabs"]["CF_UFL"] == "weekday_disagreement"
+        assert snap["covered"] == 2
 
-    def test_roll_state_is_stamped_per_tab(self):
-        prior = {
-            "snapshot_date": "2026-08-03",
-            "tabs": {
-                "CF_LLC": {"last_actual_week_ending": "2026-07-31",
-                           "forward_week_endings": ["2026-08-07", "2026-08-14"]},
-                "CF_UFL": {"last_actual_week_ending": "2026-07-31",
-                           "forward_week_endings": ["2026-08-07", "2026-08-14"]},
-            },
-        }
-
+    def test_roll_state_uses_the_workbook_boundary(self):
+        """One tab running ahead must not drag itself -- or the workbook -- into
+        a suspect stamp."""
         def read(tab):
-            return _vector(tab, last_actual="2026-08-07" if tab == "CF_UFL" else "2026-07-31")
+            return _vector(tab, last_actual="2026-08-07" if tab == "CF_UFL"
+                           else "2026-07-31")
 
         snap = cl.build_snapshot(
-            ["CF_LLC", "CF_UFL"], read_vector=read, today=self.TODAY, prior=prior
+            ["CF_LLC", "CF_LBHS", "CF_UFL"], read_vector=read, today=self.TODAY
         )
-        assert snap["tabs"]["CF_LLC"]["post_refresh_suspect"] is False
-        assert snap["tabs"]["CF_UFL"]["post_refresh_suspect"] is True
-        assert snap["prior_snapshot_date"] == "2026-08-03"
+        assert snap["workbook_boundary"] == "2026-07-31"
+        assert all(not b["post_refresh_suspect"] for b in snap["tabs"].values())
+        assert "tab_runs_ahead_of_workbook" in snap["tabs"]["CF_UFL"]["roll_signals"]
 
     def test_narrowed_run_is_marked_partial(self):
         snap = cl.build_snapshot(
@@ -239,26 +325,66 @@ class TestBuildSnapshot:
 # ── store round-trip ────────────────────────────────────────────────────────
 
 class TestStore:
-    def test_write_then_load(self):
+    LATER = datetime.date(2026, 8, 31)      # "now", for the future-date guard
+
+    def _bank(self, day: str):
         snap = cl.build_snapshot(
-            ["CF_LLC"],
-            read_vector=lambda t: _vector(t),
-            today=datetime.date(2026, 8, 10),
+            ["CF_LLC"], read_vector=lambda t: _vector(t),
+            today=datetime.date.fromisoformat(day),
         )
-        path = cl.write_snapshot(snap)
+        return cl.write_snapshot(snap, today=self.LATER)
+
+    def test_write_then_load(self):
+        path = self._bank("2026-08-10")
         assert path.name == "2026-08-10_forecast.json"
         assert cl.load_snapshot(datetime.date(2026, 8, 10))["covered"] == 1
         assert not list(path.parent.glob("*.tmp"))
 
     def test_prior_snapshot_lookup_is_strictly_older(self):
-        for d in ("2026-08-03", "2026-08-10"):
-            cl.write_snapshot(cl.build_snapshot(
-                ["CF_LLC"], read_vector=lambda t: _vector(t),
-                today=datetime.date.fromisoformat(d),
-            ))
+        self._bank("2026-08-03")
+        self._bank("2026-08-10")
         prior = cl.load_prior_snapshot(datetime.date(2026, 8, 10))
         assert prior["snapshot_date"] == "2026-08-03"
         assert cl.latest_snapshot_date() == datetime.date(2026, 8, 10)
+
+    def test_rerun_refuses_to_replace_the_mornings_capture(self):
+        """The documented exit-1 path invites a re-run; a mid-morning re-read is
+        post-refresh and would destroy the week's real forecast."""
+        self._bank("2026-08-10")
+        snap = cl.build_snapshot(["CF_LLC"], read_vector=lambda t: _vector(t),
+                                 today=datetime.date(2026, 8, 10))
+        with pytest.raises(cl.LedgerError, match="already exists"):
+            cl.write_snapshot(snap, today=self.LATER)
+
+    def test_overwrite_is_available_when_deliberate(self):
+        self._bank("2026-08-10")
+        snap = cl.build_snapshot(["CF_LLC"], read_vector=lambda t: _vector(t),
+                                 today=datetime.date(2026, 8, 10))
+        assert cl.write_snapshot(snap, overwrite=True, today=self.LATER).exists()
+
+    def test_future_dated_snapshot_is_refused(self):
+        """One stray future file would become the store's max date and blind the
+        missed-run check for months."""
+        snap = cl.build_snapshot(["CF_LLC"], read_vector=lambda t: _vector(t),
+                                 today=datetime.date(2026, 12, 28))
+        with pytest.raises(cl.LedgerError, match="future-dated"):
+            cl.write_snapshot(snap, today=self.LATER)
+
+    def test_latest_snapshot_date_can_ignore_future_files(self):
+        cl.FORECAST_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        (cl.FORECAST_SNAPSHOT_DIR / "2026-12-28_forecast.json").write_text("{}")
+        self._bank("2026-08-10")
+        assert cl.latest_snapshot_date() == datetime.date(2026, 12, 28)
+        assert cl.latest_snapshot_date(not_after=self.LATER) == datetime.date(2026, 8, 10)
+
+    def test_snapshot_coverage_reads_the_payload(self):
+        self._bank("2026-08-10")
+        assert cl.snapshot_coverage(datetime.date(2026, 8, 10)) == (1, 1)
+
+    def test_snapshot_coverage_of_a_hollow_file(self):
+        cl.FORECAST_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        (cl.FORECAST_SNAPSHOT_DIR / "2026-08-10_forecast.json").write_text("{}")
+        assert cl.snapshot_coverage(datetime.date(2026, 8, 10)) is None
 
     def test_no_snapshots_yet(self):
         assert cl.list_snapshot_dates() == []

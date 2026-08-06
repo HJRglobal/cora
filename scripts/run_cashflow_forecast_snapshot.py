@@ -170,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="write locally but skip the Drive mirror")
     parser.add_argument("--date", default="",
                         help="override the snapshot date (YYYY-MM-DD); testing only")
+    parser.add_argument("--overwrite", action="store_true",
+                        help=("replace an existing snapshot for this date. Refused by "
+                              "default: a re-run later in the day would overwrite a "
+                              "pre-refresh capture with a post-refresh one and destroy "
+                              "the week's real forecast."))
     args = parser.parse_args(argv)
 
     try:
@@ -184,10 +189,23 @@ def main(argv: list[str] | None = None) -> int:
     full_scope = cl.sweepable_tabs()
     if args.tabs.strip():
         requested = [t.strip() for t in args.tabs.split(",") if t.strip()]
-        refused = sorted(set(requested) & cl.EXCLUDED_TABS)
-        if refused:
-            log.warning("refusing to read excluded tab(s): %s", ", ".join(refused))
-        tabs = [t for t in requested if t not in cl.EXCLUDED_TABS]
+        # Allowlist, case-insensitively. An exact-string exclusion is not enough:
+        # Sheets resolves tab names case-insensitively, so "--tabs 'cf_hr llc'"
+        # slipped past the EXCLUDED_TABS check and would have published
+        # Harrison's personal books into the shared accounting folder. Accepting
+        # only names that are already in scope closes the whole class, including
+        # typos that would otherwise read as unreadable tabs.
+        by_fold = {t.casefold(): t for t in full_scope}
+        tabs, rejected = [], []
+        for name in requested:
+            canonical = by_fold.get(name.casefold())
+            if canonical is None:
+                rejected.append(name)
+            elif canonical not in tabs:
+                tabs.append(canonical)
+        if rejected:
+            log.error("not in scope, refusing: %s", ", ".join(sorted(rejected)))
+            return 2
     else:
         tabs = list(full_scope)
 
@@ -240,8 +258,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    path = cl.write_snapshot(snapshot)
+    try:
+        path = cl.write_snapshot(snapshot, overwrite=args.overwrite, today=today)
+    except cl.LedgerError as exc:
+        log.error("%s", exc)
+        return 2
     log.info("wrote %s (%d/%d tabs)", path, snapshot["covered"], snapshot["expected"])
+
+    # A run that reads cleanly but lands AFTER the refresh banks entered actuals,
+    # not forecasts. Exit code and health check both look fine, so say it here or
+    # nobody ever learns the week's forecast was lost.
+    suspect = [t for t, b in (snapshot.get("tabs") or {}).items()
+               if b.get("post_refresh_suspect")]
+    if suspect:
+        log.warning(
+            "POST-REFRESH: %d of %d tab(s) were read after the weekly refresh; "
+            "their closed-week forecast cells hold entered actuals and are "
+            "excluded from accuracy math.", len(suspect), snapshot["covered"])
 
     if not args.no_mirror:
         _mirror(snapshot)

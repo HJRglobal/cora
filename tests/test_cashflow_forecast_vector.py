@@ -107,6 +107,48 @@ class TestResolveWeekEndings:
         assert [d.isoformat() for d in endings] == ["2026-08-07", "2026-08-14"]
         assert weekday == "Friday"
 
+    def test_january_wrap_does_not_shift_the_grid_a_year(self):
+        """THE regression for the worst defect D-051 found.
+
+        Once the 13-week forward horizon crosses New Year, those January labels
+        read as past-this-year. A calendar-derived anchor picks one of them and
+        shifts the ENTIRE grid back 365 days -- silently, because a uniform
+        shift still yields one weekday and 7-day gaps, so both guards pass.
+        ~12 Mondays a year, first biting 2026-10-05.
+        """
+        labels, d = [], date(2025, 12, 5)
+        while d <= date(2027, 1, 22):
+            labels.append(f"{d.month}-{d.day}")
+            d = date.fromordinal(d.toordinal() + 7)
+        today = date(2026, 11, 4)                 # inside the broken window
+        anchor = "10-30"                          # last week carrying an actual
+
+        endings, weekday = gf.resolve_week_endings(
+            labels, today=today, anchor_label=anchor)
+        assert endings[0].isoformat() == "2025-12-05"
+        assert endings[-1].isoformat() == "2027-01-22"
+        assert weekday == "Friday"
+        # The old rule produced 2025-12-05..2026-01-22 with weekday "Thursday".
+        assert endings[labels.index(anchor)] == date(2026, 10, 30)
+
+    def test_anchor_resolves_to_nearest_occurrence_not_nearest_past(self):
+        """CF_HJR Prop carries an actual for a week that has not closed yet;
+        most-recent-PAST would throw that anchor a year back."""
+        endings, _ = gf.resolve_week_endings(
+            ["7-31", "8-7", "8-14"], today=TODAY, anchor_label="8-7")
+        assert endings[1] == date(2026, 8, 7)
+
+    def test_an_anchor_outside_the_grid_refuses_rather_than_guessing(self):
+        """Caller data and grid disagree -- falling back silently would re-open
+        exactly the guessing this function exists to close."""
+        with pytest.raises(gf.WeekGridError, match="not one of the grid's columns"):
+            gf.resolve_week_endings(["7-31", "8-7"], today=TODAY, anchor_label="3-13")
+
+    def test_an_explicit_year_is_honoured_not_discarded(self):
+        endings, _ = gf.resolve_week_endings(
+            ["1/1/2027", "1/8/2027"], today=date(2026, 11, 4))
+        assert [d.isoformat() for d in endings] == ["2027-01-01", "2027-01-08"]
+
     def test_spans_a_backward_year_boundary(self):
         labels = ["12-26", "1-2", "1-9"]
         endings, _ = gf.resolve_week_endings(labels, today=date(2026, 2, 1))
@@ -216,6 +258,35 @@ class TestParseForecastVector:
         assert not v.ok
         assert "triplet self-check failed" in v.unknown_reason
         assert v.series == {}          # no partial series leaks out
+
+    def test_whole_group_column_shift_is_caught_by_the_identity(self):
+        """The triplet check is PROVABLY blind to this: on a closed week D-121
+        forces FORECAST == ACTUAL and DIFF == 0, so shifting all three columns
+        together still satisfies it (a reviewer reproduced a $250K error that
+        passed). ending == beginning + net flow reads three DIFFERENT rows at
+        the same column, so a group shift breaks it."""
+        csv_text = _tab_csv(
+            ["7-24", "7-31"],
+            ending=[("100", "100", "- "), ("999", "999", "- ")],   # shifted
+            netflow=[("10", "10", "- "), ("10", "10", "- ")],
+            beginning=[("90", "90", ""), ("100", "100", "")],
+        )
+        v = gf.parse_forecast_vector(csv_text, "CF_TEST", today=TODAY)
+        assert not v.ok
+        assert "cash-identity check failed" in v.unknown_reason
+
+    def test_identity_holds_on_the_live_shape(self):
+        """Verified live 2026-08-05 on CF_LLC: 104,795 + (51,453) = 53,342."""
+        csv_text = _tab_csv(
+            ["7-31", "8-7"],
+            ending=[("53,342", "53,342", "- "), ("60,000", "", "")],
+            netflow=[("(51,453)", "(51,453)", "- "), ("6,658", "", "")],
+            beginning=[("104,795", "104,795", ""), ("53,342", "", "")],
+        )
+        v = gf.parse_forecast_vector(csv_text, "CF_TEST", today=TODAY)
+        assert v.ok, v.unknown_reason
+        # Forward weeks too -- the triplet check cannot reach those at all.
+        assert v.identity_checked >= 3
 
     def test_rounding_residual_is_tolerated(self):
         csv_text = _tab_csv(["7-31"], ending=[("100", "101", "2")])

@@ -71,6 +71,31 @@ class LedgerError(Exception):
     """A structural failure that must not overwrite a good snapshot."""
 
 
+#: Fixed reason codes for the MIRRORED payload. The underlying messages carry
+#: the spreadsheet id (googleapiclient HttpError embeds the request URI) and, in
+#: the self-check case, three raw cash figures for a tab whose grid was
+#: otherwise withheld -- and the mirror lands in a shared accounting folder.
+#: Detail stays in the local log, which is not mirrored.
+_REASON_CODES: tuple[tuple[str, str], ...] = (
+    ("triplet self-check failed", "triplet_mismatch"),
+    ("cash-identity check failed", "identity_mismatch"),
+    ("week grid unusable", "week_grid_unusable"),
+    ("Ending Cash", "missing_ending_cash_row"),
+    ("no week columns", "no_week_columns"),
+    ("no rows", "empty_tab"),
+    ("header rows", "header_not_found"),
+)
+
+
+def _reason_code(reason: str) -> str:
+    """Map a free-text parse reason to a fixed, figure-free code."""
+    text = str(reason or "")
+    for needle, code in _REASON_CODES:
+        if needle in text:
+            return code
+    return "unknown"
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Paths
 # ────────────────────────────────────────────────────────────────────────────
@@ -105,10 +130,36 @@ def list_snapshot_dates() -> list[datetime.date]:
     return sorted(out)
 
 
-def latest_snapshot_date(before: Optional[datetime.date] = None) -> Optional[datetime.date]:
-    """Most recent banked snapshot date, optionally strictly before ``before``."""
-    dates = [d for d in list_snapshot_dates() if before is None or d < before]
+def latest_snapshot_date(
+    before: Optional[datetime.date] = None,
+    *,
+    not_after: Optional[datetime.date] = None,
+) -> Optional[datetime.date]:
+    """Most recent banked snapshot date.
+
+    ``before`` excludes that date and later; ``not_after`` caps the result so a
+    stray future-dated file cannot masquerade as the newest snapshot.
+    """
+    dates = [
+        d for d in list_snapshot_dates()
+        if (before is None or d < before) and (not_after is None or d <= not_after)
+    ]
     return dates[-1] if dates else None
+
+
+def snapshot_coverage(snapshot_date: datetime.date) -> Optional[tuple[int, int]]:
+    """(covered, expected) for a banked snapshot, or None if unreadable.
+
+    The missed-run check needs this: a dated FILE is not evidence of a banked
+    week -- it could hold zero tabs.
+    """
+    snap = load_snapshot(snapshot_date)
+    if not isinstance(snap, dict):
+        return None
+    covered, expected = snap.get("covered"), snap.get("expected")
+    if not isinstance(covered, int) or not isinstance(expected, int):
+        return None
+    return covered, expected
 
 
 def load_snapshot(snapshot_date: datetime.date) -> Optional[dict]:
@@ -154,11 +205,31 @@ def last_completed_week_ending(
     return today - datetime.timedelta(days=delta)
 
 
+def workbook_boundary(vectors: dict[str, gf.ForecastVector]) -> Optional[str]:
+    """The workbook's last-actual week: the MODE across tabs, ties going newest.
+
+    The weekly refresh is a WORKBOOK event, not a per-tab one, so roll state has
+    to be judged workbook-wide. Judging it per tab misreads a tab that simply
+    runs ahead: CF_HJR Prop carries an actual for a week that has not closed
+    yet, so a per-tab rule stamps it post-refresh EVERY week forever and its
+    forecast accuracy could never be measured (D-051 Fin-7).
+    """
+    counts: dict[str, int] = {}
+    for v in vectors.values():
+        if v.ok and v.last_actual_week_ending:
+            counts[v.last_actual_week_ending] = counts.get(v.last_actual_week_ending, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
 def classify_roll_state(
     vector: gf.ForecastVector,
     prior_tab: Optional[dict],
     *,
     today: datetime.date,
+    boundary: Optional[str] = None,
+    prior_snapshot_date: Optional[datetime.date] = None,
 ) -> dict:
     """Decide whether this tab was read BEFORE or AFTER the weekly refresh.
 
@@ -168,18 +239,24 @@ def classify_roll_state(
     ACTUAL in the cell a forecast-accuracy calculation would read as a forecast,
     so it must be excluded from that math rather than silently averaged in.
 
-    TWO independent signals, because either alone has a blind spot:
+    THE TEST IS ABSOLUTE, NOT RELATIVE. On a pre-refresh Monday the workbook's
+    last actual is the week BEFORE the one that just closed; after the refresh
+    it is the week that just closed. So "are actuals present for the most
+    recently completed week?" answers the question exactly, needs no history,
+    and correctly stamps the very first snapshot (taken manually at merge,
+    mid-week, necessarily post-refresh).
 
-      * ABSOLUTE (calendar): actuals for the most recently completed week are
-        already present. Works with no history at all -- which matters, because
-        the design's relative-only rule would leave the very FIRST snapshot
-        (taken manually at merge, mid-week, necessarily post-refresh) unstamped
-        and therefore trusted for accuracy math it cannot support.
-      * RELATIVE (vs the prior snapshot): the actual boundary advanced, or the
-        week grid rolled, since we last looked.
+    A relative "did the boundary advance since last snapshot?" rule CANNOT work
+    and the first cut of this function got it wrong: between two consecutive
+    CORRECT pre-refresh Mondays exactly one week closes, so it fires every
+    single week and the ledger would bank data it then refuses to use, forever
+    (D-051, found independently by two lenses). The relative comparison is kept
+    only as an ANOMALY detector -- a boundary that jumped MORE weeks than
+    actually elapsed means something unexpected happened to the sheet.
 
-    Suspect if ANY fires. Signals are recorded individually so a reader can see
-    which one tripped.
+    Judged on the WORKBOOK boundary, not this tab's: the refresh is a workbook
+    event, and a tab that simply runs ahead (CF_HJR Prop) must not be stamped
+    suspect every week for the rest of time.
     """
     signals: list[str] = []
 
@@ -188,36 +265,43 @@ def classify_roll_state(
         expected_pre = last_completed_week_ending(vector.week_ending_weekday, today)
 
     last_actual = vector.last_actual_week_ending
-    if expected_pre is not None and last_actual:
-        if last_actual >= expected_pre.isoformat():
+    judged_on = boundary or last_actual
+
+    if expected_pre is not None and judged_on:
+        if judged_on >= expected_pre.isoformat():
             signals.append("actuals_for_last_completed_week_present")
+
+    # Informational, never a suspect trigger.
+    if boundary and last_actual and last_actual > boundary:
+        signals.append("tab_runs_ahead_of_workbook")
 
     if prior_tab is None:
         signals.append("no_prior_snapshot")
     else:
         prior_last = prior_tab.get("last_actual_week_ending")
         if prior_last and last_actual and last_actual > prior_last:
-            signals.append("last_actual_advanced_since_prior")
-        prior_forward = list(prior_tab.get("forward_week_endings") or [])
-        if prior_forward and vector.forward_week_endings:
-            if prior_forward[-1] != vector.forward_week_endings[-1]:
-                signals.append("week_grid_rolled_since_prior")
+            advanced = (
+                datetime.date.fromisoformat(last_actual)
+                - datetime.date.fromisoformat(prior_last)
+            ).days // 7
+            elapsed = None
+            if prior_snapshot_date:
+                elapsed = (today - prior_snapshot_date).days // 7
+            if elapsed is not None and advanced > max(elapsed, 1):
+                # More weeks closed than actually passed -- a backfill or a
+                # hand edit, not the normal weekly rhythm.
+                signals.append("boundary_jumped_more_than_elapsed")
+            else:
+                signals.append("boundary_advanced_normally")
 
-    # "no_prior_snapshot" alone is not evidence of a refresh -- it is absence of
-    # evidence. Only the three real signals mark a snapshot unusable for accuracy.
-    suspect = any(
-        s in signals for s in (
-            "actuals_for_last_completed_week_present",
-            "last_actual_advanced_since_prior",
-            "week_grid_rolled_since_prior",
-        )
-    )
+    suspect = "actuals_for_last_completed_week_present" in signals
     return {
         "post_refresh_suspect": suspect,
         "roll_signals": signals,
         "expected_pre_refresh_boundary": (
             expected_pre.isoformat() if expected_pre else None
         ),
+        "workbook_boundary": boundary,
     }
 
 
@@ -257,10 +341,17 @@ def build_snapshot(
     scope = list(full_scope if full_scope is not None else tabs)
 
     prior_tabs = (prior or {}).get("tabs") or {}
-    out_tabs: dict[str, dict] = {}
-    unreadable: dict[str, str] = {}
-    weekdays: set[str] = set()
+    prior_date: Optional[datetime.date] = None
+    if (prior or {}).get("snapshot_date"):
+        try:
+            prior_date = datetime.date.fromisoformat(prior["snapshot_date"])
+        except ValueError:
+            prior_date = None
 
+    # PASS 1 -- read every tab. Roll state cannot be judged until the whole
+    # workbook is in hand (the boundary is a workbook fact, not a tab fact).
+    vectors: dict[str, gf.ForecastVector] = {}
+    unreadable: dict[str, str] = {}
     for tab in tabs:
         if tab in EXCLUDED_TABS:
             log.warning("refusing to collect excluded tab: %s", tab)
@@ -268,32 +359,63 @@ def build_snapshot(
         try:
             vector = read_vector(tab)
         except Exception as exc:  # noqa: BLE001 -- one bad tab must not lose the week
+            # Reason CODE, not str(exc): the raw googleapiclient HttpError text
+            # carries the spreadsheet id and the request URI, and this payload is
+            # mirrored into a shared accounting folder. Detail stays in the log.
             log.error("tab %s unreadable: %s", tab, exc)
-            unreadable[tab] = str(exc)
+            unreadable[tab] = "api_error"
             continue
-
         if not vector.ok:
-            unreadable[tab] = vector.unknown_reason or "UNKNOWN"
+            log.warning("tab %s UNKNOWN: %s", tab, vector.unknown_reason)
+            unreadable[tab] = _reason_code(vector.unknown_reason)
             continue
+        vectors[tab] = vector
 
-        roll = classify_roll_state(vector, prior_tabs.get(tab), today=today)
-        if vector.week_ending_weekday:
-            weekdays.add(vector.week_ending_weekday)
+    # A weekday disagreement means one tab's grid is off, not that the workbook
+    # is unusable. Bank the majority and quarantine the outliers -- refusing the
+    # whole week would throw away 18 good tabs permanently, which contradicts
+    # the loss-criticality this store exists for.
+    weekday_counts: dict[str, int] = {}
+    for v in vectors.values():
+        if v.week_ending_weekday:
+            weekday_counts[v.week_ending_weekday] = (
+                weekday_counts.get(v.week_ending_weekday, 0) + 1
+            )
+    majority_weekday = (
+        max(weekday_counts.items(), key=lambda kv: kv[1])[0] if weekday_counts else None
+    )
+    if len(weekday_counts) > 1:
+        for tab in [t for t, v in vectors.items()
+                    if v.week_ending_weekday != majority_weekday]:
+            log.error("tab %s disagrees on week-ending weekday (%s vs majority %s)",
+                      tab, vectors[tab].week_ending_weekday, majority_weekday)
+            unreadable[tab] = "weekday_disagreement"
+            vectors.pop(tab)
 
+    boundary = workbook_boundary(vectors)
+
+    # PASS 2 -- classify against the workbook boundary.
+    out_tabs: dict[str, dict] = {}
+    for tab, vector in vectors.items():
         block = vector.as_dict()
         block.pop("tab", None)
         block["entity_codes"] = entity_codes_for_tab(tab)
-        block.update(roll)
+        block.update(classify_roll_state(
+            vector, prior_tabs.get(tab), today=today,
+            boundary=boundary, prior_snapshot_date=prior_date,
+        ))
         out_tabs[tab] = block
 
     covered = len(out_tabs)
     expected = len([t for t in scope if t not in EXCLUDED_TABS])
 
-    if len(weekdays) > 1:
-        # Tabs disagreeing on the week-ending day means the workbook is not one
-        # coherent grid; refuse rather than bank a snapshot nothing can join.
+    # COVERAGE FLOOR. A zero-tab snapshot is not a snapshot -- writing one lets
+    # the health check (which sees a dated file) report green on a total
+    # failure. Refuse, leaving the previous file and the missed-run WARN intact.
+    if covered == 0:
         raise LedgerError(
-            f"tabs disagree on the week-ending weekday: {sorted(weekdays)}"
+            f"no tab was readable (0 of {expected}) -- refusing to write an "
+            "empty snapshot that would read as a banked week"
         )
 
     return {
@@ -301,9 +423,10 @@ def build_snapshot(
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "snapshot_date": today.isoformat(),
         "basis": SNAPSHOT_BASIS,
-        "week_ending_weekday": next(iter(weekdays), None),
+        "week_ending_weekday": majority_weekday,
         "covered": covered,
         "expected": expected,
+        "workbook_boundary": boundary,
         "partial_sweep": covered < expected and len(tabs) < len(scope),
         "prior_snapshot_date": (prior or {}).get("snapshot_date"),
         "excluded_tabs": sorted(EXCLUDED_TABS),
@@ -321,16 +444,50 @@ def build_snapshot(
     }
 
 
-def write_snapshot(snapshot: dict) -> Path:
-    """Write the snapshot atomically to the local store."""
+def write_snapshot(
+    snapshot: dict,
+    *,
+    overwrite: bool = False,
+    today: Optional[datetime.date] = None,
+) -> Path:
+    """Write the snapshot atomically to the local store.
+
+    REFUSES to replace an existing snapshot for the same date unless
+    ``overwrite=True``. The documented exit-1 path (one unreadable tab) invites
+    exactly the operator response -- re-run -- that would destroy the week: the
+    06:15 pre-refresh capture gets overwritten by a mid-morning post-refresh
+    read whose forecast cells now hold entered actuals. The stamp on the
+    replacement would record that IT is unusable, but the good one is already
+    gone. Overwriting is sometimes right; it must be deliberate.
+    """
     date_str = snapshot.get("snapshot_date")
     if not date_str:
         raise LedgerError("snapshot has no snapshot_date")
-    path = snapshot_path(datetime.date.fromisoformat(date_str))
+    snap_date = datetime.date.fromisoformat(date_str)
+
+    # A future-dated file (typo'd --date, clock skew) would become the store's
+    # max date and blind the missed-run check for months.
+    if snap_date > (today or datetime.date.today()):
+        raise LedgerError(f"refusing to write a future-dated snapshot: {snap_date}")
+
+    path = snapshot_path(snap_date)
+    if path.exists() and not overwrite:
+        raise LedgerError(
+            f"{path.name} already exists. Re-running would replace a snapshot "
+            "taken earlier today -- if that one was pre-refresh and this one is "
+            "not, the week's real forecast is destroyed. Pass --overwrite if "
+            "you are sure."
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    # Process-unique tmp: a manual run overlapping the scheduled one would
+    # otherwise race on one fixed path and land a half-written payload.
+    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 

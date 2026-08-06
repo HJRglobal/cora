@@ -103,8 +103,10 @@ class TestRender:
         snap = cl.build_snapshot(["CF_LLC", "CF_UFL"], read_vector=read,
                                  today=datetime.date(2026, 8, 10))
         text = script.render_dry_run(snap)
-        assert "UNREADABLE (1)" in text and "HTTP 403" in text
+        assert "UNREADABLE (1)" in text and "api_error" in text
         assert "not counted as covered" in text
+        # The raw error carries the spreadsheet id -- never render it.
+        assert "HTTP 403" not in text
 
     def test_post_refresh_note_only_when_suspect(self):
         clean = script.render_dry_run(self._snap())
@@ -206,35 +208,73 @@ class TestMain:
         assert script.main(["--date", "2026-08-10"]) == 2
         assert cl.list_snapshot_dates() == []
 
-    def test_structural_failure_leaves_the_previous_snapshot_alone(self, monkeypatch):
+    def test_total_failure_leaves_the_previous_snapshot_alone(self, monkeypatch):
         def read(tab, **kw):
-            wd = "Thursday" if tab == "CF_UFL" else "Friday"
-            v = _vector(tab)
-            v.week_ending_weekday = wd
-            return v
+            raise RuntimeError("everything is down")
 
         _stub_reads(monkeypatch, read)
-        cl.write_snapshot(cl.build_snapshot(
-            ["CF_LLC"], read_vector=lambda t: _vector(t),
+        cl.write_snapshot(
+            cl.build_snapshot(["CF_LLC"], read_vector=lambda t: _vector(t),
+                              today=datetime.date(2026, 8, 3)),
             today=datetime.date(2026, 8, 3),
-        ))
+        )
         assert script.main(["--date", "2026-08-10"]) == 2
         assert cl.list_snapshot_dates() == [datetime.date(2026, 8, 3)]
+
+    def test_rerun_is_refused_by_default(self, monkeypatch):
+        _stub_reads(monkeypatch)
+        assert script.main(["--no-mirror", "--date", "2026-08-10"]) == 0
+        assert script.main(["--no-mirror", "--date", "2026-08-10"]) == 2
+
+    def test_rerun_with_overwrite_is_allowed(self, monkeypatch):
+        _stub_reads(monkeypatch)
+        assert script.main(["--no-mirror", "--date", "2026-08-10"]) == 0
+        assert script.main(["--no-mirror", "--overwrite",
+                            "--date", "2026-08-10"]) == 0
+
+    def test_a_miscased_excluded_tab_cannot_slip_through(self, monkeypatch):
+        """Sheets resolves tab names case-insensitively, so an exact-string
+        exclusion let '--tabs cf_hr llc' reach the personal books."""
+        seen: list[str] = []
+
+        def read(tab, **kw):
+            seen.append(tab)
+            return _vector(tab)
+
+        _stub_reads(monkeypatch, read)
+        assert script.main(["--tabs", "cf_hr llc", "--dry-run",
+                            "--date", "2026-08-10"]) == 2
+        assert seen == []
+
+    def test_an_unknown_tab_name_is_refused(self, monkeypatch):
+        _stub_reads(monkeypatch)
+        assert script.main(["--tabs", "CF_LLC,CF_Nonsense", "--dry-run",
+                            "--date", "2026-08-10"]) == 2
 
     def test_bad_date_arg(self, monkeypatch):
         _stub_reads(monkeypatch)
         assert script.main(["--date", "not-a-date"]) == 2
 
-    def test_prior_snapshot_feeds_roll_detection(self, monkeypatch):
-        _stub_reads(monkeypatch, lambda tab, **kw: _vector(tab, last_actual="2026-07-31"))
+    def test_consecutive_pre_refresh_weeks_stay_usable(self, monkeypatch):
+        """End-to-end regression for the defect that would have made the ledger
+        bank data it then refused to use, from week two onward."""
+        _stub_reads(monkeypatch, lambda tab, **kw: _vector(tab, last_actual="2026-07-24"))
         script.main(["--no-mirror", "--date", "2026-08-03"])
-        _stub_reads(monkeypatch, lambda tab, **kw: _vector(tab, last_actual="2026-08-07"))
+        _stub_reads(monkeypatch, lambda tab, **kw: _vector(tab, last_actual="2026-07-31"))
         script.main(["--no-mirror", "--date", "2026-08-10"])
+
         snap = cl.load_snapshot(datetime.date(2026, 8, 10))
         assert snap["prior_snapshot_date"] == "2026-08-03"
         block = snap["tabs"]["CF_LLC"]
-        assert block["post_refresh_suspect"] is True
-        assert "last_actual_advanced_since_prior" in block["roll_signals"]
+        assert block["post_refresh_suspect"] is False
+        assert "boundary_advanced_normally" in block["roll_signals"]
+
+    def test_a_post_refresh_run_is_flagged_in_the_log(self, monkeypatch, caplog):
+        """Exit 0 and a green health check would otherwise hide a lost week."""
+        _stub_reads(monkeypatch, lambda tab, **kw: _vector(tab, last_actual="2026-08-07"))
+        with caplog.at_level("WARNING"):
+            assert script.main(["--no-mirror", "--date", "2026-08-10"]) == 0
+        assert any("POST-REFRESH" in r.message for r in caplog.records)
 
 
 # ── Drive mirror ────────────────────────────────────────────────────────────

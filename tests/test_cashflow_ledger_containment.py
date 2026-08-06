@@ -56,11 +56,32 @@ class TestLedgerIsKbExcluded:
         assert is_finance_worksheet_title("2026-08-05_fndr_forecast-assist.md")
 
     def test_title_predicate_does_not_over_match_business_docs(self):
-        """A bare "forecast" token would swallow real business documents."""
+        """A bare keyword substring would silently and PERMANENTLY block real
+        documents from the KB, and the store logs only a count -- undiagnosable."""
         assert not is_finance_worksheet_title("2026-forecast-model.xlsx")
         assert not is_finance_worksheet_title("F3E revenue forecast.md")
+        assert not is_finance_worksheet_title("LLC-cashflow-worksheet-v3.xlsx")
+        assert not is_finance_worksheet_title("OSN cashflow worksheet.xlsx")
         assert not is_finance_worksheet_title("2026-08-10_close-pack.md")
         assert not is_finance_worksheet_title("")
+
+    def test_title_predicate_survives_drive_side_decoration(self):
+        """Drive-for-Desktop conflict copies and 'Copy of' prefixes must not
+        walk a generated file past the rule."""
+        assert is_finance_worksheet_title("2026-08-10_forecast (1).json")
+        assert is_finance_worksheet_title("Copy of 2026-08-10_forecast.json")
+        assert is_finance_worksheet_title("2026-08-10_forecast-2.json")
+        assert is_finance_worksheet_title("2026-08-10_final-W2.json")
+        assert is_finance_worksheet_title("2026-08-10_prelim-W1.json")
+
+    def test_title_predicate_matches_full_title_not_only_basename(self):
+        """A Drive display name may itself contain '/' (a date like 8/11);
+        path-splitting it would drop the token we are looking for."""
+        assert is_finance_worksheet_title("2026-08-10_fndr_cashflow-worksheet 8/11.md")
+
+    def test_non_dated_ledger_files_are_caught(self):
+        assert is_finance_worksheet_title("outlook-founder.json")
+        assert is_finance_worksheet_title("ledger.json")
 
     def test_predicates_are_wired_at_the_store_chokepoint(self):
         """One chokepoint covers every connector; assert the wiring survives."""
@@ -132,10 +153,13 @@ class TestSnapshotFreshnessCheck:
         monkeypatch.setattr(cl, "FORECAST_SNAPSHOT_DIR",
                             tmp_path / "forecast-snapshots")
 
-    def _bank(self, *dates: str):
+    def _bank(self, *dates: str, covered: int = 19, expected: int = 19):
+        import json
         cl.FORECAST_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         for d in dates:
-            (cl.FORECAST_SNAPSHOT_DIR / f"{d}_forecast.json").write_text("{}")
+            (cl.FORECAST_SNAPSHOT_DIR / f"{d}_forecast.json").write_text(
+                json.dumps({"snapshot_date": d, "covered": covered,
+                            "expected": expected}))
 
     def test_never_run_warns(self):
         r = health.check_cashflow_forecast_snapshot(today=self.TUE)
@@ -146,20 +170,43 @@ class TestSnapshotFreshnessCheck:
         self._bank("2026-08-10")
         r = health.check_cashflow_forecast_snapshot(today=self.TUE)
         assert r.status == "ok"
+        assert "19/19" in r.detail
 
-    def test_missed_monday_warns_from_tuesday(self):
+    def test_missed_monday_warns(self):
         self._bank("2026-08-03")
         r = health.check_cashflow_forecast_snapshot(today=self.TUE)
         assert r.status == "warn"
         assert "2026-08-10" in r.detail and "2026-08-03" in r.detail
 
-    def test_monday_itself_is_silent(self):
-        """08:45 health check vs a 06:10 job -- a same-day WARN would fire on
-        any week the task merely runs late."""
+    def test_monday_warns_while_recovery_is_still_possible(self):
+        """The check runs ONCE daily at 08:45, against a job that fired 06:15 --
+        the Monday outcome is already final and the sheet refresh lands later
+        that day. Staying silent until Tuesday means every miss is reported only
+        once it is permanently unrecoverable."""
         self._bank("2026-08-03")
         r = health.check_cashflow_forecast_snapshot(today=self.MON)
-        assert r.status == "ok"
-        assert "due 06:10" in r.detail
+        assert r.status == "warn"
+        assert "still time to run it by hand" in r.detail
+
+    def test_hollow_snapshot_is_not_green(self):
+        """A dated FILE is not evidence of a banked week."""
+        cl.FORECAST_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        (cl.FORECAST_SNAPSHOT_DIR / "2026-08-10_forecast.json").write_text("{}")
+        r = health.check_cashflow_forecast_snapshot(today=self.TUE)
+        assert r.status == "warn"
+        assert "coverage could not be read" in r.detail
+
+    def test_partial_coverage_warns(self):
+        self._bank("2026-08-10", covered=3, expected=19)
+        r = health.check_cashflow_forecast_snapshot(today=self.TUE)
+        assert r.status == "warn"
+        assert "3 of 19" in r.detail
+
+    def test_a_stray_future_file_does_not_blind_the_check(self):
+        """One typo'd --date used to mask a dead job for months."""
+        self._bank("2026-12-28")
+        r = health.check_cashflow_forecast_snapshot(today=self.TUE)
+        assert r.status == "warn"
 
     def test_still_warns_later_in_the_week(self):
         self._bank("2026-08-03")
