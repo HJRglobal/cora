@@ -92,6 +92,26 @@ _ENTITY_DEFS: dict[str, _EntityDef] = {
     ),
 }
 
+
+def detect_entities(text: str) -> set[str]:
+    """Every portfolio entity whose keywords appear in `text` (word-boundary,
+    case-insensitive). Read-only view over the SAME _ENTITY_DEFS table the
+    redirect guard uses, exposed so other deterministic callers (info_intake's
+    contribution tagger) cannot drift from the canonical keyword set.
+
+    Returns entity FAMILY codes (F3E, LEX, OSN, ...). FNDR/HJRG are aggregators
+    with no keywords of their own and are never returned. An empty set means
+    "no entity named" — the caller decides the fallback; this function never
+    guesses.
+    """
+    if not text:
+        return set()
+    return {
+        code for code, spec in _ENTITY_DEFS.items()
+        if any(p.search(text) for p in spec.patterns)
+    }
+
+
 # Channels that may ask portfolio-wide — no cross-entity block.
 _PASS_THROUGH: frozenset[str] = frozenset({"FNDR", "HJRG"})
 
