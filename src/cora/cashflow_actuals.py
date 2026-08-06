@@ -74,9 +74,16 @@ WINDOW_PRELIMINARY = "preliminary"
 WINDOW_FINALIZED = "finalized"
 
 #: The basis label every consumer must render alongside a figure from this file.
+#: The SIGN CONVENTION is part of the basis, not a detail: `disbursements` is a
+#: NEGATIVE total, not a magnitude, and so is every expense category value. A
+#: consumer that reads it as a magnitude and computes `receipts - disbursements`
+#: flips the sign and counts the outflow as an inflow -- on a $12,345 week that is
+#: a $24,690 error in the direction that looks like a good week.
 FLOW_BASIS = (
     "QBO bank-account register lines (General Ledger, Accrual), bank-cash only, "
-    "by transaction date"
+    "by transaction date. SIGNS: negative = money OUT of the bank; "
+    "`disbursements` and expense categories are NEGATIVE totals, not magnitudes; "
+    "net_flow = receipts + disbursements"
 )
 
 #: What the cash perimeter means, carried in the payload so a reader never has to
@@ -188,6 +195,26 @@ def window_coverage(week_ending: datetime.date, window_kind: str) -> Optional[tu
 # Week resolution -- from DATA, never from a calendar assumption
 # ────────────────────────────────────────────────────────────────────────────
 
+def week_grid_source() -> tuple[Optional[str], Optional[datetime.date]]:
+    """(week-ending weekday, the snapshot that supplied it).
+
+    Returns the snapshot ACTUALLY used, not merely the newest one: a newest
+    snapshot that failed to parse a weekday supplies nothing, and naming it as the
+    source would misdirect the one field a reader consults to answer "where did
+    this week boundary come from?". Future-dated snapshots are ignored for the
+    same reason M1's own checks ignore them (D-127c).
+    """
+    today = datetime.date.today()
+    for snapshot_date in reversed(
+        [d for d in cl.list_snapshot_dates() if d <= today]
+    ):
+        snapshot = cl.load_snapshot(snapshot_date)
+        weekday = (snapshot or {}).get("week_ending_weekday")
+        if weekday:
+            return str(weekday), snapshot_date
+    return None, None
+
+
 def resolve_windows(
     today: datetime.date,
     *,
@@ -240,6 +267,7 @@ _REASON_CODES: tuple[tuple[str, str], ...] = (
     ("HTTP 4", "api_client_error"),
     ("HTTP 5", "api_server_error"),
     ("did not carry the expected", "report_shape_changed"),
+    ("unrecognised key", "response_key_changed"),
     ("HTTP error reaching", "network_error"),
     ("non-JSON", "bad_response"),
 )
@@ -372,6 +400,7 @@ def build_realm(
     *,
     week_start: datetime.date,
     week_ending: datetime.date,
+    window_kind: str,
     category_map: cm.CategoryMap,
     query_accounts: Callable[[str], list[dict]],
     ledger_rows: Callable[[str, list[str], str, str], dict],
@@ -442,6 +471,17 @@ def build_realm(
             log.warning("cashflow_actuals: freshness failed for %s: %s", realm, exc)
             fresh = {"date": None, "errors": {"freshness": str(exc)[:200]}}
 
+        # BALANCES ARE WITHHELD UNLESS THEY COVER EVERY ACCOUNT. QBO's General
+        # Ledger renders only accounts with activity in the window -- live
+        # 2026-08-06 LEX returned ONE section for TWELVE bank accounts -- so the
+        # opening it reports is a partial sum. Published under the name
+        # `opening_bank_balance` that is a wrong number, and `closing = opening +
+        # net` inherits the error while the tie-out stays clean (the FLOW is
+        # right; nothing checks the BALANCE). A partial sum presented as a total
+        # is the D-117 failure, so the headline figures go UNKNOWN and the partial
+        # lives under a name that says what it is.
+        rendered = gl.get("accounts_with_opening") or 0
+        complete = (rendered == len(bank)) and not gl.get("opening_conflict")
         opening = gl.get("opening_balance")
         closing = None if opening is None else round(opening + net, 2)
 
@@ -449,10 +489,22 @@ def build_realm(
             "bank_accounts": len(bank),
             "rows": len(rows),
             "net_flow": net,
-            "opening_bank_balance": opening,
-            "closing_bank_balance": closing,
+            "opening_bank_balance": opening if complete else None,
+            "closing_bank_balance": closing if complete else None,
+            "balances": {
+                "complete": complete,
+                "accounts_with_opening": rendered,
+                "bank_accounts": len(bank),
+                "opening_rendered_accounts_only": opening,
+                "closing_rendered_accounts_only": closing,
+                "reason": None if complete else (
+                    "same-label section collapse" if gl.get("opening_conflict")
+                    else "QBO's General Ledger omits accounts with no activity in "
+                         "the window, so this covers only the accounts that moved"
+                ),
+            },
             **gross,
-            "posted_through": fresh.get("date"),
+            "posted_through": safe_label(fresh.get("date"), 10) or None,
             "duplicate_row_keys": gl.get("duplicate_row_keys", 0),
             "identity": gl.get("identity") or {},
             **classify_rows(rows, realm, category_map),
@@ -467,7 +519,14 @@ def build_realm(
             "recompute_net": check.get("net"),
             "residual": residual,
             "empty_types": check.get("empty_types") or [],
-            "unexpected_keys": check.get("unexpected_keys") or {},
+            # An unexpected key is an arbitrary string from a QBO JSON response
+            # body -- externally authored, so it goes through the sanitizer like
+            # any other (D-123). Same for posted_through below, which is a QBO
+            # date string this code never parses.
+            "unexpected_keys": {
+                safe_label(k, 40): safe_label(v, 40)
+                for k, v in (check.get("unexpected_keys") or {}).items()
+            },
             "capped_types": check.get("capped_types") or [],
         }
         if residual is None:
@@ -512,7 +571,14 @@ def build_realm(
                 {reason_code(v) for v in check["errors"].values()})
 
         block["usable_for_comparison"] = (
-            tie_out["status"] == "ok"
+            # A PRELIMINARY window is never usable, whatever else is true. The
+            # payload's own notes say "never use a preliminary window for
+            # comparison or accuracy math" -- but a consumer doing the obvious
+            # thing reads this FIELD, not the notes, and the field used to say
+            # True. That is the Fin-1 failure the module claims to have designed
+            # out, re-entering through a field name.
+            window_kind == WINDOW_FINALIZED
+            and tie_out["status"] == "ok"
             and bool(pairing.usable_for_accuracy)
             and not tie_out["unexpected_keys"]
             and not tie_out["capped_types"]
@@ -575,7 +641,7 @@ def build_window(
         blocks[realm] = build_realm(
             realm, entity_map.pairing(realm),
             week_start=week_start, week_ending=week_ending,
-            category_map=category_map,
+            window_kind=window_kind, category_map=category_map,
             query_accounts=query_accounts, ledger_rows=ledger_rows,
             recompute=recompute, freshness=freshness,
         )
@@ -691,40 +757,57 @@ def _window_notes(window_kind: str) -> list[str]:
 #: (needle, category) in PRIORITY order -- first match wins, so the specific
 #: cases sit above the general ones they would otherwise be swallowed by:
 #: "leasehold improvement" before "lease"/"rent", "interest income" before
-#: "interest", "cost of goods" before "cost".
+#: "interest", "cost of goods" before "cost", and every DEBT needle above "rent".
+#:
+#: MATCHED ON WORD BOUNDARIES, not as bare substrings. Verified against the live
+#: chart of accounts 2026-08-06: substring matching proposed the sheet's *Rent*
+#: row for "Other Current Liabilities:Sales Tax Payable" and "Current Portion of
+#: Long Term Debt" -- because "rent" sits inside "cur-rent" -- and proposed
+#: *Contributions/Draws* for a retail "Cash Drawer" because "draw" sits inside
+#: "drawer". Sales-tax remittance and debt principal are among the commonest
+#: counterparts of a bank outflow in the OSN store realms, so these were
+#: high-confidence proposals on real money.
 _CATEGORY_HINTS: tuple[tuple[str, str], ...] = (
-    ("leasehold improv", "Leasehold Improvements"),
+    ("leasehold improv*", "Leasehold Improvements"),
     ("interest income", "Interest Income"),
+    # Debt needles FIRST: "Current Portion of Long Term Debt" must not reach the
+    # rent rule at all, even with the word anchor doing its job.
+    ("long term debt", "Interest and Principal"),
+    ("interest and principal", "Interest and Principal"),
+    ("interest expense", "Interest and Principal"),
+    ("note payable*", "Interest and Principal"),
+    ("loan", "Interest and Principal"),
     ("payroll", "Payroll and Prof Fees"),
     ("salaries", "Payroll and Prof Fees"),
     ("wages", "Payroll and Prof Fees"),
-    ("professional fee", "Payroll and Prof Fees"),
-    ("prof fee", "Payroll and Prof Fees"),
+    ("professional fee*", "Payroll and Prof Fees"),
+    ("prof fee*", "Payroll and Prof Fees"),
     ("accounting", "Payroll and Prof Fees"),
     ("legal", "Payroll and Prof Fees"),
     ("contract labor", "Payroll and Prof Fees"),
-    ("advertis", "Advertising and Marketing"),
+    ("advertis*", "Advertising and Marketing"),
     ("marketing", "Advertising and Marketing"),
-    ("utilit", "Utilities"),
-    ("electric", "Utilities"),
+    ("utilit*", "Utilities"),
+    ("electric*", "Utilities"),
     ("water", "Utilities"),
     ("internet", "Utilities"),
     ("telephone", "Utilities"),
     ("cost of goods", "Direct Hard Costs"),
-    ("subcontract", "Direct Hard Costs"),
-    ("direct cost", "Direct Hard Costs"),
-    ("rent", "Rent"),
+    ("subcontract*", "Direct Hard Costs"),
+    ("direct cost*", "Direct Hard Costs"),
+    # `rent*` reaches "Rents Receivable" on purpose, so the direction check can
+    # veto it -- a silent miss would look identical to a correct answer.
+    ("rent*", "Rent"),
     ("furniture", "Large Equipment/Furniture acquisitions"),
     ("equipment", "Large Equipment/Furniture acquisitions"),
-    ("interest and principal", "Interest and Principal"),
-    ("interest expense", "Interest and Principal"),
-    ("note payable", "Interest and Principal"),
-    ("loan", "Interest and Principal"),
     ("paid-in", "Contributions/Draws"),
-    ("distribution", "Contributions/Draws"),
-    ("contribution", "Contributions/Draws"),
+    ("distribution*", "Contributions/Draws"),
+    ("contribution*", "Contributions/Draws"),
+    # NOT `draw*`: that reaches "Cash Drawer", a retail till whose daily sweep
+    # would then be proposed as owner contributions -- with the direction veto
+    # switched off, because this row is bidirectional.
     ("draw", "Contributions/Draws"),
-    ("management fee", "Services"),
+    ("management fee*", "Services"),
 )
 
 #: Account TYPE as a fallback signal, used only when no keyword matched. Weaker
@@ -752,6 +835,25 @@ _DIRECTION_DOMINANCE = 0.9
 #: ($72,000 and $18,000) before this exemption existed -- a check that fires on a
 #: legitimate case is the same failure class it was built to prevent.
 _BIDIRECTIONAL_ROWS: frozenset[str] = frozenset({"Contributions/Draws"})
+
+
+def _matches_word(needle: str, haystack: str) -> bool:
+    """Word-boundary containment, so "rent" cannot match inside "current".
+
+    Always anchored at the START of a word -- that alone is what kills the
+    "cur-rent" and "Other Cur-rent Liabilities" false positives.
+
+    A trailing ``*`` additionally allows the needle to be a PREFIX of a longer
+    word, which most of these needles are: "advertis" must reach "Advertising",
+    "leasehold improv" must reach "Leasehold Improvements", "rent" must reach
+    "Rents Receivable" (so the direction check can then veto it) and "Rental".
+    Without the marker the needle must end on a word boundary too, which is what
+    keeps "draw" out of "Cash Drawer".
+    """
+    prefix_ok = needle.endswith("*")
+    stem = re.escape(needle[:-1] if prefix_ok else needle)
+    tail = "" if prefix_ok else "(?![a-z0-9])"
+    return re.search(rf"(?<![a-z0-9]){stem}{tail}", haystack) is not None
 
 
 def suggest_category(
@@ -795,7 +897,7 @@ def suggest_category(
 
     haystack = f"{account.get('fqn') or ''} {account.get('name') or ''}".lower()
     for needle, category in _CATEGORY_HINTS:
-        if needle in haystack and category in valid_rows:
+        if _matches_word(needle, haystack) and category in valid_rows:
             if _directionally_wrong(category):
                 return None, "direction-conflict"
             return category, "name-match-high"
@@ -975,17 +1077,56 @@ def annotate_advisory(
             prior_block = ((prior_finalized.get("realms") or {}).get(realm) or {})
             prior_close = prior_block.get("closing_bank_balance")
             opening = block.get("opening_bank_balance")
-            if prior_close is not None and opening is not None:
+            prior_week = prior_finalized.get("week_ending")
+
+            # ADJACENCY IS THE WHOLE PREMISE. Chaining to the newest EARLIER
+            # finalized week rather than the ADJACENT one turns a missing week
+            # into a six-figure "back-dated activity" alarm: the residual is
+            # simply the absent week's net flow, and the note asserted a specific
+            # wrong cause, sending a finance reader to audit an edit that never
+            # happened. Both review lenses found this independently.
+            gap_weeks = None
+            if prior_week:
+                try:
+                    gap_weeks = (
+                        (datetime.date.fromisoformat(payload["week_ending"])
+                         - datetime.date.fromisoformat(prior_week)).days // 7
+                    )
+                except (ValueError, KeyError):
+                    gap_weeks = None
+
+            if gap_weeks is not None and gap_weeks != 1:
                 block["chain_check"] = {
-                    "prior_week_ending": prior_finalized.get("week_ending"),
+                    "status": "not_adjacent",
+                    "prior_week_ending": prior_week,
+                    "gap_weeks": gap_weeks,
+                    "note": (
+                        f"No finalized window for the {gap_weeks - 1} week(s) "
+                        "between. Nothing is compared -- a residual across a gap "
+                        "is the missing week's own flow, not a back-date. Backfill "
+                        "with --week to close the hole."
+                    ),
+                }
+            elif prior_close is not None and opening is not None:
+                block["chain_check"] = {
+                    "status": "checked",
+                    "prior_week_ending": prior_week,
                     "prior_closing_balance": prior_close,
                     "residual": round(opening - prior_close, 2),
                     "note": (
-                        "Same measure, same source: a non-zero residual means "
-                        "activity was booked into a week already finalised. "
-                        "Advisory -- a human look at the books, not a withheld "
-                        "figure."
+                        "Adjacent weeks, same measure, same source: a non-zero "
+                        "residual means activity was booked into a week already "
+                        "finalised. Advisory -- a human look at the books, not a "
+                        "withheld figure."
                     ),
+                }
+            else:
+                # Balances are withheld unless they cover every account, so most
+                # weeks land here. Say that, rather than looking checked.
+                block["chain_check"] = {
+                    "status": "unavailable",
+                    "prior_week_ending": prior_week,
+                    "note": "one or both weeks withheld a complete bank balance",
                 }
     return payload
 
@@ -1002,17 +1143,29 @@ def write_window(
 ) -> Path:
     """Write one window atomically to the local store.
 
-    Two re-runs are REFUSED because they destroy information rather than refresh
-    it, and a documented non-zero exit is exactly what invites them (D-127d):
+    Two re-writes are REFUSED because they destroy information rather than
+    refresh it, and a documented non-zero exit is exactly what invites them
+    (D-127d):
 
-      * a PRELIMINARY payload over an existing FINALIZED file for the same week
-        -- that downgrades a matured figure to a structurally incomplete one;
       * a PARTIAL sweep over a full file -- the realms it never asked about would
-        read as missing to every consumer.
+        read as missing to every consumer;
+      * a COVERAGE REGRESSION -- a full sweep in which most realms errored is not
+        a partial sweep, and `covered == 1` clears the zero floor, so a QBO outage
+        could replace a complete matured week with one where seven of eight realms
+        read UNKNOWN. Data is re-pullable, but the RECORD of what was there is not.
 
-    Re-pulling the same KIND of window is allowed and is not destructive: the
-    whole design rests on QBO being re-readable, which is what makes the
-    finalized re-pull possible in the first place.
+    Re-pulling the same kind of window at equal-or-better coverage is allowed and
+    is not destructive: the whole design rests on QBO being re-readable, which is
+    what makes the finalized re-pull possible in the first place.
+
+    NOT refused (it was, and the refusal was wrong): a PRELIMINARY payload while a
+    FINALIZED file exists for the same week. They are separate files and every
+    accuracy consumer reads `load_finalized`, so the prelim cannot overwrite or
+    shadow the matured week -- a D-051 reviewer demonstrated the finalized figure
+    surviving intact. The refusal's stated rationale was factually false, and its
+    only real effect was to fail every routine backfill of an already-matured week
+    and train the operator to add `--overwrite` reflexively, which is the flag that
+    disables the two guards above. It now logs and proceeds.
     """
     week_raw = payload.get("week_ending")
     kind = payload.get("window_kind")
@@ -1025,22 +1178,31 @@ def write_window(
     if week_ending > (today or datetime.date.today()):
         raise ActualsError(f"refusing to write a future-dated window: {week_ending}")
 
-    if kind == WINDOW_PRELIMINARY and not overwrite:
-        final = actuals_path(week_ending, WINDOW_FINALIZED)
-        if final.exists():
-            raise ActualsError(
-                f"{final.name} already exists -- a preliminary pull would "
-                "replace a matured week with a structurally incomplete one. "
-                "Pass --overwrite only if you mean it."
-            )
+    if kind == WINDOW_PRELIMINARY and actuals_path(
+        week_ending, WINDOW_FINALIZED
+    ).exists():
+        log.warning(
+            "week %s already has a FINALIZED window; this preliminary file is "
+            "written but every accuracy consumer reads the finalized one, so it "
+            "changes nothing", week_ending)
 
     path = actuals_path(week_ending, kind)
-    if payload.get("partial_sweep") and path.exists() and not overwrite:
-        raise ActualsError(
-            f"{path.name} exists and this is a PARTIAL sweep -- the realms it "
-            "never read would look missing to every consumer. Re-run without "
-            "--realms, or pass --overwrite."
-        )
+    if path.exists() and not overwrite:
+        if payload.get("partial_sweep"):
+            raise ActualsError(
+                f"{path.name} exists and this is a PARTIAL sweep -- the realms it "
+                "never read would look missing to every consumer. Re-run without "
+                "--realms, or pass --overwrite."
+            )
+        existing = load_window(week_ending, kind) or {}
+        was, now = existing.get("covered"), payload.get("covered")
+        if isinstance(was, int) and isinstance(now, int) and now < was:
+            raise ActualsError(
+                f"{path.name} exists with {was} readable realm(s); this run has "
+                f"only {now}. Refusing to replace a better record with a worse "
+                "one -- re-run when QBO is healthy, or pass --overwrite if the "
+                "lower coverage is the truth now."
+            )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     # Process-unique tmp: a manual run overlapping the scheduled one would

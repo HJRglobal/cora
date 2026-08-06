@@ -89,12 +89,21 @@ class RealmPairing:
         """True if S2 may compute figures for this realm at all.
 
         A single named tab resolves. An ambiguous realm resolves ONLY once its
-        split is declared -- an attestation that the company file equals exactly
-        the named tab, or account/class filters. Otherwise: UNKNOWN.
+        split is declared -- currently that means `scope_attested`: an attestation
+        that the company file equals exactly the named tab.
+
+        `filters` DOES NOT RESOLVE, and that is the fix for a D-051 HIGH. The
+        first cut short-circuited `if self.filters: return True` BEFORE the tab
+        check, while no consumer ever read `filters` -- so the moment Justin
+        followed the instruction in the YAML and supplied account filters, the
+        extractor would have read the ENTIRE realm unscoped and published it with
+        `tab: None`. The mechanism advertised as the containment gate was inert,
+        and using it OPENED the realm instead of narrowing it. Until per-tab
+        splitting is implemented (see refusal_reason), filters refuse.
         """
-        if self.filters:
-            return True
         if not self.tab:
+            return False
+        if self.filters:
             return False
         if self.candidate_tabs and not self.scope_attested:
             return False
@@ -104,11 +113,21 @@ class RealmPairing:
     def refusal_reason(self) -> str:
         if self.resolvable:
             return ""
+        if self.filters:
+            return (
+                f"{self.realm} declares `filters`, which NOTHING APPLIES yet -- "
+                "S2 reads a realm whole, so honouring this pairing would publish "
+                "every sibling entity's activity under one tab. Splitting one "
+                "realm across several tabs needs a per-tab schema (`tab_splits`) "
+                "that does not exist yet. Use `scope_attested` if the company "
+                "file really is exactly one tab; otherwise this realm stays "
+                "UNKNOWN, which is the correct answer."
+            )
         if self.candidate_tabs:
             return (
                 f"{self.realm} could map to {len(self.candidate_tabs)} tabs "
                 f"({', '.join(self.candidate_tabs)}) and its split is not declared "
-                "-- needs scope_attested or filters"
+                "-- needs a tab plus scope_attested"
             )
         return f"{self.realm} has no tab assigned"
 
@@ -350,6 +369,22 @@ def load_category_map(path: Optional[Path] = None) -> CategoryMap:
                     f"expense category {m.category!r}. Card purchases are not cash "
                     "events -- the bank-to-card PAYMENT is. This mapping would "
                     "double-count carded spend."
+                )
+            # THE SYMMETRIC HALF. A BANK account is the perimeter, never a
+            # category: it appears as a transaction's counterpart only when money
+            # moved between two of our own accounts, which `split_gross` keeps out
+            # of receipts and disbursements precisely because it is neither. One
+            # hand-added row here would file a $150K internal sweep as both income
+            # and spend in the same week -- inflating both sides while net_flow
+            # stayed correct, the same shape as the bug split_gross exists to
+            # prevent. Discovery already refuses to propose these; this stops a
+            # hand edit too.
+            if m.is_bank and m.category:
+                raise MapError(
+                    f"{code} account {acct_id} is a BANK account mapped to category "
+                    f"{m.category!r}. A bank account is the cash perimeter, not a "
+                    "category -- it shows up as a counterpart only for internal "
+                    "transfers, which are neither receipts nor disbursements."
                 )
             accounts[(code, str(acct_id))] = m
 

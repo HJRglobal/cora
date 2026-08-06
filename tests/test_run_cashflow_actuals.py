@@ -54,6 +54,8 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(script.drive_io, "exists",
                         lambda *a, **k: pytest.fail("drive_io.exists called"))
     monkeypatch.setattr(script.qbs, "load_snapshot", lambda *a, **k: None)
+    # The mirror reconcile touches Drive by design; no test wants the real mount.
+    monkeypatch.setattr(script, "_mirror_backfill", lambda today: None)
     return store
 
 
@@ -75,10 +77,14 @@ def _stub_qbo(monkeypatch, *, net=-100.0, fail: set[str] | None = None,
             raise RuntimeError("HTTP 503 boom")
         return [{"id": "9", "type": "Bank"}]
 
+    # BOTH: the window path uses the FLOW perimeter (which includes inactive
+    # accounts); discovery and the bank snapshot use the active-only reader.
     monkeypatch.setattr(qc, "query_accounts", query_accounts)
+    monkeypatch.setattr(qc, "query_flow_perimeter_accounts", query_accounts)
     monkeypatch.setattr(qc, "general_ledger_bank_rows", lambda *a, **k: {
         "rows": [{"txn_id": "1", "amount": net, "split_account_id": None}],
         "row_count": 1, "opening_balance": 1000.0,
+        "accounts_with_opening": 1, "opening_conflict": False,
         "identity": {"checked": 1, "worst_residual": 0.0, "failed": []},
         "duplicate_row_keys": 0, "sections": {}})
     monkeypatch.setattr(qc, "bank_side_flow", lambda *a, **k: {
@@ -323,6 +329,63 @@ class TestMain:
         _stub_maps(monkeypatch)
         _stub_provisioned(monkeypatch, ["F3E"])
         _stub_qbo(monkeypatch, tie_out_net=-88.0)
+        monkeypatch.setattr(script, "_mirror", lambda payload: None)
+        assert script.main(["--date", "2026-08-06"]) == 1
+
+    def test_week_flag_pulls_the_named_week(self, monkeypatch):
+        """THE RECOVERY LEVER. `--date` is a fake today, so backfilling week X
+        through it means passing X+8..X+14 -- documented nowhere, and the intuitive
+        `--date X` silently rewrites two other weeks instead."""
+        _snapshot()
+        _stub_maps(monkeypatch)
+        _stub_provisioned(monkeypatch, ["F3E"])
+        _stub_qbo(monkeypatch)
+        monkeypatch.setattr(script, "_mirror", lambda payload: None)
+        assert script.main(["--window", "final", "--week", "2026-07-17",
+                            "--date", "2026-08-06"]) == 0
+        assert ca.load_finalized(datetime.date(2026, 7, 17)) is not None
+        # and nothing else was written
+        assert ca.load_finalized(W2) is None
+
+    def test_week_flag_rejects_a_date_that_is_not_a_week_ending(self, monkeypatch):
+        """The workbook's weeks end on a Friday; a Wednesday is a typo, and a
+        window keyed to it would never line up with a forecast week."""
+        _snapshot()
+        _stub_maps(monkeypatch)
+        _stub_provisioned(monkeypatch, ["F3E"])
+        assert script.main(["--week", "2026-07-15", "--date", "2026-08-06"]) == 2
+
+    def test_week_flag_rejects_an_unclosed_week(self, monkeypatch):
+        _snapshot()
+        _stub_maps(monkeypatch)
+        _stub_provisioned(monkeypatch, ["F3E"])
+        assert script.main(["--week", "2026-08-14", "--date", "2026-08-06"]) == 2
+
+    def test_dry_run_exit_code_matches_the_real_run(self, monkeypatch, capsys):
+        """The dry run is documented as the only pre-flight gate before this feeds a
+        finance surface, and the PS1 hands it to the operator as THE review command
+        -- so it must not exit 0 on a window where realms were unreadable. It did."""
+        _snapshot()
+        _stub_maps(monkeypatch)
+        _stub_provisioned(monkeypatch, ["F3E", "BDM"])
+        _stub_qbo(monkeypatch, fail={"BDM"})
+        assert script.main(["--dry-run", "--date", "2026-08-06"]) == 1
+
+    def test_a_tie_out_that_never_ran_degrades_the_exit_code(self, monkeypatch):
+        """A check that was switched off is not a clean week. One QBO error on any
+        of the nine typed queries makes the recompute unavailable; the whole premise
+        is that agreement is a check a failure BREAKS, so a week where it never ran
+        must be as visible as one where it failed."""
+        _snapshot()
+        _stub_maps(monkeypatch)
+        _stub_provisioned(monkeypatch, ["F3E"])
+        _stub_qbo(monkeypatch)
+        from cora.tools import qbo_client as qc
+        monkeypatch.setattr(qc, "bank_side_flow", lambda *a, **k: {
+            "net": None, "per_type": {}, "counts": {}, "types_expected": 9,
+            "internal_transfers": 0.0, "credit_rows": 0, "empty_types": [],
+            "unexpected_keys": {}, "errors": {"Deposit": "HTTP 500"},
+            "capped_types": []})
         monkeypatch.setattr(script, "_mirror", lambda payload: None)
         assert script.main(["--date", "2026-08-06"]) == 1
 

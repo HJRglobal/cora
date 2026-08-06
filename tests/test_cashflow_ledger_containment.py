@@ -368,7 +368,7 @@ class TestActualsFreshnessCheck:
         self._bank("2026-07-10")
         r = health.check_cashflow_actuals(today=self.TUE)
         assert r.status == "warn"
-        assert "--date" in r.detail
+        assert "--week" in r.detail
 
     def test_hollow_window_is_not_green(self):
         from cora import cashflow_actuals as ca
@@ -411,6 +411,37 @@ class TestActualsFreshnessCheck:
         source = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(
             encoding="utf-8")
         assert "all_results.append(check_cashflow_actuals())" in source
+
+    def test_a_hole_in_the_series_is_detected_not_reported_green(self):
+        """D-051 HIGH, reviewer-verified. A skipped Monday is never recovered on
+        its own: StartWhenAvailable fires ONE catch-up and that run derives its
+        windows from the then-current date, so the intervening week gets no
+        finalized file EVER. A check that only inspects the newest week reported
+        "current" forever while a permanent hole sat behind it, and every accuracy
+        consumer silently skipped that week."""
+        self._bank("2026-07-31", "2026-08-14")     # 2026-08-07 missing
+        r = health.check_cashflow_actuals(today=datetime.date(2026, 8, 25))
+        assert r.status == "warn"
+        assert "2026-08-07" in r.detail
+        assert "--week" in r.detail
+
+    def test_a_contiguous_series_is_not_flagged(self):
+        self._bank("2026-07-31", "2026-08-07", "2026-08-14")
+        assert health.check_cashflow_actuals(
+            today=datetime.date(2026, 8, 17)).status == "ok"
+
+    def test_multiple_holes_are_counted(self):
+        self._bank("2026-07-03", "2026-07-31")
+        r = health.check_cashflow_actuals(today=datetime.date(2026, 8, 10))
+        assert "3 week(s)" in r.detail
+
+    def test_exit_one_is_a_signal_not_a_fault_for_this_task(self):
+        """Exit 1 is documented as "a realm went UNKNOWN, windows still written".
+        For a WEEKLY task, leaving it out of the signal-OK set means
+        LastTaskResult=1 persists until next Monday and the fleet check warns the
+        same thing seven nights running -- the crying-wolf pattern this build spent
+        a whole slice avoiding elsewhere."""
+        assert "cowork-cora-cashflow-actuals" in health._LASTRESULT_SIGNAL_OK
 
     def test_urgency_is_lower_than_the_snapshot_check(self):
         """Warning at the same pitch as an unrecoverable loss is how a reader

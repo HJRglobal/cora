@@ -295,6 +295,36 @@ class TestGeneralLedgerBankRows:
         assert out["identity"]["checked"] == 1
         assert out["identity"]["failed"] == []
 
+    def test_section_ids_are_opaque_never_account_names(self, monkeypatch):
+        """D-051 HIGH. A GL section's header IS the bank account's display name.
+        Keyed by name, it rode `identity.failed` into the payload and from there
+        into the shared accounting folder -- a reviewer executed the path and got
+        "LLC Operating - Trust 9021 for J. Doe" out of the mirrored body. Names now
+        live only in the local (unmirrored) log."""
+        name = "LLC Operating - Trust 9021 for J. Doe"
+        report = _gl_report({"Row": [{
+            "Header": {"ColData": [{"value": name, "id": "530"}]},
+            "Rows": {"Row": [_beginning(100.0),
+                             _row("2026-07-22", "Expense", "1", "9", -10.0, 50.0)]}}]})
+        out = self._call(monkeypatch, report)
+        serialised = repr(out["identity"]) + repr(out["sections"]) + repr(out["rows"])
+        assert name not in serialised
+        assert "J. Doe" not in serialised
+        assert out["identity"]["failed"] == ["s1"]
+        assert list(out["sections"]) == ["s1"]
+        assert out["rows"][0]["section"] == "s1"
+
+    def test_distinct_sections_get_distinct_opaque_ids(self, monkeypatch):
+        report = _gl_report({"Row": [
+            {"Header": {"ColData": [{"value": "Acct One"}]},
+             "Rows": {"Row": [_beginning(0.0),
+                              _row("2026-07-22", "Expense", "1", "9", -1.0, -1.0)]}},
+            {"Header": {"ColData": [{"value": "Acct Two"}]},
+             "Rows": {"Row": [_beginning(0.0),
+                              _row("2026-07-23", "Expense", "2", "9", -2.0, -2.0)]}}]})
+        out = self._call(monkeypatch, report)
+        assert {r["section"] for r in out["rows"]} == {"s1", "s2"}
+
     def test_identity_breaks_when_a_row_is_lost(self, monkeypatch):
         """Prove the guard: the balance column no longer reconciles to
         opening + rows, so the window cannot pass as clean."""
@@ -303,7 +333,7 @@ class TestGeneralLedgerBankRows:
             "Rows": {"Row": [_beginning(100.0),
                              _row("2026-07-22", "Expense", "1", "9", -10.0, 50.0)]}}]})
         out = self._call(monkeypatch, report)
-        assert out["identity"]["failed"] == ["acct"]
+        assert out["identity"]["failed"] == ["s1"]
 
     def test_txn_id_and_split_id_are_captured(self, monkeypatch):
         report = _gl_report({"Row": [{
@@ -369,7 +399,7 @@ class TestGeneralLedgerBankRows:
             "Rows": {"Row": [_beginning(100.0), _beginning(100.0)]}}]})
         out = self._call(monkeypatch, report)
         assert out["opening_balance"] == 100.0
-        assert out["sections"]["acct"]["opening_conflict"] is True
+        assert out["sections"]["s1"]["opening_conflict"] is True
 
     def test_duplicate_row_keys_are_reported_not_dropped(self, monkeypatch):
         """Two genuinely identical transactions in one day are real -- an F3E week

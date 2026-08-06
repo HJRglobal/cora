@@ -155,12 +155,27 @@ class TestRealmResolution:
         }))
         assert cm.load_entity_map(p).pairing("LEX").usable_for_accuracy
 
-    def test_filters_unlock_an_ambiguous_realm(self, tmp_path):
+    def test_filters_do_NOT_unlock_an_ambiguous_realm(self, tmp_path):
+        """INVERTED at M2 (D-051 HIGH). This test used to assert that `filters`
+        resolves the realm -- but nothing ever APPLIED filters, so honouring the
+        pairing read the ENTIRE realm and published it under one tab. The gate
+        advertised as containment was inert, and using it OPENED the realm. A
+        CONFIRMED pairing with filters now fails loudly at load."""
         p = _write(tmp_path, "e.yaml", _entity_body(pairs={
             "LEX": {"tab": None, "candidate_tabs": ["CF_LLC", "CF_LBHS"],
                     "filters": {"class": ["LLC"]}, "confirmed": True},
         }))
-        assert cm.load_entity_map(p).pairing("LEX").resolvable
+        with pytest.raises(cm.MapError, match="does not resolve"):
+            cm.load_entity_map(p)
+
+    def test_filters_unconfirmed_render_the_realm_unknown(self, tmp_path):
+        p = _write(tmp_path, "e.yaml", _entity_body(pairs={
+            "LEX": {"tab": "CF_LLC", "candidate_tabs": ["CF_LLC", "CF_LBHS"],
+                    "scope_attested": True, "filters": {"class": ["LLC"]}},
+        }))
+        pairing = cm.load_entity_map(p).pairing("LEX")
+        assert pairing.resolvable is False
+        assert "NOTHING APPLIES" in pairing.refusal_reason
 
     def test_ambiguous_without_attestation_refuses(self, tmp_path):
         p = _write(tmp_path, "e.yaml", _entity_body(pairs={
@@ -259,7 +274,11 @@ class TestCategoryMapValidation:
 
 class TestCategoryResolution:
     def _map(self, tmp_path, **acct):
-        base = {"account_type": "Bank", "category": "Rent"}
+        # An EXPENSE account, which is what a real category mapping looks like: a
+        # BANK account is the cash perimeter and the loader now refuses to see one
+        # on a category row (M2 D-051 -- it would file an internal sweep as both
+        # income and spend). See TestBankAccountsAreNotCategories below.
+        base = {"account_type": "Expense", "category": "Rent"}
         base.update(acct)
         p = _write(tmp_path, "c.yaml", _category_body(realms={
             "F3E": {"accounts": {"9": base}},
@@ -280,9 +299,44 @@ class TestCategoryResolution:
         assert self._map(tmp_path).category_for("F3E", "999") is None
 
     def test_bank_vs_cc_classification(self, tmp_path):
-        cmap = self._map(tmp_path, account_type="Bank")
+        # No category: a bank account may appear in the map (it is a real account)
+        # but never ON a category row.
+        cmap = self._map(tmp_path, account_type="Bank", category=None)
         m = cmap.mapping("F3E", "9")
         assert m.is_bank and not m.is_cc_liability
+
+
+class TestBankAccountsAreNotCategories:
+    """The symmetric half of the cash-perimeter assertion (M2 D-051).
+
+    The loader already refused a CC-liability on an expense row. A BANK account on
+    ANY category row is the same class of error from the other side: a bank
+    account shows up as a transaction's counterpart only when money moved between
+    two of our own accounts, which `split_gross` deliberately keeps out of both
+    receipts and disbursements. One hand-added row would file a $150K internal
+    sweep as income AND spend in the same week -- inflating both sides while
+    net_flow stayed correct, which is exactly the shape of the bug split_gross
+    exists to prevent.
+    """
+
+    def test_a_bank_account_on_a_category_row_refuses(self, tmp_path):
+        p = _write(tmp_path, "c.yaml", _category_body(realms={
+            "F3E": {"accounts": {"9": {"account_type": "Bank",
+                                       "category": "Rent"}}}}))
+        with pytest.raises(cm.MapError, match="cash perimeter, not a category"):
+            cm.load_category_map(p)
+
+    def test_it_refuses_on_a_receipts_row_too(self, tmp_path):
+        p = _write(tmp_path, "c.yaml", _category_body(realms={
+            "F3E": {"accounts": {"9": {"account_type": "Bank",
+                                       "category": "Services"}}}}))
+        with pytest.raises(cm.MapError, match="cash perimeter"):
+            cm.load_category_map(p)
+
+    def test_a_bank_account_with_no_category_is_fine(self, tmp_path):
+        p = _write(tmp_path, "c.yaml", _category_body(realms={
+            "F3E": {"accounts": {"9": {"account_type": "Bank"}}}}))
+        assert cm.load_category_map(p).mapping("F3E", "9").is_bank
 
 
 class TestLexNameOpacity:

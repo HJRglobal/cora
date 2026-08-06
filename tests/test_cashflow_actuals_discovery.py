@@ -73,6 +73,74 @@ class TestOpacityGate:
         assert mapping.display_name() == "Tradition F3 8950"
 
 
+# ── the `filters` gate (D-051 HIGH) ─────────────────────────────────────────
+
+class TestFiltersDoNotConferResolvability:
+    """The mechanism advertised as the containment gate was INERT, and using it
+    OPENED the realm instead of narrowing it.
+
+    `resolvable` short-circuited on `filters` BEFORE the tab check while no
+    consumer ever read `filters` -- so the moment Justin followed the YAML's own
+    instruction and supplied account filters, the extractor would have read the
+    ENTIRE LEX realm (all five Lex entities) and published it under `tab: None`.
+    """
+
+    def _lex(self, **kw):
+        base = dict(realm="LEX", tab=None,
+                    candidate_tabs=["CF_LLC", "CF_LBHS", "CF_LTS", "CF_LLA_MV",
+                                    "CF_LEXCORP"])
+        base.update(kw)
+        return cm.RealmPairing(**base)
+
+    def test_filters_alone_does_not_resolve(self):
+        pairing = self._lex(filters={"accounts": ["530", "531"]})
+        assert pairing.resolvable is False
+
+    def test_filters_plus_a_tab_still_does_not_resolve(self):
+        """Because nothing APPLIES the filters, a tab plus filters would publish
+        the whole realm under that one tab -- the exact mis-attribution the gate
+        exists to prevent."""
+        pairing = self._lex(tab="CF_LLC", scope_attested=True,
+                            filters={"accounts": ["530"]})
+        assert pairing.resolvable is False
+
+    def test_the_refusal_says_why_and_what_to_do_instead(self):
+        reason = self._lex(filters={"accounts": ["530"]}).refusal_reason
+        assert "NOTHING APPLIES" in reason
+        assert "scope_attested" in reason
+        assert "tab_splits" in reason
+
+    def test_scope_attested_remains_the_supported_path(self):
+        assert self._lex(tab="CF_LLC", scope_attested=True).resolvable is True
+
+    def test_a_confirmed_pairing_with_filters_fails_at_LOAD(self, tmp_path):
+        """Loudly, not silently: a confirmed-but-unresolvable pair already raises,
+        so a well-meaning edit stops the whole job instead of quietly widening
+        collection scope."""
+        data = {
+            "excluded_realms": ["HRLLC", "OSN"],
+            "pairs": {"LEX": {"tab": "CF_LLC", "confirmed": True,
+                              "scope_attested": True,
+                              "filters": {"accounts": ["530"]}}},
+        }
+        path = tmp_path / "entity.yaml"
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(cm.MapError, match="confirmed but does not resolve"):
+            cm.load_entity_map(path)
+
+    def test_the_shipped_map_no_longer_advertises_filters_as_available(self):
+        """The YAML told Justin to populate a field that would have opened the
+        realm. The instruction has to change with the code."""
+        body = cm.ENTITY_MAP_PATH.read_text(encoding="utf-8")
+        assert "NOT IMPLEMENTED" in body
+        assert "tab_splits" in body
+
+    def test_the_live_lex_row_is_still_unresolvable(self):
+        pairing = cm.load_entity_map().pairing("LEX")
+        assert pairing is not None
+        assert pairing.resolvable is False
+
+
 # ── category suggestion ──────────────────────────────────────────────────────
 
 def _suggest(name, type_="Expense", inflow=0.0, outflow=100.0):
@@ -134,6 +202,37 @@ class TestSuggestCategory:
     def test_nothing_is_proposed_for_an_unrecognised_account(self):
         assert _suggest("Undeposited Funds", type_="Other Current Asset",
                         inflow=50.0, outflow=50.0) == (None, "unmapped")
+
+    def test_rent_does_not_match_inside_current(self):
+        """D-051 MED, verified against the live chart of accounts: substring
+        matching proposed the sheet's *Rent* row for "Other Current
+        Liabilities:Sales Tax Payable" and "Current Portion of Long Term Debt",
+        because "rent" sits inside "cur-rent". Sales-tax remittance and debt
+        principal are among the commonest counterparts of a bank outflow in the OSN
+        store realms, so these were high-confidence proposals on real money."""
+        assert _suggest("Other Current Liabilities:Sales Tax Payable",
+                        type_="Other Current Liability", outflow=42000.0)[0] != "Rent"
+
+    def test_debt_needles_outrank_rent(self):
+        assert _suggest("Current Portion of Long Term Debt",
+                        type_="Long Term Liability",
+                        outflow=90000.0)[0] == "Interest and Principal"
+
+    def test_draw_does_not_match_inside_drawer(self):
+        """A retail store's daily cash sweep was proposed as owner contributions
+        -- and `Contributions/Draws` is exempt from the direction veto, so nothing
+        downstream would have caught it."""
+        assert _suggest("Cash Drawer", type_="Other Current Asset",
+                        inflow=250000.0, outflow=0.0)[0] != "Contributions/Draws"
+
+    def test_real_rent_and_draws_still_match(self):
+        """The boundary fix must not cost the true positives."""
+        assert _suggest("Facilities:Rent", outflow=74492.24)[0] == "Rent"
+        assert _suggest("Equipment Rental", outflow=12000.0)[0] is not None
+        assert _suggest("2. Other Equity Activity:Paid-in-Capital", type_="Equity",
+                        inflow=92150.0)[0] == "Contributions/Draws"
+        assert _suggest("Owner Draw", type_="Equity",
+                        outflow=5000.0)[0] == "Contributions/Draws"
 
     def test_a_row_the_sheet_does_not_carry_is_never_proposed(self):
         """The sheet's row labels are the contract -- inventing one would put
@@ -381,3 +480,35 @@ class TestLexConfirmArtifact:
     def test_the_confirm_dir_is_the_local_log_tree(self):
         script = _load_script()
         assert script._LEX_CONFIRM_DIR.name == "logs"
+
+    def test_table_cells_are_sanitised_and_pipe_escaped(self):
+        """The one surface in the build that renders these names at all is exactly
+        where the D-123 sanitizer must not be skipped: a pipe or control character
+        in an account name silently mangles the table Harrison confirms from."""
+        script = _load_script()
+        assert script._cell("Trust | 9021\x00") == r"Trust \| 9021"
+        assert script._cell(None) == ""
+
+    def test_the_artifact_is_only_written_under_apply(self, tmp_path, monkeypatch):
+        """`--discover` is documented as "prints by default; needs --apply to
+        write". That has to be true of THIS file above all, since it is the only
+        one carrying LEX account names in plaintext."""
+        script = _load_script()
+        monkeypatch.setattr(script, "_LEX_CONFIRM_DIR", tmp_path)
+        source = (_REPO_ROOT / "scripts" / "run_cashflow_actuals.py").read_text(
+            encoding="utf-8")
+        # The write site sits inside an --apply branch.
+        idx = source.index("_write_lex_confirm_artifact(\n                    realm")
+        assert "if args.apply:" in source[idx - 200:idx]
+
+    def test_discovery_refuses_a_realm_with_no_entity_map_pairing(self):
+        """The window path refuses an unmapped realm BEFORE its first API call.
+        Discovery must match, or it becomes the weaker of the two collection
+        boundaries -- a personal entity provisioned under a code the exclusion
+        list does not name would have its whole chart of accounts read and its
+        names written into a git-tracked file."""
+        source = (_REPO_ROOT / "scripts" / "run_cashflow_actuals.py").read_text(
+            encoding="utf-8")
+        guard = source.index("if pairing is None:")
+        first_read = source.index("qc.query_all_accounts(realm)")
+        assert guard < first_read

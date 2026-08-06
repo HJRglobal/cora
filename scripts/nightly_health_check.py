@@ -351,6 +351,14 @@ _BENIGN_LAST_RESULTS: frozenset[int] = frozenset({
 _LASTRESULT_SIGNAL_OK: frozenset[str] = frozenset({
     "Cora - QBO Token Monitor",
     "cowork-cora-health-check",
+    # Exit 1 is a documented SIGNAL here, not a fault: one realm going UNKNOWN on
+    # a transient QBO 5xx, or a tie-out that could not run, still banks the
+    # windows. Left out of this set it is a WEEKLY task, so LastTaskResult=1
+    # persists until the next Monday and this check emits the same warn every
+    # night for seven nights -- the crying-wolf pattern the actuals build spent a
+    # whole slice avoiding elsewhere. Its own check_cashflow_actuals covers the
+    # failures that matter.
+    "cowork-cora-cashflow-actuals",
 })
 
 _LAST_RESULT_HINTS: dict[int, str] = {
@@ -607,6 +615,25 @@ def check_cashflow_actuals(today: date | None = None) -> CheckResult:
             "'cowork-cora-cashflow-actuals' or run "
             r"scripts\run_cashflow_actuals.py. Recoverable -- QBO is re-readable.")
 
+    # HOLES, not just staleness. A skipped Monday is never recovered on its own:
+    # StartWhenAvailable fires ONE catch-up and that run derives its windows from
+    # the then-current date, so the intervening week gets no finalized file ever.
+    # A check that only inspects the newest week reports green forever while a
+    # permanent gap sits behind it -- and every accuracy consumer silently skips
+    # that week. Verified by a D-051 reviewer against this exact code.
+    missing = [
+        (weeks[i] + timedelta(days=7 * step)).isoformat()
+        for i in range(len(weeks) - 1)
+        for step in range(1, (weeks[i + 1] - weeks[i]).days // 7)
+    ]
+    if missing:
+        shown = ", ".join(missing[:4]) + ("..." if len(missing) > 4 else "")
+        return CheckResult(
+            label, "warn",
+            f"{len(missing)} week(s) have NO finalized actuals window and never "
+            f"will unless backfilled: {shown}. Recover each with "
+            r"scripts\run_cashflow_actuals.py --window final --week <YYYY-MM-DD>.")
+
     # The finalized window trails the run by two weeks by design, so "current"
     # means its week-ending sits within ~16 days of this Monday. A looser bound
     # than the snapshot check because the lag is structural, not a fault.
@@ -615,7 +642,8 @@ def check_cashflow_actuals(today: date | None = None) -> CheckResult:
             label, "warn",
             f"Newest finalized actuals window is {latest.isoformat()}, more than "
             "two weeks behind. 'cowork-cora-cashflow-actuals' fires Monday 06:25 "
-            "-- re-run it, or use --date to backfill an older week.")
+            "-- re-run it, or backfill a specific week with "
+            "--window final --week <YYYY-MM-DD>.")
 
     if coverage is None:
         return CheckResult(

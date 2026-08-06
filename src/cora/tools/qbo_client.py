@@ -562,7 +562,16 @@ def query_accounts(entity: str) -> list[dict[str, Any]]:
             entity,
             f"{_ACCOUNT_QUERY} STARTPOSITION {start} MAXRESULTS {_ACCOUNT_PAGE_SIZE}",
         )
-        rows = page.get("Account") or []
+        rows, unexpected = query_rows(page, "Account")
+        if unexpected:
+            # Without this the failure reads as "this realm has no bank accounts",
+            # sending the 3am diagnosis to the chart of accounts instead of to a
+            # QBO response-key change -- the CreditCardPaymentTxn lesson, one
+            # function away from where it was learned.
+            raise QboClientError(
+                f"Account query for {entity} answered under an unrecognised key "
+                f"({unexpected}) -- refusing to read it as an empty account list"
+            )
         for row in rows:
             raw_balance = row.get("CurrentBalance")
             out.append({
@@ -572,6 +581,59 @@ def query_accounts(entity: str) -> list[dict[str, Any]]:
                 "subtype": str(row.get("AccountSubType") or ""),
                 "balance": _coerce_balance(raw_balance),
                 "currency": ((row.get("CurrencyRef") or {}).get("value") or ""),
+            })
+        if len(rows) < _ACCOUNT_PAGE_SIZE:
+            break
+        start += _ACCOUNT_PAGE_SIZE
+    return out
+
+
+#: The CASH PERIMETER for flow work -- Bank + Credit Card, ACTIVE OR NOT.
+#:
+#: `_ACCOUNT_QUERY` above ends `and Active = true`, which is right for BALANCES
+#: (a closed account's residual balance would inflate every total). It is wrong
+#: for FLOWS, and silently so: if a realm sweeps money out of an account and then
+#: deactivates it, that account leaves the perimeter, only the receiving leg stays
+#: inside, and the sweep reads as real income. Both sides of the tie-out derive
+#: from the same set, so the residual is $0.00 and nothing notices.
+#: Verified live 2026-08-06: 0 inactive bank/CC accounts across LEX/HJRP/F3E/OSNGW,
+#: so this is forward-looking today -- but the failure mode is invisible, which is
+#: precisely why it is closed before it can happen rather than after.
+_FLOW_PERIMETER_QUERY = (
+    "select Id, Name, AccountType, AccountSubType, CurrentBalance, Active "
+    "from Account where AccountType in ('Bank','Credit Card')"
+)
+
+
+def query_flow_perimeter_accounts(entity: str) -> list[dict[str, Any]]:
+    """Bank + Credit Card accounts for FLOW work, including inactive ones.
+
+    Same item shape as ``query_accounts`` plus ``active``. Use this to build the
+    perimeter a weekly flow is measured against; use ``query_accounts`` when the
+    question is what the accounts are WORTH.
+    """
+    out: list[dict[str, Any]] = []
+    start = 1
+    while True:
+        page = _query(
+            entity,
+            f"{_FLOW_PERIMETER_QUERY} STARTPOSITION {start} "
+            f"MAXRESULTS {_ACCOUNT_PAGE_SIZE}",
+        )
+        rows, unexpected = query_rows(page, "Account")
+        if unexpected:
+            raise QboClientError(
+                f"Account query for {entity} answered under an unrecognised key "
+                f"({unexpected}) -- refusing to read it as an empty perimeter"
+            )
+        for row in rows:
+            out.append({
+                "id": str(row.get("Id") or ""),
+                "name": str(row.get("Name") or ""),
+                "type": str(row.get("AccountType") or ""),
+                "subtype": str(row.get("AccountSubType") or ""),
+                "balance": _coerce_balance(row.get("CurrentBalance")),
+                "active": row.get("Active") is not False,
             })
         if len(rows) < _ACCOUNT_PAGE_SIZE:
             break
@@ -1110,6 +1172,13 @@ def general_ledger_bank_rows(
     this payload is mirrored into a shared accounting folder, so the whole class
     is dropped at COLLECTION rather than filtered per surface (D-124).
 
+    SECTION IDENTIFIERS ARE OPAQUE for the same reason. A GL section's header IS
+    the bank account's display name, so returning it keyed by name put names like
+    "LLC Operating - Trust 9021" into ``identity.failed`` and from there into the
+    mirrored payload -- verified by a D-051 reviewer executing this path. Sections
+    are therefore keyed ``s1``, ``s2``, ... and the id->name mapping is written to
+    the LOCAL log, which is not mirrored, so a diagnosis is still one grep away.
+
     Raises QboClientError when the report's own columns are unrecognisable --
     guessing column positions on a finance figure is not an option.
 
@@ -1151,6 +1220,16 @@ def general_ledger_bank_rows(
     sections: dict[str, dict[str, Any]] = {}
     opening = 0.0
     opening_seen = False
+    # name -> opaque id, so the payload never carries the account display name.
+    section_ids: dict[str, str] = {}
+
+    def _section_id(label: str) -> str:
+        if label not in section_ids:
+            section_ids[label] = f"s{len(section_ids) + 1}"
+            # LOCAL log only -- this file is not mirrored, so the mapping stays
+            # available for diagnosis without the name reaching a shared folder.
+            log.info("GL section %s = %r (entity=%s)", section_ids[label], label, entity)
+        return section_ids[label]
 
     def _walk(node: Any, section: str | None) -> None:
         nonlocal opening, opening_seen
@@ -1166,7 +1245,7 @@ def general_ledger_bank_rows(
         if header:
             label = (header[0] or {}).get("value")
             if label:
-                current = str(label)
+                current = _section_id(str(label))
 
         col_data = node.get("ColData")
         if isinstance(col_data, list):
@@ -1217,14 +1296,20 @@ def general_ledger_bank_rows(
     # running balance. Reads three independently-reported quantities, so a parse
     # that lost or duplicated rows breaks it (the M1 cash-identity lesson).
     identity: dict[str, Any] = {"checked": 0, "worst_residual": 0.0, "failed": []}
-    for name, bucket in sections.items():
+    for section_id, bucket in sections.items():
         if not all(k in bucket for k in ("opening", "movement", "last_balance")):
             continue
         residual = abs(bucket["last_balance"] - (bucket["opening"] + bucket["movement"]))
         identity["checked"] += 1
         identity["worst_residual"] = max(identity["worst_residual"], round(residual, 2))
         if residual > 0.01:
-            identity["failed"].append(name)
+            # The opaque id, never the account name (see the docstring). The
+            # `GL section sN = ...` log line above resolves it locally.
+            identity["failed"].append(section_id)
+            log.error("GL identity FAILED for %s section %s (entity=%s): "
+                      "opening %s + movement %s != last balance %s",
+                      entity, section_id, entity, bucket["opening"],
+                      bucket["movement"], bucket["last_balance"])
 
     # A repeated (section, txn, date, amount) is usually two genuinely identical
     # transactions -- verified live: an F3E week held one such pair and still tied
@@ -1234,10 +1319,21 @@ def general_ledger_bank_rows(
         key = (row["section"], row["txn_id"], row["date"], row["amount"])
         seen[key] = seen.get(key, 0) + 1
 
+    # HOW MANY ACCOUNTS THE OPENING ACTUALLY COVERS. Verified live 2026-08-06:
+    # QBO's General Ledger renders ONLY accounts with activity in the window --
+    # LEX returned ONE section for TWELVE requested bank accounts. So this sum is
+    # a partial over whichever accounts happened to move, and presenting it as the
+    # realm's opening bank balance is a wrong number, not a rounded one. The
+    # caller compares this count against the accounts it asked for and withholds
+    # the balance unless they match.
+    accounts_with_opening = sum(1 for b in sections.values() if "opening" in b)
     return {
         "rows": rows,
         "row_count": len(rows),
         "opening_balance": round(opening, 2) if opening_seen else None,
+        "accounts_with_opening": accounts_with_opening,
+        # A same-label collapse would under-count the opening with no trace.
+        "opening_conflict": any(b.get("opening_conflict") for b in sections.values()),
         "identity": identity,
         "duplicate_row_keys": sum(v - 1 for v in seen.values() if v > 1),
         "sections": sections,

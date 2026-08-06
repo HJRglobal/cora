@@ -146,8 +146,18 @@ def render_dry_run(payload: dict) -> str:
             named = ", ".join(f"{k} {_fmt(v)}"
                               for k, v in sorted(block["categories"].items()))
             out.append(f"          categorised: {named}")
+        balances = block.get("balances") or {}
+        if balances and not balances.get("complete"):
+            out.append(f"          bank balances WITHHELD -- the ledger rendered "
+                       f"{balances.get('accounts_with_opening')} of "
+                       f"{balances.get('bank_accounts')} account(s); a partial sum "
+                       "is not this realm's balance")
         chain = block.get("chain_check") or {}
-        if chain.get("residual"):
+        if chain.get("status") == "not_adjacent":
+            out.append(f"          chain vs {chain.get('prior_week_ending')}: "
+                       f"NOT COMPARED, {chain.get('gap_weeks')} week(s) apart -- "
+                       "backfill the gap with --week")
+        elif chain.get("residual"):
             out.append(f"          chain vs {chain['prior_week_ending']}: "
                        f"{_fmt(chain['residual'])} booked into a finalised week "
                        "(advisory)")
@@ -156,6 +166,10 @@ def render_dry_run(payload: dict) -> str:
             out.append(f"          TIE-OUT FAILED residual "
                        f"{_fmt(tie_block.get('residual'))} -- banked but NOT "
                        "usable for comparison")
+        if tie_block.get("status") == "unavailable":
+            out.append("          TIE-OUT DID NOT RUN -- the independent check was "
+                       "unavailable, so this figure is UNVERIFIED and excluded "
+                       "from comparison")
         if tie_block.get("unexpected_keys"):
             out.append(f"          UNEXPECTED QUERY KEY(S): "
                        f"{tie_block['unexpected_keys']} -- a QBO response key "
@@ -244,6 +258,38 @@ def _mirror(payload: dict) -> None:
         log.warning("Drive mirror failed: %s", exc)
 
 
+#: How far back the mirror reconcile looks. Bounded on purpose -- this is a
+#: self-heal for a mount blip, not a full-history sync.
+_MIRROR_BACKFILL_WEEKS = 6
+
+
+def _mirror_backfill(today: datetime.date) -> None:
+    """Mirror any recent local window the shared folder is missing.
+
+    `_mirror` only ever pushes the payload just built, so a Drive mount blip at
+    06:25 left that week permanently absent from the folder Justin and Hayden work
+    in -- one local warning, no retry, and the health check reads the LOCAL store
+    so it never noticed. Fail-soft throughout: a mirror that cannot be reconciled
+    must not fail the run that already banked its data.
+    """
+    for weeks_back in range(1, _MIRROR_BACKFILL_WEEKS + 1):
+        week = today - datetime.timedelta(days=7 * weeks_back)
+        for kind in (ca.WINDOW_FINALIZED, ca.WINDOW_PRELIMINARY):
+            local = ca.actuals_path(week, kind)
+            if not local.exists():
+                continue
+            target = ca.mirror_actuals_path(week, kind)
+            try:
+                if drive_io.exists(target):
+                    continue
+                drive_io.write_text_atomic(target, local.read_text(encoding="utf-8"))
+                log.warning("mirror backfill: %s was missing from Drive -- "
+                            "restored", target.name)
+            except (drive_io.DriveUnavailable, OSError) as exc:
+                log.warning("mirror backfill skipped for %s: %s", target.name, exc)
+                return
+
+
 def _build_one(
     *,
     window_kind: str,
@@ -267,7 +313,11 @@ def _build_one(
             weekday_name=weekday_name,
             entity_map=entity_map,
             category_map=category_map,
-            query_accounts=qc.query_accounts,
+            # The FLOW perimeter, which includes inactive accounts: a realm that
+            # sweeps money out of an account and then closes it would otherwise
+            # keep only the receiving leg inside the perimeter, and the sweep
+            # would read as real income at a $0.00 tie-out residual.
+            query_accounts=qc.query_flow_perimeter_accounts,
             ledger_rows=qc.general_ledger_bank_rows,
             recompute=qc.bank_side_flow,
             freshness=qc.newest_bank_side_txn_date,
@@ -301,6 +351,17 @@ def _build_one(
 _LEX_CONFIRM_DIR = _REPO_ROOT / "logs"
 
 
+def _cell(value: object) -> str:
+    """One markdown table cell from an externally-authored string (D-123).
+
+    QBO account names are typed by people. A pipe or a control character in one
+    silently mangles the table Harrison reads and confirms from -- and this is the
+    one surface in the build that renders these names at all, so it is exactly
+    where the sanitizer must not be skipped.
+    """
+    return ca.safe_label(value, 120).replace("|", r"\|")
+
+
 def _write_lex_confirm_artifact(
     realm: str,
     accounts: list[dict],
@@ -324,20 +385,24 @@ def _write_lex_confirm_artifact(
         "confirmed through Harrison by DM (D-124); the shared map carries opaque "
         "placeholders only.",
         "",
-        "## Bank accounts -- the `filters` candidates for the 1:N split",
+        "## Bank accounts -- what the 1:N split would have to key on",
         "",
         f"QBO exposes ONE {realm} realm against five Lex tabs, so the extractor "
-        f"currently REFUSES to compute for it. Either attest that the company "
-        f"file equals exactly one tab (`scope_attested: true`) or split it with "
-        f"account filters drawn from this list:",
+        f"REFUSES to compute for it. The ONLY declaration it honours today is a "
+        f"single `tab` plus `scope_attested: true` -- an attestation that the "
+        f"company file IS exactly that one tab. `filters` is NOT implemented and "
+        f"now refuses rather than silently reading the realm whole. If the file "
+        f"really covers all five entities, leaving this realm UNKNOWN is the "
+        f"correct answer, and these accounts are the evidence for what a future "
+        f"per-tab split (`tab_splits`) would need:",
         "",
         "| account id | type | name |",
         "|---|---|---|",
     ]
     for account in sorted(accounts, key=lambda a: str(a.get("fqn") or "")):
         if account.get("type") == "Bank":
-            lines.append(f"| {account['id']} | {account['type']} | "
-                         f"{account.get('fqn') or account.get('name')} |")
+            lines.append(f"| {_cell(account['id'])} | {_cell(account['type'])} | "
+                         f"{_cell(account.get('fqn') or account.get('name'))} |")
     lines += [
         "",
         "## Counterpart accounts seen opposite bank activity",
@@ -348,9 +413,10 @@ def _write_lex_confirm_artifact(
     for account_id, entry in candidates.items():
         account = by_id.get(account_id) or {}
         lines.append(
-            f"| {entry.get('placeholder')} | {account_id} | "
-            f"{account.get('fqn') or account.get('name') or '?'} | "
-            f"{entry.get('account_type')} | {entry.get('category') or '(none)'} | "
+            f"| {_cell(entry.get('placeholder'))} | {_cell(account_id)} | "
+            f"{_cell(account.get('fqn') or account.get('name') or '?')} | "
+            f"{_cell(entry.get('account_type'))} | "
+            f"{_cell(entry.get('category') or '(none)')} | "
             f"{entry.get('observed_rows')} | {entry.get('observed_abs_amount')} |")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -387,6 +453,16 @@ def _discover(args, entity_map: cm.EntityMap, today: datetime.date) -> int:
 
     for realm in realms:
         pairing = entity_map.pairing(realm)
+        if pairing is None:
+            # The window path refuses an unmapped realm BEFORE its first API call.
+            # Discovery must match that, or it becomes the weaker of the two
+            # collection boundaries: a personal or holding entity provisioned
+            # under a code `excluded_realms` does not name would have its whole
+            # chart of accounts and 90 days of register lines read, and --apply
+            # would write its account names into a git-tracked file.
+            log.warning("%s has no entity-map pairing -- not reading it "
+                        "(add a pairing first)", realm)
+            continue
         try:
             accounts = qc.query_all_accounts(realm)
             bank = sorted(str(a["id"]) for a in accounts if a.get("type") == "Bank")
@@ -410,10 +486,17 @@ def _discover(args, entity_map: cm.EntityMap, today: datetime.date) -> int:
         if candidates:
             discovered[realm] = candidates
         # An unresolvable realm is exactly the one whose confirm artifact matters
-        # most -- it cannot be read at all until the split is declared.
+        # most -- it cannot be read at all until the split is declared. Gated on
+        # --apply: this is the one file in the build carrying LEX account names in
+        # plaintext, and "--discover prints, --apply writes" has to be true of it
+        # too or the operator's mental model is wrong about precisely that file.
         if cm.realm_names_are_opaque(realm):
-            lex_artifacts.append(_write_lex_confirm_artifact(
-                realm, accounts, candidates, today))
+            if args.apply:
+                lex_artifacts.append(_write_lex_confirm_artifact(
+                    realm, accounts, candidates, today))
+            else:
+                log.info("%s: --apply would write the local-only name-confirm "
+                         "artifact for this realm", realm)
         elif pairing and not pairing.resolvable:
             log.warning("%s is unresolvable (%s)", realm, pairing.refusal_reason)
 
@@ -478,13 +561,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="comma-separated realm codes (default: all provisioned)")
     parser.add_argument("--no-mirror", action="store_true",
                         help="write locally but skip the Drive mirror")
+    parser.add_argument(
+        "--week", default="",
+        help=("THE RECOVERY LEVER. Pull a specific WEEK-ENDING date (YYYY-MM-DD) "
+              "instead of the two windows derived from today -- use it to backfill "
+              "a week a missed Monday left with no finalized window. Combine with "
+              "--window final. Pass the week-ending date itself; --date is a fake "
+              "'today' and is not the way to do this."))
     parser.add_argument("--date", default="",
-                        help="override today (YYYY-MM-DD); testing only")
+                        help=("override today (YYYY-MM-DD). Shifts BOTH derived "
+                              "windows, so to reach week X you would have to pass "
+                              "X+8..X+14 -- use --week instead. Testing only."))
     parser.add_argument(
         "--overwrite", action="store_true",
         help=("allow a write that would otherwise be refused as destructive: "
-              "replacing a matured FINALIZED week with a preliminary pull, or "
-              "overwriting a full file with a narrowed --realms sweep"))
+              "overwriting a full file with a narrowed --realms sweep, or "
+              "replacing a window with one that covers FEWER realms"))
     parser.add_argument(
         "--discover", action="store_true",
         help=("propose account->category rows for the category map from what "
@@ -523,9 +615,32 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
-    snapshot_dates = cl.list_snapshot_dates()
-    week_source = (f"forecast snapshot {snapshot_dates[-1].isoformat()}"
-                   if snapshot_dates else "unknown")
+    # --week names the WEEK-ENDING to pull, so a backfill asks for the week it
+    # actually wants. Deriving it from a fake `today` meant asking for week X by
+    # passing X+8..X+14, which is documented nowhere and fails confusingly.
+    if args.week.strip():
+        try:
+            target = datetime.date.fromisoformat(args.week.strip())
+        except ValueError:
+            log.error("--week must be YYYY-MM-DD (the week-ENDING date)")
+            return 2
+        expected_day = target.strftime("%A")
+        if expected_day != weekday_name:
+            log.error("--week %s is a %s, but this workbook's weeks end on %s. "
+                      "Pass the week-ENDING date.", target, expected_day, weekday_name)
+            return 2
+        if target >= today:
+            log.error("--week %s has not closed yet (today is %s)", target, today)
+            return 2
+        w1 = w2 = target
+        log.info("--week %s: pulling that week only", target)
+
+    # The snapshot that ACTUALLY supplied the weekday, not merely the newest one:
+    # week_source is the field a reader consults to answer "where did this week
+    # boundary come from?", so naming a snapshot that supplied nothing misdirects.
+    _weekday, source_date = ca.week_grid_source()
+    week_source = (f"forecast snapshot {source_date.isoformat()}"
+                   if source_date else "unknown")
     log.info("week ending %s (from %s); PRELIMINARY W-1=%s, FINALIZED W-2=%s",
              weekday_name, week_source, w1, w2)
 
@@ -564,6 +679,12 @@ def main(argv: list[str] | None = None) -> int:
             print(render_dry_run(payload))
             print()
             built += 1
+            # Fall through to the same health checks below. The dry run is
+            # documented as the only pre-flight gate before this feeds a finance
+            # surface, and the task PS1 hands it to the operator as THE review
+            # command -- so it must not exit 0 on a window where realms were
+            # unreadable or the tie-out broke. It used to.
+            degraded = _report_window_health(payload, window_kind) or degraded
             continue
 
         try:
@@ -579,26 +700,51 @@ def main(argv: list[str] | None = None) -> int:
 
         if not args.no_mirror:
             _mirror(payload)
+            _mirror_backfill(today)
 
-        problems = sorted(r for r, b in payload["realms"].items()
-                          if b.get("status") in ("error", "unknown"))
-        if problems:
-            log.error("realm(s) UNKNOWN in %s window: %s", window_kind,
-                      ", ".join(problems))
-            degraded = True
-
-        untied = sorted(r for r, b in payload["realms"].items()
-                        if (b.get("tie_out") or {}).get("status") == "failed")
-        if untied:
-            # Loud on purpose: the figure is banked and looks fine, so nothing
-            # else in the estate would tell anybody it disagrees with the ledger.
-            log.error("TIE-OUT FAILED in %s window for: %s -- banked but excluded "
-                      "from comparison", window_kind, ", ".join(untied))
-            degraded = True
+        degraded = _report_window_health(payload, window_kind) or degraded
 
     if built == 0:
         return 2
     return 1 if degraded else 0
+
+
+def _report_window_health(payload: dict, window_kind: str) -> bool:
+    """Log what an operator must act on. Returns True if the run is degraded."""
+    degraded = False
+    realms = payload.get("realms") or {}
+
+    problems = sorted(r for r, b in realms.items()
+                      if b.get("status") in ("error", "unknown"))
+    if problems:
+        log.error("realm(s) UNKNOWN in %s window: %s", window_kind,
+                  ", ".join(problems))
+        degraded = True
+
+    untied = sorted(r for r, b in realms.items()
+                    if (b.get("tie_out") or {}).get("status") == "failed")
+    if untied:
+        # Loud on purpose: the figure is banked and looks fine, so nothing else in
+        # the estate would tell anybody it disagrees with the ledger.
+        log.error("TIE-OUT FAILED in %s window for: %s -- banked but excluded "
+                  "from comparison", window_kind, ", ".join(untied))
+        degraded = True
+
+    # A tie-out that never RAN is not a clean week. One QBO error on any of the
+    # nine typed queries makes the recompute unavailable, and the whole premise of
+    # this module is that agreement is a check a failure BREAKS -- so a week where
+    # the check was switched off has to be as visible as one where it failed.
+    # Otherwise exit 0, covered, monitor green, figure published, guard silently off.
+    unchecked = sorted(r for r, b in realms.items()
+                       if (b.get("tie_out") or {}).get("status") == "unavailable")
+    if unchecked:
+        log.error("TIE-OUT DID NOT RUN in %s window for: %s -- the independent "
+                  "check was unavailable, so these figures are banked UNVERIFIED "
+                  "and excluded from comparison. Re-pull when QBO is healthy.",
+                  window_kind, ", ".join(unchecked))
+        degraded = True
+
+    return degraded
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@
 
 The pins that matter are the ones a green suite and a plausible figure both hide:
 
-  * a PRELIMINARY pull must never replace a matured FINALIZED week;
+  * a PRELIMINARY window's blocks must never self-label usable for comparison;
+  * a bank balance that covers only some accounts must render UNKNOWN, not a
+    partial sum under a total's name;
   * an internal sweep between two of our own bank accounts must not read as
     income AND spend in the same week;
   * a realm we failed to read, or whose every transaction type came back empty,
@@ -199,8 +201,10 @@ def _entity_map(**pairs) -> cm.EntityMap:
     )
 
 
-def _gl(rows, opening=1000.0, identity=None):
+def _gl(rows, opening=1000.0, identity=None, accounts_with_opening=1):
     return {"rows": rows, "row_count": len(rows), "opening_balance": opening,
+            "accounts_with_opening": accounts_with_opening,
+            "opening_conflict": False,
             "identity": identity or {"checked": 1, "worst_residual": 0.0, "failed": []},
             "duplicate_row_keys": 0, "sections": {}}
 
@@ -214,10 +218,11 @@ def _check(net, **kw):
     return base
 
 
-def _build(pairing, gl, check, cmap, freshness_date="2026-08-07"):
+def _build(pairing, gl, check, cmap, freshness_date="2026-08-07",
+           window_kind=ca.WINDOW_FINALIZED):
     return ca.build_realm(
         "F3E", pairing, week_start=W1 - datetime.timedelta(days=6), week_ending=W1,
-        category_map=cmap,
+        window_kind=window_kind, category_map=cmap,
         query_accounts=lambda r: [{"id": "9", "type": "Bank"},
                                   {"id": "52", "type": "Credit Card"}],
         ledger_rows=lambda *a: gl,
@@ -241,6 +246,68 @@ class TestBuildRealm:
         assert block["usable_for_comparison"] is True
         assert block["posted_through"] == "2026-08-07"
 
+    def test_a_preliminary_window_is_never_usable_for_comparison(self, tmp_path):
+        """D-051 MED-HIGH. The payload's notes say "never use a preliminary window
+        for accuracy math", but a consumer reads the FIELD, not the notes -- and it
+        used to say True even on a confirmed, tied-out preliminary block. That is
+        the Fin-1 failure the module claims to have designed out, re-entering
+        through a field name."""
+        rows = [{"txn_id": "1", "amount": -100.0, "split_account_id": None}]
+        pairing = cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True)
+        prelim = _build(pairing, _gl(rows), _check(-100.0), self._cmap(tmp_path),
+                        window_kind=ca.WINDOW_PRELIMINARY)
+        final = _build(pairing, _gl(rows), _check(-100.0), self._cmap(tmp_path),
+                       window_kind=ca.WINDOW_FINALIZED)
+        assert prelim["usable_for_comparison"] is False
+        assert final["usable_for_comparison"] is True
+        assert prelim["net_flow"] == -100.0          # still banked, still stamped
+
+    def test_balances_are_withheld_when_the_ledger_omitted_accounts(self, tmp_path):
+        """D-051 HIGH, live-verified: QBO's General Ledger renders only accounts
+        with activity -- LEX returned ONE section for TWELVE bank accounts -- so the
+        opening it reports is a partial sum. Published as `opening_bank_balance`
+        that is a wrong number, and `closing = opening + net` inherits it while the
+        tie-out stays clean, because the FLOW is right and nothing checks the
+        BALANCE."""
+        rows = [{"txn_id": "1", "amount": -100.0, "split_account_id": None}]
+        block = ca.build_realm(
+            "LEX2", cm.RealmPairing(realm="LEX2", tab="CF_X", confirmed=True),
+            week_start=W2, week_ending=W1, window_kind=ca.WINDOW_FINALIZED,
+            category_map=self._cmap(tmp_path),
+            # 3 bank accounts in the perimeter, 1 rendered by the report.
+            query_accounts=lambda r: [{"id": str(i), "type": "Bank"} for i in (1, 2, 3)],
+            ledger_rows=lambda *a: _gl(rows, opening=160749.40,
+                                       accounts_with_opening=1),
+            recompute=lambda *a: _check(-100.0),
+            freshness=lambda *a: {"date": "2026-08-07"})
+        assert block["opening_bank_balance"] is None
+        assert block["closing_bank_balance"] is None
+        assert block["balances"]["complete"] is False
+        assert block["balances"]["accounts_with_opening"] == 1
+        assert block["balances"]["bank_accounts"] == 3
+        # The partial figure survives under a name that says what it is.
+        assert block["balances"]["opening_rendered_accounts_only"] == 160749.40
+        # And the flow, which IS complete, is untouched.
+        assert block["net_flow"] == -100.0
+
+    def test_complete_balances_are_published(self, tmp_path):
+        rows = [{"txn_id": "1", "amount": -100.0, "split_account_id": None}]
+        block = _build(cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
+                       _gl(rows, opening=1000.0, accounts_with_opening=1),
+                       _check(-100.0), self._cmap(tmp_path))
+        assert block["opening_bank_balance"] == 1000.0
+        assert block["closing_bank_balance"] == 900.0
+        assert block["balances"]["complete"] is True
+
+    def test_a_same_label_section_collapse_withholds_balances(self, tmp_path):
+        rows = [{"txn_id": "1", "amount": -100.0, "split_account_id": None}]
+        gl = _gl(rows)
+        gl["opening_conflict"] = True
+        block = _build(cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
+                       gl, _check(-100.0), self._cmap(tmp_path))
+        assert block["opening_bank_balance"] is None
+        assert "collapse" in block["balances"]["reason"]
+
     def test_unconfirmed_pair_is_not_usable_for_comparison(self, tmp_path):
         block = _build(cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=False),
                        _gl([]), _check(0.0), self._cmap(tmp_path))
@@ -256,7 +323,7 @@ class TestBuildRealm:
         called: list[str] = []
         block = ca.build_realm(
             "LEX", pairing, week_start=W2, week_ending=W1,
-            category_map=self._cmap(tmp_path),
+            window_kind=ca.WINDOW_FINALIZED, category_map=self._cmap(tmp_path),
             query_accounts=lambda r: called.append(r) or [],
             ledger_rows=lambda *a: called.append("gl") or _gl([]),
             recompute=lambda *a: _check(0.0), freshness=lambda *a: {"date": None},
@@ -336,7 +403,8 @@ class TestBuildRealm:
     def test_read_failure_renders_unknown_never_zero(self, tmp_path):
         block = ca.build_realm(
             "F3E", cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
-            week_start=W2, week_ending=W1, category_map=self._cmap(tmp_path),
+            week_start=W2, week_ending=W1, window_kind=ca.WINDOW_FINALIZED,
+            category_map=self._cmap(tmp_path),
             query_accounts=lambda r: (_ for _ in ()).throw(RuntimeError("HTTP 503")),
             ledger_rows=lambda *a: _gl([]), recompute=lambda *a: _check(0.0),
             freshness=lambda *a: {"date": None})
@@ -350,7 +418,8 @@ class TestBuildRealm:
         secret = "https://quickbooks.api.intuit.com/v3/company/9130354../query"
         block = ca.build_realm(
             "F3E", cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
-            week_start=W2, week_ending=W1, category_map=self._cmap(tmp_path),
+            week_start=W2, week_ending=W1, window_kind=ca.WINDOW_FINALIZED,
+            category_map=self._cmap(tmp_path),
             query_accounts=lambda r: (_ for _ in ()).throw(RuntimeError(secret)),
             ledger_rows=lambda *a: _gl([]), recompute=lambda *a: _check(0.0),
             freshness=lambda *a: {"date": None})
@@ -359,7 +428,8 @@ class TestBuildRealm:
     def test_no_bank_accounts_is_unknown(self, tmp_path):
         block = ca.build_realm(
             "F3E", cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
-            week_start=W2, week_ending=W1, category_map=self._cmap(tmp_path),
+            week_start=W2, week_ending=W1, window_kind=ca.WINDOW_FINALIZED,
+            category_map=self._cmap(tmp_path),
             query_accounts=lambda r: [{"id": "52", "type": "Credit Card"}],
             ledger_rows=lambda *a: _gl([]), recompute=lambda *a: _check(0.0),
             freshness=lambda *a: {"date": None})
@@ -369,7 +439,8 @@ class TestBuildRealm:
         rows = [{"txn_id": "1", "amount": -100.0, "split_account_id": None}]
         block = ca.build_realm(
             "F3E", cm.RealmPairing(realm="F3E", tab="CF_F3", confirmed=True),
-            week_start=W2, week_ending=W1, category_map=self._cmap(tmp_path),
+            week_start=W2, week_ending=W1, window_kind=ca.WINDOW_FINALIZED,
+            category_map=self._cmap(tmp_path),
             query_accounts=lambda r: [{"id": "9", "type": "Bank"}],
             ledger_rows=lambda *a: _gl(rows), recompute=lambda *a: _check(-100.0),
             freshness=lambda *a: (_ for _ in ()).throw(RuntimeError("nope")))
@@ -505,19 +576,17 @@ class TestWriteWindow:
         assert path.name == f"{W1.isoformat()}_prelim-actuals.json"
         assert ca.load_window(W1, ca.WINDOW_PRELIMINARY)["covered"] == 1
 
-    def test_preliminary_refuses_to_replace_a_finalized_week(self, tmp_path):
-        """The destructive re-run this store actually has: downgrading a matured
-        week to a structurally incomplete one."""
+    def test_preliminary_alongside_a_finalized_week_is_allowed(self, tmp_path):
+        """The refusal that used to live here protected NOTHING: prelim and final
+        are separate files and every accuracy consumer reads load_finalized, so a
+        D-051 reviewer showed the matured figure surviving intact. Its only real
+        effect was to fail routine backfills and train the operator to add
+        --overwrite reflexively -- the flag that disables the guards that matter."""
         ca.write_window(_build_window(["F3E"], kind=ca.WINDOW_FINALIZED,
-                                      tmp_path=tmp_path), today=MONDAY)
-        with pytest.raises(ca.ActualsError, match="structurally incomplete"):
-            ca.write_window(_build_window(["F3E"], tmp_path=tmp_path), today=MONDAY)
-
-    def test_overwrite_allows_it_deliberately(self, tmp_path):
-        ca.write_window(_build_window(["F3E"], kind=ca.WINDOW_FINALIZED,
-                                      tmp_path=tmp_path), today=MONDAY)
-        assert ca.write_window(_build_window(["F3E"], tmp_path=tmp_path),
-                               overwrite=True, today=MONDAY).exists()
+                                      net=-250.0, tmp_path=tmp_path), today=MONDAY)
+        ca.write_window(_build_window(["F3E"], net=-100.0, tmp_path=tmp_path),
+                        today=MONDAY)
+        assert ca.load_finalized(W1)["realms"]["F3E"]["net_flow"] == -250.0
 
     def test_re_pulling_the_same_kind_is_allowed(self, tmp_path):
         """Not destructive: the whole design rests on QBO being re-readable,
@@ -533,6 +602,25 @@ class TestWriteWindow:
                                 full_scope=["F3E", "BDM"])
         with pytest.raises(ca.ActualsError, match="PARTIAL sweep"):
             ca.write_window(partial, today=MONDAY)
+
+    def test_a_coverage_regression_refuses(self, tmp_path):
+        """D-051 MED. A full sweep where 7 of 8 realms error is NOT a partial
+        sweep, and covered==1 clears the zero floor -- so a QBO outage could
+        replace a complete matured week with one reading UNKNOWN almost
+        everywhere. The data is re-pullable; the RECORD of what was there is not."""
+        emap = _entity_map(F3E={"tab": "CF_F3", "confirmed": True},
+                           BDM={"tab": "CF_BigDM", "confirmed": True})
+        ca.write_window(_build_window(["F3E", "BDM"], emap=emap, tmp_path=tmp_path),
+                        today=MONDAY)
+        thin = _build_window(["F3E", "BDM"], emap=emap, tmp_path=tmp_path)
+        thin["covered"] = 1
+        with pytest.raises(ca.ActualsError, match="better record with a worse"):
+            ca.write_window(thin, today=MONDAY)
+
+    def test_equal_or_better_coverage_is_allowed(self, tmp_path):
+        ca.write_window(_build_window(["F3E"], tmp_path=tmp_path), today=MONDAY)
+        assert ca.write_window(_build_window(["F3E"], net=-5.0, tmp_path=tmp_path),
+                               today=MONDAY).exists()
 
     def test_future_dated_window_refuses(self, tmp_path):
         """One stray future file blinds a max()-based missed-run check for
@@ -583,6 +671,64 @@ class TestLoadPreference:
 
 
 # ── rendering safety ─────────────────────────────────────────────────────────
+
+class TestAnnotateAdvisory:
+    """chain_check must not blame a back-date for a MISSING week."""
+
+    def _payload(self, week, opening=1000.0):
+        return {"window_kind": ca.WINDOW_FINALIZED, "week_ending": week,
+                "realms": {"F3E": {"status": "ok",
+                                   "opening_bank_balance": opening}}}
+
+    def test_adjacent_weeks_are_compared(self):
+        prior = {"week_ending": "2026-07-31",
+                 "realms": {"F3E": {"closing_bank_balance": 900.0}}}
+        out = ca.annotate_advisory(self._payload("2026-08-07"),
+                                   prior_finalized=prior)
+        chain = out["realms"]["F3E"]["chain_check"]
+        assert chain["status"] == "checked"
+        assert chain["residual"] == 100.0
+
+    def test_a_gap_is_reported_as_a_gap_not_a_back_date(self):
+        """Both review lenses found this independently: chaining to the newest
+        EARLIER week rather than the ADJACENT one turns a missing week into a
+        six-figure "activity booked into a finalised week" alarm, when the residual
+        is simply the absent week's own net flow."""
+        prior = {"week_ending": "2026-07-24",
+                 "realms": {"F3E": {"closing_bank_balance": 900.0}}}
+        out = ca.annotate_advisory(self._payload("2026-08-07"),
+                                   prior_finalized=prior)
+        chain = out["realms"]["F3E"]["chain_check"]
+        assert chain["status"] == "not_adjacent"
+        assert chain["gap_weeks"] == 2
+        assert "residual" not in chain
+        assert "--week" in chain["note"]
+
+    def test_withheld_balances_render_unavailable_not_checked(self):
+        prior = {"week_ending": "2026-07-31",
+                 "realms": {"F3E": {"closing_bank_balance": None}}}
+        out = ca.annotate_advisory(self._payload("2026-08-07", opening=None),
+                                   prior_finalized=prior)
+        assert out["realms"]["F3E"]["chain_check"]["status"] == "unavailable"
+
+    def test_a_preliminary_window_gets_no_advisory_blocks(self):
+        payload = self._payload("2026-08-07")
+        payload["window_kind"] = ca.WINDOW_PRELIMINARY
+        out = ca.annotate_advisory(payload, prior_finalized={
+            "week_ending": "2026-07-31",
+            "realms": {"F3E": {"closing_bank_balance": 900.0}}})
+        assert "chain_check" not in out["realms"]["F3E"]
+
+    def test_register_reference_is_only_comparable_at_the_window_end(self):
+        snapshot = {"basis": "QBO account register (Account API)",
+                    "realms": {"F3E": {"status": "ok", "bank_total": 1234.0,
+                                       "as_of_utc": "2026-08-20T07:05:00+00:00"}}}
+        out = ca.annotate_advisory(self._payload("2026-08-07"),
+                                   register_snapshot=snapshot)
+        ref = out["realms"]["F3E"]["register_reference"]
+        assert ref["comparable"] is False
+        assert "DIFFERENT measure" in ref["note"]
+
 
 class TestSafeLabel:
     def test_strips_control_characters(self):

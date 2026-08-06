@@ -31,13 +31,27 @@
 #
 # SLOT CHECK against the LIVE registry (verified 2026-08-06): 06:25 is unused.
 # Neighbours are cowork-cora-cashflow-forecast-snapshot 06:15,
-# cowork-cora-inventory-state-sync 06:20 and cowork-cora-gap-autofill 06:10. This
-# job is heavier than S1 (about 10 read-only QBO calls per realm per window) and
-# ran roughly 4 minutes end-to-end over 9 realms in the 8/06 live dry-run, so it
-# may still be running at 06:30 -- the neighbours are independent scripts with no
-# shared lock or DB, so overlap is harmless. It sits inside the 03:00-09:00 window
-# the weekly health metric watches but is unique at its minute, so max-concurrent
-# stays 1 against a threshold of >2 -- no new alarm.
+# cowork-cora-inventory-state-sync 06:20 and cowork-cora-gap-autofill 06:10.
+#
+# CALL COUNT, counted rather than estimated: per realm per window it is 1 account
+# page + 1 General Ledger report + 9 typed flow queries (_FLOW_POSTINGS) + 5
+# freshness queries (_BANK_SIDE_TXN_TYPES + Payment) = about 16, so roughly 256
+# requests per run over 8 readable realms x 2 windows. At the ~1s/call observed in
+# the 8/06 live dry-run that is the measured ~4 minutes; if the report endpoints
+# slow to ~6s/call it approaches the 30-minute limit below, which is honest
+# headroom rather than generous. It may still be running at 06:30 -- the
+# neighbours are independent scripts with no shared lock or DB, so overlap is
+# harmless. It sits inside the 03:00-09:00 window the weekly health metric watches
+# but is unique at its minute, so max-concurrent stays 1 against a threshold of
+# >2 -- no new alarm.
+#
+# PRINCIPAL: registered with the default (Interactive / Limited), matching its M1
+# sibling and setup-qbo-bank-snapshot-task.ps1. Consequence worth knowing:
+# StartWhenAvailable covers a sleeping or powered-off host WITH the session
+# intact, but a Monday occurrence is SKIPPED outright if nobody is logged on. That
+# is the precondition for a permanent gap in the finalized series, which is why
+# the nightly health check now detects HOLES and not just staleness, and why
+# --week exists to backfill one.
 #
 # Exit codes: 0 = every realm read cleanly; 1 = at least one realm went UNKNOWN or
 # a tie-out failed (the windows are still written); 2 = total failure or a refused
@@ -72,12 +86,23 @@ Write-Host "Setting up scheduled task: $TaskName" -ForegroundColor Cyan
 # Guard the slot: refuse to stack onto a minute another Cora task already owns.
 # The M1 build found the design's stated slot already taken, so this is checked
 # against the LIVE registry rather than trusted from a document.
+# Checks the TRIGGERS, not just NextRunTime: NextRunTime reports whichever
+# occurrence happens to be next, so on a task with several triggers or a
+# repetition interval it both misses real collisions and invents false ones, and
+# it is null for a disabled task (which still collides once re-enabled).
 $collisions = @()
 foreach ($t in (Get-ScheduledTask | Where-Object { $_.TaskName -like "*cora*" -and $_.TaskName -ne $TaskName })) {
-    $nextRun = (Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue).NextRunTime
-    if ($nextRun -and $nextRun.ToString("HH:mm") -eq $HourMin) {
-        $collisions += $t.TaskName
+    $hit = $false
+    foreach ($trig in $t.Triggers) {
+        if ($trig.StartBoundary) {
+            try {
+                if (([datetime]$trig.StartBoundary).ToString("HH:mm") -eq $HourMin) { $hit = $true }
+            } catch {}
+        }
     }
+    $nextRun = (Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue).NextRunTime
+    if ($nextRun -and $nextRun.ToString("HH:mm") -eq $HourMin) { $hit = $true }
+    if ($hit) { $collisions += $t.TaskName }
 }
 if ($collisions.Count -gt 0) {
     Write-Error "Slot $HourMin is already used by: $($collisions -join ', '). Pick a free minute and update `$HourMin."

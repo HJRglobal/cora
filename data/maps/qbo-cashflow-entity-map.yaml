@@ -16,6 +16,15 @@
 #      attributing sibling-Lex activity to whichever tab it guessed. UNKNOWN is
 #      never zero and never a wrong number.
 #
+# >>> `filters:` IS NOT IMPLEMENTED. Do not populate it. <<<
+# An earlier version of this file told you to supply account/class filters to
+# split an ambiguous realm. Nothing applies them: S2 reads a realm WHOLE, so a
+# populated `filters` would have published all five Lex entities' activity under
+# one tab. It now REFUSES instead (M2 D-051 finding). Splitting one realm across
+# several tabs needs a per-tab schema (`tab_splits`) that does not exist yet.
+# The supported declaration is `scope_attested: true` + a single `tab`, which
+# asserts the company file IS exactly that one tab.
+#
 # CONFIRMATION ARTIFACT: `run_cashflow_actuals.py --discover` regenerates the
 # candidate pairs below with name-match confidence so the whole set can be
 # confirmed in one sitting rather than trickled in.
@@ -96,17 +105,20 @@ pairs:
       realms pair cleanly). Lowest-confidence OSN row -- confirm explicitly.
 
   # ── the 1:N case: one realm, five sheet tabs ──────────────────────────────
-  # S2 REFUSES to compute for this realm until either `scope_attested: true`
-  # (Justin attests the company file's scope equals exactly the one named tab)
-  # or `filters:` is populated (account and/or class filters that split the
-  # realm across the tabs below). Guessing here would attribute LBHS/LTS/LLA
-  # activity to LLC, which is worse than reporting UNKNOWN.
+  # S2 REFUSES to compute for this realm until `tab` names ONE of the candidates
+  # below AND `scope_attested: true` says the company file really is exactly that
+  # tab. Guessing would attribute LBHS/LTS/LLA activity to LLC, which is worse
+  # than reporting UNKNOWN.
+  #
+  # If the company file genuinely covers all five, there is NO valid declaration
+  # today and LEX correctly stays UNKNOWN -- see the `filters` warning at the top
+  # of this file. Leaving it refused is the right answer, not a gap to work around.
   LEX:
     tab: null
     confidence: ambiguous-1-to-many
     confirmed: false
     scope_attested: false
-    filters: {}
+    filters: {}          # NOT IMPLEMENTED -- populating this REFUSES the realm
     candidate_tabs:
       - CF_LEXCORP
       - CF_LLC
@@ -114,12 +126,13 @@ pairs:
       - CF_LTS
       - CF_LLA_MV
     note: >-
-      QBO exposes a single LEX realm; the sheet carries five Lex tabs. Justin
-      must either attest that the company file IS exactly one of these tabs, or
-      supply the account/class filters that split it. Until then every Lex tab
-      renders manual-entry and LEX cash-outlook serving stays refused.
-      LEX account names are never free-rendered on a shared surface (D-124) --
-      confirm names via Harrison DM only.
+      QBO exposes a single LEX realm; the sheet carries five Lex tabs. The only
+      declaration S2 honours today is: set `tab` to one candidate AND
+      `scope_attested: true`, attesting the company file IS exactly that tab.
+      `filters` is not implemented and refuses. Until a valid declaration exists
+      every Lex tab renders manual-entry and LEX cash-outlook serving stays
+      refused. LEX account names are never free-rendered on a shared surface
+      (D-124) -- confirm names via Harrison DM only.
 
 # Tabs with NO QBO source at all. These render "manual-entry (no QBO source)" on
 # every downstream surface and are counted honestly in coverage (D-117) -- they
