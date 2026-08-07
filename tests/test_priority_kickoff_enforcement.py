@@ -322,14 +322,20 @@ class TestPriorityKickoffMonitor:
         row, but the fold's `captured` branch REPLACES the record wholesale, so the
         item lost its severity and was skipped by the priority filter rather than by
         the approval clock -- it passed even if approved_at were never read. The
-        capture ts is now aged in place via the parser, leaving severity intact."""
-        cid = _seed(severity="P1", status="PROPOSED")
-        capture_ts = cq.get_item(cid)["ts"]
+        capture ts is aged IN PLACE -- one `captured` event, severity intact.
+
+        It is aged by STAMPING the seed 30d old, not by a _parse_ts patch keyed on the
+        ts string (the second version, ~50% flaky under full-suite load): seed_item and
+        the `approved` event below both stamp _now_iso(), and two calls in one clock
+        tick -- routine at Windows datetime resolution -- produce byte-identical
+        strings, so the string-keyed patch aged the APPROVAL too and the row correctly
+        flagged. An explicitly-old seed ts makes the two clocks distinct by
+        construction and needs no parser patch at all."""
         old = cq._now() - timedelta(days=30)
-        real_parse = cq._parse_ts
-        monkeypatch.setattr(
-            cq, "_parse_ts",
-            lambda v: old if str(v) == str(capture_ts) else real_parse(v))
+        real_now_iso = cq._now_iso
+        monkeypatch.setattr(cq, "_now_iso", lambda: old.isoformat())
+        cid = _seed(severity="P1", status="PROPOSED")
+        monkeypatch.setattr(cq, "_now_iso", real_now_iso)
         cq._append_event({"event": "approved", "ts": cq._now_iso(), "id": cid})
         rec = cq.get_item(cid)
         assert rec.get("approved_at") and rec.get("severity") == "P1"
