@@ -618,17 +618,28 @@ _RETIRED_PROCESS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE: the literal [QA] leg lives in qa_scaffolding.contains_qa_marker, NOT here
+# (R8, 2026-08-06 -- the one-definition promise). This regex carries only the OTHER
+# scaffolding signals and the caller ORs the two. A second private copy of the
+# marker pattern is exactly how the D-104 convention came to be honoured on one
+# surface and silently absent from the rest.
 _QA_SCAFFOLDING_RE = re.compile(
-    r"\[qa\]"                                       # D-104 test-text convention
     # The Cowork connector footer, which is literally "*Sent using* <@U...>". Bare
     # "sent using" over-fired on ordinary prose (D-051 lens-5 LOW: "Which invoices
     # were sent using the new template?" is a real durable question); require the
     # mention token, mirroring tool_dispatch._CONFIRM_SENT_USING_RE.
-    r"|sent using\s*\*?\s*<@"
+    r"sent using\s*\*?\s*<@"
     r"|\bsmoke ?test\b|\btest message\b|\bignore this\b|\bthis is a test\b"
     r"|\btest locker code\b",
     re.IGNORECASE,
 )
+
+
+def _is_qa_scaffolding(text: str) -> bool:
+    """The [QA] marker (shared definition) OR the other scaffolding signals."""
+    from . import qa_scaffolding
+    return bool(qa_scaffolding.contains_qa_marker(text)
+                or _QA_SCAFFOLDING_RE.search(text or ""))
 
 # Point-in-time QUESTIONS (the mirror of _SNAPSHOT_RE, which screens ANSWERS).
 # A TIME-RELATIVE marker is required. D-051 lens-5 LOW: the first cut also matched
@@ -770,7 +781,7 @@ def mine_eligibility(gap: dict[str, Any],
             log.warning("gap_autofill: capability-ask screen errored -- fail-closed",
                         exc_info=True)
             return False, MINE_INELIGIBLE_SCREEN_ERROR
-        if _QA_SCAFFOLDING_RE.search(combined):
+        if _is_qa_scaffolding(combined):
             return False, MINE_INELIGIBLE_QA
         if _RETIRED_PROCESS_RE.search(combined):
             return False, MINE_INELIGIBLE_RETIRED

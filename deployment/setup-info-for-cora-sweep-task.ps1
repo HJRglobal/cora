@@ -38,6 +38,22 @@ if (-not (Test-Path $ScriptPath)) {
 
 Write-Host "Setting up scheduled task: $TaskName" -ForegroundColor Cyan
 
+# Guard the slot: refuse to stack onto a minute another Cora task already owns.
+# The 03:00-09:00 window is dense and the weekly health metric alarms on shared
+# clock times, so a hardcoded $HourMin must be checked against the LIVE registry
+# at registration rather than trusted from the comment above it.
+$collisions = @()
+foreach ($t in (Get-ScheduledTask | Where-Object { $_.TaskName -like "*cora*" -and $_.TaskName -ne $TaskName })) {
+    $nextRun = (Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue).NextRunTime
+    if ($nextRun -and $nextRun.ToString("HH:mm") -eq $HourMin) {
+        $collisions += $t.TaskName
+    }
+}
+if ($collisions.Count -gt 0) {
+    Write-Error "Slot $HourMin is already used by: $($collisions -join ', '). Pick a free minute and update `$HourMin."
+    exit 1
+}
+
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  Removing existing task..." -ForegroundColor Yellow

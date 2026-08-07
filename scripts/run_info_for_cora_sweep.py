@@ -76,6 +76,37 @@ log = logging.getLogger("info_for_cora_sweep")
 
 _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "info-for-cora-watermark.json"
 
+# R8: process lockfile (the meeting_action_capture pattern). Two concurrent sweeps
+# would each read the same watermark and double-post acks; the propose_update id
+# check keeps the QUEUE clean either way, but the acks are not idempotent.
+_LOCK_PATH = _REPO_ROOT / "data" / "state" / "info_for_cora_sweep.lock"
+_LOCK_STALE_SECONDS = 2 * 3600
+
+
+def _acquire_lock() -> bool:
+    """True when this process may run. A lock older than 2h is assumed orphaned
+    (a killed run) and is cleared rather than blocking the sweep forever."""
+    try:
+        if _LOCK_PATH.exists():
+            age = time.time() - _LOCK_PATH.stat().st_mtime
+            if age < _LOCK_STALE_SECONDS:
+                log.warning("another sweep holds the lock (%.0fs old) -- exiting", age)
+                return False
+            log.warning("clearing a stale lock (%.0fs old)", age)
+        _LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except Exception:  # noqa: BLE001 -- a lock problem must not block the sweep
+        log.warning("lock acquire failed; continuing unlocked", exc_info=True)
+        return True
+
+
+def _release_lock() -> None:
+    try:
+        _LOCK_PATH.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        log.debug("lock release failed", exc_info=True)
+
 # First run with no watermark: how far back to look. Deliberately bounded -- the
 # channel has served as a Q&A surface since May and an unbounded first pass would
 # re-read the whole history. Questions are skipped by the chokepoint anyway, but a
@@ -205,6 +236,19 @@ def main() -> int:
         log.error("SLACK_BOT_TOKEN is not set -- cannot sweep.")
         return 2
 
+    # Only a LIVE run needs the lock: a dry-run writes nothing and posts nothing,
+    # so it must neither block nor be blocked.
+    if not args.dry_run:
+        if not _acquire_lock():
+            return 0
+        try:
+            return _sweep(args, token)
+        finally:
+            _release_lock()
+    return _sweep(args, token)
+
+
+def _sweep(args, token: str) -> int:
     from slack_sdk import WebClient
     client = WebClient(token=token)
 
