@@ -259,6 +259,17 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv("CORA_LEXICON", "off")
     monkeypatch.setenv("LEXICON_RESOLUTIONS_PATH",
                        str(tmp_path / "lexicon-resolutions.jsonl"))
+    # LEX lane flags (2026-08-06). Same hazard as the three above, and it bites
+    # HARDER: these are designed to be flipped ON in the live .env one at a time,
+    # and every "LEX is refused by default" test asserts the OFF behaviour. Left
+    # unpinned, Harrison flipping a lane turns the suite RED (~11 failures across
+    # test_web_guard / test_delegated_work / test_gap_autofill / test_gap_detection)
+    # and bricks the standing loop's never-commit-on-red gate on the very day the
+    # lane goes live. These tests must pin the CODE default, not the ambient
+    # environment; a test that needs a lane ON sets it explicitly.
+    monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "off")
+    monkeypatch.setenv("CORA_DELEGATED_WORK_LEX", "off")
+    monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "off")
     # Web-tools knobs are read per-call from the environment; a live .env flip
     # (CORA_WEB_TOOLS=off, a custom cap) would otherwise redden web_guard tests.
     # Delete them so every test starts from the code defaults (tools ON, cap 40).

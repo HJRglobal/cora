@@ -537,9 +537,22 @@ def run_job(job: dict[str, Any], *, anthropic_client: Any = None,
             partial_reason = partial_reason or _budget_exceeded()
 
     if not final_text.strip():
-        if web_findings.strip():
+        if web_findings.strip() and not is_lex_job:
             final_text = web_findings  # partial: deliver what Phase A gathered
             partial_reason = partial_reason or "phase_b_empty"
+        elif web_findings.strip():
+            # D-051 F1 (2026-08-06): this branch delivers Phase-A output
+            # UNMEDIATED -- model-summarized text built directly from untrusted
+            # fetched pages, including its auto-appended Sources block with live
+            # third-party URLs. For a LEX job that artifact is written to the
+            # Lexington Drive tree and KB-ingested by the nightly static sync,
+            # where it becomes retrievable LEX "knowledge" whose sub_entity is
+            # re-derived FROM ITS OWN CONTENT -- i.e. hostile text could select
+            # the LEX sub-entity scope it lands in. Phase B is what turns web
+            # findings into a grounded document; without it there is no artifact
+            # worth persisting at LEX. Fail instead.
+            return _fail("no_output",
+                         "the research step produced no usable draft", meter)
         else:
             return _fail("no_output", "the model produced no output", meter)
 

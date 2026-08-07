@@ -986,7 +986,10 @@ def draft_answer(gap: dict[str, Any], evidence: list[Any]) -> dict[str, Any] | N
     if not isinstance(verdict, dict) or not verdict.get("answerable"):
         return None
     answer = str(verdict.get("answer") or "").strip()
-    if not answer or is_phi_risk(answer) or is_clinical_phi(answer):
+    # 3-predicate union (D-051, 2026-08-06): same missing admin-PHI class as
+    # record_ask_answer -- a mined LEX billing/authorization answer carries no
+    # clinical keyword of its own.
+    if not answer or is_any_phi(answer):
         return None
     # GL-11/12 durability gate: don't propose a vague deflection / in-progress
     # status / point-in-time snapshot as canon (bias to precision).
@@ -1084,10 +1087,24 @@ def _lex_escalation_recipients(entity: str) -> list[str]:
         # leadership covers all four sub-entities, and Shaun/Jen are registered
         # under LEX-LLC with entities:[LEX]. Querying the raw sub-entity would
         # find nobody for an LEX-LTS or LEX-LBHS gap and silently drop the ask.
-        return [
-            r.slack_id for r in org_roles.roles_for_entity("LEX")
-            if getattr(r, "gap_escalation", False) and r.slack_id
-        ]
+        # The roster flag alone is NOT sufficient (D-051, 2026-08-06). The
+        # docstring and .env.example both advertise roster editing as the
+        # low-friction change path -- 60s TTL, no restart -- so a one-line YAML
+        # edit with no code review would otherwise move who receives verbatim
+        # LEX question text. Custodianship is checked independently against
+        # lex_phi_access, the fail-closed single source of truth. Today both
+        # flagged users happen to be custodians; nothing enforced that.
+        from . import lex_phi_access
+        out: list[str] = []
+        for r in org_roles.roles_for_entity("LEX"):
+            if not (getattr(r, "gap_escalation", False) and r.slack_id):
+                continue
+            if not lex_phi_access.phi_allowed(r.slack_id, "LEX", is_dm=True):
+                log.warning("gap_autofill: %s is flagged gap_escalation but is NOT "
+                            "a LEX PHI custodian -- skipping", r.slack_id)
+                continue
+            out.append(r.slack_id)
+        return out
     except Exception:  # noqa: BLE001 -- fail closed: no recipients, no DM
         log.warning("gap_autofill: LEX recipient resolution failed", exc_info=True)
         return []
@@ -1116,6 +1133,22 @@ def resolve_owner(entity: str) -> str | None:
         return None
     owners = data.get("owners") or {}
     return owners.get(entity) or data.get("default") or None
+
+
+def _has_client_name(text: str) -> bool:
+    """Bare client name in care context -- the residual the 3-predicate union
+    misses ("what's the respite policy for participant Marcus"). Fail-CLOSED:
+    any error reads as 'a name is present'. One branch must not screen its two
+    lanes differently -- the web lane got this detector, so the DM lane does
+    too (D-051, 2026-08-06)."""
+    try:
+        from . import phi_guard
+        from .web_guard import _lex_staff_names
+        return phi_guard.has_care_context_person_name(text, set(_lex_staff_names()))
+    except Exception:  # noqa: BLE001 -- fail closed
+        log.warning("gap_autofill: client-name screen errored -- treating as PHI",
+                    exc_info=True)
+        return True
 
 
 def should_escalate(gap: dict[str, Any]) -> bool:
@@ -1152,6 +1185,15 @@ def should_escalate(gap: dict[str, Any]) -> bool:
     # and escalation quotes this text verbatim to a possibly-non-custodian).
     if is_phi_risk(text) or is_clinical_phi(text) or is_lex_billing_status_phi(text):
         return False
+    # LEX-ONLY. Checked here as well as at the render site so an ineligible gap
+    # never burns its one-ask-ever throttle. Scoped to LEX because the detector
+    # is recall-biased for a PHI boundary and over-blocks ordinary commercial
+    # prose: it read "did SJ Food Brokers pay invoice 8562 yet?" as a client
+    # name ("invoice" is a PHI cue, "SJ Food Brokers" is Title-case) and killed
+    # a legitimate F3E escalation. Caught by test_commercial_money_gap_still_
+    # escalates -- non-LEX behaviour must stay byte-identical.
+    if entity.startswith("LEX") and _has_client_name(text):
+        return False
     try:
         from .user_access import _financials_is_blocked
         if _financials_is_blocked(text.lower()):
@@ -1174,8 +1216,11 @@ def escalate_gap(gap: dict[str, Any], slack_client: Any) -> dict[str, Any] | Non
     # for a third party re-runs the union rather than trusting an earlier gate.
     _screen_blob = f"{gap.get('question', '')} {gap.get('gap', '')}"
     try:
-        if is_phi_risk(_screen_blob) or is_clinical_phi(_screen_blob) \
-                or is_lex_billing_status_phi(_screen_blob):
+        _blob_entity = (gap.get("entity") or "").strip().upper()
+        if (is_phi_risk(_screen_blob) or is_clinical_phi(_screen_blob)
+                or is_lex_billing_status_phi(_screen_blob)
+                or (_blob_entity.startswith("LEX")
+                    and _has_client_name(_screen_blob))):
             log.info("gap_autofill: escalation blocked at render (PHI) entity=%s",
                      gap.get("entity", "?"))
             return None
@@ -1367,7 +1412,16 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
         save_pending_asks(asks)
         return "No problem -- thanks for letting me know. I'll find another route."
 
-    if is_phi_risk(reply_text) or is_clinical_phi(reply_text):
+    # 3-predicate union (D-051, 2026-08-06). is_lex_billing_status_phi was
+    # MISSING here -- the D-050 admin class that exists precisely for LEX.
+    # Before the CORA_GAP_ESCALATION_LEX lane no LEX reply could reach this
+    # function; opening it makes exactly that inbound path live, and both
+    # roster-flagged recipients are PHI custodians whose ordinary vocabulary
+    # IS this class. Without it the reply persists verbatim to
+    # gap_ask_pending.json and the review payload, the replier is told it was
+    # routed for approval, and the durable write then silently refuses at the
+    # full-union gate below.
+    if is_any_phi(reply_text):
         stored["state"] = "REJECTED_PHI"
         stored["replied_at"] = _now_iso()
         asks[stored["ask_id"]] = stored

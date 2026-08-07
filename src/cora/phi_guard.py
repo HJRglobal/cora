@@ -866,6 +866,22 @@ _NONPERSON_PROPER_NOUNS = frozenset({
     "caregiver", "caregivers", "family", "families", "individual", "individuals",
     "quality", "compliance", "licensure", "certification", "revalidation",
     "incident", "incidents", "grievance", "appeal", "appeals", "hearing",
+    # Imperative / task verbs (D-051 finding, 2026-08-06). A brief or a web ask
+    # OPENS with one of these, capitalized, and _PROPER_NAME_RE cannot tell a
+    # sentence-initial verb from a first name -- so "Research what DDD requires
+    # for respite" read as a person named "Research" and refused the single
+    # most common LEX request shape, including the exact wording the refusal
+    # copy tells the user to switch to. Fixed HERE rather than by skipping the
+    # sentence-initial token, because "Marcus needs his respite auth renewed"
+    # is the counterexample that rule would break.
+    "research", "summarize", "summarise", "compile", "investigate", "prepare",
+    "analyze", "analyse", "pull", "find", "list", "outline", "identify",
+    "write", "build", "check", "confirm", "verify", "gather", "assemble",
+    "search", "look", "google", "show", "explain", "describe", "compare",
+    "review", "draft", "create", "give", "tell", "get", "read", "collect",
+    # Landmark case names / eponyms that appear in disability-policy questions
+    # (same class: a legitimate policy ask silently degrading to KB-only).
+    "olmstead", "medicaid's", "rehabilitation",
     # legal / publication vocabulary (citation-shaped policy questions)
     "administrative", "register", "revised", "statutes", "annotated", "federal",
     "national", "association", "center", "centers", "institute", "university",
@@ -881,7 +897,8 @@ _NONPERSON_PROPER_NOUNS = frozenset({
 })
 
 
-def has_care_context_person_name(text: str, allowed_names: set[str] | None = None) -> bool:
+def has_care_context_person_name(text: str, allowed_names: set[str] | None = None,
+                                 cue_required: bool = True) -> bool:
     """True when a person-shaped proper name rides in PHI/care context.
 
     The egress half of redact_cue_adjacent_names: same two signals (a
@@ -890,33 +907,71 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
     agency / policy proper nouns excluded so a public-policy question
     ("Arizona DDD respite rate policy") is not mistaken for a client mention.
 
+    *cue_required* (D-051 finding F4, 2026-08-06): with a cue required, the
+    single most dangerous query shape slips through -- a bare locate-the-person
+    lookup with no care vocabulary at all ("Marcus Delgado current address",
+    "phone number for Marcus Delgado", "what school Marcus Delgado attends").
+    Those are realistic LEX asks AND the one shape where the USER puts the
+    client name into the outbound string directly. Pass cue_required=False on
+    an egress path to treat ANY non-roster, non-geographic person-shaped name
+    as a hit. Over-blocking there degrades silently to KB-only, which is the
+    documented-acceptable direction for the LEX web lane.
+
     Staff names are never a hit -- a LEX teammate asking about their own
     colleague is not client PHI. Pure function; no I/O.
     """
-    if not text or not _PHI_CUE_RE.search(text):
+    if not text:
+        return False
+    if cue_required and not _PHI_CUE_RE.search(text):
         return False
     full, first = _staff_name_index(allowed_names)
     first = first | _alias_first_names(first)
 
-    def _is_person_token(tok: str) -> bool:
+    def _is_person_token(tok: str, governed: bool = False) -> bool:
+        """*governed* = the token is directly governed by a care-recipient noun.
+
+        D-051 (2026-08-06), two HIGH findings, one root cause: PASS 1 was
+        applying filters that only PASS 2 may apply, making this egress screen
+        WEAKER than the display scrub it mirrors. `redact_cue_adjacent_names._gov`
+        deliberately skips the staff-first-name set in PASS 1 -- context wins
+        over the roster's guess -- and we did not.
+
+          * Staff first names: the roster yields ~28 common given names
+            (aaron, alex, dan, eric, jen, matt, sara, shaun, ...). A client
+            named Aaron was invisible: "participant Marcus" blocked while
+            "participant Aaron" attached, same sentence.
+          * Geography/agency nouns: gilbert, chandler, mesa, peoria, glendale
+            and tempe are Phoenix-metro cities AND common surnames -- the exact
+            market Lexington serves -- as are west/north/day.
+
+        A token GOVERNED by "client/participant/member/consumer" is a client
+        regardless of what else the word means, so PASS 1 applies neither set.
+        PASS 2 (a bare Title-case name merely near a cue) still applies both --
+        there the word genuinely may be a colleague or a place.
+        """
         low = tok.lower()
-        if low in _NONNAME_STOPWORDS or low in _NONPERSON_PROPER_NOUNS:
+        if low in _NONNAME_STOPWORDS:
             return False
-        return not (_PHI_CUE_RE.fullmatch(tok) or low in first)
+        if not governed and (low in _NONPERSON_PROPER_NOUNS or low in first):
+            return False
+        return not _PHI_CUE_RE.fullmatch(tok)
 
     # PASS 1 -- governed by a care-recipient noun ("client Marcus").
     for m in _CARE_NOUN_RE.finditer(text):
         name = (m.group(1) or "").strip()
         if not name or name.lower() in full:
             continue
-        if any(_is_person_token(t) for t in name.split()):
+        if any(_is_person_token(t, governed=True) for t in name.split()):
             return True
 
-    # PASS 2 -- Title-case name within the cue window.
+    # PASS 2 -- Title-case name within the cue window (or anywhere when the
+    # caller waived the cue precondition: with no cue in the text there are no
+    # spans to be "near", so proximity must not be the filter).
     cue_spans = [(mm.start(), mm.end()) for mm in _PHI_CUE_RE.finditer(text)]
     for m in _PROPER_NAME_RE.finditer(text):
         s, e = m.start(), m.end()
-        if not any(s <= ce + _CUE_WINDOW and e >= cs - _CUE_WINDOW for cs, ce in cue_spans):
+        if cue_required and not any(
+                s <= ce + _CUE_WINDOW and e >= cs - _CUE_WINDOW for cs, ce in cue_spans):
             continue
         span = m.group(0)
         if span.strip().lower() in full:

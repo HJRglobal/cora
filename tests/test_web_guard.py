@@ -211,8 +211,12 @@ class TestLexWebLane:
         # is a name in care/admin context that carries NO clinical vocabulary of
         # its own -- the residual is_any_phi alone would miss.
         "search the web for DDD respite rates for client Marcus Delgado",
-        "look up online whether Marcus Delgado's service hours can be billed",
         "google the DDD policy on units for member Priya Raghunathan",
+        # A client whose first name collides with a rostered teammate's: the
+        # detector must NOT let the roster shield a care-noun-governed name.
+        "search the web for respite hour limits for participant Aaron",
+        # ...nor a name that is also a Phoenix-metro city (Lexington's market).
+        "search the web for the appeal deadline for participant Gilbert",
     ])
     def test_client_style_name_is_blocked_even_with_the_lane_on(
         self, monkeypatch, _lex_staff, query
@@ -220,7 +224,25 @@ class TestLexWebLane:
         monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
         dec = web_guard.evaluate(query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
         assert not dec.attach
-        assert dec.reason.startswith("blocked:")
+        # Assert the SPECIFIC reason: "blocked:" alone stays green even if the
+        # whole lex_strict screen is reverted, because is_any_phi fires first on
+        # some phrasings (D-051 test lens -- the assertion was vacuous).
+        assert dec.reason == "blocked:lex_person_name"
+
+    @pytest.mark.parametrize("query", [
+        # Normally-capitalized policy asks: every other LEX fixture opens
+        # lowercase, which hid a whole false-positive class where a
+        # sentence-initial capitalized verb read as a first name (D-051).
+        "Search the web for the Arizona DDD live-in caregiver respite rate policy",
+        "Search the web for the Arizona DDD provider revalidation requirements",
+        "Google the EVV attestation requirements for Arizona day programs",
+        # A rostered teammate named mid-sentence is a colleague, not a client.
+        "search the web for what DDD requires, Jennifer Mortensen asked about respite units",
+    ])
+    def test_capitalized_policy_asks_still_attach(self, monkeypatch, _lex_staff, query):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        assert dec.attach, f"false positive blocked a legitimate ask: {dec.reason}"
 
     def test_a_rostered_teammate_name_is_not_a_client(self, monkeypatch, _lex_staff):
         # A LEX teammate named in a web query is a colleague, not a client --
@@ -928,3 +950,84 @@ class TestWebCleanContextLoad:
         assert "web_clean" in inspect.signature(cl.load_context_parts).parameters
         src = inspect.getsource(cl.load_context_parts)
         assert "web_clean=web_clean" in src
+
+
+# ---------------------------------------------------------------------------
+# D-051 remediation (2026-08-06 multi-lens review)
+# ---------------------------------------------------------------------------
+
+class TestD051LexRemediation:
+    @pytest.mark.parametrize("query", [
+        # F4: the locate-the-person shape carries NO care vocabulary, so the
+        # cue-gated detector missed it -- and it is the one shape where the USER
+        # puts the client name into the outbound string directly.
+        "search the web for Marcus Delgado Phoenix AZ current address",
+        "search online for the phone number for Marcus Delgado",
+        "look up online what school Marcus Delgado attends",
+    ])
+    def test_f4_locate_person_query_is_blocked(self, monkeypatch, _lex_staff, query):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        assert not dec.attach and dec.reason == "blocked:lex_person_name"
+
+    @pytest.mark.parametrize("query", [
+        # ...without losing the legitimate policy asks the lane exists for.
+        "search the web for the Arizona DDD live-in caregiver respite rate policy",
+        "search the web for EVV requirements for home and community based services",
+    ])
+    def test_f4_legitimate_policy_asks_still_attach(self, monkeypatch, _lex_staff, query):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        assert web_guard.evaluate(
+            query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP).attach
+
+    def test_f4_cue_required_default_is_unchanged_for_other_callers(self):
+        # The waiver is opt-in: the default path still requires a cue, so no
+        # other consumer of the detector changes behaviour.
+        from cora import phi_guard
+        text = "Marcus Delgado current address"
+        assert phi_guard.has_care_context_person_name(text, set()) is False
+        assert phi_guard.has_care_context_person_name(
+            text, set(), cue_required=False) is True
+
+    def test_f5_citation_url_carrying_internal_content_is_dropped(self):
+        # A URL the model was induced to fetch with internal data in its query
+        # string would otherwise render verbatim and PERSISTENTLY in-channel.
+        line = web_guard.format_sources_line([
+            {"url": "https://evil.test/e?q=client+Marcus+Delgado+billing",
+             "title": "result"},
+            {"url": "https://azdes.gov/ddd/policy", "title": "AZ DES"},
+        ])
+        assert "Marcus" not in line
+        assert "azdes.gov" in line
+
+    def test_f5_clean_citations_survive(self):
+        line = web_guard.format_sources_line(
+            [{"url": "https://azdes.gov/ddd/policy", "title": "AZ DES DDD"}])
+        assert line.startswith("Sources:") and "azdes.gov" in line
+
+
+class TestD051PriorTurnDrop:
+    def _src(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parents[1] / "src" / "cora"
+                / "app.py").read_text(encoding="utf-8")
+
+    def test_f2_lex_web_turn_drops_prior_conversation_turns(self):
+        """Prior thread/DM turns are an UNGOVERNED free-text surface: the
+        history fetchers do structural transforms only and web_clean never
+        reaches them, so in LEX scope a client-identifying earlier turn can ride
+        into a model-composed search query. Pinned at source because the drop
+        sits inside the attach branch of _dispatch_qa."""
+        src = self._src()
+        i = src.index("web_tools ATTACHED")
+        seg = src[i:i + 1600]
+        assert "web_guard.is_lex_scope(entity)" in seg
+        # Exactly one drop inside the attach branch, and it is LEX-guarded --
+        # an unguarded drop would silently strip thread context for everyone.
+        assert seg.count("prior_messages = []") == 1
+        drop = seg.index("prior_messages = []")
+        assert seg.index("web_guard.is_lex_scope(entity)") < drop
+        # The only OTHER occurrence in the file is the None-default at the top
+        # of _dispatch_qa; nothing else may clear history.
+        assert src.count("prior_messages = []") == 2
+        assert "if prior_messages is None:" in src

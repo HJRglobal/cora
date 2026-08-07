@@ -904,12 +904,24 @@ def _dispatch_qa(
         # this turn can attach, so there is deliberately no separate LEX clause
         # here. With CORA_WEB_TOOLS_LEX off, evaluate returns "lex_scope"
         # (attach=False) and web_clean is False exactly as before -- byte-
-        # identical. With the lane ON, a LEX web turn MUST take the web-clean
-        # load: otherwise it would keep the personal-note overlay / unstripped
-        # Tier-1 posture / cross-entity fallback in context while the model
-        # composes outbound search strings from that same context. The
-        # unstripped_personal belt below only catches the note overlay; ordinary
-        # LEX chunk text is not "personal" and would have ridden along silently.
+        # identical.
+        #
+        # What this actually buys (corrected by the D-051 F3 finding -- an
+        # earlier version of this comment overstated it): web_clean does NOT
+        # strip ordinary LEX chunk text. It demotes the asker to the fail-closed
+        # STRANGER posture -- no note overlay, Tier-1 strips every personal
+        # chunk, no asker-scoped cross-entity fallback -- and all three of those
+        # surfaces set unstripped_personal, which the belt below already
+        # converts into a withhold. So this is not the barrier against a leak;
+        # the belt is. Without it, a LEX web ask from anyone carrying a personal
+        # note would gate_skip and SILENTLY DEGRADE, i.e. exactly the
+        # cq-49a7835f081c never-attaches bug re-created for LEX. It makes the
+        # lane usable; the belt keeps it safe.
+        #
+        # Scope note: this covers the EXPLICIT-intent leg only (web_intent). The
+        # time-sensitive fallback leg can still attach in LEX without the clean
+        # load -- fail-safe, because every surface it would have removed sets
+        # unstripped_personal and is withheld by the belt.
         web_clean = (
             web_intent
             and not phi_custodian
@@ -1077,6 +1089,23 @@ def _dispatch_qa(
                 channel_name, user_id, model_router.short_label(chosen_model),
                 web_decision.reason,
             )
+            # D-051 F4/F2 (2026-08-06): prior thread/DM turns are an UNGOVERNED
+            # free-text surface -- _fetch_thread_history/_fetch_dm_history do
+            # structural transforms only, no PHI scrub, and web_clean never
+            # reaches them (it governs the KB load, not the conversation). The
+            # model composes its search strings from the whole window, so in
+            # LEX scope those turns can carry client-identifying prose straight
+            # into an outbound query. This turn's LEX chunks ARE deterministically
+            # scrubbed; the human turns above them are not -- that asymmetry is
+            # the exposure. Drop history for LEX web turns only: thread context
+            # is the least valuable input to a live-web lookup, and screening
+            # free-text Slack prose would over-block and re-create the
+            # never-attaches bug (cq-49a7835f081c). Non-LEX is untouched;
+            # cq-505a37b1c4b7 still owns the general case.
+            if web_guard.is_lex_scope(entity) and prior_messages:
+                log.info("web_tools: dropping %d prior turn(s) for a LEX web turn",
+                         len(prior_messages))
+                prior_messages = []
         elif web_decision.reason not in ("no_intent", "disabled"):
             log.info(
                 "web_tools withheld channel=#%s user=%s reason=%s",

@@ -1045,3 +1045,43 @@ class TestAggregateQualityRejections:
         ])
         result = ga.aggregate_quality_rejections(days=14, repo_root=tmp_path)
         assert result["total_rejections"] == 0
+
+
+class TestD051EscalationReplyScreen:
+    """The inbound reply path was 2-predicate and omitted is_lex_billing_status_phi
+    -- the D-050 admin class that exists precisely for LEX. Before the escalation
+    lane no LEX reply could reach it; opening the lane makes that path live, and
+    both roster-flagged recipients are custodians whose ordinary vocabulary IS
+    this class."""
+
+    ADMIN_PHI = ("Bob Smith's DDD authorization expired 7/1 and his units "
+                 "were reduced to 20 per week")
+
+    def test_admin_phi_trips_only_the_third_predicate(self):
+        from cora.phi_guard import (is_any_phi, is_clinical_phi,
+                                    is_lex_billing_status_phi, is_phi_risk)
+        assert not is_phi_risk(self.ADMIN_PHI)
+        assert not is_clinical_phi(self.ADMIN_PHI)
+        assert is_lex_billing_status_phi(self.ADMIN_PHI)
+        assert is_any_phi(self.ADMIN_PHI)   # ...so only the union catches it
+
+    def test_reply_screen_rejects_admin_phi(self, paths, monkeypatch):
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text("owners:\n  F3E: U111\n", encoding="utf-8")
+        ask = ga.escalate_gap(_gap(), _FakeSlack())
+        assert ask is not None
+        reply = ga.record_ask_answer(ask, self.ADMIN_PHI)
+        assert reply and "protected" in reply
+        stored = ga.load_pending_asks()[ask["ask_id"]]
+        assert stored["state"] == "REJECTED_PHI"
+        # And the text must not have been persisted as an answer.
+        assert self.ADMIN_PHI not in json.dumps(stored)
+
+    def test_draft_answer_screen_uses_the_full_union(self):
+        # Same missing predicate on the mining side -- pinned at source because
+        # draft_answer's verdict comes from an Anthropic call.
+        src = (_REPO_ROOT / "src" / "cora" / "gap_autofill.py").read_text(
+            encoding="utf-8")
+        i = src.index("def draft_answer(")
+        seg = src[i:i + 3000]
+        assert "if not answer or is_any_phi(answer):" in seg

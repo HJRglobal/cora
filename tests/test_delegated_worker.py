@@ -1138,3 +1138,50 @@ def test_runner_script_subprocess_pulls_no_bot_process():
     result = subprocess.run([sys.executable, "-c", code],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# D-051 remediation (2026-08-06 multi-lens review) -- LEX lane
+# ---------------------------------------------------------------------------
+
+def test_f1_lex_job_refuses_rather_than_deliver_raw_phase_a_output(monkeypatch):
+    """Phase-A output is model-summarized text built directly from untrusted
+    fetched pages. Delivering it unmediated as a LEX artifact would persist it
+    to the Lexington Drive tree and KB-ingest it, where hostile prose becomes
+    retrievable LEX 'knowledge'. Phase B is what grounds it -- without B there
+    is nothing worth persisting at LEX."""
+    monkeypatch.setenv("CORA_DELEGATED_WORK_LEX", "on")
+    job = _job(entity="LEX-LLC", archetype="research_brief")
+    # Phase A yields findings; Phase B returns empty.
+    client = FakeClient([
+        _resp([_text_block("web findings from a fetched page")]),
+        _resp([_text_block("")]),
+    ])
+    out = worker.run_job(job, anthropic_client=client)
+    assert out["ok"] is False
+    assert out["failure_class"] == "no_output"
+
+
+def test_f1_non_lex_job_still_delivers_partial_phase_a(monkeypatch):
+    """Invariant 4: the LEX-only refusal must not change non-LEX behaviour --
+    a non-LEX job still gets its partial Phase-A delivery."""
+    job = _job(entity="F3E", archetype="research_brief")
+    client = FakeClient([
+        _resp([_text_block("web findings from a fetched page")]),
+        _resp([_text_block("")]),
+    ])
+    out = worker.run_job(job, anthropic_client=client)
+    assert out["ok"] is True
+    assert out["partial_reason"] == "phase_b_empty"
+
+
+def test_f1_delegated_artifacts_are_pinned_gm_level_at_ingest():
+    """The artifact carries no sub_entity, so the store would RE-DERIVE one from
+    its own CONTENT -- letting model-written text choose which Lexington
+    sub-entity channel it surfaces in. lex_gm_level opts it out of detection."""
+    src = (_REPO_ROOT / "scripts" / "incremental_sync_static.py").read_text(
+        encoding="utf-8")
+    i = src.index("if is_delegated_work_path(path):")
+    seg = src[i:i + 1400]
+    assert 'metadata["bot_authored"] = True' in seg
+    assert 'metadata["lex_gm_level"] = True' in seg

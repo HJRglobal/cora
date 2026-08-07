@@ -347,7 +347,13 @@ def _screen_query(text: str, lex_strict: bool = False) -> str | None:
         return "internal_figure"
     if lex_strict:
         try:
-            if phi_guard.has_care_context_person_name(text, set(_lex_staff_names())):
+            # cue_required=False (D-051 F4): a locate-the-person lookup carries
+            # no care vocabulary at all -- "Marcus Delgado current address" --
+            # and is the one shape where the USER puts the client name into the
+            # outbound query. A false positive here degrades silently to
+            # KB-only, which is this lane's accepted failure direction.
+            if phi_guard.has_care_context_person_name(
+                    text, set(_lex_staff_names()), cue_required=False):
                 return "lex_person_name"
         except Exception:  # noqa: BLE001 -- fail closed
             log.warning("web_guard: LEX name screen errored -- blocking", exc_info=True)
@@ -615,6 +621,17 @@ def format_sources_line(citations: list[dict] | None, max_sources: int = 4) -> s
         except ValueError:
             continue
         if not host or _INTERNAL_CITE_RE.match(host):
+            continue
+        # D-051 F5 (2026-08-06): the URL itself is attacker-influenced content.
+        # A page the model was induced to fetch with internal data in the query
+        # string would otherwise render that string verbatim and PERSISTENTLY in
+        # the channel. Exfil already happened at fetch time, so this bounds
+        # durability/visibility, not the channel -- but a Slack message is the
+        # more durable surface of the two. Screen it like any other egress text.
+        try:
+            if _screen_query(url):
+                continue
+        except Exception:  # noqa: BLE001 -- fail closed: drop the citation
             continue
         if url in seen:
             continue

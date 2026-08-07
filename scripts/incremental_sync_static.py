@@ -187,6 +187,16 @@ def file_to_document(path: Path) -> Document | None:
     # for Cora's own Slack replies).
     if is_delegated_work_path(path):
         metadata["bot_authored"] = True
+        # D-051 F1 (2026-08-06, LEX lane): the artifact carries no sub_entity,
+        # so store.upsert_documents Step 0 would RE-DERIVE one from its own
+        # CONTENT. For a LEX research brief that content is model-written from
+        # untrusted fetched pages -- i.e. third-party text would choose which
+        # Lexington sub-entity channel it becomes visible in. lex_gm_level opts
+        # the doc out of that detection, pinning it GM-level (sub_entity NULL)
+        # where a human decides its scope. Applied to every entity's artifacts,
+        # not just LEX: the same argument holds anywhere auto-detection reads
+        # AI-authored prose, and it keeps one rule instead of a LEX branch.
+        metadata["lex_gm_level"] = True
 
     return Document(
         source="static_md",
