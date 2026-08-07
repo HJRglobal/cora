@@ -523,16 +523,48 @@ _DELEGATE_INTENT_RE = re.compile(
     r"(?:"
     r"\bdelegate\s+(?:a|this|that|the)?\s*(?:job|task|work|brief|research)\b"
     r"|\bdelegate\s*:"
-    r"|\brun\s+(?:a|this)\s+(?:background\s+)?job\b"
+    # "background" is MANDATORY: "run a job costing analysis" is not a request
+    # to run a background job (D-051 HIGH-1).
+    r"|\brun\s+(?:a|this)\s+background\s+job\b"
     r"|\b(?:queue|kick\s+off|start|spin\s+up)\s+(?:a|the)\s+"
     r"(?:research\s+brief|doc(?:ument)?\s+draft|background\s+job)\b"
-    r"|\bresearch\s+brief\s+on\b"
+    # NOTE the bare "research brief on ..." alternative was REMOVED. It matched
+    # every message that merely DISCUSSED a brief -- "where's the research brief
+    # on Sprouts?", "what did the research brief on F3 retail conclude?" -- and
+    # because cora_delegate_work is a contract-write tool its string is posted
+    # VERBATIM over the model, so the user's actual question was destroyed and
+    # replaced by "Unknown job archetype ''". The queue/kick-off/start/spin-up
+    # branch above already covers the genuine imperative.
     r")",
     re.IGNORECASE,
 )
-# "delegate that to Shaun" is about a HUMAN, not the worker. Anchored to the
-# text AFTER the delegation verb so an ordinary hand-off is never forced.
-_DELEGATE_TO_HUMAN_RE = re.compile(r"^\s*(?:it|this|that)?\s*to\s+[A-Z]", re.IGNORECASE)
+# An interrogative is a question ABOUT delegation, not a delegation. Mirrors the
+# bail _asana_destructive_intent has had since F-23 Slice 2 -- its absence here
+# is what let "how do I delegate a task in Asana" force a job preview.
+_DELEGATE_INTERROGATIVE_RE = re.compile(
+    r"^\s*(?:@?\w+[,:]?\s+)?(?:"
+    # Informational openers -- a question ABOUT delegation.
+    r"(?:how|what|where|which|who|whose|when|why|do|does|did|is|are|was|were"
+    r"|have|has|any)\b"
+    # Modals are only interrogative when NOT aimed at Cora: "can you run a
+    # background job" is a polite IMPERATIVE and must still force, while
+    # "can I delegate a task in Asana" is a question.
+    r"|(?:can|could|should|would|will)\s+(?!you\b|u\b)"
+    r")",
+    re.IGNORECASE,
+)
+# "delegate that to Shaun" is about a HUMAN, not the worker. Anchored to the text
+# AFTER the delegation verb. The object list is deliberately NEGATIVE-scoped:
+# "delegate a job TO YOU / to Cora / to the background worker" are the most
+# explicit statements of the intent this detector exists to catch, and an
+# any-capitalised-word rule sent all three back to the path that produced the
+# live defect (D-051 MED-1).
+_DELEGATE_TO_HUMAN_RE = re.compile(
+    r"^\s*(?:it|this|that)?\s*to\s+"
+    r"(?!(?:you|yourself|cora|the\s+(?:background\s+)?worker|the\s+bot)\b)"
+    r"[A-Z@]",
+    re.IGNORECASE,
+)
 
 
 def _delegate_work_intent(text: str) -> bool:
@@ -555,7 +587,7 @@ def _delegate_work_intent(text: str) -> bool:
     exactly the surface a forced tool closes.
     """
     t = (text or "").strip()
-    if not t:
+    if not t or _DELEGATE_INTERROGATIVE_RE.match(t):
         return False
     m = _DELEGATE_INTENT_RE.search(t)
     if not m:

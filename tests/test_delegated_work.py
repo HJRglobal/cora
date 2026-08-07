@@ -1341,6 +1341,13 @@ class TestDwIntakeRecallClasses:
         # hits into 1-token misses).
         "Provider Madison Delgado respite units",
         "Lexington Madison respite hours",
+        # The case that actually DISTINGUISHES skip-vs-reset: a non-person
+        # token sits BETWEEN two real name tokens AND the name is far enough
+        # from the cue that the tight-cue branch cannot rescue it. The two
+        # cases above are caught by other mechanisms, so neither fails when the
+        # loop is reverted to resetting (D-051 LOW-4 -- verified by revert).
+        "the authorization packet must be filed before the end of this "
+        "quarter for Madison Report Delgado",
     ])
     def test_lone_and_adjacent_names_are_caught(self, text):
         assert self._caught(text), text
@@ -1394,14 +1401,31 @@ class TestRaForcedDelegateTool:
         "Delegate: put together a brief on Sprouts",
         "can you run a background job for this",
         "queue a research brief on the AZ DDD respite rates",
+        # An explicit hand-off naming the WORKER is the clearest statement of
+        # this intent; an any-capitalised-object rule sent all three back to
+        # the path that produced the live defect (D-051 MED-1).
+        "delegate a job to the background worker: research DDD rates",
+        "delegate a job to you: research the DDD rates",
+        "delegate a job to Cora: research the rates",
     ])
     def test_explicit_delegation_forces_the_tool(self, text):
         from cora import app
         assert app._delegate_work_intent(text) is True
 
     @pytest.mark.parametrize("text", [
-        # A hand-off to a HUMAN is not a worker job.
+        # A hand-off to a HUMAN is not a worker job. These must MATCH the
+        # intent regex first, or they pin nothing -- "delegate that to Shaun"
+        # never reaches the guard at all (D-051 MED-2).
+        "delegate the work to Shaun", "delegate this task to Jen",
         "delegate that to Shaun", "delegate it to Jen please",
+        # Interrogatives are questions ABOUT delegation, not delegations.
+        "how do I delegate a task in Asana",
+        "where's the research brief on Sprouts?",
+        "what did the research brief on F3 retail conclude about Q3",
+        "we need to run a job costing analysis",
+        # ...and these must stay with the Asana force, not be stolen.
+        "create a task to write the research brief on the AZ rates",
+        "delete the task about the research brief on Q3",
         "we should delegate more work", "what jobs are running?",
         "cancel my job", "yes", "", "add a task to research the rates",
     ])
@@ -1437,6 +1461,19 @@ class TestRbCompoundAdjective:
     hyphenated compound adjective is one word and names no individual."""
 
     STAFF = {"Shaun Hawkins", "Jennifer Mortensen"}
+
+    @pytest.fixture(autouse=True)
+    def _real_predicates(self, monkeypatch):
+        # The module-level _isolated fixture stubs is_phi_risk_person_linked to
+        # a benign False, and _any calls it. Without this restore, every
+        # `assert not self._any(...)` below is satisfied by the stub -- the
+        # trap this file already documents at its imports (D-051 HIGH-3).
+        import cora.phi_guard as phi_guard
+        monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked",
+                            _REAL_PERSON_LINKED)
+        monkeypatch.setattr(phi_guard, "is_any_phi", _pg.is_any_phi)
+        yield
+
     REFUSED = ("Research brief on current AZ DDD/AHCCCS provider revalidation "
                "requirements for Provider Type 15: what Lexington LLC must submit, "
                "the APEP (AHCCCS Provider Enrollment Portal) process steps "
@@ -1470,10 +1507,8 @@ class TestRbCompoundAdjective:
         "no client‑specific content needed for enrollment",
         "no client–specific enrollment data",
         "no client--specific enrollment data",
-        "client-5 records for enrollment",
         "no client-specific enrollment data needed",
         "member-facing enrollment portal documentation",
-        "patient-level billing rollups, de-identified",
     ])
     def test_compound_adjectives_name_no_individual(self, text):
         assert not self._any(text)

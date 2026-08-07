@@ -179,8 +179,8 @@ _NAME_POSSESSIVE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}['’]s\b
 # (U+2010 hyphen, U+2011 non-breaking, U+2012 figure, U+2013 en, U+2014 em,
 # U+2015 horizontal bar). Repeats allowed -- "client--specific" is the same
 # compound as "client-specific", and Cora's own prose uses "--" constantly.
-_DASHES = r"[-‐-―]"
-_DASH_CHARS = frozenset("-‐‑‒–—―")
+_DASHES = "[-­‐-―−﹣－]"
+_DASH_CHARS = frozenset("-­‐‑‒–—―−﹣－")
 # (?!-\w) excludes a HYPHENATED COMPOUND ADJECTIVE -- "client-specific",
 # "member-facing", "patient-level". Those are descriptors; they name no
 # individual, and D-050 is about an admin term tied to a SPECIFIC PERSON. Live
@@ -191,7 +191,13 @@ _DASH_CHARS = frozenset("-‐‑‒–—―")
 # "client Marcus", "the client's units" and a bare "client" all still match.
 _CARE_RECIPIENT_RE = re.compile(
     r"\b(client|patient|member|individual|participant|recipient|guardian|parent)\b"
-    rf"(?!{_DASHES}+\w)",
+    # [^\W\d_] is a LETTER, not \w. \w includes digits, and a digit is never a
+    # compound adjective -- it is a case NUMBER. "client-047 units of service"
+    # and "member-84726 claims reimbursement" are exactly the de-identified-
+    # looking references a LEX brief uses for a real person, and \w silenced
+    # every belt on them (D-051 HIGH-2). Letters only: "client-specific" is
+    # excluded, "client-047" is not.
+    rf"(?!{_DASHES}+[^\W\d_])",
     re.IGNORECASE,
 )
 
