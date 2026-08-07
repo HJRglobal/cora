@@ -24,7 +24,12 @@ and records the gap as resolved in design/known-answers/.resolved-gaps.jsonl
 
 Guardrails:
   - PHI: gaps or evidence flagged by phi_guard are never mined or escalated.
-  - LEX: escalation DMs are skipped entirely for LEX* gaps.
+  - LEX: escalation DMs are skipped for LEX* gaps unless the
+    CORA_GAP_ESCALATION_LEX lane is on (default off; Harrison 2026-08-06,
+    superseding the 1uuu Fork-2 "LEX escalation stays OFF" lock). Even then the
+    ONLY recipients are roster entries flagged `gap_escalation: true` for LEX
+    (leadership), the PHI union is re-screened at the DM render site, and LEX
+    stays excluded from MINING at the SQL layer -- only the ASK lane opens.
   - Visibility CPA: never an escalation target (IDs map is internal-only).
   - Throttle: one escalation DM per gap, ever. Max MAX_ASKS_PER_RUN per run.
   - Fail-closed drafting: an API/parse failure proposes nothing.
@@ -1051,8 +1056,55 @@ def propose_known_answer(
 # Stage 2 -- escalate to the entity's domain owner via DM
 # ---------------------------------------------------------------------------
 
+def lex_escalation_enabled() -> bool:
+    """CORA_GAP_ESCALATION_LEX: may a LEX gap ask a LEX leader?
+
+    Default OFF (unset/unrecognized -> off). SCRIPT-SIDE: the only consumer is
+    scripts/run_gap_autofill.py, a fresh process per fire, so flipping this
+    takes effect at the next run with NO restart -- unlike the web and
+    delegated-work lanes, whose intake lives in the always-on bot.
+    """
+    return (os.environ.get("CORA_GAP_ESCALATION_LEX", "") or "").strip().lower() in (
+        "on", "1", "true", "yes",
+    )
+
+
+def _lex_escalation_recipients(entity: str) -> list[str]:
+    """LEX leaders flagged `gap_escalation: true` in the org registry.
+
+    Roster-driven on purpose: Harrison changes WHO is asked by editing
+    org-roles.yaml (60s TTL, no restart), not by a code change. Returns [] on
+    any error -- an unresolvable roster means no DM, never a fallback to the
+    owners map's `default` (which is Harrison, and would silently convert a
+    scoped LEX ask into a founder ask).
+    """
+    try:
+        from . import org_roles
+        # Resolve against the LEX PARENT, not the exact sub-entity: LEX
+        # leadership covers all four sub-entities, and Shaun/Jen are registered
+        # under LEX-LLC with entities:[LEX]. Querying the raw sub-entity would
+        # find nobody for an LEX-LTS or LEX-LBHS gap and silently drop the ask.
+        return [
+            r.slack_id for r in org_roles.roles_for_entity("LEX")
+            if getattr(r, "gap_escalation", False) and r.slack_id
+        ]
+    except Exception:  # noqa: BLE001 -- fail closed: no recipients, no DM
+        log.warning("gap_autofill: LEX recipient resolution failed", exc_info=True)
+        return []
+
+
 def resolve_owner(entity: str) -> str | None:
-    """Slack user ID of the domain owner for an entity, or None."""
+    """Slack user ID of the domain owner for an entity, or None.
+
+    LEX resolves through the ROSTER (gap_escalation flag), never the owners
+    map: the map carries a `default: Harrison` fallback, and LEX-LTS has no
+    entry at all, so a map lookup would silently route a Lexington gap to the
+    founder instead of the scoped leadership pair.
+    """
+    entity = (entity or "").strip().upper()
+    if entity.startswith("LEX"):
+        recipients = _lex_escalation_recipients(entity)
+        return recipients[0] if recipients else None
     path = _owners_map_path()
     if not path.exists():
         return None
@@ -1063,7 +1115,6 @@ def resolve_owner(entity: str) -> str | None:
         log.warning("gap_autofill: could not read owners map: %s", exc)
         return None
     owners = data.get("owners") or {}
-    entity = (entity or "").strip().upper()
     return owners.get(entity) or data.get("default") or None
 
 
@@ -1084,7 +1135,7 @@ def should_escalate(gap: dict[str, Any]) -> bool:
     stays allowed (Harrison-gated).
     """
     entity = (gap.get("entity") or "").strip().upper()
-    if entity.startswith("LEX"):
+    if entity.startswith("LEX") and not lex_escalation_enabled():
         return False
     if gap.get("private_source") or (gap.get("channel") or "").strip().lower() == "dm":
         return False
@@ -1117,6 +1168,25 @@ def escalate_gap(gap: dict[str, Any], slack_client: Any) -> dict[str, Any] | Non
 
     Returns the pending-ask record on success, None on failure/skip.
     """
+    # INDEPENDENT PHI belt at the render site. should_escalate already screens,
+    # but this function composes the DM text and is reachable from any caller
+    # (and from a future one), so the last thing before a client's words leave
+    # for a third party re-runs the union rather than trusting an earlier gate.
+    _screen_blob = f"{gap.get('question', '')} {gap.get('gap', '')}"
+    try:
+        if is_phi_risk(_screen_blob) or is_clinical_phi(_screen_blob) \
+                or is_lex_billing_status_phi(_screen_blob):
+            log.info("gap_autofill: escalation blocked at render (PHI) entity=%s",
+                     gap.get("entity", "?"))
+            return None
+    except Exception:  # noqa: BLE001 -- fail CLOSED
+        log.warning("gap_autofill: render-site PHI screen errored -- not escalating",
+                    exc_info=True)
+        return None
+    entity = (gap.get("entity") or "").strip().upper()
+    if entity.startswith("LEX") and not lex_escalation_enabled():
+        log.info("gap_autofill: LEX escalation lane is off -- skip")
+        return None
     owner = resolve_owner(gap.get("entity", ""))
     if not owner:
         log.info("gap_autofill: no domain owner for entity %s -- skip escalation",

@@ -155,10 +155,13 @@ users:
       - LLC operations (DDD/HCBS/DTA), residential + community services
       - Staff training and operational systems
     manager: U0B2RM2JYJ1
+    gap_escalation: true
     notes: >-
       PHI custodian (LEX scope only). Operator within his lane, NOT an
       approval gate -- escalate decisions to Harrison. LLC-specific topics
       belong in #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
+      gap_escalation: LEX leadership -- receives knowledge-gap ask DMs when the
+      CORA_GAP_ESCALATION_LEX lane is on (Harrison 2026-08-06).
 
   - slack_id: U0B3VGT8RE0
     name: Jennifer Mortensen
@@ -169,12 +172,15 @@ users:
       - Runs all HCBS (Home and Community Based Services) for Lexington's DDD services
       - Office administration and client-records oversight
     manager: U0B3PS82G30
+    gap_escalation: true
     notes: >-
       Role corrected 2026-08-05 per Harrison (estate-map session): HCBS Director
       running the whole HCBS line for LEX DDD services, reporting to Shaun
       Hawkins (prior registry title "Office Manager" was stale). PHI custodian
       (LEX scope only). LLC-specific topics belong in #llc-leadership, not
       #lex-leadership (Harrison 2026-06-11).
+      gap_escalation: LEX leadership -- receives knowledge-gap ask DMs when the
+      CORA_GAP_ESCALATION_LEX lane is on (Harrison 2026-08-06).
 
   - slack_id: U0B3KHBJJ91
     name: Jeff Montgomery

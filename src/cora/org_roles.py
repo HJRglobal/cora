@@ -55,6 +55,12 @@ class RoleRecord:
     manager: str = ""
     notes: str = ""
     external: bool = False
+    # Opt-in roster flag (the fireflies_seat pattern): may this person receive a
+    # knowledge-gap escalation DM for their entity? Used by gap_autofill to
+    # scope the LEX lane to leadership WITHOUT hard-coding names in code --
+    # Harrison changes who is asked by editing the registry (60s TTL, no
+    # restart). Absent/false is the default for everyone.
+    gap_escalation: bool = False
 
     @property
     def all_entities(self) -> list[str]:
@@ -111,6 +117,7 @@ def _parse(raw: object) -> tuple[dict[str, RoleRecord], list[RoleRecord]]:
             manager=str(entry.get("manager") or "").strip(),
             notes=str(entry.get("notes") or "").strip(),
             external=bool(entry.get("external", False)),
+            gap_escalation=bool(entry.get("gap_escalation", False)),
         )
         if sid:
             index[sid] = rec

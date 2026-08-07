@@ -334,6 +334,99 @@ class TestShouldEscalate:
         assert ga.should_escalate(g) is False
 
 
+# ---------------------------------------------------------------------------
+# LEX escalation lane (CORA_GAP_ESCALATION_LEX) -- Harrison decision 2026-08-06,
+# superseding the 1uuu Fork-2 "LEX escalation stays OFF" lock.
+# test_lex_never_escalates above pins the OFF default and stays green unchanged.
+# ---------------------------------------------------------------------------
+
+class TestLexEscalationLane:
+    @pytest.mark.parametrize("value", ["", "off", "0", "false", "later"])
+    def test_flag_defaults_and_unrecognized_read_off(self, monkeypatch, value):
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", value)
+        assert not ga.lex_escalation_enabled()
+
+    def test_lex_gap_escalates_with_the_lane_on(self, paths, monkeypatch):
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        assert ga.should_escalate(_gap(ts=_iso(hours_ago=100), entity="LEX-LLC")) is True
+
+    def test_phi_lex_gap_never_escalates_even_with_the_lane_on(self, paths, monkeypatch):
+        # Smoke (b): PHI-flagged gaps NEVER escalate, fail-closed.
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        g = _gap(ts=_iso(hours_ago=100), entity="LEX-LLC",
+                 question="what is the care plan for this client name?")
+        assert ga.should_escalate(g) is False
+
+    def test_recipients_come_from_the_roster_flag_not_the_owners_map(
+        self, paths, monkeypatch
+    ):
+        # Smoke (a): the ask goes to flagged LEX leadership only. The owners map
+        # is deliberately NOT consulted for LEX -- its `default` is Harrison, so
+        # a map lookup would silently convert a scoped ask into a founder ask.
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text(
+            "owners:\n  LEX: UMAP_WRONG\ndefault: UHARRISON\n", encoding="utf-8")
+        owner = ga.resolve_owner("LEX-LLC")
+        assert owner not in ("UMAP_WRONG", "UHARRISON")
+        # U0B3PS82G30 Shaun / U0B3VGT8RE0 Jen are the two flagged in org-roles.
+        assert owner in ("U0B3PS82G30", "U0B3VGT8RE0")
+
+    def test_lts_has_no_owners_map_entry_and_still_resolves(self, paths, monkeypatch):
+        # LEX-LTS is absent from gap-domain-owners.yaml entirely; the roster
+        # path must still produce a scoped recipient rather than the default.
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text("owners: {}\ndefault: UHARRISON\n",
+                                           encoding="utf-8")
+        assert ga.resolve_owner("LEX-LTS") in ("U0B3PS82G30", "U0B3VGT8RE0")
+
+    def test_unresolvable_roster_yields_no_recipient_never_a_default(
+        self, paths, monkeypatch
+    ):
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text("owners: {}\ndefault: UHARRISON\n",
+                                           encoding="utf-8")
+        monkeypatch.setattr(ga, "_lex_escalation_recipients", lambda e: [])
+        assert ga.resolve_owner("LEX-LLC") is None
+
+    def test_exactly_the_decided_pair_is_flagged_in_the_registry(self):
+        # Roster-drift pin: update this alongside org-roles.yaml when Harrison
+        # changes who receives LEX gap asks.
+        from cora import org_roles
+        flagged = {
+            r.name for r in org_roles.roles_for_entity("LEX")
+            if getattr(r, "gap_escalation", False)
+        }
+        assert flagged == {"Shaun Hawkins", "Jennifer Mortensen"}
+
+    def test_render_site_phi_belt_blocks_even_if_should_escalate_is_bypassed(
+        self, paths, monkeypatch
+    ):
+        # escalate_gap composes the DM text, so it re-screens independently
+        # rather than trusting the earlier gate.
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text("owners:\n  F3E: U111\n", encoding="utf-8")
+        slack = _FakeSlack()
+        g = _gap(question="what is the care plan for this client name?")
+        assert ga.escalate_gap(g, slack) is None
+        assert not slack.posts
+
+    def test_lane_off_blocks_at_the_render_site_too(self, paths, monkeypatch):
+        monkeypatch.delenv("CORA_GAP_ESCALATION_LEX", raising=False)
+        (paths / "owners.yaml").write_text("owners:\n  LEX: U111\n", encoding="utf-8")
+        slack = _FakeSlack()
+        assert ga.escalate_gap(_gap(entity="LEX-LLC"), slack) is None
+        assert not slack.posts
+
+    def test_non_lex_escalation_is_unaffected_by_the_lane(self, paths, monkeypatch):
+        # Invariant 4: non-LEX behaviour identical with the flag ON.
+        monkeypatch.setenv("CORA_GAP_ESCALATION_LEX", "on")
+        (paths / "owners.yaml").write_text(
+            "owners:\n  F3E: U111\ndefault: U999\n", encoding="utf-8")
+        assert ga.resolve_owner("F3E") == "U111"
+        assert ga.resolve_owner("UNKNOWN") == "U999"
+        assert ga.should_escalate(_gap(ts=_iso(hours_ago=100))) is True
+
+
 class TestResolveOwner:
     def test_missing_map_returns_none(self, paths):
         assert ga.resolve_owner("F3E") is None
