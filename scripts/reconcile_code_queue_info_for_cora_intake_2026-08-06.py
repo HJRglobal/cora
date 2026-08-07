@@ -12,17 +12,18 @@ never a hand-edit of data/state/code-session-queue.jsonl or the generated backlo
 DELIBERATELY NOT SHIPPED here:
 - cq-86c283d95a34 (F3E ecom source-opacity) is RED on main, pre-existing, and
   untouched by this work.
-- cq-4e39d9f0f994 (Alina org-roles test pin). The 2026-08-06 remediation kickoff
-  asked this script to carry TWO items, closing this one via R9's roster commit.
-  R9 HIT ITS OWN STOP GATE: the uncommitted data/maps/org-roles.yaml carries four
-  role/entity/manager changes beyond the named 1yyyy/1ssss canon (Eric Canku,
-  Jennifer Mortensen, Aaron Ferrucci, and Alina's role+entity on top of her
-  manager), and the "Jerry mapped" edit the kickoff expected is absent entirely.
-  The kickoff's instruction for that case is STOP and report, so nothing was
-  committed, the test pin was left alone, and this seed stays OPEN. See section F
-  of the cascade report. Add it here only once Harrison rules on the roster file.
 - No OTHER seed is claimed. The D-104 [QA] quarantine shipped here as the rider the
   bundle kickoff assigned it; it has no separate queue id, so nothing else to close.
+
+HISTORY on cq-4e39d9f0f994 (now INCLUDED): this script briefly carried one item
+because R9 stopped at its own gate -- the uncommitted org-roles.yaml held four
+role/entity/manager changes beyond what the kickoff named, and the expected "Jerry
+mapped" edit appeared absent. Cowork verified all four against founder canon on
+2026-08-06 (Eric -> AP-Finance under Justin, Jen -> HCBS Director, Aaron -> Day
+Programs Director per TOM 1yyyy; Alina -> HJRG HR/Payroll per TOM 1ssss + 1yyyy)
+and established that Jerry's entry already existed at HEAD, so nothing was ever
+pending for him. Harrison cleared R9 the same day and the roster landed with the
+test-pin fix, so the seed is closed here.
 
 VERIFY BEFORE APPLYING: this branch does NOT fully close the reported symptom on its
 own. The @mention route and the reconciling sweep work today, but the original
@@ -52,6 +53,10 @@ SHIPPED = [
     ("cq-f1236540b61e",
      "S1-S4 -- shared info_intake chokepoint + @mention route + kept message-event "
      "route + reconciling sweep, all on one idempotent infocora-{ts} id"),
+    ("cq-4e39d9f0f994",
+     "R9 -- Harrison-approved org-roles roster committed (Eric/Jen/Aaron/Alina role "
+     "corrections + Brei Pebley) with the stale Alina manager test pin fixed in the "
+     "same commit; both identity tests green"),
 ]
 
 

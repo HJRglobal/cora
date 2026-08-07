@@ -120,12 +120,19 @@ users:
 
   - slack_id: U0B3PRZMBCN
     name: Eric Canku
-    role: F3E Logistics
-    entity: F3E
+    role: Accounts Payable (AP) - Finance Department
+    entity: HJRG
+    entities: [F3E]
     responsibilities:
-      - F3E logistics and fulfillment coordination
-    manager: U0B2RM2JYJ1
-    notes: Finance receipt retrieval allowlisted (#founder-finance only).
+      - Accounts payable across the portfolio (invoice intake, approval queues, payment prep)
+      - F3E logistics support with Alex Cordova (freight/fulfillment coordination, as needed)
+    manager: U0B3AEJCYGP
+    notes: >-
+      Role corrected 2026-08-05 per Harrison (estate-map session): AP in the
+      Finance Department reporting to Justin Moran; the prior "F3E Logistics"
+      primary was actually his secondary lane. Finance receipt retrieval
+      allowlisted (#founder-finance only). Payment execution stays human and
+      Harrison-gated.
 
   - slack_id: U0B3PS7RFJA
     name: Matt Petrovich
@@ -155,15 +162,19 @@ users:
 
   - slack_id: U0B3VGT8RE0
     name: Jennifer Mortensen
-    role: Lexington Services Office Manager
+    role: HCBS Director (LLC)
     entity: LEX-LLC
     entities: [LEX]
     responsibilities:
-      - LLC office administration and client records
+      - Runs all HCBS (Home and Community Based Services) for Lexington's DDD services
+      - Office administration and client-records oversight
     manager: U0B3PS82G30
     notes: >-
-      PHI custodian (LEX scope only). LLC-specific topics belong in
-      #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
+      Role corrected 2026-08-05 per Harrison (estate-map session): HCBS Director
+      running the whole HCBS line for LEX DDD services, reporting to Shaun
+      Hawkins (prior registry title "Office Manager" was stale). PHI custodian
+      (LEX scope only). LLC-specific topics belong in #llc-leadership, not
+      #lex-leadership (Harrison 2026-06-11).
 
   - slack_id: U0B3KHBJJ91
     name: Jeff Montgomery
@@ -179,15 +190,18 @@ users:
 
   - slack_id: U0B3PS32A22
     name: Aaron Ferrucci
-    role: Programs Director (LLC)
+    role: Day Programs Director (LLC)
     entity: LEX-LLC
     entities: [LEX]
     responsibilities:
-      - LLC program direction and day-program operations
+      - Runs all Lexington Day Programs (DTA, TTE, and related day services)
     manager: U0B3PS82G30
     notes: >-
-      Added 2026-06-11 (Harrison: LLC-specific roster). PHI custodian (LEX
-      scope only) per Harrison 2026-06-11 -- "can be added to all PHI access".
+      Role corrected 2026-08-05 per Harrison (estate-map session): Day Programs
+      Director running all LEX day programs (DTA, TTE, etc.), reporting to
+      Shaun Hawkins. Added 2026-06-11 (Harrison: LLC-specific roster). PHI
+      custodian (LEX scope only) per Harrison 2026-06-11 -- "can be added to
+      all PHI access".
       Asana invite issued (Harrison 2026-06-11) but not yet visible via the
       API (likely pending acceptance) -- add his slack-to-asana row the
       moment his GID appears in workspace users.
@@ -248,11 +262,21 @@ users:
 
   - slack_id: U0B3TPD2MEV
     name: Alina Thomas
-    role: Content Creator
-    entity: BDM
+    role: HR / Payroll Administrator (+ content support)
+    entity: HJRG
+    entities: [BDM]
     responsibilities:
-      - Content creation across portfolio brands
-    manager: U0B3NGR1Y85
+      - ASA Phoenix + Show Low payroll cycles; payroll-week execution
+      - Benefits and open-enrollment administration; HR compliance intake
+      - Fleet-safety training program (annual refresher proposal owner)
+      - Content support across portfolio brands (secondary)
+    manager: U0B3AEQS0NB
+    notes: >-
+      Fully remote. Role corrected 2026-08-04 per the delegation-matrix audit
+      (registry said BDM content; observed lane is HJRG/ASA payroll + HR).
+      Manager set to Hannah Grant 2026-08-05 per Harrison (estate-map session;
+      resolves the defaulted-to-Harrison line). Maricopa County budget/
+      probation classes are OFF-LIMITS (third-party PII, no AI bots).
 
   - slack_id: U0B3PS63F1C
     name: Daniel Sion
@@ -264,6 +288,20 @@ users:
     notes: >-
       Executor-removed entity-wide per 2026-05-22 lock -- never propose Daniel
       as owner/executor for any workstream.
+
+  - slack_id: U0B3RU72B9Q
+    name: Brei Pebley
+    role: BDM Content / Client Coordination (contractor)
+    entity: BDM
+    responsibilities:
+      - Client hold docs and weekly email tracker (Pooph, Demi Brand, Barclay)
+      - Filming-slot coordination; LAC project support
+    manager: U0B3NGR1Y85
+    notes: >-
+      Contractor (6-month intro period, review ~2026-08-13). Delegated-work
+      pilot member since 2026-08-03. BDM scope only. Added 2026-08-04
+      (Harrison-approved roster fix -- she was a pilot user with no registry
+      entry, fail-closed role-blind).
 
   - slack_id: U0B4L7886PJ
     name: Jerry Reick

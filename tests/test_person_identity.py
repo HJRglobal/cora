@@ -78,9 +78,14 @@ def test_demi_personal_mailbox_excluded_structurally_and_flagged():
 
 
 def test_alina_maricopa_flag_and_manager():
+    # Manager updated 2026-08-05 per Harrison (estate-map session, TOM 1yyyy):
+    # Alina's lane is HJRG HR/Payroll under Hannah Grant, not BDM content under
+    # Larry Stone. The pin moves with the registry -- this test failed for a day
+    # against the stale "Larry Stone" value while the roster edit sat uncommitted
+    # (cq-4e39d9f0f994), which is exactly the drift it exists to catch.
     p = pi.resolve(ALINA)
     assert p.exclude_maricopa is True
-    assert p.manager == "Larry Stone"
+    assert p.manager == "Hannah Grant"
 
 
 def test_manager_blank_resolves_to_harrison():
