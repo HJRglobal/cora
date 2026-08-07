@@ -867,6 +867,9 @@ def _dispatch_qa(
     # similar question next, bypassing the retrieval-path scrub entirely. Defaulted
     # here so it is in scope for cache_storable regardless of which branch runs.
     phi_custodian = False
+    # Hoisted so the web gate below can read it on EVERY branch (the Tier-2
+    # grant path never computes one). R1 makes the gate depend on it.
+    web_clean = False
     if retrieval_grant is not None:
         # Tier-2 grant: owner-authorized retrieval REPLACES normal KB
         # retrieval, and the static portfolio context is withheld — explicit
@@ -922,9 +925,23 @@ def _dispatch_qa(
         # time-sensitive fallback leg can still attach in LEX without the clean
         # load -- fail-safe, because every surface it would have removed sets
         # unstripped_personal and is withheld by the belt.
+        #
+        # R1 (Harrison ruling 2026-08-07): `not phi_custodian` is GONE from this
+        # condition. A custodian used to be excluded here and then withheld
+        # outright at the gate below, which made the whole LEX web lane inert --
+        # all five people who can ask a LEX web question are custodians. The fix
+        # is the same shape that closed Harrison's own web blackout
+        # (cq-49a7835f081c): exclude the CONTENT from the turn, not the turn
+        # from the capability. A custodian whose turn will actually attach now
+        # takes the stranger-posture load for that turn only. Identity and
+        # authorization are untouched -- `phi_custodian` below still holds the
+        # true value for access checks and the cache guard; only what the model
+        # can see while composing outbound queries is demoted. load_context_parts
+        # forces phi_custodian=False internally under web_clean so the LEX scrub
+        # actually runs (the flag is a separate parameter from the three
+        # asker-scoped locals web_clean already nulls).
         web_clean = (
             web_intent
-            and not phi_custodian
             and web_guard.evaluate(
                 user_message, entity, kb_meta=None,
                 skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
@@ -1051,6 +1068,14 @@ def _dispatch_qa(
     #    The web-clean load above makes unstripped_personal unreachable on an
     #    explicit-intent turn (cq-49a7835f081c); the check stays as a fail-closed
     #    belt for the time-sensitive fallback path and any future setter.
+    #    R1 (2026-08-07): the custodian exclusion is now `and not web_clean`.
+    #    The exclusion exists because unscrubbed content is in context -- when
+    #    the web-clean load ran, it is NOT: the three asker-scoped locals are
+    #    nulled and phi_custodian is forced False for that load, so the LEX
+    #    scrub runs and the custodian sees exactly what a stranger sees. The
+    #    premise of the withhold is gone, so the withhold goes. A custodian turn
+    #    that did NOT take the clean load (time-sensitive fallback, or any
+    #    future caller) still withholds, fail-closed.
     web_on = False
     web_gate_skip: str | None = None
     if force_tool is not None:
@@ -1059,7 +1084,7 @@ def _dispatch_qa(
         web_gate_skip = "assume_confirm"
     elif retrieval_grant is not None:
         web_gate_skip = "retrieval_grant"
-    elif phi_custodian:
+    elif phi_custodian and not web_clean:
         web_gate_skip = "phi_custodian"
     elif kb_meta.get("unstripped_personal"):
         web_gate_skip = "unstripped_personal"

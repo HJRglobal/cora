@@ -634,6 +634,16 @@ def _try_kb_retrieve(
         asker_slack_id = None
         asker_emails = frozenset()
         asker_unrestricted = False
+        # R1 (2026-08-07): phi_custodian is a SEPARATE parameter from the three
+        # asker-scoped locals above -- nulling those does not reach the LEX
+        # content scrub, which is keyed on this flag alone. Before the custodian
+        # web lane existed, no custodian turn could ever reach a web-clean load
+        # (app.py excluded them), so the gap was unreachable. It is reachable
+        # now, and leaving it would mean the one asker class the lane was opened
+        # for composes outbound queries with UNSCRUBBED client content in view
+        # -- the exact opposite of stranger posture. Forced here, in the
+        # function that owns the posture, so no caller can forget it.
+        phi_custodian = False
 
     try:
         # LEX sub-entity channels (e.g. "LEX-LLC") store KB docs under parent entity "LEX"

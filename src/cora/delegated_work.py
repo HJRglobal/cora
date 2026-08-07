@@ -479,11 +479,13 @@ _LEX_ARCHETYPE_REFUSAL = (
 
 _LEX_PHI_REFUSAL = (
     "That brief names a specific person in a care or billing context, so I "
-    "can't run it as a background job -- Lexington jobs are limited to "
-    "policy/process work with no client details. Nothing was queued. What "
-    "works: ask the same question about the POLICY (\"what does DDD require "
-    "for live-in caregiver respite?\") and I'll research that. Harrison and "
-    "Shaun own any exception."
+    "can't run it as a background job. This isn't about YOUR access -- it's "
+    "that the background worker retrieves as a non-custodian by design, so it "
+    "could not read that person's records even if I queued the job. Nothing "
+    "was queued. What works: ask the same question about the POLICY (\"what "
+    "does DDD require for live-in caregiver respite?\") and I'll research that "
+    "properly -- or ask me here in the channel, where your own access applies. "
+    "Harrison owns any exception."
 )
 
 
@@ -609,14 +611,31 @@ def screen_request(
     # cross-entity run against the BRIEF exactly as app.py runs them for an
     # interactive mention. These are app.py chokepoints, NOT inside dispatch(),
     # so intake must run them explicitly or the core invariant is false.
-    # phi_custodian is deliberately pinned False: a delegated job never carries
-    # custodian privileges (mirrors the worker kb_search pinning, design 8.3).
+    # R2 (Harrison ruling 2026-08-07): this screen asks "is this REQUESTER
+    # authorized for this TOPIC" -- a question about the human. It was passing
+    # phi_custodian=False, the WORKER's retrieval pin, which conflated two
+    # different things and made the lane refuse its own use case: every LEX
+    # requester carries `phi` in sensitive_topics_blocked, so "research the DDD
+    # provider revalidation requirements" drew "Client-specific health info
+    # stays in the EHR." Authorization at intake now reflects the requester's
+    # REAL custodian status; the pin stays exactly where it belongs -- on WORKER
+    # retrieval (delegated_worker.make_kb_search, design 8.3), which is what
+    # actually bounds privilege. Content containment is unchanged and lives at
+    # screen #3 above: a client-identifying brief still refuses fail-closed for
+    # all five custodians.
     try:
-        from . import channel_classifier, cross_entity_guard, sibling_guard, user_access
+        from . import (channel_classifier, cross_entity_guard, lex_phi_access,
+                       sibling_guard, user_access)
         tier = channel_classifier.tier_label(
             entity, channel_classifier.classify_function(channel_name or ""))
+        # Fail-closed: an unresolvable identity reads as non-custodian.
+        try:
+            requester_custodian = bool(slack_user_id) and lex_phi_access.phi_allowed(
+                slack_user_id, entity, is_dm=False)
+        except Exception:  # noqa: BLE001
+            requester_custodian = False
         access_block = user_access.check_access(
-            slack_user_id, entity, brief, phi_custodian=False, tier=tier)
+            slack_user_id, entity, brief, phi_custodian=requester_custodian, tier=tier)
         if access_block:
             return access_block
         sibling_redirect = sibling_guard.check_redirect(entity, brief)

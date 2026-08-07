@@ -396,7 +396,19 @@ class TestLexEscalationLane:
             r.name for r in org_roles.roles_for_entity("LEX")
             if getattr(r, "gap_escalation", False)
         }
-        assert flagged == {"Shaun Hawkins", "Jennifer Mortensen"}
+        assert flagged == {"Shaun Hawkins", "Jennifer Mortensen",
+                           "Jeff Montgomery", "Aaron Ferrucci"}
+
+    def test_every_flagged_recipient_is_a_phi_custodian(self):
+        # R3 widened the set to all four LEX leaders. The roster flag alone is
+        # not sufficient -- recipient resolution independently verifies
+        # custodianship, so a flag added to a non-custodian is inert. This pins
+        # that the CURRENT roster satisfies it, so widening never silently
+        # produces a recipient who is then dropped at resolution time.
+        from cora import lex_phi_access, org_roles
+        for r in org_roles.roles_for_entity("LEX"):
+            if getattr(r, "gap_escalation", False):
+                assert lex_phi_access.phi_allowed(r.slack_id, "LEX", is_dm=True), r.name
 
     def test_render_site_phi_belt_blocks_even_if_should_escalate_is_bypassed(
         self, paths, monkeypatch

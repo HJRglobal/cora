@@ -764,7 +764,12 @@ class TestAppWiring:
         src = self._src()
         seg = src[src.index("web_clean = ("):src.index("static_text, kb_text = load_context_parts")]
         assert "web_intent" in seg
-        assert "not phi_custodian" in seg
+        # R1 (2026-08-07): `not phi_custodian` was REMOVED from this condition on
+        # purpose -- it made the LEX web lane inert for the only people who use
+        # it. The custodian is now handled by demoting the CONTENT (web_clean
+        # forces the scrub in context_loader) rather than withholding the turn.
+        # See TestR1CustodianWebLane.
+        assert "not phi_custodian" not in seg
         assert ").attach" in seg  # pre-flight evaluate: degrade only on real attach
         assert "kb_meta=None," in seg  # explicit leg is kb_meta-independent
         assert "web_clean=web_clean," in src
@@ -1031,3 +1036,55 @@ class TestD051PriorTurnDrop:
         # of _dispatch_qa; nothing else may clear history.
         assert src.count("prior_messages = []") == 2
         assert "if prior_messages is None:" in src
+
+
+class TestR1CustodianWebLane:
+    """R1 (Harrison ruling 2026-08-07): a custodian used to be withheld outright,
+    which made the LEX web lane inert -- all five people who can ask a LEX web
+    question are custodians. The fix is the cq-49a7835f081c shape: exclude the
+    CONTENT from the turn, not the turn from the capability."""
+
+    def _src(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parents[1] / "src" / "cora"
+                / "app.py").read_text(encoding="utf-8")
+
+    def test_web_clean_no_longer_excludes_custodians(self):
+        src = self._src()
+        seg = src[src.index("web_clean = ("):
+                  src.index("static_text, kb_text = load_context_parts")]
+        # The exclusion that made the lane inert must be gone...
+        assert "not phi_custodian" not in seg
+        # ...and evaluate() remains the single authority (D-146).
+        assert "is_lex_scope" not in seg
+        assert ").attach" in seg
+
+    def test_custodian_withhold_is_now_conditional_on_the_clean_load(self):
+        src = self._src()
+        # The withhold survives for a custodian turn that did NOT take the clean
+        # load (time-sensitive fallback, future callers) -- fail-closed.
+        assert 'elif phi_custodian and not web_clean:' in src
+        assert 'web_gate_skip = "phi_custodian"' in src
+
+    def test_web_clean_is_in_scope_on_every_branch(self):
+        # The Tier-2 grant path never computes one; an unbound name here would
+        # crash the gate rather than fail closed.
+        src = self._src()
+        assert "web_clean = False" in src
+        assert src.index("web_clean = False") < src.index("if retrieval_grant is not None:")
+
+    def test_clean_load_forces_the_custodian_scrub(self):
+        """The load-side half. phi_custodian is a SEPARATE parameter from the
+        three asker-scoped locals web_clean nulls, so without this a custodian
+        would compose outbound queries with UNSCRUBBED client content in view --
+        the opposite of stranger posture."""
+        from pathlib import Path
+        cl = (Path(__file__).resolve().parents[1] / "src" / "cora"
+              / "context_loader.py").read_text(encoding="utf-8")
+        i = cl.index("    if web_clean:")
+        seg = cl[i:i + 1600]
+        assert "asker_slack_id = None" in seg
+        assert "phi_custodian = False" in seg
+        # ...and it must land BEFORE the LEX scrub reads the flag.
+        assert cl.index("phi_custodian = False", i) < cl.index(
+            'if kb_entity == "LEX" and not phi_custodian')

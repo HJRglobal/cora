@@ -29,6 +29,14 @@
 #   - finance-receipt-allowlist.yaml  Tier 2-Finance gate
 #   - gap-domain-owners.yaml     gap-escalation routing
 #
+# OPT-IN KEYS (absent/false is the default for everyone):
+#   gap_escalation: true  -- may receive a knowledge-gap ask DM for their entity
+#     when the lane flag is on (LEX: CORA_GAP_ESCALATION_LEX). Recipient
+#     resolution ALSO verifies PHI custodianship independently, so flagging a
+#     non-custodian is inert. Currently the four LEX leaders (Harrison
+#     2026-08-06 Shaun+Jen; 2026-08-07 R3 widened to Jeff+Aaron). Harrison
+#     changes who is asked by editing this file -- 60s TTL, no restart.
+#
 # Field reference:
 #   slack_id          primary key when present; registry-only entries (no
 #                     Slack access, e.g. part-time staff) may omit it -- they
@@ -160,8 +168,6 @@ users:
       PHI custodian (LEX scope only). Operator within his lane, NOT an
       approval gate -- escalate decisions to Harrison. LLC-specific topics
       belong in #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
-      gap_escalation: LEX leadership -- receives knowledge-gap ask DMs when the
-      CORA_GAP_ESCALATION_LEX lane is on (Harrison 2026-08-06).
 
   - slack_id: U0B3VGT8RE0
     name: Jennifer Mortensen
@@ -179,8 +185,6 @@ users:
       Hawkins (prior registry title "Office Manager" was stale). PHI custodian
       (LEX scope only). LLC-specific topics belong in #llc-leadership, not
       #lex-leadership (Harrison 2026-06-11).
-      gap_escalation: LEX leadership -- receives knowledge-gap ask DMs when the
-      CORA_GAP_ESCALATION_LEX lane is on (Harrison 2026-08-06).
 
   - slack_id: U0B3KHBJJ91
     name: Jeff Montgomery
@@ -190,6 +194,7 @@ users:
     responsibilities:
       - LEX 20% minority owner (confirmed 2026-05-13); strategic oversight
     manager: U0B2RM2JYJ1
+    gap_escalation: true
     notes: >-
       PHI custodian (LEX scope only). LLC-specific topics belong in
       #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
@@ -202,6 +207,7 @@ users:
     responsibilities:
       - Runs all Lexington Day Programs (DTA, TTE, and related day services)
     manager: U0B3PS82G30
+    gap_escalation: true
     notes: >-
       Role corrected 2026-08-05 per Harrison (estate-map session): Day Programs
       Director running all LEX day programs (DTA, TTE, etc.), reporting to

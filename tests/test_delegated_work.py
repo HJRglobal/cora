@@ -991,3 +991,109 @@ def test_render_job_list_filters_to_requester():
     other_job = [r for r in dw.load_jobs() if r["requester"] == OTHER][0]
     assert other_job["job_id"] not in mine
     assert mine.count("dw-") == 1
+
+
+class TestR2IntakeAuthorization:
+    """R2 (Harrison ruling 2026-08-07): intake asks 'is this REQUESTER authorized
+    for this TOPIC' -- a question about the human. It was passing the WORKER's
+    phi_custodian=False retrieval pin, which conflated two things and made the
+    lane refuse its own use case."""
+
+    LEX_POLICY_BRIEF = ("research the DDD provider revalidation requirements and "
+                        "summarize what our agency must submit")
+
+    def test_custodian_lex_policy_brief_passes_intake(self, monkeypatch, _lex_lane):
+        # THE R2 REGRESSION. Shaun is a LEX PHI custodian; his DDD-topic policy
+        # brief must queue. Before R2 this drew "Client-specific health info
+        # stays in the EHR" from user_access's `phi` topic block.
+        import cora.org_roles as org_roles
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        assert dw.screen_request(
+            "U0B3PS82G30", "LEX-LLC", "llc-leadership", "research_brief",
+            self.LEX_POLICY_BRIEF, "md") is None
+
+    def test_intake_passes_the_requesters_REAL_custodian_status(
+        self, monkeypatch, _lex_lane
+    ):
+        """The load-bearing assertion. The autouse fixture stubs check_access to
+        always pass, so assert on the ARGUMENT rather than the outcome: intake
+        must hand user_access the requester's true custodian status, not the
+        worker's pin. Reverting to phi_custodian=False fails this."""
+        import cora.org_roles as org_roles
+        import cora.user_access as user_access
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        seen = {}
+        monkeypatch.setattr(
+            user_access, "check_access",
+            lambda uid, ent, txt, phi_custodian=None, tier=None: seen.update(
+                phi_custodian=phi_custodian) or None)
+        # Shaun IS a custodian in the real lex-phi-custodians.yaml.
+        dw.screen_request("U0B3PS82G30", "LEX-LLC", "llc-leadership",
+                          "research_brief", self.LEX_POLICY_BRIEF, "md")
+        assert seen["phi_custodian"] is True
+
+    def test_a_non_custodian_requester_is_passed_through_as_false(
+        self, monkeypatch, _lex_lane
+    ):
+        # The flip is a SCOPED ALLOW, not a guard removal: someone not on
+        # lex-phi-custodians.yaml still reaches user_access as a non-custodian,
+        # so their topic block stands.
+        import cora.org_roles as org_roles
+        import cora.user_access as user_access
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        seen = {}
+        monkeypatch.setattr(
+            user_access, "check_access",
+            lambda uid, ent, txt, phi_custodian=None, tier=None: seen.update(
+                phi_custodian=phi_custodian) or None)
+        dw.screen_request("U_NOT_A_CUSTODIAN", "LEX-LLC", "llc-leadership",
+                          "research_brief", self.LEX_POLICY_BRIEF, "md")
+        assert seen["phi_custodian"] is False
+
+    def test_client_identifying_brief_refuses_for_a_custodian_too(
+        self, monkeypatch, _lex_lane
+    ):
+        # Content containment is unchanged: authorization went up, the CONTENT
+        # gate did not move. A custodian still cannot queue a client brief.
+        import cora.org_roles as org_roles
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        refusal = dw.screen_request(
+            "U0B3PS82G30", "LEX-LLC", "llc-leadership", "research_brief",
+            "research whether client Marcus Delgado qualifies for respite units",
+            "md")
+        assert refusal and "names a specific person" in refusal
+        # ...and the copy now states the TRUE reason (the worker cannot read
+        # those records), not an implied slight on the requester's access.
+        assert "non-custodian by design" in refusal
+
+    def test_intake_resolution_is_fail_closed(self, monkeypatch, _lex_lane):
+        # A custodian-check error must read as NON-custodian, never as a pass.
+        import cora.lex_phi_access as lex_phi_access
+        import cora.org_roles as org_roles
+        import cora.user_access as user_access
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        monkeypatch.setattr(lex_phi_access, "phi_allowed",
+                            MagicMock(side_effect=RuntimeError("boom")))
+        seen = {}
+        monkeypatch.setattr(
+            user_access, "check_access",
+            lambda uid, ent, txt, phi_custodian=None, tier=None: seen.update(
+                phi_custodian=phi_custodian) or None)
+        dw.screen_request("U0B3PS82G30", "LEX-LLC", "llc-leadership",
+                          "research_brief", self.LEX_POLICY_BRIEF, "md")
+        assert seen["phi_custodian"] is False
+
+    def test_worker_retrieval_pin_is_untouched(self):
+        """Revert-and-fail pin on the pin itself: authorization moved at INTAKE,
+        privilege did NOT move at EXECUTION."""
+        src = (REPO_ROOT / "src" / "cora" / "delegated_worker.py").read_text(
+            encoding="utf-8")
+        i = src.index("def make_kb_search")
+        seg = src[i:i + 4000]
+        assert "phi_custodian" in seg
+        assert "phi_custodian=True" not in seg
