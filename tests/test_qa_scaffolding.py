@@ -61,15 +61,33 @@ class TestGapIntakeQuarantine:
 
 
 class TestCodeQueueQuarantine:
+    """R7(b): the original version of this test was VACUOUS. Its text tripped
+    neither _PHRASE_RE nor the deflection regex, so the assertion passed even with
+    the quarantine deleted. The text below deliberately trips _PHRASE_RE ("cora
+    should"), and the companion test proves that -- so this pair fails if the
+    quarantine is removed."""
+
     def test_qa_message_never_captures_a_signal(self):
         from cora import code_queue
         with patch.object(code_queue, "code_queue_level", return_value="shadow"), \
              patch.object(code_queue, "_submit") as submit:
             code_queue.capture_message_signal(
-                text="[QA] can you build a tool that checks RepRally listings?",
+                text="[QA] cora should track RepRally listings",
                 entity="FNDR", channel_id="C1", channel_name="c",
                 slack_user_id="U1")
         assert not submit.called
+
+    def test_the_same_text_without_the_marker_DOES_capture(self):
+        """Non-vacuity guard: proves the quarantine is what suppressed the capture
+        above, not an inert phrase."""
+        from cora import code_queue
+        with patch.object(code_queue, "code_queue_level", return_value="shadow"), \
+             patch.object(code_queue, "_submit") as submit:
+            code_queue.capture_message_signal(
+                text="cora should track RepRally listings",
+                entity="FNDR", channel_id="C1", channel_name="c",
+                slack_user_id="U1")
+        assert submit.called
 
 
 class TestDecisionInboxQuarantine:

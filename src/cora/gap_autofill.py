@@ -1486,6 +1486,13 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
         text = re.sub(r"\s+", " ", (payload.get("text") or payload.get("note") or "")).strip()
         if not text:
             return False, "info-for-cora payload has no text -- skipped"
+        # R5a belt (D-123 class): this file is ALWAYS-INJECTED context and the
+        # egress boundary deliberately preserves `<...>`, so a live `<!channel>`
+        # broadcast or a labelled attacker link must never be written here.
+        # info_intake already scrubs before proposing; this covers every OTHER
+        # producer that reaches this executor (the team-note fold, backfills).
+        from .info_intake import scrub_contribution
+        text = scrub_contribution(text)
         # Fail-closed PHI re-check at the IRREVERSIBLE write (adversarial review
         # MEDIUM). This is a durable write to an always-loaded known-answers file;
         # the #info-for-cora intake admin-PHI gate is LEX-ASKER-scoped, so a non-LEX

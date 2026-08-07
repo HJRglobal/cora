@@ -508,3 +508,86 @@ class TestNoPreApprovalEgress:
                       author_id="U1", ts="45.1", route="sweep",
                       known_answers_dir=tmp_path)
         assert kr.propose_update.call_args.kwargs["source_evidence"] == ""
+
+
+# ── R5a: D-123-class scrub of externally-authored contribution text ─────────
+class TestContributionScrub:
+    """known-answers is ALWAYS-INJECTED context and the egress boundary
+    deliberately PRESERVES `<...>`, so live Slack behaviour must die here."""
+
+    @pytest.mark.parametrize("raw,expect_absent,expect_present", [
+        ("Heads up <!channel> the vendor changed", "<!channel>", "[channel]"),
+        ("<!here|here> the vendor changed", "<!here", "[here]"),
+        ("See <https://evil.example/x|click here> for details", "https://evil", "click here"),
+        ("Bare <https://evil.example/x> link", "https://evil", "[link removed]"),
+        ("Ask <@U0B2RM2JYJ1> about it", "<@U0B2RM2JYJ1>", "[@user]"),
+        ("Posted in <#C0B5BNP6YKY|info-for-cora> today", "<#C0B5", "#info-for-cora"),
+    ])
+    def test_live_slack_tokens_neutralized(self, raw, expect_absent, expect_present):
+        out = ii.scrub_contribution(raw)
+        assert expect_absent not in out
+        assert expect_present in out
+
+    def test_ordinary_facts_survive_including_vendor_names(self):
+        """Unlike inventory_state.scrub this must NOT strip platform names -- a fact
+        about Shopify pricing IS the knowledge."""
+        text = "F3 Pure is $36.99 on Shopify DTC and Amazon as of 2026-07-08"
+        assert ii.scrub_contribution(text) == text
+
+    def test_scrub_applied_to_stored_text_and_card(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="Heads up <!channel> the Tucson vendor is Apex Appliance",
+                      author_id="U1", ts="46.1", route="mention",
+                      known_answers_dir=tmp_path)
+        kwargs = kr.propose_update.call_args.kwargs
+        assert "<!channel>" not in kwargs["payload"]["text"]
+        assert "<!channel>" not in kwargs["description"]
+
+    def test_executor_belt_scrubs_for_other_producers(self, tmp_path, monkeypatch):
+        """info_intake scrubs before proposing; this covers every OTHER producer
+        that reaches the executor (the team-note fold, backfills)."""
+        from cora import gap_autofill
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        ok, _ = gap_autofill.apply_contributed_note(
+            {"entity": "FNDR", "text": "Ping <!channel> about the new kiosk rollout"})
+        assert ok is True
+        written = (tmp_path / "fndr.md").read_text(encoding="utf-8")
+        assert "<!channel>" not in written and "[channel]" in written
+
+
+# ── R5b: the approve-sight-unseen tail ──────────────────────────────────────
+class TestTruncationSymmetry:
+    def test_long_contribution_is_bounded_and_disclosed(self, tmp_path):
+        long_text = "The vendor list is as follows: " + ("Apex Appliance, " * 200)
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text=long_text, author_id="U1", ts="47.1", route="sweep",
+                      known_answers_dir=tmp_path)
+        kwargs = kr.propose_update.call_args.kwargs
+        stored = kwargs["payload"]["text"]
+        assert len(stored) == ii.STORED_TEXT_CAP
+        assert kwargs["payload"]["stored_text_truncated"] is True
+        # The card discloses the bound rather than silently storing a hidden tail.
+        assert "truncated" in kwargs["description"]
+        # ...and the card shows more than the old 240-char window.
+        assert len(kwargs["description"]) > 1000
+
+    def test_card_carries_the_permalink(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                      author_id="U1", ts="48.1", route="sweep",
+                      known_answers_dir=tmp_path)
+        desc = kr.propose_update.call_args.kwargs["description"]
+        assert "hjr-global.slack.com/archives" in desc
+
+    def test_short_contribution_is_not_flagged_truncated(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                      author_id="U1", ts="49.1", route="sweep",
+                      known_answers_dir=tmp_path)
+        kwargs = kr.propose_update.call_args.kwargs
+        assert kwargs["payload"]["stored_text_truncated"] is False
+        assert "truncated" not in kwargs["description"]

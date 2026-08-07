@@ -426,6 +426,24 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"
                 log.warning("gap-executor: info-for-cora note failed uid=%s: %s", uid_short, summary)
+            # R4 (fan-out Lens A-2): render screen at THIS egress. #hjrg-leadership
+            # is a multi-person channel and this branch interpolates the raw
+            # contribution; the lexicon branch ~40 lines above already screens at
+            # exactly this point on the principle that the read side never trusts
+            # write-side redaction (D-051 remediation F1). Fail-closed: a screen
+            # error also withholds.
+            try:
+                from cora.phi_guard import is_any_phi
+                if is_any_phi(msg):
+                    msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` a "
+                           f"contributed note was filed to "
+                           f"{payload.get('entity', 'FNDR')} -- details withheld "
+                           f"(PHI-shaped); see the local executor log.")
+            except Exception:  # noqa: BLE001
+                msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` a "
+                       f"contributed note was filed to "
+                       f"{payload.get('entity', 'FNDR')} -- details withheld "
+                       f"(screen unavailable).")
             _post_to_slack(slack_token, notify_ch, msg)
 
         else:

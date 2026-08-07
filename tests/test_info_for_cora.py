@@ -173,9 +173,32 @@ class TestInfoForCoraIntake:
         assert not prop.called
         assert "EHR" in client.chat_postMessage.call_args.kwargs["text"]
 
+    def test_phi_strictness_direction_non_lex_author_still_refused(self):
+        """R7(c): the STRICTNESS DIRECTION of the parity-raise was unpinned.
+
+        The old path applied is_lex_billing_status_phi only for a LEX-entity
+        ASKER; the raise made the union unconditional. This test uses the REAL
+        predicates (no wholesale phi_guard patching) with a NON-LEX author, so it
+        fails if the screen ever reverts to asker-scoped.
+        """
+        client = MagicMock()
+        f3e_role = app_module.org_roles.RoleRecord(
+            slack_id="U_TOMMY", name="Tommy Anderson", role="Sales", entity="F3E")
+        with patch.object(app_module.org_roles, "get_role", return_value=f3e_role), \
+             patch.object(app_module.knowledge_review, "load_proposed_updates", return_value=[]), \
+             patch.object(app_module.knowledge_review, "propose_update") as prop:
+            app_module._handle_info_for_cora(
+                _event(text="Bob Smith's billing authorization is pending",
+                       user="U_TOMMY"),
+                client)
+        assert not prop.called
+        assert "EHR" in client.chat_postMessage.call_args.kwargs["text"]
+
     def test_non_lex_business_authorization_not_over_refused(self):
-        # The LEX augmentation is scoped to LEX askers, so an F3E business fact
-        # mentioning "authorization" is NOT over-refused.
+        # The over-refusal guard for the unconditional is_any_phi union: a
+        # company-named PO authorization carries an admin term but no possessive
+        # personal name, so it must still flow. (The comment previously said the
+        # augmentation was "scoped to LEX askers" -- stale since the parity-raise.)
         client = MagicMock()
         f3e_role = app_module.org_roles.RoleRecord(
             slack_id="U_TOMMY", name="Tommy Anderson", role="Sales", entity="F3E")

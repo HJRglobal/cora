@@ -290,6 +290,41 @@ def resolve_entity(text: str) -> tuple[str, bool]:
     return "FNDR", bool(hits)
 
 
+# ── R5a: D-123-class scrub of externally-authored contribution text ─────────
+# An approved contribution is written verbatim into known-answers/{entity}.md --
+# ALWAYS-INJECTED context -- and the same raw text renders on Harrison's DM card.
+# The egress boundary deliberately PRESERVES `<...>` (the sanctioned citation
+# form), so a contributor could make Cora carry a live `<!channel>` broadcast or a
+# labelled attacker link into both surfaces. Neutralize before interpolation,
+# never after (the D-123 chokepoint pattern).
+#
+# Unlike inventory_state.scrub this does NOT strip vendor/platform names or cap at
+# 80: a fact about Shopify pricing IS the knowledge. Only live Slack behaviour is
+# removed; the readable content survives.
+_SCRUB_BROADCAST_RE = re.compile(r"<!([^>|]*)(?:\|[^>]*)?>")
+_SCRUB_LINK_LABELLED_RE = re.compile(r"<(?:https?://|mailto:)[^>|]+\|([^>]*)>")
+_SCRUB_LINK_BARE_RE = re.compile(r"<(?:https?://|mailto:)[^>]+>")
+_SCRUB_USER_RE = re.compile(r"<@[UW][A-Z0-9]+(?:\|[^>]*)?>")
+_SCRUB_CHANNEL_REF_RE = re.compile(r"<#C[A-Z0-9]+(?:\|([^>]*))?>")
+
+# R5b: the card used to render clean[:240] while the WRITE was unbounded, so a long
+# contribution's tail was approved sight-unseen. Card renders up to the Slack block
+# cap; the stored text is bounded and the truncation is disclosed on the card.
+CARD_TEXT_CAP = 2900
+STORED_TEXT_CAP = 1500
+
+
+def scrub_contribution(text: str) -> str:
+    """Neutralize live Slack behaviour in externally-authored contribution text."""
+    t = str(text or "")
+    t = _SCRUB_BROADCAST_RE.sub(r"[\1]", t)          # <!channel> -> [channel]
+    t = _SCRUB_LINK_LABELLED_RE.sub(r"\1 [link removed]", t)
+    t = _SCRUB_LINK_BARE_RE.sub("[link removed]", t)
+    t = _SCRUB_USER_RE.sub("[@user]", t)
+    t = _SCRUB_CHANNEL_REF_RE.sub(lambda m: f"#{m.group(1)}" if m.group(1) else "[#channel]", t)
+    return t
+
+
 def is_lex_content(text: str) -> bool:
     """True when `text` carries ANY LEX signal. Raises on a detector failure so the
     caller can fail CLOSED -- see ingest().
@@ -537,16 +572,30 @@ def ingest(
                 ack="I already have that one -- no need to review it again.",
                 detail="already in known-answers")
 
+        # R5a: neutralize live Slack behaviour BEFORE the text is interpolated into
+        # either surface -- the durable known-answers write and the DM card both
+        # consume what is built here.
+        safe = scrub_contribution(clean)
+        # R5b: bound the STORED text and disclose the bound on the card, so the
+        # approver can never approve a tail they were not shown.
+        stored_text = safe[:STORED_TEXT_CAP]
+        truncated = len(safe) > STORED_TEXT_CAP
+
         label = f"#info-for-cora from {author_name or author_id} ({entity})"
         if ambiguous:
             label += " [entity ambiguous -- filed FNDR]"
-        description = f"{label}: {clean[:240]}"
         if verdict == "supersedes":
-            description = (f"{label} [MAY SUPERSEDE existing fact: {matched[:120]}]: "
-                           f"{clean[:240]}")
+            label += f" [MAY SUPERSEDE existing fact: {scrub_contribution(matched)[:120]}]"
+        if truncated:
+            label += (f" [stored text truncated to {STORED_TEXT_CAP} chars; "
+                      f"full post at the permalink]")
+        link = permalink(channel_id, ts)
+        description = f"{label}: {safe[:CARD_TEXT_CAP]}"
+        if link:
+            description = f"{description}\n{link}"
 
         payload = {
-            "text": clean,
+            "text": stored_text,
             "author_id": author_id,
             "author_name": author_name or author_id,
             "entity": entity,
@@ -555,12 +604,15 @@ def ingest(
             "channel_id": channel_id,
             "source": SOURCE,
             "message_ts": ts,
-            "permalink": permalink(channel_id, ts),
+            "permalink": link,
             "intake_route": route,
             "connector_relayed": is_connector,
+            "stored_text_truncated": truncated,
         }
         if verdict == "supersedes":
-            payload["supersedes_candidate"] = matched
+            # Scrubbed too: this excerpt comes from known-answers, which is itself
+            # fed by contributions, and it rides the same mirrored ledger + card.
+            payload["supersedes_candidate"] = scrub_contribution(matched)
 
         if dry_run:
             return IntakeResult(

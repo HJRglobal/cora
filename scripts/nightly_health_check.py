@@ -515,6 +515,47 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
 
 
+def check_info_for_cora_watermark(now: datetime | None = None) -> CheckResult:
+    """The #info-for-cora sweep FREEZES its watermark on any per-message error or
+    unfetched tail, so nothing is ever silently skipped (R6a/R6b). The cost of that
+    safety is that a poison-pill message pins the watermark FOREVER, visible only
+    in the task's own log. WARN when the watermark stops advancing.
+
+    Daily task, so >48h stale means it has missed at least two runs or is frozen.
+    A MISSING watermark is not a fault -- the sweep bootstraps on first run.
+    `now` is injectable for tests."""
+    now = now or datetime.now(timezone.utc)
+    path = _REPO_ROOT / "data" / "state" / "info-for-cora-watermark.json"
+    if not path.exists():
+        return CheckResult(
+            "info-for-cora sweep", "ok",
+            "No watermark yet -- the sweep bootstraps on its first run.")
+    try:
+        last_ts = float(json.loads(path.read_text(encoding="utf-8")).get("last_ts") or 0)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("info-for-cora sweep", "warn",
+                           f"watermark unreadable ({exc}) -- intake may be stalled.")
+    if last_ts <= 0:
+        return CheckResult("info-for-cora sweep", "warn",
+                           "watermark present but empty -- intake may be stalled.")
+    age_h = (now.timestamp() - last_ts) / 3600
+    # The watermark tracks the newest PROCESSED MESSAGE, so a quiet channel is a
+    # normal reason for it to be old. Only the FILE's mtime tells us the sweep is
+    # still running; use it to separate "quiet channel" from "frozen sweep".
+    try:
+        run_age_h = (now.timestamp() - path.stat().st_mtime) / 3600
+    except OSError:
+        run_age_h = age_h
+    if run_age_h > 48:
+        return CheckResult(
+            "info-for-cora sweep", "warn",
+            f"watermark last written {run_age_h:.0f}h ago (expected daily) -- the "
+            "sweep is frozen (poison-pill message or unfetched tail) or not firing. "
+            "Check logs/info-for-cora-sweep and data/state/info-for-cora-watermark.json.")
+    return CheckResult("info-for-cora sweep", "ok",
+                       f"Watermark written {run_age_h:.0f}h ago.")
+
+
 def check_cashflow_forecast_snapshot(today: date | None = None) -> CheckResult:
     """The 13WCF forecast snapshot (S1) must fire every Monday.
 
@@ -1278,6 +1319,7 @@ def main() -> int:
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())
+    all_results.append(check_info_for_cora_watermark())
 
     log.info("Checking dynamic-answers snapshot freshness...")
     all_results.append(check_dynamic_snapshots())

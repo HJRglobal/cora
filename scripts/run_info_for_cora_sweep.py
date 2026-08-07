@@ -105,9 +105,15 @@ def _write_watermark(last_ts: str) -> None:
     tmp.replace(_WATERMARK_PATH)
 
 
-def _fetch_messages(client, oldest: str, limit: int) -> list[dict[str, Any]]:
-    """Top-level messages newer than `oldest`, OLDEST-FIRST so the watermark can
-    advance monotonically and a mid-run failure only costs the unprocessed tail."""
+def _fetch_messages(client, oldest: str, limit: int) -> tuple[list[dict[str, Any]], bool]:
+    """(messages oldest-first, window_complete).
+
+    window_complete is False when pagination stopped with a LIVE next_cursor, i.e.
+    an older tail of the window was never fetched at all. R6a (fan-out Lens C-F2):
+    the first cut swallowed that case -- it advanced the watermark past messages it
+    had never seen, and its "the remainder drains on the next run" log line was a
+    lie for exactly that path, because the watermark had already moved past them.
+    """
     out: list[dict[str, Any]] = []
     cursor = None
     pages = 0
@@ -132,11 +138,17 @@ def _fetch_messages(client, oldest: str, limit: int) -> list[dict[str, Any]]:
     # message and every older unprocessed message in the window was skipped
     # FOREVER. Taking the oldest slice keeps the watermark contiguous, so a backlog
     # larger than the cap simply drains over consecutive runs.
+    window_complete = not cursor
+    if not window_complete:
+        log.error("PAGE CAP HIT (%d pages) with a live cursor -- an OLDER tail of "
+                  "this window was never fetched. Freezing the watermark for this "
+                  "run so nothing is skipped; widen --max-messages or run again.",
+                  _MAX_PAGES)
     out.sort(key=lambda m: float(m.get("ts") or 0))
     if len(out) > limit:
         log.warning("window holds %d messages; processing the OLDEST %d this run -- "
                     "the remainder drains on the next run", len(out), limit)
-    return out[:limit]
+    return out[:limit], window_complete
 
 
 def _eligible(msg: dict[str, Any], bot_user_id: str) -> bool:
@@ -178,7 +190,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="Classify and report; write nothing, post nothing.")
     ap.add_argument("--since-days", type=int, default=None,
-                    help="Ignore the watermark and look back N days.")
+                    help="RECOVERY FLAG: ignore the watermark and look back N days. "
+                         "Such a run NEVER advances the watermark -- its window can "
+                         "start after unswept backlog, so advancing would jump the "
+                         "normal cadence past messages nothing ever read.")
     ap.add_argument("--max-messages", type=int, default=200,
                     help="Safety cap on messages processed in one run (default 200).")
     ap.add_argument("--no-ack", action="store_true",
@@ -200,9 +215,14 @@ def main() -> int:
         log.warning("auth.test failed; falling back to bot_id-only exclusion",
                     exc_info=True)
 
+    # R6c (fan-out Lens C-F5): --since-days is RECOVERY-FLAG semantics (D-130(c)).
+    # It selects an arbitrary window that may start AFTER unswept backlog, so
+    # writing a watermark from it would jump the normal cadence past messages that
+    # were never read. A --since-days run therefore never advances the watermark.
     if args.since_days is not None:
         oldest = f"{time.time() - args.since_days * 86400:.6f}"
-        log.info("window: last %d days (watermark ignored)", args.since_days)
+        log.info("window: last %d days (watermark ignored AND never advanced -- "
+                 "recovery-flag semantics)", args.since_days)
     else:
         oldest = _read_watermark()
         if not oldest:
@@ -213,7 +233,7 @@ def main() -> int:
             log.info("window: since watermark ts=%s", oldest)
 
     try:
-        messages = _fetch_messages(client, oldest, args.max_messages)
+        messages, window_complete = _fetch_messages(client, oldest, args.max_messages)
     except Exception:  # noqa: BLE001
         log.error("conversations.history failed -- aborting without advancing the "
                   "watermark", exc_info=True)
@@ -231,7 +251,8 @@ def main() -> int:
     # ERROR only for systemic causes (ledger write failure, PHI checker down),
     # which affect the whole run, so freezing here costs one deferred run and is
     # loudly logged rather than losing a contribution.
-    frozen = False
+    # R6a: an unfetched older tail freezes the watermark exactly like an ERROR.
+    frozen = not window_complete
 
     for msg in messages:
         ts = str(msg.get("ts") or "")
@@ -277,6 +298,17 @@ def main() -> int:
     if args.dry_run:
         log.info("DRY-RUN -- watermark not advanced. Outcomes: %s",
                  counts or "{}")
+        return 0
+
+    if args.since_days is not None:
+        log.info("--since-days run -- watermark deliberately NOT advanced. "
+                 "Outcomes: %s", counts or "{}")
+        return 0
+
+    if frozen:
+        log.warning("watermark FROZEN this run (unfetched tail or a per-message "
+                    "error) -- the next run re-reads from the same point. "
+                    "Outcomes: %s", counts or "{}")
         return 0
 
     if high_water:
