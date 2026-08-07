@@ -517,6 +517,54 @@ def _code_queue_capture_intent(text: str) -> bool:
     return True
 
 
+# Explicit "hand this to the background worker" command. Deliberately narrow:
+# a delegation VERB aimed at Cora, or a named job archetype.
+_DELEGATE_INTENT_RE = re.compile(
+    r"(?:"
+    r"\bdelegate\s+(?:a|this|that|the)?\s*(?:job|task|work|brief|research)\b"
+    r"|\bdelegate\s*:"
+    r"|\brun\s+(?:a|this)\s+(?:background\s+)?job\b"
+    r"|\b(?:queue|kick\s+off|start|spin\s+up)\s+(?:a|the)\s+"
+    r"(?:research\s+brief|doc(?:ument)?\s+draft|background\s+job)\b"
+    r"|\bresearch\s+brief\s+on\b"
+    r")",
+    re.IGNORECASE,
+)
+# "delegate that to Shaun" is about a HUMAN, not the worker. Anchored to the
+# text AFTER the delegation verb so an ordinary hand-off is never forced.
+_DELEGATE_TO_HUMAN_RE = re.compile(r"^\s*(?:it|this|that)?\s*to\s+[A-Z]", re.IGNORECASE)
+
+
+def _delegate_work_intent(text: str) -> bool:
+    """True for an EXPLICIT delegated-work command, so tool_choice can force
+    cora_delegate_work.
+
+    Why forcing is safe here, on the same reasoning that made forcing
+    cora_queue_code_session safe: `action=request` FILES NOTHING -- it runs the
+    intake screens, then returns a preview and stashes server-side. A false
+    positive costs one dismissable preview, never a data write. The tool is in
+    _GLOBAL_CORE_TOOLS (exposed in every entity + DMs), so tool_choice can never
+    name an unexposed tool.
+
+    Why it is needed (cq-d30815ee6993, live 2026-08-07): a LEX-TS ask reading
+    "delegate a job: research brief on <person>'s AHCCCS eligibility renewal
+    status" produced a job PREVIEW with no cora_delegate_work call anywhere in
+    the log -- so the intake screen never ran at all. The screen was correct;
+    it was simply never reached. A model that narrates a preview instead of
+    calling the tool bypasses every deterministic guard behind it, which is
+    exactly the surface a forced tool closes.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    m = _DELEGATE_INTENT_RE.search(t)
+    if not m:
+        return False
+    if _DELEGATE_TO_HUMAN_RE.match(t[m.end():]):
+        return False
+    return True
+
+
 def _asana_destructive_intent(text: str) -> str | None:
     """Return the Asana WRITE tool to force (delete/complete/create/update/comment/
     subtask) for a clear imperative task action, else None. F-23 Slice 2 + PM-hub
@@ -1003,6 +1051,15 @@ def _dispatch_qa(
         if _code_queue_capture_intent(user_message):
             force_tool = "cora_queue_code_session"
             log.info("code_queue capture intent -> forcing tool channel=#%s user=%s",
+                     channel_name, user_id)
+        elif _delegate_work_intent(user_message):
+            # Ordered ABOVE the Asana force: "delegate a job: ..." is an
+            # explicit worker hand-off, not a task op. Forcing it is what makes
+            # the delegated-work intake screens actually RUN -- a narrated
+            # preview with no tool call bypasses every guard behind them
+            # (cq-d30815ee6993).
+            force_tool = "cora_delegate_work"
+            log.info("delegate-work intent -> forcing tool channel=#%s user=%s",
                      channel_name, user_id)
         else:
             force_tool = _asana_destructive_intent(user_message)

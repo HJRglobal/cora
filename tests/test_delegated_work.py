@@ -1362,3 +1362,124 @@ class TestDwIntakeRecallClasses:
         re-checked against the real briefs. 'Include' sat 20 chars from the cue
         'billing' and re-broke brief 2 when the tight window was added."""
         assert not self._caught(text)
+
+
+# ---------------------------------------------------------------------------
+# cq-d30815ee6993 -- two live residuals, 2026-08-07 evening.
+# ---------------------------------------------------------------------------
+
+class TestRaForcedDelegateTool:
+    """R-A: an explicit 'delegate a job: <person>'s eligibility status' ask in
+    #lts-leadership PREVIEWED a job. VERIFY-FIRST OVERTURNED THE PREMISE -- the
+    screen did not fail, it never RAN: the log holds six cora_delegate_work
+    calls that day and NONE from LEX-TS, while the asks 3s before and 2min after
+    it both produced one. A narrated preview with no tool call bypasses every
+    deterministic guard behind the tool, so the fix is to force the tool."""
+
+    def test_the_screen_would_have_refused_all_three_phrasings(self):
+        """Proves the defect is upstream of the screen, not in it -- including
+        the model's own 'for the named individual' paraphrase."""
+        from cora import phi_guard
+        for brief in (
+            "research brief on Maria Gonzalez's AHCCCS eligibility renewal status",
+            "Research Maria Gonzalez's AHCCCS eligibility renewal status.",
+            "Research the current AHCCCS eligibility renewal status for the "
+            "named individual.",
+        ):
+            assert phi_guard.is_lex_billing_status_phi(brief), brief
+
+    @pytest.mark.parametrize("text", [
+        "delegate a job: research brief on Maria Gonzalez's eligibility status",
+        "delegate a job: research the DDD provider revalidation requirements",
+        "Delegate: put together a brief on Sprouts",
+        "can you run a background job for this",
+        "queue a research brief on the AZ DDD respite rates",
+    ])
+    def test_explicit_delegation_forces_the_tool(self, text):
+        from cora import app
+        assert app._delegate_work_intent(text) is True
+
+    @pytest.mark.parametrize("text", [
+        # A hand-off to a HUMAN is not a worker job.
+        "delegate that to Shaun", "delegate it to Jen please",
+        "we should delegate more work", "what jobs are running?",
+        "cancel my job", "yes", "", "add a task to research the rates",
+    ])
+    def test_ordinary_phrasings_do_not_force(self, text):
+        from cora import app
+        assert app._delegate_work_intent(text) is False
+
+    def test_forcing_is_wired_above_the_asana_force(self):
+        """'delegate a job: ...' is a worker hand-off, not a task op -- and the
+        force must reach force_tool, which is what makes the intake screens run."""
+        src = (REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        seg = src[src.index("if _code_queue_capture_intent(user_message):"):
+                  src.index("# Staged-WRITE escalation")]
+        seg = "\n".join(l for l in seg.splitlines() if not l.lstrip().startswith("#"))
+        assert 'elif _delegate_work_intent(user_message):' in seg
+        assert 'force_tool = "cora_delegate_work"' in seg
+        assert seg.index("_delegate_work_intent") < seg.index("_asana_destructive_intent")
+
+    def test_the_forced_tool_is_exposed_everywhere(self):
+        """tool_choice must never name an unexposed tool -- and action=request
+        FILES NOTHING, which is what makes forcing it safe."""
+        from cora.tools import tool_dispatch as td
+        assert "cora_delegate_work" in td._GLOBAL_CORE_TOOLS
+        for entity in ("LEX-LTS", "LEX-LLC", "F3E", "FNDR"):
+            names = [t["name"] for t in td.tools_for_entity(entity, cross_entity=False)]
+            assert "cora_delegate_work" in names, entity
+
+
+class TestRbCompoundAdjective:
+    """R-B: the SAME person-free topic refused in one phrasing and previewed in
+    another. The trigger was the model's own disclaimer -- 'No client-specific
+    or PHI content needed' -- read as client PHI by BOTH predicates. A
+    hyphenated compound adjective is one word and names no individual."""
+
+    STAFF = {"Shaun Hawkins", "Jennifer Mortensen"}
+    REFUSED = ("Research brief on current AZ DDD/AHCCCS provider revalidation "
+               "requirements for Provider Type 15: what Lexington LLC must submit, "
+               "the APEP (AHCCCS Provider Enrollment Portal) process steps "
+               "end-to-end, and any 2026 revalidation fee. Context: LLC has active "
+               "revalidation deadlines under AHCCCS for its Provider Type 15 "
+               "service-site IDs (hard portfolio deadline 2026-06-30, with related "
+               "Provider Type 13/14 notices also circulating through 2026-08-31). "
+               "No client-specific or PHI content needed -- this is a "
+               "policy/process brief.")
+    PREVIEWED = ("Research DDD provider revalidation requirements for Lexington LLC "
+                 "and summarize what our agency must submit to maintain AHCCCS "
+                 "Provider Type 14 enrollment. Include deadlines, required "
+                 "documentation, submission process, and any recent changes or "
+                 "updates from AZ DDD/AHCCCS.")
+
+    def _any(self, text):
+        from cora import phi_guard
+        return (phi_guard.is_lex_billing_status_phi(text)
+                or phi_guard.is_phi_risk_person_linked(text)
+                or phi_guard.is_clinical_phi(text)
+                or phi_guard.has_care_context_person_name(text, self.STAFF))
+
+    def test_both_phrasings_of_the_same_topic_now_agree(self):
+        assert not self._any(self.REFUSED), "the was-refusing phrasing"
+        assert not self._any(self.PREVIEWED), "the was-previewing phrasing"
+
+    @pytest.mark.parametrize("text", [
+        "no client-specific enrollment data needed",
+        "member-facing enrollment portal documentation",
+        "patient-level billing rollups, de-identified",
+    ])
+    def test_compound_adjectives_name_no_individual(self, text):
+        assert not self._any(text)
+
+    @pytest.mark.parametrize("text", [
+        # D-050 recall, including the exact live miss the doctrine was created
+        # for. The compound exclusion must not touch any of these.
+        "Bob Smith's billing authorization is pending",
+        "research whether client Marcus qualifies for respite units",
+        "summarize the client's eligibility status",
+        "Maria Gonzalez's AHCCCS eligibility renewal status",
+        "research units of service for member Delgado",
+        "the client is pending discharge",
+    ])
+    def test_d050_recall_is_untouched(self, text):
+        assert self._any(text), text
