@@ -22,6 +22,19 @@ from cora import web_guard
 from cora.web_guard import WebDecision
 
 ACCEPTANCE_QUERY = "what does a 96GB DDR5 kit cost right now?"
+
+def _code_only(text: str) -> str:
+    """Strip whole-line comments before a source-level assertion.
+
+    D-051 (2026-08-07): source pins that grep for a token are satisfied by the
+    EXPLANATORY COMMENT next to the code they mean to protect -- so the pin goes
+    green with the fix reverted. Proven empirically: reverting the prior-turn
+    co-extension left 545 tests passing because the comment above it contained
+    the token. Assert against code, never against prose."""
+    return chr(10).join(
+        l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
 SUP = "claude-sonnet-5"  # a model that accepts the 20260209 web tool revisions
 
 KB_HIT = {"kb_search_ran": True, "kb_relevant_hits": 3, "kb_best_distance": 0.92}
@@ -1026,13 +1039,15 @@ class TestD051PriorTurnDrop:
         src = self._src()
         i = src.index("web_tools ATTACHED")
         seg = src[i:i + 3000]
+        seg = _code_only(seg)
         assert "web_guard.is_lex_scope(entity)" in seg
         # R1 follow-up (D-051 2026-08-07): the drop must cover the SAME set as
         # the custodian withhold R1 relaxed, or relaxing one un-covers the
         # other. phi_allowed is True for the founder in a DM while his entity is
         # pinned FNDR -- phi_custodian=True, is_lex_scope=False -- so keying on
         # scope alone left the highest-volume DM surface uncovered.
-        assert "or phi_custodian" in seg
+        assert ("if (web_guard.is_lex_scope(entity) or phi_custodian) "
+                "and prior_messages:") in seg
         # Exactly one drop inside the attach branch, and it is guarded -- an
         # unguarded drop would silently strip thread context for everyone.
         assert seg.count("prior_messages = []") == 1
@@ -1063,8 +1078,9 @@ class TestR1PriorTurnDropCoExtension:
                / "app.py").read_text(encoding="utf-8")
         i = src.index("web_tools ATTACHED")
         seg = src[i:i + 3000]
-        cond = seg[:seg.index("prior_messages = []")]
-        assert "is_lex_scope(entity)" in cond and "or phi_custodian" in cond
+        cond = _code_only(seg[:seg.index("prior_messages = []")])
+        assert ("if (web_guard.is_lex_scope(entity) or phi_custodian) "
+                "and prior_messages:") in cond
 
 
 class TestR1CustodianWebLane:
@@ -1080,8 +1096,8 @@ class TestR1CustodianWebLane:
 
     def test_web_clean_no_longer_excludes_custodians(self):
         src = self._src()
-        seg = src[src.index("web_clean = ("):
-                  src.index("static_text, kb_text = load_context_parts")]
+        seg = _code_only(src[src.index("web_clean = ("):
+                  src.index("static_text, kb_text = load_context_parts")])
         # The exclusion that made the lane inert must be gone...
         assert "not phi_custodian" not in seg
         # ...and evaluate() remains the single authority (D-146).
@@ -1111,9 +1127,51 @@ class TestR1CustodianWebLane:
         cl = (Path(__file__).resolve().parents[1] / "src" / "cora"
               / "context_loader.py").read_text(encoding="utf-8")
         i = cl.index("    if web_clean:")
-        seg = cl[i:i + 1600]
+        seg = _code_only(cl[i:i + 2200])
         assert "asker_slack_id = None" in seg
         assert "phi_custodian = False" in seg
         # ...and it must land BEFORE the LEX scrub reads the flag.
         assert cl.index("phi_custodian = False", i) < cl.index(
             'if kb_entity == "LEX" and not phi_custodian')
+
+
+class TestR1CleanLoadScrubsForCustodians:
+    """R1c behavioural pin. The source-level version catches a revert, but this
+    proves the OUTCOME: on a web-clean load a custodian sees exactly what a
+    stranger sees, because phi_custodian is forced False in the function that
+    owns the posture (context_loader), not at the call site."""
+
+    def _run(self, *, phi_custodian, web_clean, content):
+        from unittest.mock import MagicMock
+        from cora import context_loader as cl
+        from cora.knowledge_base.store import SearchResult
+
+        chunk = SearchResult(
+            chunk_id="c1", source="slack", source_id="s1", entity="LEX",
+            title="t", content=content, deep_link="", date_modified=None,
+            distance=0.4, author="", metadata=None)
+        fake_kb = MagicMock()
+        fake_kb.search.return_value = [chunk]
+        with patch.object(cl, "get_shared_kb", lambda: fake_kb), \
+             patch.object(cl, "_format_kb_chunks", lambda r: " | ".join(
+                 x.content for x in r)):
+            return cl._try_kb_retrieve(
+                "LEX-LLC", "what is the respite policy", None,
+                phi_custodian=phi_custodian, web_clean=web_clean) or ""
+
+    CLIENT_LINE = "The client, Madison Delgado, has respite units remaining."
+
+    def test_custodian_on_a_web_clean_load_is_scrubbed(self):
+        out = self._run(phi_custodian=True, web_clean=True,
+                        content=self.CLIENT_LINE)
+        assert "Madison" not in out, (
+            "a custodian composing outbound web queries must see stranger "
+            "posture -- forcing phi_custodian=False under web_clean is what "
+            "makes that true")
+
+    def test_custodian_on_a_normal_load_is_not_scrubbed(self):
+        # Control: the demotion is scoped to the web-clean turn ONLY. If this
+        # ever starts scrubbing, R1 has over-reached into ordinary LEX Q&A.
+        out = self._run(phi_custodian=True, web_clean=False,
+                        content=self.CLIENT_LINE)
+        assert "Madison" in out

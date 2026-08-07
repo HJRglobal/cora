@@ -926,6 +926,18 @@ def _dispatch_qa(
         # load -- fail-safe, because every surface it would have removed sets
         # unstripped_personal and is withheld by the belt.
         #
+        # Honest limitation (D-051 2026-08-07 -- an earlier phrasing of this
+        # claimed context degrades ONLY when tools really attach, which is not
+        # true for one branch): web_clean is decided HERE, but force_tool and
+        # the gate are computed AFTER the load. A turn carrying explicit web
+        # intent AND a forced-tool intent (a destructive Asana confirm, a
+        # code-queue op) takes the stranger-posture load and is then withheld
+        # as gate_skipped:forced_tool -- degraded context, no web, pure loss.
+        # Pre-existing for ordinary askers; R1 extends it to custodians on their
+        # own LEX surface. Narrow and fail-safe (it loses context, never leaks
+        # it); the real fix is to move the gate-skip computation above the load,
+        # which is a larger reshuffle than this rider should carry.
+        #
         # R1 (Harrison ruling 2026-08-07): `not phi_custodian` is GONE from this
         # condition. A custodian used to be excluded here and then withheld
         # outright at the gate below, which made the whole LEX web lane inert --

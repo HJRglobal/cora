@@ -1185,3 +1185,43 @@ def test_f1_delegated_artifacts_are_pinned_gm_level_at_ingest():
     seg = src[i:i + 1400]
     assert 'metadata["bot_authored"] = True' in seg
     assert 'metadata["lex_gm_level"] = True' in seg
+
+
+def test_kb_search_lex_job_still_retrieves_as_non_custodian(monkeypatch):
+    """R2 moved AUTHORIZATION at intake; PRIVILEGE at execution must not move.
+
+    Behavioural replacement for a source-grep pin that was vacuous -- the only
+    `phi_custodian` tokens in make_kb_search are a docstring and a comment, so
+    the grep stayed green with the pin removed (verified against the full suite,
+    D-051 2026-08-07). This exercises the LEX branch the existing OSNGW test
+    never reaches: the requester is a real PHI custodian, and the worker must
+    STILL run the non-custodian LEX scrub on his behalf."""
+    import cora.context_loader as cl
+    import cora.historical_access as ha
+
+    fake_kb = MagicMock()
+    chunk = SimpleNamespace(distance=0.5, source="static_md", content="c",
+                            title="t", deep_link="", chunk_id="1", entity="LEX")
+    fake_kb.search.return_value = [chunk]
+    monkeypatch.setattr(worker, "_get_ro_kb", lambda: fake_kb)
+    monkeypatch.setattr(worker, "_RO_KB", None)
+    from cora.knowledge_base import embeddings
+    monkeypatch.setattr(embeddings, "embed_query", lambda q: [0.0] * 8)
+    monkeypatch.setattr(ha, "apply_tier1", lambda r, e, u: (r, False))
+    monkeypatch.setattr(ha, "owned_emails", lambda uid: frozenset())
+    lex_scrub = MagicMock(side_effect=lambda r: r)
+    nonlex_scrub = MagicMock(side_effect=lambda r: r)
+    monkeypatch.setattr(cl, "_apply_lex_phi_scrub", lex_scrub)
+    monkeypatch.setattr(cl, "_withhold_non_lex_phi", nonlex_scrub)
+    monkeypatch.setattr(cl, "_format_kb_chunks", lambda r: "formatted chunks")
+
+    # U0B3PS82G30 is Shaun -- a real LEX PHI custodian on the live allowlist.
+    fn = worker.make_kb_search(_job(entity="LEX-LLC", requester="U0B3PS82G30"))
+    out = fn("what does the DDD manual say about respite")
+    assert "formatted chunks" in out
+    kwargs = fake_kb.search.call_args.kwargs
+    assert kwargs["entity"] == "LEX"                # parent-collapsed in code
+    assert kwargs["sub_entity"] == "LEX-LLC"        # strict sub-entity scoping
+    # THE PIN: the LEX scrub runs even though the requester is a custodian.
+    lex_scrub.assert_called_once()
+    nonlex_scrub.assert_not_called()                # LEX branch, not the backstop

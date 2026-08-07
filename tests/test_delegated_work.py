@@ -21,6 +21,13 @@ import cora.tools.tool_dispatch as td
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# The autouse _isolated fixture stubs user_access.check_access to always pass.
+# Captured here at import so a test that needs the REAL topic block can restore
+# it (D-051 2026-08-07: a "regression pin" that runs against the stub is pinning
+# nothing -- it stayed green with the fix reverted).
+import cora.user_access as _ua
+_REAL_CHECK_ACCESS = _ua.check_access
+
 USER = "U_TEAMMATE1"
 OTHER = "U_TEAMMATE2"
 CHANNEL = "f3e-leadership"
@@ -1003,10 +1010,16 @@ class TestR2IntakeAuthorization:
                         "summarize what our agency must submit")
 
     def test_custodian_lex_policy_brief_passes_intake(self, monkeypatch, _lex_lane):
-        # THE R2 REGRESSION. Shaun is a LEX PHI custodian; his DDD-topic policy
-        # brief must queue. Before R2 this drew "Client-specific health info
-        # stays in the EHR" from user_access's `phi` topic block.
+        """THE R2 REGRESSION, against the REAL topic block.
+
+        Shaun is a LEX PHI custodian; his DDD-topic policy brief must queue.
+        Before R2 this drew "Client-specific health info stays in the EHR."
+        The autouse fixture stubs check_access to always pass, which would make
+        this pin nothing -- so the real implementation is restored for this one
+        test (verified: with R2 reverted, this FAILS)."""
         import cora.org_roles as org_roles
+        import cora.user_access as user_access
+        monkeypatch.setattr(user_access, "check_access", _REAL_CHECK_ACCESS)
         monkeypatch.setattr(org_roles, "get_role",
                             lambda uid: _role(entity="LEX-LLC"))
         assert dw.screen_request(
@@ -1088,12 +1101,10 @@ class TestR2IntakeAuthorization:
                           "research_brief", self.LEX_POLICY_BRIEF, "md")
         assert seen["phi_custodian"] is False
 
-    def test_worker_retrieval_pin_is_untouched(self):
-        """Revert-and-fail pin on the pin itself: authorization moved at INTAKE,
-        privilege did NOT move at EXECUTION."""
-        src = (REPO_ROOT / "src" / "cora" / "delegated_worker.py").read_text(
-            encoding="utf-8")
-        i = src.index("def make_kb_search")
-        seg = src[i:i + 4000]
-        assert "phi_custodian" in seg
-        assert "phi_custodian=True" not in seg
+    # NOTE: the behavioural revert-and-fail pin for the worker retrieval pin
+    # lives in tests/test_delegated_worker.py
+    # (test_kb_search_lex_job_still_retrieves_as_non_custodian). It was moved
+    # there from a source-grep version here that was VACUOUS: the only
+    # `phi_custodian` tokens inside make_kb_search are a docstring line and a
+    # comment, so the grep passed with the pin genuinely removed -- verified
+    # against the full suite (D-051, 2026-08-07).
