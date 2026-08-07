@@ -10,10 +10,17 @@ Transitions via code_queue.process_queue_action(ACTION_MARK_SHIPPED, ...) only -
 never a hand-edit of data/state/code-session-queue.jsonl or the generated backlog .md.
 
 DELIBERATELY NOT SHIPPED here:
-- cq-4e39d9f0f994 (Alina org-roles test pin) and cq-86c283d95a34 (F3E ecom
-  source-opacity, RED on main). Both fail in this branch's full-suite runs and BOTH
-  were verified to fail identically against pristine HEAD -- they are pre-existing
-  and untouched by this work.
+- cq-86c283d95a34 (F3E ecom source-opacity) is RED on main, pre-existing, and
+  untouched by this work.
+- cq-4e39d9f0f994 (Alina org-roles test pin). The 2026-08-06 remediation kickoff
+  asked this script to carry TWO items, closing this one via R9's roster commit.
+  R9 HIT ITS OWN STOP GATE: the uncommitted data/maps/org-roles.yaml carries four
+  role/entity/manager changes beyond the named 1yyyy/1ssss canon (Eric Canku,
+  Jennifer Mortensen, Aaron Ferrucci, and Alina's role+entity on top of her
+  manager), and the "Jerry mapped" edit the kickoff expected is absent entirely.
+  The kickoff's instruction for that case is STOP and report, so nothing was
+  committed, the test pin was left alone, and this seed stays OPEN. See section F
+  of the cascade report. Add it here only once Harrison rules on the roster file.
 - No OTHER seed is claimed. The D-104 [QA] quarantine shipped here as the rider the
   bundle kickoff assigned it; it has no separate queue id, so nothing else to close.
 
