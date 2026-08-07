@@ -1202,6 +1202,30 @@ class TestDwIntakePrecision:
         assert "names a specific person" not in out, (
             "asserted a person-detection that did not fire")
 
+    @pytest.mark.parametrize("brief", [
+        # Case must NEVER gate a care-noun-governed name. An earlier cut of this
+        # fix required the governed name to be capitalised, which was a
+        # self-inflicted egress miss -- people type lowercase in Slack all day,
+        # and "client marcus delgado" then sailed through to the search API.
+        "research the respite rules for client marcus delgado",
+        "research the placement options for client madison",
+        "research eligibility for participant aaron",
+    ])
+    def test_lowercase_governed_names_still_refuse(self, monkeypatch, brief):
+        out = self._screen(monkeypatch, brief)
+        assert out and "names a specific person" in out
+
+    @pytest.mark.parametrize("phrase", [
+        "member id", "client record", "participant roster", "member number",
+    ])
+    def test_record_nouns_after_a_care_noun_are_not_people(self, phrase):
+        """The narrow precision case the record-noun set exists for: these
+        follow a care-recipient noun but name nobody."""
+        from cora import phi_guard
+        assert phi_guard.has_care_context_person_name(
+            f"what does the DDD manual say about the {phrase} field",
+            {"Shaun Hawkins"}) is False
+
     def test_ingestion_screen_is_deliberately_unchanged(self, monkeypatch):
         """is_phi_risk still carries the payer/programme names. It guards email
         SUBJECTS and Drive FILENAMES before KB ingestion, where recall beats

@@ -935,6 +935,18 @@ _NONPERSON_PROPER_NOUNS = frozenset({
 })
 
 
+# Words that genuinely follow a care-recipient noun WITHOUT naming anyone:
+# "member id", "client record", "participant roster". Checked in PASS 1 only,
+# where governance by a care noun would otherwise make any following token a
+# person. A real given name is never one of these.
+_RECORD_NOUNS = frozenset({
+    "id", "ids", "number", "numbers", "no", "record", "records", "file", "files",
+    "chart", "charts", "name", "names", "roster", "rosters", "list", "lists",
+    "count", "counts", "status", "type", "types", "portal", "profile",
+    "profiles", "data", "info", "information", "details", "detail",
+})
+
+
 def has_care_context_person_name(text: str, allowed_names: set[str] | None = None,
                                  cue_required: bool = True) -> bool:
     """True when a person-shaped proper name rides in PHI/care context.
@@ -999,13 +1011,15 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
         name = (m.group(1) or "").strip()
         if not name or name.lower() in full:
             continue
-        # A real name is capitalised. _CARE_NOUN_RE's capture deliberately
-        # allows a lowercase first character (the REDACTOR wants that latitude),
-        # but here it made "member id" read as a person named "Id" and served
-        # the person-named refusal for a brief naming nobody. Requiring the
-        # capital costs no recall -- "client marcus" is not how anyone writes a
-        # name -- and keeps the refusal copy truthful.
-        if not name[:1].isupper():
+        # "member id" was reading as a person named "Id" and drawing the
+        # person-named refusal for a brief naming nobody. The first fix required
+        # the governed name to be CAPITALISED -- which was wrong, and a
+        # self-inflicted egress miss: people type lowercase in Slack all day, so
+        # "rules for client marcus delgado" then sailed through to the search
+        # API. Governance by a care noun is the highest-confidence signal there
+        # is and case must not gate it; exclude the RECORD nouns that actually
+        # follow those nouns instead.
+        if all(t.lower() in _RECORD_NOUNS for t in name.split()):
             continue
         if any(_is_person_token(t, governed=True) for t in name.split()):
             return True
