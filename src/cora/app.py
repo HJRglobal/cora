@@ -900,10 +900,19 @@ def _dispatch_qa(
         # attach is pure loss). Residual: a daily-cap race between this
         # pre-flight and the authoritative post-load evaluate can yield one
         # degraded KB-only reply — accepted (ms window, fail-safe direction).
+        # LEX lane (2026-08-06): evaluate() is the SINGLE authority on whether
+        # this turn can attach, so there is deliberately no separate LEX clause
+        # here. With CORA_WEB_TOOLS_LEX off, evaluate returns "lex_scope"
+        # (attach=False) and web_clean is False exactly as before -- byte-
+        # identical. With the lane ON, a LEX web turn MUST take the web-clean
+        # load: otherwise it would keep the personal-note overlay / unstripped
+        # Tier-1 posture / cross-entity fallback in context while the model
+        # composes outbound search strings from that same context. The
+        # unstripped_personal belt below only catches the note overlay; ordinary
+        # LEX chunk text is not "personal" and would have ridden along silently.
         web_clean = (
             web_intent
             and not phi_custodian
-            and not web_guard.is_lex_scope(entity)
             and web_guard.evaluate(
                 user_message, entity, kb_meta=None,
                 skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
@@ -1015,9 +1024,11 @@ def _dispatch_qa(
         cache_storable = False
     # ── Web tools gate (2026-07-31): the server-side web_search/web_fetch tools
     # attach only when web_guard says so — explicit web intent, or a time-sensitive
-    # question whose KB retrieval missed; NEVER in LEX scope; the user query is
-    # egress-screened fail-closed; a daily search cap bounds spend. A block is a
-    # soft degradation (KB-only behavior), never a user-facing refusal.
+    # question whose KB retrieval missed; in LEX scope only when the
+    # CORA_WEB_TOOLS_LEX lane is on (default off) and then through a stricter
+    # client-name screen; the user query is egress-screened fail-closed; a daily
+    # search cap bounds spend. A block is a soft degradation (KB-only behavior),
+    # never a user-facing refusal.
     #
     # DETERMINISTIC EXCLUSIONS (never carry web tools):
     #  - forced-tool / bare-affirmative confirm / Tier-2 retrieval-grant turns;

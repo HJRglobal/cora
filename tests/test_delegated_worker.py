@@ -441,19 +441,19 @@ def test_phase_a_search_budget_exhausted_drops_tool():
 
 
 def test_web_withheld_screen_trip(monkeypatch):
-    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q: "phi")
+    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q, **kw: "phi")
     assert worker.web_withheld_reason("brief") == "screen:phi"
 
 
 def test_web_withheld_org_cap(monkeypatch):
-    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q: None)
+    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q, **kw: None)
     monkeypatch.setattr(worker.web_guard, "searches_today", lambda: 40)
     monkeypatch.setattr(worker.web_guard, "daily_cap", lambda: 40)
     assert worker.web_withheld_reason("brief") == "org_daily_cap"
 
 
 def test_web_withheld_jobs_lane_cap(monkeypatch):
-    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q: None)
+    monkeypatch.setattr(worker.web_guard, "_screen_query", lambda q, **kw: None)
     monkeypatch.setattr(worker.web_guard, "searches_today", lambda: 0)
     monkeypatch.setattr(worker, "jobs_lane_searches_today",
                         lambda: worker.JOBS_LANE_DAILY_SEARCH_CAP)

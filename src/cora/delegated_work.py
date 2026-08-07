@@ -456,14 +456,80 @@ def envelope_headroom(jobs: dict[str, dict[str, Any]] | None = None) -> float:
 # Intake screens (design section 3 order; ALL fail-closed)
 # ─────────────────────────────────────────────────────────────────────────────
 _LEX_REFUSAL = (
-    "Delegated work is not available in Lexington scope in v1 -- nothing was "
-    "queued. Ask Harrison if you need this for LEX."
+    "Delegated work isn't enabled for Lexington scope yet, so nothing was "
+    "queued. What I *can* do right now: answer it directly here, or pull the "
+    "policy/document from the knowledge base if it's already been dumped. "
+    "Harrison can turn the Lexington lane on."
 )
+
+# LEX lane (2026-08-06 Harrison decision -- supersedes the D-102 v1
+# "LEX excluded by construction" line). Only these two archetypes: they produce
+# a document from policy + internal knowledge. spreadsheet_build and
+# creator_shortlist have no LEX v1 case and both invite roster/client data into
+# a structured artifact (a spreadsheet of "individuals" is the exact shape PHI
+# takes at LEX), so they refuse with route-copy even when the lane is ON.
+LEX_ALLOWED_ARCHETYPES = frozenset({"research_brief", "doc_draft"})
+
+_LEX_ARCHETYPE_REFUSAL = (
+    "For Lexington I can run a *research brief* or a *document draft* -- not "
+    "{archetype}. Nothing was queued. If you need data assembled into a "
+    "spreadsheet, ask me for the numbers here and I'll pull what I'm allowed "
+    "to show; Harrison owns widening this."
+)
+
+_LEX_PHI_REFUSAL = (
+    "That brief names a specific person in a care or billing context, so I "
+    "can't run it as a background job -- Lexington jobs are limited to "
+    "policy/process work with no client details. Nothing was queued. What "
+    "works: ask the same question about the POLICY (\"what does DDD require "
+    "for live-in caregiver respite?\") and I'll research that. Harrison and "
+    "Shaun own any exception."
+)
+
+
+def lex_delegated_enabled() -> bool:
+    """CORA_DELEGATED_WORK_LEX: may LEX requesters/channels queue a job?
+
+    Default OFF (unset/unrecognized -> off), independent of CORA_DELEGATED_WORK:
+    the base flag must ALSO be on. MIXED activation surface -- intake
+    (screen_request) runs in the always-on BOT, which snapshots ``.env`` at
+    startup, so opening the lane needs the value change AND a restart; the
+    RUNNER is a fresh process per fire and sees a change immediately. Flip both
+    together and treat the bot as the slower half.
+    """
+    return (os.environ.get("CORA_DELEGATED_WORK_LEX", "") or "").strip().lower() in (
+        "on", "1", "true", "yes",
+    )
 
 
 def _is_lex(code: str) -> bool:
     c = (code or "").strip().upper()
     return c == "LEX" or c.startswith("LEX-")
+
+
+_staff_names_cache: set[str] | None = None
+
+
+def _staff_names() -> set[str]:
+    """Roster display names the LEX brief screen PRESERVES (colleagues, not
+    clients). Same source + fail-toward-blocking posture as web_guard's."""
+    global _staff_names_cache
+    if _staff_names_cache is not None:
+        return _staff_names_cache
+    names: set[str] = set()
+    try:
+        import yaml
+        path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        names = {
+            str(u.get("display_name", "")).strip()
+            for u in (raw.get("users") or []) if u.get("display_name")
+        }
+    except Exception:  # noqa: BLE001 -- fail toward refusing, never crash intake
+        log.warning("delegated_work: staff-name load failed -- LEX screen runs nameless",
+                    exc_info=True)
+    _staff_names_cache = names
+    return _staff_names_cache
 
 
 def screen_request(
@@ -511,18 +577,30 @@ def screen_request(
     if getattr(role, "external", False):
         return ("Delegated work is for internal teammates only -- nothing was "
                 "queued.")
-    if _is_lex(getattr(role, "entity", "")):
-        return _LEX_REFUSAL
-    if _is_lex(entity):
-        return _LEX_REFUSAL
+    # A job is LEX if EITHER side is LEX -- the requester's primary entity or
+    # the channel it was asked in. Both legs kept (a LEX requester in a shared
+    # channel, and a non-LEX requester in a LEX channel, are both LEX jobs).
+    lex_job = _is_lex(getattr(role, "entity", "")) or _is_lex(entity)
+    if lex_job:
+        if not lex_delegated_enabled():
+            return _LEX_REFUSAL
+        if archetype not in LEX_ALLOWED_ARCHETYPES:
+            return _LEX_ARCHETYPE_REFUSAL.format(
+                archetype=f"a {archetype.replace('_', ' ')}")
 
-    # 3. PHI -- BEFORE any stash/preview; fail-closed on error.
+    # 3. PHI -- BEFORE any stash/preview; fail-closed on error. For a LEX job the
+    # screen is RAISED: is_any_phi (which already unions the D-050 admin-PHI
+    # class) plus the client-name detector, so a brief naming an individual in
+    # care/billing context refuses even when it carries no clinical vocabulary.
     try:
         if phi_guard.is_any_phi(brief):
-            return ("That brief looks like it contains protected client/health "
+            return _LEX_PHI_REFUSAL if lex_job else (
+                    "That brief looks like it contains protected client/health "
                     "info, so I can't run it as a background job. Nothing was "
                     "queued -- rephrase without client details if this was a "
                     "false alarm.")
+        if lex_job and phi_guard.has_care_context_person_name(brief, _staff_names()):
+            return _LEX_PHI_REFUSAL
     except Exception:  # noqa: BLE001 -- fail closed
         return ("I couldn't screen that brief for protected info (fail-closed), "
                 "so nothing was queued. Try again in a moment.")

@@ -157,6 +157,118 @@ class TestScope:
     def test_model_unsupported_soft_degrades(self):
         dec = web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model="claude-haiku-4-5")
         assert not dec.attach and dec.reason == "model_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# LEX lane (CORA_WEB_TOOLS_LEX) -- Harrison decision 2026-08-06, superseding the
+# D-097 v1 "LEX scope OFF entirely" line. Default OFF; stricter screen when ON.
+# ---------------------------------------------------------------------------
+
+LEX_POLICY_QUERY = "search the web for the Arizona DDD live-in caregiver respite rate policy"
+
+
+@pytest.fixture
+def _lex_staff(monkeypatch):
+    """Pin the roster so the name screen is deterministic (no YAML dependency)."""
+    monkeypatch.setattr(
+        web_guard, "_staff_names_cache",
+        frozenset({"Shaun Hawkins", "Jennifer Mortensen", "Harrison Rogers"}),
+    )
+    yield
+
+
+class TestLexWebLane:
+    @pytest.mark.parametrize("value", ["", "off", "0", "false", "no", "disabled", "maybe"])
+    def test_flag_defaults_and_unrecognized_read_off(self, monkeypatch, value):
+        # Fail-closed whitelist: only an explicitly-truthy value opens the lane.
+        # NOTE the deliberate asymmetry vs CORA_WEB_TOOLS, where "" is truthy --
+        # extending scope to the most regulated entity is opt-in, never inherited.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", value)
+        assert not web_guard.lex_web_enabled()
+        dec = web_guard.evaluate(LEX_POLICY_QUERY, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        assert not dec.attach and dec.reason == "lex_scope"
+
+    def test_flag_unset_reads_off(self, monkeypatch):
+        monkeypatch.delenv("CORA_WEB_TOOLS_LEX", raising=False)
+        assert not web_guard.lex_web_enabled()
+
+    @pytest.mark.parametrize("value", ["on", "1", "true", "yes", "ON", " True "])
+    def test_flag_truthy_spellings_open_the_lane(self, monkeypatch, value):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", value)
+        assert web_guard.lex_web_enabled()
+
+    @pytest.mark.parametrize("entity", ["LEX", "LEX-LLC", "LEX-LTS", "LEX-LBHS", "LEX-LLA", "lex"])
+    def test_all_four_sub_entities_attach_on_a_clean_policy_ask(
+        self, monkeypatch, _lex_staff, entity
+    ):
+        # Smoke (a): one screen covers LEX and all four sub-entities.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(LEX_POLICY_QUERY, entity, kb_meta=dict(KB_MISS), model=SUP)
+        assert dec.attach and dec.reason == "explicit_intent"
+
+    @pytest.mark.parametrize("query", [
+        # Smoke (b): a client-style name never leaves the machine. Each of these
+        # is a name in care/admin context that carries NO clinical vocabulary of
+        # its own -- the residual is_any_phi alone would miss.
+        "search the web for DDD respite rates for client Marcus Delgado",
+        "look up online whether Marcus Delgado's service hours can be billed",
+        "google the DDD policy on units for member Priya Raghunathan",
+    ])
+    def test_client_style_name_is_blocked_even_with_the_lane_on(
+        self, monkeypatch, _lex_staff, query
+    ):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        assert not dec.attach
+        assert dec.reason.startswith("blocked:")
+
+    def test_a_rostered_teammate_name_is_not_a_client(self, monkeypatch, _lex_staff):
+        # A LEX teammate named in a web query is a colleague, not a client --
+        # over-blocking here is the LEX-17 dead-end failure mode.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(
+            "search the web for DDD respite billing guidance Shaun Hawkins asked about",
+            "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP,
+        )
+        assert dec.attach
+
+    def test_lex_strict_screen_is_additive_not_a_replacement(self, monkeypatch, _lex_staff):
+        # is_any_phi still runs FIRST for LEX: a clinical query blocks as "phi",
+        # not as the narrower name reason.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(
+            "search the web for risperidone dosing guidance", "LEX-LLC",
+            kb_meta=dict(KB_MISS), model=SUP,
+        )
+        assert not dec.attach and dec.reason == "blocked:phi"
+
+    def test_name_screen_does_not_apply_outside_lex(self, monkeypatch, _lex_staff):
+        # Invariant 4: non-LEX behaviour is identical with the lane ON.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        dec = web_guard.evaluate(
+            "search the web for DDD respite rates for client Marcus Delgado",
+            "FNDR", kb_meta=dict(KB_MISS), model=SUP,
+        )
+        assert dec.attach  # the LEX-only belt must not leak into other scopes
+
+    def test_name_screen_error_fails_closed(self, monkeypatch, _lex_staff):
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        monkeypatch.setattr(
+            web_guard.phi_guard, "has_care_context_person_name",
+            MagicMock(side_effect=RuntimeError("boom")),
+        )
+        dec = web_guard.evaluate(LEX_POLICY_QUERY, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        assert not dec.attach and dec.reason == "blocked:lex_screen_error"
+
+    def test_blocked_lex_ask_is_ledgered_without_query_text(self, monkeypatch, _lex_staff):
+        # D-082: the ledger records the decision, never the query.
+        monkeypatch.setenv("CORA_WEB_TOOLS_LEX", "on")
+        query = "search the web for DDD respite rates for client Marcus Delgado"
+        dec = web_guard.evaluate(query, "LEX-LLC", kb_meta=dict(KB_MISS), model=SUP)
+        web_guard.record_decision(dec, entity="LEX-LLC", channel_name="llc-leadership")
+        written = open(web_guard._USAGE_LEDGER, encoding="utf-8").read()
+        assert "blocked:lex_person_name" in written
+        assert "Marcus" not in written and "respite" not in written
         assert web_guard.evaluate(ACCEPTANCE_QUERY, "FNDR", kb_meta=dict(KB_HIT), model=None).reason == "model_unsupported"
 
     @pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-5", "claude-opus-4-8"])
@@ -625,16 +737,26 @@ class TestAppWiring:
     def test_web_clean_load_wired(self):
         # cq-49a7835f081c: an explicit-web-intent turn that WILL attach loads a
         # web-clean context (notes/unstripped-personal absent by construction);
-        # custodian/LEX/blocked/capped/disabled turns keep their full context
+        # custodian/blocked/capped/disabled turns keep their full context
         # (they never attach, so degrading them is pure loss — D-051 review).
         src = self._src()
         seg = src[src.index("web_clean = ("):src.index("static_text, kb_text = load_context_parts")]
         assert "web_intent" in seg
         assert "not phi_custodian" in seg
-        assert "not web_guard.is_lex_scope(entity)" in seg
         assert ").attach" in seg  # pre-flight evaluate: degrade only on real attach
         assert "kb_meta=None," in seg  # explicit leg is kb_meta-independent
         assert "web_clean=web_clean," in src
+
+    def test_web_clean_has_no_separate_lex_clause(self):
+        # LEX lane (2026-08-06): evaluate() is the SINGLE authority on attach.
+        # A separate `not is_lex_scope(entity)` clause here would mean an
+        # ENABLED LEX web turn attaches while still carrying the note overlay /
+        # unstripped Tier-1 posture / cross-entity fallback in the context the
+        # model composes outbound queries from. Behavioural coverage that the
+        # OFF default is unchanged lives in TestLexWebLane.
+        src = self._src()
+        seg = src[src.index("web_clean = ("):src.index("static_text, kb_text = load_context_parts")]
+        assert "is_lex_scope" not in seg
 
     def test_gate_skips_are_observable(self):
         # A deterministic exclusion swallowing a web-actionable turn must leave

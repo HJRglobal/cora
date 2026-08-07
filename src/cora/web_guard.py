@@ -5,7 +5,12 @@ Cora answers live-web questions via the Messages API server tools
 model may compose search queries that LEAVE the machine, so enablement is
 deterministic and fail-closed (kickoff 2026-07-31, gate lifted by Harrison):
 
-  1. LEX scope (entity LEX or any LEX-* sub-entity) NEVER gets web tools in v1.
+  1. LEX scope (entity LEX or any LEX-* sub-entity) carries web tools ONLY when
+     CORA_WEB_TOOLS_LEX is explicitly on (default OFF), and then only through a
+     STRICTER screen -- the shared checks plus a client-name detector (Harrison
+     decision 2026-08-06, superseding the D-097 v1 "LEX off entirely" line). A
+     LEX block is the same silent KB-only degradation as any other block; it is
+     never a user-facing refusal.
   2. Tools attach only on (a) explicit web intent ("search the web",
      "current price of ...") or (b) a time-sensitive question whose KB
      retrieval came back empty/weak (kb_best_distance past the relevance gate).
@@ -98,6 +103,25 @@ _TRUTHY = frozenset({"on", "1", "true", "yes", ""})
 
 def _enabled() -> bool:
     return os.environ.get("CORA_WEB_TOOLS", "on").strip().lower() in _TRUTHY
+
+
+# LEX lane flag (2026-08-06 Harrison decision -- supersedes the v1 "LEX scope
+# OFF entirely" line in D-097). Default OFF: unset reads as OFF, which is the
+# OPPOSITE default from CORA_WEB_TOOLS above -- extending scope to the most
+# regulated entity is opt-in, never inherited. Only an explicitly-truthy value
+# opens the lane; "" is NOT truthy here for the same reason.
+_LEX_TRUTHY = frozenset({"on", "1", "true", "yes"})
+
+
+def lex_web_enabled() -> bool:
+    """CORA_WEB_TOOLS_LEX: may LEX-scope questions carry the web tools?
+
+    BOT-SNAPSHOT: evaluate() runs inside the always-on bot, which loads ``.env``
+    ONCE at startup -- editing the file does NOT flip a running bot (the
+    code_queue_level lesson, cq-06f4797db4f1). Flipping this lane requires the
+    value change AND a restart.
+    """
+    return os.environ.get("CORA_WEB_TOOLS_LEX", "").strip().lower() in _LEX_TRUTHY
 
 
 def _int_env(name: str, default: int) -> int:
@@ -270,8 +294,47 @@ _ENTITY_TOKEN_RE = re.compile(
 )
 
 
-def _screen_query(text: str) -> str | None:
-    """Return a block-reason slug, or None when the query may leave the machine."""
+_staff_names_cache: frozenset[str] | None = None
+
+
+def _lex_staff_names() -> frozenset[str]:
+    """Roster display names PRESERVED by the LEX-strict name screen.
+
+    A teammate named in a LEX web query is a colleague, not a client. Read from
+    the slack-to-asana map (same source channel_synthesis._lex_staff_names uses);
+    a broader-than-LEX roster is the safe direction -- a client name is simply
+    never on it. Cached for the process; an empty/failed read just means every
+    proper name reads as non-staff (fail-closed toward blocking)."""
+    global _staff_names_cache
+    if _staff_names_cache is not None:
+        return _staff_names_cache
+    names: set[str] = set()
+    try:
+        import yaml
+        path = _REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        names = {
+            str(u.get("display_name", "")).strip()
+            for u in (raw.get("users") or [])
+            if u.get("display_name")
+        }
+    except Exception:  # noqa: BLE001 -- fail toward blocking, never crash the gate
+        log.warning("web_guard: staff-name load failed -- LEX screen runs nameless",
+                    exc_info=True)
+    _staff_names_cache = frozenset(names)
+    return _staff_names_cache
+
+
+def _screen_query(text: str, lex_strict: bool = False) -> str | None:
+    """Return a block-reason slug, or None when the query may leave the machine.
+
+    *lex_strict* adds the LEX-only client-name screen on top of the shared
+    checks: a person-shaped proper name in care/admin context that is not a
+    rostered teammate. is_any_phi (which already unions the D-050 admin-PHI
+    class) still runs FIRST for every scope, so this is an additional belt on
+    the narrow residual -- a bare client name carrying no clinical or
+    billing-status vocabulary of its own.
+    """
     if phi_guard.is_any_phi(text):
         return "phi"
     if phi_guard.is_visibility_cpa_mention(text):
@@ -282,15 +345,22 @@ def _screen_query(text: str) -> str | None:
         _FINANCE_VOCAB_RE.search(text) or _ENTITY_TOKEN_RE.search(text)
     ):
         return "internal_figure"
+    if lex_strict:
+        try:
+            if phi_guard.has_care_context_person_name(text, set(_lex_staff_names())):
+                return "lex_person_name"
+        except Exception:  # noqa: BLE001 -- fail closed
+            log.warning("web_guard: LEX name screen errored -- blocking", exc_info=True)
+            return "lex_screen_error"
     return None
 
 
 def is_lex_scope(entity: str) -> bool:
-    """LEX or any LEX-* sub-entity — the scope that never carries web tools.
+    """LEX or any LEX-* sub-entity — the scope gated by CORA_WEB_TOOLS_LEX.
 
-    Public so app.py can scope the web-clean context load to turns that could
-    actually attach (a LEX web ask is blocked by evaluate() anyway, so its
-    context must not be degraded by the clean posture)."""
+    Public for callers that need the scope predicate itself. app.py deliberately
+    does NOT re-check it around the web-clean load: evaluate() is the single
+    authority on attach, so the clean posture follows the real decision."""
     ent = (entity or "").upper()
     return ent == "LEX" or ent.startswith("LEX-")
 
@@ -331,11 +401,12 @@ def evaluate(
         if not explicit and not fallback:
             return WebDecision(False, "no_intent")
         # There IS web intent -> now apply the deterministic exclusions.
-        if _is_lex_scope(entity):
+        lex = _is_lex_scope(entity)
+        if lex and not lex_web_enabled():
             return WebDecision(False, "lex_scope")
         if not web_model_supported(model):
             return WebDecision(False, "model_unsupported")
-        blocked = _screen_query(query)
+        blocked = _screen_query(query, lex_strict=lex)
         if blocked:
             return WebDecision(False, f"blocked:{blocked}")
         if searches_today() >= daily_cap():

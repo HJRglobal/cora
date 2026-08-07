@@ -797,3 +797,104 @@ def redact_cue_adjacent_names(
         return _redact_multi(toks, full, first)
 
     return _PROPER_NAME_RE.sub(_broad, out)
+
+
+# ---------------------------------------------------------------------------
+# Outbound-egress person-name detector (LEX web screen)
+# ---------------------------------------------------------------------------
+# Proper nouns that are NEVER a person: geography, agencies, programs, and the
+# policy vocabulary a legitimate public-policy web query is made of.
+#
+# SCOPE (load-bearing): this set is consumed ONLY by
+# has_care_context_person_name below -- a BLOCK-vs-ALLOW decision on a query
+# about to leave the machine. It is deliberately NOT wired into
+# redact_cue_adjacent_names / scrub_lex_phi: those decide what a non-custodian
+# SEES, and widening their allowlist would weaken the live retrieval scrub.
+# Here the failure directions are asymmetric in the other direction -- a false
+# positive silently degrades a legitimate DDD-policy web ask to KB-only (the
+# LEX-17 dead-end failure mode), while a false negative is still backstopped by
+# is_any_phi, which runs FIRST at every call site.
+_NONPERSON_PROPER_NOUNS = frozenset({
+    # AZ geography + the states/cities LEX operates or asks policy about
+    "arizona", "phoenix", "tucson", "mesa", "scottsdale", "chandler", "glendale",
+    "tempe", "gilbert", "peoria", "yuma", "flagstaff", "maricopa", "pima",
+    "utah", "nevada", "california", "texas", "colorado", "america", "american",
+    "united", "states", "state", "county", "city", "north", "south", "east", "west",
+    # agencies / programs / payers
+    "ahcccs", "ddd", "dds", "medicaid", "medicare", "division", "developmental",
+    "disabilities", "department", "economic", "security", "des", "olcr", "evv",
+    "hcbs", "iep", "isp", "waiver", "title", "chapter", "section", "article",
+    "appendix", "exhibit", "attachment", "policy", "policies", "manual", "manuals",
+    "handbook", "guide", "guidance", "bulletin", "memo", "rule", "rules",
+    "regulation", "regulations", "statute", "code", "codes", "standard", "standards",
+    "requirement", "requirements", "provider", "providers", "agency", "agencies",
+    "office", "bureau", "board", "commission", "council", "committee", "administration",
+    # service / program vocabulary that is routinely Title-cased in policy prose
+    "health", "healthcare", "care", "cost", "containment", "system", "systems",
+    "services", "service", "support", "supports", "behavioral", "behavior",
+    "habilitation", "respite", "attendant", "companion", "nursing", "therapy",
+    "residential", "community", "based", "home", "living", "day", "group",
+    "program", "programs", "training", "employment", "transportation", "housing",
+    "rate", "rates", "reimbursement", "billing", "unit", "units", "hour", "hours",
+    "eligibility", "enrollment", "authorization", "assessment", "plan", "plans",
+    "caregiver", "caregivers", "family", "families", "individual", "individuals",
+    "quality", "compliance", "licensure", "certification", "revalidation",
+    "incident", "incidents", "grievance", "appeal", "appeals", "hearing",
+    # legal / publication vocabulary (citation-shaped policy questions)
+    "administrative", "register", "revised", "statutes", "annotated", "federal",
+    "national", "association", "center", "centers", "institute", "university",
+    "school", "schools", "education", "social", "human", "children", "child",
+    "adult", "adults", "senior", "disability", "medical", "mental", "physical",
+    "occupational", "speech", "special", "public", "general", "official",
+    # calendar. DELIBERATELY OMITS may/june/april/august/march -- they double as
+    # first names, and _NONNAME_STOPWORDS omits them for exactly that reason
+    # (see its comment). Listing them here would make "client April" invisible
+    # to PASS 1, which is a PHI miss, not a precision win.
+    "january", "february", "july", "september", "october", "november", "december",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+
+
+def has_care_context_person_name(text: str, allowed_names: set[str] | None = None) -> bool:
+    """True when a person-shaped proper name rides in PHI/care context.
+
+    The egress half of redact_cue_adjacent_names: same two signals (a
+    care-recipient-noun-governed name, or a Title-case name within the cue
+    window) reported as a boolean instead of a redaction, with geography /
+    agency / policy proper nouns excluded so a public-policy question
+    ("Arizona DDD respite rate policy") is not mistaken for a client mention.
+
+    Staff names are never a hit -- a LEX teammate asking about their own
+    colleague is not client PHI. Pure function; no I/O.
+    """
+    if not text or not _PHI_CUE_RE.search(text):
+        return False
+    full, first = _staff_name_index(allowed_names)
+    first = first | _alias_first_names(first)
+
+    def _is_person_token(tok: str) -> bool:
+        low = tok.lower()
+        if low in _NONNAME_STOPWORDS or low in _NONPERSON_PROPER_NOUNS:
+            return False
+        return not (_PHI_CUE_RE.fullmatch(tok) or low in first)
+
+    # PASS 1 -- governed by a care-recipient noun ("client Marcus").
+    for m in _CARE_NOUN_RE.finditer(text):
+        name = (m.group(1) or "").strip()
+        if not name or name.lower() in full:
+            continue
+        if any(_is_person_token(t) for t in name.split()):
+            return True
+
+    # PASS 2 -- Title-case name within the cue window.
+    cue_spans = [(mm.start(), mm.end()) for mm in _PHI_CUE_RE.finditer(text)]
+    for m in _PROPER_NAME_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if not any(s <= ce + _CUE_WINDOW and e >= cs - _CUE_WINDOW for cs, ce in cue_spans):
+            continue
+        span = m.group(0)
+        if span.strip().lower() in full:
+            continue
+        if any(_is_person_token(t) for t in span.split()):
+            return True
+    return False

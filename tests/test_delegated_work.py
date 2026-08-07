@@ -147,6 +147,98 @@ def test_screen_phi_refused(monkeypatch):
     assert refusal and "protected" in refusal
 
 
+# ---------------------------------------------------------------------------
+# LEX lane (CORA_DELEGATED_WORK_LEX) -- Harrison decision 2026-08-06,
+# superseding the D-102 v1 "LEX excluded by construction" line.
+# The two tests above pin the OFF default and must stay green unchanged.
+# ---------------------------------------------------------------------------
+
+LEX_BRIEF = "research what DDD requires for live-in caregiver respite documentation"
+
+
+@pytest.fixture
+def _lex_lane(monkeypatch):
+    monkeypatch.setenv("CORA_DELEGATED_WORK_LEX", "on")
+    monkeypatch.setattr(
+        dw, "_staff_names_cache", {"Shaun Hawkins", "Jennifer Mortensen"})
+    yield
+
+
+class TestLexDelegatedLane:
+    @pytest.mark.parametrize("value", ["", "off", "0", "false", "no", "sometimes"])
+    def test_flag_defaults_and_unrecognized_read_off(self, monkeypatch, value):
+        monkeypatch.setenv("CORA_DELEGATED_WORK_LEX", value)
+        assert not dw.lex_delegated_enabled()
+
+    @pytest.mark.parametrize("archetype", ["research_brief", "doc_draft"])
+    def test_allowed_archetypes_pass_with_the_lane_on(self, _lex_lane, archetype):
+        # Smoke (a): a LEX policy research brief / doc draft may queue.
+        assert dw.screen_request(
+            USER, "LEX-LLC", "llc-leadership", archetype, LEX_BRIEF, "md") is None
+
+    @pytest.mark.parametrize("archetype", ["spreadsheet_build", "creator_shortlist"])
+    def test_off_archetypes_refuse_with_route_copy(self, _lex_lane, archetype):
+        # Smoke (c): archetype refusal names what IS available, never a bare no.
+        refusal = dw.screen_request(
+            USER, "LEX-LLC", "llc-leadership", archetype, LEX_BRIEF, "xlsx"
+            if archetype == "spreadsheet_build" else "md")
+        assert refusal
+        assert "research brief" in refusal and "document draft" in refusal
+        assert "Harrison" in refusal  # who can unlock
+
+    def test_lane_off_refusal_carries_all_three_parts(self):
+        # C2 route-don't-deflect: why + nearest path + unlock owner.
+        refusal = dw.screen_request(
+            USER, "LEX-LLC", "llc-leadership", "research_brief", LEX_BRIEF, "md")
+        assert refusal
+        assert "isn't enabled" in refusal            # why
+        assert "knowledge base" in refusal           # nearest working path
+        assert "Harrison" in refusal                 # who unlocks
+
+    @pytest.mark.parametrize("brief", [
+        "research whether client Marcus Delgado qualifies for respite units",
+        "draft a memo about Marcus Delgado's service authorization renewal",
+    ])
+    def test_client_identifying_brief_refuses_fail_closed(self, _lex_lane, brief):
+        # Smoke (b): nothing queued, and the refusal routes rather than dead-ends.
+        refusal = dw.screen_request(
+            USER, "LEX-LLC", "llc-leadership", "research_brief", brief, "md")
+        assert refusal
+        assert "names a specific person" in refusal
+        assert "what does DDD require" in refusal    # the nearest working path
+        assert "Harrison" in refusal
+
+    def test_lex_requester_in_a_non_lex_channel_is_still_a_lex_job(
+        self, monkeypatch, _lex_lane
+    ):
+        # Both legs of the LEX test survive the flip: a LEX person asking in a
+        # shared channel gets the LEX archetype restriction, not the open set.
+        import cora.org_roles as org_roles
+        monkeypatch.setattr(org_roles, "get_role", lambda uid: _role(entity="LEX-LLC"))
+        refusal = dw.screen_request(
+            USER, "F3E", CHANNEL, "spreadsheet_build", LEX_BRIEF, "xlsx")
+        assert refusal and "research brief" in refusal
+
+    def test_non_lex_requests_are_unaffected_by_the_lane(self, _lex_lane):
+        # Invariant 4: non-LEX behaviour identical with the flag ON.
+        assert dw.screen_request(
+            USER, "F3E", CHANNEL, "spreadsheet_build", LEX_BRIEF, "xlsx") is None
+        assert dw.screen_request(
+            USER, "F3E", CHANNEL, "research_brief",
+            "research whether client Marcus Delgado qualifies for respite units",
+            "md") is None
+
+    def test_guard_parity_still_runs_for_lex(self, monkeypatch, _lex_lane):
+        # The flip must be a SCOPED ALLOW, never a guard removal (D-102).
+        import cora.user_access as user_access
+        monkeypatch.setattr(
+            user_access, "check_access",
+            lambda *a, **k: "blocked by user_access")
+        refusal = dw.screen_request(
+            USER, "LEX-LLC", "llc-leadership", "research_brief", LEX_BRIEF, "md")
+        assert refusal == "blocked by user_access"
+
+
 def test_screen_phi_error_fail_closed(monkeypatch):
     import cora.phi_guard as phi_guard
 

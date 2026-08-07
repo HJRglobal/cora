@@ -96,11 +96,17 @@ def jobs_lane_searches_today() -> int:
     return total
 
 
-def web_withheld_reason(brief: str) -> str | None:
+def web_withheld_reason(brief: str, lex_strict: bool = False) -> str | None:
     """Deterministic pre-attach screen for Phase A. Any reason -> the job runs
-    WEB-WITHHELD (soft degrade, matching the Q&A posture) -- never a refusal."""
+    WEB-WITHHELD (soft degrade, matching the Q&A posture) -- never a refusal.
+
+    *lex_strict* mirrors the interactive LEX lane: a LEX job's Phase-A queries
+    are composed from this brief, so the brief passes the same raised screen the
+    Q&A path applies to a LEX channel query. Intake already refuses a
+    name-bearing LEX brief; this keeps the web-egress decision independent of
+    that (a brief queued before the belt existed still degrades to no-web)."""
     try:
-        blocked = web_guard._screen_query(brief)
+        blocked = web_guard._screen_query(brief, lex_strict=lex_strict)
         if blocked:
             return f"screen:{blocked}"
         if web_guard.searches_today() >= web_guard.daily_cap():
@@ -457,9 +463,17 @@ def run_job(job: dict[str, Any], *, anthropic_client: Any = None,
     if spec is None:
         return _fail("error", f"unknown archetype {archetype!r}", meter)
     entity = str(job.get("entity") or "").strip().upper()
-    if entity == "LEX" or entity.startswith("LEX-"):
-        # By construction no LEX job exists (intake refuses); belt only.
-        return _fail("error", "LEX jobs are excluded in v1", meter)
+    is_lex_job = entity == "LEX" or entity.startswith("LEX-")
+    if is_lex_job:
+        # Independent belt, re-evaluated at RUN time rather than trusting the
+        # intake screen that queued this job. Two live cases this catches:
+        # a job queued while the lane was open and claimed after Harrison shut
+        # it (the kill switch must reach in-flight work), and an archetype that
+        # was allowed at intake but is not on the LEX list.
+        if not dw.lex_delegated_enabled():
+            return _fail("error", "LEX delegated work is not enabled", meter)
+        if archetype not in dw.LEX_ALLOWED_ARCHETYPES:
+            return _fail("error", f"archetype {archetype!r} is not allowed for LEX", meter)
 
     if anthropic_client is None:
         import anthropic
@@ -491,7 +505,7 @@ def run_job(job: dict[str, Any], *, anthropic_client: Any = None,
     citations: list[dict] = []
     withheld = None
     if spec["phase_a_web"]:
-        withheld = web_withheld_reason(brief)
+        withheld = web_withheld_reason(brief, lex_strict=is_lex_job)
         if withheld is None:
             web_findings = _run_phase_a(
                 anthropic_client, model, caller, job, meter, citations,
