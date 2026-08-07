@@ -1242,10 +1242,123 @@ class TestDwIntakePrecision:
         # ...while still firing on anything person-linked.
         assert phi_guard.is_phi_risk_person_linked("send me the member id") is True
 
-    def test_non_lex_intake_is_unaffected(self, monkeypatch):
-        # Regression: a non-LEX job must behave byte-identically.
+    def test_non_lex_intake_uses_the_same_request_shaped_screen(self, monkeypatch):
+        """NOT 'byte-identical' -- an earlier docstring claimed that and it was
+        false: the non-LEX union changed too (is_any_phi -> person_linked u
+        clinical u billing), so a non-LEX brief mentioning Medicaid POLICY now
+        queues where it used to refuse. That is the intended behaviour; pin it
+        honestly, against the REAL predicates rather than the fixture stubs."""
         import cora.org_roles as org_roles
+        import cora.phi_guard as phi_guard
         monkeypatch.setattr(org_roles, "get_role", lambda uid: _role(entity="F3E"))
+        monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked",
+                            _REAL_PERSON_LINKED)
+        # A programme name is a topic in F3E scope too.
         assert dw.screen_request(
             USER, "F3E", CHANNEL, "research_brief",
-            "research the Sprouts energy-set reset timeline", "md") is None
+            "research how Medicaid policy shifts could change our retail base",
+            "md") is None
+        # ...and person-linked content still refuses outside LEX.
+        refusal = dw.screen_request(
+            USER, "F3E", CHANNEL, "research_brief",
+            "research the diagnosis documentation our clinic must retain", "md")
+        assert refusal and "protected client/health info" in refusal
+
+    @pytest.mark.parametrize("brief,must_say,must_not_say", [
+        # Each branch gets its OWN message. Collapsing them is how a false claim
+        # shipped twice (D-051 MED-4).
+        ("research the client eligibility backlog reporting we owe DDD quarterly",
+         "billing, authorization or eligibility", "clinical or identifier"),
+        ("research the diagnosis documentation standards we must retain",
+         "clinical or identifier", "billing, authorization or eligibility"),
+        ("research whether participant Marcus Delgado qualifies for respite",
+         "names a specific person", "clinical or identifier"),
+    ])
+    def test_each_refusal_names_only_what_fired(self, monkeypatch, brief,
+                                                must_say, must_not_say):
+        out = self._screen(monkeypatch, brief)
+        assert out, brief
+        assert must_say in out
+        assert must_not_say not in out
+
+
+class TestDwIntakeRecallClasses:
+    """Recall classes a D-051 review measured as LOST by the first cut of the
+    precision fix. Every one is live-reachable (all three lane flags are on),
+    on BOTH the DW intake path and the web egress path -- so each is pinned
+    against the predicates directly rather than through one caller."""
+
+    STAFF = {"Shaun Hawkins", "Jennifer Mortensen"}
+
+    @pytest.fixture(autouse=True)
+    def _real_predicates(self, monkeypatch):
+        # The module-level _isolated fixture stubs these to a benign False.
+        # A recall pin that runs against the stub proves nothing.
+        import cora.phi_guard as phi_guard
+        monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked",
+                            _REAL_PERSON_LINKED)
+        monkeypatch.setattr(phi_guard, "is_any_phi", _pg.is_any_phi)
+        yield
+
+    def _caught(self, text):
+        from cora import phi_guard
+        return (phi_guard.is_phi_risk_person_linked(text)
+                or phi_guard.is_clinical_phi(text)
+                or phi_guard.is_lex_billing_status_phi(text)
+                or phi_guard.has_care_context_person_name(
+                    text, self.STAFF, cue_required=False))
+
+    @pytest.mark.parametrize("text", [
+        # str.rstrip takes a CHARACTER SET: rstrip("'’s") ate the name's own
+        # trailing s, so the possessive branch was dead for every -s name --
+        # Marcus, James, Williams, Davis, Harris, Jones, Rogers...
+        "Marcus's home address",
+        "James's respite schedule",
+        "Williams's authorization renewal",
+        "Delgado's home address",          # control: non-s name always worked
+    ])
+    def test_possessive_names_are_caught(self, text):
+        assert self._caught(text), text
+
+    @pytest.mark.parametrize("text", [
+        # A Medicaid/AHCCCS beneficiary number IS a HIPAA identifier, and the
+        # programme name is its only marker -- _PHI_PATTERNS carries the literal
+        # "member id"/"provider id" but nothing for these.
+        "the client's Medicaid ID is 1234567 -- research what we file with it",
+        "research the appeal path for AHCCCS ID 84213365",
+        "look up Medicaid number 900123 for the packet",
+    ])
+    def test_programme_own_identifiers_are_caught(self, text):
+        assert self._caught(text), text
+
+    @pytest.mark.parametrize("text", [
+        # A lone name tight against a care cue is person-evidence; a lone
+        # capitalised word in long policy prose is not.
+        "research respite units available for Madison",
+        "pull the respite auth file for Delgado",
+        # ...and a known non-person token must not SPLIT a real name or
+        # suppress the one beside it (adding stopwords was converting 2-token
+        # hits into 1-token misses).
+        "Provider Madison Delgado respite units",
+        "Lexington Madison respite hours",
+    ])
+    def test_lone_and_adjacent_names_are_caught(self, text):
+        assert self._caught(text), text
+
+    @pytest.mark.parametrize("text", [
+        "Research brief on current AZ DDD/AHCCCS provider revalidation "
+        "requirements for Provider Type 15: what Lexington LLC must submit, the "
+        "APEP (AHCCCS Provider Enrollment Portal) process steps, and the 2026 "
+        "revalidation fee.",
+        "Research Arizona DDD Provider (Qualified Vendor) revalidation "
+        "requirements. Summarize what Lexington LLC must submit to AHCCCS and "
+        "DDD to maintain provider credentials and billing privileges. Include "
+        "deadline, submission process, required documentation, and any recent "
+        "changes. Focus on Provider Type 14 (Therapy/HCBS) requirements "
+        "specifically.",
+    ])
+    def test_the_live_briefs_stay_clean_under_every_widening(self, text):
+        """The precision side of the same frontier: each recall fix above was
+        re-checked against the real briefs. 'Include' sat 20 chars from the cue
+        'billing' and re-broke brief 2 when the tight window was added."""
+        assert not self._caught(text)

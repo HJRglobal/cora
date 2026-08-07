@@ -97,6 +97,15 @@ def is_phi_risk(text: str) -> bool:
 # the bare token "AHCCCS".
 _PHI_PROGRAM_NAME_RE = re.compile(r"\b(?:medicaid|ahcccs)\b", re.IGNORECASE)
 
+# An identifier riding immediately behind a programme name ("Medicaid ID 12345",
+# "AHCCCS #84213365", "Medicaid number 900123"). Anchored with .match() at the
+# programme match's end, so it only fires on what directly follows.
+_PROGRAM_ID_TAIL_RE = re.compile(
+    r"[\s:#-]{0,3}(?:\b(?:id|ids|no|num|number|#)\b[\s:#-]{0,3})?\d{4,}"
+    r"|[\s:#-]{0,3}\b(?:id|ids|no|num|number)\b",
+    re.IGNORECASE,
+)
+
 
 def is_phi_risk_person_linked(text: str) -> bool:
     """is_phi_risk MINUS the bare payer/program names.
@@ -112,8 +121,17 @@ def is_phi_risk_person_linked(text: str) -> bool:
     """
     if not text:
         return False
-    return any(not _PHI_PROGRAM_NAME_RE.fullmatch(m.group(0))
-               for m in _PHI_PATTERNS.finditer(text))
+    for m in _PHI_PATTERNS.finditer(text):
+        if not _PHI_PROGRAM_NAME_RE.fullmatch(m.group(0)):
+            return True
+        # ...unless the programme name IS the identifier. "Medicaid ID 1234567"
+        # and "AHCCCS ID 84213365" are HIPAA beneficiary numbers, and
+        # _PHI_PATTERNS only carries the literal "member id" / "provider id", so
+        # subtracting the bare programme token removed their ONLY signal. Keep
+        # the subtraction for the topic, not for the number.
+        if _PROGRAM_ID_TAIL_RE.match(text, m.end()):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +795,9 @@ _FIRST_NAME_ALIASES = {
 }
 
 _CUE_WINDOW = 120  # chars; widened from 40 (review MED) to span multi-clause sentences
+# Tight window for the LONE-name case in has_care_context_person_name: a single
+# capitalised word is only person-evidence when it sits right against a care cue.
+_TIGHT_CUE_WINDOW = 24
 
 
 def _alias_first_names(first: set[str]) -> set[str]:
@@ -911,6 +932,10 @@ _NONPERSON_PROPER_NOUNS = frozenset({
     "write", "build", "check", "confirm", "verify", "gather", "assemble",
     "search", "look", "google", "show", "explain", "describe", "compare",
     "review", "draft", "create", "give", "tell", "get", "read", "collect",
+    # List/section openers -- a brief's own scaffolding. "Include deadline..."
+    # sat 20 chars from the cue "billing" and read as a person named Include.
+    "include", "including", "focus", "cover", "note", "consider", "highlight",
+    "flag", "detail", "specify", "address", "explore", "assess", "evaluate",
     # Landmark case names / eponyms that appear in disability-policy questions
     # (same class: a legitimate policy ask silently degrading to KB-only).
     "olmstead", "medicaid's", "rehabilitation",
@@ -1046,7 +1071,13 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
     # identifier predicates. That residual is the price of the lane being
     # usable at all; the alternative measured 100% refusal on real briefs.
     cue_spans = [(mm.start(), mm.end()) for mm in _PHI_CUE_RE.finditer(text)]
-    possessive = {m.group(0).rstrip("'’s").strip().lower()
+    # str.rstrip takes a CHARACTER SET, not a suffix -- rstrip("'’s") ate the
+    # name's own trailing s ("Marcus's" -> "marcu"), so this branch was dead for
+    # every -s name: Marcus, James, Williams, Davis, Harris, Jones, Rogers...
+    # i.e. a large share of real surnames AND the worked example in the comment
+    # below. "Marcus's home address" reached the search API. Use the suffix
+    # substitution this module already uses twice elsewhere.
+    possessive = {re.sub(r"['’]s$", "", m.group(0)).strip().lower()
                   for m in _NAME_POSSESSIVE_RE.finditer(text)}
     for m in _PROPER_NAME_RE.finditer(text):
         s, e = m.start(), m.end()
@@ -1060,10 +1091,26 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
         # A possessive name is a person at any length ("Marcus's", "Delgado's").
         if span.strip().lower() in possessive and any(_is_person_token(t) for t in toks):
             return True
-        # Otherwise: two ADJACENT unknown person-shaped tokens.
+        # Two ADJACENT unknown person-shaped tokens. A known non-person token
+        # does NOT reset the run -- it is skipped -- so "Provider Marcus
+        # Delgado" still reads as a name rather than being split by the noun in
+        # front of it (D-051 finding: adding stopwords was silently converting
+        # 2-token hits into 1-token misses).
         run = 0
         for t in toks:
-            run = run + 1 if _is_person_token(t) else 0
+            if not _is_person_token(t):
+                continue
+            run += 1
             if run >= 2:
                 return True
+        # A LONE person-shaped token is still a hit when it sits TIGHT against a
+        # care cue ("respite units for Madison"). The two-token bar exists
+        # because a lone capitalised word ANYWHERE in long policy prose is
+        # noise; within a few words of a care cue it is not. Narrower than the
+        # 120-char window PASS 2 uses for proximity, deliberately -- measured
+        # against the three real policy briefs, which stay clean.
+        if run == 1:
+            for cs, ce in cue_spans:
+                if s <= ce + _TIGHT_CUE_WINDOW and e >= cs - _TIGHT_CUE_WINDOW:
+                    return True
     return False

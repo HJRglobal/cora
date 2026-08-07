@@ -499,6 +499,23 @@ _LEX_CLINICAL_REFUSAL = (
 )
 
 
+_LEX_BILLING_REFUSAL = (
+    "That brief ties a named individual to their billing, authorization or "
+    "eligibility status, which is protected information at Lexington even with "
+    "no clinical detail in it. I can't run it as a background job -- the worker "
+    "retrieves as a non-custodian by design. Nothing was queued. What works: "
+    "ask about the RULE rather than the person (\"how are DDD respite units "
+    "authorized?\"), or ask me here in the channel where your own access "
+    "applies. Harrison owns any exception."
+)
+
+_GENERIC_PHI_REFUSAL = (
+    "That brief looks like it contains protected client/health info, so I "
+    "can't run it as a background job. Nothing was queued -- rephrase without "
+    "client details if this was a false alarm."
+)
+
+
 def lex_delegated_enabled() -> bool:
     """CORA_DELEGATED_WORK_LEX: may LEX requesters/channels queue a job?
 
@@ -617,9 +634,15 @@ def screen_request(
     try:
         if lex_job and phi_guard.has_care_context_person_name(brief, _staff_names()):
             return _LEX_PHI_REFUSAL                       # a person WAS named
+        # THREE branches, THREE messages. The first cut of this fix collapsed
+        # them into one "clinical or identifier detail" template -- which is the
+        # same defect it was written to close, just narrowed from one false
+        # claim to two: an eligibility/authorization brief carries no diagnosis,
+        # medication or record identifier, and was told it did (D-051 MED-4).
+        if phi_guard.is_lex_billing_status_phi(brief):
+            return _LEX_BILLING_REFUSAL if lex_job else _GENERIC_PHI_REFUSAL
         if (phi_guard.is_phi_risk_person_linked(brief)
-                or phi_guard.is_clinical_phi(brief)
-                or phi_guard.is_lex_billing_status_phi(brief)):
+                or phi_guard.is_clinical_phi(brief)):
             return _LEX_CLINICAL_REFUSAL if lex_job else (
                     "That brief looks like it contains protected client/health "
                     "info, so I can't run it as a background job. Nothing was "
