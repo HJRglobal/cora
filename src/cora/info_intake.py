@@ -500,8 +500,13 @@ def ingest(
         # PHI: 3-predicate union, unconditional, fail-closed.
         try:
             if phi_guard.is_any_phi(clean):
-                log.info("info_intake: PHI-flagged contribution refused route=%s user=%s",
-                         route, author_id)
+                # LEX-61: record WHICH predicate fired (never the text, D-082)
+                # so a false positive is tunable instead of unreproducible.
+                log.info("info_intake: PHI-flagged contribution refused route=%s "
+                         "user=%s predicates=%s len=%d",
+                         route, author_id,
+                         ",".join(phi_guard.which_predicates(clean)) or "none",
+                         len(clean or ""))
                 return IntakeResult(
                     PHI_REFUSED, is_connector=is_connector,
                     ack=("Thanks, but that reads like client / PHI information -- I can't "

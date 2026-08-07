@@ -182,6 +182,32 @@ def is_any_phi(text: str) -> bool:
     return bool(is_phi_risk(text) or is_clinical_phi(text) or is_lex_billing_status_phi(text))
 
 
+def which_predicates(text: str) -> list[str]:
+    """Names of the union members that trip on *text* -- diagnostics only.
+
+    LEX-61 (2026-08-06): a live false positive could not be tuned because a PHI
+    refusal left no trace of WHICH detector fired, and the refused text itself
+    must never be persisted (D-082). Logging these names at a refusal site gives
+    the next false positive a specific target -- "is_phi_risk fired, the other
+    two did not" -- without creating a PHI sink.
+
+    Never use this to DECIDE anything: is_any_phi is the decision function, and
+    an empty list here on a fail-closed error path is not an all-clear.
+    """
+    out: list[str] = []
+    if not text:
+        return out
+    for name, fn in (("is_phi_risk", is_phi_risk),
+                     ("is_clinical_phi", is_clinical_phi),
+                     ("is_lex_billing_status_phi", is_lex_billing_status_phi)):
+        try:
+            if fn(text):
+                out.append(name)
+        except Exception:  # noqa: BLE001 -- a diagnostic never raises
+            out.append(f"{name}:error")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Non-LEX PHI backstop — shared by the LIVE retrieval path and the Drive egress
 # ---------------------------------------------------------------------------

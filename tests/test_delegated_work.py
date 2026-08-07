@@ -839,7 +839,10 @@ def test_all_entity_prompts_carry_delegation_section():
             missing.append(f.name)
             continue
         if f.name in lex_files:
-            if "NOT available in Lexington scope" not in text:
+            # LEX lane (2026-08-06): the prompts no longer say "NOT available";
+            # they state the RESTRICTED shape and must not promise the lane,
+            # which may be off. See test_lex_prompts_state_the_restricted_lane.
+            if "research brief" not in text or "document draft" not in text:
                 wrong.append(f.name)
         elif "cora_delegate_work" not in text:
             wrong.append(f.name)
@@ -847,11 +850,35 @@ def test_all_entity_prompts_carry_delegation_section():
     assert not wrong, f"prompts with the wrong delegation variant: {wrong}"
 
 
-def test_lex_prompts_do_not_offer_the_tool():
+def test_lex_prompts_state_the_restricted_lane():
+    """LEX prompts must name the two allowed archetypes, exclude the other two,
+    forbid client detail in a brief, and NOT promise a lane that may be off."""
     prompts_dir = REPO_ROOT / "design" / "system-prompts"
     for name in ("lex.md", "llc.md", "lts.md", "lbhs.md", "lla.md"):
         text = (prompts_dir / name).read_text(encoding="utf-8")
-        assert "do not call the tool" in text
+        seg = text[text.index("## Delegating work to Cora"):]
+        seg = seg[:seg.index("\n## ")] if "\n## " in seg else seg
+        seg = " ".join(seg.split())  # prompts are hard-wrapped; match on prose
+        assert "research brief" in seg and "document draft" in seg, name
+        assert "Spreadsheet builds" in seg and "creator shortlists" in seg, name
+        assert "may not be switched on yet" in seg, name   # never promises
+        assert "Do not promise it" in seg, name
+        assert "client names" in seg, name                 # PHI shape warning
+
+
+def test_every_prompt_carries_the_route_dont_deflect_doctrine():
+    """C2 (2026-08-06): every refusal must carry why + nearest path + who
+    unlocks. A bare 'I can't' is what ended a real user's usage."""
+    prompts_dir = REPO_ROOT / "design" / "system-prompts"
+    missing = []
+    for f in sorted(prompts_dir.glob("*.md")):
+        text = f.read_text(encoding="utf-8")
+        if ("Refusals: route, never dead-end" not in text
+                or "Who can unlock it" not in text
+                or "How you actually work" not in text
+                or "Never invent a mechanism" not in text):
+            missing.append(f.name)
+    assert not missing, f"prompts missing the refusal doctrine: {missing}"
 
 
 # ---------------------------------------------------------------------------

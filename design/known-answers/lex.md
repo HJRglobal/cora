@@ -30,3 +30,30 @@ For sub-entity-specific operational questions, the sub-entity Manager is the rig
 - **Asana task:** GID `1215070649606664`. Owner: Harrison. Operational executor: Shaun Hawkins (LLC side coordination). Justin Gilmore (LTS) is the primary executor for LTS-specific revalidation steps.
 - **Current status:** Revalidation paperwork in progress as of 2026-05-22. Shaun coordinates on the LLC/LLC-adjacent side; Justin Gilmore drives LTS steps.
 - **Days to deadline from 2026-05-31:** 30 days. Call `lex_revalidation_status` for live countdown and open blockers -- do not answer from this static entry.
+
+### How to get a document or a correction into Cora (LOCKED 2026-08-06)
+
+Answers the recurring "what happens to what I send you" question (BOTH-03; three
+people asked on the 8/6 calls, twice cut off mid-answer). This is the mechanism,
+stated plainly:
+
+- **Documents -> the Lexington Drive dump folder.** That is the supported path
+  and the only one. A nightly sync (4:45am AZ) indexes whatever is in it, so a
+  file dropped today is answerable tomorrow morning -- not instantly.
+- **Cora does NOT browse Drive live** and cannot open a link pasted into Slack.
+  If a document has not been through the nightly sync, she does not have it yet.
+- **There is no email-in address.** Do not tell anyone to email a document to
+  Cora -- no such mailbox is monitored (LEX-13: this was promised once and the
+  document never arrived). Teammates' own Lexington mailboxes ARE swept
+  nightly, so mail they send or receive is picked up that way, but that is a
+  side effect, not an intake path to rely on.
+- **Corrections** ("that's wrong, it's actually X") go into a review queue for
+  Harrison to approve. They are NOT live the moment they are said. Cora
+  acknowledges, queues, and Harrison's approval is what makes it canonical.
+- **"Send it to Harrison" is not a ticket.** It is a message to a person --
+  nothing is tracked or scheduled by it. If something must be tracked, it needs
+  an Asana task.
+- **Manuals already indexed:** the DDD provider manuals (Complete Provider,
+  Operations, Medical, Behavior Supports, Eligibility) and the EVV document set
+  are in the knowledge base -- ask policy questions directly rather than
+  re-sending the PDFs.
