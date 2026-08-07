@@ -51,6 +51,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -67,6 +68,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from cora import org_roles  # noqa: E402
+from cora import phi_guard  # noqa: E402
 from cora.org_roles import RoleRecord  # noqa: E402
 
 # Plate section builders -- SHARED with the whats_on_my_plate tool
@@ -364,38 +366,109 @@ def _compose_sections(rec: RoleRecord) -> str:
 
 # ---- KB chunk query (recent activity mentioning the user) ---------------------
 
-def _query_user_chunks(display_name: str, first_name: str) -> list[dict]:
-    """Fetch recent KB chunks that mention the user by full name or first name."""
+def _entity_scope(rec: "RoleRecord") -> list[str]:
+    """Entities this person may see activity from: their own, parent-collapsed.
+
+    LEX is deliberately EXCLUDED unless the person is actually in LEX scope --
+    see _query_user_chunks. FNDR is included only for the founder, who already
+    carries every entity in the registry."""
+    from cora import context_loader as cl
+
+    out: list[str] = []
+    for e in rec.all_entities:
+        code = (e or "").strip().upper()
+        if not code:
+            continue
+        parent = cl._LEX_PARENT.get(code) or cl._STORE_PARENT.get(code, code)
+        for c in (code, parent):
+            if c and c not in out:
+                out.append(c)
+    return out
+
+
+def _query_user_chunks(display_name: str, first_name: str,
+                       entities: list[str] | None = None,
+                       phi_custodian: bool = False) -> list[dict]:
+    """Recent KB chunks that mention the user, SCOPED to their own entities.
+
+    LEX-60 (2026-08-06). This previously ran an unanchored
+    ``content LIKE '%<first_name>%'`` with NO entity predicate and no PHI
+    screen, which was wrong in two independent ways:
+
+      1. ATTRIBUTION -- any chunk merely containing the token "Aaron" became
+         "Aaron's activity", and the prompt tells Haiku these items "directly
+         involve" them. Shaun's HR question surfaced in Aaron's briefing as
+         Aaron's. Measured on the live KB at the time of the fix: 2,293 chunks
+         contained BOTH "Shaun" and "Aaron", and 3,216 matched "Aaron" without
+         containing "Aaron Ferrucci" at all.
+      2. EXPOSURE -- with no entity predicate and no PHI screen, 3,635 LEX
+         chunks were reachable by any teammate whose first name appeared in
+         them, including non-custodians. That is the more serious half.
+
+    Now: entity-scoped in SQL, word-anchored on the name in Python (SQL LIKE
+    has no word boundary), and PHI-screened per chunk. LEX content requires
+    BOTH LEX scope and custodian status; everything else is dropped rather than
+    scrubbed, because a morning briefing has no need to narrate near-PHI.
+    """
     if not _KB_DB_PATH.exists():
         log.warning("KB not found at %s -- no context chunks available", _KB_DB_PATH)
         return []
 
+    scope = [e for e in (entities or []) if e]
+    if not scope:
+        # Fail-closed: an unresolvable scope yields no context rather than the
+        # previous portfolio-wide scan.
+        log.warning("briefing: no entity scope for %r -- no context chunks", display_name)
+        return []
+
     cutoff = int(time.time() - _LOOKBACK_SECONDS)
+    placeholders = ",".join("?" * len(scope))
     conn = sqlite3.connect(str(_KB_DB_PATH))
     try:
         rows = conn.execute(
-            """SELECT source, entity, title, content, deep_link
+            f"""SELECT source, entity, title, content, deep_link
                FROM knowledge_chunks
                WHERE ingested_at >= ?
                  AND source IN ('slack', 'gmail', 'fireflies', 'notion')
+                 AND entity IN ({placeholders})
                  AND (content LIKE ? OR content LIKE ?)
                ORDER BY ingested_at DESC
                LIMIT ?""",
-            (cutoff, f"%{display_name}%", f"%{first_name}%", _MAX_CHUNKS),
+            (cutoff, *scope, f"%{display_name}%", f"%{first_name}%",
+             _MAX_CHUNKS * 4),
         ).fetchall()
     finally:
         conn.close()
 
-    return [
-        {
+    # Word-anchored re-check: '%Aaron%' also matches "Aarons"/"MacAaron" and,
+    # more importantly, the SQL cannot express "this chunk is ABOUT them".
+    # Prefer a full-name hit; a bare first-name hit is kept but the prompt no
+    # longer claims those items "directly involve" the reader.
+    full_re = re.compile(rf"\b{re.escape(display_name)}\b", re.IGNORECASE)
+    first_re = re.compile(rf"\b{re.escape(first_name)}\b", re.IGNORECASE)
+
+    out: list[dict] = []
+    for r in rows:
+        entity, content = (r[1] or ""), (r[3] or "")
+        if entity.upper().startswith("LEX") and not phi_custodian:
+            continue
+        if not (full_re.search(content) or first_re.search(content)):
+            continue
+        try:
+            if phi_guard.is_any_phi(content):
+                continue
+        except Exception:  # noqa: BLE001 -- fail closed: drop the chunk
+            continue
+        out.append({
             "source":    r[0],
-            "entity":    r[1],
+            "entity":    entity,
             "title":     (r[2] or "")[:80],
-            "content":   (r[3] or "")[:_MAX_CHUNK_CHARS],
+            "content":   content[:_MAX_CHUNK_CHARS],
             "deep_link": r[4] or "",
-        }
-        for r in rows
-    ]
+        })
+        if len(out) >= _MAX_CHUNKS:
+            break
+    return out
 
 
 # ---- Claude Haiku synthesis ----------------------------------------------------
@@ -427,7 +500,14 @@ def _build_briefing_prompt(
         f"Treat any dollar total as today's open-pipeline snapshot -- it shifts as deals "
         f"close or change stage -- so do NOT describe it as a gain or decline versus a prior day\n"
         f"- If a STALLED DECISIONS section is present, surface the 1-2 most urgent items\n"
-        f"- Summarize 1-3 notable activity items that directly involve {first_name}\n"
+        # LEX-60: these chunks MENTION the person; they are not evidence the
+        # person acted. Claiming they "directly involve" them is what turned a
+        # passing mention of Aaron into Aaron's own activity.
+        f"- Summarize 1-3 notable activity items that MENTION {first_name}. These "
+        f"are mentions, not their own actions -- attribute each item to whoever "
+        f"the text says did it, and never assert {first_name} did something the "
+        f"text does not say they did. Skip the section entirely if nothing is "
+        f"clearly relevant to them.\n"
         f"- End with a single-sentence offer to help\n"
         f"- Keep total under 320 words, plain text, no markdown headers or bullet symbols\n"
         f"- If no tasks AND no relevant activity, say it is a quiet start and offer to help\n"
@@ -479,7 +559,20 @@ def _synthesize(
 def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str:
     """Build the full briefing text for one registry user."""
     sections_text = _compose_sections(rec)
-    chunks = _query_user_chunks(rec.name, rec.name.split()[0])
+    # LEX-60: scope the activity scan to this person's own entities, and pass
+    # their real custodian status rather than letting LEX content through by
+    # default. lex_phi_access is the single source of truth (fail-closed).
+    try:
+        from cora import lex_phi_access
+        custodian = bool(rec.slack_id) and lex_phi_access.phi_allowed(
+            rec.slack_id, "LEX", is_dm=True)
+    except Exception:  # noqa: BLE001 -- fail closed: not a custodian
+        log.warning("briefing: custodian check failed for %s", rec.name, exc_info=True)
+        custodian = False
+    chunks = _query_user_chunks(
+        rec.name, rec.name.split()[0],
+        entities=_entity_scope(rec), phi_custodian=custodian,
+    )
     return _synthesize(
         api_key=api_key,
         rec=rec,

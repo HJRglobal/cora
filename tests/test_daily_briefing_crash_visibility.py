@@ -133,7 +133,7 @@ def test_synthesize_bounds_the_anthropic_call(monkeypatch):
 
     rec = rdb.RoleRecord(slack_id="U1", name="Test User", role="ops", entity="FNDR")
     monkeypatch.setattr(rdb, "_compose_sections", lambda r: "sections")
-    monkeypatch.setattr(rdb, "_query_user_chunks", lambda name, first: [])
+    monkeypatch.setattr(rdb, "_query_user_chunks", lambda name, first, **kw: [])
 
     out = rdb.build_user_briefing(rec, api_key="sk-test", today_str="2026-07-12")
     assert out == "ok briefing"

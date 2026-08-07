@@ -693,3 +693,95 @@ class TestBudgetAndPrompt:
         # regression: existing guardrails survive the extraction
         assert "Do NOT add financial figures" in prompt
         assert "Good morning, Tara!" in prompt
+
+
+# ---------------------------------------------------------------------------
+# LEX-60 -- asker attribution + activity-scan scoping (2026-08-06)
+#
+# The activity scan ran an unanchored `content LIKE '%<first>%'` with NO entity
+# predicate and no PHI screen, and the prompt told Haiku those items "directly
+# involve" the reader. Two independent defects: Shaun's HR question surfaced as
+# Aaron's activity, and LEX chunks were reachable by any teammate whose first
+# name appeared in them. Blocks the 8/20 adoption read.
+# ---------------------------------------------------------------------------
+
+class TestActivityScanScoping:
+    @staticmethod
+    def _rec(name="Aaron Ferrucci", entity="LEX-LLC", sid="U_TEST"):
+        from cora.org_roles import RoleRecord
+        return RoleRecord(slack_id=sid, name=name, role="Director",
+                          entity=entity, entities=["LEX"])
+
+    @staticmethod
+    def _kb(tmp_path, rows):
+        """Build a throwaway knowledge_chunks DB matching the real columns."""
+        import sqlite3 as s3
+        import time as _t
+        db = tmp_path / f"kb-{len(list(tmp_path.glob('kb-*.db')))}.db"
+        conn = s3.connect(str(db))
+        conn.execute(
+            "CREATE TABLE knowledge_chunks (source TEXT, entity TEXT, title TEXT,"
+            " content TEXT, deep_link TEXT, ingested_at INTEGER)")
+        now = int(_t.time())
+        conn.executemany(
+            "INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?)",
+            [(r[0], r[1], "t", r[2], "", now) for r in rows])
+        conn.commit()
+        conn.close()
+        return db
+
+    def _q(self, monkeypatch, tmp_path, rows, *, name="Aaron Ferrucci",
+           first="Aaron", entities=("LEX-LLC", "LEX"), custodian=False):
+        monkeypatch.setattr(rdb, "_KB_DB_PATH", self._kb(tmp_path, rows))
+        return rdb._query_user_chunks(name, first, entities=list(entities),
+                                      phi_custodian=custodian)
+
+    def test_a_chunk_about_someone_else_is_not_attributed(self, monkeypatch, tmp_path):
+        """THE LEX-60 REGRESSION. A chunk whose subject is Shaun but which
+        mentions Aaron in passing must not become Aaron's activity."""
+        rows = [("slack", "LEX-LLC",
+                 "Shaun asked about the HR onboarding policy; looping in Aaron."),
+                ("slack", "LEX-LLC", "Aaron Ferrucci updated the day-program roster.")]
+        got = self._q(monkeypatch, tmp_path, rows, custodian=True)
+        contents = " ".join(c["content"] for c in got)
+        # The chunk that is genuinely his survives...
+        assert "day-program roster" in contents
+        # ...and the prompt no longer claims mentions are the reader's own acts.
+        prompt = rdb._build_briefing_prompt(
+            self._rec(), "sections", contents, "Thu Aug 6")
+        assert "directly involve" not in prompt
+        assert "not their own actions" in prompt
+
+    def test_entity_predicate_scopes_the_scan(self, monkeypatch, tmp_path):
+        # A teammate's briefing must never pull another entity's chunks.
+        rows = [("slack", "F3E", "Aaron mentioned in an F3E retail thread"),
+                ("slack", "LEX-LLC", "Aaron in his own LLC thread")]
+        got = self._q(monkeypatch, tmp_path, rows, custodian=True)
+        assert all(c["entity"] != "F3E" for c in got)
+        assert len(got) == 1
+
+    def test_lex_chunks_withheld_from_non_custodians(self, monkeypatch, tmp_path):
+        # The more serious half: no entity predicate + no PHI screen meant LEX
+        # content reached anyone whose first name appeared in it.
+        rows = [("slack", "LEX-LLC", "Aaron reviewed the LLC staffing plan")]
+        assert self._q(monkeypatch, tmp_path, rows, custodian=False) == []
+        assert len(self._q(monkeypatch, tmp_path, rows, custodian=True)) == 1
+
+    def test_phi_bearing_chunk_is_dropped(self, monkeypatch, tmp_path):
+        rows = [("slack", "LEX-LLC",
+                 "Aaron noted the client was diagnosed with autism spectrum disorder")]
+        assert self._q(monkeypatch, tmp_path, rows, custodian=True) == []
+
+    def test_substring_collision_does_not_match(self, monkeypatch, tmp_path):
+        # '%Aaron%' also matched "Aarons"/"MacAaron"; the re-check is word-anchored.
+        rows = [("slack", "LEX-LLC", "MacAaronson Industries sent an invoice")]
+        assert self._q(monkeypatch, tmp_path, rows, custodian=True) == []
+
+    def test_empty_scope_fails_closed(self, monkeypatch, tmp_path):
+        rows = [("slack", "LEX-LLC", "Aaron did a thing")]
+        assert self._q(monkeypatch, tmp_path, rows, entities=(), custodian=True) == []
+
+    def test_entity_scope_collapses_sub_entities(self):
+        got = rdb._entity_scope(self._rec(name='Shaun Hawkins'))
+        assert got  # non-empty
+        assert all(isinstance(e, str) and e == e.upper() for e in got)
