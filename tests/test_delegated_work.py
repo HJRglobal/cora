@@ -1464,6 +1464,13 @@ class TestRbCompoundAdjective:
         assert not self._any(self.PREVIEWED), "the was-previewing phrasing"
 
     @pytest.mark.parametrize("text", [
+        # Every dash a model actually emits. The first cut handled only the
+        # ASCII hyphen, so a Unicode hyphen or a doubled "--" still refused --
+        # and Cora's own prose uses "--" constantly.
+        "no client‑specific content needed for enrollment",
+        "no client–specific enrollment data",
+        "no client--specific enrollment data",
+        "client-5 records for enrollment",
         "no client-specific enrollment data needed",
         "member-facing enrollment portal documentation",
         "patient-level billing rollups, de-identified",
@@ -1480,6 +1487,13 @@ class TestRbCompoundAdjective:
         "Maria Gonzalez's AHCCCS eligibility renewal status",
         "research units of service for member Delgado",
         "the client is pending discharge",
+        # A dash must never become a hiding place for a real person -- in every
+        # variant the NAME itself is still caught by the other predicate.
+        "client-Marcus eligibility renewal",
+        "client‑Marcus eligibility renewal",
+        "client–Marcus eligibility renewal",
+        "client - Marcus eligibility renewal",
+        "client, Marcus eligibility renewal",
     ])
     def test_d050_recall_is_untouched(self, text):
         assert self._any(text), text

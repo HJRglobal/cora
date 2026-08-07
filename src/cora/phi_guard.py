@@ -174,6 +174,13 @@ _LEX_ADMIN_TERM_RE = re.compile(
 # A specific individual: a possessive proper name ("Bob's" / "Bob Smith's") OR
 # an explicit care-recipient noun. ['’] covers straight + curly apostrophe.
 _NAME_POSSESSIVE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}['’]s\b")
+
+# Every dash a model actually emits: ASCII hyphen plus the Unicode dash block
+# (U+2010 hyphen, U+2011 non-breaking, U+2012 figure, U+2013 en, U+2014 em,
+# U+2015 horizontal bar). Repeats allowed -- "client--specific" is the same
+# compound as "client-specific", and Cora's own prose uses "--" constantly.
+_DASHES = r"[-‐-―]"
+_DASH_CHARS = frozenset("-‐‑‒–—―")
 # (?!-\w) excludes a HYPHENATED COMPOUND ADJECTIVE -- "client-specific",
 # "member-facing", "patient-level". Those are descriptors; they name no
 # individual, and D-050 is about an admin term tied to a SPECIFIC PERSON. Live
@@ -183,7 +190,8 @@ _NAME_POSSESSIVE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}['’]s\b
 # it look like PHI. Excluding compounds is doctrinally correct, not a loosening:
 # "client Marcus", "the client's units" and a bare "client" all still match.
 _CARE_RECIPIENT_RE = re.compile(
-    r"\b(client|patient|member|individual|participant|recipient|guardian|parent)\b(?!-\w)",
+    r"\b(client|patient|member|individual|participant|recipient|guardian|parent)\b"
+    rf"(?!{_DASHES}+\w)",
     re.IGNORECASE,
 )
 
@@ -1061,7 +1069,7 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
         # _CARE_NOUN_RE also drives redact_cue_adjacent_names, and the redactor
         # must not be narrowed by a fix aimed at an intake screen.
         sep = m.group(0)[:m.start(1) - m.start(0)]
-        if "-" in sep and not any(c.isspace() for c in sep):
+        if _DASH_CHARS.intersection(sep) and not any(c.isspace() for c in sep):
             continue
         if any(_is_person_token(t, governed=True) for t in name.split()):
             return True
