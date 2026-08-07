@@ -489,6 +489,16 @@ _LEX_PHI_REFUSAL = (
 )
 
 
+_LEX_CLINICAL_REFUSAL = (
+    "That brief carries clinical or identifier detail (a diagnosis, medication, "
+    "record identifier, or care documentation), so I can't run it as a "
+    "background job -- the worker retrieves as a non-custodian by design and "
+    "could not read those records anyway. Nothing was queued. What works: ask "
+    "the POLICY version and I'll research that properly, or ask me here in the "
+    "channel where your own access applies. Harrison owns any exception."
+)
+
+
 def lex_delegated_enabled() -> bool:
     """CORA_DELEGATED_WORK_LEX: may LEX requesters/channels queue a job?
 
@@ -590,19 +600,31 @@ def screen_request(
             return _LEX_ARCHETYPE_REFUSAL.format(
                 archetype=f"a {archetype.replace('_', ' ')}")
 
-    # 3. PHI -- BEFORE any stash/preview; fail-closed on error. For a LEX job the
-    # screen is RAISED: is_any_phi (which already unions the D-050 admin-PHI
-    # class) plus the client-name detector, so a brief naming an individual in
-    # care/billing context refuses even when it carries no clinical vocabulary.
+    # 3. PHI -- BEFORE any stash/preview; fail-closed on error.
+    #
+    # A BRIEF is request-shaped text, so it takes the person-linked screen, not
+    # the ingestion screen (cq-a24f9d2210fc, 2026-08-07): is_phi_risk carries
+    # bare payer/programme names for filename/subject triage, and every real AZ
+    # DDD policy brief says "AHCCCS". That single token refused three live
+    # person-free briefs and blocked the lane's flagship use case. Clinical,
+    # identifier, D-050 admin-PHI and the client-name detector all still apply;
+    # only "names a programme" stopped counting as "names a person".
+    #
+    # The fired class is ROUTED INTO THE COPY. One template for every hit is how
+    # a false claim shipped: all three refusals asserted "that brief names a
+    # specific person" about briefs naming nobody. Never assert a detection that
+    # did not fire (D-151/D-152).
     try:
-        if phi_guard.is_any_phi(brief):
-            return _LEX_PHI_REFUSAL if lex_job else (
+        if lex_job and phi_guard.has_care_context_person_name(brief, _staff_names()):
+            return _LEX_PHI_REFUSAL                       # a person WAS named
+        if (phi_guard.is_phi_risk_person_linked(brief)
+                or phi_guard.is_clinical_phi(brief)
+                or phi_guard.is_lex_billing_status_phi(brief)):
+            return _LEX_CLINICAL_REFUSAL if lex_job else (
                     "That brief looks like it contains protected client/health "
                     "info, so I can't run it as a background job. Nothing was "
                     "queued -- rephrase without client details if this was a "
                     "false alarm.")
-        if lex_job and phi_guard.has_care_context_person_name(brief, _staff_names()):
-            return _LEX_PHI_REFUSAL
     except Exception:  # noqa: BLE001 -- fail closed
         return ("I couldn't screen that brief for protected info (fail-closed), "
                 "so nothing was queued. Try again in a moment.")

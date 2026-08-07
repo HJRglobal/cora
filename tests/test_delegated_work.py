@@ -27,6 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # nothing -- it stayed green with the fix reverted).
 import cora.user_access as _ua
 _REAL_CHECK_ACCESS = _ua.check_access
+# Same reason for the PHI predicates: the fixture stubs them to a benign False,
+# so a test asserting REAL detection behaviour must restore them explicitly.
+import cora.phi_guard as _pg
+_REAL_PERSON_LINKED = _pg.is_phi_risk_person_linked
+_REAL_PHI_RISK = _pg.is_phi_risk
 
 USER = "U_TEAMMATE1"
 OTHER = "U_TEAMMATE2"
@@ -62,6 +67,7 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(sibling_guard, "check_redirect", lambda *a, **k: None)
     monkeypatch.setattr(cross_entity_guard, "check_cross_entity", lambda *a, **k: None)
     monkeypatch.setattr(phi_guard, "is_any_phi", lambda text: False)
+    monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked", lambda text: False)
     td._PENDING_DELEGATED_WORK.clear()
     yield
     td._PENDING_DELEGATED_WORK.clear()
@@ -147,8 +153,13 @@ def test_screen_lex_channel_refused():
 
 
 def test_screen_phi_refused(monkeypatch):
+    # cq-a24f9d2210fc (2026-08-07): a BRIEF is request-shaped text, so this
+    # screen now uses is_phi_risk_person_linked -- is_phi_risk itself carries
+    # bare payer/programme names ("AHCCCS") for filename/subject triage, and
+    # that single token refused three live person-free policy briefs. Stub the
+    # predicate the path actually calls, or the pin tests nothing.
     import cora.phi_guard as phi_guard
-    monkeypatch.setattr(phi_guard, "is_any_phi", lambda text: True)
+    monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked", lambda text: True)
     refusal = dw.screen_request(USER, "F3E", CHANNEL, "research_brief",
                                 "long enough brief here", "md")
     assert refusal and "protected" in refusal
@@ -252,7 +263,7 @@ def test_screen_phi_error_fail_closed(monkeypatch):
     def _boom(text):
         raise RuntimeError("phi check exploded")
 
-    monkeypatch.setattr(phi_guard, "is_any_phi", _boom)
+    monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked", _boom)
     refusal = dw.screen_request(USER, "F3E", CHANNEL, "research_brief",
                                 "long enough brief here", "md")
     assert refusal and "fail-closed" in refusal
@@ -718,7 +729,7 @@ def test_tool_live_mode_ack_has_no_trial_label(monkeypatch):
 
 def test_tool_phi_screen_runs_before_stash(monkeypatch):
     import cora.phi_guard as phi_guard
-    monkeypatch.setattr(phi_guard, "is_any_phi", lambda text: True)
+    monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked", lambda text: True)
     out = _tool(action="request", archetype="doc_draft",
                 brief="Bob Smith's billing authorization draft long enough")
     assert out.startswith("WRITE_BLOCKED")
@@ -898,7 +909,7 @@ def test_confirm_rescreens_phi_flip_between_preview_and_confirm(monkeypatch):
     import cora.phi_guard as phi_guard
     _tool(action="request", archetype="doc_draft",
           brief="benign at preview time, flagged at confirm long enough")
-    monkeypatch.setattr(phi_guard, "is_any_phi", lambda text: True)
+    monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked", lambda text: True)
     out = _tool(confirmed=True)
     assert out.startswith("WRITE_BLOCKED")
     assert dw.load_jobs() == []  # the stale stash never executed
@@ -1108,3 +1119,109 @@ class TestR2IntakeAuthorization:
     # `phi_custodian` tokens inside make_kb_search are a docstring line and a
     # comment, so the grep passed with the pin genuinely removed -- verified
     # against the full suite (D-051, 2026-08-07).
+
+
+# ---------------------------------------------------------------------------
+# cq-a24f9d2210fc -- DW intake refused person-free DDD policy briefs (HIGH).
+# Live evidence 2026-08-07, #llc-leadership / #lts-leadership: three briefs the
+# MODEL composed (captured verbatim from cora-2026-08-07.log) were refused with
+# a template asserting they "name a specific person". They name nobody.
+# ---------------------------------------------------------------------------
+
+# Verbatim from the live tool_use log lines -- not paraphrased. The defect
+# shipped "verified" because the previous session tested a hand-fed string
+# through the function instead of the text the model actually sends (D-154).
+LIVE_REFUSED_BRIEFS = [
+    ("09:53", "Research brief on current AZ DDD/AHCCCS provider revalidation "
+              "requirements for Provider Type 15: what Lexington LLC must submit, "
+              "the APEP (AHCCCS Provider Enrollment Portal) process steps, and "
+              "the 2026 revalidation fee."),
+    ("09:54", "Research Arizona DDD Provider (Qualified Vendor) revalidation "
+              "requirements. Summarize what Lexington LLC must submit to AHCCCS "
+              "and DDD to maintain provider credentials and billing privileges. "
+              "Include deadline, submission process, required documentation, and "
+              "any recent changes. Focus on Provider Type 14 (Therapy/HCBS) "
+              "requirements specifically."),
+    ("10:11", "Research DDD provider revalidation requirements for Lexington LLC "
+              "(Qualified Vendor). Focus on: what documents and attestations must "
+              "be submitted, timeline/deadlines, the revalidation process via "
+              "AHCCCS APEP, required staff credentials and continuing education, "
+              "any compliance cross-validation requirements from DDD, and what "
+              "happens if revalidation is not completed. Summarize in plain "
+              "language what our agency must do to maintain Provider Type 14 and "
+              "15 IDs."),
+]
+
+
+class TestDwIntakePrecision:
+    def _screen(self, monkeypatch, brief, user="U0B2RM2JYJ1"):
+        import cora.org_roles as org_roles
+        import cora.user_access as user_access
+        monkeypatch.setenv("CORA_DELEGATED_WORK_LEX", "on")
+        monkeypatch.setattr(dw, "_staff_names_cache",
+                            {"Shaun Hawkins", "Jennifer Mortensen"})
+        monkeypatch.setattr(org_roles, "get_role",
+                            lambda uid: _role(entity="LEX-LLC"))
+        # Real topic block, not the autouse stub -- this path must be exercised
+        # end to end or the pin is decorative (D-151).
+        monkeypatch.setattr(user_access, "check_access", _REAL_CHECK_ACCESS)
+        import cora.phi_guard as phi_guard
+        monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked",
+                            _REAL_PERSON_LINKED)
+        return dw.screen_request(user, "LEX-LLC", "llc-leadership",
+                                 "research_brief", brief, "md")
+
+    @pytest.mark.parametrize("when,brief", LIVE_REFUSED_BRIEFS)
+    def test_live_person_free_policy_briefs_now_queue(self, monkeypatch, when, brief):
+        assert self._screen(monkeypatch, brief) is None, (
+            f"the {when} live brief is still refused")
+
+    @pytest.mark.parametrize("brief", [
+        "research whether participant Marcus Delgado qualifies for respite units",
+        "summarize participant Aaron's authorization history",
+        "draft a memo about Marcus Delgado's service authorization renewal",
+        "brief on client Gilbert current placement status",
+    ])
+    def test_person_named_briefs_still_refuse(self, monkeypatch, brief):
+        out = self._screen(monkeypatch, brief)
+        assert out and "names a specific person" in out
+
+    @pytest.mark.parametrize("brief", [
+        "research the diagnosis and medication documentation standards we keep",
+        "pull the member id and npi needed for the revalidation packet",
+    ])
+    def test_clinical_or_identifier_briefs_refuse_with_TRUE_copy(
+        self, monkeypatch, brief
+    ):
+        """The copy must name what actually fired. One template for every hit is
+        how a false claim shipped: all three live refusals asserted a person was
+        named in briefs naming nobody."""
+        out = self._screen(monkeypatch, brief)
+        assert out
+        assert "clinical or identifier" in out
+        assert "names a specific person" not in out, (
+            "asserted a person-detection that did not fire")
+
+    def test_ingestion_screen_is_deliberately_unchanged(self, monkeypatch):
+        """is_phi_risk still carries the payer/programme names. It guards email
+        SUBJECTS and Drive FILENAMES before KB ingestion, where recall beats
+        precision -- only the request-shaped screen dropped them."""
+        from cora import phi_guard
+        monkeypatch.setattr(phi_guard, "is_phi_risk", _REAL_PHI_RISK)
+        monkeypatch.setattr(phi_guard, "is_phi_risk_person_linked",
+                            _REAL_PERSON_LINKED)
+        assert phi_guard.is_phi_risk("AHCCCS eligibility letter.pdf") is True
+        assert phi_guard.is_phi_risk("Medicaid renewal packet") is True
+        # ...and the request-shaped screen does NOT fire on a bare programme name.
+        assert phi_guard.is_phi_risk_person_linked(
+            "what are the AHCCCS revalidation steps") is False
+        # ...while still firing on anything person-linked.
+        assert phi_guard.is_phi_risk_person_linked("send me the member id") is True
+
+    def test_non_lex_intake_is_unaffected(self, monkeypatch):
+        # Regression: a non-LEX job must behave byte-identically.
+        import cora.org_roles as org_roles
+        monkeypatch.setattr(org_roles, "get_role", lambda uid: _role(entity="F3E"))
+        assert dw.screen_request(
+            USER, "F3E", CHANNEL, "research_brief",
+            "research the Sprouts energy-set reset timeline", "md") is None

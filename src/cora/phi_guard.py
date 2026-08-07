@@ -84,6 +84,38 @@ def is_phi_risk(text: str) -> bool:
     return bool(_PHI_PATTERNS.search(text))
 
 
+# Payer / program NAMES. These are the one group above that names a TOPIC
+# rather than anything about a person: every Arizona DDD policy question says
+# "AHCCCS" or "Medicaid" the way an F3E question says "Shopify".
+#
+# They belong in is_phi_risk, which screens email SUBJECTS and Drive FILENAMES
+# before KB ingestion -- there, "AHCCCS" in a subject line genuinely correlates
+# with client records, and over-refusing costs nothing. They do NOT belong in a
+# screen over a REQUEST someone typed, where the same token is the topic. Live
+# evidence (cq-a24f9d2210fc, 2026-08-07): three person-free DDD-policy briefs
+# were refused at delegated-work intake, and the ONLY match in all three was
+# the bare token "AHCCCS".
+_PHI_PROGRAM_NAME_RE = re.compile(r"\b(?:medicaid|ahcccs)\b", re.IGNORECASE)
+
+
+def is_phi_risk_person_linked(text: str) -> bool:
+    """is_phi_risk MINUS the bare payer/program names.
+
+    True when the text carries a PHI signal that says something about a PERSON
+    -- an identifier (ssn/dob/member id/npi), clinical documentation, a
+    diagnosis or medication, or a care-recipient class ("DDD client"). A
+    question ABOUT a program is not one of those.
+
+    Use this on request-shaped text (a delegated-work brief, a typed ask).
+    Keep is_phi_risk on ingestion surfaces, where recall beats precision and a
+    program name in a filename is a fair proxy for client records.
+    """
+    if not text:
+        return False
+    return any(not _PHI_PROGRAM_NAME_RE.fullmatch(m.group(0))
+               for m in _PHI_PATTERNS.finditer(text))
+
+
 # ---------------------------------------------------------------------------
 # LEX-scope billing / authorization / client-status augmentation
 # ---------------------------------------------------------------------------
@@ -882,6 +914,12 @@ _NONPERSON_PROPER_NOUNS = frozenset({
     # Landmark case names / eponyms that appear in disability-policy questions
     # (same class: a legitimate policy ask silently degrading to KB-only).
     "olmstead", "medicaid's", "rehabilitation",
+    # Our OWN entity + brand names. A client is never called "Lexington"
+    # (cq-a24f9d2210fc: it false-positived on the entity's own name).
+    "lexington", "hjr", "cora", "f3", "osn", "bdm", "ufl",
+    # AZ DDD / AHCCCS programme vocabulary that is routinely Title-cased
+    "type", "portal", "vendor", "qualified", "enrollment", "apep", "credential",
+    "credentials", "attestation", "attestations", "revalidation", "waiver",
     # legal / publication vocabulary (citation-shaped policy questions)
     "administrative", "register", "revised", "statutes", "annotated", "federal",
     "national", "association", "center", "centers", "institute", "university",
@@ -961,13 +999,41 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
         name = (m.group(1) or "").strip()
         if not name or name.lower() in full:
             continue
+        # A real name is capitalised. _CARE_NOUN_RE's capture deliberately
+        # allows a lowercase first character (the REDACTOR wants that latitude),
+        # but here it made "member id" read as a person named "Id" and served
+        # the person-named refusal for a brief naming nobody. Requiring the
+        # capital costs no recall -- "client marcus" is not how anyone writes a
+        # name -- and keeps the refusal copy truthful.
+        if not name[:1].isupper():
+            continue
         if any(_is_person_token(t, governed=True) for t in name.split()):
             return True
 
     # PASS 2 -- Title-case name within the cue window (or anywhere when the
     # caller waived the cue precondition: with no cue in the text there are no
     # spans to be "near", so proximity must not be the filter).
+    #
+    # EVIDENCE BAR (cq-a24f9d2210fc, 2026-08-07): a LONE Title-case word is not
+    # evidence of a person. Measured on three real, entirely person-free DDD
+    # policy briefs, this pass produced six false positives -- `Lexington` (the
+    # entity's own name), `Provider Type`, `Qualified Vendor`, `Portal`,
+    # `Include`, `Focus`. Extending the stopword list each time is an unbounded
+    # tail: ordinary prose has an endless supply of capitalised nouns and
+    # sentence-initial verbs. A personal name in ungoverned prose is
+    # First+Last, so PASS 2 now requires TWO ADJACENT person-shaped tokens, or
+    # a possessive.
+    #
+    # RECALL TRADE, stated plainly: a lone first name with no governing noun
+    # and no possessive ("respite units for Madison") is no longer caught HERE.
+    # It is still caught when governed by a care-recipient noun (PASS 1, which
+    # deliberately keeps single-token detection -- "participant Aaron"), when
+    # possessive (below, and is_lex_billing_status_phi), and by the clinical /
+    # identifier predicates. That residual is the price of the lane being
+    # usable at all; the alternative measured 100% refusal on real briefs.
     cue_spans = [(mm.start(), mm.end()) for mm in _PHI_CUE_RE.finditer(text)]
+    possessive = {m.group(0).rstrip("'’s").strip().lower()
+                  for m in _NAME_POSSESSIVE_RE.finditer(text)}
     for m in _PROPER_NAME_RE.finditer(text):
         s, e = m.start(), m.end()
         if cue_required and not any(
@@ -976,6 +1042,14 @@ def has_care_context_person_name(text: str, allowed_names: set[str] | None = Non
         span = m.group(0)
         if span.strip().lower() in full:
             continue
-        if any(_is_person_token(t) for t in span.split()):
+        toks = span.split()
+        # A possessive name is a person at any length ("Marcus's", "Delgado's").
+        if span.strip().lower() in possessive and any(_is_person_token(t) for t in toks):
             return True
+        # Otherwise: two ADJACENT unknown person-shaped tokens.
+        run = 0
+        for t in toks:
+            run = run + 1 if _is_person_token(t) else 0
+            if run >= 2:
+                return True
     return False
