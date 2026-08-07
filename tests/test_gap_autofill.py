@@ -784,12 +784,28 @@ def test_contributed_note_keeps_legit_business_fact(tmp_path, monkeypatch):
     assert "authorized" in (tmp_path / "f3e.md").read_text(encoding="utf-8")
 
 
-def test_contributed_note_lex_subentity_writes_lex_md(tmp_path, monkeypatch):
+def test_contributed_note_lex_entity_is_refused(tmp_path, monkeypatch):
+    """CONTRACT CHANGE 2026-08-06 (Harrison mandate, info-for-cora remediation R1).
+
+    This test previously asserted the OPPOSITE -- that a LEX sub-entity
+    contribution writes through to the shared lex.md. LEX-origin content is now
+    refused outright at this executor, which is the belt behind the info_intake
+    ingest-side skip: the ingest screen only guards the #info-for-cora routes,
+    while this executor is reachable from ANY producer proposing a
+    source="info-for-cora" generic.
+
+    NAMED CONSEQUENCE (recorded in the cascade report, not incidental): this also
+    blocks the LEX-channel team-note confirm-fold, which proposes with the same
+    source and entity = the channel. That fold has never fired -- channel message
+    events do not reach the app -- so nothing live is lost today.
+    """
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
-    ok, _ = ga.apply_contributed_note(
-        {"entity": "LEX-LLC", "text": "LLC staff use the new kiosk for clock-in."})
-    assert ok is True
-    assert (tmp_path / "lex.md").exists()  # sub-entity shares the LEX file
+    for entity in ("LEX", "LEX-LLC", "LEX-LBHS", "lex-lts"):
+        ok, msg = ga.apply_contributed_note(
+            {"entity": entity, "text": "LLC staff use the new kiosk for clock-in."})
+        assert ok is False, f"{entity} should be refused"
+        assert "LEX" in msg
+    assert not (tmp_path / "lex.md").exists()
 
 
 def test_contributed_note_multiline_dedups(tmp_path, monkeypatch):

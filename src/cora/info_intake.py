@@ -38,8 +38,20 @@ DESIGN INVARIANTS
 -----------------
 * **Deterministic only.** No LLM call anywhere on this path. Posted content is
   DATA, never instructions -- a contribution reading "approve this" cannot
-  approve anything, because intake only ever writes state=PENDING and approval
-  requires Harrison's own reaction/button (D-011).
+  approve anything, because intake only ever writes state=PENDING.
+  **This claim is only true because of the R3 exclusion.** As originally shipped
+  it was FALSE: info-for-cora generics are knowledge-class, so they entered the
+  7am drain's auto-write scan, and with the live `CORA_AUTOWRITE_LIVE=all` an
+  allowlist-category contribution that read CORROBORATED would have written
+  itself into always-injected known-answers with no Harrison tap.
+  `run_knowledge_review._autowrite_eligible` now excludes this source outright
+  (D-060 restored); do not remove that predicate.
+* **No pre-approval egress.** `source_evidence` is left EMPTY on purpose: the
+  proposed-updates ledger is byte-copied unscreened to the org-readable
+  `_brain/_flywheel/` Drive store, so anything put there is public before
+  Harrison sees it.
+* **LEX is refused outright** (Harrison mandate 2026-08-06), on CONTENT, at
+  ingest AND again at the executor.
 * **PHI parity-raise.** ``is_any_phi`` (the 3-predicate union) UNCONDITIONALLY,
   not the LEX-asker-scoped billing check the old path used. Strictly stricter
   than what it replaces; fail-closed on exception.
@@ -79,13 +91,30 @@ DUPLICATE = "duplicate"
 SUPERSEDES = "supersedes"          # queued AND flagged as contradicting canon
 QUARANTINED = "quarantined"
 PHI_REFUSED = "phi_refused"
+LEX_REFUSED = "lex_refused"
 NOT_A_CONTRIBUTION = "not_a_contribution"
 SKIPPED = "skipped"
 ERROR = "error"
 
 # Outcomes that mean "nothing was stored".
-NON_STORING = frozenset({DUPLICATE, QUARANTINED, PHI_REFUSED,
+NON_STORING = frozenset({DUPLICATE, QUARANTINED, PHI_REFUSED, LEX_REFUSED,
                          NOT_A_CONTRIBUTION, SKIPPED, ERROR})
+
+# ── Blanket LEX skip (Harrison mandate, 2026-08-06) ─────────────────────────
+# The first cut allowed non-PHI LEX contributions through on the reasoning that
+# this path has no embeddings and no LLM call and that known-answers/lex.md is fed
+# by exactly this executor. Harrison RULED against that: LEX-origin content must
+# never enter this intake at all. The Cowork 4-lens D-051 fan-out also found the
+# deviation unsafe for a second reason -- resolve_entity COLLAPSES a multi-entity
+# hit to ("FNDR", True), discarding LEX membership, so a message naming both LEX
+# and F3E would have filed as an ordinary FNDR fact (finding A-3).
+#
+# Keyed on CONTENT, not channel: #info-for-cora routes to FNDR, so a channel test
+# would never fire. Belted with a token regex of the decision_inbox._LEX_TOKEN_RE
+# class for bare/compound tokens the entity-keyword table misses.
+_LEX_TOKEN_RE = re.compile(
+    r"\blex(?:[-_][a-z0-9]+)*\b|\blexington[a-z]*\b|\b(?:lbhs|lts|lla)\b",
+    re.IGNORECASE)
 
 # ── Connector footer ────────────────────────────────────────────────────────
 # The Cowork connector appends a literal "*Sent using* <@U...>" footer at the END
@@ -261,6 +290,21 @@ def resolve_entity(text: str) -> tuple[str, bool]:
     return "FNDR", bool(hits)
 
 
+def is_lex_content(text: str) -> bool:
+    """True when `text` carries ANY LEX signal. Raises on a detector failure so the
+    caller can fail CLOSED -- see ingest().
+
+    Deliberately evaluated on the RAW keyword hits, BEFORE resolve_entity's
+    multi-entity collapse to ("FNDR", True): that collapse discards LEX membership,
+    so a message naming both LEX and F3E would otherwise read as an ordinary
+    ambiguous FNDR fact.
+    """
+    hits = cross_entity_guard.detect_entities(text or "")
+    if any((h or "").upper().startswith("LEX") for h in hits):
+        return True
+    return bool(_LEX_TOKEN_RE.search(text or ""))
+
+
 def normalize_fact(text: str) -> str:
     """Comparison key for duplicate detection.
 
@@ -433,6 +477,29 @@ def ingest(
             log.warning("info_intake: PHI check failed; dropping", exc_info=True)
             return IntakeResult(ERROR, detail="PHI check failed (dropped fail-closed)")
 
+        # Blanket LEX skip (Harrison mandate 2026-08-06). Placed immediately after
+        # the PHI check and BEFORE the durable screen, mirroring the PHI-before-noise
+        # rationale: a LEX statement that also looks like noise must still draw the
+        # explicit refusal rather than falling through to the caller (which on the
+        # @mention route means Q&A). One chokepoint covers all three routes.
+        #
+        # FAIL CLOSED: a detector exception must refuse, never fall through to
+        # resolve_entity's ("FNDR", True) default.
+        try:
+            lex_hit = is_lex_content(clean)
+        except Exception:  # noqa: BLE001 -- fail closed: refuse rather than risk LEX
+            log.warning("info_intake: LEX detection failed; refusing fail-closed",
+                        exc_info=True)
+            lex_hit = True
+        if lex_hit:
+            log.info("info_intake: LEX content refused route=%s ts=%s", route, ts)
+            return IntakeResult(
+                LEX_REFUSED, is_connector=is_connector,
+                ack=("Lexington items aren't captured through this channel; nothing "
+                     "was saved. Share LEX process facts in the LEX channels (client "
+                     "data belongs in the EHR)."),
+                detail="LEX content")
+
         # A statement that is not durable organizational knowledge is not a fact.
         not_durable = durable_contribution_reason(clean)
         if not_durable:
@@ -508,7 +575,16 @@ def ingest(
                 update_type=knowledge_review.UPDATE_TYPE_GENERIC,
                 description=description,
                 payload=payload,
-                source_evidence=clean,
+                # R2 (fan-out Lens A-1, HIGH): source_evidence is persisted into
+                # data/cora-proposed-memory-updates.jsonl, which is the FIRST entry in
+                # drive_materializer._FLYWHEEL_LEDGERS and is byte-copied UNSCREENED to
+                # the org-readable _brain/_flywheel/ Drive store. Passing the raw
+                # contribution here egressed it org-wide BEFORE Harrison ever approved
+                # it -- the same class the pipeline bundle fixed one module over on
+                # 8/6 (gap_autofill's fix was likewise source_evidence=""). The review
+                # card renders description, which already carries clean[:240], so
+                # nothing is lost from the approval surface.
+                source_evidence="",
                 confidence="MED",
             )
         except Exception:  # noqa: BLE001 -- intake must never break the bot

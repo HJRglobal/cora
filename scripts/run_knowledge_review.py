@@ -916,6 +916,20 @@ def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
     fact (D-051 fix). Tier-2 never eligible; Tier-1 only at 'all'; Tier-0 at
     'tier0'/'all'.
     """
+    # R3 (fan-out Lens B-3.1, HIGH): a teammate contribution posted in
+    # #info-for-cora is NEVER autowrite-eligible, by SOURCE. Verified chain before
+    # this exclusion: info-for-cora generics are knowledge-class
+    # (knowledge_review.is_knowledge_update), so they entered this scan; the live
+    # .env carries CORA_AUTOWRITE_LIVE=all; categorize() allowlists
+    # operational/sop/ownership/contacts/logistics/addresses/product_inventory; and
+    # the corroboration verdict comes from a Haiku read whose prompt embeds the
+    # contribution's OWN text. So an allowlist-category teammate note that read
+    # CORROBORATED would have auto-written into always-injected known-answers with
+    # zero Harrison tap -- and this branch newly turns ON a previously-dead producer
+    # feeding this drain. Excluding by source RESTORES standing doctrine (D-060):
+    # teammate-sourced answers stay Harrison-gated by construction.
+    if ((update or {}).get("payload") or {}).get("source") == "info-for-cora":
+        return False, 2, "info_for_cora_never_autowrites"
     verdict = str(update.get("_coras_read_verdict", ""))
     rec = gts.build_shadow_record(update, verdict)
     tier = int(rec.get("shadow_tier", 2))

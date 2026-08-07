@@ -1466,6 +1466,20 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
     """
     try:
         entity = (payload.get("entity") or "FNDR").strip().upper()
+        # Blanket LEX refusal at the WRITE (Harrison mandate 2026-08-06). The
+        # info_intake skip alone does NOT close known-answers/lex.md: this executor
+        # is reachable from any producer that proposes a source="info-for-cora"
+        # generic, and the ingest-side screen only guards the #info-for-cora routes.
+        #
+        # NAMED CONSEQUENCE: this also blocks the LEX-channel team-note confirm-fold,
+        # which proposes with the same source and entity = the channel. That fold has
+        # never fired (channel message events do not reach the app -- two orphaned
+        # paraphrases, 6/06 and 6/30), so nothing live is lost today; it would matter
+        # only if the dark message event is ever lit up. Flagged in the cascade report
+        # so it is a decision rather than an accident.
+        if entity.startswith("LEX"):
+            log.info("gap_autofill: contributed note refused (LEX entity) -- not persisted")
+            return False, "LEX contributions are not captured through this path"
         # Normalize to a single line so the dedup search below is reliable and the
         # stored fact is a clean one-liner (adversarial review LOW: a multi-line
         # contribution otherwise defeated the line-anchored dedup regex).

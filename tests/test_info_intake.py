@@ -406,3 +406,105 @@ class TestConcurrentRouteRace:
                             known_answers_dir=tmp_path)
         assert res.outcome == ii.DUPLICATE
         assert res.ack == ""
+
+
+# ── R1: blanket LEX skip (Harrison mandate 2026-08-06) ──────────────────────
+class TestBlanketLexSkip:
+    """LEX-origin content must never enter this intake. Keyed on CONTENT, because
+    #info-for-cora routes to FNDR and a channel test would never fire."""
+
+    @pytest.mark.parametrize("text", [
+        "Lexington revalidation paperwork is due in October for the DDD contract",
+        "The LBHS COPA diligence packet is with counsel until the end of the month",
+        "LTS billing runs on the second Tuesday of each month going forward",
+        "lex-llc moved its admin office to the Tucson DTA suite this quarter",
+    ])
+    def test_lex_content_is_refused(self, text, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            res = ii.ingest(text=text, author_id="U1", ts="40.1", route="mention",
+                            known_answers_dir=tmp_path)
+        assert res.outcome == ii.LEX_REFUSED
+        assert res.stored is False
+        assert not kr.propose_update.called
+        assert "Lexington" in res.ack
+
+    def test_multi_entity_lex_hit_refuses_not_fndr_ambiguous(self, tmp_path):
+        """finding A-3: resolve_entity collapses a multi-entity hit to
+        ("FNDR", True), discarding LEX membership. The skip must run on the RAW
+        hits, so LEX+F3E refuses instead of filing as an ordinary FNDR fact."""
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            res = ii.ingest(
+                text="Lexington and F3 Energy both moved to the same payroll provider",
+                author_id="U1", ts="41.1", route="mention", known_answers_dir=tmp_path)
+        assert res.outcome == ii.LEX_REFUSED
+        assert not kr.propose_update.called
+        # Confirm the collapse this guards against really does discard LEX.
+        assert ii.resolve_entity(
+            "Lexington and F3 Energy both moved") == ("FNDR", True)
+
+    def test_token_regex_belts_the_keyword_table(self, tmp_path):
+        """Bare/compound LEX tokens the entity-keyword table misses."""
+        assert ii.is_lex_content("the LEX-DDS rollout slipped a week") is True
+        assert ii.is_lex_content("LLA staffing is stable") is True
+
+    def test_detector_exception_fails_closed(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr), \
+             patch.object(ii.cross_entity_guard, "detect_entities",
+                          side_effect=RuntimeError("boom")):
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                            author_id="U1", ts="42.1", route="mention",
+                            known_answers_dir=tmp_path)
+        assert res.outcome == ii.LEX_REFUSED
+        assert not kr.propose_update.called
+
+    def test_non_lex_content_still_flows(self, tmp_path):
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            res = ii.ingest(text="F3 Pure retail price is $36.99 everywhere now",
+                            author_id="U1", ts="43.1", route="mention",
+                            known_answers_dir=tmp_path)
+        assert res.outcome == ii.QUEUED and res.entity == "F3E"
+
+    def test_sweep_posts_no_ack_because_lex_refused_is_non_storing(self):
+        """The sweep acks only on result.stored, so the live-route ack text exists
+        but can never be necroposted by the sweep."""
+        assert ii.LEX_REFUSED in ii.NON_STORING
+        res = ii.IntakeResult(ii.LEX_REFUSED, ack="something")
+        assert res.stored is False
+
+    def test_executor_belt_refuses_lex_entity(self):
+        """The ingest skip alone does NOT close known-answers/lex.md."""
+        from cora import gap_autofill
+        ok, msg = gap_autofill.apply_contributed_note(
+            {"entity": "LEX-LLC", "text": "some LEX process fact", "author_name": "X"})
+        assert ok is False
+        assert "LEX" in msg
+
+
+# ── R2: no pre-approval egress via the org-readable flywheel mirror ─────────
+class TestNoPreApprovalEgress:
+    def test_source_evidence_is_empty(self, tmp_path):
+        """The proposed-updates ledger is byte-copied unscreened to _brain/_flywheel/,
+        so raw contribution text in source_evidence would be org-readable BEFORE
+        Harrison approves it (fan-out Lens A-1, HIGH)."""
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                      author_id="U1", ts="44.1", route="mention",
+                      known_answers_dir=tmp_path)
+        kwargs = kr.propose_update.call_args.kwargs
+        assert kwargs["source_evidence"] == ""
+
+    def test_supersedes_excerpt_stays_out_of_source_evidence(self, tmp_path):
+        (tmp_path / "f3e.md").write_text(
+            "## Known facts\n\nF3 Pure retail price is $32.99 everywhere\n",
+            encoding="utf-8")
+        kr = _kr()
+        with patch.object(ii, "knowledge_review", kr):
+            ii.ingest(text="F3 Pure retail price is $36.99 everywhere",
+                      author_id="U1", ts="45.1", route="sweep",
+                      known_answers_dir=tmp_path)
+        assert kr.propose_update.call_args.kwargs["source_evidence"] == ""
