@@ -1025,10 +1025,16 @@ class TestD051PriorTurnDrop:
         sits inside the attach branch of _dispatch_qa."""
         src = self._src()
         i = src.index("web_tools ATTACHED")
-        seg = src[i:i + 1600]
+        seg = src[i:i + 3000]
         assert "web_guard.is_lex_scope(entity)" in seg
-        # Exactly one drop inside the attach branch, and it is LEX-guarded --
-        # an unguarded drop would silently strip thread context for everyone.
+        # R1 follow-up (D-051 2026-08-07): the drop must cover the SAME set as
+        # the custodian withhold R1 relaxed, or relaxing one un-covers the
+        # other. phi_allowed is True for the founder in a DM while his entity is
+        # pinned FNDR -- phi_custodian=True, is_lex_scope=False -- so keying on
+        # scope alone left the highest-volume DM surface uncovered.
+        assert "or phi_custodian" in seg
+        # Exactly one drop inside the attach branch, and it is guarded -- an
+        # unguarded drop would silently strip thread context for everyone.
         assert seg.count("prior_messages = []") == 1
         drop = seg.index("prior_messages = []")
         assert seg.index("web_guard.is_lex_scope(entity)") < drop
@@ -1036,6 +1042,29 @@ class TestD051PriorTurnDrop:
         # of _dispatch_qa; nothing else may clear history.
         assert src.count("prior_messages = []") == 2
         assert "if prior_messages is None:" in src
+
+
+class TestR1PriorTurnDropCoExtension:
+    """The drop and the withhold R1 relaxed must cover the same set. Regression
+    for the one live case where they diverge: the founder in a DM is a custodian
+    (fixed-identity carve-out in lex_phi_access) while his DM entity is pinned
+    FNDR, so is_lex_scope is False."""
+
+    def test_founder_dm_is_custodian_but_not_lex_scope(self):
+        from cora import lex_phi_access
+        # If either half of this ever changes, the co-extension fix below is
+        # no longer load-bearing and should be re-derived, not just deleted.
+        assert lex_phi_access.phi_allowed("U0B2RM2JYJ1", "FNDR", is_dm=True) is True
+        assert web_guard.is_lex_scope("FNDR") is False
+
+    def test_drop_condition_covers_the_custodian_case(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "src" / "cora"
+               / "app.py").read_text(encoding="utf-8")
+        i = src.index("web_tools ATTACHED")
+        seg = src[i:i + 3000]
+        cond = seg[:seg.index("prior_messages = []")]
+        assert "is_lex_scope(entity)" in cond and "or phi_custodian" in cond
 
 
 class TestR1CustodianWebLane:

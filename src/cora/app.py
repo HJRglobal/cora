@@ -1127,9 +1127,24 @@ def _dispatch_qa(
             # free-text Slack prose would over-block and re-create the
             # never-attaches bug (cq-49a7835f081c). Non-LEX is untouched;
             # cq-505a37b1c4b7 still owns the general case.
-            if web_guard.is_lex_scope(entity) and prior_messages:
-                log.info("web_tools: dropping %d prior turn(s) for a LEX web turn",
-                         len(prior_messages))
+            # R1 follow-up (D-051, 2026-08-07) -- HIGH, caught pre-push. This
+            # drop and the custodian withhold R1 relaxed must cover the SAME
+            # set, or relaxing one silently un-covers the other. They were keyed
+            # on different predicates and are NOT co-extensive:
+            # lex_phi_access.phi_allowed also returns True for the founder in a
+            # DM (a fixed-identity carve-out), and _handle_dm_qa pins his DM
+            # entity to FNDR -- so `phi_custodian=True` with
+            # `is_lex_scope("FNDR")=False`. Before R1 that turn was withheld
+            # outright; after R1 it attached with prior DM turns intact, and a
+            # custodian's DM note overlay is unscrubbed AND forced into the LEX
+            # store (user_notes.resolve_save_scope). A client name quoted one
+            # turn earlier could ride into a model-composed search query on the
+            # highest-volume DM surface in the system. `or phi_custodian`
+            # restores co-extension.
+            if (web_guard.is_lex_scope(entity) or phi_custodian) and prior_messages:
+                log.info("web_tools: dropping %d prior turn(s) (lex_scope=%s "
+                         "custodian=%s)", len(prior_messages),
+                         web_guard.is_lex_scope(entity), phi_custodian)
                 prior_messages = []
         elif web_decision.reason not in ("no_intent", "disabled"):
             log.info(
