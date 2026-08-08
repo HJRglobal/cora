@@ -4391,6 +4391,39 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
         except Exception as exc:  # noqa: BLE001 -- ADDITIVE: degrade to legacy
             log.warning("f3e_shopify_set_inventory lexicon resolve degraded: %s", exc)
             lex_res = None
+    # v2 S7 (cq-483109dfea11): the ask was being lost BEFORE the resolver ever
+    # ran. The model canonicalizes the user's words while composing the tool call
+    # ("set the variety pack at the office to 40" arrives as
+    # product_query="pure variety pack"), so an ambiguous USER phrase reaches
+    # lexicon.resolve pre-disambiguated, resolves exact, and the which-one ask
+    # never fires -- 5+ live repros 8/1-8/2. Judge ambiguity on the VERBATIM turn
+    # text instead, and let it OVERRIDE an exact resolution of the rewritten arg:
+    # the human, not the model, decides whether they were specific.
+    # Longest-match-wins inside find_ambiguous_in_text keeps this from
+    # over-asking when the user really did name the specific product.
+    if _lexicon_active() and (lex_res is None or lex_res.status != "ambiguous"):
+        verbatim = str(input_data.get("_user_message") or "")
+        if verbatim:
+            try:
+                # Imported locally, matching every other lexicon consumer in
+                # this module (the module-level name does not exist here).
+                from .. import lexicon as _lex
+                verbatim_amb = _lex.find_ambiguous_in_text(
+                    verbatim, "F3E", types=("product",))
+            except Exception as exc:  # noqa: BLE001 -- ADDITIVE: degrade to legacy
+                log.warning("f3e_shopify_set_inventory verbatim ambiguity scan degraded: %s", exc)
+                verbatim_amb = None
+            if verbatim_amb is not None:
+                log.info(
+                    "lexicon ask-on-ambiguity from VERBATIM user text user=%s "
+                    "user_phrase=%r model_arg=%r model_status=%s",
+                    slack_user_id, verbatim_amb.query, product_query,
+                    getattr(lex_res, "status", "none"),
+                )
+                lex_res = verbatim_amb
+                # The ask names the USER's phrase, not the model's rewrite.
+                product_query = verbatim_amb.query
+
     if lex_res is not None and lex_res.status == "ambiguous":
         listing = "; ".join(
             dict.fromkeys(f"{c.canonical_name}" for c in lex_res.candidates[:6]))
@@ -11413,6 +11446,7 @@ def dispatch(
     channel_name: str = "",
     channel_id: str = "",
     thread_ts: str | None = None,
+    user_message: str = "",
 ) -> str:
     """Run a tool by name. Always returns a string for tool_result content.
 
@@ -11441,6 +11475,12 @@ def dispatch(
         injected["_channel_id"] = channel_id
     if thread_ts:
         injected["_thread_ts"] = thread_ts
+    # v2 S7: the user's VERBATIM turn text. A tool whose arguments the model
+    # normalized (the lexicon ask-bypass class) needs the original words to
+    # judge ambiguity on what the human actually said, not on what the model
+    # decided they meant. Read-only context; never an argument to a write.
+    if user_message:
+        injected["_user_message"] = user_message
     try:
         timeout = _TOOL_TIMEOUTS.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
         # W3-01: do NOT use the ThreadPoolExecutor context manager -- its __exit__

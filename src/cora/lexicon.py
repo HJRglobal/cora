@@ -454,6 +454,84 @@ def resolve(
     return result
 
 
+def find_ambiguous_in_text(
+    text: str,
+    entity: str,
+    types: Optional[Iterable[str]] = None,
+    scope: Optional[str] = None,
+) -> Optional[Resolution]:
+    """Longest lexicon surface present in `text` -- returned ONLY if it is
+    ambiguous, else None (v2 S7, cq-483109dfea11).
+
+    resolve() answers "is THIS term ambiguous?" about a single query string. It
+    cannot see the user's own words, and that is where the ask was being lost:
+    the model canonicalizes the phrase before the tool is ever called ("the
+    variety pack at the office" arrives as product_query="pure variety pack"),
+    so an ambiguous USER phrase reaches the resolver pre-disambiguated, resolves
+    exact, and the which-one-did-you-mean ask never fires. Five-plus live repros
+    8/1-8/2. This scans the VERBATIM text instead, so ambiguity is judged on what
+    the human actually said.
+
+    LONGEST-MATCH-WINS, which is what keeps it from over-asking: if the user
+    typed a specific "pure variety pack" and the lexicon also carries an
+    ambiguous shorter "variety pack", the longer surface is present too and
+    shadows it -- no ask. An ambiguous surface only wins when nothing longer
+    containing it is also present, i.e. the user really was non-specific.
+
+    Fail-soft to None (a load failure or an unusable text is simply "no
+    ambiguity found"), preserving the module's ADDITIVE invariant."""
+    if not (text or "").strip():
+        return None
+    try:
+        entries = _entries_for(entity, scope)
+    except Exception as exc:  # noqa: BLE001 -- ADDITIVE: load failure == no finding
+        log.warning("lexicon: find_ambiguous_in_text degraded (%s)", exc)
+        return None
+    type_filter = frozenset(t.strip().lower() for t in types) if types else None
+    if type_filter:
+        entries = [e for e in entries if e.type in type_filter]
+    if not entries:
+        return None
+
+    # surface -> the distinct (canonical, type) pairs it can mean.
+    by_surface: dict[str, list[LexEntry]] = {}
+    for e in entries:
+        for s in e.surfaces():
+            if not s:
+                continue
+            bucket = by_surface.setdefault(s, [])
+            if (e.canonical, e.type) not in {(b.canonical, b.type) for b in bucket}:
+                bucket.append(e)
+
+    norm_text = norm_term(text)
+    if not norm_text:
+        return None
+    padded = f" {norm_text} "
+    # A trailing plural is tolerated ("variety packs" hits the "variety pack"
+    # surface). Cheap and low-risk: it only ever widens what counts as PRESENT,
+    # and the ask is the conservative outcome. Anything richer belongs in
+    # norm_term, which is parity-pinned against tool_dispatch._norm_alias.
+    present = [s for s in by_surface if f" {s} " in padded or f" {s}s " in padded]
+    if not present:
+        return None
+
+    present.sort(key=len, reverse=True)
+    for surface in present:
+        if len(by_surface[surface]) < 2:
+            continue  # unambiguous here
+        shadowed = any(
+            other != surface and len(other) > len(surface) and surface in other
+            for other in present
+        )
+        if shadowed:
+            # The user WAS specific -- a longer surface containing this one is
+            # also present, so this shorter ambiguity is not what they meant.
+            continue
+        return Resolution(status="ambiguous", query=surface,
+                          candidates=tuple(by_surface[surface]))
+    return None
+
+
 # ── Telemetry (lane-A chokepoint ledger) ─────────────────────────────────────
 
 

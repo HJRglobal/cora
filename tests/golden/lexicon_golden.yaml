@@ -86,6 +86,46 @@ resolve_cases:
   # --- fuzzy is SUGGESTION only, never a resolution ---
   - {id: fuzzy-gw,         utterance: "gilbert warner",     entity: OSN, expect: suggestion}
   - {id: fuzzy-bluechip,   utterance: "blu chip",           entity: F3E, expect: suggestion}
+# --- v2 S7 (cq-483109dfea11): the REWRITE-BYPASS class ------------------------
+# resolve_cases ask "is this TERM ambiguous?". These ask the question that was
+# actually being lost: "was the USER ambiguous?". The model canonicalizes the
+# phrase while composing the tool call ("the variety pack at the office" arrives
+# as product_query="pure variety pack"), so the resolver saw a pre-disambiguated
+# term, resolved exact, and the ask never fired -- 5+ live repros 8/1-8/2. Run
+# through lexicon.find_ambiguous_in_text over the FULL verbatim sentence.
+#
+# expect semantics:
+#   ask    -> an ambiguous surface is present and unshadowed; MUST return the
+#             given phrase and EXACTLY the given candidate canonicals
+#   no_ask -> MUST return None (the user was specific, or nothing matched).
+#             These are the over-asking guard: a fix that asks on everything
+#             would pass the ask cases and fail here.
+verbatim_cases:
+  # the live repro, plus the same ambiguity in other sentence shapes
+  - {id: vb-variety-office, utterance: "set the variety pack at the office to 40",
+     entity: F3E, expect: ask, phrase: "variety pack",
+     candidates: [F3VPE4, F3VPM4, F3-PureE-V4F]}
+  - {id: vb-variety-question, utterance: "how many cases of variety pack do we have",
+     entity: F3E, expect: ask, phrase: "variety pack",
+     candidates: [F3VPE4, F3VPM4, F3-PureE-V4F]}
+  - {id: vb-variety-plural, utterance: "set variety packs at the office to 40",
+     entity: F3E, expect: ask, phrase: "variety pack",
+     candidates: [F3VPE4, F3VPM4, F3-PureE-V4F]}
+  - {id: vb-variety-caps, utterance: "Bump the VARIETY PACK by 12 please",
+     entity: F3E, expect: ask, phrase: "variety pack",
+     candidates: [F3VPE4, F3VPM4, F3-PureE-V4F]}
+  # the user WAS specific -- a longer surface shadows the ambiguous one
+  - {id: vb-energy-variety, utterance: "set the energy variety pack at HQ to 12",
+     entity: F3E, expect: no_ask}
+  - {id: vb-pure-variety,   utterance: "set the pure variety to 40",
+     entity: F3E, expect: no_ask}
+  # unambiguous terms and plain sentences must never trigger an ask
+  - {id: vb-bcb,            utterance: "bump bcb by 10", entity: F3E, expect: no_ask}
+  - {id: vb-mood-run,       utterance: "set the mood run to 30", entity: F3E, expect: no_ask}
+  - {id: vb-no-terms,       utterance: "what is our cash position", entity: F3E, expect: no_ask}
+  - {id: vb-empty,          utterance: "", entity: F3E, expect: no_ask}
+  - {id: vb-unknown-entity, utterance: "set the variety pack to 40",
+     entity: NOT-AN-ENTITY, expect: no_ask}
 capture_cases:
   # LEX client-name-shaped payloads MUST be refused at capture (applier screen).
   - id: cap-lex-client-billing

@@ -42,8 +42,9 @@ _GOLDEN = _REPO_ROOT / "tests" / "golden" / "lexicon_golden.yaml"
 
 
 def run_eval() -> dict:
-    cases = (yaml.safe_load(_GOLDEN.read_text(encoding="utf-8"))
-             .get("resolve_cases") or [])
+    corpus = yaml.safe_load(_GOLDEN.read_text(encoding="utf-8"))
+    cases = corpus.get("resolve_cases") or []
+    verbatim_cases = corpus.get("verbatim_cases") or []
     results = []
     seeded_total = seeded_hit = 0
     ask_total = ask_correct = 0
@@ -75,19 +76,51 @@ def run_eval() -> dict:
                 false_resolutions.append(case["id"])
         results.append({"id": case["id"], "status": r.status, "ok": ok})
 
+    # v2 S7 (cq-483109dfea11): the REWRITE-BYPASS class. resolve() can only
+    # answer "is this TERM ambiguous?", which the model defeats by canonicalizing
+    # the user's phrase before the tool is ever called -- so the ask silently
+    # stopped firing while every gate above stayed green. These run the VERBATIM
+    # sentence through find_ambiguous_in_text. Both directions count: a missed
+    # ask is a false resolution (the write proceeds on a guess), and an
+    # over-ask on a specific user is its own failure, so a fix that asks on
+    # everything cannot pass.
+    vb_ask_total = vb_ask_correct = 0
+    vb_overasks = []
+    for case in verbatim_cases:
+        r = lexicon.find_ambiguous_in_text(
+            case["utterance"], case["entity"], types=("product",))
+        if case["expect"] == "ask":
+            vb_ask_total += 1
+            ok = (r is not None and r.status == "ambiguous" and not r.canonical
+                  and r.query == case["phrase"]
+                  and {c.canonical for c in r.candidates} == set(case["candidates"]))
+            vb_ask_correct += 1 if ok else 0
+            if not ok:
+                false_resolutions.append(case["id"])  # the ask never fired
+        else:
+            ok = r is None
+            if not ok:
+                vb_overasks.append(case["id"])
+        results.append({"id": case["id"], "status": "verbatim", "ok": ok})
+
     resolution_rate = round(seeded_hit / seeded_total, 4) if seeded_total else None
     ask_rate = round(ask_correct / ask_total, 4) if ask_total else None
+    vb_ask_rate = round(vb_ask_correct / vb_ask_total, 4) if vb_ask_total else None
     return {
         "date": date.today().isoformat(),
         "lexicon_level": lexicon.lexicon_level(),
-        "cases": len(cases),
+        "cases": len(cases) + len(verbatim_cases),
         "seeded_resolution_rate": resolution_rate,
         "ask_on_ambiguity_rate": ask_rate,
+        "verbatim_ask_rate": vb_ask_rate,
+        "verbatim_overasks": vb_overasks,
         "false_resolutions": false_resolutions,
         "gates": {
             "zero_false_resolutions": not false_resolutions,
             "ask_on_ambiguity_100pct": ask_rate == 1.0,
             "seeded_resolution_90pct": (resolution_rate or 0) >= 0.90,
+            "verbatim_ask_100pct": vb_ask_rate == 1.0,
+            "zero_verbatim_overasks": not vb_overasks,
         },
         "failures": [r for r in results if not r["ok"]],
     }

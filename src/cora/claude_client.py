@@ -738,6 +738,7 @@ def _dispatch_tools_parallel(
     channel_name: str = "",
     channel_id: str = "",
     thread_ts: str | None = None,
+    user_message: str = "",
 ) -> list[dict]:
     """Dispatch a batch of tool_use blocks, in parallel when there are 2+.
 
@@ -781,7 +782,8 @@ def _dispatch_tools_parallel(
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cora-tool") as executor:
         futures = [
             executor.submit(contextvars.copy_context().run, dispatch, b.name, b.input or {},
-                            slack_user_id, entity, channel_name, channel_id, thread_ts)
+                            slack_user_id, entity, channel_name, channel_id, thread_ts,
+                            user_message)
             for b in tool_use_blocks
         ]
         results = [f.result() for f in futures]
@@ -1163,6 +1165,7 @@ def generate_response(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use", channel_name=channel_name,
             channel_id=channel_id, thread_ts=thread_ts,
+            user_message=user_message,
         )
 
         messages.append({"role": "user", "content": tool_results})
@@ -1422,6 +1425,7 @@ def generate_response_streaming(
             tool_use_blocks, slack_user_id, entity, iteration,
             log_prefix="tool_use (stream)", channel_name=channel_name,
             channel_id=channel_id, thread_ts=thread_ts,
+            user_message=user_message,
         )
 
         messages.append({"role": "user", "content": tool_results})

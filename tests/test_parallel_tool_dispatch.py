@@ -49,7 +49,7 @@ def test_multi_tool_blocks_dispatched_in_parallel():
     ]
 
     def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="",
-                      _thread_ts=None):
+                      _thread_ts=None, _user_message=""):
         # Each tool "takes" some work — verify they actually run concurrently
         return f"result for {name}"
 
@@ -73,7 +73,7 @@ def test_parallel_dispatch_actually_runs_concurrently():
     ]
 
     def slow_dispatch(name, _input, _user, _entity, _channel="", _channel_id="",
-                      _thread_ts=None):
+                      _thread_ts=None, _user_message=""):
         time.sleep(0.3)
         return f"result for {name}"
 
@@ -97,7 +97,7 @@ def test_results_preserve_order_when_tools_finish_out_of_order():
     ]
 
     def staggered(name, _input, _user, _entity, _channel="", _channel_id="",
-                  _thread_ts=None):
+                  _thread_ts=None, _user_message=""):
         if name == "slow":
             time.sleep(0.2)
             return "slow result"
@@ -162,7 +162,7 @@ def test_single_tool_dispatch_sees_the_calling_threads_turn_id():
     tid = confirm_cards.current_turn_id()
     seen = {}
 
-    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None, _user_message=""):
         seen["turn_id"] = confirm_cards.current_turn_id()
         return "ok"
 
@@ -178,7 +178,7 @@ def test_parallel_tool_dispatch_each_worker_sees_the_calling_threads_turn_id():
     tid = confirm_cards.current_turn_id()
     seen = {}
 
-    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None, _user_message=""):
         seen[name] = confirm_cards.current_turn_id()
         return f"result for {name}"
 
@@ -198,7 +198,7 @@ def test_a_workers_own_turn_id_mutation_never_leaks_to_siblings_or_caller():
     caller_tid = confirm_cards.current_turn_id()
     seen = {}
 
-    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None):
+    def fake_dispatch(name, _input, _user, _entity, _channel="", _channel_id="", _thread_ts=None, _user_message=""):
         # Simulate a worker minting its OWN fresh turn (should never happen in
         # production -- begin_turn only runs once per _dispatch_qa turn -- but
         # proves copy_context() isolation holds even if it did).
