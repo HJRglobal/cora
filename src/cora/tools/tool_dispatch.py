@@ -789,7 +789,7 @@ def _tool_asana_create_task(slack_user_id: str, entity: str, _input: dict) -> st
         "action": "create", **resolved, "ts": time.time(),
         "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
-    return _write_blocked_contract(_asana_create_preview_text(resolved))
+    return _write_blocked_contract(_asana_create_preview_text(resolved, channel))
 
 
 # --- Relative due-date resolution (Slice 4, 2026-07-29 audit) ------------------
@@ -999,11 +999,11 @@ def _resolve_asana_create(slack_user_id: str, entity: str, input_data: dict):
     }
 
 
-def _asana_create_preview_text(r: dict) -> str:
+def _asana_create_preview_text(r: dict, channel: str = "") -> str:
     """The NOT-CREATED-yet preview line the narration net posts verbatim (Slice 4)."""
     lines = [
-        "Not created yet -- reply to confirm and I'll create this task in Asana. "
-        "Nothing is created until you confirm.",
+        f"Not created yet -- {_confirm_how(channel)} and I'll create this task in "
+        "Asana. Nothing is created until you confirm.",
         f"- Task: {r['title']}",
         f"- Assignee: {r['assignee_display']}",
         f"- Due: {r['due_on'] or '(none)'}",
@@ -1261,6 +1261,28 @@ def _write_confirmed_contract(user_text: str) -> str:
     return f"WRITE_CONFIRMED\n\n{user_text}"
 
 
+def _confirm_how(channel: str, *, capitalize: bool = False) -> str:
+    """The ONE honest "how do I confirm this?" phrase, for every staged-write
+    preview (v2 S4).
+
+    Every preview except Shopify's said "reply to confirm", which is simply FALSE
+    in a channel: channel `message` events are not subscribed, so a bare in-thread
+    reply never reaches the app at all (cq-8063c3cee70f -- a DW confirm typed in a
+    channel thread was silently ignored, and the preview had told the user that
+    would work). Shopify already said the true thing; this generalises its wording
+    to every kind and adds the button, which is now the primary affordance.
+
+    Adapts to BOTH axes that change what is actually true:
+      * surface -- a DM does deliver a bare reply, so there "reply" is honest;
+      * CORA_CONFIRM_BUTTONS -- with buttons off there is no Confirm to tap, so
+        the line must not promise one (part of the flag's byte-identical revert)."""
+    typed = ('reply "confirm"' if (channel or "").strip().lower() == "dm"
+             else '@mention me with "confirm"')
+    phrase = (f"tap *Confirm* below (or {typed})"
+              if confirm_cards.confirm_buttons_enabled() else typed)
+    return phrase[0].upper() + phrase[1:] if capitalize else phrase
+
+
 def _write_blocked_contract(user_text: str) -> str:
     """Sentinel-wrap a NON-write (preview / refusal / error). The net posts the part
     after the blank verbatim; NOTHING was written, so a mis-narrating model can't
@@ -1299,8 +1321,8 @@ def _tool_asana_complete_task(slack_user_id: str, entity: str, _input: dict) -> 
         "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
-        f'Not done yet -- reply to confirm and I\'ll mark "{label}" complete in Asana. '
-        f"Nothing changes until you confirm."
+        f'Not done yet -- {_confirm_how(channel)} and I\'ll mark "{label}" complete in '
+        f"Asana. Nothing changes until you confirm."
     )
 
 
@@ -1331,8 +1353,8 @@ def _tool_asana_delete_task(slack_user_id: str, entity: str, _input: dict) -> st
     })
     return _write_blocked_contract(
         f'Not deleted yet -- deleting is PERMANENT (completing is usually better). '
-        f'Reply to confirm and I\'ll permanently delete "{label}" from Asana. Nothing '
-        f"changes until you confirm."
+        f'{_confirm_how(channel, capitalize=True)} and I\'ll permanently delete '
+        f'"{label}" from Asana. Nothing changes until you confirm.'
     )
 
 
@@ -1498,7 +1520,7 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
         "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     preview = (
-        f'Not updated yet -- reply to confirm and I\'ll update "{label}": '
+        f'Not updated yet -- {_confirm_how(channel)} and I\'ll update "{label}": '
         + "; ".join(change_desc) + ". Nothing changes until you confirm."
     )
     if skipped:
@@ -1542,7 +1564,7 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
         "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
-        f'Not added yet -- reply to confirm and I\'ll post this comment on "{label}": '
+        f'Not added yet -- {_confirm_how(channel)} and I\'ll post this comment on "{label}": '
         f'"{scrubbed}". Nothing is posted until you confirm.'
     )
 
@@ -1614,7 +1636,7 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
         "stash_id": confirm_cards.mint_stash_id("asana", slack_user_id, channel),
     })
     return _write_blocked_contract(
-        f'Not added yet -- reply to confirm and I\'ll add subtask "{name_scrubbed}" '
+        f'Not added yet -- {_confirm_how(channel)} and I\'ll add subtask "{name_scrubbed}" '
         f'(assignee: {assignee_display}) under "{parent_label}". '
         f"Nothing is created until you confirm."
     )
@@ -2190,8 +2212,8 @@ def _tool_calendar_create_event(slack_user_id: str, entity: str, _input: dict) -
         f"- End: {end}\n"
         + (f"- Location: {location}\n" if location else "")
         + (f"- Attendees: {', '.join(attendee_list)}\n" if attendee_list else "")
-        + f"\nReply to confirm and I'll book it (a Google Meet link is added "
-        f"automatically).{attendee_note}"
+        + f"\n{_confirm_how(channel, capitalize=True)} and I'll book it (a Google Meet "
+        f"link is added automatically).{attendee_note}"
     )
 
 
@@ -2231,7 +2253,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
             "stash_id": confirm_cards.mint_stash_id("calendar", slack_user_id, channel),
         })
         return (
-            f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{summary}'. "
+            f"NOT CANCELLED yet -- {_confirm_how(channel)} and I'll cancel '{summary}'. "
             f"Attendees will be notified. Nothing changes until you confirm."
         )
 
@@ -2265,7 +2287,7 @@ def _tool_calendar_delete_event(slack_user_id: str, entity: str, _input: dict) -
         "stash_id": confirm_cards.mint_stash_id("calendar", slack_user_id, channel),
     })
     return (
-        f"NOT CANCELLED yet -- reply to confirm and I'll cancel '{ev_summary}' ({label}). "
+        f"NOT CANCELLED yet -- {_confirm_how(channel)} and I'll cancel '{ev_summary}' ({label}). "
         f"Attendees will be notified. Nothing changes until you confirm."
     )
 
@@ -4045,6 +4067,7 @@ def _shopify_write_blocked(user_text: str) -> str:
 def _shopify_preview_text(
     *, variant_label: str, location_name: str, current: int, quantity: int,
     moved_from: int | None = None, unit: str = "units", resolved_from: str = "",
+    channel: str = "",
 ) -> str:
     """Source-opaque NOT-WRITTEN preview line the net posts to the user. `unit`
     labels the count ('cases' for the office channel) -- the tool NEVER converts;
@@ -4062,8 +4085,10 @@ def _shopify_preview_text(
         f"{variant_label} at {location_name}: {current} -> {quantity} {unit}.{provenance} "
         # F-18: a bare in-thread reply may not reach Cora (Path-2 delivery, F-19),
         # so instruct the reliable path -- @mention + confirm -- which pops the
-        # (user, channel) pending entry regardless of thread.
-        f"@mention me and say \"confirm\" and I'll set it."
+        # (user, channel) pending entry regardless of thread. v2 S4 generalises
+        # this (already-correct) wording to every kind via _confirm_how, which
+        # also makes it DM-correct and drops the button clause when buttons are off.
+        f"{_confirm_how(channel, capitalize=True)} and I'll set it."
     )
 
 
@@ -4514,7 +4539,7 @@ def _store_and_preview_shopify(slack_user_id: str, channel: str, data: dict,
     return _shopify_write_blocked(_shopify_preview_text(
         variant_label=match.label, location_name=data["loc_name"],
         current=data["current"], quantity=data["quantity"], moved_from=moved_from, unit=unit,
-        resolved_from=data.get("resolved_from") or ""))
+        resolved_from=data.get("resolved_from") or "", channel=channel))
 
 
 # ── Company-lexicon teach tool (Lexicon Flywheel S6; F-23 parity) ─────────────
@@ -4696,7 +4721,7 @@ def _tool_cora_lexicon_add(slack_user_id: str, entity: str, input_data: dict) ->
     return (f"NOT SAVED yet. Adding to the {target_entity} lexicon: \"{term}\" = "
             f"{meaning} [{etype}]{canon_note}"
             + (f" (aliases: {', '.join(aliases)})" if aliases else "")
-            + f". @mention me and say \"confirm\" and {gate_note}.")
+            + f". {_confirm_how(channel, capitalize=True)} and {gate_note}.")
 
 
 def _log_lexicon_confirmed(lex: dict | None, slack_user_id: str, channel: str) -> None:
@@ -4789,7 +4814,7 @@ def _shopify_execute_pending(slack_user_id: str, channel: str, pending: dict) ->
         return _shopify_write_blocked(_shopify_preview_text(
             variant_label=variant_label, location_name=loc_name,
             current=live, quantity=target, moved_from=preview_qty, unit=unit,
-            resolved_from=pending.get("resolved_from") or "")), fresh_id
+            resolved_from=pending.get("resolved_from") or "", channel=channel)), fresh_id
 
     # Belt-and-suspenders (Slice 1): resolve/re-preview already guard every absolute
     # stash path, so this should never fire -- but never WRITE an absurd absolute even
@@ -4861,7 +4886,7 @@ def _repreview_pending_new_target(slack_user_id: str, channel: str, pending: dic
              slack_user_id, item_id, loc_id, live, new_qty)
     return _shopify_write_blocked(_shopify_preview_text(
         variant_label=variant_label, location_name=loc_name, current=live, quantity=new_qty, unit=unit,
-        resolved_from=pending.get("resolved_from") or ""))
+        resolved_from=pending.get("resolved_from") or "", channel=channel))
 
 
 def _short_block_reason(blocked: str) -> str:
@@ -4871,7 +4896,8 @@ def _short_block_reason(blocked: str) -> str:
     return (tail.split("\n", 1)[0].strip() or "couldn't resolve").rstrip(".")
 
 
-def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: bool = False) -> str:
+def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: bool = False,
+                               channel: str = "") -> str:
     """Source-opaque NOT-WRITTEN preview for a BULK request: one line per resolved
     row + an explicit skipped list (never silently dropped). Inner text only -- the
     caller wraps it via _shopify_write_blocked."""
@@ -4889,7 +4915,7 @@ def _shopify_bulk_preview_text(rows: list[dict], skipped: list[dict], *, moved: 
         lines.append(f"Skipped ({len(skipped)}, NOT applied):")
         for sk in skipped:
             lines.append(f"  - {sk['product']}: {sk['reason']}")
-    lines.append('@mention me and say "confirm" and I\'ll set them all.')
+    lines.append(f"{_confirm_how(channel, capitalize=True)} and I'll set them all.")
     return "\n".join(lines)
 
 
@@ -4988,7 +5014,7 @@ def _resolve_and_preview_batch(slack_user_id: str, channel: str, items: list) ->
                                   "stash_id": confirm_cards.mint_stash_id("shopify", slack_user_id, channel)})
     log.info("f3e_shopify_set_inventory BATCH PREVIEW user=%s rows=%d skipped=%d",
              slack_user_id, len(resolved), len(skipped))
-    return _shopify_write_blocked(_shopify_bulk_preview_text(resolved, skipped))
+    return _shopify_write_blocked(_shopify_bulk_preview_text(resolved, skipped, channel=channel))
 
 
 def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: dict) -> tuple[str, str | None]:
@@ -5049,7 +5075,8 @@ def _shopify_execute_pending_batch(slack_user_id: str, channel: str, pending: di
             _take_pending_shopify_write(slack_user_id, channel)  # nothing valid left -> clear
         log.info("f3e_shopify_set_inventory BATCH re-preview user=%s valid=%d invalid=%d drift=%s",
                  slack_user_id, len(refreshed), len(invalid), drift)
-        return _shopify_write_blocked(_shopify_bulk_preview_text(refreshed, invalid, moved=True)), fresh_id
+        return _shopify_write_blocked(
+            _shopify_bulk_preview_text(refreshed, invalid, moved=True, channel=channel)), fresh_id
 
     # All rows stable + valid -> write every row.
     ok_lines: list[str] = []
@@ -6621,7 +6648,7 @@ def _tool_cora_forget_note(slack_user_id: str, entity: str, _input: dict) -> str
     })
     excerpt_note = f' ("{excerpt}...")' if excerpt else ""
     return _write_blocked_contract(
-        f"Not deleted yet -- reply to confirm and I'll delete that note{excerpt_note}. "
+        f"Not deleted yet -- {_confirm_how(channel)} and I'll delete that note{excerpt_note}. "
         "Nothing is deleted until you confirm."
     )
 
@@ -10374,8 +10401,9 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
         "stash_id": confirm_cards.mint_stash_id("code_queue", slack_user_id, channel),
     })
     return _write_blocked_contract(
-        f'Queueing to the code-session queue: "{request[:200]}". Reply to confirm and '
-        "I'll file it. Nothing is filed until you confirm."
+        f'Queueing to the code-session queue: "{request[:200]}". '
+        f"{_confirm_how(channel, capitalize=True)} and I'll file it. "
+        "Nothing is filed until you confirm."
     )
 
 
@@ -10508,7 +10536,7 @@ def has_pending_code_queue(slack_user: str, channel: str) -> bool:
     return _peek_pending_code_queue(slack_user, channel) is not None
 
 
-def _delegated_preview_text(entry: dict, quota_line: str) -> str:
+def _delegated_preview_text(entry: dict, quota_line: str, channel: str = "") -> str:
     """Render the WRITE_BLOCKED preview. The brief is rendered VERBATIM so any
     drift between what the user said and what will run is visible (design 3)."""
     from cora import delegated_work
@@ -10520,7 +10548,8 @@ def _delegated_preview_text(entry: dict, quota_line: str) -> str:
         f"Brief (runs verbatim):\n> {entry['brief']}\n\n"
         f"{quota_line} Cost: capped at ${delegated_work.job_usd_cap():.2f}/job. "
         "Turnaround: async -- the runner picks jobs up about every 15 minutes.\n\n"
-        "Reply to confirm and I'll queue it. Nothing runs until you confirm."
+        f"{_confirm_how(channel, capitalize=True)} and I'll queue it. "
+        "Nothing runs until you confirm."
     )
 
 
@@ -10626,7 +10655,7 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
     remaining = delegated_work.quota_remaining(slack_user_id)
     quota_line = (f"Quota: {remaining} of {delegated_work.user_daily_quota()} "
                   "jobs left today.")
-    preview = _delegated_preview_text(entry, quota_line)
+    preview = _delegated_preview_text(entry, quota_line, channel)
     if delegated_work.delegated_level() == "log":
         preview += ("\n(TRIAL MODE: confirmed jobs are recorded for validation "
                     "but not executed yet.)")
