@@ -5436,6 +5436,7 @@ def _run_confirm_execute(
 
 def try_confirm_pending_write(
     *, slack_user_id: str, channel_name: str, entity: str, message: str,
+    turn_started_at: float | None = None,
 ) -> str | None:
     """Deterministic pre-model confirm/cancel of a staged write (F-23). Returns the
     user-facing reply string to post, or None to fall through to the model.
@@ -5461,7 +5462,25 @@ def try_confirm_pending_write(
     types a bare affirmative in thread B as their very next message could still confirm a
     thread-A pending -- the pending key is (user, channel), not per-thread. Mitigated by
     F-19 (a bare in-thread channel reply may not even reach the app); the exercisable
-    surfaces today are DMs + @mention confirms. Thread anchoring is a follow-up."""
+    surfaces today are DMs + @mention confirms. Thread anchoring is a follow-up.
+
+    `turn_started_at` (v2 S1, cq-db3b28dcdd42) is this turn's own start time. Any
+    pending whose ts is NEWER than that was minted by a CONCURRENT turn still in
+    flight -- it cannot be what this message is answering, because this
+    interceptor runs before this turn's model/tool loop has minted anything. Such
+    pendings are excluded from the arbitration AND, critically, from the
+    supersede-abandon below.
+
+    Without that exclusion, three staged-write asks seconds apart in one channel
+    lost one of them outright (live 8/3, the asana+shopify+calendar trio): turn 3
+    peeked, found turn 2's fresher Shopify pending on top, took Case 2's
+    "a fresher write superseded the stale destructive Asana pending" branch, and
+    popped turn 1's Asana delete -- which was not stale at all, it was still
+    mid-flight and had not yet reached its own reply. That turn then rendered no
+    card (its stash had been destroyed before freshest_changed_stash could see
+    it) and a later typed confirm found nothing pending: the "no reply, no stash,
+    no card, no error" symptom. Defaults to None (no filtering) so every existing
+    single-turn caller and test is byte-identical."""
     # Read-only harness / catch-up reconstruction (CORA_EVAL_MODE=1) must never fire a
     # staged write. This matches the belt-and-braces gate in dispatch(): the confirm
     # interceptor is a real-write path that does NOT route through dispatch(), so it
@@ -5479,12 +5498,21 @@ def try_confirm_pending_write(
     # token can itself contain "?", but a real gap if that ever changes).
     # _confirm_intent's own strip becomes a harmless no-op on already-clean text.
     message = _strip_connector_noise(message)
-    asana = _peek_pending_asana(slack_user_id, channel_name)
-    shopify = _peek_pending_shopify(slack_user_id, channel_name)
-    calendar = _peek_pending_calendar(slack_user_id, channel_name)
-    lexadd = _peek_pending_lexicon(slack_user_id, channel_name)
-    delegated = _peek_pending_delegated(slack_user_id, channel_name)
-    codequeue = _peek_pending_code_queue(slack_user_id, channel_name)
+    def _mine(entry: dict | None) -> dict | None:
+        """Drop a pending minted by a CONCURRENT turn (ts newer than this turn's
+        start). Returning None here keeps such an entry out of BOTH the
+        freshest-first arbitration and the supersede-abandon -- another turn owns
+        it and is still on its way to previewing it."""
+        if entry is None or turn_started_at is None:
+            return entry
+        return None if float(entry.get("ts", 0)) > turn_started_at else entry
+
+    asana = _mine(_peek_pending_asana(slack_user_id, channel_name))
+    shopify = _mine(_peek_pending_shopify(slack_user_id, channel_name))
+    calendar = _mine(_peek_pending_calendar(slack_user_id, channel_name))
+    lexadd = _mine(_peek_pending_lexicon(slack_user_id, channel_name))
+    delegated = _mine(_peek_pending_delegated(slack_user_id, channel_name))
+    codequeue = _mine(_peek_pending_code_queue(slack_user_id, channel_name))
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -10679,6 +10707,38 @@ def freshest_changed_stash(before: dict, slack_user_id: str, channel_name: str) 
 
     k = max(owned, key=_ts_for)
     return k, after[k]
+
+
+def stash_is_live(stash_id: str) -> bool:
+    """True iff `stash_id` is STILL the current, un-expired entry in its own
+    kind's pending store (or ask store, for a picker's ask_id).
+
+    The read side of the v2 S1 card-closing sweep: app.py renders a card, then
+    after every reply asks this about each still-open card. False means the
+    stash reached a terminal state by ANY route -- the typed/model confirm
+    consumed it, a cancel popped it, a fresher preview of the same kind
+    superseded it, the TTL expired, or a button tap claimed it -- and the card's
+    buttons must come down. Deliberately a single pull-based predicate rather
+    than a note-on-consumption hook at each of the 9 stores' claim sites: every
+    terminal route ends in the same observable state (this id is no longer the
+    live entry), so one check covers routes that do not exist yet as well.
+
+    Fail-closed in the useful direction: an unknown id is NOT live, so the worst
+    case is closing a card whose stash is already unreachable anyway."""
+    if not stash_id:
+        return False
+    ask_idx = confirm_cards.ask_index_lookup(stash_id)
+    if ask_idx is not None:
+        entry = _peek_pending_ask(ask_idx["user"], ask_idx["channel"])
+        return bool(entry) and entry.get("ask_id") == stash_id
+    idx = confirm_cards.index_lookup(stash_id)
+    if idx is None or idx.get("resolved"):
+        return False
+    spec = _stash_kind_specs().get(idx.get("kind"))
+    if spec is None:
+        return False
+    entry = spec["peek"](idx["user"], idx["channel"])
+    return bool(entry) and entry.get("stash_id") == stash_id
 
 
 def _claim_stash_by_id(kind: str, user: str, channel: str, stash_id: str) -> tuple[str, dict | None]:

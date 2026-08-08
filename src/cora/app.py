@@ -825,9 +825,18 @@ def _dispatch_qa(
     # their snapshot/diff windows overlap (same (user, channel), overlapping
     # @mentions).
     confirm_cards.begin_turn()
+    # Wall-clock (not monotonic) on purpose: every pending store stamps its
+    # entries with time.time(), and the interceptor compares against those.
+    _turn_started_at = time.time()
     _confirm_before_snapshot = (
         _tool_dispatch.snapshot_stash_ids(user_id, channel_name) if user_id else {}
     )
+
+    # v2 S1: the stash_id this turn's reply actually got carded with (if any),
+    # so the post site can register WHERE the card landed once the post
+    # succeeds. A one-element holder rather than a nonlocal because the reply
+    # sites live in sibling scopes.
+    _carded: dict[str, str] = {}
 
     def _confirm_card_for_reply(text: str) -> list[dict] | None:
         if not user_id or not text or not confirm_cards.confirm_buttons_enabled():
@@ -837,6 +846,15 @@ def _dispatch_qa(
         if changed is None:
             return None
         kind, cid = changed
+        # v2 S1 (cq-fee6c9764950): one stash gets at most ONE live card. The
+        # claim is atomic and one-shot, so a second attach attempt for the same
+        # stash -- from a retry, a concurrent turn that raced onto the same id,
+        # or a future reply site -- degrades to a plain text reply instead of
+        # posting a duplicate apparently-actionable copy. The typed confirm
+        # path still works for that reply, so nothing is lost.
+        if not confirm_cards.claim_card_attach(cid):
+            log.info("confirm_card attach REFUSED (already carded) stash=%s kind=%s", cid, kind)
+            return None
         if kind == "ask":
             ask_entry = _tool_dispatch.get_pending_ask(user_id, channel_name)
             if not ask_entry or ask_entry.get("ask_id") != cid:
@@ -844,8 +862,37 @@ def _dispatch_qa(
             candidates = [(key, label) for key, label, _value in ask_entry.get("candidates", [])]
             if not candidates:
                 return None
+            _carded["id"] = cid
+            _carded["text"] = text
+            log.info("confirm_card attached kind=ask stash=%s channel=#%s user=%s",
+                     cid, channel_name, user_id)
             return confirm_cards.build_picker_blocks(text, cid, candidates)
+        _carded["id"] = cid
+        _carded["text"] = text
+        log.info("confirm_card attached kind=%s stash=%s channel=#%s user=%s",
+                 kind, cid, channel_name, user_id)
         return confirm_cards.build_confirm_blocks(text, cid)
+
+    def _register_posted_card(channel, message_ts) -> None:
+        """Record where this turn's card landed, so a later terminal state can
+        take its buttons down (v2 S1). No-op when nothing was carded.
+
+        Both args come straight off a Slack API response, so they are validated
+        as real strings here rather than trusted: a test double (or a Slack
+        response shape change) must never register a junk coordinate that a
+        later sweep would then try to chat_update."""
+        cid = _carded.get("id")
+        if not cid or not isinstance(message_ts, str) or not message_ts:
+            return
+        ch = channel if isinstance(channel, str) and channel else channel_id
+        confirm_cards.register_card(cid, ch, message_ts, _carded.get("text", ""))
+
+    def _post_reply_card_sweep() -> None:
+        """Close any rendered card whose stash went terminal -- including THIS
+        turn's own typed/model confirm, cancel, or supersede (v2 S1). Runs after
+        the reply is posted so a card minted THIS turn (still live) is untouched
+        while a card the turn just consumed comes down immediately."""
+        _close_stale_confirm_cards(client)
 
     # ── Deterministic staged-write confirm interceptor (F-23, 2026-07-12) ──────
     # A fresh pending Asana/Shopify write for this (user, channel) + a clear bare
@@ -879,15 +926,17 @@ def _dispatch_qa(
     if user_id:
         confirm_reply = _tool_dispatch.try_confirm_pending_write(
             slack_user_id=user_id, channel_name=channel_name, entity=entity,
-            message=user_message,
+            message=user_message, turn_started_at=_turn_started_at,
         )
         if confirm_reply is not None:
             log.info(
                 "confirm_interceptor served channel=#%s user=%s", channel_name, user_id,
             )
             guarded_reply = _guard_content(confirm_reply)
-            say(text=guarded_reply, blocks=_confirm_card_for_reply(guarded_reply),
-                thread_ts=reply_thread_ts, unfurl_links=False, unfurl_media=False)
+            _resp = say(text=guarded_reply, blocks=_confirm_card_for_reply(guarded_reply),
+                        thread_ts=reply_thread_ts, unfurl_links=False, unfurl_media=False)
+            _register_posted_card((_resp or {}).get("channel", ""), (_resp or {}).get("ts", ""))
+            _post_reply_card_sweep()
             active_thread_store.register(channel_id, register_ts)
             return
 
@@ -1376,13 +1425,15 @@ def _dispatch_qa(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
         )
-        say(
+        _resp = say(
             text=response_text,
             blocks=_confirm_card_for_reply(response_text),
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
         )
+        _register_posted_card((_resp or {}).get("channel", ""), (_resp or {}).get("ts", ""))
+        _post_reply_card_sweep()
         active_thread_store.register(channel_id, register_ts)
         return
 
@@ -1509,18 +1560,21 @@ def _dispatch_qa(
             text=response_text,
             blocks=confirm_blocks,
         )
+        _register_posted_card(placeholder_channel, placeholder_ts)
     except Exception as exc:  # noqa: BLE001
         log.error(
             "Final chat_update failed for ts=%s: %s — sending fresh reply as fallback",
             placeholder_ts, exc,
         )
-        say(
+        _resp = say(
             text=response_text,
             blocks=confirm_blocks,
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
         )
+        _register_posted_card((_resp or {}).get("channel", ""), (_resp or {}).get("ts", ""))
+    _post_reply_card_sweep()
 
     # Register AFTER the response is confirmed posted so only successful
     # interactions activate the thread follow-up window.
@@ -3728,12 +3782,64 @@ def _post_followup_confirm_card(client, channel_id: str, text: str, stash_id: st
     the picker's pick -> preview hand-off AND a confirm-tap whose own execute
     declined to write and re-stashed a fresh preview instead (D-051 review:
     both cases need the SAME "a fresh stash appeared, give it a card" step)."""
-    blocks = confirm_cards.build_confirm_blocks(text, stash_id)
+    # v2 S1: same one-card-per-stash claim the reply sites use. A refused claim
+    # means something already carded this stash; post the text without buttons
+    # rather than a second live copy.
+    carded = confirm_cards.claim_card_attach(stash_id)
+    blocks = confirm_cards.build_confirm_blocks(text, stash_id) if carded else None
     try:
-        client.chat_postMessage(channel=channel_id, text=text, blocks=blocks)
+        resp = client.chat_postMessage(channel=channel_id, text=text, blocks=blocks)
+        if carded:
+            confirm_cards.register_card(stash_id, channel_id, (resp or {}).get("ts", ""), text)
     except Exception:  # noqa: BLE001
         log.warning("confirm-button follow-up card post failed (non-fatal) channel=%s",
                     channel_id, exc_info=True)
+
+
+# Neutral, honest terminal line for a card closed by the sweep rather than by a
+# tap. The sweep only knows THAT the stash left its store, never by which route
+# (typed confirm, typed cancel, supersede, expiry all look identical from here),
+# so the copy must not claim an outcome it cannot see. The reply that actually
+# handled it is already in the conversation directly above.
+_CARD_CLOSED_BY_SWEEP = (
+    "_Handled in the conversation -- these buttons are closed._"
+)
+
+
+def _close_stale_confirm_cards(client) -> None:
+    """Take the buttons down on every rendered card whose stash is no longer
+    live (v2 S1, cq-fee6c9764950).
+
+    v1 could only close a card from a tap on that same card, so a user who
+    TYPED "confirm"/"cancel" -- or whose next request superseded the pending --
+    was left looking at live-looking Confirm/Cancel buttons over a stash that no
+    longer existed. Called after every reply post and after every tap, so a
+    stash consumed by ANY route has its card closed within the same turn.
+
+    Best-effort throughout: a failed edit just leaves that card visually stale,
+    and tapping it still resolves honestly through resolve_and_claim_stash."""
+    if not confirm_cards.confirm_buttons_enabled():
+        return
+    try:
+        open_ids = confirm_cards.open_card_stash_ids()
+    except Exception:  # noqa: BLE001
+        return
+    for sid in open_ids:
+        try:
+            if _tool_dispatch.stash_is_live(sid):
+                continue
+            # pop_cards hands each coordinate over exactly once, so two racing
+            # sweeps can never both chat_update the same message.
+            for card_channel, card_ts, preview in confirm_cards.pop_cards(sid):
+                preview_blocks = (
+                    [{"type": "section", "text": {"type": "mrkdwn", "text": preview}}]
+                    if preview else []
+                )
+                _edit_card_terminal(client, card_channel, card_ts, preview_blocks,
+                                    _CARD_CLOSED_BY_SWEEP)
+                log.info("confirm_card closed by sweep stash=%s channel=%s", sid, card_channel)
+        except Exception:  # noqa: BLE001 -- card hygiene must never break a reply
+            log.warning("confirm-card sweep error stash=%s (non-fatal)", sid, exc_info=True)
 
 
 def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
@@ -3833,10 +3939,12 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
         # resolve_and_claim_stash), so it can never race another edit of the
         # SAME message_ts.
         text = result.get("message") or "The count moved -- here's an updated preview."
+        confirm_cards.pop_cards(stash_id)  # this tap owns the outcome text; keep the sweep off it
         _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
         fresh_stash_id = result.get("stash_id")
         if fresh_stash_id:
             _post_followup_confirm_card(client, channel_id, text, fresh_stash_id)
+        _close_stale_confirm_cards(client)
         return
 
     if outcome == "superseded":
@@ -3861,7 +3969,14 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     # one caller ever reaches "claimed" for a given stash_id (the lock inside
     # _claim_stash_by_id), so none of these can race another edit of the SAME
     # message_ts. already_handled is handled above and never reaches here.
+    #
+    # Discard this stash's registered coordinates FIRST (v2 S1): the tap writes
+    # the real outcome ("Done: ..."), and the generic sweep below must never
+    # come along afterwards and overwrite it with its vaguer "handled in the
+    # conversation" line.
+    confirm_cards.pop_cards(stash_id)
     _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
+    _close_stale_confirm_cards(client)
 
 
 @app.action(confirm_cards.ACTION_CONFIRM)
@@ -3944,14 +4059,17 @@ def _handle_pick_tap(body: dict, client) -> None:
         # Only reachable AFTER this caller's OWN atomic claim already
         # succeeded (unique per ask_id) -- cannot race another edit of the
         # SAME message_ts, so a direct card edit is safe here.
+        confirm_cards.pop_cards(ask_id)  # this tap owns the outcome text (v2 S1)
         _edit_card_terminal(client, channel_id, message_ts, orig_blocks,
                             "That option didn't resolve cleanly -- restate the item and I'll ask again.")
+        _close_stale_confirm_cards(client)
         return
 
     # outcome == "preview": close the picker card, then post the fresh
     # preview as ITS OWN Confirm/Cancel card (pick -> preview -> confirm). A
     # refusal from the resolution tail (e.g. "not stocked here anymore") has
     # no stash_id -- nothing to confirm -- so it posts as plain text instead.
+    confirm_cards.pop_cards(ask_id)  # this tap owns the outcome text (v2 S1)
     _edit_card_terminal(client, channel_id, message_ts, orig_blocks, "Picked.")
     clean_text = message or ""
     if stash_id:
@@ -3962,6 +4080,7 @@ def _handle_pick_tap(body: dict, client) -> None:
         except Exception:  # noqa: BLE001
             log.warning("picker follow-up text post failed (non-fatal) channel=%s",
                         channel_id, exc_info=True)
+    _close_stale_confirm_cards(client)
 
 
 @app.action(confirm_cards.ACTION_PICK)

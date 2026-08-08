@@ -148,6 +148,97 @@ def index_mark_resolved(stash_id: str) -> None:
             entry["resolved"] = True
 
 
+# ── Rendered-card registry (v2 S1) ─────────────────────────────────────────
+# v1 knew how to mint and index a stash_id, but never recorded WHERE a card for
+# it was actually rendered. Two live consequences (cq-fee6c9764950):
+#
+#   1. The TYPED path (a "confirm"/"cancel" the model routes to the tool with
+#      confirmed=true, or the deterministic interceptor) consumes the per-kind
+#      store entry and never touches this module at all -- so the already-posted
+#      card kept LIVE Confirm/Cancel buttons on a stash that no longer exists.
+#      Tapping them was honest ("already handled"), but the card visibly lied.
+#   2. Nothing stopped the same stash_id from being rendered as a SECOND live
+#      card, so one pending write could show two apparently-actionable copies.
+#
+# Fixed here by making "a card exists for this stash" first-class state:
+#   * claim_card_attach() is an atomic one-shot -- the SECOND attempt to card a
+#     given stash_id is refused, so one stash can never have two live cards no
+#     matter which reply site (or how many concurrent turns) tries;
+#   * register_card() records (channel, message_ts, preview_text) after the post
+#     succeeds, so a closer can rebuild the card's terminal blocks WITHOUT
+#     re-fetching the message;
+#   * pop_cards() hands the coordinates over exactly once, so two racing closers
+#     cannot both chat_update the same message (the same "never order two
+#     independent HTTP calls" constraint the terminal-edit note below describes).
+#
+# Entries age out on the same INDEX_GRACE_SECONDS prune as the stash index.
+_CARD_LOCK = Lock()
+# stash_id -> {"attached": bool, "cards": [(channel_id, message_ts, preview_text)], "ts": float}
+_CARDS: dict[str, dict] = {}
+
+
+def _prune_cards_locked() -> None:
+    now = time.time()
+    dead = [k for k, e in _CARDS.items() if now - e.get("ts", 0) > INDEX_GRACE_SECONDS]
+    for k in dead:
+        _CARDS.pop(k, None)
+
+
+def claim_card_attach(stash_id: str) -> bool:
+    """Atomically claim the right to render THE card for `stash_id`. True for the
+    first caller, False for every later one -- the caller must fall back to a
+    plain text reply (the typed confirm path still works). One stash, one live
+    card, by construction."""
+    if not stash_id:
+        return False
+    with _CARD_LOCK:
+        _prune_cards_locked()
+        entry = _CARDS.get(stash_id)
+        if entry is not None and entry.get("attached"):
+            return False
+        _CARDS[stash_id] = {"attached": True, "cards": [], "ts": time.time()}
+    return True
+
+
+def register_card(stash_id: str, channel_id: str, message_ts: str, preview_text: str) -> None:
+    """Record where a card for `stash_id` actually landed, once the post/update
+    that carries it has succeeded. Best-effort: an unregistered card simply
+    cannot be auto-closed later (it still resolves honestly when tapped)."""
+    if not stash_id or not channel_id or not message_ts:
+        return
+    with _CARD_LOCK:
+        entry = _CARDS.setdefault(
+            stash_id, {"attached": True, "cards": [], "ts": time.time()})
+        coords = (channel_id, message_ts, preview_text or "")
+        if coords not in entry["cards"]:
+            entry["cards"].append(coords)
+
+
+def pop_cards(stash_id: str) -> list[tuple[str, str, str]]:
+    """Take (and clear) every rendered-card coordinate for `stash_id`. The
+    'attached' claim deliberately SURVIVES the pop, so a closed card can never
+    be silently replaced by a second live one for the same stash."""
+    with _CARD_LOCK:
+        entry = _CARDS.get(stash_id)
+        if not entry:
+            return []
+        cards = list(entry.get("cards") or [])
+        entry["cards"] = []
+        return cards
+
+
+def open_card_stash_ids() -> list[str]:
+    """Every stash_id that still has at least one rendered, un-closed card."""
+    with _CARD_LOCK:
+        _prune_cards_locked()
+        return [k for k, e in _CARDS.items() if e.get("cards")]
+
+
+def reset_cards_for_tests() -> None:
+    with _CARD_LOCK:
+        _CARDS.clear()
+
+
 def mint_ask_id(user: str, channel: str) -> str:
     with _ASK_INDEX_LOCK:
         _prune_locked(_ASK_INDEX)
