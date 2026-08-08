@@ -606,6 +606,37 @@ def get_task_completion(task_gid: str) -> dict[str, Any]:
     }
 
 
+def get_task_name(task_gid: str) -> str | None:
+    """Fetch a task's name, or None if it cannot be read (v2 S8,
+    cq-8e2771423833).
+
+    The unrestricted branch of _resolve_asker_task (the portfolio founder, and
+    any FNDR/HJRG channel) deliberately skips the ownership lookup that every
+    other caller uses to learn a task's name -- so a gid-only reference had no
+    name to show and the confirm preview echoed the raw gid back at the user
+    ('mark "1215070431336670" complete'), which is unreviewable: the whole point
+    of the preview is that the user can see WHAT they are about to change.
+
+    Fail-soft by contract (returns None rather than raising): a name is
+    presentation only, and losing it must never block a write the caller is
+    otherwise authorized to make."""
+    if not task_gid or not task_gid.strip():
+        return None
+    headers = {"Authorization": f"Bearer {_pat()}"}
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.get(
+                f"{_BASE}/tasks/{task_gid.strip()}",
+                params={"opt_fields": "name"},
+                headers=headers,
+            )
+        if r.status_code != 200:
+            return None
+        return ((r.json().get("data") or {}).get("name") or "").strip() or None
+    except Exception:  # noqa: BLE001 -- presentation only, never block the write
+        return None
+
+
 def find_recent_duplicate_task(name: str, within_days: int = 7) -> str | None:
     """Return the GID of an existing OPEN task with the same name created recently.
 

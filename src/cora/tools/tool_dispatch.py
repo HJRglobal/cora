@@ -1123,7 +1123,19 @@ def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entit
 
     if task_gid:
         if unrestricted:
-            return task_gid, (task_name or task_gid).strip(), None
+            # v2 S8 (cq-8e2771423833): this branch skips the ownership lookup by
+            # design (cross-entity authority), which also means it never learned
+            # the task's NAME -- so a gid-only ask previewed the raw gid back at
+            # the user, which is not reviewable. Resolve the name for display
+            # only; fail-soft to the gid so a lookup failure can never block a
+            # write this asker is already authorized to make.
+            label = (task_name or "").strip()
+            if not label:
+                try:
+                    label = asana_client.get_task_name(task_gid) or ""
+                except Exception:  # noqa: BLE001 -- presentation only
+                    label = ""
+            return task_gid, (label or task_gid).strip(), None
         if not agid:
             return None, None, (
                 "I can't verify that task is yours -- your Slack->Asana mapping is "
