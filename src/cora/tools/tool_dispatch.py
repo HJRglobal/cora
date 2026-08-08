@@ -5380,10 +5380,28 @@ _CONFIRM_SENT_USING_RE = re.compile(r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*
 
 
 def _strip_connector_noise(message: str) -> str:
-    """Strip the Cowork 'Sent using <@user>' footer + any Slack mention tokens
-    before confirm-intent classification."""
+    """Strip the Cowork 'Sent using <@user>' footer, any Slack mention tokens,
+    and a leading [QA] smoke marker before confirm-intent classification.
+
+    HOTFIX 2026-08-08: the [QA] marker (D-104 quarantine tag) made
+    _confirm_intent return None for EVERY smoke of the typed path -- "qa"
+    tokenizes as a content word, and one content word is enough to disqualify a
+    bare confirm by construction. The v2 cascade's own section-F battery is
+    specified as "[QA]-tagged", so the protocol used to verify this path was
+    guaranteed to fail it: three of the five live typed turns on 2026-08-08 were
+    "[QA] cancel". Stripped here rather than added to the filler vocabulary so
+    the marker cannot be smuggled mid-sentence to soften an otherwise
+    disqualifying message."""
     t = _CONFIRM_SENT_USING_RE.sub("", message or "")
-    return _CONFIRM_MENTION_RE.sub(" ", t)
+    t = _CONFIRM_MENTION_RE.sub(" ", t)
+    return _QA_SMOKE_PREFIX_RE.sub("", t, count=1)
+
+
+# Leading [QA] marker only (optionally behind mention tokens the line above has
+# already blanked, and behind simple Slack emphasis). Mirrors
+# qa_scaffolding._QA_PREFIX_RE; duplicated as a local constant so this
+# confirm-path helper takes no new import.
+_QA_SMOKE_PREFIX_RE = re.compile(r"^\s*(?:[*_~`>\s]+)?\[qa\]\s*", re.IGNORECASE)
 
 
 def _confirm_intent(message: str, pending_action: str | None) -> str | None:
@@ -5560,6 +5578,80 @@ def _run_confirm_execute(
     log.info("confirm_interceptor EXECUTE user=%s kind=%s action=%s",
              slack_user_id, kind, action)
     return _strip_write_sentinel(raw)
+
+
+_PENDING_KIND_LABELS = {
+    "asana": "an Asana task change",
+    "shopify": "an inventory change",
+    "calendar": "a calendar event",
+    "lexicon": "a lexicon entry",
+    "code_queue": "a code-queue capture",
+    "delegated": "a delegated-work job",
+    "remember": "a personal note",
+    "forget_note": "a note deletion",
+    "schedule_meeting": "a meeting booking",
+}
+
+
+def describe_live_pendings(slack_user: str, channel: str) -> str:
+    """One terse line naming what this (user, channel) currently has staged, or
+    "" when nothing is (cq-24cc6ac4bbc8, HOTFIX 2026-08-08).
+
+    The deterministic interceptor deliberately DEFERS several kinds to the model
+    (it has no executor for them), and on those turns the model had no way to
+    know a write was staged -- so it confidently narrated "nothing is staged /
+    no action needed" while three previews sat armed and confirmable (live
+    2026-08-08 16:03-16:07). Deferring is correct; leaving the model blind while
+    deferring is not. This is FACTUAL context only: it names kinds, never
+    payloads, and it authorizes nothing -- every write still goes through the
+    tool's own confirmed=true path or a button tap."""
+    live = []
+    for kind in _stash_kind_specs():
+        entry = _peek_kind(kind, slack_user, channel)
+        if entry:
+            live.append((float(entry.get("ts", 0)), kind))
+    if not live:
+        return ""
+    live.sort(reverse=True)
+    names = [_PENDING_KIND_LABELS.get(k, k) for _ts, k in live]
+    listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+    return (
+        f"STAGED WRITES AWAITING CONFIRMATION: this person currently has {listed} "
+        f"staged and unconfirmed (newest first: {names[0]}). NEVER tell them nothing "
+        f"is staged or that no action is needed. If their message confirms one, call "
+        f"that tool again with confirmed=true; if it is unclear which they mean, ask "
+        f"which one, or point them at the Confirm button on the preview."
+    )
+
+
+def _peek_kind(kind: str, slack_user: str, channel: str) -> dict | None:
+    spec = _stash_kind_specs().get(kind)
+    return spec["peek"](slack_user, channel) if spec else None
+
+
+def _claim_deferred_kind(kind: str, slack_user: str, channel: str) -> dict | None:
+    """Pop a DEFER-kind's pending so a typed cancel can dismiss it (HOTFIX
+    2026-08-08). Uses each kind's OWN store/lock/TTL through the shared spec
+    table, so this is the same atomic take the kind's tool performs -- no new
+    lock, no second code path, and a kind added to _stash_kind_specs later is
+    cancellable here by construction.
+
+    Returns the popped entry, or None if nothing was there (a race with a tap or
+    the kind's own tool); the caller must then fall through rather than claim a
+    cancellation that did not happen."""
+    spec = _stash_kind_specs().get(kind)
+    if spec is None:
+        return None
+    with spec["lock"]:
+        entry = spec["store"].pop(spec["key"](slack_user, channel), None)
+    if not entry:
+        return None
+    sid = entry.get("stash_id")
+    if sid:
+        # Keep the button card honest: a tap on it afterwards must read
+        # "already handled", not re-offer a pending this cancel just removed.
+        confirm_cards.index_mark_resolved(sid)
+    return entry
 
 
 def try_confirm_pending_write(
@@ -5813,6 +5905,25 @@ def try_confirm_pending_write(
         # this arbitration -- so their confirm turn's bare "yes" was free to fire
         # somebody else's staler write. Each defers; the Sonnet-force chain in
         # app.py covers all three so the model reliably reaches the tool.
+        #
+        # HOTFIX 2026-08-08: deferral applies to an AFFIRM only. Deferring exists
+        # because this function has no executor for these kinds, so a "yes" must
+        # reach the kind's own tool -- but a CANCEL needs no executor at all: it
+        # is just popping the pending, which this function can always do. Blanket
+        # deferral made every typed cancel a silent no-op whenever a defer-kind
+        # happened to be freshest, which is what the live 16:03-16:05 smoke hit
+        # (a calendar preview was newest, so "cancel" x4 fell through to the
+        # model and three staged writes stayed armed while it narrated "nothing
+        # is staged"). Freshest-first is the same rule a confirm uses, and a
+        # cancel is non-destructive, so acting on it is strictly safer than the
+        # silent fall-through it replaces.
+        intent = _confirm_intent(message, None)
+        if intent == "negate":
+            claimed = _claim_deferred_kind(kind, slack_user_id, channel_name)
+            log.info("confirm_interceptor CANCEL user=%s kind=%s (deferred-kind)",
+                     slack_user_id, kind)
+            if claimed:
+                return _CONFIRM_CANCELLED_REPLY
         return None
 
     intent = _confirm_intent(message, action)

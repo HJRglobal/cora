@@ -787,6 +787,19 @@ def _dispatch_qa(
     # resolved relative phrases against a stale internal date (the S4 create-path
     # incident). One factual line; rides the uncached runtime block.
     az_today = datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
+    # cq-24cc6ac4bbc8 (HOTFIX 2026-08-08): the deterministic interceptor DEFERS
+    # several stash kinds to the model by design, and on those turns the model
+    # had no way to know a write was staged -- so it narrated "nothing is
+    # staged / no action needed" while three previews sat armed and confirmable
+    # (live 16:03-16:07). Factual, payload-free, authorizes nothing.
+    try:
+        pending_note = (
+            _tool_dispatch.describe_live_pendings(user_id, channel_name) if user_id else ""
+        )
+    except Exception:  # noqa: BLE001 -- context enrichment must never break a reply
+        log.warning("pending-state context probe failed (non-fatal)", exc_info=True)
+        pending_note = ""
+    pending_block = f"\n{pending_note}\n" if pending_note else ""
     runtime_context = (
         f"## Runtime channel context\n\n"
         f"Today's date: {az_today} (America/Phoenix).\n"
@@ -801,7 +814,8 @@ def _dispatch_qa(
         + (f"\n{caller_role_block}\n" if caller_role_block else "")
         + f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
-        f"{historical_access.TIER1_SYNTHESIS_RULE}\n\n"
+        f"{historical_access.TIER1_SYNTHESIS_RULE}\n"
+        f"{pending_block}\n"
         f"---\n\n"
     )
 
