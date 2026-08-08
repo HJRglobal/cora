@@ -240,6 +240,33 @@ class TestPendingStateVisibility:
         assert "describe_live_pendings" in src
         assert "pending_block" in src
 
+    def test_a_pending_bearing_turn_is_never_semantically_cached(self):
+        """The semantic cache is entity-keyed, not user-keyed. A reply generated
+        with pending-state context can name THIS person's staged writes, so
+        storing it would serve one person's staged-write state to the next asker
+        in the same entity -- the same exclusion unstripped_personal gets."""
+        import ast
+        src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        found = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and node.targets
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "cache_storable"
+                    and isinstance(node.value, ast.BoolOp)):
+                names = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+                if "pending_note" in names:
+                    found = True
+        assert found, "cache_storable does not exclude pending-bearing turns"
+
+    def test_the_pending_line_rides_the_uncached_context_block(self):
+        """It must NOT ride `cached_context` (the prompt-cache block 2), which
+        is shared across turns and would bake one turn's state into the cache."""
+        src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        assert "pending_block" not in src.split("cached_context=static_text")[0][-2000:], \
+            "pending_block appears near the cached-context assembly"
+        assert "runtime_context = (" in src
+
 
 class TestDeferredCancelClaimsExactlyOnce:
     """The typed cancel added for defer-kinds must be a real atomic claim."""

@@ -1160,6 +1160,12 @@ def _dispatch_qa(
         retrieval_grant is None
         and not kb_meta.get("unstripped_personal")
         and not phi_custodian
+        # A turn carrying pending-state context can produce a reply that names
+        # THIS person's staged writes ("you have an inventory change staged").
+        # The semantic cache is entity-keyed, not user-keyed, so storing that
+        # would serve one person's staged-write state to the next asker in the
+        # same entity. Same exclusion shape as unstripped_personal (D-043).
+        and not pending_note
     )
     prompt = load_prompt(entity)
     chosen_model = model_router.choose_model(user_message)
