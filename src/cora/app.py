@@ -651,15 +651,20 @@ def _asana_destructive_intent(text: str) -> str | None:
 # question ("do you remember...") or a reminiscing aside never matches -- a
 # miss just leaves the turn on today's model_router pick, same fallback
 # safety as the Asana detector.
+# Optional leading vocative (v2 S3). A DM carries no <@Uxxx> token for
+# _MENTION_RE to strip, so people simply type "Cora, remember ..." -- which is
+# precisely the live cq-67490abe2d86 phrasing the bare ^remember anchor missed.
+# Kept anchored: "remember" mid-sentence still does not count as a command.
+_VOCATIVE = r"(?:(?:hey|hi|ok|okay)\s+)?@?cora\s*[,:]?\s+"
 _REMEMBER_INTENT_RE = re.compile(
-    r"^\s*(?:please\s+)?remember\b"
-    r"|^\s*(?:please\s+)?note\s+that\b"
-    r"|^\s*make\s+a\s+note\b",
+    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?remember\b"
+    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?note\s+that\b"
+    rf"|^\s*(?:{_VOCATIVE})?make\s+a\s+note\b",
     re.IGNORECASE,
 )
 _FORGET_NOTE_INTENT_RE = re.compile(
-    r"^\s*(?:please\s+)?forget\b[^.\n]{0,40}\bnote\b"
-    r"|^\s*(?:please\s+)?(?:delete|remove)\b[^.\n]{0,40}\bnote\b",
+    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?forget\b[^.\n]{{0,40}}\bnote\b"
+    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:delete|remove)\b[^.\n]{{0,40}}\bnote\b",
     re.IGNORECASE,
 )
 
@@ -2351,6 +2356,17 @@ def handle_message_event(event: dict, client) -> None:
             # interrogative top-level DM falls through to the normal Q&A path
             # instead; a genuine answer typed in the ask's OWN thread still
             # always matches (looks_like_question only gates the top-level path).
+            # v2 S3 (cq-67490abe2d86, live 8/3): a clear "remember that X" /
+            # "forget that note" DM is a STAGED-WRITE COMMAND, not an answer to
+            # a pending gap ask -- but it is also not interrogative, so
+            # looks_like_question let the greedy top-level match swallow it.
+            # Live symptom: "Cora, remember the cobalt falcon ..." was filed as
+            # a bogus known-answer proposal and nothing was ever saved to the
+            # user's notes. Same shape and same remedy as the two predicates
+            # beside it: a top-level DM that is plainly something else does not
+            # count as an answer. The THREADED path is untouched -- a genuine
+            # answer typed in the ask's own thread ignores allow_toplevel and
+            # still always matches, even if it happens to contain "remember".
             try:
                 ask = gap_autofill.match_pending_ask(
                     user_id,
@@ -2358,6 +2374,7 @@ def handle_message_event(event: dict, client) -> None:
                     allow_toplevel=(
                         not gap_autofill.is_shift_keyword(text)
                         and not gap_autofill.looks_like_question(text)
+                        and not _remember_or_forget_intent(text)
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — capture must never break DMs
