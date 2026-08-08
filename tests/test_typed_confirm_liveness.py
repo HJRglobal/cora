@@ -238,7 +238,36 @@ class TestPendingStateVisibility:
     def test_the_runtime_context_carries_it(self):
         src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
         assert "describe_live_pendings" in src
-        assert "pending_block" in src
+
+    def test_the_probe_runs_AFTER_the_interceptor(self):
+        """The interceptor mutates this state while still returning None (it
+        abandons a stale destructive Asana pending on a superseding write and on
+        a question), so a probe taken earlier told the model a delete was staged
+        that had just been abandoned."""
+        src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        interceptor_at = src.index("try_confirm_pending_write(")
+        probe_at = src.index("describe_live_pendings(")
+        assert probe_at > interceptor_at, (
+            "the pending-state probe snapshots state the interceptor then mutates")
+
+    def test_the_probe_is_turn_scoped(self):
+        src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        call = src[src.index("describe_live_pendings("):][:200]
+        assert "turn_started_at=_turn_started_at" in call, (
+            "the note must apply the same concurrent-turn exclusion as the arbitration")
+
+    def test_a_concurrent_turns_pending_is_never_advertised(self):
+        """D-051 lens-1 HIGH: advertising it handed the model an imperative to
+        confirm a write for a preview the user has not yet been shown, and the
+        per-kind claims are keyed on (user, channel) with no turn check."""
+        now = time.time()
+        _mint_shopify(now + 30)  # a sibling turn's mint, comfortably past tolerance
+        assert td.describe_live_pendings(USER, CHANNEL, turn_started_at=now) == ""
+
+    def test_this_turns_own_pending_is_still_advertised(self):
+        now = time.time()
+        _mint_shopify(now - 30)
+        assert td.describe_live_pendings(USER, CHANNEL, turn_started_at=now) != ""
 
     def test_a_pending_bearing_turn_is_never_semantically_cached(self):
         """The semantic cache is entity-keyed, not user-keyed. A reply generated
@@ -306,6 +335,50 @@ class TestDeferredCancelClaimsExactlyOnce:
         assert result["outcome"] == "already_handled", (
             "the card must not re-offer a pending a typed cancel removed")
 
+    def test_a_racing_overwrite_is_not_silently_destroyed(self):
+        """D-051 lens-1: the first cut popped whatever was in the slot, so a
+        sibling turn that overwrote it between peek and pop had ITS never-seen
+        preview destroyed while the user was told theirs was cancelled."""
+        now = time.time()
+        mine = _mint_calendar(now - 45)
+        theirs = _mint_calendar(now - 1)  # overwrites the same (user, channel) slot
+        assert mine != theirs
+        claimed = td._claim_deferred_kind("calendar", USER, CHANNEL, mine)
+        assert claimed is None, "claimed a stash id that no longer occupies the slot"
+        assert td.stash_is_live(theirs), "destroyed the sibling turn's preview"
+
+    def test_an_expired_pending_is_not_reported_as_cancelled(self):
+        now = time.time()
+        sid = _mint_calendar(now - (td._CALENDAR_PENDING_TTL_SECONDS + 5))
+        assert td._claim_deferred_kind("calendar", USER, CHANNEL, sid) is None
+
+    def test_the_reply_names_what_was_cancelled(self):
+        now = time.time()
+        _mint_calendar(now - 45)
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHANNEL, entity="FNDR",
+            message="cancel", turn_started_at=now)
+        assert "calendar event" in reply
+        assert "Still staged" not in reply, "nothing else was armed"
+
+    def test_the_reply_names_the_pendings_that_SURVIVE(self):
+        """A cancel pops only the FRESHEST pending, so a blanket "nothing was
+        changed" reads as "everything is clear" while the others stay armed and
+        confirmable by a later bare "yes". This path also RETURNS a reply, which
+        ends the turn before the model runs -- so the S2 pending-state context
+        never reaches the user here and this sentence is the only chance."""
+        now = time.time()
+        _mint_shopify(now - 120)
+        _mint_asana_create(now - 100)
+        _mint_calendar(now - 45)          # freshest -> the one cancelled
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHANNEL, entity="FNDR",
+            message="cancel", turn_started_at=now)
+        assert "cancelled a calendar event" in reply
+        assert "Still staged" in reply
+        assert "an inventory change" in reply and "an Asana task change" in reply
+        assert "a calendar event staged" not in reply, "named the one it just cancelled"
+
     def test_an_affirm_never_takes_the_cancel_path(self):
         now = time.time()
         sid = _mint_calendar(now - 45)
@@ -341,6 +414,58 @@ class TestQaMarkerStripping:
         assert td._confirm_intent("confirm", None) == "affirm"
         assert td._confirm_intent("cancel", None) == "negate"
         assert td._confirm_intent("what is our cash position", None) is None
+
+
+class TestConnectorNoiseStripIsLinear:
+    """Third ReDoS of this session, so this gets a permanent timing guard.
+
+    _strip_connector_noise runs on the pre-model hot path for EVERY turn of
+    every user, before rate limiting. It holds two super-linear patterns: the
+    [QA] prefix added by this hotfix (7,065 ms at 40k spaces as first written)
+    and the PRE-EXISTING Sent-using footer, which is cubic (~703 ms at 800
+    spaces). CPython's re holds the GIL, so either one blocks the whole process.
+    """
+
+    # Explicit ids: a 40,000-character parameter becomes the test id otherwise,
+    # and pytest prints it on every summary line.
+    @pytest.mark.parametrize("payload", [
+        pytest.param(" " * 40000, id="40k-spaces"),
+        pytest.param(" " * 40000 + "confirm", id="40k-spaces-then-confirm"),
+        pytest.param("*" * 20000 + " " * 20000, id="20k-stars-20k-spaces"),
+        pytest.param("> " * 20000, id="20k-quote-markers"),
+        pytest.param("confirm" + " " * 3000 + "Sent using <@U123>",
+                     id="cubic-footer-pattern"),
+    ])
+    def test_pathological_whitespace_returns_fast(self, payload):
+        t0 = time.perf_counter()
+        td._strip_connector_noise(payload)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 0.25, f"took {elapsed * 1000:.0f} ms -- super-linear"
+
+    @pytest.mark.parametrize("payload", [
+        pytest.param(" " * 40000 + "confirm", id="40k-spaces-then-confirm"),
+        pytest.param("x" * 5000, id="5k-chars"),
+    ])
+    def test_the_whole_intent_classifier_returns_fast(self, payload):
+        t0 = time.perf_counter()
+        td._confirm_intent(payload, None)
+        assert (time.perf_counter() - t0) < 0.25
+
+    def test_the_length_bail_cannot_hide_a_real_confirm(self):
+        """The bail only skips messages far longer than any bare confirm --
+        _confirm_intent independently rejects anything over 10 tokens."""
+        assert len("confirm") < td._STRIP_MAX_CHARS
+        assert td._confirm_intent("confirm", None) == "affirm"
+        assert td._confirm_intent("[QA] confirm", None) == "affirm"
+        long_but_not_a_confirm = "word " * 500
+        assert td._confirm_intent(long_but_not_a_confirm, None) is None
+
+    def test_stripping_still_works_on_normal_length_input(self):
+        assert td._strip_connector_noise("[QA] confirm").strip() == "confirm"
+        # The real Cowork footer shape: the pattern requires a <@...> token.
+        assert "Sent using" not in td._strip_connector_noise(
+            "confirm\nSent using <@U0B2RM2JYJ1>")
+        assert td._confirm_intent("confirm\nSent using <@U0B2RM2JYJ1>", None) == "affirm"
 
 
 class TestDmRememberTypedConfirm:

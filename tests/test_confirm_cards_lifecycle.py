@@ -211,7 +211,10 @@ class TestInterceptorIgnoresConcurrentTurnPendings:
     def test_concurrent_turns_pending_survives(self):
         now = time.time()
         turn_start = now          # this turn began now...
-        sid = self._seed(asana_ts=now + 0.2, shopify_ts=now + 0.3)  # ...both minted after
+        # Comfortably past _CLOCK_SKEW_TOLERANCE_SECONDS: a sub-second margin
+        # is deliberately treated as this turn's own, since wall-clock skew
+        # of that size is indistinguishable from a genuine sibling mint.
+        sid = self._seed(asana_ts=now + 30, shopify_ts=now + 31)
 
         reply = td.try_confirm_pending_write(
             slack_user_id=USER_ID, channel_name=CHANNEL_NAME, entity="F3E",
@@ -238,7 +241,7 @@ class TestInterceptorIgnoresConcurrentTurnPendings:
     def test_default_none_keeps_legacy_behaviour(self):
         """No turn_started_at (every pre-v2 caller and test) = unfiltered."""
         now = time.time()
-        sid = self._seed(asana_ts=now + 0.2, shopify_ts=now + 0.3)
+        sid = self._seed(asana_ts=now + 30, shopify_ts=now + 31)
 
         td.try_confirm_pending_write(
             slack_user_id=USER_ID, channel_name=CHANNEL_NAME, entity="F3E",
@@ -253,7 +256,7 @@ class TestInterceptorIgnoresConcurrentTurnPendings:
         sid = cc.mint_stash_id("asana", USER_ID, CHANNEL_NAME)
         td._store_pending_asana_write(USER_ID, CHANNEL_NAME, {
             "action": "delete", "gid": "g1", "label": "Sibling task",
-            "ts": now + 0.2, "stash_id": sid,
+            "ts": now + 30, "stash_id": sid,
         })
         with patch.object(td, "_run_confirm_execute") as ex:
             reply = td.try_confirm_pending_write(

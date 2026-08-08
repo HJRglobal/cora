@@ -5379,6 +5379,9 @@ _CONFIRM_MENTION_RE = re.compile(r"<[@#!][^>]*>")
 _CONFIRM_SENT_USING_RE = re.compile(r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$", re.IGNORECASE)
 
 
+_STRIP_MAX_CHARS = 2000
+
+
 def _strip_connector_noise(message: str) -> str:
     """Strip the Cowork 'Sent using <@user>' footer, any Slack mention tokens,
     and a leading [QA] smoke marker before confirm-intent classification.
@@ -5392,6 +5395,16 @@ def _strip_connector_noise(message: str) -> str:
     "[QA] cancel". Stripped here rather than added to the filler vocabulary so
     the marker cannot be smuggled mid-sentence to soften an otherwise
     disqualifying message."""
+    # D-051 lens-2: bail before the super-linear strips on anything that cannot
+    # possibly be a bare confirm. _confirm_intent already rejects >10 tokens, and
+    # the only other consumer of the stripped text is its "?" check -- neither
+    # regex can remove a "?" -- so this is behaviour-preserving. It also bounds
+    # the PRE-EXISTING cubic blowup in _CONFIRM_SENT_USING_RE (two `\s*\*?\s*`
+    # groups, retried at every start position: measured 703 ms at 800 spaces and
+    # extrapolating to ~45 s at 3,200), which sits on this same pre-model hot
+    # path for every turn of every user.
+    if message and len(message) > _STRIP_MAX_CHARS:
+        return message
     t = _CONFIRM_SENT_USING_RE.sub("", message or "")
     t = _CONFIRM_MENTION_RE.sub(" ", t)
     return _QA_SMOKE_PREFIX_RE.sub("", t, count=1)
@@ -5401,7 +5414,15 @@ def _strip_connector_noise(message: str) -> str:
 # already blanked, and behind simple Slack emphasis). Mirrors
 # qa_scaffolding._QA_PREFIX_RE; duplicated as a local constant so this
 # confirm-path helper takes no new import.
-_QA_SMOKE_PREFIX_RE = re.compile(r"^\s*(?:[*_~`>\s]+)?\[qa\]\s*", re.IGNORECASE)
+# D-051 lens-2 HIGH: the first cut was `^\s*(?:[*_~`>\s]+)?\[qa\]\s*` -- `\s*`
+# followed by an optional class that ALSO matches whitespace is nested
+# ambiguity, and it measured 7,065 ms on a 40,000-space message (Slack's max
+# length) reached on every turn of every user, pre-model. This is the THIRD
+# regex of this shape in one session (see the 43s vocative incident); the
+# lesson is that any new pattern with two whitespace-capable quantifiers in
+# sequence must be timed on `" " * 40000` before it ships. One unambiguous
+# class, same accepted inputs, 0.10 ms at 40k.
+_QA_SMOKE_PREFIX_RE = re.compile(r"^[*_~`>\s]*\[qa\]\s*", re.IGNORECASE)
 
 
 def _confirm_intent(message: str, pending_action: str | None) -> str | None:
@@ -5580,6 +5601,29 @@ def _run_confirm_execute(
     return _strip_write_sentinel(raw)
 
 
+# A pending must be MATERIALLY newer than the turn's start to count as a
+# concurrent turn's (D-051 lens-1 MEDIUM). Wall clock is the only clock these
+# comparisons have, so a backward NTP/sleep-resume step makes live pendings look
+# future-stamped -- and because a single such entry sets concurrent_seen and
+# blanks the interceptor for EVERY kind on that turn, a 3-second step reproduced
+# the exact reported symptom shape (typed dark, taps working) from an unrelated
+# cause. A small tolerance absorbs ordinary step sizes; a grossly broken host
+# clock still degrades, but fail-closed (no deterministic write), never wrong.
+_CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
+
+
+def _minted_by_a_concurrent_turn(ts: float, turn_started_at: float | None) -> bool:
+    """True when `ts` belongs to a turn that started AFTER this one.
+
+    Boundary is deliberately inclusive-of-equality (strict `>`): an exact tie is
+    treated as this turn's own, because excluding it would silently orphan a
+    pending the user is looking at, while including it at worst re-arbitrates
+    something already this turn's."""
+    if turn_started_at is None:
+        return False
+    return ts > turn_started_at + _CLOCK_SKEW_TOLERANCE_SECONDS
+
+
 _PENDING_KIND_LABELS = {
     "asana": "an Asana task change",
     "shopify": "an inventory change",
@@ -5593,7 +5637,8 @@ _PENDING_KIND_LABELS = {
 }
 
 
-def describe_live_pendings(slack_user: str, channel: str) -> str:
+def describe_live_pendings(slack_user: str, channel: str,
+                           turn_started_at: float | None = None) -> str:
     """One terse line naming what this (user, channel) currently has staged, or
     "" when nothing is (cq-24cc6ac4bbc8, HOTFIX 2026-08-08).
 
@@ -5608,8 +5653,20 @@ def describe_live_pendings(slack_user: str, channel: str) -> str:
     live = []
     for kind in _stash_kind_specs():
         entry = _peek_kind(kind, slack_user, channel)
-        if entry:
-            live.append((float(entry.get("ts", 0)), kind))
+        if not entry:
+            continue
+        ts = float(entry.get("ts", 0))
+        # D-051 lens-1 HIGH: apply the SAME concurrent-turn exclusion the
+        # arbitration uses. try_confirm_pending_write refuses to act on a
+        # pending minted after this turn began precisely because the user
+        # cannot have seen it; advertising it here -- with an imperative to
+        # call the tool with confirmed=true -- handed the model the authority
+        # the interceptor had just declined, and the per-kind claims are keyed
+        # on (user, channel) with no turn check, so it would execute a write
+        # for a preview that is still on its way to another reply.
+        if _minted_by_a_concurrent_turn(ts, turn_started_at):
+            continue
+        live.append((ts, kind))
     if not live:
         return ""
     live.sort(reverse=True)
@@ -5629,7 +5686,33 @@ def _peek_kind(kind: str, slack_user: str, channel: str) -> dict | None:
     return spec["peek"](slack_user, channel) if spec else None
 
 
-def _claim_deferred_kind(kind: str, slack_user: str, channel: str) -> dict | None:
+def _deferred_cancel_reply(kind: str, slack_user: str, channel: str) -> str:
+    """Name what was cancelled AND what survives (D-051 lens-1 + lens-2).
+
+    A typed cancel pops only the FRESHEST pending, so with several armed the
+    others stay live and confirmable by a later bare "yes". The shared line
+    ("Nothing was changed") is literally true and pragmatically false -- the
+    user reads it as "my cancel landed, I'm clear". This path also RETURNS a
+    reply, which ends the turn before the model runs, so the S2 pending-state
+    context never reaches the user here: this sentence is the only chance to
+    tell them. Enumerated from the live stores AFTER the pop, so it cannot
+    describe the one just cancelled."""
+    label = _PENDING_KIND_LABELS.get(kind, "that request")
+    survivors = [
+        _PENDING_KIND_LABELS.get(k, k)
+        for k in _stash_kind_specs()
+        if _peek_kind(k, slack_user, channel)
+    ]
+    base = f"Okay -- I've cancelled {label}. Nothing was changed."
+    if not survivors:
+        return base
+    listed = (survivors[0] if len(survivors) == 1
+              else ", ".join(survivors[:-1]) + f" and {survivors[-1]}")
+    return f"{base} Still staged and awaiting confirmation: {listed}."
+
+
+def _claim_deferred_kind(kind: str, slack_user: str, channel: str,
+                         stash_id: str) -> dict | None:
     """Pop a DEFER-kind's pending so a typed cancel can dismiss it (HOTFIX
     2026-08-08). Uses each kind's OWN store/lock/TTL through the shared spec
     table, so this is the same atomic take the kind's tool performs -- no new
@@ -5638,19 +5721,23 @@ def _claim_deferred_kind(kind: str, slack_user: str, channel: str) -> dict | Non
 
     Returns the popped entry, or None if nothing was there (a race with a tap or
     the kind's own tool); the caller must then fall through rather than claim a
-    cancellation that did not happen."""
-    spec = _stash_kind_specs().get(kind)
-    if spec is None:
+    cancellation that did not happen.
+
+    D-051 lens-1: `stash_id` is REQUIRED and matched exactly. The first cut
+    popped whatever was in the slot, so a sibling turn that overwrote it between
+    this turn's peek and this pop had ITS never-seen preview silently destroyed
+    while the user was told their own one was cancelled -- and the preview they
+    meant survived. Delegating to _claim_stash_by_id gets the exact-id match AND
+    the TTL check for free, and means there is exactly ONE claim implementation
+    per kind rather than a second one that drifts from it."""
+    if not stash_id:
         return None
-    with spec["lock"]:
-        entry = spec["store"].pop(spec["key"](slack_user, channel), None)
-    if not entry:
+    status, entry = _claim_stash_by_id(kind, slack_user, channel, stash_id)
+    if status != "claimed":
         return None
-    sid = entry.get("stash_id")
-    if sid:
-        # Keep the button card honest: a tap on it afterwards must read
-        # "already handled", not re-offer a pending this cancel just removed.
-        confirm_cards.index_mark_resolved(sid)
+    # Keep the button card honest: a tap on it afterwards must read
+    # "already handled", not re-offer a pending this cancel just removed.
+    confirm_cards.index_mark_resolved(stash_id)
     return entry
 
 
@@ -5728,7 +5815,7 @@ def try_confirm_pending_write(
         nonlocal concurrent_seen
         if entry is None or turn_started_at is None:
             return entry
-        if float(entry.get("ts", 0)) > turn_started_at:
+        if _minted_by_a_concurrent_turn(float(entry.get("ts", 0)), turn_started_at):
             concurrent_seen = True
             return None
         return entry
@@ -5919,11 +6006,20 @@ def try_confirm_pending_write(
         # silent fall-through it replaces.
         intent = _confirm_intent(message, None)
         if intent == "negate":
-            claimed = _claim_deferred_kind(kind, slack_user_id, channel_name)
-            log.info("confirm_interceptor CANCEL user=%s kind=%s (deferred-kind)",
-                     slack_user_id, kind)
+            fresh = _peek_kind(kind, slack_user_id, channel_name) or {}
+            claimed = _claim_deferred_kind(
+                kind, slack_user_id, channel_name, str(fresh.get("stash_id") or ""))
             if claimed:
-                return _CONFIRM_CANCELLED_REPLY
+                # D-051 lens-1 LOW: log only on the REAL outcome. The first cut
+                # logged CANCEL before checking the claim, so a lost race left a
+                # log line asserting a cancellation that never happened -- and
+                # this whole incident was diagnosed by reading interceptor log
+                # lines, so one that lies is worse than one that is missing.
+                log.info("confirm_interceptor CANCEL user=%s kind=%s (deferred-kind)",
+                         slack_user_id, kind)
+                return _deferred_cancel_reply(kind, slack_user_id, channel_name)
+            log.info("confirm_interceptor CANCEL-RACE user=%s kind=%s "
+                     "(pending gone before the claim; deferring)", slack_user_id, kind)
         return None
 
     intent = _confirm_intent(message, action)

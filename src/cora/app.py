@@ -724,6 +724,16 @@ def _dispatch_qa(
         root_thread_ts:   Thread root to register in active_thread_store after
                           responding. Defaults to reply_thread_ts if None.
     """
+    # FIRST statement on purpose (D-051 lens-1 MEDIUM). This is the reference
+    # point for "did a sibling turn mint this pending after my turn began", so
+    # every millisecond between the user's message arriving and this line is a
+    # window in which a concurrent turn's pending is misread as this turn's own
+    # -- the cq-db3b28dcdd42 shape. Derived here it still trails the pre-dispatch
+    # Slack calls (_fetch_thread_history, _resolve_channel_name) by up to a few
+    # hundred ms; closing that fully means threading the triggering event ts
+    # through all five call sites, which is a follow-up, not a hotfix.
+    # Wall clock (not monotonic): every pending store stamps time.time().
+    _turn_started_at = time.time()
     if prior_messages is None:
         prior_messages = []
     register_ts = root_thread_ts or reply_thread_ts
@@ -787,19 +797,11 @@ def _dispatch_qa(
     # resolved relative phrases against a stale internal date (the S4 create-path
     # incident). One factual line; rides the uncached runtime block.
     az_today = datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
-    # cq-24cc6ac4bbc8 (HOTFIX 2026-08-08): the deterministic interceptor DEFERS
-    # several stash kinds to the model by design, and on those turns the model
-    # had no way to know a write was staged -- so it narrated "nothing is
-    # staged / no action needed" while three previews sat armed and confirmable
-    # (live 16:03-16:07). Factual, payload-free, authorizes nothing.
-    try:
-        pending_note = (
-            _tool_dispatch.describe_live_pendings(user_id, channel_name) if user_id else ""
-        )
-    except Exception:  # noqa: BLE001 -- context enrichment must never break a reply
-        log.warning("pending-state context probe failed (non-fatal)", exc_info=True)
-        pending_note = ""
-    pending_block = f"\n{pending_note}\n" if pending_note else ""
+    # cq-24cc6ac4bbc8's pending-state line is appended AFTER the confirm
+    # interceptor runs (D-051 lens-1 MEDIUM) -- probing it here would snapshot
+    # state the interceptor is about to mutate. Declared now so it is in scope
+    # for cache_storable regardless of which branch runs.
+    pending_note = ""
     runtime_context = (
         f"## Runtime channel context\n\n"
         f"Today's date: {az_today} (America/Phoenix).\n"
@@ -814,8 +816,7 @@ def _dispatch_qa(
         + (f"\n{caller_role_block}\n" if caller_role_block else "")
         + f"{founder_note}\n"
         f"Apply the cross-entity and financial guardrails accordingly.\n\n"
-        f"{historical_access.TIER1_SYNTHESIS_RULE}\n"
-        f"{pending_block}\n"
+        f"{historical_access.TIER1_SYNTHESIS_RULE}\n\n"
         f"---\n\n"
     )
 
@@ -855,9 +856,6 @@ def _dispatch_qa(
     # their snapshot/diff windows overlap (same (user, channel), overlapping
     # @mentions).
     confirm_cards.begin_turn()
-    # Wall-clock (not monotonic) on purpose: every pending store stamps its
-    # entries with time.time(), and the interceptor compares against those.
-    _turn_started_at = time.time()
     _confirm_before_snapshot = (
         _tool_dispatch.snapshot_stash_ids(user_id, channel_name) if user_id else {}
     )
@@ -987,6 +985,30 @@ def _dispatch_qa(
             _post_reply_card_sweep()
             active_thread_store.register(channel_id, register_ts)
             return
+
+    # ── Pending-state visibility for the model (cq-24cc6ac4bbc8) ────────────
+    # Probed HERE, after the interceptor, for two reasons found by the D-051
+    # lens-1 pass:
+    #   * the interceptor MUTATES this state while still returning None (it
+    #     abandons a stale destructive Asana pending on a superseding write and
+    #     on a question), so a probe taken earlier told the model a delete was
+    #     staged that had just been abandoned;
+    #   * it takes turn_started_at, so a pending minted by a CONCURRENT turn is
+    #     excluded here exactly as it is from the arbitration. Without that, the
+    #     note re-exposed a sibling turn's pending on the model path with an
+    #     imperative to confirm it -- and the per-kind claims are keyed on
+    #     (user, channel) with no turn check, so the model could have executed a
+    #     write for a preview the user had not yet been shown. That is
+    #     cq-db3b28dcdd42 reintroduced on the model path.
+    if user_id:
+        try:
+            pending_note = _tool_dispatch.describe_live_pendings(
+                user_id, channel_name, turn_started_at=_turn_started_at)
+        except Exception:  # noqa: BLE001 -- enrichment must never break a reply
+            log.warning("pending-state context probe failed (non-fatal)", exc_info=True)
+            pending_note = ""
+        if pending_note:
+            runtime_context = runtime_context + pending_note + "\n\n"
 
     t0 = time.monotonic()
 

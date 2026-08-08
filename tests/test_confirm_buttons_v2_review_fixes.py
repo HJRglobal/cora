@@ -208,7 +208,7 @@ class TestConcurrentSiblingNeverFiresAStaleDelete:
             "ts": now - 60, "stash_id": sid,
         })
         td._store_pending_shopify_write(USER, CHANNEL, {
-            "sku": "S", "delta": -1, "ts": now + 0.2,
+            "sku": "S", "delta": -1, "ts": now + 30,
             "stash_id": cc.mint_stash_id("shopify", USER, CHANNEL),
         })
         with patch.object(td, "_run_confirm_execute") as ex:
@@ -225,7 +225,7 @@ class TestConcurrentSiblingNeverFiresAStaleDelete:
         a question the user did not ask and destroy the tombstone."""
         now = time.time()
         td._store_pending_calendar_write(USER, CHANNEL, {
-            "action": "create", "summary": "Sync", "ts": now + 0.2,
+            "action": "create", "summary": "Sync", "ts": now + 30,
             "stash_id": cc.mint_stash_id("calendar", USER, CHANNEL),
         })
         with patch.object(td, "_pop_expired_shopify_write") as popped:
@@ -242,7 +242,7 @@ class TestConcurrentSiblingNeverFiresAStaleDelete:
         sid = cc.mint_stash_id("asana", USER, CHANNEL)
         td._store_pending_asana_write(USER, CHANNEL, {
             "action": "delete", "gid": "g1", "label": "In-flight",
-            "ts": now + 0.2, "stash_id": sid,
+            "ts": now + 30, "stash_id": sid,
         })
         td.try_confirm_pending_write(
             slack_user_id=USER, channel_name=CHANNEL, entity="F3E",
