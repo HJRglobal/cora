@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -655,7 +656,17 @@ def _asana_destructive_intent(text: str) -> str | None:
 # _MENTION_RE to strip, so people simply type "Cora, remember ..." -- which is
 # precisely the live cq-67490abe2d86 phrasing the bare ^remember anchor missed.
 # Kept anchored: "remember" mid-sentence still does not count as a command.
-_VOCATIVE = r"(?:(?:hey|hi|ok|okay)\s+)?@?cora\s*[,:]?\s+"
+#
+# D-051 lens-3 HIGH: the first cut wrote `@?cora\s*[,:]?\s+` -- two overlapping
+# whitespace quantifiers with an optional element between them, which is
+# quadratic on a FAILING match. Measured on this machine: "cora" + 40,000 spaces
+# + "x" took 43 SECONDS per regex, and _remember_or_forget_intent runs two of
+# them. CPython's re does not release the GIL, so that burn blocks the whole bot
+# process -- heartbeat, Socket Mode acks, every other user's turn -- and this
+# predicate is evaluated eagerly on EVERY DM, upstream of the rate limiter. The
+# bounded {0,2}/{1,4} repeats remove the overlap; a vocative separated from the
+# verb by more than a few spaces is not a real message.
+_VOCATIVE = r"(?:(?:hey|hi|ok|okay)\s+)?@?cora\s{0,2}[,:]?\s{1,4}"
 _REMEMBER_INTENT_RE = re.compile(
     rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?remember\b"
     rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?note\s+that\b"
@@ -857,9 +868,10 @@ def _dispatch_qa(
         # or a future reply site -- degrades to a plain text reply instead of
         # posting a duplicate apparently-actionable copy. The typed confirm
         # path still works for that reply, so nothing is lost.
-        if not confirm_cards.claim_card_attach(cid):
-            log.info("confirm_card attach REFUSED (already carded) stash=%s kind=%s", cid, kind)
-            return None
+        # D-051 lens-2 LOW: validate BEFORE claiming. The claim is one-shot and
+        # deliberately survives pop_cards, so claiming and then bailing on an
+        # invalid ask would permanently bar that id from ever getting a card.
+        candidates: list[tuple[str, str]] = []
         if kind == "ask":
             ask_entry = _tool_dispatch.get_pending_ask(user_id, channel_name)
             if not ask_entry or ask_entry.get("ask_id") != cid:
@@ -867,6 +879,10 @@ def _dispatch_qa(
             candidates = [(key, label) for key, label, _value in ask_entry.get("candidates", [])]
             if not candidates:
                 return None
+        if not confirm_cards.claim_card_attach(cid):
+            log.info("confirm_card attach REFUSED (already carded) stash=%s kind=%s", cid, kind)
+            return None
+        if kind == "ask":
             _carded["id"] = cid
             _carded["text"] = text
             log.info("confirm_card attached kind=ask stash=%s channel=#%s user=%s",
@@ -1590,14 +1606,19 @@ def _dispatch_qa(
             "Final chat_update failed for ts=%s: %s — sending fresh reply as fallback",
             placeholder_ts, exc,
         )
-        _resp = say(
+        # D-051 lens-1 LOW: post the fallback WITHOUT buttons. chat_update can
+        # be applied server-side and still raise client-side (a read timeout or
+        # reset after Slack processed it), in which case the card already
+        # landed; re-posting `confirm_blocks` here would put a SECOND live card
+        # under a claim that was already consumed, breaking one-stash-one-card
+        # and leaving the first copy unregistered and unclosable. The text still
+        # reaches the user, and the typed confirm path still works.
+        say(
             text=response_text,
-            blocks=confirm_blocks,
             thread_ts=reply_thread_ts,
             unfurl_links=False,
             unfurl_media=False,
         )
-        _register_posted_card((_resp or {}).get("channel", ""), (_resp or {}).get("ts", ""))
     _post_reply_card_sweep()
 
     # Register AFTER the response is confirmed posted so only successful
@@ -2367,6 +2388,18 @@ def handle_message_event(event: dict, client) -> None:
             # count as an answer. The THREADED path is untouched -- a genuine
             # answer typed in the ask's own thread ignores allow_toplevel and
             # still always matches, even if it happens to contain "remember".
+            # D-051 lens-2 MEDIUM: a live staged write outranks the gap ask
+            # outright. S4's new preview copy tells DM users to reply "confirm",
+            # and "confirm" is neither a shift keyword nor a question nor a
+            # remember command -- so it was eligible for top-level capture, and
+            # a user with a pending gap ask who did exactly what the preview
+            # said would have their write silently NOT fire while the literal
+            # word "confirm" was filed as the gap's answer. Same failure family
+            # as cq-67490abe2d86, newly reachable because of S4. A
+            # pending-stash test is tighter than any bare-affirmative regex: it
+            # covers "yes", "2", a slot number and every future phrasing.
+            _has_staged_write = bool(
+                any(_tool_dispatch.snapshot_stash_ids(user_id, "dm").values()))
             try:
                 ask = gap_autofill.match_pending_ask(
                     user_id,
@@ -2375,6 +2408,7 @@ def handle_message_event(event: dict, client) -> None:
                         not gap_autofill.is_shift_keyword(text)
                         and not gap_autofill.looks_like_question(text)
                         and not _remember_or_forget_intent(text)
+                        and not _has_staged_write
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — capture must never break DMs
@@ -3791,8 +3825,18 @@ def handle_cq_edit_submit(ack, body, client, view) -> None:
         log.warning("code-queue edit-submit handler error (non-fatal)", exc_info=True)
 
 
+def _card_preview_text(orig_blocks: list[dict]) -> str:
+    """The card's original preview text, recovered from its rendered blocks --
+    used to re-register a card whose terminal edit failed, so a later sweep can
+    retry with the same preview visible."""
+    for b in orig_blocks or []:
+        if b.get("type") == "section":
+            return ((b.get("text") or {}).get("text") or "")
+    return ""
+
+
 def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: list[dict],
-                        outcome_text: str) -> None:
+                        outcome_text: str) -> bool:
     """Edit a confirm/picker card to a terminal state: keep the original
     preview/question section(s), append the outcome, drop the actions block
     (buttons gone -- revops/code-queue precedent).
@@ -3803,14 +3847,24 @@ def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: l
     never call this -- it should go ephemeral-only instead, since there is no
     way to order two independent chat_update calls against each other, and
     the loser's edit is never necessary (the winner always edits the card
-    with the real outcome)."""
+    with the real outcome).
+
+    Returns True when the edit landed. D-051 lens-1 MEDIUM: the callers pop the
+    card's ONLY coordinate out of the registry before calling this, and a
+    swallowed failure here (a chat.update 429 -- Tier 3, ~50 RPM, and card edits
+    are not throttled -- or any transient error) then left a live-buttoned card
+    over a dead stash that NOTHING could ever close again, which is the exact
+    symptom S1 exists to remove. Callers re-register the coordinate on False so
+    the next sweep retries."""
     section_blocks = [b for b in orig_blocks if b.get("type") == "section"]
     new_blocks = section_blocks + confirm_cards.terminal_blocks(outcome_text)
     try:
         client.chat_update(channel=channel_id, ts=message_ts, text=outcome_text, blocks=new_blocks)
+        return True
     except Exception:  # noqa: BLE001
         log.warning("confirm-button card edit failed (non-fatal) channel=%s ts=%s",
                     channel_id, message_ts, exc_info=True)
+        return False
 
 
 def _post_followup_confirm_card(client, channel_id: str, text: str, stash_id: str) -> None:
@@ -3841,6 +3895,15 @@ _CARD_CLOSED_BY_SWEEP = (
     "_Handled in the conversation -- these buttons are closed._"
 )
 
+# D-051 lens-2 MEDIUM: expiry is the one terminal route with NO reply above the
+# card, so the generic line would assert an outcome that never happened -- and
+# on a destructive stash (delete a task, cancel an event, forget a note) the
+# user reads "handled" as "it went through". Separate, explicitly negative copy.
+_CARD_CLOSED_BY_EXPIRY = (
+    "_This expired before you confirmed. Nothing was changed -- "
+    "ask me again and I'll re-preview it._"
+)
+
 
 def _close_stale_confirm_cards(client) -> None:
     """Take the buttons down on every rendered card whose stash is no longer
@@ -3854,6 +3917,12 @@ def _close_stale_confirm_cards(client) -> None:
 
     Best-effort throughout: a failed edit just leaves that card visually stale,
     and tapping it still resolves honestly through resolve_and_claim_stash."""
+    # D-051 lens-2 LOW: the sweep is a NEW Slack-write surface reached from
+    # _dispatch_qa, which missed_message_catchup drives with CORA_EVAL_MODE=1.
+    # It was safe only by accident (separate process, overridden client); make
+    # it safe by construction, matching every other write path's own gate.
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return
     if not confirm_cards.confirm_buttons_enabled():
         return
     try:
@@ -3864,6 +3933,8 @@ def _close_stale_confirm_cards(client) -> None:
         try:
             if _tool_dispatch.stash_is_live(sid):
                 continue
+            expired = _tool_dispatch.stash_expired_not_consumed(sid)
+            outcome = _CARD_CLOSED_BY_EXPIRY if expired else _CARD_CLOSED_BY_SWEEP
             # pop_cards hands each coordinate over exactly once, so two racing
             # sweeps can never both chat_update the same message.
             for card_channel, card_ts, preview in confirm_cards.pop_cards(sid):
@@ -3871,9 +3942,14 @@ def _close_stale_confirm_cards(client) -> None:
                     [{"type": "section", "text": {"type": "mrkdwn", "text": preview}}]
                     if preview else []
                 )
-                _edit_card_terminal(client, card_channel, card_ts, preview_blocks,
-                                    _CARD_CLOSED_BY_SWEEP)
-                log.info("confirm_card closed by sweep stash=%s channel=%s", sid, card_channel)
+                if _edit_card_terminal(client, card_channel, card_ts, preview_blocks, outcome):
+                    log.info("confirm_card closed by sweep stash=%s channel=%s reason=%s",
+                             sid, card_channel, "expired" if expired else "handled")
+                else:
+                    # Put the coordinate back so a later sweep retries -- without
+                    # this, a transient chat_update failure orphans a live-buttoned
+                    # card permanently (D-051 lens-1 MEDIUM).
+                    confirm_cards.register_card(sid, card_channel, card_ts, preview)
         except Exception:  # noqa: BLE001 -- card hygiene must never break a reply
             log.warning("confirm-card sweep error stash=%s (non-fatal)", sid, exc_info=True)
 
@@ -3981,7 +4057,8 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
         # resolve_and_claim_stash), so it can never race another edit of the
         # SAME message_ts.
         text = result.get("message") or "The count moved -- here's an updated preview."
-        confirm_cards.pop_cards(stash_id)  # this tap owns the outcome text; keep the sweep off it
+        # Coordinates were popped inside resolve_and_claim_stash, at claim
+        # time, so no concurrent sweep can be mid-flight against this card.
         _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
         fresh_stash_id = result.get("stash_id")
         if fresh_stash_id:
@@ -4016,8 +4093,15 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
     # the real outcome ("Done: ..."), and the generic sweep below must never
     # come along afterwards and overwrite it with its vaguer "handled in the
     # conversation" line.
-    confirm_cards.pop_cards(stash_id)
-    _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text)
+    # This tap owns the outcome text. Its coordinates left the registry at
+    # CLAIM time (resolve_and_claim_stash), before execute ran, so the
+    # process-global sweep could never race this edit.
+    if not _edit_card_terminal(client, channel_id, message_ts, orig_blocks, text):
+        # Re-register THIS card so a later sweep retries, rather than
+        # orphaning live buttons over a stash that is already gone. The
+        # coordinates are the tap's own, straight off the action payload.
+        confirm_cards.register_card(stash_id, channel_id, message_ts,
+                                    _card_preview_text(orig_blocks))
     _close_stale_confirm_cards(client)
 
 

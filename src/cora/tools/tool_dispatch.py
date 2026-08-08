@@ -1132,9 +1132,22 @@ def _resolve_asker_task(slack_user_id: str, task_gid: str, task_name: str, entit
             label = (task_name or "").strip()
             if not label:
                 try:
-                    label = asana_client.get_task_name(task_gid) or ""
+                    fetched = asana_client.get_task_name(task_gid) or ""
                 except Exception:  # noqa: BLE001 -- presentation only
-                    label = ""
+                    fetched = ""
+                # D-051 lens-3 MEDIUM: this branch is entered by ANY user in a
+                # FNDR/HJRG channel, not just the founder, and it does no
+                # ownership check -- so a pasted gid can name an arbitrary
+                # workspace task, including a [LEX-*] one whose manually-typed
+                # name carries a client name. The caller's _lex_safe_label keys
+                # on the CHANNEL's entity, so in #hjrg-leadership it would not
+                # scrub at all and the name would land in a non-LEX channel on
+                # the PREVIEW, before any confirm. Pre-v2 the label was the raw
+                # gid, so this exposure is new with the lookup. A name we
+                # fetched for a task the asker proved no relationship to is
+                # scrubbed as if it were LEX, unconditionally; a name the user
+                # supplied themselves is theirs already and is left alone.
+                label = _lex_safe_label(fetched, "LEX") if fetched else ""
             return task_gid, (label or task_gid).strip(), None
         if not agid:
             return None, None, (
@@ -4413,13 +4426,56 @@ def _shopify_resolve(slack_user_id: str, input_data: dict, *, channel: str = "")
             except Exception as exc:  # noqa: BLE001 -- ADDITIVE: degrade to legacy
                 log.warning("f3e_shopify_set_inventory verbatim ambiguity scan degraded: %s", exc)
                 verbatim_amb = None
-            if verbatim_amb is not None:
+            # D-051 lens-3 HIGH: the override must be ABOUT the product the model
+            # resolved, not merely co-present in the sentence. Without this, "we
+            # are out of variety pack -- set original energy at the office to 40"
+            # resolved "original energy" correctly, then got hijacked by the
+            # unrelated ambiguous "variety pack" and stashed an ask carrying the
+            # ORIGINAL ENERGY request's location and quantity with VARIETY PACK
+            # candidates: tapping one would set a Variety Pack to 40, and the
+            # actual request would be gone. Longest-match shadowing only defends
+            # against a longer surface CONTAINING the ambiguous one; it does
+            # nothing about a second, unrelated product being named.
+            #
+            # So: override ONLY on the rewrite-bypass itself -- the model
+            # resolved EXACT to one of the very meanings the user's own phrase is
+            # ambiguous between. That is the whole of cq-483109dfea11 and nothing
+            # else. A miss/suggestion keeps the legacy alias path, which handles
+            # it correctly today.
+            _bypass = (
+                verbatim_amb is not None
+                and lex_res is not None
+                and lex_res.status == "exact"
+                and lex_res.canonical in {c.canonical for c in verbatim_amb.candidates}
+            )
+            if _bypass:
                 log.info(
                     "lexicon ask-on-ambiguity from VERBATIM user text user=%s "
-                    "user_phrase=%r model_arg=%r model_status=%s",
+                    "user_phrase=%r model_arg=%r model_canonical=%s",
                     slack_user_id, verbatim_amb.query, product_query,
-                    getattr(lex_res, "status", "none"),
+                    lex_res.canonical,
                 )
+                # Record the REAL outcome in the resolver ledger (D-051 lens-3
+                # MEDIUM): _lexicon_resolve_pack_tolerant already logged this
+                # turn as "exact" before the override ran, so without this row
+                # the flywheel monitor counts an exact resolution for exactly
+                # the population that was actually ASKED -- blind to the new
+                # asks it exists to measure. Distinct event name so the
+                # pre-existing `resolve` counts stay comparable across the
+                # change. Fail-soft: telemetry never breaks a reply.
+                try:
+                    # Re-imported rather than reusing the name bound in the try
+                    # above: that binding only exists if the import succeeded,
+                    # and relying on it is the same NameError-into-a-fail-soft-
+                    # except trap that made this whole scan a no-op once already.
+                    from .. import lexicon as _lex_log
+                    _lex_log.log_event(
+                        entity="F3E", channel=channel, user=slack_user_id,
+                        consumer="f3e_shopify_set_inventory", status="ambiguous",
+                        query=verbatim_amb.query, event="resolve_verbatim",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 lex_res = verbatim_amb
                 # The ask names the USER's phrase, not the model's rewrite.
                 product_query = verbatim_amb.query
@@ -5570,14 +5626,20 @@ def try_confirm_pending_write(
     # token can itself contain "?", but a real gap if that ever changes).
     # _confirm_intent's own strip becomes a harmless no-op on already-clean text.
     message = _strip_connector_noise(message)
+    concurrent_seen = False
+
     def _mine(entry: dict | None) -> dict | None:
         """Drop a pending minted by a CONCURRENT turn (ts newer than this turn's
         start). Returning None here keeps such an entry out of BOTH the
         freshest-first arbitration and the supersede-abandon -- another turn owns
         it and is still on its way to previewing it."""
+        nonlocal concurrent_seen
         if entry is None or turn_started_at is None:
             return entry
-        return None if float(entry.get("ts", 0)) > turn_started_at else entry
+        if float(entry.get("ts", 0)) > turn_started_at:
+            concurrent_seen = True
+            return None
+        return entry
 
     asana = _mine(_peek_pending_asana(slack_user_id, channel_name))
     shopify = _mine(_peek_pending_shopify(slack_user_id, channel_name))
@@ -5626,6 +5688,30 @@ def try_confirm_pending_write(
         entries.append((float(forget_note.get("ts", 0)), "forget_note", "forget"))
     if schedmtg:
         entries.append((float(schedmtg.get("ts", 0)), "schedule_meeting", "schedule"))
+    # ── A sibling turn is mid-flight: this affirmative is genuinely ambiguous ──
+    # D-051 lens-1, TWO findings, both introduced by the S1 fix itself:
+    #
+    # HIGH: _mine() hiding a concurrent pending does not just remove it from the
+    # arbitration, it removes it from Case 2's supersede-ABANDON. With a stale
+    # destructive Asana delete from t=0 and a concurrent turn's Shopify pending
+    # in flight, a bare "yes" used to fire the Shopify write (abandoning the
+    # delete); with the filter it falls through to Case 1 and PERMANENTLY DELETES
+    # the task. The S1 fix re-armed the exact stale-delete path the module
+    # docstring promises can never fire.
+    #
+    # MEDIUM: with every pending belonging to a sibling turn, `entries` is now
+    # empty in cases it never used to be, so the expired-Shopify tombstone branch
+    # below fires, answers a question the user did not ask, swallows the turn
+    # (the model never runs) and destroys the tombstone.
+    #
+    # Both close the same way: if a sibling turn is mid-flight on this
+    # (user, channel), the referent of a bare affirmative is genuinely unknown --
+    # defer to the model, touch nothing. The 8/3 fix is preserved (the sibling's
+    # pending is still not abandoned) without re-arming anything.
+    if concurrent_seen:
+        log.info("confirm_interceptor DEFER user=%s (a concurrent turn is mid-flight)",
+                 slack_user_id)
+        return None
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
         # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
@@ -5988,7 +6074,17 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
             "ts": time.time(),
             "stash_id": confirm_cards.mint_stash_id("schedule_meeting", slack_user_id, channel),
         })
-    return calendar_client.format_slot_proposals_for_llm(slots, names, title=title)
+    proposals = calendar_client.format_slot_proposals_for_llm(slots, names, title=title)
+    # D-051 lens-3 MEDIUM: the proposal text tells the user to "reply with 1, 2,
+    # or 3", which in a channel is the exact cq-8063c3cee70f lie S4 exists to
+    # remove -- a bare in-thread reply never reaches the app. Rewrite that one
+    # sentence through the shared honest instruction. Done here rather than in
+    # calendar_client so the formatter stays Slack-surface-agnostic.
+    return proposals.replace(
+        "Ask the user to reply with 1, 2, or 3 (or their preferred option).",
+        f"Tell the user to {_confirm_how(channel)} naming the option they want "
+        f"(or tap its button).",
+    )
 
 
 def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -6532,6 +6628,10 @@ def _tool_cora_remember(slack_user_id: str, entity: str, _input: dict) -> str:
     )
     return _write_blocked_contract(
         f"Saving to your notes (only you can retrieve this): \"{note_text}\".{share_note} "
+        # D-051 lens-3 MEDIUM: S4 standardised every OTHER preview's confirm
+        # instruction but this one had none at all -- with buttons off it was
+        # unconfirmable-by-instruction in a channel.
+        f"{_confirm_how(channel, capitalize=True)} and I'll save it. "
         "Nothing is saved until you confirm."
     )
 
@@ -10853,6 +10953,35 @@ def stash_is_live(stash_id: str) -> bool:
     return bool(entry) and entry.get("stash_id") == stash_id
 
 
+def stash_expired_not_consumed(stash_id: str) -> bool:
+    """True when `stash_id` went terminal by TTL EXPIRY specifically, rather
+    than by being consumed (typed confirm, cancel, tap) or superseded.
+
+    D-051 lens-2 MEDIUM: the card-closing sweep folds four terminal routes into
+    one line, and its copy ("handled in the conversation") is justified by "the
+    reply that handled it is directly above". That premise is false for expiry:
+    a user who stages a delete and walks away gets no reply at all, and hours
+    later an unrelated turn in another channel rewrites their card to claim it
+    was handled -- which on a destructive stash reads as "it went through".
+
+    Distinguishable because every _peek_pending_* is a non-destructive TTL
+    FILTER: an expired entry is still sitting in its store dict, whereas a
+    consumed one was popped. So "not live, but the raw key is still present"
+    means exactly expired-and-never-acted-on."""
+    if not stash_id:
+        return False
+    idx = confirm_cards.index_lookup(stash_id)
+    if idx is None or idx.get("resolved"):
+        return False  # a tap resolved it; that path writes its own outcome
+    spec = _stash_kind_specs().get(idx.get("kind"))
+    if spec is None:
+        return False
+    with spec["lock"]:
+        raw = spec["store"].get(spec["key"](idx["user"], idx["channel"]))
+    # Same id still parked in the slot, but stash_is_live said no -> TTL expiry.
+    return bool(raw) and raw.get("stash_id") == stash_id
+
+
 def _claim_stash_by_id(kind: str, user: str, channel: str, stash_id: str) -> tuple[str, dict | None]:
     """Generic atomic by-id claim. Runs under the SAME lock + dict each kind's
     typed-path peek/claim already uses. Returns (status, entry): status in
@@ -10999,6 +11128,19 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
         return {"outcome": "unauthorized", "owner": idx["user"]}
     kind, user, channel = idx["kind"], idx["user"], idx["channel"]
 
+    # D-051 lens-2 LOW (defense-in-depth): a slot tap must only ever confirm a
+    # schedule_meeting stash. slot_index is inert for the other eight kinds, so
+    # without this the slot handler is a generic "confirm ANY stash" primitive --
+    # not exploitable today (button values are server-authored and
+    # build_slot_picker_blocks is only called with a schedule_meeting stash), but
+    # it voids the separate-authority property ACTION_PICK_SLOT exists to have,
+    # and any future reuse of the slot card for another kind would inherit full
+    # confirm authority with no gate. Refuse BEFORE the claim.
+    if slot_index is not None and kind != "schedule_meeting":
+        log.warning("slot tap against a non-meeting stash REFUSED kind=%s user=%s",
+                    kind, tapping_user_id)
+        return {"outcome": "orphaned"}
+
     status, entry = _claim_stash_by_id(kind, user, channel, stash_id)
     if status == "not_found":
         # The index still has a (not-yet-resolved) record, but the per-kind
@@ -11012,6 +11154,7 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
         return {"outcome": "superseded"}
     if status == "expired":
         confirm_cards.index_mark_resolved(stash_id)
+        confirm_cards.pop_cards(stash_id)
         return {"outcome": "expired", "label": _stash_expired_label(kind, entry)}
 
     # status == "claimed" -- exactly one caller (this one) reaches here for
@@ -11021,6 +11164,19 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
     # time the per-kind store is already empty) reads 'already_handled' via
     # the index rather than racing the "not_found" sync path above.
     confirm_cards.index_mark_resolved(stash_id)
+    # D-051 lens-1 MEDIUM: take the card coordinates out of the registry HERE,
+    # in the same breath as the resolve mark -- not after execute returns.
+    # index_mark_resolved makes stash_is_live() False immediately, but execute
+    # can run for SECONDS (an Asana delete, a Calendar create). During that
+    # window ANY other turn's reply anywhere fires the process-global sweep,
+    # which would pop these coordinates and chat_update the card with its
+    # generic line, racing the tap's own real outcome. pop_cards is the
+    # exactly-once handover, so taking it before execute leaves the sweep
+    # nothing to find -- the only race-free fix, exactly as the S2 note says
+    # (two independent HTTP calls cannot be ordered after the fact). Popped
+    # AFTER authorization so an unauthorized tap can never discard the owner's
+    # coordinates.
+    confirm_cards.pop_cards(stash_id)
     if action == "cancel":
         return {"outcome": "cancelled"}
 

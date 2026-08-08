@@ -28,8 +28,12 @@ def test_single_tool_block_dispatches_sequentially():
             [block], slack_user_id="U123", entity="FNDR", iteration=0,
         )
 
+    # The trailing "" is user_message: the single-block fast path forwards the
+    # verbatim turn text just like the parallel branch (D-051 lens-2 HIGH -- it
+    # used to drop it, which made the S7 verbatim-ambiguity scan a no-op on
+    # exactly the one-tool turns it exists to fix).
     mock_dispatch.assert_called_once_with(
-        "asana_get_my_tasks", {}, "U123", "FNDR", "", "", None,
+        "asana_get_my_tasks", {}, "U123", "FNDR", "", "", None, "",
     )
     assert results == [{
         "type": "tool_result",

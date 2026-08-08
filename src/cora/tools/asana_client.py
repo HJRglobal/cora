@@ -622,9 +622,17 @@ def get_task_name(task_gid: str) -> str | None:
     otherwise authorized to make."""
     if not task_gid or not task_gid.strip():
         return None
-    headers = {"Authorization": f"Bearer {_pat()}"}
     try:
-        with httpx.Client(timeout=_TIMEOUT) as c:
+        # _pat() inside the try (D-051 lens-3 LOW): it raises when ASANA_PAT is
+        # unset, which would contradict this function's never-raises contract.
+        headers = {"Authorization": f"Bearer {_pat()}"}
+        # Deliberately SHORTER than the module _TIMEOUT (10s). This runs inside
+        # the 12s budget of asana_complete_task / asana_delete_task, and a
+        # dispatch timeout does NOT cancel the worker (W3-01) -- so a slow read
+        # here would let the tool tell the model "timed out" and then still
+        # stash a live destructive pending, which the next stray "yes" could
+        # fire. A name is presentation only; it is never worth that.
+        with httpx.Client(timeout=4.0) as c:
             r = c.get(
                 f"{_BASE}/tasks/{task_gid.strip()}",
                 params={"opt_fields": "name"},

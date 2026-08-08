@@ -762,8 +762,17 @@ def _dispatch_tools_parallel(
 
     if len(tool_use_blocks) == 1:
         block = tool_use_blocks[0]
+        # D-051 lens-2 HIGH (2026-08-08): this fast path is the COMMON case (a
+        # one-tool turn), and it silently dropped user_message while the
+        # parallel branch below forwarded it -- so the S7 verbatim-ambiguity
+        # scan, whose whole purpose is a single f3e_shopify_set_inventory call,
+        # never received the user's words and never ran. The fix looked correct
+        # and the suite was green because every test either drove _shopify_resolve
+        # directly with _user_message pre-seeded, or exercised the parallel path.
+        # Same lesson as D-156: a new argument must be traced down EVERY branch
+        # of the call graph, not just the one the change was written against.
         result_str = dispatch(block.name, block.input or {}, slack_user_id, entity,
-                              channel_name, channel_id, thread_ts)
+                              channel_name, channel_id, thread_ts, user_message)
         return [{
             "type": "tool_result",
             "tool_use_id": block.id,
