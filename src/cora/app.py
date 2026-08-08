@@ -867,6 +867,19 @@ def _dispatch_qa(
             log.info("confirm_card attached kind=ask stash=%s channel=#%s user=%s",
                      cid, channel_name, user_id)
             return confirm_cards.build_picker_blocks(text, cid, candidates)
+        if kind == "schedule_meeting":
+            # One button per OFFERED slot instead of a single Confirm (v2 S2):
+            # v1's Confirm always booked slots[0] while the preview text offered
+            # up to 3. Falls back to the plain Confirm/Cancel pair if the stash
+            # carries no labels (a proposal minted before this change).
+            entry = _tool_dispatch._peek_pending_schedule_meeting(user_id, channel_name) or {}
+            labels = entry.get("slot_labels") or []
+            if entry.get("stash_id") == cid and labels:
+                _carded["id"] = cid
+                _carded["text"] = text
+                log.info("confirm_card attached kind=schedule_meeting slots=%d stash=%s "
+                         "channel=#%s user=%s", len(labels), cid, channel_name, user_id)
+                return confirm_cards.build_slot_picker_blocks(text, cid, labels)
         _carded["id"] = cid
         _carded["text"] = text
         log.info("confirm_card attached kind=%s stash=%s channel=#%s user=%s",
@@ -1189,6 +1202,12 @@ def _dispatch_qa(
         # text with zero tool_use on exactly this shape. Slice 2's forced capture
         # makes this turn common, so it joins the chain.
         or _tool_dispatch.has_pending_code_queue(user_id, channel_name)
+        # v2 S2: schedule_meeting was the last staged-write kind still absent
+        # from this chain. Its confirm turn is the same bare-affirmative-answers-
+        # a-staged-preview shape as every other kind here, and it now also
+        # participates in the typed-confirm arbitration (which DEFERS to the
+        # model), so the model has to reliably reach the tool.
+        or _tool_dispatch.has_pending_schedule_meeting(user_id, channel_name)
     )):
         chosen_model = model_router.MODEL_SONNET
     log.info(
@@ -3842,7 +3861,9 @@ def _close_stale_confirm_cards(client) -> None:
             log.warning("confirm-card sweep error stash=%s (non-fatal)", sid, exc_info=True)
 
 
-def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
+def _handle_confirm_tap(body: dict, client, *, action: str,
+                        stash_id_override: str | None = None,
+                        slot_index: int | None = None) -> None:
     """Shared Confirm/Cancel tap handler for all 9 stash kinds (S2, design
     2026-08-02). Requester-only, atomic claim, honest terminal states for
     every lifecycle case (superseded/expired/orphaned/indeterminate/already-
@@ -3853,7 +3874,10 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     message_ts = (body.get("message") or {}).get("ts", "")
     orig_blocks = (body.get("message") or {}).get("blocks") or []
     actions = body.get("actions") or [{}]
-    stash_id = str(actions[0].get("value") or "")
+    # A slot tap's raw value is "{stash_id}:{slot_index}", already split by the
+    # slot handler -- everything downstream sees a bare stash_id, exactly as a
+    # plain Confirm tap does (v2 S2).
+    stash_id = stash_id_override if stash_id_override is not None else str(actions[0].get("value") or "")
 
     if not confirm_cards.confirm_buttons_enabled():
         # Kill switch: a stale card tapped after a flag flip to off. Never
@@ -3882,7 +3906,8 @@ def _handle_confirm_tap(body: dict, client, *, action: str) -> None:
     # the invariant "a mint's turn_id reflects ITS OWN triggering event" true
     # by construction rather than true-by-coincidence.
     confirm_cards.begin_turn()
-    result = _tool_dispatch.resolve_and_claim_stash(stash_id, tapping_user, action)
+    result = _tool_dispatch.resolve_and_claim_stash(
+        stash_id, tapping_user, action, slot_index=slot_index)
     outcome = result.get("outcome")
 
     if outcome == "unauthorized":
@@ -3989,6 +4014,23 @@ def handle_confirm_write(ack, body, client) -> None:
 def handle_cancel_write(ack, body, client) -> None:
     ack()
     _handle_confirm_tap(body, client, action="cancel")
+
+
+@app.action(confirm_cards.ACTION_PICK_SLOT)
+def handle_pick_slot(ack, body, client) -> None:
+    """Meeting-slot tap (v2 S2): "{stash_id}:{slot_index}". Split here, then run
+    the SAME claim/authorize/execute path a plain Confirm takes -- the slot index
+    is bounds-checked against the stash's own offered list server-side, so a
+    forged or stale index can only ever address a slot this stash really
+    offered."""
+    ack()
+    actions = body.get("actions") or [{}]
+    raw = str(actions[0].get("value") or "")
+    sid, _, idx_raw = raw.partition(":")
+    if not sid or not idx_raw.isdigit():
+        return
+    _handle_confirm_tap(body, client, action="confirm",
+                        stash_id_override=sid, slot_index=int(idx_raw))
 
 
 def _handle_pick_tap(body: dict, client) -> None:

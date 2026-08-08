@@ -31,6 +31,12 @@ from threading import Lock
 ACTION_CONFIRM = "cora_confirm_write"
 ACTION_CANCEL = "cora_cancel_write"
 ACTION_PICK = "cora_pick_candidate"
+# One button per OFFERED meeting slot (v2 S2). Deliberately its own action id
+# rather than reusing ACTION_PICK: a candidate pick answers an ambiguity ask
+# (value = ask_id:key, resolved against the ask store), whereas a slot pick
+# CONFIRMS a staged write (value = stash_id:slot_index, resolved against the
+# schedule_meeting stash). Same-looking values, completely different authority.
+ACTION_PICK_SLOT = "cora_pick_slot"
 
 # Matches every existing pending store's TTL (asana/shopify/calendar/lexicon/
 # code_queue/delegated all use 600s independently -- kept as one named constant
@@ -310,6 +316,45 @@ def build_picker_blocks(prompt_text: str, ask_id: str, candidates: list[tuple[st
     return [
         {"type": "section", "text": {"type": "mrkdwn", "text": prompt_text}},
         {"type": "actions", "block_id": f"cora_pick_actions_{ask_id}", "elements": elements},
+    ]
+
+
+# Matches _tool_calendar_schedule_meeting's own slots[:3] cap.
+MAX_SLOT_BUTTONS = 3
+
+
+def build_slot_picker_blocks(preview_text: str, stash_id: str,
+                             slot_labels: list[str]) -> list[dict]:
+    """Meeting-proposal card: one button per OFFERED slot, plus Cancel (v2 S2).
+
+    v1 gave schedule_meeting a single Confirm that always booked slots[0], while
+    the typed path let the user pick any of the up-to-3 offered options -- so the
+    button silently did something different from what the words next to it
+    offered. One button per slot removes the divergence; a slot the stash never
+    offered still cannot be booked, because the index is resolved against the
+    stash's OWN slot list server-side (_execute_claimed_schedule_meeting's
+    exact-match check is unchanged and remains the real gate)."""
+    elements = []
+    for idx, label in enumerate(slot_labels[:MAX_SLOT_BUTTONS]):
+        btn = label if len(label) <= _BTN_LABEL_MAX else label[: _BTN_LABEL_MAX - 3] + "..."
+        elements.append({
+            "type": "button",
+            "action_id": ACTION_PICK_SLOT,
+            "style": "primary",
+            "text": {"type": "plain_text", "text": btn},
+            "value": f"{stash_id}:{idx}",
+        })
+    elements.append({
+        "type": "button",
+        "action_id": ACTION_CANCEL,
+        "style": "danger",
+        "text": {"type": "plain_text", "text": "Cancel"},
+        "value": stash_id,
+    })
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": preview_text}},
+        {"type": "actions", "block_id": f"cora_slot_actions_{stash_id}",
+         "elements": elements},
     ]
 
 

@@ -5513,6 +5513,16 @@ def try_confirm_pending_write(
     lexadd = _mine(_peek_pending_lexicon(slack_user_id, channel_name))
     delegated = _mine(_peek_pending_delegated(slack_user_id, channel_name))
     codequeue = _mine(_peek_pending_code_queue(slack_user_id, channel_name))
+    # v2 S2: the three kinds added last (remember / forget_note /
+    # schedule_meeting) were never peeked here, so a bare "yes" answering ONE OF
+    # THEIR previews fell through to the freshest of the six kinds above and
+    # fired a staler Asana/Shopify write instead -- the exact class the 8/6
+    # code-queue fix closed, left open for three more kinds. They join the
+    # arbitration and DEFER to the model (see the kind check below), so their
+    # own tool sees the confirm.
+    remember = _mine(_peek_pending_remember(slack_user_id, channel_name))
+    forget_note = _mine(_peek_pending_forget_note(slack_user_id, channel_name))
+    schedmtg = _mine(_peek_pending_schedule_meeting(slack_user_id, channel_name))
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -5538,6 +5548,12 @@ def try_confirm_pending_write(
         # A fresh code-queue capture preview. Participates in the freshest-first
         # arbitration and always DEFERS (see the kind check below for why).
         entries.append((float(codequeue.get("ts", 0)), "code_queue", "capture"))
+    if remember:
+        entries.append((float(remember.get("ts", 0)), "remember", "remember"))
+    if forget_note:
+        entries.append((float(forget_note.get("ts", 0)), "forget_note", "forget"))
+    if schedmtg:
+        entries.append((float(schedmtg.get("ts", 0)), "schedule_meeting", "schedule"))
     if not entries:
         # Expired-confirm tombstone (cq-ed29165fca97): with no FRESH pending, a bare
         # affirmative + a recently-EXPIRED Shopify entry means the user is confirming
@@ -5618,7 +5634,8 @@ def try_confirm_pending_write(
         log.info("confirm_interceptor ABANDON stale destructive asana user=%s action=%s (superseded)",
                  slack_user_id, asana.get("action"))
 
-    if kind in ("calendar", "lexicon", "code_queue"):
+    if kind in ("calendar", "lexicon", "code_queue",
+                "remember", "forget_note", "schedule_meeting"):
         # Deferred to the model; never fire a staler write on a confirm meant
         # for a calendar booking, a lexicon teach, or a code-queue capture.
         #
@@ -5631,6 +5648,13 @@ def try_confirm_pending_write(
         # most likely to have a stale Asana pending. Deferring (the calendar/lexicon
         # pattern) is the minimal fix: the model sees the fresh code-queue pending
         # and calls the tool with confirmed=true.
+        #
+        # remember / forget_note / schedule_meeting joined on 2026-08-08 (v2 S2)
+        # for exactly the same reason: all three mint a pending, none had a
+        # deterministic confirm executor here, and all three were invisible to
+        # this arbitration -- so their confirm turn's bare "yes" was free to fire
+        # somebody else's staler write. Each defers; the Sonnet-force chain in
+        # app.py covers all three so the model reliably reaches the tool.
         return None
 
     intent = _confirm_intent(message, action)
@@ -5685,6 +5709,15 @@ def _peek_pending_schedule_meeting(slack_user: str, channel: str) -> dict | None
     if entry and (time.time() - float(entry.get("ts", 0))) <= _SCHEDULE_MEETING_PENDING_TTL_SECONDS:
         return entry
     return None
+
+
+def has_pending_schedule_meeting(slack_user: str, channel: str) -> bool:
+    """Fresh meeting proposal awaiting confirmation -> force Sonnet on the
+    confirm turn, matching has_pending_asana_write/remember/etc. v1 left this
+    kind out of the escalation chain entirely even though its confirm turn is
+    exactly the shape (a bare affirmative answering a staged preview) that made
+    Haiku fabricate preview-shaped text with zero tool_use."""
+    return _peek_pending_schedule_meeting(slack_user, channel) is not None
 
 
 def _execute_claimed_schedule_meeting(
@@ -5870,11 +5903,16 @@ def _tool_calendar_schedule_meeting(slack_user_id: str, entity: str, _input: dic
         # Stash the SAME iso strings format_slot_proposals_for_llm embeds in the
         # passback text, so a confirm-turn echo can be validated against exactly
         # what was offered (never an arbitrary/hallucinated time).
-        iso_slots = [(calendar_client._fmt_slot(s, e)[3], calendar_client._fmt_slot(s, e)[4])
-                     for s, e in slots[:3]]
+        fmt = [calendar_client._fmt_slot(s, e) for s, e in slots[:3]]
+        iso_slots = [(f[3], f[4]) for f in fmt]
+        # Human labels for the per-slot buttons (v2 S2). Derived from the SAME
+        # _fmt_slot call as the iso passback strings, so a button's label and the
+        # time it actually books can never drift apart.
+        slot_labels = [f"{f[0]}, {f[1]}" for f in fmt]
         _store_pending_schedule_meeting(slack_user_id, channel, {
             "requester_email": requester_email, "requester_name": requester_name,
             "title": title, "names": names, "emails": emails, "slots": iso_slots,
+            "slot_labels": slot_labels,
             "ts": time.time(),
             "stash_id": confirm_cards.mint_stash_id("schedule_meeting", slack_user_id, channel),
         })
@@ -10794,7 +10832,7 @@ def _stash_expired_label(kind: str, entry: dict) -> str:
 
 
 def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity: str,
-                           channel: str) -> tuple[str, str | None]:
+                           channel: str, slot_index: int | None = None) -> tuple[str, str | None]:
     """Dispatch an ALREADY-CLAIMED stash entry to its kind's own execute
     function -- the identical function the typed-confirm path calls.
 
@@ -10827,20 +10865,29 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
     if kind == "forget_note":
         return _execute_claimed_forget_note(entry, tapping_user_id), None
     if kind == "schedule_meeting":
-        # The Confirm button always books the FIRST (soonest) offered slot --
-        # design section 4.1's single Confirm/Cancel pair, not a 3-way picker
-        # (the typed path is UNCHANGED and unaffected: a user who wants a
-        # different one of the up-to-3 options still types "2" or the exact
-        # iso strings, exactly as before this feature existed).
+        # v2 S2: the card renders ONE BUTTON PER OFFERED SLOT, so the tap says
+        # which slot it means. v1 had a single Confirm that always booked
+        # slots[0] while the typed path allowed any of the up-to-3 options -- the
+        # button quietly did something different from the words beside it.
+        # slot_index is still bounds-checked here (a forged/stale index can only
+        # ever address a slot THIS stash actually offered), and
+        # _execute_claimed_schedule_meeting's exact iso match remains the gate.
+        # Defaults to 0 so any caller that does not pass one keeps the old
+        # soonest-slot behaviour.
         slots = entry.get("slots") or []
         if not slots:
             return "calendar_schedule_meeting: no slot was available to book.", None
-        start, end = slots[0]
+        idx = 0 if slot_index is None else int(slot_index)
+        if idx < 0 or idx >= len(slots):
+            return ("calendar_schedule_meeting: that option is no longer one of the "
+                    "times I offered. Ask me to find a time again."), None
+        start, end = slots[idx]
         return _execute_claimed_schedule_meeting(entry, tapping_user_id, start, end), None
     return "Internal error -- unrecognized stash kind. Nothing changed.", None
 
 
-def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) -> dict:
+def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
+                            slot_index: int | None = None) -> dict:
     """Resolve + authorize + atomically claim a Confirm/Cancel button tap.
     `action` is 'confirm' or 'cancel'. Returns a result dict:
       {'outcome': 'unauthorized', 'owner': <slack id>}
@@ -10943,7 +10990,8 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str) ->
         # populated ONLY by the same call that minted it (Shopify's executors
         # thread it straight through; every other kind hard-codes None since
         # none of them can re-stash). There is no shared state left to race.
-        raw, fresh_stash_id = _execute_claimed_stash(kind, entry, tapping_user_id, entity, channel)
+        raw, fresh_stash_id = _execute_claimed_stash(
+            kind, entry, tapping_user_id, entity, channel, slot_index=slot_index)
         clean_message = _strip_write_sentinel(raw)
     except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
         log.exception("confirm-button execute crashed AFTER claim kind=%s user=%s",
