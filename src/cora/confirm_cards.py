@@ -37,6 +37,15 @@ ACTION_PICK = "cora_pick_candidate"
 # CONFIRMS a staged write (value = stash_id:slot_index, resolved against the
 # schedule_meeting stash). Same-looking values, completely different authority.
 ACTION_PICK_SLOT = "cora_pick_slot"
+# One Confirm/Cancel pair per ITEM of a multi-item meeting stash (v2b S5).
+# Again its own action ids rather than reusing ACTION_CONFIRM/ACTION_CANCEL: a
+# plain Confirm claims a WHOLE stash and consumes it, whereas an item tap claims
+# exactly ONE index of a stash that stays live for its remaining items. Sharing
+# ids would let a forged bare-stash_id value consume every item at once, and
+# would make the "a slot/item index only ever addresses its own kind" refusal
+# impossible to express (the same separation ACTION_PICK_SLOT exists for).
+ACTION_CONFIRM_ITEM = "cora_confirm_item"
+ACTION_CANCEL_ITEM = "cora_cancel_item"
 
 # Matches every existing pending store's TTL (asana/shopify/calendar/lexicon/
 # code_queue/delegated all use 600s independently -- kept as one named constant
@@ -220,6 +229,32 @@ def register_card(stash_id: str, channel_id: str, message_ts: str, preview_text:
             entry["cards"].append(coords)
 
 
+def pop_card_at(stash_id: str, channel_id: str, message_ts: str) -> bool:
+    """Take exactly ONE rendered-card coordinate for `stash_id`, leaving its
+    siblings registered. True if a coordinate was removed.
+
+    pop_cards() takes them all, which is right for a single-card stash: the tap
+    claims the whole thing, so every card for it is finished. A meeting stash
+    renders one card PER ITEM under one stash_id, and confirming item 0 must not
+    deregister items 1..N -- doing so would leave their cards live-buttoned with
+    nothing able to close them later (the exact orphan the S1 sweep exists to
+    prevent). Each item tap hands over only its own coordinate, at claim time,
+    for the same reason pop_cards does: so no concurrent sweep can be mid-flight
+    against the message this tap is about to edit."""
+    if not stash_id:
+        return False
+    with _CARD_LOCK:
+        entry = _CARDS.get(stash_id)
+        if not entry:
+            return False
+        coords = entry.get("cards") or []
+        for i, (ch, ts, _preview) in enumerate(coords):
+            if ch == channel_id and ts == message_ts:
+                coords.pop(i)
+                return True
+    return False
+
+
 def pop_cards(stash_id: str) -> list[tuple[str, str, str]]:
     """Take (and clear) every rendered-card coordinate for `stash_id`. The
     'attached' claim deliberately SURVIVES the pop, so a closed card can never
@@ -355,6 +390,53 @@ def build_slot_picker_blocks(preview_text: str, stash_id: str,
         {"type": "section", "text": {"type": "mrkdwn", "text": preview_text}},
         {"type": "actions", "block_id": f"cora_slot_actions_{stash_id}",
          "elements": elements},
+    ]
+
+
+# Cap on how many item cards one meeting preview posts. Matches
+# meeting_actions._MAX_SELECTED, which is the cap the CREATE path already
+# enforces -- offering a button for an item the write path would refuse to
+# create would be a card that lies.
+MAX_ITEM_CARDS = 6
+
+
+def build_item_confirm_blocks(item_text: str, stash_id: str,
+                              item_index: int) -> list[dict]:
+    """ONE item of a multi-item meeting stash: its text + its own Confirm/Cancel.
+
+    value = "{stash_id}:{item_index}" -- the same shape as a slot pick, and for
+    the same reason: the index is an offset into a list the SERVER holds, never a
+    payload. The item's text rides in the message body for the human; nothing in
+    the button value is trusted.
+
+    Deliberately one card per MESSAGE rather than one message with N button rows.
+    Two taps on different items of one shared message would each be a legitimate
+    claim winner with a DIFFERENT correct outcome, and their two chat_update
+    round-trips cannot be ordered after the fact (see the terminal-edit note at
+    the bottom of this module) -- so the later-applied edit would clobber the
+    other item's result. Separate messages make that race structurally
+    impossible: each tap only ever edits its own."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": item_text}},
+        {
+            "type": "actions",
+            "block_id": f"cora_item_actions_{stash_id}_{item_index}",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": ACTION_CONFIRM_ITEM,
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "Create task"},
+                    "value": f"{stash_id}:{item_index}",
+                },
+                {
+                    "type": "button",
+                    "action_id": ACTION_CANCEL_ITEM,
+                    "text": {"type": "plain_text", "text": "Skip"},
+                    "value": f"{stash_id}:{item_index}",
+                },
+            ],
+        },
     ]
 
 

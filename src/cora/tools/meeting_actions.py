@@ -1257,14 +1257,58 @@ def _create_selected(
 # Tool entry point
 # ---------------------------------------------------------------------------
 
+def verified_item_texts(mine: list[dict], unclear: list[dict], is_lex: bool) -> list[str]:
+    """The asker's own action items, exactly as the preview renders them.
+
+    This is the list the per-item cards address by index and the list a typed
+    confirm is filtered against (v2b S5). Scrubbed for LEX the same way the
+    preview text is, so a card can never show more than the preview did, and
+    capped at _MAX_SELECTED because that is the cap the CREATE path already
+    enforces -- offering an item the write path would drop would be a lie."""
+    texts = [_scrub_for_lex(it["task"], is_lex) for it in (mine + unclear)
+             if str(it.get("task") or "").strip()]
+    return texts[:_MAX_SELECTED]
+
+
+def _stashed_item_filter(stashed_items: list[str], selected: list[str]) -> list[str]:
+    """Keep only the selected texts that correspond to a VERIFIED item.
+
+    The typed confirm path echoes item texts through the model. Today they are
+    checked against the meeting's whole action_items blob, which also contains
+    OTHER attendees' items -- so a model that picked up somebody else's line
+    passed. Matching against the asker's own verified list instead closes that,
+    and stays lenient about relay drift: normalized equality first, then the same
+    significant-token check the meeting-content rail uses, run against the
+    verified list rather than the full blob."""
+    if not stashed_items:
+        return list(selected)
+    keys = {_dedup_key(s) for s in stashed_items}
+    blob = "\n".join(stashed_items)
+    return [s for s in selected
+            if _dedup_key(s) in keys or _item_matches_meeting(s, blob)]
+
+
 def run_meeting_action_items(
     slack_user_id: str,
     entity: str,
     _input: dict,
     *,
     dry_run: bool = False,
+    stash_items=None,
+    stashed_items_for=None,
 ) -> str:
-    """Pull flow entry point. See module docstring for the full contract."""
+    """Pull flow entry point. See module docstring for the full contract.
+
+    stash_items(items, transcript_id) -> None: called at PREVIEW time with the
+    asker's verified item list, so the tool wrapper can record it server-side for
+    the per-item confirm cards (v2b S5).
+    stashed_items_for(transcript_id) -> list[str] | None: called at CONFIRM time
+    to read that list back, so a model-echoed selection can be filtered against
+    it.
+
+    Callbacks rather than imports, so this module keeps knowing nothing about
+    tool_dispatch. Both default to None -- scripts, tests and dry runs get
+    exactly the pre-S5 behaviour."""
     input_data = _input or {}
     meeting_query = str(input_data.get("meeting_query", "") or "").strip()
     transcript_id = str(input_data.get("transcript_id", "") or "").strip()
@@ -1327,9 +1371,24 @@ def run_meeting_action_items(
         lex_ok, lex_reason, scoped_entity = _lex_gate(transcript, title, meeting_entity)
         if not lex_ok:
             return lex_reason
+        # v2b S5: when a verified list was stashed for THIS meeting, filter the
+        # model-echoed selection against it before the write path runs. Purely
+        # additive -- with no stash (expired, restarted, a script caller) the
+        # selection passes through and the existing rails are unchanged.
+        chosen = list(selected_items)
+        if callable(stashed_items_for):
+            stashed = stashed_items_for(transcript_id)
+            if stashed:
+                chosen = _stashed_item_filter(stashed, chosen)
+                if not chosen:
+                    return (
+                        "None of those match the action items I showed you for that "
+                        "meeting, so I didn't create anything. Ask me for the meeting "
+                        "again and pick from the list."
+                    )
         return _create_selected(
             slack_user_id, transcript, transcript_id, meeting_entity,
-            is_lex, scoped_entity, list(selected_items), dry_run=dry_run,
+            is_lex, scoped_entity, chosen, dry_run=dry_run,
         )
 
     # ── PREVIEW / RESOLVE (read-only) ───────────────────────────────────────
@@ -1422,4 +1481,15 @@ def run_meeting_action_items(
         "meeting_action_items PREVIEW asker=%s meeting=%r entity=%s is_lex=%s mine=%d unclear=%d",
         slack_user_id, _scrub_for_lex(title, is_lex), meeting_entity, is_lex, len(mine), len(unclear),
     )
+    # v2b S5: hand the verified list to the wrapper so it can stash it and post
+    # one confirm card per item. Everything the write path needs to re-run its
+    # rails goes with it -- the cards carry only an index into this list.
+    if callable(stash_items) and (mine or unclear):
+        try:
+            stash_items(
+                verified_item_texts(mine, unclear, is_lex),
+                {"transcript_id": resolved_id, "entity": entity, "is_dm": is_dm},
+            )
+        except Exception:  # noqa: BLE001 -- a card is a nicety; the preview is the answer
+            log.warning("meeting_action_items: item stash failed (non-fatal)", exc_info=True)
     return _format_preview(transcript, resolved_id, is_lex, mine, unclear)

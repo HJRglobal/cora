@@ -7315,7 +7315,121 @@ def _tool_meeting_action_items(slack_user_id: str, entity: str, _input: dict) ->
     (attendee gate, channel/DM scope, D-052 LEX rails, staged-write create) lives
     in cora.tools.meeting_actions. Lazy import avoids any import-order surprise."""
     from cora.tools import meeting_actions  # noqa: PLC0415
-    return meeting_actions.run_meeting_action_items(slack_user_id, entity, _input or {})
+    input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
+
+    def _stash(items: list[str], context: dict) -> None:
+        """PREVIEW hook: record the asker's verified item list so the reply can
+        carry one Confirm/Skip card per item (v2b S5, cq-b5460ae7aca3)."""
+        _classb_stash("meeting_item", slack_user_id, channel, {
+            "items": list(items), "claimed": [False] * len(items),
+            "transcript_id": context.get("transcript_id", ""),
+            "entity": context.get("entity", entity),
+            "is_dm": bool(context.get("is_dm")),
+        })
+
+    def _stashed_for(transcript_id: str) -> list[str] | None:
+        """CONFIRM hook: the verified list for THIS meeting, or None. Peeked, not
+        taken -- a typed confirm of one item must leave the rest confirmable, and
+        the per-item cards for them are still live."""
+        entry = _CLASSB["meeting_item"]["peek"](slack_user_id, channel) or {}
+        if entry.get("transcript_id") != transcript_id:
+            return None
+        return entry.get("items") or None
+
+    return meeting_actions.run_meeting_action_items(
+        slack_user_id, entity, input_data,
+        stash_items=_stash, stashed_items_for=_stashed_for)
+
+
+def peek_meeting_items(slack_user: str, channel: str) -> dict | None:
+    """The live meeting-item stash for (user, channel), or None. app.py reads it
+    to decide whether this turn's reply should be followed by item cards."""
+    return _CLASSB["meeting_item"]["peek"](slack_user, channel)
+
+
+def _claim_meeting_item(stash_id: str, user: str, channel: str,
+                        item_index: int) -> tuple[str, dict | None]:
+    """Atomically claim ONE item of a multi-item meeting stash.
+
+    Unlike _claim_stash_by_id this does NOT pop the entry on success -- it marks
+    that one index claimed and leaves the rest confirmable, popping only when the
+    last one goes. Everything else matches: the same lock, the same exact
+    stash_id match, the same TTL check, so a superseded or expired stash behaves
+    identically to every other kind.
+
+    Returns (status, payload); status is claimed / already_handled /
+    out_of_range / superseded / expired / not_found. The payload carries the
+    item text plus the meeting context the write path re-verifies against, and a
+    'last' flag so the caller knows whether the whole stash is now finished."""
+    spec = _CLASSB["meeting_item"]
+    key = spec["key"](user, channel)
+    with spec["lock"]:
+        entry = spec["store"].get(key)
+        if not entry:
+            return "not_found", None
+        if entry.get("stash_id") != stash_id:
+            return "superseded", None
+        if (time.time() - float(entry.get("ts", 0))) > spec["ttl"]:
+            spec["store"].pop(key, None)
+            return "expired", entry
+        items = entry.get("items") or []
+        claimed = entry.get("claimed") or []
+        if item_index < 0 or item_index >= len(items) or item_index >= len(claimed):
+            return "out_of_range", None
+        if claimed[item_index]:
+            return "already_handled", None
+        claimed[item_index] = True
+        last = all(claimed)
+        if last:
+            spec["store"].pop(key, None)
+        return "claimed", {
+            "item": items[item_index], "item_index": item_index, "last": last,
+            "transcript_id": entry.get("transcript_id", ""),
+            "entity": entry.get("entity", ""), "is_dm": bool(entry.get("is_dm")),
+        }
+
+
+def _execute_claimed_meeting_item(payload: dict, tapping_user_id: str) -> str:
+    """Create ONE tapped meeting action item as an Asana task.
+
+    Runs the SAME server-side rails the typed confirm runs, in the same place:
+    re-fetch the transcript, _asker_attended, _scope_ok, _lex_gate, then
+    _create_selected (which owns _item_matches_meeting, the dedups, the LEX
+    project routing and the budget). Nothing is re-derived from the tap -- the
+    item text and the meeting id both come from the stash."""
+    from cora.tools import meeting_actions as ma  # noqa: PLC0415
+
+    transcript_id = payload.get("transcript_id", "")
+    if not transcript_id:
+        return "I lost track of which meeting that was. Ask me for it again."
+    asker_emails = ma._asker_emails(tapping_user_id)
+    if not asker_emails:
+        return ("I can't match you to a meeting attendee -- your account isn't in "
+                "my Slack-to-Asana map yet.")
+    try:
+        transcript = ma._fetch_transcript_by_id(transcript_id)
+    except ma.FirefliesConnectorError:
+        log.warning("meeting item tap: transcript fetch failed", exc_info=True)
+        return "I couldn't reach the meeting service just now -- please try again shortly."
+    if not transcript:
+        return "I couldn't re-find that meeting, so I didn't create anything."
+    if not ma._asker_attended(transcript, asker_emails, tapping_user_id):
+        log.info("meeting item tap refused (non-attendee) asker=%s", tapping_user_id)
+        return "I can only create action items for meetings you attended."
+    title = (transcript.get("title") or "").strip()
+    meeting_entity, is_lex = ma._classify_meeting(transcript)
+    ok, reason = ma._scope_ok(meeting_entity, payload.get("entity", ""),
+                              bool(payload.get("is_dm")))
+    if not ok:
+        return reason
+    lex_ok, lex_reason, scoped_entity = ma._lex_gate(transcript, title, meeting_entity)
+    if not lex_ok:
+        return lex_reason
+    return ma._create_selected(
+        tapping_user_id, transcript, transcript_id, meeting_entity,
+        is_lex, scoped_entity, [payload["item"]],
+    )
 
 
 # --- Catalog: tool definitions exposed to Claude ---
@@ -11752,11 +11866,70 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
                     "times I offered. Ask me to find a time again."), None
         start, end = slots[idx]
         return _execute_claimed_schedule_meeting(entry, tapping_user_id, start, end), None
+    # meeting_item is deliberately absent: it is a MULTI-item stash, and this
+    # function's callers claim (and therefore consume) a whole entry. Its taps
+    # are refused before they reach here and routed to _resolve_meeting_item_tap
+    # instead, so falling through to the honest error below is the correct
+    # behaviour for anything that somehow arrives with that kind.
     return "Internal error -- unrecognized stash kind. Nothing changed.", None
 
 
+def _resolve_meeting_item_tap(stash_id: str, tapping_user_id: str, action: str,
+                              user: str, channel: str, item_index: int,
+                              card_coords: tuple[str, str] | None) -> dict:
+    """The per-item half of resolve_and_claim_stash (v2b S5).
+
+    Shares that function's whole preamble (EVAL_MODE, index lookup, resolved
+    check, requester authorization) -- it is called from inside it, after all of
+    that has passed -- and diverges only where it must: the claim is per-index,
+    the stash stays live while items remain, and only THIS card's coordinate is
+    handed over rather than every card for the stash."""
+    status, payload = _claim_meeting_item(stash_id, user, channel, item_index)
+    if status == "not_found":
+        # The whole stash went away by another route (typed confirm of the last
+        # item, cancel, supersede). Idempotent ack, same as the generic path.
+        confirm_cards.index_mark_resolved(stash_id)
+        return {"outcome": "already_handled"}
+    if status == "superseded":
+        return {"outcome": "superseded"}
+    if status == "expired":
+        confirm_cards.index_mark_resolved(stash_id)
+        confirm_cards.pop_cards(stash_id)  # the WHOLE stash expired: every card is done
+        return {"outcome": "expired", "label": _stash_expired_label("meeting_item", payload or {})}
+    if status == "out_of_range":
+        # A forged or stale index. Never leaks whether the stash exists.
+        log.warning("meeting item tap out of range idx=%s user=%s",
+                    item_index, tapping_user_id)
+        return {"outcome": "orphaned"}
+    if status == "already_handled":
+        return {"outcome": "already_handled"}
+
+    # status == "claimed": exactly one caller reaches here for THIS index.
+    if payload.get("last"):
+        # Only now is the stash itself finished, so only now may the index say so
+        # -- marking it resolved earlier would make stash_is_live() False and let
+        # the sweep close the still-live sibling cards.
+        confirm_cards.index_mark_resolved(stash_id)
+    if card_coords:
+        # Hand over THIS card's coordinate only, at claim time, for the same
+        # reason the generic path pops: execute can run for seconds, and any
+        # reply anywhere fires the process-global sweep meanwhile.
+        confirm_cards.pop_card_at(stash_id, card_coords[0], card_coords[1])
+    if action == "cancel":
+        return {"outcome": "cancelled"}
+    try:
+        raw = _execute_claimed_meeting_item(payload, tapping_user_id)
+        return {"outcome": "executed", "message": _strip_write_sentinel(raw)}
+    except Exception:  # noqa: BLE001 -- never crash the Slack action receiver
+        log.exception("meeting item tap execute crashed AFTER claim user=%s",
+                      tapping_user_id)
+        return {"outcome": "indeterminate"}
+
+
 def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
-                            slot_index: int | None = None) -> dict:
+                            slot_index: int | None = None,
+                            item_index: int | None = None,
+                            card_coords: tuple[str, str] | None = None) -> dict:
     """Resolve + authorize + atomically claim a Confirm/Cancel button tap.
     `action` is 'confirm' or 'cancel'. Returns a result dict:
       {'outcome': 'unauthorized', 'owner': <slack id>}
@@ -11806,6 +11979,22 @@ def resolve_and_claim_stash(stash_id: str, tapping_user_id: str, action: str,
         log.warning("slot tap against a non-meeting stash REFUSED kind=%s user=%s",
                     kind, tapping_user_id)
         return {"outcome": "orphaned"}
+
+    # v2b S5, the same separation in both directions. An item tap must only ever
+    # address a meeting_item stash; and a meeting_item stash must ONLY be reached
+    # through an item tap, because the generic claim below pops the whole entry
+    # and would silently discard every unconfirmed sibling item.
+    if item_index is not None and kind != "meeting_item":
+        log.warning("item tap against a non-meeting-item stash REFUSED kind=%s user=%s",
+                    kind, tapping_user_id)
+        return {"outcome": "orphaned"}
+    if kind == "meeting_item":
+        if item_index is None:
+            log.warning("bare tap against a meeting_item stash REFUSED user=%s",
+                        tapping_user_id)
+            return {"outcome": "orphaned"}
+        return _resolve_meeting_item_tap(stash_id, tapping_user_id, action,
+                                         user, channel, item_index, card_coords)
 
     status, entry = _claim_stash_by_id(kind, user, channel, stash_id)
     if status == "not_found":

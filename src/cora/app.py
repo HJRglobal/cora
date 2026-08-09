@@ -900,6 +900,23 @@ def _dispatch_qa(
             log.info("confirm_card attached kind=ask stash=%s channel=#%s user=%s",
                      cid, channel_name, user_id)
             return confirm_cards.build_picker_blocks(text, cid, candidates)
+        if kind == "meeting_item":
+            # v2b S5 (cq-b5460ae7aca3): a meeting preview lists SEVERAL action
+            # items, and the user wants some of them, so one Confirm over the
+            # whole reply is the wrong shape. The reply itself stays buttonless
+            # and one Confirm/Skip card per item follows it (posted by
+            # _register_posted_card once the reply has landed). Claimed here so
+            # the one-card-per-stash rule still holds -- a second turn that
+            # somehow reached the same stash gets no cards rather than a
+            # duplicate set.
+            entry = _tool_dispatch.peek_meeting_items(user_id, channel_name) or {}
+            items = entry.get("items") or []
+            if entry.get("stash_id") == cid and items and confirm_cards.claim_card_attach(cid):
+                _carded["item_stash"] = cid
+                _carded["items"] = items
+                log.info("confirm_card meeting items=%d stash=%s channel=#%s user=%s",
+                         len(items), cid, channel_name, user_id)
+            return None
         if kind == "schedule_meeting":
             # One button per OFFERED slot instead of a single Confirm (v2 S2):
             # v1's Confirm always booked slots[0] while the preview text offered
@@ -928,10 +945,41 @@ def _dispatch_qa(
         response shape change) must never register a junk coordinate that a
         later sweep would then try to chat_update."""
         cid = _carded.get("id")
-        if not cid or not isinstance(message_ts, str) or not message_ts:
+        if cid and isinstance(message_ts, str) and message_ts:
+            ch = channel if isinstance(channel, str) and channel else channel_id
+            confirm_cards.register_card(cid, ch, message_ts, _carded.get("text", ""))
+        # v2b S5: meeting per-item cards ride AFTER the reply, one message each.
+        # Folded in here rather than added at each reply site so all three sites
+        # get it from the single place that already runs post-reply.
+        _post_meeting_item_cards()
+
+    def _post_meeting_item_cards() -> None:
+        """One Confirm/Skip card per action item, each its own message.
+
+        Separate messages, not one message with N button rows: two taps on
+        different items of a shared message would each be a legitimate claim
+        winner with a DIFFERENT correct outcome, and their two chat_update calls
+        cannot be ordered after the fact -- the later-applied edit would clobber
+        the other item's result. One message per item makes that impossible.
+
+        Best-effort throughout: a card that fails to post simply is not there,
+        and the typed 'create the first and third' path still works."""
+        sid = _carded.pop("item_stash", None)
+        items = _carded.pop("items", None) or []
+        if not sid or not items:
             return
-        ch = channel if isinstance(channel, str) and channel else channel_id
-        confirm_cards.register_card(cid, ch, message_ts, _carded.get("text", ""))
+        for idx, item in enumerate(items[:confirm_cards.MAX_ITEM_CARDS]):
+            text = f"*{idx + 1}.* {item}"
+            try:
+                resp = client.chat_postMessage(
+                    channel=channel_id, thread_ts=reply_thread_ts, text=text,
+                    blocks=confirm_cards.build_item_confirm_blocks(text, sid, idx),
+                    unfurl_links=False, unfurl_media=False,
+                )
+                confirm_cards.register_card(sid, channel_id, (resp or {}).get("ts", ""), text)
+            except Exception:  # noqa: BLE001 -- a card is a nicety, never the answer
+                log.warning("meeting item card post failed idx=%d (non-fatal)", idx,
+                            exc_info=True)
 
     def _post_reply_card_sweep() -> None:
         """Close any rendered card whose stash went terminal -- including THIS
@@ -4004,7 +4052,8 @@ def _close_stale_confirm_cards(client) -> None:
 
 def _handle_confirm_tap(body: dict, client, *, action: str,
                         stash_id_override: str | None = None,
-                        slot_index: int | None = None) -> None:
+                        slot_index: int | None = None,
+                        item_index: int | None = None) -> None:
     """Shared Confirm/Cancel tap handler for all 9 stash kinds (S2, design
     2026-08-02). Requester-only, atomic claim, honest terminal states for
     every lifecycle case (superseded/expired/orphaned/indeterminate/already-
@@ -4048,7 +4097,11 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
     # by construction rather than true-by-coincidence.
     confirm_cards.begin_turn()
     result = _tool_dispatch.resolve_and_claim_stash(
-        stash_id, tapping_user, action, slot_index=slot_index)
+        stash_id, tapping_user, action, slot_index=slot_index,
+        item_index=item_index,
+        # v2b S5: an item tap hands over only ITS OWN card coordinate at claim
+        # time, so its siblings stay registered and sweepable.
+        card_coords=(channel_id, message_ts) if item_index is not None else None)
     outcome = result.get("outcome")
 
     if outcome == "unauthorized":
@@ -4121,7 +4174,11 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
         text = (f"That {label} expired before you confirmed. Nothing was "
                 f"changed -- tell me again and I'll re-preview it.")
     elif outcome == "cancelled":
-        text = "Cancelled -- nothing was changed."
+        # v2b S5: an item Skip dismisses ONE item, and the sibling cards next to
+        # it are still live -- "nothing was changed" would read as "I cancelled
+        # the whole thing" when the others are still awaiting a tap.
+        text = ("Skipped -- no task created for this one." if item_index is not None
+                else "Cancelled -- nothing was changed.")
     elif outcome == "indeterminate":
         text = ("Something may have gone through, but I hit an error right "
                 "after -- I can't confirm either way. Check before retrying; "
@@ -4180,6 +4237,32 @@ def handle_pick_slot(ack, body, client) -> None:
         return
     _handle_confirm_tap(body, client, action="confirm",
                         stash_id_override=sid, slot_index=int(idx_raw))
+
+
+def _handle_item_tap(body: dict, client, *, action: str) -> None:
+    """Meeting per-item tap (v2b S5): "{stash_id}:{item_index}". Split here, then
+    run the SAME claim/authorize path a plain Confirm takes -- the index is
+    bounds-checked against the stash's OWN verified list server-side, so a forged
+    or stale index can only ever address an item this stash really offered."""
+    actions = body.get("actions") or [{}]
+    raw = str(actions[0].get("value") or "")
+    sid, _, idx_raw = raw.partition(":")
+    if not sid or not idx_raw.isdigit():
+        return
+    _handle_confirm_tap(body, client, action=action,
+                        stash_id_override=sid, item_index=int(idx_raw))
+
+
+@app.action(confirm_cards.ACTION_CONFIRM_ITEM)
+def handle_confirm_item(ack, body, client) -> None:
+    ack()
+    _handle_item_tap(body, client, action="confirm")
+
+
+@app.action(confirm_cards.ACTION_CANCEL_ITEM)
+def handle_cancel_item(ack, body, client) -> None:
+    ack()
+    _handle_item_tap(body, client, action="cancel")
 
 
 def _handle_pick_tap(body: dict, client) -> None:
