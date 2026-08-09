@@ -64,6 +64,22 @@ def _input(**kwargs) -> dict:
     return base
 
 
+# v2b S5: both tools became real staged writes. A confirm no longer carries the
+# payload -- it executes the STASH the preview call recorded -- so every
+# confirmed=True test here must preview FIRST. Each test's own patches stay
+# exactly as they were; only the preview turn is added. Full staged-write
+# behaviour (retarget resistance, single consumption, taps, tombstones) is
+# covered in tests/test_hubspot_staged_writes.py.
+@pytest.fixture(autouse=True)
+def _clear_classb_stashes():
+    from cora.tools import tool_dispatch as _td
+    for kind in ("hubspot_stage", "hubspot_note"):
+        _td._CLASSB[kind]["store"].clear()
+    yield
+    for kind in ("hubspot_stage", "hubspot_note"):
+        _td._CLASSB[kind]["store"].clear()
+
+
 # ---------------------------------------------------------------------------
 # hubspot_client.get_deal tests
 # ---------------------------------------------------------------------------
@@ -173,6 +189,14 @@ class TestToolUpdateDealStage:
     def _call(self, entity: str = _ENTITY_F3E, **kwargs) -> str:
         return _tool_hubspot_update_deal_stage(_SLACK_USER, entity, _input(**kwargs))
 
+    def _stage_then_call(self, entity: str = _ENTITY_F3E, **kwargs) -> str:
+        """Run the PREVIEW turn (which stashes) and then the confirm turn, under
+        whatever patches the caller already has active."""
+        preview = dict(kwargs)
+        preview["confirmed"] = False
+        self._call(entity, **preview)
+        return self._call(entity, **{**kwargs, "confirmed": True})
+
     def test_lex_channel_blocked(self):
         result = self._call(entity=_ENTITY_LEX, deal_id="123", stage_id="s1", confirmed=True)
         assert "blocked" in result.lower()
@@ -189,7 +213,8 @@ class TestToolUpdateDealStage:
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 result = self._call(deal_id="12345", stage_id="stage_qualified", confirmed=False)
-                assert "WRITE_PREVIEW" in result
+                assert "WRITE_BLOCKED" in result
+                assert "NOT CHANGED yet" in result
                 assert "Hensley Distribution" in result
                 assert "Outreach" in result
                 assert "Qualified" in result
@@ -198,7 +223,7 @@ class TestToolUpdateDealStage:
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 with patch.object(hubspot_client, "update_deal_stage", return_value={}) as mock_update:
-                    result = self._call(deal_id="12345", stage_id="stage_qualified", confirmed=True)
+                    result = self._stage_then_call(deal_id="12345", stage_id="stage_qualified")
                     mock_update.assert_called_once_with("12345", "stage_qualified")
                     assert "WRITE_CONFIRMED" in result
 
@@ -206,7 +231,7 @@ class TestToolUpdateDealStage:
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 with patch.object(hubspot_client, "update_deal_stage", return_value={}):
-                    result = self._call(deal_id="12345", stage_id="stage_qualified", confirmed=True)
+                    result = self._stage_then_call(deal_id="12345", stage_id="stage_qualified")
                     assert "Hensley Distribution" in result
 
     def test_deal_fetch_failure_returns_error(self):
@@ -220,20 +245,22 @@ class TestToolUpdateDealStage:
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 with patch.object(hubspot_client, "update_deal_stage",
                                   side_effect=hubspot_client.HubSpotClientError("API error")):
-                    result = self._call(deal_id="12345", stage_id="stage_q", confirmed=True)
+                    result = self._stage_then_call(deal_id="12345", stage_id="stage_q")
                     assert "failed" in result.lower() or "error" in result.lower()
 
     def test_fndr_entity_is_allowed(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 result = self._call(entity="FNDR", deal_id="12345", stage_id="stage_outreach", confirmed=False)
-                assert "blocked" not in result.lower()
+                assert "not available from lex" not in result.lower()
+                assert "NOT CHANGED yet" in result
 
     def test_bdm_entity_is_allowed(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "_STAGE_NAME_CACHE", _FAKE_STAGE_CACHE):
                 result = self._call(entity="BDM", deal_id="12345", stage_id="stage_outreach", confirmed=False)
-                assert "blocked" not in result.lower()
+                assert "not available from lex" not in result.lower()
+                assert "NOT CHANGED yet" in result
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +270,12 @@ class TestToolUpdateDealStage:
 class TestToolAddNote:
     def _call(self, entity: str = _ENTITY_F3E, **kwargs) -> str:
         return _tool_hubspot_add_note(_SLACK_USER, entity, _input(**kwargs))
+
+    def _stage_then_call(self, entity: str = _ENTITY_F3E, **kwargs) -> str:
+        preview = dict(kwargs)
+        preview["confirmed"] = False
+        self._call(entity, **preview)
+        return self._call(entity, **{**kwargs, "confirmed": True})
 
     def test_lex_channel_blocked(self):
         result = self._call(entity=_ENTITY_LEX, deal_id="123", note_body="hello", confirmed=True)
@@ -259,28 +292,29 @@ class TestToolAddNote:
     def test_unconfirmed_returns_preview(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             result = self._call(deal_id="12345", note_body="Following up on delivery timeline.", confirmed=False)
-            assert "WRITE_PREVIEW" in result
+            assert "WRITE_BLOCKED" in result
+            assert "NOT ADDED yet" in result
             assert "Hensley Distribution" in result
             assert "Following up" in result
 
     def test_confirmed_true_calls_create_note(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "create_note", return_value="note_123") as mock_create:
-                result = self._call(deal_id="12345", note_body="Test note.", confirmed=True)
+                result = self._stage_then_call(deal_id="12345", note_body="Test note.")
                 mock_create.assert_called_once_with(body="Test note.", deal_id="12345")
                 assert "WRITE_CONFIRMED" in result
 
     def test_confirmed_result_contains_deal_name(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "create_note", return_value="note_123"):
-                result = self._call(deal_id="12345", note_body="Test note.", confirmed=True)
+                result = self._stage_then_call(deal_id="12345", note_body="Test note.")
                 assert "Hensley Distribution" in result
 
     def test_note_creation_failure_returns_error(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             with patch.object(hubspot_client, "create_note",
                               side_effect=hubspot_client.HubSpotClientError("API error")):
-                result = self._call(deal_id="12345", note_body="Test.", confirmed=True)
+                result = self._stage_then_call(deal_id="12345", note_body="Test.")
                 assert "failed" in result.lower() or "error" in result.lower()
 
     def test_deal_fetch_failure_returns_error(self):
@@ -293,18 +327,20 @@ class TestToolAddNote:
         long_note = "A" * 400
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             result = self._call(deal_id="12345", note_body=long_note, confirmed=False)
-            assert "WRITE_PREVIEW" in result
+            assert "WRITE_BLOCKED" in result
             assert "..." in result
 
     def test_hjrg_entity_is_allowed(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             result = self._call(entity="HJRG", deal_id="12345", note_body="Note.", confirmed=False)
-            assert "blocked" not in result.lower()
+            assert "not available from lex" not in result.lower()
+            assert "NOT ADDED yet" in result
 
     def test_osn_entity_is_allowed(self):
         with patch.object(hubspot_client, "get_deal", return_value=_FAKE_DEAL_PROPS):
             result = self._call(entity="OSN", deal_id="12345", note_body="Note.", confirmed=False)
-            assert "blocked" not in result.lower()
+            assert "not available from lex" not in result.lower()
+            assert "NOT ADDED yet" in result
 
 
 # ---------------------------------------------------------------------------

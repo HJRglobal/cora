@@ -6477,6 +6477,20 @@ def _tool_hjrp_lease_status(slack_user_id: str, entity: str, _input: dict) -> st
     return hjrp_client.get_lease_status()
 
 
+# How much of a deal note the preview renders. The write files the whole body.
+_HUBSPOT_NOTE_PREVIEW_CHARS = 300
+
+
+def _hubspot_lex_blocked(entity: str) -> bool:
+    """HubSpot write tools are unavailable in Lexington scope (Tier-1 doctrine).
+
+    One predicate rather than the two inline copies it replaces, because it is
+    now evaluated in FOUR places per tool family (preview, confirm call, and each
+    executor's defense-in-depth re-check of the STASHED entity) and two of those
+    are new. A blank/None entity is NOT LEX, matching the previous behaviour."""
+    return bool(entity) and entity.upper().startswith("LEX")
+
+
 def _tool_hubspot_update_deal_stage(slack_user_id: str, entity: str, _input: dict) -> str:
     """Update a HubSpot deal's pipeline stage. Staged-write tool.
 
@@ -6487,22 +6501,34 @@ def _tool_hubspot_update_deal_stage(slack_user_id: str, entity: str, _input: dic
 
     Scope: FNDR, F3E, OSN, BDM only. Blocked from LEX channels.
     """
-    import os
-    from slack_sdk import WebClient as _SlackWebClient
-    from slack_sdk.errors import SlackApiError as _SlackApiError
-
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    # Scope guard
-    if entity and entity.upper().startswith("LEX"):
+    # Scope guard. Runs BEFORE the confirm branch, so it covers the confirm call
+    # as well as the preview; the executor re-checks the STASHED entity, which is
+    # what a button tap (whose entity is re-derived from the channel) goes
+    # through. The three imports that used to sit here were dead -- this function
+    # makes no Slack call.
+    if _hubspot_lex_blocked(entity):
         return (
             "hubspot_update_deal_stage blocked: HubSpot write tools are not available "
             "from Lex channels. Use a non-Lex channel or contact Harrison."
         )
 
+    # v2b S5: real staged write. The unconfirmed call validates, resolves the
+    # rendered names and STASHES; the confirmed call (or a button tap) executes
+    # THE STASH. Under the old honor gate the second call carried its own
+    # deal_id/stage_id, so a model that altered either silently moved a
+    # DIFFERENT deal, or moved this deal to a different stage, than the one the
+    # user approved in the preview.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("hubspot_stage", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("deal-stage change")
+        return _execute_claimed_hubspot_stage(pending, slack_user_id)
+
     deal_id = (input_data.get("deal_id") or "").strip()
     stage_id = (input_data.get("stage_id") or "").strip()
-    confirmed = input_data.get("confirmed", False)
 
     if not deal_id:
         return "hubspot_update_deal_stage: missing `deal_id`. Ask the user for the HubSpot deal ID."
@@ -6526,14 +6552,36 @@ def _tool_hubspot_update_deal_stage(slack_user_id: str, entity: str, _input: dic
     current_stage_name = hubspot_client._STAGE_NAME_CACHE.get(current_stage_id, current_stage_id)
     new_stage_name = hubspot_client._STAGE_NAME_CACHE.get(stage_id, stage_id)
 
-    if confirmed is not True:
-        return (
-            f"WRITE_PREVIEW Update deal '{deal_name}' stage from "
-            f"'{current_stage_name}' to '{new_stage_name}'? "
-            f"Respond with confirmed=True to proceed."
-        )
+    sid = _classb_stash("hubspot_stage", slack_user_id, channel, {
+        "deal_id": deal_id, "stage_id": stage_id, "deal_name": deal_name,
+        "current_stage_name": current_stage_name, "new_stage_name": new_stage_name,
+        "entity": entity,
+    })
+    log.info("hubspot_update_deal_stage PREVIEW asker=%s deal_id=%s stash=%s",
+             slack_user_id, deal_id, sid)
+    return _write_blocked_contract(
+        f"NOT CHANGED yet -- this is a preview.\n"
+        f"- Deal: {deal_name}\n"
+        f"- Stage: {current_stage_name} -> {new_stage_name}\n"
+        f"{_confirm_how(channel, capitalize=True)} and I'll move it. "
+        f"Nothing changes in HubSpot until you confirm."
+    )
 
-    # Execute the update
+
+def _execute_claimed_hubspot_stage(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED hubspot_update_deal_stage stash. Shared by the
+    tool's own confirmed=true call and the confirm-button tap, so there is exactly
+    one write implementation per kind regardless of route."""
+    # Defense in depth: a tap re-derives its entity from the stash's own channel,
+    # so this cannot differ from the preview's scope today. Re-checking the
+    # STASHED entity means it stays true if that ever stops holding.
+    if _hubspot_lex_blocked(pending.get("entity", "")):
+        log.warning("hubspot_update_deal_stage LEX-BLOCKED at execute asker=%s", slack_user_id)
+        return ("That deal-stage change was staged from a Lexington channel, so I "
+                "can't make it. Nothing was changed.")
+    deal_id, stage_id = pending["deal_id"], pending["stage_id"]
+    deal_name = pending["deal_name"]
+    current_stage_name, new_stage_name = pending["current_stage_name"], pending["new_stage_name"]
     try:
         hubspot_client.update_deal_stage(deal_id, stage_id)
     except hubspot_client.HubSpotClientError as exc:
@@ -6571,17 +6619,27 @@ def _tool_hubspot_add_note(slack_user_id: str, entity: str, _input: dict) -> str
     Scope: FNDR, F3E, OSN, BDM, HJRG channels. Blocked from LEX channels.
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    # Scope guard
-    if entity and entity.upper().startswith("LEX"):
+    # Scope guard (see the stage tool: covers preview AND confirm; the executor
+    # re-checks the stashed entity for the button route).
+    if _hubspot_lex_blocked(entity):
         return (
             "hubspot_add_note blocked: HubSpot write tools are not available "
             "from Lex channels. Use a non-Lex channel or contact Harrison."
         )
 
+    # v2b S5: real staged write -- the confirmed call executes THE STASH, so a
+    # model that rewrites note_body on the second call cannot file text the user
+    # never approved.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("hubspot_note", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("deal note")
+        return _execute_claimed_hubspot_note(pending, slack_user_id)
+
     deal_id = (input_data.get("deal_id") or "").strip()
     note_body = (input_data.get("note_body") or "").strip()
-    confirmed = input_data.get("confirmed", False)
 
     if not deal_id:
         return "hubspot_add_note: missing `deal_id`. Ask the user which deal to note."
@@ -6596,14 +6654,38 @@ def _tool_hubspot_add_note(slack_user_id: str, entity: str, _input: dict) -> str
 
     deal_name = deal_props.get("dealname") or "(unnamed)"
 
-    if confirmed is not True:
-        preview_body = note_body[:300] + ("..." if len(note_body) > 300 else "")
-        return (
-            f"WRITE_PREVIEW Add note to '{deal_name}':\n\n"
-            f"{preview_body}\n\n"
-            f"Respond with confirmed=True to add this note."
-        )
+    sid = _classb_stash("hubspot_note", slack_user_id, channel, {
+        "deal_id": deal_id, "note_body": note_body, "deal_name": deal_name,
+        "entity": entity,
+    })
+    # The preview has always truncated at 300 chars while the write filed the
+    # FULL body -- the user approves a rendering of something longer than what
+    # they can see. Kept (a 5,000-char note is not a readable card) but now SAID,
+    # in the same honesty family as the confirm-instruction fix.
+    truncated = len(note_body) > _HUBSPOT_NOTE_PREVIEW_CHARS
+    preview_body = note_body[:_HUBSPOT_NOTE_PREVIEW_CHARS] + ("..." if truncated else "")
+    trunc_note = (f"\n(Preview shortened. The full {len(note_body)}-character note "
+                  f"is what gets filed.)") if truncated else ""
+    log.info("hubspot_add_note PREVIEW asker=%s deal_id=%s stash=%s chars=%d",
+             slack_user_id, deal_id, sid, len(note_body))
+    return _write_blocked_contract(
+        f"NOT ADDED yet -- this is a preview.\n"
+        f"- Deal: {deal_name}\n"
+        f"- Note:\n{preview_body}{trunc_note}\n"
+        f"{_confirm_how(channel, capitalize=True)} and I'll file it. "
+        f"Nothing is written to HubSpot until you confirm."
+    )
 
+
+def _execute_claimed_hubspot_note(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED hubspot_add_note stash. Shared by the tool's own
+    confirmed=true call and the confirm-button tap."""
+    if _hubspot_lex_blocked(pending.get("entity", "")):
+        log.warning("hubspot_add_note LEX-BLOCKED at execute asker=%s", slack_user_id)
+        return ("That note was staged from a Lexington channel, so I can't file it. "
+                "Nothing was written.")
+    deal_id, note_body = pending["deal_id"], pending["note_body"]
+    deal_name = pending["deal_name"]
     # Execute note creation
     try:
         note_id = hubspot_client.create_note(body=note_body, deal_id=deal_id)
@@ -10027,8 +10109,14 @@ TOOL_DEFINITIONS = [
     {
         "name": "hubspot_update_deal_stage",
         "description": (
-            "Update a HubSpot deal's pipeline stage. STAGED-WRITE TOOL -- show a preview "
-            "and receive explicit approval (confirmed=true) before mutating.\n\n"
+            "Update a HubSpot deal's pipeline stage. STAGED-WRITE TOOL.\n\n"
+            "Call it WITHOUT confirmed to stage the change: the tool looks the deal "
+            "up, resolves the stage names and returns a preview to relay. Nothing "
+            "moves. When the user approves, call again with confirmed=true -- the "
+            "tool then executes THE STAGED CHANGE it already recorded, so the "
+            "deal_id/stage_id on that second call are ignored and cannot retarget "
+            "it. If no staged change is waiting (it expired, or the user already "
+            "confirmed), the tool says so and writes nothing.\n\n"
             "Trigger phrases: 'move deal to', 'update deal stage', 'advance deal', "
             "'change stage for', 'mark deal as'.\n\n"
             "Scope: FNDR, F3E, OSN, BDM channels only. Not available in LEX channels."
@@ -10055,8 +10143,13 @@ TOOL_DEFINITIONS = [
     {
         "name": "hubspot_add_note",
         "description": (
-            "Add a note to a HubSpot deal. STAGED-WRITE TOOL -- show a preview and receive "
-            "explicit approval (confirmed=true) before writing.\n\n"
+            "Add a note to a HubSpot deal. STAGED-WRITE TOOL.\n\n"
+            "Call it WITHOUT confirmed to stage the note: the tool looks the deal up "
+            "and returns a preview to relay. Nothing is written. When the user "
+            "approves, call again with confirmed=true -- the tool files THE STAGED "
+            "NOTE, so a re-worded note_body on that second call is ignored and "
+            "cannot change what gets filed. If no staged note is waiting, the tool "
+            "says so and writes nothing.\n\n"
             "Trigger phrases: 'add note to deal', 'log note', 'note on deal', 'update deal notes'.\n\n"
             "Scope: FNDR, F3E, OSN, BDM, HJRG channels. Not available in LEX channels."
         ),
@@ -11401,6 +11494,18 @@ def _stash_expired_label(kind: str, entry: dict) -> str:
         "remember": "that note",
         "forget_note": "that note deletion",
         "schedule_meeting": "that meeting proposal",
+        # v2b S5. Without these the six Class-B kinds fell through to the generic
+        # "that request", which on an expired-tombstone tap tells the user
+        # nothing about WHICH staged thing lapsed -- and they can easily have had
+        # several staged at once, since these kinds share (user, channel) with
+        # every other kind.
+        "gmail_draft": "that email draft",
+        "hubspot_stage": "that deal-stage change",
+        "hubspot_note": "that deal note",
+        "slack_dm": "that DM",
+        "influencer_handle": "that handle registration",
+        "influencer_deliverable": "that deliverable update",
+        "meeting_item": "that meeting action item",
     }
     return labels.get(kind, "that request")
 
@@ -11443,6 +11548,10 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
     # exactly one write implementation per kind regardless of route.
     if kind == "gmail_draft":
         return _execute_claimed_gmail_draft(entry, tapping_user_id), None
+    if kind == "hubspot_stage":
+        return _execute_claimed_hubspot_stage(entry, tapping_user_id), None
+    if kind == "hubspot_note":
+        return _execute_claimed_hubspot_note(entry, tapping_user_id), None
     if kind == "schedule_meeting":
         # v2 S2: the card renders ONE BUTTON PER OFFERED SLOT, so the tap says
         # which slot it means. v1 had a single Confirm that always booked
