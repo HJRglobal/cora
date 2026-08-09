@@ -24,6 +24,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import slack_sdk
 
 import cora.tools.tool_dispatch as td
@@ -33,6 +35,15 @@ import cora.tools.tool_dispatch as td
 # slack_send_dm — the direct-send write tool
 # ─────────────────────────────────────────────────────────────────────────────
 class TestSlackSendDm:
+    # The Class-B stash store is process-global and keyed on (user, channel);
+    # every test here uses the same asker and omits _channel_name, so without
+    # this a preview left by one test is claimed by the next one's confirm.
+    @pytest.fixture(autouse=True)
+    def _no_leftover_stash(self):
+        td._CLASSB["slack_dm"]["store"].clear()
+        yield
+        td._CLASSB["slack_dm"]["store"].clear()
+
     def test_lex_channel_blocked_before_any_send(self):
         with patch.object(slack_sdk, "WebClient") as WC:
             result = td._tool_slack_send_dm(
@@ -43,23 +54,35 @@ class TestSlackSendDm:
         assert "blocked" in result.lower()
         WC.assert_not_called()  # no Slack client ever constructed for a LEX ask
 
-    def test_unconfirmed_refuses_before_any_send(self):
-        with patch.object(slack_sdk, "WebClient") as WC:
+    # v2b S5: slack_send_dm became a real staged write. The unconfirmed call now
+    # PREVIEWS and stashes (it used to just refuse), and the confirmed call sends
+    # the STASH rather than its own args. Deeper coverage lives in
+    # tests/test_slack_send_dm_staged.py; these keep the wrapper-level pins.
+
+    def test_unconfirmed_previews_before_any_send(self):
+        with patch.object(td, "resolve_name_to_slack_user_id",
+                          return_value=("U_TOMMY", None)), \
+             patch.object(td, "_load_slack_asana_map",
+                          return_value={"U_TOMMY": {"display_name": "Tommy"}}), \
+             patch.object(slack_sdk, "WebClient") as WC:
             result = td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
                 {"recipient_name": "Tommy", "message": "hi"},  # no confirmed=true
             )
-        assert "refused" in result.lower()
+        assert "NOT SENT yet" in result
         WC.assert_not_called()
 
-    def test_confirmed_string_true_does_not_satisfy_gate(self):
-        # The gate is `confirmed is not True` — a truthy string must NOT pass it.
+    def test_confirmed_string_true_lands_in_the_no_pending_refusal(self):
+        # _confirmed_flag deliberately treats a "true"/"True" STRING echo as
+        # confirmed, so it reaches the honest Phase-2 no-pending reply instead of
+        # silently regenerating a preview (D-051, cq-ed29165fca97 A2). With
+        # nothing staged, that means: no send, and an honest answer.
         with patch.object(slack_sdk, "WebClient") as WC:
             result = td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
                 {"confirmed": "true", "recipient_name": "Tommy", "message": "hi"},
             )
-        assert "refused" in result.lower()
+        assert "NOT DONE" in result
         WC.assert_not_called()
 
     def test_unmapped_recipient_refuses(self):
@@ -68,7 +91,7 @@ class TestSlackSendDm:
              patch.object(slack_sdk, "WebClient") as WC:
             result = td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
-                {"confirmed": True, "recipient_name": "Nobody", "message": "hi"},
+                {"recipient_name": "Nobody", "message": "hi"},
             )
         resolve.assert_called_once()
         assert "could not resolve" in result.lower()
@@ -76,6 +99,7 @@ class TestSlackSendDm:
 
     def test_mapped_and_confirmed_sends(self, monkeypatch):
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test-token")
+        td._CLASSB["slack_dm"]["store"].clear()
         fake_client = MagicMock()
         fake_client.conversations_open.return_value = {"channel": {"id": "D_TOMMY"}}
         fake_client.chat_postMessage.return_value = {"ts": "1700.1"}
@@ -84,14 +108,16 @@ class TestSlackSendDm:
              patch.object(td, "_load_slack_asana_map",
                           return_value={"U_TOMMY": {"display_name": "Tommy"}}), \
              patch.object(slack_sdk, "WebClient", return_value=fake_client):
-            result = td._tool_slack_send_dm(
+            td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
-                {"confirmed": True, "recipient_name": "Tommy", "message": "ship it"},
+                {"recipient_name": "Tommy", "message": "ship it"},
             )
+            result = td._tool_slack_send_dm("U_ASKER", "F3E", {"confirmed": True})
         fake_client.conversations_open.assert_called_once_with(users=["U_TOMMY"])
         fake_client.chat_postMessage.assert_called_once_with(channel="D_TOMMY", text="ship it")
         assert result.startswith("WRITE_CONFIRMED")
         assert "DM sent to Tommy" in result
+        td._CLASSB["slack_dm"]["store"].clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

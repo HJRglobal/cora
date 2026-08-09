@@ -6725,29 +6725,29 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
     - Cora signs the message as itself -- no impersonation.
     - No PHI, no financial data, no cross-entity information in DMs.
     """
-    import os
-    from slack_sdk import WebClient as _SlackWebClient
-    from slack_sdk.errors import SlackApiError as _SlackApiError
-
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    # PHI / LEX guardrail
-    if entity and entity.upper().startswith("LEX"):
+    # PHI / LEX guardrail. Runs on BOTH calls; the executor re-checks the
+    # STASHED entity, which is what a button tap goes through.
+    if _slack_dm_lex_blocked(entity):
         return (
             "slack_send_dm blocked: DMs cannot be triggered from Lex channels "
             "due to PHI guardrails. If this is non-PHI coordination, ask Harrison "
             "to send the message from a non-Lex channel."
         )
 
-    # Confirmation gate
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "slack_send_dm refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a preview (recipient + full message text) "
-            "AND received their explicit approval ('yes', 'send it', 'go ahead', or "
-            "similar). Format a clear preview NOW if you have not done that yet."
-        )
+    # v2b S5: a real preview branch. Before this the unconfirmed call simply
+    # REFUSED, so there was no preview for the confirm-card layer to attach to
+    # and the model had to invent the preview text itself -- and the confirmed
+    # call then sent whatever recipient_name/message IT carried. The recipient
+    # now binds SERVER-SIDE here (the resolved Slack id goes in the stash), so a
+    # confirm turn naming somebody else cannot redirect the message.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("slack_dm", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("Slack DM")
+        return _execute_claimed_slack_dm(pending, slack_user_id)
 
     recipient_name = (input_data.get("recipient_name") or "").strip()
     message = (input_data.get("message") or "").strip()
@@ -6765,6 +6765,83 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
             f"{info or 'Check the name and try again.'}"
         )
 
+    if _slack_dm_phi_blocked(message):
+        log.warning("slack_send_dm PHI-BLOCKED asker=%s recipient=%s",
+                    slack_user_id, resolved_id)
+        return (
+            "slack_send_dm refused: the message tripped the PHI screen, so nothing "
+            "was staged or sent. Tell the user the DM was blocked for containing "
+            "possible PHI and cannot be sent from here."
+        )
+
+    display_name = _load_slack_asana_map().get(resolved_id, {}).get(
+        "display_name", recipient_name)
+    sid = _classb_stash("slack_dm", slack_user_id, channel, {
+        "recipient_id": resolved_id, "recipient_name": recipient_name,
+        "display_name": display_name, "message": message, "entity": entity,
+    })
+    log.info("slack_send_dm PREVIEW asker=%s recipient=%s stash=%s chars=%d",
+             slack_user_id, resolved_id, sid, len(message))
+    return _write_blocked_contract(
+        f"NOT SENT yet -- this is a preview.\n"
+        f"- To: {display_name}\n"
+        f"- Message:\n{message}\n"
+        f"{_confirm_how(channel, capitalize=True)} and I'll send it as Cora. "
+        f"Nothing is sent until you confirm."
+    )
+
+
+def _slack_dm_lex_blocked(entity: str) -> bool:
+    """DMs are never triggered from Lexington scope (PHI guardrail)."""
+    return bool(entity) and entity.upper().startswith("LEX")
+
+
+def _slack_dm_phi_blocked(message: str) -> bool:
+    """PHI screen for an outbound DM.
+
+    is_phi_risk_person_linked, NOT is_phi_risk. The base predicate is an
+    INGESTION screen (email subjects, Drive filenames) where recall beats
+    precision, and the 2026-08-07 delegated-work finding is that reusing it on
+    composed, request-shaped text over-refuses on a bare programme name -- three
+    person-free DDD policy briefs were refused whose only match was the token
+    "AHCCCS". A DM body is composed prose, so it takes the person-linked variant
+    the same way a delegated-work brief does.
+
+    LEX scope is already blocked outright above, so this is the residual case: a
+    PHI-shaped message composed in an F3E/OSN/FNDR channel. Deliberately does NOT
+    include is_lex_billing_status_phi -- outside LEX, a named buyer's billing
+    authorization is ordinary business (its own docstring says so)."""
+    from .. import phi_guard
+    return phi_guard.is_phi_risk_person_linked(message or "")
+
+
+def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED slack_send_dm stash. Shared by the tool's own
+    confirmed=true call and the confirm-button tap.
+
+    This is the single code path both routes take, which is why the egress
+    screens live HERE rather than at the preview: a button tap is a one-tap SEND
+    to another human, and it must not be able to skip anything the typed path
+    does. The screens are (1) the LEX scope re-check, (2) the PHI re-check, and
+    (3) slack_egress's class-level WebClient patch, which sanitizes the body of
+    the chat_postMessage call below -- there is no send that is not that call."""
+    import os
+    from slack_sdk import WebClient as _SlackWebClient
+    from slack_sdk.errors import SlackApiError as _SlackApiError
+
+    if _slack_dm_lex_blocked(pending.get("entity", "")):
+        log.warning("slack_send_dm LEX-BLOCKED at execute asker=%s", slack_user_id)
+        return ("That DM was staged from a Lexington channel, so I can't send it. "
+                "Nothing was sent.")
+    message = pending["message"]
+    if _slack_dm_phi_blocked(message):
+        log.warning("slack_send_dm PHI-BLOCKED at execute asker=%s", slack_user_id)
+        return ("That message tripped the PHI screen, so I didn't send it. "
+                "Nothing was sent.")
+
+    resolved_id = pending["recipient_id"]
+    display_name = pending.get("display_name") or pending.get("recipient_name", "them")
+
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
         return "slack_send_dm: SLACK_BOT_TOKEN not configured. Tell Harrison."
@@ -6777,8 +6854,8 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
         send_resp = client.chat_postMessage(channel=dm_channel, text=message)
     except _SlackApiError as exc:
         log.warning(
-            "slack_send_dm FAILED asker=%s recipient=%s (%s) exc=%s",
-            slack_user_id, recipient_name, resolved_id, exc,
+            "slack_send_dm FAILED asker=%s recipient=%s exc=%s",
+            slack_user_id, resolved_id, exc,
         )
         return (
             f"Slack DM error: {exc.response.get('error', str(exc))}. "
@@ -6787,12 +6864,9 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
 
     ts = send_resp.get("ts", "")
     log.info(
-        "slack_send_dm SENT asker=%s recipient=%s (%s) ts=%s chars=%d",
-        slack_user_id, recipient_name, resolved_id, ts, len(message),
+        "slack_send_dm SENT asker=%s recipient=%s ts=%s chars=%d",
+        slack_user_id, resolved_id, ts, len(message),
     )
-
-    recipient_map = _load_slack_asana_map().get(resolved_id, {})
-    display_name = recipient_map.get("display_name", recipient_name)
 
     return (
         f"WRITE_CONFIRMED -- post the following lines as your entire response "
@@ -10177,8 +10251,15 @@ TOOL_DEFINITIONS = [
         "name": "slack_send_dm",
         "description": (
             "Send a Slack DM to a named teammate on behalf of Cora. "
-            "STAGED-WRITE TOOL -- you MUST show a preview (recipient name + full message text) "
-            "and receive the user's explicit approval before calling with confirmed=true.\n"
+            "STAGED-WRITE TOOL.\n"
+            "\n"
+            "Call it WITHOUT confirmed to stage the DM: the tool resolves the "
+            "recipient, screens the message and returns a preview to relay. "
+            "Nothing is sent. When the user approves, call again with "
+            "confirmed=true -- the tool sends THE STAGED MESSAGE to THE STAGED "
+            "RECIPIENT, so recipient_name/message on that second call are ignored "
+            "and cannot redirect or rewrite it. If no staged DM is waiting, the "
+            "tool says so and sends nothing.\n"
             "\n"
             "Guardrails:\n"
             "- LEX channels are BLOCKED (PHI risk). Do not attempt from any LEX context.\n"
@@ -11552,6 +11633,8 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
         return _execute_claimed_hubspot_stage(entry, tapping_user_id), None
     if kind == "hubspot_note":
         return _execute_claimed_hubspot_note(entry, tapping_user_id), None
+    if kind == "slack_dm":
+        return _execute_claimed_slack_dm(entry, tapping_user_id), None
     if kind == "schedule_meeting":
         # v2 S2: the card renders ONE BUTTON PER OFFERED SLOT, so the tap says
         # which slot it means. v1 had a single Confirm that always booked
