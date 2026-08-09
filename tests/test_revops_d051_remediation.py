@@ -421,8 +421,16 @@ def test_draft_guard_screens_subject(monkeypatch):
     )
     monkeypatch.setattr(td, "_load_slack_asana_map",
                         lambda: {"U1": {"asana_email": "x@hjrglobal.com"}})
+    # v2b S5: gmail_create_draft is now a real staged write, so the PHI screen
+    # runs on the UNCONFIRMED (preview) call -- strictly stronger than before,
+    # because PHI is refused BEFORE anything is stashed and therefore can never
+    # become a confirmable pending or a tappable card.
+    td._CLASSB["gmail_draft"]["store"].clear()
     out = td._tool_gmail_create_draft(
         "U1", "F3E",
-        {"confirmed": True, "to": "a@b.com", "subject": "PATIENT records", "body": "hi"},
+        {"_channel_name": "f3e-leadership", "to": "a@b.com",
+         "subject": "PATIENT records", "body": "hi"},
     )
     assert "PHI" in out and "refused" in out
+    assert td._CLASSB["gmail_draft"]["peek"]("U1", "f3e-leadership") is None, (
+        "a PHI-blocked draft must never be stashed")

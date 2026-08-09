@@ -80,139 +80,177 @@ def test_build_mime_message_includes_cc_when_provided():
     assert "Cc: cc1@example.com" in decoded
 
 
-# ---- Tool dispatch — confirmation gate ----
+# ---- Tool dispatch: STAGED WRITE (v2b S5) ----
+#
+# gmail_create_draft was an honor gate: it refused unless the model asserted
+# confirmed=true, then drafted whatever THAT call carried. A model that dropped
+# or altered a field on the second call silently drafted something other than
+# what the user approved. It is now a real staged write -- the unconfirmed call
+# validates and STASHES, and the confirmed call (or a button tap) executes the
+# STASH.
+
+CHAN = {"_channel_name": "hjrg-leadership"}
 
 
-def test_create_draft_refuses_without_confirmed():
-    result = td._tool_gmail_create_draft(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={
-            "to": "alice@example.com",
-            "subject": "Hi",
-            "body": "Test",
-        },
-    )
-    assert "refused" in result.lower()
-    assert "confirmed" in result.lower()
-    assert "preview" in result.lower()
+def _clear():
+    td._CLASSB["gmail_draft"]["store"].clear()
 
 
-def test_create_draft_refuses_with_confirmed_false():
-    result = td._tool_gmail_create_draft(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={
-            "to": "alice@example.com",
-            "subject": "Hi",
-            "body": "Test",
-            "confirmed": False,
-        },
-    )
-    assert "refused" in result.lower()
-
-
-def test_create_draft_refuses_missing_to():
-    result = td._tool_gmail_create_draft(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={
-            "subject": "Hi",
-            "body": "Test",
-            "confirmed": True,
-        },
-    )
-    assert "to" in result.lower()
-    assert "required" in result.lower() or "missing" in result.lower()
-
-
-def test_create_draft_refuses_missing_subject():
-    result = td._tool_gmail_create_draft(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={
-            "to": "alice@example.com",
-            "body": "Test",
-            "confirmed": True,
-        },
-    )
-    assert "subject" in result.lower()
-
-
-def test_create_draft_refuses_missing_body():
-    result = td._tool_gmail_create_draft(
-        slack_user_id=HARRISON_SLACK,
-        entity="FNDR",
-        _input={
-            "to": "alice@example.com",
-            "subject": "Hi",
-            "confirmed": True,
-        },
-    )
-    assert "body" in result.lower()
-
-
-def test_create_draft_happy_path_calls_gmail_client():
-    fake_draft = {
-        "id": "draft_abc123",
-        "message": {"id": "msg_xyz789"},
-    }
-    with patch.object(gc, "create_draft", return_value=fake_draft) as mock:
-        result = td._tool_gmail_create_draft(
-            slack_user_id=HARRISON_SLACK,
-            entity="FNDR",
-            _input={
-                "to": "shaun@lexingtonservices.com",
-                "subject": "Quick question",
-                "body": "Hey Shaun — quick context.\n\n— Harrison",
-                "confirmed": True,
-            },
-        )
-
-    mock.assert_called_once()
-    call_kwargs = mock.call_args.kwargs
-    # Sender resolved from Harrison's row in slack-to-asana.yaml
-    assert call_kwargs["sender_email"] == "harrison@hjrglobal.com"
-    assert call_kwargs["to"] == "shaun@lexingtonservices.com"
-    assert call_kwargs["subject"] == "Quick question"
-    assert "Shaun" in call_kwargs["body"]
-    # Output for the LLM should surface the draft
-    assert "CREATED" in result
-    assert "draft_abc123" in result
-    assert "Drafts" in result  # link to Gmail Drafts folder
-
-
-def test_create_draft_unknown_asker_refuses_gracefully():
+def test_unconfirmed_call_previews_and_stashes_instead_of_refusing():
+    _clear()
     with patch.object(gc, "create_draft") as mock:
         result = td._tool_gmail_create_draft(
-            slack_user_id="U_NOT_IN_MAP",
-            entity="FNDR",
-            _input={
-                "to": "alice@example.com",
-                "subject": "Hi",
-                "body": "Test",
-                "confirmed": True,
-            },
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "to": "alice@example.com", "subject": "Hi", "body": "Test"},
         )
     mock.assert_not_called()
-    assert "not in the slack-to-asana" in result.lower() or "not in the slack-to-asana" in result.lower()
+    assert "WRITE_BLOCKED" in result
+    assert "NOT DRAFTED yet" in result
+    assert "alice@example.com" in result and "Hi" in result and "Test" in result
+    pending = td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership")
+    assert pending is not None and pending["stash_id"]
+    _clear()
 
 
-def test_create_draft_with_cc():
-    fake_draft = {"id": "draft_cc_test"}
+def test_the_preview_carries_an_honest_confirm_instruction():
+    _clear()
+    result = td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "a@b.com", "subject": "S", "body": "B"},
+    )
+    # The USER-facing half is everything after the contract preamble; the
+    # preamble itself legitimately says "reply to confirm" because it is
+    # MODEL-facing instruction about calling the tool again (S4 kept it).
+    user_facing = result.split("\n\n", 1)[1]
+    assert "@mention me with" in user_facing or "tap *Confirm* below" in user_facing
+    assert "reply to confirm" not in user_facing.lower()
+    _clear()
+
+
+def test_confirm_executes_the_STASH_not_the_confirm_turn_args():
+    """The whole point of the migration: a confirm turn that carries DIFFERENT
+    values must not be able to retarget the draft."""
+    _clear()
+    td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "shaun@lexingtonservices.com",
+                "subject": "Quick question", "body": "Hey Shaun."},
+    )
+    fake_draft = {"id": "draft_abc123", "message": {"id": "msg_xyz789"}}
     with patch.object(gc, "create_draft", return_value=fake_draft) as mock:
         result = td._tool_gmail_create_draft(
-            slack_user_id=HARRISON_SLACK,
-            entity="FNDR",
-            _input={
-                "to": "alice@example.com",
-                "cc": ["bob@example.com", "carol@example.com"],
-                "subject": "CC test",
-                "body": "body",
-                "confirmed": True,
-            },
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": True,
+                    "to": "attacker@evil.com", "subject": "CHANGED", "body": "CHANGED"},
         )
-    call_kwargs = mock.call_args.kwargs
-    assert call_kwargs["cc"] == ["bob@example.com", "carol@example.com"]
-    # Output mentions cc
+    kw = mock.call_args.kwargs
+    assert kw["sender_email"] == "harrison@hjrglobal.com"
+    assert kw["to"] == "shaun@lexingtonservices.com", "confirm-turn args retargeted the draft"
+    assert kw["subject"] == "Quick question"
+    assert "Shaun" in kw["body"]
+    assert "draft_abc123" in result
+    _clear()
+
+
+def test_a_confirm_with_no_pending_is_honest_and_writes_nothing():
+    _clear()
+    with patch.object(gc, "create_draft") as mock:
+        result = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": True, "to": "a@b.com",
+                    "subject": "S", "body": "B"},
+        )
+    mock.assert_not_called()
+    assert "NOT DONE" in result and "expired" in result.lower()
+
+
+def test_the_stash_is_consumed_exactly_once():
+    _clear()
+    td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "a@b.com", "subject": "S", "body": "B"},
+    )
+    with patch.object(gc, "create_draft", return_value={"id": "d1"}):
+        first = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": True})
+    with patch.object(gc, "create_draft") as mock2:
+        second = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": True})
+    assert "d1" in first
+    mock2.assert_not_called()
+    assert "NOT DONE" in second
+
+
+def test_a_button_tap_executes_the_same_stash():
+    _clear()
+    td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "a@b.com", "subject": "S", "body": "B"},
+    )
+    sid = td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership")["stash_id"]
+    with patch.object(gc, "create_draft", return_value={"id": "tapped"}) as mock,          patch("cora.entity_router.route", return_value="FNDR"):
+        result = td.resolve_and_claim_stash(sid, HARRISON_SLACK, "confirm")
+    mock.assert_called_once()
+    assert result["outcome"] == "executed"
+    assert "tapped" in result["message"]
+
+
+def test_a_non_requester_tap_is_refused_and_consumes_nothing():
+    _clear()
+    td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "a@b.com", "subject": "S", "body": "B"},
+    )
+    sid = td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership")["stash_id"]
+    with patch.object(gc, "create_draft") as mock:
+        result = td.resolve_and_claim_stash(sid, "U0SOMEONE_ELSE", "confirm")
+    mock.assert_not_called()
+    assert result["outcome"] == "unauthorized"
+    assert td.stash_is_live(sid)
+    _clear()
+
+
+def test_missing_fields_still_refuse_at_PREVIEW_time_and_stash_nothing():
+    """Validation moved ahead of the stash: a bad request never becomes a
+    confirmable pending."""
+    _clear()
+    for bad, word in (
+        ({"subject": "Hi", "body": "T"}, "to"),
+        ({"to": "a@b.com", "body": "T"}, "subject"),
+        ({"to": "a@b.com", "subject": "Hi"}, "body"),
+    ):
+        result = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR", _input={**CHAN, **bad})
+        assert word in result.lower()
+        assert td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership") is None
+
+
+def test_unknown_asker_refuses_at_preview_and_stashes_nothing():
+    _clear()
+    with patch.object(gc, "create_draft") as mock:
+        result = td._tool_gmail_create_draft(
+            slack_user_id="U_NOT_IN_MAP", entity="FNDR",
+            _input={**CHAN, "to": "alice@example.com", "subject": "Hi", "body": "Test"},
+        )
+    mock.assert_not_called()
+    assert "not in the slack-to-asana" in result.lower()
+    assert td._CLASSB["gmail_draft"]["peek"]("U_NOT_IN_MAP", "hjrg-leadership") is None
+
+
+def test_cc_survives_the_stash_round_trip():
+    _clear()
+    td._tool_gmail_create_draft(
+        slack_user_id=HARRISON_SLACK, entity="FNDR",
+        _input={**CHAN, "to": "alice@example.com",
+                "cc": ["bob@example.com", "carol@example.com"],
+                "subject": "CC test", "body": "body"},
+    )
+    with patch.object(gc, "create_draft", return_value={"id": "draft_cc_test"}) as mock:
+        result = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": True})
+    assert mock.call_args.kwargs["cc"] == ["bob@example.com", "carol@example.com"]
     assert "bob@example.com" in result.lower() or "carol@example.com" in result.lower()
+    _clear()

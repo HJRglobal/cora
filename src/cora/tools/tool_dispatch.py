@@ -1801,18 +1801,18 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
     The user must open Gmail and send the draft themselves; Cora never sends.
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    # Confirmation gate (same pattern as asana_create_task)
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "gmail_create_draft refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a preview block (to, cc, subject, body) "
-            "AND received their explicit approval in their next message "
-            "('yes', 'draft it', 'create it', or similar). If you have NOT done "
-            "that yet, format a clear preview NOW and ask the user to confirm "
-            "before drafting."
-        )
+    # v2b S5: real staged write. The unconfirmed call VALIDATES and STASHES, and
+    # the confirmed call (or a button tap) executes THE STASH -- never the
+    # confirm turn's own re-echoed args. Under the old honor gate a model that
+    # dropped or altered a field on the second call silently drafted something
+    # different from what the user approved.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("gmail_draft", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("email draft")
+        return _execute_claimed_gmail_draft(pending, slack_user_id)
 
     to = input_data.get("to")
     subject = (input_data.get("subject") or "").strip()
@@ -1868,6 +1868,34 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
         w["reason"] for w in _guard_result.warns
     ]
 
+    sid = _classb_stash("gmail_draft", slack_user_id, channel, {
+        "sender_email": sender_email, "to": to, "subject": subject,
+        "body": body, "cc": cc, "bcc": bcc, "entity": entity,
+        "guard_notes": _guard_notes,
+    })
+    to_disp = ", ".join(gmail_client._normalize_recipients(to))
+    cc_disp = ", ".join(gmail_client._normalize_recipients(cc)) if cc else ""
+    note = ("\nEMAIL GUARD NOTES: " + "; ".join(_guard_notes[:3])) if _guard_notes else ""
+    log.info("gmail_create_draft PREVIEW asker=%s stash=%s", slack_user_id, sid)
+    return _write_blocked_contract(
+        f"NOT DRAFTED yet -- this is a preview.\n"
+        f"- To: {to_disp}\n"
+        + (f"- Cc: {cc_disp}\n" if cc_disp else "")
+        + f"- Subject: {subject}\n"
+        f"- Body:\n{body}\n"
+        f"{note}\n"
+        f"{_confirm_how(channel, capitalize=True)} and I'll create the draft in "
+        f"your own Gmail Drafts. Nothing is drafted until you confirm."
+    )
+
+
+def _execute_claimed_gmail_draft(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED gmail_create_draft stash. Shared by the tool's
+    own confirmed=true call and the confirm-button tap."""
+    sender_email = pending["sender_email"]
+    to, subject, body = pending["to"], pending["subject"], pending["body"]
+    cc, bcc = pending.get("cc"), pending.get("bcc")
+    _guard_notes = pending.get("guard_notes") or []
     try:
         draft = gmail_client.create_draft(
             sender_email=sender_email,
@@ -5634,6 +5662,13 @@ _PENDING_KIND_LABELS = {
     "remember": "a personal note",
     "forget_note": "a note deletion",
     "schedule_meeting": "a meeting booking",
+    "gmail_draft": "an email draft",
+    "hubspot_stage": "a deal-stage change",
+    "hubspot_note": "a deal note",
+    "slack_dm": "a Slack DM",
+    "influencer_handle": "an influencer handle",
+    "influencer_deliverable": "a deliverable update",
+    "meeting_item": "a meeting action item",
 }
 
 
@@ -11025,6 +11060,83 @@ def _tool_cora_delegate_work(slack_user_id: str, entity: str, _input: dict) -> s
 # Built as a FUNCTION (not a module-level dict literal) so its definition
 # doesn't depend on where each of the ~9 stores happens to be defined earlier
 # in this file -- it is only ever CALLED after the module has fully loaded.
+# ── Class B v2: one shared staged-write store, six kinds (v2b S5) ────────────
+# The nine v1/v2 kinds each hand-rolled an identical store (single slot per
+# (user, channel), RLock, 600s TTL, store/take/peek). Six more copies would be
+# six more places for the peek and the take to drift apart -- which is exactly
+# the class the v2 review kept finding (a claim function that did not match its
+# sibling). One factory, one behaviour, and a new kind is registered by adding a
+# name to the tuple below.
+_CLASSB_TTL_SECONDS = 600
+
+
+def _make_classb_store(kind: str) -> dict:
+    lock = RLock()
+    store: dict[tuple[str, str], dict] = {}
+
+    def key(slack_user: str, channel: str) -> tuple[str, str]:
+        return (slack_user or "", (channel or "").strip().lower())
+
+    def put(slack_user: str, channel: str, entry: dict) -> None:
+        with lock:
+            store[key(slack_user, channel)] = entry
+
+    def take(slack_user: str, channel: str) -> dict | None:
+        with lock:
+            entry = store.pop(key(slack_user, channel), None)
+        if not entry:
+            return None
+        if (time.time() - float(entry.get("ts", 0))) > _CLASSB_TTL_SECONDS:
+            return None
+        return entry
+
+    def peek(slack_user: str, channel: str) -> dict | None:
+        with lock:
+            entry = store.get(key(slack_user, channel))
+        if entry and (time.time() - float(entry.get("ts", 0))) <= _CLASSB_TTL_SECONDS:
+            return entry
+        return None
+
+    return {"lock": lock, "store": store, "key": key, "ttl": _CLASSB_TTL_SECONDS,
+            "peek": peek, "put": put, "take": take}
+
+
+# Kind names are part of the stash-id index contract; do not rename in place.
+_CLASSB_KINDS = (
+    "gmail_draft",
+    "hubspot_stage",
+    "hubspot_note",
+    "slack_dm",
+    "influencer_handle",
+    "influencer_deliverable",
+    "meeting_item",
+)
+_CLASSB: dict[str, dict] = {k: _make_classb_store(k) for k in _CLASSB_KINDS}
+
+
+def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
+    """Stash a Class-B payload at PREVIEW time and return its stash_id. The
+    payload is what executes -- never the confirm turn's own re-echoed args,
+    which is the honor-gate weakness this batch exists to close."""
+    sid = confirm_cards.mint_stash_id(kind, slack_user, channel)
+    entry = dict(entry)
+    entry["ts"] = time.time()
+    entry["stash_id"] = sid
+    _CLASSB[kind]["put"](slack_user, channel, entry)
+    return sid
+
+
+def _classb_take(kind: str, slack_user: str, channel: str) -> dict | None:
+    return _CLASSB[kind]["take"](slack_user, channel)
+
+
+def _classb_no_pending(what: str) -> str:
+    """Honest no-pending reply for a confirm that has nothing to confirm. Never
+    fabricates a success and never re-derives the payload from the turn."""
+    return (f"NOT DONE. I don't have a pending {what} to confirm -- it may have "
+            f"expired. Tell me again and I'll show you a fresh preview.")
+
+
 def _stash_kind_specs() -> dict[str, dict]:
     return {
         "asana": {"lock": _ASANA_PENDING_LOCK, "store": _PENDING_ASANA_WRITES,
@@ -11056,6 +11168,8 @@ def _stash_kind_specs() -> dict[str, dict]:
                              "key": _schedule_meeting_pending_key,
                              "ttl": _SCHEDULE_MEETING_PENDING_TTL_SECONDS,
                              "peek": _peek_pending_schedule_meeting},
+        # v2b S5: the six Class-B kinds, all backed by the shared factory above.
+        **{k: _CLASSB[k] for k in _CLASSB_KINDS},
     }
 
 
@@ -11274,6 +11388,11 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
         return _execute_claimed_remember(entry, tapping_user_id), None
     if kind == "forget_note":
         return _execute_claimed_forget_note(entry, tapping_user_id), None
+    # v2b S5: the Class-B kinds. Each executes THE STASH via the same
+    # _execute_claimed_* function its own confirmed=true call uses, so there is
+    # exactly one write implementation per kind regardless of route.
+    if kind == "gmail_draft":
+        return _execute_claimed_gmail_draft(entry, tapping_user_id), None
     if kind == "schedule_meeting":
         # v2 S2: the card renders ONE BUTTON PER OFFERED SLOT, so the tap says
         # which slot it means. v1 had a single Confirm that always booked
