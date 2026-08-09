@@ -297,33 +297,48 @@ _MOCK_MAP = {
 
 
 class TestToolInfluencerAddHandle:
+    # v2b S5: influencer_add_handle became a real staged write -- the unconfirmed
+    # call previews and stashes, the confirmed call registers the stash. Deeper
+    # coverage in tests/test_influencer_staged_writes.py.
+    @pytest.fixture(autouse=True)
+    def _no_leftover_stash(self):
+        import cora.tools.tool_dispatch as td
+        td._CLASSB["influencer_handle"]["store"].clear()
+        yield
+        td._CLASSB["influencer_handle"]["store"].clear()
+
     def _call(self, input_data, user_id="U_ALEX", entity="F3E"):
         import cora.tools.tool_dispatch as td
         with patch("cora.tools.tool_dispatch._load_slack_asana_map", return_value=_MOCK_MAP):
             return td._tool_influencer_add_handle(user_id, entity, input_data)
 
-    def test_refuses_without_confirmed(self):
-        result = self._call({"athlete_name": "A", "platform": "instagram", "handle": "@a"})
-        assert "refused" in result.lower()
+    def _stage_then_call(self, input_data, user_id="U_ALEX", entity="F3E"):
+        preview = {k: v for k, v in input_data.items() if k != "confirmed"}
+        self._call(preview, user_id=user_id, entity=entity)
+        return self._call({**input_data, "confirmed": True}, user_id=user_id, entity=entity)
 
-    def test_refuses_confirmed_false(self):
+    def test_unconfirmed_previews_and_registers_nothing(self):
+        result = self._call({"athlete_name": "A", "platform": "instagram", "handle": "@a"})
+        assert "NOT REGISTERED yet" in result
+        assert ic.get_athlete_by_handle("instagram", "a") is None
+
+    def test_confirmed_false_also_previews(self):
         result = self._call({"athlete_name": "A", "platform": "instagram", "handle": "@a", "confirmed": False})
-        assert "refused" in result.lower()
+        assert "NOT REGISTERED yet" in result
 
     def test_missing_athlete_name(self):
-        result = self._call({"platform": "instagram", "handle": "@a", "confirmed": True})
+        result = self._call({"platform": "instagram", "handle": "@a"})
         assert "athlete_name" in result.lower()
 
     def test_missing_platform(self):
-        result = self._call({"athlete_name": "A", "handle": "@a", "confirmed": True})
+        result = self._call({"athlete_name": "A", "handle": "@a"})
         assert "platform" in result.lower()
 
     def test_successful_registration(self):
-        result = self._call({
+        result = self._stage_then_call({
             "athlete_name": "Luis Pena",
             "platform": "instagram",
             "handle": "@luispena_ufc",
-            "confirmed": True,
         })
         assert "REGISTERED" in result.upper() or "registered" in result.lower()
         assert "Luis Pena" in result
@@ -333,11 +348,10 @@ class TestToolInfluencerAddHandle:
         assert row["athlete_name"] == "Luis Pena"
 
     def test_entity_defaults_to_channel_entity(self):
-        self._call({
+        self._stage_then_call({
             "athlete_name": "UFC Athlete",
             "platform": "tiktok",
             "handle": "@ufcathlte",
-            "confirmed": True,
         }, entity="UFL")
         row = ic.get_athlete_by_handle("tiktok", "ufcathlte")
         assert row["entity"] == "UFL"

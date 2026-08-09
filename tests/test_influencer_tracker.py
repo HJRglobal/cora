@@ -252,94 +252,106 @@ class TestToolInfluencerGetStatus:
 # ---------------------------------------------------------------------------
 
 class TestToolInfluencerLogDeliverable:
+    # v2b S5: this became a real staged write. The unconfirmed call validates,
+    # RESOLVES the target row and stashes; the confirmed call writes the stash.
+    # Full staged-write behaviour is in tests/test_influencer_staged_writes.py;
+    # these keep the original per-action pins, now run through both turns.
+    @pytest.fixture(autouse=True)
+    def _no_leftover_stash(self):
+        td._CLASSB["influencer_deliverable"]["store"].clear()
+        yield
+        td._CLASSB["influencer_deliverable"]["store"].clear()
+
     def _call(self, input_data: dict, user_id="U_ALEX", entity="F3E"):
         with patch("cora.tools.tool_dispatch._load_slack_asana_map", return_value=_MOCK_MAP):
             return td._tool_influencer_log_deliverable(user_id, entity, input_data)
 
-    def test_refuses_without_confirmed(self):
-        result = self._call({"action": "add", "athlete_name": "A", "platform": "instagram", "deliverable_type": "post"})
-        assert "refused" in result.lower()
+    def _stage_then_call(self, input_data: dict, user_id="U_ALEX", entity="F3E"):
+        """Run the preview turn, then the confirm turn."""
+        preview = {k: v for k, v in input_data.items() if k != "confirmed"}
+        self._call(preview, user_id=user_id, entity=entity)
+        return self._call({**input_data, "confirmed": True}, user_id=user_id, entity=entity)
 
-    def test_refuses_with_confirmed_false(self):
+    def test_unconfirmed_previews_and_writes_nothing(self):
+        result = self._call({"action": "add", "athlete_name": "A", "platform": "instagram", "deliverable_type": "post"})
+        assert "NOT LOGGED yet" in result
+        assert not ic.get_deliverables(athlete="A")
+
+    def test_confirmed_false_also_previews(self):
         result = self._call({
             "action": "add", "athlete_name": "A", "platform": "instagram",
             "deliverable_type": "post", "confirmed": False,
         })
-        assert "refused" in result.lower()
+        assert "NOT LOGGED yet" in result
 
     def test_unknown_action_returns_error(self):
-        result = self._call({"action": "delete", "confirmed": True})
+        result = self._call({"action": "delete"})
         assert "unknown action" in result.lower()
 
     def test_add_missing_athlete_returns_message(self):
-        result = self._call({"action": "add", "platform": "instagram", "deliverable_type": "post", "confirmed": True})
+        result = self._call({"action": "add", "platform": "instagram", "deliverable_type": "post"})
         assert "athlete_name" in result.lower()
 
     def test_add_missing_platform_returns_message(self):
-        result = self._call({"action": "add", "athlete_name": "A", "deliverable_type": "post", "confirmed": True})
+        result = self._call({"action": "add", "athlete_name": "A", "deliverable_type": "post"})
         assert "platform" in result.lower()
 
     def test_successful_add_returns_confirmation(self):
-        result = self._call({
+        result = self._stage_then_call({
             "action": "add",
             "athlete_name": "Luis Pena",
             "platform": "instagram",
             "deliverable_type": "reel",
             "due_date": "2026-06-15",
-            "confirmed": True,
         })
         assert "Luis Pena" in result
         assert "LOGGED" in result.upper() or "logged" in result.lower()
 
     def test_complete_without_id_returns_message(self):
-        result = self._call({"action": "complete", "confirmed": True})
+        result = self._call({"action": "complete"})
         assert "deliverable_id" in result.lower()
 
     def test_complete_unknown_id_returns_friendly_error(self):
-        result = self._call({"action": "complete", "deliverable_id": 9999, "confirmed": True})
+        result = self._stage_then_call({"action": "complete", "deliverable_id": 9999})
         assert "error" in result.lower() or "not found" in result.lower()
 
     def test_successful_complete_returns_confirmation(self):
         row = ic.add_deliverable(athlete_name="Fighter A", platform="instagram", deliverable_type="story", entity="F3E")
-        result = self._call({
+        result = self._stage_then_call({
             "action": "complete",
             "deliverable_id": row["id"],
             "completion_link": "https://www.instagram.com/p/test123",
-            "confirmed": True,
         })
         assert "COMPLETE" in result.upper() or "complete" in result.lower()
         assert "Fighter A" in result
 
     def test_waive_marks_correctly(self):
         row = ic.add_deliverable(athlete_name="Fighter B", platform="tiktok", deliverable_type="video", entity="F3E")
-        result = self._call({
+        result = self._stage_then_call({
             "action": "waive",
             "deliverable_id": row["id"],
             "notes": "Injury",
-            "confirmed": True,
         })
         assert "WAIVED" in result.upper() or "waived" in result.lower()
         assert "Fighter B" in result
 
     def test_entity_defaults_to_channel_entity(self):
-        self._call({
+        self._stage_then_call({
             "action": "add",
             "athlete_name": "Channel Default",
             "platform": "instagram",
             "deliverable_type": "post",
-            "confirmed": True,
         }, entity="UFL")
         rows = ic.get_deliverables(entity="UFL")
         assert any(r["athlete_name"] == "Channel Default" for r in rows)
 
     def test_add_with_hubspot_deal_id(self):
-        result = self._call({
+        result = self._stage_then_call({
             "action": "add",
             "athlete_name": "HubSpot Athlete",
             "platform": "instagram",
             "deliverable_type": "post",
             "hubspot_deal_id": "987654321",
-            "confirmed": True,
         })
         assert "HubSpot Athlete" in result
         rows = ic.get_deliverables(athlete="HubSpot Athlete")

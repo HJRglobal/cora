@@ -2356,15 +2356,16 @@ def _tool_influencer_add_handle(slack_user_id: str, entity: str, _input: dict) -
         '@Cora add handle for Luis Pena — instagram @luispena_ufc'
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "influencer_add_handle refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a preview (athlete name, platform, handle) "
-            "AND received their explicit approval. Show the preview first, then re-call "
-            "with confirmed=true."
-        )
+    # v2b S5: real staged write -- the confirmed call registers THE STASHED
+    # handle, so a model that alters athlete_name or handle on the second call
+    # cannot register a different account than the one previewed.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("influencer_handle", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("handle registration")
+        return _execute_claimed_influencer_handle(pending, slack_user_id)
 
     athlete_name = (input_data.get("athlete_name") or "").strip()
     platform = (input_data.get("platform") or "").strip().lower()
@@ -2378,6 +2379,27 @@ def _tool_influencer_add_handle(slack_user_id: str, entity: str, _input: dict) -
     if not handle:
         return "influencer_add_handle: `handle` is required (the athlete's account handle, with or without @)."
 
+    sid = _classb_stash("influencer_handle", slack_user_id, channel, {
+        "athlete_name": athlete_name, "platform": platform,
+        "handle": handle, "row_entity": row_entity,
+    })
+    log.info("influencer_add_handle PREVIEW actor=%s athlete=%r stash=%s",
+             slack_user_id, athlete_name, sid)
+    return _write_blocked_contract(
+        f"NOT REGISTERED yet -- this is a preview.\n"
+        f"- Athlete: {athlete_name}\n"
+        f"- {platform.capitalize()}: @{handle.lstrip('@')}\n"
+        f"- Entity: {row_entity}\n"
+        f"{_confirm_how(channel, capitalize=True)} and I'll add it to the tracker. "
+        f"Nothing is registered until you confirm."
+    )
+
+
+def _execute_claimed_influencer_handle(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED influencer_add_handle stash. Shared by the
+    tool's own confirmed=true call and the confirm-button tap."""
+    athlete_name, platform = pending["athlete_name"], pending["platform"]
+    handle, row_entity = pending["handle"], pending["row_entity"]
     try:
         row = influencer_client.register_handle(
             athlete_name=athlete_name,
@@ -2471,17 +2493,20 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
     action=waive:    Mark an existing deliverable as excused / cancelled.
     """
     input_data = _input or {}
+    channel = str(input_data.get("_channel_name", "") or "")
 
-    # Confirmation gate
-    confirmed = input_data.get("confirmed", False)
-    if confirmed is not True:
-        return (
-            "influencer_log_deliverable refused: `confirmed` must be set to true ONLY "
-            "after you have shown the user a preview block AND received their explicit "
-            "approval ('yes', 'log it', 'mark it done', 'waive it', or similar). "
-            "If you have NOT done that yet, format a clear preview NOW and ask the user "
-            "to confirm before writing to the tracker."
-        )
+    # v2b S5: real staged write. Crucially, the NAME-BASED RESOLUTION ("complete
+    # Mario Bautista story" -> row 42) now happens at PREVIEW time and the
+    # resolved id goes in the stash, so the confirm executes the row the user was
+    # shown. Under the honor gate the confirm re-resolved from scratch, and
+    # resolve_pending_deliverable returns the oldest pending match -- so a row
+    # that closed in between (or a second story landing) could hand the confirm a
+    # DIFFERENT deliverable than the preview named, with no way to tell.
+    if _confirmed_flag(input_data):
+        pending = _classb_take("influencer_deliverable", slack_user_id, channel)
+        if pending is None:
+            return _classb_no_pending("deliverable update")
+        return _execute_claimed_influencer_deliverable(pending, slack_user_id)
 
     action = (input_data.get("action") or "add").strip().lower()
     if action not in ("add", "complete", "waive"):
@@ -2512,22 +2537,19 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
             if not deliverable_type:
                 return "influencer_log_deliverable: `deliverable_type` is required for action=add (e.g. post, story, reel)."
 
-            row = influencer_client.add_deliverable(
-                athlete_name=athlete_name,
-                platform=platform,
-                deliverable_type=deliverable_type,
-                due_date=due_date,
-                notes=notes,
-                hubspot_deal_id=hubspot_deal_id,
-                entity=row_entity,
-                created_by=slack_user_id,
+            payload = {
+                "action": "add", "athlete_name": athlete_name, "platform": platform,
+                "deliverable_type": deliverable_type, "due_date": due_date,
+                "notes": notes, "hubspot_deal_id": hubspot_deal_id,
+                "row_entity": row_entity, "actor_display": actor_display,
+            }
+            preview = (
+                f"NOT LOGGED yet -- this is a preview.\n"
+                f"- Add: {deliverable_type} on {platform} for {athlete_name}\n"
+                f"- Due: {due_date or 'not set'}   Entity: {row_entity}\n"
             )
-            row["display_status"] = "pending"
-            log.info(
-                "influencer_log_deliverable ADD actor=%s id=%d athlete=%r",
-                actor_display, row["id"], row["athlete_name"],
-            )
-            return influencer_client.format_logged_deliverable_for_llm(row, action="add")
+            return _stash_influencer_deliverable(
+                slack_user_id, channel, payload, preview)
 
         else:  # complete or waive
             deliverable_id_raw = input_data.get("deliverable_id")
@@ -2552,6 +2574,12 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
                         f"or try specifying the type (story/post/reel)."
                     )
                 deliverable_id = resolved["id"]
+                # The resolved ROW is what the preview describes and what the
+                # stash targets -- the confirm never re-resolves.
+                target_label = (
+                    f"#{deliverable_id} {resolved.get('deliverable_type', '')} "
+                    f"for {resolved.get('athlete_name', athlete_name_raw)}"
+                ).strip()
                 log.info(
                     "influencer_log_deliverable: resolved %r %r -> id=%d",
                     athlete_name_raw, dtype, deliverable_id,
@@ -2564,41 +2592,35 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
                         f"influencer_log_deliverable: `deliverable_id` must be a number. "
                         f"Got {deliverable_id_raw!r}."
                     )
+                target_label = f"#{deliverable_id}"
             else:
                 return (
                     f"influencer_log_deliverable: provide either `deliverable_id` (numeric) "
                     f"or `athlete_name` (e.g. 'Mario Bautista') to identify the deliverable."
                 )
 
+            notes = input_data.get("notes") or None
+            payload = {
+                "action": action, "deliverable_id": deliverable_id,
+                "notes": notes, "actor_display": actor_display,
+            }
             if action == "complete":
-                completion_link = (input_data.get("completion_link") or "").strip() or None
-                notes = input_data.get("notes") or None
-                row = influencer_client.mark_complete(
-                    deliverable_id=deliverable_id,
-                    completion_link=completion_link,
-                    notes=notes,
-                    actor=actor_display,
+                payload["completion_link"] = (
+                    input_data.get("completion_link") or "").strip() or None
+                preview = (
+                    f"NOT LOGGED yet -- this is a preview.\n"
+                    f"- Mark COMPLETE: {target_label}\n"
+                    + (f"- Link: {payload['completion_link']}\n"
+                       if payload["completion_link"] else "")
                 )
-                row["display_status"] = "complete"
-                log.info(
-                    "influencer_log_deliverable COMPLETE actor=%s id=%d athlete=%r",
-                    actor_display, deliverable_id, row["athlete_name"],
-                )
-                return influencer_client.format_logged_deliverable_for_llm(row, action="complete")
-
             else:  # waive
-                notes = input_data.get("notes") or None
-                row = influencer_client.mark_waived(
-                    deliverable_id=deliverable_id,
-                    notes=notes,
-                    actor=actor_display,
+                preview = (
+                    f"NOT LOGGED yet -- this is a preview.\n"
+                    f"- WAIVE: {target_label}\n"
+                    + (f"- Reason: {notes}\n" if notes else "")
                 )
-                row["display_status"] = "waived"
-                log.info(
-                    "influencer_log_deliverable WAIVE actor=%s id=%d athlete=%r",
-                    actor_display, deliverable_id, row["athlete_name"],
-                )
-                return influencer_client.format_logged_deliverable_for_llm(row, action="waive")
+            return _stash_influencer_deliverable(
+                slack_user_id, channel, payload, preview)
 
     except influencer_client.InfluencerClientError as exc:
         log.warning(
@@ -2609,6 +2631,73 @@ def _tool_influencer_log_deliverable(slack_user_id: str, entity: str, _input: di
             f"Influencer tracker error: {exc}. Tell the user the action wasn't completed "
             f"and suggest they check the deliverable ID or input values."
         )
+
+
+def _stash_influencer_deliverable(slack_user_id: str, channel: str,
+                                  payload: dict, preview: str) -> str:
+    """Stash a validated deliverable action and return its preview. One place, so
+    the three actions cannot drift in how they stage."""
+    sid = _classb_stash("influencer_deliverable", slack_user_id, channel, payload)
+    log.info("influencer_log_deliverable PREVIEW actor=%s action=%s stash=%s",
+             slack_user_id, payload.get("action"), sid)
+    return _write_blocked_contract(
+        preview
+        + f"{_confirm_how(channel, capitalize=True)} and I'll write it to the "
+          f"tracker. Nothing is logged until you confirm."
+    )
+
+
+def _execute_claimed_influencer_deliverable(pending: dict, slack_user_id: str) -> str:
+    """Execute an ALREADY-CLAIMED influencer_log_deliverable stash. Shared by the
+    tool's own confirmed=true call and the confirm-button tap.
+
+    Targets the deliverable_id RESOLVED AT PREVIEW, never a fresh name lookup."""
+    action = pending["action"]
+    actor_display = pending.get("actor_display", slack_user_id)
+    try:
+        if action == "add":
+            row = influencer_client.add_deliverable(
+                athlete_name=pending["athlete_name"],
+                platform=pending["platform"],
+                deliverable_type=pending["deliverable_type"],
+                due_date=pending.get("due_date"),
+                notes=pending.get("notes"),
+                hubspot_deal_id=pending.get("hubspot_deal_id"),
+                entity=pending["row_entity"],
+                created_by=slack_user_id,
+            )
+            row["display_status"] = "pending"
+            log.info("influencer_log_deliverable ADD actor=%s id=%d athlete=%r",
+                     actor_display, row["id"], row["athlete_name"])
+        elif action == "complete":
+            row = influencer_client.mark_complete(
+                deliverable_id=pending["deliverable_id"],
+                completion_link=pending.get("completion_link"),
+                notes=pending.get("notes"),
+                actor=actor_display,
+            )
+            row["display_status"] = "complete"
+            log.info("influencer_log_deliverable COMPLETE actor=%s id=%d athlete=%r",
+                     actor_display, pending["deliverable_id"], row["athlete_name"])
+        else:  # waive
+            row = influencer_client.mark_waived(
+                deliverable_id=pending["deliverable_id"],
+                notes=pending.get("notes"),
+                actor=actor_display,
+            )
+            row["display_status"] = "waived"
+            log.info("influencer_log_deliverable WAIVE actor=%s id=%d athlete=%r",
+                     actor_display, pending["deliverable_id"], row["athlete_name"])
+    except influencer_client.InfluencerClientError as exc:
+        log.warning(
+            "influencer_log_deliverable FAILED actor=%s action=%s: %s",
+            actor_display, action, exc,
+        )
+        return (
+            f"Influencer tracker error: {exc}. Tell the user the action wasn't completed "
+            f"and suggest they check the deliverable ID or input values."
+        )
+    return influencer_client.format_logged_deliverable_for_llm(row, action=action)
 
 
 def _tool_fighter_compliance(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -8978,9 +9067,13 @@ TOOL_DEFINITIONS = [
             "Instagram', '[athlete] is @handle on TikTok', 'add [name] to the influencer tracker'.\n"
             "\n"
             "REQUIRED PATTERN (staged-write — never skip):\n"
-            "1. Show a preview: Athlete name, platform, handle. Ask the user to confirm.\n"
+            "1. Call WITHOUT confirmed. The tool validates and returns a preview "
+            "   (athlete, platform, handle) to relay. Nothing is registered.\n"
             "2. Wait for explicit approval ('yes', 'register it', 'add it').\n"
-            "3. Then call with confirmed=true.\n"
+            "3. Then call with confirmed=true. The tool registers THE STAGED "
+            "   HANDLE, so the fields on that second call are ignored and cannot "
+            "   register a different account. If nothing is staged, the tool says "
+            "   so and writes nothing.\n"
             "\n"
             "Platform values: 'instagram', 'tiktok'. "
             "Handle: the athlete's account username, with or without the @ symbol."
@@ -9052,14 +9145,15 @@ TOOL_DEFINITIONS = [
             "tracker. This is a WRITE tool — same staged-write pattern as other Cora write tools.\n"
             "\n"
             "REQUIRED PATTERN (staged-write — never skip):\n"
-            "1. When the user asks to log, add, complete, or waive a deliverable, show a "
-            "   PREVIEW BLOCK in your reply first. For add: show athlete, platform, type, due date. "
-            "   For complete: show the deliverable ID, athlete, and optional link. "
-            "   For waive: show the deliverable ID, athlete, and reason. "
-            "   DO NOT call this tool on the first turn.\n"
+            "1. Call WITHOUT confirmed. The tool validates, RESOLVES which "
+            "   deliverable is meant (a name like 'Mario Bautista story' becomes a "
+            "   specific row) and returns a preview to relay. Nothing is written.\n"
             "2. Wait for the user's explicit approval ('yes', 'log it', 'mark it done', "
             "   'looks good', etc.). Then call with confirmed=true.\n"
-            "3. If they want changes, re-show the preview and wait again.\n"
+            "3. The confirmed call writes THE STAGED ACTION against the row that was "
+            "   resolved in step 1, so the fields on that second call are ignored and "
+            "   cannot retarget it. If nothing is staged, the tool says so and writes "
+            "   nothing. If they want changes, call step 1 again with the new values.\n"
             "\n"
             "Use this tool when:\n"
             "- action=add: 'add a deliverable for [athlete]', 'log that [athlete] owes us a post', "
@@ -11635,6 +11729,10 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
         return _execute_claimed_hubspot_note(entry, tapping_user_id), None
     if kind == "slack_dm":
         return _execute_claimed_slack_dm(entry, tapping_user_id), None
+    if kind == "influencer_handle":
+        return _execute_claimed_influencer_handle(entry, tapping_user_id), None
+    if kind == "influencer_deliverable":
+        return _execute_claimed_influencer_deliverable(entry, tapping_user_id), None
     if kind == "schedule_meeting":
         # v2 S2: the card renders ONE BUTTON PER OFFERED SLOT, so the tap says
         # which slot it means. v1 had a single Confirm that always booked
