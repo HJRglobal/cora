@@ -5871,6 +5871,15 @@ def try_confirm_pending_write(
     remember = _mine(_peek_pending_remember(slack_user_id, channel_name))
     forget_note = _mine(_peek_pending_forget_note(slack_user_id, channel_name))
     schedmtg = _mine(_peek_pending_schedule_meeting(slack_user_id, channel_name))
+    # v2b S5: the Class-B kinds mint their pendings in the shared factory store,
+    # so they are enumerated rather than named one by one -- a seventh Class-B
+    # kind joins this arbitration by being added to _CLASSB_KINDS, which is the
+    # whole point of the factory. Peeked through the same _mine() concurrency
+    # filter as every kind above.
+    classb = {
+        k: e for k in _CLASSB_KINDS
+        if (e := _mine(_CLASSB[k]["peek"](slack_user_id, channel_name)))
+    }
 
     entries: list[tuple[float, str, str | None]] = []
     if asana:
@@ -5902,6 +5911,12 @@ def try_confirm_pending_write(
         entries.append((float(forget_note.get("ts", 0)), "forget_note", "forget"))
     if schedmtg:
         entries.append((float(schedmtg.get("ts", 0)), "schedule_meeting", "schedule"))
+    for _cb_kind, _cb_entry in classb.items():
+        # The third tuple slot is an action token. Every Class-B kind DEFERS (see
+        # the kind check below), so its token is never fed to _confirm_intent --
+        # it only has to be a string, because entries.sort() compares slot 3 when
+        # two pendings share a ts and str-vs-None would raise there.
+        entries.append((float(_cb_entry.get("ts", 0)), _cb_kind, _cb_kind))
     # ── A sibling turn is mid-flight: this affirmative is genuinely ambiguous ──
     # D-051 lens-1, TWO findings, both introduced by the S1 fix itself:
     #
@@ -6006,8 +6021,7 @@ def try_confirm_pending_write(
         log.info("confirm_interceptor ABANDON stale destructive asana user=%s action=%s (superseded)",
                  slack_user_id, asana.get("action"))
 
-    if kind in ("calendar", "lexicon", "code_queue",
-                "remember", "forget_note", "schedule_meeting"):
+    if kind in _defer_to_model_kinds():
         # Deferred to the model; never fire a staler write on a confirm meant
         # for a calendar booking, a lexicon teach, or a code-queue capture.
         #
@@ -6027,6 +6041,15 @@ def try_confirm_pending_write(
         # this arbitration -- so their confirm turn's bare "yes" was free to fire
         # somebody else's staler write. Each defers; the Sonnet-force chain in
         # app.py covers all three so the model reliably reaches the tool.
+        #
+        # The six Class-B kinds joined on 2026-08-08 (v2b S5) for the third time
+        # around the same loop. Before the migration they were honor gates that
+        # minted nothing, so there was nothing to arbitrate; the moment
+        # gmail_create_draft started stashing, its confirm turn's bare "yes" was
+        # free to fire a staler Asana/Shopify pending -- a defect the migration
+        # itself introduced. They defer for the same reason the others do (this
+        # function has no executor for them) and ride the same Sonnet-force
+        # entry (has_pending_classb) so the model reliably reaches the tool.
         #
         # HOTFIX 2026-08-08: deferral applies to an AFFIRM only. Deferring exists
         # because this function has no executor for these kinds, so a "yes" must
@@ -11128,6 +11151,33 @@ def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
 
 def _classb_take(kind: str, slack_user: str, channel: str) -> dict | None:
     return _CLASSB[kind]["take"](slack_user, channel)
+
+
+def has_pending_classb(slack_user: str, channel: str) -> bool:
+    """Any Class-B staged write awaiting confirmation for this (user, channel).
+
+    ONE entry in app.py's Sonnet-force chain covers all six kinds -- and a
+    seventh added to _CLASSB_KINDS joins by construction, which is exactly the
+    drift the per-kind has_pending_* functions kept inviting. Their confirm turn
+    is the same shape every other kind in that chain has (a bare affirmative
+    answering a staged preview), and since they DEFER in the arbitration above,
+    the model is the only thing that can reach the tool -- so it must not be
+    Haiku, which live-fabricated preview-shaped text with zero tool_use on
+    exactly this shape (the S4 finding)."""
+    return any(_CLASSB[k]["peek"](slack_user, channel) for k in _CLASSB_KINDS)
+
+
+# Kinds try_confirm_pending_write peeks but has no executor for: it arbitrates
+# them freshest-first (so a staler kind's write can never fire on a confirm meant
+# for one of these) and then hands the turn to the model, whose tool call is what
+# actually executes. A typed CANCEL is still handled deterministically here --
+# cancelling needs no executor, only a claim (HOTFIX 2026-08-08 / D-164).
+# Referenced from try_confirm_pending_write, which is DEFINED earlier in this
+# file but only ever CALLED after the module has fully loaded -- same ordering
+# contract as _stash_kind_specs() below.
+def _defer_to_model_kinds() -> frozenset[str]:
+    return frozenset({"calendar", "lexicon", "code_queue", "remember",
+                      "forget_note", "schedule_meeting"}) | frozenset(_CLASSB_KINDS)
 
 
 def _classb_no_pending(what: str) -> str:

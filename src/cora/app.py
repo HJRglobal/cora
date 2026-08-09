@@ -1271,6 +1271,12 @@ def _dispatch_qa(
         # participates in the typed-confirm arbitration (which DEFERS to the
         # model), so the model has to reliably reach the tool.
         or _tool_dispatch.has_pending_schedule_meeting(user_id, channel_name)
+        # v2b S5: all six Class-B kinds behind ONE call (gmail draft, HubSpot
+        # stage/note, Slack DM, influencer handle/deliverable, meeting items).
+        # They defer in the arbitration exactly like the kinds above, so the
+        # model is the only route to their tool -- and a seventh Class-B kind
+        # is covered here the moment it is registered, with no edit to this line.
+        or _tool_dispatch.has_pending_classb(user_id, channel_name)
     )):
         chosen_model = model_router.MODEL_SONNET
     log.info(
