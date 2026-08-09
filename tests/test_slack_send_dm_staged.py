@@ -348,13 +348,46 @@ class TestPhiAndLexFloor:
         assert fake.sent == []
         assert "PHI" in out
 
-    def test_a_bare_program_name_is_NOT_treated_as_phi(self):
-        """The 2026-08-07 precision lesson: is_phi_risk is an INGESTION screen and
-        over-refuses request-shaped text on a bare 'AHCCCS'. This path uses the
-        person-linked predicate instead."""
-        out = _preview(message="Can you send me the AHCCCS policy summary?")
-        assert "PHI" not in out
-        assert _peek() is not None
+    @pytest.mark.parametrize("msg", [
+        "Marcus's AHCCCS is 84213365 if you need it for the portal.",
+        "His Medicaid, ID 84213365, expires next month.",
+        "Please check Bob Smith's billing authorization before Friday.",
+        "The client is not eligible for coverage under his current placement.",
+        "Marcus Alvarez's DDD authorization lapsed, can you resubmit his units?",
+    ])
+    def test_the_screen_catches_person_linked_program_and_billing_phi(self, msg):
+        """The first cut used is_phi_risk_person_linked and MISSED every one of
+        these -- including the literal D-050 bug string -- because the adjacency
+        rule that re-admits a beneficiary number needs the identifier to sit
+        immediately after the programme name."""
+        out = _preview(message=msg)
+        assert "PHI" in out
+        assert _peek() is None, "a PHI message must never become a tappable stash"
+
+    def test_ordinary_business_language_still_sends(self):
+        for msg in ("Heads up, the pallet ships Friday.",
+                    "Send Josh the invoice authorization for the pallet order",
+                    "Can you send Tommy the Q3 sponsorship deck before the call?"):
+            td._CLASSB["slack_dm"]["store"].clear()
+            out = _preview(message=msg)
+            assert "PHI" not in out
+            assert _peek() is not None
+
+    @pytest.mark.parametrize("msg", [
+        "Can you send me the AHCCCS policy summary?",
+        "Costco's purchase authorization for the Pure launch order is approved.",
+        "Tommy - can you send me the Q3 revenue assessment by Friday?",
+    ])
+    def test_ACCEPTED_false_refusals_are_pinned_not_forgotten(self, msg):
+        """is_any_phi is the house standard for an egress checkpoint and the
+        sibling gmail path already uses it, so this path takes it too -- at a
+        known cost. These three are refused and should not be. Pinned so the
+        trade-off is visible and so sharpening phi_guard shows up here as a
+        deliberate change rather than a surprise."""
+        out = _preview(message=msg)
+        assert "PHI" in out
+        assert "send it themselves" in out, \
+            "a false refusal must tell the user what to do instead"
 
 
 class TestRegistration:

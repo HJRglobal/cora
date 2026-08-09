@@ -1868,13 +1868,25 @@ def _tool_gmail_create_draft(slack_user_id: str, entity: str, _input: dict) -> s
         w["reason"] for w in _guard_result.warns
     ]
 
+    # Render the recipients BEFORE stashing. _normalize_recipients RAISES on an
+    # address with no "@", and doing it after the stash meant a typo'd recipient
+    # crashed the preview turn (degraded to "Tool gmail_create_draft crashed")
+    # while leaving a live, claimable stash behind -- confirmable by a later bare
+    # "yes" or a button tap. The old honor-gate code only normalized AFTER a
+    # successful send, inside the try, so a bad address returned the friendly
+    # error and left nothing staged.
+    try:
+        to_disp = ", ".join(gmail_client._normalize_recipients(to))
+        cc_disp = ", ".join(gmail_client._normalize_recipients(cc)) if cc else ""
+    except gmail_client.GmailClientError as exc:
+        return (f"gmail_create_draft: {exc}. Ask the user for a valid email "
+                f"address. Nothing was drafted or staged.")
+
     sid = _classb_stash("gmail_draft", slack_user_id, channel, {
         "sender_email": sender_email, "to": to, "subject": subject,
         "body": body, "cc": cc, "bcc": bcc, "entity": entity,
         "guard_notes": _guard_notes,
     })
-    to_disp = ", ".join(gmail_client._normalize_recipients(to))
-    cc_disp = ", ".join(gmail_client._normalize_recipients(cc)) if cc else ""
     note = ("\nEMAIL GUARD NOTES: " + "; ".join(_guard_notes[:3])) if _guard_notes else ""
     log.info("gmail_create_draft PREVIEW asker=%s stash=%s", slack_user_id, sid)
     return _write_blocked_contract(
@@ -5796,12 +5808,16 @@ def describe_live_pendings(slack_user: str, channel: str,
     live.sort(reverse=True)
     names = [_PENDING_KIND_LABELS.get(k, k) for _ts, k in live]
     listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+    # The button clause has to follow the kill switch: with buttons off there is
+    # no Confirm to point at, and this line is injected for far more kinds now
+    # that the Class-B stashes are in the spec table.
+    tail = ("ask which one, or point them at the Confirm button on the preview."
+            if confirm_cards.confirm_buttons_enabled() else "ask which one.")
     return (
         f"STAGED WRITES AWAITING CONFIRMATION: this person currently has {listed} "
         f"staged and unconfirmed (newest first: {names[0]}). NEVER tell them nothing "
         f"is staged or that no action is needed. If their message confirms one, call "
-        f"that tool again with confirmed=true; if it is unclear which they mean, ask "
-        f"which one, or point them at the Confirm button on the preview."
+        f"that tool again with confirmed=true; if it is unclear which they mean, {tail}"
     )
 
 
@@ -5810,7 +5826,8 @@ def _peek_kind(kind: str, slack_user: str, channel: str) -> dict | None:
     return spec["peek"](slack_user, channel) if spec else None
 
 
-def _deferred_cancel_reply(kind: str, slack_user: str, channel: str) -> str:
+def _deferred_cancel_reply(kind: str, slack_user: str, channel: str,
+                           claimed_entry: dict | None = None) -> str:
     """Name what was cancelled AND what survives (D-051 lens-1 + lens-2).
 
     A typed cancel pops only the FRESHEST pending, so with several armed the
@@ -5827,7 +5844,20 @@ def _deferred_cancel_reply(kind: str, slack_user: str, channel: str) -> str:
         for k in _stash_kind_specs()
         if _peek_kind(k, slack_user, channel)
     ]
-    base = f"Okay -- I've cancelled {label}. Nothing was changed."
+    # A meeting stash is the one kind where cancelling dismisses SEVERAL things
+    # at once, and where some of them may already have been carried out by a
+    # tap or an earlier typed confirm. "Nothing was changed" is then flatly
+    # false: it reads as though the task the user just created was rolled back.
+    if kind == "meeting_item" and claimed_entry:
+        done = sum(1 for c in (claimed_entry.get("claimed") or []) if c)
+        left = len(claimed_entry.get("items") or []) - done
+        noun = "action item" if left == 1 else "action items"
+        base = (f"Okay -- I've dismissed {left} remaining meeting {noun}."
+                if left else "Okay -- there was nothing left to dismiss.")
+        base += (f" The {done} you already created {'is' if done == 1 else 'are'} "
+                 f"unaffected." if done else " Nothing was changed.")
+    else:
+        base = f"Okay -- I've cancelled {label}. Nothing was changed."
     if not survivors:
         return base
     listed = (survivors[0] if len(survivors) == 1
@@ -6164,7 +6194,8 @@ def try_confirm_pending_write(
                 # lines, so one that lies is worse than one that is missing.
                 log.info("confirm_interceptor CANCEL user=%s kind=%s (deferred-kind)",
                          slack_user_id, kind)
-                return _deferred_cancel_reply(kind, slack_user_id, channel_name)
+                return _deferred_cancel_reply(kind, slack_user_id, channel_name,
+                                              claimed_entry=claimed)
             log.info("confirm_interceptor CANCEL-RACE user=%s kind=%s "
                      "(pending gone before the claim; deferring)", slack_user_id, kind)
         return None
@@ -6859,8 +6890,8 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
                     slack_user_id, resolved_id)
         return (
             "slack_send_dm refused: the message tripped the PHI screen, so nothing "
-            "was staged or sent. Tell the user the DM was blocked for containing "
-            "possible PHI and cannot be sent from here."
+            "was staged or sent. Tell the user I can't send this one for them, and "
+            "that if it is not actually PHI they can send it themselves in Slack."
         )
 
     display_name = _load_slack_asana_map().get(resolved_id, {}).get(
@@ -6880,28 +6911,46 @@ def _tool_slack_send_dm(slack_user_id: str, entity: str, _input: dict) -> str:
     )
 
 
+# A bare Slack user id, nothing else. See _execute_claimed_slack_dm for why.
+_SLACK_USER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,}")
+
+
 def _slack_dm_lex_blocked(entity: str) -> bool:
     """DMs are never triggered from Lexington scope (PHI guardrail)."""
     return bool(entity) and entity.upper().startswith("LEX")
 
 
 def _slack_dm_phi_blocked(message: str) -> bool:
-    """PHI screen for an outbound DM.
+    """PHI screen for an outbound DM: is_any_phi, the house egress union.
 
-    is_phi_risk_person_linked, NOT is_phi_risk. The base predicate is an
-    INGESTION screen (email subjects, Drive filenames) where recall beats
-    precision, and the 2026-08-07 delegated-work finding is that reusing it on
-    composed, request-shaped text over-refuses on a bare programme name -- three
-    person-free DDD policy briefs were refused whose only match was the token
-    "AHCCCS". A DM body is composed prose, so it takes the person-linked variant
-    the same way a delegated-work brief does.
+    The first cut used is_phi_risk_person_linked, reasoning from the 2026-08-07
+    delegated-work finding that the base predicate over-refuses request-shaped
+    text on a bare programme name. Measured against real strings, that reasoning
+    produced the worst of both: it MISSED "Marcus's AHCCCS is 84213365"
+    (_PROGRAM_ID_TAIL_RE only re-admits an identifier sitting IMMEDIATELY after
+    the programme name, and "is" breaks the adjacency), missed the literal D-050
+    bug string "Bob Smith's billing authorization is pending", and still refused
+    "the Q3 revenue assessment" -- because "assessment" is a base pattern, not a
+    programme name, so the subtraction never touched the false positives it was
+    adopted for.
 
-    LEX scope is already blocked outright above, so this is the residual case: a
-    PHI-shaped message composed in an F3E/OSN/FNDR channel. Deliberately does NOT
-    include is_lex_billing_status_phi -- outside LEX, a named buyer's billing
-    authorization is ordinary business (its own docstring says so)."""
+    is_any_phi is what is_any_phi's own docstring prescribes for "any
+    write/egress checkpoint that must not miss PHI", and it is already what the
+    SIBLING tool on this branch uses -- gmail_create_draft screens through
+    revops.email_egress_guard, which calls it. Having the weaker screen guard the
+    HIGHER-stakes action (a message actually delivered to another person, versus
+    a draft that lands unsent in the asker's own mailbox) was indefensible.
+
+    Known cost, accepted deliberately: is_any_phi also refuses a DM that merely
+    ASKS about a programme ("send me the AHCCCS policy summary") and a non-LEX
+    possessive authorization ("Costco's purchase authorization"). On the only
+    path that delivers to a third party, a false refusal costs one rephrase and
+    the user can send it themselves; a miss is irreversible. The refusal copy
+    says so. Sharpening the underlying predicates (the adjacency gap, and
+    "assessment"/"incident report" as bare business words) is a phi_guard change
+    with many other consumers, seeded rather than smuggled in here."""
     from .. import phi_guard
-    return phi_guard.is_phi_risk_person_linked(message or "")
+    return phi_guard.is_any_phi(message or "")
 
 
 def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
@@ -6931,17 +6980,32 @@ def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
     resolved_id = pending["recipient_id"]
     display_name = pending.get("display_name") or pending.get("recipient_name", "them")
 
+    # A comma (or any junk) in a mapped slack_user_id would make conversations.open
+    # create an MPIM and deliver the DM to an unintended EXTRA recipient, while the
+    # receipt still names one person. Same fullmatch guard, and the same reason,
+    # as the finance close-pack sender.
+    if not _SLACK_USER_ID_RE.fullmatch(resolved_id or ""):
+        log.warning("slack_send_dm REFUSED malformed recipient id asker=%s", slack_user_id)
+        return ("slack_send_dm: that recipient's Slack id in the user map is "
+                "malformed, so I didn't send anything. Tell Harrison.")
+
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
         return "slack_send_dm: SLACK_BOT_TOKEN not configured. Tell Harrison."
 
     try:
-        client = _SlackWebClient(token=token)
+        # Timeout INSIDE this tool's 12s dispatch budget (slack_sdk defaults to
+        # 30s). Without it the dispatch timer fired first, the worker was
+        # abandoned but not killed, the send completed anyway, and the user was
+        # told "please try again" over a DM that had in fact been delivered --
+        # so they re-asked and the recipient got it twice.
+        client = _SlackWebClient(token=token, timeout=5)
         # Open (or reuse) a DM channel with the recipient
         open_resp = client.conversations_open(users=[resolved_id])
         dm_channel = open_resp["channel"]["id"]
         send_resp = client.chat_postMessage(channel=dm_channel, text=message)
     except _SlackApiError as exc:
+        # Slack REJECTED the post, so "not sent" is accurate here.
         log.warning(
             "slack_send_dm FAILED asker=%s recipient=%s exc=%s",
             slack_user_id, resolved_id, exc,
@@ -6949,6 +7013,17 @@ def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
         return (
             f"Slack DM error: {exc.response.get('error', str(exc))}. "
             f"Tell the user the message wasn't sent and suggest they send it manually."
+        )
+    except Exception as exc:  # noqa: BLE001 -- transport-level: outcome UNKNOWN
+        # A read timeout or socket error can arrive AFTER Slack accepted the
+        # post. The stash is already consumed, so claiming failure here invites a
+        # retry that double-sends -- D-101 says an irreversible action reports
+        # INDETERMINATE rather than guessing.
+        log.warning("slack_send_dm INDETERMINATE asker=%s recipient=%s exc=%s",
+                    slack_user_id, resolved_id, exc)
+        return (
+            "I couldn't confirm whether that DM went through -- it may have been "
+            "delivered. Tell the user to check with them before sending it again."
         )
 
     ts = send_resp.get("ts", "")
@@ -7337,9 +7412,32 @@ def _tool_meeting_action_items(slack_user_id: str, entity: str, _input: dict) ->
             return None
         return entry.get("items") or None
 
+    def _mark_claimed(transcript_id: str, texts: list[str]) -> None:
+        """CONFIRM hook: retire the items a typed confirm just handled, under the
+        store's own lock, and pop the entry when nothing is left. Matched on the
+        same normalized key the create path dedups on, so relay drift in the
+        model's echo does not leave an item un-retired."""
+        from cora.tools import meeting_actions as _ma  # noqa: PLC0415
+        spec = _CLASSB["meeting_item"]
+        key = spec["key"](slack_user_id, channel)
+        wanted = {_ma._dedup_key(t) for t in texts}
+        with spec["lock"]:
+            entry = spec["store"].get(key)
+            if not entry or entry.get("transcript_id") != transcript_id:
+                return
+            items = entry.get("items") or []
+            claimed = entry.get("claimed") or []
+            for i, item in enumerate(items):
+                if i < len(claimed) and _ma._dedup_key(item) in wanted:
+                    claimed[i] = True
+            if claimed and all(claimed):
+                spec["store"].pop(key, None)
+                confirm_cards.index_mark_resolved(entry.get("stash_id", ""))
+
     return meeting_actions.run_meeting_action_items(
         slack_user_id, entity, input_data,
-        stash_items=_stash, stashed_items_for=_stashed_for)
+        stash_items=_stash, stashed_items_for=_stashed_for,
+        mark_items_claimed=_mark_claimed)
 
 
 def peek_meeting_items(slack_user: str, channel: str) -> dict | None:
@@ -7348,8 +7446,8 @@ def peek_meeting_items(slack_user: str, channel: str) -> dict | None:
     return _CLASSB["meeting_item"]["peek"](slack_user, channel)
 
 
-def _claim_meeting_item(stash_id: str, user: str, channel: str,
-                        item_index: int) -> tuple[str, dict | None]:
+def _claim_meeting_item(stash_id: str, user: str, channel: str, item_index: int,
+                        card_coords: tuple[str, str] | None = None) -> tuple[str, dict | None]:
     """Atomically claim ONE item of a multi-item meeting stash.
 
     Unlike _claim_stash_by_id this does NOT pop the entry on success -- it marks
@@ -7371,7 +7469,16 @@ def _claim_meeting_item(stash_id: str, user: str, channel: str,
         if entry.get("stash_id") != stash_id:
             return "superseded", None
         if (time.time() - float(entry.get("ts", 0))) > spec["ttl"]:
-            spec["store"].pop(key, None)
+            # Deliberately NOT popped, unlike _claim_stash_by_id. A meeting stash
+            # has up to six cards, and the sweep can only give the honest "this
+            # expired, nothing was created" copy to the siblings while
+            # stash_expired_not_consumed() is True -- which requires the raw
+            # entry to still be sitting in the store (that predicate's whole
+            # distinction between "consumed" and "lapsed" is presence). Popping
+            # here would hand every sibling the vaguer "handled in the
+            # conversation" line, which on a task-creation card reads as though
+            # the tasks were made. It stays inert: every peek TTL-filters it and
+            # the next preview overwrites the slot.
             return "expired", entry
         items = entry.get("items") or []
         claimed = entry.get("claimed") or []
@@ -7383,6 +7490,15 @@ def _claim_meeting_item(stash_id: str, user: str, channel: str,
         last = all(claimed)
         if last:
             spec["store"].pop(key, None)
+        # Hand this card's coordinate over INSIDE the lock, so the claim and the
+        # handover are one atomic step exactly as they are on the generic path.
+        # Done after the lock, a sibling tap that made the stash non-live in the
+        # meantime could let a sweep pop this coordinate and rewrite the message
+        # while this tap is still inside its (multi-second) Fireflies+Asana
+        # execute -- two unordered chat_updates on one message, which is the one
+        # race this module says cannot be repaired after the fact.
+        if card_coords:
+            confirm_cards.pop_card_at(stash_id, card_coords[0], card_coords[1])
         return "claimed", {
             "item": items[item_index], "item_index": item_index, "last": last,
             "transcript_id": entry.get("transcript_id", ""),
@@ -11884,7 +12000,8 @@ def _resolve_meeting_item_tap(stash_id: str, tapping_user_id: str, action: str,
     that has passed -- and diverges only where it must: the claim is per-index,
     the stash stays live while items remain, and only THIS card's coordinate is
     handed over rather than every card for the stash."""
-    status, payload = _claim_meeting_item(stash_id, user, channel, item_index)
+    status, payload = _claim_meeting_item(stash_id, user, channel, item_index,
+                                          card_coords=card_coords)
     if status == "not_found":
         # The whole stash went away by another route (typed confirm of the last
         # item, cancel, supersede). Idempotent ack, same as the generic path.
@@ -11893,8 +12010,18 @@ def _resolve_meeting_item_tap(stash_id: str, tapping_user_id: str, action: str,
     if status == "superseded":
         return {"outcome": "superseded"}
     if status == "expired":
-        confirm_cards.index_mark_resolved(stash_id)
-        confirm_cards.pop_cards(stash_id)  # the WHOLE stash expired: every card is done
+        # NOT index_mark_resolved, and NOT pop_cards. The generic path does both
+        # because it has exactly one card and writes that card's expiry copy
+        # itself. Here the siblings are separate messages this tap will never
+        # touch, and the sweep is what closes them -- it needs
+        # stash_expired_not_consumed() to stay True to pick the expiry copy over
+        # the "handled in the conversation" one, and index_mark_resolved would
+        # make it False. Popping all the coordinates would be worse still: the
+        # siblings would be deregistered, so NOTHING could ever close them and
+        # they would keep live Create-task buttons over a stash that is gone.
+        # Only this card's own coordinate is handed over.
+        if card_coords:
+            confirm_cards.pop_card_at(stash_id, card_coords[0], card_coords[1])
         return {"outcome": "expired", "label": _stash_expired_label("meeting_item", payload or {})}
     if status == "out_of_range":
         # A forged or stale index. Never leaks whether the stash exists.
@@ -11908,13 +12035,9 @@ def _resolve_meeting_item_tap(stash_id: str, tapping_user_id: str, action: str,
     if payload.get("last"):
         # Only now is the stash itself finished, so only now may the index say so
         # -- marking it resolved earlier would make stash_is_live() False and let
-        # the sweep close the still-live sibling cards.
+        # the sweep close the still-live sibling cards. (This card's own
+        # coordinate was already handed over inside the claim's lock.)
         confirm_cards.index_mark_resolved(stash_id)
-    if card_coords:
-        # Hand over THIS card's coordinate only, at claim time, for the same
-        # reason the generic path pops: execute can run for seconds, and any
-        # reply anywhere fires the process-global sweep meanwhile.
-        confirm_cards.pop_card_at(stash_id, card_coords[0], card_coords[1])
     if action == "cancel":
         return {"outcome": "cancelled"}
     try:

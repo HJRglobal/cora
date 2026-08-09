@@ -832,6 +832,13 @@ def _dispatch_qa(
     # (unguarded) answer is what gets CACHED; guarding happens at serve time.
     # Skipped on the Tier-2 owner-mail GRANT path (1:1 DM, owner-scoped, already
     # access-controlled + PHI-dropped).
+    # Set when guard_outbound REPLACED a reply with a refusal, so the card layer
+    # can tell "this text is the answer" from "this text is a refusal standing in
+    # for an answer the channel may not see" (v2b S5 D-051). Attaching Confirm
+    # buttons to a refusal asks the user to approve a payload they were just told
+    # they cannot be shown.
+    _guard_tripped: dict[str, str] = {}
+
     def _guard_content(txt: str) -> str:
         if retrieval_grant is not None or not txt:
             return txt
@@ -839,6 +846,8 @@ def _dispatch_qa(
             txt, entity=entity, tier=tier, channel_name=channel_name,
             user_id=user_id or "", is_dm=is_dm,
         )
+        if tripped:
+            _guard_tripped["class"] = tripped
         return guarded
 
     # ── Confirm-button turn snapshot (S1/S2, design 2026-08-02) ─────────────
@@ -869,6 +878,15 @@ def _dispatch_qa(
     def _confirm_card_for_reply(text: str) -> list[dict] | None:
         if not user_id or not text or not confirm_cards.confirm_buttons_enabled():
             return None
+        if _guard_tripped:
+            # The reply IS a refusal. Buttons under it would ask the user to
+            # approve a write whose preview the channel guard just withheld --
+            # and for gmail/hubspot the preview embeds the whole body, which is
+            # exactly the kind of content that trips. The stash stays live for
+            # the typed path and expires honestly on its own.
+            log.info("confirm_card suppressed (reply refused by content guard class=%s)",
+                     _guard_tripped.get("class"))
+            return None
         changed = _tool_dispatch.freshest_changed_stash(
             _confirm_before_snapshot, user_id, channel_name)
         if changed is None:
@@ -884,12 +902,25 @@ def _dispatch_qa(
         # deliberately survives pop_cards, so claiming and then bailing on an
         # invalid ask would permanently bar that id from ever getting a card.
         candidates: list[tuple[str, str]] = []
+        item_texts: list[str] = []
         if kind == "ask":
             ask_entry = _tool_dispatch.get_pending_ask(user_id, channel_name)
             if not ask_entry or ask_entry.get("ask_id") != cid:
                 return None
             candidates = [(key, label) for key, label, _value in ask_entry.get("candidates", [])]
             if not candidates:
+                return None
+        if kind == "meeting_item":
+            # Validated HERE, alongside the ask, for the reason the comment above
+            # gives: the claim below is one-shot and survives pop_cards, so
+            # claiming and then bailing would bar this stash from ever being
+            # carded. The first cut validated AFTER the claim and re-claimed --
+            # which always failed, because the claim had already been taken by
+            # the line above, so no item card was ever posted at all (D-051).
+            entry = _tool_dispatch.peek_meeting_items(user_id, channel_name) or {}
+            if entry.get("stash_id") == cid:
+                item_texts = entry.get("items") or []
+            if not item_texts:
                 return None
         if not confirm_cards.claim_card_attach(cid):
             log.info("confirm_card attach REFUSED (already carded) stash=%s kind=%s", cid, kind)
@@ -905,17 +936,12 @@ def _dispatch_qa(
             # items, and the user wants some of them, so one Confirm over the
             # whole reply is the wrong shape. The reply itself stays buttonless
             # and one Confirm/Skip card per item follows it (posted by
-            # _register_posted_card once the reply has landed). Claimed here so
-            # the one-card-per-stash rule still holds -- a second turn that
-            # somehow reached the same stash gets no cards rather than a
-            # duplicate set.
-            entry = _tool_dispatch.peek_meeting_items(user_id, channel_name) or {}
-            items = entry.get("items") or []
-            if entry.get("stash_id") == cid and items and confirm_cards.claim_card_attach(cid):
-                _carded["item_stash"] = cid
-                _carded["items"] = items
-                log.info("confirm_card meeting items=%d stash=%s channel=#%s user=%s",
-                         len(items), cid, channel_name, user_id)
+            # _register_posted_card once the reply has landed). The claim above
+            # covers all of them: one stash, one set of cards.
+            _carded["item_stash"] = cid
+            _carded["items"] = item_texts
+            log.info("confirm_card meeting items=%d stash=%s channel=#%s user=%s",
+                     len(item_texts), cid, channel_name, user_id)
             return None
         if kind == "schedule_meeting":
             # One button per OFFERED slot instead of a single Confirm (v2 S2):
@@ -968,8 +994,40 @@ def _dispatch_qa(
         items = _carded.pop("items", None) or []
         if not sid or not items:
             return
+        # This is a NEW Slack-write surface reached from _dispatch_qa, and unlike
+        # every other reply site it posts its own messages rather than going
+        # through `say`. Both of the gates those sites get by construction have to
+        # be stated here (D-051):
+        #
+        # EVAL_MODE -- missed_message_catchup drives _dispatch_qa with
+        # CORA_EVAL_MODE=1 and a capture client that overrides ONLY chat_update,
+        # so a raw chat_postMessage would reach real Slack. Unreachable today
+        # (eval mode disables the tool, so no stash is minted and turn-ownership
+        # would not match anyway) -- gated so it is safe by construction rather
+        # than by accident, exactly as _close_stale_confirm_cards was.
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+        if not confirm_cards.confirm_buttons_enabled():
+            return
         for idx, item in enumerate(items[:confirm_cards.MAX_ITEM_CARDS]):
+            # format_reply -- every other card's text is the model's reply, which
+            # has already been through it. This text comes from the STASH, so it
+            # would otherwise skip the source-opacity lints (bare doc URLs, GIDs,
+            # sheet identifiers, Drive paths). That matters more here than
+            # anywhere else: slack_egress's class-level sanitizer only rewrites
+            # the `text=` kwarg, and Slack renders `blocks`, so the string the
+            # channel actually SEES has no egress backstop at all.
+            item = format_reply(item)
             text = f"*{idx + 1}.* {item}"
+            # channel_content_guard -- same story. guard_outbound is
+            # all-or-nothing (it replaces the whole answer with a refusal), so an
+            # unguarded card would publish, in its own message, the exact content
+            # the guard had just refused to put in this channel. Per item, so one
+            # tripping item is dropped rather than the whole set.
+            if not item.strip() or _guard_content(text) != text:
+                log.warning("meeting item card WITHHELD by outbound guards idx=%d channel=#%s",
+                            idx, channel_name)
+                continue
             try:
                 resp = client.chat_postMessage(
                     channel=channel_id, thread_ts=reply_thread_ts, text=text,
@@ -1284,6 +1342,13 @@ def _dispatch_qa(
             or _tool_dispatch.has_pending_shopify_write(user_id, channel_name)
             or _tool_dispatch.has_pending_calendar_write(user_id, channel_name)
             or _tool_dispatch.has_pending_delegated_write(user_id, channel_name)
+            # v2b S5: the Class-B kinds mint pendings this gate was blind to,
+            # and its whole premise is "a pending means a real write is coming,
+            # so broadening would clobber its legitimate success narration".
+            # Without this, a bare "yes" that sends a DM had its truthful
+            # "Done -- DM sent to Tommy" replaced with "I didn't actually change
+            # anything in Asana" -- inviting a re-ask that sends it twice.
+            or _tool_dispatch.has_pending_classb(user_id, channel_name)
         )
     )
     # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory/calendar/

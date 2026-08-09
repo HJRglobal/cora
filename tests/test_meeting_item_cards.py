@@ -301,11 +301,26 @@ class TestWritePathRails:
 
 
 class TestPreviewStashAndTypedPath:
-    def test_verified_item_texts_scrubs_and_caps(self):
+    def test_verified_item_texts_is_NOT_capped(self):
+        """_MAX_SELECTED is a per-CALL creation cap, not a limit on WHICH items
+        are creatable, and the preview renders every item. Capping the verified
+        list made previewed items 7+ un-creatable by any route, and dropped them
+        SILENTLY from a mixed selection."""
         many = [{"task": f"item {i}"} for i in range(10)]
         out = ma.verified_item_texts(many, [], is_lex=False)
-        assert len(out) == ma._MAX_SELECTED
+        assert len(out) == 10
         assert out[0] == "item 0"
+
+    def test_an_item_past_the_card_cap_is_still_typed_confirmable(self):
+        many = [{"task": f"Follow up on workstream {i}"} for i in range(10)]
+        stashed = ma.verified_item_texts(many, [], is_lex=False)
+        eighth = many[7]["task"]
+        assert ma._stashed_item_filter(stashed, [eighth]) == [eighth]
+
+    def test_the_card_layer_is_where_the_display_cap_lives(self):
+        many = [{"task": f"item {i}"} for i in range(10)]
+        stashed = ma.verified_item_texts(many, [], is_lex=False)
+        assert len(stashed[:cc.MAX_ITEM_CARDS]) == cc.MAX_ITEM_CARDS
 
     def test_verified_item_texts_drops_blanks(self):
         out = ma.verified_item_texts([{"task": "real"}, {"task": "   "}], [], False)
@@ -447,6 +462,127 @@ class TestAppTapWiring:
         assert td.stash_is_live(sid)
 
 
+class TestReplySiteEndToEnd:
+    """The gap that let a HIGH ship: nothing drove _confirm_card_for_reply or
+    _post_meeting_item_cards, so a double claim_card_attach made the whole
+    feature a no-op in production while 50 tests stayed green.
+
+    Rebuilds the two closures exactly as _dispatch_qa does, over the real
+    confirm_cards registry and the real stash store."""
+
+    def _closures(self, client, *, buttons="on", eval_mode=False,
+                  guard=lambda t: t, monkeypatch=None):
+        carded: dict = {}
+        guard_tripped: dict = {}
+
+        def _guard_content(txt):
+            out = guard(txt)
+            if out != txt:
+                guard_tripped["class"] = "company_financials"
+            return out
+
+        def _card_for_reply(text, kind, cid, items):
+            if not text or buttons != "on":
+                return None
+            if guard_tripped:
+                return None
+            if not items:
+                return None
+            if not cc.claim_card_attach(cid):
+                return None
+            carded["item_stash"] = cid
+            carded["items"] = items
+            return None
+
+        def _post_cards():
+            sid = carded.pop("item_stash", None)
+            its = carded.pop("items", None) or []
+            if not sid or not its or eval_mode or buttons != "on":
+                return
+            for idx, item in enumerate(its[:cc.MAX_ITEM_CARDS]):
+                text = f"*{idx + 1}.* {item}"
+                if not item.strip() or _guard_content(text) != text:
+                    continue
+                resp = client.chat_postMessage(
+                    channel="C0T", text=text,
+                    blocks=cc.build_item_confirm_blocks(text, sid, idx))
+                cc.register_card(sid, "C0T", (resp or {}).get("ts", ""), text)
+
+        return _card_for_reply, _post_cards, _guard_content
+
+    def test_a_card_posts_for_every_item(self):
+        sid = _stash()
+        client = MagicMock()
+        client.chat_postMessage.return_value = {"ts": "1.1"}
+        card_for_reply, post_cards, _g = self._closures(client)
+        assert card_for_reply("the reply", "meeting_item", sid, ITEMS) is None
+        post_cards()
+        assert client.chat_postMessage.call_count == len(ITEMS), \
+            "the double-claim regression makes this 0"
+        values = [b["blocks"][1]["elements"][0]["value"]
+                  for b in [c.kwargs for c in client.chat_postMessage.call_args_list]]
+        assert values == [f"{sid}:0", f"{sid}:1", f"{sid}:2"]
+
+    def test_the_reply_itself_carries_no_buttons(self):
+        sid = _stash()
+        card_for_reply, _post, _g = self._closures(MagicMock())
+        assert card_for_reply("the reply", "meeting_item", sid, ITEMS) is None
+
+    def test_a_guard_tripping_item_is_withheld_and_the_rest_post(self):
+        sid = _stash(items=["Send the deck", "Rebuild the model at $412,000 net revenue"])
+        client = MagicMock()
+        client.chat_postMessage.return_value = {"ts": "1.1"}
+
+        def _guard(t):
+            return "I can't share company financial figures in this channel." \
+                if "$412,000" in t else t
+
+        card_for_reply, post_cards, _g = self._closures(client, guard=_guard)
+        card_for_reply("the reply", "meeting_item", sid, ["Send the deck",
+                                                          "Rebuild the model at $412,000 net revenue"])
+        post_cards()
+        assert client.chat_postMessage.call_count == 1
+        assert "$412,000" not in client.chat_postMessage.call_args.kwargs["text"]
+
+    def test_a_refused_reply_posts_no_cards_at_all(self):
+        sid = _stash()
+        client = MagicMock()
+        card_for_reply, post_cards, guard = self._closures(
+            client, guard=lambda t: "I can't share that in this channel.")
+        guard("the reply")           # the reply itself was refused
+        card_for_reply("I can't share that in this channel.", "meeting_item", sid, ITEMS)
+        post_cards()
+        client.chat_postMessage.assert_not_called()
+
+    def test_buttons_off_posts_no_cards(self):
+        sid = _stash()
+        client = MagicMock()
+        card_for_reply, post_cards, _g = self._closures(client, buttons="off")
+        card_for_reply("the reply", "meeting_item", sid, ITEMS)
+        post_cards()
+        client.chat_postMessage.assert_not_called()
+
+    def test_eval_mode_posts_no_cards(self):
+        sid = _stash()
+        client = MagicMock()
+        card_for_reply, post_cards, _g = self._closures(client, eval_mode=True)
+        card_for_reply("the reply", "meeting_item", sid, ITEMS)
+        post_cards()
+        client.chat_postMessage.assert_not_called()
+
+    def test_the_real_reply_site_gates_are_all_present_in_source(self):
+        """Revert-proofing (D-154): the closures above mirror app.py, so pin the
+        real thing rather than trusting the mirror."""
+        src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
+        body = src.split("def _post_meeting_item_cards")[1].split("\n    def ")[0]
+        assert 'os.environ.get("CORA_EVAL_MODE") == "1"' in body
+        assert "confirm_buttons_enabled()" in body
+        assert "_guard_content(text) != text" in body
+        assert "format_reply(item)" in body
+        # exactly ONE claim for the meeting branch, taken by the shared line
+        assert src.count("confirm_cards.claim_card_attach(cid)") == 1
+
+
 class TestRegistration:
     def test_the_kind_is_registered_everywhere_it_has_to_be(self):
         assert "meeting_item" in td._stash_kind_specs()
@@ -459,7 +595,29 @@ class TestRegistration:
         reply = td.try_confirm_pending_write(
             slack_user_id=USER, channel_name=CHAN, entity="F3E",
             message="no, cancel that")
-        assert reply is not None and "cancelled" in reply.lower()
+        assert reply is not None
+        assert "dismissed 3 remaining meeting action items" in reply
+        assert "Nothing was changed" in reply
+        assert not td.stash_is_live(sid)
+
+    def test_a_typed_cancel_after_a_tap_does_NOT_say_nothing_was_changed(self):
+        """The tapped item created a real Asana task. Telling the user "nothing
+        was changed" reads as though it had been rolled back."""
+        sid = _stash()
+        with patch.object(td, "_execute_claimed_meeting_item", return_value="Created."):
+            _tap(sid, 0)
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHAN, entity="F3E", message="cancel")
+        assert "Nothing was changed" not in reply
+        assert "dismissed 2 remaining meeting action items" in reply
+        assert "The 1 you already created is unaffected" in reply
+        assert not td.stash_is_live(sid)
+
+    def test_the_cancel_reply_is_singular_for_one_remaining_item(self):
+        sid = _stash(items=[ITEMS[0]])
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHAN, entity="F3E", message="cancel")
+        assert "1 remaining meeting action item." in reply
         assert not td.stash_is_live(sid)
 
     def test_the_sweep_leaves_a_partly_claimed_stash_alone(self):

@@ -61,9 +61,9 @@ class TestSlackSendDm:
 
     def test_unconfirmed_previews_before_any_send(self):
         with patch.object(td, "resolve_name_to_slack_user_id",
-                          return_value=("U_TOMMY", None)), \
+                          return_value=("U0TOMMY", None)), \
              patch.object(td, "_load_slack_asana_map",
-                          return_value={"U_TOMMY": {"display_name": "Tommy"}}), \
+                          return_value={"U0TOMMY": {"display_name": "Tommy"}}), \
              patch.object(slack_sdk, "WebClient") as WC:
             result = td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
@@ -104,16 +104,16 @@ class TestSlackSendDm:
         fake_client.conversations_open.return_value = {"channel": {"id": "D_TOMMY"}}
         fake_client.chat_postMessage.return_value = {"ts": "1700.1"}
         with patch.object(td, "resolve_name_to_slack_user_id",
-                          return_value=("U_TOMMY", None)), \
+                          return_value=("U0TOMMY", None)), \
              patch.object(td, "_load_slack_asana_map",
-                          return_value={"U_TOMMY": {"display_name": "Tommy"}}), \
+                          return_value={"U0TOMMY": {"display_name": "Tommy"}}), \
              patch.object(slack_sdk, "WebClient", return_value=fake_client):
             td._tool_slack_send_dm(
                 "U_ASKER", "F3E",
                 {"recipient_name": "Tommy", "message": "ship it"},
             )
             result = td._tool_slack_send_dm("U_ASKER", "F3E", {"confirmed": True})
-        fake_client.conversations_open.assert_called_once_with(users=["U_TOMMY"])
+        fake_client.conversations_open.assert_called_once_with(users=["U0TOMMY"])
         fake_client.chat_postMessage.assert_called_once_with(channel="D_TOMMY", text="ship it")
         assert result.startswith("WRITE_CONFIRMED")
         assert "DM sent to Tommy" in result

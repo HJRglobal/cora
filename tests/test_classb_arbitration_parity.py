@@ -62,7 +62,13 @@ def _fresh_classb(kind: str, age: float = 0.0) -> str:
     rather than through each tool: this file is about the ARBITRATION contract,
     which must hold for a kind whose producer has not been written yet."""
     sid = cc.mint_stash_id(kind, USER_ID, CHANNEL)
-    td._CLASSB[kind]["put"](USER_ID, CHANNEL, {"ts": time.time() - age, "stash_id": sid})
+    entry = {"ts": time.time() - age, "stash_id": sid}
+    if kind == "meeting_item":
+        # The one MULTI-item kind: its cancel copy counts what it dismissed, so
+        # a shapeless stub would exercise the empty case rather than the real one.
+        entry.update(items=["Item one", "Item two"], claimed=[False, False],
+                     transcript_id="T1", entity="F3E", is_dm=False)
+    td._CLASSB[kind]["put"](USER_ID, CHANNEL, entry)
     return sid
 
 
@@ -174,7 +180,8 @@ class TestDeterministicTypedCancel:
             slack_user_id=USER_ID, channel_name=CHANNEL, entity="F3E",
             message="no, cancel that")
         assert reply is not None, "a typed cancel must not silently fall through"
-        assert "cancelled" in reply.lower()
+        # meeting_item dismisses N items and says so; every other kind cancels one.
+        assert ("cancelled" in reply.lower() or "dismissed" in reply.lower())
         assert not td.stash_is_live(sid)
 
     @pytest.mark.parametrize("kind", ALL_KINDS)

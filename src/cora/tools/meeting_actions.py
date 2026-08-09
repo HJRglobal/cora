@@ -1262,12 +1262,20 @@ def verified_item_texts(mine: list[dict], unclear: list[dict], is_lex: bool) -> 
 
     This is the list the per-item cards address by index and the list a typed
     confirm is filtered against (v2b S5). Scrubbed for LEX the same way the
-    preview text is, so a card can never show more than the preview did, and
-    capped at _MAX_SELECTED because that is the cap the CREATE path already
-    enforces -- offering an item the write path would drop would be a lie."""
-    texts = [_scrub_for_lex(it["task"], is_lex) for it in (mine + unclear)
-             if str(it.get("task") or "").strip()]
-    return texts[:_MAX_SELECTED]
+    preview text is, so a card can never show more than the preview did.
+
+    NOT capped at _MAX_SELECTED. The first cut capped it here, reasoning that the
+    create path enforces the same number -- but _MAX_SELECTED is a per-CALL
+    creation cap (_create_selected slices `selected[:_MAX_SELECTED]`), not a limit
+    on WHICH items are creatable, and _format_preview renders every item
+    uncapped. Capping the verified list therefore made items 7+ un-creatable by
+    ANY route: the typed confirm filtered them out against this list and told the
+    user "none of those match the action items I showed you", about items it had
+    just shown them. Worse, a mixed selection dropped them SILENTLY, before
+    _create_selected could report them. The card layer caps separately
+    (MAX_ITEM_CARDS), which is a display limit and the right place for one."""
+    return [_scrub_for_lex(it["task"], is_lex) for it in (mine + unclear)
+            if str(it.get("task") or "").strip()]
 
 
 def _stashed_item_filter(stashed_items: list[str], selected: list[str]) -> list[str]:
@@ -1296,6 +1304,7 @@ def run_meeting_action_items(
     dry_run: bool = False,
     stash_items=None,
     stashed_items_for=None,
+    mark_items_claimed=None,
 ) -> str:
     """Pull flow entry point. See module docstring for the full contract.
 
@@ -1305,10 +1314,16 @@ def run_meeting_action_items(
     stashed_items_for(transcript_id) -> list[str] | None: called at CONFIRM time
     to read that list back, so a model-echoed selection can be filtered against
     it.
+    mark_items_claimed(transcript_id, texts) -> None: called after a typed
+    confirm has created tasks, so the items it consumed stop being offered by
+    their still-live cards. Without it the typed path created the tasks and left
+    every card sitting there with a live Create-task button over completed work
+    (the exact symptom v2 S1 removed for the single-card kinds), and the stash
+    stayed "live" so the sweep was structurally unable to close them.
 
     Callbacks rather than imports, so this module keeps knowing nothing about
-    tool_dispatch. Both default to None -- scripts, tests and dry runs get
-    exactly the pre-S5 behaviour."""
+    tool_dispatch. All default to None -- scripts, tests and dry runs get exactly
+    the pre-S5 behaviour."""
     input_data = _input or {}
     meeting_query = str(input_data.get("meeting_query", "") or "").strip()
     transcript_id = str(input_data.get("transcript_id", "") or "").strip()
@@ -1386,10 +1401,24 @@ def run_meeting_action_items(
                         "meeting, so I didn't create anything. Ask me for the meeting "
                         "again and pick from the list."
                     )
-        return _create_selected(
+        out = _create_selected(
             slack_user_id, transcript, transcript_id, meeting_entity,
             is_lex, scoped_entity, chosen, dry_run=dry_run,
         )
+        # Retire the items this confirm consumed, so their cards stop offering a
+        # Create-task button over work that already exists. Passed the SELECTION
+        # rather than only the successfully-created names on purpose: an item
+        # that was skipped as an existing duplicate is equally "already handled"
+        # from the card's point of view, and re-offering it is what produces the
+        # duplicate. Fail-soft -- a bookkeeping miss must never turn a successful
+        # create into an error.
+        if callable(mark_items_claimed) and not dry_run:
+            try:
+                mark_items_claimed(transcript_id, chosen)
+            except Exception:  # noqa: BLE001
+                log.warning("meeting_action_items: claim write-back failed (non-fatal)",
+                            exc_info=True)
+        return out
 
     # ── PREVIEW / RESOLVE (read-only) ───────────────────────────────────────
     visible: list[dict] = []  # in scope for the grounded not-found fallback below

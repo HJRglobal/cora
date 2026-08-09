@@ -149,7 +149,46 @@ def test_confirm_executes_the_STASH_not_the_confirm_turn_args():
     assert kw["subject"] == "Quick question"
     assert "Shaun" in kw["body"]
     assert "draft_abc123" in result
+    # Restored pins (D-051): the rewrite for the staged contract dropped these,
+    # and a mutation replacing format_created_draft_for_llm with the plain
+    # WRITE_CONFIRMED shape the other Class-B executors use -- a realistic
+    # refactor -- silently removes the Drafts hyperlink, which is the user's ONLY
+    # route to a draft Cora deliberately never sends.
+    assert "CREATED" in result
+    assert "Drafts" in result
     _clear()
+
+
+def test_an_explicit_confirmed_false_previews_and_drafts_nothing():
+    """Restored pin (D-051): every other unconfirmed case in this file OMITS the
+    key, so a mutation keying on presence rather than value would execute a
+    turn-2 confirmed=False and go untested here."""
+    _clear()
+    with patch.object(gc, "create_draft") as mock:
+        result = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "confirmed": False, "to": "a@b.com",
+                    "subject": "S", "body": "B"},
+        )
+    mock.assert_not_called()
+    assert "NOT DRAFTED yet" in result
+    _clear()
+
+
+def test_a_malformed_recipient_refuses_and_leaves_no_claimable_stash():
+    """The preview used to stash BEFORE normalizing recipients, so a typo'd
+    address raised out of the tool (surfacing as 'Tool crashed') while leaving a
+    live stash a later bare 'yes' or button tap could claim."""
+    _clear()
+    with patch.object(gc, "create_draft") as mock:
+        result = td._tool_gmail_create_draft(
+            slack_user_id=HARRISON_SLACK, entity="FNDR",
+            _input={**CHAN, "to": "notanemail", "subject": "S", "body": "B"},
+        )
+    mock.assert_not_called()
+    assert "doesn't look like an email" in result
+    assert "Nothing was drafted or staged" in result
+    assert td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership") is None
 
 
 def test_a_confirm_with_no_pending_is_honest_and_writes_nothing():
@@ -223,7 +262,9 @@ def test_missing_fields_still_refuse_at_PREVIEW_time_and_stash_nothing():
     ):
         result = td._tool_gmail_create_draft(
             slack_user_id=HARRISON_SLACK, entity="FNDR", _input={**CHAN, **bad})
-        assert word in result.lower()
+        # `word` alone is near-vacuous for "to" ("into", "custom", "automatically"
+        # all contain it), so pin the refusal shape as well.
+        assert f"missing required field `{word}`" in result
         assert td._CLASSB["gmail_draft"]["peek"](HARRISON_SLACK, "hjrg-leadership") is None
 
 
