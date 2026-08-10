@@ -683,13 +683,141 @@ _FORGET_NOTE_INTENT_RE = re.compile(
 
 
 def _remember_or_forget_intent(text: str) -> bool:
-    """True for a clear imperative 'remember'/'forget note' command -- see
-    the module comment above for why this only escalates the MODEL, never
-    forces a specific tool."""
+    """True for a clear imperative 'remember'/'forget note' command -- used for
+    the Sonnet escalation, which covers BOTH verbs (see the module comment
+    above for why only 'remember' is safe to FORCE)."""
     t = (text or "").strip()
     if not t or "?" in t:
         return False
     return bool(_REMEMBER_INTENT_RE.search(t) or _FORGET_NOTE_INTENT_RE.search(t))
+
+
+# ── Phantom-preview force: staged-write intents (S6 rider, cq-904f849bc59a) ──
+#
+# THE DEFECT. The 8/9 acceptance battery proved the model narrates a
+# preview-shaped reply with ZERO tool_use across cora_remember, slack_send_dm
+# (twice, including an explicit tool-name ask on haiku) and gmail_create_draft.
+# No tool call means no server-side stash, so there is nothing for a confirm --
+# typed or tapped -- to execute, and every deterministic guard behind the tool
+# is bypassed. Escalating to Sonnet was the S4 mitigation and it is NOT enough:
+# the battery caught Sonnet doing it too. The fix is the same one the 8/7 DW
+# intake used for cq-d30815ee6993 -- force the tool via tool_choice on the first
+# model turn, so the preview is produced BY the tool or not at all.
+#
+# WHY FORCING THESE FOUR IS SAFE, on the reasoning that made forcing
+# cora_queue_code_session and cora_delegate_work safe:
+#   * all four are staged writes -- an unconfirmed first call FILES NOTHING, it
+#     validates, stashes server-side and returns a preview. A false positive
+#     costs one dismissable preview, never a data write;
+#   * all four are in _GLOBAL_CORE_TOOLS, exposed in every entity and in DMs, so
+#     tool_choice can never name an unexposed tool (a forced name that is not in
+#     the turn's tool list is silently dropped by _apply_forced_tool anyway);
+#   * cora_forget_note is deliberately NOT forced -- it needs a note_id the model
+#     can only have after a prior cora_my_notes call, so forcing it blind would
+#     produce a nonsensical call. It keeps the Sonnet escalation only.
+#
+# THE REAL COST IS DISPLACEMENT, NOT NOISE (D-158): the DW force's first cut
+# stole an Asana DELETE, and a stolen turn is worse than a dismissable card --
+# the user's actual request never happens. So every branch here is
+# START-ANCHORED after the mention strip, excludes interrogatives outright, and
+# requires an explicit object. The measured safe-set lives in
+# tests/test_phantom_preview_force.py: every candidate string is run through the
+# REAL function against must-force / must-not-force expectations, including the
+# existing detectors' own positives, so a new branch that steals an Asana,
+# code-queue or delegate turn fails the suite (D-169).
+#
+# All bounded-quantifier by construction and timed on a 40k input in that same
+# file -- three self-inflicted ReDoS in this arc were all found by review, not
+# tests (D-165).
+
+# Reflexive/broadcast objects: "message me the numbers" is a request TO Cora,
+# not a DM to a teammate, and "dm everyone" is not a single-recipient send.
+_DM_NOT_A_RECIPIENT = (
+    r"(?!(?:me|us|myself|everyone|everybody|all|here|them|him|her|you|"
+    r"the\s+team|the\s+channel)\b)"
+)
+_SLACK_DM_INTENT_RE = re.compile(
+    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:dm|slack)\s+{_DM_NOT_A_RECIPIENT}\S"
+    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?send\s+(?:a\s+)?"
+    rf"(?:dm|slack\s+message|message)\s+to\s+{_DM_NOT_A_RECIPIENT}\S",
+    re.IGNORECASE,
+)
+# The email NOUN is mandatory: "draft a reply" alone is just as likely a Slack
+# reply, and "write up the notes" is not a drafting request at all.
+_GMAIL_DRAFT_INTENT_RE = re.compile(
+    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:draft|compose|write|prepare)\s+"
+    r"(?:me\s+)?(?:an?|the|a\s+quick)\s+(?:email|e-mail)\b"
+    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:draft|compose)\s+(?:an?|the)\s+"
+    r"(?:reply|response)\s+to\b[^.\n]{0,40}\b(?:email|e-mail|thread)\b",
+    re.IGNORECASE,
+)
+# Teaching a shared term, as opposed to saving a personal note. Anchored like
+# the rest: "create a task to add the SKU to the lexicon" is a TASK request and
+# must keep reaching asana_create_task, which an unanchored branch would steal.
+_LEXICON_TEACH_INTENT_RE = re.compile(
+    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:add|save|record|teach)\b"
+    r"[^.\n]{0,40}\bto\s+(?:the\s+|our\s+|your\s+)?"
+    r"(?:lexicon|glossary|vocabulary|dictionary)\b"
+    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:the\s+)?"
+    r"(?:term|word|acronym|abbreviation)\s+[^.\n]{1,60}?\bmeans\b",
+    re.IGNORECASE,
+)
+
+
+def _slack_dm_intent(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return False
+    return bool(_SLACK_DM_INTENT_RE.search(t))
+
+
+def _gmail_draft_intent(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return False
+    return bool(_GMAIL_DRAFT_INTENT_RE.search(t))
+
+
+def _lexicon_teach_intent(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return False
+    return bool(_LEXICON_TEACH_INTENT_RE.search(t))
+
+
+def _remember_intent(text: str) -> bool:
+    """The FORCEABLE half of _remember_or_forget_intent (remember only)."""
+    t = (text or "").strip()
+    if not t or "?" in t:
+        return False
+    return bool(_REMEMBER_INTENT_RE.search(t))
+
+
+def _staged_write_force_tool(text: str) -> str | None:
+    """The staged-write tool to force for this message, or None.
+
+    One function so precedence is testable in isolation and the call site stays
+    a single branch. Ordered most-specific first: a lexicon teach and an email
+    draft both look like "save this" to a looser matcher.
+    """
+    if _lexicon_teach_intent(text):
+        # Only when the teach lane is actually live. With CORA_LEXICON below
+        # "full" the tool answers every call with "isn't enabled yet", so
+        # forcing it would replace a useful reply with a dead end. Read
+        # per-call, so this activates the day the flag flips (cq-8866d3f7ac3b).
+        try:
+            from . import lexicon as _lex
+            if _lex.lexicon_level() == "full":
+                return "cora_lexicon_add"
+        except Exception:  # noqa: BLE001 -- flag unavailable: fall through
+            pass
+    if _gmail_draft_intent(text):
+        return "gmail_create_draft"
+    if _slack_dm_intent(text):
+        return "slack_send_dm"
+    if _remember_intent(text):
+        return "cora_remember"
+    return None
 
 
 def _dispatch_qa(
@@ -1327,7 +1455,18 @@ def _dispatch_qa(
             log.info("delegate-work intent -> forcing tool channel=#%s user=%s",
                      channel_name, user_id)
         else:
-            force_tool = _asana_destructive_intent(user_message)
+            # S6 rider (cq-904f849bc59a): the Class-B staged-write intents.
+            # Ordered ABOVE the Asana force and BELOW code-queue/delegate. All
+            # four branches are start-anchored, so a task request that merely
+            # MENTIONS one of them ("create a task to draft an email to Bob")
+            # still reaches asana_create_task -- the displacement class D-158
+            # was opened by an unanchored match.
+            force_tool = _staged_write_force_tool(user_message)
+            if force_tool:
+                log.info("staged-write intent -> forcing %s channel=#%s user=%s",
+                         force_tool, channel_name, user_id)
+            else:
+                force_tool = _asana_destructive_intent(user_message)
     # F-23 Slice 3: a bare affirmative broadens the phantom-write guard so a fabricated
     # "Confirmed -- task deleted" (with no write sentinel) is corrected. Gated on NO
     # pending write existing (review HIGH #3/#4, MED #5): if a pending exists and a bare
@@ -4450,6 +4589,9 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
     # the invariant "a mint's turn_id reflects ITS OWN triggering event" true
     # by construction rather than true-by-coincidence.
     confirm_cards.begin_turn()
+    # Resolve the kind BEFORE the claim: the claim consumes the stash, and the
+    # log line below wants to name what was acted on (cq-b8a4d7b9dd4a).
+    _idx = confirm_cards.index_lookup(stash_id) or {}
     result = _tool_dispatch.resolve_and_claim_stash(
         stash_id, tapping_user, action, slot_index=slot_index,
         item_index=item_index,
@@ -4457,6 +4599,17 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
         # time, so its siblings stay registered and sweepable.
         card_coords=(channel_id, message_ts) if item_index is not None else None)
     outcome = result.get("outcome")
+
+    # cq-b8a4d7b9dd4a: a tapped Cancel used to write NOTHING to the log, while a
+    # typed cancel logs "confirm_interceptor CANCEL" and a typed confirm logs
+    # EXECUTE -- so a card that vanished could not be attributed to a person or
+    # even distinguished from an expiry. One symmetric line for EVERY tap
+    # outcome, on the button path, at INFO. Deliberately payload-free: the kind
+    # and the opaque stash id, never the previewed content.
+    log.info("confirm_card TAP action=%s outcome=%s kind=%s stash=%s user=%s%s",
+             action, outcome, _idx.get("kind", "?"), stash_id, tapping_user,
+             f" item={item_index}" if item_index is not None else
+             (f" slot={slot_index}" if slot_index is not None else ""))
 
     if outcome == "unauthorized":
         owner = result.get("owner", "")

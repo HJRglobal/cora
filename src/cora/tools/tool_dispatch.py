@@ -11635,12 +11635,42 @@ _CLASSB_KINDS = (
 _CLASSB: dict[str, dict] = {k: _make_classb_store(k) for k in _CLASSB_KINDS}
 
 
+# Free-text payload fields that are COMPOSED message bodies -- the ones a
+# connector footer can ride into. Ids, labels and names are deliberately absent:
+# this strip must never touch a field whose exact value is load-bearing.
+_CLASSB_BODY_FIELDS = ("message", "body", "note_body")
+
+
+def strip_connector_footer(text: str) -> str:
+    """Remove a trailing Cowork "*Sent using* <@U...>" footer from a composed
+    payload (S6 rider).
+
+    The 8/9 battery caught a hubspot note_body carrying the footer VERBATIM into
+    the CRM: the connector appends it to the relayed Slack message, the model
+    copies the message into the tool arg, and the footer is filed as if the user
+    had typed it. Uses the same END-ANCHORED pattern the confirm classifier
+    uses -- an unanchored strip would eat legitimate content like "the invoices
+    sent using the old template". Mentions and the [QA] marker are deliberately
+    NOT stripped here: a DM body may legitimately address a teammate by mention,
+    and this runs on content that gets FILED, not on content being classified."""
+    if not text:
+        return text
+    return _CONFIRM_SENT_USING_RE.sub("", text).rstrip()
+
+
 def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
     """Stash a Class-B payload at PREVIEW time and return its stash_id. The
     payload is what executes -- never the confirm turn's own re-echoed args,
     which is the honor-gate weakness this batch exists to close."""
     sid = confirm_cards.mint_stash_id(kind, slack_user, channel)
     entry = dict(entry)
+    # One chokepoint for every Class-B kind, so a seventh gets it for free.
+    # Runs AFTER the per-tool screens (PHI etc.) deliberately: stripping only
+    # ever removes Cora-generated noise, so a screen that saw the footer saw
+    # strictly more text than what is filed.
+    for field in _CLASSB_BODY_FIELDS:
+        if isinstance(entry.get(field), str):
+            entry[field] = strip_connector_footer(entry[field])
     entry["ts"] = time.time()
     entry["stash_id"] = sid
     _CLASSB[kind]["put"](slack_user, channel, entry)
