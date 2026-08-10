@@ -18,14 +18,23 @@ shape that loses a write. So the state I/O moved HERE, and both sides import it:
   * one enrollment mutation (`process_enrollment_tap`) that the bot calls and
     whose effect is identical to the reaction verdict the script applies.
 
-CROSS-PROCESS RESIDUAL (accepted, documented rather than papered over): a tap
-that lands DURING the ~seconds the 7:30am script holds its own in-memory copy
-can still be overwritten by the script's end-of-run save. This is bounded and
-self-healing -- the review message is still pending, so Harrison's tap can be
-repeated, or a :+1: reaction resolves it at the next fire. A real fix is an
-OS-level file lock across both processes, which is a bigger change than this
-migration warrants (the script already carries its own single-instance run
-lock, so the only overlap window is one short run per weekday).
+CROSS-PROCESS RESIDUAL (measured, not estimated). The first version of this note
+claimed the exposure was "the ~seconds the 7:30am script holds its own in-memory
+copy". That was wrong by two orders of magnitude and was corrected in D-051
+review: the script loads state ONCE at the top of its run and saves ONCE at the
+end, with every per-user LLM briefing build in between. Measured from
+logs/cora-daily-briefing.jsonl across 39 live runs: median 296s, p90 358s, max
+935s -- and all 39 exceeded 60s. A tap landing in that window was reverted by
+the script's stale copy AFTER the card had already been edited to "Enabled ..."
+with its buttons dropped, so the state recovered on the next run but the card
+Harrison had acted on stayed a permanent lie.
+
+`apply_enrollment_delta` below closes almost all of it by re-reading the file
+immediately before the write, so the surviving window is that function's own
+microseconds rather than the whole run. Two processes still are not mutually
+exclusive -- that needs an OS-level lock across both -- but the residual is now
+genuinely small rather than merely described as such, and the temp file is
+process-unique so neither writer can publish the other's partial file.
 
 D-011 intact: enrollment is Harrison-only on BOTH paths. This module never
 writes canonical memory; it only records who has opted in to receiving their
@@ -82,20 +91,67 @@ def load_state(path: Path | None = None) -> dict:
     }
 
 
-def save_state(state: dict, path: Path | None = None) -> None:
+def save_state(state: dict, path: Path | None = None) -> bool:
     """Atomically persist the delivery state (tmp file + os.replace).
 
-    The script used a plain write_text, which on a crash mid-write leaves a
-    truncated file that then reads as empty -- silently un-enrolling everyone.
-    os.replace is atomic on Windows and POSIX alike."""
+    Returns True on success. The script used a plain write_text, which on a
+    crash mid-write leaves a truncated file that then reads as empty -- silently
+    un-enrolling everyone. os.replace is atomic on Windows and POSIX alike.
+
+    The temp file is PROCESS-UNIQUE (D-051 lens-2/5): the bot and the scheduled
+    script both write this state, and a shared fixed tmp name lets one process
+    os.replace() the other's half-written file into place -- the exact torn read
+    the atomic write exists to prevent."""
     target = path or STATE_PATH
+    tmp = target.with_suffix(f".json.{os.getpid()}.tmp")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         os.replace(tmp, target)
+        return True
     except OSError as exc:
         log.warning("Could not persist briefing delivery state: %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def apply_enrollment_delta(sid: str, name: str, *, enable: bool,
+                           review_id: str, path: Path | None = None) -> bool:
+    """Re-read the state file and apply ONLY this one verdict, then save.
+
+    D-051 lens-1/2/5 HIGH: the scheduled briefing script loads the state ONCE at
+    the top of its run and saves it ONCE at the end, with every per-user LLM
+    briefing build in between -- minutes, not the "~seconds" the first cut of
+    this module claimed. A tap landing inside that window was silently reverted
+    by the script's stale in-memory copy, AFTER the card had already been edited
+    to "Enabled ..." with its buttons removed. The state recovered on the next
+    run; the card Harrison had already acted on stayed a permanent lie.
+
+    Re-reading immediately before the write shrinks the loss window from the
+    whole run to this function's own microseconds, and makes the losing writer
+    the SCRIPT (whose own save is a full-state overwrite) rather than the human
+    verdict. It does not make the two processes mutually exclusive -- that needs
+    an OS-level lock across both -- so the residual is now genuinely small
+    rather than merely described as such."""
+    with _LOCK:
+        fresh = load_state(path)
+        now = time.time()
+        if enable:
+            fresh["enabled"][sid] = {"name": name, "enabled_at": now,
+                                     "via": "digest_button"}
+            fresh["declined"].pop(sid, None)
+        else:
+            fresh["declined"][sid] = {"name": name, "declined_at": now,
+                                      "via": "digest_button"}
+            fresh["enabled"].pop(sid, None)
+        fresh["pending_reviews"] = [
+            p for p in fresh.get("pending_reviews", [])
+            if str(p.get("review_id") or "") != review_id
+        ]
+        return save_state(fresh, path)
 
 
 def _harrison_id() -> str:
@@ -104,39 +160,6 @@ def _harrison_id() -> str:
     time (it is imported by a script that must stay light)."""
     from .tools.tool_dispatch import _HARRISON_SLACK_ID
     return _HARRISON_SLACK_ID
-
-
-# Slack's section-text hard limit is 3000 chars; leave headroom for the mrkdwn
-# wrapper. A review message carries a full plate (role, tasks, calendar,
-# pipeline, decisions, recent activity) and routinely runs longer than one
-# section, so the body is CHUNKED across sections rather than truncated --
-# posting blocks makes `text=` a notification fallback only, so a capped single
-# section would silently shorten what Harrison actually reviews.
-_SECTION_CHARS = 2900
-_MAX_BODY_BLOCKS = 40  # Slack allows 50 blocks; leave room for the actions block
-
-
-def _chunk_for_sections(text: str) -> list[str]:
-    """Split on line boundaries into <=_SECTION_CHARS pieces (hard-split only a
-    single line that is itself too long)."""
-    chunks: list[str] = []
-    current = ""
-    for line in (text or "").split("\n"):
-        while len(line) > _SECTION_CHARS:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(line[:_SECTION_CHARS])
-            line = line[_SECTION_CHARS:]
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > _SECTION_CHARS:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks or [""]
 
 
 def build_review_blocks(body_text: str, review_id: str) -> list[dict]:
@@ -157,13 +180,8 @@ def build_review_blocks(body_text: str, review_id: str) -> list[dict]:
         text = sanitize_text(text)
     except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
         pass
-    pieces = _chunk_for_sections(text)
-    if len(pieces) > _MAX_BODY_BLOCKS:
-        pieces = pieces[:_MAX_BODY_BLOCKS]
-        pieces[-1] = pieces[-1][: _SECTION_CHARS - 40] + "\n... (truncated)"
-    blocks: list[dict] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": p}} for p in pieces
-    ]
+    from . import confirm_cards as _cc
+    blocks: list[dict] = list(_cc.chunk_mrkdwn_sections(text))
     blocks.append({
         "type": "actions",
         "block_id": f"cora_briefing_actions_{review_id}"[:255],
@@ -231,28 +249,27 @@ def process_enrollment_tap(review_id: str, actor_id: str, *, enable: bool
         if not sid:
             return "orphaned", "That review entry is incomplete -- no change made."
 
-        now = time.time()
-        if enable:
-            state["enabled"][sid] = {
-                "name": name, "enabled_at": now, "via": "digest_button",
-            }
-            state["declined"].pop(sid, None)
-            msg = (f"Enabled -- {name} starts receiving their briefing at the "
-                   f"next weekday run.")
-            outcome = "enabled"
-        else:
-            state["declined"][sid] = {
-                "name": name, "declined_at": now, "via": "digest_button",
-            }
-            state["enabled"].pop(sid, None)
-            msg = f"Skipped -- {name} dropped from review and delivery."
-            outcome = "declined"
+    # Re-read + apply just this verdict (see apply_enrollment_delta): the
+    # scheduled script holds a whole-run-old copy of this file.
+    persisted = apply_enrollment_delta(sid, name, enable=enable,
+                                       review_id=review_id)
+    if not persisted:
+        # NEVER report success on a failed write: the caller edits the card to
+        # the outcome text and drops the buttons, so an unreported failure is
+        # indistinguishable from success to the only human in the loop.
+        log.warning("briefing enrollment write FAILED for %s (review=%s)",
+                    name, review_id)
+        return "write_failed", (
+            "I couldn't save that just now -- nothing changed. Try the button "
+            "again in a moment, or react :+1: / :-1: instead.")
 
-        state["pending_reviews"] = [
-            p for p in state.get("pending_reviews", [])
-            if str(p.get("review_id") or "") != review_id
-        ]
-        save_state(state)
+    if enable:
+        outcome = "enabled"
+        msg = (f"Enabled -- {name} starts receiving their briefing at the "
+               f"next weekday run.")
+    else:
+        outcome = "declined"
+        msg = f"Skipped -- {name} dropped from review and delivery."
 
     log.info("briefing enrollment %s for %s via button (review=%s)",
              outcome, name, review_id)

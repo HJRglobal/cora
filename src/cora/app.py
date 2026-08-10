@@ -733,20 +733,46 @@ def _remember_or_forget_intent(text: str) -> bool:
 # Reflexive/broadcast objects: "message me the numbers" is a request TO Cora,
 # not a DM to a teammate, and "dm everyone" is not a single-recipient send.
 _DM_NOT_A_RECIPIENT = (
-    r"(?!(?:me|us|myself|everyone|everybody|all|here|them|him|her|you|"
+    r"(?!(?i:me|us|myself|everyone|everybody|all|here|them|him|her|you|"
     r"the\s+team|the\s+channel)\b)"
 )
-_SLACK_DM_INTENT_RE = re.compile(
-    rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:dm|slack)\s+{_DM_NOT_A_RECIPIENT}\S"
-    rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?send\s+(?:a\s+)?"
-    rf"(?:dm|slack\s+message|message)\s+to\s+{_DM_NOT_A_RECIPIENT}\S",
-    re.IGNORECASE,
+# D-051 lens-5 HIGH (2026-08-09): the first cut tested the object with a bare
+# `\S`, so "Slack is down for me right now", "Slack channel health monitor keeps
+# firing", "slack messages are not syncing to the KB" and "DM notifications are
+# broken" ALL forced slack_send_dm -- the D-158 stolen-turn class, reintroduced
+# by the very branch whose header comment claims to have closed it, and invisible
+# because the safe-set carried no noun-"Slack"/noun-"DM" case. A forced tool
+# REPLACES the answer, so the usual "a false positive costs one dismissable
+# preview" argument does not apply here.
+#
+# The object must now LOOK LIKE A PERSON: a Slack mention, an @handle, or a
+# Capitalised name. That requires case sensitivity, so this pattern carries NO
+# re.IGNORECASE -- the verb casings are enumerated instead, and the stopword
+# lookahead uses an inline (?i:...) group.
+# The \b belongs only on the bare-name forms: a mention ends in '>', which is a
+# non-word char, so a trailing \b after it never matches before a space (the
+# first cut silently missed every "DM <@U...> ..." -- the exact live phrasing).
+_DM_RECIPIENT = (
+    r"(?:<@[A-Z0-9]+>|(?:@[A-Za-z][\w.\-]{0,30}|[A-Z][a-z]{1,20})\b)"
 )
-# The email NOUN is mandatory: "draft a reply" alone is just as likely a Slack
-# reply, and "write up the notes" is not a drafting request at all.
+_VOCATIVE_CS = r"(?:(?:[Hh]ey|[Hh]i|[Oo]k|[Oo]kay)\s+)?@?[Cc]ora\s{0,2}[,:]?\s{1,4}"
+_SLACK_DM_INTENT_RE = re.compile(
+    rf"^\s*(?:{_VOCATIVE_CS})?(?:[Pp]lease\s+)?(?:[Dd][Mm]|[Ss]lack)\s+"
+    rf"{_DM_NOT_A_RECIPIENT}{_DM_RECIPIENT}"
+    rf"|^\s*(?:{_VOCATIVE_CS})?(?:[Pp]lease\s+)?[Ss]end\s+(?:an?\s+)?"
+    rf"(?:[Dd][Mm]|[Ss]lack\s+message|message)\s+to\s+"
+    rf"{_DM_NOT_A_RECIPIENT}{_DM_RECIPIENT}",
+)
+# The email NOUN is mandatory, AND it must be an email TO someone. D-051 lens-3
+# MED-4: without a recipient this took copy-writing turns -- "write an email
+# signature block for Justin", "prepare an email summary of the board deck",
+# "compose an email subject line for the campaign" -- where the model then has no
+# `to` and Cora answers a copy request with "who is the recipient?". A drafting
+# request that names no recipient is not yet a draft request.
 _GMAIL_DRAFT_INTENT_RE = re.compile(
     rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:draft|compose|write|prepare)\s+"
-    r"(?:me\s+)?(?:an?|the|a\s+quick)\s+(?:email|e-mail)\b"
+    r"(?:me\s+)?(?:an?|the|a\s+quick)\s+(?:email|e-mail)\s+"
+    r"(?:back\s+)?to\b"
     rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:draft|compose)\s+(?:an?|the)\s+"
     r"(?:reply|response)\s+to\b[^.\n]{0,40}\b(?:email|e-mail|thread)\b",
     re.IGNORECASE,
@@ -754,41 +780,104 @@ _GMAIL_DRAFT_INTENT_RE = re.compile(
 # Teaching a shared term, as opposed to saving a personal note. Anchored like
 # the rest: "create a task to add the SKU to the lexicon" is a TASK request and
 # must keep reaching asana_create_task, which an unanchored branch would steal.
+#
+# D-051 lens-3 MED-2: anchoring alone was NOT enough. "add a comment to the
+# glossary task" / "add a note to the vocabulary task" start with `add`, so they
+# matched and stole a correct asana_add_comment force -- the very displacement
+# the comment above claimed to have closed. The glossary noun must be the DIRECT
+# object, so an intervening object noun (task/comment/note/doc/deck/...) between
+# the verb and "to the lexicon" disqualifies the match. Latent today
+# (CORA_LEXICON=resolve gates the force off) but it would arm on the flag flip.
+_LEXICON_OBJECT_BLOCKER = (
+    r"(?:tasks?|to-?dos?|comments?|notes?|subtasks?|docs?|documents?|"
+    r"decks?|sections?|tabs?|folders?|sheets?|pages?|channels?|threads?)"
+)
 _LEXICON_TEACH_INTENT_RE = re.compile(
     rf"^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:add|save|record|teach)\b"
-    r"[^.\n]{0,40}\bto\s+(?:the\s+|our\s+|your\s+)?"
+    rf"(?:(?!\b{_LEXICON_OBJECT_BLOCKER}\b)[^.\n]){{0,40}}"
+    r"\bto\s+(?:the\s+|our\s+|your\s+)?"
     r"(?:lexicon|glossary|vocabulary|dictionary)\b"
+    # ...and the glossary word must not itself be modifying a DOCUMENT: "add
+    # the definitions to the glossary doc in Drive" / "add these to the
+    # glossary section of the deck" are file edits, not lexicon teaches.
+    r"(?!\s+(?:docs?|documents?|sections?|tabs?|pages?|sheets?|files?|"
+    r"folders?|decks?|channels?)\b)"
     rf"|^\s*(?:{_VOCATIVE})?(?:please\s+)?(?:the\s+)?"
-    r"(?:term|word|acronym|abbreviation)\s+[^.\n]{1,60}?\bmeans\b",
+    r"(?:term|word|acronym|abbreviation)\s+"
+    # "the term sheet means we are past LOI" is a business statement, not a
+    # definition -- the head noun must not itself be a document (lens-3 MED-2).
+    r"(?!sheets?\b)[^.\n]{1,60}?\bmeans\b",
+    re.IGNORECASE,
+)
+# A trailing request clause turns a "remember"/"note that" opener into a
+# discourse marker rather than a command (D-051 lens-3 MED-3): "note that the
+# numbers exclude OSNVV, give me the WoW delta" is a data question, and forcing
+# cora_remember makes the actual ask unreachable. The remember regex was authored
+# for MODEL escalation, where an over-broad match was harmless; promoting it to a
+# forced tool changes that calculus, so it needs its own precision guard.
+# D-165, caught by measurement on the very next run: the first cut used
+# `\s+--+` / `\s+—`, and this predicate is an UNANCHORED search over a message
+# up to Slack's 40k limit -- `\s+` re-consuming a long whitespace run at every
+# start position took 4.2s (vs 0.007s before). A real clause separator is never
+# more than a few spaces, so every whitespace run here is bounded. Fifth regex
+# of this shape in the arc; the lesson keeps being "measure, then believe".
+_REMEMBER_TRAILING_REQUEST_RE = re.compile(
+    r"(?:[,;]|\s{1,4}--+|\s{1,4}—)\s{0,4}(?:and\s{1,4})?"
+    r"(?:give|show|send|pull|find|get|tell|list|check|"
+    r"what|who|when|where|how|why|which)\b",
     re.IGNORECASE,
 )
 
 
-def _slack_dm_intent(text: str) -> bool:
+# A polite modal aimed at CORA is an imperative, not a question -- "can you dm
+# Tommy the Q3 numbers?" is the most natural phrasing of the very intent these
+# detectors exist to catch, and a blanket "?" bail left the headline fix dark for
+# it (D-051 lens-3 LOW-6). Same distinction _DELEGATE_INTERROGATIVE_RE already
+# draws: modal + "you" is a request, modal + anything else is a question. The
+# prefix is STRIPPED so the start-anchored patterns still see the imperative.
+_POLITE_MODAL_RE = re.compile(
+    r"^\s*(?:hey\s+|hi\s+)?(?:@?cora[,:]?\s+)?"
+    r"(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _imperative_body(text: str) -> str | None:
+    """The command text to match, or None when the message is a real question.
+
+    Strips a leading "can you ..." politeness wrapper; anything else carrying a
+    "?" is treated as a question and never forces a tool."""
     t = (text or "").strip()
-    if not t or "?" in t:
-        return False
-    return bool(_SLACK_DM_INTENT_RE.search(t))
+    if not t:
+        return None
+    m = _POLITE_MODAL_RE.match(t)
+    if m:
+        t = t[m.end():].strip().rstrip("?").strip()
+        return t or None
+    if "?" in t:
+        return None
+    return t
+
+
+def _slack_dm_intent(text: str) -> bool:
+    t = _imperative_body(text)
+    return bool(t and _SLACK_DM_INTENT_RE.search(t))
 
 
 def _gmail_draft_intent(text: str) -> bool:
-    t = (text or "").strip()
-    if not t or "?" in t:
-        return False
-    return bool(_GMAIL_DRAFT_INTENT_RE.search(t))
+    t = _imperative_body(text)
+    return bool(t and _GMAIL_DRAFT_INTENT_RE.search(t))
 
 
 def _lexicon_teach_intent(text: str) -> bool:
-    t = (text or "").strip()
-    if not t or "?" in t:
-        return False
-    return bool(_LEXICON_TEACH_INTENT_RE.search(t))
+    t = _imperative_body(text)
+    return bool(t and _LEXICON_TEACH_INTENT_RE.search(t))
 
 
 def _remember_intent(text: str) -> bool:
     """The FORCEABLE half of _remember_or_forget_intent (remember only)."""
-    t = (text or "").strip()
-    if not t or "?" in t:
+    t = _imperative_body(text)
+    if not t or _REMEMBER_TRAILING_REQUEST_RE.search(t):
         return False
     return bool(_REMEMBER_INTENT_RE.search(t))
 
@@ -1542,6 +1631,14 @@ def _dispatch_qa(
     # bypassed above): a KB-only degraded answer to a web ask must not shadow the
     # web path for the next asker.
     if web_intent:
+        cache_storable = False
+    # A FORCED staged-write turn produces a preview bound to a server-side stash
+    # that exists only for this (user, channel). Caching it means a later,
+    # similar ask is served the stored preview text verbatim -- with no stash, no
+    # buttons, and, entity-keyed as the cache is, potentially another user's
+    # recipient and message body. That replayed buttonless preview IS the phantom
+    # state this rider exists to eliminate (D-051 lens-3 MED-5).
+    if force_tool is not None:
         cache_storable = False
     # ── Web tools gate (2026-07-31): the server-side web_search/web_fetch tools
     # attach only when web_guard says so — explicit web intent, or a time-sensitive
@@ -3676,6 +3773,29 @@ def handle_autowrite_revert(ack, body, client) -> None:
 # All correctness (Harrison-only gate, atomic read-modify-write, consumption)
 # lives in briefing_enrollment.process_enrollment_tap; this wrapper is Slack I/O.
 
+# A tap CONSUMES the pending-review entry, and the script's reaction resolver
+# only acts on entries still in that list -- so after a tap, any reaction on that
+# message is a permanent no-op. The retained body still said "Reacting :+1: /
+# :-1: still works too", which is exactly the promise Harrison would reach for to
+# correct a mis-tap (D-051 lens-5 MED). Rewrite that sentence on the terminal
+# edit so the card never advertises an affordance it has just disabled.
+_REACTION_AFFORDANCE_RE = re.compile(
+    r"\s*Reacting :\+1: / :-1: still works too \(picked up at the next run\)\.",
+)
+
+
+def _strip_reaction_affordance(block: dict) -> dict:
+    try:
+        txt = ((block.get("text") or {}).get("text") or "")
+        if not txt or "Reacting :+1:" not in txt:
+            return block
+        cleaned = _REACTION_AFFORDANCE_RE.sub(
+            " (Reactions no longer apply to this card.)", txt)
+        return {**block, "text": {**block["text"], "text": cleaned}}
+    except Exception:  # noqa: BLE001 -- cosmetic; never break the edit
+        return block
+
+
 def _handle_briefing_enrollment_tap(body: dict, client, *, enable: bool) -> None:
     try:
         actions = body.get("actions") or []
@@ -3706,11 +3826,13 @@ def _handle_briefing_enrollment_tap(body: dict, client, *, enable: bool) -> None
         outcome, msg = briefing_enrollment.process_enrollment_tap(
             review_id, actor_id, enable=enable)
 
-        if outcome in ("not_authorized", "orphaned", "already_handled"):
+        if outcome in ("not_authorized", "orphaned", "already_handled",
+                       "write_failed"):
             # None of these may edit the shared card. not_authorized must not
             # rewrite Harrison's DM on a stranger's tap; already_handled is the
             # fast RACE LOSER of two taps on one card, and the winner's own edit
             # is the authoritative one (the D-051 terminal-edit race rule).
+            # write_failed must leave the buttons LIVE so the tap can be retried.
             try:
                 client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
             except Exception:  # noqa: BLE001
@@ -3723,7 +3845,8 @@ def _handle_briefing_enrollment_tap(body: dict, client, *, enable: bool) -> None
         # briefing Harrison just reviewed).
         if channel_id and message_ts:
             orig = (body.get("message") or {}).get("blocks") or []
-            section_blocks = [b for b in orig if b.get("type") == "section"]
+            section_blocks = [_strip_reaction_affordance(b)
+                              for b in orig if b.get("type") == "section"]
             new_blocks = section_blocks + [
                 {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
             ]

@@ -188,6 +188,42 @@ class TestForcedToolsAreExposedAndStaged:
             assert "confirmed" in src, f"{fn_name} has no confirm gate"
 
 
+class TestF23NoStashRefusalHolds:
+    """cq-8866d3f7ac3b: the live defect was the model calling cora_remember with
+    confirmed=True on the FIRST call (a self-confirm attempt). The F-23 gate
+    refused and re-staged. Forcing the tool makes the first call a proper
+    unconfirmed preview -- but the gate is the belt behind it and must stay
+    pinned: a confirm with no server-side stash NEVER fabricates a success.
+    """
+
+    @pytest.mark.parametrize("tool_fn,marker", [
+        ("_tool_cora_remember", "NOT SAVED"),
+        ("_tool_cora_lexicon_add", "NOT SAVED"),
+    ])
+    def test_confirmed_true_with_no_stash_refuses(self, tool_fn, marker,
+                                                  monkeypatch):
+        from cora.tools import tool_dispatch as td
+        monkeypatch.setenv("CORA_LEXICON", "full")
+        out = getattr(td, tool_fn)(
+            "U_NOBODY", "FNDR",
+            {"confirmed": True, "_channel_name": "cora-build",
+             "text": "the gate code is 4412", "term": "BDM",
+             "meaning": "Big D Media"},
+        )
+        assert marker in out, f"{tool_fn} fabricated a success with no stash"
+
+    def test_gmail_and_dm_confirms_with_no_stash_refuse(self):
+        from cora.tools import tool_dispatch as td
+        out = td._tool_slack_send_dm("U_NOBODY", "FNDR", {
+            "confirmed": True, "_channel_name": "cora-build",
+            "recipient_name": "Tommy", "message": "hi"})
+        assert "NOT DONE" in out or "don't have a pending" in out
+        out = td._tool_gmail_create_draft("U_NOBODY", "FNDR", {
+            "confirmed": True, "_channel_name": "cora-build",
+            "to": "a@b.c", "subject": "s", "body": "b"})
+        assert "NOT DONE" in out or "don't have a pending" in out
+
+
 class TestNoReDoS:
     """D-165: three self-inflicted ReDoS in this arc, all found by review not
     tests. Every new regex is timed on a 40k adversarial input; a comment does

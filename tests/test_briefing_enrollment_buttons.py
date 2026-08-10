@@ -130,18 +130,76 @@ class TestEnrollmentCore:
 
 
 class TestStatePersistence:
-    def test_save_is_atomic_and_leaves_no_tmp_file(self, tmp_path):
-        state = be._empty_state()
-        state["enabled"]["U1"] = {"name": "X", "enabled_at": 1.0, "via": "t"}
-        be.save_state(state)
-        assert be.STATE_PATH.exists()
-        assert not (tmp_path / "briefing-delivery.json.tmp").exists()
-        assert json.loads(be.STATE_PATH.read_text(encoding="utf-8"))["enabled"]["U1"]["name"] == "X"
+    def test_save_never_leaves_a_partial_file_on_a_mid_write_crash(self, tmp_path):
+        """The REAL atomicity pin. The first version of this test only asserted
+        that no .tmp file lingered, which is equally true of the plain
+        write_text it replaced -- it passed against the un-fixed code, so it
+        proved nothing (D-051 lens-6 LOW: a vacuous test)."""
+        good = be._empty_state()
+        good["enabled"]["U1"] = {"name": "Keep me", "enabled_at": 1.0, "via": "t"}
+        be.save_state(good)
+
+        # Crash *after* the temp file is written, before the atomic swap.
+        with patch("cora.briefing_enrollment.os.replace",
+                   side_effect=OSError("boom")):
+            assert be.save_state({"enabled": {"U2": {}}, "declined": {},
+                                  "pending_reviews": []}) is False
+
+        # The previously-good file is untouched, not truncated to empty.
+        assert be.load_state()["enabled"]["U1"]["name"] == "Keep me"
+
+    def test_save_reports_failure_rather_than_returning_none(self):
+        assert be.save_state(be._empty_state()) is True
+
+    def test_tmp_file_is_process_unique(self, tmp_path):
+        """A fixed shared tmp name lets the script os.replace() the bot's
+        half-written file into place (D-051 lens-5)."""
+        import os as _os
+        captured = {}
+        real_replace = be.os.replace
+
+        def _spy(src, dst):
+            captured["src"] = str(src)
+            return real_replace(src, dst)
+
+        with patch("cora.briefing_enrollment.os.replace", side_effect=_spy):
+            be.save_state(be._empty_state())
+        assert str(_os.getpid()) in captured["src"]
+
+    def test_no_tmp_file_lingers_after_a_successful_save(self, tmp_path):
+        be.save_state(be._empty_state())
+        assert not list(tmp_path.glob("*.tmp"))
 
     def test_corrupt_file_reads_as_empty_not_crash(self):
         be.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         be.STATE_PATH.write_text("{not json", encoding="utf-8")
         assert be.load_state() == be._empty_state()
+
+
+class TestCrossProcessDelta:
+    """apply_enrollment_delta re-reads immediately before writing, so a verdict
+    cannot be reverted by a whole-run-old copy held by the briefing script."""
+
+    def test_delta_preserves_concurrent_changes_made_since_load(self):
+        rid = _seed_review()
+        # Simulate the script having written OTHER state while the tap was in
+        # flight (a second user enabled by a reaction earlier in the same run).
+        other = be.load_state()
+        other["enabled"]["U_OTHER"] = {"name": "Other", "enabled_at": 1.0,
+                                       "via": "digest_reaction"}
+        be.save_state(other)
+
+        be.process_enrollment_tap(rid, HARRISON, enable=True)
+        state = be.load_state()
+        assert "U_TEAMMATE" in state["enabled"]     # the tap landed
+        assert "U_OTHER" in state["enabled"]        # and did not clobber
+
+    def test_write_failure_is_reported_and_does_not_claim_success(self):
+        rid = _seed_review()
+        with patch("cora.briefing_enrollment.save_state", return_value=False):
+            outcome, msg = be.process_enrollment_tap(rid, HARRISON, enable=True)
+        assert outcome == "write_failed"
+        assert "nothing changed" in msg.lower()
 
 
 class TestReviewBlocks:
@@ -231,6 +289,29 @@ class TestHandlerEntryPoint:
             _tap_body(HARRISON, rid, be.ACTION_ENABLE), fake, enable=True)
         assert be.load_state()["enabled"] == {}
         assert not fake.updated and not fake.ephemeral
+
+    def test_write_failure_leaves_the_buttons_live_for_a_retry(self):
+        rid = _seed_review()
+        fake = _FakeClient()
+        with patch("cora.briefing_enrollment.save_state", return_value=False):
+            capp._handle_briefing_enrollment_tap(
+                _tap_body(HARRISON, rid, be.ACTION_ENABLE), fake, enable=True)
+        assert not fake.updated                  # card untouched, buttons live
+        assert len(fake.ephemeral) == 1
+
+    def test_terminal_card_stops_advertising_the_reaction_fallback(self):
+        """A tap consumes the pending entry, so reactions on that message become
+        permanent no-ops -- the card must not keep promising them (lens-5 MED)."""
+        rid = _seed_review()
+        fake = _FakeClient()
+        body = _tap_body(HARRISON, rid, be.ACTION_ENABLE)
+        body["message"]["blocks"][0]["text"]["text"] = (
+            "WOULD-BE BRIEFING -- Tommy\nTap *Enable delivery* ... Reacting "
+            ":+1: / :-1: still works too (picked up at the next run).\n\nbody")
+        capp._handle_briefing_enrollment_tap(body, fake, enable=True)
+        rendered = json.dumps(fake.updated[0]["blocks"])
+        assert "still works too" not in rendered
+        assert "Reactions no longer apply" in rendered
 
     def test_buttons_off_refuses_and_names_the_reaction_fallback(self, monkeypatch):
         monkeypatch.setenv("CORA_CONFIRM_BUTTONS", "off")

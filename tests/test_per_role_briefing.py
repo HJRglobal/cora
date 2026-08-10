@@ -92,8 +92,14 @@ def empty_registry(tmp_path):
     org_roles.invalidate_cache()
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def state_path(tmp_path):
+    """AUTOUSE (D-051 lens-6, 2026-08-09): this fixture was opt-in and only 36 of
+    the 61 tests requested it, so the rest wrote synthetic rows ("Tara Sales",
+    "Lana Lex") straight into the LIVE data/state/briefing-delivery.json. The
+    file is gitignored, so the pollution never showed up in git status or a diff
+    review. Same test/prod isolation class as cq-d9432f552a33, and the stakes
+    just rose: the bot process is now a second writer to that same file."""
     p = tmp_path / "briefing-delivery.json"
     with patch.object(rdb, "_DELIVERY_STATE_PATH", p):
         yield p

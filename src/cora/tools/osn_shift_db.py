@@ -328,12 +328,15 @@ def approve_schedule(schedule_id: str, approved_by: str) -> bool:
 
 def approve_schedule_if_pending(schedule_id: str, approved_by: str) -> bool:
     """Compare-and-swap approve: only flips a schedule that is STILL awaiting
-    approval, and returns True to exactly one caller (S6 migration 3).
+    approval, and returns True to exactly one caller (S6 migration 4).
 
-    approve_schedule() above is an unconditional UPDATE, so two taps on one card
-    would both report success and the second would overwrite approved_by. The
-    button needs a real claim; the REACTION path deliberately keeps calling the
-    unconditional version so its behavior is unchanged by this migration."""
+    approve_schedule() above is an unconditional UPDATE, so two actors on one
+    card would both report success and the second would overwrite approved_by
+    with the LOSER. BOTH the button and the ✅ reaction path now claim through
+    here (D-051 lens-2), so exactly one actor is ever the approver, whichever
+    affordance they used. approve_schedule stays for the typed
+    `approve schedule <id>` command, which addresses a schedule by id rather
+    than racing a shared card."""
     conn = _connect()
     result = conn.execute(
         "UPDATE osn_schedules SET status = 'approved', approved_by = ?, "

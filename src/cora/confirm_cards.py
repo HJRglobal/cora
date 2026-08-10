@@ -445,6 +445,52 @@ def terminal_blocks(outcome_text: str) -> list[dict]:
     return [{"type": "section", "text": {"type": "mrkdwn", "text": outcome_text}}]
 
 
+# ── Shared body chunking for card builders (S6 D-051 lens-4/5 HIGH) ─────────
+# Slack's section-text limit is 3000 chars, and once a message carries `blocks`
+# the `text=` field is demoted to a notification fallback -- so a body that used
+# to render in full as text= is SILENTLY TRUNCATED the moment buttons are added
+# to it, with no marker. Live consequence caught in review: the OSN approval card
+# lost Sunday's whole shift assignment AND the "Scheduling warnings" block, while
+# the primary-styled Approve button sat below looking like the end of the card.
+#
+# Every card builder that renders a body it did not itself bound must chunk
+# through here rather than slicing.
+SECTION_CHARS = 2900
+MAX_BODY_BLOCKS = 40  # Slack allows 50; leave room for the actions block
+
+
+def chunk_mrkdwn_sections(text: str,
+                          max_blocks: int = MAX_BODY_BLOCKS) -> list[dict]:
+    """Split `text` into <=SECTION_CHARS mrkdwn section blocks on line
+    boundaries (hard-splitting only a single line that is itself too long).
+
+    Overflow past `max_blocks` is marked explicitly -- a truncation the reader
+    cannot see is the defect this exists to prevent."""
+    chunks: list[str] = []
+    current = ""
+    for line in (text or "").split("\n"):
+        while len(line) > SECTION_CHARS:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:SECTION_CHARS])
+            line = line[SECTION_CHARS:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > SECTION_CHARS:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    chunks = chunks or [""]
+    if len(chunks) > max_blocks:
+        chunks = chunks[:max_blocks]
+        chunks[-1] = chunks[-1][: SECTION_CHARS - 40] + "\n... (truncated)"
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": c}}
+            for c in chunks]
+
+
 # ── Terminal-edit race (S2, live-smoke 2026-08-02 + D-051 re-review) ────────
 # resolve_and_claim_stash's atomic pop already guarantees at most ONE caller
 # ever sees a genuine outcome for a given stash_id -- but two racing taps on

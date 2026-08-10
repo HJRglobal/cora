@@ -739,18 +739,29 @@ def _post_approval_card(sched, formatted: str, warnings: list, channel_id: str, 
         warn_lines = "\n".join(f"⚠ {w}" for w in warnings[:8])
         warn_section = f"\n\n*Scheduling warnings:*\n{warn_lines}"
 
+    # Instruction must match what renders: with buttons off this is exactly the
+    # pre-branch card (the kill switch reverts the surface byte-identically).
+    try:
+        from .. import confirm_cards as _cc
+        _buttons_on = _cc.confirm_buttons_enabled()
+    except Exception:  # noqa: BLE001
+        _buttons_on = False
+    _instruction = (
+        f"*Tap Approve below, react ✅ on this message, or reply "
+        f"`approve schedule {sched.schedule_id[:8]}`.*" if _buttons_on else
+        f"*React ✅ on this message to approve, or reply "
+        f"`approve schedule {sched.schedule_id[:8]}` below.*"
+    )
     card = (
         f"*OSN Schedule Draft — week of {sched.week_start}*\n"
         f"Schedule ID: `{sched.schedule_id[:8]}`\n\n"
         f"{formatted}{warn_section}\n\n"
-        f"*Tap Approve below, react ✅ on this message, or reply "
-        f"`approve schedule {sched.schedule_id[:8]}`.*"
+        f"{_instruction}"
     )
     try:
         blocks = None
         try:
-            from .. import confirm_cards as _cc
-            if _cc.confirm_buttons_enabled():
+            if _buttons_on:
                 blocks = build_approval_blocks(card, sched.schedule_id)
         except Exception:  # noqa: BLE001 -- a card issue never blocks the card post
             blocks = None
@@ -811,7 +822,16 @@ def handle_schedule_approval_reaction(
         except Exception:
             notes = {}
         if notes.get("approval_card_ts") == message_ts:
-            ok = approve_schedule(sched.schedule_id, reactor_user_id)
+            # D-051 lens-2: was the UNCONDITIONAL approve_schedule, which let a
+            # reaction landing just after a button tap re-run the UPDATE --
+            # overwriting approved_by with the LOSER and posting a second
+            # "approved!" announcement to the channel. The compare-and-swap
+            # makes exactly one actor the approver, whichever affordance they
+            # used; a later ✅ on an already-approved card is now a silent no-op,
+            # which is what the reaction path already did for every other
+            # non-matching case.
+            from .osn_shift_db import approve_schedule_if_pending
+            ok = approve_schedule_if_pending(sched.schedule_id, reactor_user_id)
             if ok:
                 return (
                     f"✅ Schedule `{sched.schedule_id[:8]}` for week of *{sched.week_start}* approved!\n"
@@ -952,9 +972,13 @@ def build_approval_blocks(body_text: str, schedule_id: str) -> list[dict]:
         text = sanitize_text(text)
     except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
         pass
+    # CHUNKED, not sliced (D-051 lens-4/5 HIGH): a fully-staffed week runs past
+    # 3,000 chars, and a single capped section silently dropped Sunday's shifts
+    # and the whole "Scheduling warnings" block while the Approve button still
+    # rendered -- an admin approving a week they never saw.
+    from .. import confirm_cards as _cc
     return [
-        {"type": "section",
-         "text": {"type": "mrkdwn", "text": text[:_APPROVAL_SECTION_CHARS]}},
+        *_cc.chunk_mrkdwn_sections(text),
         {"type": "actions",
          "block_id": f"cora_osn_approve_actions_{schedule_id}"[:255],
          "elements": [

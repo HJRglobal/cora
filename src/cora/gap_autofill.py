@@ -1237,6 +1237,16 @@ def escalate_gap(gap: dict[str, Any], slack_client: Any) -> dict[str, Any] | Non
         log.info("gap_autofill: no domain owner for entity %s -- skip escalation",
                  gap.get("entity", "?"))
         return None
+    # The decline sentence must match what actually renders: with buttons off
+    # nothing is attached, so naming a button would point at something that is
+    # not there (and the kill switch reverts this surface byte-identically).
+    try:
+        from . import confirm_cards as _cc
+        _buttons_on = _cc.confirm_buttons_enabled()
+    except Exception:  # noqa: BLE001 -- flag unavailable: behave as pre-branch
+        _buttons_on = False
+    _decline_hint = ("tap a button below or just say so" if _buttons_on
+                     else "just say so")
     text = (
         ":wave: Hi -- I'm trying to fill a knowledge gap and you're the best "
         f"person to ask for *{gap.get('entity', 'the portfolio')}*.\n\n"
@@ -1244,15 +1254,12 @@ def escalate_gap(gap: dict[str, Any], slack_client: Any) -> dict[str, Any] | Non
         f"> {gap.get('question', '')[:400]}\n\n"
         f"What I couldn't answer: _{gap.get('gap', '')[:300]}_\n\n"
         "If you know the answer, *reply to this message* (a thread reply is "
-        "best) and I'll route it for approval. If it's not your area, tap a "
-        "button below or just say so."
+        f"best) and I'll route it for approval. If it's not your area, {_decline_hint}."
     )
     # Minted BEFORE the post so the buttons can carry it (S6 migration 2).
     ask_id = f"gapask-{uuid.uuid4().hex[:12]}"
     try:
-        from . import confirm_cards as _cc
-        blocks = (build_ask_blocks(text, ask_id)
-                  if _cc.confirm_buttons_enabled() else None)
+        blocks = build_ask_blocks(text, ask_id) if _buttons_on else None
     except Exception:  # noqa: BLE001 -- a card problem must never block the ask
         blocks = None
     try:
@@ -1446,9 +1453,9 @@ def build_ask_blocks(body_text: str, ask_id: str) -> list[dict]:
         text = sanitize_text(text)
     except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
         pass
+    from . import confirm_cards as _cc
     return [
-        {"type": "section",
-         "text": {"type": "mrkdwn", "text": text[:_ASK_SECTION_CHARS]}},
+        *_cc.chunk_mrkdwn_sections(text),
         {"type": "actions",
          "block_id": f"cora_gap_ask_actions_{ask_id}"[:255],
          "elements": [
@@ -1512,9 +1519,16 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
     stored = asks.get(ask.get("ask_id", ""), ask)
 
     if _DECLINE_RE.match(reply_text):
-        _mark_declined(stored, via="reply")
-        asks[stored["ask_id"]] = stored
-        save_pending_asks(asks)
+        # Locked read-modify-write (D-051 lens-2): the button path locks, and
+        # this whole-dict write would otherwise revert a concurrent button
+        # decline -- after that tap's card had already been edited and its
+        # buttons dropped. Same lock, so the two paths serialise.
+        with _ASKS_LOCK:
+            fresh = _read_json(_pending_asks_path(), {})
+            target = fresh.get(stored.get("ask_id", "")) or stored
+            _mark_declined(target, via="reply")
+            fresh[target["ask_id"]] = target
+            _write_json(_pending_asks_path(), fresh)
         return DECLINE_ACK
 
     # 3-predicate union (D-051, 2026-08-06). is_lex_billing_status_phi was

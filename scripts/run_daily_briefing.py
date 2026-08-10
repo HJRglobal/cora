@@ -607,17 +607,31 @@ def _compose_review_header(
     return "\n".join(lines)
 
 
-def _compose_review_message(rec: RoleRecord, text: str) -> str:
-    """The review body. Copy names BOTH affordances (S6 migration 1): the buttons
-    act immediately, the reactions are resolved at the next run. The reaction
-    sentence is never removed -- buttons are ADDITIVE (locked pattern rule), so
-    the message must stay accurate if Slack interactivity is ever off."""
+def _compose_review_message(rec: RoleRecord, text: str,
+                            buttons_on: bool = False) -> str:
+    """The review body.
+
+    The instruction line MUST match what actually renders: with
+    CORA_CONFIRM_BUTTONS=off no buttons are attached, so naming them would tell
+    Harrison to tap something that is not there -- and the kill switch is
+    specified to revert this surface byte-identically. With buttons on, both
+    affordances are named (the reaction path is ADDITIVE-preserved and still
+    resolves at the next run)."""
     first = rec.name.split()[0]
+    if buttons_on:
+        instruction = (
+            f"Tap *Enable delivery* to start sending this briefing to {first} "
+            f"each weekday, or *Skip* to drop {first} from review. Reacting "
+            f":+1: / :-1: still works too (picked up at the next run)."
+        )
+    else:
+        instruction = (
+            f"React :+1: on THIS message to start delivering this briefing to "
+            f"{first} each weekday. React :-1: to drop {first} from review."
+        )
     return (
         f"WOULD-BE BRIEFING -- {rec.name} ({rec.role}, {rec.entity})\n"
-        f"Tap *Enable delivery* to start sending this briefing to {first} each "
-        f"weekday, or *Skip* to drop {first} from review. Reacting :+1: / :-1: "
-        f"still works too (picked up at the next run).\n\n{text}"
+        f"{instruction}\n\n{text}"
     )
 
 
@@ -638,9 +652,10 @@ def _send_review_messages(
         # the blocks can carry it, and stored on the pending entry so a tap
         # resolves back to (sid, name) server-side.
         review_id = f"brev-{uuid.uuid4().hex[:12]}"
-        body = _compose_review_message(rec, text)
+        buttons_on = confirm_cards.confirm_buttons_enabled()
+        body = _compose_review_message(rec, text, buttons_on)
         blocks = (briefing_enrollment.build_review_blocks(body, review_id)
-                  if confirm_cards.confirm_buttons_enabled() else None)
+                  if buttons_on else None)
         ts = _post_returning_ts(client, dest, body, blocks=blocks)
         if ts:
             state["pending_reviews"] = [

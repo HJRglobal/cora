@@ -5505,7 +5505,18 @@ _CONFIRM_ACTION_VERBS = {
 # invoices sent using the old template", so this is deliberately end-anchored,
 # not DOTALL, not applied mid-message.
 _CONFIRM_MENTION_RE = re.compile(r"<[@#!][^>]*>")
-_CONFIRM_SENT_USING_RE = re.compile(r"\n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$", re.IGNORECASE)
+# D-165 / D-051 lens-1 (2026-08-09): the original form was
+#   \n?\s*\*?\s*sent using\s*\*?\s*<@[^>]+>\s*$
+# -- FOUR whitespace-capable quantifiers with optional `\*?` between them, which
+# is ambiguous at every split point and measured CUBIC: 0.9s at 800 spaces, 8.8s
+# at 1,600, 25.6s at 2,400. `_strip_connector_noise`'s 2,000-char bail bounded it
+# but did not remove it (2,000 spaces was still ~15s), and the S6 rider's
+# strip_connector_footer reintroduced it unbounded on arbitrary-length message
+# bodies. Collapsing each run to ONE unambiguous character class removes the
+# split ambiguity entirely -- same language (whitespace and asterisks in any
+# order), no backtracking choice. Timed permanently in
+# tests/test_s6_rider_footer_and_tap_log.py.
+_CONFIRM_SENT_USING_RE = re.compile(r"[\s*]*sent using[\s*]*<@[^>]+>\s*$", re.IGNORECASE)
 
 
 _STRIP_MAX_CHARS = 2000
@@ -11638,7 +11649,23 @@ _CLASSB: dict[str, dict] = {k: _make_classb_store(k) for k in _CLASSB_KINDS}
 # Free-text payload fields that are COMPOSED message bodies -- the ones a
 # connector footer can ride into. Ids, labels and names are deliberately absent:
 # this strip must never touch a field whose exact value is load-bearing.
-_CLASSB_BODY_FIELDS = ("message", "body", "note_body")
+#
+# D-051 lens-6 LOW: the first cut listed only the three obvious bodies, and the
+# comment claimed every Class-B kind was covered. Two further fields are FILED
+# verbatim and were carrying the footer -- gmail_draft's `subject` (measured:
+# "Wholesale terms\n\n*Sent using* <@U...>") and influencer_deliverable's
+# `notes`. Enumerated explicitly rather than "every string field", so an id or a
+# resolved label can never be silently rewritten.
+_CLASSB_BODY_FIELDS = ("message", "body", "note_body", "subject", "notes")
+
+
+# The footer is a fixed shape ("*Sent using* <@U01234567890>", well under 80
+# chars) and is END-anchored, so only the tail of a body can possibly contain
+# one. Bounding the regex input to a fixed window makes this O(1) in the body
+# size instead of O(n^2) -- the D-051 lens-1/2 finding: the first cut ran the
+# pattern over the WHOLE body, which is arbitrarily long (hubspot_add_note
+# explicitly anticipates 5,000-char note bodies) and user-influenced.
+_FOOTER_TAIL_CHARS = 200
 
 
 def strip_connector_footer(text: str) -> str:
@@ -11652,10 +11679,19 @@ def strip_connector_footer(text: str) -> str:
     uses -- an unanchored strip would eat legitimate content like "the invoices
     sent using the old template". Mentions and the [QA] marker are deliberately
     NOT stripped here: a DM body may legitimately address a teammate by mention,
-    and this runs on content that gets FILED, not on content being classified."""
+    and this runs on content that gets FILED, not on content being classified.
+
+    D-165: the regex itself was de-ambiguated (see _CONFIRM_SENT_USING_RE) AND
+    its input is windowed to the tail here. Both, because this path takes
+    unbounded user-influenced text on the bot's shared thread and CPython's `re`
+    holds the GIL -- a stall here is an org-wide outage, not a slow reply."""
     if not text:
         return text
-    return _CONFIRM_SENT_USING_RE.sub("", text).rstrip()
+    tail = text[-_FOOTER_TAIL_CHARS:]
+    stripped = _CONFIRM_SENT_USING_RE.sub("", tail)
+    if stripped == tail:
+        return text
+    return (text[:-_FOOTER_TAIL_CHARS] + stripped).rstrip()
 
 
 def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
@@ -11664,7 +11700,7 @@ def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
     which is the honor-gate weakness this batch exists to close."""
     sid = confirm_cards.mint_stash_id(kind, slack_user, channel)
     entry = dict(entry)
-    # One chokepoint for every Class-B kind, so a seventh gets it for free.
+    # One chokepoint for all seven Class-B kinds, so an EIGHTH gets it for free.
     # Runs AFTER the per-tool screens (PHI etc.) deliberately: stripping only
     # ever removes Cora-generated noise, so a screen that saw the footer saw
     # strictly more text than what is filed.

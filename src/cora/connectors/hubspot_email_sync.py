@@ -249,9 +249,9 @@ def build_match_blocks(body_text: str, pending_id: str) -> list[dict]:
         text = sanitize_text(text)
     except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
         pass
+    from cora import confirm_cards as _cc
     return [
-        {"type": "section",
-         "text": {"type": "mrkdwn", "text": text[:_MATCH_SECTION_CHARS]}},
+        *_cc.chunk_mrkdwn_sections(text),
         {"type": "actions",
          "block_id": f"cora_hubspot_match_actions_{pending_id}"[:255],
          "elements": [
@@ -295,14 +295,16 @@ def process_match_tap(pending_id: str, actor_id: str, *, attach: bool
     if not pending_id or not actor_id:
         return "orphaned", "I don't have a record of that match anymore."
 
-    with _PENDING_LOCK:
-        found = find_pending_by_id(pending_id)
-        if not found:
-            return "orphaned", "I don't have a record of that match anymore."
-        message_ts, entry = found
-        if entry.get("slack_user_id") and entry["slack_user_id"] != actor_id:
-            return "not_authorized", "Only the mailbox owner can act on this one."
-        ok = resolve_pending_reaction(message_ts, approved=attach)
+    found = find_pending_by_id(pending_id)
+    if not found:
+        return "orphaned", "I don't have a record of that match anymore."
+    message_ts, entry = found
+    if entry.get("slack_user_id") and entry["slack_user_id"] != actor_id:
+        return "not_authorized", "Only the mailbox owner can act on this one."
+    # The atomic claim lives inside resolve_pending_reaction (which the reaction
+    # path also calls), so this authorization check is a pre-filter and the pop
+    # is the real gate -- a racing reaction simply wins and this returns False.
+    ok = resolve_pending_reaction(message_ts, approved=attach)
 
     if not ok:
         # The entry vanished between the scan and the pop -- a racing tap or the
@@ -367,12 +369,20 @@ def resolve_pending_reaction(message_ts: str, approved: bool) -> bool:
     """
     from cora.tools.hubspot_client import HubSpotClientError, log_email_engagement
 
-    pending = _load_pending()
-    entry = pending.pop(message_ts, None)
-    if not entry:
-        return False
-
-    _save_pending(pending)
+    # D-051 lens-2/4/5: the CLAIM must be inside the lock, and the lock has to
+    # live HERE rather than only in process_match_tap -- the 👍/👎 reaction
+    # handler calls this function directly, in the same bot process, so a lock
+    # only one of the two callers takes provides no mutual exclusion at all. A
+    # reaction and an Attach tap landing in the same second could both see the
+    # entry and both file the engagements (a duplicate thread on the deal).
+    # Only the pop+save is held; the HubSpot writes below run OUTSIDE the lock,
+    # so one slow thread cannot queue every other tap behind it.
+    with _PENDING_LOCK:
+        pending = _load_pending()
+        entry = pending.pop(message_ts, None)
+        if not entry:
+            return False
+        _save_pending(pending)
 
     if not approved:
         log.info("email_sync: pending reaction dismissed for thread=%s", entry.get("thread_id"))
@@ -548,19 +558,27 @@ def sync_user(
                 for cid, cname, open_ids in active[:3]:  # cap at 3 options
                     deal_url = (f"https://app.hubspot.com/contacts/"
                                 f"{_PORTAL_ID}/deal/{open_ids[0]}")
+                    # Instruction must match what renders: with buttons off the
+                    # DM is exactly the pre-branch message (kill-switch parity).
+                    try:
+                        from cora import confirm_cards as _cc
+                        _buttons_on = _cc.confirm_buttons_enabled()
+                    except Exception:  # noqa: BLE001
+                        _buttons_on = False
+                    _hint = ("Tap a button below, or react 👍 to attach · 👎 to skip"
+                             if _buttons_on else "👍 attach this thread  ·  👎 skip")
                     dm_text = (
                         f":email: *Ambiguous email match — confirm attachment*\n\n"
                         f"*Subject:* {subject}\n"
                         f"*Contact:* {cname}\n"
                         f"*Deal:* <{deal_url}|Open in HubSpot>\n\n"
-                        f"Tap a button below, or react 👍 to attach · 👎 to skip"
+                        f"{_hint}"
                     )
                     # Minted BEFORE the post so the buttons can carry it.
                     pending_id = f"hsmatch-{uuid.uuid4().hex[:12]}"
                     try:
-                        from cora import confirm_cards as _cc
                         blocks = (build_match_blocks(dm_text, pending_id)
-                                  if _cc.confirm_buttons_enabled() else None)
+                                  if _buttons_on else None)
                     except Exception:  # noqa: BLE001 -- a card issue never blocks the DM
                         blocks = None
                     msg_ts = _dm_user_with_ts(slack_uid, dm_text, blocks)
