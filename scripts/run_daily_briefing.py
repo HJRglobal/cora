@@ -55,6 +55,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -74,6 +75,8 @@ from cora.org_roles import RoleRecord  # noqa: E402
 # Plate section builders -- SHARED with the whats_on_my_plate tool
 # (tool_dispatch). Reused, not forked: any fix to plate scoping/fail-soft
 # behavior applies to the briefing automatically.
+from cora import briefing_enrollment  # noqa: E402
+from cora import confirm_cards  # noqa: E402
 from cora.tools.tool_dispatch import (  # noqa: E402
     _HARRISON_SLACK_ID,
     _plate_asana_section,
@@ -106,7 +109,10 @@ _BRIEFING_STALE_OVERDUE_DAYS = 90
 
 # Review-driven enablement state (who Harrison has thumbed up/down, plus the
 # review messages still awaiting his reaction).
-_DELIVERY_STATE_PATH  = _REPO_ROOT / "data" / "state" / "briefing-delivery.json"
+# Sourced from the shared module so the script and the bot's Enable/Skip handler
+# can never drift onto two different files (S6 migration 1). Tests still redirect
+# THIS name to a tmp path; the module keeps its own default for the bot.
+_DELIVERY_STATE_PATH  = briefing_enrollment.STATE_PATH
 _THUMBS_UP            = {"+1", "thumbsup"}
 _THUMBS_DOWN          = {"-1", "thumbsdown"}
 _PENDING_MAX_AGE_DAYS = 30
@@ -200,28 +206,16 @@ def _load_briefing_roster() -> tuple[list[RoleRecord], list[str]]:
 
 # ---- Delivery enablement state (Harrison's review verdicts) --------------------
 
+# S6 migration 1: the state I/O moved into cora.briefing_enrollment so the
+# scheduled script and the bot's Enable/Skip button handler share ONE
+# implementation (atomic tmp+replace save, one lock, one schema). These thin
+# wrappers keep the script's call sites unchanged.
 def _load_delivery_state() -> dict:
-    try:
-        raw = json.loads(_DELIVERY_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    return {
-        "enabled": dict(raw.get("enabled") or {}),
-        "declined": dict(raw.get("declined") or {}),
-        "pending_reviews": list(raw.get("pending_reviews") or []),
-    }
+    return briefing_enrollment.load_state(_DELIVERY_STATE_PATH)
 
 
 def _save_delivery_state(state: dict) -> None:
-    try:
-        _DELIVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _DELIVERY_STATE_PATH.write_text(
-            json.dumps(state, indent=2), encoding="utf-8"
-        )
-    except OSError as exc:
-        log.warning("Could not persist briefing delivery state: %s", exc)
+    briefing_enrollment.save_state(state, _DELIVERY_STATE_PATH)
 
 
 # ---- Single-instance run lock (double-fire guard) ------------------------------
@@ -614,11 +608,16 @@ def _compose_review_header(
 
 
 def _compose_review_message(rec: RoleRecord, text: str) -> str:
+    """The review body. Copy names BOTH affordances (S6 migration 1): the buttons
+    act immediately, the reactions are resolved at the next run. The reaction
+    sentence is never removed -- buttons are ADDITIVE (locked pattern rule), so
+    the message must stay accurate if Slack interactivity is ever off."""
     first = rec.name.split()[0]
     return (
         f"WOULD-BE BRIEFING -- {rec.name} ({rec.role}, {rec.entity})\n"
-        f"React :+1: on THIS message to start delivering this briefing to {first} "
-        f"each weekday. React :-1: to drop {first} from review.\n\n{text}"
+        f"Tap *Enable delivery* to start sending this briefing to {first} each "
+        f"weekday, or *Skip* to drop {first} from review. Reacting :+1: / :-1: "
+        f"still works too (picked up at the next run).\n\n{text}"
     )
 
 
@@ -635,7 +634,14 @@ def _send_review_messages(
     """
     errors = 0
     for rec, text in items:
-        ts = _post_returning_ts(client, dest, _compose_review_message(rec, text))
+        # Opaque per-message handle: the button value. Minted BEFORE the post so
+        # the blocks can carry it, and stored on the pending entry so a tap
+        # resolves back to (sid, name) server-side.
+        review_id = f"brev-{uuid.uuid4().hex[:12]}"
+        body = _compose_review_message(rec, text)
+        blocks = (briefing_enrollment.build_review_blocks(body, review_id)
+                  if confirm_cards.confirm_buttons_enabled() else None)
+        ts = _post_returning_ts(client, dest, body, blocks=blocks)
         if ts:
             state["pending_reviews"] = [
                 p for p in state["pending_reviews"] if p.get("sid") != rec.slack_id
@@ -645,6 +651,7 @@ def _send_review_messages(
                 "name": rec.name,
                 "channel": dest,
                 "ts": ts,
+                "review_id": review_id,
                 "sent_at": time.time(),
             })
         else:
@@ -672,9 +679,15 @@ def _send_message(client: SlackWebClient, channel: str, text: str) -> bool:
         return False
 
 
-def _post_returning_ts(client: SlackWebClient, channel: str, text: str) -> str | None:
+def _post_returning_ts(client: SlackWebClient, channel: str, text: str,
+                       *, blocks: list[dict] | None = None) -> str | None:
+    """Post and return the ts. `text` stays the notification fallback even when
+    blocks render the body, so a card-less client still shows the briefing."""
     try:
-        resp = client.chat_postMessage(channel=channel, text=text)
+        kwargs: dict = {"channel": channel, "text": text}
+        if blocks:
+            kwargs["blocks"] = blocks
+        resp = client.chat_postMessage(**kwargs)
         return str(resp.get("ts") or "") or None
     except SlackApiError as exc:
         log.warning("Failed to send message to %s: %s", channel, exc.response)

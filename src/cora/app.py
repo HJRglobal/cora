@@ -16,6 +16,7 @@ from .claude_client import (
     user_facing_message,
 )
 from . import active_thread_store
+from . import briefing_enrollment
 from . import channel_classifier
 from . import channel_content_guard
 from . import confirm_cards
@@ -3520,6 +3521,95 @@ def _handle_autowrite_revert(body, client) -> None:
 def handle_autowrite_revert(ack, body, client) -> None:
     ack()
     _handle_autowrite_revert(body, client)
+
+
+# ── Daily-briefing enrollment one-tap (S6 migration 1, 2026-08-09) ───────────
+# Enable/Skip on the "WOULD-BE BRIEFING" review DMs. Before this, enrolling a
+# teammate meant reacting :+1: and WAITING for the next 7:30am fire to resolve
+# it -- the button applies the same verdict immediately.
+#
+# The reaction path is untouched and permanent (locked pattern rule: buttons are
+# ADDITIVE). Idempotency between the two comes from the shared pending-review
+# list: a tap CONSUMES the entry, and the script's reaction resolver only acts on
+# entries still in that list, so tapping and then reacting cannot double-apply.
+#
+# All correctness (Harrison-only gate, atomic read-modify-write, consumption)
+# lives in briefing_enrollment.process_enrollment_tap; this wrapper is Slack I/O.
+
+def _handle_briefing_enrollment_tap(body: dict, client, *, enable: bool) -> None:
+    try:
+        actions = body.get("actions") or []
+        review_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        # Read-only harness (missed-message catch-up) must never mutate
+        # enrollment -- same gate every other write surface carries.
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            # Kill-switch parity: with buttons off these cards are never posted,
+            # but a card rendered BEFORE a flip-and-restart can still be tapped.
+            # Refuse and name the fallback that still works.
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("Buttons are turned off right now -- react :+1: "
+                              "or :-1: on the message instead."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        outcome, msg = briefing_enrollment.process_enrollment_tap(
+            review_id, actor_id, enable=enable)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled"):
+            # None of these may edit the shared card. not_authorized must not
+            # rewrite Harrison's DM on a stranger's tap; already_handled is the
+            # fast RACE LOSER of two taps on one card, and the winner's own edit
+            # is the authoritative one (the D-051 terminal-edit race rule).
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # Unique winner: keep the briefing body, drop the buttons, append the
+        # outcome. Section blocks carry the body across several chunks, so they
+        # are all preserved (dropping to a single block would delete most of the
+        # briefing Harrison just reviewed).
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("briefing enrollment: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("briefing enrollment handler error (non-fatal)", exc_info=True)
+
+
+@app.action(briefing_enrollment.ACTION_ENABLE)
+def handle_briefing_enable(ack, body, client) -> None:
+    ack()
+    _handle_briefing_enrollment_tap(body, client, enable=True)
+
+
+@app.action(briefing_enrollment.ACTION_SKIP)
+def handle_briefing_skip(ack, body, client) -> None:
+    ack()
+    _handle_briefing_enrollment_tap(body, client, enable=False)
+
+
 
 
 # ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
