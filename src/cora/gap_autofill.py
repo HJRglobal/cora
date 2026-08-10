@@ -1244,19 +1244,30 @@ def escalate_gap(gap: dict[str, Any], slack_client: Any) -> dict[str, Any] | Non
         f"> {gap.get('question', '')[:400]}\n\n"
         f"What I couldn't answer: _{gap.get('gap', '')[:300]}_\n\n"
         "If you know the answer, *reply to this message* (a thread reply is "
-        "best) and I'll route it for approval. If it's not your area, just say so."
+        "best) and I'll route it for approval. If it's not your area, tap a "
+        "button below or just say so."
     )
+    # Minted BEFORE the post so the buttons can carry it (S6 migration 2).
+    ask_id = f"gapask-{uuid.uuid4().hex[:12]}"
+    try:
+        from . import confirm_cards as _cc
+        blocks = (build_ask_blocks(text, ask_id)
+                  if _cc.confirm_buttons_enabled() else None)
+    except Exception:  # noqa: BLE001 -- a card problem must never block the ask
+        blocks = None
     try:
         open_resp = slack_client.conversations_open(users=[owner])
         dm_channel = open_resp["channel"]["id"]
-        post = slack_client.chat_postMessage(
-            channel=dm_channel, text=text, unfurl_links=False, unfurl_media=False,
-        )
+        post_kwargs = {"channel": dm_channel, "text": text,
+                       "unfurl_links": False, "unfurl_media": False}
+        if blocks:
+            post_kwargs["blocks"] = blocks
+        post = slack_client.chat_postMessage(**post_kwargs)
     except Exception as exc:
         log.warning("gap_autofill: escalation DM to %s failed: %s", owner, exc)
         return None
     ask = {
-        "ask_id": f"gapask-{uuid.uuid4().hex[:12]}",
+        "ask_id": ask_id,
         "gap_ts": gap.get("ts", ""),
         "entity": gap.get("entity", "FNDR"),
         "question": gap.get("question", ""),
@@ -1394,6 +1405,101 @@ _DECLINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+DECLINE_ACK = "No problem -- thanks for letting me know. I'll find another route."
+
+
+def _mark_declined(stored: dict[str, Any], *, via: str) -> None:
+    """The DECLINED state transition, shared by the typed reply and the button.
+
+    Extracted so the two paths cannot drift: the S6 buttons must resolve a
+    pending ask EXACTLY as the decline-phrase regex does (kickoff wording), and
+    the only way to guarantee that over time is for both to run this code.
+    `via` is additive audit metadata; nothing branches on it."""
+    stored["state"] = "DECLINED"
+    stored["replied_at"] = _now_iso()
+    stored["declined_via"] = via
+
+
+# ── Decline buttons on the escalation DM (S6 migration 2, 2026-08-09) ────────
+# DECLINE ONLY, deliberately. The typed reply REMAINS the answer mechanism --
+# a gap answer is free prose and no button can carry it. What buttons remove is
+# the friction on the one response that IS enumerable: "this isn't mine". There
+# is no answer-via-button and there must never be one.
+ACTION_DECLINE_NOT_MINE = "cora_gap_decline_not_mine"
+ACTION_DECLINE_UNKNOWN = "cora_gap_decline_unknown"
+
+# Slack section-text limit is 3000; the ask body is bounded by construction
+# (question capped at 400, gap at 300) so one section always suffices.
+_ASK_SECTION_CHARS = 2900
+
+
+def build_ask_blocks(body_text: str, ask_id: str) -> list[dict]:
+    """(blocks) for one gap-escalation DM: the ask + two decline buttons.
+
+    Values are the ask_id, which is already an opaque minted handle
+    (`gapask-<hex12>`) and never a payload. Body is sanitize_text-wrapped at
+    construction -- Block Kit bodies bypass the class-level WebClient egress
+    patch, which only covers `text=` (D-168)."""
+    text = body_text or ""
+    try:
+        from .slack_egress import sanitize_text
+        text = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
+        pass
+    return [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": text[:_ASK_SECTION_CHARS]}},
+        {"type": "actions",
+         "block_id": f"cora_gap_ask_actions_{ask_id}"[:255],
+         "elements": [
+             {"type": "button", "action_id": ACTION_DECLINE_NOT_MINE,
+              "text": {"type": "plain_text", "text": "Not my area"},
+              "value": ask_id},
+             {"type": "button", "action_id": ACTION_DECLINE_UNKNOWN,
+              "text": {"type": "plain_text", "text": "I don't know"},
+              "value": ask_id},
+         ]},
+    ]
+
+
+def process_decline_tap(ask_id: str, actor_id: str, *, reason: str = "not_mine"
+                        ) -> tuple[str, str]:
+    """Apply a decline-button tap. Returns (outcome, message).
+
+    Outcomes: declined | not_authorized | orphaned | already_handled | expired.
+
+    ADDRESSEE-ONLY authorization: only the person the ask was sent to may
+    decline it. The ask lives in a 1:1 DM so in practice nobody else can tap --
+    but a decline sends the gap back to the digest flow, and letting a third
+    party trigger that from a forged payload is a denial-of-answer.
+
+    The whole read-modify-write runs under _ASKS_LOCK so two fast taps cannot
+    both see PENDING (`save_pending_asks` takes the same non-reentrant lock, so
+    the underlying _write_json is used directly here)."""
+    if not ask_id or not actor_id:
+        return "orphaned", "I don't have a record of that question anymore."
+
+    with _ASKS_LOCK:
+        asks = _read_json(_pending_asks_path(), {})
+        stored = asks.get(ask_id)
+        if not stored:
+            return "orphaned", "I don't have a record of that question anymore."
+        if stored.get("target_user_id") != actor_id:
+            return "not_authorized", "Only the person I asked can answer this one."
+        if stored.get("state") != "PENDING":
+            return "already_handled", "Thanks -- that one's already resolved."
+        if _ask_expired(stored):
+            # Honest tombstone (D-095): the ask aged out, so nothing changes.
+            return "expired", ("That question expired before you got to it -- "
+                               "nothing to do.")
+        _mark_declined(stored, via=f"button:{reason}")
+        asks[ask_id] = stored
+        _write_json(_pending_asks_path(), asks)
+
+    log.info("gap_autofill: ask %s DECLINED via button (%s) by %s",
+             ask_id, reason, actor_id)
+    return "declined", DECLINE_ACK
+
 
 def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
     """Capture a teammate's DM reply to a gap ask. Returns the ack message.
@@ -1406,11 +1512,10 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
     stored = asks.get(ask.get("ask_id", ""), ask)
 
     if _DECLINE_RE.match(reply_text):
-        stored["state"] = "DECLINED"
-        stored["replied_at"] = _now_iso()
+        _mark_declined(stored, via="reply")
         asks[stored["ask_id"]] = stored
         save_pending_asks(asks)
-        return "No problem -- thanks for letting me know. I'll find another route."
+        return DECLINE_ACK
 
     # 3-predicate union (D-051, 2026-08-06). is_lex_billing_status_phi was
     # MISSING here -- the D-050 admin class that exists precisely for LEX.

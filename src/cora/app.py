@@ -3610,6 +3610,69 @@ def handle_briefing_skip(ack, body, client) -> None:
     _handle_briefing_enrollment_tap(body, client, enable=False)
 
 
+def _handle_gap_decline_tap(body: dict, client, *, reason: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        ask_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("Buttons are turned off right now -- just reply "
+                              "\"not my area\" and I'll pick it up."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        outcome, msg = gap_autofill.process_decline_tap(
+            ask_id, actor_id, reason=reason)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled"):
+            # Never edit the shared card: not_authorized is a stranger's tap,
+            # already_handled is the fast race loser of two taps (the winner
+            # owns the outcome text -- D-051 terminal-edit rule).
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # declined | expired: the unique winner closes its own card.
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("gap decline: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("gap decline handler error (non-fatal)", exc_info=True)
+
+
+@app.action(gap_autofill.ACTION_DECLINE_NOT_MINE)
+def handle_gap_decline_not_mine(ack, body, client) -> None:
+    ack()
+    _handle_gap_decline_tap(body, client, reason="not_mine")
+
+
+@app.action(gap_autofill.ACTION_DECLINE_UNKNOWN)
+def handle_gap_decline_unknown(ack, body, client) -> None:
+    ack()
+    _handle_gap_decline_tap(body, client, reason="unknown")
 
 
 # ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
