@@ -27,7 +27,9 @@ import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import yaml
@@ -171,8 +173,12 @@ def _dm_user(slack_user_id: str, text: str) -> None:
     _dm_user_with_ts(slack_user_id, text)
 
 
-def _dm_user_with_ts(slack_user_id: str, text: str) -> str | None:
-    """Send a Slack DM and return the message_ts (needed to track reactions)."""
+def _dm_user_with_ts(slack_user_id: str, text: str,
+                     blocks: list[dict] | None = None) -> str | None:
+    """Send a Slack DM and return the message_ts (needed to track reactions).
+
+    `text` stays the notification fallback when blocks render the body, so a
+    client that cannot render Block Kit still shows the match question."""
     from slack_sdk import WebClient  # type: ignore[import]
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not bot_token:
@@ -182,8 +188,11 @@ def _dm_user_with_ts(slack_user_id: str, text: str) -> str | None:
     try:
         dm = client.conversations_open(users=[slack_user_id])
         channel = dm["channel"]["id"]
-        resp = client.chat_postMessage(channel=channel, text=text,
-                                       unfurl_links=False, unfurl_media=False)
+        kwargs = {"channel": channel, "text": text,
+                  "unfurl_links": False, "unfurl_media": False}
+        if blocks:
+            kwargs["blocks"] = blocks
+        resp = client.chat_postMessage(**kwargs)
         return resp.get("ts")
     except Exception as exc:
         log.warning("DM failed to %s: %s", slack_user_id, exc)
@@ -209,6 +218,101 @@ def _save_pending(pending: dict) -> None:
     _PENDING_PATH.write_text(json.dumps(pending, indent=2), encoding="utf-8")
 
 
+# ── Attach/Skip buttons (S6 migration 3, 2026-08-09) ────────────────────────
+# The ambiguous-match DM was 👍/👎-only. Buttons are ADDITIVE: the reaction
+# handler in app.py is untouched and stays the permanent fallback.
+ACTION_ATTACH = "cora_hubspot_attach"
+ACTION_SKIP = "cora_hubspot_skip"
+
+# Serialises the read-modify-write of the pending file WITHIN this process, so
+# two fast taps cannot both pop the same entry and attach the thread twice.
+# CROSS-PROCESS residual (pre-existing, unchanged by this migration): the sync
+# script writes this same file from its scheduled run, and a tap landing inside
+# that run's read-modify-write window can still be lost. The reaction path has
+# always had the identical exposure; closing it needs an OS-level file lock
+# across both processes, which is a bigger change than this migration.
+_PENDING_LOCK = RLock()
+
+_MATCH_SECTION_CHARS = 2900
+
+
+def build_match_blocks(body_text: str, pending_id: str) -> list[dict]:
+    """(blocks) for one ambiguous-match DM: the question + Attach/Skip.
+
+    Value is the opaque pending_id, never the deal/contact ids (design
+    invariant #1 -- button values land in Slack payload logs). Body is
+    sanitize_text-wrapped at construction: Block Kit bodies bypass the
+    class-level WebClient egress patch, which only covers text= (D-168)."""
+    text = body_text or ""
+    try:
+        from cora.slack_egress import sanitize_text
+        text = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
+        pass
+    return [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": text[:_MATCH_SECTION_CHARS]}},
+        {"type": "actions",
+         "block_id": f"cora_hubspot_match_actions_{pending_id}"[:255],
+         "elements": [
+             {"type": "button", "action_id": ACTION_ATTACH, "style": "primary",
+              "text": {"type": "plain_text", "text": "Attach thread"},
+              "value": pending_id},
+             {"type": "button", "action_id": ACTION_SKIP,
+              "text": {"type": "plain_text", "text": "Skip"},
+              "value": pending_id},
+         ]},
+    ]
+
+
+def find_pending_by_id(pending_id: str) -> tuple[str, dict] | None:
+    """(message_ts, entry) for an opaque pending_id, or None.
+
+    The store stays keyed by message_ts -- that is what the reaction path looks
+    up and it must keep working untouched -- so the id is carried INSIDE the
+    entry and resolved by scan. The file holds a handful of entries."""
+    if not pending_id:
+        return None
+    for ts, entry in _load_pending().items():
+        if isinstance(entry, dict) and entry.get("pending_id") == pending_id:
+            return ts, entry
+    return None
+
+
+def process_match_tap(pending_id: str, actor_id: str, *, attach: bool
+                      ) -> tuple[str, str]:
+    """Apply an Attach/Skip tap. Returns (outcome, message).
+
+    Outcomes: attached | skipped | not_authorized | orphaned.
+
+    REQUESTER-SCOPED: only the mailbox owner the DM was sent to may act. The DM
+    is 1:1 so in practice nobody else can tap, but attaching an email thread to
+    a CRM record on someone else's behalf is a real write and must not rest on
+    the surface happening to be private.
+
+    Apply-first-then-resolve (D-098) is inherited from resolve_pending_reaction,
+    which pops the entry and then performs the HubSpot writes."""
+    if not pending_id or not actor_id:
+        return "orphaned", "I don't have a record of that match anymore."
+
+    with _PENDING_LOCK:
+        found = find_pending_by_id(pending_id)
+        if not found:
+            return "orphaned", "I don't have a record of that match anymore."
+        message_ts, entry = found
+        if entry.get("slack_user_id") and entry["slack_user_id"] != actor_id:
+            return "not_authorized", "Only the mailbox owner can act on this one."
+        ok = resolve_pending_reaction(message_ts, approved=attach)
+
+    if not ok:
+        # The entry vanished between the scan and the pop -- a racing tap or the
+        # reaction path got there first. Idempotent ack, never a false success.
+        return "orphaned", "That one was already handled."
+    if attach:
+        return "attached", ":white_check_mark: Attached -- the thread is on the HubSpot deal."
+    return "skipped", ":x: Skipped -- the thread won't be attached."
+
+
 def _store_pending_reaction(
     message_ts: str,
     thread_id: str,
@@ -218,6 +322,8 @@ def _store_pending_reaction(
     contact_name: str,
     deal_ids: list,
     messages: list,
+    slack_user_id: str = "",
+    pending_id: str = "",
 ) -> None:
     pending = _load_pending()
     # Compact message storage — keep only what log_email_engagement needs
@@ -239,6 +345,10 @@ def _store_pending_reaction(
         "contact_name": contact_name,
         "deal_ids": deal_ids,
         "messages": compact_msgs,
+        # S6 migration 3: who may tap (the DM recipient -- `owner_id` above is a
+        # HUBSPOT owner id, not a Slack user), and the opaque button handle.
+        "slack_user_id": slack_user_id,
+        "pending_id": pending_id,
     }
     _save_pending(pending)
 
@@ -443,9 +553,17 @@ def sync_user(
                         f"*Subject:* {subject}\n"
                         f"*Contact:* {cname}\n"
                         f"*Deal:* <{deal_url}|Open in HubSpot>\n\n"
-                        f"👍 attach this thread  ·  👎 skip"
+                        f"Tap a button below, or react 👍 to attach · 👎 to skip"
                     )
-                    msg_ts = _dm_user_with_ts(slack_uid, dm_text)
+                    # Minted BEFORE the post so the buttons can carry it.
+                    pending_id = f"hsmatch-{uuid.uuid4().hex[:12]}"
+                    try:
+                        from cora import confirm_cards as _cc
+                        blocks = (build_match_blocks(dm_text, pending_id)
+                                  if _cc.confirm_buttons_enabled() else None)
+                    except Exception:  # noqa: BLE001 -- a card issue never blocks the DM
+                        blocks = None
+                    msg_ts = _dm_user_with_ts(slack_uid, dm_text, blocks)
                     if msg_ts:
                         _store_pending_reaction(
                             message_ts=msg_ts,
@@ -456,6 +574,8 @@ def sync_user(
                             contact_name=cname,
                             deal_ids=open_ids,
                             messages=messages,
+                            slack_user_id=slack_uid,
+                            pending_id=pending_id,
                         )
                         stats["dm_sent"] += 1
             _mark_thread_skipped(thread_id, "ambiguous_active", skipped)

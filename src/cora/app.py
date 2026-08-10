@@ -17,6 +17,7 @@ from .claude_client import (
 )
 from . import active_thread_store
 from . import briefing_enrollment
+from .connectors import hubspot_email_sync
 from . import channel_classifier
 from . import channel_content_guard
 from . import confirm_cards
@@ -3673,6 +3674,76 @@ def handle_gap_decline_not_mine(ack, body, client) -> None:
 def handle_gap_decline_unknown(ack, body, client) -> None:
     ack()
     _handle_gap_decline_tap(body, client, reason="unknown")
+
+
+# ── HubSpot email-sync ambiguous match (S6 migration 3, 2026-08-09) ──────────
+# Attach/Skip on the ambiguous-match DM. The 👍/👎 reaction handler above is
+# untouched and stays the permanent fallback (locked pattern rule).
+#
+# Authorization is REQUESTER-SCOPED (the mailbox owner the DM went to), checked
+# in hubspot_email_sync.process_match_tap against the real action-payload user.
+
+def _handle_hubspot_match_tap(body: dict, client, *, attach: bool) -> None:
+    try:
+        actions = body.get("actions") or []
+        pending_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("Buttons are turned off right now -- react "
+                              ":+1: to attach or :-1: to skip instead."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        from .connectors import hubspot_email_sync as _hes
+        outcome, msg = _hes.process_match_tap(pending_id, actor_id, attach=attach)
+
+        if outcome in ("not_authorized", "orphaned"):
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("hubspot match: chat_update failed: %s", exc)
+        log.info("email_sync: button %s on pending=%s by %s",
+                 "ATTACH" if attach else "SKIP", pending_id, actor_id)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("hubspot match handler error (non-fatal)", exc_info=True)
+
+
+@app.action(hubspot_email_sync.ACTION_ATTACH)
+def handle_hubspot_match_attach(ack, body, client) -> None:
+    ack()
+    _handle_hubspot_match_tap(body, client, attach=True)
+
+
+@app.action(hubspot_email_sync.ACTION_SKIP)
+def handle_hubspot_match_skip(ack, body, client) -> None:
+    ack()
+    _handle_hubspot_match_tap(body, client, attach=False)
 
 
 # ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
