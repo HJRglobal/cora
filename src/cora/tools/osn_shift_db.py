@@ -326,6 +326,26 @@ def approve_schedule(schedule_id: str, approved_by: str) -> bool:
     return result.rowcount > 0
 
 
+def approve_schedule_if_pending(schedule_id: str, approved_by: str) -> bool:
+    """Compare-and-swap approve: only flips a schedule that is STILL awaiting
+    approval, and returns True to exactly one caller (S6 migration 3).
+
+    approve_schedule() above is an unconditional UPDATE, so two taps on one card
+    would both report success and the second would overwrite approved_by. The
+    button needs a real claim; the REACTION path deliberately keeps calling the
+    unconditional version so its behavior is unchanged by this migration."""
+    conn = _connect()
+    result = conn.execute(
+        "UPDATE osn_schedules SET status = 'approved', approved_by = ?, "
+        "approved_at = ? WHERE schedule_id = ? "
+        "AND status IN ('draft', 'pending_approval')",
+        (approved_by, int(time.time()), schedule_id),
+    )
+    conn.commit()
+    conn.close()
+    return result.rowcount > 0
+
+
 def publish_schedule(schedule_id: str) -> bool:
     conn = _connect()
     result = conn.execute(

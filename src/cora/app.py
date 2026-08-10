@@ -3746,6 +3746,71 @@ def handle_hubspot_match_skip(ack, body, client) -> None:
     _handle_hubspot_match_tap(body, client, attach=False)
 
 
+# ── OSN shift-schedule approve button (S6 migration 4, 2026-08-09) ───────────
+# The ✅ reaction handler above is untouched and stays the permanent fallback.
+#
+# AUTHORITY-SCOPED, not requester-scoped: osn_shift_handler._is_admin, the same
+# gate the reaction path uses, applied to the real action-payload user.
+#
+# The button APPROVES ONLY -- it does not publish. See the note on
+# osn_shift_handler.ACTION_APPROVE: publishing DMs every active employee and is
+# a separate admin command the reaction path has never performed either.
+
+def _handle_osn_approve_tap(body: dict, client) -> None:
+    try:
+        actions = body.get("actions") or []
+        schedule_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("Buttons are turned off right now -- react "
+                              ":white_check_mark: on the schedule instead."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        outcome, msg = osn_shift_handler.process_schedule_approval_tap(
+            schedule_id, actor_id)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled"):
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            section_blocks = [b for b in orig if b.get("type") == "section"]
+            new_blocks = section_blocks + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not section_blocks:
+                new_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("osn approve: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("osn approve handler error (non-fatal)", exc_info=True)
+
+
+@app.action(osn_shift_handler.ACTION_APPROVE)
+def handle_osn_schedule_approve(ack, body, client) -> None:
+    ack()
+    _handle_osn_approve_tap(body, client)
+
+
 # ── Missed-Message Catch-Up one-tap (Send / Skip / Edit) ─────────────────────────
 # Mirrors the knowledge one-tap contract: ack() immediately, then delegate; ALL
 # correctness (Harrison gate, idempotency, apply-then-record, re-guard-at-post)

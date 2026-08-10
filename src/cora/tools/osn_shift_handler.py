@@ -743,15 +743,22 @@ def _post_approval_card(sched, formatted: str, warnings: list, channel_id: str, 
         f"*OSN Schedule Draft — week of {sched.week_start}*\n"
         f"Schedule ID: `{sched.schedule_id[:8]}`\n\n"
         f"{formatted}{warn_section}\n\n"
-        f"*React ✅ on this message to approve, or reply `approve schedule {sched.schedule_id[:8]}` below.*"
+        f"*Tap Approve below, react ✅ on this message, or reply "
+        f"`approve schedule {sched.schedule_id[:8]}`.*"
     )
     try:
-        resp = client.chat_postMessage(
-            channel=channel_id,
-            text=card,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        blocks = None
+        try:
+            from .. import confirm_cards as _cc
+            if _cc.confirm_buttons_enabled():
+                blocks = build_approval_blocks(card, sched.schedule_id)
+        except Exception:  # noqa: BLE001 -- a card issue never blocks the card post
+            blocks = None
+        post_kwargs = {"channel": channel_id, "text": card,
+                       "unfurl_links": False, "unfurl_media": False}
+        if blocks:
+            post_kwargs["blocks"] = blocks
+        resp = client.chat_postMessage(**post_kwargs)
         # Store approval card ts in schedule notes for reaction lookup
         card_ts = resp.get("ts", "")
         card_channel = resp.get("channel", channel_id)
@@ -913,3 +920,79 @@ def _is_admin(slack_user_id: str) -> bool:
         # No admin list configured — allow any user (open mode for initial setup)
         return True
     return slack_user_id in _ADMIN_USER_IDS
+
+
+# ── Approve button (S6 migration 4, 2026-08-09) ─────────────────────────────
+# The ✅ reaction path is untouched and stays the permanent fallback (locked
+# pattern rule: buttons are ADDITIVE).
+#
+# VERIFY-FIRST correction to the kickoff, which specified an "Approve & publish"
+# button: the ✅ reaction APPROVES ONLY. Publishing is a separate admin command
+# (`publish schedule <id>`) that DMs EVERY active employee their shifts -- an
+# irreversible fan-out to N people that the reaction has never done. A button
+# labelled "Approve & publish" that only approved would be a card that lies; one
+# that actually published would hand a single tap far more authority than the
+# affordance it mirrors. So the button does exactly what the reaction does, and
+# says so, keeping the same two-step flow.
+ACTION_APPROVE = "cora_osn_schedule_approve"
+
+_APPROVAL_SECTION_CHARS = 2900
+
+
+def build_approval_blocks(body_text: str, schedule_id: str) -> list[dict]:
+    """(blocks) for the schedule approval card: the schedule + an Approve button.
+
+    Value is the schedule_id -- a minted uuid handle, not a payload. Authority
+    is enforced server-side by _is_admin, exactly as the reaction path does, so
+    a replayed value still cannot approve for a non-admin. Body is
+    sanitize_text-wrapped at construction (D-168)."""
+    text = body_text or ""
+    try:
+        from ..slack_egress import sanitize_text
+        text = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- sanitizer is a belt, never a blocker
+        pass
+    return [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": text[:_APPROVAL_SECTION_CHARS]}},
+        {"type": "actions",
+         "block_id": f"cora_osn_approve_actions_{schedule_id}"[:255],
+         "elements": [
+             {"type": "button", "action_id": ACTION_APPROVE, "style": "primary",
+              "text": {"type": "plain_text", "text": "Approve schedule"},
+              "value": schedule_id},
+         ]},
+    ]
+
+
+def process_schedule_approval_tap(schedule_id: str, actor_id: str
+                                  ) -> tuple[str, str]:
+    """Apply an Approve-button tap. Returns (outcome, message).
+
+    Outcomes: approved | not_authorized | orphaned | already_handled.
+
+    AUTHORITY-SCOPED (not requester-scoped): the same _is_admin check the ✅
+    reaction path uses, against the real action-payload user. Unlike the
+    reaction path -- which returns None and silently does nothing for a
+    non-admin -- the tap tells the tapper it was refused, because a button that
+    appears to do nothing reads as broken."""
+    if not schedule_id or not actor_id:
+        return "orphaned", "I can't find that schedule anymore."
+    if not _is_admin(actor_id):
+        return "not_authorized", "Only OSN scheduling admins can approve schedules."
+
+    sched = get_schedule(schedule_id)
+    if not sched:
+        return "orphaned", "I can't find that schedule anymore."
+
+    from .osn_shift_db import approve_schedule_if_pending
+    if not approve_schedule_if_pending(schedule_id, actor_id):
+        # Already approved/published, by an earlier tap or the ✅ reaction.
+        return "already_handled", (
+            f"Schedule `{schedule_id[:8]}` was already approved -- no change made.")
+
+    log.info("osn_shift_handler: schedule %s APPROVED via button by %s",
+             schedule_id[:8], actor_id)
+    return "approved", (
+        f"✅ Schedule `{schedule_id[:8]}` for week of *{sched.week_start}* approved!\n"
+        f"Use `@Cora publish schedule {schedule_id[:8]}` to notify employees.")
