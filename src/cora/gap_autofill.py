@@ -1332,6 +1332,25 @@ def match_pending_ask(
     return None
 
 
+def has_live_ask(user_id: str) -> bool:
+    """True when this user has ANY unexpired PENDING ask.
+
+    Distinct from match_pending_ask(user_id, None), which returns the ask only
+    when there is EXACTLY ONE (its top-level branch is deliberately refused on
+    ambiguity). Callers that need to know "is a typed answer already spoken
+    for?" -- e.g. the knowledge check, which must not also claim a top-level DM
+    when a gap ask is outstanding -- need presence, not uniqueness.
+    """
+    try:
+        return any(a.get("state") == "PENDING"
+                   and a.get("target_user_id") == user_id
+                   and not _ask_expired(a)
+                   for a in load_pending_asks().values())
+    except Exception:  # noqa: BLE001 -- routing must never break on a state read
+        log.warning("gap_autofill: has_live_ask failed", exc_info=True)
+        return False
+
+
 def is_shift_keyword(text: str) -> bool:
     """True if a DM looks like an OSN shift-scheduler command, not a gap answer."""
     t = (text or "").lower().strip()

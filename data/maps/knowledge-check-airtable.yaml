@@ -1,0 +1,50 @@
+# Org Remodel Tracker -- Training Log write map for the daily knowledge check.
+#
+# WHY FIELD IDS, NOT NAMES: writes against this base 400 on field NAMES, so every
+# key below is the immutable field ID. Names are carried only as comments so a
+# human can read the map. IDs verified live 2026-08-11 via get_table_schema.
+#
+# WHY A MAP FILE AND NOT CONSTANTS IN CODE: if Harrison renames or re-adds a
+# field, this is a one-line data fix with no restart (the writer re-reads it), not
+# a code change + FF-merge + restart.
+#
+# THE WRITE IS OFF UNTIL A TOKEN EXISTS. The existing AIRTABLE_API_KEY is a
+# READ-ONLY PAT scoped to two dashboard bases and deliberately cannot reach this
+# one. Enabling the Training Log mirror needs a separate PAT with
+# data.records:write on appAUZSQOCTnCO8yi, in AIRTABLE_WRITE_API_KEY. Until then
+# the mirror is a logged no-op and the known-answers write -- the one that
+# matters -- still happens.
+
+base_id: appAUZSQOCTnCO8yi        # Org Remodel Tracker (Harrison-only)
+table_id: tbladeAQjMUlGOxhX       # Training Log
+
+fields:
+  session:   fldQwMNp2KeURi2aO    # "Session"            singleLineText (primary)
+  date:      fldF1rxPHiRNYu7q9    # "Date"               date
+  person:    fldkTSVceb5mDvcCD    # "Person / Role"      singleLineText
+  type:      fldxsG3r83eJ0SAit    # "Type"               singleSelect
+  outcome:   fldqjPtPxuuwTLCy8    # "Outcome"            multilineText
+  feeds:     fldzHW0S983lCJ8bU    # "Feeds"              singleSelect
+  logged_by: fldDqIrNp7Gn9A9iP    # "Logged By"          singleLineText
+
+# ---------------------------------------------------------------------------
+# SINGLE-SELECT OPTIONS -- READ THIS BEFORE ENABLING THE WRITE.
+#
+# `feeds_option` is an EXISTING option on the Feeds field (verified live), so it
+# writes cleanly and changes nothing about the base.
+#
+# `type_option` is NOT an existing option on the Type field. Its live options are:
+#   Screen-share / 1:1 training | Fireflies-recorded | One-pager delivered |
+#   Quick-start / manual | Drip
+# None of them describes a knowledge contribution, and the kickoff asks for
+# type = "knowledge-check". Because `typecast: true` is set on the write, the
+# FIRST successful row will CREATE this option on Harrison's Type field -- a
+# schema change to his base. That is called out here rather than done quietly:
+#   * to keep his schema untouched, set type_option to one of the five existing
+#     names above (closest in spirit: "Drip");
+#   * to accept the new option, leave it as-is.
+# Either way nothing happens until AIRTABLE_WRITE_API_KEY is set.
+# ---------------------------------------------------------------------------
+type_option: Knowledge check
+feeds_option: Cora KB
+logged_by: Cora (daily knowledge check)

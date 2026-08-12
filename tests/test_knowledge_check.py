@@ -767,6 +767,292 @@ def test_edit_keeps_the_cycle_live_for_a_reworded_answer():
 
 
 # ---------------------------------------------------------------------------
+# Layer B -- PROMOTE (known-answers write, TTL, collisions)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _ka_dir(tmp_path, monkeypatch):
+    d = tmp_path / "known-answers"
+    d.mkdir()
+    monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(d))
+    monkeypatch.delenv("AIRTABLE_WRITE_API_KEY", raising=False)
+    yield d
+
+
+def _cycle(tier=1, entity="OSN", question="How many PCI notices are open?",
+           answer="3 still open", user="U0B3PS7RFJA", cycle_id="kchk-a",
+           kpi="KPI 2 -- PCI closure"):
+    return {"cycle_id": cycle_id, "user": user, "date": "2026-08-11",
+            "entity": entity, "tier": tier, "item_key": "matt-pci-closure",
+            "question": question, "answer": answer, "kpi": kpi, "state": kc.STATE_CAPTURED}
+
+
+def test_promote_writes_an_attributed_entry(_ka_dir):
+    outcome, msg = kc.promote(_cycle(), today="2026-08-11")
+    assert outcome == "promoted", msg
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "Q: How many PCI notices are open?" in text
+    assert "A: 3 still open" in text
+    assert "Author: Matt Petrovich -- contributed via daily knowledge check" in text
+    assert "## Known facts" in text
+
+
+def test_tier1_entry_carries_a_real_machine_sweepable_expiry(_ka_dir):
+    kc.promote(_cycle(tier=1), today="2026-08-11")
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "<!-- kc-entry cycle=kchk-a expires=2026-08-18 -->" in text
+    assert "status snapshot, expires 2026-08-18" in text
+
+
+def test_tier2_entry_is_durable_with_no_expiry(_ka_dir):
+    kc.promote(_cycle(tier=2, kpi="open knowledge gap"), today="2026-08-11")
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "expires=never" in text
+    assert "contributed answer" in text
+
+
+def test_expired_tier1_entries_are_swept(_ka_dir):
+    """The TTL must actually remove stale status, not just label it -- otherwise
+    it accumulates forever in an always-injected file (D-087)."""
+    kc.promote(_cycle(), today="2026-08-11")
+    assert kc.expire_stale_answers(today="2026-08-17") == {}     # not yet lapsed
+    removed = kc.expire_stale_answers(today="2026-08-18")
+    assert removed == {"osn.md": 1}
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "kc-entry" not in text and "3 still open" not in text
+    assert "## Known facts" in text  # the file structure survives
+
+
+def test_the_sweep_never_touches_anything_it_did_not_write(_ka_dir):
+    other = ("# Known Answers\n\n## Routing rules\n\nsome rule\n\n## Known facts\n\n"
+             "**[2026-01-01] a gap-autofill answer** _(gap autofill -- mined from Slack)_\n"
+             "Q: who owns recon?\nA: Matt\n\n")
+    (_ka_dir / "osn.md").write_text(other, encoding="utf-8")
+    kc.promote(_cycle(), today="2026-08-11")
+    kc.expire_stale_answers(today="2026-09-01")
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "Q: who owns recon?" in text and "A: Matt" in text
+    assert "some rule" in text
+    assert "3 still open" not in text  # only ours went
+
+
+def test_tier2_entries_survive_the_sweep(_ka_dir):
+    kc.promote(_cycle(tier=2), today="2026-08-11")
+    assert kc.expire_stale_answers(today="2027-01-01") == {}
+    assert "3 still open" in (_ka_dir / "osn.md").read_text(encoding="utf-8")
+
+
+def test_sweep_dry_run_reports_without_writing(_ka_dir):
+    kc.promote(_cycle(), today="2026-08-11")
+    assert kc.expire_stale_answers(today="2026-08-20", dry_run=True) == {"osn.md": 1}
+    assert "3 still open" in (_ka_dir / "osn.md").read_text(encoding="utf-8")
+
+
+def test_a_live_contradiction_is_held_and_routed_not_written(_ka_dir, monkeypatch):
+    """Spec 4.5 / D-128: never silently overwrite. Detected in CODE."""
+    kc.promote(_cycle(cycle_id="kchk-a", answer="3 still open"), today="2026-08-11")
+    routed = {}
+    monkeypatch.setattr(kc, "route_collision_to_decisions",
+                        lambda c, a, e: routed.update({"answer": a, "existing": e}) or "kc-d")
+    outcome, msg = kc.promote(_cycle(cycle_id="kchk-b", answer="zero, all closed"),
+                              today="2026-08-12")
+    assert outcome == "held"
+    assert routed == {"answer": "zero, all closed", "existing": "3 still open"}
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "zero, all closed" not in text     # nothing written
+    assert "3 still open" in text             # canon intact
+
+
+def test_a_fresh_snapshot_after_expiry_is_not_a_collision(_ka_dir):
+    """Re-asking a KPI a week later produces the SAME key with a different
+    answer -- that is a fresh snapshot superseding a lapsed one, not a dispute."""
+    kc.promote(_cycle(cycle_id="kchk-a", answer="3 still open"), today="2026-08-11")
+    outcome, _ = kc.promote(_cycle(cycle_id="kchk-b", answer="1 still open"),
+                            today="2026-08-18")
+    assert outcome == "promoted"
+
+
+def test_an_identical_repeat_answer_is_not_a_collision(_ka_dir):
+    kc.promote(_cycle(cycle_id="kchk-a", answer="3 still open"), today="2026-08-11")
+    outcome, _ = kc.promote(_cycle(cycle_id="kchk-b", answer="3 still open."),
+                            today="2026-08-12")
+    assert outcome == "promoted"
+
+
+def test_collision_detects_a_contradiction_of_gap_autofills_own_answer(_ka_dir):
+    """The dispute rule must cover canon written by ANY producer, not just ours."""
+    (_ka_dir / "osn.md").write_text(
+        "# Known Answers\n\n## Known facts\n\n"
+        "**[2026-01-01] mined** _(gap autofill)_\n"
+        "Q: How many PCI notices are open?\nA: none, all closed\n\n", encoding="utf-8")
+    assert kc.detect_collision("OSN", "How many PCI notices are open?",
+                               "3 still open", today="2026-08-11")[0] is True
+
+
+def test_collision_scan_fails_closed_on_an_unreadable_file(_ka_dir, monkeypatch):
+    monkeypatch.setattr(kc, "_entity_file",
+                        lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+    collides, _ = kc.detect_collision("OSN", "q", "a", today="2026-08-11")
+    assert collides is True  # hold rather than risk overwriting canon
+
+
+def test_lex_answers_are_written_verbatim_by_decision(_ka_dir):
+    """Harrison 2026-08-11: LEX is treated identically to every other entity in
+    this build -- no scrub, no gate. Pinned so the decision is visible in tests."""
+    cyc = _cycle(entity="LEX-LLC", user="U0B3VGT8RE0",
+                 question="What is the current EVV exception rate?",
+                 answer="4 percent, two open for client M R",
+                 kpi="KPI 2 -- EVV exception rate")
+    outcome, _ = kc.promote(cyc, today="2026-08-11")
+    assert outcome == "promoted"
+    text = (_ka_dir / "lex.md").read_text(encoding="utf-8")
+    assert "4 percent, two open for client M R" in text
+    assert "Author: Jennifer Mortensen" in text
+
+
+def test_arming_the_phi_gate_would_refuse_that_same_lex_answer(_ka_dir, monkeypatch):
+    """The reversal path is real: one flip and the same content is refused."""
+    monkeypatch.setattr(kc, "PHI_GATE_ANSWERS", True)
+    cyc = _cycle(entity="LEX-LLC", user="U0B3VGT8RE0",
+                 answer="client Bob Smith has an autism diagnosis")
+    outcome, _ = kc.promote(cyc, today="2026-08-11")
+    assert outcome == "refused"
+    assert not (_ka_dir / "lex.md").exists()
+
+
+def test_promote_refuses_an_empty_staged_answer(_ka_dir):
+    assert kc.promote(_cycle(answer="   "), today="2026-08-11")[0] == "empty"
+
+
+def test_a_failed_airtable_mirror_never_loses_the_answer(_ka_dir, monkeypatch):
+    """known-answers is the write that matters; the mirror is best-effort."""
+    import cora.connectors.airtable_training_log as atl
+    monkeypatch.setattr(atl, "log_knowledge_check",
+                        lambda **_kw: (_ for _ in ()).throw(RuntimeError("airtable down")))
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN",
+                     question="How many PCI notices are open?")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "3 still open")
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "promoted"
+    assert "3 still open" in (_ka_dir / "osn.md").read_text(encoding="utf-8")
+
+
+def test_promote_makes_no_network_call_under_the_claim_lock(_ka_dir, monkeypatch):
+    """An HTTP call with retries inside _CLAIM_LOCK would stall every other
+    capture and tap in the bot for tens of seconds. promote() must stay local."""
+    import cora.connectors.airtable_training_log as atl
+    monkeypatch.setattr(atl, "log_knowledge_check",
+                        lambda **_kw: pytest.fail("promote() must not hit the network"))
+    assert kc.promote(_cycle(), today="2026-08-11")[0] == "promoted"
+
+
+def test_the_mirror_still_fires_after_a_confirm_tap(_ka_dir, monkeypatch):
+    calls = []
+    import cora.connectors.airtable_training_log as atl
+    monkeypatch.setattr(atl, "log_knowledge_check",
+                        lambda **kw: calls.append(kw) or (True, "rec1"))
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN",
+                     question="How many PCI notices are open?")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "3 still open")
+    kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")
+    assert len(calls) == 1
+    assert calls[0]["person"] == "Matt Petrovich"
+    assert "3 still open" in calls[0]["outcome"]
+
+
+def test_repeated_write_and_sweep_cycles_do_not_grow_whitespace(_ka_dir):
+    for i in range(4):
+        kc.promote(_cycle(cycle_id=f"kchk-{i}", answer=f"{i} open"),
+                   today="2026-08-11")
+        kc.expire_stale_answers(today="2026-08-20")
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert "\n\n\n" not in text
+
+
+def test_mirror_is_a_clean_noop_when_no_write_token_is_configured(_ka_dir):
+    import cora.connectors.airtable_training_log as atl
+    ok, detail = atl.log_knowledge_check(session="s", person="p", outcome="o",
+                                         date="2026-08-11")
+    assert ok is False and "AIRTABLE_WRITE_API_KEY" in detail
+
+
+def test_the_readonly_airtable_client_stays_readonly():
+    """Structural pin: the dashboard client's 'READ-ONLY by construction'
+    property must not be weakened for this feature."""
+    src = (_REPO_ROOT / "src" / "cora" / "connectors" / "airtable_client.py"
+           ).read_text(encoding="utf-8")
+    for verb in ("client.post", "client.patch", "client.delete", "def create_",
+                 "def update_", "def delete_"):
+        assert verb not in src, f"airtable_client must stay read-only ({verb})"
+    import cora.connectors.airtable_client as ac
+    assert "appAUZSQOCTnCO8yi" not in ac.ALLOWED_BASES
+
+
+def test_training_log_writer_is_pinned_to_one_base_and_table():
+    import cora.connectors.airtable_training_log as atl
+    assert atl.EXPECTED_BASE == "appAUZSQOCTnCO8yi"
+    assert atl.EXPECTED_TABLE == "tbladeAQjMUlGOxhX"
+    cfg = atl.load_map()
+    assert cfg and cfg["base_id"] == atl.EXPECTED_BASE
+    assert all(cfg["fields"][k].startswith("fld") for k in
+               ("session", "date", "person", "type", "outcome", "feeds", "logged_by"))
+
+
+def test_training_log_map_pointing_elsewhere_is_refused(tmp_path, monkeypatch):
+    """A data-file edit must never be able to redirect writes at another base."""
+    bad = tmp_path / "m.yaml"
+    bad.write_text("base_id: appOTHERBASE1234\ntable_id: tbladeAQjMUlGOxhX\n"
+                   "fields: {session: fldA, date: fldB, person: fldC, type: fldD,"
+                   " outcome: fldE, feeds: fldF, logged_by: fldG}\n", encoding="utf-8")
+    monkeypatch.setenv("KNOWLEDGE_CHECK_AIRTABLE_MAP", str(bad))
+    import cora.connectors.airtable_training_log as atl
+    assert atl.load_map() is None
+
+
+# ---------------------------------------------------------------------------
+# Layer B -- confirm tap (claim + write, exactly once)
+# ---------------------------------------------------------------------------
+
+def test_confirm_tap_writes_exactly_once(_ka_dir):
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a",
+                     item_key="matt-pci-closure", entity="OSN",
+                     question="How many PCI notices are open?")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "3 still open")
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "promoted"
+    # A racing second tap is an idempotent ack, and must not double-write.
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "already_handled"
+    text = (_ka_dir / "osn.md").read_text(encoding="utf-8")
+    assert text.count("A: 3 still open") == 1
+
+
+def test_confirm_tap_is_addressee_only(_ka_dir):
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "3 still open")
+    assert kc.process_confirm_tap("kchk-a", "U2")[0] == "not_authorized"
+    assert not (_ka_dir / "osn.md").exists()
+
+
+def test_confirm_tap_refuses_a_cycle_with_nothing_staged(_ka_dir):
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN")
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "not_live"
+
+
+def test_a_held_collision_marks_the_cycle_terminal(_ka_dir, monkeypatch):
+    monkeypatch.setattr(kc, "promote", lambda *_a, **_k: ("held", "flagged"))
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "x")
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "held"
+    assert kc.fold_state()["cycles"]["kchk-a"]["state"] == kc.STATE_HELD
+
+
+def test_a_refused_promote_leaves_the_cycle_open_to_reword(_ka_dir, monkeypatch):
+    monkeypatch.setattr(kc, "promote", lambda *_a, **_k: ("refused", "nope"))
+    _reserve_and_ask("U0B3PS7RFJA", kc.az_date(), "kchk-a", entity="OSN")
+    kc.record_answer("kchk-a", "U0B3PS7RFJA", "x")
+    assert kc.process_confirm_tap("kchk-a", "U0B3PS7RFJA")[0] == "refused"
+    assert kc.fold_state()["cycles"]["kchk-a"]["state"] == kc.STATE_CAPTURED
+
+
+# ---------------------------------------------------------------------------
 # Layer B -- participation reporting
 # ---------------------------------------------------------------------------
 

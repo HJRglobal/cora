@@ -158,7 +158,10 @@ def _events_path() -> Path:
 
 
 def _known_answers_dir() -> Path:
-    return _REPO_ROOT / "design" / "known-answers"
+    # Same env override gap_autofill uses, so tests point both writers at one
+    # temp dir and the two can be exercised against the same files.
+    return Path(os.environ.get("KNOWN_ANSWERS_DIR")
+                or _REPO_ROOT / "design" / "known-answers")
 
 
 # ── Time helpers ────────────────────────────────────────────────────────────
@@ -1009,6 +1012,52 @@ def process_edit_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
                        "I'll show you the new version.")
 
 
+# A confirm reply must be a WHOLE-MESSAGE affirmation. Anchored deliberately:
+# "yes, but actually it's 4 open" is a REWORD, not a confirm, and treating it as
+# a confirm would save the wrong number.
+_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(yes|yep|yeah|yup|yes please|confirm|confirmed|correct|that'?s right|"
+    r"right|save|save it|looks good|lgtm|ok|okay|perfect)\s*[.!]?\s*$",
+    re.IGNORECASE)
+_NEGATIVE_RE = re.compile(
+    r"^\s*(no|nope|nah|don'?t|do not|cancel|scratch that|never ?mind)\s*[.!]?\s*$",
+    re.IGNORECASE)
+
+
+def is_affirmative(text: str) -> bool:
+    return bool(_AFFIRMATIVE_RE.match(str(text or "")))
+
+
+def is_negative(text: str) -> bool:
+    return bool(_NEGATIVE_RE.match(str(text or "")))
+
+
+def handle_dm_reply(cycle_id: str, user_id: str, text: str) -> tuple[str, str, bool]:
+    """Route one DM reply against a live cycle. Returns (outcome, reply, post_card).
+
+    THE TYPED PATH IS FIRST-CLASS, not a fallback. Buttons are additive (and can
+    be switched off with CORA_CONFIRM_BUTTONS), so a flow that could only be
+    completed by tapping would strand every staged answer unwritten the moment
+    that flag flips. A whole-message "yes" confirms; a whole-message "no" skips;
+    anything else is the answer, or a reword of it.
+    """
+    state = fold_state()
+    cyc = get_cycle(state, cycle_id)
+    if cyc is None:
+        return "not_live", "", False
+    if cyc.get("state") == STATE_CAPTURED:
+        if is_affirmative(text):
+            outcome, msg = process_confirm_tap(cycle_id, user_id)
+            return outcome, msg, False
+        if is_negative(text):
+            outcome, msg = process_skip_answer_tap(cycle_id, user_id)
+            return outcome, msg, False
+    outcome, answer = record_answer(cycle_id, user_id, text)
+    if outcome in ("captured", "recaptured"):
+        return outcome, answer, True
+    return outcome, answer, False
+
+
 def _tap_message(outcome: str) -> str:
     return {
         "orphaned": "I don't have a record of that question anymore.",
@@ -1016,6 +1065,381 @@ def _tap_message(outcome: str) -> str:
         "already_handled": "That one's already handled.",
         "not_live": "That question isn't waiting on anything right now.",
     }.get(outcome, "Something went wrong there.")
+
+
+# ── PROMOTE ─────────────────────────────────────────────────────────────────
+#
+# A confirmed answer is appended to design/known-answers/{entity}.md -- the same
+# always-injected store gap answers use -- and mirrored to the Org Remodel
+# Tracker Training Log.
+#
+# THE ENTRY IS MACHINE-SWEEPABLE ON PURPOSE. A Tier-1 answer is a dated STATUS
+# SNAPSHOT ("3 PCI notices still open"), which is wrong within the week. Writing
+# it with only a human-readable "expires" note would leave stale status
+# accumulating forever in a file injected into every reply -- exactly the
+# KB-staleness problem D-087 exists for. So each block opens with a marker
+# comment carrying its expiry, and expire_stale_answers() removes its own
+# entries once they lapse. The TTL is real, not decorative.
+#
+# Tier-2 answers fill a genuine durable knowledge gap and are written with NO
+# expiry.
+
+_KC_MARKER_RE = re.compile(
+    r"^<!--\s*kc-entry\s+cycle=(?P<cycle>[\w.-]+)\s+expires=(?P<expires>[\w-]+)\s*-->$")
+_Q_LINE_RE = re.compile(r"^Q: (?P<q>.*)$")
+_A_LINE_RE = re.compile(r"^A: (?P<a>.*)$")
+
+
+def _entity_file(entity: str) -> Path:
+    from .known_answers_map import file_for
+    return _known_answers_dir() / file_for(entity)
+
+
+def _expiry_for(tier: int, today: str) -> str:
+    """Tier-1 status snapshots expire; Tier-2 durable answers do not."""
+    if tier != 1:
+        return "never"
+    d = datetime.strptime(today, "%Y-%m-%d") + timedelta(days=ANSWER_TTL_DAYS)
+    return d.date().isoformat()
+
+
+def _is_expired(expires: str, today: str) -> bool:
+    if not expires or expires == "never":
+        return False
+    return expires <= today
+
+
+def build_entry_lines(cycle: dict[str, Any], answer: str, today: str) -> list[str]:
+    """The exact block written to known-answers.
+
+    Attribution is mandatory (spec section 2): every promoted item names who
+    contributed it and how, so a reader can always tell an attested human report
+    from something Cora derived.
+    """
+    tier = int(cycle.get("tier") or 1)
+    expires = _expiry_for(tier, today)
+    person = roster_member(str(cycle.get("user", ""))) or {}
+    name = person.get("name") or str(cycle.get("user", ""))
+    label = cycle.get("kpi") or ("open knowledge gap" if tier == 2 else "status")
+    kind = ("status snapshot, expires " + expires) if tier == 1 else "contributed answer"
+    return [
+        f"<!-- kc-entry cycle={cycle.get('cycle_id', '')} expires={expires} -->",
+        f"**[{today}] {name} -- {label}** _(daily knowledge check -- {kind})_",
+        f"Q: {str(cycle.get('question', '')).strip()}",
+        f"A: {answer}",
+        f"Author: {name} -- contributed via daily knowledge check",
+        "",
+    ]
+
+
+def _scan_entries(text: str, today: str) -> list[dict[str, Any]]:
+    """Every Q/A pair in a known-answers file, with its live/expired status.
+
+    A pair inside a LAPSED kc-entry is treated as absent: it is about to be swept
+    and must not be mistaken for canon that a fresh answer contradicts. Pairs
+    with no marker (gap-autofill's own writes) are durable and always live.
+    """
+    out: list[dict[str, Any]] = []
+    cur_expires = "never"
+    cur_cycle = ""
+    pending_q: str | None = None
+    for line in (text or "").split("\n"):
+        m = _KC_MARKER_RE.match(line.strip())
+        if m:
+            cur_expires, cur_cycle = m.group("expires"), m.group("cycle")
+            pending_q = None
+            continue
+        if not line.strip():
+            # A blank line ends a block, so the next pair is outside any marker.
+            cur_expires, cur_cycle = "never", ""
+            pending_q = None
+            continue
+        mq = _Q_LINE_RE.match(line)
+        if mq:
+            pending_q = mq.group("q").strip()
+            continue
+        ma = _A_LINE_RE.match(line)
+        if ma and pending_q is not None:
+            out.append({"question": pending_q, "answer": ma.group("a").strip(),
+                        "expires": cur_expires, "cycle_id": cur_cycle,
+                        "expired": _is_expired(cur_expires, today)})
+            pending_q = None
+    return out
+
+
+def detect_collision(entity: str, question: str, answer: str,
+                     today: str | None = None) -> tuple[bool, str]:
+    """DETERMINISTIC key-collision check. Returns (collides, existing_answer).
+
+    The key is the QUESTION text. A Tier-1 question is a fixed template, so the
+    same KPI asked next week produces the same key -- which is precisely why the
+    check ignores lapsed entries: a fresh snapshot superseding an expired one is
+    NOT a contradiction. What IS a contradiction is a LIVE entry, from this flow
+    or from gap-autofill's mining, whose answer differs.
+
+    This is code, never model judgment (spec section 4.5 / doctrine 1jjj): a
+    model asked "does this contradict?" is exactly the unreliable step the
+    dispute rule exists to remove.
+    """
+    today = today or az_date()
+    try:
+        path = _entity_file(entity)
+        if not path.exists():
+            return False, ""
+        target_q = str(question or "").strip()
+        new_a = normalize_answer(answer).lower().rstrip(".")
+        for e in _scan_entries(path.read_text(encoding="utf-8"), today):
+            if e["expired"] or e["question"] != target_q:
+                continue
+            if e["answer"].lower().rstrip(".") != new_a:
+                return True, e["answer"]
+        return False, ""
+    except Exception:  # noqa: BLE001 -- fail CLOSED: treat an unreadable file as
+        # a possible collision rather than risk silently overwriting canon.
+        log.error("knowledge_check: collision scan failed for %s -- holding",
+                  entity, exc_info=True)
+        return True, ""
+
+
+def expire_stale_answers(today: str | None = None,
+                         dry_run: bool = False) -> dict[str, int]:
+    """Sweep lapsed knowledge-check entries out of every known-answers file.
+
+    Removes ONLY blocks this module wrote (they carry the kc-entry marker) and
+    ONLY once their expiry has passed. Everything else in the file -- gap-autofill
+    answers, routing rules, hand-written facts -- is untouched by construction.
+    """
+    today = today or az_date()
+    from .known_answers_map import ENTITY_FILES
+    removed: dict[str, int] = {}
+    for filename in sorted(set(ENTITY_FILES.values())):
+        path = _known_answers_dir() / filename
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").split("\n")
+        except Exception:  # noqa: BLE001
+            log.warning("knowledge_check: could not read %s", filename, exc_info=True)
+            continue
+        out: list[str] = []
+        i = 0
+        count = 0
+        while i < len(lines):
+            m = _KC_MARKER_RE.match(lines[i].strip())
+            if m and _is_expired(m.group("expires"), today):
+                count += 1
+                i += 1
+                # Drop through to (and including) the block's terminating blank.
+                while i < len(lines) and lines[i].strip():
+                    i += 1
+                if i < len(lines):
+                    i += 1
+                continue
+            out.append(lines[i])
+            i += 1
+        if count:
+            removed[filename] = count
+            if not dry_run:
+                # Each entry is written as blank + block + blank, and the sweep
+                # takes block + trailing blank -- so without this the leading
+                # blanks pile up and the file slowly grows whitespace over
+                # months of write/expire cycles.
+                collapsed: list[str] = []
+                for ln in out:
+                    if not ln.strip() and collapsed and not collapsed[-1].strip():
+                        continue
+                    collapsed.append(ln)
+                _atomic_write_text(path, "\n".join(collapsed))
+    return removed
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _append_entry(entity: str, entry_lines: list[str]) -> Path:
+    """Append under '## Known facts', matching gap_autofill._append_to_section's
+    insertion semantics so both writers produce identically-shaped files."""
+    path = _entity_file(entity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = "## Known facts"
+    if not path.exists():
+        _atomic_write_text(path, f"# Known Answers\n\n## Routing rules\n\n{header}\n")
+    lines = path.read_text(encoding="utf-8").rstrip("\n").split("\n")
+    insert_at = len(lines)
+    in_section = False
+    for i, line in enumerate(lines):
+        if line == header:
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            insert_at = i
+            break
+    if not in_section:
+        lines += ["", header]
+        insert_at = len(lines)
+    lines = lines[:insert_at] + [""] + entry_lines + lines[insert_at:]
+    _atomic_write_text(path, "\n".join(lines) + "\n")
+    return path
+
+
+def route_collision_to_decisions(cycle: dict[str, Any], answer: str,
+                                 existing: str) -> str | None:
+    """D-128: a contradiction is a CALL, not a fact -- never silently overwrite.
+
+    Returns the update_id, or None when the decisions lane declined it. A LEX
+    collision is expected to be declined here: decision_inbox.screen_decision
+    excludes LEX content from the decisions inbox, which is a surface Harrison's
+    2026-08-11 knowledge-check decision did not cover, so it is left standing.
+    The collision is still HELD (nothing written) and surfaced in the run report,
+    which is the outcome that actually matters -- canon is not overwritten either
+    way.
+    """
+    entity = str(cycle.get("entity", "FNDR") or "FNDR").strip().upper()
+    cycle_id = str(cycle.get("cycle_id", ""))
+    person = roster_member(str(cycle.get("user", ""))) or {}
+    name = person.get("name") or str(cycle.get("user", ""))
+    update_id = f"kc-dispute-{cycle_id}"
+    candidate = {
+        "update_id": update_id,
+        "description": f"[{entity}] Conflicting answer from {name}: "
+                       f"{str(cycle.get('question', ''))[:120]}",
+        "payload": {
+            "entity": entity,
+            "decision_text": (
+                f"UNRESOLVED (routed by the daily knowledge check under D-128, not a "
+                f"mined fact): {name} answered a question that already has a different "
+                f"live answer on file.\n"
+                f"Asked: {str(cycle.get('question', ''))[:400]}\n"
+                f"On file: {existing[:400]}\n"
+                f"New answer: {answer[:400]}\n"
+                f"Which is authoritative is a call, not a fact -- so nothing was "
+                f"written to known-answers."),
+            "source": "knowledge_check_d128",
+            "cycle_id": cycle_id,
+        },
+        "source_evidence": "",
+    }
+    try:
+        from .decision_inbox import screen_decision
+        excluded, why = screen_decision(candidate)
+    except Exception:  # noqa: BLE001 -- fail closed
+        log.warning("knowledge_check: decision screen errored -- not routing",
+                    exc_info=True)
+        return None
+    if excluded:
+        log.info("knowledge_check: collision for %s not routed (screen: %s)",
+                 cycle_id, why)
+        return None
+    try:
+        from .knowledge_review import UPDATE_TYPE_DECISION, propose_update
+        propose_update(update_id=update_id, update_type=UPDATE_TYPE_DECISION,
+                       description=candidate["description"],
+                       payload=candidate["payload"], source_evidence="",
+                       confidence="MED")
+    except Exception:  # noqa: BLE001
+        log.warning("knowledge_check: collision route failed for %s", cycle_id,
+                    exc_info=True)
+        return None
+    return update_id
+
+
+def promote(cycle: dict[str, Any], today: str | None = None) -> tuple[str, str]:
+    """Write a confirmed answer. Returns (outcome, human_message).
+
+    Outcomes: promoted | held | refused | empty.
+
+    ORDER IS THE CONTRACT:
+      1. PHI gate (a no-op under the decided posture -- see PHI_GATE_ANSWERS).
+      2. Collision -> decisions lane, write NOTHING. Canon is never overwritten.
+      3. known-answers write. THIS IS THE ONE THAT MATTERS.
+
+    STRICTLY LOCAL, NO NETWORK. The Airtable Training Log mirror is deliberately
+    NOT done here: this runs under _CLAIM_LOCK, and an HTTP call with retries
+    could hold that lock for tens of seconds -- stalling every other person's
+    capture and every other button tap in the whole bot process. The caller
+    fires the mirror after releasing the lock (see process_confirm_tap), which
+    also keeps the ordering the kickoff asks for: known-answers is the write that
+    matters, the mirror is best-effort and can never fail the promote.
+    """
+    today = today or az_date()
+    answer = normalize_answer(cycle.get("answer", ""))
+    if not answer:
+        return "empty", "There was nothing staged to save."
+    entity = str(cycle.get("entity", "FNDR") or "FNDR").strip().upper()
+    question = str(cycle.get("question", "")).strip()
+
+    blocked, reason = phi_blocked(f"{question}\n{answer}")
+    if blocked:
+        return "refused", reason
+
+    collides, existing = detect_collision(entity, question, answer, today=today)
+    if collides:
+        route_collision_to_decisions(cycle, answer, existing)
+        return "held", ("Thanks -- that differs from what I already have on file, "
+                        "so I've flagged it for Harrison instead of overwriting it.")
+
+    try:
+        path = _append_entry(entity, build_entry_lines(cycle, answer, today))
+    except Exception:  # noqa: BLE001
+        log.error("knowledge_check: known-answers write failed for %s",
+                  cycle.get("cycle_id"), exc_info=True)
+        return "refused", "Something went wrong saving that -- nothing was written."
+
+    log.info("knowledge_check: promoted %s -> %s", cycle.get("cycle_id"), path.name)
+    return "promoted", "Saved -- thanks, that's genuinely useful."
+
+
+def _mirror_to_training_log(cycle: dict[str, Any], answer: str,
+                            today: str) -> tuple[bool, str]:
+    try:
+        from .connectors import airtable_training_log as atl
+        person = roster_member(str(cycle.get("user", ""))) or {}
+        name = person.get("name") or str(cycle.get("user", ""))
+        return atl.log_knowledge_check(
+            session=f"Knowledge check -- {cycle.get('kpi') or 'question'}",
+            person=name, date=today,
+            outcome=f"Q: {str(cycle.get('question', '')).strip()}\nA: {answer}")
+    except Exception as exc:  # noqa: BLE001 -- best-effort, never raises upward
+        return False, str(exc)
+
+
+def process_confirm_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
+    """"Save it" on the confirm card: claim, then write. Exactly once.
+
+    The whole claim-and-write runs under _CLAIM_LOCK and re-folds the log inside
+    it, so a double-tap (or a tap racing a typed reply) can reach the write at
+    most once -- the loser reads 'already handled', which is an idempotent ack
+    rather than a false 'nothing happened'.
+    """
+    with _CLAIM_LOCK:
+        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,))
+        if outcome != "ok":
+            return outcome, _tap_message(outcome)
+        result, message = promote(cyc)
+        if result == "promoted":
+            append_event("promoted", cycle_id=cycle_id, user=actor_id,
+                         date=cyc.get("date"), entity=cyc.get("entity"),
+                         tier=cyc.get("tier"), item_key=cyc.get("item_key"))
+        elif result == "held":
+            append_event("held_collision", cycle_id=cycle_id, user=actor_id,
+                         date=cyc.get("date"))
+        # 'refused'/'empty' leave the cycle CAPTURED so the person can reword;
+        # end-of-day expiry closes it if they do not.
+
+    # OUTSIDE the lock: this is an HTTP call with retries, and holding the claim
+    # lock across it would stall every other capture and tap in the process. The
+    # cycle is already durably PROMOTED, so a mirror failure is a logged
+    # discrepancy against a completed write -- never a lost answer.
+    if result == "promoted":
+        ok, detail = _mirror_to_training_log(
+            cyc, normalize_answer(cyc.get("answer", "")), az_date())
+        if not ok:
+            log.warning("knowledge_check: Training Log mirror failed for %s (%s) -- "
+                        "known-answers write stands", cycle_id, detail)
+    return result, message
 
 
 # ── Participation reporting (feeds Hannah's weekly training-readiness audit) ─

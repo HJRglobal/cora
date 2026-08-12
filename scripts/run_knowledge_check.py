@@ -158,6 +158,15 @@ def main() -> int:
             log.info("expired cycle=%s reason=%s", row.get("cycle_id"), row.get("reason"))
         state = kc.fold_state()
 
+    # Make the operational TTL real: sweep lapsed Tier-1 status snapshots out of
+    # known-answers. Without this the "expires" note is decorative and stale
+    # status accumulates in an always-injected file (the D-087 problem).
+    swept = kc.expire_stale_answers(today=today, dry_run=dry)
+    for filename, n in sorted(swept.items()):
+        log.info("%s %d expired knowledge-check entr%s from %s",
+                 "would sweep" if dry else "swept", n,
+                 "y" if n == 1 else "ies", filename)
+
     try:
         from cora import gap_autofill as ga
         open_gaps = ga.load_open_gaps()

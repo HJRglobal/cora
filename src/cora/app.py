@@ -35,6 +35,7 @@ from . import intent_classifier as ic
 from . import knowledge_gaps
 from . import gap_detection
 from . import gap_autofill
+from . import knowledge_check
 from . import code_queue
 from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
@@ -2749,6 +2750,149 @@ def _handle_info_for_cora(event: dict, client) -> None:
 
 
 @app.event("message")
+def _kc_post(client, channel: str, thread_ts: str | None, text: str,
+             blocks: list | None = None) -> str:
+    """Post one knowledge-check DM message. Returns its ts ("" on failure)."""
+    try:
+        kwargs = {"channel": channel, "text": text, "unfurl_links": False,
+                  "unfurl_media": False}
+        if blocks:
+            kwargs["blocks"] = blocks
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        return (client.chat_postMessage(**kwargs) or {}).get("ts", "") or ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("knowledge_check: post failed: %s", exc)
+        return ""
+
+
+def _handle_knowledge_check_reply(event: dict, client, user_id: str, text: str,
+                                  cycle: dict) -> bool:
+    """Route a DM reply into the knowledge-check flow.
+
+    Returns True when this branch OWNS the message (caller must return), False
+    when it declined it so the DM falls through to the normal routing. Declining
+    matters: an outcome of not_live/not_authorized/empty means this was never an
+    answer, and swallowing it would leave a real question unanswered.
+    """
+    try:
+        outcome, payload, post_card = knowledge_check.handle_dm_reply(
+            cycle.get("cycle_id", ""), user_id, text)
+    except Exception:  # noqa: BLE001 -- capture must never break DMs
+        log.warning("knowledge_check: handle_dm_reply failed", exc_info=True)
+        return False
+
+    if outcome in ("not_live", "not_authorized", "empty"):
+        return False
+
+    channel = event.get("channel", user_id)
+    thread_ts = event.get("thread_ts")
+    log.info("knowledge_check: DM reply user=%s cycle=%s outcome=%s",
+             user_id, cycle.get("cycle_id"), outcome)
+
+    if post_card:
+        cid = cycle.get("cycle_id", "")
+        body = knowledge_check.confirm_text(payload, cycle.get("question", ""))
+        blocks = (knowledge_check.build_confirm_blocks(
+            payload, cid, cycle.get("question", ""))
+            if confirm_cards.confirm_buttons_enabled() else None)
+        # With buttons off the same text still ships and the TYPED path
+        # ("yes" / "no") completes the loop -- the flow never depends on a tap.
+        if not blocks:
+            body += "\n\n_Reply *yes* to save it, or *no* to skip._"
+        _kc_post(client, channel, thread_ts, body, blocks)
+        return True
+
+    _kc_post(client, channel, thread_ts, payload or "Got it.")
+    return True
+
+
+def _handle_kc_tap(body: dict, client, action: str) -> None:
+    """Shared receiver for the four knowledge-check buttons.
+
+    Mirrors the gap-decline handler's terminal-edit rule exactly: an outcome the
+    tapper does not own (not_authorized / already_handled / orphaned) replies
+    EPHEMERALLY and never touches the shared card, because two independent
+    chat_update round-trips cannot be ordered after the fact and the race loser
+    would clobber the winner's real result.
+    """
+    try:
+        actions = body.get("actions") or []
+        cycle_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+        if not knowledge_check.enabled():
+            return
+
+        if action == "confirm":
+            outcome, msg = knowledge_check.process_confirm_tap(cycle_id, actor_id)
+        elif action == "edit":
+            outcome, msg = knowledge_check.process_edit_tap(cycle_id, actor_id)
+        elif action == "skip_answer":
+            outcome, msg = knowledge_check.process_skip_answer_tap(cycle_id, actor_id)
+        else:
+            outcome, msg = knowledge_check.process_skip_today_tap(cycle_id, actor_id)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled", "not_live"):
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        if outcome == "editing":
+            # The card stays live: they are about to send a reworded answer, and
+            # dropping the buttons now would strand it if they change their mind.
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # promoted | held | skipped | refused: the unique winner closes its card.
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            sections = [b for b in orig if b.get("type") == "section"]
+            new_blocks = (sections or [{"type": "section",
+                                        "text": {"type": "mrkdwn", "text": msg}}]) + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("knowledge_check: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("knowledge_check tap handler error (non-fatal)", exc_info=True)
+
+
+@app.action(knowledge_check.ACTION_CONFIRM_ANSWER)
+def handle_kc_confirm(ack, body, client) -> None:
+    ack()
+    _handle_kc_tap(body, client, "confirm")
+
+
+@app.action(knowledge_check.ACTION_EDIT_ANSWER)
+def handle_kc_edit(ack, body, client) -> None:
+    ack()
+    _handle_kc_tap(body, client, "edit")
+
+
+@app.action(knowledge_check.ACTION_SKIP_ANSWER)
+def handle_kc_skip_answer(ack, body, client) -> None:
+    ack()
+    _handle_kc_tap(body, client, "skip_answer")
+
+
+@app.action(knowledge_check.ACTION_SKIP_TODAY)
+def handle_kc_skip_today(ack, body, client) -> None:
+    ack()
+    _handle_kc_tap(body, client, "skip_today")
+
+
 def handle_message_event(event: dict, client) -> None:
     """Thread reply handler: correction capture and active-thread follow-up routing.
 
@@ -2799,16 +2943,50 @@ def handle_message_event(event: dict, client) -> None:
             # covers "yes", "2", a slot number and every future phrasing.
             _has_staged_write = bool(
                 any(_tool_dispatch.snapshot_stash_ids(user_id, "dm").values()))
+
+            # ── Daily knowledge check capture ────────────────────────────────
+            # Same intent-collision family as the gap ask above, and it shares
+            # that branch's whole guard set: a shift command, a fresh question, a
+            # remember/forget command and a live staged write all outrank a
+            # top-level capture, because each of those is a DIFFERENT thing the
+            # person plainly meant to do.
+            #
+            # The two capture systems are MUTUALLY EXCLUSIVE on the ambiguous
+            # top-level path: if a gap ask is also outstanding, neither claims
+            # the DM and it falls through to Q&A. Letting both compete would mean
+            # one person's single reply silently answering whichever question the
+            # code happened to check first. A THREADED reply is unambiguous and
+            # always matches its own ask, in either system.
+            #
+            # Safety of the capture itself: nothing is written here. A capture
+            # stages an answer and shows it back on a card, so a mis-capture
+            # costs one Skip tap -- never a wrong fact in an always-injected file.
+            _kc_live = knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)
+            _gap_ask_live = gap_autofill.has_live_ask(user_id)
+            _generic_intent_ok = (
+                not gap_autofill.is_shift_keyword(text)
+                and not gap_autofill.looks_like_question(text)
+                and not _remember_or_forget_intent(text)
+                and not _has_staged_write
+            )
+            if _kc_live:
+                try:
+                    kc_cycle = knowledge_check.match_live_cycle(
+                        user_id, event.get("thread_ts"),
+                        allow_toplevel=_generic_intent_ok and not _gap_ask_live,
+                    )
+                except Exception:  # noqa: BLE001 -- capture must never break DMs
+                    log.warning("knowledge_check: match_live_cycle failed", exc_info=True)
+                    kc_cycle = None
+                if kc_cycle and _handle_knowledge_check_reply(
+                        event, client, user_id, text, kc_cycle):
+                    return
+
             try:
                 ask = gap_autofill.match_pending_ask(
                     user_id,
                     event.get("thread_ts"),
-                    allow_toplevel=(
-                        not gap_autofill.is_shift_keyword(text)
-                        and not gap_autofill.looks_like_question(text)
-                        and not _remember_or_forget_intent(text)
-                        and not _has_staged_write
-                    ),
+                    allow_toplevel=_generic_intent_ok and not _kc_live,
                 )
             except Exception as exc:  # noqa: BLE001 — capture must never break DMs
                 log.warning("gap_autofill: match_pending_ask failed: %s", exc)
