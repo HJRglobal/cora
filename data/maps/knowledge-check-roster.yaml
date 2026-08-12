@@ -1,0 +1,231 @@
+# Daily Personalized Knowledge Check -- locked pilot roster + Tier-1 question bank.
+#
+# Design of record: 00-Founder/projects/build-personalized-daily-knowledge-check/
+#   2026-08-11_fndr_daily-knowledge-check-design-v1.md  (APPROVED Harrison 2026-08-11)
+#
+# WHAT THIS FILE IS
+# The bot-readable encoding of the "Instrumentation ledger" in
+#   00-Founder/projects/map-staff-roles-to-cora-automation/
+#   2026-08-04_fndr_daily-schedules-and-kpis-v1.md
+# which is the LOCKED source of truth for who has which KPI and which of those
+# KPIs are still "attested" (a human reports them, because the system of record
+# sits outside Cora's read surface) rather than "system-read".
+#
+# The attested list IS the question bank. Every `items` entry below traces to a
+# numbered KPI row in that doc. NOTHING here is invented -- an LLM-generated
+# question is the exact failure class this design rejects (spec section 3), so
+# the pool is derived ONLY from KPIs the ledger explicitly marks attested or
+# gated-with-a-named-unlock. A KPI the ledger does not clearly place is left
+# OUT: skipping a person beats asking them something ungrounded.
+#
+# EXPECTED EMPTY POOLS (spec section 3.4 -- not a bug):
+# Tommy, Justin, Hannah and Jerry are already fully system-read, so they have no
+# Tier-1 items and will mostly log skipped_no_gap unless a real Tier-2 gap lands
+# that day. tests/test_knowledge_check.py pins this so it can never drift
+# silently into "the mechanism is broken for those four".
+#
+# ROTATION, NOT CONSUMPTION (spec section 3.1): an item is re-asked at most once
+# per ITEM_COOLDOWN_DAYS. Answering it does NOT consume it -- a confirmed answer
+# is a dated status snapshot written with an operational TTL, not durable canon.
+# An item retires only when its underlying source actually goes system-read via
+# a real integration, which is a human edit to this file (set `retired: true`
+# with a dated reason), never something the code infers from an answer.
+#
+# LEX POSTURE (Harrison's explicit, informed decision 2026-08-11): Shaun, Jen and
+# Aaron are day-1 participants with NO PHI scrub or gating on their questions or
+# answers -- treated identically to every other entity in this build. Escalation
+# record: _notes/2026-08-11_fndr_ESCALATION-lex-phi-egress-scope.md (RESOLVED).
+# The single code-level switch for that posture is knowledge_check.PHI_GATE_ANSWERS.
+#
+# EXCLUDED BY DESIGN: Jeff (oversight role, "no invented KPIs"), Sara (freelancer),
+# and all of BDM (strawman held pending the Micah + Demi co-owner consult). Micah
+# appears here for his OSN half ONLY -- his BDM half is deliberately out of scope,
+# which is why his entity below is OSN and not his registry-primary BDM.
+#
+# Slack IDs are the canonical ones from data/maps/org-roles.yaml. A test asserts
+# every roster slack_id resolves to that registry, so a roster typo cannot DM a
+# stranger.
+
+roster:
+
+  - slack_id: U0B3RU5Q55G
+    name: Tommy Anderson
+    entity: F3E
+    # All 5 KPIs system-read (ledger: "all Tommy (5)"). Empty by design.
+    items: []
+
+  - slack_id: U0B3VGWJTMJ
+    name: Alex Cordova
+    entity: F3E
+    items:
+      - key: alex-close-out-hygiene
+        kpi: "KPI 2 -- close-out hygiene"
+        question: >-
+          Are there any Booked events that are past their date by more than 7 days
+          and still not reconciled? If so, which ones?
+      - key: alex-sample-queue-latency
+        kpi: "KPI 3 -- sample-queue latency"
+        question: >-
+          How many sample requests are pending right now, and are any of them
+          older than 48 hours?
+
+  - slack_id: U0B8DGHR2D6
+    name: Elena Meirndorf
+    entity: F3E
+    items:
+      - key: elena-admin-currency
+        kpi: "KPI 3 -- admin currency"
+        question: >-
+          Are your mileage and BA-hours submitted for this week, or is anything
+          still outstanding?
+
+  - slack_id: U0B3PRZMBCN
+    name: Eric Canku
+    entity: HJRG
+    items:
+      - key: eric-invoice-triage-latency
+        kpi: "KPI 1 -- invoice triage latency"
+        question: >-
+          What is your current turnaround on new AP invoices, and are any sitting
+          longer than 2 business days?
+      - key: eric-approval-queue-latency
+        kpi: "KPI 2 -- approval-queue latency"
+        question: >-
+          Are any approval items currently sitting longer than 5 business days?
+          Which ones?
+
+  - slack_id: U0B3AEQS0NB
+    name: Hannah Grant
+    entity: FNDR
+    # KPIs 1-4 system-read (Asana / DW ledger / hygiene). Empty by design.
+    items: []
+
+  - slack_id: U0B3AEJCYGP
+    name: Justin Moran
+    entity: HJRG
+    # "All four system-read, zero attested" (ledger). Empty by design.
+    items: []
+
+  - slack_id: U0B3TPD2MEV
+    name: Alina Thomas
+    entity: HJRG
+    items:
+      - key: alina-payroll-timeliness
+        kpi: "KPI 1 -- payroll timeliness"
+        question: >-
+          For the current payroll cycle, were all cutoffs met, and were corrections
+          made before submission?
+      - key: alina-hr-intake-latency
+        kpi: "KPI 3 -- HR intake latency"
+        question: >-
+          Are there any HR or benefits requests you have not acknowledged within
+          2 business days?
+
+  - slack_id: U0B4L7886PJ
+    name: Jerry Reick
+    entity: HJRG
+    # All 3 KPIs system-read (QBO AR aging / pack callouts / Sat hygiene-qbo).
+    items: []
+
+  - slack_id: U0B3PS7RFJA
+    name: Matt Petrovich
+    entity: OSN
+    # "OSN has no automated KPI reader yet -- everything lands Thursday until the
+    # data-source decision at 8/13." All four are attested or deferred.
+    items:
+      - key: matt-recon-currency
+        kpi: "KPI 1 -- recon currency"
+        question: >-
+          Did this week's Wednesday inventory reconciliation get done for each
+          store? Any store still outstanding?
+      - key: matt-pci-closure
+        kpi: "KPI 2 -- PCI closure"
+        question: >-
+          How many of the PCI notices are still open, and is the tracker current?
+      - key: matt-platform-exceptions
+        kpi: "KPI 3 -- platform exceptions"
+        question: >-
+          What platform anomalies came up today, and were they actioned the same
+          day?
+      - key: matt-punch-correction-latency
+        kpi: "KPI 4 -- punch-correction latency"
+        question: >-
+          Are any punch corrections currently outstanding longer than 48 hours?
+
+  - slack_id: U0B4L78SZHN
+    name: Micah Kessler
+    entity: OSN          # OSN half ONLY -- BDM is out of scope for this pilot.
+    items:
+      - key: micah-iou-tracker-currency
+        kpi: "KPI 3 -- IOU tracker currency"
+        question: >-
+          Has the IOU / equity-credit tracker been refreshed this month, and is
+          anything still unlogged?
+
+  - slack_id: U0B3PS82G30
+    name: Shaun Hawkins
+    entity: LEX-LLC
+    items:
+      - key: shaun-program-utilization
+        kpi: "KPI 1 -- program utilization vs capacity"
+        question: >-
+          Where does program utilization sit against capacity right now?
+      - key: shaun-training-currency
+        kpi: "KPI 3 -- training currency"
+        question: >-
+          What percentage of staff are current on required training right now?
+
+  - slack_id: U0B3VGT8RE0
+    name: Jennifer Mortensen
+    entity: LEX-LLC
+    items:
+      - key: jen-units-delivered
+        kpi: "KPI 1 -- units delivered vs authorized"
+        question: >-
+          What is the aggregate percentage of units delivered against authorized
+          for the current billing cycle?
+      - key: jen-evv-exception-rate
+        kpi: "KPI 2 -- EVV exception rate"
+        question: >-
+          What is the current EVV exception rate, and were all exceptions resolved
+          within the cycle?
+      - key: jen-hcbs-staffing-coverage
+        kpi: "KPI 3 -- HCBS staffing coverage"
+        question: >-
+          How many open shifts are unfilled right now, and how old is the oldest
+          vacancy?
+
+  - slack_id: U0B3PS32A22
+    name: Aaron Ferrucci
+    entity: LEX-LLC
+    items:
+      - key: aaron-day-program-utilization
+        kpi: "KPI 2 -- day-program utilization"
+        question: >-
+          Where does utilization sit for each day program (DTA / TTE) this week?
+      - key: aaron-program-calendar-readiness
+        kpi: "KPI 3 -- program-calendar readiness"
+        question: >-
+          Is next month's program calendar ready? The deadline is the 25th.
+      - key: aaron-ratio-compliance
+        kpi: "KPI 4 -- ratio compliance"
+        question: >-
+          Were staffing ratios met on every operating day this week? Any
+          exceptions?
+
+  # ---------------------------------------------------------------------------
+  # DOGFOOD ONLY -- never included in a roster run. Harrison is the pre-rollout
+  # end-to-end test target (spec rollout step 3): the full ASK -> CAPTURE ->
+  # CONFIRM -> PROMOTE loop is proven against his own DM before any of the 13
+  # see a question. Reached only via `--dogfood`.
+  # ---------------------------------------------------------------------------
+  - slack_id: U0B2RM2JYJ1
+    name: Harrison Rogers
+    entity: FNDR
+    dogfood_only: true
+    items:
+      - key: dogfood-loop-smoke
+        kpi: "dogfood -- end-to-end loop smoke"
+        question: >-
+          Dogfood check: what is the one thing you would want Cora to learn about
+          how you run Monday mornings?
