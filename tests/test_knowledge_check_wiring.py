@@ -33,6 +33,7 @@ OTHER = "U0B3RU5Q55G"    # Tommy Anderson
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(kc, "_events_path", lambda: tmp_path / "events.jsonl")
+    kc.reset_caches_for_tests()
     monkeypatch.setenv("CORA_KNOWLEDGE_CHECK", "on")
     monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
     yield
@@ -55,11 +56,52 @@ def _live_cycle(user=USER, cycle_id="kchk-a", message_ts="111.222",
 _APP_SRC = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
 
 
+def _registered_listener_names() -> set[str]:
+    """Every function Bolt will actually dispatch to, from the LIVE app object."""
+    names = set()
+    for listener in app_module.app._listeners:
+        fn = getattr(listener, "ack_function", None)
+        if fn is None:
+            lazy = getattr(listener, "lazy_functions", None) or []
+            fn = lazy[0] if lazy else None
+        if fn is not None:
+            names.add(getattr(fn, "__name__", ""))
+    return names
+
+
+def test_the_message_handler_is_still_the_registered_message_listener():
+    """THE regression pin for this branch's worst defect.
+
+    Inserting these new functions between `@app.event("message")` and
+    `handle_message_event` orphaned the decorator onto the first new function.
+    Bolt then dispatched EVERY message event to a helper that takes non-
+    injectable kwargs, and `handle_message_event` -- which owns plain-DM Q&A, the
+    gap-ask capture, the OSN shift scheduler, Tier-2 historical retrieval, and
+    this build's own CAPTURE stage -- became unreachable. Silent: the helper's
+    own except swallowed the resulting failure.
+
+    A source grep for `@app.action(...)` cannot catch decorator drift, which is
+    exactly why the original wiring test missed it. This walks the real
+    registration table instead.
+    """
+    registered = _registered_listener_names()
+    assert "handle_message_event" in registered
+    for helper in ("_kc_post", "_handle_knowledge_check_reply", "_handle_kc_tap"):
+        assert helper not in registered, (
+            f"{helper} is registered as a Slack listener -- a decorator has been "
+            f"orphaned onto it")
+
+
 def test_knowledge_check_is_imported_and_handlers_are_registered():
     assert "from . import knowledge_check" in _APP_SRC
     for action in ("ACTION_CONFIRM_ANSWER", "ACTION_EDIT_ANSWER",
                    "ACTION_SKIP_ANSWER", "ACTION_SKIP_TODAY"):
         assert f"@app.action(knowledge_check.{action})" in _APP_SRC
+    # And the handlers themselves are really on the app, not just in the source.
+    registered = _registered_listener_names()
+    for fn in ("handle_kc_confirm", "handle_kc_edit", "handle_kc_skip_answer",
+               "handle_kc_skip_today"):
+        assert fn in registered
 
 
 def test_capture_is_gated_on_the_feature_flag():
@@ -76,7 +118,7 @@ def test_capture_shares_the_gap_asks_whole_guard_set():
     """Each guard marks a DIFFERENT thing the person plainly meant to do; the
     knowledge check must not be laxer than the branch beside it."""
     block = _APP_SRC.split("_generic_intent_ok = (", 1)[1].split("\n            )", 1)[0]
-    for guard in ("is_shift_keyword", "looks_like_question",
+    for guard in ("_dm_is_shift_message", "looks_like_question",
                   "_remember_or_forget_intent", "_has_staged_write"):
         assert guard in block
 
@@ -202,7 +244,14 @@ class TestReplyOwnership:
         _owned, client = self._run("3 still open", cyc)
         kwargs = client.chat_postMessage.call_args.kwargs
         assert not kwargs.get("blocks")
-        assert "yes" in kwargs["text"] and "no" in kwargs["text"]
+        # "save"/"discard", NOT "yes"/"no": the F-23 interceptor's affirm list
+        # contains "yes"/"ok" and its STOP list contains "no"/"skip", so the
+        # buttons-off copy must not steer a user into firing or cancelling an
+        # unrelated staged write.
+        assert "save" in kwargs["text"] and "discard" in kwargs["text"]
+        import cora.tools.tool_dispatch as td
+        assert "save" not in td._CONFIRM_AFFIRM_WORDS
+        assert "discard" not in td._CONFIRM_STOP_WORDS
 
     def test_a_threaded_ask_gets_a_threaded_reply(self):
         cyc = _live_cycle()
@@ -298,3 +347,51 @@ class TestTapReceiver:
         client.chat_update.side_effect = RuntimeError("slack down")
         _live_cycle()
         app_module._handle_kc_tap(self._body(), client, "skip_today")  # must not raise
+
+    def test_a_stale_card_cannot_promote_an_answer_it_is_not_showing(self, tmp_path,
+                                                                     monkeypatch):
+        """"Let me reword" leaves the old card live, so a second card exists for
+        the same cycle. Tapping the OLDER one used to write the NEWER answer
+        while still displaying the old text."""
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        _live_cycle()
+        kc.record_answer("kchk-a", USER, "3 still open")
+        stale_value = f"kchk-a:{kc.answer_fingerprint('3 still open')}"
+        kc.record_answer("kchk-a", USER, "actually 4 still open")
+
+        client = MagicMock()
+        body = {"actions": [{"value": stale_value}], "user": {"id": USER},
+                "channel": {"id": "D1"}, "message": {"ts": "222.1", "blocks": []}}
+        app_module._handle_kc_tap(body, client, "confirm")
+        assert client.chat_postEphemeral.called      # refused, ephemerally
+        assert not client.chat_update.called
+        assert not (tmp_path / "osn.md").exists()    # nothing written
+
+        # The CURRENT card still works.
+        fresh = f"kchk-a:{kc.answer_fingerprint('actually 4 still open')}"
+        body["actions"] = [{"value": fresh}]
+        app_module._handle_kc_tap(body, MagicMock(), "confirm")
+        assert "actually 4 still open" in (tmp_path / "osn.md").read_text(encoding="utf-8")
+
+    def test_an_ok_after_reword_does_not_promote_the_rejected_answer(self, tmp_path,
+                                                                     monkeypatch):
+        """The edit tap's own instruction invites an acknowledgement; "ok" must
+        not save the very answer the person just rejected."""
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        _live_cycle()
+        kc.record_answer("kchk-a", USER, "3 still open")
+        assert kc.process_edit_tap("kchk-a", USER)[0] == "editing"
+        outcome, _payload, post_card = kc.handle_dm_reply("kchk-a", USER, "ok")
+        assert outcome == "recaptured" and post_card is True
+        assert not (tmp_path / "osn.md").exists()
+
+    def test_a_tap_writes_nothing_in_dry_mode(self, tmp_path, monkeypatch):
+        """`dry` is documented as no sends and NO WRITES. Cards outstanding from
+        an earlier `on` run must not still write after the flag is turned down."""
+        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path))
+        _live_cycle()
+        kc.record_answer("kchk-a", USER, "3 still open")
+        monkeypatch.setenv("CORA_KNOWLEDGE_CHECK", "dry")
+        outcome, _ = kc.process_confirm_tap("kchk-a", USER)
+        assert outcome == "refused"
+        assert not (tmp_path / "osn.md").exists()

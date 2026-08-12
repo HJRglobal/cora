@@ -12,11 +12,16 @@
 # sits outside Cora's read surface) rather than "system-read".
 #
 # The attested list IS the question bank. Every `items` entry below traces to a
-# numbered KPI row in that doc. NOTHING here is invented -- an LLM-generated
-# question is the exact failure class this design rejects (spec section 3), so
-# the pool is derived ONLY from KPIs the ledger explicitly marks attested or
-# gated-with-a-named-unlock. A KPI the ledger does not clearly place is left
-# OUT: skipping a person beats asking them something ungrounded.
+# KPI row in that doc -- numbered rows for F3E/HJRG/OSN, and for LEX (which the
+# source doc lists as prose bullets rather than a table) numbered by bullet
+# order. Aaron's page reads "3 + M1"; M1 is a dated MILESTONE, not a recurring
+# KPI, so it is excluded and his three items are KPI 1/2/3.
+#
+# NOTHING here is invented -- an LLM-generated question is the exact failure
+# class this design rejects (spec section 3), so the pool is derived ONLY from
+# KPIs the ledger explicitly marks attested or gated-with-a-named-unlock. A KPI
+# the ledger does not clearly place is left OUT: skipping a person beats asking
+# them something ungrounded.
 #
 # EXPECTED EMPTY POOLS (spec section 3.4 -- not a bug):
 # Tommy, Justin, Hannah and Jerry are already fully system-read, so they have no
@@ -200,15 +205,15 @@ roster:
     entity: LEX-LLC
     items:
       - key: aaron-day-program-utilization
-        kpi: "KPI 2 -- day-program utilization"
+        kpi: "KPI 1 -- day-program utilization"
         question: >-
           Where does utilization sit for each day program (DTA / TTE) this week?
       - key: aaron-program-calendar-readiness
-        kpi: "KPI 3 -- program-calendar readiness"
+        kpi: "KPI 2 -- program-calendar readiness"
         question: >-
           Is next month's program calendar ready? The deadline is the 25th.
       - key: aaron-ratio-compliance
-        kpi: "KPI 4 -- ratio compliance"
+        kpi: "KPI 3 -- ratio compliance"
         question: >-
           Were staffing ratios met on every operating day this week? Any
           exceptions?

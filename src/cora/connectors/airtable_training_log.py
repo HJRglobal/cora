@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ log = logging.getLogger(__name__)
 _API_ROOT = "https://api.airtable.com/v0"
 _HTTP_TIMEOUT = 15.0
 _MAX_ATTEMPTS = 3          # one initial try + two retries on a transient failure
+_BACKOFF_SECONDS = 1.5     # multiplied by the attempt number
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Belt-and-braces pin. The map file supplies these, but a map edit must never be
@@ -123,8 +125,14 @@ def log_knowledge_check(*, session: str, person: str, outcome: str,
             with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
                 resp = client.post(url, headers=headers, json=payload)
             if resp.status_code < 300:
-                rec = ((resp.json() or {}).get("records") or [{}])[0]
-                return True, rec.get("id", "created")
+                # A 2xx means the row IS committed. Parsing the body must never
+                # turn that into a "failure" the loop then RETRIES -- that is how
+                # a duplicate Training Log row gets created (D-051 lens-3).
+                try:
+                    rec = ((resp.json() or {}).get("records") or [{}])[0]
+                    return True, rec.get("id", "created")
+                except Exception:  # noqa: BLE001
+                    return True, "created (unparseable response body)"
             body = (resp.text or "")[:200]
             last = f"HTTP {resp.status_code}: {body}"
             if resp.status_code < 500 and resp.status_code != 429:
@@ -134,4 +142,9 @@ def log_knowledge_check(*, session: str, person: str, outcome: str,
             last = str(exc)
         log.warning("airtable_training_log: attempt %d/%d failed: %s",
                     attempt, _MAX_ATTEMPTS, last)
+        if attempt < _MAX_ATTEMPTS:
+            # Backoff. Airtable rate-limits at 5 req/s/base and then imposes a
+            # 30s lockout; three instant retries would burn the budget and
+            # EXTEND the lockout rather than ride it out.
+            time.sleep(_BACKOFF_SECONDS * attempt)
     return False, last

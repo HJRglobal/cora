@@ -44,11 +44,25 @@ is surfaced in the run report so that loss is visible, never silent.
 LEX POSTURE -- READ BEFORE CHANGING. Harrison's explicit, informed decision
 (2026-08-11, after the PHI-egress scope was named and escalated) is that LEX
 participants are treated IDENTICALLY to every other entity in this build: no PHI
-scrub, no PHI gating, on questions or answers. That posture lives in exactly one
-place -- PHI_GATE_ANSWERS below -- so it is one flip to reverse if legal comes
-back. This module deliberately does NOT reuse gap_autofill.apply_known_answer:
-that function's PHI refusal is load-bearing for the mining path, and adding a
-bypass parameter would weaken a shared writer for every one of its callers.
+scrub, no PHI gating, on the questions asked or the ANSWERS STORED. That posture
+lives in exactly one place -- PHI_GATE_ANSWERS below -- so reversing it is one
+flip. Be precise about the scope of that claim: Tier-2 QUESTION SELECTION
+additionally inherits gap_autofill.should_escalate's own PHI/LEX screens (see the
+Tier-2 section), a separate pre-existing policy this flag does not control. Those
+screens guard re-broadcasting a THIRD PARTY's logged text, which is not what
+Harrison's decision was about, so they are deliberately left standing.
+
+WHERE A CONFIRMED ANSWER ACTUALLY GOES (the real blast radius, enumerated here
+because the decision record named only the first two): design/known-answers/
+{entity}.md -- which in production resolves to the G: Drive mount, so it is also
+CLOUD-SYNCED -- plus the vector KB that ingests those curated files, plus the
+Airtable Training Log (third-party SaaS), plus the append-only event log. All but
+the event log are behind the flip; the event log copy is written at CAPTURE, so
+phi_blocked runs there too.
+
+This module deliberately does NOT reuse gap_autofill.apply_known_answer: that
+function's PHI refusal is load-bearing for the mining path, and adding a bypass
+parameter would weaken a shared writer for every one of its callers.
 Escalation record: 00-Founder/projects/build-personalized-daily-knowledge-check/
 _notes/2026-08-11_fndr_ESCALATION-lex-phi-egress-scope.md (RESOLVED).
 
@@ -62,6 +76,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -81,6 +96,13 @@ _AZ_TZ = timezone(timedelta(hours=-7))
 # consume it (spec section 3.1): a Tier-1 answer is a dated status snapshot, so
 # the same KPI is a legitimately fresh question a week later.
 ITEM_COOLDOWN_DAYS = 7
+
+# How many consecutive re-asks an UNANSWERED item gets before it falls back to
+# the full cooldown (kickoff step 2.4 asks for a gentle re-ask; this bounds
+# "gentle" so a person who never engages is not asked the same thing daily
+# forever). Counted in MISSES: the 1st and 2nd no-response re-ask, the 3rd does
+# not.
+MAX_UNANSWERED_REASKS = 2
 
 # D-089 operational TTL. A Tier-1 answer describes point-in-time status ("3 PCI
 # notices still open"), which is stale within the week -- it is written with an
@@ -185,14 +207,6 @@ def is_weekday(dt: datetime | None = None) -> bool:
     return (dt or _now()).astimezone(_AZ_TZ).weekday() < 5
 
 
-def _parse_iso(value: Any) -> datetime | None:
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except Exception:  # noqa: BLE001
-        return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-
-
 def _days_between(a_date: str, b_date: str) -> int | None:
     """Whole days from a_date to b_date (both YYYY-MM-DD), or None if unparseable."""
     try:
@@ -285,6 +299,14 @@ def validate_roster() -> list[str]:
     problems: list[str] = []
     seen_ids: set[str] = set()
     seen_keys: set[str] = set()
+    # (entity, normalized question) -> owner. Collision detection keys on the
+    # QUESTION TEXT, and several people share one known-answers file (Matt and
+    # Micah are both OSN; Shaun, Jen and Aaron all write to lex.md). Two roster
+    # items with the same question in one entity would therefore turn two valid
+    # independent observations into a permanent "dispute", with the second
+    # person's answer discarded every week. That is a data-only foot-gun -- no
+    # code change, no restart -- so the guard belongs here.
+    seen_questions: dict[tuple[str, str], str] = {}
     try:
         from . import org_roles
         registry = {r.slack_id for r in (org_roles.all_roles() or [])}
@@ -303,6 +325,14 @@ def validate_roster() -> list[str]:
             if it["key"] in seen_keys:
                 problems.append(f"duplicate item key {it['key']}")
             seen_keys.add(it["key"])
+            from .known_answers_map import file_for
+            qkey = (file_for(p["entity"]), normalize_answer(it["question"]).lower())
+            owner = seen_questions.get(qkey)
+            if owner and owner != sid:
+                problems.append(
+                    f"{p['name']} and {owner} share an identical question in "
+                    f"{qkey[0]} ({it['key']}) -- their answers would collide")
+            seen_questions.setdefault(qkey, sid)
     return problems
 
 
@@ -311,7 +341,7 @@ def validate_roster() -> list[str]:
 _APPEND_LOCK = Lock()
 
 
-def append_event(event: str, **fields: Any) -> dict[str, Any]:
+def append_event(event: str, **fields: Any) -> dict[str, Any] | None:
     """Append ONE event line. Never raises (a logging failure must not break a
     DM handler or abort a run mid-roster).
 
@@ -332,8 +362,44 @@ def append_event(event: str, **fields: Any) -> dict[str, Any]:
                 fh.flush()
                 os.fsync(fh.fileno())
     except Exception:  # noqa: BLE001
+        # Returns None on failure so a caller whose next step is IRREVERSIBLE can
+        # refuse to take it. The reservation is the case that matters: sending a
+        # DM whose ledger row never landed means the next run sees the person as
+        # unhandled and DMs them again (D-051 lens-1 HIGH).
         log.error("knowledge_check: event append failed (%s)", event, exc_info=True)
+        return None
     return row
+
+
+# fold_state() runs on the DM hot path -- has_live_cycle fires for EVERY DM from
+# every user, roster or not, and a single captured reply folds several times over.
+# _read_events parses the whole append-only log from byte 0, and json.loads does
+# not release the GIL, so an unmemoized fold burns the bot's shared thread
+# (heartbeat, Socket Mode acks, every other user's turn) once per DM and grows
+# forever. Memoized on the file's (size, mtime_ns): any append changes both, so a
+# stale fold is impossible, and a same-process append invalidates it immediately.
+_FOLD_LOCK = Lock()
+_FOLD_CACHE: dict[str, Any] = {"key": None, "value": None}
+
+
+def _events_fingerprint(path: Path) -> tuple[str, int, int] | None:
+    """(path, size, mtime_ns). The PATH is part of the key on purpose: keying on
+    (size, mtime_ns) alone lets two DIFFERENT event logs written in the same
+    filesystem tick with the same length collide and serve each other's fold.
+    Benign in production (one path) but a real cross-contamination hazard, and it
+    silently broke test isolation the moment it was introduced -- which is how it
+    was caught."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (str(path), st.st_size, st.st_mtime_ns)
+
+
+def reset_caches_for_tests() -> None:
+    with _FOLD_LOCK:
+        _FOLD_CACHE["key"] = None
+        _FOLD_CACHE["value"] = None
 
 
 def _read_events() -> list[dict[str, Any]]:
@@ -373,13 +439,14 @@ _EVENT_STATES: dict[str, str] = {
 
 
 def fold_state() -> dict[str, Any]:
-    """Fold the event log into effective state.
+    """Fold the event log into effective state (memoized on the file fingerprint).
 
     Returns:
       {
         "cycles":     {cycle_id: {...}},
         "by_day":     {(user, date): cycle_id},          # send ledger
         "last_asked": {(user, item_key): date},          # cooldown
+        "last_cycle": {(user, item_key): cycle},         # most recent, for re-ask
         "no_gap":     {(user, date): True},              # skipped_no_gap ledger
       }
 
@@ -389,9 +456,17 @@ def fold_state() -> dict[str, Any]:
     the state back to live. Without this, appending any non-terminal event to a
     finished cycle would resurrect it and it could be answered/promoted twice.
     """
+    path = _events_path()
+    fp = _events_fingerprint(path)
+    with _FOLD_LOCK:
+        if fp is not None and _FOLD_CACHE["key"] == fp:
+            return _FOLD_CACHE["value"]
+
     cycles: dict[str, dict[str, Any]] = {}
     by_day: dict[tuple[str, str], str] = {}
     last_asked: dict[tuple[str, str], str] = {}
+    last_cycle: dict[tuple[str, str], dict[str, Any]] = {}
+    _streaks: dict[tuple[str, str], int] = {}
     no_gap: dict[tuple[str, str], bool] = {}
 
     for row in _read_events():
@@ -418,6 +493,7 @@ def fold_state() -> dict[str, Any]:
                 "tier": row.get("tier"),
                 "item_key": str(row.get("item_key", "") or ""),
                 "question": str(row.get("question", "") or ""),
+                "kpi": str(row.get("kpi", "") or ""),
                 "gap_ts": str(row.get("gap_ts", "") or ""),
                 "state": STATE_RESERVED,
                 "answer": "",
@@ -425,8 +501,21 @@ def fold_state() -> dict[str, Any]:
                 "channel": "",
                 "created_ts": row.get("ts"),
                 "edited": False,
+                "delivered": False,
+                "awaiting_reword": False,
+                "card_ts": "",
             }
             cycles[cycle_id] = cyc
+
+        # `delivered` is tracked OUTSIDE the terminal guard: it records whether
+        # the DM ever actually reached the person, which stays true no matter
+        # how the cycle ends. The cooldown keys on it, so a reservation that
+        # crashed before the send -- or a send that failed -- can never burn a
+        # week of that KPI's rotation for a question nobody ever saw.
+        if ev == "asked":
+            cyc["delivered"] = True
+        if row.get("card_ts"):
+            cyc["card_ts"] = row["card_ts"]
 
         # Terminal is sticky: record nothing further onto the state.
         if cyc["state"] in TERMINAL_STATES:
@@ -435,25 +524,57 @@ def fold_state() -> dict[str, Any]:
         new_state = _EVENT_STATES.get(ev)
         if new_state:
             cyc["state"] = new_state
+        if ev == "expired":
+            cyc["end_reason"] = str(row.get("reason", "") or "")
         if ev == "recaptured":
             cyc["edited"] = True
+        # An edit tap parks the cycle until fresh prose arrives, so a bare "ok"
+        # acknowledging the reword instruction cannot promote the very answer
+        # the person just rejected (D-051 lens-2 MEDIUM).
+        if ev == "editing":
+            cyc["awaiting_reword"] = True
+        elif ev in ("captured", "recaptured"):
+            cyc["awaiting_reword"] = False
         for fld in ("answer", "message_ts", "channel", "question", "entity",
-                    "item_key", "gap_ts", "tier"):
+                    "item_key", "gap_ts", "tier", "kpi"):
             if row.get(fld) not in (None, ""):
                 cyc[fld] = row[fld]
         cyc["last_ts"] = row.get("ts")
 
     for cid, cyc in cycles.items():
         u, d, k = cyc.get("user"), cyc.get("date"), cyc.get("item_key")
-        if u and d:
-            by_day[(u, d)] = cid
-            if k:
-                prev = last_asked.get((u, k))
-                if prev is None or d > prev:
-                    last_asked[(u, k)] = d
+        if not (u and d):
+            continue
+        by_day[(u, d)] = cid
+        if not k:
+            continue
+        # Only a DELIVERED ask counts toward the cooldown (see `delivered` above).
+        if cyc.get("delivered"):
+            prev = last_asked.get((u, k))
+            if prev is None or d > prev:
+                last_asked[(u, k)] = d
+        prev_cyc = last_cycle.get((u, k))
+        if prev_cyc is None or d > str(prev_cyc.get("date", "")):
+            last_cycle[(u, k)] = cyc
+        # Consecutive-unanswered streak per item: any cycle that got as far as an
+        # ANSWER resets it, so a person who engages is never penalised.
+        streak_key = (u, k)
+        if cyc.get("delivered"):
+            if cyc.get("state") == STATE_EXPIRED and cyc.get("end_reason") == "no_response":
+                _streaks[streak_key] = _streaks.get(streak_key, 0) + 1
+            elif cyc.get("answer"):
+                _streaks[streak_key] = 0
 
-    return {"cycles": cycles, "by_day": by_day,
-            "last_asked": last_asked, "no_gap": no_gap}
+    for key, n in _streaks.items():
+        if key in last_cycle:
+            last_cycle[key]["unanswered_streak"] = n
+    out = {"cycles": cycles, "by_day": by_day, "last_asked": last_asked,
+           "last_cycle": last_cycle, "no_gap": no_gap}
+    with _FOLD_LOCK:
+        if fp is not None:
+            _FOLD_CACHE["key"] = fp
+            _FOLD_CACHE["value"] = out
+    return out
 
 
 def handled_today(state: dict[str, Any], user: str, date: str) -> bool:
@@ -467,18 +588,31 @@ def handled_today(state: dict[str, Any], user: str, date: str) -> bool:
     return state["cycles"][cid].get("state") in HANDLED_STATES
 
 
-def live_cycle_for(state: dict[str, Any], user: str) -> dict[str, Any] | None:
+def live_cycle_for(state: dict[str, Any], user: str,
+                   today: str | None = None) -> dict[str, Any] | None:
     """The one in-flight cycle for a person, if any.
 
     "In flight" means ASKED (awaiting an answer) or CAPTURED (awaiting a confirm
-    tap). Terminal cycles are invisible here, so a person who already confirmed
-    today cannot have their next unrelated DM swallowed as an answer.
+    tap), AND asked TODAY.
+
+    THE DATE FILTER IS LOAD-BEARING, not tidiness (D-051 lens-2 HIGH). Expiry
+    used to be purely runner-side, which meant a cycle was only really dead once
+    the next weekday run swept it. A Friday question therefore stayed live all
+    weekend, and ANY declarative DM on Saturday -- "the Tucson inspection is
+    Tuesday" -- was captured as its answer, producing a wrong Q/A pair in an
+    always-injected file. The same held, unbounded, whenever the scheduled task
+    simply did not fire. Enforcing it at READ time makes "expires end of day"
+    true regardless of whether anything ran; expire_stale_cycles still exists to
+    record the outcome for the participation metrics.
     """
+    today = today or az_date()
     best: dict[str, Any] | None = None
     for cyc in state["cycles"].values():
         if cyc.get("user") != user:
             continue
         if cyc.get("state") not in (STATE_ASKED, STATE_CAPTURED):
+            continue
+        if str(cyc.get("date", "")) != today:
             continue
         if best is None or str(cyc.get("date", "")) > str(best.get("date", "")):
             best = cyc
@@ -512,9 +646,11 @@ def expire_stale_cycles(state: dict[str, Any], today: str | None = None) -> list
         reason = {STATE_ASKED: "no_response",
                   STATE_CAPTURED: "no_confirm",
                   STATE_RESERVED: "reserved_never_sent"}[cyc["state"]]
-        out.append(append_event("expired", cycle_id=cyc["cycle_id"],
-                                user=cyc.get("user"), date=cyc.get("date"),
-                                reason=reason))
+        row = append_event("expired", cycle_id=cyc["cycle_id"],
+                           user=cyc.get("user"), date=cyc.get("date"),
+                           reason=reason)
+        if row is not None:
+            out.append(row)
     return out
 
 
@@ -549,6 +685,18 @@ def select_tier1(person: dict[str, Any], state: dict[str, Any],
             # re-ask something we cannot prove is off cooldown).
             continue
         if age < ITEM_COOLDOWN_DAYS:
+            # Kickoff step 2.4: an UNANSWERED question gets a gentle re-ask the
+            # next weekday rather than sitting out the full cooldown -- the
+            # cooldown exists to stop re-asking something we already have an
+            # answer for, which is not this case. Bounded by
+            # MAX_UNANSWERED_REASKS so somebody who never engages is not asked
+            # the same thing every single day indefinitely.
+            last = state.get("last_cycle", {}).get((person["slack_id"], item["key"]))
+            if (last and age >= 1
+                    and last.get("state") == STATE_EXPIRED
+                    and last.get("end_reason") == "no_response"
+                    and int(last.get("unanswered_streak", 0)) <= MAX_UNANSWERED_REASKS):
+                candidates.append((0, idx, item))
             continue
         candidates.append((1, -age, item))
     if not candidates:
@@ -737,16 +885,21 @@ def claim_gap(gap_ts: str, cycle_id: str) -> bool:
         return False
     try:
         from . import gap_autofill as ga
-        state = ga.load_state()
-        if gap_ts in state:
+        # RE-READ IMMEDIATELY BEFORE WRITING, then merge only our own key
+        # (D-051 lens-1 MEDIUM). The scheduling argument below covers the 06:00
+        # gap-autofill SCRIPT, but the always-on BOT writes this same ledger
+        # too, whenever a teammate answers a gap-ask DM, at any hour.
+        # save_state replaces the whole file, so writing back a copy read 45
+        # minutes earlier erased that teammate's claim and reopened a gap they
+        # had already answered. Merging into a freshly-read dict cannot drop a
+        # key we never saw; the residual (both writers landing between this read
+        # and the write) loses OUR OWN claim, which is the benign direction.
+        fresh = ga.load_state()
+        if gap_ts in fresh:
             return False  # somebody already claimed it
-        state[gap_ts] = {
-            "state": "asked",
-            "via": "knowledge_check",
-            "cycle_id": cycle_id,
-            "at": _now_iso(),
-        }
-        ga.save_state(state)
+        fresh[gap_ts] = {"state": "asked", "via": "knowledge_check",
+                         "cycle_id": cycle_id, "at": _now_iso()}
+        ga.save_state(fresh)
         return True
     except Exception:  # noqa: BLE001 -- a failed claim must not break the run
         log.warning("knowledge_check: gap claim failed for %s", gap_ts, exc_info=True)
@@ -765,11 +918,19 @@ def select_question(person: dict[str, Any], state: dict[str, Any],
     """
     gap = select_tier2(person, open_gaps=open_gaps, claimed=claimed)
     if gap is not None:
+        # A Tier-2 question is a VERBATIM Slack message body written by whoever
+        # asked it -- third-party text, unlike a roster question. It is relayed
+        # in a DM from Cora AND written into an always-injected file, so it goes
+        # through exactly the same door as an answer: whitespace-collapsed,
+        # structure-neutralized (safe_line) and Slack-neutralized (scrub_answer,
+        # which rewrites `<url|label>`, `<!channel>` and `<@user>`). Without this
+        # a crafted gap question could forge a provenance block in known-answers
+        # or get Cora to DM 13 people an attacker-chosen labelled link.
         return {
             "tier": 2,
             "item_key": f"gap:{gap.get('ts', '')}",
             "gap_ts": str(gap.get("ts", "") or ""),
-            "question": str(gap.get("question", "") or "")[:400],
+            "question": safe_line(scrub_answer(str(gap.get("question", "") or ""))),
             "kpi": "open knowledge gap",
         }
     item = select_tier1(person, state, today=today)
@@ -846,8 +1007,27 @@ def confirm_text(answer: str, question: str = "") -> str:
     return body + f"*{str(answer or '').strip()}*"
 
 
+def answer_fingerprint(answer: str) -> str:
+    """Short, stable digest of the answer a card is DISPLAYING.
+
+    Not a secret and not an authorization token -- the opaque cycle_id remains
+    the only thing that authorizes anything. This binds a card to the exact text
+    printed on it, which the cycle_id alone cannot do (D-051 lens-1 MEDIUM):
+    "Let me reword" deliberately leaves the old card live, so a reworded answer
+    produces a SECOND card carrying the same cycle_id. Tapping "Save it" on the
+    older card wrote the NEWER answer while the card still displayed the old one,
+    and the outcome line was appended to that stale text -- the person would
+    reasonably believe they had saved what they were looking at. That breaks the
+    hard rule "never write what the person did not confirm" through an
+    advertised flow, with no race required.
+    """
+    import hashlib
+    return hashlib.sha256(normalize_answer(answer).encode("utf-8")).hexdigest()[:10]
+
+
 def build_confirm_blocks(answer: str, cycle_id: str, question: str = "") -> list[dict]:
     from . import confirm_cards as _cc
+    value = f"{cycle_id}:{answer_fingerprint(answer)}"
     return [
         *_cc.chunk_mrkdwn_sections(_sanitize(confirm_text(answer, question))),
         {"type": "actions",
@@ -855,20 +1035,23 @@ def build_confirm_blocks(answer: str, cycle_id: str, question: str = "") -> list
          "elements": [
              {"type": "button", "action_id": ACTION_CONFIRM_ANSWER, "style": "primary",
               "text": {"type": "plain_text", "text": "Save it"},
-              "value": cycle_id},
+              "value": value},
              {"type": "button", "action_id": ACTION_EDIT_ANSWER,
               "text": {"type": "plain_text", "text": "Let me reword"},
-              "value": cycle_id},
+              "value": value},
              {"type": "button", "action_id": ACTION_SKIP_ANSWER,
               "text": {"type": "plain_text", "text": "Skip"},
-              "value": cycle_id},
+              "value": value},
          ]},
     ]
 
 
-def terminal_blocks(text: str) -> list[dict]:
-    from . import confirm_cards as _cc
-    return _cc.chunk_mrkdwn_sections(_sanitize(text))
+def split_tap_value(value: str) -> tuple[str, str]:
+    """(cycle_id, fingerprint) from a button value. Fingerprint is "" when absent
+    (the ask card's Skip-today button, which has no answer to bind to)."""
+    raw = str(value or "")
+    cycle_id, _, fp = raw.partition(":")
+    return cycle_id, fp
 
 
 def open_dm(client: Any, slack_id: str) -> str:
@@ -899,8 +1082,18 @@ def match_live_cycle(user_id: str, thread_ts: str | None,
     if cyc is None:
         return None
     if thread_ts:
-        return cyc if cyc.get("message_ts") == thread_ts else None
+        # The ask's ts OR the confirm card's ts. The flow encourages a top-level
+        # answer, so the confirm card is usually posted top-level too -- and a
+        # user replying in THAT card's thread is unambiguously answering it.
+        return cyc if thread_ts in (cyc.get("message_ts"), cyc.get("card_ts")) else None
     return cyc if allow_toplevel else None
+
+
+def register_card_ts(cycle_id: str, card_ts: str) -> None:
+    """Record where a confirm card landed, so a reply typed in the CARD's own
+    thread matches as well as one typed in the ask's thread."""
+    if cycle_id and card_ts:
+        append_event("card_posted", cycle_id=cycle_id, card_ts=card_ts)
 
 
 def has_live_cycle(user_id: str) -> bool:
@@ -939,6 +1132,18 @@ def record_answer(cycle_id: str, user_id: str, text: str) -> tuple[str, str]:
         answer = scrub_answer(text)
         if not answer:
             return "empty", ""
+        # PHI gate at CAPTURE, not only at the write (D-051 lens-4 MEDIUM). The
+        # answer is durably persisted into the append-only event log the moment
+        # it is staged, so gating only in promote() meant an ARMED gate still let
+        # PHI reach durable state -- and because a refused promote leaves the
+        # cycle CAPTURED for a reword, each retry appended another plaintext
+        # copy. Under the decided posture this is a no-op (PHI_GATE_ANSWERS is
+        # False); it exists so the reversal is actually complete.
+        blocked, reason = phi_blocked(answer)
+        if blocked:
+            append_event("skipped_by_user", cycle_id=cycle_id, user=user_id,
+                         date=cyc.get("date"), reason="phi_refused")
+            return "declined", reason
         if is_non_answer(answer):
             append_event("skipped_by_user", cycle_id=cycle_id, user=user_id,
                          date=cyc.get("date"), reason="declined_in_reply")
@@ -953,7 +1158,8 @@ def record_answer(cycle_id: str, user_id: str, text: str) -> tuple[str, str]:
 # ── CONFIRM / EDIT / SKIP taps ──────────────────────────────────────────────
 
 def _authorize_tap(cycle_id: str, actor_id: str,
-                   allowed_states: tuple[str, ...]) -> tuple[str, dict[str, Any] | None]:
+                   allowed_states: tuple[str, ...],
+                   fingerprint: str = "") -> tuple[str, dict[str, Any] | None]:
     """Shared resolve+authorize. Returns (outcome, cycle) where outcome is "ok"
     or a terminal explanation.
 
@@ -975,6 +1181,12 @@ def _authorize_tap(cycle_id: str, actor_id: str,
         return "already_handled", cyc
     if cyc.get("state") not in allowed_states:
         return "not_live", cyc
+    # The card must be acting on the text it is DISPLAYING. A tap carrying a
+    # fingerprint that no longer matches the staged answer is a stale card (the
+    # user reworded, then scrolled up and tapped the older one) -- refuse rather
+    # than write something they were not looking at.
+    if fingerprint and fingerprint != answer_fingerprint(cyc.get("answer", "")):
+        return "superseded", cyc
     return "ok", cyc
 
 
@@ -989,10 +1201,12 @@ def process_skip_today_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
     return "skipped", "No problem -- skipped for today."
 
 
-def process_skip_answer_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
+def process_skip_answer_tap(cycle_id: str, actor_id: str,
+                            fingerprint: str = "") -> tuple[str, str]:
     """"Skip" on the CONFIRM card: the staged answer is discarded unwritten."""
     with _CLAIM_LOCK:
-        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,))
+        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,),
+                                      fingerprint)
         if outcome != "ok":
             return outcome, _tap_message(outcome)
         append_event("skipped_by_user", cycle_id=cycle_id, user=actor_id,
@@ -1000,16 +1214,26 @@ def process_skip_answer_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
     return "skipped", "Got it -- nothing saved."
 
 
-def process_edit_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
+def process_edit_tap(cycle_id: str, actor_id: str,
+                     fingerprint: str = "") -> tuple[str, str]:
     """"Let me reword": stay in CAPTURED and wait for a fresh typed answer.
 
     Deliberately does NOT open a modal. The whole capture surface is free prose
     in a DM; a second input mechanism would be a parallel path with its own
     failure modes for no benefit. The next DM replaces the staged answer.
     """
-    outcome, _cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,))
-    if outcome != "ok":
-        return outcome, _tap_message(outcome)
+    with _CLAIM_LOCK:
+        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,),
+                                      fingerprint)
+        if outcome != "ok":
+            return outcome, _tap_message(outcome)
+        # PARK the cycle until fresh prose arrives. Without this, a user who taps
+        # "Let me reword", reads the instruction below and types "ok" as an
+        # acknowledgement hits the CAPTURED + is_affirmative branch and promotes
+        # the very answer they just rejected -- irreversibly, from their side
+        # (D-051 lens-2 MEDIUM).
+        append_event("editing", cycle_id=cycle_id, user=actor_id,
+                     date=cyc.get("date"))
     return "editing", ("Sure -- send it again however you'd like it worded, and "
                        "I'll show you the new version.")
 
@@ -1030,7 +1254,7 @@ _AFFIRMATIVE_RE = re.compile(
     r"right|save|save it|looks good|lgtm|ok|okay|perfect)[.!]?$",
     re.IGNORECASE)
 _NEGATIVE_RE = re.compile(
-    r"^(no|nope|nah|don'?t|do not|cancel|scratch that|never ?mind)[.!]?$",
+    r"^(no|nope|nah|don'?t|do not|cancel|discard|scratch that|never ?mind)[.!]?$",
     re.IGNORECASE)
 
 
@@ -1055,7 +1279,10 @@ def handle_dm_reply(cycle_id: str, user_id: str, text: str) -> tuple[str, str, b
     cyc = get_cycle(state, cycle_id)
     if cyc is None:
         return "not_live", "", False
-    if cyc.get("state") == STATE_CAPTURED:
+    # `awaiting_reword` suppresses the affirmative/negative branch until fresh
+    # prose lands, so an "ok" acknowledging the reword prompt is treated as the
+    # start of the new answer rather than as a confirm of the rejected one.
+    if cyc.get("state") == STATE_CAPTURED and not cyc.get("awaiting_reword"):
         if is_affirmative(text):
             outcome, msg = process_confirm_tap(cycle_id, user_id)
             return outcome, msg, False
@@ -1074,6 +1301,8 @@ def _tap_message(outcome: str) -> str:
         "not_authorized": "That question was for someone else.",
         "already_handled": "That one's already handled.",
         "not_live": "That question isn't waiting on anything right now.",
+        "superseded": ("That card is showing an older version of your answer -- "
+                       "use the most recent one."),
     }.get(outcome, "Something went wrong there.")
 
 
@@ -1105,18 +1334,59 @@ def _entity_file(entity: str) -> Path:
     return _known_answers_dir() / file_for(entity)
 
 
-def _expiry_for(tier: int, today: str) -> str:
-    """Tier-1 status snapshots expire; Tier-2 durable answers do not."""
+def _expiry_for(tier: int, asked_date: str) -> str:
+    """Tier-1 status snapshots expire; Tier-2 durable answers do not.
+
+    Keyed on the date the question was ASKED, not the date it was confirmed
+    (D-051 lens-3 MEDIUM). The cooldown is measured from the ask, so keying the
+    expiry off the confirm made a cross-midnight tap (answered 08-11, tapped
+    00:05 on 08-12) expire one day AFTER its own re-ask date -- the old entry
+    was still live when the fresh answer arrived, so the new reading was
+    discarded as a "dispute" and a false D-128 card went to Harrison. Self-
+    healing on the following cycle, which made it fire every OTHER week for a
+    habitual late-night responder. Anchoring both to the ask date removes the
+    drift entirely.
+    """
     if tier != 1:
         return "never"
-    d = datetime.strptime(today, "%Y-%m-%d") + timedelta(days=ANSWER_TTL_DAYS)
-    return d.date().isoformat()
+    try:
+        base = datetime.strptime(asked_date, "%Y-%m-%d")
+    except Exception:  # noqa: BLE001 -- an unparseable date must not lose the TTL
+        base = datetime.strptime(az_date(), "%Y-%m-%d")
+    return (base + timedelta(days=ANSWER_TTL_DAYS)).date().isoformat()
 
 
 def _is_expired(expires: str, today: str) -> bool:
     if not expires or expires == "never":
         return False
     return expires <= today
+
+
+def safe_line(text: str, limit: int = 400) -> str:
+    """Force `text` into ONE line that cannot forge this file's own structure.
+
+    Everything written into a known-answers file is third-party-authored: an
+    answer is typed by a teammate, and a Tier-2 question is a verbatim Slack
+    message body from the gap log (NOT whitespace-collapsed at source, unlike a
+    roster question). Three concrete structural attacks, all closed here:
+
+      * a NEWLINE splits one logical field across lines, so _scan_entries records
+        only the first fragment while detect_collision compares the whole string.
+        They can never match, which renders that entry permanently INVISIBLE to
+        every future collision check -- silently disabling hard rule 3 for it.
+      * a leading '#' becomes a fake '## ' section boundary, which moves
+        _append_entry's insertion point and can strand later entries outside
+        '## Known facts'.
+      * a forged '<!-- kc-entry ... expires=<past> -->' line makes the TTL sweep
+        delete from there to the next blank -- truncating a legitimate entry it
+        did not write.
+    """
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = t.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    t = re.sub(r"^#+\s*", "", t)
+    if len(t) > limit:
+        t = t[:limit].rstrip() + " ..."
+    return t
 
 
 def build_entry_lines(cycle: dict[str, Any], answer: str, today: str) -> list[str]:
@@ -1127,17 +1397,21 @@ def build_entry_lines(cycle: dict[str, Any], answer: str, today: str) -> list[st
     from something Cora derived.
     """
     tier = int(cycle.get("tier") or 1)
-    expires = _expiry_for(tier, today)
+    expires = _expiry_for(tier, str(cycle.get("date") or today))
     person = roster_member(str(cycle.get("user", ""))) or {}
     name = person.get("name") or str(cycle.get("user", ""))
     label = cycle.get("kpi") or ("open knowledge gap" if tier == 2 else "status")
     kind = ("status snapshot, expires " + expires) if tier == 1 else "contributed answer"
+    # safe_line on BOTH fields, defensively, even though select_question already
+    # cleans the Tier-2 question: this is the last gate before an always-injected
+    # file, and a future producer must not be able to reintroduce the forgery.
     return [
         f"<!-- kc-entry cycle={cycle.get('cycle_id', '')} expires={expires} -->",
-        f"**[{today}] {name} -- {label}** _(daily knowledge check -- {kind})_",
-        f"Q: {str(cycle.get('question', '')).strip()}",
-        f"A: {answer}",
-        f"Author: {name} -- contributed via daily knowledge check",
+        f"**[{today}] {safe_line(name, 80)} -- {safe_line(label, 80)}** "
+        f"_(daily knowledge check -- {kind})_",
+        f"Q: {safe_line(cycle.get('question', ''))}",
+        f"A: {safe_line(answer, MAX_ANSWER_CHARS)}",
+        f"Author: {safe_line(name, 80)} -- contributed via daily knowledge check",
         "",
     ]
 
@@ -1177,6 +1451,10 @@ def _scan_entries(text: str, today: str) -> list[dict[str, Any]]:
     return out
 
 
+# Distinguishes "the scan failed" from "an entry exists and differs".
+_COLLISION_READ_ERROR = "__read_error__"
+
+
 def detect_collision(entity: str, question: str, answer: str,
                      today: str | None = None) -> tuple[bool, str]:
     """DETERMINISTIC key-collision check. Returns (collides, existing_answer).
@@ -1206,9 +1484,13 @@ def detect_collision(entity: str, question: str, answer: str,
         return False, ""
     except Exception:  # noqa: BLE001 -- fail CLOSED: treat an unreadable file as
         # a possible collision rather than risk silently overwriting canon.
+        # A SENTINEL, not "" -- the first cut passed the empty string straight
+        # into the decision card, which then asserted a contradiction and showed
+        # nothing to contradict ("On file: "), with no hint that the scan had
+        # failed rather than found something (D-051 lens-4 LOW).
         log.error("knowledge_check: collision scan failed for %s -- holding",
                   entity, exc_info=True)
-        return True, ""
+        return True, _COLLISION_READ_ERROR
 
 
 def expire_stale_answers(today: str | None = None,
@@ -1226,54 +1508,180 @@ def expire_stale_answers(today: str | None = None,
         path = _known_answers_dir() / filename
         if not path.exists():
             continue
+        # PER-FILE guard around read AND write (D-051 lens-3 MEDIUM-HIGH). These
+        # files live on the G: Drive mount in production, where a stalled mount
+        # raises WinError 21/53/67. The first cut wrapped only the read, so one
+        # unwritable file propagated out of the sweep, out of the runner, and
+        # killed the whole morning's DMs -- and because files are swept in sorted
+        # order, every later entity went unswept too.
         try:
-            lines = path.read_text(encoding="utf-8").split("\n")
-        except Exception:  # noqa: BLE001
-            log.warning("knowledge_check: could not read %s", filename, exc_info=True)
+            with _known_answers_lock():
+                n = _sweep_one_file(path, today, dry_run)
+        except Exception:  # noqa: BLE001 -- one bad file must not end the sweep
+            log.warning("knowledge_check: sweep failed for %s -- continuing",
+                        filename, exc_info=True)
             continue
-        out: list[str] = []
-        i = 0
-        count = 0
-        while i < len(lines):
-            m = _KC_MARKER_RE.match(lines[i].strip())
-            if m and _is_expired(m.group("expires"), today):
-                count += 1
-                i += 1
-                # Drop through to (and including) the block's terminating blank.
-                while i < len(lines) and lines[i].strip():
-                    i += 1
-                if i < len(lines):
-                    i += 1
-                continue
-            out.append(lines[i])
-            i += 1
-        if count:
-            removed[filename] = count
-            if not dry_run:
-                # Each entry is written as blank + block + blank, and the sweep
-                # takes block + trailing blank -- so without this the leading
-                # blanks pile up and the file slowly grows whitespace over
-                # months of write/expire cycles.
-                collapsed: list[str] = []
-                for ln in out:
-                    if not ln.strip() and collapsed and not collapsed[-1].strip():
-                        continue
-                    collapsed.append(ln)
-                _atomic_write_text(path, "\n".join(collapsed))
+        if n:
+            removed[filename] = n
     return removed
 
 
+def _sweep_one_file(path: Path, today: str, dry_run: bool) -> int:
+    lines = path.read_text(encoding="utf-8").split("\n")
+    out: list[str] = []
+    i = 0
+    count = 0
+    while i < len(lines):
+        m = _KC_MARKER_RE.match(lines[i].strip())
+        if m and _is_expired(m.group("expires"), today):
+            count += 1
+            i += 1
+            # Terminator is the block's trailing blank OR the next block's
+            # marker OR a section header, whichever comes first. Trusting the
+            # blank alone assumed every field is single-line; a field that ever
+            # contains a blank line (or a truncated legacy entry) would leave the
+            # tail behind as an UNMARKED, undated fragment that no later sweep
+            # could ever remove -- permanently resident in an always-injected
+            # file. safe_line() now prevents such an entry being written, but the
+            # sweep must also be able to clean any that already exist.
+            while i < len(lines):
+                s = lines[i].strip()
+                if not s:
+                    i += 1
+                    break
+                if _KC_MARKER_RE.match(s) or s.startswith("## "):
+                    break
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if count and not dry_run:
+        # Each entry is written as blank + block + blank and the sweep takes
+        # block + trailing blank, so without this the leading blanks pile up and
+        # the file grows whitespace over months of write/expire cycles. Scoped to
+        # runs of 3+ so it only removes the blanks the sweep itself just created
+        # and leaves ordinary one-blank-line formatting alone.
+        collapsed: list[str] = []
+        run = 0
+        for ln in out:
+            if not ln.strip():
+                run += 1
+                if run >= 3:
+                    continue
+            else:
+                run = 0
+            collapsed.append(ln)
+        _atomic_write_text(path, "\n".join(collapsed))
+    return count
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    """Atomic replace via a PROCESS-UNIQUE temp file.
+
+    The obvious `path.with_suffix(".tmp")` is a FIXED name shared by every
+    writer of these files (this module, gap_autofill, info_intake). Two
+    processes writing `lex.md.tmp` interleave their bytes and whichever calls
+    replace() second publishes a TORN file as that entity's always-injected
+    known-answers (D-051 lens-3 HIGH). A unique name makes the temp private, so
+    replace() is the only shared step and it is atomic.
+    """
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
-def _append_entry(entity: str, entry_lines: list[str]) -> Path:
+# ── Cross-process lock for known-answers read-modify-write ──────────────────
+#
+# The module docstring's "no read-modify-write anywhere in this module's state
+# path" is true of the EVENT LOG and false of the artifact this feature exists
+# to produce. Two processes mutate known-answers: the 08:05 runner (the TTL
+# sweep) and the always-on bot (a promote). _CLAIM_LOCK is a threading.Lock and
+# does not cross processes, so a sweep that read the file before a promote
+# appended would write its stale copy back and DESTROY a confirmed answer --
+# reproduced in review, with the cycle left terminally PROMOTED, the person
+# thanked, and the fact simply absent. Morning taps on the previous day's cards
+# are exactly the traffic the 08:05 run overlaps.
+#
+# O_CREAT|O_EXCL is atomic on Windows and POSIX alike. Fail-OPEN on a timeout:
+# the lock reduces a real race, but blocking a person's confirmed answer because
+# a lock file was left behind would be a worse failure than the race it prevents.
+_KA_LOCK_STALE_S = 60.0
+_KA_LOCK_TIMEOUT_S = 5.0
+
+
+def _ka_lock_path() -> Path:
+    return _known_answers_dir() / ".knowledge-check-write.lock"
+
+
+class _known_answers_lock:
+    """Best-effort cross-process mutex around a known-answers read-modify-write."""
+
+    def __init__(self) -> None:
+        self._held = False
+
+    def __enter__(self) -> "_known_answers_lock":
+        path = _ka_lock_path()
+        deadline = time.monotonic() + _KA_LOCK_TIMEOUT_S
+        while True:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self._held = True
+                return self
+            except FileExistsError:
+                try:  # reclaim a lock orphaned by a killed process
+                    if time.time() - path.stat().st_mtime > _KA_LOCK_STALE_S:
+                        path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+            except OSError:
+                return self  # unwritable dir -- proceed unlocked rather than block
+            if time.monotonic() > deadline:
+                log.warning("knowledge_check: known-answers lock timed out -- "
+                            "proceeding unlocked")
+                return self
+            time.sleep(0.05)
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._held:
+            try:
+                _ka_lock_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _append_entry(entity: str, entry_lines: list[str], cycle_id: str = "") -> Path:
     """Append under '## Known facts', matching gap_autofill._append_to_section's
-    insertion semantics so both writers produce identically-shaped files."""
+    insertion semantics so both writers produce identically-shaped files.
+
+    IDEMPOTENT on cycle_id (D-051 lens-3 MEDIUM -- the B6 window, re-opened).
+    append_event swallows its own write failures, so a `promoted` append that
+    fails leaves the cycle CAPTURED while the person has already been told
+    "Saved". Their retry re-enters promote with an IDENTICAL answer, which is
+    correctly not a collision, and the fact block is written twice.
+    gap_autofill.apply_known_answer closes exactly this window with a
+    resolved-ledger short-circuit plus a content check; this is the same guard,
+    keyed on the marker that is already unique per cycle.
+    """
     path = _entity_file(entity)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if cycle_id and path.exists():
+        try:
+            if f"cycle={cycle_id} " in path.read_text(encoding="utf-8"):
+                log.info("knowledge_check: entry for %s already present -- skipping",
+                         cycle_id)
+                return path
+        except Exception:  # noqa: BLE001 -- an unreadable file falls through to append
+            pass
     header = "## Known facts"
     if not path.exists():
         _atomic_write_text(path, f"# Known Answers\n\n## Routing rules\n\n{header}\n")
@@ -1323,7 +1731,11 @@ def route_collision_to_decisions(cycle: dict[str, Any], answer: str,
                 f"mined fact): {name} answered a question that already has a different "
                 f"live answer on file.\n"
                 f"Asked: {str(cycle.get('question', ''))[:400]}\n"
-                f"On file: {existing[:400]}\n"
+                + (f"On file: COULD NOT BE READ -- the scan failed, so this may "
+                   f"not be a real conflict; the answer was held rather than "
+                   f"risk overwriting canon.\n"
+                   if existing == _COLLISION_READ_ERROR
+                   else f"On file: {existing[:400]}\n") +
                 f"New answer: {answer[:400]}\n"
                 f"Which is authoritative is a call, not a fact -- so nothing was "
                 f"written to known-answers."),
@@ -1375,6 +1787,15 @@ def promote(cycle: dict[str, Any], today: str | None = None) -> tuple[str, str]:
     matters, the mirror is best-effort and can never fail the promote.
     """
     today = today or az_date()
+    # `dry` must mean NO WRITES, everywhere (D-051, three lenses). The runner
+    # half honoured it; the bot half gated on enabled(), which is true for dry --
+    # so `on -> dry` (the natural "pause it, something looks wrong" move) left
+    # every outstanding card still able to write to an always-injected file and
+    # fire the Airtable mirror, in a mode .env.example documents as write-free.
+    # Gated HERE rather than only at the app layer so every caller inherits it.
+    if not live():
+        return "refused", ("The knowledge check isn't in live mode right now, so "
+                           "I haven't saved anything.")
     answer = normalize_answer(cycle.get("answer", ""))
     if not answer:
         return "empty", "There was nothing staged to save."
@@ -1388,11 +1809,16 @@ def promote(cycle: dict[str, Any], today: str | None = None) -> tuple[str, str]:
     collides, existing = detect_collision(entity, question, answer, today=today)
     if collides:
         route_collision_to_decisions(cycle, answer, existing)
+        if existing == _COLLISION_READ_ERROR:
+            return "held", ("I couldn't read what I already have on file, so I've "
+                            "held that rather than risk overwriting something.")
         return "held", ("Thanks -- that differs from what I already have on file, "
                         "so I've flagged it for Harrison instead of overwriting it.")
 
     try:
-        path = _append_entry(entity, build_entry_lines(cycle, answer, today))
+        with _known_answers_lock():
+            path = _append_entry(entity, build_entry_lines(cycle, answer, today),
+                                 cycle_id=str(cycle.get("cycle_id", "")))
     except Exception:  # noqa: BLE001
         log.error("knowledge_check: known-answers write failed for %s",
                   cycle.get("cycle_id"), exc_info=True)
@@ -1416,7 +1842,8 @@ def _mirror_to_training_log(cycle: dict[str, Any], answer: str,
         return False, str(exc)
 
 
-def process_confirm_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
+def process_confirm_tap(cycle_id: str, actor_id: str,
+                        fingerprint: str = "") -> tuple[str, str]:
     """"Save it" on the confirm card: claim, then write. Exactly once.
 
     The whole claim-and-write runs under _CLAIM_LOCK and re-folds the log inside
@@ -1425,7 +1852,8 @@ def process_confirm_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
     rather than a false 'nothing happened'.
     """
     with _CLAIM_LOCK:
-        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,))
+        outcome, cyc = _authorize_tap(cycle_id, actor_id, (STATE_CAPTURED,),
+                                      fingerprint)
         if outcome != "ok":
             return outcome, _tap_message(outcome)
         result, message = promote(cyc)

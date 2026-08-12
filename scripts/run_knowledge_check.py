@@ -67,6 +67,48 @@ def _setup_logging() -> logging.Logger:
     return logging.getLogger("run_knowledge_check")
 
 
+class _RunLock:
+    """Best-effort single-instance guard (O_CREAT|O_EXCL, stale after 2h).
+
+    Fail-CLOSED on contention -- a second concurrent run is exactly the thing
+    that produces duplicate DMs, so exiting is the safe outcome. Stale-clears so
+    a killed run cannot block every subsequent morning.
+    """
+
+    STALE_SECONDS = 2 * 3600
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._held = False
+
+    def acquire(self) -> bool:
+        import os as _os
+        import time as _time
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists():
+                if _time.time() - self.path.stat().st_mtime > self.STALE_SECONDS:
+                    self.path.unlink(missing_ok=True)
+                else:
+                    return False
+            fd = _os.open(str(self.path), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+            _os.write(fd, str(_os.getpid()).encode())
+            _os.close(fd)
+            self._held = True
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            return True  # cannot lock -- proceed rather than never run
+
+    def release(self) -> None:
+        if self._held:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _slack_client():
     import os
     from slack_sdk import WebClient
@@ -110,7 +152,14 @@ def main() -> int:
     ap.add_argument("--max-sends", type=int, default=0, help="cap sends (0 = no cap)")
     ap.add_argument("--report", action="store_true",
                     help="print the participation report and exit")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the already-handled ledger and the item cooldown; "
+                         "only valid with --dogfood or --user (retry a failed smoke)")
     args = ap.parse_args()
+
+    if args.force and not (args.dogfood or args.user):
+        ap.error("--force requires --dogfood or --user (it bypasses the "
+                 "duplicate-send guard, so it is never allowed roster-wide)")
 
     log = _setup_logging()
     today = kc.az_date()
@@ -119,17 +168,41 @@ def main() -> int:
 
     log.info("knowledge check: date=%s mode=%s dry=%s", today, mode, dry)
 
-    problems = kc.validate_roster()
-    if problems:
-        for p in problems:
-            log.error("roster problem: %s", p)
-        log.error("refusing to run on an invalid roster")
-        return 1
-
     if args.report:
         for line in kc.participation_report():
             log.info("%s", line)
         return 0
+
+    # ── The TTL sweep runs FIRST, before every other gate ────────────────────
+    # It is independent of the roster, the flag and the calendar, and putting it
+    # after those gates made it unreachable in exactly the situations where it
+    # matters most (D-051 lens-3 HIGH): setting CORA_KNOWLEDGE_CHECK=off is the
+    # documented kill switch and would have frozen every expired status snapshot
+    # in an always-injected file permanently, each still printing its own
+    # "expires" date. One departed teammate failing validate_roster would have
+    # done the same, silently, every morning.
+    try:
+        for filename, n in sorted(kc.expire_stale_answers(today=today,
+                                                          dry_run=dry).items()):
+            log.info("%s %d expired knowledge-check entr%s from %s",
+                     "would sweep" if dry else "swept", n,
+                     "y" if n == 1 else "ies", filename)
+    except Exception:  # noqa: BLE001 -- the sweep must never block the asks
+        log.warning("TTL sweep failed -- continuing", exc_info=True)
+
+    # Close out anything still in flight from a previous day. Runs regardless of
+    # dry: it records outcomes, it does not send. Skipping it in dry left a
+    # paused pilot with cycles frozen in ASKED/CAPTURED forever.
+    if not args.dry_run:
+        for row in kc.expire_stale_cycles(kc.fold_state(), today=today):
+            log.info("expired cycle=%s reason=%s", row.get("cycle_id"), row.get("reason"))
+
+    problems = kc.validate_roster()
+    if problems:
+        for p in problems:
+            log.error("roster problem: %s", p)
+        log.error("refusing to send on an invalid roster")
+        return 1
 
     people = ([p for p in kc.load_roster() if p.get("dogfood_only")] if args.dogfood
               else kc.pilot_roster())
@@ -150,23 +223,7 @@ def main() -> int:
         log.info("weekend -- no questions today")
         return 0
 
-    # Close out anything still in flight from a previous day BEFORE selecting,
-    # so a stale cycle can never be mistaken for today's live one.
     state = kc.fold_state()
-    if not dry:
-        for row in kc.expire_stale_cycles(state, today=today):
-            log.info("expired cycle=%s reason=%s", row.get("cycle_id"), row.get("reason"))
-        state = kc.fold_state()
-
-    # Make the operational TTL real: sweep lapsed Tier-1 status snapshots out of
-    # known-answers. Without this the "expires" note is decorative and stale
-    # status accumulates in an always-injected file (the D-087 problem).
-    swept = kc.expire_stale_answers(today=today, dry_run=dry)
-    for filename, n in sorted(swept.items()):
-        log.info("%s %d expired knowledge-check entr%s from %s",
-                 "would sweep" if dry else "swept", n,
-                 "y" if n == 1 else "ies", filename)
-
     try:
         from cora import gap_autofill as ga
         open_gaps = ga.load_open_gaps()
@@ -174,6 +231,21 @@ def main() -> int:
         log.warning("could not load open gaps -- Tier 1 only this run", exc_info=True)
         open_gaps = []
 
+    # SINGLE INSTANCE. Task Scheduler's MultipleInstances policy cannot stop a
+    # hand-run, and this loop stays alive for ~45 minutes while it staggers, so
+    # two overlapping runs are entirely reachable. Same lockfile shape the repo
+    # standardised after the D-030 meeting-capture double-fire.
+    lock = _RunLock(_REPO_ROOT / "data" / "state" / "knowledge_check.lock")
+    if not dry and not lock.acquire():
+        log.error("another knowledge-check run is already in progress -- exiting")
+        return 0
+    try:
+        return _send_loop(args, log, today, dry, state, open_gaps, people)
+    finally:
+        lock.release()
+
+
+def _send_loop(args, log, today, dry, state, open_gaps, people) -> int:
     client = None if dry else _slack_client()
     claimed: set[str] = set()
     sent = skipped = failed = already = 0
@@ -182,7 +254,18 @@ def main() -> int:
     for idx, person in enumerate(people):
         sid, name = person["slack_id"], person["name"]
 
-        if kc.handled_today(state, sid, today):
+        if args.max_sends and sent >= args.max_sends:
+            log.info("max-sends reached -- stopping")
+            break
+
+        # RE-FOLD PER PERSON, not once before the loop (D-051 lens-1 HIGH). The
+        # loop sleeps ~3.5 min between sends, so a snapshot taken before it began
+        # is up to 45 minutes stale by the end. A hand re-run at 08:20 -- the
+        # documented recovery action, which the PS1 itself teaches -- would
+        # correctly skip everyone already reached, while THIS process kept
+        # consulting its 08:05 snapshot and DM'd persons 5-13 a second time.
+        state = kc.fold_state()
+        if not args.force and kc.handled_today(state, sid, today):
             already += 1
             log.info("SKIP(already) %-22s already handled today", name)
             continue
@@ -191,6 +274,22 @@ def main() -> int:
             person, state,
             open_gaps=open_gaps if tier2_used < kc.MAX_TIER2_PER_RUN else [],
             claimed=claimed, today=today)
+
+        # A Tier-2 gap claimed elsewhere between load and now must not cost this
+        # person their whole day: drop that gap and re-select, which degrades
+        # naturally to Tier 1. The first cut `continue`d, so the person vanished
+        # from the run with no DM, no event and no report line -- the exact
+        # silent loss this module claims to make visible (lens-1 MEDIUM).
+        if picked is not None and picked["tier"] == 2 and not dry:
+            if kc.claim_gap(picked["gap_ts"], "pending"):
+                claimed.add(picked["gap_ts"])
+                tier2_used += 1
+            else:
+                log.info("gap %s was claimed elsewhere -- re-selecting for %s",
+                         picked["gap_ts"], name)
+                claimed.add(picked["gap_ts"])
+                picked = kc.select_question(
+                    person, state, open_gaps=open_gaps, claimed=claimed, today=today)
 
         if picked is None:
             skipped += 1
@@ -207,28 +306,21 @@ def main() -> int:
             sent += 1
             continue
 
-        if args.max_sends and sent >= args.max_sends:
-            log.info("max-sends reached -- stopping")
-            break
-
         cycle_id = kc.new_cycle_id()
-
-        # Tier-2 claim BEFORE the reservation: if the gap is already spoken for,
-        # fall through rather than burning this person's slot on a duplicate.
-        if picked["tier"] == 2:
-            if not kc.claim_gap(picked["gap_ts"], cycle_id):
-                log.info("SKIP(claimed) %-22s gap %s was claimed elsewhere",
-                         name, picked["gap_ts"])
-                continue
-            claimed.add(picked["gap_ts"])
-            tier2_used += 1
 
         # RESERVE, then send. A crash in between costs this person one day's
         # question -- deliberately preferred over any chance of a duplicate DM.
-        kc.append_event("reserved", cycle_id=cycle_id, user=sid, date=today,
-                        entity=person["entity"], tier=picked["tier"],
-                        item_key=picked["item_key"], gap_ts=picked["gap_ts"] or None,
-                        question=picked["question"])
+        # If the reservation itself could not be written, do NOT send: a DM with
+        # no ledger row is exactly how the next run duplicates it.
+        if kc.append_event("reserved", cycle_id=cycle_id, user=sid, date=today,
+                           entity=person["entity"], tier=picked["tier"],
+                           item_key=picked["item_key"], kpi=picked.get("kpi"),
+                           gap_ts=picked["gap_ts"] or None,
+                           question=picked["question"]) is None:
+            failed += 1
+            log.error("FAIL         %-22s reservation could not be written -- "
+                      "not sending", name)
+            continue
 
         channel = kc.open_dm(client, sid)
         if not channel:

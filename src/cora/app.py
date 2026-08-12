@@ -2749,7 +2749,6 @@ def _handle_info_for_cora(event: dict, client) -> None:
              result.outcome, user_id, result.entity)
 
 
-@app.event("message")
 def _kc_post(client, channel: str, thread_ts: str | None, text: str,
              blocks: list | None = None) -> str:
     """Post one knowledge-check DM message. Returns its ts ("" on failure)."""
@@ -2797,10 +2796,26 @@ def _handle_knowledge_check_reply(event: dict, client, user_id: str, text: str,
             payload, cid, cycle.get("question", ""))
             if confirm_cards.confirm_buttons_enabled() else None)
         # With buttons off the same text still ships and the TYPED path
-        # ("yes" / "no") completes the loop -- the flow never depends on a tap.
+        # completes the loop -- the flow never depends on a tap.
+        #
+        # "save" / "discard", NOT "yes" / "no" (D-051 lens-2 HIGH). The F-23
+        # deterministic interceptor executes a pending staged write on a bare
+        # affirmative BEFORE the model runs, and its vocabulary contains "yes"
+        # and "ok" while its STOP list contains "no" and "skip". Since a live
+        # staged write outranks this branch, telling the user to reply "yes"
+        # would instruct them straight into firing an unrelated staged write
+        # (potentially a destructive Asana delete), and "no" would cancel it.
+        # Neither "save" nor "discard" appears in either list, so the copy can
+        # never steer a user into the collision.
         if not blocks:
-            body += "\n\n_Reply *yes* to save it, or *no* to skip._"
-        _kc_post(client, channel, thread_ts, body, blocks)
+            body += "\n\n_Reply *save* to save it, or *discard* to skip._"
+        card_ts = _kc_post(client, channel, thread_ts, body, blocks)
+        # Record where the card landed so a reply typed in the CARD's thread
+        # matches too. Without it, match_live_cycle only ever recognised the ASK
+        # message's ts, so a confirm typed in the confirm card's own thread fell
+        # through to Q&A and the answer expired unwritten.
+        if card_ts:
+            knowledge_check.register_card_ts(cid, card_ts)
         return True
 
     _kc_post(client, channel, thread_ts, payload or "Got it.")
@@ -2818,7 +2833,8 @@ def _handle_kc_tap(body: dict, client, action: str) -> None:
     """
     try:
         actions = body.get("actions") or []
-        cycle_id = (actions[0].get("value") if actions else "") or ""
+        raw_value = (actions[0].get("value") if actions else "") or ""
+        cycle_id, fingerprint = knowledge_check.split_tap_value(raw_value)
         actor_id = (body.get("user") or {}).get("id", "")
         channel_id = (body.get("channel") or {}).get("id", "")
         message_ts = (body.get("message") or {}).get("ts", "")
@@ -2829,15 +2845,19 @@ def _handle_kc_tap(body: dict, client, action: str) -> None:
             return
 
         if action == "confirm":
-            outcome, msg = knowledge_check.process_confirm_tap(cycle_id, actor_id)
+            outcome, msg = knowledge_check.process_confirm_tap(
+                cycle_id, actor_id, fingerprint)
         elif action == "edit":
-            outcome, msg = knowledge_check.process_edit_tap(cycle_id, actor_id)
+            outcome, msg = knowledge_check.process_edit_tap(
+                cycle_id, actor_id, fingerprint)
         elif action == "skip_answer":
-            outcome, msg = knowledge_check.process_skip_answer_tap(cycle_id, actor_id)
+            outcome, msg = knowledge_check.process_skip_answer_tap(
+                cycle_id, actor_id, fingerprint)
         else:
             outcome, msg = knowledge_check.process_skip_today_tap(cycle_id, actor_id)
 
-        if outcome in ("not_authorized", "orphaned", "already_handled", "not_live"):
+        if outcome in ("not_authorized", "orphaned", "already_handled", "not_live",
+                       "superseded"):
             try:
                 client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
             except Exception:  # noqa: BLE001
@@ -2893,6 +2913,7 @@ def handle_kc_skip_today(ack, body, client) -> None:
     _handle_kc_tap(body, client, "skip_today")
 
 
+@app.event("message")
 def handle_message_event(event: dict, client) -> None:
     """Thread reply handler: correction capture and active-thread follow-up routing.
 
@@ -2961,10 +2982,19 @@ def handle_message_event(event: dict, client) -> None:
             # Safety of the capture itself: nothing is written here. A capture
             # stages an answer and shows it back on a card, so a mis-capture
             # costs one Skip tap -- never a wrong fact in an always-injected file.
+            # _dm_is_shift_message, NOT gap_autofill.is_shift_keyword (D-051
+            # lens-2 HIGH). The two vocabularies differ: is_shift_keyword misses
+            # "submit availability" -- the exact phrase OSN employees are nudged
+            # with -- and, critically, it has no mid-flow check, so a scheduler
+            # user part-way through submitting availability would have their
+            # "Mon Wed Fri 6a-2p" captured as a knowledge-check answer while the
+            # scheduler stayed stuck. _dm_is_shift_message is the predicate the
+            # router itself trusts 100 lines below; using anything weaker here
+            # makes this branch laxer than the one that actually owns the intent.
             _kc_live = knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)
             _gap_ask_live = gap_autofill.has_live_ask(user_id)
             _generic_intent_ok = (
-                not gap_autofill.is_shift_keyword(text)
+                not _dm_is_shift_message(user_id, text)
                 and not gap_autofill.looks_like_question(text)
                 and not _remember_or_forget_intent(text)
                 and not _has_staged_write
