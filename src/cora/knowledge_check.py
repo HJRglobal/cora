@@ -588,8 +588,10 @@ def scrub_answer(text: str) -> str:
     return t
 
 
+# Same edge-quantifier rule as _AFFIRMATIVE_RE below: normalized input only, so
+# no `\s*` bookends and no O(n^2) whitespace backtracking.
 _NON_ANSWER_RE = re.compile(
-    r"^\s*(no idea|not my area|don'?t know|dunno|no clue|n/?a|nothing|skip)\s*$",
+    r"^(no idea|not my area|don'?t know|dunno|no clue|n/?a|nothing|skip)$",
     re.IGNORECASE,
 )
 
@@ -1015,21 +1017,29 @@ def process_edit_tap(cycle_id: str, actor_id: str) -> tuple[str, str]:
 # A confirm reply must be a WHOLE-MESSAGE affirmation. Anchored deliberately:
 # "yes, but actually it's 4 open" is a REWORD, not a confirm, and treating it as
 # a confirm would save the wrong number.
+#
+# NO `\s*` AT THE EDGES -- these run on normalize_answer()'d input, which has
+# already collapsed and stripped whitespace. The obvious spelling,
+# `^\s*(alt)\s*[.!]?\s*$`, is a ReDoS: two `\s*` separated by an optional
+# character give O(n^2) backtracking on a long whitespace run that fails to
+# match, and this matches RAW Slack message text where an attacker (or an
+# accident) controls the length. Normalizing first makes the edge quantifiers
+# unnecessary rather than merely careful.
 _AFFIRMATIVE_RE = re.compile(
-    r"^\s*(yes|yep|yeah|yup|yes please|confirm|confirmed|correct|that'?s right|"
-    r"right|save|save it|looks good|lgtm|ok|okay|perfect)\s*[.!]?\s*$",
+    r"^(yes|yep|yeah|yup|yes please|confirm|confirmed|correct|that'?s right|"
+    r"right|save|save it|looks good|lgtm|ok|okay|perfect)[.!]?$",
     re.IGNORECASE)
 _NEGATIVE_RE = re.compile(
-    r"^\s*(no|nope|nah|don'?t|do not|cancel|scratch that|never ?mind)\s*[.!]?\s*$",
+    r"^(no|nope|nah|don'?t|do not|cancel|scratch that|never ?mind)[.!]?$",
     re.IGNORECASE)
 
 
 def is_affirmative(text: str) -> bool:
-    return bool(_AFFIRMATIVE_RE.match(str(text or "")))
+    return bool(_AFFIRMATIVE_RE.match(normalize_answer(text)))
 
 
 def is_negative(text: str) -> bool:
-    return bool(_NEGATIVE_RE.match(str(text or "")))
+    return bool(_NEGATIVE_RE.match(normalize_answer(text)))
 
 
 def handle_dm_reply(cycle_id: str, user_id: str, text: str) -> tuple[str, str, bool]:
