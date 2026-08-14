@@ -996,6 +996,20 @@ def gather_f3e_ecom(*, today: date | None = None) -> dict:
         log.warning("channel_synthesis: F3E cross-channel inventory unavailable: %s", exc)
         lines.append("- Cross-channel inventory: not available")
 
+    # Warehouse (3PL) on-hand from the WMS feed (Deposco V1 read-only, Phase 1).
+    # DEFAULT OFF: the Phase-1 gate is two consecutive clean weekly reconciles
+    # against the warehouse UI and the manual Sheet, which no build session can
+    # satisfy -- so this ships dark and Harrison flips CORA_DEPOSCO_WAREHOUSE_LINE
+    # once it clears. Fail-soft, and never a zero: see render_warehouse_line.
+    try:
+        from . import inventory_state as _inv
+
+        if _inv.warehouse_enabled():
+            lines.append(_inv.render_warehouse_line())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_synthesis: F3E warehouse inventory unavailable: %s", exc)
+        lines.append("- Warehouse (3PL) on-hand: not available")
+
     # Production (Run-2)
     try:
         from .tools import asana_client

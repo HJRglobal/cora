@@ -97,8 +97,12 @@ _WS_RE = re.compile(r"\s+")
 # Mirrors tool_dispatch._dash_scrub, which exists for exactly this on the other
 # dashboard readers (D-051, 2026-07-11).
 _URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.IGNORECASE)
+# `deposco` joined this list with the warehouse view (2026-08-14): it is the WMS
+# we read the 3PL figures out of, i.e. a data-SOURCE name, and the same rule that
+# keeps "shopify" off a Slack surface applies to it. The FACILITY (Nimbl) and the
+# sales channels stay sayable -- those are operational facts, not tooling.
 _VENDOR_RE = re.compile(
-    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion)\b",
+    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion|deposco)\b",
     re.IGNORECASE,
 )
 
@@ -612,6 +616,96 @@ _SOURCE_LABELS: dict[str, str] = {
 
 def source_label(source: str) -> str:
     return _SOURCE_LABELS.get(source, "feed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Warehouse (3PL) view -- the Deposco-side store file
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Written by scripts/run_deposco_inventory_sync.py. Deliberately NOT in
+#: STORE_FILES: that store models per-SALES-CHANNEL counts and this is a
+#: per-FACILITY warehouse view, so registering it would inflate the merge's
+#: `expected_channels` with a source that can never satisfy it.
+WAREHOUSE_FILE = "f3e-inventory-deposco.json"
+
+#: Default OFF. The Phase-1 gate is "figures reconcile against the warehouse UI
+#: AND the manual weekly Sheet on 2 consecutive weekly checks" -- which cannot be
+#: met in the session that builds this. So the consumer ships dark and Harrison
+#: flips it once the gate clears (the D-087 operator-flag pattern).
+WAREHOUSE_FLAG = "CORA_DEPOSCO_WAREHOUSE_LINE"
+
+#: Measures worth a one-line brief, in render order.
+_WAREHOUSE_MEASURES = ("totalOnHandQty", "atpQty")
+
+
+def warehouse_enabled() -> bool:
+    return os.environ.get(WAREHOUSE_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def warehouse_path() -> Path:
+    return store_dir() / WAREHOUSE_FILE
+
+
+def load_warehouse(reader: Any = None) -> SourceLoad:
+    """Load the warehouse store file with the same defences as every other
+    source: a dead mount, a missing file or a torn write degrade to a labelled
+    UNKNOWN rather than to silence."""
+    if reader is None:
+        from . import drive_io  # noqa: PLC0415
+
+        reader = drive_io
+    payload, status, detail = _read_json(warehouse_path(), reader)
+    return SourceLoad("warehouse", payload, status, detail)
+
+
+def render_warehouse_line(load: SourceLoad | None = None, reader: Any = None) -> str:
+    """One brief line of warehouse on-hand. Channel/facility names only.
+
+    Refuses to present a figure it cannot vouch for, in four distinct ways, each
+    of which would otherwise read as "the 3PL holds nothing":
+      * unreadable store file  -> UNKNOWN, not zero
+      * `status: failed`       -> the writer's own coverage floor already said so
+      * a non-production stamp -> sandbox carries no inventory, so never show it
+      * a missing measure      -> UNKNOWN for that SKU, not zero
+    """
+    load = load if load is not None else load_warehouse(reader=reader)
+    if not load.usable:
+        return "- Warehouse (3PL) on-hand: not readable (UNKNOWN, not zero)"
+
+    data = load.data or {}
+    if str(data.get("status") or "").lower() == "failed":
+        return "- Warehouse (3PL) on-hand: last sync did not complete (UNKNOWN, not zero)"
+    if str(data.get("env") or "").lower() != "prod":
+        # A sandbox payload reaching this renderer would show zeroes as fact.
+        return "- Warehouse (3PL) on-hand: non-production data withheld (UNKNOWN, not zero)"
+
+    items = data.get("items")
+    if not isinstance(items, dict) or not items:
+        return "- Warehouse (3PL) on-hand: no items returned (UNKNOWN, not zero)"
+
+    parts: list[str] = []
+    for sku in sorted(items):
+        block = items[sku] if isinstance(items.get(sku), dict) else {}
+        measures = block.get("measures") if isinstance(block.get("measures"), dict) else {}
+        on_hand = coerce_count(measures.get(_WAREHOUSE_MEASURES[0]))
+        shown = f"{on_hand:,}" if on_hand is not None else "UNKNOWN"
+        parts.append(f"{scrub(sku, 24)} {shown}")
+
+    line = "- Warehouse (3PL) on-hand: " + " | ".join(parts)
+
+    notes: list[str] = []
+    coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
+    missing = coverage.get("missing")
+    if isinstance(missing, list) and missing:
+        notes.append(f"{len(missing)} SKU(s) not returned (UNKNOWN, not zero)")
+    if data.get("truncated"):
+        notes.append("results truncated -- partial")
+    as_of = data.get("as_of_utc")
+    if as_of:
+        notes.append(f"as of {scrub(as_of, 32)}")
+    if notes:
+        line += f" -- {'; '.join(notes)}"
+    return line
 
 
 def _coverage_footer(merged: MergedInventory) -> str:

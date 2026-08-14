@@ -115,6 +115,7 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "f3e_creator_crm",
     "fndr_content_pipeline",
     "f3e_channel_inventory",
+    "f3e_warehouse_inventory",
     "f3e_rangeme_status",
     "f3e_cultural_radar",
     "personal_travel_points",
@@ -7931,6 +7932,7 @@ _DASH_TRAVEL = "travel-points-command-center"
 _DASH_RANGEME = "f3-retail-rangeme"
 _DASH_CULTURAL = "f3-cultural-radar"
 _DASH_CHANNEL_INVENTORY = "f3e-channel-inventory"
+_DASH_WAREHOUSE_INVENTORY = "f3e-warehouse-inventory"
 
 
 # Source-opacity scrub for pass-through free-text field values. These tools are
@@ -8516,6 +8518,42 @@ def _tool_f3e_channel_inventory(slack_user_id: str, entity: str, _input: dict) -
     return _dash_scrub("\n".join([header, *render_rows(merged, sku_map, wanted)]))
 
 
+def _tool_f3e_warehouse_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Warehouse (3PL) on-hand from the WMS feed -- Phase 1, read-only.
+
+    GATED on CORA_DEPOSCO_WAREHOUSE_LINE. Until the Phase-1 reconcile gate clears
+    (two consecutive clean weekly checks against the warehouse UI and the manual
+    Sheet), these figures are unvalidated -- and an unvalidated stock number in a
+    leadership channel is worse than no number, because it will be acted on.
+    """
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_WAREHOUSE_INVENTORY, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+
+    from ..inventory_state import (  # noqa: PLC0415
+        load_warehouse, render_warehouse_line, warehouse_enabled,
+    )
+
+    if not warehouse_enabled():
+        return (
+            "I'm not reporting warehouse stock yet -- the 3PL feed is still being "
+            "reconciled against the warehouse system and the weekly count sheet. "
+            "Until those agree twice running I'd rather give you nothing than a "
+            "number you'd act on. Cross-channel stock is available now: ask "
+            "\"what's our cross-channel inventory?\""
+        )
+
+    log.info("f3e_warehouse_inventory user=%s entity=%s", slack_user_id, entity)
+    line = render_warehouse_line(load_warehouse())
+    # Same scrub every sibling dashboard reader applies (D-051 2026-07-11): the
+    # store file carries item numbers straight out of an external system, and this
+    # is a VERBATIM_TABLE_TOOL, so format_reply is bypassed.
+    return _dash_scrub("*F3 warehouse (3PL) stock*\n" + line)
+
+
 def _tool_f3e_rangeme_status(slack_user_id: str, entity: str, _input: dict) -> str:
     inp = _input or {}
     refusal = dashboard_access.check_dashboard_access(
@@ -8636,6 +8674,7 @@ _DASH_INDEX: dict[str, tuple[str, str]] = {
     _DASH_RANGEME: ("F3 retail submissions on RangeMe -- what's In Review, buyer replies", "where do we stand on RangeMe?"),
     _DASH_CULTURAL: ("The weekly F3 cultural radar -- trending hooks by brand", "what's on the cultural radar?"),
     _DASH_CHANNEL_INVENTORY: ("F3 inventory across every sales channel -- office, DTC 3PL, UNIS, TikTok FBT, Amazon FBA, Walmart WFS", "what's our cross-channel inventory?"),
+    _DASH_WAREHOUSE_INVENTORY: ("F3 warehouse (3PL) on-hand per SKU", "what's our warehouse stock?"),
 }
 
 
@@ -11083,6 +11122,20 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "f3e_warehouse_inventory",
+        "description": (
+            "F3 Energy on-hand stock AT THE 3PL WAREHOUSE, per SKU, straight from the "
+            "warehouse management feed. Use for 'how much do we have at the warehouse', "
+            "'what's our 3PL stock', 'how many Pure cases are at Nimbl'. For stock "
+            "across SALES CHANNELS (FBA / WFS / FBT / office) use f3e_channel_inventory "
+            "instead. A SKU the warehouse did not report reads as UNKNOWN, never as "
+            "zero. Available in F3E leadership/ops + founder channels and Harrison's DM "
+            "(refuses elsewhere). Note: while the feed is still being reconciled this "
+            "tool declines to report figures -- say so rather than guessing."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "f3e_cultural_radar",
         "description": (
             "The weekly F3 cultural radar: the latest run's headline + pulse and the top "
@@ -12351,6 +12404,7 @@ _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
         "f3e_creator_crm",
         "f3e_channel_inventory",
+        "f3e_warehouse_inventory",
         "f3e_rangeme_status",
         "f3e_cultural_radar",
         "f3e_shopify_sales_pulse",
@@ -12516,6 +12570,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_creator_crm": _tool_f3e_creator_crm,
     "fndr_content_pipeline": _tool_fndr_content_pipeline,
     "f3e_channel_inventory": _tool_f3e_channel_inventory,
+    "f3e_warehouse_inventory": _tool_f3e_warehouse_inventory,
     "f3e_rangeme_status": _tool_f3e_rangeme_status,
     "f3e_cultural_radar": _tool_f3e_cultural_radar,
     "personal_travel_points": _tool_personal_travel_points,
@@ -12546,6 +12601,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "influencer_get_status": 8,
     "f3e_ai_visibility": 8,
     "f3e_channel_inventory": 15,
+    "f3e_warehouse_inventory": 15,
     "revops_ledger_status": 8,
     # Normal — single external API call
     "asana_create_task": 12,

@@ -115,6 +115,31 @@ dashboards:
         manual: f3e-inventory-manual.json        # writer: Cowork TikTok digest (Airtable)
     tools: [f3e_channel_inventory]
 
+  # Warehouse (3PL) on-hand from the WMS feed, Phase 1 read-only (2026-08-14).
+  # Audience is the NARROWED set from the day one above, adopted deliberately
+  # rather than re-derived: per-SKU warehouse stock is the same class of figure as
+  # the per-SKU marketplace levels that were pulled back off every f3-* channel on
+  # 2026-08-05, so it starts at the narrow end. Add a channel here (live-reload)
+  # rather than widening by entity class.
+  #
+  # GATED: the reader tool refuses until CORA_DEPOSCO_WAREHOUSE_LINE is set. The
+  # Phase-1 gate is two consecutive clean weekly reconciles against the warehouse
+  # UI and the manual Sheet; until that clears the figures are unvalidated, and an
+  # unvalidated stock number in a leadership channel is worse than no number.
+  f3e-warehouse-inventory:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [f3e-leadership, f3-hq-inventory-adjustments, f3e-sales, founder-operations]
+    allow_entities: [FNDR, HJRG]
+    store:
+      type: drive_json
+      read_via: drive_io_mount
+      folder_relpath: "02-F3-Energy/inventory-state"
+      files:
+        warehouse: f3e-inventory-deposco.json   # writer: Cora run_deposco_inventory_sync.py
+    tools: [f3e_warehouse_inventory]
+
   # RESERVED (registration + sensitivity only). claude-cost-review is a STATIC
   # snapshot baked into the artifact HTML -- there is no live backing store to read,
   # so no reader tool is wired. Registered here so the drift check treats it as
