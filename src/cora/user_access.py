@@ -220,6 +220,84 @@ def _financials_is_blocked(msg_lower: str) -> bool:
     return False
 
 
+# ── Word-BOUNDED sensitive-topic patterns (hr / phi / cap_table) ──────────────
+# These three topics were the last ones still matched by a naive
+# ``any(p in msg_lower for p in patterns)`` substring scan. `legal` and
+# `financials` were hardened to bounded matching earlier (Phase 1.6 / the
+# TIER_1 finance work); hr / phi / cap_table were left behind, and the gap
+# produced a live false refusal on a daily-use WRITE path:
+#
+#   2026-08-13 #f3-hq-inventory-adjustments -- Alex Cordova submitted an F3 PURE
+#   office-inventory removal whose free-text Reason read "Handout at
+#   camptontozona ( ASU FOOTBALL)". "cam-PTO-ntozona" contains the hr pattern
+#   "pto", so the entire write was refused with "HR matters go to Hannah Grant
+#   or Harrison." Alex had to push back before the write went through.
+#
+# Latent siblings the same scan carried: "fire" inside *Fireflies* (a core Cora
+# system name), "stake" inside *mistake*, "pto" inside *Compton*/*Hampton*/
+# *crypto*, "hire" inside *Hampshire*.
+#
+# Boundaries use (?<!\w) / (?!\w) rather than \b so a pattern may legally end in
+# punctuation ("401(k)") -- a trailing \b after ")" can never match.
+# INFLECTIONS THE OLD SUBSTRING FORM CAUGHT ARE PRESERVED EXPLICITLY
+# (fired/firing, sickness, clients, percentage): a precision fix must not
+# silently cost a true positive. Each entry is a regex BODY.
+_TOPIC_PATTERN_SOURCES: dict[str, tuple[str, ...]] = {
+    "hr": (
+        r"salar(?:y|ies)", r"compensation", r"pay\s+rates?",
+        r"hire[ds]?", r"hiring", r"fire[ds]?", r"firing",
+        # NOT "termination": "early-termination penalty ... sponsorship
+        # contract" is ordinary commercial talk, and a hyphen counts as a
+        # boundary, so adding it refused a legitimate deal question. Keep the
+        # matcher at parity with the pre-fix substring list plus inflections.
+        r"terminate[ds]?", r"performance\s+reviews?",
+        # NOT "benefit" singular: product/marketing copy says "the benefit of"
+        # constantly. Plural only, as before.
+        r"employee\s+complaints?", r"disciplinary", r"benefits",
+        r"pto", r"vacations?", r"sick\w*", r"401\(?k\)?",
+    ),
+    "phi": (
+        r"clients?'?s?", r"patients?'?s?", r"diagnos(?:is|es|ed)",
+        r"treatments?", r"medications?", r"care\s+plans?",
+        r"progress\s+notes?", r"clinical", r"ddd", r"hcbs",
+        r"behavioral\s+health", r"therapy\s+sessions?",
+    ),
+    "cap_table": (
+        r"equity", r"ownership", r"cap\s+table", r"shares",
+        r"percent\w*", r"stakes?", r"investors?", r"dilution",
+        r"valuations?", r"funding\s+rounds?",
+    ),
+    "cross_entity": (),  # handled by the entity check in check_access
+}
+
+
+def _compile_topic_patterns() -> dict[str, re.Pattern[str] | None]:
+    """One alternation per topic, compiled once at import (check_access is a
+    per-request pre-LLM hot path). A topic with no patterns compiles to None."""
+    out: dict[str, re.Pattern[str] | None] = {}
+    for topic, bodies in _TOPIC_PATTERN_SOURCES.items():
+        if not bodies:
+            out[topic] = None
+            continue
+        alternation = "|".join(f"(?:{b})" for b in bodies)
+        out[topic] = re.compile(rf"(?<!\w)(?:{alternation})(?!\w)", re.I)
+    return out
+
+
+_TOPIC_PATTERNS: dict[str, re.Pattern[str] | None] = _compile_topic_patterns()
+
+
+def _topic_is_blocked(topic: str, msg_lower: str) -> bool:
+    """Word-bounded sensitive-topic match for hr / phi / cap_table. An unknown
+    topic never blocks (fail-open here is correct: `blocked_topics` is the
+    authorization list, and an unrecognized label must not silently refuse
+    everything)."""
+    pattern = _TOPIC_PATTERNS.get(topic)
+    if pattern is None:
+        return False
+    return bool(pattern.search(msg_lower))
+
+
 def _load_permissions() -> dict[str, Any]:
     """Load user-permissions.yaml with a 60s TTL cache.
 
@@ -354,30 +432,6 @@ def check_access(
 
     msg_lower = user_message.lower()
 
-    # NOTE: 'financials' is matched by _financials_is_blocked() (word-bounded,
-    # restricted-finance only), not by a substring list — see the loop below.
-    topic_patterns = {
-        "hr": [
-            "salary", "compensation", "pay rate", "hire", "fire", "terminate",
-            "performance review", "employee complaint", "disciplinary",
-            "benefits", "pto", "vacation", "sick", "401k",
-        ],
-        "legal": [
-            "contract", "agreement", "nda", "lawsuit", "litigation", "legal",
-            "attorney", "counsel", "sue", "liability", "indemnif",
-        ],
-        "phi": [
-            "client", "patient", "diagnosis", "treatment", "medication",
-            "care plan", "progress note", "clinical", "ddd", "hcbs",
-            "behavioral health", "therapy session",
-        ],
-        "cap_table": [
-            "equity", "ownership", "cap table", "shares", "percent", "stake",
-            "investor", "dilution", "valuation", "funding round",
-        ],
-        "cross_entity": [],  # handled by entity check above
-    }
-
     for topic in blocked:
         # Authorized LEX PHI custodian (in LEX scope) — skip the phi block only.
         if topic == "phi" and phi_custodian:
@@ -394,8 +448,7 @@ def check_access(
             # Two-signal precision (Phase 1.6) instead of a blanket keyword match.
             matched = _legal_is_blocked(msg_lower)
         else:
-            patterns = topic_patterns.get(topic, [])
-            matched = any(p in msg_lower for p in patterns)
+            matched = _topic_is_blocked(topic, msg_lower)
         if matched:
             redirects = {
                 "financials": "Company financials (P&L, cash, payroll) go in a finance channel or to Harrison.",
