@@ -18,6 +18,8 @@ The guard uses word-boundary regex matching to avoid false positives (e.g.
 import re
 from dataclasses import dataclass
 
+from . import guard_input
+
 
 @dataclass(frozen=True)
 class _SiblingDef:
@@ -122,6 +124,12 @@ def check_redirect(entity: str, message: str) -> str | None:
     (e.g. "villa" should not match LLA, "Lexington" alone should not redirect).
     First-match-wins (highest specificity keywords listed first in _SIBLING_DEFS).
     """
+    # Guard-normalized text (see cross_entity_guard for the same rationale): an
+    # office-inventory write's free-text "Reason:" is annotation, never a routing
+    # signal. Narrow by construction -- guard_input requires the full request
+    # shape, so a bare "Reason: ..." line is still evaluated in full.
+    message = guard_input.scope_guard_text(message)
+
     # LBHS confidential-entity guard: hard-block COPA/BHRF/UnitedHealthcare references
     # before any LLM call, regardless of how the question is phrased.
     if entity == "LEX-LBHS" and _LBHS_PRIVATE_RE.search(message):

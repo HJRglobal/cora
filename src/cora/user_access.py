@@ -24,6 +24,8 @@ from typing import Any
 
 import yaml
 
+from . import guard_input
+
 log = logging.getLogger(__name__)
 
 _PERMISSIONS_PATH = (
@@ -430,7 +432,14 @@ def check_access(
     if not blocked:
         return None
 
-    msg_lower = user_message.lower()
+    # Guard-normalized text for the TOPIC match only (the entity check above
+    # reads user_id/entity, not text). An office-inventory write's free-text
+    # "Reason:" is operator annotation: "Reason: Handout at camptontozona" had
+    # already refused a write via the hr topic before the boundary fix above, and
+    # a Reason reading "employee complaint" would still do it. Narrow by
+    # construction -- guard_input requires the full inventory-request shape, so a
+    # bare "Reason: what is <person>'s salary" is NOT an evasion path.
+    msg_lower = guard_input.scope_guard_text(user_message).lower()
 
     for topic in blocked:
         # Authorized LEX PHI custodian (in LEX scope) — skip the phi block only.

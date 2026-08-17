@@ -24,6 +24,8 @@ FNDR and HJRG channels are pass-through: FNDR is the cross-entity aggregator and
 import re
 from dataclasses import dataclass
 
+from . import guard_input
+
 
 @dataclass(frozen=True)
 class _EntityDef:
@@ -154,6 +156,14 @@ def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
     """
     if not message_text or not channel_entity:
         return None
+
+    # Evaluate the guard-normalized text, not the raw message: an office-
+    # inventory write's free-text "Reason:" line is operator annotation, and
+    # "Reason: 4 OSN Stores" on an all-F3E-SKU write was redirected to
+    # #osn-leadership 5x across two users (2026-08-03..08-06). Narrow by
+    # construction -- see guard_input. Applied HERE rather than at the 4 app.py
+    # call sites so no current or future caller can miss it.
+    message_text = guard_input.scope_guard_text(message_text)
 
     if channel_entity.upper() in _PASS_THROUGH:
         return None
