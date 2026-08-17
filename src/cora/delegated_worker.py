@@ -756,13 +756,75 @@ def resolve_delivery_tier(job: dict[str, Any]) -> str:
         return "TIER_3"
 
 
-def guard_artifact_text(job: dict[str, Any], text: str) -> tuple[str | None, str]:
+# ── Requester-facing content-guard diagnostics (cq-233ca1a22976) ─────────────
+# A content_guard failure used to tell the requester only that "its output
+# tripped the channel content guard", and the LEDGER recorded the same flat
+# string -- so 9 live failures (2026-08-02..08-13, 50% of post-GO jobs) were
+# un-triageable after the fact and the requester had no idea what to change.
+# guard_outbound ALREADY computes the specific class; it was being discarded at
+# both boundaries. These give it a human label + the actual remedy.
+#
+# The conversational refusals in channel_content_guard are deliberately NOT
+# reused here: they are written for a Q&A reply ("ask me there and I'll pull it
+# up"), which is the wrong voice for a job that already ran, and two of them
+# carry no remedy at all.
+#
+# LOCKSTEP with channel_content_guard._CLASSES -- test_delegated_worker asserts
+# every guard class has an entry here, so a new class cannot ship without one.
+_GUARD_DIAGNOSTICS: dict[str, tuple[str, str]] = {
+    "personal_insurance": ("personal insurance/policy figures", "a DM with me"),
+    "capital_program": ("capital-raise terms", "a DM with me"),
+    "travel_points": ("personal travel-points detail", "a DM with me"),
+    "creator_crm": ("creator/sponsorship CRM detail",
+                    "the channel that owns that dashboard, or a DM with me"),
+    "content_pipeline": ("content-pipeline detail",
+                         "the channel that owns that dashboard, or a DM with me"),
+    "company_financials": ("company financial figures",
+                           "a finance or leadership channel, or a DM with me"),
+}
+# Sentinels for the two non-_CLASSES refusal paths.
+GUARD_CLASS_PHI = "non_lex_phi"
+GUARD_CLASS_SCREEN_ERROR = "screen_error"
+
+
+def guard_failure_message(job: dict[str, Any], guard_class: str) -> str:
+    """The requester-facing diagnostic for a content_guard refusal: what tripped,
+    which channel it was evaluated against, and what to do about it."""
+    channel = str(job.get("channel_name") or "").lstrip("#")
+    where = f"#{channel}" if channel and channel != "dm" else "this conversation"
+
+    if guard_class == GUARD_CLASS_PHI:
+        return ("Your delegated job finished, but its draft carried protected "
+                "client/health content, so the file was withheld (fail-closed). "
+                "That content can't be delivered to a Slack channel at all -- it "
+                "stays in the EHR.")
+    if guard_class == GUARD_CLASS_SCREEN_ERROR:
+        return ("Your delegated job finished, but I couldn't screen its output "
+                "for confidential content, so the file was withheld "
+                "(fail-closed). Nothing is wrong with your brief -- re-ask to "
+                "run it again.")
+
+    label, remedy = _GUARD_DIAGNOSTICS.get(
+        guard_class, ("confidential content", "a DM with me"))
+    return (f"Your delegated job finished, but its draft contained {label}, "
+            f"which {where} isn't scoped for -- so no file was delivered "
+            f"(fail-closed). To get this: re-ask in {remedy}, or narrow the "
+            f"brief so it doesn't need that data.")
+
+
+def guard_artifact_text(
+    job: dict[str, Any], text: str,
+) -> tuple[str | None, str, str]:
     """Run the composed artifact/summary text through guard_outbound + the
     non-LEX PHI backstop, evaluated against the REQUESTING channel's context.
-    Returns (failure_class or None, guarded_text). Fail-closed: a guard error
-    refuses."""
+
+    Returns (failure_class or None, requester_message, guard_class). On the pass
+    path requester_message is the guarded text and guard_class is "". On a
+    refusal, guard_class is the SPECIFIC trip reason -- carried out so the runner
+    can both tell the requester what to change and record a triageable ledger
+    row. Fail-closed: a guard error refuses."""
     if not text:
-        return None, text
+        return None, text, ""
     try:
         from . import channel_content_guard
         is_dm = (str(job.get("channel_name") or "") == "dm"
@@ -776,7 +838,7 @@ def guard_artifact_text(job: dict[str, Any], text: str) -> tuple[str | None, str
             is_dm=is_dm,
         )
         if tripped:
-            return "content_guard", guarded
+            return "content_guard", guard_failure_message(job, tripped), tripped
         # Non-LEX PHI backstop (the same live predicate the retrieval path uses).
         from . import org_roles, phi_guard
         try:
@@ -784,15 +846,15 @@ def guard_artifact_text(job: dict[str, Any], text: str) -> tuple[str | None, str
         except Exception:  # noqa: BLE001
             staff = set()
         if phi_guard.non_lex_phi_backstop_trips_live(text, allowed_names=staff):
-            return "content_guard", (
-                "This job's output carried protected client/health content, so "
-                "the file was withheld (fail-closed).")
-        return None, guarded
+            return ("content_guard",
+                    guard_failure_message(job, GUARD_CLASS_PHI),
+                    GUARD_CLASS_PHI)
+        return None, guarded, ""
     except Exception:  # noqa: BLE001 -- fail closed
         log.exception("artifact guard errored -- refusing (fail-closed)")
-        return "content_guard", (
-            "This job's output could not be screened, so the file was "
-            "withheld (fail-closed).")
+        return ("content_guard",
+                guard_failure_message(job, GUARD_CLASS_SCREEN_ERROR),
+                GUARD_CLASS_SCREEN_ERROR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -243,11 +243,32 @@ _FAIL_NOTES = {
 }
 
 
+def quota_note(job: dict) -> str:
+    """One line disclosing that this failed job still spent a daily slot.
+
+    Quota is counted on `requested` events REGARDLESS of outcome and is never
+    refunded (delegated-work design section 4). With content_guard accounting for
+    50% of post-GO failures, a requester could burn their whole daily allowance
+    on refused jobs and never be told -- so say it plainly rather than change a
+    documented design decision here. Founder is quota-exempt, so no note.
+
+    Fail-soft: any lookup error yields no note (never block a failure notice)."""
+    requester = str(job.get("requester") or "")
+    if not requester or requester == dw.HARRISON_ID:
+        return ""
+    try:
+        remaining = dw.quota_remaining(requester)
+    except Exception:  # noqa: BLE001
+        return ""
+    return (f"This attempt still used one of your daily job slots "
+            f"({remaining} left today) -- a guard refusal doesn't refund it.\n")
+
+
 def notify_failure(client, job: dict, failure_class: str) -> None:
     note = _FAIL_NOTES.get(failure_class, _FAIL_NOTES["error"])
     post_threaded(client, job,
                   f"Heads up <@{job.get('requester', '')}> -- {note} "
-                  f"(`{job.get('job_id', '')}`)")
+                  f"{quota_note(job)}(`{job.get('job_id', '')}`)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -489,16 +510,26 @@ def deliver(client, job_id: str, outcome: dict) -> None:
         str(outcome.get("xlsx_cell_text") or "") if outcome.get("artifact_bytes")
         else str(outcome.get("artifact_text") or ""),
     ]))
-    fclass, guard_text = worker.guard_artifact_text(rec, guard_surface)
+    fclass, guard_text, guard_class = worker.guard_artifact_text(rec, guard_surface)
     if fclass:
+        # Record the SPECIFIC trip class plus the job's shape. The flat
+        # "artifact tripped the channel content guard" row left 9 live failures
+        # (2026-08-02..08-13) impossible to triage -- no class, no archetype, no
+        # channel (cq-233ca1a22976).
         dw.append_runner_event({"event": "failed", "ts": dw._now_iso(), "job_id": job_id,
                                 "failure_class": "content_guard",
-                                "message": "artifact tripped the channel content guard",
+                                "guard_class": guard_class,
+                                "message": f"artifact tripped the channel content "
+                                           f"guard: {guard_class}",
+                                "archetype": str(rec.get("archetype") or ""),
+                                "entity": str(rec.get("entity") or ""),
+                                "channel_name": str(rec.get("channel_name") or ""),
                                 "cost": cost})
         post_threaded(client, rec,
-                      f"{guard_text}\n(Delegated job `{job_id}` failed: "
-                      "content guard -- no file was delivered.)")
-        post_sessions_line(client, f"DW FAIL {job_id} content_guard")
+                      f"{guard_text}\n{quota_note(rec)}"
+                      f"(Delegated job `{job_id}` failed: content guard "
+                      f"[{guard_class}] -- no file was delivered.)")
+        post_sessions_line(client, f"DW FAIL {job_id} content_guard {guard_class}")
         return
 
     # Stage locally (retained until homed, then cleaned).

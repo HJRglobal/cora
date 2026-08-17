@@ -536,10 +536,14 @@ def test_kb_search_schema_has_no_entity_parameter():
 def test_guard_artifact_trip_returns_content_guard(monkeypatch):
     import cora.channel_content_guard as ccg
     monkeypatch.setattr(ccg, "guard_outbound",
-                        lambda text, **k: ("refusal text", True))
-    fclass, text = worker.guard_artifact_text(_job(), "company revenue $320,615")
+                        lambda text, **k: ("refusal text", "company_financials"))
+    fclass, text, gclass = worker.guard_artifact_text(_job(), "company revenue $320,615")
     assert fclass == "content_guard"
-    assert text == "refusal text"
+    assert gclass == "company_financials"
+    # The requester now gets a job-aware diagnostic, not the raw
+    # conversational refusal (cq-233ca1a22976).
+    assert "company financial figures" in text
+    assert "re-ask in" in text
 
 
 def test_guard_artifact_pass_and_phi_backstop(monkeypatch):
@@ -548,12 +552,13 @@ def test_guard_artifact_pass_and_phi_backstop(monkeypatch):
     monkeypatch.setattr(ccg, "guard_outbound", lambda text, **k: (text, False))
     monkeypatch.setattr(pg, "non_lex_phi_backstop_trips_live",
                         lambda text, allowed_names=None: False)
-    fclass, text = worker.guard_artifact_text(_job(), "clean body")
-    assert fclass is None and text == "clean body"
+    fclass, text, gclass = worker.guard_artifact_text(_job(), "clean body")
+    assert fclass is None and text == "clean body" and gclass == ""
     monkeypatch.setattr(pg, "non_lex_phi_backstop_trips_live",
                         lambda text, allowed_names=None: True)
-    fclass, _ = worker.guard_artifact_text(_job(), "Marcus's service hours...")
-    assert fclass == "content_guard"
+    fclass, msg, gclass = worker.guard_artifact_text(_job(), "Marcus's service hours...")
+    assert fclass == "content_guard" and gclass == worker.GUARD_CLASS_PHI
+    assert "protected" in msg
 
 
 def test_guard_artifact_error_fails_closed(monkeypatch):
@@ -563,8 +568,9 @@ def test_guard_artifact_error_fails_closed(monkeypatch):
         raise RuntimeError("guard exploded")
 
     monkeypatch.setattr(ccg, "guard_outbound", _boom)
-    fclass, _ = worker.guard_artifact_text(_job(), "anything")
-    assert fclass == "content_guard"
+    fclass, msg, gclass = worker.guard_artifact_text(_job(), "anything")
+    assert fclass == "content_guard" and gclass == worker.GUARD_CLASS_SCREEN_ERROR
+    assert "couldn't screen" in msg
 
 
 def test_resolve_delivery_tier_fails_most_restrictive(monkeypatch):
@@ -661,7 +667,7 @@ def test_runner_live_runs_and_delivers(monkeypatch, tmp_path):
                "web_withheld_reason": None, "cost": {"est_usd": 0.4}}
     monkeypatch.setattr(runner.worker, "run_job", MagicMock(return_value=outcome))
     monkeypatch.setattr(runner.worker, "guard_artifact_text",
-                        lambda job, text: (None, text))
+                        lambda job, text: (None, text, ""))
     written = {}
     monkeypatch.setattr(runner.drive_io, "write_text_atomic",
                         lambda path, text, **k: written.setdefault("path", str(path)))
@@ -710,7 +716,7 @@ def _ok_outcome(**over):
 def test_deliver_content_guard_trip_fails_job(monkeypatch):
     _seed_job(state_events=("queued", "started"))
     monkeypatch.setattr(runner.worker, "guard_artifact_text",
-                        lambda job, text: ("content_guard", "guard refusal"))
+                        lambda job, text: ("content_guard", "guard refusal", "company_financials"))
     posts = []
     monkeypatch.setattr(runner, "post_threaded",
                         lambda c, j, t: posts.append(t) or True)
@@ -721,7 +727,7 @@ def test_deliver_content_guard_trip_fails_job(monkeypatch):
     assert rec["failure"]["class"] == "content_guard"
     # FAIL line carries the CLASS enum only.
     fail_lines = [p for p in posts if p.startswith("DW FAIL")]
-    assert fail_lines == ["DW FAIL dw-abc123def456 content_guard"]
+    assert fail_lines == ["DW FAIL dw-abc123def456 content_guard company_financials"]
 
 
 def test_deliver_suppressed_when_cancelled_mid_run(monkeypatch):
@@ -738,7 +744,7 @@ def test_deliver_suppressed_when_cancelled_mid_run(monkeypatch):
 def test_deliver_drive_down_marks_mis_homed_and_still_delivers(monkeypatch):
     _seed_job(state_events=("queued", "started"))
     monkeypatch.setattr(runner.worker, "guard_artifact_text",
-                        lambda job, text: (None, text))
+                        lambda job, text: (None, text, ""))
 
     def _down(path, text, **k):
         raise runner.drive_io.DriveUnavailable("G: gone")
@@ -760,7 +766,7 @@ def test_deliver_drive_down_marks_mis_homed_and_still_delivers(monkeypatch):
 def test_mis_homed_retry_homes_without_reposting(monkeypatch):
     _seed_job(state_events=("queued", "started"))
     monkeypatch.setattr(runner.worker, "guard_artifact_text",
-                        lambda job, text: (None, text))
+                        lambda job, text: (None, text, ""))
     calls = {"n": 0}
 
     def _down_then_up(path, text, **k):
