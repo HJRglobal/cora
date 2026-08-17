@@ -124,14 +124,14 @@ def check_redirect(entity: str, message: str) -> str | None:
     (e.g. "villa" should not match LLA, "Lexington" alone should not redirect).
     First-match-wins (highest specificity keywords listed first in _SIBLING_DEFS).
     """
-    # Guard-normalized text (see cross_entity_guard for the same rationale): an
-    # office-inventory write's free-text "Reason:" is annotation, never a routing
-    # signal. Narrow by construction -- guard_input requires the full request
-    # shape, so a bare "Reason: ..." line is still evaluated in full.
-    message = guard_input.scope_guard_text(message)
-
     # LBHS confidential-entity guard: hard-block COPA/BHRF/UnitedHealthcare references
     # before any LLM call, regardless of how the question is phrased.
+    # EVALUATED ON THE RAW MESSAGE, BEFORE any normalization -- a hard-block that
+    # promises "regardless of how the question is phrased" must never read
+    # rewritten text. With the strip first, "Reason: COPA diligence for
+    # UnitedHealthcare" inside an inventory-shaped message bypassed it entirely
+    # (D-051 HIGH, 2026-08-17). An F3E inventory write never legitimately names
+    # COPA/BHRF/UHC, so there is no false-positive cost to checking raw.
     if entity == "LEX-LBHS" and _LBHS_PRIVATE_RE.search(message):
         return (
             "That information is confidential to LBHS and cannot be discussed here. "

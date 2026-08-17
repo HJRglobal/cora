@@ -232,8 +232,14 @@ _FAIL_NOTES = {
     "interrupted": ("your delegated job was interrupted mid-run (likely a crash "
                     "or restart) and did not finish. Nothing was delivered -- "
                     "re-ask to run it again."),
-    "content_guard": ("your delegated job finished, but its output tripped the "
-                      "channel content guard, so no file was delivered "
+    # UNREACHABLE by design: run_job never emits content_guard -- the guard runs
+    # in deliver(), which posts worker.guard_failure_message() instead (it names
+    # the class, the channel and the remedy). Kept, and worded to match, ONLY so
+    # that if a future path ever does route content_guard through here the
+    # requester does not silently fall back to "failed unexpectedly". Any real
+    # diagnostic belongs in guard_failure_message, not here.
+    "content_guard": ("your delegated job finished, but its output could not be "
+                      "delivered to this channel, so no file was written "
                       "(fail-closed)."),
     "api_error": ("your delegated job hit a model/API error and could not "
                   "finish. Re-ask to try again."),
@@ -241,6 +247,17 @@ _FAIL_NOTES = {
                   "specific brief."),
     "error": "your delegated job failed unexpectedly. Re-ask to try again.",
 }
+
+
+def _guard_class_label(guard_class: str) -> str:
+    """Human form of a guard class for the requester-facing parenthetical. The
+    raw sentinels (`non_lex_phi`, `screen_error`) are internal enums and read as
+    jargon in an end-user message; the _CLASSES names just need underscores out.
+    The machine-readable form still goes to the ledger and #cora-sessions."""
+    return {
+        worker.GUARD_CLASS_PHI: "protected health content",
+        worker.GUARD_CLASS_SCREEN_ERROR: "screening error",
+    }.get(guard_class, guard_class.replace("_", " ") or "confidential content")
 
 
 def quota_note(job: dict) -> str:
@@ -252,22 +269,44 @@ def quota_note(job: dict) -> str:
     on refused jobs and never be told -- so say it plainly rather than change a
     documented design decision here. Founder is quota-exempt, so no note.
 
+    Wording is outcome-NEUTRAL on purpose: notify_failure reaches this for
+    interrupted / api_error / no_output / error, and run_job never emits
+    content_guard -- so a "a guard refusal doesn't refund it" tail would blame a
+    content guard for Cora's own crash and imply the requester's brief tripped
+    something (D-051 MED, this branch).
+
+    Only claims "N left today" when the job was actually REQUESTED today (AZ).
+    requested_today() counts by AZ date, so for a job that crossed midnight the
+    slot was spent on a prior day and today's remaining count says nothing about
+    it -- printing both read as a contradiction ("used a slot" / "3 left today"
+    with a full allowance).
+
     Fail-soft: any lookup error yields no note (never block a failure notice)."""
     requester = str(job.get("requester") or "")
     if not requester or requester == dw.HARRISON_ID:
         return ""
     try:
+        requested_dt = dw._parse_ts(job.get("requested_at"))
+        # _az_date(None) silently means "today" -- an unparseable/missing
+        # requested_at must NOT be read as today.
+        requested_day = dw._az_date(requested_dt) if requested_dt else ""
+        if requested_day and requested_day != dw._az_date():
+            return (f"This attempt still used one of your daily job slots "
+                    f"(requested {requested_day}) -- a failed attempt doesn't "
+                    f"refund it.\n")
         remaining = dw.quota_remaining(requester)
     except Exception:  # noqa: BLE001
         return ""
     return (f"This attempt still used one of your daily job slots "
-            f"({remaining} left today) -- a guard refusal doesn't refund it.\n")
+            f"({remaining} left today) -- a failed attempt doesn't refund it.\n")
 
 
 def notify_failure(client, job: dict, failure_class: str) -> None:
     note = _FAIL_NOTES.get(failure_class, _FAIL_NOTES["error"])
+    # Job id always on its own line -- with the quota note present it would
+    # otherwise land inline in one case and on a new line in the other.
     post_threaded(client, job,
-                  f"Heads up <@{job.get('requester', '')}> -- {note} "
+                  f"Heads up <@{job.get('requester', '')}> -- {note}\n"
                   f"{quota_note(job)}(`{job.get('job_id', '')}`)")
 
 
@@ -528,7 +567,8 @@ def deliver(client, job_id: str, outcome: dict) -> None:
         post_threaded(client, rec,
                       f"{guard_text}\n{quota_note(rec)}"
                       f"(Delegated job `{job_id}` failed: content guard "
-                      f"[{guard_class}] -- no file was delivered.)")
+                      f"[{_guard_class_label(guard_class)}] -- no file was "
+                      f"delivered.)")
         post_sessions_line(client, f"DW FAIL {job_id} content_guard {guard_class}")
         return
 

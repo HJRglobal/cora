@@ -172,6 +172,40 @@ class TestTruePositivesPreserved:
         assert user_access.check_access(ALEX, "F3E", text) == R_PHI, text
 
 
+class TestInflectionRegressionsCaughtByReview:
+    """Six phrasings the OLD substring scan refused that the first bounded rewrite
+    let through. The header comment claimed inflections were preserved; these were
+    the exception set that claim missed (D-051, 2026-08-17). Each is realistic --
+    "clinically significant behaviors" is textbook LEX/BH phrasing, and Cora is
+    asked to rehire/vacation questions constantly.
+    """
+
+    @pytest.mark.parametrize("topic,text,expected", [
+        ("hr", "should we rehire Micah", R_HR),
+        ("hr", "did we rehire him last year", R_HR),
+        ("hr", "who is rehiring for that role", R_HR),
+        ("hr", "who is vacationing next week", R_HR),
+        ("hr", "what are the compensations for the team", R_HR),
+        ("phi", "clinically significant behaviors", R_PHI),
+        ("phi", "our clientele records", R_PHI),
+        ("phi", "our DDDs paperwork", R_PHI),
+    ])
+    def test_inflection_still_refused(self, block, topic, text, expected):
+        block([topic])
+        assert user_access.check_access(ALEX, "F3E", text) == expected, text
+
+    @pytest.mark.parametrize("text", [
+        "handout at camptontozona (asu football)",   # the live incident
+        "pull the fireflies transcript",
+        "hampton inn receipt for the trip",
+        "crypto payment option for the store",
+        "the new hampshire distributor wants a quote",
+    ])
+    def test_widening_did_not_reintroduce_the_false_positives(self, block, text):
+        block(["hr"])
+        assert user_access.check_access(ALEX, "F3E", text) is None, text
+
+
 class TestUnchangedBehavior:
     def test_harrison_never_topic_blocked(self):
         assert user_access.check_access(HARRISON, "F3E", "what is her salary") is None

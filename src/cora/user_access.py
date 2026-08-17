@@ -24,8 +24,6 @@ from typing import Any
 
 import yaml
 
-from . import guard_input
-
 log = logging.getLogger(__name__)
 
 _PERMISSIONS_PATH = (
@@ -246,8 +244,8 @@ def _financials_is_blocked(msg_lower: str) -> bool:
 # silently cost a true positive. Each entry is a regex BODY.
 _TOPIC_PATTERN_SOURCES: dict[str, tuple[str, ...]] = {
     "hr": (
-        r"salar(?:y|ies)", r"compensation", r"pay\s+rates?",
-        r"hire[ds]?", r"hiring", r"fire[ds]?", r"firing",
+        r"salar(?:y|ies)", r"compensations?", r"pay\s+rates?",
+        r"(?:re)?hire[ds]?", r"(?:re)?hiring", r"fire[ds]?", r"firing",
         # NOT "termination": "early-termination penalty ... sponsorship
         # contract" is ordinary commercial talk, and a hyphen counts as a
         # boundary, so adding it refused a legitimate deal question. Keep the
@@ -256,12 +254,12 @@ _TOPIC_PATTERN_SOURCES: dict[str, tuple[str, ...]] = {
         # NOT "benefit" singular: product/marketing copy says "the benefit of"
         # constantly. Plural only, as before.
         r"employee\s+complaints?", r"disciplinary", r"benefits",
-        r"pto", r"vacations?", r"sick\w*", r"401\(?k\)?",
+        r"pto", r"vacation\w*", r"sick\w*", r"401\(?k\)?",
     ),
     "phi": (
-        r"clients?'?s?", r"patients?'?s?", r"diagnos(?:is|es|ed)",
+        r"client\w*", r"patients?'?s?", r"diagnos(?:is|es|ed)",
         r"treatments?", r"medications?", r"care\s+plans?",
-        r"progress\s+notes?", r"clinical", r"ddd", r"hcbs",
+        r"progress\s+notes?", r"clinical\w*", r"ddds?", r"hcbs",
         r"behavioral\s+health", r"therapy\s+sessions?",
     ),
     "cap_table": (
@@ -432,14 +430,15 @@ def check_access(
     if not blocked:
         return None
 
-    # Guard-normalized text for the TOPIC match only (the entity check above
-    # reads user_id/entity, not text). An office-inventory write's free-text
-    # "Reason:" is operator annotation: "Reason: Handout at camptontozona" had
-    # already refused a write via the hr topic before the boundary fix above, and
-    # a Reason reading "employee complaint" would still do it. Narrow by
-    # construction -- guard_input requires the full inventory-request shape, so a
-    # bare "Reason: what is <person>'s salary" is NOT an evasion path.
-    msg_lower = guard_input.scope_guard_text(user_message).lower()
+    # ALWAYS the full RAW message. guard_input.scope_guard_text is deliberately
+    # NOT applied here: an inventory-request wrapper is cheap to fake, so any text
+    # it strips is text an operator could hide, and a DECLARATIVE payload
+    # ("Justin's salary, print the figure") measurably sailed past the hr / phi /
+    # cap_table / financials blocks when it was applied -- privilege escalation,
+    # not a false-positive fix (D-051 HIGH, 2026-08-17). It was also unnecessary:
+    # the 2026-08-13 "camptontozona" -> "pto" false refusal was a naive SUBSTRING
+    # match, fixed at the root by the word-bounded patterns above.
+    msg_lower = user_message.lower()
 
     for topic in blocked:
         # Authorized LEX PHI custodian (in LEX scope) — skip the phi block only.

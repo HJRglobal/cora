@@ -83,6 +83,25 @@ class TestDiagnosticContent:
         assert "#dm" not in msg
         assert "this conversation" in msg
 
+    @pytest.mark.parametrize("guard_class", [
+        "personal_insurance", "capital_program", "travel_points",
+        "creator_crm", "content_pipeline",
+    ])
+    def test_dm_trip_never_tells_you_to_re_ask_in_a_dm(self, guard_class):
+        """A DM trip is always dashboard-gated (company_financials is PERMITTED
+        in a DM), so the DM already refused. Pointing the requester back at it is
+        unactionable and invites a re-ask that burns another quota slot
+        (D-051 MED, this branch)."""
+        msg = worker.guard_failure_message(
+            _job(channel_name="dm", channel_id="D0B4CTD3B09"), guard_class)
+        assert "re-ask in a DM with me" not in msg
+        assert "even in a DM" in msg
+        assert "Narrow the brief" in msg
+
+    def test_channel_trip_still_offers_the_dm_remedy(self):
+        msg = worker.guard_failure_message(_job(), "capital_program")
+        assert "re-ask in a DM with me" in msg
+
     def test_phi_refusal_offers_no_channel_remedy(self):
         # PHI is never deliverable to Slack -- promising a remedy would be a lie.
         msg = worker.guard_failure_message(_job(), worker.GUARD_CLASS_PHI)
@@ -121,11 +140,41 @@ class TestClassPropagation:
 
 
 class TestQuotaDisclosure:
-    def test_non_founder_is_told_the_slot_was_spent(self):
+    @pytest.fixture
+    def hermetic_quota(self, monkeypatch):
+        """Pin quota + clock so these never read the live host ledger."""
         import run_delegated_work_runner as runner
-        note = runner.quota_note(_job())
+        monkeypatch.setattr(runner.dw, "quota_remaining", lambda _u: 2)
+        return runner
+
+    def test_non_founder_is_told_the_slot_was_spent(self, hermetic_quota):
+        runner = hermetic_quota
+        note = runner.quota_note(_job(requested_at=runner.dw._now_iso()))
         assert "daily job slot" in note
+        assert "2 left today" in note
         assert "doesn't refund it" in note
+
+    def test_wording_is_outcome_neutral(self, hermetic_quota):
+        """quota_note is reached from notify_failure for interrupted/api_error/
+        no_output/error -- none of which is a guard refusal, so it must not blame
+        one (D-051 MED, this branch)."""
+        note = hermetic_quota.quota_note(
+            _job(requested_at=hermetic_quota.dw._now_iso()))
+        assert "guard refusal" not in note
+        assert "failed attempt doesn't refund it" in note
+
+    def test_job_from_a_prior_az_day_does_not_claim_todays_allowance(
+            self, hermetic_quota):
+        """requested_today() counts by AZ date, so for a job that crossed
+        midnight "used a slot" + "N left today" is self-contradictory."""
+        note = hermetic_quota.quota_note(_job(requested_at="2026-08-01T10:00:00+00:00"))
+        assert "left today" not in note
+        assert "requested 2026-08-01" in note
+
+    def test_unparseable_requested_at_is_not_read_as_today(self, hermetic_quota):
+        # _az_date(None) silently means "today" -- guard against that.
+        note = hermetic_quota.quota_note(_job(requested_at="not-a-timestamp"))
+        assert "daily job slot" in note
 
     def test_founder_gets_no_quota_note(self):
         import run_delegated_work_runner as runner

@@ -769,8 +769,9 @@ def resolve_delivery_tier(job: dict[str, Any]) -> str:
 # up"), which is the wrong voice for a job that already ran, and two of them
 # carry no remedy at all.
 #
-# LOCKSTEP with channel_content_guard._CLASSES -- test_delegated_worker asserts
-# every guard class has an entry here, so a new class cannot ship without one.
+# LOCKSTEP with channel_content_guard._CLASSES -- asserted BOTH directions in
+# tests/test_dw_content_guard_diagnostics.py, so a new class cannot ship without
+# an entry here (proven non-vacuous: injecting a 7th class fails that test).
 _GUARD_DIAGNOSTICS: dict[str, tuple[str, str]] = {
     "personal_insurance": ("personal insurance/policy figures", "a DM with me"),
     "capital_program": ("capital-raise terms", "a DM with me"),
@@ -785,6 +786,19 @@ _GUARD_DIAGNOSTICS: dict[str, tuple[str, str]] = {
 # Sentinels for the two non-_CLASSES refusal paths.
 GUARD_CLASS_PHI = "non_lex_phi"
 GUARD_CLASS_SCREEN_ERROR = "screen_error"
+
+
+def _dashboard_backed_classes() -> frozenset[str]:
+    """Guard classes whose channel permission is delegated to dashboard_access
+    (dash_id is not None in _CLASSES) rather than the channel tier. Read from the
+    live table so it cannot drift; fail-open to empty (the caller then uses the
+    ordinary channel wording, which is never wrong -- just less specific)."""
+    try:
+        from . import channel_content_guard
+        return frozenset(c[0] for c in channel_content_guard._CLASSES
+                         if c[2] is not None)
+    except Exception:  # noqa: BLE001
+        return frozenset()
 
 
 def guard_failure_message(job: dict[str, Any], guard_class: str) -> str:
@@ -806,9 +820,28 @@ def guard_failure_message(job: dict[str, Any], guard_class: str) -> str:
 
     label, remedy = _GUARD_DIAGNOSTICS.get(
         guard_class, ("confidential content", "a DM with me"))
+
+    # A DM-originated job that tripped a DASHBOARD-backed class was refused BY
+    # the DM (dashboard_access refuses unless the user is in that dashboard's
+    # dm_users). Telling the requester to "re-ask in a DM with me" would point
+    # them at the surface that just refused -- unactionable, and it invites a
+    # re-ask that burns another quota slot (D-051 MED, this branch).
+    #
+    # Keyed on the dashboard-backed SET, not on the remedy text: company_
+    # financials also carries "or a DM with me", but it is tier-gated and
+    # PERMITTED in a DM, so it can never reach this branch -- and telling its
+    # requester to "ask Harrison for dashboard access" would be wrong.
+    if where == "this conversation" and guard_class in _dashboard_backed_classes():
+        return (f"Your delegated job finished, but its draft contained {label}, "
+                f"which I can't deliver here even in a DM -- so no file was "
+                f"delivered (fail-closed). Narrow the brief so it doesn't need "
+                f"that data, or ask Harrison for access to that dashboard.")
+
+    # Two sentences, not three stacked "or"s -- several remedies are themselves
+    # a comma list ("a finance or leadership channel, or a DM with me").
     return (f"Your delegated job finished, but its draft contained {label}, "
             f"which {where} isn't scoped for -- so no file was delivered "
-            f"(fail-closed). To get this: re-ask in {remedy}, or narrow the "
+            f"(fail-closed). To get this, re-ask in {remedy}. Or narrow the "
             f"brief so it doesn't need that data.")
 
 

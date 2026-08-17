@@ -157,14 +157,6 @@ def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
     if not message_text or not channel_entity:
         return None
 
-    # Evaluate the guard-normalized text, not the raw message: an office-
-    # inventory write's free-text "Reason:" line is operator annotation, and
-    # "Reason: 4 OSN Stores" on an all-F3E-SKU write was redirected to
-    # #osn-leadership 5x across two users (2026-08-03..08-06). Narrow by
-    # construction -- see guard_input. Applied HERE rather than at the 4 app.py
-    # call sites so no current or future caller can miss it.
-    message_text = guard_input.scope_guard_text(message_text)
-
     if channel_entity.upper() in _PASS_THROUGH:
         return None
 
@@ -173,6 +165,18 @@ def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
     if self_def is None:
         # Unrecognized / non-firewalled channel family — do not interfere.
         return None
+
+    # Evaluate the guard-normalized text, not the raw message: an office-
+    # inventory write's free-text "Reason:" line is operator annotation, and
+    # "Reason: 4 OSN Stores" on an all-F3E-SKU write was redirected to
+    # #osn-leadership 5x across two users (2026-08-03..08-06). Narrow by
+    # construction -- see guard_input. Applied HERE rather than at the 4 app.py
+    # call sites so no current or future caller can miss it.
+    #
+    # AFTER the early returns on purpose: a FNDR/HJRG pass-through channel and an
+    # unrecognized family both return None unconditionally, so normalizing first
+    # was pure work on paths this guard does not govern (D-051 LOW, this branch).
+    message_text = guard_input.scope_guard_text(message_text)
 
     paired = PAIRED_ENTITIES.get(family, set())
 
