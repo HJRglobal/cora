@@ -75,6 +75,14 @@ NON_TERMINAL_STATES: frozenset[str] = frozenset({
     "REQUESTED", STATE_HELD, STATE_QUEUED, STATE_RUNNING,
 })
 
+# The one failure class that refunds a quota slot (Harrison 2026-08-17, TOM
+# 1vvvvv). Defined HERE, next to the states, because the runner WRITES this
+# string onto the failed event and this module READS it back to compute the
+# refund. Two copies of the literal is a silent-drift bug: change one and the
+# refund quietly stops happening with every test still green, because each side
+# would agree with itself. The runner imports this name.
+FAILURE_CONTENT_GUARD = "content_guard"
+
 # Events, per writer (single-writer-per-file invariant).
 BOT_EVENTS: frozenset[str] = frozenset({
     "requested", "held", "released", "queued", "cancelled",
@@ -400,9 +408,13 @@ def _requested_events() -> list[dict[str, Any]]:
 
 
 def requested_today(user: str | None = None) -> int:
-    """Count of ``requested`` events today (AZ), org-wide or per user. Quota
-    basis is requested events REGARDLESS of later outcome -- a cancel does not
-    refund the slot (design section 4)."""
+    """Count of ``requested`` events today (AZ), org-wide or per user.
+
+    RAW basis -- outcome-blind. A cancel does not refund the slot (design
+    section 4). The one exception is applied by :func:`quota_used_today`, which
+    is what the gates actually consult; this stays raw so "how many did you ask
+    for" remains answerable separately from "how many count against you".
+    """
     today = _az_date()
     n = 0
     for ev in _requested_events():
@@ -415,10 +427,50 @@ def requested_today(user: str | None = None) -> int:
     return n
 
 
+def refunded_today(user: str | None = None,
+                   jobs: dict[str, dict[str, Any]] | None = None) -> int:
+    """Slots given back today (AZ) because the artifact tripped content_guard.
+
+    Harrison ruled 2026-08-17 (TOM 1vvvvv) that a content_guard refusal refunds
+    the quota slot -- and ONLY content_guard. The rationale is that this failure
+    class is frequently CHANNEL-caused rather than brief-caused (round3 measured
+    capital_program / company_financials tripping in TIER_3 F3E channels), so the
+    requester is charged for a fail-closed decision they could not have predicted
+    from their own brief. Every other class -- api_error, no_output, interrupted,
+    error, expired, cancelled -- still spends the slot, because those either
+    consumed real model work or reflect a choice the requester made.
+
+    Keyed on the job's REQUESTED day, not its failure day: the quota is a budget
+    of asks per day, so a job requested yesterday and refused today must not
+    credit a slot against today's allowance.
+    """
+    jobs = jobs if jobs is not None else _fold_jobs()
+    today = _az_date()
+    n = 0
+    for rec in jobs.values():
+        if rec.get("state") != STATE_FAILED:
+            continue
+        if str(((rec.get("failure") or {}).get("class") or "")) != FAILURE_CONTENT_GUARD:
+            continue
+        ts = _parse_ts(rec.get("requested_at"))
+        if ts is None or _az_date(ts) != today:
+            continue
+        if user is not None and str(rec.get("requester")) != user:
+            continue
+        n += 1
+    return n
+
+
+def quota_used_today(user: str | None = None,
+                     jobs: dict[str, dict[str, Any]] | None = None) -> int:
+    """Slots that actually count against today's allowance (never below 0)."""
+    return max(0, requested_today(user) - refunded_today(user, jobs))
+
+
 def quota_remaining(user: str) -> int:
     if user == HARRISON_ID:
         return user_daily_quota()  # founder exempt; display-only value
-    return max(0, user_daily_quota() - requested_today(user))
+    return max(0, user_daily_quota() - quota_used_today(user))
 
 
 def mtd_spend(jobs: dict[str, dict[str, Any]] | None = None) -> float:
@@ -876,9 +928,13 @@ def submit_job(
 
         held_reason = ""
         if slack_user_id != HARRISON_ID:
-            if requested_today(slack_user_id) >= user_daily_quota():
+            # quota_used_today, not requested_today: content_guard refusals are
+            # refunded (Harrison 2026-08-17). `jobs` is the fold already taken
+            # inside this lock, so the refund is computed from the same snapshot
+            # the dedup check used -- no second read, no torn view.
+            if quota_used_today(slack_user_id, jobs) >= user_daily_quota():
                 held_reason = "user_quota"
-            elif requested_today() >= org_daily_quota():
+            elif quota_used_today(None, jobs) >= org_daily_quota():
                 held_reason = "org_quota"
         if not held_reason and envelope_headroom(jobs) < job_usd_cap():
             held_reason = "envelope"
@@ -1102,18 +1158,72 @@ def cancel_job(dw_id: str, actor_id: str) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # List view (cross-channel title suppression) + observability summary
 # ─────────────────────────────────────────────────────────────────────────────
+def _age_phrase(iso_ts: str) -> str:
+    """Human age of a timestamp ("12m ago", "3h ago", "2d ago"), "" if unknown.
+
+    "QUEUED" alone does not answer "is it stuck?" -- a job queued 4 minutes ago
+    and one queued 30 hours ago read identically without this, and the second is
+    the only one worth asking about.
+    """
+    ts = _parse_ts(iso_ts)
+    if ts is None:
+        return ""
+    delta = datetime.now(timezone.utc) - ts.astimezone(timezone.utc)
+    mins = int(delta.total_seconds() // 60)
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{mins}m ago"
+    if mins < 60 * 24:
+        return f"{mins // 60}h ago"
+    return f"{mins // (60 * 24)}d ago"
+
+
+def _state_detail(rec: dict[str, Any]) -> str:
+    """The one clause that makes a terminal state actionable.
+
+    A bare "FAILED" tells the requester nothing they can act on; the failure
+    class is already recorded, and content_guard in particular now means "your
+    slot came back", which they would otherwise never learn from a list."""
+    state = rec.get("state")
+    if state == STATE_FAILED:
+        fclass = str((rec.get("failure") or {}).get("class") or "error")
+        if fclass == FAILURE_CONTENT_GUARD:
+            return "content guard -- slot refunded"
+        return fclass.replace("_", " ")
+    if state == STATE_HELD:
+        return "waiting on Harrison"
+    if state == STATE_DELIVERED:
+        target = str((rec.get("artifact") or {}).get("target_path") or "")
+        return f"file: {target}" if target else ""
+    return ""
+
+
 def render_job_list(user: str, channel_id: str) -> str:
     """The asker's own jobs, newest first (cap 10). Full titles render ONLY for
     jobs requested in the CURRENT channel -- a title authored in a higher-tier
     channel must not render in a lower-tier one (design section 3). An empty
-    current-channel id suppresses every title (fail-closed)."""
+    current-channel id suppresses every title (fail-closed).
+
+    Carries age + a terminal-state detail clause, because the ask this serves is
+    "what happened to my job?", not "enumerate my jobs". The cross-channel title
+    suppression is unchanged -- the detail clause is derived from the job's own
+    state and failure class, never from its brief or title.
+    """
     mine = [r for r in load_jobs() if str(r.get("requester")) == user]
     if not mine:
-        return "You have no delegated jobs on record."
+        return ("You have no delegated jobs on record. Ask me to research, "
+                "build, or draft something and I'll queue one.")
     lines = ["Your delegated jobs (newest first):"]
     for r in mine[:10]:
         jid = r.get("job_id", "?")
         base = f"- `{jid}` {r.get('archetype', '?')} [{r.get('entity', '?')}] -- {r.get('state', '?')}"
+        detail = _state_detail(r)
+        if detail:
+            base += f" ({detail})"
+        age = _age_phrase(str(r.get("requested_at") or ""))
+        if age:
+            base += f", requested {age}"
         if channel_id and str(r.get("channel_id") or "") == channel_id:
             base += f": {r.get('title', '')}"
         cost = (r.get("cost") or {}).get("est_usd")
@@ -1122,6 +1232,7 @@ def render_job_list(user: str, channel_id: str) -> str:
         lines.append(base)
     if len(mine) > 10:
         lines.append(f"(+{len(mine) - 10} older)")
+    lines.append(f"Quota: {quota_remaining(user)} of {user_daily_quota()} left today.")
     return "\n".join(lines)
 
 

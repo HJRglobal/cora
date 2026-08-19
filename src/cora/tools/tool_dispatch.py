@@ -11192,8 +11192,15 @@ TOOL_DEFINITIONS = [
             "something multi-step -- NOT for quick questions answerable in-thread. "
             "action='request' (default) previews the job for the requester to confirm "
             "(two-call staged write: preview first, then confirmed=true after the user "
-            "says yes); action='list' shows the asker's jobs; action='cancel' with "
-            "job_id cancels their queued job. Jobs run asynchronously (~15-min pickup) "
+            "says yes); action='cancel' with job_id cancels their queued job. "
+            "\n\nUSE action='list' -- a READ, no confirmation needed -- whenever "
+            "someone asks about work they already delegated: 'list my delegated jobs', "
+            "'what jobs do I have running', 'what's the status of my brief', 'did that "
+            "research finish', 'is my spreadsheet done yet', 'what happened to the job "
+            "I asked for', 'how many job slots do I have left'. It returns their own "
+            "jobs with state, age, why a failed one failed, and remaining quota. Do "
+            "NOT answer these from memory or guess a status -- call the tool. "
+            "\n\nJobs run asynchronously (~15-min pickup) "
             "and deliver back to the requesting thread. Not available in LEX scope."
         ),
         "input_schema": {

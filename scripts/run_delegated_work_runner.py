@@ -301,6 +301,37 @@ def quota_note(job: dict) -> str:
             f"({remaining} left today) -- a failed attempt doesn't refund it.\n")
 
 
+def guard_quota_note(job: dict) -> str:
+    """The content_guard counterpart to :func:`quota_note` -- this one REFUNDS.
+
+    Harrison ruled 2026-08-17 that a content_guard refusal gives the slot back
+    (content_guard only). Shipping the refund while still printing quota_note's
+    "a failed attempt doesn't refund it" would leave the requester believing they
+    had been charged, which defeats the point of the ruling as thoroughly as not
+    building it: the fairness the rule buys is only real if the person is told.
+
+    Reads the remaining count AFTER the refusal has been recorded, so the number
+    shown is the number the next request will actually see. Founder is
+    quota-exempt, so no note. Fail-soft: any lookup error yields no note.
+    """
+    requester = str(job.get("requester") or "")
+    if not requester or requester == dw.HARRISON_ID:
+        return ""
+    try:
+        requested_dt = dw._parse_ts(job.get("requested_at"))
+        requested_day = dw._az_date(requested_dt) if requested_dt else ""
+        if requested_day and requested_day != dw._az_date():
+            # Slot was spent on a prior day; today's counter says nothing about
+            # it, and the refund lands against that prior day's allowance.
+            return ("This didn't cost you a job slot -- a content-guard refusal "
+                    "refunds it.\n")
+        remaining = dw.quota_remaining(requester)
+    except Exception:  # noqa: BLE001
+        return ""
+    return (f"This didn't cost you a job slot -- a content-guard refusal refunds "
+            f"it ({remaining} left today).\n")
+
+
 def notify_failure(client, job: dict, failure_class: str) -> None:
     note = _FAIL_NOTES.get(failure_class, _FAIL_NOTES["error"])
     # Job id always on its own line -- with the quota note present it would
@@ -601,7 +632,7 @@ def deliver(client, job_id: str, outcome: dict) -> None:
         # (2026-08-02..08-13) impossible to triage -- no class, no archetype, no
         # channel (cq-233ca1a22976).
         dw.append_runner_event({"event": "failed", "ts": dw._now_iso(), "job_id": job_id,
-                                "failure_class": "content_guard",
+                                "failure_class": dw.FAILURE_CONTENT_GUARD,
                                 "guard_class": guard_class,
                                 "message": f"artifact tripped the channel content "
                                            f"guard: {guard_class}",
@@ -610,7 +641,7 @@ def deliver(client, job_id: str, outcome: dict) -> None:
                                 "channel_name": str(rec.get("channel_name") or ""),
                                 "cost": cost})
         post_threaded(client, rec,
-                      f"{guard_text}\n{quota_note(rec)}"
+                      f"{guard_text}\n{guard_quota_note(rec)}"
                       f"(Delegated job `{job_id}` failed: content guard "
                       f"[{_guard_class_label(guard_class)}] -- no file was "
                       f"delivered.)")
