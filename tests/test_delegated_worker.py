@@ -804,38 +804,87 @@ def test_deliver_drive_down_marks_mis_homed_and_still_delivers(monkeypatch):
     assert dw.staging_dir("dw-abc123def456").exists()
 
 
-def test_mis_homed_retry_homes_without_reposting(monkeypatch):
-    _seed_job(state_events=("queued", "started"))
-    monkeypatch.setattr(runner.worker, "guard_artifact_text",
-                        lambda job, text: (None, text, ""))
-    calls = {"n": 0}
+def test_mis_homed_retry_homes_and_announces_the_late_landing(monkeypatch, tmp_path):
+    """Contract CHANGED 2026-08-18 (D-051). This used to assert the retry pass
+    NEVER posts. That was the defect: the delivery message said "staged locally
+    and will land on Drive automatically", and nothing ever announced the
+    landing -- a delivered file whose path the requester was never told. It still
+    must not re-post the full delivery summary; it posts one landing line.
 
-    def _down_then_up(path, text, **k):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise runner.drive_io.DriveUnavailable("G: gone")
+    It also must not claim a landing it cannot verify: the pass previously
+    appended artifact_homed unconditionally and deleted staging, so a write into
+    a vanishing handle lost the artifact silently.
+    """
+    monkeypatch.setattr(runner, "_client", lambda: None)
+    monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path))
+    _seed_job(state_events=("queued",))
 
-    monkeypatch.setattr(runner.drive_io, "write_text_atomic", _down_then_up)
-    monkeypatch.setattr(runner, "post_threaded", lambda c, j, t: True)
-    monkeypatch.setattr(runner, "post_sessions_line", lambda c, t: None)
-    runner.deliver(None, "dw-abc123def456", _ok_outcome())
-    assert dw.get_job("dw-abc123def456")["artifact"]["mis_homed"] is True
+    jid = "dw-abc123def456"
+    staging = dw.staging_dir(jid)
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "artifact.md").write_text("# body", encoding="utf-8")
+    target = tmp_path / "landed.md"
+    dw.append_runner_event({
+        "event": "delivering", "ts": dw._now_iso(), "job_id": jid,
+        "artifact": {"local_path": str(staging / "artifact.md"),
+                     "target_path": str(target), "mis_homed": True},
+        "cost": {"est_usd": 0.1},
+    })
+    dw.append_runner_event({"event": "delivered", "ts": dw._now_iso(),
+                            "job_id": jid, "cost": {"est_usd": 0.1},
+                            "artifact": {"local_path": str(staging / "artifact.md"),
+                                         "target_path": str(target),
+                                         "mis_homed": True}})
 
-    posted = MagicMock()
-    monkeypatch.setattr(runner, "post_threaded", posted)
+    posts = []
+    monkeypatch.setattr(runner, "post_threaded",
+                        lambda c, j2, txt: posts.append(txt) or True)
+
+    def _really_write(path, text, **k):
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(path).write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(runner.drive_io, "write_text_atomic", _really_write)
     runner.mis_homed_retry_pass(None)
-    rec = dw.get_job("dw-abc123def456")
-    assert rec["artifact"]["mis_homed"] is False
-    posted.assert_not_called()  # artifact_homed NEVER re-posts
-    assert not dw.staging_dir("dw-abc123def456").exists()  # cleaned once homed
-    # Idempotency: a second pass finds nothing to do.
+
+    rec = dw.get_job(jid)
+    assert (rec.get("artifact") or {}).get("mis_homed") is False
+    body = "\n".join(posts)
+    assert "has now landed on Drive" in body
+    # NOT a second full delivery summary.
+    assert "is done" not in body
+
+
+def test_mis_homed_retry_refuses_to_claim_an_unverifiable_write(monkeypatch, tmp_path):
+    """The write returns cleanly but lands nothing: mis_homed must STAY set and
+    staging must survive, or the only copy is gone (D-051 HIGH)."""
+    monkeypatch.setattr(runner, "_client", lambda: None)
+    monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path))
+    _seed_job(state_events=("queued",))
+
+    jid = "dw-abc123def456"
+    staging = dw.staging_dir(jid)
+    staging.mkdir(parents=True, exist_ok=True)
+    local = staging / "artifact.md"
+    local.write_text("# body", encoding="utf-8")
+    target = tmp_path / "never-lands.md"
+    for ev in ("delivering", "delivered"):
+        dw.append_runner_event({
+            "event": ev, "ts": dw._now_iso(), "job_id": jid,
+            "artifact": {"local_path": str(local), "target_path": str(target),
+                         "mis_homed": True},
+            "cost": {"est_usd": 0.1}})
+
+    monkeypatch.setattr(runner, "post_threaded", lambda c, j2, txt: True)
+    # Returns cleanly, writes nothing.
+    monkeypatch.setattr(runner.drive_io, "write_text_atomic",
+                        lambda path, text, **k: None)
     runner.mis_homed_retry_pass(None)
-    assert dw.get_job("dw-abc123def456")["artifact"]["mis_homed"] is False
 
+    rec = dw.get_job(jid)
+    assert (rec.get("artifact") or {}).get("mis_homed") is True
+    assert local.exists(), "staging must survive an unverified re-home"
 
-# ---------------------------------------------------------------------------
-# Runner: crash recovery (both arms) + expiry
-# ---------------------------------------------------------------------------
 
 def _age_event(job_id, event, hours, lane="runner", **extra):
     ts = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()

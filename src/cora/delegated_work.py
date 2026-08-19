@@ -731,16 +731,33 @@ def screen_request(
 # delimiter-rich string -- and the scan is length-capped.
 _DEST_SCAN_CAP = 2000
 
-# Verb phrases that name a place to put the result.
+# Verb phrases that name a place to put the result. The verb+preposition alone
+# is NOT enough -- "Drop in a chart of monthly revenue" matched the first version
+# (D-051). It must be followed, within a short window, by something that actually
+# denotes a location.
 _DEST_VERB_RE = re.compile(
     r"\b(?:deliver|save|store|put|drop|upload|write|place|file)\s+"
     r"(?:it|this|them)?\s*"
-    r"(?:to|in|into|under|at)\b",
+    r"(?:to|in|into|under|at)\s+"
+    r"[^.\n]{0,40}?"
+    r"(?:folder|directory|drive|subfolder|[A-Za-z]:[\\/]|[\w.\-]{1,40}[\\/])",
     re.IGNORECASE)
 
-# A literal path-ish token: a drive letter, or 2+ slash-separated segments.
+# A literal path-ish token. Measured against all 26 real briefs in the live
+# ledger, the first version ("2+ slash-separated segments") fired on 4 of 6 --
+# "Energy/Mood/", "Pure/Mood/", "$125/athlete/month" -- so 67% of notices were
+# noise telling a requester "I can't deliver to a folder you pick" when they had
+# named no folder. Now: a drive letter, OR a backslash path, OR 3+ segments where
+# at least one looks like a filesystem name (>=4 chars containing _ - or .).
+# That keeps `_shared/team-knowledge/hannah/` and drops dates (8/18/2026),
+# short lists (Q1/Q2/Q3, US/CA/MX) and product pairs.
 _DEST_PATH_RE = re.compile(
-    r"[A-Za-z]:[\\/]|(?:[\w.\-]{1,40}[\\/]){2,}")
+    r"[A-Za-z]:[\\/]"
+    r"|(?:[\w.\-]{1,40}\\){2,}"
+    r"|(?:[\w.\-]{1,40}/){2,}(?=[\w.\-]{0,40}(?:/|\b))")
+
+# A segment that reads like a real folder name rather than a list item.
+_DEST_PATHY_SEGMENT_RE = re.compile(r"(?:^|[\\/])[\w.\-]*[_\-.][\w.\-]*(?=[\\/])")
 
 # Named Drive locations people actually ask for by name.
 _DEST_NAMED_RE = re.compile(
@@ -758,9 +775,15 @@ def brief_names_a_destination(brief: str) -> bool:
     text = (brief or "")[:_DEST_SCAN_CAP]
     if not text:
         return False
-    return bool(_DEST_PATH_RE.search(text)
-                or _DEST_NAMED_RE.search(text)
-                or _DEST_VERB_RE.search(text))
+    if _DEST_NAMED_RE.search(text) or _DEST_VERB_RE.search(text):
+        return True
+    hit = _DEST_PATH_RE.search(text)
+    if not hit:
+        return False
+    # A forward-slash run only counts when one segment reads like a folder name.
+    frag = text[max(0, hit.start() - 1):hit.end() + 41]
+    return bool("\\" in hit.group(0) or ":" in hit.group(0)
+                or _DEST_PATHY_SEGMENT_RE.search(frag))
 
 
 def destination_notice(job: dict[str, Any]) -> str:
@@ -773,9 +796,15 @@ def destination_notice(job: dict[str, Any]) -> str:
     try:
         from .delegated_worker import artifact_target_path
         target = artifact_target_path(job)
+        # The STABLE parent, not the dated `YYYY-MM` leaf. The leaf is computed
+        # from `now` at ask time and recomputed at delivery time, so a HELD job
+        # (which never expires) or a QUEUED job crossing a month boundary was
+        # promised `.../2026-08/` and landed in `.../2026-09/` -- the one way the
+        # two could actually disagree (D-051).
         return ("Heads up on where it lands: I can't deliver to a folder you "
-                f"pick -- every delegated artifact homes to `{target.parent}` "
-                "and I'll post the exact filename here when it's done.")
+                f"pick -- every delegated artifact homes under "
+                f"`{target.parent.parent}` in a dated subfolder, and I'll post "
+                "the exact path here when it's done.")
     except Exception:  # noqa: BLE001 -- never block a queued job on this
         return ("Heads up on where it lands: I can't deliver to a folder you "
                 "pick -- artifacts home to the entity's `_delegated-work` "
