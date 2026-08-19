@@ -1039,6 +1039,13 @@ def _format_kb_chunks(chunks: list) -> str:
                 bot_label = " — [includes Cora's own prior reply — Cora-authored lines are not canon]"
             elif meta.get("bot_authored"):
                 bot_label = " — [bot/automation-authored — not human knowledge]"
+            elif meta.get("attribution_unreliable"):
+                # cq-e63feff3a0bf: diarization collapsed on this transcript, so
+                # every "[Name] said X" line in it is one speaker's label applied
+                # to the whole room. The words are real; WHO said them is not.
+                bot_label = (" — [SPEAKER LABELS UNRELIABLE — diarization collapsed on "
+                             "this transcript; do NOT attribute any quote to a named "
+                             "person from it]")
 
         lines.append(
             f"## [{i}] {r.source} | {title} | entity={r.entity}{date_str}{link_block}{bot_label}"

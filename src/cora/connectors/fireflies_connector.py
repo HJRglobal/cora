@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from cora.connectors import fireflies_diarization
 from cora.kb_exclusions import is_copa_meeting_title
 from cora.knowledge_base.store import Document
 
@@ -544,6 +545,83 @@ _DEDUP_TOLERANCE_SEC = 300  # +/- 5 min: notetaker copies of one meeting cluster
 # different same-titled/same-attendee meetings that merely fall inside +/-5 min (WS13).
 _TITLE_MERGE_TOLERANCE_SEC = 180  # +/- 3 min
 _DEDUP_LEDGER_PATH = Path(__file__).resolve().parents[3] / "data" / "state" / "fireflies-dedup-ledger.json"
+
+#: Diarization-collapse flags, newest-last (cq-e63feff3a0bf). A jsonl rather than
+#: a KB query so the weekly coverage digest -- which deliberately reads no
+#: transcript CONTENT -- can report the flags without gaining that reach.
+DIARIZATION_LEDGER_PATH = (
+    Path(__file__).resolve().parents[3] / "logs" / "fireflies-diarization.jsonl"
+)
+
+
+def _record_diarization_flag(transcript_id: str, title: str, entity: str,
+                             meeting_ts: int | None, health) -> None:
+    """Append one collapse flag. Fail-soft: a canary never breaks an ingest.
+
+    The TITLE is recorded because the digest goes to Harrison alone and a flag
+    nobody can identify is not actionable. LEX titles are already hard-excluded
+    from ingest upstream, so nothing clinical reaches this file by construction.
+    """
+    try:
+        DIARIZATION_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "transcript_id": transcript_id,
+            "title": title[:160],
+            "entity": entity,
+            "meeting_ts": meeting_ts,
+            "sentences": health.sentences,
+            "speakers": health.speakers,
+            "top_share": round(health.top_speaker_share, 3),
+            "expected_parties": health.expected_parties,
+            "reason": health.reason,
+        }
+        with DIARIZATION_LEDGER_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not record diarization flag for %s: %s", transcript_id, exc)
+
+
+def read_diarization_flags(max_age_days: int = 7, now: datetime | None = None) -> list[dict]:
+    """Collapse flags newer than max_age_days, newest first. [] on any failure."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        lines = DIARIZATION_LEDGER_PATH.read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    cutoff = now - timedelta(days=max_age_days)
+    rows: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            stamped = datetime.fromisoformat(str(row.get("ts", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamped.tzinfo is None:
+            stamped = stamped.replace(tzinfo=timezone.utc)
+        if stamped >= cutoff:
+            rows.append(row)
+    # Newest first, and de-duplicated by transcript: a re-sync re-flags the same
+    # meeting, and one meeting should occupy one digest line.
+    rows.reverse()
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for row in rows:
+        tid = str(row.get("transcript_id") or "")
+        if tid and tid in seen:
+            continue
+        seen.add(tid)
+        unique.append(row)
+    return unique
 _DEDUP_LEDGER_MAX = 5000  # cap entries (only duplicated meetings get one)
 
 
@@ -925,6 +1003,25 @@ def backfill(since: datetime) -> Iterator[Document]:
         sub_entity = _tag_fireflies_sub_entity(t) if entity == "LEX" else None
 
         meeting_attendees = t.get("meeting_attendees") or []
+
+        # Diarization-collapse canary (cq-e63feff3a0bf). A 77-minute multi-party
+        # meeting was ingested with 100% single-speaker labels and nothing
+        # noticed -- and every downstream consumer trusts those labels. Advisory
+        # only: the transcript still ingests (the words were said), it is tagged
+        # attribution-unreliable and recorded for the weekly coverage digest.
+        try:
+            health = fireflies_diarization.assess(t)
+            diarization_meta = health.as_metadata()
+            if health.collapsed:
+                log.warning(
+                    "Fireflies diarization COLLAPSE on %r (%s): %s",
+                    title, transcript_id, health.reason,
+                )
+                _record_diarization_flag(transcript_id, title, entity, meeting_ts, health)
+        except Exception as exc:  # noqa: BLE001 -- a canary must never break ingest
+            log.warning("Fireflies diarization canary failed on %r: %s", title, exc)
+            diarization_meta = {}
+
         yield Document(
             source="fireflies",
             source_id=transcript_id,
@@ -945,6 +1042,7 @@ def backfill(since: datetime) -> Iterator[Document]:
                 ],
                 "participant_slack_ids": _resolve_participant_slack_ids(meeting_attendees),
                 "participants": t.get("participants") or [],
+                **diarization_meta,
             },
         )
         transcript_count += 1

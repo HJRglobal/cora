@@ -341,6 +341,56 @@ def _person_line(r: PersonResult, days: int) -> str:
     return f"  - {h.name} <{h.primary_email}>"
 
 
+#: Days of diarization flags the digest reports. Matches the weekly cadence, so
+#: consecutive digests neither skip a flag nor repeat one.
+DIARIZATION_WINDOW_DAYS = 7
+
+
+def format_diarization_section(flags: list[dict] | None = None) -> str:
+    """The diarization-collapse block (cq-e63feff3a0bf), or "" when clean.
+
+    COVERAGE has two failure modes and this monitor only ever watched one. "Are
+    this person's meetings being captured?" was answered; "is what we captured
+    usable?" was not, so a 77-minute multi-party meeting ingested with 100%
+    single-speaker labels passed silently. Same monitor, same weekly DM, second
+    question.
+
+    Reads the ingest-written ledger, never transcript content -- this module's
+    no-content posture (the reason the PHI guardrail is not engaged here) holds.
+    """
+    if flags is None:
+        try:
+            from .fireflies_connector import read_diarization_flags
+            flags = read_diarization_flags(max_age_days=DIARIZATION_WINDOW_DAYS)
+        except Exception:  # noqa: BLE001 -- a digest section never breaks the digest
+            log.warning("fireflies_coverage: could not read diarization flags",
+                        exc_info=True)
+            return ""
+    if not flags:
+        return ""
+    lines = [
+        f"\n:studio_microphone: *Speaker labels collapsed* "
+        f"({len(flags)} meeting(s) in {DIARIZATION_WINDOW_DAYS}d) -- the transcript "
+        f"is in the KB but every quote in it is attributed to ONE speaker, so "
+        f"attribution from these is not trustworthy:"
+    ]
+    for row in flags[:10]:
+        title = str(row.get("title") or "(untitled)")[:80]
+        share = row.get("top_share")
+        try:
+            share_txt = f"{float(share):.0%}"
+        except (TypeError, ValueError):
+            share_txt = "?"
+        lines.append(
+            f"  - {title} [{row.get('entity') or '?'}] -- {share_txt} of "
+            f"{row.get('sentences') or '?'} lines on one speaker, "
+            f"{row.get('expected_parties') or '?'} known parties"
+        )
+    if len(flags) > 10:
+        lines.append(f"  - ...and {len(flags) - 10} more")
+    return "\n".join(lines)
+
+
 def format_digest(report: CoverageReport, days: int = 30) -> str:
     """Build the Harrison digest (Slack mrkdwn). Always safe to send."""
     lines: list[str] = ["*Fireflies coverage check* (DWD users)"]
@@ -354,6 +404,11 @@ def format_digest(report: CoverageReport, days: int = 30) -> str:
         for r in sorted(report.results, key=lambda x: x.human.name.lower()):
             lines.append(f"  - {r.human.name} <{r.human.primary_email}>")
         lines.append(f"\nVerify members: {_ADMIN_LINK}")
+        # Reported even here: a failed member enumeration says nothing about
+        # whether what we DID capture is usable.
+        diarization = format_diarization_section()
+        if diarization:
+            lines.append(diarization)
         return "\n".join(lines)
 
     lines.append(
@@ -376,6 +431,10 @@ def format_digest(report: CoverageReport, days: int = 30) -> str:
         lines.append("\n:white_check_mark: *Covered*:")
         for r in sorted(report.covered, key=lambda x: x.human.name.lower()):
             lines.append(_person_line(r, days))
+
+    diarization = format_diarization_section()
+    if diarization:
+        lines.append(diarization)
 
     lines.append(f"\nVerify acceptances: {_ADMIN_LINK}")
     return "\n".join(lines)
