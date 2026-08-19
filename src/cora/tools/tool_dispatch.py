@@ -11513,6 +11513,13 @@ def _delegated_preview_text(entry: dict, quota_line: str, channel: str = "") -> 
     drift between what the user said and what will run is visible (design 3)."""
     from cora import delegated_work
 
+    destination_hint = ""
+    try:
+        if delegated_work.brief_names_a_destination(str(entry.get("brief") or "")):
+            destination_hint = delegated_work.destination_notice(entry)
+    except Exception:  # noqa: BLE001 -- a hint must never block a preview
+        destination_hint = ""
+
     return (
         f"Delegating to Cora -- *{entry['archetype']}* job for "
         f"[{entry.get('entity', '?')}], delivered as .{entry['deliverable']} back "
@@ -11520,7 +11527,13 @@ def _delegated_preview_text(entry: dict, quota_line: str, channel: str = "") -> 
         f"Brief (runs verbatim):\n> {entry['brief']}\n\n"
         f"{quota_line} Cost: capped at ${delegated_work.job_usd_cap():.2f}/job. "
         "Turnaround: async -- the runner picks jobs up about every 15 minutes.\n\n"
-        f"{_confirm_how(channel, capitalize=True)} and I'll queue it. "
+        # The destination correction belongs HERE, not only on the post-confirm
+        # ack: the preview is the only point at which it is actionable. A
+        # requester who wrote "deliver to _shared/team-knowledge/hannah/" would
+        # otherwise confirm still believing it and learn otherwise on a job that
+        # is already queued and budget-reserved (D-051).
+        + (destination_hint + "\n\n" if destination_hint else "")
+        + f"{_confirm_how(channel, capitalize=True)} and I'll queue it. "
         "Nothing runs until you confirm."
     )
 

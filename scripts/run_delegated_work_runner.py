@@ -394,9 +394,44 @@ def expiry_pass(client) -> None:
         post_sessions_line(client, f"DW FAIL {jid} expired")
 
 
+def _target_verified(target, *, job_id: str) -> bool:
+    """True only when the target exists with a non-zero size.
+
+    An explicit short budget: stat_info's DEFAULTS are timeout=10 with
+    retry_seconds=90, and on a mount-gone classification drive_io trips a
+    PROCESS-WIDE breaker for >=90s regardless of the mount recovering -- which
+    would fast-fail the NEXT job's write in the same pass and cascade mis_homed
+    onto jobs that were fine. Every other runner drive call passes an explicit
+    budget for this reason (crash_recovery_pass uses the same values).
+    """
+    try:
+        info = drive_io.stat_info(target, timeout=10.0, retry_seconds=0)
+    except Exception as exc:  # noqa: BLE001 -- unverifiable == not delivered
+        log.warning("post-delivery verify for %s failed (%s) -- treating as "
+                    "mis_homed", job_id, exc)
+        return False
+    size = int(info[1]) if info else 0
+    if size <= 0:
+        log.warning("post-delivery verify for %s: target absent or empty (%r) "
+                    "-- treating as mis_homed", job_id, info)
+        return False
+    return True
+
+
 def mis_homed_retry_pass(client) -> None:
     """DELIVERED jobs whose Drive write failed at delivery: retry from staging,
-    append artifact_homed on success. NEVER re-posts the Slack delivery."""
+    append artifact_homed on VERIFIED success, and tell the requester the path.
+
+    This pass used to contain the exact hole the delivery-time verify closes: it
+    wrote, appended ``artifact_homed`` unconditionally (which clears mis_homed in
+    the fold) and then ``_clean_staging`` deleted the only other copy -- so a
+    write into a vanishing handle left the target empty, staging gone, the ledger
+    reading homed, and (because this pass never posted) the requester never
+    corrected. Adding the delivery-time verify routed MORE traffic here, so the
+    same stat check applies, and a late success now posts the real path once --
+    otherwise a recovered file is never announced to the person waiting on it
+    (D-051).
+    """
     for rec in dw.load_jobs():
         if rec.get("state") != dw.STATE_DELIVERED:
             continue
@@ -416,10 +451,20 @@ def mis_homed_retry_pass(client) -> None:
         except Exception as exc:  # noqa: BLE001 -- G: still down; retry next pass
             log.info("mis-homed retry for %s still failing: %s", jid, exc)
             continue
+
+        if not _target_verified(target, job_id=jid):
+            # Leave mis_homed set and staging intact; try again next pass.
+            continue
+
         dw.append_runner_event({"event": "artifact_homed", "ts": dw._now_iso(),
                                 "job_id": jid, "target_path": target})
         _clean_staging(jid)
         log.info("artifact homed for %s -> %s", jid, target)
+        # The delivery post said "staged locally and will land automatically".
+        # Without this the landing is never announced.
+        post_threaded(client, rec,
+                      f"Your delegated job `{jid}` has now landed on Drive.\n\n"
+                      f"File: {target}")
 
 
 def overflow_digest_pass(client) -> None:
@@ -602,21 +647,8 @@ def deliver(client, job_id: str, outcome: dict) -> None:
     # path that held nothing while discarding the staged original. Stat it, and
     # downgrade to mis_homed on any doubt: that keeps staging AND lets
     # mis_homed_retry_pass re-home it on a later pass.
-    # stat_info returns a (st_mtime, st_size) TUPLE, or None when the file is
-    # absent and the mount is UP; it raises DriveUnavailable when the mount is
-    # gone. All three non-happy cases mean "not delivered".
-    if not mis_homed:
-        try:
-            info = drive_io.stat_info(target)
-            size = int(info[1]) if info else 0
-            if size <= 0:
-                log.warning("post-delivery verify for %s: target absent or "
-                            "empty (%r) -- treating as mis_homed", job_id, info)
-                mis_homed = True
-        except Exception as exc:  # noqa: BLE001 -- unverifiable == not delivered
-            log.warning("post-delivery verify for %s failed (%s) -- treating as "
-                        "mis_homed", job_id, exc)
-            mis_homed = True
+    if not mis_homed and not _target_verified(target, job_id=job_id):
+        mis_homed = True
 
     artifact_meta = {"local_path": str(local), "target_path": str(target),
                      "mis_homed": mis_homed}
