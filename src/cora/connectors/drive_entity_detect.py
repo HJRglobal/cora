@@ -81,20 +81,107 @@ _CODE_TO_LABEL: dict[str, str] = {
     # this slug every month, so without this row it would industrialize that
     # misclassification (D-051).
     "osn-core4": "OSN",
+    # ---- accounting-archive slugs (2026-08-19, D-194) ----------------------
+    # 01-HJR-Global/accounting/monthly-reports/ is swept into the KB by
+    # justin@lexingtonservices.com (entity_default LEX), so ANY archive slug
+    # missing from this map is decided by a Haiku guess anchored to LEX. The
+    # archive's full slug universe is pinned in data/maps/qbo-monthly-report-
+    # slugs.yaml; these are the remaining ones that have a deterministic home.
+    "f3comm": "F3C",        # F3 Community
+    "hjrpod": "HJRPROD",    # HJR Podcast -- rolls up like pod/ff/chk/chb
+    "mv": "LEX-LLA",        # LLA Maryvale
+    # `lexcorp` ("LexCorp, LLC") maps to the LEX PARENT, not a sub-entity: it is
+    # a Lexington-family book, but no `LEX-CORP` KB sub-entity exists and
+    # asserting one of LLC/LLA/LBHS/LTS would be a guess. Parent-level (sub_entity
+    # NULL, GM-level) stops the observed scatter without inventing a placement.
+    # NOTE for whoever settles this: drive_financial_reader.ENTITY_TO_REPORT_CODE
+    # maps LEX -> "lexcorp", which CONTRADICTS the twice-confirmed
+    # qbo-monthly-report-slugs.yaml (realm LEX -> slug "llc", company "Lexington
+    # LLC", with "lexcorp" listed as a separate unmapped company). That conflict
+    # is money-adjacent and is flagged for Harrison rather than resolved here.
+    "lexcorp": "LEX",
 }
 
-# Archive slugs deliberately NOT mapped, so a filename alone can never place them:
-#   hjrllc  -- "Harrison Rogers, LLC" is PERSONAL expense data (it is in
-#              finance_close.PACK_EXCLUDED_ENTITIES for that reason) and there is
-#              no KB entity that means "personal". Mapping it to FNDR would be
-#              worse than leaving it: FNDR chunks co-scan into every non-LEX
-#              retrieval. It needs a sweep EXCLUSION, not an entity -- see the
-#              escalation in the 2026-08-18 remodel-fixes handoff.
-#   lexcorp -- "LexCorp, LLC"; which KB entity (if any) it belongs to is unsettled.
+# Slugs whose files must never enter the KB at all. This is an EXCLUSION, not an
+# entity: there is no KB entity that means "personal", and mapping one to FNDR
+# would be strictly worse because FNDR chunks co-scan into every non-LEX
+# retrieval. Enforced at the sweep chokepoint (drive_sweep), so it covers every
+# swept mailbox rather than one roster entry (D-194, Harrison-ruled 2026-08-18).
+#
+#   hjrllc -- "Harrison Rogers, LLC", Harrison's PERSONAL books. Already in
+#             finance_close.PACK_EXCLUDED_ENTITIES and shipped `enabled: false`
+#             in the monthly-report populator for the same reason. The rows the
+#             pre-exclusion sweeps already ingested are purged separately by
+#             scripts/purge_kb_personal_books_2026-08-19.py (Harrison-gated).
+_EXCLUDED_CODES: frozenset[str] = frozenset({"hjrllc"})
 
 # Tokens we never treat as an entity code even if they collide (kept explicit so
 # the map above stays the single source of truth; reserved for future guards).
 _AMBIGUOUS: frozenset[str] = frozenset({"hjr"})
+
+
+def naming_tokens(filename: str) -> list[str]:
+    """Return the naming tokens a code match may be drawn from, lowercased.
+
+    Shared by :func:`detect_entity_from_filename` and :func:`excluded_slug_from_filename`
+    so the exclusion and the entity map can never disagree about which tokens a
+    filename offers: the same window decides both.
+
+    Splits on underscores only (codes may contain hyphens, e.g. ``lex-llc``),
+    drops one optional leading date token, and keeps only the first two naming
+    positions so ordinary description words cannot trigger a match.
+    """
+    if not filename:
+        return []
+
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    tokens = [t for t in stem.split("_") if t]
+    if not tokens:
+        return []
+
+    # Drop a single leading date token if present.
+    if _DATE_TOKEN.match(tokens[0]):
+        tokens = tokens[1:]
+
+    return [t.strip().lower() for t in tokens[:2]]
+
+
+def excluded_slug_from_filename(filename: str) -> str | None:
+    """Return the excluded slug encoded in a filename, or None.
+
+    A non-None result means the file must not be ingested into the KB at all --
+    it is not a "which entity?" answer, it is a "no entity, ever" answer.
+    Checked BEFORE :func:`detect_entity_from_filename` at the sweep chokepoint so
+    a filename carrying both an excluded slug and a mappable one (e.g.
+    ``2026-05_hjrllc_llc-summary.xlsx``) is excluded rather than filed.
+    """
+    for code in naming_tokens(filename):
+        if code in _EXCLUDED_CODES:
+            return code
+    return None
+
+
+# Parent codes whose "PARENT-CHILD" labels are real KB sub-entities. Everything
+# else (e.g. OSN store codes) has already been collapsed to its parent above.
+_SUBENTITY_PREFIXES: tuple[str, ...] = ("LEX", "HJRP", "HJRPROD")
+
+
+def split_entity_label(label: str) -> tuple[str, str | None]:
+    """Split an entity LABEL into the (entity, sub_entity) pair the KB stores.
+
+    ``"LEX-LLA" -> ("LEX", "LEX-LLA")`` · ``"OSN" -> ("OSN", None)``.
+
+    This is the same split :func:`cora.connectors.drive_sweep._ingest_file`
+    applies, extracted so that anything reasoning about where a filename SHOULD
+    have landed (the D-194 re-tag pass) computes it from the same function the
+    sweep writes with, rather than from a re-derived copy that can drift.
+    """
+    entity = (label or "").strip()
+    if "-" in entity:
+        prefix = entity.split("-")[0]
+        if prefix in _SUBENTITY_PREFIXES:
+            return prefix, entity
+    return entity, None
 
 
 def detect_entity_from_filename(filename: str) -> str | None:
@@ -104,24 +191,13 @@ def detect_entity_from_filename(filename: str) -> str | None:
     optional leading date), so description words cannot trigger a false match.
     Codes may themselves contain hyphens (e.g. ``lex-llc``), so we split on
     underscores only.
+
+    An excluded slug (see :func:`excluded_slug_from_filename`) never yields a
+    label -- it is absent from ``_CODE_TO_LABEL`` by construction -- but callers
+    must still check the exclusion explicitly, because a *second* token could
+    otherwise place a file the first token forbids.
     """
-    if not filename:
-        return None
-
-    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
-    tokens = [t for t in stem.split("_") if t]
-    if not tokens:
-        return None
-
-    # Drop a single leading date token if present.
-    if _DATE_TOKEN.match(tokens[0]):
-        tokens = tokens[1:]
-    if not tokens:
-        return None
-
-    # Only consider the first two naming positions for a code match.
-    for token in tokens[:2]:
-        code = token.strip().lower()
+    for code in naming_tokens(filename):
         if code in _AMBIGUOUS:
             continue
         label = _CODE_TO_LABEL.get(code)

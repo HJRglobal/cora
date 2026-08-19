@@ -42,7 +42,11 @@ from typing import Any
 
 import yaml
 
-from cora.connectors.drive_entity_detect import detect_entity_from_filename
+from cora.connectors.drive_entity_detect import (
+    detect_entity_from_filename,
+    excluded_slug_from_filename,
+    split_entity_label,
+)
 from cora.drive_materializer import ENTITY_CODES as _MATERIALIZER_ENTITY_CODES
 from cora.kb_exclusions import (
     KB_EXCLUDED_FOLDER_IDS,
@@ -388,13 +392,9 @@ def _chunk_text(text: str) -> list[str]:
 def _ingest_file(kb: Any, file_meta: dict, content: str,
                  classification: dict, user: dict) -> int:
     """Store classified content in the KB as a single Document. Returns chunk count ingested."""
-    entity = classification.get("entity") or user.get("entity_default", "FNDR")
-    sub_entity: str | None = None
-    if "-" in entity:
-        prefix = entity.split("-")[0]
-        if prefix in ("LEX", "HJRP", "HJRPROD"):
-            sub_entity = entity
-            entity = prefix
+    label = classification.get("entity") or user.get("entity_default", "FNDR")
+    # Shared with the D-194 re-tag pass -- see drive_entity_detect.split_entity_label.
+    entity, sub_entity = split_entity_label(label)
 
     # Entity-firewall guard (audit W6-05): Haiku can hallucinate an off-menu code
     # (e.g. the filename token "F3" minted entity='F3' from an OSN receipt) that
@@ -760,6 +760,21 @@ def sweep_user(
                 stats["cora_internal_skipped"] += 1
                 continue
 
+            # D-194: personal books never enter the KB. The accounting archive is
+            # swept by justin@lexingtonservices.com (entity_default LEX), so a
+            # `hjrllc` file -- Harrison Rogers, LLC, his PERSONAL books -- landed
+            # under LEX/LEX-LLC/LEX-LLA and became answerable to any #llc-* member
+            # asking "what were our expenses last month?". There is no KB entity
+            # that means "personal", so this is an EXCLUSION, not a re-tag.
+            # Checked BEFORE extraction so the file is never even downloaded.
+            _excluded_slug = excluded_slug_from_filename(filename)
+            if _excluded_slug:
+                log.debug("drive_sweep: excluded slug %s -- skipping %s",
+                          _excluded_slug, filename)
+                stats.setdefault("personal_books_skipped", 0)
+                stats["personal_books_skipped"] += 1
+                continue
+
             # Dashboard read layer: never ingest personal/confidential dashboard
             # stores (OneAmerica, capital-raise, travel-points) or their subtrees.
             if _file_under_excluded_folder(
@@ -1114,6 +1129,21 @@ def _process_single_folder_files(
             if is_cora_internal_title(filename, broad=True):
                 stats.setdefault("cora_internal_skipped", 0)
                 stats["cora_internal_skipped"] += 1
+                continue
+
+            # D-194: personal books never enter the KB. The accounting archive is
+            # swept by justin@lexingtonservices.com (entity_default LEX), so a
+            # `hjrllc` file -- Harrison Rogers, LLC, his PERSONAL books -- landed
+            # under LEX/LEX-LLC/LEX-LLA and became answerable to any #llc-* member
+            # asking "what were our expenses last month?". There is no KB entity
+            # that means "personal", so this is an EXCLUSION, not a re-tag.
+            # Checked BEFORE extraction so the file is never even downloaded.
+            _excluded_slug = excluded_slug_from_filename(filename)
+            if _excluded_slug:
+                log.debug("drive_sweep: excluded slug %s -- skipping %s",
+                          _excluded_slug, filename)
+                stats.setdefault("personal_books_skipped", 0)
+                stats["personal_books_skipped"] += 1
                 continue
 
             # Dashboard read layer: skip personal/confidential dashboard stores
