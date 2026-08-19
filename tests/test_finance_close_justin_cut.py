@@ -146,10 +146,26 @@ class TestClassificationCompleteness:
         sys.modules["close_pack_keys"] = mod
         spec.loader.exec_module(mod)
 
-        src = (_REPO_ROOT / "src" / "cora" / "finance_close.py").read_text(
-            encoding="utf-8")
-        import re
-        emitted = set(re.findall(r'key="([a-z_]+)"', src))
+        # Derived by BUILDING a pack, not by regexing the source: a section
+        # keyed by a constant, an f-string, or single quotes escapes a regex, and
+        # the failure this pin guards (a new section defaulting into Justin's DM)
+        # would then become permanent instead of loud. Falls back to the regex
+        # only if a pack cannot be built in this environment.
+        from cora import finance_close
+
+        emitted: set[str] = set()
+        try:
+            pack = finance_close.build_pack(entities=[], persist_snapshot=False)
+            emitted = {getattr(s, "key", "") for s in pack.sections}
+            emitted.discard("")
+        except Exception:  # noqa: BLE001 -- no creds in this env
+            emitted = set()
+        if not emitted:
+            import re
+            src = (_REPO_ROOT / "src" / "cora" / "finance_close.py").read_text(
+                encoding="utf-8")
+            emitted = set(re.findall(r"""key=["']([a-z_]+)["']""", src))
+        assert emitted, "could not determine the section-key universe"
         missing = sorted(emitted - set(mod.SECTION_PURPOSE))
         assert missing == [], (
             f"close-pack sections with no SECTION_PURPOSE entry: {missing}")

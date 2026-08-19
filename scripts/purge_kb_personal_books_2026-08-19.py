@@ -26,8 +26,10 @@ and they need OPPOSITE remedies:
          would throw away institutional knowledge to fix a labelling error, and
          a re-sweep would NOT restore them: the sweep is watermark-bounded, so an
          untouched file is never revisited. A metadata-only UPDATE fixes the
-         placement in situ -- no re-embedding, no vec-table work (the
-         retro_tag_bot_slack_chunks.py precedent, and D-046a's 2,840-row re-tag).
+         placement in situ -- no RE-EMBEDDING (the content is unchanged, so the
+         vector is too). It is NOT vec-table-free: `entity` is a vec0 PARTITION
+         KEY on the coarse bin table as well as a column on knowledge_chunks, so
+         the bin row is re-written from the stored float. See apply_retag.
 
 TARGETING
 ---------
@@ -87,8 +89,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from cora import kb_archive  # noqa: E402
 from cora.connectors.drive_entity_detect import (  # noqa: E402
     _CODE_TO_LABEL,
-    _DATE_TOKEN,
     excluded_slug_from_filename,
+    has_date_token,
     naming_tokens,
     split_entity_label,
 )
@@ -146,11 +148,7 @@ def archive_slug(title: str) -> str | None:
     OS tree, whose entity comes from the folder path) never qualify.
     """
     tokens = naming_tokens(title or "")
-    if not tokens:
-        return None
-    stem = (title or "").rsplit(".", 1)[0]
-    head = stem.split("_", 1)[0].strip()
-    if not _DATE_TOKEN.match(head):
+    if not tokens or not has_date_token(title or ""):
         return None
     return tokens[0]
 
@@ -247,8 +245,35 @@ def scan(conn) -> tuple[list[str], dict[str, list[str]], dict]:
 
 
 def apply_retag(conn, retag: dict[str, list[str]]) -> int:
-    """Metadata-only UPDATE. Touches no vector table -- the embedding is a
-    function of the CONTENT, which is unchanged, so nothing needs re-embedding."""
+    """Re-file chunks under their correct entity -- in BOTH stores that hold it.
+
+    `entity` is NOT metadata. It lives in `knowledge_chunks` AND, as a vec0
+    PARTITION KEY, in the coarse bin table(s) (`schema.py`:
+    `entity TEXT PARTITION KEY`). `store._search_binary` filters stage 1 on the
+    BIN table's copy and then re-filters stage 2 on `knowledge_chunks`, so
+    updating only the latter makes a chunk unreachable under BOTH entities:
+      * search the NEW entity -> the bin row still says the old one, so the chunk
+        is never a coarse candidate;
+      * search the OLD entity -> it IS a candidate, and stage 2 reads the new
+        entity off knowledge_chunks and filters it out.
+    The first cut of this pass did exactly that and called itself
+    "metadata-only", which is true of `sub_entity` (enforced only at re-rank) and
+    of the retro_tag_bot_slack_chunks precedent, but NOT of `entity`. It would
+    have silently darkened all 52 rows it claimed to be fixing -- the same class
+    the repo already locked as doctrine (a plain-sqlite3 test over plain tables
+    passes vacuously), here on the UPDATE side rather than the DELETE side.
+
+    The bin row is REPLACED rather than updated: a vec0 partition key is not
+    reliably updatable in place, so the row is deleted and re-inserted with the
+    stored float re-quantized -- byte-identical to what store.upsert_documents
+    writes (`vec_quantize_binary` over the knowledge_vec_f32 blob).
+    """
+    from cora.knowledge_base import schema as _schema
+
+    # Same named-candidate discovery store._bin_write_tables uses -- never a
+    # LIKE sweep, which also matches vec0's internal shadow tables.
+    bin_tables = _schema.bin_tables_present(conn)
+
     total = 0
     for key, ids in retag.items():
         entity, _, sub = key.partition("|")
@@ -256,12 +281,30 @@ def apply_retag(conn, retag: dict[str, list[str]]) -> int:
         for i in range(0, len(ids), _BATCH):
             batch = ids[i:i + _BATCH]
             ph = ",".join("?" * len(batch))
+
+            # 1. The authoritative row.
             cur = conn.execute(
                 f"UPDATE knowledge_chunks SET entity = ?, sub_entity = ? "
                 f"WHERE chunk_id IN ({ph})",
                 [entity, sub_val, *batch],
             )
             total += cur.rowcount
+
+            # 2. The coarse index's copy of the same key, per bin table.
+            for tbl in bin_tables:
+                vecs = conn.execute(
+                    f"SELECT chunk_id, embedding FROM knowledge_vec_f32 "
+                    f"WHERE chunk_id IN ({ph})",
+                    batch,
+                ).fetchall()
+                conn.execute(
+                    f"DELETE FROM {tbl} WHERE chunk_id IN ({ph})", batch)
+                for chunk_id, emb in vecs:
+                    conn.execute(
+                        f"INSERT INTO {tbl} (chunk_id, entity, embedding) "
+                        f"VALUES (?, ?, vec_quantize_binary(?))",
+                        (chunk_id, entity, emb),
+                    )
     conn.commit()
     return total
 

@@ -56,7 +56,8 @@ FAILED = "failed"                   # everything else
 _REQUESTER_NOTE: dict[str, str] = {
     NO_SCOPE: ("_I couldn't attach this as a file -- my Slack app is missing the "
                "`files:write` permission, so I've posted it inline instead. "
-               "Harrison can grant it in the Slack app settings._"),
+               "Granting it means adding the scope AND reinstalling the app, "
+               "which issues a new bot token -- a short admin job, not a toggle._"),
     NO_TOKEN: ("_I couldn't attach this as a file (Slack credentials unavailable), "
                "so I've posted it inline instead._"),
     NO_HTTPX: ("_I couldn't attach this as a file (upload transport unavailable), "
@@ -161,10 +162,24 @@ def upload_bytes(
     NOT, and the caller owes the requester `requester_note(outcome)` alongside
     whatever fallback it serves.
 
-    Text callers should route through :func:`upload_text`, which applies the
-    egress sanitizer. Binary payloads (xlsx) cannot be sanitized as text and are
-    the caller's responsibility to have built from already-guarded values.
+    The FILENAME and TITLE are sanitized HERE rather than relying on each caller
+    to have done it. These bytes are PUT straight to Slack's upload URL, which
+    bypasses the slack_egress WebClient patch entirely, and `title` is shared via
+    files_completeUploadExternal -- so the guarantee has to be structural. It was
+    per-caller in the first cut, and the one live title is already
+    model-influenced ("Cash Flow Report -- {entity_filter}"), surviving only
+    because that path happened to route through upload_text.
+
+    Binary payloads cannot be sanitized as text and remain the caller's
+    responsibility to have built from already-guarded values (table_export
+    sanitizes the report text BEFORE building the workbook, for that reason).
     """
+    try:
+        from ..slack_egress import sanitize_text
+        title = sanitize_text(title)
+        filename = sanitize_text(filename)
+    except Exception:  # noqa: BLE001 -- never let sanitization drop the upload
+        log.exception("slack_file_upload: egress sanitize failed; uploading raw")
     try:
         import httpx
     except ImportError:
@@ -229,6 +244,11 @@ def upload_bytes(
             except Exception:  # noqa: BLE001
                 err = ""
         err = err or str(exc)
+        # An httpx transport error embeds the request URL, and that URL is
+        # Slack's SIGNED upload endpoint. These lines are archived by
+        # compact_logs and bundled into the offsite DR backup, so scrub it.
+        if "://" in err:
+            err = re.sub(r"https?://\S+", "<upload-url redacted>", err)
         if "missing_scope" in err or "not_allowed_token_type" in err:
             log.warning("slack_file_upload: missing files:write scope uploading %s "
                         "-- caller must fall back visibly", filename)

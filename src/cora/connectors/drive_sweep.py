@@ -396,6 +396,21 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
     # Shared with the D-194 re-tag pass -- see drive_entity_detect.split_entity_label.
     entity, sub_entity = split_entity_label(label)
 
+    # A deterministic filename assertion of PARENT-level LEX must not be
+    # overridden by content detection. store.upsert_documents Step 0 re-derives
+    # sub_entity for any LEX doc arriving with sub_entity=None, from title +
+    # content -- so `2026-05_lexcorp_bs.xlsx`, whose name says "Lexington family,
+    # no sub-entity", would still be scattered into LEX-LLC or LEX-LTS by
+    # keyword. metadata.lex_gm_level is the EXISTING opt-out for exactly this
+    # case (published DDD manuals, 2026-06-11): a whole-company statement is a
+    # GM-level document whose text unavoidably mentions sub-entity terms.
+    # Only set when the filename detector actually FIRED -- an entity_default
+    # fallback asserts nothing about the file and must keep the detection.
+    gm_level = bool(
+        classification.get("entity_from_filename")
+        and entity == "LEX" and sub_entity is None
+    )
+
     # Entity-firewall guard (audit W6-05): Haiku can hallucinate an off-menu code
     # (e.g. the filename token "F3" minted entity='F3' from an OSN receipt) that
     # no channel routes to. Reject any non-canonical post-split parent code and
@@ -443,6 +458,7 @@ def _ingest_file(kb: Any, file_meta: dict, content: str,
             "haiku_summary": summary,
             "modified_time": modified_iso,
             "drive_link": drive_link,
+            **({"lex_gm_level": True} if gm_level else {}),
         },
     )
     try:
@@ -822,6 +838,10 @@ def sweep_user(
             detected_entity = detect_entity_from_filename(filename)
             if detected_entity:
                 classification["entity"] = detected_entity
+                # Records that the FILENAME decided this, not Haiku -- _ingest_file
+                # uses it to stop content detection re-deriving a sub-entity the
+                # naming convention deliberately withheld.
+                classification["entity_from_filename"] = True
 
             if score < 4:
                 log.debug("drive_sweep: discarded %s (score=%s: %s)",

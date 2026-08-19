@@ -115,15 +115,25 @@ class TestDelegatedWorkLane:
         ])
         assert _lane(recon.analyze(now=NOW, days=30), "delegated_work")["denied"] == 1
 
-    def test_a_requester_cancel_is_not_an_approval_decision(self, recon):
-        """The requester withdrawing is not the approver deciding."""
+    def test_a_requester_cancel_is_withdrawn_not_denied_and_not_open(self, recon):
+        """The requester withdrawing is not the approver deciding -- AND it is
+        not still waiting for one either.
+
+        This test previously asserted `open == 1`, which pinned the defect: a
+        withdrawn job is terminal, so counting it open accrued unbounded "wait"
+        on a job nobody was waiting for, inflating the very number the
+        second-approver recommendation turns on (D-051).
+        """
         _write(recon.LEDGERS["delegated_work"], [
             {"event": "held", "ts": _iso(10), "job_id": "dw-1"},
             {"event": "cancelled", "ts": _iso(4), "job_id": "dw-1",
              "reason": "requester_cancel"},
         ])
         lane = _lane(recon.analyze(now=NOW, days=30), "delegated_work")
-        assert lane["denied"] == 0 and lane["open"] == 1
+        assert lane["denied"] == 0
+        assert lane["withdrawn"] == 1
+        assert lane["open"] == 0
+        assert lane["open_wait_total_h"] == 0
 
     def test_cost_comes_from_the_runner_records(self, recon):
         _write(recon.LEDGERS["delegated_work_runner"], [

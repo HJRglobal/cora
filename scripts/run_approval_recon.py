@@ -87,6 +87,7 @@ class Lane:
     denied: int = 0        # a human said no
     expired: int = 0       # NOBODY decided -- aged out
     routed: int = 0        # handed to an owner; not an approval decision
+    withdrawn: int = 0     # terminal, but nobody was waiting on an approver
     open_items: int = 0
     resolved_wait_hours: list[float] = field(default_factory=list)
     open_wait_hours: list[float] = field(default_factory=list)
@@ -103,6 +104,7 @@ class Lane:
             "denied": self.denied,
             "expired": self.expired,
             "routed": self.routed,
+            "withdrawn": self.withdrawn,
             "open": self.open_items,
             "decided_by_a_human": self.approved + self.denied,
             "median_wait_h": _median(self.resolved_wait_hours),
@@ -212,9 +214,17 @@ def analyze(now: datetime | None = None, days: int = 30) -> dict[str, Any]:
             held_at[jid] = ts
         elif ev.get("event") == "released":
             resolved_at[jid] = ("approved", ts)
-        elif ev.get("event") == "cancelled" \
-                and str(ev.get("reason") or "") == "harrison_dismiss":
-            resolved_at[jid] = ("denied", ts)
+        elif ev.get("event") == "cancelled":
+            # `harrison_dismiss` is the approver saying no. Every OTHER cancel --
+            # requester_cancel, harrison_cancel -- is terminal but is NOT an
+            # approval decision, and crucially is NOT still waiting on one.
+            # Counting those as `open` accrued unbounded "wait" on jobs nobody
+            # was waiting for, and that number is exactly what the
+            # second-approver recommendation turns on. Same mislabel class as
+            # counting an expiry as a denial, one lane over.
+            reason = str(ev.get("reason") or "")
+            resolved_at[jid] = (
+                "denied" if reason == "harrison_dismiss" else "withdrawn", ts)
     for jid, ts in held_at.items():
         if ts < cutoff:
             continue
@@ -226,7 +236,9 @@ def analyze(now: datetime | None = None, days: int = 30) -> dict[str, Any]:
             continue
         kind, when = outcome
         setattr(lane, kind, getattr(lane, kind) + 1)
-        lane.resolved_wait_hours.append(_hours(ts, when))
+        if kind != "withdrawn":
+            # A withdrawal's elapsed time is not approver latency.
+            lane.resolved_wait_hours.append(_hours(ts, when))
     for ev in runner:
         cost = (ev.get("cost") or {}).get("est_usd")
         ts = _parse_ts(ev.get("ts"))
@@ -239,6 +251,26 @@ def analyze(now: datetime | None = None, days: int = 30) -> dict[str, Any]:
 
     # ── code queue (build work; NOT second-approver eligible) ───────────────
     lane = lanes["code"] = Lane("code")
+    # KNOWN TRANSITIONS only, read from the field that actually carries them.
+    # Verified against the live ledger (308 rows): `status` appears ONLY on the
+    # `captured` seed row; every transition rides the EVENT name (shipped /
+    # staged / approved / dismissed / superseded). The ledger ALSO carries
+    # non-transition events -- dm_sent (19), recurrence (8), evidence (2),
+    # edited (1), dm_held (1) -- and the first cut read
+    # `status or event`, which treated each of those as a status: a teammate
+    # re-mentioning an already-SHIPPED item appends `recurrence`, and the item
+    # silently reverted to "open" with its full age added to the accrued wait.
+    # An allowlist keyed to the real vocabulary is the only version of this that
+    # cannot be broken by adding a new bookkeeping event.
+    _EVENT_OUTCOME = {
+        "shipped": "approved", "staged": "approved", "approved": "approved",
+        "dismissed": "denied", "superseded": "denied", "expired": "expired",
+    }
+    _SEED_OUTCOME = {
+        "SHIPPED": "approved", "STAGED": "approved", "APPROVED": "approved",
+        "DISMISSED": "denied", "SUPERSEDED": "denied", "EXPIRED": "expired",
+    }
+
     first_seen: dict[str, datetime] = {}
     latest: dict[str, tuple[str, datetime]] = {}
     for ev in _read(LEDGERS["code"]):
@@ -247,21 +279,21 @@ def analyze(now: datetime | None = None, days: int = 30) -> dict[str, Any]:
         if ts is None or not cq:
             continue
         first_seen.setdefault(cq, ts)
-        status = str(ev.get("status") or ev.get("event") or "").upper()
-        if status:
-            latest[cq] = (status, ts)
+        outcome = _EVENT_OUTCOME.get(str(ev.get("event") or "").strip().lower())
+        if outcome is None:
+            outcome = _SEED_OUTCOME.get(str(ev.get("status") or "").strip().upper())
+        if outcome:
+            latest[cq] = (outcome, ts)
+
     for cq, ts in first_seen.items():
         if ts < cutoff:
             continue
         lane.proposed += 1
-        status, when = latest.get(cq, ("", ts))
-        if status in ("APPROVED", "STAGED", "SHIPPED"):
-            lane.approved += 1
+        outcome, when = latest.get(cq, ("", ts))
+        if outcome in ("approved", "denied"):
+            setattr(lane, outcome, getattr(lane, outcome) + 1)
             lane.resolved_wait_hours.append(_hours(ts, when))
-        elif status in ("DISMISSED", "SUPERSEDED"):
-            lane.denied += 1
-            lane.resolved_wait_hours.append(_hours(ts, when))
-        elif status == "EXPIRED":
+        elif outcome == "expired":
             lane.expired += 1
         else:
             lane.open_items += 1
@@ -306,14 +338,14 @@ def render(result: dict[str, Any]) -> str:
         f"generated {result['generated_at_utc']} (read-only)",
         "",
         f"{'lane':<18}{'prop':>6}{'appr':>6}{'deny':>6}{'exp':>6}{'rout':>6}"
-        f"{'open':>6}{'med h':>8}{'p90 h':>8}{'oldest h':>10}{'cost':>9}",
+        f"{'wdrn':>6}{'open':>6}{'med h':>8}{'p90 h':>8}{'oldest h':>10}{'cost':>9}",
     ]
     for lane in result["lanes"]:
         cost = "n/a" if lane["cost_usd"] is None else f"${lane['cost_usd']:.2f}"
         lines.append(
             f"{lane['lane']:<18}{lane['proposed']:>6}{lane['approved']:>6}"
             f"{lane['denied']:>6}{lane['expired']:>6}{lane['routed']:>6}"
-            f"{lane['open']:>6}"
+            f"{lane['withdrawn']:>6}{lane['open']:>6}"
             f"{_fmt(lane['median_wait_h']):>8}{_fmt(lane['p90_wait_h']):>8}"
             f"{_fmt(lane['oldest_open_h']):>10}{cost:>9}")
     cf = result["counterfactual"]

@@ -344,8 +344,24 @@ def contributor_recognized(slack_id: str, entity: str) -> bool:
 
 def authorized_owner(slack_id: str, entity: str) -> bool:
     """True iff slack_id is the entity's authorized domain owner
-    (gap-domain-owners.yaml). Fail-safe to False."""
+    (gap-domain-owners.yaml). Fail-safe to False.
+
+    Honors `autowrite_excluded` too. D-051: the flag was applied only in
+    `contributor_recognized`, which feeds the TIER_0 branch -- but TIER_1 /
+    DECISION_OWNER is reached through THIS predicate, and `_autowrite_eligible`
+    auto-writes tier 1 whenever CORA_AUTOWRITE_LIVE=all (the live setting). So
+    an excluded person who also appears in gap-domain-owners.yaml kept half the
+    authority the flag documents itself as removing. Latent for Tessa (not an
+    owner) and silent for whoever it was applied to next, which is the worse
+    property: a gate one branch short fails quietly and only for some people.
+    """
     if not slack_id:
+        return False
+    try:
+        rec = _role_for(slack_id)
+        if rec is not None and getattr(rec, "autowrite_excluded", False):
+            return False
+    except Exception:  # noqa: BLE001 -- fail-safe: no owner authority
         return False
     try:
         from .gap_autofill import resolve_owner

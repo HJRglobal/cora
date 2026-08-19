@@ -211,10 +211,6 @@ def justin_needs(section_key: str) -> bool:
     return SECTION_PURPOSE.get(section_key, (_UNCLASSIFIED_NEEDS_ACTION, ""))[0]
 
 
-def _has_flag(lines: list[str], markers: tuple[str, ...]) -> bool:
-    return any(any(m in ln for m in markers) for ln in lines)
-
-
 def build_justin_cut(pack, flag_markers: tuple[str, ...] = _FLAG_MARKERS) -> str:
     """The close pack, cut down to what Justin has to DO.
 
@@ -270,6 +266,11 @@ def build_justin_cut(pack, flag_markers: tuple[str, ...] = _FLAG_MARKERS) -> str
             if not hits:
                 continue
             included += 1
+            # A flagged section that ran on part of the portfolio still owes the
+            # partial-list caveat -- the docstring promises coverage travels, and
+            # the first cut only set the flag on the ACTION branch.
+            if getattr(section, "is_partial", False):
+                partial_any = True
             lines.append(f"*{title}*")
             lines.append("  _Not an action item, but Cora flagged this:_")
             lines.extend(f"  {h}" for h in hits)

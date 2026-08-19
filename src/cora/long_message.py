@@ -53,6 +53,11 @@ def _split_oversized_line(line: str, limit: int) -> list[str]:
     like; it is reachable only for a token longer than the whole limit, which no
     real link is.
     """
+    # A limit of 0 makes every slice empty, `rest` never shrinks, and the loop
+    # runs forever while `out` grows. Not reachable from today's two callers
+    # (both pass constants), but `limit` is a public parameter of both
+    # split_for_slack and post_long.
+    limit = max(1, int(limit))
     out: list[str] = []
     rest = line
     while len(rest) > limit:
@@ -79,6 +84,7 @@ def split_for_slack(text: str, limit: int = SLACK_TEXT_LIMIT) -> list[str]:
     an empty list so callers post nothing rather than an empty message.
     """
     text = text or ""
+    limit = max(1, int(limit))
     if not text.strip():
         return []
     if len(text) <= limit:
@@ -206,6 +212,15 @@ def complete_truncated(
             if system:
                 kwargs["system"] = system
             response = client.messages.create(**kwargs)
+            # Continuations are real API calls. Without this a truncated weekly
+            # memo costs up to 3x what the ledger records, and mtd_spend /
+            # batch-adoption accounting under-report by construction.
+            try:
+                from .llm_usage import log_usage
+                log_usage(response, caller=caller or "long_message.continuation",
+                          model=model)
+            except Exception:  # noqa: BLE001 -- accounting must not break a job
+                pass
         except Exception:  # noqa: BLE001
             log.exception("long_message: continuation call failed for %s", caller)
             return text, False
@@ -214,13 +229,14 @@ def complete_truncated(
         )
         if not chunk.strip():
             return text, not was_truncated(response)
-        # The model resumes mid-sentence by design, so join WITHOUT a separator
-        # unless the seam would weld two words together.
-        if text and not text[-1].isspace() and not chunk[:1].isspace() \
-                and text[-1].isalnum() and chunk[:1].isalnum():
-            text = f"{text}{chunk}"
-        else:
-            text = f"{text}{chunk}"
+        # The model resumes mid-sentence by design, so join WITHOUT a separator.
+        # The one case that needs care is a cut that landed mid-WORD: the
+        # continuation prompt asks the model to finish that word, so the seam is
+        # intentional and must NOT get a space inserted. Both branches of the
+        # first cut were byte-identical, i.e. the comment promised a guard that
+        # did not exist -- concatenation is the correct behaviour, so this is now
+        # stated once rather than dressed up as a decision.
+        text = f"{text}{chunk}"
         convo = convo[:-2]
 
     return text, not was_truncated(response)

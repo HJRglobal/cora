@@ -703,6 +703,35 @@ def _enforce_token_budget(
     return blocks
 
 
+# Appended to any reply the model cut short at max_tokens (cq-64a8f5e3e654).
+_TRUNCATION_MARKER = "\n\n_(cut short at the length limit -- ask me to continue.)_"
+
+
+def _mark_if_truncated(response: object, text: str) -> str:
+    """Append a visible marker when the model stopped at max_tokens.
+
+    The API raises nothing on a max_tokens stop, so without this a clipped reply
+    is delivered as though complete and the reader has no way to tell a short
+    answer from a severed one (cq-64a8f5e3e654). The scheduled surfaces CONTINUE
+    generation instead -- see long_message.complete_truncated -- but the
+    interactive Slack path is latency-sensitive and a second round-trip on every
+    long reply is a different trade. Saying so is the part that is not optional:
+    an honest "cut short" beats a silent stump, and the reader knows to ask for
+    the rest.
+
+    Idempotent, and never applied to an empty reply (there is nothing to have
+    been cut).
+    """
+    try:
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            return text
+    except Exception:  # noqa: BLE001
+        return text
+    if not (text or "").strip() or _TRUNCATION_MARKER.strip() in text:
+        return text
+    return text + _TRUNCATION_MARKER
+
+
 def _log_usage(response: anthropic.types.Message, iteration: int) -> None:
     """Log token usage including cache hit/miss accounting.
 
@@ -1150,9 +1179,9 @@ def generate_response(
             if _is_shopify_directive(_last_shopify_result):
                 return _shopify_directed_text(_last_shopify_result) or "(Cora returned no text)"
             # No contract-write sentinel this turn -> phantom-destructive guard (F-23).
-            return _guard_phantom_destructive(
+            return _mark_if_truncated(response, _guard_phantom_destructive(
                 _paused_text + _extract_text(response),
-                broaden=_should_broaden(assume_confirm, meta)) or "(Cora returned no text)"
+                broaden=_should_broaden(assume_confirm, meta))) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True
@@ -1414,7 +1443,7 @@ def generate_response_streaming(
                 if guarded != accumulated_text:
                     accumulated_text = guarded
                     _maybe_push(accumulated_text)
-            return accumulated_text or "(Cora returned no text)"
+            return _mark_if_truncated(final, accumulated_text) or "(Cora returned no text)"
 
         if meta is not None:
             meta["used_tools"] = True

@@ -158,13 +158,19 @@ def deliver_to_channel(channel_id: str, body: str, *, today: date | None = None)
         from .long_message import split_for_slack
         client = WebClient(token=token)
         parts = split_for_slack(text, limit=_MAX_SLACK_CHARS)
+        sent = 0
         for i, part in enumerate(parts, start=1):
             body = (part if len(parts) == 1
                     else f"{part}\n\n_(continued {i}/{len(parts)})_")
-            client.chat_postMessage(channel=channel_id, text=body)
-        log.info("channel_synthesis: posted to %s (%d chars, %d message(s))",
-                 channel_id, len(text), len(parts))
-        return bool(parts)
+            try:
+                client.chat_postMessage(channel=channel_id, text=body)
+                sent += 1
+            except Exception:  # noqa: BLE001 -- 3 of 4 parts beats none
+                log.exception("channel_synthesis: part %d/%d failed to post",
+                              i, len(parts))
+        log.info("channel_synthesis: posted to %s (%d chars, %d of %d message(s))",
+                 channel_id, len(text), sent, len(parts))
+        return sent > 0
     except Exception as exc:  # noqa: BLE001 -- fail-soft; never raise
         log.error("channel_synthesis: post to %s failed: %s", channel_id, exc)
         return False

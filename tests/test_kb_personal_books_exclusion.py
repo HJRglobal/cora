@@ -157,6 +157,33 @@ class TestSweepWiring:
         first_extract = src.index("content = _extract_content(")
         assert first_excl < first_extract
 
+    def test_a_deterministic_parent_level_name_is_not_re_scattered(self):
+        """`lexcorp -> LEX` alone does NOT hold.
+
+        store.upsert_documents Step 0 re-derives sub_entity for ANY LEX doc
+        arriving with sub_entity=None, from title + content -- so a whole-company
+        statement whose filename deliberately withholds a sub-entity would still
+        be scattered into LEX-LLC or LEX-LTS by keyword, and the map entry would
+        have fixed the parent while leaving the scatter it was added to stop.
+        metadata.lex_gm_level is the existing opt-out for exactly this shape.
+        """
+        src = (_REPO_ROOT / "src" / "cora" / "connectors" / "drive_sweep.py").read_text(
+            encoding="utf-8")
+        assert '"lex_gm_level": True' in src
+        assert 'classification["entity_from_filename"] = True' in src
+
+    def test_gm_level_is_only_claimed_when_the_filename_decided(self):
+        """An entity_default fallback asserts nothing about the file, so it must
+        NOT suppress content detection -- that would silently turn every
+        undetected LEX file into a GM-level one."""
+        src = (_REPO_ROOT / "src" / "cora" / "connectors" / "drive_sweep.py").read_text(
+            encoding="utf-8")
+        block = src[src.index("gm_level = bool("):]
+        block = block[:block.index("\n    )") + 6]
+        assert 'classification.get("entity_from_filename")' in block
+        assert 'entity == "LEX"' in block
+        assert "sub_entity is None" in block
+
     def test_ingest_uses_the_shared_split_helper(self):
         """_ingest_file and the re-tag pass must compute placement from ONE
         function, or a re-tag can silently disagree with what the sweep writes."""

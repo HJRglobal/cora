@@ -3005,6 +3005,34 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
         qbo_client.format_recent_transactions_for_llm(payload, target, days))
 
 
+_QBO_NAME_OPAQUE_REFUSAL = (
+    "I can give you Lexington's totals, but not its account or vendor NAMES. "
+    "Lexington account titles can carry a person's name, and a human reading a "
+    "finance channel can't reliably spot one -- so the close pack renders them "
+    "as opaque candidates and this does the same by refusing. Ask for the P&L or "
+    "balance sheet for the totals, or take the detail up with Justin directly."
+)
+
+
+def _qbo_names_are_opaque(target: str) -> bool:
+    """True when this realm's ACCOUNT/VENDOR NAMES must not render on a surface.
+
+    Reuses finance_close.is_name_opaque_realm rather than re-deriving the rule --
+    the close pack opaques LEX account names on exactly the surfaces these tools
+    answer into (#hjrg-finance most of all), and two copies of that judgement
+    would drift. Imported lazily: finance_close is heavy and only finance tools
+    need it. Fail-CLOSED on an import error -- a missing opacity rule must not
+    read as "no rule".
+    """
+    try:
+        from ..finance_close import is_name_opaque_realm
+        return bool(is_name_opaque_realm(target))
+    except Exception:  # noqa: BLE001
+        log.warning("qbo: could not load the name-opacity rule -- refusing detail "
+                    "for %s rather than assuming it is safe", target)
+        return True
+
+
 def _tool_qbo_get_expense_detail(slack_user_id: str, entity: str, _input: dict) -> str:
     """Category-level expense breakdown for a period (cq-e3f057668e1f).
 
@@ -3018,6 +3046,12 @@ def _tool_qbo_get_expense_detail(slack_user_id: str, entity: str, _input: dict) 
     target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
+    # Leaf ACCOUNT / VENDOR names, unlike the rolled-up totals the older
+    # QBO tools return, are exactly what the close pack withholds for this
+    # realm. The tier gate does not bound this: a TIER_1 FNDR channel
+    # (#hjrg-finance) lets any member pass entity='LEX'.
+    if _qbo_names_are_opaque(target):
+        return _QBO_NAME_OPAQUE_REFUSAL
     start_date, end_date = qbo_client.parse_period((_input or {}).get("period"))
     basis = qbo_client.entity_pnl_basis(target)
     try:
@@ -3055,6 +3089,12 @@ def _tool_qbo_get_vendor_spend(slack_user_id: str, entity: str, _input: dict) ->
     target, err = _resolve_qbo_entity(entity, override)
     if err:
         return err
+    # Leaf ACCOUNT / VENDOR names, unlike the rolled-up totals the older
+    # QBO tools return, are exactly what the close pack withholds for this
+    # realm. The tier gate does not bound this: a TIER_1 FNDR channel
+    # (#hjrg-finance) lets any member pass entity='LEX'.
+    if _qbo_names_are_opaque(target):
+        return _QBO_NAME_OPAQUE_REFUSAL
     start_date, end_date = qbo_client.parse_period((_input or {}).get("period"))
     vendor = str((_input or {}).get("vendor") or "").strip() or None
     basis = qbo_client.entity_pnl_basis(target)
@@ -3124,9 +3164,14 @@ def _is_tier1_channel(entity: str, channel_name: str) -> bool:
     pull live finance DATA in a DM even though user_access.check_access already pins
     DMs to TIER_3 (see app._handle_dm_qa). Refusing DMs here makes the tool-level
     finance gate roster-independent and consistent with that pinned tier. The DM
-    signal at the tool layer is channel_name=="dm" -- claude_client does NOT thread
-    the "D..."-prefixed channel_id into dispatch, so _channel_id is empty on the
-    Q&A tool path; an empty/unknown channel_name is already non-TIER_1 below.
+    signal at the tool layer is channel_name=="dm", and that is what refuses --
+    NOT an absent channel id. (An earlier version of this note claimed
+    claude_client does not thread the "D..."-prefixed channel_id into dispatch;
+    it does -- app._handle_dm_qa -> _dispatch_qa -> generate_response ->
+    _dispatch_tools_parallel -> dispatch, which injects it. The claim mattered
+    because _maybe_export_xlsx reads exactly that field a few dozen lines below,
+    and a reader could otherwise conclude "no upload can fire in a DM because
+    _channel_id is empty", which is not what stops it.)
     """
     if not channel_name:
         return False
@@ -12909,18 +12954,27 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "f3e_shopify_inventory": 12,
     "f3e_inventory_pulse": 12,
     "f3e_inventory_by_location": 12,
-    "financial_get_cashflow": 15,
+    # RAISED from 15s for the finance/QBO family (D-051). These tools can now
+    # run a synchronous 3-step Slack upload INLINE after the report fetch
+    # (auth.test probe + getUploadURL + a 30s httpx PUT + completeUpload) when
+    # the asker requested format=xlsx. Under a 15s wall the dispatch timeout
+    # returns "Tool timed out" while the abandoned worker may still finish the
+    # upload -- so the FILE lands with no numbers beside it, which is worse than
+    # either outcome alone. The upload lane previously failed fast on
+    # missing_scope, which is why this never bit; granting files:write turns it
+    # into a multi-second path.
+    "financial_get_cashflow": 45,
     "financial_get_pulse": 15,
     "financial_get_close_pack": 15,
-    "qbo_get_profit_loss": 15,
-    "qbo_get_balance_sheet": 15,
-    "qbo_get_ar_aging": 15,
-    "qbo_get_ap_aging": 15,
-    "qbo_get_recent_transactions": 15,
+    "qbo_get_profit_loss": 45,
+    "qbo_get_balance_sheet": 45,
+    "qbo_get_ar_aging": 45,
+    "qbo_get_ap_aging": 45,
+    "qbo_get_recent_transactions": 45,
     # One report call each (30s HTTP budget). Vendor spend fans out into a
     # larger detail report, so it gets the heavier tier.
-    "qbo_get_expense_detail": 15,
-    "qbo_get_vendor_spend": 20,
+    "qbo_get_expense_detail": 45,
+    "qbo_get_vendor_spend": 50,
     # Heavy — multi-step, slow uploads, or long-running APIs
     "gmail_create_draft": 20,
     "calendar_create_event": 20,

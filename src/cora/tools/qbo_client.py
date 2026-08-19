@@ -1409,13 +1409,35 @@ _EXPENSE_SECTION_HINTS: tuple[str, ...] = (
 )
 
 
+#: The only report shape whose columns can be read POSITIONALLY: two columns,
+#: [name, total]. That is what ProfitAndLoss returns when no summarize_column_by
+#: is requested, which is how get_profit_loss calls it.
+_TWO_COL = 2
+
+
+def report_column_count(report: dict[str, Any]) -> int:
+    """How many columns QBO says the report has (0 when it does not say)."""
+    cols = ((report or {}).get("Columns") or {}).get("Column") or []
+    return len(cols) if isinstance(cols, list) else 0
+
+
 def _row_label_and_value(row: dict[str, Any]) -> tuple[str, str]:
-    """(label, value) from a QBO Data row's ColData: first column, last column."""
+    """(label, value) from a two-column QBO Data row.
+
+    POSITIONAL, and therefore only safe on a report this module has verified is
+    two columns wide -- see :func:`report_column_count` and its callers. On a
+    DETAIL report the last column is the running BALANCE, not the amount:
+    general_ledger_bank_rows binds `subt_nat_amount` and `rbal_nat_amount` by
+    ColType for exactly this reason and refuses rather than guess, because
+    "guessing column positions on a finance figure is not an option". Reading
+    cols[-1] off a detail report quotes the cumulative balance as if it were the
+    spend, labelled with the transaction date.
+    """
     cols = (row or {}).get("ColData") or []
-    if not cols:
+    if len(cols) < 2:
         return "", ""
     label = str(cols[0].get("value", "") or "").strip()
-    value = str(cols[-1].get("value", "") or "").strip() if len(cols) >= 2 else ""
+    value = str(cols[-1].get("value", "") or "").strip()
     return label, value
 
 
@@ -1476,6 +1498,18 @@ def format_expense_detail_for_llm(
     period = f"{start_date} to {end_date}"
     basis = _report_basis(report)
     basis_tag = f" [{basis} basis]" if basis else ""
+
+    # Refuse rather than read a column positionally out of a shape we have not
+    # verified. A P&L with no summarize_column_by is two columns wide; anything
+    # else means QBO added period columns, and cols[-1] would then be one period
+    # rather than the total.
+    ncols = report_column_count(report)
+    if ncols and ncols != _TWO_COL:
+        return (f"Expense detail for {entity} ({period}){basis_tag}: the report came "
+                f"back with {ncols} columns instead of the expected two, so I can't "
+                f"tell which one is the total. Reporting nothing rather than a "
+                f"figure I'd have to guess at.")
+
     rows = extract_leaf_rows(report, _EXPENSE_SECTION_HINTS)
 
     if not rows:
@@ -1532,6 +1566,30 @@ def get_vendor_spend(
     )
 
 
+def vendor_totals(report: dict[str, Any]) -> list[tuple[str, str]]:
+    """[(vendor, total), ...] from a vendor-grouped detail report, in report order.
+
+    Reads each top-level Section's own SUMMARY row -- QBO's per-vendor total,
+    computed by QBO. This is the same `Summary.ColData[-1]` convention
+    _extract_top_level_sections already relies on for P&L, balance sheet and
+    aging, and it is the one column on a detail report whose meaning does not
+    depend on knowing the column layout.
+    """
+    out: list[tuple[str, str]] = []
+    for row in ((report.get("Rows") or {}).get("Row") or []):
+        if not isinstance(row, dict) or row.get("type") != "Section":
+            continue
+        header = (row.get("Header") or {}).get("ColData") or [{}]
+        name = str(header[0].get("value", "") or "").strip()
+        summary = (row.get("Summary") or {}).get("ColData") or []
+        if not name or len(summary) < 2:
+            continue
+        total = str(summary[-1].get("value", "") or "").strip()
+        if total:
+            out.append((name, total))
+    return out
+
+
 def format_vendor_spend_for_llm(
     report: dict[str, Any],
     entity: str,
@@ -1540,31 +1598,38 @@ def format_vendor_spend_for_llm(
     vendor: str | None = None,
     limit: int = 40,
 ) -> str:
-    """Vendor/payee spend. Source-opaque (B2 -- see format_pnl).
+    """Vendor/payee spend, as QBO's own per-vendor totals. Source-opaque (B2).
 
-    When `vendor` is given, rows are filtered by case-insensitive substring on
-    the section name (QBO groups this report by vendor) or the row label, and
-    the filter is STATED in the header -- a narrow answer must never be
-    mistakable for the full picture. A filter matching nothing says so
+    TOTALS ONLY, deliberately. The first cut rendered the report's leaf DATA rows
+    through a positional [first column, last column] read -- but this is a QBO
+    DETAIL report, whose last column is the running BALANCE and whose first is
+    the transaction date. That renders `04/12/2026: 84,210.00` and calls it the
+    payment: a cumulative balance quoted as spend, on a finance surface, with the
+    D-095 "every figure is QBO's own string, moved" argument giving no protection
+    at all, because the wrong string is still QBO's. The per-vendor section
+    summary is the one figure on this report whose meaning does not depend on
+    knowing the column layout, and it is what "how much did we pay X" asks for.
+
+    When `vendor` is given the vendor list is filtered by case-insensitive
+    substring and the filter is STATED in the header -- a narrow answer must
+    never be mistakable for the full picture. A filter matching nothing says so
     explicitly rather than rendering an empty list, which would read as "this
-    vendor had no spend" when it may just be spelled differently in the books.
+    vendor had no spend" when the name may just be recorded differently.
 
-    Note on names: `general_ledger_bank_rows` deliberately DROPS payee/memo text
-    at collection (D-124) because that payload is mirrored to a shared folder.
-    This path has no mirror -- it answers into a TIER_1 finance channel only, and
-    vendor identity IS the question being asked -- so the names are the point
-    rather than a leak. The tier gate is what bounds the audience.
+    Note on names: general_ledger_bank_rows deliberately DROPS payee/memo text at
+    collection (D-124) because that payload is mirrored to a shared folder. This
+    path has no mirror -- it answers into a TIER_1 finance channel only, and
+    vendor identity IS the question -- so the names are the point rather than a
+    leak. The tier gate is what bounds the audience.
     """
     period = f"{start_date} to {end_date}"
     basis = _report_basis(report)
     basis_tag = f" [{basis} basis]" if basis else ""
-    rows = extract_leaf_rows(report)
+    rows = vendor_totals(report)
 
     needle = (vendor or "").strip().casefold()
     if needle:
-        rows = [r for r in rows
-                if needle in (r[0] or "").casefold()
-                or needle in (r[1] or "").casefold()]
+        rows = [r for r in rows if needle in (r[0] or "").casefold()]
 
     scope = f" matching '{vendor.strip()}'" if needle else ""
     if not rows:
@@ -1575,13 +1640,9 @@ def format_vendor_spend_for_llm(
         return f"No vendor purchases for {entity} ({period}){basis_tag}."
 
     lines = [f"Vendor spend for {entity} ({period}){basis_tag}{scope}:"]
-    last_section = None
-    for section, label, value in rows[:limit]:
-        if section and section != last_section:
-            lines.append(f"{section}:")
-            last_section = section
-        lines.append(f"  • {label}: {value}")
+    for name, total in rows[:limit]:
+        lines.append(f"  • {name}: {total}")
     if len(rows) > limit:
-        lines.append(f"  ... and {len(rows) - limit} more rows not shown "
+        lines.append(f"  ... and {len(rows) - limit} more vendor(s) not shown "
                      f"(showing the first {limit} of {len(rows)}).")
     return "\n".join(lines)

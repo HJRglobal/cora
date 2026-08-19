@@ -1045,11 +1045,17 @@ def deliver_to_harrison(memo_body: str, *, today: date | None = None) -> bool:
         from .long_message import split_for_slack
         parts = split_for_slack(text)
         dm_channel = resp["channel"]["id"]
+        sent = 0
         for i, part in enumerate(parts, start=1):
             body = (part if len(parts) == 1
                     else f"{part}\n\n_(continued {i}/{len(parts)})_")
-            client.chat_postMessage(channel=dm_channel, text=body)
-        return bool(parts)
+            try:
+                client.chat_postMessage(channel=dm_channel, text=body)
+                sent += 1
+            except Exception:  # noqa: BLE001 -- 3 of 4 parts beats none
+                log.exception("strategy_memo: memo part %d/%d failed to post",
+                              i, len(parts))
+        return sent > 0
     except Exception as exc:  # noqa: BLE001
         log.error("strategy_memo: DM delivery failed: %s", exc)
         return False

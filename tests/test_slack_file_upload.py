@@ -127,7 +127,11 @@ class TestUploadOutcomes:
                                       "f.txt", b"x", "T")
         assert outcome == sfu.NO_SCOPE
         note = sfu.requester_note(outcome)
-        assert "files:write" in note and "Harrison" in note
+        assert "files:write" in note
+        # D-051: adding a bot scope requires REINSTALLING the app, which issues a
+        # new bot token. "Harrison can grant it in the Slack app settings" reads
+        # as a toggle and would send him looking for one that does not exist.
+        assert "reinstalling" in note and "new bot token" in note
 
     def test_missing_scope_detected_at_the_api_when_the_probe_was_unknown(self, put_ok):
         outcome, _ = sfu.upload_bytes(

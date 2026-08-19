@@ -92,8 +92,14 @@ _CODE_TO_LABEL: dict[str, str] = {
     "mv": "LEX-LLA",        # LLA Maryvale
     # `lexcorp` ("LexCorp, LLC") maps to the LEX PARENT, not a sub-entity: it is
     # a Lexington-family book, but no `LEX-CORP` KB sub-entity exists and
-    # asserting one of LLC/LLA/LBHS/LTS would be a guess. Parent-level (sub_entity
-    # NULL, GM-level) stops the observed scatter without inventing a placement.
+    # asserting one of LLC/LLA/LBHS/LTS would be a guess.
+    #
+    # Parent-level is only ACTUALLY parent-level because drive_sweep marks these
+    # files `metadata.lex_gm_level`. Without that, store.upsert_documents Step 0
+    # re-derives sub_entity from title + content for any LEX doc arriving with
+    # sub_entity=None, so this row would have fixed the parent while leaving the
+    # scatter it was added to stop. A map entry and an ingest flag are load-
+    # bearing together here; changing one without the other re-opens it.
     # NOTE for whoever settles this: drive_financial_reader.ENTITY_TO_REPORT_CODE
     # maps LEX -> "lexcorp", which CONTRADICTS the twice-confirmed
     # qbo-monthly-report-slugs.yaml (realm LEX -> slug "llc", company "Lexington
@@ -114,6 +120,22 @@ _CODE_TO_LABEL: dict[str, str] = {
 #             pre-exclusion sweeps already ingested are purged separately by
 #             scripts/purge_kb_personal_books_2026-08-19.py (Harrison-gated).
 _EXCLUDED_CODES: frozenset[str] = frozenset({"hjrllc"})
+
+# Slugs that mean what they mean ONLY inside the dated accounting-archive
+# convention (`YYYY-MM_<slug>_<doctype>`), and are ordinary words or initials
+# everywhere else. They match ONLY when a leading date token is present.
+#
+# D-051: without this the detector runs corpus-wide over every swept mailbox and
+# overrides Haiku on a bare token match, so `MV.xlsx` and `LexCorp_Balance+Sheet.xlsx`
+# -- real Founder-OS files currently tagged HJRG/FNDR, verified live against
+# 53,350 distinct Drive titles -- would move into LEX, the FIREWALLED entity, on
+# their next sweep: visible to #llc-*/#lex-* and invisible to HJRG. `mv` is two
+# characters; it was never safe as a global token. The purge pass already
+# required the dated convention for its re-tag (archive_slug); the sweep-side
+# detector has to agree, or the two disagree about what an archive file is.
+_ARCHIVE_ONLY_CODES: frozenset[str] = frozenset({
+    "mv", "lexcorp", "f3comm", "hjrpod", "osn-core4",
+})
 
 # Tokens we never treat as an entity code even if they collide (kept explicit so
 # the map above stays the single source of truth; reserved for future guards).
@@ -144,6 +166,17 @@ def naming_tokens(filename: str) -> list[str]:
         tokens = tokens[1:]
 
     return [t.strip().lower() for t in tokens[:2]]
+
+
+def has_date_token(filename: str) -> bool:
+    """True when the filename opens with the archive convention's date token.
+
+    Shared by the detector and the D-194 re-tag pass so "is this an archive
+    file?" has exactly one answer.
+    """
+    stem = (filename or "").rsplit(".", 1)[0] if "." in (filename or "") else (filename or "")
+    head = stem.split("_", 1)[0].strip()
+    return bool(head) and bool(_DATE_TOKEN.match(head))
 
 
 def excluded_slug_from_filename(filename: str) -> str | None:
@@ -192,13 +225,20 @@ def detect_entity_from_filename(filename: str) -> str | None:
     Codes may themselves contain hyphens (e.g. ``lex-llc``), so we split on
     underscores only.
 
+    Codes in :data:`_ARCHIVE_ONLY_CODES` additionally require the dated
+    accounting-archive convention -- they are ordinary words or initials outside
+    it, and this function runs over every swept mailbox.
+
     An excluded slug (see :func:`excluded_slug_from_filename`) never yields a
     label -- it is absent from ``_CODE_TO_LABEL`` by construction -- but callers
     must still check the exclusion explicitly, because a *second* token could
     otherwise place a file the first token forbids.
     """
+    dated = has_date_token(filename)
     for code in naming_tokens(filename):
         if code in _AMBIGUOUS:
+            continue
+        if code in _ARCHIVE_ONLY_CODES and not dated:
             continue
         label = _CODE_TO_LABEL.get(code)
         if label:

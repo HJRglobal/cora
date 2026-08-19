@@ -108,18 +108,45 @@ class TestLeafExtraction:
         out = qc.format_expense_detail_for_llm(summary_only, "F3E", "a", "b")
         assert "only rolled-up totals" in out
 
+    def test_refuses_a_report_whose_column_shape_is_unverified(self):
+        """Positional column reads are only safe on the two-column shape
+        get_profit_loss actually requests. More columns means QBO added periods,
+        and cols[-1] would be one period rather than the total -- so refuse
+        rather than quote a figure that would have to be guessed at."""
+        wide = {"Columns": {"Column": [{}] * 5}, "Rows": PNL["Rows"]}
+        out = qc.format_expense_detail_for_llm(wide, "F3E", "a", "b")
+        assert "5 columns instead of the expected two" in out
+        assert "Rent" not in out
+
+    def test_the_normal_two_column_shape_is_accepted(self):
+        ok = {"Columns": {"Column": [{}, {}]},
+              "Header": PNL["Header"], "Rows": PNL["Rows"]}
+        assert "Rent" in qc.format_expense_detail_for_llm(ok, "F3E", "a", "b")
+
     def test_malformed_payload_degrades_instead_of_raising(self):
         """Intuit reshapes report payloads occasionally."""
         assert qc.extract_leaf_rows({}) == []
         assert qc.extract_leaf_rows({"Rows": {"Row": [None, "junk", {}]}}) == []
 
 
+def _detail_row(date, txn_type, amount, running_balance):
+    """A REAL PurchaseByVendorDetail data row: the last column is the running
+    BALANCE, not the amount, and the first is the transaction date."""
+    return {"ColData": [{"value": date}, {"value": txn_type},
+                        {"value": amount}, {"value": running_balance}]}
+
+
 VENDOR = {
     "Header": {"ReportBasis": "Accrual"},
+    "Columns": {"Column": [{}, {}, {}, {}]},
     "Rows": {"Row": [
-        _section("Cox Communications", [_data("2026-02-03 Bill", "412.55"),
-                                        _data("2026-03-03 Bill", "418.02")]),
-        _section("Sprouts Farmers Market", [_data("2026-02-14 Check", "1,200.00")]),
+        _section("Cox Communications",
+                 [_detail_row("2026-02-03", "Bill", "412.55", "412.55"),
+                  _detail_row("2026-03-03", "Bill", "418.02", "830.57")],
+                 summary="830.57"),
+        _section("Sprouts Farmers Market",
+                 [_detail_row("2026-02-14", "Check", "1,200.00", "1,200.00")],
+                 summary="1,200.00"),
     ]},
 }
 
@@ -142,6 +169,34 @@ class TestVendorSpend:
         out = qc.format_vendor_spend_for_llm(VENDOR, "F3E", "a", "b", vendor="zzz")
         assert "No purchases matching 'zzz'" in out
         assert "different name" in out
+
+    def test_never_quotes_the_running_balance_as_spend(self):
+        """REGRESSION, D-051 HIGH found by three independent lenses.
+
+        The first cut rendered this report's leaf DATA rows through a positional
+        [first column, last column] read. On a DETAIL report that is
+        [transaction date, RUNNING BALANCE] -- so it emitted
+        `04/12/2026: 830.57` and called it the payment: a cumulative balance
+        quoted as spend, on a finance surface, with D-095's "every figure is
+        QBO's own string, moved" giving no protection at all because the wrong
+        string is still QBO's. Totals now come from QBO's own per-vendor section
+        summary, the one figure whose meaning does not depend on the layout.
+        """
+        out = qc.format_vendor_spend_for_llm(VENDOR, "F3E", "a", "b")
+        assert "Cox Communications: 830.57" in out
+        # neither a transaction date nor an individual line amount is a "vendor"
+        assert "2026-02-03" not in out
+        assert "412.55" not in out
+
+    def test_totals_come_from_the_section_summary(self):
+        assert qc.vendor_totals(VENDOR) == [
+            ("Cox Communications", "830.57"),
+            ("Sprouts Farmers Market", "1,200.00"),
+        ]
+
+    def test_a_section_with_no_summary_is_skipped_not_guessed(self):
+        report = {"Rows": {"Row": [_section("Mystery Vendor", [_data("x", "1")])]}}
+        assert qc.vendor_totals(report) == []
 
     def test_pins_the_accounting_method_when_asked(self):
         with patch.object(qc, "_request") as req:
@@ -233,11 +288,17 @@ class TestCoincidentalDefaultIsDetectable:
 
 class TestToolWiring:
     @pytest.mark.parametrize("name,timeout", [
-        ("qbo_get_expense_detail", 15), ("qbo_get_vendor_spend", 20)])
+        ("qbo_get_expense_detail", 45), ("qbo_get_vendor_spend", 50)])
     def test_registered_everywhere_a_tool_must_be(self, name, timeout):
+        """The timeout must exceed the report fetch PLUS a possible inline xlsx
+        upload (auth.test + getUploadURL + a 30s httpx PUT + completeUpload).
+        At the original 15s the dispatch wall could fire while the abandoned
+        worker still finished the upload -- landing a file with no numbers beside
+        it, which is worse than either failure alone (D-051)."""
         assert any(t["name"] == name for t in td.TOOL_DEFINITIONS)
         assert name in td._TOOL_FUNCTIONS
         assert td._TOOL_TIMEOUTS[name] == timeout
+        assert td._TOOL_TIMEOUTS[name] > 30   # the PUT's own budget
         assert name in td.VERBATIM_TABLE_TOOLS
 
     @pytest.mark.parametrize("name", ["qbo_get_expense_detail", "qbo_get_vendor_spend"])
@@ -267,6 +328,32 @@ class TestToolWiring:
         desc = next(t for t in td.TOOL_DEFINITIONS
                     if t["name"] == name)["description"].lower()
         assert "do not" in desc and ("total" in desc or "rank" in desc)
+
+    @pytest.mark.parametrize("name", ["qbo_get_expense_detail", "qbo_get_vendor_spend"])
+    def test_lex_account_and_vendor_names_are_refused(self, name):
+        """D-051 HIGH. finance_close opaques LEX ACCOUNT NAMES on finance
+        surfaces (`_NAME_OPAQUE_REALMS`), on the premise that a LEX account title
+        can carry a person's name and a human cannot reliably spot one. These
+        tools return LEAF account and vendor names, which the older QBO tools
+        never could -- and the tier gate does not bound it to LEX, because
+        #hjrg-finance routes to FNDR, is TIER_1, and lets any member pass
+        entity='LEX'. So the branch withheld LEX names from that channel in one
+        file and published them into it from another.
+        """
+        out = td._TOOL_FUNCTIONS[name](
+            "U1", "FNDR", {"_channel_name": "hjrg-finance", "entity": "LEX"})
+        assert out == td._QBO_NAME_OPAQUE_REFUSAL
+
+    @pytest.mark.parametrize("name", ["qbo_get_expense_detail", "qbo_get_vendor_spend"])
+    def test_the_opacity_rule_is_shared_not_re_derived(self, name):
+        """Two copies of that judgement would drift. It must come from
+        finance_close, and an import failure must fail CLOSED."""
+        src = (_REPO_ROOT / "src" / "cora" / "tools" / "tool_dispatch.py").read_text(
+            encoding="utf-8")
+        assert "from ..finance_close import is_name_opaque_realm" in src
+        block = src[src.index("def _qbo_names_are_opaque"):]
+        block = block[:block.index("def _tool_qbo_get_expense_detail")]
+        assert "return True" in block   # fail-closed on error
 
     def test_expense_detail_reuses_the_pnl_fetch(self):
         """No new endpoint and no new permission for the category half -- the

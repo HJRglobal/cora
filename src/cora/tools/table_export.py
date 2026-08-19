@@ -52,25 +52,40 @@ def rows_from_report(text: str) -> list[list[str]]:
     """
     rows: list[list[str]] = [["Section", "Item", "Value"]]
     section = ""
+    truncated = False
+    first_content_line = True
+    # The cap is checked on EVERY branch. The first cut checked it only in the
+    # non-matching-line branch, so a report of pure bullets never tripped it and
+    # build_xlsx simply sliced at MAX_ROWS with no marker -- and the marker it
+    # did append pushed the list to MAX_ROWS+1, exactly where build_xlsx's own
+    # [:MAX_ROWS] slice discarded it. A cap that drops its own truncation notice
+    # is the failure this module's docstring says it prevents.
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
+        if len(rows) >= MAX_ROWS - 1:      # leave room for the marker itself
+            truncated = True
+            break
         m = _BULLET.match(line)
         if m:
+            first_content_line = False
             rows.append([section,
                          m.group("label").strip()[:MAX_CELL_CHARS],
                          m.group("value").strip()[:MAX_CELL_CHARS]])
             continue
-        h = _HEADING.match(line)
+        # The report's OWN header line ("Expense detail for HJRG (...):") ends in
+        # a colon and would otherwise be captured as the first Section, stamping
+        # the report title onto every row above the first real QBO section.
+        h = _HEADING.match(line) if not first_content_line else None
+        first_content_line = False
         if h:
             section = h.group("heading").strip()[:MAX_CELL_CHARS]
             rows.append([section, "", ""])
             continue
         rows.append([line.strip()[:MAX_CELL_CHARS], "", ""])
-        if len(rows) >= MAX_ROWS:
-            rows.append(["(truncated -- report longer than the export cap)", "", ""])
-            break
+    if truncated:
+        rows.append(["(truncated -- report longer than the export cap)", "", ""])
     return rows
 
 
@@ -100,6 +115,12 @@ def build_xlsx(rows: list[list[str]], sheet_title: str = "Report") -> bytes:
     for r in rows[:MAX_ROWS]:
         cells = [("" if c is None else str(c))[:MAX_CELL_CHARS] for c in r]
         ws.append(cells)
+        # openpyxl's value binder types a leading "=" as a FORMULA. The module
+        # contract is that values land as TEXT -- a transcription must never
+        # become something Excel evaluates.
+        for cell in ws[ws.max_row]:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
         for i, c in enumerate(cells, start=1):
             widths[i] = min(60, max(widths.get(i, 10), len(c) + 2))
     for i, w in widths.items():

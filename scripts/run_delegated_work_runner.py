@@ -321,10 +321,15 @@ def guard_quota_note(job: dict) -> str:
         requested_dt = dw._parse_ts(job.get("requested_at"))
         requested_day = dw._az_date(requested_dt) if requested_dt else ""
         if requested_day and requested_day != dw._az_date():
-            # Slot was spent on a prior day; today's counter says nothing about
-            # it, and the refund lands against that prior day's allowance.
-            return ("This didn't cost you a job slot -- a content-guard refusal "
-                    "refunds it.\n")
+            # The refund is keyed on the job's REQUESTED day, and that day has
+            # already passed -- so the credit lands against an allowance nobody
+            # can still spend. Saying "this didn't cost you a slot" here would be
+            # false, and it is the NORMAL case for any late-evening request the
+            # 15-minute runner picks up after midnight. Say what actually
+            # happened instead.
+            return (f"This used one of your job slots for {requested_day}. A "
+                    f"content-guard refusal refunds the slot, but that day is "
+                    f"over, so it doesn't come back to today's allowance.\n")
         remaining = dw.quota_remaining(requester)
     except Exception:  # noqa: BLE001
         return ""

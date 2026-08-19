@@ -427,6 +427,20 @@ def requested_today(user: str | None = None) -> int:
     return n
 
 
+def max_refunds_per_day() -> int:
+    """Ceiling on refunded slots per user per day.
+
+    D-051: content_guard is CHANNEL-caused by design -- round3 measured
+    capital_program / company_financials tripping in TIER_3 F3E channels -- which
+    makes it reliably reproducible by the requester. An uncapped refund therefore
+    turns "submit a financials-shaped brief in a TIER_3 channel" into unlimited
+    jobs/day for that user and for the org, with only the monthly $ envelope left
+    as a backstop. The refund exists so an unpredictable refusal is not charged,
+    not so a predictable one is free.
+    """
+    return _int_env("CORA_DELEGATED_MAX_REFUNDS", 3)
+
+
 def refunded_today(user: str | None = None,
                    jobs: dict[str, dict[str, Any]] | None = None) -> int:
     """Slots given back today (AZ) because the artifact tripped content_guard.
@@ -458,6 +472,10 @@ def refunded_today(user: str | None = None,
         if user is not None and str(rec.get("requester")) != user:
             continue
         n += 1
+    # Capped per-user; the org-wide roll-up is the sum of per-user caps rather
+    # than one shared ceiling, so one looping user cannot consume everyone's.
+    if user is not None:
+        return min(n, max_refunds_per_day())
     return n
 
 
@@ -930,8 +948,11 @@ def submit_job(
         if slack_user_id != HARRISON_ID:
             # quota_used_today, not requested_today: content_guard refusals are
             # refunded (Harrison 2026-08-17). `jobs` is the fold already taken
-            # inside this lock, so the refund is computed from the same snapshot
-            # the dedup check used -- no second read, no torn view.
+            # inside this lock, so the REFUND half is computed from the same
+            # snapshot the dedup check used. (The requested-count half re-reads
+            # the bot ledger; harmless under _BOT_LOCK, which this holds, and the
+            # bot is that file's only writer -- an earlier version of this comment
+            # claimed "no second read", which was simply wrong.)
             if quota_used_today(slack_user_id, jobs) >= user_daily_quota():
                 held_reason = "user_quota"
             elif quota_used_today(None, jobs) >= org_daily_quota():
@@ -1194,8 +1215,17 @@ def _state_detail(rec: dict[str, Any]) -> str:
     if state == STATE_HELD:
         return "waiting on Harrison"
     if state == STATE_DELIVERED:
-        target = str((rec.get("artifact") or {}).get("target_path") or "")
-        return f"file: {target}" if target else ""
+        # NO PATH HERE. D-051 (two independent lenses): the artifact filename
+        # embeds _slug(job["title"]) -- 40 readable characters of it -- so
+        # returning the target path re-emitted, OUTSIDE the same-channel gate,
+        # exactly the title that gate exists to suppress. A job titled in
+        # #llc-leadership listed from #f3e-sales rendered
+        # "...research-brief-lbhs-copa-settlement-exposure-me-....md".
+        # Nothing downstream catches it either: reply_formatter._DRIVE_PATH_RE
+        # needs "/"-delimited segments and this is a Windows path, and
+        # slack_egress redacts URLs and ids, not filesystem paths. The path is
+        # now rendered by the caller INSIDE the gate.
+        return "delivered"
     return ""
 
 
@@ -1206,9 +1236,13 @@ def render_job_list(user: str, channel_id: str) -> str:
     current-channel id suppresses every title (fail-closed).
 
     Carries age + a terminal-state detail clause, because the ask this serves is
-    "what happened to my job?", not "enumerate my jobs". The cross-channel title
-    suppression is unchanged -- the detail clause is derived from the job's own
-    state and failure class, never from its brief or title.
+    "what happened to my job?", not "enumerate my jobs".
+
+    EVERYTHING DERIVED FROM THE TITLE STAYS INSIDE THE SAME-CHANNEL GATE. That
+    includes the delivered artifact PATH, whose filename embeds a slug of the
+    title -- the first cut of this function leaked it by rendering the path in
+    the always-shown detail clause, which is precisely the suppression it was
+    documented as preserving.
     """
     mine = [r for r in load_jobs() if str(r.get("requester")) == user]
     if not mine:
@@ -1226,13 +1260,22 @@ def render_job_list(user: str, channel_id: str) -> str:
             base += f", requested {age}"
         if channel_id and str(r.get("channel_id") or "") == channel_id:
             base += f": {r.get('title', '')}"
+            # Same gate, same reason: the path carries the title.
+            target = str((r.get("artifact") or {}).get("target_path") or "")
+            if target:
+                base += f"\n    file: {target}"
         cost = (r.get("cost") or {}).get("est_usd")
         if cost:
             base += f" (~${float(cost):.2f})"
         lines.append(base)
     if len(mine) > 10:
         lines.append(f"(+{len(mine) - 10} older)")
-    lines.append(f"Quota: {quota_remaining(user)} of {user_daily_quota()} left today.")
+    if user != HARRISON_ID:
+        # quota_remaining returns the FULL quota unconditionally for the founder
+        # (exempt, display-only), so printing it would always read "3 of 3 left"
+        # regardless of use -- a number that looks like information and is not.
+        lines.append(
+            f"Quota: {quota_remaining(user)} of {user_daily_quota()} left today.")
     return "\n".join(lines)
 
 
