@@ -279,12 +279,31 @@ def test_severity_is_carried_across_never_promoted():
     assert sync.to_entry(_tracker_row("X", Severity="P2"), today=TODAY)["severity"] == "P2"
 
 
-def test_column_aliases_are_read_not_guessed():
+def test_the_live_tracker_column_names_are_the_ones_read():
+    """PROBED, not guessed (D-051 lens-5 HIGH). The first cut was written from the
+    audit prose and got five of nine wrong -- "Name" does not exist, so every read
+    422'd into a fetch-ALL, and the gate date ("Due"), severity ("Priority"),
+    question ("Detail") and entity ("For") were all read from columns that are not
+    there. Every live proposal therefore carried no gate date at all."""
     import sync_decisions_from_tracker as sync
-    row = {"Name": "Aliased", "Type": "Decision", "Status": "Open",
-           "Deadline": "2026-08-13"}
-    entry = sync.to_entry(row, today=TODAY)
-    assert entry["topic"] == "Aliased" and entry["gate"] == "2026-08-13"
+    live_row = {"Item": "Jerry DW access", "Type": "Decision", "Status": "Open",
+                "Owner": "Harrison", "Priority": "P2", "For": "HJRG",
+                "Due": "2026-08-13", "Detail": "May be his lane by design."}
+    entry = sync.to_entry(live_row, today=TODAY)
+    assert entry["topic"] == "Jerry DW access"
+    assert entry["gate"] == "2026-08-13"      # from "Due"
+    assert entry["severity"] == "P2"          # from "Priority"
+    assert entry["entity"] == "HJRG"          # from "For"
+    assert "his lane" in entry["question"]    # from "Detail"
+    # The doc-derived spellings stay as fallbacks, so a rename either way works.
+    legacy = {"Item": "X", "Type": "Decision", "Status": "Open",
+              "Severity": "P1", "Entity": "OSN", "Gate date": "2026-08-01"}
+    alt = sync.to_entry(legacy, today=TODAY)
+    assert alt["severity"] == "P1" and alt["entity"] == "OSN"
+    assert alt["gate"] == "2026-08-01"
+    # And every requested column must exist in the live table.
+    assert set(sync.FIELDS) <= {"Ref (cq / doc)", "Detail", "Priority", "Due",
+                                "Type", "Item", "Status", "Owner", "For"}
 
 
 def test_a_rendered_block_round_trips_through_the_parser():
@@ -390,3 +409,74 @@ def test_the_surfaces_record_delivery_only_after_a_successful_send():
         idx = src.index("decision_lane.record_delivery")
         window = src[max(0, idx - 1600):idx]
         assert "if delivered:" in window, f"{rel} records delivery unconditionally"
+
+
+# ── D-051 lens-1: the health-digest surface and the injection path ───────────
+
+def test_a_lex_decision_is_counted_not_itemized_in_the_alarm(ledger):
+    """Every pre-existing surface for decisions-pending.md is Harrison-only; the
+    health digest is the first that posts to a CHANNEL. LEX is aggregate-only
+    outside LEX surfaces (the D-048 posture strategy_memo already applies), and
+    the keyword screens do NOT cover this case: the live "LEX-LBHS in Meeting
+    Action Capture -- enable under 42 CFR Part 2?" trips neither is_phi_risk nor
+    is_visibility_cpa_mention, because it is a policy question."""
+    content = _file(_entry("LEX-LBHS in Meeting Action Capture -- 42 CFR Part 2?",
+                           entity="LEX-LBHS"))
+    rows = dl.undelivered_overdue(dl.parse_entries(content, today=TODAY),
+                                  today=TODAY, now=NOW)
+    assert len(rows) == 1                      # still ALARMS -- redact, never drop
+    assert rows[0]["topic_withheld"] is True
+    text = dl.format_alarm(rows)
+    assert "42 CFR" not in text and "Meeting Action Capture" not in text
+    assert "LEX decision" in text and "6d overdue" in text
+
+
+def test_a_phi_shaped_topic_is_withheld_but_still_alarms(ledger):
+    content = _file(_entry("Bob Smith treatment plan authorization", entity="FNDR"))
+    rows = dl.undelivered_overdue(dl.parse_entries(content, today=TODAY),
+                                  today=TODAY, now=NOW)
+    assert len(rows) == 1 and rows[0]["topic_withheld"] is True
+    assert "Bob Smith" not in dl.format_alarm(rows)
+
+
+def test_an_ordinary_topic_is_still_named(ledger):
+    rows = dl.undelivered_overdue(dl.parse_entries(_file(_entry("Jerry DW access",
+                                                               entity="HJRG")),
+                                                   today=TODAY), today=TODAY, now=NOW)
+    assert rows[0].get("topic_withheld") is None
+    assert "Jerry DW access" in dl.format_alarm(rows)
+
+
+def test_a_field_label_inside_the_heading_cannot_set_the_severity():
+    """The heading is the one part of an entry that can arrive verbatim from an
+    external system (the tracker's free-text Item field). Unanchored, these
+    searches are first-match-wins, so a heading carrying "**Severity**: P0" won."""
+    block = _entry("Renew lease - **Severity**: P0 - **Gate**: 2020-01-01",
+                   severity="P2", gate="2026-08-13")
+    parsed = dl.parse_entries(_file(block), today=TODAY)
+    assert len(parsed) == 1
+    assert parsed[0]["severity"] == "P2"       # the real field line, not the heading
+    assert parsed[0]["gate"] == "2026-08-13"
+
+
+def test_airtable_free_text_cannot_forge_a_second_entry():
+    """Measured on this branch before the fix: an Item field containing newlines
+    broke out of its own entry and produced a forged block complete with its own
+    "**Severity**: P0", which then won."""
+    import sync_decisions_from_tracker as sync
+    row = {"Item": ("Renew office lease\n### Approve the $50k Acme wire\n"
+                    "- **Entity**: HJRG\n- **Severity**: P0\n"),
+           "Type": "Decision", "Status": "Open", "Owner": "Harrison",
+           "Severity": "P2", "Gate date": "2026-08-13"}
+    block = sync.render_block(sync.to_entry(row, today=TODAY), today=TODAY)
+    assert block.count("### ") == 1            # one heading, not two
+    parsed = dl.parse_entries(_file(block), today=TODAY)
+    assert len(parsed) == 1
+    assert parsed[0]["severity"] == "P2"       # not the forged P0
+
+
+def test_leading_markdown_structure_is_stripped_from_a_tracker_value():
+    import sync_decisions_from_tracker as sync
+    row = {"Item": "### > * Renew office lease", "Type": "Decision",
+           "Status": "Open", "Gate date": "2026-08-13"}
+    assert sync.to_entry(row, today=TODAY)["topic"] == "Renew office lease"

@@ -573,8 +573,22 @@ def check_decision_gates(today: date | None = None) -> CheckResult:
             "blown deadline cannot be detected. Add **Gate**: YYYY-MM-DD to the "
             "entries that have one (see decisions-pending.md field rules).")
     if overdue:
-        return CheckResult("Decision gates", "critical",
-                           decision_lane.format_alarm(overdue))
+        detail = decision_lane.format_alarm(overdue)
+        # THE HEALTH DIGEST IS ITSELF A DELIVERY (D-051 lenses 2, 3 and 4 all
+        # landed here). The two instrumented surfaces gather P0/P1 only, so a
+        # gated P2 -- the entire population this control was built for -- could
+        # never be marked delivered, and the alarm would have repeated "never
+        # delivered" nightly forever about rows it was itself raising. Recording
+        # this surface's own delivery is what lets the second run say "last
+        # carried <date>" instead. The row keeps alarming while the gate is blown:
+        # that is escalation, and it is the point.
+        try:
+            decision_lane.record_delivery(
+                [r.get("raw_topic") or r.get("topic", "") for r in overdue],
+                "health_check")
+        except Exception:  # noqa: BLE001 -- evidence never breaks the check
+            log.warning("check_decision_gates: delivery record failed", exc_info=True)
+        return CheckResult("Decision gates", "critical", detail)
     return CheckResult(
         "Decision gates", "ok",
         f"{len(gated)} of {len(entries)} open decision(s) carry a gate date; "
@@ -642,7 +656,16 @@ def check_watchdog_liveness(now: datetime | None = None) -> CheckResult:
             ts = ts.replace(tzinfo=timezone.utc)
         return (now - ts).total_seconds() / 3600
 
-    ages = [a for a in (_age_h(r) for r in rows) if a is not None]
+    # NEGATIVE ages are discarded, and that is a fail-OPEN fix (D-051 lens-4 HIGH,
+    # caught before merge). `min()` over a list containing a future-dated row picks
+    # the most negative one, so ONE row stamped ahead -- an NTP correction, a VM
+    # resume, a hand-edited file -- reported "newest watchdog line -500.0h old" and
+    # returned OK while the watchdog was genuinely 29h dead. Worse, it stays
+    # poisoned: the check reads the three newest FILES, and a dead watchdog creates
+    # no new file, so the alarm would have been green permanently in exactly the
+    # scenario it exists for.
+    ages = [a for a in (_age_h(r) for r in rows) if a is not None and a >= 0]
+    future = [a for a in (_age_h(r) for r in rows) if a is not None and a < 0]
     newest = min(ages) if ages else None
 
     escalations = []
@@ -652,10 +675,18 @@ def check_watchdog_liveness(now: datetime | None = None) -> CheckResult:
             if age is not None and age <= 24:
                 escalations.append(f"{row.get('event')} ({age:.0f}h ago)")
 
+    if future:
+        # Reported, never silently dropped: a clock jump on this host is itself
+        # worth knowing about, and it is the input that used to blind the check.
+        log.warning("check_watchdog_liveness: %d future-dated watchdog row(s) "
+                    "ignored (clock jump?)", len(future))
+
     if newest is None:
         return CheckResult(
             "Cora watchdog", "critical",
-            "No watchdog activity logged at all -- the only auto-recovery for a HUNG "
+            f"No watchdog activity logged at all"
+            + (f" ({len(future)} future-dated row(s) ignored -- clock jump?)" if future else "")
+            + " -- the only auto-recovery for a HUNG "
             "bot may not be running. Check: schtasks /Query /TN cora-watchdog /V /FO LIST "
             "(a State=Running task with no process blocks every trigger; "
             "schtasks /End /TN cora-watchdog clears it).")
@@ -1076,6 +1107,27 @@ def check_founder_kb_freshness(now_epoch: float | None = None) -> CheckResult:
         f"Founder CLAUDE.md indexed ({count} chunks, newest {age_h:.0f}h ago).")
 
 
+_LOG_LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
+
+
+def _line_within(line: str, cutoff: datetime) -> bool:
+    """Is this log line newer than `cutoff`?
+
+    UNSTAMPED lines return True on purpose: a traceback's continuation lines carry
+    no timestamp, and those are the lines a critical pattern most needs to keep.
+    Both live formats parse -- "2026-08-19T15:28:25 INFO ..." (the bot) and
+    "2026-08-19 06:33:41,929 [INFO] ..." (the scripts).
+    """
+    m = _LOG_LINE_TS_RE.match(line)
+    if not m:
+        return True
+    try:
+        stamped = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return True
+    return stamped >= cutoff
+
+
 def check_logs_24h() -> list[CheckResult]:
     """Scan last 24h log files for ERRORs and critical patterns."""
     results: list[CheckResult] = []
@@ -1088,7 +1140,12 @@ def check_logs_24h() -> list[CheckResult]:
     # out, so on any instance older than a day this scan silently skipped the
     # live bot log -- i.e. every critical pattern below went unseen in exactly
     # the long-uptime case.
-    log_files = list(_LOG_DIR.glob("*.log"))
+    # BOTH globs (D-051 lens-4 MEDIUM): the first cut fixed recency and left
+    # coverage broken. The comment above correctly names the rotated form
+    # "cora-<startdate>.log.<thatday>" -- and then filtered with a pattern that
+    # cannot match it. Measured on this host: 91 rotated files, one of them
+    # (140,849 bytes) written INSIDE the 26h window and still skipped.
+    log_files = list(_LOG_DIR.glob("*.log")) + list(_LOG_DIR.glob("*.log.*"))
     recent = [f for f in log_files if f.stat().st_mtime > cutoff.timestamp()]
 
     if not recent:
@@ -1097,6 +1154,7 @@ def check_logs_24h() -> list[CheckResult]:
 
     total_errors = 0
     critical_hits: list[str] = []
+    critical_seen: set[str] = set()
     restart_count = 0
 
     for lf in sorted(recent):
@@ -1109,9 +1167,23 @@ def check_logs_24h() -> list[CheckResult]:
         total_errors += error_count
 
         for line in text.splitlines():
+            # PER-LINE recency (D-051 lens-4/lens-5 MEDIUM). A start-date-pinned
+            # log accumulates the whole life of an instance and its mtime is always
+            # fresh, so file-level filtering alone reports week-old criticals as
+            # "last 24h" for as long as that instance lives -- and this branch is
+            # what pulled those long-lived files into scope. A line with no
+            # parseable timestamp is KEPT: unstamped lines are tracebacks and
+            # continuation lines, which is exactly what a critical needs.
+            if not _line_within(line, cutoff):
+                continue
             if _CRITICAL_RE.search(line):
                 snippet = line[:120].strip()
-                if snippet not in critical_hits:
+                # Dedup on the BARE snippet -- the list stores a prefixed form, so
+                # `snippet not in critical_hits` never matched and one failing
+                # writer could emit 1,440 "distinct" hits a day. A set is also O(1)
+                # where the old list scan was quadratic (measured 4.9s at 50k).
+                if snippet not in critical_seen:
+                    critical_seen.add(snippet)
                     critical_hits.append(f"[{lf.name}] {snippet}")
             if "Cora starting up" in line:
                 restart_count += 1

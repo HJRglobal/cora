@@ -196,13 +196,30 @@ try {
     $pidBefore = Read-InstancePid $instPath
     Write-WLog @{ ts = $nowUtc.ToString("o"); event = "restart_begin"; age_min = $ageMin; pid_before = $pidBefore }
     Write-Host ("WATCHDOG: heartbeat " + $ageMin + " min stale -> restarting Cora")
-    & (Join-Path $Root "deployment\restart-cora.ps1")
-    $rc = $LASTEXITCODE
 
-    # 6. Record the attempt BEFORE verifying, so a crash during verification cannot
-    #    lose the cooldown record and free the next tick to restart again immediately.
+    # 6. RECORD THE ATTEMPT FIRST, and isolate the call.
+    #
+    # This ordering is the whole anti-thrash guarantee, and the previous version
+    # lost it on exactly the failure it exists for (D-051 lens-4 HIGH, caught
+    # before merge). restart-cora.ps1 sets ErrorActionPreference=Stop and gates on
+    # Write-Error when the import smoke fails -- and under Stop, Write-Error is a
+    # TERMINATING error that propagates straight out of the `&` call into the
+    # outer catch, skipping the Save-State below. Measured: with a hung bot AND a
+    # broken HEAD, neither the cooldown nor MaxRestartsPerHour ever saw the
+    # attempt, so the task re-fired every 5 minutes forever -- each run killing
+    # the bot and running a 2.5s import smoke -- while reporting only as a WARN.
+    # That is precisely what the file header promises cannot happen.
     $recent = @($recent) + @($nowUtc.ToString("o"))
     Save-State $nowUtc.ToString("o") $recent $nowUtc.ToString("o")
+
+    $rc = 1
+    try {
+        & (Join-Path $Root "deployment\restart-cora.ps1")
+        $rc = $LASTEXITCODE
+    } catch {
+        Write-WLog @{ ts = (Get-Date).ToUniversalTime().ToString("o"); event = "restart_script_error"; error = ([string]$_.Exception.Message); action = "ESCALATE_ALERT" }
+        Write-Host ("WATCHDOG: restart-cora.ps1 threw: " + $_.Exception.Message)
+    }
     Write-WLog @{ ts = $nowUtc.ToString("o"); event = "restart_done"; age_min = $ageMin; restart_exit = $rc; restarts_last_hour = $recent.Count }
     Write-Host ("WATCHDOG: restart complete (exit " + $rc + ")")
 

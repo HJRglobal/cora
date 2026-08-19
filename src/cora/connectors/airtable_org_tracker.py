@@ -5,21 +5,29 @@ WHY THIS IS A THIRD MODULE, when two Airtable connectors already exist. Both
 existing boundaries are documented invariants with tests behind them, and this
 read fits neither:
 
-  * `airtable_client.py` is the DASHBOARD read surface: a hard base allowlist
-    covering exactly two dashboard bases, pinned by
-    test_airtable_allowed_bases_are_the_two_dashboards. Adding the tracker there
-    would widen that boundary -- AND would not even work: `AIRTABLE_API_KEY` is
-    scoped to those two bases and deliberately cannot reach this one, so the
-    entry would be inert as well as wrong.
+  * `airtable_client.py` is the DASHBOARD read surface, with a hard base allowlist
+    pinned by test. The tracker is not a dashboard, so widening that allowlist to
+    reach it would erase a real boundary.
+
+    CORRECTION 2026-08-19 (D-051 lens-5): an earlier draft of this comment also
+    claimed `AIRTABLE_API_KEY` "is scoped to those two bases and deliberately
+    cannot reach this one". That is FALSE -- measured, the read-only PAT returns
+    HTTP 200 on this base. The claim was inherited from
+    airtable_training_log.py's header, where it is about WRITE access (a
+    read-only PAT indeed cannot write) and was over-read as being about reads.
+    The allowlist argument stands on its own; the credential argument does not,
+    and a broadly-scoped PAT is a reason to keep the allowlist narrow, not to
+    widen it.
   * `airtable_training_log.py` is the WRITE path, and its stated invariant is
     "ONE operation: create. No update, no delete, no list." Adding a list would
     break the sentence its own test reads.
 
 So: one base, one table, ONE operation (list), GET-only by construction -- there
 is no post/patch/delete in this file and no parameter that can point it at another
-base or table. It shares AIRTABLE_WRITE_API_KEY because that is the only
-credential with access to this base; the name is about scope, not intent, and
-nothing here writes.
+base or table. It prefers AIRTABLE_WRITE_API_KEY when set and falls back to the
+read-only AIRTABLE_API_KEY -- which is the correct credential for a GET-only
+module. Keying on the write PAT alone made this module dead on this host, where
+that variable is not set at all.
 
 FAIL-SOFT: an unset token, an HTTP error or a schema drift returns an empty,
 `available=False` result and NEVER raises. The consumer is a propose-only script;
@@ -58,7 +66,18 @@ class TrackerResult:
 
 
 def _key() -> str:
-    return os.environ.get("AIRTABLE_WRITE_API_KEY", "").strip()
+    """A credential that can READ this base.
+
+    Prefers the write PAT when present, but falls back to the read-only
+    AIRTABLE_API_KEY -- which is the CORRECT credential for a GET-only module,
+    and, measured 2026-08-19, reads this base fine:
+        GET /v0/appAUZSQOCTnCO8yi/tbldM2EqIcho589Ql -> HTTP 200, records returned.
+    The write PAT is not set on this host at all, so keying only on it made this
+    reader -- and with it the entire decisions-transcription intake -- DEAD on
+    arrival (D-051 lens-5 HIGH, caught before merge).
+    """
+    return (os.environ.get("AIRTABLE_WRITE_API_KEY", "").strip()
+            or os.environ.get("AIRTABLE_API_KEY", "").strip())
 
 
 def is_connected() -> bool:

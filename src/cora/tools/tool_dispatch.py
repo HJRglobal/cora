@@ -8114,9 +8114,26 @@ _DASH_PRODUCTION = "f3-production-pipeline"
 # step" note). So a URL or platform token pasted into an Airtable/OneAmerica field
 # would leak verbatim. Neutralize both here before interpolation (D-051 2026-07-11).
 _DASH_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_DASH_VENDOR_RE = re.compile(
-    r"\b(airtable|quickbooks|shopify|oneamerica|one\s?america|notion)\b", re.IGNORECASE
-)
+# BUILT from inventory_state.SOURCE_NAME_TOKENS plus this surface's own extras,
+# rather than being a second divergent list (D-051 lens-3/lens-5). The old copy
+# lacked recharge / klaviyo / hubspot / intuit / polar / deposco / seller central --
+# and this is the scrubber the new price-free production reader runs every value
+# through, so an Airtable note naming one of those passed straight to Slack.
+def _dash_vendor_pattern() -> str:
+    from ..inventory_state import SOURCE_NAME_TOKENS
+    extra = ("oneamerica", "one america")
+    parts = []
+    for token in tuple(SOURCE_NAME_TOKENS) + extra:
+        if token == "seller central":
+            parts.append(r"seller\s?cent(?:ral|er)")
+        elif token == "one america":
+            parts.append(r"one\s?america")
+        else:
+            parts.append(re.escape(token))
+    return r"\b(" + "|".join(parts) + r")\b"
+
+
+_DASH_VENDOR_RE = re.compile(_dash_vendor_pattern(), re.IGNORECASE)
 
 
 def _dash_scrub(text: str) -> str:
@@ -8499,34 +8516,80 @@ def _tool_f3e_creator_crm(slack_user_id: str, entity: str, _input: dict) -> str:
 #      free-text "notes" field is the realistic leak, and no projection stops it.
 # Over-screening is the intended failure direction: a run note reading "flow rate
 # stable" loses that value rather than risking a rate reaching a partner surface.
+# D-051 lens-1 MEDIUM (this branch, caught before merge): the first cut of this
+# pattern missed the most natural way a cost gets typed. Measured on the branch --
+# all of these passed the screen untouched: "Cost came in at 0.42 per can",
+# "Co-packer agreed 38c per unit", "Total 12,500 USD due on delivery", "Freight
+# charge 1,800". A screen that catches "price" and misses "cost" is not a rail.
+# The bare-decimal alternation is the backstop for a figure typed with no word
+# attached at all; on a price-free surface, a stray "0.42" is exactly the thing
+# worth losing.
 _PROD_MONEY_RE = re.compile(
-    r"\$|\b(?:tolling|margin|cogs|price|pricing|priced|rate|rates|deposit|"
-    r"discount|quote|quoted|invoice|invoiced)\b|/kg|/case|per\s?kg|per\s?case",
+    r"\$|\u00a3|\u20ac|"
+    r"\b(?:tolling|margin|cogs|cost|costs|costed|price|pricing|priced|rate|rates|"
+    r"deposit|discount|quote|quoted|invoice|invoiced|fee|fees|charge|charges|"
+    r"charged|usd|eur|gbp|moq|payable|payment|terms|net\s?\d+|"
+    r"per\s?(?:kg|case|unit|can|bottle|pallet|pack)|each)\b|"
+    r"/kg|/case|/unit|/can|/pallet|"
+    r"\b\d+[.,]\d{2}\b|\b\d+\s?(?:c|cents)\b",
     re.IGNORECASE,
 )
 
-#: Requested columns per table, from the 2026-08-09 design doc's own schema
-#: (Runs: run / brand-line / co-packer / date / status / volume plan / notes ·
-#: Run Items: item / type / supplier / qty / lot / status / COA / linked run ·
-#: Partners: contact card, "names/roles only, no rates"). Nothing cost-shaped
-#: appears here, by construction.
+#: Requested columns per table. PROBED AGAINST THE LIVE BASE 2026-08-19 (D-051
+#: lens-5 HIGH) rather than transcribed from the design doc, because the doc's
+#: prose and the base's actual column names differ in five places and the first
+#: cut got them wrong: every one of the three projections returned HTTP 422
+#: UNKNOWN_FIELD_NAME, which sent each call into airtable_client's fetch-ALL
+#: recovery. So rail 1 ("a cost column is never fetched") was not running at all,
+#: and lot / COA / contacts / run-date rendered EMPTY -- while the tool's own
+#: description advertises "lot or COA status" and "the partner contact list".
+#: Live columns:
+#:   Runs       Run · Code · Line · Co-packer · Run Date · Status · Volume Plan · Notes
+#:   Run Items  Item · Type · Supplier · Lot · Status · COA · Run Code · Notes
+#:   Partners   Partner · Role · Location · Contacts · Notes
+#: Nothing cost-shaped exists in the base today; the projection is what keeps it
+#: that way if one is ever added.
 _PROD_FIELDS: dict[str, list[str]] = {
-    "runs": ["Run", "Name", "Brand", "Line", "Brand/Line", "Co-packer", "Run date",
-             "Status", "Volume plan", "Notes"],
-    "run_items": ["Item", "Type", "Supplier", "Qty", "Lot #", "Status",
-                  "COA status", "Run", "Notes"],
-    "partners": ["Partner", "Name", "Role", "Type", "Contact", "Notes"],
+    "runs": ["Run", "Code", "Line", "Co-packer", "Run Date", "Status",
+             "Volume Plan", "Notes"],
+    "run_items": ["Item", "Type", "Supplier", "Lot", "Status", "COA",
+                  "Run Code", "Notes"],
+    "partners": ["Partner", "Role", "Location", "Contacts", "Notes"],
 }
 
 
 def _prod_value(raw: Any) -> str:
-    """One field value, source-scrubbed and cost-screened. "" when withheld."""
-    text = _dash_scrub(str(raw or "").strip())
+    """One field value, flattened, source-scrubbed and cost-screened. "" when withheld.
+
+    The flatten is not cosmetic: the live Partners table stores multi-line contact
+    cards ("Steve Finn - President
+Tessa Toth - Senior Account Manager
+..."), and
+    this renderer emits ONE line per row. Without collapsing, one Airtable field
+    breaks the list structure of a VERBATIM_TABLE_TOOL reply -- the same reason
+    inventory_state.scrub collapses whitespace before anything reaches Slack.
+    """
+    text = _dash_scrub(re.sub(r"\s+", " ", str(raw or "")).strip())
     if not text:
         return ""
     if _PROD_MONEY_RE.search(text):
         return "[cost content withheld -- it lives in the cost lab]"
     return text[:160]
+
+
+def _prod_counts(records: list[dict], field_name: str) -> Counter:
+    """_dash_count_single, but every LABEL is screened before it can be rendered.
+
+    A status/single-select option name is admin-editable free text on the way to a
+    partner-visible surface, so it gets the same treatment as a notes field. Counts
+    for withheld labels are merged under one bucket rather than dropped -- losing
+    the row would understate how many runs are in that state, which is a different
+    kind of wrong answer.
+    """
+    out: Counter = Counter()
+    for label, count in _dash_count_single(records, field_name).items():
+        out[_prod_value(label) or "(unlabelled)"] += count
+    return out
 
 
 def _prod_pick(row: dict, *names: str) -> str:
@@ -8544,7 +8607,13 @@ def _format_production_pipeline(runs: list[dict], items: list[dict],
     lines = ["*F3 production pipeline:*"]
 
     if runs:
-        by_status = _dash_count_single(runs, "Status")
+        # Every rendered value goes through the screen, INCLUDING these aggregate
+        # lines (D-051 lens-1 MEDIUM). They interpolated raw _dash_count_single
+        # keys, so one Airtable single-select option name -- admin-editable --
+        # printed unscreened and unscrubbed next to the same string being
+        # correctly withheld one line below: "Runs: Blocked - awaiting 12k deposit
+        # at 0.42 each 1".
+        by_status = _prod_counts(runs, "Status")
         if by_status:
             lines.append("Runs: " + ", ".join(
                 f"{k} {v}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1])))
@@ -8557,10 +8626,10 @@ def _format_production_pipeline(runs: list[dict], items: list[dict],
             # realistic leak, a dollar figure typed into free text, is exactly
             # what the screen is for.
             bits = [b for b in (
-                _prod_pick(run, "Brand/Line", "Brand", "Line"),
+                _prod_pick(run, "Line", "Brand/Line", "Brand"),
                 _prod_pick(run, "Co-packer"),
-                _prod_pick(run, "Run date"),
-                _prod_pick(run, "Volume plan"),
+                _prod_pick(run, "Run Date", "Run date"),
+                _prod_pick(run, "Volume Plan", "Volume plan"),
                 _prod_pick(run, "Notes"),
             ) if b]
             lines.append(f"  - {label}"
@@ -8570,7 +8639,7 @@ def _format_production_pipeline(runs: list[dict], items: list[dict],
         lines.append("Runs: nothing recorded")
 
     if items:
-        item_status = _dash_count_single(items, "Status")
+        item_status = _prod_counts(items, "Status")
         if item_status:
             lines.append("Run items: " + ", ".join(
                 f"{k} {v}" for k, v in sorted(item_status.items(), key=lambda kv: -kv[1])))
@@ -8578,18 +8647,29 @@ def _format_production_pipeline(runs: list[dict], items: list[dict],
                    if str(i.get("Status", "")).strip().lower() in ("blocked", "needed")]
         for item in waiting[:8]:
             supplier = _prod_pick(item, "Supplier")
-            coa = _prod_pick(item, "COA status")
+            coa = _prod_pick(item, "COA", "COA status")
+            lot = _prod_pick(item, "Lot", "Lot #")
             note = _prod_pick(item, "Notes")
             lines.append(
                 f"  - [{_prod_pick(item, 'Status')}] {_prod_pick(item, 'Item') or '?'}"
                 + (f" ({supplier})" if supplier else "")
+                + (f" -- lot {lot}" if lot else "")
                 + (f" -- COA {coa}" if coa else "")
                 + (f" -- {note}" if note else ""))
 
     if partners:
-        names = [n for n in (_prod_pick(p, "Partner", "Name") for p in partners[:10]) if n]
-        if names:
-            lines.append("Partners: " + ", ".join(names))
+        rows = []
+        for partner in partners[:10]:
+            name = _prod_pick(partner, "Partner", "Name")
+            if not name:
+                continue
+            role = _prod_pick(partner, "Role")
+            where = _prod_pick(partner, "Location")
+            contact = _prod_pick(partner, "Contacts", "Contact")
+            detail = " / ".join(b for b in (role, where, contact) if b)
+            rows.append(f"{name} ({detail})" if detail else name)
+        if rows:
+            lines.append("Partners: " + "; ".join(rows))
 
     lines.append("_Costs, rates and negotiation terms are not served here._")
     return "\n".join(lines)

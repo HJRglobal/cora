@@ -61,14 +61,40 @@ def test_no_requested_column_is_cost_shaped():
             assert not td._PROD_MONEY_RE.search(name), f"{table}.{name} is cost-shaped"
 
 
-def test_the_projection_matches_the_documented_schema():
-    """From the 2026-08-09 design doc: Runs (run / brand-line / co-packer / date /
-    status / volume plan / notes), Run Items (item / type / supplier / qty / lot /
-    status / COA / linked run), Partners (names + roles only, no rates)."""
-    assert "Co-packer" in td._PROD_FIELDS["runs"]
-    assert "COA status" in td._PROD_FIELDS["run_items"]
-    assert "Role" in td._PROD_FIELDS["partners"]
+def test_the_projection_matches_the_LIVE_schema():
+    """PROBED, not transcribed (D-051 lens-5 HIGH). The first cut came from the
+    design doc's prose and every one of the three projections returned HTTP 422
+    UNKNOWN_FIELD_NAME against the real base -- which sent each call into
+    airtable_client's fetch-ALL recovery, so rail 1 was not running, and lot / COA /
+    contacts / run-date rendered EMPTY while the tool's own description advertises
+    them. Live columns:
+      Runs       Run · Code · Line · Co-packer · Run Date · Status · Volume Plan · Notes
+      Run Items  Item · Type · Supplier · Lot · Status · COA · Run Code · Notes
+      Partners   Partner · Role · Location · Contacts · Notes
+    """
     assert set(td._PROD_FIELDS) == {"runs", "run_items", "partners"}
+    assert set(td._PROD_FIELDS["runs"]) <= {
+        "Run", "Code", "Line", "Co-packer", "Run Date", "Status", "Volume Plan", "Notes"}
+    assert set(td._PROD_FIELDS["run_items"]) <= {
+        "Item", "Type", "Supplier", "Lot", "Status", "COA", "Run Code", "Notes"}
+    assert set(td._PROD_FIELDS["partners"]) <= {
+        "Partner", "Role", "Location", "Contacts", "Notes"}
+    # The columns the description promises must actually be requested.
+    assert "COA" in td._PROD_FIELDS["run_items"]
+    assert "Lot" in td._PROD_FIELDS["run_items"]
+    assert "Contacts" in td._PROD_FIELDS["partners"]
+    assert "Run Date" in td._PROD_FIELDS["runs"]
+
+
+def test_multi_line_fields_are_flattened_to_one_row():
+    """The live Partners table stores multi-line contact cards, and this renderer
+    emits one line per row -- an unflattened field breaks the list structure of a
+    VERBATIM_TABLE_TOOL reply."""
+    partners = [{"Partner": "Blue Chip", "Role": "Co-packer",
+                 "Contacts": "Steve Finn - President\nTessa Toth - AM"}]
+    out = td._format_production_pipeline([], [], partners)
+    assert "Steve Finn - President Tessa Toth - AM" in out
+    assert len([l for l in out.splitlines() if "Steve Finn" in l]) == 1
 
 
 # ── rail 2: the value screen ─────────────────────────────────────────────────
@@ -245,3 +271,84 @@ def test_table_names_with_spaces_are_url_quoted():
     src = (_REPO_ROOT / "src" / "cora" / "connectors"
            / "airtable_client.py").read_text(encoding="utf-8")
     assert "quote(str(table)" in src
+
+
+# ── D-051 lens-1 MEDIUM: neither rail held ───────────────────────────────────
+
+@pytest.mark.parametrize("value", [
+    "Cost came in at 0.42 per can, under budget",
+    "Co-packer agreed 38c per unit",
+    "Total 12,500 USD due on delivery",
+    "Freight charge 1,800",
+    "fee waived for this run",
+    "MOQ 40k",
+    "net 30 terms",
+    "1.42 each",
+])
+def test_the_cost_wordings_the_first_pattern_missed(value):
+    """Measured on this branch before the fix: every one of these passed the
+    screen untouched. A screen that catches "price" and misses "cost" is not a
+    rail -- and Notes IS rendered, so these reached #f3e-leadership verbatim."""
+    assert "withheld" in td._prod_value(value)
+
+
+def test_the_status_summary_lines_are_screened_too():
+    """They interpolated raw _dash_count_single keys, so an Airtable single-select
+    option name -- admin-editable -- printed unscreened one line above the same
+    string being correctly withheld: "Runs: Blocked - awaiting 12k deposit at 0.42
+    each 1"."""
+    runs = [{"Run": "R1", "Status": "Blocked - awaiting 12k deposit at 0.42 each"}]
+    out = td._format_production_pipeline(runs, [], [])
+    assert "0.42" not in out and "deposit" not in out.lower()
+    assert "withheld" in out
+
+
+def test_a_vendor_token_in_a_status_name_is_scrubbed_not_printed():
+    runs = [{"Run": "R1", "Status": "waiting on Shopify sync"}]
+    out = td._format_production_pipeline(runs, [], [])
+    assert "shopify" not in out.lower()
+
+
+def test_screened_status_labels_are_counted_not_dropped():
+    """Losing the row would understate how many runs are in that state -- a
+    different kind of wrong answer."""
+    runs = [{"Run": "R1", "Status": "blocked on $ deposit"},
+            {"Run": "R2", "Status": "blocked on $ deposit"},
+            {"Run": "R3", "Status": "In production"}]
+    counts = td._prod_counts(runs, "Status")
+    assert sum(counts.values()) == 3
+    assert any("withheld" in k for k in counts)
+
+
+def test_volume_and_lot_figures_are_not_mistaken_for_money():
+    """The bare-decimal backstop must not eat the operational numbers this tool
+    exists to report."""
+    for keep in ("40,000 cans", "lot L-2201", "Run 2E", "2026-08-11",
+                 "12 pallets", "run of 40k units"):
+        assert "withheld" not in td._prod_value(keep), keep
+
+
+def test_the_router_forces_sonnet_for_production_questions():
+    """Same failure mode as its four sibling dashboard tools: without a force,
+    Haiku under-calls the reader and answers a run-readiness question from KB
+    memory instead (D-051 lens-3 F7)."""
+    from cora import model_router as mr
+    for q in ("what's blocking run 2E", "who is the co-packer for the mood run",
+              "did the COAs come back", "production pipeline status",
+              "lot numbers for run 2E"):
+        assert mr.short_label(mr.choose_model(q)) == "sonnet", q
+    # ...and it must not drag unrelated chatter onto Sonnet.
+    for q in ("hi there", "thanks!", "what is our DTC revenue"):
+        assert mr.short_label(mr.choose_model(q)) == "haiku", q
+
+
+def test_the_f3e_prompt_makes_the_tool_call_mandatory_and_price_free():
+    """Every sibling dashboard tool gets an anti-KB-answer directive; the
+    difference between "usually called" and "reliably called" (D-051 lens-5)."""
+    prompt = (_REPO_ROOT / "design" / "system-prompts" / "f3e.md").read_text(
+        encoding="utf-8")
+    assert "f3e_production_pipeline" in prompt
+    section = prompt.split("## Production pipeline (mandatory tool call)")[1][:1400]
+    assert "Do NOT answer from KB memory" in section
+    assert "PRICE-FREE" in section
+    assert "cost lab" in section

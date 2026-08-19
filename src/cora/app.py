@@ -2122,7 +2122,12 @@ def handle_cora_ask(ack, body, client) -> None:
     if sibling_redirect:
         client.chat_postEphemeral(channel=channel_id, user=user_id, text=sibling_redirect)
         return
-    cross_redirect = cross_entity_guard.check_cross_entity(text, entity)
+    # channel_name threaded here too: without it the live 8/19 13:14 defect
+    # still reproduced via /cora-ask in the inventory channel, and the
+    # surface-parity test could not catch the divergence because it patches
+    # the guard with a return_value (D-051 lens-3 F6).
+    cross_redirect = cross_entity_guard.check_cross_entity(
+        text, entity, channel_name=channel_name)
     if cross_redirect:
         client.chat_postEphemeral(channel=channel_id, user=user_id, text=cross_redirect)
         return
@@ -3021,6 +3026,14 @@ def handle_message_event(event: dict, client) -> None:
             # router itself trusts 100 lines below; using anything weaker here
             # makes this branch laxer than the one that actually owns the intent.
             _kc_live = knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)
+            # TWO predicates, not one (D-051 lens-3 F4). `_kc_live` is the RECALL
+            # window and decides whether KC may try to match at all; `_kc_today` is
+            # the same-day window and is what gap_autofill's mutual exclusion needs
+            # -- the two capture systems only genuinely compete for the same reply
+            # while both asks are live TODAY. Passing the wide predicate to
+            # gap_autofill silently suppressed a gap-ask answer for up to four
+            # days: all weekend, every weekend.
+            _kc_today = _kc_live and knowledge_check.has_cycle_asked_today(user_id)
             _gap_ask_live = gap_autofill.has_live_ask(user_id)
             _generic_intent_ok = (
                 not _dm_is_shift_message(user_id, text)
@@ -3045,7 +3058,7 @@ def handle_message_event(event: dict, client) -> None:
                 ask = gap_autofill.match_pending_ask(
                     user_id,
                     event.get("thread_ts"),
-                    allow_toplevel=_generic_intent_ok and not _kc_live,
+                    allow_toplevel=_generic_intent_ok and not _kc_today,
                 )
             except Exception as exc:  # noqa: BLE001 — capture must never break DMs
                 log.warning("gap_autofill: match_pending_ask failed: %s", exc)

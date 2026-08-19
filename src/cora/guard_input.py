@@ -58,6 +58,7 @@ six ReDoS defects; treat a quantifier next to another quantifier as a bug.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 # An "OFFICE INVENTORY UPDATE - 1337 S Gilbert Rd" style header. ONE bounded
@@ -127,7 +128,15 @@ _REASON_IS_REQUEST_RE = re.compile(
 _INVENTORY_WRITE_VERB_RE = re.compile(
     r"(?<!\w)(?:add|added|adding|remove|removed|removing|set|setting|adjust\w*|"
     r"deduct\w*|subtract\w*|restock\w*|took|take|taking|move|moved|moving|"
-    r"received|receive|receiving|count|counted|drop|dropped|bump|bumped)(?!\w)",
+    r"received|receive|receiving|count|counted|drop|dropped|bump|bumped|"
+    # Broadened after measurement (D-051 lens-5): 5 of 7 realistic prose writes
+    # still redirected because the operator's actual verb was "update", "logged",
+    # "changed" or "make it N" -- including "make it 3 instead", the very
+    # follow-up phrasing the commit cited when threading channel_name into the
+    # thread path. A vocabulary this narrow leaves the reported class half-closed.
+    r"update|updated|updating|change|changed|changing|correct|corrected|"
+    r"reduce|reduced|increase|increased|log|logged|logging|make|made|"
+    r"pull|pulled|pulling|swap|swapped|write|wrote|fix|fixed)(?!\w)",
     re.I,
 )
 
@@ -139,18 +148,66 @@ _INVENTORY_ANCHOR_RE = re.compile(
     re.I,
 )
 
-# The veto. Anything question-shaped is NOT a write request, however many
+# The veto. Anything that ASKS FOR SOMETHING is not a write request, however many
 # inventory words it carries -- this is what keeps "how are the OSN stores doing
 # this week?" redirecting (verified live as a control on the same smoke run).
+#
+# D-051 lens-1 HIGH (this branch, caught before merge): the first cut vetoed
+# interrogatives and a few soft requests only, so a BARE IMPERATIVE walked
+# straight through and the exemption became a bypass by simple concatenation --
+# measured on the branch:
+#   "Added 20 cases to the office count. Also list the OSN store cash positions."
+#     -> is_inventory_write_request True -> the cross-entity redirect never fired.
+# Same for "Print the LEX client census", "Walk through the OSN pop-up numbers".
+# A retrieval request does not have to be phrased as a question, so the veto
+# vocabulary now covers the imperative forms too.
+#
+# TWO TIERS, because the first cut vetoed on a bare copula ANYWHERE and that broke
+# the writes it was meant to allow (D-051 lens-2, measured: "Added 12 cases of Pure
+# to the office at 1337, they were sent to the OSN pop-up" was vetoed on "were" and
+# redirected). An interrogative or auxiliary only makes a QUESTION at the start of a
+# clause, so tier 1 is clause-anchored; tier 2 is the multi-word and imperative
+# retrieval forms, which are unambiguous wherever they appear.
+#: One bounded optional lead-in, because the bypass shape observed was
+#: "…office count. ALSO list the OSN store cash positions" -- a conjunction
+#: sitting between the clause boundary and the ask.
+_LEAD_IN = r"(?:(?:also|then|and|plus|now|next|additionally)\s{1,3})?"
+
 _QUESTION_SHAPE_RE = re.compile(
-    r"\?|(?<!\w)(?:what|what's|whats|how|how's|hows|who|whose|why|when|where|"
-    r"which|is|are|was|were|do|does|did|can|could|should|would|tell\s+me|"
-    r"show\s+me|give\s+me|pull\s+up|status\s+of|update\s+on|summar\w*|explain|"
-    r"compare|report\s+on|break\s+down)(?!\w)",
+    # Tier 1a -- a literal question mark, or an INTERROGATIVE/AUXILIARY opening a
+    # sentence (start of text, or after . ; ! ? or a newline). The boundary set
+    # deliberately excludes the comma: "Added 12 cases to the office at 1337, they
+    # WERE sent to the OSN pop-up" is a write, and vetoing on a mid-sentence "were"
+    # is what broke five of seven realistic writes (D-051 lens-2, measured).
+    r"\?"
+    r"|(?:^|(?<=[.;!?\n]))\s{0,4}" + _LEAD_IN +
+    r"(?:what|what's|whats|how|how's|hows|who|whose|why|when|where|which|"
+    r"is|are|was|were|do|does|did|can|could|should|would)(?!\w)"
+    # Tier 1b -- IMPERATIVE retrieval verbs. These take a WIDER boundary set,
+    # including the comma and colon, because "removed 3 cases at the office, check
+    # the OSN inventory" and "Reason: what is the OSN revenue" are both asks
+    # stapled to a write and neither opens a sentence.
+    r"|(?:^|(?<=[.;!?,:\n]))\s{0,4}" + _LEAD_IN +
+    r"(?:list|print|show|find|check|name|send|share|tell|describe|detail|"
+    r"remind|recap|review|need|want|give)(?!\w)"
+    # Tier 2 -- multi-word forms that are a retrieval ask wherever they sit. Bare
+    # "pull" is NOT here: "pop-up pull", "warehouse pull" and "we pulled N cases"
+    # are routine in this channel and vetoing it killed real writes; "pull up" is.
+    r"|(?<!\w)(?:tell\s+me|show\s+me|give\s+me|send\s+me|pull\s+up|status\s+of|"
+    r"update\s+on|summar\w*|explain|compare|report\s+on|break\s+down|"
+    r"look\s+up|walk\s+through|walk\s+me|i\s+need|i\s+want)(?!\w)",
     re.I,
 )
 
 _DIGIT_RE = re.compile(r"\d")
+
+#: A hard LENGTH bound on the exemption, and the second half of the lens-1 fix.
+#: The module's own evidence is that real prose writes are SHORT -- the two that
+#: succeeded live on 8/19 were 105 and 108 characters. The bypass shape is
+#: "a legitimate write, then an appended ask", which is necessarily longer. A
+#: vocabulary list can always be out-vocabularied; a length bound cannot, and it
+#: costs nothing a real write needs.
+_MAX_WRITE_REQUEST_LEN = 240
 
 
 def is_inventory_write_request(text: str) -> bool:
@@ -173,6 +230,15 @@ def is_inventory_write_request(text: str) -> bool:
     """
     if not text or not isinstance(text, str):
         return False
+    # The TEMPLATE form is explicitly NOT prose. Broadening the verb list to cover
+    # "update" made "OFFICE INVENTORY UPDATE ..." satisfy this predicate, which
+    # handed the template a second mechanism it does not need and re-opened the
+    # smuggled-question hole the strip exists to keep shut. One form, one
+    # mechanism: template -> scope_guard_text, prose -> here.
+    if is_inventory_adjustment_request(text):
+        return False
+    if len(text) > _MAX_WRITE_REQUEST_LEN:
+        return False
     if _QUESTION_SHAPE_RE.search(text):
         return False
     return bool(
@@ -191,30 +257,46 @@ _INV_CHANNEL_CFG_PATH = (
 )
 
 
+#: 60s TTL, the same live-reload pattern org_roles and lex-phi-custodians use.
+#: This runs on the pre-LLM path of EVERY message in EVERY channel, and an
+#: uncached read measured a 52x slowdown of check_cross_entity (0.011ms ->
+#: 0.571ms) -- negligible against an LLM turn, but there is no reason to pay it
+#: (D-051 lens-4).
+_INV_CHANNEL_CACHE: dict[str, object] = {"at": 0.0, "value": None}
+_INV_CHANNEL_TTL = 60.0
+
+
 def inventory_write_channels() -> set[str]:
     """Normalized channel names configured as office-inventory write channels.
 
-    Read fresh (live-reload: add a channel to the YAML, no restart). FAIL-SOFT to
-    an EMPTY set -- on any error the prose exemption below simply does not apply
-    anywhere, which is the guarded direction.
+    60s TTL (edit the YAML, no restart). FAIL-SOFT to an EMPTY set -- on any error
+    the prose exemption simply does not apply anywhere, which is the guarded
+    direction. A failed read is never cached.
     """
+    now = time.monotonic()
+    cached = _INV_CHANNEL_CACHE.get("value")
+    if cached is not None and (now - float(_INV_CHANNEL_CACHE["at"])) < _INV_CHANNEL_TTL:
+        return cached  # type: ignore[return-value]
     try:
         import yaml
         if not _INV_CHANNEL_CFG_PATH.exists():
             return set()
         data = yaml.safe_load(_INV_CHANNEL_CFG_PATH.read_text(encoding="utf-8")) or {}
-        return {
+        value = {
             str(k).strip().lstrip("#").lower()
             for k, v in (data.get("channels") or {}).items()
             if isinstance(v, dict) and str(k).strip()
         }
     except Exception:  # noqa: BLE001 -- a guard input helper never raises
         return set()
+    if value:  # never cache an empty/failed load
+        _INV_CHANNEL_CACHE.update({"at": now, "value": value})
+    return value
 
 
 def is_inventory_write_channel(channel_name: str | None) -> bool:
-    """True when this channel exists to file office-inventory writes."""
-    name = (channel_name or "").strip().lstrip("#").lower()
+    """True when this channel exists to file office-inventory writes. Total."""
+    name = str(channel_name or "").strip().lstrip("#").lower()
     return bool(name) and name in inventory_write_channels()
 
 

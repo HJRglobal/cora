@@ -5,8 +5,10 @@ READ-ONLY by construction: the only network method is a paginated
 
 A HARD base-ID allowlist restricts reads to the two dashboard bases; any other
 base id is refused before a request is made. The read-only Personal Access
-Token (``AIRTABLE_API_KEY``, scoped to just those two bases) is the real
-boundary -- this allowlist is defense in depth.
+Token (``AIRTABLE_API_KEY``) is BROADER than this list -- measured 2026-08-19, it
+returns HTTP 200 on bases that are not dashboards, including the Org Remodel
+Tracker. So THIS ALLOWLIST is the real boundary for this surface, not defense in
+depth behind a narrow credential. Treat an addition accordingly.
 
 Fail-soft (mirrors ``otterly_client``): a missing ``AIRTABLE_API_KEY`` or any
 HTTP / parse error yields ``AirtableResult(available=False, error=...)`` and
@@ -45,12 +47,16 @@ ALLOWED_BASES: frozenset[str] = frozenset(
         "app1hWKmTAnvp09rR",
     }
 )
-# DO NOT add the Org Remodel Tracker (appAUZSQOCTnCO8yi) here. Two reasons, both
-# load-bearing and both pinned by tests: this module's allowlist is the dashboard
-# read surface, and AIRTABLE_API_KEY is scoped to the two bases above and cannot
-# reach the tracker at all -- so the entry would be an inert widening of a
-# documented boundary. The tracker is read through connectors/airtable_org_tracker.py
-# (one base, one table, GET-only, its own credential).
+# DO NOT add the Org Remodel Tracker (appAUZSQOCTnCO8yi) here. This module's
+# allowlist is the DASHBOARD read surface; the tracker is not a dashboard, and it is
+# read through connectors/airtable_org_tracker.py (one base, one table, GET-only).
+# Pinned by test.
+#
+# CORRECTION 2026-08-19 (D-051 lens-5): an earlier version of this note also
+# claimed the PAT "is scoped to the two bases above and cannot reach the tracker at
+# all", so an entry here would be inert. MEASURED FALSE -- the read-only PAT
+# returns HTTP 200 on the tracker base. The credential does not enforce this
+# boundary; this list does.
 
 
 @dataclass

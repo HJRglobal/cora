@@ -595,6 +595,14 @@ def live_cycle_for(state: dict[str, Any], user: str,
     "In flight" means ASKED (awaiting an answer) or CAPTURED (awaiting a confirm
     tap), AND asked TODAY.
 
+    NOTE (2026-08-19): `match_live_cycle` no longer calls this -- it uses
+    `recent_cycle_for`, so the same-day protection described below is NO LONGER the
+    gate on the top-level capture path. What replaced it is the re-anchored confirm
+    card: a late answer stages against a question whose DATE is printed on the
+    card, so a mismatched pair cannot be confirmed by reflex. This function remains
+    the same-day predicate for the router's mutual-exclusion check
+    (`has_cycle_asked_today`) and for expiry accounting.
+
     THE DATE FILTER IS LOAD-BEARING, not tidiness (D-051 lens-2 HIGH). Expiry
     used to be purely runner-side, which meant a cycle was only really dead once
     the next weekday run swept it. A Friday question therefore stayed live all
@@ -620,16 +628,22 @@ def live_cycle_for(state: dict[str, Any], user: str,
 
 
 #: How many days back Cora still REMEMBERS a question it asked. Distinct from the
-#: same-day capture gate above, and deliberately small: 4 covers a Friday ask
-#: answered on Tuesday, which is the real-world case that produced the 8/14
-#: incident, without leaving a week of unanswered asks fishing for any passing
-#: declarative DM.
+#: same-day capture gate above, and deliberately small: 4 spans a Friday ask
+#: answered on Tuesday without leaving a week of unanswered asks fishing for any
+#: passing declarative DM.
+#:
+#: NOTE on what this actually reaches (D-051 lens-3 F8): the runner expires every
+#: previous-day cycle at the top of each weekday run, so for CAPTURE the effective
+#: window is same-day plus the weekend/missed-run gap, not four days. MEMORY sees
+#: the full four via recent_cycle_for(include_expired=True), which is what covers
+#: the Monday-after-a-Friday-ask case the incident actually was.
 RECALL_LOOKBACK_DAYS = 4
 
 
 def recent_cycle_for(state: dict[str, Any], user: str,
                      today: str | None = None,
-                     lookback_days: int = RECALL_LOOKBACK_DAYS) -> dict[str, Any] | None:
+                     lookback_days: int = RECALL_LOOKBACK_DAYS,
+                     include_expired: bool = False) -> dict[str, Any] | None:
     """The newest question Cora asked this person that is still unresolved.
 
     WHY THIS IS NOT live_cycle_for (cq-6fbaf37b1ee7 / the 8/14 incident):
@@ -645,22 +659,46 @@ def recent_cycle_for(state: dict[str, Any], user: str,
       * "may I treat this DM as the answer, with no further signal?"  -> live_cycle_for
       * "did I ask this person something, and what?"                  -> here
 
-    Scope is ASKED/CAPTURED only. An EXPIRED cycle stays expired -- reopening a
-    swept cycle is a state-machine change, and "that question expired on Monday"
-    is already an honest answer that remembers.
+    `include_expired` splits MEMORY from CAPTURE, and that split is what makes the
+    lookback reach the actual 8/14 case (D-051 lens-2/lens-3). The runner calls
+    `expire_stale_cycles` at the TOP of every weekday run, so Friday's unanswered
+    ask is EXPIRED by Monday 08:05 AZ -- meaning a Monday-morning answer found
+    nothing under an ASKED/CAPTURED-only scope, and Cora was back to denying its
+    own question. So:
+
+      * CAPTURE (match_live_cycle / has_live_cycle) stays ASKED/CAPTURED. An
+        expired cycle is not reopened; that would be a state-machine change.
+      * MEMORY (recall_ask_note) passes include_expired=True, so Cora can say "I
+        asked you Friday; that one expired -- tell me and I will record it fresh"
+        instead of "I never asked".
+
+    Nothing about the write gate moves either way.
     """
     today = today or az_date()
+    allowed = ((STATE_ASKED, STATE_CAPTURED, STATE_EXPIRED) if include_expired
+               else (STATE_ASKED, STATE_CAPTURED))
     best: dict[str, Any] | None = None
     for cyc in state["cycles"].values():
         if cyc.get("user") != user:
             continue
-        if cyc.get("state") not in (STATE_ASKED, STATE_CAPTURED):
+        if cyc.get("state") not in allowed:
             continue
         asked = str(cyc.get("date", ""))
         gap = _days_between(asked, today)
         if gap is None or gap < 0 or gap > lookback_days:
             continue
-        if best is None or asked > str(best.get("date", "")):
+        # >= on the DATE, tie-broken on the ask's own message_ts: two cycles can
+        # share a date now that --force can send a second same-day ask, and strict
+        # `>` on the date string kept the FIRST (older) one while the docstring
+        # promised the newest (D-051 lens-2).
+        if best is None:
+            best = cyc
+            continue
+        best_date = str(best.get("date", ""))
+        if asked > best_date:
+            best = cyc
+        elif asked == best_date and str(cyc.get("message_ts", "")) > str(
+                best.get("message_ts", "")):
             best = cyc
     return best
 
@@ -1184,17 +1222,32 @@ def register_card_ts(cycle_id: str, card_ts: str) -> None:
 
 
 def has_live_cycle(user_id: str) -> bool:
-    """Cheap predicate for the DM router's ambiguity check.
+    """Cheap predicate for the DM router: is a knowledge-check answer possible?
 
-    Uses the RECALL window, so it agrees with match_live_cycle. When it used the
-    same-day window and match_live_cycle used it too, a Monday reply to Friday's
-    ask was invisible to the router; if only one of the two had been widened the
-    router would have gated out the very match it was about to make.
+    Uses the RECALL window, so it agrees with match_live_cycle -- widening only one
+    of the two would have the router gate out the very match it was about to make.
     """
     try:
         return recent_cycle_for(fold_state(), user_id) is not None
     except Exception:  # noqa: BLE001 -- routing must never break on a state read
         log.warning("knowledge_check: has_live_cycle failed", exc_info=True)
+        return False
+
+
+def has_cycle_asked_today(user_id: str) -> bool:
+    """Is a knowledge-check cycle COMPETING for this person's top-level DM today?
+
+    Separate from has_live_cycle on purpose (D-051 lens-3 F4). The router uses the
+    wide predicate to decide whether KC may try to match at all, and passes THIS
+    narrow one to gap_autofill's `allow_toplevel`: the two capture systems are
+    mutually exclusive only while they are genuinely competing for the same reply,
+    which is a SAME-DAY condition. Using the wide window for both silently
+    suppressed a gap-ask answer for up to four days -- all weekend, every weekend.
+    """
+    try:
+        return live_cycle_for(fold_state(), user_id) is not None
+    except Exception:  # noqa: BLE001 -- routing must never break on a state read
+        log.warning("knowledge_check: has_cycle_asked_today failed", exc_info=True)
         return False
 
 
@@ -1208,7 +1261,11 @@ def recall_ask_note(user_id: str, today: str | None = None) -> str:
     never break a DM.
     """
     try:
-        cyc = recent_cycle_for(fold_state(), user_id, today=today)
+        # include_expired: MEMORY, not capture. A Monday answer to Friday's ask
+        # arrives after the runner has already swept it, and "I never asked" was
+        # the whole complaint.
+        cyc = recent_cycle_for(fold_state(), user_id, today=today,
+                               include_expired=True)
     except Exception:  # noqa: BLE001
         log.warning("knowledge_check: recall_ask_note failed", exc_info=True)
         return ""
@@ -1218,11 +1275,22 @@ def recall_ask_note(user_id: str, today: str | None = None) -> str:
     if not question:
         return ""
     when = "today" if not is_late_ask(cyc, today) else f"on {cyc.get('date')}"
-    state_note = ("they answered and it is awaiting their confirmation"
-                  if cyc.get("state") == STATE_CAPTURED else "still unanswered")
+    if cyc.get("state") == STATE_CAPTURED:
+        state_note = "they answered and it is awaiting their confirmation"
+        closing = ("If this message is their answer, say you will record it and "
+                   "ask them to confirm.")
+    elif cyc.get("state") == STATE_EXPIRED:
+        state_note = "unanswered, and that ask has since expired"
+        closing = ("If this message is their answer, thank them, say the ask had "
+                   "expired, and tell them you will get it recorded -- do NOT "
+                   "claim it is saved.")
+    else:
+        state_note = "still unanswered"
+        closing = ("If this message is their answer, say you will record it and "
+                   "ask them to confirm.")
     return (f"KNOWLEDGE CHECK: you asked this person {when}: \"{question}\" "
-            f"({state_note}). You DID ask it -- never deny it. If this message is "
-            f"their answer, say you will record it and ask them to confirm.")
+            f"({state_note}). You DID ask it -- never deny it. {closing}")
+
 
 
 # One process owns every button tap and every DM capture (the always-on bot), so

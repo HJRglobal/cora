@@ -141,6 +141,13 @@ _SONNET_INDICATOR_PATTERNS = [
     r"\b(capital program|cap table|the raise|equity seats?)\b",
     r"\b(content pipeline|content calendar|freelancer deliverables?)\b",
     r"\b(creator crm|creator roster|sponsorship pipeline)\b",
+    # f3e_production_pipeline (2026-08-19, D-051 lens-3 F7). Same family, same
+    # failure mode: with no force the model answers a run-readiness question from
+    # KB memory instead of calling the reader -- exactly what this block exists to
+    # prevent for its four siblings.
+    r"\b(production (run|pipeline|schedule)|co-?packer)\b",
+    r"\b(run 2e|run 2m|run readiness)\b",
+    r"\b(coas?|certificate of analysis|lot numbers?)\b",
     # Calendar-READ intents (F-02, 2026-07-12). On Haiku the model skipped
     # calendar_get_my_events and FABRICATED an outage ("I don't have access to your
     # calendar"); force Sonnet so the read tool is actually invoked. Anchored so

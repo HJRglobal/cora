@@ -382,6 +382,9 @@ _GUARDED_LEDGERS = (
     # process. A suite-run mutation means a test wrote the real path instead of
     # monkeypatching instance_ledger.LEDGER_FILE.
     "logs/cora-instances.jsonl",
+    "data/health/instance.json",
+    "logs/decision-deliveries.jsonl",
+    "logs/fireflies-diarization.jsonl",
 )
 
 

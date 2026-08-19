@@ -58,14 +58,16 @@ def _parties(metas: list[dict]) -> int:
     """Distinct known attendees across a meeting's chunks (metadata, not labels)."""
     seen: set[str] = set()
     for meta in metas:
-        for email in meta.get("attendee_emails") or []:
-            value = str(email or "").strip().lower()
-            if value:
-                seen.add(value)
-        for participant in meta.get("participants") or []:
-            value = str(participant or "").strip().lower()
-            if value:
-                seen.add(value)
+        participants = meta.get("participants") or []
+        if isinstance(participants, str):
+            participants = [participants]
+        for value in list(meta.get("attendee_emails") or []) + list(participants):
+            text = str(value or "").strip().lower()
+            # The notetaker bot rides in both lists; counting it makes a genuine
+            # solo recording look multi-party and false-flags it. Same predicate
+            # the canary uses, so the two cannot disagree (D-051 lens-2).
+            if text and fd._is_human_address(text):
+                seen.add(text)
     return len(seen)
 
 
@@ -100,6 +102,7 @@ def main() -> int:
 
     updates: list[tuple[str, str]] = []
     flagged: list[tuple[str, str, object]] = []
+    ledger_rows: list[tuple[str, str, str, object]] = []
     stats = {"chunks": len(rows), "meetings": len(meetings), "collapsed": 0,
              "healthy": 0, "too_short": 0, "single_party": 0, "already": 0}
 
@@ -117,7 +120,9 @@ def main() -> int:
             continue
         stats["collapsed"] += 1
         title = str(chunk_rows[0][2] or source_id)
+        entity = str(chunk_rows[0][3] or "")
         flagged.append((title, health.reason, len(chunk_rows)))
+        ledger_rows.append((source_id, title, entity, health))
         for row, meta in zip(chunk_rows, metas):
             if meta.get("attribution_unreliable") is True:
                 stats["already"] += 1
@@ -151,7 +156,20 @@ def main() -> int:
             updates[i:i + _BATCH])
         conn.commit()
     conn.close()
-    print(f"\nAPPLIED: {len(updates)} chunk rows flagged attribution-unreliable.")
+    # The weekly coverage digest reads the FLAG LEDGER, not chunk metadata, so a
+    # metadata-only sweep would tag these 126 meetings and the digest would never
+    # mention one of them -- while the commit implied the digest was the surface
+    # for this class (D-051 lens-5). Write both.
+    recorded = 0
+    for source_id, title, entity, health in ledger_rows:
+        try:
+            from cora.connectors.fireflies_connector import _record_diarization_flag
+            _record_diarization_flag(source_id, title, entity, None, health)
+            recorded += 1
+        except Exception as exc:  # noqa: BLE001 -- the tagging is the primary write
+            print(f"  ledger row failed for {source_id}: {exc}")
+    print(f"\nAPPLIED: {len(updates)} chunk rows flagged attribution-unreliable; "
+          f"{recorded} flag(s) recorded for the weekly coverage digest.")
     return 0
 
 

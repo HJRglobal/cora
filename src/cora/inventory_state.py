@@ -133,11 +133,25 @@ SOURCE_NAME_TOKENS: tuple[str, ...] = (
     "intuit",
 )
 
-_VENDOR_RE = re.compile(
-    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion|deposco"
-    r"|recharge|klaviyo|hubspot|intuit)\b",
-    re.IGNORECASE,
-)
+def _vendor_pattern(tokens: tuple[str, ...]) -> str:
+    """One alternation BUILT from SOURCE_NAME_TOKENS.
+
+    It used to be a hand-mirrored copy, and the docstring above claimed the regex
+    was "built from it" when it was merely documented as such -- so a token added
+    to one and not the other would drift exactly the way the test copy did, one
+    level up (D-051 lens-5). `seller central` is spelled to tolerate the
+    "Seller Center" variant and an optional space.
+    """
+    parts = []
+    for token in tokens:
+        if token == "seller central":
+            parts.append(r"seller\s?cent(?:ral|er)")
+        else:
+            parts.append(re.escape(token))
+    return r"\b(" + "|".join(parts) + r")\b"
+
+
+_VENDOR_RE = re.compile(_vendor_pattern(SOURCE_NAME_TOKENS), re.IGNORECASE)
 
 
 def founder_os_root() -> Path:

@@ -213,3 +213,57 @@ def test_a_prose_write_is_not_an_hr_bypass():
     assert gi.is_inventory_write_request(prose_hr) is True
     assert ceg.check_cross_entity(prose_hr, "F3E", channel_name=INV_CHANNEL) is None
     assert ua.check_access(ALEX, "F3E", prose_hr) is not None
+
+
+# ── D-051 lens-1 HIGH: the exemption was a bypass by concatenation ───────────
+
+@pytest.mark.parametrize("message", [
+    "Added 20 cases to the office count. Also list the OSN store cash positions.",
+    "Counted 12 cases at the office. Print the LEX client census for me.",
+    "Took 2 cases from office inventory. Walk through the OSN pop-up numbers.",
+    "Adjusted 4 cases at the office. Send me the OSN store numbers.",
+    "Set office count to 40. I need the OSN pop-up totals.",
+    "removed 3 cases at the office, check the OSN inventory while you are there",
+])
+def test_a_write_with_an_appended_retrieval_ask_does_not_get_the_exemption(message):
+    """Measured on this branch before the fix: every one of these returned
+    is_inventory_write_request=True and the cross-entity redirect never fired.
+    The veto only covered interrogatives and a few soft requests, so a bare
+    IMPERATIVE walked through -- and the shape is trivially reachable by anyone in
+    the channel: write a real adjustment, then append the ask."""
+    assert gi.is_inventory_write_request(message) is False
+    assert ceg.check_cross_entity(message, "F3E", channel_name=INV_CHANNEL) is not None
+
+
+def test_a_long_message_is_never_exempt_whatever_it_says():
+    """The second half of the fix, and the half a vocabulary list cannot
+    out-vocabulary: real prose writes are SHORT (the two that succeeded live on
+    8/19 were 105 and 108 chars), and the bypass shape is necessarily longer."""
+    padded = ("add 2 Pure Citrus at the office, replacing the cases sent to the "
+              "OSN pop-up. " + "context context " * 20)
+    assert len(padded) > gi._MAX_WRITE_REQUEST_LEN
+    assert gi.is_inventory_write_request(padded) is False
+    assert ceg.check_cross_entity(padded, "F3E", channel_name=INV_CHANNEL) is not None
+
+
+def test_the_exemption_is_bound_to_the_f3e_family():
+    """The predicate is entity-agnostic, so without this a LEX or OSN inventory
+    channel added to the YAML would hand THAT channel's entity wall the same
+    exemption with no code change. The write tool only reaches F3E locations."""
+    write = "add 2 cases at the office for the F3E pop-up"
+    assert gi.is_inventory_write_request(write) is True
+    assert ceg.check_cross_entity(write, "OSN", channel_name=INV_CHANNEL) is not None
+
+
+def test_bare_LEX_redirects_out_of_an_f3e_channel():
+    """Pre-existing hole found while remediating the above: on main, "the LEX
+    client census" did NOT redirect out of an F3E channel while "lexington client
+    census" did -- bare "lex" was missing from the keyword set."""
+    assert ceg.check_cross_entity("the LEX client census", "F3E") is not None
+    assert ceg.check_cross_entity("LEX Phase 2 go/no-go", "F3E") is not None
+    # ...and it must not fire on ordinary words that merely contain the letters.
+    for benign in ("ask Alex about the pallets", "flex the schedule",
+                   "a complex order", "Alexis called back"):
+        assert ceg.check_cross_entity(benign, "F3E") is None, benign
+    # A LEX channel is never blocked against its own entity.
+    assert ceg.check_cross_entity("LEX Phase 2 go/no-go", "LEX-LLC") is None

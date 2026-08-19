@@ -58,7 +58,16 @@ _PLACEHOLDER_SPEAKERS = {"", "speaker", "unknown", "unknown speaker", "n/a", "no
 #: sentence body is taken by slicing to the next match rather than by a second
 #: quantifier, so there is no backtracking surface at all (the _DRIVE_PATH_RE
 #: ReDoS class).
-_RENDERED_TOKEN_RE = re.compile(r"\[([^\[\]\n]{1,80})\]")
+#:
+#: PRECEDED BY A SENTENCE BOUNDARY (D-051 lens-2, measured). Any `[...]` counted as
+#: a speaker, so three mid-sentence asides -- `[inaudible]`, `[crosstalk]`,
+#: `[laughter]` -- turned a genuine 100%-collapsed meeting into
+#: "4 speakers, top share 93% -- healthy". A canary that a transcription artifact
+#: can switch off is worse than none. Verified against the live corpus: of 542,474
+#: real speaker labels the preceding non-space character is `.` (482,559), `?`
+#: (41,317), start-of-text (17,106), newline (1,482) or `:` (10) -- 100% still
+#: match, while an aside after "…point 7 " no longer does.
+_RENDERED_TOKEN_RE = re.compile(r"(?:^|(?<=[.?!:\n]))\s{0,4}\[([^\[\]\n]{1,80})\]")
 
 #: Structural labels the formatter itself writes, which are not speakers. Live
 #: count: "Fireflies Meeting" appears exactly 735 times across 735 stored
@@ -159,22 +168,44 @@ def _judge(counts: Counter, expected_parties: int) -> DiarizationHealth:
     return health
 
 
+#: Addresses that are software, not people. The notetaker bot rides in BOTH the
+#: attendee and participant lists on live transcripts, so counting it made a
+#: genuine one-human recording look like a 2-party meeting -- and the multi-party
+#: precondition is the whole reason a solo memo is "deliberately NOT flagged"
+#: (D-051 lens-2). Measured current exposure: zero flagged meetings depend on it,
+#: which is why this is a correctness fix rather than a bug report.
+_NON_HUMAN_ADDRESSES = ("@fireflies.ai", "notetaker@", "noreply@", "no-reply@")
+
+
+def _is_human_address(value: str) -> bool:
+    low = value.lower()
+    return bool(low) and not any(marker in low for marker in _NON_HUMAN_ADDRESSES)
+
+
 def expected_parties(transcript: dict[str, Any]) -> int:
-    """How many people the meeting RECORD says were there.
+    """How many PEOPLE the meeting RECORD says were there.
 
     Read from the attendee/participant lists -- never from the speaker labels,
     which are the thing under test. Emails are lower-cased and de-duplicated
-    because Fireflies returns the same person under both keys.
+    because Fireflies returns the same person under both keys, and the notetaker
+    bot is excluded because it is not a party to the conversation.
     """
     seen: set[str] = set()
     for attendee in transcript.get("meeting_attendees") or []:
         if isinstance(attendee, dict):
             email = str(attendee.get("email") or "").strip().lower()
-            if email:
+            if email and _is_human_address(email):
                 seen.add(email)
-    for participant in transcript.get("participants") or []:
+    participants = transcript.get("participants") or []
+    # A STRING here would iterate per character and report ~10 parties from one
+    # address. Live data is always a list, and fireflies_connector's own
+    # participant handling already guards this way -- so this is parity, not
+    # speculation (D-051 lens-4).
+    if isinstance(participants, str):
+        participants = [participants]
+    for participant in participants:
         value = str(participant or "").strip().lower()
-        if value:
+        if value and _is_human_address(value):
             seen.add(value)
     return len(seen)
 

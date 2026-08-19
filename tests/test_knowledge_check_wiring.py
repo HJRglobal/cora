@@ -110,8 +110,15 @@ def test_capture_is_gated_on_the_feature_flag():
 
 
 def test_the_two_capture_systems_are_mutually_exclusive_toplevel():
+    """Mutual exclusion is now keyed on the SAME-DAY predicate, not the recall one
+    (D-051 lens-3 F4, 2026-08-19). The two systems only genuinely compete for one
+    person's single top-level reply while both asks are live TODAY; keying
+    gap_autofill's allow_toplevel on the widened 4-day recall window silently
+    suppressed a gap-ask answer all weekend, every weekend. KC still uses the wide
+    window to decide whether it may try to match at all."""
     assert "allow_toplevel=_generic_intent_ok and not _gap_ask_live" in _APP_SRC
-    assert "allow_toplevel=_generic_intent_ok and not _kc_live" in _APP_SRC
+    assert "allow_toplevel=_generic_intent_ok and not _kc_today" in _APP_SRC
+    assert "_kc_today = _kc_live and knowledge_check.has_cycle_asked_today" in _APP_SRC
 
 
 def test_capture_shares_the_gap_asks_whole_guard_set():

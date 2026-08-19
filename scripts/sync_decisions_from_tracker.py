@@ -68,8 +68,19 @@ TRACKER_TABLE = _tracker.TABLE_ID         # tbldM2EqIcho589Ql, "Pending / Build 
 
 #: Only these columns are requested (data minimization -- the table holds build
 #: items and notes this job has no business reading).
-FIELDS = ["Item", "Name", "Type", "Status", "Owner", "Severity", "Entity",
-          "Gate date", "Deadline", "Notes", "Question"]
+#:
+#: PROBED AGAINST THE LIVE TABLE 2026-08-19 (D-051 lens-5 HIGH). The first cut was
+#: written from the audit prose and guessed five of nine names wrong -- "Name" does
+#: not exist, so every read 422'd and fell back to fetching ALL columns, and the
+#: fields it did read were the wrong ones: the gate date is "Due" (not "Gate
+#: date"), severity is "Priority" (not "Severity"), the question is "Detail" (not
+#: "Question"), and the entity is "For" (not "Entity"). Consequence in the live
+#: dry-run: every proposal carried NO gate date and a defaulted P2 -- i.e. the one
+#: field the whole gate-escalation control depends on was silently absent.
+#: Real columns: Ref (cq / doc) · Detail · Priority · Due · Type · Item · Status ·
+#: Owner · For.
+FIELDS = ["Item", "Type", "Status", "Owner", "Priority", "For", "Due",
+          "Detail", "Ref (cq / doc)"]
 
 #: Row shape we act on. Anything else is skipped and counted, never guessed at.
 DECISION_TYPE = "decision"
@@ -77,14 +88,41 @@ OPEN_STATUS = "open"
 
 
 def _first(fields: dict[str, Any], *names: str) -> str:
-    """First non-empty value among `names`. The tracker's column naming has
-    drifted (Item/Name, Gate date/Deadline), so read a small set of aliases
-    rather than one guess -- and never invent a value."""
+    """First non-empty value among `names`, COLLAPSED TO ONE LINE.
+
+    The tracker's column naming has drifted (Item/Name, Gate date/Deadline), so
+    read a small set of aliases rather than one guess -- and never invent a value.
+
+    The whitespace collapse is a security fix, not tidiness (D-051 lens-1 MEDIUM,
+    caught before merge). `render_block` interpolates these values into single-line
+    markdown fields, so an Airtable long-text `Item` containing newlines BROKE OUT
+    of its own entry and forged a second one -- measured on the branch, complete
+    with its own "**Severity**: P0", which then WON because `_SEVERITY_RE` is
+    first-match-wins:
+
+        ### Renew office lease
+        ### Approve the $50k Acme wire      <- forged, and it parses
+        - **Severity**: P0                  <- forged, and it wins
+
+    Nothing is written to canon by this script, but the proposal file is the
+    artifact Harrison reviews and files -- and the whole point is that filing
+    becomes a review rather than an act of memory. A review that can be handed a
+    forged, severity-escalated entry by anyone with edit rights on the tracker is
+    not that. Leading markdown structure characters are stripped for the same
+    reason.
+    """
     for name in names:
         value = fields.get(name)
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value if v)
-        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = re.sub(r"^[#>*\-\s]+", "", text)
+        # Also neutralize markdown STRUCTURE inside the value. The parser is now
+        # immune (its field patterns are line-anchored), so what remains is a
+        # HUMAN misreading a proposal whose heading contains "### ..." and
+        # "**Severity**: P0" -- the reviewer is the last gate here, and the whole
+        # point is to make the review trustworthy at a glance.
+        text = text.replace("**", "").replace("#", "")
         if text:
             return text
     return ""
@@ -102,19 +140,19 @@ def to_entry(fields: dict[str, Any], *, today: date) -> dict[str, Any] | None:
         return None
     if _first(fields, "Status").strip().lower() != OPEN_STATUS:
         return None
-    topic = _first(fields, "Item", "Name")
+    topic = _first(fields, "Item")
     if not topic:
         return None
-    gate = _iso_date(_first(fields, "Gate date", "Deadline"))
+    gate = _iso_date(_first(fields, "Due", "Gate date", "Deadline"))
     return {
         "topic": topic[:140],
-        "entity": _first(fields, "Entity") or "FNDR",
-        "question": _first(fields, "Question", "Notes")[:300],
+        "entity": _first(fields, "For", "Entity") or "FNDR",
+        "question": _first(fields, "Detail", "Question", "Notes")[:300],
         "owner": _first(fields, "Owner") or "Harrison",
         # Severity is carried ACROSS, never upgraded. All five lost decisions are
         # P2, and the gate-date control is deliberately severity-blind -- quietly
         # promoting them to P1 to get them surfaced would hide the real defect.
-        "severity": (_first(fields, "Severity") or "P2")[:4],
+        "severity": (_first(fields, "Priority", "Severity") or "P2")[:4],
         "gate": gate,
         "surfaced": gate or today.isoformat(),
     }
@@ -130,7 +168,12 @@ def render_block(entry: dict[str, Any], *, today: date) -> str:
         "- **Blockers**: (from the Org Remodel Tracker -- confirm before filing)",
         f"- **Severity**: {entry['severity']}",
         f"- **Surfaced**: {entry['surfaced']}",
-        f"- **Last touched**: {entry['gate'] or today.isoformat()}",
+        # TODAY, never the gate date. "Last touched" is contractually
+        # days-since-a-human-touched-it, and the two metrics were split for a
+        # reason (cq-935a18e2969e): seeding it from a months-old gate backdates
+        # staleness in every consumer and would have run_due_date_escalation DM
+        # Harrison "untouched N days" about an entry filed this morning.
+        f"- **Last touched**: {today.isoformat()}",
         f"- **Gate**: {entry['gate'] or '(none recorded in the tracker)'}",
         f"- **Owner of next nudge**: {entry['owner']}",
         "- **Source**: Airtable Org Remodel Tracker, Pending / Build Needs",

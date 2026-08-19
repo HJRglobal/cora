@@ -142,11 +142,21 @@ def touch(uptime_s: int, write_failures: int = 0, log_file: str | None = None) -
     `write_failures` is the count of CONSECUTIVE heartbeat.txt write failures --
     the number that turns "the file is stale" into "we know why". Never raises.
     """
+    # COERCED, not trusted: this module's contract is "nothing raises", and a bare
+    # int() on a caller-supplied value broke it for touch(None) / touch("abc")
+    # (D-051 lens-4). The live callers pass ints; a fail-soft observability module
+    # that asserts this in its own docstring should hold it anyway.
+    def _as_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     payload: dict[str, Any] = {
         "pid": os.getpid(),
         "last_heartbeat": _now_iso(),
-        "uptime_s": int(uptime_s),
-        "heartbeat_write_failures": int(write_failures),
+        "uptime_s": _as_int(uptime_s),
+        "heartbeat_write_failures": _as_int(write_failures),
     }
     prior = read_current()
     if prior:
@@ -171,6 +181,10 @@ def read_current() -> dict[str, Any] | None:
 
 def read_starts(limit: int = 20) -> list[dict[str, Any]]:
     """The most recent `limit` start rows, oldest-first. Empty on any failure."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
     if limit <= 0:
         return []
     try:

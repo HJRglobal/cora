@@ -68,7 +68,7 @@ load_dotenv()
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from cora import org_roles  # noqa: E402
+from cora import decision_lane, org_roles  # noqa: E402
 from cora import phi_guard  # noqa: E402
 from cora.org_roles import RoleRecord  # noqa: E402
 

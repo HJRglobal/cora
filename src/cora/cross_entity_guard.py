@@ -57,7 +57,14 @@ _ENTITY_DEFS: dict[str, _EntityDef] = {
     ),
     "LEX": _EntityDef(
         "Lexington Services", "#lex-leadership or #llc-leadership",
-        _compile("lexington", "lex services", "lex-llc", "lex llc", "lbhs",
+        # "lex" ALONE was missing until 2026-08-19, and that is a pre-existing
+        # hole in this wall rather than anything this branch introduced: on main,
+        # "the LEX client census" and "LEX Phase 2 go/no-go" did not redirect out
+        # of an F3E channel while "lexington client census" did. Found while
+        # remediating the D-051 lens-1 finding on the inventory exemption. Safe
+        # under \b...\b: it cannot match inside "lexington" (already covered),
+        # "Alex", "flex" or "complex".
+        _compile("lexington", "lex", "lex services", "lex-llc", "lex llc", "lbhs",
                  "lla", "lex-lts", "lts", "ddd", "hcbs", "tucson dta",
                  "revalidation"),
     ),
@@ -189,8 +196,18 @@ def check_cross_entity(message_text: str, channel_entity: str,
     # construction (the tool only reaches F3E locations). Question-shaped text is
     # vetoed inside the predicate, so "how are the OSN stores doing this week?"
     # in this same channel still redirects.
-    if (guard_input.is_inventory_write_channel(channel_name)
-            and guard_input.is_inventory_write_request(message_text)):
+    # F3E ONLY, and that is a third condition rather than a comment (D-051 lens-1):
+    # the predicate is entity-agnostic, so adding a LEX or OSN inventory channel to
+    # inventory-channel-config.yaml would otherwise hand that channel's own entity
+    # wall the same exemption with no code change -- and the LEX wall is not a
+    # thing to widen by editing a YAML. The office-inventory write tool only
+    # reaches F3E Shopify locations, so F3E is the only family whose writes can
+    # justify it.
+    # Order matters for cost, not correctness: the two pure predicates are ~0.01ms
+    # and run on every message in every channel, so they gate the YAML read.
+    if (family == "F3E"
+            and guard_input.is_inventory_write_request(message_text)
+            and guard_input.is_inventory_write_channel(channel_name)):
         return None
 
     paired = PAIRED_ENTITIES.get(family, set())

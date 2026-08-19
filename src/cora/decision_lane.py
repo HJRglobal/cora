@@ -61,24 +61,49 @@ _TEMPLATE_TOPIC = "[Topic]"
 # Field patterns. All tolerate the file's real formatting (bolded label, em
 # dashes, trailing annotations) and all are anchored + bounded -- this text comes
 # from a hand-maintained file, and the repo has had six ReDoS defects.
-_SEVERITY_RE = re.compile(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)")
-_ENTITY_RE = re.compile(r"\*\*Entity\*\*:\s*([^\n]{0,120})")
-_OWNER_RE = re.compile(r"\*\*Owner of next nudge\*\*:\s*([^\n]{0,120})")
-_SURFACED_RE = re.compile(r"\*\*Surfaced\*\*:\s*[^\n]{0,40}?(\d{4}-\d{2}-\d{2})")
-_TOUCHED_RE = re.compile(r"\*\*Last touched\*\*:\s*[^\n]{0,40}?(\d{4}-\d{2}-\d{2})")
+#
+# LINE-ANCHORED as of 2026-08-19 (D-051 lens-1 MEDIUM, caught before merge).
+# Unanchored, a field label appearing ANYWHERE in the block counted -- including
+# inside the HEADING, which is the one part of an entry that can arrive verbatim
+# from an external system (the Airtable tracker's free-text Item field). A heading
+# reading "Renew lease - **Severity**: P0" therefore set the entry's severity to
+# P0, because these searches are first-match-wins. Every real field line in the
+# live file is prefixed "- " (64 of 64 measured), so anchoring costs nothing and
+# closes the escalation; `[-*]?` tolerates a bullet-style drift.
+_FIELD = r"^\s{0,4}[-*]?\s{0,3}"
+_SEVERITY_RE = re.compile(_FIELD + r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", re.M)
+_ENTITY_RE = re.compile(_FIELD + r"\*\*Entity\*\*:\s*([^\n]{0,120})", re.M)
+_OWNER_RE = re.compile(_FIELD + r"\*\*Owner of next nudge\*\*:\s*([^\n]{0,120})", re.M)
+_SURFACED_RE = re.compile(
+    _FIELD + r"\*\*Surfaced\*\*:\s*[^\n]{0,120}?(\d{4}-\d{2}-\d{2})", re.M)
+_TOUCHED_RE = re.compile(
+    _FIELD + r"\*\*Last touched\*\*:\s*[^\n]{0,120}?(\d{4}-\d{2}-\d{2})", re.M)
 
 #: The GATE date -- the day a decision was supposed to be made. NOT in the file's
 #: template today, which is exactly why nothing could enforce it; the parser
 #: accepts three spellings so the schema addition can land without a migration,
 #: and an ABSENT gate is not an alarm (it is simply a decision with no deadline).
 _GATE_RE = re.compile(
-    r"\*\*(?:Gate|Gate date|Decide by|Decision due)\*\*:\s*[^\n]{0,40}?(\d{4}-\d{2}-\d{2})",
-    re.I,
+    _FIELD + r"\*\*(?:Gate|Gate date|Decide by|Decision due)\*\*:"
+    r"\s*[^\n]{0,120}?(\d{4}-\d{2}-\d{2})",
+    re.I | re.M,
 )
 
 #: A closed entry. The live file marks these inline in the heading ("-- CLOSED
 #: 2026-07-20"), so a parser that ignored it would alarm on settled decisions.
-_CLOSED_RE = re.compile(r"\b(?:closed|resolved|decided|withdrawn)\b", re.I)
+#:
+#: KEYED ON THE ANNOTATION, not the word (D-051 lens-2, measured). The first cut
+#: matched "closed|resolved|decided|withdrawn" ANYWHERE in the heading, and those
+#: are ordinary governance phrasing: "How the OSN data source gets decided (owner
+#: + cadence)" -- an OPEN P2 with a blown gate -- disappeared from the only
+#: control that would have caught it, while strategy_memo still counted it. The
+#: file's real marker is an UPPERCASE annotation after a separator, so that is
+#: what to match.
+#: `[^\w\n]{0,6}` not `\s*`: the live closed entry reads "-- ✅ CLOSED 2026-07-20",
+#: so an emoji sits between the separator and the marker. One bounded quantifier
+#: over a non-word class -- no adjacency, no backtracking surface.
+_CLOSED_RE = re.compile(
+    r"(?:^|--|—|–|\(|\[|:)[^\w\n]{0,6}(?:CLOSED|RESOLVED|WITHDRAWN|DECIDED)\b")
 
 
 def decisions_pending_path() -> Path:
@@ -100,10 +125,17 @@ def parse_entries(content: str, *, today: date | None = None,
                   skip_closed: bool = True) -> list[dict[str, Any]]:
     """Every real entry in decisions-pending.md, at EVERY severity.
 
-    THE SHARED PARSER. `strategy_memo.gather_stalled_decisions` applies its
-    P0/P1 filter on top of this rather than parsing again -- one grammar, so a
-    field added here cannot be visible to one surface and invisible to another.
-    That drift is the shape of the original bug: two registries of the same thing.
+    THE PARSER FOR THE DECISION LANE. `strategy_memo.gather_stalled_decisions`
+    applies its P0/P1 filter on top of this rather than parsing again, so a field
+    added here is visible to the memo, the daily synthesis and the gate control at
+    once.
+
+    NOT the parser for every consumer, and claiming otherwise would repeat the
+    original bug's shape (D-051 lens-3 F1). Two more grammars over this same file
+    remain: `tool_dispatch._tool_fndr_open_decisions` (the plate tool AND the daily
+    briefing) and `scripts/run_due_date_escalation.py`. Neither reads **Gate**, so
+    a gate date enforced by the nightly digest is invisible to Harrison's morning
+    briefing. Consolidating them is filed, not done.
 
     Skips the "## Recently resolved" tail and the template skeleton always.
     `skip_closed` additionally drops an entry whose HEADING marks it closed (the
@@ -113,6 +145,11 @@ def parse_entries(content: str, *, today: date | None = None,
     persisted weekly snapshots were built from. Never raises.
     """
     today = today or datetime.now(timezone.utc).date()
+    if not isinstance(content, str):
+        # "Never raises" has to survive bytes / an int / a Path being handed in
+        # (D-051 lens-4). The consumer is a CRITICAL health check whose own
+        # try/except would otherwise downgrade a real gate breach to a warn.
+        content = str(content or "")
     resolved = re.search(r"^## Recently resolved\b", content or "", re.MULTILINE)
     parseable = (content or "")[:resolved.start()] if resolved else (content or "")
 
@@ -135,6 +172,17 @@ def parse_entries(content: str, *, today: date | None = None,
 
         entries.append({
             "topic": heading[:140],
+            # IMMUTABLE identity + the UNTRUNCATED text. A surface that reformats
+            # a topic before recording delivery (channel_synthesis scrubs LEX
+            # topics) recorded a key the lookup could never match, and two
+            # headings sharing their first 140 chars collapsed to one key -- so a
+            # delivery for A suppressed the alarm for B (D-051 lens-2, measured).
+            # And the PHI / Visibility screens must see the FULL text: screening
+            # heading[:140] + entity[:60] is strictly weaker than what
+            # strategy_memo did before this refactor (lens-3 F9).
+            "topic_key": _topic_key(heading),
+            "raw_topic": heading,
+            "raw_entity": (entity_m.group(1).strip() if entity_m else "FNDR"),
             "entity": (entity_m.group(1).strip() if entity_m else "FNDR")[:60],
             # None, not a default: an entry with no parseable severity is a
             # FORMATTING defect, and inventing "P3" would hide it.
@@ -211,9 +259,9 @@ def delivery_index(*, ledger: Path | None = None,
     """
     now = now or datetime.now(timezone.utc)
     try:
-        lines = (ledger or DELIVERY_LEDGER).read_text(
-            encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+        path = Path(ledger) if ledger is not None else DELIVERY_LEDGER
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:  # noqa: BLE001 -- "never raises" includes a bad path type
         return {}
     index: dict[str, dict[str, Any]] = {}
     for line in lines:
@@ -269,15 +317,59 @@ def undelivered_overdue(entries: list[dict[str, Any]] | None = None, *,
         overdue = entry.get("gate_overdue_days")
         if overdue is None or overdue < grace_days:
             continue
-        record = index.get(_topic_key(entry.get("topic", "")))
+        record = index.get(entry.get("topic_key")
+                           or _topic_key(entry.get("topic", "")))
         last = record["last"] if record else None
+        # A LOWER BOUND as well as an upper one, so a future-dated row cannot
+        # suppress the alarm forever (D-051 lens-2: a negative timedelta satisfied
+        # `<= window`). The bound is -1 day rather than 0, in seconds: a row
+        # stamped slightly ahead is ordinary clock skew between a scheduled task
+        # and this check, and discarding THAT would re-open the "never delivered"
+        # lie from the other side. A genuinely poisoned row (weeks ahead) is still
+        # rejected.
+        delta_s = (now - last).total_seconds() if last else None
         delivered_recently = bool(
-            last and (now - last).days <= window_days)
+            delta_s is not None
+            and -86_400 <= delta_s <= window_days * 86_400)
         if delivered_recently:
             continue
         item = dict(entry)
         item["last_delivered"] = last.isoformat() if last else None
         item["never_delivered"] = last is None
+        # THE SAME SCREEN THE OTHER DECISION SURFACE APPLIES (D-051 lens-1
+        # MEDIUM, caught before merge). Every pre-existing surface for this file
+        # is Harrison-only; the health digest is the first one that posts to a
+        # CHANNEL (#cora-health), and it was printing topic headings verbatim --
+        # a file whose live contents include "LEX-LBHS in Meeting Action Capture
+        # -- enable under 42 CFR Part 2?" and cap-table items. strategy_memo
+        # filters those out with is_phi_risk / is_visibility_cpa_mention; this
+        # path had neither.
+        #
+        # REDACT, DO NOT DROP. Dropping the row would make a blown gate on a
+        # PHI-adjacent decision silent, which is the exact failure this whole
+        # control exists to end. The alarm still fires, still counts, still names
+        # the severity and the age -- it just does not print the topic.
+        blob = (f"{entry.get('raw_topic') or entry.get('topic', '')} "
+                f"{entry.get('raw_entity') or entry.get('entity', '')}")
+        try:
+            from .phi_guard import is_phi_risk, is_visibility_cpa_mention
+            entity = str(entry.get("entity", "")).upper()
+            # LEX is AGGREGATE-ONLY outside LEX surfaces (the D-048 posture that
+            # already governs the strategy memo: "LEX tasks are counted, never
+            # itemized"). The keyword screens do NOT cover this: the live
+            # "LEX-LBHS in Meeting Action Capture -- enable under 42 CFR Part 2?"
+            # trips neither predicate -- verified -- because it is a policy
+            # question, not clinical text. It still has no business printing into
+            # a shared channel.
+            if entity.startswith("LEX"):
+                item["topic"] = "[LEX decision -- counted, not itemized here]"
+                item["topic_withheld"] = True
+            elif is_phi_risk(blob) or is_visibility_cpa_mention(blob):
+                item["topic"] = "[topic withheld -- PHI/restricted scope]"
+                item["topic_withheld"] = True
+        except Exception:  # noqa: BLE001 -- a screen error withholds, never leaks
+            item["topic"] = "[topic withheld -- screen unavailable]"
+            item["topic_withheld"] = True
         out.append(item)
     out.sort(key=lambda e: -(e.get("gate_overdue_days") or 0))
     return out
