@@ -37,6 +37,18 @@
 #     2026-08-06 Shaun+Jen; 2026-08-07 R3 widened to Jeff+Aaron). Harrison
 #     changes who is asked by editing this file -- 60s TTL, no restart.
 #
+# OPT-OUT KEYS (absent/false is the default for everyone):
+#   autowrite_excluded: true -- this person's contributed claims never clear
+#     TIER_0 / DECISION_AUTO in the graduated-trust auto-write path; they always
+#     route to Harrison. Everything else about the person is unaffected --
+#     delegated work, role injection, briefings all keep working. Use this when
+#     someone should be ACTIVE but not yet TRUSTED TO WRITE CANON: those are two
+#     separate decisions, and activating a registry user silently conferred the
+#     second until this key existed. Not `external: true` (that also changes
+#     routing and proactive comms, and misdescribes an internal teammate), and
+#     not a separate map (a missing grant file fails closed, but a missing
+#     EXCLUSION file would fail OPEN and re-confer the authority silently).
+#
 # Field reference:
 #   slack_id          primary key when present; registry-only entries (no
 #                     Slack access, e.g. part-time staff) may omit it -- they
@@ -225,6 +237,14 @@ users:
       Asana mapped 2026-08-18 (active member, alias aaron@hjrglobal.com).
       LLC-specific topics belong in #llc-leadership, not #lex-leadership.
 
+  # Asana GID 1215786741942728 mapped in slack-to-asana.yaml 2026-08-19
+  # (Harrison-supplied, Aaron-precedent manual carry, cq-795b9caa0b3a). No
+  # `asana_email` was asserted -- that field authorizes mailbox impersonation and
+  # an Asana roster lookup is not evidence of mailbox ownership.
+  #
+  # Provenance lives in this COMMENT, never in `notes` (D-193): `notes` is
+  # injected into the LLM context on every reply AND a reply built on it is
+  # storable in the entity-keyed semantic cache.
   - slack_id: U0B9JS3JW07
     name: Sara Fonseca
     role: Marketing Freelancer (LLC) -- videography + social media
@@ -237,8 +257,8 @@ users:
       Freelance contractor (not FTE), added 2026-06-11 per Harrison. Reports
       to Shaun AND Jen Mortensen. Needs access to LLC marketing assets
       (Drive ACLs handled outside Cora). NOT a PHI custodian -- never
-      surface client-level information to her. No Asana/Google mapping yet.
-      LLC marketing topics live in #llc-marketing.
+      surface client-level information to her. LLC marketing topics live in
+      #llc-marketing.
 
   - slack_id: U0B3NGR1Y85
     name: Larry Stone
@@ -351,11 +371,21 @@ users:
   # asker in HJRG/F3E/OSN/HJRP. Both facts live here instead --
   #   * team announcement POSTPONED pending her daily rhythm (Harrison, 8/18)
   #   * capacity re-eval week of 2026-08-24
+  # AUTO-WRITE EXCLUDED until the 2026-08-24 re-eval (Harrison ruling 2026-08-18).
+  # Activating her carried an unintended second grant: `contributor_recognized`
+  # keys on PRESENCE in this registry, so the moment she went active her
+  # contributed claims satisfied the third TIER_0 condition and could auto-write
+  # to canonical known-answers without Harrison's gate (CORA_AUTOWRITE_LIVE=all
+  # is live). "Make her active" and "trust her contributions to write canon" are
+  # separate decisions; this key separates them. Delegated-work eligibility is
+  # deliberately KEPT -- that grant was reviewed and wanted.
+  # REVISIT: week of 2026-08-24, alongside her capacity re-eval.
   - slack_id: U0B3KH5UZJ7
     name: Tessa Miller
     role: Operations Coordinator (part-time)
     entity: HJRG
     entities: [F3E, OSN, HJRP]
+    autowrite_excluded: true
     responsibilities:
       - Email-marketing review lane with Hannah (F3E)
       - Metrics + meeting structure (since 5/26)

@@ -320,11 +320,21 @@ def _entity_matches(role_entities: list[str], entity: str) -> bool:
 def contributor_recognized(slack_id: str, entity: str) -> bool:
     """True iff slack_id is a recognized (non-external) teammate whose role
     entities include `entity`. Machine-mined items (no slack_id) are NOT
-    recognized -- they can never clear Tier 0. Fail-safe to False."""
+    recognized -- they can never clear Tier 0. Fail-safe to False.
+
+    `autowrite_excluded: true` on the role entry is a per-person opt-OUT: the
+    person stays fully active everywhere else (role injection, delegated work,
+    briefings) but their contributed claims always route to Harrison instead of
+    clearing TIER_0 / DECISION_AUTO. Activating a registry user is a decision
+    about identity; conferring auto-write authority is a separate one, and this
+    key keeps them separable (Harrison ruling 2026-08-18).
+    """
     rec = _role_for(slack_id)
     if rec is None:
         return False
     if getattr(rec, "external", False):
+        return False
+    if getattr(rec, "autowrite_excluded", False):
         return False
     try:
         return _entity_matches(rec.all_entities, entity)

@@ -157,8 +157,19 @@ users:
     asana_user_gid: 1215737571728920
     display_name: Aaron Ferrucci
 
-  # Sara Fonseca -- LLC marketing freelancer. No Asana/Google mapping yet.
+  # Sara Fonseca -- LLC marketing freelancer. GID read live from the Asana
+  # workspace roster 2026-08-19 (Harrison-supplied; the code queue's
+  # LEX-sensitivity guard refuses named-person seeds, so this rides as a manual
+  # carry on the Aaron precedent -- see cq-795b9caa0b3a).
+  #
+  # NO `asana_email`, same reason as Aaron above: that field doubles as the
+  # Google identity Cora impersonates via DWD for gmail_inbox, gmail_create_draft
+  # (the SENDER) and calendar_schedule_meeting. An Asana roster lookup proves an
+  # ASANA identity and nothing about mailbox ownership, and Sara has no row in
+  # monitored-email-accounts.yaml to corroborate one. She is also an external
+  # freelancer, which makes an unverified impersonation grant worse, not better.
   - slack_user_id: U0B9JS3JW07
+    asana_user_gid: 1215786741942728
     display_name: Sara Fonseca
 
   # Jerry Reick -- HJRG Staff Accountant. Asana GID TBD (add when known).

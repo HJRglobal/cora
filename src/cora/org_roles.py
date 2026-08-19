@@ -61,6 +61,17 @@ class RoleRecord:
     # Harrison changes who is asked by editing the registry (60s TTL, no
     # restart). Absent/false is the default for everyone.
     gap_escalation: bool = False
+    # OPT-OUT roster flag: exclude this person from the graduated-trust
+    # auto-write contributor set (graduated_trust_shadow.contributor_recognized),
+    # so their contributed claims can never clear TIER_0 / DECISION_AUTO and
+    # always route to Harrison. Deliberately NOT `external: true`: external
+    # changes routing, proactive comms and the role block too, and it would
+    # misdescribe an internal teammate. Deliberately NOT a separate map either:
+    # a grant fails closed when its file is missing, but an EXCLUSION would fail
+    # OPEN -- an unreadable file would silently re-confer auto-write. Inline on
+    # the role entry, it cannot go missing while the person stays active.
+    # Absent/false is the default for everyone; DW eligibility is unaffected.
+    autowrite_excluded: bool = False
 
     @property
     def all_entities(self) -> list[str]:
@@ -118,6 +129,7 @@ def _parse(raw: object) -> tuple[dict[str, RoleRecord], list[RoleRecord]]:
             notes=str(entry.get("notes") or "").strip(),
             external=bool(entry.get("external", False)),
             gap_escalation=bool(entry.get("gap_escalation", False)),
+            autowrite_excluded=bool(entry.get("autowrite_excluded", False)),
         )
         if sid:
             index[sid] = rec
