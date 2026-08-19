@@ -101,6 +101,15 @@ _HAIKU_MODEL       = "claude-haiku-4-5-20251001"
 # that briefing soft and the loop continues + the budget check fires.
 _ANTHROPIC_TIMEOUT_S = 90.0
 
+# Sized to the CONTENT, not left at the old flat 600 (cq-64a8f5e3e654 slice C).
+# A briefing composes role + lanes + up to 10 tasks + two days of calendar +
+# pipeline + stalled decisions + a 25h activity scan; 600 tokens fits a light
+# day and clips a heavy one, which is exactly the length-dependent pattern the
+# 7/27 and 7/29 cut-offs showed. Raising it is a cost/latency choice; the
+# CORRECTNESS guarantee is the continuation below, which is why the cap can stay
+# a modest number instead of an unfalsifiable "big enough".
+_BRIEFING_MAX_TOKENS = 1200
+
 # Drop tasks overdue by more than this many days from the brief's task feed
 # (N7 / Harrison #1): abandoned goal-tracking tasks ("Sales & Revenue Goals
 # due 2025-02-04") surfaced every morning. The on-demand plate tool keeps
@@ -535,19 +544,34 @@ def _synthesize(
     import anthropic
     # F-14a: bound the call so a stall can't run to the task SIGKILL (see constant).
     client = anthropic.Anthropic(api_key=api_key, timeout=_ANTHROPIC_TIMEOUT_S)
+    messages = [{"role": "user", "content": prompt}]
     resp = client.messages.create(
         model=_HAIKU_MODEL,
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=_BRIEFING_MAX_TOKENS,
+        messages=messages,
         timeout=_ANTHROPIC_TIMEOUT_S,
     )
     from cora.llm_usage import log_usage
     log_usage(resp, caller="daily_briefing", model=_HAIKU_MODEL)
+    # The 7/27 and 7/29 briefings ended mid-word ("How can I", "...priorit")
+    # while 7/28 and 7/30 completed -- a length-dependent max_tokens cut that
+    # raises nothing. Raising the cap alone only moves the threshold at which it
+    # silently fails again, so detect and continue (cq-64a8f5e3e654).
+    from cora.long_message import TRUNCATION_NOTICE, complete_truncated
+    text = resp.content[0].text.strip()
+    text, complete = complete_truncated(
+        client, model=_HAIKU_MODEL, system=None,
+        messages=messages, first_text=text, first_response=resp,
+        max_tokens=_BRIEFING_MAX_TOKENS, caller="daily_briefing",
+        timeout=_ANTHROPIC_TIMEOUT_S,
+    )
+    if not complete:
+        text = text + TRUNCATION_NOTICE
     # WS-5: Haiku emits literal **bold** despite the prompt; this composer
     # egresses outside format_reply's conversational path, so normalize here --
     # one call covers both the user-DM delivery and the Harrison review copy.
     from cora.reply_formatter import normalize_slack_bold
-    return normalize_slack_bold(resp.content[0].text.strip())
+    return normalize_slack_bold(text)
 
 
 def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str:

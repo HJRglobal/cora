@@ -145,13 +145,26 @@ def deliver_to_channel(channel_id: str, body: str, *, today: date | None = None)
     from .reply_formatter import normalize_slack_bold
     from .slack_egress import sanitize_text
 
-    text = sanitize_text(
-        normalize_slack_bold(_scrub_visibility_cpa(body)))[:_MAX_SLACK_CHARS]
+    # NOT a [:N] slice. A raw character cut lands mid-word, mid-link or
+    # mid-number with no marker, and the reader cannot tell a truncated
+    # synthesis from a short one (cq-64a8f5e3e654). Splitting happens at the
+    # POST, after sanitization, so a chunk boundary can never land inside a
+    # token the sanitizer was still treating as one unit.
+    text = sanitize_text(normalize_slack_bold(_scrub_visibility_cpa(body)))
     try:
+        # Post site stays INLINE -- test_channel_synthesis pins that this module
+        # posts to channels and never opens a DM, by reading the source. A shared
+        # sender would hide the one thing that pin exists to make visible.
+        from .long_message import split_for_slack
         client = WebClient(token=token)
-        client.chat_postMessage(channel=channel_id, text=text)
-        log.info("channel_synthesis: posted to %s (%d chars)", channel_id, len(text))
-        return True
+        parts = split_for_slack(text, limit=_MAX_SLACK_CHARS)
+        for i, part in enumerate(parts, start=1):
+            body = (part if len(parts) == 1
+                    else f"{part}\n\n_(continued {i}/{len(parts)})_")
+            client.chat_postMessage(channel=channel_id, text=body)
+        log.info("channel_synthesis: posted to %s (%d chars, %d message(s))",
+                 channel_id, len(text), len(parts))
+        return bool(parts)
     except Exception as exc:  # noqa: BLE001 -- fail-soft; never raise
         log.error("channel_synthesis: post to %s failed: %s", channel_id, exc)
         return False

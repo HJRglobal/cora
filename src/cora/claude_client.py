@@ -708,7 +708,21 @@ def _log_usage(response: anthropic.types.Message, iteration: int) -> None:
 
     Wrapped in try/except so a mock or malformed Usage object never breaks the
     request — logging is observability, not a correctness contract.
+
+    Also surfaces a max_tokens stop (cq-64a8f5e3e654). The API raises nothing
+    when the cap binds, and nothing in this codebase compared `stop_reason` to
+    "max_tokens" — the only acknowledgement of it was a comment — so a clipped
+    reply was delivered as if complete and the defect read as random rather than
+    length-dependent. Logged HERE because both create-loops already funnel every
+    response through this one call, so neither can be wired and the other missed.
     """
+    try:
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            log.warning(
+                "claude reply TRUNCATED at max_tokens (iteration=%d) — the reply "
+                "was clipped, likely mid-sentence", iteration)
+    except Exception:  # noqa: BLE001 -- observability must never break a reply
+        pass
     try:
         usage = getattr(response, "usage", None)
         if usage is None:

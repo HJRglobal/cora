@@ -952,6 +952,24 @@ def synthesize_memo(facts_text: str) -> str | None:
         from .llm_usage import log_usage
         log_usage(response, caller="strategy_memo")
         text = (response.content[0].text or "").strip()
+        # The 7/26 memo ended mid-word. max_tokens raises nothing, so without
+        # this the memo is filed and DM'd as if it were complete
+        # (cq-64a8f5e3e654). Continue rather than raise the cap blindly: the
+        # length varies week to week, so a bigger fixed number only moves the
+        # threshold at which it silently fails again.
+        from .long_message import TRUNCATION_NOTICE, complete_truncated
+        text, complete = complete_truncated(
+            client, model=SONNET_MODEL, system=None,
+            messages=[{"role": "user",
+                       "content": _SYNTH_PROMPT.format(facts=facts_text)}],
+            first_text=text, first_response=response,
+            max_tokens=_SYNTH_MAX_TOKENS, caller="strategy_memo",
+            thinking={"type": "disabled"},
+        )
+        if not complete:
+            # Better a memo that admits it was cut than one that stops mid-word
+            # and reads as finished.
+            text = (text or "") + TRUNCATION_NOTICE
     except Exception as exc:  # noqa: BLE001 -- fail-closed by design
         log.warning("strategy_memo: synthesis failed: %s", exc)
         return None
@@ -1013,8 +1031,25 @@ def deliver_to_harrison(memo_body: str, *, today: date | None = None) -> bool:
     try:
         client = WebClient(token=token)
         resp = client.conversations_open(users=[HARRISON_SLACK_ID])
-        client.chat_postMessage(channel=resp["channel"]["id"], text=text[:39000])
-        return True
+        # NOT text[:39000]. A raw character slice cuts wherever the count lands
+        # -- the 7/26 memo split the word "for" across the boundary. split_for_slack
+        # breaks on paragraph/line/sentence boundaries instead.
+        #
+        # The send stays INLINE rather than going through a shared helper: the
+        # Harrison-only invariant is enforced by a source-level pin that COUNTS
+        # the send sites in this module. Routing them into a helper would satisfy
+        # the letter of that test by emptying it -- the guarantee it encodes is
+        # that you can read this one file and see every place it can post.
+        # (Do not name the counted symbols in this comment; the pin counts
+        # occurrences, so prose about them breaks it.)
+        from .long_message import split_for_slack
+        parts = split_for_slack(text)
+        dm_channel = resp["channel"]["id"]
+        for i, part in enumerate(parts, start=1):
+            body = (part if len(parts) == 1
+                    else f"{part}\n\n_(continued {i}/{len(parts)})_")
+            client.chat_postMessage(channel=dm_channel, text=body)
+        return bool(parts)
     except Exception as exc:  # noqa: BLE001
         log.error("strategy_memo: DM delivery failed: %s", exc)
         return False
