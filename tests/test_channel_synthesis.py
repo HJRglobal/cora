@@ -766,6 +766,10 @@ class TestEcomFold:
         out2 = cs.gather_f3e_ecom(today=date(2026, 7, 7))
         cross = next(ln for ln in out2["lines"] if "Cross-channel inventory" in ln)
         assert "not available" in cross
+        # Every OTHER section degraded too (this assertion belongs here, where the
+        # connectors really are down -- not on the test below, whose only broken
+        # source is the inventory store).
+        assert any("not available" in ln or "not connected" in ln for ln in out2["lines"])
 
     def test_cross_channel_line_says_unread_never_zero(self, monkeypatch):
         """A channel nobody could read must never render as 0 units."""
@@ -777,7 +781,6 @@ class TestEcomFold:
         cross = next(ln for ln in out["lines"] if "Cross-channel inventory" in ln)
         assert "0" not in cross.replace("Cross-channel", "")
         assert "nothing merged" in cross or "not zero" in cross
-        assert any("not available" in ln or "not connected" in ln for ln in out["lines"])
 
 
 class TestRunEntityWiring:

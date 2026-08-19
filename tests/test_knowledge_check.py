@@ -38,6 +38,21 @@ def _flag_off(monkeypatch):
     yield
 
 
+#: Every date literal in this file is anchored here. Without a pinned clock the
+#: read-time date filter in live_cycle_for compares a hardcoded "2026-08-11"
+#: against the real today, so from 2026-08-12 onward three tests failed outright
+#: and -- worse -- every test whose assertion was `is None` passed VACUOUSLY: the
+#: date filter, not the behaviour under test, was returning None. Pin the clock
+#: for the day the fixtures describe (feedback_test_clock_collision).
+_PINNED_TODAY = "2026-08-11"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_clock(monkeypatch):
+    monkeypatch.setattr(kc, "az_date", lambda dt=None: _PINNED_TODAY)
+    yield
+
+
 def _reserve_and_ask(user, date, cycle_id, item_key="k1", entity="F3E",
                      question="q?", tier=1):
     kc.append_event("reserved", cycle_id=cycle_id, user=user, date=date,

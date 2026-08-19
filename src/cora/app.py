@@ -1336,6 +1336,24 @@ def _dispatch_qa(
         if pending_note:
             runtime_context = runtime_context + pending_note + "\n\n"
 
+        # Cora's memory of its OWN outstanding knowledge-check question
+        # (cq-6fbaf37b1ee7). Reaching here means the message did not match as an
+        # answer -- a competing intent won, or the person is asking something
+        # else -- and the 8/14 complaint was that Cora then told the person it
+        # had never asked. DM-ONLY: the ask is delivered by DM, and the question
+        # carries its own entity scope (a LEX question has no business appearing
+        # in an F3E channel's context just because the same person mentioned
+        # Cora there). Fail-soft to "".
+        if channel_name == "dm":
+            try:
+                kc_note = knowledge_check.recall_ask_note(user_id)
+            except Exception:  # noqa: BLE001 -- enrichment must never break a reply
+                log.warning("knowledge-check recall probe failed (non-fatal)",
+                            exc_info=True)
+                kc_note = ""
+            if kc_note:
+                runtime_context = runtime_context + kc_note + "\n\n"
+
     t0 = time.monotonic()
 
     # ── Intent classification + semantic cache ─────────────────────────────
@@ -2791,9 +2809,15 @@ def _handle_knowledge_check_reply(event: dict, client, user_id: str, text: str,
 
     if post_card:
         cid = cycle.get("cycle_id", "")
-        body = knowledge_check.confirm_text(payload, cycle.get("question", ""))
+        # A cycle asked on an EARLIER day gets its date printed on the card, so a
+        # late answer is bound to a named question rather than confirmed blind
+        # (cq-6fbaf37b1ee7).
+        asked_on = (str(cycle.get("date") or "")
+                    if knowledge_check.is_late_ask(cycle) else "")
+        body = knowledge_check.confirm_text(
+            payload, cycle.get("question", ""), asked_on)
         blocks = (knowledge_check.build_confirm_blocks(
-            payload, cid, cycle.get("question", ""))
+            payload, cid, cycle.get("question", ""), asked_on)
             if confirm_cards.confirm_buttons_enabled() else None)
         # With buttons off the same text still ships and the TYPED path
         # completes the loop -- the flow never depends on a tap.

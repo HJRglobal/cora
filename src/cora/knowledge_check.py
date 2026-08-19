@@ -619,6 +619,64 @@ def live_cycle_for(state: dict[str, Any], user: str,
     return best
 
 
+#: How many days back Cora still REMEMBERS a question it asked. Distinct from the
+#: same-day capture gate above, and deliberately small: 4 covers a Friday ask
+#: answered on Tuesday, which is the real-world case that produced the 8/14
+#: incident, without leaving a week of unanswered asks fishing for any passing
+#: declarative DM.
+RECALL_LOOKBACK_DAYS = 4
+
+
+def recent_cycle_for(state: dict[str, Any], user: str,
+                     today: str | None = None,
+                     lookback_days: int = RECALL_LOOKBACK_DAYS) -> dict[str, Any] | None:
+    """The newest question Cora asked this person that is still unresolved.
+
+    WHY THIS IS NOT live_cycle_for (cq-6fbaf37b1ee7 / the 8/14 incident):
+    live_cycle_for enforces "asked TODAY" at read time, which is correct for
+    deciding whether a passing DM may be auto-captured. But it was also the only
+    memory Cora had, so a Friday ask answered on Monday produced "I have no
+    memory of asking you that" -- Cora denying its own question to the person who
+    was answering it. Live data shows the shape clearly: 8/14 was a Friday, its
+    five unanswered asks were not swept until Monday 8/17 08:05 AZ, and every
+    reply in between fell through to plain Q&A. 51 asks, 9 captured.
+
+    Two different questions need two different answers:
+      * "may I treat this DM as the answer, with no further signal?"  -> live_cycle_for
+      * "did I ask this person something, and what?"                  -> here
+
+    Scope is ASKED/CAPTURED only. An EXPIRED cycle stays expired -- reopening a
+    swept cycle is a state-machine change, and "that question expired on Monday"
+    is already an honest answer that remembers.
+    """
+    today = today or az_date()
+    best: dict[str, Any] | None = None
+    for cyc in state["cycles"].values():
+        if cyc.get("user") != user:
+            continue
+        if cyc.get("state") not in (STATE_ASKED, STATE_CAPTURED):
+            continue
+        asked = str(cyc.get("date", ""))
+        gap = _days_between(asked, today)
+        if gap is None or gap < 0 or gap > lookback_days:
+            continue
+        if best is None or asked > str(best.get("date", "")):
+            best = cyc
+    return best
+
+
+def is_late_ask(cycle: dict[str, Any] | None, today: str | None = None) -> bool:
+    """True when this cycle was asked on an EARLIER day than today.
+
+    The confirm card must say so: re-anchoring a staged answer to "Friday's
+    question" is what stops someone confirming a mismatched pair by reflex.
+    """
+    if not cycle:
+        return False
+    today = today or az_date()
+    return str(cycle.get("date", "")) != today
+
+
 def get_cycle(state: dict[str, Any], cycle_id: str) -> dict[str, Any] | None:
     return state["cycles"].get(cycle_id)
 
@@ -663,7 +721,8 @@ def new_cycle_id() -> str:
 
 
 def select_tier1(person: dict[str, Any], state: dict[str, Any],
-                 today: str | None = None) -> dict[str, Any] | None:
+                 today: str | None = None,
+                 ignore_cooldown: bool = False) -> dict[str, Any] | None:
     """The person's least-recently-asked eligible item, or None.
 
     ROTATION, NOT CONSUMPTION: eligibility is purely the cooldown. An item that
@@ -671,6 +730,14 @@ def select_tier1(person: dict[str, Any], state: dict[str, Any],
     passed, because a status snapshot goes stale. Never-asked items sort first,
     then oldest-asked; ties break on the roster's own order so rotation is
     deterministic and reviewable.
+
+    `ignore_cooldown` is the runner's --force (cq-ab0a8e753f19), whose help text
+    has always claimed it bypasses the cooldown while only ever being wired to
+    the already-handled ledger. Re-smoking the flow the same day therefore hit
+    "no Tier-1 item off cooldown" and sent nothing, which is worse than useless
+    for the one job --force exists to do. It stays ORDER-PRESERVING: the same
+    least-recently-asked item is chosen, the cooldown simply no longer excludes
+    it. The runner still refuses --force roster-wide (--dogfood/--user only).
     """
     today = today or az_date()
     candidates: list[tuple[int, int, dict[str, Any]]] = []
@@ -684,7 +751,7 @@ def select_tier1(person: dict[str, Any], state: dict[str, Any],
             # Unparseable date -- treat as recently asked (fail-closed: do not
             # re-ask something we cannot prove is off cooldown).
             continue
-        if age < ITEM_COOLDOWN_DAYS:
+        if age < ITEM_COOLDOWN_DAYS and not ignore_cooldown:
             # Kickoff step 2.4: an UNANSWERED question gets a gentle re-ask the
             # next weekday rather than sitting out the full cooldown -- the
             # cooldown exists to stop re-asking something we already have an
@@ -909,7 +976,8 @@ def claim_gap(gap_ts: str, cycle_id: str) -> bool:
 def select_question(person: dict[str, Any], state: dict[str, Any],
                     *, open_gaps: list[dict[str, Any]] | None = None,
                     claimed: set[str] | None = None,
-                    today: str | None = None) -> dict[str, Any] | None:
+                    today: str | None = None,
+                    ignore_cooldown: bool = False) -> dict[str, Any] | None:
     """The one question for this person today, or None to SKIP them.
 
     Tier 2 preempts Tier 1. Returning None is a first-class outcome -- there is
@@ -933,7 +1001,7 @@ def select_question(person: dict[str, Any], state: dict[str, Any],
             "question": safe_line(scrub_answer(str(gap.get("question", "") or ""))),
             "kpi": "open knowledge gap",
         }
-    item = select_tier1(person, state, today=today)
+    item = select_tier1(person, state, today=today, ignore_cooldown=ignore_cooldown)
     if item is not None:
         return {
             "tier": 1,
@@ -998,10 +1066,20 @@ def build_ask_blocks(question: str, cycle_id: str, name: str = "") -> list[dict]
     ]
 
 
-def confirm_text(answer: str, question: str = "") -> str:
+def confirm_text(answer: str, question: str = "", asked_on: str = "") -> str:
     """The confirm-back body: the person's OWN words restated as the fact that
-    would be stored. Cora invents nothing here -- that is the whole point."""
-    body = "Here's what I got -- save it?\n\n"
+    would be stored. Cora invents nothing here -- that is the whole point.
+
+    `asked_on` RE-ANCHORS a late answer (cq-6fbaf37b1ee7). Now that a Friday ask
+    can be answered on Monday, the card has to say which day's question it is
+    binding the answer to -- otherwise someone who typed an unrelated line could
+    confirm a mismatched pair by reflex, which is exactly the risk the old
+    same-day read gate was protecting against. Same-day cards are unchanged.
+    """
+    if asked_on:
+        body = f"Reading this as your answer to what I asked on {asked_on} -- save it?\n\n"
+    else:
+        body = "Here's what I got -- save it?\n\n"
     if question:
         body += f"> {str(question).strip()[:300]}\n\n"
     return body + f"*{str(answer or '').strip()}*"
@@ -1025,11 +1103,12 @@ def answer_fingerprint(answer: str) -> str:
     return hashlib.sha256(normalize_answer(answer).encode("utf-8")).hexdigest()[:10]
 
 
-def build_confirm_blocks(answer: str, cycle_id: str, question: str = "") -> list[dict]:
+def build_confirm_blocks(answer: str, cycle_id: str, question: str = "",
+                         asked_on: str = "") -> list[dict]:
     from . import confirm_cards as _cc
     value = f"{cycle_id}:{answer_fingerprint(answer)}"
     return [
-        *_cc.chunk_mrkdwn_sections(_sanitize(confirm_text(answer, question))),
+        *_cc.chunk_mrkdwn_sections(_sanitize(confirm_text(answer, question, asked_on))),
         {"type": "actions",
          "block_id": f"cora_kc_confirm_{cycle_id}"[:255],
          "elements": [
@@ -1076,9 +1155,17 @@ def match_live_cycle(user_id: str, thread_ts: str | None,
     every competing intent (staged write, shift command, remember/forget, a
     fresh question, a live gap ask) -- see the ordering note in
     app.handle_message_event.
+
+    2026-08-19 (cq-6fbaf37b1ee7): the window is now recent_cycle_for's, not
+    live_cycle_for's same-day one. A Friday ask answered on Monday used to match
+    nothing at all, so the answer was silently dropped into plain Q&A and Cora
+    told the person it had never asked. Nothing about the WRITE gate changed --
+    a match still only STAGES an answer behind the confirm card, and `is_late_ask`
+    makes that card name the day the question was asked so a mismatched pair
+    cannot be confirmed by reflex.
     """
     state = fold_state()
-    cyc = live_cycle_for(state, user_id)
+    cyc = recent_cycle_for(state, user_id)
     if cyc is None:
         return None
     if thread_ts:
@@ -1097,12 +1184,45 @@ def register_card_ts(cycle_id: str, card_ts: str) -> None:
 
 
 def has_live_cycle(user_id: str) -> bool:
-    """Cheap predicate for the DM router's ambiguity check."""
+    """Cheap predicate for the DM router's ambiguity check.
+
+    Uses the RECALL window, so it agrees with match_live_cycle. When it used the
+    same-day window and match_live_cycle used it too, a Monday reply to Friday's
+    ask was invisible to the router; if only one of the two had been widened the
+    router would have gated out the very match it was about to make.
+    """
     try:
-        return live_cycle_for(fold_state(), user_id) is not None
+        return recent_cycle_for(fold_state(), user_id) is not None
     except Exception:  # noqa: BLE001 -- routing must never break on a state read
         log.warning("knowledge_check: has_live_cycle failed", exc_info=True)
         return False
+
+
+def recall_ask_note(user_id: str, today: str | None = None) -> str:
+    """One line of runtime context so Cora never denies its own question.
+
+    Fires on the DM Q&A path -- i.e. exactly when the reply did NOT match as an
+    answer (a competing intent won, or the person is asking something else). The
+    8/14 complaint was not only that the answer was dropped: it was that Cora
+    said it had no memory of asking. Fail-soft to "" -- context enrichment must
+    never break a DM.
+    """
+    try:
+        cyc = recent_cycle_for(fold_state(), user_id, today=today)
+    except Exception:  # noqa: BLE001
+        log.warning("knowledge_check: recall_ask_note failed", exc_info=True)
+        return ""
+    if not cyc:
+        return ""
+    question = _sanitize(str(cyc.get("question") or ""))[:200]
+    if not question:
+        return ""
+    when = "today" if not is_late_ask(cyc, today) else f"on {cyc.get('date')}"
+    state_note = ("they answered and it is awaiting their confirmation"
+                  if cyc.get("state") == STATE_CAPTURED else "still unanswered")
+    return (f"KNOWLEDGE CHECK: you asked this person {when}: \"{question}\" "
+            f"({state_note}). You DID ask it -- never deny it. If this message is "
+            f"their answer, say you will record it and ask them to confirm.")
 
 
 # One process owns every button tap and every DM capture (the always-on bot), so

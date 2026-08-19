@@ -10,6 +10,7 @@ here as observable parity.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -54,7 +55,14 @@ def _isolated(tmp_path, monkeypatch):
 
 
 def _seed_ask(ask_id="gapask-abc123def456", state="PENDING", target=OWNER,
-              asked_at="2026-08-09T00:00:00+00:00"):
+              asked_at=None):
+    # RELATIVE, not a literal date. `_ask_expired` measures asked_at against the
+    # real clock (ASK_TTL_HOURS), so the old hardcoded 2026-08-09 aged past the
+    # TTL and from ~8/10 onward six tests failed with outcome "expired" -- they
+    # were pinning the TTL, not the decline path. The deliberately-expired case
+    # passes its own literal (feedback_test_clock_collision).
+    if asked_at is None:
+        asked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     asks = {ask_id: {
         "ask_id": ask_id, "gap_ts": "g1", "entity": "F3E",
         "question": "What is the wholesale case price?",
@@ -93,11 +101,14 @@ class TestDeclineCore:
     def test_button_and_typed_decline_reach_identical_state(self):
         """Parity is the whole requirement: the button must resolve the ask
         exactly as the decline-phrase regex does."""
-        a1 = _seed_ask(ask_id="gapask-button")
+        # One shared asked_at: the two seeds are compared field-by-field, so
+        # letting each stamp its own "now" would differ by microseconds.
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        a1 = _seed_ask(ask_id="gapask-button", asked_at=recent)
         ga.process_decline_tap(a1, OWNER, reason="unknown")
         btn = ga.load_pending_asks()[a1]
 
-        a2 = _seed_ask(ask_id="gapask-typed")
+        a2 = _seed_ask(ask_id="gapask-typed", asked_at=recent)
         typed_ack = ga.record_ask_answer(ga.load_pending_asks()[a2], "not my area")
         typed = ga.load_pending_asks()[a2]
 

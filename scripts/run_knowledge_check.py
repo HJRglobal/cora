@@ -153,8 +153,10 @@ def main() -> int:
     ap.add_argument("--report", action="store_true",
                     help="print the participation report and exit")
     ap.add_argument("--force", action="store_true",
-                    help="ignore the already-handled ledger and the item cooldown; "
-                         "only valid with --dogfood or --user (retry a failed smoke)")
+                    help="ignore the already-handled ledger AND the item cooldown "
+                         "(both, since 2026-08-19 -- it used to claim the cooldown "
+                         "and only bypass the ledger); only valid with --dogfood or "
+                         "--user (retry a failed smoke)")
     args = ap.parse_args()
 
     if args.force and not (args.dogfood or args.user):
@@ -273,7 +275,7 @@ def _send_loop(args, log, today, dry, state, open_gaps, people) -> int:
         picked = kc.select_question(
             person, state,
             open_gaps=open_gaps if tier2_used < kc.MAX_TIER2_PER_RUN else [],
-            claimed=claimed, today=today)
+            claimed=claimed, today=today, ignore_cooldown=args.force)
 
         # A Tier-2 gap claimed elsewhere between load and now must not cost this
         # person their whole day: drop that gap and re-select, which degrades
@@ -289,7 +291,8 @@ def _send_loop(args, log, today, dry, state, open_gaps, people) -> int:
                          picked["gap_ts"], name)
                 claimed.add(picked["gap_ts"])
                 picked = kc.select_question(
-                    person, state, open_gaps=open_gaps, claimed=claimed, today=today)
+                    person, state, open_gaps=open_gaps, claimed=claimed, today=today,
+                    ignore_cooldown=args.force)
 
         if picked is None:
             skipped += 1
