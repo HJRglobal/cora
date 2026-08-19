@@ -656,8 +656,8 @@ def test_load_adherence_facts_missing_and_corrupt(tmp_path):
 def test_build_pack_all_sections_present(tmp_path):
     pack = fc.build_pack(_sources(), today=MONDAY, snapshot_dir=tmp_path)
     assert [s.key for s in pack.sections] == [
-        "cash", "qbo_bank", "forecast_assist", "intercompany", "aging", "pnl",
-        "close_prep", "renewals",
+        "cash", "qbo_bank", "forecast_assist", "cashflow_parallel",
+        "intercompany", "aging", "pnl", "close_prep", "renewals",
     ]
     rendered = pack.render()
     assert "Weekly Finance Close-Support Pack" in rendered
@@ -700,10 +700,11 @@ def test_build_pack_no_provisioned_entities_stubs_everything(tmp_path):
     pack = fc.build_pack(
         _sources(provisioned_entities=lambda: []), today=MONDAY, snapshot_dir=tmp_path,
     )
-    for key in ("cash", "qbo_bank", "forecast_assist", "intercompany", "aging", "pnl"):
+    for key in ("cash", "qbo_bank", "forecast_assist", "cashflow_parallel",
+                "intercompany", "aging", "pnl"):
         section = next(s for s in pack.sections if s.key == key)
         assert section.available is False
-    assert len(pack.sections) == 8
+    assert len(pack.sections) == 9
 
 
 def test_build_pack_provisioned_listing_failure_is_survivable(tmp_path):
@@ -713,8 +714,8 @@ def test_build_pack_provisioned_listing_failure_is_survivable(tmp_path):
     pack = fc.build_pack(
         _sources(provisioned_entities=boom), today=MONDAY, snapshot_dir=tmp_path,
     )
-    assert len(pack.sections) == 8
-    assert all(not s.available for s in pack.sections[:6])
+    assert len(pack.sections) == 9
+    assert all(not s.available for s in pack.sections[:7])
 
 
 def test_pack_footer_counts_flags_and_names_unavailable_sections(tmp_path):

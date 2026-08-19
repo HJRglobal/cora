@@ -114,10 +114,10 @@ pairs:
   # today and LEX correctly stays UNKNOWN -- see the `filters` warning at the top
   # of this file. Leaving it refused is the right answer, not a gap to work around.
   LEX:
-    tab: null
-    confidence: ambiguous-1-to-many
+    tab: CF_LLC
+    confidence: scope-attested-by-founder
     confirmed: false
-    scope_attested: false
+    scope_attested: true
     filters: {}          # NOT IMPLEMENTED -- populating this REFUSES the realm
     candidate_tabs:
       - CF_LEXCORP
@@ -125,14 +125,28 @@ pairs:
       - CF_LBHS
       - CF_LTS
       - CF_LLA_MV
+    scope_attested_by: Harrison
+    scope_attested_on: 2026-08-18
     note: >-
-      QBO exposes a single LEX realm; the sheet carries five Lex tabs. The only
-      declaration S2 honours today is: set `tab` to one candidate AND
-      `scope_attested: true`, attesting the company file IS exactly that tab.
-      `filters` is not implemented and refuses. Until a valid declaration exists
-      every Lex tab renders manual-entry and LEX cash-outlook serving stays
-      refused. LEX account names are never free-rendered on a shared surface
-      (D-124) -- confirm names via Harrison DM only.
+      RESOLVED 2026-08-18 (Harrison, 13WCF M3 input): the QBO company behind the
+      LEX realm is "Lexington LLC" -- the QBO company nickname, fka Lexington
+      Learning Center. That is the CF_LLC tab, so the 1:N ambiguity is closed by
+      identifying the company file, not by splitting a realm: the realm was never
+      five entities, it was one that had not been named. The other four Lex tabs
+      (LEXCORP / LBHS / LTS / LLA_MV) have no QBO realm provisioned and stay
+      manual-entry, which is why they remain listed as candidates -- if a
+      separate realm is ever provisioned for one of them, this row must be
+      re-examined rather than assumed still correct.
+
+      `confirmed` stays FALSE on purpose. `scope_attested` answers "which tab is
+      this company file?"; `confirmed` is Justin's sign-off that the pairing is
+      right for accuracy math, and the founder clearing an ambiguity is not the
+      controller confirming a mapping. Until Justin flips it, LEX computes and
+      renders UNCONFIRMED but never feeds comparison or accuracy math, and LEX
+      cash-outlook serving (M4) stays refused.
+
+      LEX account names are never free-rendered on a shared surface (D-124) --
+      confirm names via Harrison DM only.
 
 # Tabs with NO QBO source at all. These render "manual-entry (no QBO source)" on
 # every downstream surface and are counted honestly in coverage (D-117) -- they
@@ -141,3 +155,14 @@ manual_entry_tabs:
   - CF_HJR PROD
   - CF_HJR Podcast
   - CF_UFL
+  # The four Lex tabs the LEX realm is NOT. Added 2026-08-18 with the LEX
+  # scope attestation above: once that realm is identified as the Lexington LLC
+  # company file, these four have no QBO counterpart provisioned (the realm list
+  # verified 2026-08-05 carries no Lex sibling), so "awaiting map confirmation"
+  # became a wrong label -- there is nothing pending to confirm for them. They
+  # stay in the LEX row's `candidate_tabs` as provenance for how the ambiguity
+  # was posed, and this list is what every downstream surface reads.
+  - CF_LEXCORP
+  - CF_LBHS
+  - CF_LTS
+  - CF_LLA_MV

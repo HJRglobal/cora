@@ -63,13 +63,46 @@ class TestShippedSeeds:
         """Nothing may feed accuracy math until Justin flips a row."""
         assert cm.load_entity_map().confirmed_count() == 0
 
-    def test_lex_refuses_until_its_split_is_declared(self):
-        """One QBO LEX realm vs five Lex tabs. Guessing would attribute
-        LBHS/LTS/LLA activity to LLC."""
+    def test_lex_resolves_by_attestation_but_is_not_confirmed(self):
+        """SUPERSEDES the old "LEX refuses" pin, 2026-08-18 (13WCF M3 input).
+
+        The QBO company behind the LEX realm is "Lexington LLC" (QBO company
+        nickname, fka Lexington Learning Center) = the CF_LLC tab. The 1:N
+        ambiguity closed by IDENTIFYING the company file, not by splitting a
+        realm -- it was never five entities, it was one that had not been named.
+
+        Both halves matter. `scope_attested` answers "which tab is this company
+        file?" and is now true, so S2 computes. `confirmed` is Justin's sign-off
+        that the pairing is right for accuracy math and stays FALSE -- the
+        founder clearing an ambiguity is not the controller confirming a
+        mapping, so LEX renders UNCONFIRMED and feeds no comparison or accuracy
+        math until he flips it.
+        """
         p = cm.load_entity_map().pairing("LEX")
         assert p is not None
+        assert p.tab == "CF_LLC"
+        assert p.scope_attested is True
+        assert p.resolvable is True
+        assert p.refusal_reason == ""
+        assert p.confirmed is False
+        assert p.usable_for_accuracy is False
+
+    def test_populating_filters_would_still_refuse_lex(self):
+        """D-130(a). The attestation must not have re-opened the inert-gate
+        hole: `filters` is applied by nothing, so honouring it would publish all
+        five Lex entities' activity under one tab."""
+        p = cm.load_entity_map().pairing("LEX")
+        p.filters = {"account_ids": ["1"]}
         assert p.resolvable is False
-        assert "split is not declared" in p.refusal_reason
+        assert "NOTHING APPLIES" in p.refusal_reason
+
+    def test_the_four_lex_tabs_the_realm_is_not_read_manual_entry(self):
+        """Not "awaiting map confirmation" -- there is no realm provisioned for
+        them, so there is nothing pending to confirm."""
+        em = cm.load_entity_map()
+        for tab in ("CF_LEXCORP", "CF_LBHS", "CF_LTS", "CF_LLA_MV"):
+            assert em.tab_status(tab) == "manual-entry (no QBO source)"
+        assert em.tab_status("CF_LLC") == "awaiting-map-confirmation"
 
     def test_excluded_realms_have_no_pairing(self):
         em = cm.load_entity_map()

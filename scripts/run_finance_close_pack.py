@@ -359,6 +359,52 @@ def post_ops_alert(client, failed: list[str], n_flags: int) -> None:
         log.error("close-pack: delivery-failure notice ALSO failed: %s", exc)
 
 
+def write_worksheet(pack, day: datetime.date) -> None:
+    """Write the Monday worksheet locally and mirror it into the accounting tree.
+
+    FAIL-SOFT AND NEVER LOAD-BEARING. The pack is the deliverable; the worksheet
+    is a durable artifact beside it, so a Drive blip or a read-only mount logs
+    and moves on rather than failing a run that already posted to three finance
+    surfaces.
+
+    Change-gated on the mirror side (the M1 snapshot pattern): rewriting an
+    identical file every Monday is pure churn on a network mount.
+
+    The destination is KB-EXCLUDED by construction -- it sits under
+    `01-HJR-Global/accounting/cashflow-ledger/`, whose Drive folder id is pinned
+    in `kb_exclusions.KB_EXCLUDED_FOLDER_IDS` (which prunes the whole subtree
+    from `sweep_founders_os`) and whose path segment and dated
+    `*cashflow-worksheet*` filename are both matched at the store chokepoint. A
+    cross-portfolio cash worksheet must never become retrievable KB chunks.
+    """
+    if not pack.worksheet:
+        log.warning("close-pack: no worksheet was built -- nothing written")
+        return
+
+    from cora import cashflow_worksheet as cw  # noqa: PLC0415
+    from cora import drive_io  # noqa: PLC0415
+
+    try:
+        path = cw.write_worksheet(pack.worksheet, day)
+        log.info("close-pack: worksheet written to %s", path)
+    except OSError as exc:
+        log.warning("close-pack: local worksheet write failed: %s", exc)
+        return
+
+    target = cw.mirror_worksheet_path(day)
+    try:
+        existing = drive_io.read_text(target) if drive_io.exists(target) else None
+        if existing == pack.worksheet:
+            log.info("close-pack: worksheet mirror unchanged -- skipping write")
+            return
+        drive_io.write_text_atomic(target, pack.worksheet)
+        log.info("close-pack: worksheet mirrored to %s", target)
+    except drive_io.DriveUnavailable as exc:
+        log.warning("close-pack: worksheet mirror skipped (mount unavailable): %s", exc)
+    except OSError as exc:
+        log.warning("close-pack: worksheet mirror failed: %s", exc)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -369,6 +415,8 @@ def main() -> int:
                         help="Ignore the once-per-ISO-week dedup")
     parser.add_argument("--entities", default="",
                         help="Comma-separated QBO entity codes to limit the run (testing)")
+    parser.add_argument("--no-worksheet", action="store_true",
+                        help="Skip writing the Monday worksheet file and its Drive mirror")
     args = parser.parse_args()
 
     from cora import finance_close  # noqa: PLC0415
@@ -425,7 +473,27 @@ def main() -> int:
         print(f"[DRY RUN] FOUNDER CUT -> #founder-finance ({FOUNDER_FINANCE_CHANNEL})")
         print("=" * 72)
         print(founder)
+        print("\n" + "=" * 72)
+        print("[DRY RUN] MONDAY WORKSHEET -> cashflow-ledger/worksheets/ "
+              "(local + Drive mirror)")
+        print("=" * 72)
+        # The worksheet is the artifact Justin types from, so the dry run -- the
+        # only pre-flight gate before it lands in a shared accounting folder --
+        # must show it in full, not merely report that one was built.
+        print(pack.worksheet or "(no worksheet was built)")
         return 0
+
+    # Written BEFORE delivery on purpose: the worksheet is a local/Drive artifact
+    # with no Slack dependency, and a missing token or a failed post must not also
+    # cost Justin the worksheet.
+    if args.no_worksheet:
+        log.info("close-pack: --no-worksheet -- skipping the worksheet file")
+    elif entities:
+        log.info("close-pack: scoped run -- worksheet NOT written (it would cover "
+                 "only %s while carrying the whole week's filename)",
+                 ", ".join(entities))
+    else:
+        write_worksheet(pack, datetime.date.today())
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not bot_token:

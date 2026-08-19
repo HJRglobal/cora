@@ -135,9 +135,17 @@ class TestFiltersDoNotConferResolvability:
         assert "NOT IMPLEMENTED" in body
         assert "tab_splits" in body
 
-    def test_the_live_lex_row_is_still_unresolvable(self):
+    def test_the_live_lex_row_resolves_only_via_scope_attestation(self):
+        """SUPERSEDED 2026-08-18: the LEX realm is the Lexington LLC company
+        file (CF_LLC), attested by Harrison. What this class actually guards is
+        that `filters` never confers resolvability -- so assert the attestation
+        is what carries it, and that adding filters still refuses."""
         pairing = cm.load_entity_map().pairing("LEX")
         assert pairing is not None
+        assert pairing.resolvable is True
+        assert pairing.scope_attested is True
+        assert pairing.filters == {}
+        pairing.filters = {"class_ids": ["7"]}
         assert pairing.resolvable is False
 
 

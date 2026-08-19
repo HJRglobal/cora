@@ -96,210 +96,218 @@ def _realm(net, *, status="ok", shell=False):
 
 
 class TestForecastAssist:
-    OVERWRITTEN = [
-        {"week": "7-24", "forecast": 508684.0, "actual": 508684.0, "forecast_overwritten": True},
-        {"week": "7-31", "forecast": 1625638.0, "actual": 1625638.0, "forecast_overwritten": True},
-        {"week": "8-7", "forecast": 1767089.0, "actual": None, "forecast_overwritten": False},
-    ]
+    """REWRITTEN at 13WCF M3 (2026-08-18) for the named supersession.
 
-    def test_says_accuracy_is_not_computable_when_forecasts_are_overwritten(self):
+    The six tests that used to live here all pinned the SHEET-DUAL accuracy leg
+    -- "NOT COMPUTABLE because the forecast column is overwritten", the
+    staleness note, the pack-history fallback. That leg is gone, not demoted:
+    M1's snapshot store banks a real pre-close forecast, so the section now has
+    a source that can actually answer the question, and keeping a second one
+    behind it was the Mig-1 failure the supersession exists to prevent.
+
+    What stays pinned here is the CARRY-IN half (unchanged in substance, reworded
+    to the v1 bank-sourced posture) plus the guarantee that the sheet-dual
+    accessor is never consulted again. The store-side accuracy behaviour is
+    pinned in tests/test_cashflow_worksheet.py, where its fixtures live.
+    """
+
+    @staticmethod
+    def _snapshot(tabs=None, *, snapshot_date="2026-08-03"):
+        return {
+            "schema_version": 1,
+            "snapshot_date": snapshot_date,
+            "week_ending_weekday": "Friday",
+            "tabs": tabs if tabs is not None else {
+                "CF_F3": {
+                    "status": "ok",
+                    "post_refresh_suspect": False,
+                    "last_actual_week_ending": "2026-07-31",
+                    "forward_week_endings": ["2026-08-07", "2026-08-14"],
+                    "series": {"ending_cash": [
+                        {"week_ending": "2026-07-31", "forecast": 1625638.0,
+                         "actual": 1625638.0, "diff": 0.0,
+                         "basis": "post_close_column_value"},
+                        {"week_ending": "2026-08-07", "forecast": 1767089.0,
+                         "actual": None, "diff": None, "basis": "forecast"},
+                    ]},
+                },
+            },
+        }
+
+    def _sources(self, **over):
+        base = dict(
+            cashflow_snapshot=self._snapshot,
+            cashflow_snapshot_dates=lambda: [],
+            cashflow_load_snapshot=lambda d: None,
+            bank_snapshot=lambda: _bank(F3E=_realm(11750.93)),
+        )
+        base.update(over)
+        return fc.Sources(**base)
+
+    # ── the supersession itself ─────────────────────────────────────────────
+
+    def test_the_sheet_dual_series_is_never_consulted(self):
+        """The overwritten column is the thing this milestone stopped reading.
+        A source that is merely DEMOTED still runs; assert it is not called."""
+        called: list[str] = []
+        fc.build_forecast_assist_section(
+            ["F3E"],
+            self._sources(cash_dual=lambda: called.append("dual") or []),
+            today=MONDAY)
+        assert called == []
+
+    def test_no_snapshot_is_an_honest_stub_with_no_fallback(self):
         section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(11750.93))),
+            self._sources(cashflow_snapshot=lambda: None,
+                          cash_dual=lambda: [{"week": "7-31", "forecast": 1.0,
+                                              "actual": 2.0,
+                                              "forecast_overwritten": False}]),
             today=MONDAY)
+        assert section.available is False
+        assert "no fallback" in (section.stub_reason or "")
+
+    def test_no_measurable_week_never_claims_a_variance(self):
+        """Mig-12/D-121: not 100%, not zero, and no figure invented."""
+        section, snap = fc.build_forecast_assist_section(
+            ["F3E"], self._sources(), today=MONDAY)
         body = "\n".join(section.lines)
         assert "NOT COMPUTABLE" in body
-        assert "overwritten with the actual at week close" in body
-
-    def test_never_reports_a_near_perfect_accuracy(self):
-        """The whole point: a naive dual-series variance here would be ~$0."""
-        section, snap = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
-            today=MONDAY)
-        body = "\n".join(section.lines)
-        # No accuracy FIGURE is claimed and none is recorded downstream...
-        assert not any(ln.startswith("Forecast accuracy, week") for ln in section.lines)
         assert "accuracy" not in snap
-        # ...and the only near-perfect number mentioned is inside the disclaimer
-        # explaining why one is NOT reported.
-        assert "NOT COMPUTABLE" in body
-        assert "would read ~100% accurate" in body
 
-    def test_a_genuine_variance_is_reported_when_one_exists(self):
-        dual = [{"week": "2-6", "forecast": 2314479.0, "actual": 2304132.0,
-                 "forecast_overwritten": False},
-                {"week": "8-7", "forecast": 1767089.0, "actual": None,
-                 "forecast_overwritten": False}]
+    def test_first_run_with_an_empty_workbook_says_so(self):
         section, snap = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: dual,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
+            ["F3E"], self._sources(cashflow_snapshot=lambda: self._snapshot({})),
             today=MONDAY)
-        assert "-$10,347" in "\n".join(section.lines)
-        assert snap["accuracy"]["variance"] == pytest.approx(-10347.0)
+        assert "no completed week" in "\n".join(section.lines)
+        assert "accuracy" not in snap
 
-    def test_a_stale_usable_week_says_how_far_back_it_is(self):
-        """On the live sheet the newest COMPARABLE forecast is months old because
-        every week since had its forecast overwritten. Rendering that as plain
-        'forecast accuracy' would read as last week's number."""
-        dual = [
-            {"week": "2-6", "forecast": 2314479.0, "actual": 2304132.0,
-             "forecast_overwritten": False},
-            {"week": "7-24", "forecast": 508684.0, "actual": 508684.0,
-             "forecast_overwritten": True},
-            {"week": "7-31", "forecast": 1625638.0, "actual": 1625638.0,
-             "forecast_overwritten": True},
-            {"week": "8-7", "forecast": 1767089.0, "actual": None,
-             "forecast_overwritten": False},
-        ]
-        section, snap = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: dual,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
-            today=MONDAY)
-        body = "\n".join(section.lines)
-        assert "most recent week that still HAS a comparable forecast" in body
-        assert "2 completed week(s) since then had theirs overwritten" in body
-        assert snap["accuracy"]["weeks_since"] == 2
+    # ── carry-in ────────────────────────────────────────────────────────────
 
-    def test_a_current_usable_week_carries_no_staleness_note(self):
-        dual = [{"week": "7-31", "forecast": 100.0, "actual": 150.0,
-                 "forecast_overwritten": False}]
-        section, snap = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: dual,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
-            today=MONDAY)
-        assert "most recent week that still HAS" not in "\n".join(section.lines)
-        assert snap["accuracy"]["weeks_since"] == 0
-
-    def test_first_run_says_so_rather_than_inventing_a_variance(self):
-        section, _ = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: [{"week": "8-7", "forecast": 10.0,
-                                           "actual": None, "forecast_overwritten": False}],
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
-            today=MONDAY)
-        assert "first run" in "\n".join(section.lines)
-
-    def test_next_week_starting_point_is_the_BOOK_balance_not_the_register(self):
-        """D-116: the sheet's opening row is a BOOK balance. Carrying the QBO
-        REGISTER figure in would manufacture the very break the cash section then
-        flags -- live 2026-08-05, HJRP reads $128,128 on the register against
-        $26,880 on the report, and BDM flips sign by ~$20K."""
+    def test_both_measures_render_and_neither_is_named_the_carry_in(self):
+        """D-116/D-120(d) unchanged in substance; the v1 posture (cleared
+        2026-08-18) makes both figures REFERENCES rather than one of them an
+        instruction. Live 2026-08-05 HJRP read $128,128 on the register against
+        $26,880 on the report, so naming either as 'the' carry-in would
+        manufacture the very break the cash section then flags."""
         section, snap = fc.build_forecast_assist_section(
             ["F3E", "BDM"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(128128.02),
-                                                   BDM=_realm(11758.94))),
+            self._sources(bank_snapshot=lambda: _bank(F3E=_realm(128128.02),
+                                                      BDM=_realm(11758.94))),
             cash_fragment={"F3E": {"books_net": 26879.52},
                            "BDM": {"books_net": -8483.22}},
             today=MONDAY)
         body = "\n".join(section.lines)
-        assert "week 8-7" in body
-        assert snap["F3E"]["starting_point_books"] == 26879.52
+        assert "2026-08-07" in body
+        assert snap["F3E"]["book_reference"] == 26879.52
         assert snap["F3E"]["register_reference"] == 128128.02
-        assert "carry $26,880 into the 8-7 opening row" in body
+        assert "$128,128" in body and "$26,880" in body
         assert "different measures" in body
+        assert "BANK-SOURCED and Justin-entered" in body
         assert section.covered == 2
 
-    def test_without_a_book_balance_it_refuses_to_name_a_carry_in(self):
+    def test_the_deferred_qbo_substitute_is_proposed_not_taken(self):
+        """Harrison's 2026-08-18 input: propose it WITH the feed-lag caveat,
+        do not decide it."""
+        section, _ = fc.build_forecast_assist_section(
+            ["F3E"], self._sources(),
+            cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
+        body = "\n".join(section.lines)
+        assert "PROPOSED, NOT DECIDED" in body
+        assert "~1 day behind the portal" in body
+
+    def test_without_a_book_balance_the_books_figure_is_unknown_not_omitted(self):
         section, snap = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(128128.02))),
+            self._sources(bank_snapshot=lambda: _bank(F3E=_realm(128128.02))),
             cash_fragment={}, today=MONDAY)
-        body = "\n".join(section.lines)
-        assert "reference only" in body
-        assert "not available this run" in body
-        assert snap["F3E"]["starting_point_books"] is None
+        assert "books UNKNOWN this run" in "\n".join(section.lines)
+        assert snap["F3E"]["book_reference"] is None
 
     def test_a_late_actual_does_not_relabel_a_past_week_as_next(self):
-        """If 7-31's actual is still unfilled on 8-3, "first entry lacking an
-        actual" is a week that already CLOSED -- carrying balances into its
-        opening row would overwrite history. Selection is POSITIONAL: the first
-        forward week AFTER the last week that has an actual."""
-        dual = [
-            {"week": "7-24", "forecast": 1.0, "actual": 1.0, "forecast_overwritten": True},
-            {"week": "7-31", "forecast": 2.0, "actual": None, "forecast_overwritten": False},
-            {"week": "8-7", "forecast": 3.0, "actual": None, "forecast_overwritten": False},
-        ]
+        """If 7-31's actual is still unfilled on 8-3, its column is 'forward' on
+        that tab even though the week already CLOSED. Selection is CALENDAR-based
+        (see cashflow_worksheet.next_forecast_week) precisely so a lagging tab
+        cannot point the carry-in at a week that has ended."""
         section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: dual,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
+            self._sources(cashflow_snapshot=lambda: self._snapshot({
+                "CF_F3": {
+                    "status": "ok", "post_refresh_suspect": False,
+                    "last_actual_week_ending": "2026-07-24",
+                    "forward_week_endings": ["2026-07-31", "2026-08-07"],
+                    "series": {"ending_cash": []},
+                },
+            })),
             cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
         body = "\n".join(section.lines)
-        assert "week 7-31" in body
-        assert "week 8-7" not in body
+        assert "2026-08-07" in body
+        assert "2026-07-31" not in body
 
-    def test_week_selection_does_not_use_the_backward_looking_date_parser(self):
-        """_parse_week_date resolves a bare "8-7" against a 2026-08-03 run date to
-        2025-08-07, so a date filter would discard EVERY forward week and silently
-        kill this entire leg. Pin that forward weeks still resolve."""
+    def test_no_forward_week_says_so_rather_than_going_silent(self):
         section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
+            self._sources(cashflow_snapshot=lambda: self._snapshot({
+                "CF_F3": {"status": "ok", "post_refresh_suspect": False,
+                          "last_actual_week_ending": "2026-07-31",
+                          "forward_week_endings": [], "series": {"ending_cash": []}},
+            })),
             cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
-        assert "no forward forecast week" not in "\n".join(section.lines)
+        assert "no forward forecast week" in "\n".join(section.lines)
 
     def test_stale_snapshot_warning_travels_with_this_section(self):
-        """render_forecast_worksheet emits ONLY these lines, so the bank section's
-        warning under a different heading never reaches the worksheet."""
+        """render_forecast_worksheet emits ONLY these lines, so the bank
+        section's warning under a different heading never reaches it."""
         section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: {
-                           "generated_at_utc": "2026-07-01T00:00:00+00:00",
-                           "realms": {"F3E": _realm(1.0)}}),
+            self._sources(bank_snapshot=lambda: {
+                "generated_at_utc": "2026-07-01T00:00:00+00:00",
+                "realms": {"F3E": _realm(1.0)}}),
             cash_fragment={"F3E": {"books_net": 1.0}}, today=MONDAY)
         body = "\n".join(section.lines)
         assert ":warning:" in body
         assert "NOT 'as of now'" in body
 
-    def test_shell_realm_contributes_no_starting_point(self):
-        section, snap = fc.build_forecast_assist_section(
+    def test_shell_realm_contributes_no_carry_in(self):
+        _, snap = fc.build_forecast_assist_section(
             ["OSN"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(OSN=_realm(0.0, shell=True))),
+            self._sources(bank_snapshot=lambda: _bank(OSN=_realm(0.0, shell=True))),
             cash_fragment={"OSN": {"books_net": 0.0}}, today=MONDAY)
         assert "OSN" not in snap
 
     def test_unknown_balance_renders_unknown_not_zero(self):
-        section, snap = fc.build_forecast_assist_section(
+        section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(None))),
+            self._sources(bank_snapshot=lambda: _bank(F3E=_realm(None))),
             today=MONDAY)
         assert "UNKNOWN" in "\n".join(section.lines)
-        assert "F3E" not in snap
 
-    def test_unreadable_sheet_is_an_honest_stub(self):
+    def test_a_missing_realm_is_named_unavailable_for_the_founder_cut(self):
+        """'unavailable —' is the literal substring build_founder_cut collects;
+        any other wording makes the gap invisible in the cut Harrison reads."""
         section, _ = fc.build_forecast_assist_section(
-            ["F3E"], fc.Sources(cash_dual=lambda: None), today=MONDAY)
-        assert section.available is False
+            ["UFL"], self._sources(bank_snapshot=lambda: _bank()), today=MONDAY)
+        assert "unavailable —" in "\n".join(section.lines)
 
     def test_section_states_cora_never_writes_the_sheet(self):
         section, _ = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(1.0))),
-            today=MONDAY)
+            ["F3E"], self._sources(), today=MONDAY)
         assert "never writes the cash sheet" in "\n".join(section.lines)
 
-    def test_worksheet_reuses_the_computed_lines(self):
+    def test_the_section_names_its_sole_forecast_source(self):
         section, _ = fc.build_forecast_assist_section(
-            ["F3E"],
-            fc.Sources(cash_dual=lambda: self.OVERWRITTEN,
-                       bank_snapshot=lambda: _bank(F3E=_realm(11750.93))),
-            today=MONDAY)
+            ["F3E"], self._sources(), today=MONDAY)
+        body = "\n".join(section.lines)
+        assert "ONLY source" in body
+        assert "cashflow-ledger/worksheets/" in body
+
+    def test_worksheet_reuses_the_computed_lines_and_points_at_the_new_lane(self):
+        section, _ = fc.build_forecast_assist_section(
+            ["F3E"], self._sources(), today=MONDAY)
         doc = fc.render_forecast_worksheet(section, today=MONDAY)
         assert "# Forecast assist — 2026-08-03" in doc
         assert "does NOT write the Standing ACTUALS sheet" in doc
+        assert "SUPERSEDED" in doc
         for line in section.lines:
             assert line in doc
 

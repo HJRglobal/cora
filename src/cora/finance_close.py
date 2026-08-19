@@ -235,6 +235,12 @@ class Section:
 class ClosePack:
     generated_at: str
     sections: list[Section] = field(default_factory=list)
+    #: The rendered Monday worksheet (13WCF S3), or None when it could not be
+    #: built. Carried ON the pack so the delivery script writes the SAME
+    #: computation the sections were rendered from -- rebuilding it from a fresh
+    #: Sources would let the file and the posted pack disagree about the same
+    #: Monday, which is the failure the supersession exists to prevent.
+    worksheet: Optional[str] = None
 
     @property
     def total_flags(self) -> int:
@@ -573,6 +579,18 @@ class Sources:
     adherence_facts: Callable[[], dict[str, Any] | None] | None = None
     bank_snapshot: Callable[[], dict[str, Any] | None] | None = None
     cash_dual: Callable[[], list[dict[str, Any]] | None] | None = None
+    # ── 13WCF shadow-ledger stores (M1/M2), injected so the pack's forecast and
+    # parallel sections are testable without touching disk. These are the SOLE
+    # forecast baseline as of M3 -- there is deliberately no sheet-side or
+    # pack-history fallback behind them (migration Mig-1: a superseded lane that
+    # keeps a quiet fallback is a second variance system, not a supersession).
+    cashflow_snapshot: Callable[[], dict[str, Any] | None] | None = None
+    cashflow_snapshot_dates: Callable[[], list[datetime.date]] | None = None
+    cashflow_load_snapshot: Callable[[datetime.date], dict[str, Any] | None] | None = None
+    cashflow_finalized: Callable[[], dict[str, Any] | None] | None = None
+    cashflow_preliminary: Callable[[str], dict[str, Any] | None] | None = None
+    cashflow_newest_preliminary: Callable[[], dict[str, Any] | None] | None = None
+    cashflow_entity_map: Callable[[], Any] | None = None
 
     def get_provisioned(self) -> list[str]:
         if self.provisioned_entities:
@@ -680,6 +698,81 @@ class Sources:
         except Exception as exc:  # noqa: BLE001 -- honest stub beats a dead pack
             log.warning("finance_close: cash dual series unavailable: %s", exc)
             return None
+
+    # ── 13WCF stores ────────────────────────────────────────────────────────
+
+    def get_cashflow_snapshot(self) -> dict[str, Any] | None:
+        from . import cashflow_worksheet as cw  # noqa: PLC0415
+        try:
+            return (self.cashflow_snapshot or cw.latest_snapshot)()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: forecast snapshot unavailable: %s", exc)
+            return None
+
+    def get_cashflow_snapshot_dates(self) -> list[datetime.date]:
+        from . import cashflow_ledger as cl  # noqa: PLC0415
+        try:
+            return (self.cashflow_snapshot_dates or cl.list_snapshot_dates)()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: snapshot index unavailable: %s", exc)
+            return []
+
+    def load_cashflow_snapshot(self, day: datetime.date) -> dict[str, Any] | None:
+        from . import cashflow_ledger as cl  # noqa: PLC0415
+        try:
+            return (self.cashflow_load_snapshot or cl.load_snapshot)(day)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: snapshot %s unreadable: %s", day, exc)
+            return None
+
+    def get_cashflow_finalized(self) -> dict[str, Any] | None:
+        from . import cashflow_worksheet as cw  # noqa: PLC0415
+        try:
+            return (self.cashflow_finalized or cw.latest_finalized)()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: finalized actuals unavailable: %s", exc)
+            return None
+
+    def get_cashflow_preliminary(self, week_ending: str) -> dict[str, Any] | None:
+        """The PRELIMINARY window for a NAMED week (the maturation leg)."""
+        from . import cashflow_worksheet as cw  # noqa: PLC0415
+        try:
+            if self.cashflow_preliminary:
+                return self.cashflow_preliminary(week_ending)
+            return cw.preliminary_for(datetime.date.fromisoformat(week_ending))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: preliminary %s unreadable: %s",
+                        week_ending, exc)
+            return None
+
+    def get_cashflow_newest_preliminary(self) -> dict[str, Any] | None:
+        """The newest PRELIMINARY window (last week's actuals for the worksheet).
+
+        Deliberately a DIFFERENT accessor from the one above: the worksheet
+        shows W-1, the parallel section needs W-2's own preliminary to measure
+        maturation. Serving one from the other would silently compare two
+        different weeks.
+        """
+        from . import cashflow_worksheet as cw  # noqa: PLC0415
+        try:
+            return (self.cashflow_newest_preliminary or cw.newest_preliminary)()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("finance_close: preliminary window unavailable: %s", exc)
+            return None
+
+    def get_cashflow_entity_map(self) -> Any:
+        from . import cashflow_maps as cm  # noqa: PLC0415
+        try:
+            return (self.cashflow_entity_map or cm.load_entity_map)()
+        except Exception as exc:  # noqa: BLE001
+            # FAIL-CLOSED to an EMPTY map, never to None: an empty map has zero
+            # confirmed pairs, so the debut gate stays shut and every
+            # QBO-attributed leg stubs. Returning None would hand every caller
+            # an AttributeError instead -- and a section that raises stubs with
+            # "section builder failed", which reads as a code bug rather than as
+            # the unreadable map it is.
+            log.warning("finance_close: entity map unreadable: %s", exc)
+            return cm.EntityMap()
 
     def get_bank_snapshot(self) -> dict[str, Any] | None:
         """Daily QBO bank snapshot, or None when it has not run.
@@ -1252,123 +1345,140 @@ def build_bank_section(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 1c — Forecast assist (A5 S2b, absorbed L2)
+# Section 1c — Forecast assist (A5 S2b; SUPERSEDED IN PLACE at 13WCF M3)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # A worksheet Justin types FROM while doing his Monday refresh. Cora never writes
 # the Standing ACTUALS sheet -- stewardship stays his (SOP rev 4; the 2026-06-04
 # row-label fragility doctrine; D-011).
 #
-# THE ACCURACY LEG IS DELIBERATELY MODEST, and that is a finding, not a shortcut.
-# The design assumed a dual forecast/actual series would make "forecast accuracy
-# for the last completed week" computable. It does not: verified live 2026-08-04,
-# the sheet's FORECAST column is OVERWRITTEN with the actual once a week closes --
-# 41 of 42 completed weeks matched to sub-dollar rounding. Computing a variance
-# from those cells would report ~99.99% accuracy forever: precise, plausible, and
-# meaningless. So accuracy comes from the pack's OWN prior snapshots, and says so.
+# WHAT M3 CHANGED, AND WHY IT IS A SUPERSESSION RATHER THAN AN ADDITION
+# ---------------------------------------------------------------------
+# The accuracy leg used to read the SHEET's own dual forecast/actual series and
+# then say -- correctly -- that a variance computed from it is meaningless,
+# because the sheet overwrites its forecast column at week close (D-121: live
+# 2026-08-04, 41 of 42 completed weeks matched to the dollar; re-verified
+# 2026-08-17, DIFF read 0.00 on every closed week but one). Behind that honest
+# statement sat a "pack-history fallback" that quietly reported week-over-week
+# movement in the pack's OWN prior snapshot as an accuracy source.
+#
+# M1 built the store that actually answers the question, so as of M3:
+#   * the S1 forecast-snapshot store is the SOLE forecast baseline;
+#   * the sheet-dual accuracy leg is GONE (not demoted -- gone);
+#   * the pack-history fallback is DELETED, not kept as a quiet second source.
+# Two systems computing "forecast accuracy" from different bases in one pack is
+# the Mig-1 failure this supersession exists to prevent, and a fallback that
+# only fires when the primary is missing is the hardest kind to notice.
+#
+# The durable WORKSHEET FILE moved with it: `cashflow-ledger/worksheets/` is the
+# one path (see cashflow_worksheet.render_worksheet). `render_forecast_worksheet`
+# is retained ONLY to render this section into that file's predecessor shape for
+# any caller still holding a Section; it writes nothing itself, and nothing in
+# production calls it -- verified 2026-08-18, its only callers were tests.
 
+#: Where the retired lane pointed. Kept as a POINTER, so the supersession is
+#: discoverable from the old name instead of the name simply disappearing.
 FORECAST_ASSIST_RELDIR = "01-HJR-Global/accounting/forecast-assist"
+
+#: Where the Monday worksheet lives now.
+CASHFLOW_WORKSHEET_RELDIR = "01-HJR-Global/accounting/cashflow-ledger/worksheets"
+
+#: How many accuracy rows the PACK renders inline. The full table lives in the
+#: worksheet; a 19-tab list inside a Slack section pushes every later section
+#: past the point anyone reads.
+_ACCURACY_MAX_ROWS = 5
+
+_SUPERSESSION_NOTE = (
+    "_Forecast baseline: the S1 snapshot store (`cashflow-ledger/forecast-snapshots/`) "
+    "is the ONLY source — the sheet's own forecast column is overwritten at week "
+    "close, and this pack no longer keeps a history fallback behind that. The "
+    "Monday worksheet moved to `cashflow-ledger/worksheets/`._"
+)
 
 
 def build_forecast_assist_section(
     entities: list[str],
     sources: Sources,
     *,
-    prior: dict[str, Any] | None = None,
     cash_fragment: dict[str, Any] | None = None,
     today: datetime.date | None = None,
 ) -> tuple[Section, dict[str, Any]]:
-    """Next-week cash starting points + an honest accuracy statement."""
+    """Next-week carry-in references + forecast accuracy from banked forecasts.
+
+    ``prior`` is deliberately GONE from the signature. It carried the pack-history
+    fallback, and leaving it as an ignored parameter would let a caller keep
+    passing a second forecast source that silently does nothing.
+    """
+    from . import cashflow_worksheet as cw  # noqa: PLC0415
     from .qbo_bank_snapshot import BALANCE_BASIS  # noqa: PLC0415
 
+    day = today or _today()
     section = Section(key="forecast_assist", title=":chart_with_upwards_trend: Forecast assist")
     snap: dict[str, Any] = {}
 
-    dual = sources.get_cash_dual()
-    if dual is None:
+    snapshot = sources.get_cashflow_snapshot()
+    if not snapshot:
+        # NO FALLBACK. The sheet cannot answer this question and the pack's own
+        # history is not a forecast record; an unavailable store is unavailable.
         section.available = False
-        section.stub_reason = "the cash sheet could not be read for the forecast series"
+        section.stub_reason = (
+            "no forecast snapshot has been banked yet — the Monday 06:15 S1 job "
+            "is the only forecast baseline and there is deliberately no fallback"
+        )
         return section, snap
 
-    usable = [
-        w for w in dual
-        if w.get("actual") is not None and w.get("forecast") is not None
-        and not w.get("forecast_overwritten")
-    ]
-    completed = [w for w in dual if w.get("actual") is not None]
-    overwritten = [w for w in completed if w.get("forecast_overwritten")]
+    # ── accuracy, from VERIFIED pre-close snapshots only ─────────────────────
+    accuracy_week, rows, pending = cw.resolve_accuracy(
+        latest=snapshot,
+        load_snapshot=sources.load_cashflow_snapshot,
+        snapshot_dates=sources.get_cashflow_snapshot_dates(),
+    )
 
-    # ── accuracy, stated honestly ────────────────────────────────────────────
-    if overwritten and not usable:
+    if not accuracy_week:
         section.lines.append(
-            f"Forecast accuracy: NOT COMPUTABLE from the sheet — its forecast column is "
-            f"overwritten with the actual at week close ({len(overwritten)} of "
-            f"{len(completed)} completed weeks match to the dollar), so a sheet-based "
-            f"variance would read ~100% accurate regardless of what really happened."
+            "Forecast accuracy: no completed week is present in the snapshot yet."
         )
-    elif usable:
-        recent = usable[-1]
-        variance = round(recent["actual"] - recent["forecast"], 2)
-        # The newest week with a COMPARABLE forecast is often not the newest
-        # completed week -- on the live sheet it is six months back, because every
-        # week since had its forecast overwritten. Presenting that as plain
-        # "forecast accuracy" would read as last week's number.
-        weeks_since = 0
-        for week in reversed(completed):
-            if week is recent or week.get("week") == recent.get("week"):
-                break
-            weeks_since += 1
-        staleness = (
-            f" NOTE: this is the most recent week that still HAS a comparable "
-            f"forecast — {weeks_since} completed week(s) since then had theirs "
-            f"overwritten."
-            if weeks_since else ""
-        )
+    elif rows:
+        worst = max(rows, key=lambda r: abs(r.variance))
         section.lines.append(
-            f"Forecast accuracy, week {_scrub_external(str(recent['week']), 20)}: "
-            f"forecast {fmt_money(recent['forecast'])} vs actual "
-            f"{fmt_money(recent['actual'])} — variance {fmt_delta(variance)} "
-            f"({len(usable)} of {len(completed)} completed week(s) retain a "
-            f"comparable forecast).{staleness}"
+            f"Forecast accuracy, week ending {_scrub_external(accuracy_week, 12)} "
+            f"— {len(rows)} tab(s) measured against a forecast banked before the "
+            f"week closed. Largest miss: {_scrub_external(worst.tab, 40)} forecast "
+            f"{fmt_money(worst.forecast)} vs actual {fmt_money(worst.actual)}, "
+            f"variance {fmt_delta(worst.variance)} ({worst.horizon_days}-day horizon)."
         )
+        for row in sorted(rows, key=lambda r: abs(r.variance), reverse=True)[:_ACCURACY_MAX_ROWS]:
+            section.lines.append(
+                f"• {_scrub_external(row.tab, 40)}: forecast {fmt_money(row.forecast)} "
+                # ASCII arrow ON PURPOSE. The pack renders to a cp1252 Windows
+                # console, which has no U+2192 -- and --dry-run is the only
+                # pre-flight gate before three finance surfaces, so it must not
+                # be the thing that breaks (the D-119 lesson, re-learned here).
+                f"-> actual {fmt_money(row.actual)}, variance {fmt_delta(row.variance)}"
+            )
+        if len(rows) > _ACCURACY_MAX_ROWS:
+            section.lines.append(
+                f"• _…and {len(rows) - _ACCURACY_MAX_ROWS} more — full table in the "
+                f"Monday worksheet._"
+            )
         snap["accuracy"] = {
-            "week": recent["week"], "variance": variance, "weeks_since": weeks_since,
+            "week_ending": accuracy_week,
+            "measured": len(rows),
+            "pending": len(pending),
+            "worst": worst.as_dict(),
         }
     else:
+        # NOT "0 weeks" and NOT 100%: name which of the two reasons applies.
         section.lines.append(
-            "Forecast accuracy: first run — no accuracy history yet."
+            f"Forecast accuracy: NOT COMPUTABLE for week ending "
+            f"{_scrub_external(accuracy_week, 12)} — no tab has both a closed "
+            f"actual and a verified pre-close forecast. First runs read this way "
+            f"until a full week has passed since the first snapshot."
         )
 
-    # Pack-history fallback: week-over-week movement in OUR OWN prior snapshot.
-    if prior and isinstance(prior.get("cash"), dict):
-        section.lines.append(
-            f"Accuracy history source: this pack's prior snapshot "
-            f"({_scrub_external(str(prior.get('generated_at') or 'unknown date'), 20)}) — "
-            f"the only forecast record that is not overwritten."
-        )
-
-    # ── next-week starting points ────────────────────────────────────────────
-    # Choosing "the first entry with no actual" relabels a PAST week as next
-    # week's target the moment one actual is late -- Justin is out, 7-31 is still
-    # unfilled when the pack runs on 8-3, and the section then tells everyone to
-    # carry today's balances into the opening row of a week that already closed.
-    #
-    # Anchor on SERIES POSITION, not on parsed dates. The dual series is already
-    # chronological (sheet column order), and the sheet's week labels carry no
-    # year: _parse_week_date is deliberately BACKWARD-looking and resolves "8-7"
-    # against a 2026-08-03 run date to 2025-08-07, so a date filter would have
-    # discarded every forward week and silently killed this whole leg.
-    last_actual_idx = max(
-        (i for i, w in enumerate(dual) if w.get("actual") is not None), default=-1
-    )
-    forward = [
-        w for w in dual[last_actual_idx + 1:]
-        if w.get("actual") is None and w.get("forecast") is not None
-    ]
-    next_week = forward[0] if forward else None
-
+    # ── next-week carry-in references ────────────────────────────────────────
+    next_week = cw.next_forecast_week(snapshot, today=day)
     bank = sources.get_bank_snapshot()
-    realms = (bank or {}).get("realms") or {}
 
     # The bank section warns about a stale snapshot under its OWN heading; this
     # section asserts figures are "on hand now" under a different one, and
@@ -1384,96 +1494,262 @@ def build_forecast_assist_section(
         )
 
     renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
-    shell_realms: list[str] = []
+    carry = cw.build_carry_in(
+        renderable, bank_snapshot=bank, book_balances=cash_fragment)
+    shell_realms = [r.entity for r in carry if r.status == "shell"]
     covered = 0
+
     if next_week is None:
         section.lines.append(
-            "Next-week starting point: the sheet carries no forward forecast week."
+            "Next-week carry-in: the snapshot carries no forward forecast week."
         )
     else:
-        label = _scrub_external(str(next_week["week"]), 20)
+        label = _scrub_external(next_week, 12)
+        portfolio = cw.portfolio_forecast(snapshot, next_week)
         section.lines.append(
-            f"Next-week starting point — week {label} (sheet forecast "
-            f"{fmt_money(next_week['forecast'])} portfolio-wide):"
+            f"Carry-in references — week ending {label}"
+            + (f" (CF_SUMMARY forecast {fmt_money(portfolio)} portfolio-wide)"
+               if portfolio is not None else
+               " (CF_SUMMARY portfolio forecast UNKNOWN)")
+            + ". " + cw.CARRY_IN_POSTURE
         )
-        for entity in renderable:
-            block = realms.get(entity)
-            # A cash-less shell has no starting point to carry, so it is dropped
-            # from the DENOMINATOR rather than counted as a coverage gap. Leaving
-            # it in made this section report itself partial EVERY week (OSN is
-            # shell-configured and is not pack-excluded), and a permanent
-            # false-partial trains the reader to ignore the real ones.
-            if block and block.get("shell"):
-                shell_realms.append(entity)
+        for row in carry:
+            if row.status == "shell":
+                # A cash-less shell has no carry-in, so it leaves the DENOMINATOR
+                # rather than counting as a coverage gap -- a permanent
+                # false-partial trains the reader to ignore the real ones.
                 continue
-            if not block or block.get("status") != "ok":
-                # An unreadable realm must be NAMED, not silently absent. The
-                # "unavailable —" wording is what build_founder_cut collects.
+            if row.status != "ok":
+                # "unavailable —" is the literal substring build_founder_cut
+                # collects; any other wording makes this invisible in the cut.
                 section.lines.append(
-                    f"• {entity_label(entity)}: unavailable — no bank snapshot for "
-                    f"this realm, so it has no starting point"
-                )
-                continue
-            net = block.get("cash_net_of_cards")
-            if net is None:
-                section.lines.append(
-                    f"• {entity_label(entity)}: unavailable — books position UNKNOWN, "
-                    f"so it has no starting point"
+                    f"• {entity_label(row.entity)}: unavailable — {row.reason}"
                 )
                 continue
             covered += 1
-            # BASIS, not decoration (D-116). The sheet's opening row is
-            # "BEGINNING Cash/CC - BOOK Balance", so the number that belongs in it
-            # is the BalanceSheet-report figure the pack's cash section already
-            # computed -- NOT this register balance. Telling Justin to carry the
-            # register in would have manufactured the very break the cash section
-            # then flags: verified live 2026-08-05, HJR Properties reads $128,128
-            # on the register against $26,880 on the report, and Big D Media flips
-            # sign by ~$20K. So the register is shown as a reference only, and the
-            # carry-in names the book figure when we have it.
-            books = (cash_fragment or {}).get(entity, {}).get("books_net")
-            if books is None:
-                section.lines.append(
-                    f"• {entity_label(entity)}: register reads {fmt_money(net)} "
-                    f"[{BALANCE_BASIS}] — reference only; the {label} opening row "
-                    f"takes a BOOK balance, which is not available this run"
-                )
-            else:
-                section.lines.append(
-                    f"• {entity_label(entity)}: carry {fmt_money(books)} into the "
-                    f"{label} opening row [books, BalanceSheet report — the basis "
-                    f"that row uses]. Live register reads {fmt_money(net)} "
-                    f"[{BALANCE_BASIS}]; the two are different measures, so do NOT "
-                    f"substitute one for the other."
-                )
-            snap[entity] = {
-                "starting_point_books": books, "register_reference": net,
-                "week": next_week["week"],
+            books = (f"books {fmt_money(row.book_total)} [BalanceSheet report — the "
+                     f"basis the opening row uses]"
+                     if row.book_total is not None else
+                     "books UNKNOWN this run")
+            section.lines.append(
+                f"• {entity_label(row.entity)}: register {fmt_money(row.register_total)} "
+                f"[{BALANCE_BASIS}], {books}; posted through "
+                f"{row.posted_through or 'UNKNOWN'} (realm-level). The two are "
+                f"different measures — do NOT substitute one for the other."
+            )
+            snap[row.entity] = {
+                "register_reference": row.register_total,
+                "book_reference": row.book_total,
+                "week_ending": next_week,
             }
 
     section.covered = covered
     section.expected = len(renderable) - len(shell_realms)
     section.lines.append(
-        f"_Starting points for {covered} of {section.expected} entity(ies). "
+        f"_Carry-in references for {covered} of {section.expected} entity(ies). "
         f"Cora never writes the cash sheet — this is a worksheet to type from._"
     )
+    section.lines.append(f"_{cw.CARRY_IN_PROPOSAL}_")
+    section.lines.append(_SUPERSESSION_NOTE)
     return section, snap
 
 
 def render_forecast_worksheet(section: Section, today: datetime.date | None = None) -> str:
-    """The durable markdown worksheet. Same computed lines, no recomputation."""
+    """The predecessor worksheet shape. Retained for callers holding a Section.
+
+    The DURABLE Monday worksheet is `cashflow_worksheet.render_worksheet`, which
+    writes to `cashflow-ledger/worksheets/`. Nothing in production calls this.
+    """
     day = today or _today()
     return "\n".join([
         f"# Forecast assist — {day.isoformat()}",
         "",
         "_Generated by Cora. Deterministic; every figure is a direct source read._",
         "_Cora does NOT write the Standing ACTUALS sheet — type from this._",
+        f"_SUPERSEDED: the Monday worksheet is now {CASHFLOW_WORKSHEET_RELDIR}/._",
         "",
         *(section.lines if section.available
           else [f"Section unavailable — {section.stub_reason}"]),
         "",
     ])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1c-2 — Parallel run: sheet actuals vs QBO actuals (13WCF M3 / S4)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHAT IT COMPARES, AND WHAT IT REFUSES TO CLAIM
+# -----------------------------------------------
+# One FINALIZED QBO week against the sheet's entered actual for that same week.
+# Never the just-ended week: the sheet's column does not exist until Monday
+# evening and QBO is structurally incomplete at 06:25 (Fin-1/Fin-2), so the
+# comparison lags one matured week.
+#
+# THE DELTA IS "UNATTRIBUTED", NOT "UNEXPLAINED", AND THAT WORD IS THE FINDING.
+# The sheet's rows are Cash/CC; M2's perimeter is bank accounts only, where a
+# card PAYMENT is the cash event and card PURCHASES are not (D-120/Fin-3). Any
+# week with card spending diverges by construction, and nothing available in v1
+# splits that component out. Measured on the live 2026-08-07 finalized window
+# against the 2026-08-17 snapshot, every single covered realm was four or five
+# figures away from a gate of max($100, 0.5%): BDM +$16,065, F3E +$20,675,
+# HJRP +$19,834, OSNGW -$6,118, OSNVV -$1,293.
+#
+# So the flip gate is reported as BLOCKED with that stated as its reason,
+# instead of starting a four-week clock on a number no amount of clean
+# bookkeeping can bring inside tolerance. Calling an undecomposable delta
+# "unexplained" would have manufactured a permanent alarm; calling the two
+# figures simply non-comparable and moving on would leave nothing watching
+# either (the D-129 companion trap). The section does the third thing: it
+# publishes the delta, names what it cannot separate, and points at the one
+# component it CAN measure.
+#
+# THAT COMPONENT IS MATURATION: finalized net minus the SAME week's preliminary
+# net is what posted into QBO after the first pull -- the timing half, measured
+# rather than asserted. Live on 2026-08-07 it ran from +$586 (OSNGW) to
+# -$79,054 (HJRP), which is exactly why the design mandated two windows.
+
+_PARALLEL_METHOD_FOOTER = (
+    "_Method: this section is FLOW-grain (a week's net cash movement) read at a "
+    "different instant from the cash section's BALANCE-grain sheet-vs-books "
+    "cross-check above. They answer different questions and are never "
+    "cross-flagged — a difference here is not evidence about that one._"
+)
+
+
+def build_cashflow_parallel_section(
+    sources: Sources,
+    *,
+    today: datetime.date | None = None,
+) -> tuple[Section, dict[str, Any]]:
+    """Sheet-entered actuals vs QBO finalized actuals for one matured week."""
+    from . import cashflow_worksheet as cw  # noqa: PLC0415
+
+    day = today or _today()
+    section = Section(
+        key="cashflow_parallel",
+        title=":scales: Parallel run — sheet vs QBO actuals",
+    )
+    frag: dict[str, Any] = {}
+
+    entity_map = sources.get_cashflow_entity_map()
+    gate = cw.debut_gate(entity_map)
+    snapshot = sources.get_cashflow_snapshot()
+    finalized = sources.get_cashflow_finalized()
+    prelim = None
+    if finalized and finalized.get("week_ending"):
+        prelim = sources.get_cashflow_preliminary(str(finalized["week_ending"]))
+
+    parallel = cw.build_parallel(
+        snapshot=snapshot, finalized=finalized, preliminary=prelim,
+        entity_map=entity_map, gate=gate, today=day,
+    )
+
+    if not parallel.available:
+        section.available = False
+        section.stub_reason = _scrub_external(parallel.reason, 300)
+        return section, frag
+
+    week = _scrub_external(parallel.week_ending or "unknown", 12)
+    section.lines.append(
+        f"Comparing week ending *{week}* — the sheet's entered actual against "
+        f"QBO's FINALIZED re-pull. The just-ended week is never compared: its "
+        f"sheet column does not exist yet and its QBO side is not mature."
+    )
+    if parallel.stale_window:
+        # A monitor that watches only the newest artifact cannot see a hole
+        # behind it (D-130(d)). Say the window is behind rather than presenting
+        # a stale week as this week's comparison.
+        section.lines.append(
+            f":warning: the newest finalized window is week {week}, but this "
+            f"Monday should have produced "
+            f"{_scrub_external(parallel.expected_week_ending or 'a later week', 12)} "
+            f"— the actuals job appears to have missed a run."
+        )
+        section.flags += 1
+
+    section.lines.append(
+        "_Bases differ by construction: the sheet's rows are Cash/CC, QBO's "
+        "perimeter is bank accounts only (a card PAYMENT is the cash event; card "
+        "PURCHASES are not). v1 cannot split that component out, so deltas below "
+        "are UNATTRIBUTED — not 'unexplained', and not evidence of a bookkeeping "
+        "error on their own._"
+    )
+
+    for row in parallel.rows:
+        label = entity_label(row.realm)
+        tab = _scrub_external(row.tab or "unpaired", 40)
+        if row.status == "unavailable":
+            section.lines.append(
+                f"• {label}: unavailable — {_scrub_external(row.reason, 80)}"
+            )
+            continue
+        if row.status == "pending_sheet":
+            section.lines.append(
+                f"• {label} ({tab}): sheet actual not entered for this week yet — "
+                f"QBO reads {fmt_money(row.qbo_net)}. Not a zero and not a break."
+            )
+            continue
+
+        maturation = (
+            f"; {fmt_delta(row.maturation)} of it posted to QBO after the "
+            f"preliminary pull"
+            if row.maturation is not None else
+            "; no preliminary window for this week, so the timing component is "
+            "UNKNOWN"
+        )
+        section.lines.append(
+            f"• {label} ({tab}): sheet {fmt_money(row.sheet_net)} vs QBO "
+            f"{fmt_money(row.qbo_net)} — delta {fmt_delta(row.delta)}{maturation}."
+        )
+        if row.qbo_ending is not None and row.sheet_ending is not None:
+            # Renders only when QBO produced a COMPLETE balance. It usually does
+            # not: the General Ledger omits accounts with no activity, so M2
+            # withholds the figure rather than publish a partial as a total
+            # (D-129). Live to date this line has never rendered.
+            section.lines.append(
+                f"    ending cash: sheet {fmt_money(row.sheet_ending)} vs QBO "
+                f"{fmt_money(row.qbo_ending)} "
+                f"[QBO balance complete for every bank account]"
+            )
+
+    out = parallel.out_of_tolerance
+    section.covered = parallel.covered
+    section.expected = parallel.expected
+
+    # ── flip gate ────────────────────────────────────────────────────────────
+    # Reported as BLOCKED rather than as a streak count. A gate whose metric
+    # cannot reach its threshold for a STRUCTURAL reason must say so; rendering
+    # "0 of 4 weeks" would read as progress toward something achievable.
+    section.lines.append(
+        f"_Flip gate: BLOCKED, not failing. It needs "
+        f"{cw.FLIP_GATE_WEEKS} consecutive weeks with every covered entity's "
+        f"delta inside max(${cw.FLIP_GATE_ABS:,.0f}, "
+        f"{cw.FLIP_GATE_PCT * 100:.1f}%), but the Cash/CC-vs-bank-cash basis "
+        f"difference above is not separable in v1, so the metric cannot reach "
+        f"that threshold however clean the books are. This week "
+        f"{len(out)} of {parallel.covered} compared entity(ies) sit outside it. "
+        f"Unblocking it needs card-side flows (the BILL/Divvy pull, "
+        f"`cq-f3bfa4e9ca5b`) or a Cash/CC-basis QBO perimeter — a decision, not "
+        f"a fix._"
+    )
+    section.lines.append(
+        f"_Compared {parallel.covered} of {parallel.expected} entity(ies); "
+        f"snapshot {_scrub_external(parallel.snapshot_date or 'unknown', 12)}, "
+        f"window run {_scrub_external(parallel.window_run_date or 'unknown', 12)}._"
+    )
+    section.lines.append(_PARALLEL_METHOD_FOOTER)
+
+    frag = {
+        "week_ending": parallel.week_ending,
+        "covered": parallel.covered,
+        "expected": parallel.expected,
+        "out_of_tolerance": [r.realm for r in out],
+        "pending_sheet": [r.realm for r in parallel.rows
+                          if r.status == "pending_sheet"],
+        "flip_gate": "blocked",
+        "stale_window": parallel.stale_window,
+    }
+    return section, frag
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Section 1d — Intercompany discovery / check (A5 S3, absorbed L2)
@@ -1732,6 +2008,68 @@ def _pair_balance(found: dict[str, list[dict[str, Any]]], side: dict[str, Any]) 
             if row["name"].strip().lower() == name:
                 return row.get("balance")
     return None
+
+
+def build_worksheet(
+    entities: list[str],
+    sources: Sources,
+    *,
+    cash_fragment: dict[str, Any] | None = None,
+    today: datetime.date | None = None,
+) -> str:
+    """Render the Monday worksheet v2 from the same stores the pack sections read.
+
+    ONE COMPUTATION, TWO RENDERS. The accuracy rows here come from the same
+    ``cashflow_worksheet.forecast_accuracy`` call the pack section makes, over
+    the same store, for the same week -- because two systems computing "forecast
+    accuracy" in one Monday is exactly the Mig-1 failure the supersession exists
+    to prevent, and a worksheet that disagreed with the pack posted beside it
+    would be worse than either alone.
+
+    THE DEBUT GATE APPLIES TO THE MAP-DEPENDENT LEG ONLY, and that is a
+    deliberate, named narrowing of the design's wording ("S3/S4 sections render
+    only once the entity map has >=N confirmed pairs"). The gate exists so no
+    figure is published against a realm-tab pairing nobody has verified. The
+    accuracy, carry-in and candidates legs carry no QBO attribution at all --
+    accuracy compares the sheet against its own banked forecast, carry-in reads
+    the bank register per realm, candidates are cited text -- so withholding
+    them would suppress verified figures for a reason that does not apply to
+    them. The QBO-actuals leg, which is entirely map-dependent, renders the
+    gate's stub; so does the whole ``cashflow_parallel`` pack section.
+    """
+    from . import cashflow_worksheet as cw  # noqa: PLC0415
+
+    day = today or _today()
+    snapshot = sources.get_cashflow_snapshot()
+    entity_map = sources.get_cashflow_entity_map()
+    gate = cw.debut_gate(entity_map)
+
+    accuracy_week, accuracy, pending = cw.resolve_accuracy(
+        latest=snapshot,
+        load_snapshot=sources.load_cashflow_snapshot,
+        snapshot_dates=sources.get_cashflow_snapshot_dates(),
+    )
+
+    renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]
+    carry = cw.build_carry_in(
+        renderable,
+        bank_snapshot=sources.get_bank_snapshot(),
+        book_balances=cash_fragment,
+    )
+
+    return cw.render_worksheet(
+        today=day,
+        snapshot=snapshot,
+        preliminary=sources.get_cashflow_newest_preliminary(),
+        accuracy=accuracy,
+        accuracy_week=accuracy_week,
+        accuracy_pending=pending,
+        carry_in=carry,
+        candidates=cw.read_candidates(),
+        entity_map=entity_map,
+        gate=gate,
+    )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2267,6 +2605,7 @@ def build_pack(
             ("cash", ":bank: Cash — cash sheet vs books"),
             ("qbo_bank", ":bank: QBO bank & books freshness"),
             ("forecast_assist", ":chart_with_upwards_trend: Forecast assist"),
+            ("cashflow_parallel", ":scales: Parallel run — sheet vs QBO actuals"),
             ("intercompany", ":left_right_arrow: Intercompany"),
             ("aging", ":inbox_tray: AR / AP aging — week over week"),
             ("pnl", ":bar_chart: P&L sanity — month over month"),
@@ -2317,9 +2656,13 @@ def build_pack(
         # above. Passing it means the carry-in figure is on the same basis as the
         # sheet row it goes into, with no extra API call.
         lambda: build_forecast_assist_section(
-            provisioned, src, prior=prior,
+            provisioned, src,
             cash_fragment=snapshot.get("cash"), today=day,
         ),
+    )
+    parallel_section = guarded(
+        "cashflow_parallel", ":scales: Parallel run — sheet vs QBO actuals",
+        lambda: build_cashflow_parallel_section(src, today=day),
     )
     intercompany_section = guarded(
         "intercompany", ":left_right_arrow: Intercompany",
@@ -2343,9 +2686,18 @@ def build_pack(
     )
 
     pack.sections = [
-        cash_section, bank_section, forecast_section, intercompany_section,
-        aging_section, pnl_section, close_prep, renewals,
+        cash_section, bank_section, forecast_section, parallel_section,
+        intercompany_section, aging_section, pnl_section, close_prep, renewals,
     ]
+
+    # Guarded like a section: a worksheet failure must cost the worksheet, never
+    # the pack. The delivery script treats `worksheet is None` as "write nothing"
+    # rather than writing a stub file that would look like this week's worksheet.
+    try:
+        pack.worksheet = build_worksheet(
+            provisioned, src, cash_fragment=snapshot.get("cash"), today=day)
+    except Exception as exc:  # noqa: BLE001
+        log.error("finance_close: worksheet build raised: %s", exc)
 
     # Only persist a snapshot that actually carries data. A run where every section
     # stubbed would otherwise become next week's "most recent prior snapshot" --
