@@ -359,8 +359,33 @@ def post_ops_alert(client, failed: list[str], n_flags: int) -> None:
         log.error("close-pack: delivery-failure notice ALSO failed: %s", exc)
 
 
+def worksheet_date(pack) -> datetime.date:
+    """The date the worksheet's CONTENT was computed for.
+
+    Taken from the pack, never from the wall clock at write time: the pack is
+    built with one `today` and every figure in the worksheet was computed
+    against it, so a run that straddles midnight would otherwise file Monday's
+    worksheet under Tuesday's name. Falls back to today only if the pack's
+    stamp is unparseable, which cannot happen from build_pack.
+    """
+    try:
+        return datetime.date.fromisoformat(str(pack.generated_at))
+    except (TypeError, ValueError):
+        log.warning("close-pack: pack has no parseable generated_at -- "
+                    "naming the worksheet by today's date")
+        return datetime.date.today()
+
+
 def write_worksheet(pack, day: datetime.date) -> None:
     """Write the Monday worksheet locally and mirror it into the accounting tree.
+
+    SILENT OVERWRITE IS CORRECT HERE, and the asymmetry with
+    `cashflow_ledger.write_snapshot` (which refuses a same-date overwrite) is
+    deliberate. A forecast snapshot captures a sheet state that exists for one
+    morning only, so replacing it destroys history no later run can recover. The
+    worksheet is fully DERIVED from those banked stores -- regenerating it reads
+    the same inputs and produces the same file, so refusing would only make a
+    legitimate re-run fail and train the operator to reach for a force flag.
 
     FAIL-SOFT AND NEVER LOAD-BEARING. The pack is the deliverable; the worksheet
     is a durable artifact beside it, so a Drive blip or a read-only mount logs
@@ -493,7 +518,7 @@ def main() -> int:
                  "only %s while carrying the whole week's filename)",
                  ", ".join(entities))
     else:
-        write_worksheet(pack, datetime.date.today())
+        write_worksheet(pack, worksheet_date(pack))
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not bot_token:

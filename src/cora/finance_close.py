@@ -578,7 +578,6 @@ class Sources:
     renewals: Callable[[], list[dict[str, Any]] | None] | None = None
     adherence_facts: Callable[[], dict[str, Any] | None] | None = None
     bank_snapshot: Callable[[], dict[str, Any] | None] | None = None
-    cash_dual: Callable[[], list[dict[str, Any]] | None] | None = None
     # ── 13WCF shadow-ledger stores (M1/M2), injected so the pack's forecast and
     # parallel sections are testable without touching disk. These are the SOLE
     # forecast baseline as of M3 -- there is deliberately no sheet-side or
@@ -682,22 +681,13 @@ class Sources:
             return self.adherence_facts()
         return load_adherence_facts()
 
-    def get_cash_dual(self) -> list[dict[str, Any]] | None:
-        """The NON-COLLAPSING per-week {week, forecast, actual, forecast_overwritten}
-        series, or None when the sheet cannot be read.
-
-        Separate from get_cash_closing because that one returns the collapsed
-        actual-else-forecast figure, from which an original forecast is
-        unrecoverable once a week closes.
-        """
-        if self.cash_dual:
-            return self.cash_dual()
-        try:
-            from .connectors import gsheets_financials  # noqa: PLC0415
-            return gsheets_financials.get_cashflow().ending_cash_dual
-        except Exception as exc:  # noqa: BLE001 -- honest stub beats a dead pack
-            log.warning("finance_close: cash dual series unavailable: %s", exc)
-            return None
+    # `get_cash_dual` was REMOVED at 13WCF M3 (2026-08-18) with the forecast_assist
+    # supersession. It read the sheet's own forecast/actual dual series -- the
+    # column the sheet OVERWRITES at week close (D-121) -- and it no longer has a
+    # consumer. Deleting it rather than leaving it unused is the point of the
+    # supersession: a live accessor to the retired source is the thing someone
+    # re-wires. The connector-side `CashflowSummary.ending_cash_dual` is
+    # untouched; this only removes the pack's door to it.
 
     # ── 13WCF stores ────────────────────────────────────────────────────────
 

@@ -743,19 +743,12 @@ class TestForecastAssistSupersession:
         assert not section.available
         assert "no fallback" in (section.stub_reason or "")
 
-    def test_the_section_reads_the_s1_store_not_the_cash_dual_series(self):
-        """The sheet's dual series must not be consulted at all -- it is the
-        overwritten column this supersession exists to stop using."""
-        called: list[str] = []
-        src = fc.Sources(
-            cash_dual=lambda: called.append("dual") or [],
-            cashflow_snapshot=lambda: _snapshot("2026-08-24", {}),
-            cashflow_snapshot_dates=lambda: [],
-            cashflow_load_snapshot=lambda d: None,
-            bank_snapshot=lambda: None,
-        )
-        fc.build_forecast_assist_section(["F3E"], src, today=MONDAY)
-        assert called == []
+    def test_the_pack_has_no_door_to_the_sheet_dual_series_at_all(self):
+        """Stronger than "it is not called": the accessor and its Sources field
+        are GONE. A live accessor to the retired source is the thing someone
+        re-wires, and the sheet's forecast column is overwritten at week close."""
+        assert not hasattr(fc.Sources, "get_cash_dual")
+        assert "cash_dual" not in fc.Sources.__dataclass_fields__
 
     def test_the_supersession_note_rides_every_rendered_section(self):
         src = fc.Sources(

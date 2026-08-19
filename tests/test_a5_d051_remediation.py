@@ -136,13 +136,28 @@ class TestShellRealmsDoNotCreateAPermanentFalsePartial:
     it in `expected` made forecast_assist report itself partial EVERY week --
     training the reader to ignore the one signal that marks a real gap."""
 
-    DUAL = [{"week": "8-7", "forecast": 1767089.0, "actual": None,
-             "forecast_overwritten": False}]
+    # 13WCF M3: the sheet-dual series is no longer read. An injected SNAPSHOT
+    # replaces it -- without one these fall through to the live on-disk store
+    # and this unit test starts depending on whether this week's S1 job ran.
+    SNAPSHOT = {
+        "schema_version": 1, "snapshot_date": "2026-08-03",
+        "week_ending_weekday": "Friday",
+        "tabs": {"CF_SUMMARY": {
+            "status": "ok", "post_refresh_suspect": False,
+            "last_actual_week_ending": "2026-07-31",
+            "forward_week_endings": ["2026-08-07"],
+            "series": {"ending_cash": [
+                {"week_ending": "2026-08-07", "forecast": 1767089.0,
+                 "actual": None, "diff": None, "basis": "forecast"}]},
+        }},
+    }
 
     def test_forecast_assist_is_complete_on_a_clean_run(self):
         section, _ = fc.build_forecast_assist_section(
             ["F3E", "BDM", "OSN"],
-            fc.Sources(cash_dual=lambda: self.DUAL,
+            fc.Sources(cashflow_snapshot=lambda: self.SNAPSHOT,
+                       cashflow_snapshot_dates=lambda: [],
+                       cashflow_load_snapshot=lambda d: None,
                        bank_snapshot=lambda: _snap(
                            F3E=_realm(1.0), BDM=_realm(2.0),
                            OSN=_realm(0.0, shell=True))),
@@ -153,7 +168,9 @@ class TestShellRealmsDoNotCreateAPermanentFalsePartial:
     def test_a_real_gap_still_shows_as_partial_and_is_named(self):
         section, _ = fc.build_forecast_assist_section(
             ["F3E", "BDM", "OSN"],
-            fc.Sources(cash_dual=lambda: self.DUAL,
+            fc.Sources(cashflow_snapshot=lambda: self.SNAPSHOT,
+                       cashflow_snapshot_dates=lambda: [],
+                       cashflow_load_snapshot=lambda d: None,
                        bank_snapshot=lambda: _snap(
                            F3E=_realm(1.0), BDM=_realm(0.0, status="error"),
                            OSN=_realm(0.0, shell=True))),

@@ -146,26 +146,22 @@ class TestForecastAssist:
 
     # ── the supersession itself ─────────────────────────────────────────────
 
-    def test_the_sheet_dual_series_is_never_consulted(self):
+    def test_the_sheet_dual_series_has_no_accessor_left(self):
         """The overwritten column is the thing this milestone stopped reading.
-        A source that is merely DEMOTED still runs; assert it is not called."""
-        called: list[str] = []
-        fc.build_forecast_assist_section(
-            ["F3E"],
-            self._sources(cash_dual=lambda: called.append("dual") or []),
-            today=MONDAY)
-        assert called == []
+        A source that is merely DEMOTED still runs, so it is removed instead."""
+        assert not hasattr(fc.Sources, "get_cash_dual")
+        assert "cash_dual" not in fc.Sources.__dataclass_fields__
 
     def test_no_snapshot_is_an_honest_stub_with_no_fallback(self):
         section, _ = fc.build_forecast_assist_section(
             ["F3E"],
-            self._sources(cashflow_snapshot=lambda: None,
-                          cash_dual=lambda: [{"week": "7-31", "forecast": 1.0,
-                                              "actual": 2.0,
-                                              "forecast_overwritten": False}]),
+            self._sources(cashflow_snapshot=lambda: None),
             today=MONDAY)
         assert section.available is False
         assert "no fallback" in (section.stub_reason or "")
+        # The stub is the WHOLE outcome: no accuracy line, no carry-in, no
+        # figures from anywhere else. An unavailable store is unavailable.
+        assert section.lines == []
 
     def test_no_measurable_week_never_claims_a_variance(self):
         """Mig-12/D-121: not 100%, not zero, and no figure invented."""
