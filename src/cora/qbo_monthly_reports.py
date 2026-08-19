@@ -266,6 +266,32 @@ def report_period(report: dict[str, Any]) -> tuple[str | None, str | None]:
     return (header.get("StartPeriod"), header.get("EndPeriod"))
 
 
+def report_date_macro(report: dict[str, Any]) -> str | None:
+    """The date macro QBO actually applied, if any.
+
+    This job ALWAYS asks with explicit dates, so a macro in the response means
+    QBO ignored what we sent and substituted a period of its own -- which is
+    precisely how the BalanceSheet `as_of_date` bug produced correctly-named
+    files holding another month's figures (cq-157a961853c4).
+
+    Checking the echoed EndPeriod alone cannot catch that class: QBO's default
+    is "Last Month", and the scheduled run fires on the 2nd asking for the prior
+    month, so the default and the request COINCIDE every single time. The
+    mismatch is only ever visible on a backfill. The presence of a macro is the
+    signature that survives the coincidence.
+    """
+    header = report.get("Header") or {}
+    macro = header.get("DateMacro")
+    if macro:
+        return str(macro)
+    for opt in header.get("Option") or []:
+        if str((opt or {}).get("Name")) in ("DateMacro", "date_macro"):
+            val = str((opt or {}).get("Value", "")).strip()
+            if val:
+                return val
+    return None
+
+
 def report_has_no_data(report: dict[str, Any]) -> bool:
     """QBO signals an empty report via a header Option rather than empty Rows."""
     for opt in (report.get("Header") or {}).get("Option") or []:
@@ -579,6 +605,20 @@ def build_month(
                      "reason": f"period mismatch -- asked "
                                f"{want_start or end}..{end}, got "
                                f"{got_start or '?'}..{got_end or '?'}"})
+                continue
+
+            # An EndPeriod that MATCHES is not proof our dates were honored: the
+            # scheduled run asks for the prior month and QBO's default is "Last
+            # Month", so a wholly-ignored date param produces an identical echo
+            # every time it fires. We always send explicit dates, so a macro in
+            # the response means QBO substituted a period of its own.
+            macro = report_date_macro(report)
+            if macro:
+                summary["skipped"].append(
+                    {"entity": entity, "kind": kind,
+                     "reason": f"QBO applied date macro {macro!r} instead of the "
+                               f"explicit dates we sent -- the echoed period "
+                               f"cannot be trusted to be the one requested"})
                 continue
 
             data = render_xlsx(

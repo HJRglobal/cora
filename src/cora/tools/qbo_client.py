@@ -293,7 +293,17 @@ def get_balance_sheet(
     if not as_of_date:
         as_of_date = datetime.date.today().isoformat()
     token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
-    params: dict = {"as_of_date": as_of_date, "minorversion": "65"}
+    # `end_date`, NOT `as_of_date` (cq-157a961853c4). The BalanceSheet report
+    # takes start_date/end_date/date_macro; `as_of_date` is not a parameter it
+    # recognizes, so QBO SILENTLY IGNORED it and fell back to its own default
+    # period. Proven live 2026-08-19 by the monthly-report backfill: asking
+    # as_of 2026-06-30 returned 2026-07-01..2026-07-31 on ALL ELEVEN realms --
+    # i.e. "last month" relative to the 8/19 run date. The July backfill
+    # "passed" the period verify for the same reason, purely by coincidence,
+    # and the on-schedule monthly run (fires on the 2nd, asks for the prior
+    # month) would have coincided forever -- so this defect was invisible except
+    # to a backfill. The report renders as-of end_date.
+    params: dict = {"end_date": as_of_date, "minorversion": "65"}
     if accounting_method:
         params["accounting_method"] = accounting_method
     return _request(
@@ -1367,4 +1377,211 @@ def format_recent_transactions_for_llm(payload: dict[str, Any], entity: str, day
             continue
         items = section.get(_qbo_response_keys[kind]) or []
         lines.append(f"  • {kind}: {len(items)} updated")
+    return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Transaction-level detail (cq-42787b27d4cb P1 + cq-e3f057668e1f)
+#
+# VERIFY-FIRST FINDING, recorded because it changes what the P1 bug actually was.
+# The seed reads "Cora cannot pull required detail level from QBO despite having
+# access ... confirm capability gap and add missing tool/permission". The access
+# was never the problem, and no new permission is needed for the category half:
+# `get_profit_loss` already returns QBO's FULL nested report tree, containing
+# every leaf account. What threw the detail away was the RENDERER --
+# `_extract_top_level_sections` keeps only top-level Summary rows, so the most
+# Cora could ever say was "Total Expenses: 90,000.00", never which categories
+# made it up. That is outcome (A) of the seed's own branch test (the capability
+# exists and was ungated at the wrong layer), not outcome (B).
+#
+# WHY REPORTS AND NOT THE QUERY API: cq-db2fd53aa608 -- QBO transaction-type
+# queries return EMPTY BODIES rather than errors, which reads as "no spend" with
+# nothing to refuse it. Reports do not have that failure mode, and QBO does its
+# own aggregation, so no total here is ever computed by Cora or by the model
+# (D-095). Every figure below is QBO's own string, moved.
+# ────────────────────────────────────────────────────────────────────────────
+
+#: Section names whose subtree holds spend. Matched case-insensitively against
+#: the section header QBO emits, so a realm rendering "Expenses" and one
+#: rendering "Total Expenses" both resolve.
+_EXPENSE_SECTION_HINTS: tuple[str, ...] = (
+    "expense", "cost of goods sold", "cogs",
+)
+
+
+def _row_label_and_value(row: dict[str, Any]) -> tuple[str, str]:
+    """(label, value) from a QBO Data row's ColData: first column, last column."""
+    cols = (row or {}).get("ColData") or []
+    if not cols:
+        return "", ""
+    label = str(cols[0].get("value", "") or "").strip()
+    value = str(cols[-1].get("value", "") or "").strip() if len(cols) >= 2 else ""
+    return label, value
+
+
+def extract_leaf_rows(report: dict[str, Any],
+                      section_hints: tuple[str, ...] | None = None
+                      ) -> list[tuple[str, str, str]]:
+    """Walk a report tree to its LEAF Data rows.
+
+    Returns ``[(section, account, value), ...]`` where `section` is the nearest
+    enclosing named section. When `section_hints` is given, only subtrees whose
+    section name contains one of the hints are descended -- that is how the
+    expense breakdown avoids dragging Income rows into an expense answer.
+
+    Structure-agnostic and total-free: it moves QBO's own strings and never adds
+    them up. Intuit reshapes report payloads occasionally, so an unrecognized
+    shape yields fewer rows rather than raising.
+    """
+    out: list[tuple[str, str, str]] = []
+
+    def _walk(rows: list[dict[str, Any]], section: str, inside: bool) -> None:
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") == "Section":
+                header = (row.get("Header") or {}).get("ColData") or [{}]
+                name = str(header[0].get("value", "") or "").strip() or section
+                now_inside = inside
+                if section_hints is not None and not inside:
+                    now_inside = any(h in name.casefold() for h in section_hints)
+                _walk((row.get("Rows") or {}).get("Row") or [], name, now_inside)
+                continue
+            if section_hints is not None and not inside:
+                continue
+            label, value = _row_label_and_value(row)
+            if label and value:
+                out.append((section, label, value))
+
+    _walk((report.get("Rows") or {}).get("Row") or [], "", section_hints is None)
+    return out
+
+
+def format_expense_detail_for_llm(
+    report: dict[str, Any],
+    entity: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 40,
+) -> str:
+    """Category-level expense breakdown. Source-opaque (B2 -- see format_pnl).
+
+    Rows render in QBO's own report order, NOT re-sorted by size: that order is
+    the account hierarchy, and re-ordering it silently asserts a ranking Cora did
+    not compute. When the list exceeds `limit` the truncation is STATED with both
+    counts, because a silently-cut expense list reads as a complete one -- the
+    same failure class as a digest that drops a store from the ranking and the
+    total at once.
+    """
+    period = f"{start_date} to {end_date}"
+    basis = _report_basis(report)
+    basis_tag = f" [{basis} basis]" if basis else ""
+    rows = extract_leaf_rows(report, _EXPENSE_SECTION_HINTS)
+
+    if not rows:
+        totals = _extract_top_level_sections(report)
+        if totals:
+            return (f"Expense detail for {entity} ({period}){basis_tag}: the report "
+                    f"returned only rolled-up totals, no category rows.\n"
+                    + "\n".join(f"  • {k}: {v}" for k, v in totals.items()))
+        return (f"Expense detail for {entity} ({period}){basis_tag} returned no "
+                f"category rows.")
+
+    lines = [f"Expense detail for {entity} ({period}){basis_tag}:"]
+    last_section = None
+    for section, account, value in rows[:limit]:
+        if section and section != last_section:
+            lines.append(f"{section}:")
+            last_section = section
+        lines.append(f"  • {account}: {value}")
+    if len(rows) > limit:
+        lines.append(f"  ... and {len(rows) - limit} more category rows not shown "
+                     f"(showing the first {limit} of {len(rows)}).")
+    return "\n".join(lines)
+
+
+#: QBO report name for vendor/payee spend detail.
+_VENDOR_SPEND_REPORT = "PurchaseByVendorDetail"
+
+
+def get_vendor_spend(
+    entity: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    accounting_method: str | None = None,
+) -> dict[str, Any]:
+    """Fetch purchases grouped by vendor/payee over a date range.
+
+    accounting_method follows the same contract as get_profit_loss: omitted
+    means each COMPANY's own default basis, which differs per realm. The tool
+    layer pins it so a figure quoted in one channel is comparable with one
+    quoted in another (the C-track doctrine), and the formatter labels whatever
+    basis QBO actually rendered.
+    """
+    if not start_date or not end_date:
+        start_date, end_date = _default_date_range()
+    token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
+    params: dict = {"start_date": start_date, "end_date": end_date,
+                    "minorversion": "65"}
+    if accounting_method:
+        params["accounting_method"] = accounting_method
+    return _request(
+        token_entity,
+        "/v3/company/{realm_id}/reports/" + _VENDOR_SPEND_REPORT,
+        params=params,
+    )
+
+
+def format_vendor_spend_for_llm(
+    report: dict[str, Any],
+    entity: str,
+    start_date: str,
+    end_date: str,
+    vendor: str | None = None,
+    limit: int = 40,
+) -> str:
+    """Vendor/payee spend. Source-opaque (B2 -- see format_pnl).
+
+    When `vendor` is given, rows are filtered by case-insensitive substring on
+    the section name (QBO groups this report by vendor) or the row label, and
+    the filter is STATED in the header -- a narrow answer must never be
+    mistakable for the full picture. A filter matching nothing says so
+    explicitly rather than rendering an empty list, which would read as "this
+    vendor had no spend" when it may just be spelled differently in the books.
+
+    Note on names: `general_ledger_bank_rows` deliberately DROPS payee/memo text
+    at collection (D-124) because that payload is mirrored to a shared folder.
+    This path has no mirror -- it answers into a TIER_1 finance channel only, and
+    vendor identity IS the question being asked -- so the names are the point
+    rather than a leak. The tier gate is what bounds the audience.
+    """
+    period = f"{start_date} to {end_date}"
+    basis = _report_basis(report)
+    basis_tag = f" [{basis} basis]" if basis else ""
+    rows = extract_leaf_rows(report)
+
+    needle = (vendor or "").strip().casefold()
+    if needle:
+        rows = [r for r in rows
+                if needle in (r[0] or "").casefold()
+                or needle in (r[1] or "").casefold()]
+
+    scope = f" matching '{vendor.strip()}'" if needle else ""
+    if not rows:
+        if needle:
+            return (f"No purchases{scope} for {entity} ({period}){basis_tag}. "
+                    f"The vendor may be recorded under a different name, or "
+                    f"there may genuinely be no activity in that window.")
+        return f"No vendor purchases for {entity} ({period}){basis_tag}."
+
+    lines = [f"Vendor spend for {entity} ({period}){basis_tag}{scope}:"]
+    last_section = None
+    for section, label, value in rows[:limit]:
+        if section and section != last_section:
+            lines.append(f"{section}:")
+            last_section = section
+        lines.append(f"  • {label}: {value}")
+    if len(rows) > limit:
+        lines.append(f"  ... and {len(rows) - limit} more rows not shown "
+                     f"(showing the first {limit} of {len(rows)}).")
     return "\n".join(lines)

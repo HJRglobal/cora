@@ -90,6 +90,8 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "qbo_get_ar_aging",
     "qbo_get_ap_aging",
     "qbo_get_recent_transactions",
+    "qbo_get_expense_detail",
+    "qbo_get_vendor_spend",
     # Sales / pipeline / decision dashboards
     "f3e_hubspot_pipeline_summary",
     "fndr_open_decisions",
@@ -3001,6 +3003,74 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
     return _maybe_export_xlsx(
         _input, f"Recent transactions {target} last {days}d",
         qbo_client.format_recent_transactions_for_llm(payload, target, days))
+
+
+def _tool_qbo_get_expense_detail(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Category-level expense breakdown for a period (cq-e3f057668e1f).
+
+    Same fetch as the P&L tool -- the detail was always in the payload; only the
+    renderer was throwing it away. No new QBO permission is involved.
+    """
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
+    if err:
+        return err
+    start_date, end_date = qbo_client.parse_period((_input or {}).get("period"))
+    basis = qbo_client.entity_pnl_basis(target)
+    try:
+        report = qbo_client.get_profit_loss(
+            target, start_date, end_date, accounting_method=basis)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO expense-detail tool error entity=%s: %s", target, exc)
+        return _qbo_error_message(target, exc)
+    log.info("qbo_get_expense_detail entity=%s period=%s..%s",
+             target, start_date, end_date)
+    return _maybe_export_xlsx(
+        _input, f"Expense detail {target} {start_date} to {end_date}",
+        qbo_client.format_expense_detail_for_llm(
+            report, target, start_date, end_date))
+
+
+def _tool_qbo_get_vendor_spend(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Vendor/payee spend over a period, optionally narrowed to one vendor.
+
+    Basis handling deliberately MATCHES the P&L tool rather than hard-pinning
+    Accrual. `entity_pnl_basis` is the shared per-entity override and is
+    currently empty on purpose -- LEX-LLC keeps cash basis and LBHS differs
+    under 42 CFR Part 2 -- so blanket-pinning here would make this tool
+    disagree with the P&L for the same entity and period, which is a worse
+    failure than an unpinned basis. What makes the figures explicable instead is
+    the LABEL: the formatter reports whichever basis QBO actually rendered
+    (`Header.ReportBasis`), so a cash-basis realm reads as cash-basis rather
+    than as an unexplained mismatch. Pinning a parameter is not evidence the API
+    honored it; the echo is.
+    """
+    channel_name = (_input or {}).get("_channel_name", "")
+    if not _is_tier1_channel(entity, channel_name):
+        return _QBO_TIER1_REQUIRED
+    override = (_input or {}).get("entity") if _is_founder_entity(entity) else None
+    target, err = _resolve_qbo_entity(entity, override)
+    if err:
+        return err
+    start_date, end_date = qbo_client.parse_period((_input or {}).get("period"))
+    vendor = str((_input or {}).get("vendor") or "").strip() or None
+    basis = qbo_client.entity_pnl_basis(target)
+    try:
+        report = qbo_client.get_vendor_spend(
+            target, start_date, end_date, accounting_method=basis)
+    except qbo_client.QboClientError as exc:
+        log.warning("QBO vendor-spend tool error entity=%s: %s", target, exc)
+        return _qbo_error_message(target, exc)
+    log.info("qbo_get_vendor_spend entity=%s period=%s..%s vendor=%s",
+             target, start_date, end_date, bool(vendor))
+    title = f"Vendor spend {target} {start_date} to {end_date}"
+    return _maybe_export_xlsx(
+        _input, title,
+        qbo_client.format_vendor_spend_for_llm(
+            report, target, start_date, end_date, vendor))
 
 
 # --- Finance channel enforcement ---
@@ -9770,6 +9840,100 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "qbo_get_expense_detail",
+        "description": (
+            "CATEGORY-LEVEL EXPENSE BREAKDOWN for an entity over a period -- what the "
+            "money was spent ON, account by account, not just a rolled-up total. Use "
+            "for 'what did we spend on', 'break down our expenses', 'where is the "
+            "money going', 'expense detail', 'which categories', 'itemize our costs', "
+            "or any follow-up asking for MORE DETAIL after a P&L answer. "
+            "qbo_get_profit_loss gives the top-line totals; this gives the lines "
+            "underneath them. Pre-resolved date ranges: Q1 = '2026-01-01 to "
+            "2026-03-31', Q2 = '2026-04-01 to 2026-06-30', Q3 = '2026-07-01 to "
+            "2026-09-30', Q4 = '2026-10-01 to 2026-12-31'. Present the numbers "
+            "directly; do NOT add a QuickBooks/QBO link or name the source system. "
+            "Rows are in the books' own order -- do NOT re-rank them by size or "
+            "compute totals, subtotals or percentages yourself; report only the "
+            "figures shown. Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": ("Founder-only override to read another entity's "
+                                    "books (e.g. 'OSN'). Omit in an entity channel."),
+                },
+                "period": {
+                    "type": "string",
+                    "description": ("'this_month', 'last_month', 'ytd', 'last_year', "
+                                    "'last_30_days', 'last_90_days', or an explicit "
+                                    "'YYYY-MM-DD to YYYY-MM-DD' range."),
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "qbo_get_vendor_spend",
+        "description": (
+            "VENDOR / PAYEE SPEND for an entity over a period -- how much went to each "
+            "supplier, optionally narrowed to one of them. Use for 'how much did we "
+            "pay <vendor>', 'what are we spending with <supplier>', 'vendor spend', "
+            "'who are our biggest vendors', 'purchases by vendor', or any question "
+            "naming a company we BUY from. For what the spend was categorized as "
+            "rather than who it went to, use qbo_get_expense_detail instead. Pass "
+            "`vendor` to filter -- match on how the vendor is likely spelled in the "
+            "books; if nothing matches, the reply says so rather than reporting zero "
+            "spend, so try an alternative spelling before concluding there was none. "
+            "Pre-resolved date ranges: Q1 = '2026-01-01 to 2026-03-31', Q2 = "
+            "'2026-04-01 to 2026-06-30', Q3 = '2026-07-01 to 2026-09-30', Q4 = "
+            "'2026-10-01 to 2026-12-31'. Present the numbers directly; do NOT add a "
+            "QuickBooks/QBO link or name the source system, and do NOT total or rank "
+            "the rows yourself. Refuse in TIER_3 channels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": ("Founder-only override to read another entity's "
+                                    "books (e.g. 'OSN'). Omit in an entity channel."),
+                },
+                "period": {
+                    "type": "string",
+                    "description": ("'this_month', 'last_month', 'ytd', 'last_year', "
+                                    "'last_30_days', 'last_90_days', or an explicit "
+                                    "'YYYY-MM-DD to YYYY-MM-DD' range."),
+                },
+                "vendor": {
+                    "type": "string",
+                    "description": ("Optional vendor/payee name to narrow to. "
+                                    "Case-insensitive substring match."),
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "financial_get_cashflow",
         "description": (
             "Fetch the current week's cash flow data from the portfolio's Standing ACTUALS "
@@ -12499,6 +12663,8 @@ _FINANCIAL_TOOLS: frozenset[str] = frozenset({
     "qbo_get_ar_aging",
     "qbo_get_ap_aging",
     "qbo_get_recent_transactions",
+    "qbo_get_expense_detail",
+    "qbo_get_vendor_spend",
     "financial_get_pulse",
     "financial_get_close_pack",
 })
@@ -12634,6 +12800,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "qbo_get_ar_aging": _tool_qbo_get_ar_aging,
     "qbo_get_ap_aging": _tool_qbo_get_ap_aging,
     "qbo_get_recent_transactions": _tool_qbo_get_recent_transactions,
+    "qbo_get_expense_detail": _tool_qbo_get_expense_detail,
+    "qbo_get_vendor_spend": _tool_qbo_get_vendor_spend,
     "financial_get_cashflow": _tool_financial_get_cashflow,
     "financial_get_pulse": _tool_financial_get_pulse,
     "financial_get_close_pack": _tool_financial_get_close_pack,
@@ -12749,6 +12917,10 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "qbo_get_ar_aging": 15,
     "qbo_get_ap_aging": 15,
     "qbo_get_recent_transactions": 15,
+    # One report call each (30s HTTP budget). Vendor spend fans out into a
+    # larger detail report, so it gets the heavier tier.
+    "qbo_get_expense_detail": 15,
+    "qbo_get_vendor_spend": 20,
     # Heavy — multi-step, slow uploads, or long-running APIs
     "gmail_create_draft": 20,
     "calendar_create_event": 20,
