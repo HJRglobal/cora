@@ -140,6 +140,162 @@ def _ops_alert_channel() -> str:
 _FLAG_MARKERS = (":triangular_flag_on_post:", ":rotating_light:", ":warning:")
 
 
+# ---------------------------------------------------------------------------
+# Justin's DM cut (cq-f330d402e5cd) -- necessity-gated, plain language
+# ---------------------------------------------------------------------------
+#
+# Justin's complaint, verbatim from the 8/18 Finance x Cora meeting: "scattered
+# information... my eyes start to roll". He was being DM'd the entire pack --
+# nine sections, every entity, flagged and clean alike -- and had to work out for
+# himself which parts were addressed to him. When most of a message needs nothing
+# from you, the parts that DO need something stop being visible. The pack was not
+# too long; it was undifferentiated.
+#
+# So the DM is now NECESSITY-GATED: a section reaches Justin only when it is
+# waiting on an action HE takes. Everything else still ships in full to
+# #hjrg-finance, where it is a record rather than an ask. Nothing is deleted and
+# no figure is recomputed -- the same computed lines are ROUTED differently.
+#
+# WHY A STATIC MAP RATHER THAN "sections with flags"
+# ---------------------------------------------------
+# Flags mark ANOMALIES, not actions, and the two come apart in both directions.
+# The Monday worksheet carries no flag and is the single thing he must act on
+# every week. A P&L variance flag is real and interesting and is Cora telling him
+# something, not asking him for something. Gating on flags alone would have
+# dropped the worksheet from his DM and kept a month-over-month expense delta --
+# exactly inverting the intent.
+#
+# NEEDS_JUSTIN is therefore a deliberate editorial list, keyed to what the
+# section ASKS OF HIM, with the reason stated in the same place so the two cannot
+# drift. Each entry is a plain-language purpose line: one sentence, no jargon,
+# saying what he is being asked to do and why.
+
+#: section key -> (does it ask something of Justin, one-line plain-language purpose)
+SECTION_PURPOSE: dict[str, tuple[bool, str]] = {
+    "cash": (True,
+             "Check these against the bank before Monday's sheet -- Cora compares "
+             "the cash sheet to the books and cannot see which one is right."),
+    "intercompany": (True,
+                     "Confirm which of these are genuine intercompany accounts. "
+                     "Until you do, Cora treats every one as unconfirmed and "
+                     "checks none of them."),
+    "close_prep": (True,
+                   "The close to-dos for this week."),
+    "aging": (True,
+              "AR and AP that moved week over week -- collections and payables "
+              "to chase."),
+    "renewals": (True,
+                 "Renewals and payments coming up that need a decision or a "
+                 "cancellation before they auto-renew."),
+    "qbo_bank": (False,
+                 "Freshness of the bank feed vs the books -- informational unless "
+                 "something is flagged."),
+    "pnl": (False,
+            "Month-over-month P&L sanity -- informational unless something is "
+            "flagged."),
+    "forecast_assist": (False,
+                        "Forecast accuracy and next week's carry-in references."),
+    "cashflow_parallel": (False,
+                          "Parallel run of the sheet against QBO actuals."),
+}
+
+#: Fallback for a section key nobody has classified yet. TRUE on purpose: a new
+#: section silently vanishing from the one person who acts on this pack is a
+#: worse failure than one extra section in his DM, and the missing-key case is
+#: exactly what a fresh section looks like. It also fails LOUDLY in the test
+#: suite, which pins that every section build_pack emits has an entry here.
+_UNCLASSIFIED_NEEDS_ACTION = True
+
+
+def justin_needs(section_key: str) -> bool:
+    return SECTION_PURPOSE.get(section_key, (_UNCLASSIFIED_NEEDS_ACTION, ""))[0]
+
+
+def _has_flag(lines: list[str], markers: tuple[str, ...]) -> bool:
+    return any(any(m in ln for m in markers) for ln in lines)
+
+
+def build_justin_cut(pack, flag_markers: tuple[str, ...] = _FLAG_MARKERS) -> str:
+    """The close pack, cut down to what Justin has to DO.
+
+    Deterministic slice of the same computed lines: it re-renders nothing,
+    recomputes nothing, and drops no figure it shows.
+
+    A non-action section is included ONLY when it flagged something -- a flag is
+    Cora saying "look at this", which earns a place even in an
+    action-only message. When such a section rides along, only its flagged lines
+    do, not its whole body.
+
+    Coverage still travels. An action list that quietly omits "this ran on 3 of
+    10 entities" reads as a complete list of what needs doing, which is the same
+    failure class as an all-clear that was never checked.
+    """
+    lines = [
+        ":ledger: *Your close-support items* — what needs you this week",
+        f"_Generated {pack.generated_at}. The full pack is in #hjrg-finance; "
+        "this DM is only the parts waiting on you._",
+        "",
+    ]
+    included = 0
+    partial_any = False
+
+    for section in pack.sections:
+        # Duck-typed for the same reason build_founder_cut is: this repo runs
+        # `cora.*` and `src.cora.*` as distinct module objects, and an isinstance
+        # check would silently SKIP a section built under the other import path --
+        # turning a type mismatch into a quietly shorter action list.
+        key = getattr(section, "key", "") or ""
+        title = getattr(section, "title", None)
+        if title is None:
+            continue
+
+        needs = justin_needs(key)
+        _, purpose = SECTION_PURPOSE.get(key, (_UNCLASSIFIED_NEEDS_ACTION, ""))
+
+        if not getattr(section, "available", True):
+            # An unavailable ACTION section is itself actionable: he is being
+            # told a check he relies on did not run this week.
+            if needs:
+                partial_any = True
+                included += 1
+                lines.append(f"*{title}*")
+                lines.append(f"  _Couldn't run this week — "
+                             f"{getattr(section, 'stub_reason', 'no data')}._")
+                lines.append("")
+            continue
+
+        body = list(getattr(section, "lines", []))
+        if not needs:
+            hits = [ln for ln in body if any(m in ln for m in flag_markers)]
+            if not hits:
+                continue
+            included += 1
+            lines.append(f"*{title}*")
+            lines.append("  _Not an action item, but Cora flagged this:_")
+            lines.extend(f"  {h}" for h in hits)
+            lines.append("")
+            continue
+
+        included += 1
+        if getattr(section, "is_partial", False):
+            partial_any = True
+        lines.append(f"*{title}*")
+        if purpose:
+            lines.append(f"  _{purpose}_")
+        lines.extend(f"  {ln}" for ln in body)
+        lines.append("")
+
+    if included == 0:
+        lines.append("_Nothing in this week's pack needs an action from you._")
+        lines.append("")
+
+    if partial_any:
+        lines.append("_Some of the above ran on only part of the portfolio — "
+                     "treat it as a partial list, not a complete one._")
+    lines.append("_Everything else this week is in #hjrg-finance._")
+    return "\n".join(lines)
+
+
 def build_founder_cut(pack) -> str:
     """Flagged-items-only view for #founder-finance.
 
@@ -486,13 +642,17 @@ def main() -> int:
             f"_Summary (restatement of the facts below):_ {narration}\n\n{full}"
         )
     founder = build_founder_cut(pack)
+    # cq-f330d402e5cd: Justin gets the ACTION cut, not the whole pack. The full
+    # pack still lands in #hjrg-finance unchanged -- nothing is deleted, the same
+    # computed lines are routed by whether they ask something of him.
+    justin = build_justin_cut(pack)
 
     if entities:
         banner = (
             f":warning: *SCOPED RUN* — this pack covers only {', '.join(entities)}, "
             "not the full portfolio.\n\n"
         )
-        full, founder = banner + full, banner + founder
+        full, founder, justin = banner + full, banner + founder, banner + justin
 
     log.info("close-pack: built -- %d flag(s), %d unavailable section(s)",
              pack.total_flags, len(pack.unavailable_sections))
@@ -564,7 +724,7 @@ def main() -> int:
             failed.append(target)
 
     deliver(TARGET_HJRG, lambda: post_to_channel(client, HJRG_FINANCE_CHANNEL, full))
-    deliver(TARGET_DM, lambda: dm_user(client, JUSTIN_SLACK_ID, full))
+    deliver(TARGET_DM, lambda: dm_user(client, JUSTIN_SLACK_ID, justin))
     deliver(TARGET_FOUNDER, lambda: post_to_channel(client, FOUNDER_FINANCE_CHANNEL, founder))
 
     if failed:
