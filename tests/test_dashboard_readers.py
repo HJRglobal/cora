@@ -11,6 +11,7 @@ from cora.connectors import dashboard_drive_reader as ddr
 
 ALLOWED = "appwF6W6eVTvPFjct"
 CONTENT = "appxbEBjIBf8Wwlbd"
+PRODUCTION = "app1hWKmTAnvp09rR"
 
 
 # --------------------------------------------------------------------------- #
@@ -165,8 +166,19 @@ def test_airtable_retries_without_fields_on_unknown_field(monkeypatch):
     assert any("fields[]" not in c for c in calls)  # then retried fieldless
 
 
-def test_airtable_allowed_bases_are_the_two_dashboards():
-    assert airtable_client.ALLOWED_BASES == frozenset({ALLOWED, CONTENT})
+def test_airtable_allowed_bases_are_the_dashboard_bases():
+    """The allowlist is the DASHBOARD bases and nothing else. Third entry added
+    2026-08-19 for the F3E production pipeline read lane (cq-fe9ec84a5ca2)."""
+    assert airtable_client.ALLOWED_BASES == frozenset({ALLOWED, CONTENT, PRODUCTION})
+
+
+def test_the_org_remodel_tracker_is_not_reachable_through_this_client():
+    """Deliberate boundary, and my first cut of the decisions transcription broke
+    it: the tracker is not a dashboard, and AIRTABLE_API_KEY cannot reach it. It
+    is read through connectors/airtable_org_tracker.py -- one base, one table,
+    GET-only, its own credential."""
+    from cora.connectors import airtable_org_tracker
+    assert airtable_org_tracker.BASE_ID not in airtable_client.ALLOWED_BASES
 
 
 def test_airtable_no_write_methods():

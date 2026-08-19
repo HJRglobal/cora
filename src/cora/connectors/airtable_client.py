@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,11 +31,18 @@ _HTTP_TIMEOUT = 15.0
 _PAGE_SIZE = 100          # Airtable per-page maximum
 _MAX_PAGES = 30           # safety cap -> at most 3000 records per call
 
-# HARD allowlist: the two dashboard bases. Any other base id is refused.
+# HARD allowlist: the DASHBOARD bases. Any other base id is refused.
 ALLOWED_BASES: frozenset[str] = frozenset(
     {
         "appwF6W6eVTvPFjct",  # F3 Creators & Ambassadors CRM
         "appxbEBjIBf8Wwlbd",  # [FNDR] Freelancer & Content Pipeline
+        # [F3E] Production Pipeline (2026-08-19, cq-fe9ec84a5ca2). A dashboard
+        # base like the two above, so this is the right home for it -- unlike the
+        # Org Remodel Tracker (see the note below). Its reader is PRICE-FREE by
+        # construction: a fixed non-cost column projection plus a value screen on
+        # everything rendered. NOTE the PAT must be granted read on this base;
+        # until it is, the tool degrades to "isn't connected yet".
+        "app1hWKmTAnvp09rR",
     }
 )
 # DO NOT add the Org Remodel Tracker (appAUZSQOCTnCO8yi) here. Two reasons, both
@@ -102,7 +110,11 @@ def list_records(
             base_id=base_id, table=table, available=False, error="AIRTABLE_API_KEY not set"
         )
 
-    url = f"{_API_ROOT}/{base_id}/{table}"
+    # A table NAME is as valid as a tbl id in this path, and the F3E production
+    # base's names contain spaces ("Run Items"). quote() is a no-op on the tbl
+    # ids every other caller passes, so this widens what works without changing
+    # any existing request by a byte.
+    url = f"{_API_ROOT}/{base_id}/{quote(str(table), safe='')}"
     headers = {"Authorization": f"Bearer {key}"}
 
     def _fetch(use_fields: bool) -> list[dict[str, Any]]:

@@ -169,6 +169,32 @@ dashboards:
       tables: {roster: tbl2WMoSoWmIuvQdw, content: tblnDplqlUhZ8kDuf, activity: tbldf9x3chG5DOMgm, cadence: tbl7E6EVfxuNH8dLH}
     tools: [f3e_creator_crm]
 
+  # F3E co-packer production pipeline (cq-fe9ec84a5ca2). PRICE-FREE by
+  # construction: this base and the Asana project are the team- and
+  # partner-visible surface class, and every cost/rate/negotiation figure lives in
+  # the f3-cost-lab artifact. The reader projects a fixed non-cost column list AND
+  # screens every rendered value against the design doc's counterparty grep, so a
+  # dollar figure typed into a free-text note cannot pass either.
+  #
+  # TABLE NAMES, not tbl ids: the base's table ids are not recorded anywhere in
+  # the repo or the Founder OS docs, and the Airtable API accepts either. Swap in
+  # ids when they are to hand -- a name breaks on a table rename, an id does not.
+  # PREREQ: the read-only AIRTABLE_API_KEY is scoped to the two OTHER dashboard
+  # bases today, so it must be granted read on app1hWKmTAnvp09rR before this
+  # returns anything; until then the tool degrades to "isn't connected yet".
+  f3-production-pipeline:
+    sensitivity: ENTITY
+    entity: F3E
+    dm_users: ["U0B2RM2JYJ1"]        # Harrison
+    allow_channels: [f3e-leadership, f3e-ops, founder-operations]
+    allow_entities: [FNDR, HJRG]
+    store:
+      type: airtable
+      base: "app1hWKmTAnvp09rR"
+      tables: {runs: "Runs", run_items: "Run Items", partners: "Partners"}
+    tools: [f3e_production_pipeline]
+    no_cache: true
+
   f3-content-pipeline:
     sensitivity: FOUNDER_OPS
     dm_users: ["U0B2RM2JYJ1"]        # Harrison

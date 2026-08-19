@@ -116,6 +116,7 @@ VERBATIM_TABLE_TOOLS: frozenset[str] = frozenset({
     "personal_capital_program_state",
     "f3e_creator_crm",
     "fndr_content_pipeline",
+    "f3e_production_pipeline",
     "f3e_channel_inventory",
     "f3e_warehouse_inventory",
     "f3e_rangeme_status",
@@ -8103,6 +8104,7 @@ _DASH_RANGEME = "f3-retail-rangeme"
 _DASH_CULTURAL = "f3-cultural-radar"
 _DASH_CHANNEL_INVENTORY = "f3e-channel-inventory"
 _DASH_WAREHOUSE_INVENTORY = "f3e-warehouse-inventory"
+_DASH_PRODUCTION = "f3-production-pipeline"
 
 
 # Source-opacity scrub for pass-through free-text field values. These tools are
@@ -8478,6 +8480,150 @@ def _tool_f3e_creator_crm(slack_user_id: str, entity: str, _input: dict) -> str:
     if person:
         return _creator_person_lookup(roster.records, person)
     return _format_creator_crm(roster.records, activity_records)
+
+
+# --- F3E production pipeline (co-packer runs / run items / partners) ---
+#
+# PRICE-FREE BY CONSTRUCTION (cq-fe9ec84a5ca2, TOM 1kkkkk). Every cost,
+# negotiation and rate figure for this program lives in the f3-cost-lab artifact
+# and is NEVER served here: the Airtable base and the Asana project are the team-
+# and partner-visible surface class, and the dashboard's standing guardrail is
+# "zero-dollar by construction -- any future edit re-runs the counterparty grep
+# before deploy" (2026-08-09 design doc, which supplies the pattern below).
+#
+# TWO independent rails, because a field allowlist is only as good as the field
+# names staying put:
+#   1. PROJECTION -- a fixed column list per table. A cost column is not filtered
+#      downstream; it is never fetched.
+#   2. A VALUE SCREEN over everything rendered. A dollar figure typed into a
+#      free-text "notes" field is the realistic leak, and no projection stops it.
+# Over-screening is the intended failure direction: a run note reading "flow rate
+# stable" loses that value rather than risking a rate reaching a partner surface.
+_PROD_MONEY_RE = re.compile(
+    r"\$|\b(?:tolling|margin|cogs|price|pricing|priced|rate|rates|deposit|"
+    r"discount|quote|quoted|invoice|invoiced)\b|/kg|/case|per\s?kg|per\s?case",
+    re.IGNORECASE,
+)
+
+#: Requested columns per table, from the 2026-08-09 design doc's own schema
+#: (Runs: run / brand-line / co-packer / date / status / volume plan / notes ·
+#: Run Items: item / type / supplier / qty / lot / status / COA / linked run ·
+#: Partners: contact card, "names/roles only, no rates"). Nothing cost-shaped
+#: appears here, by construction.
+_PROD_FIELDS: dict[str, list[str]] = {
+    "runs": ["Run", "Name", "Brand", "Line", "Brand/Line", "Co-packer", "Run date",
+             "Status", "Volume plan", "Notes"],
+    "run_items": ["Item", "Type", "Supplier", "Qty", "Lot #", "Status",
+                  "COA status", "Run", "Notes"],
+    "partners": ["Partner", "Name", "Role", "Type", "Contact", "Notes"],
+}
+
+
+def _prod_value(raw: Any) -> str:
+    """One field value, source-scrubbed and cost-screened. "" when withheld."""
+    text = _dash_scrub(str(raw or "").strip())
+    if not text:
+        return ""
+    if _PROD_MONEY_RE.search(text):
+        return "[cost content withheld -- it lives in the cost lab]"
+    return text[:160]
+
+
+def _prod_pick(row: dict, *names: str) -> str:
+    """First screened non-empty value among `names`. The base's column naming is
+    documented but not verified field-by-field, so read a small alias set."""
+    for name in names:
+        value = _prod_value(row.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _format_production_pipeline(runs: list[dict], items: list[dict],
+                                partners: list[dict]) -> str:
+    lines = ["*F3 production pipeline:*"]
+
+    if runs:
+        by_status = _dash_count_single(runs, "Status")
+        if by_status:
+            lines.append("Runs: " + ", ".join(
+                f"{k} {v}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1])))
+        for run in runs[:8]:
+            label = _prod_pick(run, "Run", "Name") or "(unnamed run)"
+            status = _prod_pick(run, "Status")
+            # Notes IS rendered (screened). Projecting a column and never showing
+            # it would make the value screen dead code and leave the useful
+            # operational line ("QA sample pulled") on the floor -- while the
+            # realistic leak, a dollar figure typed into free text, is exactly
+            # what the screen is for.
+            bits = [b for b in (
+                _prod_pick(run, "Brand/Line", "Brand", "Line"),
+                _prod_pick(run, "Co-packer"),
+                _prod_pick(run, "Run date"),
+                _prod_pick(run, "Volume plan"),
+                _prod_pick(run, "Notes"),
+            ) if b]
+            lines.append(f"  - {label}"
+                         + (f" [{status}]" if status else "")
+                         + (" -- " + " | ".join(bits) if bits else ""))
+    else:
+        lines.append("Runs: nothing recorded")
+
+    if items:
+        item_status = _dash_count_single(items, "Status")
+        if item_status:
+            lines.append("Run items: " + ", ".join(
+                f"{k} {v}" for k, v in sorted(item_status.items(), key=lambda kv: -kv[1])))
+        waiting = [i for i in items
+                   if str(i.get("Status", "")).strip().lower() in ("blocked", "needed")]
+        for item in waiting[:8]:
+            supplier = _prod_pick(item, "Supplier")
+            coa = _prod_pick(item, "COA status")
+            note = _prod_pick(item, "Notes")
+            lines.append(
+                f"  - [{_prod_pick(item, 'Status')}] {_prod_pick(item, 'Item') or '?'}"
+                + (f" ({supplier})" if supplier else "")
+                + (f" -- COA {coa}" if coa else "")
+                + (f" -- {note}" if note else ""))
+
+    if partners:
+        names = [n for n in (_prod_pick(p, "Partner", "Name") for p in partners[:10]) if n]
+        if names:
+            lines.append("Partners: " + ", ".join(names))
+
+    lines.append("_Costs, rates and negotiation terms are not served here._")
+    return "\n".join(lines)
+
+
+def _tool_f3e_production_pipeline(slack_user_id: str, entity: str, _input: dict) -> str:
+    inp = _input or {}
+    refusal = dashboard_access.check_dashboard_access(
+        _DASH_PRODUCTION, slack_user_id, inp.get("_channel_name", "")
+    )
+    if refusal:
+        return refusal
+    store = dashboard_access.store_for(_DASH_PRODUCTION)
+    base = store.get("base", "")
+    tables = store.get("tables") or {}
+
+    runs = airtable_client.list_records(
+        base, tables.get("runs", ""), fields=_PROD_FIELDS["runs"])
+    if not runs.available:
+        return ("The production pipeline isn't connected yet, so I can't pull that "
+                "right now.")
+    items = airtable_client.list_records(
+        base, tables.get("run_items", ""), fields=_PROD_FIELDS["run_items"])
+    partners = airtable_client.list_records(
+        base, tables.get("partners", ""), fields=_PROD_FIELDS["partners"])
+    log.info("f3e_production_pipeline user=%s runs=%d items=%d partners=%d",
+             slack_user_id, len(runs.records),
+             len(items.records) if items.available else 0,
+             len(partners.records) if partners.available else 0)
+    return _format_production_pipeline(
+        runs.records,
+        items.records if items.available else [],
+        partners.records if partners.available else [],
+    )
 
 
 # --- Founder content & freelancer pipeline (founder channels + DM) ---
@@ -11380,6 +11526,20 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "f3e_production_pipeline",
+        "description": (
+            "F3's co-packer production pipeline: run statuses, what each run is "
+            "waiting on (ingredients / packaging / docs / COAs), blocked or "
+            "not-yet-ordered items, and the partner contact list. Use when someone "
+            "asks about a production run, a co-packer, run readiness, lot or COA "
+            "status, or what is blocking a run. PRICE-FREE: it cannot return "
+            "tolling rates, costs, margins or negotiation terms -- those live in "
+            "the cost lab and are not served here. Available in F3E channels, "
+            "founder channels and Harrison's DM (it refuses elsewhere)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "fndr_content_pipeline",
         "description": (
             "The founder content & freelancer pipeline: deliverables by priority (overdue "
@@ -12734,6 +12894,7 @@ _F3_IMAGE_TOOLS: frozenset[str] = frozenset({
 _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
         "f3e_creator_crm",
+        "f3e_production_pipeline",
         "f3e_channel_inventory",
         "f3e_warehouse_inventory",
         "f3e_rangeme_status",
@@ -12901,6 +13062,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "personal_oneamerica_portfolio": _tool_personal_oneamerica_portfolio,
     "personal_capital_program_state": _tool_personal_capital_program_state,
     "f3e_creator_crm": _tool_f3e_creator_crm,
+    "f3e_production_pipeline": _tool_f3e_production_pipeline,
     "fndr_content_pipeline": _tool_fndr_content_pipeline,
     "f3e_channel_inventory": _tool_f3e_channel_inventory,
     "f3e_warehouse_inventory": _tool_f3e_warehouse_inventory,
@@ -13031,6 +13193,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "personal_oneamerica_portfolio": 20,   # Drive JSON download
     "personal_capital_program_state": 15,  # folder list + newest JSON download
     "f3e_creator_crm": 15,                 # 2 Airtable list calls
+    "f3e_production_pipeline": 20,         # 3 Airtable list calls
     "fndr_content_pipeline": 20,           # 5 sequential Airtable list calls
     "f3e_rangeme_status": 20,              # folder list + newest JSON download
     "f3e_cultural_radar": 20,              # folder list + newest JSON download
