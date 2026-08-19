@@ -223,19 +223,55 @@ class TestVendorSpend:
 
 
 class TestBalanceSheetDateParam:
-    """cq-157a961853c4 -- the param QBO silently ignored."""
+    """cq-157a961853c4, then cq-d5945e401fca -- two wrong answers that both
+    looked right. QBO's BalanceSheet needs the start_date/end_date PAIR; either
+    one alone is silently ignored and the report falls back to date_macro
+    "last month". Measured live 2026-08-19 on the BDM realm, one call per
+    variant."""
 
-    def test_balance_sheet_sends_end_date_not_as_of_date(self):
-        """`as_of_date` is not a BalanceSheet parameter. QBO ignored it and fell
-        back to its own default period -- proven live on all 11 realms: asking
-        as_of 2026-06-30 returned 2026-07-01..2026-07-31 on 2026-08-19.
-        """
+    def test_balance_sheet_sends_the_date_pair_not_a_lone_end_date(self):
+        """A lone end_date was ignored exactly like as_of_date before it: asking
+        end_date=2026-06-30 returned Start=2026-07-01 End=2026-07-31
+        DateMacro="last month". The pair returned the month asked for, no macro."""
         with patch.object(qc, "_request") as req:
             req.return_value = {}
             qc.get_balance_sheet("F3E", "2026-06-30")
             params = req.call_args.kwargs["params"]
             assert params["end_date"] == "2026-06-30"
+            assert params["start_date"] == "2026-06-30"
             assert "as_of_date" not in params
+
+    def test_start_equals_as_of_because_it_does_not_move_the_figures(self):
+        """start_date is purely the token that gets QBO out of default-macro
+        mode -- measured: four different start dates (2020-01-01, 2026-01-01,
+        2026-06-01, 2026-06-30) against one end_date returned identical rows and
+        totals. Setting it EQUAL to as_of makes the echoed period the instant the
+        report actually describes, so no consumer can misread a point-in-time
+        report as a range."""
+        with patch.object(qc, "_request") as req:
+            req.return_value = {}
+            qc.get_balance_sheet("F3E", "2026-06-30")
+            params = req.call_args.kwargs["params"]
+            assert params["start_date"] == params["end_date"] == "2026-06-30"
+
+    def test_no_date_macro_is_ever_sent(self):
+        """date_macro="Custom" is rejected outright: HTTP 400 Invalid
+        Enumeration. Explicit dates are the only route."""
+        with patch.object(qc, "_request") as req:
+            req.return_value = {}
+            qc.get_balance_sheet("F3E", "2026-06-30")
+            assert "date_macro" not in req.call_args.kwargs["params"]
+
+    def test_the_populator_verify_accepts_an_honored_pair(self):
+        """The BS branch checks EndPeriod only (want_start is None for a balance
+        sheet), so an honored pair whose StartPeriod echoes as_of does not trip
+        the period-mismatch refusal."""
+        from cora import qbo_monthly_reports as qmr
+        honored = {"Header": {"StartPeriod": "2026-06-30",
+                              "EndPeriod": "2026-06-30",
+                              "ReportBasis": "Accrual"}}
+        assert qmr.report_period(honored) == ("2026-06-30", "2026-06-30")
+        assert qmr.report_date_macro(honored) is None
 
     def test_python_signature_is_unchanged_for_callers(self):
         with patch.object(qc, "_request") as req:
@@ -250,8 +286,9 @@ class TestBalanceSheetDateParam:
         with patch.object(qc, "_request") as req:
             req.return_value = {}
             qc.get_balance_sheet("F3E")
-            assert req.call_args.kwargs["params"]["end_date"] == \
-                _dt.date.today().isoformat()
+            params = req.call_args.kwargs["params"]
+            assert params["end_date"] == _dt.date.today().isoformat()
+            assert params["start_date"] == _dt.date.today().isoformat()
 
 
 class TestCoincidentalDefaultIsDetectable:

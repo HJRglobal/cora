@@ -293,17 +293,41 @@ def get_balance_sheet(
     if not as_of_date:
         as_of_date = datetime.date.today().isoformat()
     token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
-    # `end_date`, NOT `as_of_date` (cq-157a961853c4). The BalanceSheet report
-    # takes start_date/end_date/date_macro; `as_of_date` is not a parameter it
-    # recognizes, so QBO SILENTLY IGNORED it and fell back to its own default
-    # period. Proven live 2026-08-19 by the monthly-report backfill: asking
-    # as_of 2026-06-30 returned 2026-07-01..2026-07-31 on ALL ELEVEN realms --
-    # i.e. "last month" relative to the 8/19 run date. The July backfill
-    # "passed" the period verify for the same reason, purely by coincidence,
-    # and the on-schedule monthly run (fires on the 2nd, asks for the prior
-    # month) would have coincided forever -- so this defect was invisible except
-    # to a backfill. The report renders as-of end_date.
-    params: dict = {"end_date": as_of_date, "minorversion": "65"}
+    # THE start_date/end_date PAIR, not either one alone (cq-157a961853c4, then
+    # cq-d5945e401fca). History, because both wrong answers looked right:
+    #
+    #   as_of_date        -> not a BalanceSheet parameter at all; silently ignored.
+    #   end_date alone    -> ALSO silently ignored. Same fallback, same symptom.
+    #   start+end pair    -> honored.
+    #
+    # Measured live 2026-08-19 against the BDM realm, one call per variant:
+    #   {"end_date": "2026-06-30"}                       -> Start=2026-07-01
+    #                                                       End=2026-07-31
+    #                                                       DateMacro="last month"
+    #   {"start_date": "2026-06-01", "end_date": ...}     -> Start=2026-06-01
+    #                                                       End=2026-06-30
+    #                                                       DateMacro=None
+    # (date_macro="Custom" is rejected outright: HTTP 400 Invalid Enumeration.)
+    #
+    # start_date does NOT move the figures -- also measured, four different start
+    # dates (2020-01-01, 2026-01-01, 2026-06-01, 2026-06-30) against the same
+    # end_date returned byte-identical rows and totals. A balance sheet is
+    # cumulative as of the end date; the start is purely the token that gets QBO
+    # out of its default-macro mode. So it is set EQUAL to as_of_date: the range
+    # degenerates to the instant the report actually describes, and the echoed
+    # StartPeriod==EndPeriod==as_of can never be misread as a period report.
+    #
+    # Why this class of defect was invisible: QBO's default is "last month" and
+    # the scheduled run fires on the 2nd asking for the prior month, so an
+    # entirely ignored date param produces an identical echo every single time.
+    # Only a backfill ever disagrees. The period + DateMacro verify in
+    # qbo_monthly_reports is what caught both rounds, and it refused to write --
+    # no wrong-month file was ever filed under a right-month name.
+    params: dict = {
+        "start_date": as_of_date,
+        "end_date": as_of_date,
+        "minorversion": "65",
+    }
     if accounting_method:
         params["accounting_method"] = accounting_method
     return _request(
