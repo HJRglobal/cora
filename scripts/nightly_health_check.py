@@ -526,6 +526,61 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
 
 
+def check_decision_gates(today: date | None = None) -> CheckResult:
+    """An Open decision past its GATE date that no surface has delivered.
+
+    cq-232fe6a541ff. Five decisions (OSN data source, Jerry DW access, BDM
+    department lock, Eric LEX Learning Center, LEX Phase 2) sat Open past their
+    2026-08-13 gate and never reached Harrison on any surface. The seed asked for
+    "delivery verification for P-decisions older than N days"; implemented
+    literally -- staleness on P0/P1 -- that check would have stayed GREEN through
+    all five, because every one of them is P2. So this check is ANY SEVERITY, and
+    it turns on DELIVERY (a surface actually emitted it), not on gathering.
+
+    Nothing here expires anything: a passed gate makes a decision louder, never
+    gone (the expiry semantics adopted with the 8/19 approval recon).
+
+    A decision with no gate date is not reported -- it has no deadline to blow.
+    That is why the transcription script carries the gate across from Airtable.
+    Daily rather than weekly on purpose: the failure mode is silence, and a weekly
+    check tolerates six more days of it.
+    """
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import decision_lane
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Decision gates", "warn",
+                           f"decision_lane unavailable ({exc}) -- gate-date "
+                           "escalation not evaluated this run.")
+    try:
+        entries = decision_lane.load_entries(today=today)
+        overdue = decision_lane.undelivered_overdue(entries, today=today)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Decision gates", "warn",
+                           f"gate check failed ({exc}).")
+
+    gated = [e for e in entries if e.get("gate")]
+    if not entries:
+        return CheckResult("Decision gates", "warn",
+                           "decisions-pending.md could not be read or holds no "
+                           "entries -- the decision lane cannot be verified.")
+    if not gated:
+        # Truthful, and the actionable half: with no gate dates recorded, this
+        # control has nothing to enforce. Do NOT report "ok".
+        return CheckResult(
+            "Decision gates", "warn",
+            f"{len(entries)} open decision(s), NONE carrying a gate date -- so a "
+            "blown deadline cannot be detected. Add **Gate**: YYYY-MM-DD to the "
+            "entries that have one (see decisions-pending.md field rules).")
+    if overdue:
+        return CheckResult("Decision gates", "critical",
+                           decision_lane.format_alarm(overdue))
+    return CheckResult(
+        "Decision gates", "ok",
+        f"{len(gated)} of {len(entries)} open decision(s) carry a gate date; "
+        "none are past it undelivered.")
+
+
 _WATCHDOG_TASK = "cora-watchdog"
 # The watchdog logs a tick at most hourly when healthy, so >3h of silence means it
 # is not running -- not that it saw nothing wrong.
@@ -1494,6 +1549,9 @@ def main() -> int:
 
     log.info("Checking watchdog liveness...")
     all_results.append(check_watchdog_liveness())
+
+    log.info("Checking decision gate dates...")
+    all_results.append(check_decision_gates())
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())

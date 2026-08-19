@@ -1,0 +1,9 @@
+{"records": [
+ {"id": "recgbyFYokl5e9ySQ", "fields": {"Item": "OSN data-source decision (mailhook vs Clover API vs stay-manual)", "Type": "Decision", "Status": "Open", "Owner": "Harrison", "Severity": "P2", "Entity": "OSN", "Gate date": "2026-08-13"}},
+ {"id": "rectutHf0DlErcF7g", "fields": {"Item": "Jerry DW access", "Type": "Decision", "Status": "Open", "Owner": "Harrison", "Severity": "P2", "Entity": "HJRG", "Gate date": "2026-08-13"}},
+ {"id": "rectv5FNqgjXxki99", "fields": {"Item": "BDM department lock (post co-owner consult)", "Type": "Decision", "Status": "Open", "Owner": "Harrison", "Severity": "P2", "Entity": "BDM", "Gate date": "2026-08-13"}},
+ {"id": "rec0mjiFUsdUKbXOJ", "fields": {"Item": "Eric LEX Learning Center queue keep-vs-rehome", "Type": "Decision", "Status": "Open", "Owner": "Harrison", "Severity": "P2", "Entity": "LEX", "Gate date": "2026-08-13"}},
+ {"id": "recYFcljOQFQeoeW9", "fields": {"Item": "LEX Phase 2 go/no-go", "Type": "Decision", "Status": "Open", "Owner": "Harrison", "Severity": "P2", "Entity": "LEX", "Gate date": "2026-08-13"}},
+ {"id": "recBUILDITEM0001", "fields": {"Item": "Wire the mailhook", "Type": "Build", "Status": "Open", "Owner": "Hannah"}},
+ {"id": "recCLOSEDDEC0001", "fields": {"Item": "Sara guest-vs-member", "Type": "Decision", "Status": "Closed", "Owner": "Harrison", "Gate date": "2026-08-01"}}
+]}

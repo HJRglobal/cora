@@ -37,6 +37,12 @@ ALLOWED_BASES: frozenset[str] = frozenset(
         "appxbEBjIBf8Wwlbd",  # [FNDR] Freelancer & Content Pipeline
     }
 )
+# DO NOT add the Org Remodel Tracker (appAUZSQOCTnCO8yi) here. Two reasons, both
+# load-bearing and both pinned by tests: this module's allowlist is the dashboard
+# read surface, and AIRTABLE_API_KEY is scoped to the two bases above and cannot
+# reach the tracker at all -- so the entry would be an inert widening of a
+# documented boundary. The tracker is read through connectors/airtable_org_tracker.py
+# (one base, one table, GET-only, its own credential).
 
 
 @dataclass

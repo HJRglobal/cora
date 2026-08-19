@@ -260,6 +260,25 @@ def gather_pipeline(
 # ---------------------------------------------------------------------------
 
 def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
+    """The P0/P1 stalled-decision fact base for the memo, synthesis and briefing.
+
+    Parsing now lives in ONE place -- `decision_lane.parse_entries` -- because two
+    grammars over the same hand-maintained file is how a field ends up visible to
+    one surface and invisible to another, which is the shape of the bug the
+    2026-08-18 delivery audit found (cq-232fe6a541ff). This function keeps
+    everything that is ITS policy rather than the file's grammar:
+
+      * the P0/P1 filter (kept: this is the founder's stalled-decision digest, and
+        the ANY-severity gate control is a separate check, not a rewrite of this);
+      * the PHI / Visibility-CPA exclusions;
+      * the exact output dict keys, INCLUDING the historical `age_days` alias --
+        persisted weekly snapshots compare these dicts across weeks, so a rename
+        would silently break every delta;
+      * skip_closed=False, so an entry annotated closed in its heading is treated
+        exactly as before.
+    """
+    from . import decision_lane
+
     path = _decisions_pending_path()
     try:
         # G: mount: drive_io makes a transient unmount a bounded DriveUnavailable
@@ -270,66 +289,38 @@ def gather_stalled_decisions(*, today: date | None = None) -> dict[str, Any]:
         return {"ok": False, "decisions": []}
     today = today or _today()
 
-    resolved = re.search(r"^## Recently resolved\b", content, re.MULTILINE)
-    parseable = content[:resolved.start()] if resolved else content
-
     decisions: list[dict[str, Any]] = []
-    for block in re.split(r"\n(?=### )", parseable):
-        if not block.startswith("### "):
+    for entry in decision_lane.parse_entries(content, today=today, skip_closed=False):
+        if entry.get("severity") not in ("P0", "P1"):
             continue
-        topic = block.split("\n", 1)[0][4:].strip()
-        if topic == "[Topic]":
-            continue   # the "How to use" template skeleton, not a real entry
-        # The template's "P0 / P1 / P2 / P3" alternatives line must not match;
-        # annotated real values ("P0 (decision Monday)") must.
-        sev = re.search(r"\*\*Severity\*\*:\s*(P\d)\b(?!\s*/)", block)
-        if not sev or sev.group(1) not in ("P0", "P1"):
-            continue
-        entity_m = re.search(r"\*\*Entity\*\*:\s*([^\n]+)", block)
-        entity = entity_m.group(1).strip() if entity_m else "FNDR"
-        # TWO distinct metrics (bug-hunt 2026-07-31, cq-935a18e2969e): age_days is
-        # days-since-LAST-TOUCH (staleness — the surfacing trigger per the file's
-        # own header rules) and open_days is days-since-SURFACED (true open age).
-        # The 7/19-7/31 evidence was these being conflated: a legitimate
-        # "verify-the-yellows" touch on 7/20 reset the narrated "age" of a
-        # ~10-week-old P0 to "4 days". Renderers must never label one as the other.
-        age_days: int | None = None
-        touched = re.search(r"\*\*Last touched\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
-        if touched:
-            try:
-                age_days = (today - datetime.strptime(
-                    touched.group(1), "%Y-%m-%d").date()).days
-            except ValueError:
-                pass
-        open_days: int | None = None
-        surfaced_date: str | None = None
-        surfaced = re.search(r"\*\*Surfaced\*\*:\s*[^\n]*?(\d{4}-\d{2}-\d{2})", block)
-        if surfaced:
-            try:
-                open_days = (today - datetime.strptime(
-                    surfaced.group(1), "%Y-%m-%d").date()).days
-                surfaced_date = surfaced.group(1)
-            except ValueError:
-                pass
-        owner_m = re.search(r"\*\*Owner of next nudge\*\*:\s*([^\n]+)", block)
-        text_blob = topic + " " + entity
+        text_blob = f"{entry['topic']} {entry['entity']}"
         if is_phi_risk(text_blob) or is_visibility_cpa_mention(text_blob):
             continue
+        age_days = entry.get("stale_days")
         decisions.append({
-            "topic": topic[:140],
-            "entity": entity[:60],
-            "severity": sev.group(1),
-            # KEPT under its historical name (staleness) — persisted strategy-memo
-            # snapshots compare these dicts across weeks; never rename/remove.
+            "topic": entry["topic"],
+            "entity": entry["entity"],
+            "severity": entry["severity"],
+            # TWO distinct metrics (bug-hunt 2026-07-31, cq-935a18e2969e):
+            # age_days/stale_days is days-since-LAST-TOUCH (staleness -- the
+            # surfacing trigger per the file's own header rules) and open_days is
+            # days-since-SURFACED (true open age). The 7/19-7/31 evidence was
+            # these being conflated: a legitimate "verify-the-yellows" touch on
+            # 7/20 reset the narrated "age" of a ~10-week-old P0 to "4 days".
+            # Renderers must never label one as the other.
             "age_days": age_days,
             "stale_days": age_days,
-            "open_days": open_days,
-            "surfaced": surfaced_date,
+            "open_days": entry.get("open_days"),
+            "surfaced": entry.get("surfaced"),
             # A Surfaced field that exists but isn't an absolute date (the frozen
             # "14+ days" strings the 2026-07-31 normalization cleaned up) must be
             # flagged, never silently misread.
-            "origination_unknown": open_days is None,
-            "owner": (owner_m.group(1).strip() if owner_m else "unassigned")[:60],
+            "origination_unknown": entry.get("open_days") is None,
+            "owner": entry.get("owner", "unassigned"),
+            # New, additive: the gate date when the entry carries one. Present so
+            # a renderer CAN say "gate was 8/13" without a second parse; absent
+            # (None) on every entry in the file as it stands today.
+            "gate": entry.get("gate"),
         })
     decisions.sort(key=lambda d: (d["severity"], -(d["open_days"] or d["age_days"] or 0)))
     return {"ok": True, "decisions": decisions}
@@ -1130,6 +1121,26 @@ def run_memo(
         except Exception as exc:  # noqa: BLE001 -- file write must not block the DM
             log.error("strategy_memo: memo file write failed: %s", exc)
         delivered = deliver_fn(memo_body)
+        if delivered:
+            # DELIVERY EVIDENCE (cq-232fe6a541ff). Recorded only on a successful
+            # send, and only for the decisions this surface actually carried --
+            # which is the P0/P1 fact base, since that is what gather returns.
+            # A P2 past its gate is therefore NOT marked delivered here, and the
+            # gate control fires: correct, and the whole point (all five lost
+            # decisions were P2).
+            #
+            # Honest residual: the synthesis can paraphrase a decision away, and
+            # this still records it as delivered. The alternative -- verbatim
+            # topic matching in synthesized prose -- would report "undelivered"
+            # on nearly every real memo, and an alarm nobody believes is the
+            # state this control exists to fix. The fail-closed rollup prints the
+            # fact base verbatim, so the paraphrase case only arises when a memo
+            # WAS synthesized and did discuss the portfolio.
+            from . import decision_lane
+            decision_lane.record_delivery(
+                [d.get("topic", "") for d in
+                 ((gathered.get("decisions") or {}).get("decisions") or [])],
+                "strategy_memo")
 
     return {
         "dry_run": dry_run,

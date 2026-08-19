@@ -417,6 +417,19 @@ def run_synthesis(
     if not dry_run:
         sm.save_snapshot(gathered, today=today, snapshot_dir=snap_dir)
         delivered = deliver_fn(body)
+        if delivered:
+            # Delivery evidence (cq-232fe6a541ff): the daily synthesis is the
+            # fastest of the three decision surfaces, so a decision it carries is
+            # genuinely reaching a human daily. Recorded only on a successful post.
+            try:
+                from . import decision_lane
+                decision_lane.record_delivery(
+                    [d.get("topic", "") for d in
+                     ((gathered.get("decisions") or {}).get("decisions") or [])],
+                    f"synthesis:{scope}")
+            except Exception:  # noqa: BLE001 -- evidence never breaks a post
+                log.warning("channel_synthesis: delivery evidence failed",
+                            exc_info=True)
 
     return {
         "scope": scope,
