@@ -28,9 +28,41 @@ Cora writes a UTC timestamp to `data/health/heartbeat.txt` every 60 seconds.
 If this file is older than 3 minutes, the process is stalled or dead.
 
 ```powershell
-Get-Content "data\health\heartbeat.txt"
-(Get-Date).ToUniversalTime() - [datetime]::Parse((Get-Content "data\health\heartbeat.txt").Trim())
+Get-Content "data\health\heartbeat.txt" -TotalCount 1
+(Get-Date).ToUniversalTime() - [datetime]::Parse((Get-Content "data\health\heartbeat.txt" -TotalCount 1).Trim())
 ```
+
+`heartbeat.txt` is contractually **one bare ISO-8601 UTC timestamp** — ten parsers
+depend on that (cora-watchdog.ps1, health_endpoint, strategy_memo,
+nightly_health_check, four KB-maintenance heartbeat guards, restart-cora.ps1, this
+runbook). Never add a second line; new facts go in the two files below.
+
+**Who wrote it** (added 2026-08-19, cq-7915a8647cff):
+
+```powershell
+Get-Content "data\health\instance.json"          # live pid, started_at, uptime_s,
+                                                 # heartbeat_write_failures
+Get-Content "logs\cora-instances.jsonl" -Tail 5  # append-only start/stop ledger
+```
+
+A restart is proven by a **new pid in a new `start` row**, not by an exit code. Do
+not try to prove it from the log: `TimedRotatingFileHandler` pins the live log file
+to the process's START date and moves each completed day to
+`cora-<startdate>.log.<thatday>`, so a `cora-*.log` glob cannot see the startup line
+of any instance older than one midnight.
+
+If `heartbeat.txt` is stale but the log shows heartbeats flowing, look for
+`HEARTBEAT_FILE_WRITE_FAILING` — the write is failing and the log says why (the
+nightly health check treats that token as critical).
+
+**Watchdog silence is now meaningful.** `logs/watchdog-<date>.jsonl` carries a
+`tick` row at least hourly whenever the watchdog runs and is happy, so no lines =
+the task is not running. The usual cause is a stuck `State=Running` instance with
+no process behind it, which silently rejects every trigger (`LastTaskResult`
+0x80070420 ALREADY_RUNNING): clear it with `schtasks /End /TN cora-watchdog`, and
+if the task settings were never hardened run
+`deployment\fix-watchdog-task-settings-2026-08-19.ps1` from elevated PS. The
+nightly health check CRITICALs on a watchdog line older than 3h.
 
 
 ---

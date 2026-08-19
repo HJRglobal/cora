@@ -10,7 +10,7 @@ from pathlib import Path
 
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import drive_io
+from . import drive_io, instance_ledger
 from .app import app
 from .config import config
 from .context_loader import _load_static_context
@@ -36,7 +36,7 @@ _BACKOFF = (1, 2, 5, 10, 30)
 _STABLE_RUN_SECS = 60
 
 
-def _setup_logging() -> None:
+def _setup_logging() -> str:
     log_dir = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
     log_dir = os.path.normpath(log_dir)
     os.makedirs(log_dir, exist_ok=True)
@@ -58,20 +58,53 @@ def _setup_logging() -> None:
 
     level = getattr(logging, config.log_level.upper(), logging.INFO)
     logging.basicConfig(level=level, handlers=[file_handler, stream_handler])
+    # Returned so the instance ledger records WHICH file this process writes to.
+    # TimedRotatingFileHandler pins this name to the process START date and moves
+    # each completed day aside as "<this name>.<that day>" -- so the name alone is
+    # not a reliable place to look for a given day's lines (see instance_ledger).
+    return log_file
 
 
 def _heartbeat(stop: threading.Event, log: logging.Logger) -> None:
+    """Log a liveness line and refresh the sentinel files, once a minute.
+
+    The log line and the file write live in the SAME loop iteration, so "log
+    heartbeats flowing while heartbeat.txt is frozen" is only possible if the
+    write is failing -- and a failure used to be a single WARNING that nothing
+    watched. Consecutive failures now escalate to an ERROR carrying the
+    HEARTBEAT_FILE_WRITE_FAILING token, which nightly_health_check treats as a
+    critical log pattern. The pid + failure count also land in instance.json, so
+    a stale heartbeat.txt can be told apart from a dead process.
+    """
     start = time.monotonic()
+    write_failures = 0
     while not stop.wait(60):
         uptime = int(time.monotonic() - start)
-        log.info("heartbeat alive uptime_s=%d", uptime)
+        log.info("heartbeat alive uptime_s=%d pid=%d", uptime, os.getpid())
         try:
             _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
             _HEARTBEAT_FILE.write_text(
                 datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8"
             )
+            if write_failures:
+                log.warning(
+                    "heartbeat: sentinel file write RECOVERED after %d consecutive failures",
+                    write_failures,
+                )
+            write_failures = 0
         except Exception as exc:
-            log.warning("heartbeat: failed to write sentinel file: %s", exc)
+            write_failures += 1
+            if write_failures == 1:
+                log.warning("heartbeat: failed to write sentinel file: %s", exc)
+            else:
+                # Second failure onward is no longer a blip: the watchdog and the
+                # health check both trust this file, so a persistent failure is
+                # an outage of the liveness signal itself.
+                log.error(
+                    "HEARTBEAT_FILE_WRITE_FAILING: %d consecutive failures writing %s: %s",
+                    write_failures, _HEARTBEAT_FILE, exc,
+                )
+        instance_ledger.touch(uptime, write_failures=write_failures)
 
 
 _ALL_ENTITIES = [
@@ -174,9 +207,12 @@ def _drive_reachability_monitor(log, stop, *, probe=None, interval=None) -> None
 
 
 def main() -> None:
-    _setup_logging()
+    log_file = _setup_logging()
     log = logging.getLogger(__name__)
     log.info("Cora starting up…")
+    # Provable instance identity: a restart is verified by a NEW start row with a
+    # DIFFERENT pid, never by a restart script's exit code.
+    instance_ledger.record_start(log_file=log_file)
 
     # Pre-warm all entity contexts in background so first requests don't pay the
     # cold-cache penalty (Google Drive read per entity, up to 2s each).
@@ -236,6 +272,7 @@ def main() -> None:
                 time.sleep(delay)
             except KeyboardInterrupt:
                 log.info("Cora shutting down (KeyboardInterrupt).")
+                instance_ledger.record_stop("KeyboardInterrupt")
                 return
 
         attempt += 1
@@ -281,6 +318,7 @@ def main() -> None:
         except KeyboardInterrupt:
             log.info("Cora shutting down (KeyboardInterrupt).")
             stop_heartbeat.set()
+            instance_ledger.record_stop("KeyboardInterrupt")
             return
 
         except Exception as exc:

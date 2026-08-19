@@ -1898,15 +1898,28 @@ deployment/
      Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
    ```
-   After Start-ScheduledTask + sleep, verify single instance. **Healthy shape
-   (verified live 2026-06-11, all 3 created the same second):** `cora.exe`
-   launcher -> `.venv\Scripts\python.exe` (venv REDIRECTOR, not the bot) -> base
-   `Python312\python.exe` (the actual bot). So the query returns 3 rows for ONE
-   instance: 1 cora.exe + 2 python.exe. More than that = stacked; confirm via the
-   log (a single "Cora starting up" + one monotonic heartbeat sequence). FYI the
-   service task action is `.venv\Scripts\cora.exe` (verified live 2026-06-16 via
-   `schtasks /query /tn cowork-cora-service /v`; D-005 compliant). The older
-   "uv.exe run cora" note was STALE -- there is no `uv` in the live action.
+   After Start-ScheduledTask + sleep, verify single instance. **HEALTHY SHAPE
+   CORRECTED 2026-08-19 (cq-0d163e5f9c22, verified live):** the service task action
+   is `.venv\Scripts\python.exe -m cora.main` (`schtasks /query /tn
+   cowork-cora-service /v`, 8/19) -- there is **NO `cora.exe` process at all**. One
+   healthy instance = **2 python.exe** matching the filter (`.venv\Scripts\python.exe
+   -m cora.main` redirector -> base `Python312\python.exe -m cora.main`). The kill
+   filter still works (it matches on `cora.main`), but the old "1 cora.exe + 2
+   python.exe" shape check counted processes the filter never matches, printed
+   "0 + 0" and warned on EVERY restart -- loud enough to mask a real stacking. The
+   2026-06-11/06-16 `cora.exe` observations are STALE, as is the older "uv.exe run
+   cora" note. Count what the kill filter matches: 2 = `-m cora.main`, 3 = a
+   console-script launch, both ONE instance; >3 = stacked. **Definitive check is
+   `logs/cora-instances.jsonl`** -- one `start` row per real process (pid + ts), so
+   a restart is proven by a NEW pid, never by a restart script's exit code. The log
+   line alone cannot prove it: `TimedRotatingFileHandler` pins the live file to the
+   process START date and moves each finished day to `cora-<startdate>.log.<thatday>`,
+   so an instance's startup line is invisible to a `cora-*.log` glob after its first
+   midnight (this is what made the 8/18 forensics conclude, wrongly, that four
+   watchdog restarts had never restarted anything).
+   **Service RunLevel is `Limited`, not Highest** (verified live 8/19) -- the
+   watchdog task is the one at `Highest`. Elevation is still required for
+   restart-cora.ps1 because Stop-Process against another session's tree needs it.
 
 6. **Import smoke test** -- Before every commit:
    `.venv\Scripts\python.exe -c "from src.cora.app import app"`

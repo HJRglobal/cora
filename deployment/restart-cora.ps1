@@ -41,19 +41,55 @@ if ($leftover.Count -gt 0) {
 }
 
 Write-Host "=== Starting Cora ==="
+$restartBeganUtc = (Get-Date).ToUniversalTime()
 Start-ScheduledTask -TaskName "cowork-cora-service"
 Start-Sleep 90
 Write-Host "Heartbeat:"
-Get-Content "data\health\heartbeat.txt"
+Get-Content "data\health\heartbeat.txt" -TotalCount 1
 Write-Host "Verify the timestamp above is fresh (within ~60s of now, UTC)."
 
-# Healthy single instance = cora.exe launcher -> venv python redirector ->
-# base python = 1 cora.exe + 2 python.exe matches (doctrine 5).
-$pys = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" })
-$launchers = @(Get-CimInstance Win32_Process -Filter "Name='cora.exe'")
-Write-Host ("Bot processes: " + $launchers.Count + " cora.exe + " + $pys.Count + " python (healthy single instance = 1 + 2)")
-if ($pys.Count -ne 2 -or $launchers.Count -ne 1) {
-    Write-Warning "PROCESS SHAPE UNEXPECTED (stacked or partial instance?) -- check the log for one 'Cora starting up' + a single monotonic heartbeat sequence."
+# PROCESS SHAPE (corrected 2026-08-19, cq-0d163e5f9c22). The old check counted
+# python.exe whose command line contains "\Scripts\cora.exe" plus cora.exe
+# processes, and declared "1 cora.exe + 2 python.exe" healthy. Neither exists on
+# this host: the live service action is `.venv\Scripts\python.exe -m cora.main`
+# (verified live 8/19 via schtasks), so the chain is venv-redirector python ->
+# base python, 2 matches, and ZERO cora.exe. The check therefore printed
+# "0 cora.exe + 0 python" and warned on EVERY restart -- a false alarm loud
+# enough to mask a real stacked instance. Count what the KILL FILTER matches
+# instead, so the counter and the kill can never disagree: 2 = the -m cora.main
+# chain, 3 = a console-script (cora.exe) launch, both ONE instance.
+$bot = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
+    Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" })
+Write-Host ("Bot processes matching the kill filter: " + $bot.Count + " (ONE healthy instance = 2 for '-m cora.main', 3 via the cora.exe launcher)")
+$bot | ForEach-Object { Write-Host ("  PID " + $_.ProcessId + " " + $_.Name) }
+if ($bot.Count -eq 0) {
+    Write-Warning "NO bot process is running -- the service did not come up. Check today's log and the task's Last Result."
+} elseif ($bot.Count -gt 3) {
+    Write-Warning ("STACKED INSTANCES LIKELY (" + $bot.Count + " matching processes) -- confirm via logs\cora-instances.jsonl (one start row) before leaving it.")
+}
+
+# Restart verification (cq-7915a8647cff): a fresh start row in the instance ledger
+# is the only direct proof a NEW process came up. Absent ledger = a pre-2026-08-19
+# build is still live, which is itself worth saying out loud.
+$ledger = "logs\cora-instances.jsonl"
+if (Test-Path $ledger) {
+    $lastStart = $null
+    foreach ($line in @(Get-Content $ledger -Tail 40)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $row = $line | ConvertFrom-Json } catch { continue }
+        if ($row.event -eq "start") { $lastStart = $row }
+    }
+    if ($null -eq $lastStart) {
+        Write-Warning "Instance ledger has no start row -- cannot verify a fresh instance."
+    } else {
+        $startUtc = [datetimeoffset]::Parse($lastStart.ts).UtcDateTime
+        if ($startUtc -ge $restartBeganUtc) {
+            Write-Host ("Restart VERIFIED: fresh instance pid " + $lastStart.pid + " started " + $lastStart.ts)
+        } else {
+            Write-Warning ("NO fresh start row since this restart began (newest is pid " + $lastStart.pid + " at " + $lastStart.ts + ") -- the old instance may still be the live one.")
+        }
+    }
+} else {
+    Write-Host "No instance ledger yet (logs\cora-instances.jsonl) -- expected until the first restart onto the 2026-08-19 build."
 }
 Write-Host "=== Restart complete -- activated whatever bot-loaded code is at HEAD. ==="

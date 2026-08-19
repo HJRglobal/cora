@@ -149,6 +149,10 @@ _CRITICAL_LOG_PATTERNS = [
     r"connection refused",
     r"SLACK_BOT_TOKEN.*invalid",
     r"API key.*invalid",
+    # The liveness sentinel's own writer failing repeatedly (cq-7915a8647cff): the
+    # watchdog and this check both trust heartbeat.txt, so a persistent write
+    # failure is an outage of the signal, not a warning.
+    r"HEARTBEAT_FILE_WRITE_FAILING",
 ]
 _CRITICAL_RE = re.compile("|".join(_CRITICAL_LOG_PATTERNS), re.IGNORECASE)
 
@@ -219,11 +223,16 @@ def _restart_cora(dry_run: bool) -> str:
             ["schtasks", "/End", "/TN", "cowork-cora-service"],
             capture_output=True, timeout=15
         )
-        # Kill orphan python processes
+        # Kill orphan BOT processes only. The old filter was "*cora*" anywhere in
+        # the command line, which also matches scripts/run_mcp_server.py (path
+        # contains "cora"), every scheduled cora script and any in-flight KB
+        # backfill -- an auto-restart could shoot down a multi-hour migration.
+        # Use the doctrine-5 filter: the bot chain and nothing else.
         subprocess.run(
-            ["powershell", "-Command",
-             "Get-WmiObject Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -like '*cora*' } | "
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='cora.exe'\" | "
+             r"Where-Object { $_.CommandLine -like '*\Scripts\cora.exe*' -or "
+             "$_.CommandLine -like '*cora.main*' } | "
              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
             capture_output=True, timeout=15
         )
@@ -363,6 +372,8 @@ _LASTRESULT_SIGNAL_OK: frozenset[str] = frozenset({
 
 _LAST_RESULT_HINTS: dict[int, str] = {
     267014: "TASK_TERMINATED - likely hit its ExecutionTimeLimit",
+    2147946720: ("ALREADY_RUNNING (0x80070420) - a stuck instance is blocking every "
+                 "trigger under MultipleInstances=IgnoreNew; run schtasks /End on it"),
     1: "generic failure exit",
     2: "partial failure exit",
     267012: "NO_MORE_RUNS",
@@ -513,6 +524,104 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
             f"'{_QBO_MONITOR_TASK}' last ran {age_h:.0f}h ago (expected daily) -- "
             "it may have stopped firing.")
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
+
+
+_WATCHDOG_TASK = "cora-watchdog"
+# The watchdog logs a tick at most hourly when healthy, so >3h of silence means it
+# is not running -- not that it saw nothing wrong.
+_WATCHDOG_TICK_STALE_HOURS = 3.0
+_WATCHDOG_ESCALATE_EVENTS = frozenset({
+    "watchdog_error",
+    "restart_unverified",
+    "restart_blocked_not_elevated",
+    "no_heartbeat_file",
+    "thrash_guard_hold",
+})
+
+
+def check_watchdog_liveness(now: datetime | None = None) -> CheckResult:
+    """Is the auto-recovery layer itself alive? (cq-7915a8647cff)
+
+    The 8/18 forensics hit a wall precisely here: heartbeat.txt looked 29h stale
+    with ZERO watchdog log lines, and there was no way to tell "the watchdog ran
+    and was happy" (which logged nothing at all) from "the watchdog never ran".
+    Live 8/19 the task was in fact stuck: State=Running with no process behind it
+    and LastTaskResult=0x80070420 ALREADY_RUNNING, which under
+    MultipleInstances=IgnoreNew silently rejects every 5-minute trigger for up to
+    the task's ExecutionTimeLimit (PT72H as registered). Nothing alarmed.
+
+    The watchdog now emits a periodic `tick`, so this check reads two things:
+      * tick freshness -- silence is now unambiguous evidence it is not running;
+      * escalation events in the last 24h (unverified restart, non-elevated
+        watchdog, watchdog_error, thrash hold).
+
+    A watchdog that is not running is CRITICAL: it is the only auto-recovery for a
+    hung bot, and a hang produces no failure exit code for RestartOnFailure.
+    `now` is injectable for tests.
+    """
+    now = now or datetime.now(timezone.utc)
+    rows: list[dict] = []
+    for path in sorted(_LOG_DIR.glob("watchdog-*.jsonl"))[-3:]:
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+
+    def _age_h(row: dict) -> float | None:
+        raw = str(row.get("ts") or "")
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (now - ts).total_seconds() / 3600
+
+    ages = [a for a in (_age_h(r) for r in rows) if a is not None]
+    newest = min(ages) if ages else None
+
+    escalations = []
+    for row in rows:
+        if row.get("event") in _WATCHDOG_ESCALATE_EVENTS or row.get("action") == "ESCALATE_ALERT":
+            age = _age_h(row)
+            if age is not None and age <= 24:
+                escalations.append(f"{row.get('event')} ({age:.0f}h ago)")
+
+    if newest is None:
+        return CheckResult(
+            "Cora watchdog", "critical",
+            "No watchdog activity logged at all -- the only auto-recovery for a HUNG "
+            "bot may not be running. Check: schtasks /Query /TN cora-watchdog /V /FO LIST "
+            "(a State=Running task with no process blocks every trigger; "
+            "schtasks /End /TN cora-watchdog clears it).")
+
+    if newest > _WATCHDOG_TICK_STALE_HOURS:
+        return CheckResult(
+            "Cora watchdog", "critical",
+            f"Newest watchdog log line is {newest:.1f}h old (a tick is expected at least "
+            f"hourly) -- the watchdog is not running. A stuck State=Running instance "
+            f"silently rejects every trigger; clear it with "
+            f"schtasks /End /TN {_WATCHDOG_TASK}.")
+
+    if escalations:
+        return CheckResult(
+            "Cora watchdog", "warn",
+            f"Running (newest line {newest:.1f}h old) but {len(escalations)} escalation(s) "
+            f"in 24h: " + ", ".join(escalations[:5]))
+
+    return CheckResult(
+        "Cora watchdog", "ok",
+        f"Alive -- newest watchdog line {newest:.1f}h old, no escalations in 24h.")
 
 
 def check_info_for_cora_watermark(now: datetime | None = None) -> CheckResult:
@@ -916,15 +1025,16 @@ def check_logs_24h() -> list[CheckResult]:
     """Scan last 24h log files for ERRORs and critical patterns."""
     results: list[CheckResult] = []
     cutoff = datetime.now() - timedelta(hours=26)
-    today_str  = datetime.now().strftime("%Y-%m-%d")
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Recency is MTIME, never the date in the filename (cq-7915a8647cff).
+    # TimedRotatingFileHandler pins the bot's live log to the process START date:
+    # an instance started 8/17 was still appending 8/19's lines to
+    # cora-2026-08-17.log. The old today/yesterday NAME filter ANDed that file
+    # out, so on any instance older than a day this scan silently skipped the
+    # live bot log -- i.e. every critical pattern below went unseen in exactly
+    # the long-uptime case.
     log_files = list(_LOG_DIR.glob("*.log"))
-    recent = [
-        f for f in log_files
-        if f.stat().st_mtime > cutoff.timestamp()
-        and (today_str in f.name or yesterday_str in f.name)
-    ]
+    recent = [f for f in log_files if f.stat().st_mtime > cutoff.timestamp()]
 
     if not recent:
         results.append(CheckResult("Log scan", "warn", "No recent log files found."))
@@ -1381,6 +1491,9 @@ def main() -> int:
 
     log.info("Checking scheduled-task last results (W4-07)...")
     all_results.extend(check_task_last_results())
+
+    log.info("Checking watchdog liveness...")
+    all_results.append(check_watchdog_liveness())
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())

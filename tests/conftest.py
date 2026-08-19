@@ -378,6 +378,10 @@ _GUARDED_LEDGERS = (
     "data/maps/user-aliases.yaml",
     "data/state/delegated-work.jsonl",
     "data/state/delegated-work-runner.jsonl",
+    # Instance ledger (cq-7915a8647cff): the live bot appends a start row per
+    # process. A suite-run mutation means a test wrote the real path instead of
+    # monkeypatching instance_ledger.LEDGER_FILE.
+    "logs/cora-instances.jsonl",
 )
 
 
