@@ -66,12 +66,19 @@ SHIPPED: dict[str, str] = {
     "cq-fe9ec84a5ca2": (
         "F3E Production Pipeline read lane -- D-077 registry entry + GET-only "
         "reader + channel gate, price-free by construction on two rails (slice 6). "
-        "PREREQ: the read PAT needs read granted on app1hWKmTAnvp09rR"),
+        "The D-051 review found BOTH rails leaky and the column projection written "
+        "from documentation rather than probed -- every read 422'd into a "
+        "fetch-ALL and lot/COA/contacts/run-date rendered empty; fixed against the "
+        "live schema. NO PAT grant needed after all: the read-only key already "
+        "returns HTTP 200 on that base"),
     "cq-232fe6a541ff": (
         "decisions lane -- gate-date escalation at ANY severity keyed on DELIVERY, "
-        "one shared parser, delivery evidence at both surfaces, propose-only "
-        "Airtable transcription (slice 8). The audit half was already done 8/18; "
-        "this is the mechanism it specified"),
+        "one lane parser, delivery evidence, propose-only Airtable transcription "
+        "(slice 8). The audit half was already done 8/18; this is the mechanism it "
+        "specified. The D-051 review caught the intake DEAD on this host (the "
+        "write-PAT env var is unset, and the read PAT reads that base fine) and "
+        "the alarm unable to ever clear -- both fixed; the live sync now proposes "
+        "all SIX open tracker decisions with their gate dates"),
     "cq-1b6554a58fae": (
         "inventory Reason-line guards -- the entity-guard half was REAL (prose "
         "writes were never recognized, so \"sent to the OSN pop-up\" routed the "
