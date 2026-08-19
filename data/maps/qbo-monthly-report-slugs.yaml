@@ -1,0 +1,77 @@
+# QBO realm -> monthly-report filename slug + expected company name.
+#
+# Drives scripts/run_qbo_monthly_reports.py (cq-96adf03bcda3), which replaces
+# Justin's manual QBO export loop into
+# 01-HJR-Global/accounting/monthly-reports/{filing-month}/.
+#
+# HOW THE SLUGS WERE DERIVED (2026-08-18, not guessed)
+# ----------------------------------------------------
+# The historical folders carry 19 distinct entity slugs, but Cora holds QBO
+# tokens for only 11 realms. Mapping realm -> slug by name similarity would be a
+# money-adjacent guess (LEX could plausibly have been `llc`, `lexcorp` or `lts`),
+# so each row below was confirmed TWICE:
+#   1. live QBO `companyinfo` read per realm, and
+#   2. row 1 of the existing 2026-05 .xlsx for that slug, which is the company
+#      name QBO itself stamped on Justin's manual export.
+# Both agreed on all 11. That is why `company_name` is stored here: it is not
+# decoration, it is the pre-write assertion (see verify_company) that makes
+# filing a P&L under the wrong entity structurally impossible rather than
+# merely unlikely.
+#
+# ADDING A REALM: OAuth it, read its companyinfo CompanyName, and use the EXACT
+# string. A mismatch refuses that entity's write and reports it -- it never
+# falls back to writing under a guessed slug.
+#
+# NOT COVERED (no Cora QBO token -- these 8 slugs stay a manual export):
+#   f3comm (F3 Community) · hjrpod (HJR Podcast) · hjrprod (HJR Productions)
+#   lbhs (LBHS) · lexcorp (LexCorp, LLC) · lts (Lexington Therapies, LLC)
+#   mv (LLA Maryvale) · ufl (United Fight League)
+# The run summary names these every time, so a partially-populated folder can
+# never read as a complete one.
+
+realms:
+  BDM:
+    slug: bdm
+    company_name: Big D Media
+  F3E:
+    slug: f3e
+    company_name: F3 Energy Holdings Inc
+  HJRG:
+    slug: hjrg
+    company_name: HJR Global Services LLC
+  HJRP:
+    slug: hjrp
+    company_name: HJR Properties
+  HRLLC:
+    slug: hjrllc
+    company_name: Harrison Rogers, LLC
+  LEX:
+    slug: llc
+    company_name: Lexington LLC
+  OSN:
+    slug: osn-core4
+    company_name: CORE 4 OSN LLC
+  OSNGF:
+    slug: osn-gf
+    company_name: OSN Greenfield and 60 LLC
+  OSNGM:
+    slug: osn-gm
+    company_name: OSN Gilbert and McKellips
+  OSNGW:
+    slug: osn-gw
+    company_name: OSN Gilbert and Warner
+  OSNVV:
+    slug: osn-vvp
+    company_name: OSN Val Vista and Pecos LLC
+
+# Slugs present in the historical archive that Cora cannot produce. Kept as
+# DATA so the run summary's "still manual" line cannot drift from reality.
+unmapped_slugs:
+  - f3comm
+  - hjrpod
+  - hjrprod
+  - lbhs
+  - lexcorp
+  - lts
+  - mv
+  - ufl

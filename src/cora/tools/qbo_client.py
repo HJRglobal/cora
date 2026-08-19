@@ -2,7 +2,7 @@
 
 Phase 2 #10 part 2 scope (Cora tool surface):
   - get_profit_loss(entity, start_date, end_date)
-  - get_balance_sheet(entity, as_of_date)
+  - get_balance_sheet(entity, as_of_date, accounting_method)
   - get_ar_aging(entity)
   - get_ap_aging(entity)
   - get_recent_transactions(entity, days=30)
@@ -277,15 +277,29 @@ def get_profit_loss(
     )
 
 
-def get_balance_sheet(entity: str, as_of_date: str | None = None) -> dict[str, Any]:
-    """Fetch BalanceSheet report. Defaults to today if as_of_date omitted."""
+def get_balance_sheet(
+    entity: str,
+    as_of_date: str | None = None,
+    accounting_method: str | None = None,
+) -> dict[str, Any]:
+    """Fetch BalanceSheet report. Defaults to today if as_of_date omitted.
+
+    accounting_method: same contract as get_profit_loss -- when omitted, QBO
+    renders in each COMPANY's own default basis, which differs per realm, so
+    sheets from different companies are not comparable. Added 2026-08-18 for the
+    monthly-report populator, which pins Accrual across all 11 realms. Optional
+    and default-None, so every pre-existing caller keeps byte-identical behavior.
+    """
     if not as_of_date:
         as_of_date = datetime.date.today().isoformat()
     token_entity = "HJRP" if entity in _HJRP_CLASS_MAP else entity
+    params: dict = {"as_of_date": as_of_date, "minorversion": "65"}
+    if accounting_method:
+        params["accounting_method"] = accounting_method
     return _request(
         token_entity,
         "/v3/company/{realm_id}/reports/BalanceSheet",
-        params={"as_of_date": as_of_date, "minorversion": "65"},
+        params=params,
     )
 
 
