@@ -430,10 +430,21 @@ def build_realm(
         return block
 
     if not pairing.resolvable:
-        # The LEX case: one QBO realm against five Lex tabs. Attributing its
-        # activity to whichever tab we guessed would put LBHS/LTS/LLA money on
-        # LLC. Refuse, and do not even COLLECT -- an unattributable realm's
-        # figures have no home in this file (D-124: exclude at collection).
+        # An unattributable realm: it could map to several tabs and its split is
+        # not declared. Attributing its activity to whichever tab we guessed
+        # would put sibling entities' money on one of them. Refuse, and do not
+        # even COLLECT -- an unattributable realm's figures have no home in this
+        # file (D-124: exclude at collection).
+        #
+        # NOTE (2026-08-18, M3): LEX no longer reaches here. It was the example
+        # this branch was written for, but the realm has since been identified as
+        # the Lexington LLC company file and declared `scope_attested` onto
+        # CF_LLC, so it now RESOLVES and is collected. Do not read this comment as
+        # evidence that LEX is never collected -- two consequences follow from
+        # that flip: LEX leaves `awaiting_map_confirmation`, which puts it into
+        # the S2 coverage DENOMINATOR, so a LEX read failure now trips the
+        # `covered < expected` WARN in check_cashflow_actuals where it used to
+        # stay silent. That is a new alarm source, and it is correct.
         block.update({
             "status": "refused",
             "reason_code": "realm_scope_undeclared",

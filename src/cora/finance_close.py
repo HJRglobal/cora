@@ -1373,6 +1373,11 @@ FORECAST_ASSIST_RELDIR = "01-HJR-Global/accounting/forecast-assist"
 #: Where the Monday worksheet lives now.
 CASHFLOW_WORKSHEET_RELDIR = "01-HJR-Global/accounting/cashflow-ledger/worksheets"
 
+#: A weekly snapshot older than this means the Monday S1 job is not firing.
+#: Eight days, not seven: a Monday-to-Monday cadence is exactly 7, so 7 would
+#: warn on a healthy week whose pack ran a few hours after the snapshot.
+_SNAPSHOT_MAX_AGE_DAYS = 8
+
 #: How many accuracy rows the PACK renders inline. The full table lives in the
 #: worksheet; a 19-tab list inside a Slack section pushes every later section
 #: past the point anyone reads.
@@ -1418,11 +1423,36 @@ def build_forecast_assist_section(
         return section, snap
 
     # ── accuracy, from VERIFIED pre-close snapshots only ─────────────────────
+    # Derived roll-ups are excluded from accuracy: measuring "OSN Consolidated"
+    # beside its four member tabs restates one variance as five.
+    entity_map = sources.get_cashflow_entity_map()
     accuracy_week, rows, pending = cw.resolve_accuracy(
         latest=snapshot,
         load_snapshot=sources.load_cashflow_snapshot,
         snapshot_dates=sources.get_cashflow_snapshot_dates(),
+        derived_tabs=getattr(entity_map, "derived_tabs", None),
     )
+
+    # STALENESS. Every sibling leg in this pack warns when its source ages --
+    # the carry-in on the bank snapshot, the parallel section on a lagging
+    # finalized window. The accuracy leg had none, so a broken Monday S1 job
+    # would keep re-rendering the SAME measurable week from the same frozen
+    # snapshot, week after week, reading as a normal healthy section on the
+    # three finance surfaces while the only signal sat on a different one.
+    snap_date = str(snapshot.get("snapshot_date") or "")
+    try:
+        snap_age = (day - datetime.date.fromisoformat(snap_date)).days
+    except ValueError:
+        snap_age = None
+    if snap_age is None or snap_age > _SNAPSHOT_MAX_AGE_DAYS:
+        section.lines.append(
+            ":warning: the forecast snapshot behind this section is "
+            + (f"{snap_age} days old ({_scrub_external(snap_date, 12)})"
+               if snap_age is not None else "of UNKNOWN age")
+            + " — the Monday 06:15 job may not be firing, and these figures are "
+            "not this week's."
+        )
+        section.flags += 1
 
     if not accuracy_week:
         section.lines.append(
@@ -1435,7 +1465,8 @@ def build_forecast_assist_section(
             f"— {len(rows)} tab(s) measured against a forecast banked before the "
             f"week closed. Largest miss: {_scrub_external(worst.tab, 40)} forecast "
             f"{fmt_money(worst.forecast)} vs actual {fmt_money(worst.actual)}, "
-            f"variance {fmt_delta(worst.variance)} ({worst.horizon_days}-day horizon)."
+            f"variance {fmt_delta(worst.variance)} ({worst.horizon_days}-day "
+            f"horizon; snapshot {_scrub_external(snap_date, 12)})."
         )
         for row in sorted(rows, key=lambda r: abs(r.variance), reverse=True)[:_ACCURACY_MAX_ROWS]:
             section.lines.append(
@@ -1495,12 +1526,13 @@ def build_forecast_assist_section(
         )
     else:
         label = _scrub_external(next_week, 12)
-        portfolio = cw.portfolio_forecast(snapshot, next_week)
+        portfolio = cw.portfolio_carry_in(snapshot, next_week)
         section.lines.append(
-            f"Carry-in references — week ending {label}"
-            + (f" (CF_SUMMARY forecast {fmt_money(portfolio)} portfolio-wide)"
+            f"Carry-in references — for the week ending {label}"
+            + (f" (CF_SUMMARY forecast carry-in {fmt_money(portfolio)} "
+               f"portfolio-wide — the BEGINNING-cash row, not the week's close)"
                if portfolio is not None else
-               " (CF_SUMMARY portfolio forecast UNKNOWN)")
+               " (CF_SUMMARY portfolio carry-in UNKNOWN)")
             + ". " + cw.CARRY_IN_POSTURE
         )
         for row in carry:
@@ -1508,6 +1540,24 @@ def build_forecast_assist_section(
                 # A cash-less shell has no carry-in, so it leaves the DENOMINATOR
                 # rather than counting as a coverage gap -- a permanent
                 # false-partial trains the reader to ignore the real ones.
+                continue
+            if row.status == "shell_holding":
+                # But a shell that is HOLDING money is a flag, not a footnote.
+                section.lines.append(
+                    f":warning: {entity_label(row.entity)}: configured as a "
+                    f"cash-less shell but holding "
+                    f"{fmt_money(row.shell_balance)} — portfolio totals are "
+                    f"withheld while this is true."
+                )
+                section.flags += 1
+                continue
+            if row.status == "ok" and not row.balances_complete:
+                section.lines.append(
+                    f":warning: {entity_label(row.entity)}: unavailable — QBO "
+                    f"returned no balance for {row.unknown_accounts} account(s), "
+                    f"so its totals understate the realm; do not carry it in."
+                )
+                section.flags += 1
                 continue
             if row.status != "ok":
                 # "unavailable —" is the literal substring build_founder_cut
@@ -1673,6 +1723,13 @@ def build_cashflow_parallel_section(
                 f"• {label}: unavailable — {_scrub_external(row.reason, 80)}"
             )
             continue
+        if row.status == "sheet_unfilled":
+            section.lines.append(
+                f"• {label} ({tab}): NOT COMPARED — {_scrub_external(row.reason, 140)}. "
+                f"QBO reads {fmt_money(row.qbo_net)} for the week. This is a "
+                f"data-entry gap, not a reconciliation break."
+            )
+            continue
         if row.status == "pending_sheet":
             section.lines.append(
                 f"• {label} ({tab}): sheet actual not entered for this week yet — "
@@ -1680,9 +1737,14 @@ def build_cashflow_parallel_section(
             )
             continue
 
+        # NOT "N of it". maturation = final_net - prelim_net, i.e. how much the
+        # QBO figure MOVED between the two pulls -- it can exceed the delta and
+        # carry the opposite sign (live: HJRP delta +$19,834 with maturation
+        # -$79,054). Calling it a component of the current gap is a wrong
+        # attribution on the one line the section exists to make attributable.
         maturation = (
-            f"; {fmt_delta(row.maturation)} of it posted to QBO after the "
-            f"preliminary pull"
+            f"; QBO's own figure moved {fmt_delta(row.maturation)} between the "
+            f"preliminary and finalized pulls"
             if row.maturation is not None else
             "; no preliminary window for this week, so the timing component is "
             "UNKNOWN"
@@ -1722,6 +1784,13 @@ def build_cashflow_parallel_section(
         f"`cq-f3bfa4e9ca5b`) or a Cash/CC-basis QBO perimeter — a decision, not "
         f"a fix._"
     )
+    if parallel.window_partial:
+        section.lines.append(
+            f":warning: the finalized window this reads was written by a SCOPED "
+            f"run — it states {parallel.window_expected} realm(s) expected, so "
+            f"the coverage below is against a partial file."
+        )
+        section.flags += 1
     section.lines.append(
         f"_Compared {parallel.covered} of {parallel.expected} entity(ies); "
         f"snapshot {_scrub_external(parallel.snapshot_date or 'unknown', 12)}, "
@@ -2038,6 +2107,7 @@ def build_worksheet(
         latest=snapshot,
         load_snapshot=sources.load_cashflow_snapshot,
         snapshot_dates=sources.get_cashflow_snapshot_dates(),
+        derived_tabs=getattr(entity_map, "derived_tabs", None),
     )
 
     renderable = [e for e in entities if e not in PACK_EXCLUDED_ENTITIES]

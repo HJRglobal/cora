@@ -442,6 +442,10 @@ def main() -> int:
                         help="Comma-separated QBO entity codes to limit the run (testing)")
     parser.add_argument("--no-worksheet", action="store_true",
                         help="Skip writing the Monday worksheet file and its Drive mirror")
+    parser.add_argument("--worksheet-only", action="store_true",
+                        help=("Build and write ONLY the Monday worksheet -- post "
+                              "nothing. The recovery path for a worksheet that "
+                              "failed to write after the pack was delivered."))
     args = parser.parse_args()
 
     from cora import finance_close  # noqa: PLC0415
@@ -450,7 +454,11 @@ def main() -> int:
     log.info("=== finance close-support pack starting (week=%s dry_run=%s force=%s) ===",
              week, args.dry_run, args.force)
 
-    if not args.dry_run and not args.force and _already_sent(week):
+    # --worksheet-only deliberately runs BEFORE the dedup check. Recovering a
+    # worksheet must not require --force, whose only other effect is to re-post
+    # the full pack and the founder cut to three finance surfaces a second time.
+    if (not args.dry_run and not args.worksheet_only and not args.force
+            and _already_sent(week)):
         log.info("close-pack: already sent for %s -- skipping (use --force to override)", week)
         return 0
 
@@ -488,6 +496,17 @@ def main() -> int:
 
     log.info("close-pack: built -- %d flag(s), %d unavailable section(s)",
              pack.total_flags, len(pack.unavailable_sections))
+
+    if args.worksheet_only:
+        # No delivery, no dedup mark. The worksheet is derived from banked
+        # stores, so this regenerates TODAY's from whatever S1/S2 hold now. It
+        # is deliberately NOT a backfill and offers no --week: the carry-in
+        # references read the CURRENT daily bank snapshot, so a regenerated past
+        # worksheet would carry today's balances under an old date -- the
+        # plausible-wrong-figure class this program exists to stop.
+        write_worksheet(pack, worksheet_date(pack))
+        log.info("=== worksheet-only run complete (nothing posted) ===")
+        return 0
 
     if args.dry_run:
         print("\n" + "=" * 72)

@@ -708,6 +708,71 @@ def check_cashflow_actuals(today: date | None = None) -> CheckResult:
         f"{covered}/{expected} realms){pending}.")
 
 
+def check_cashflow_worksheet(today: date | None = None) -> CheckResult:
+    """The 13WCF Monday worksheet (S3) must appear every week.
+
+    WHY THIS CHECK EXISTS. Unlike S1 and S2, the worksheet has no job of its
+    own: it is built inside the close pack and written by
+    `run_finance_close_pack.py`. Both layers are fail-soft by design -- the pack
+    must survive a worksheet failure -- so a build that raises every Monday, or
+    a local write that fails on a full disk, produces exactly one `log.error`
+    line on a headless 09:00 task and nothing else. The worksheet is not a
+    pack Section, so it never reaches Slack as an unavailable stub either.
+
+    Meanwhile the pack keeps POINTING at it: the forecast-assist section renders
+    "full table in the Monday worksheet" and names the folder. A reader sent to
+    a folder that has not gained a file since the merge has no way to tell a
+    broken job from a quiet week.
+
+    Unlike the S1 snapshot this is RECOVERABLE -- the worksheet is derived from
+    banked stores, so `--worksheet-only` regenerates it -- which is why this
+    warns rather than shouting, and why it tolerates the pack's own dedup
+    (a week the pack legitimately skipped has no worksheet and should not warn
+    if no pack ran either). `today` is injectable for tests.
+    """
+    today = today or date.today()
+    monday = today - timedelta(days=today.weekday())
+    label = "13wk cashflow worksheet"
+
+    try:
+        from cora import cashflow_worksheet as cw  # noqa: PLC0415
+        directory = cw.WORKSHEET_DIR
+        dates: list[date] = []
+        if directory.exists():
+            for path in directory.glob("*_fndr_cashflow-worksheet.md"):
+                try:
+                    stamp = date.fromisoformat(path.name.split("_", 1)[0])
+                except ValueError:
+                    continue
+                # A stray future-dated file must not become the max() and blind
+                # this check for weeks (the D-127(c) lesson).
+                if stamp <= today:
+                    dates.append(stamp)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(label, "warn", f"could not read the worksheet store: {exc}")
+
+    if not dates:
+        return CheckResult(
+            label, "warn",
+            "No Monday worksheet has ever been written, but the close pack's "
+            "forecast-assist section points readers at "
+            "cashflow-ledger/worksheets/. Regenerate with "
+            "scripts/run_finance_close_pack.py --worksheet-only.")
+
+    latest = max(dates)
+    if latest < monday:
+        return CheckResult(
+            label, "warn",
+            f"No worksheet for the week of {monday.isoformat()} (latest is "
+            f"{latest.isoformat()}). The close pack builds it fail-soft, so a "
+            "broken build is otherwise one log line. Regenerate with "
+            "scripts/run_finance_close_pack.py --worksheet-only -- it is derived "
+            "from banked stores, so this is recoverable.")
+
+    return CheckResult(
+        label, "ok", f"This week's worksheet is written ({latest.isoformat()}).")
+
+
 _MCP_HTTP_TASK = "cowork-cora-mcp-http"
 
 
@@ -1327,6 +1392,7 @@ def main() -> int:
     log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
     all_results.append(check_cashflow_forecast_snapshot())
     all_results.append(check_cashflow_actuals())
+    all_results.append(check_cashflow_worksheet())
 
     log.info("Checking MCP HTTP bridge (if registered)...")
     all_results.append(check_mcp_http_bridge())

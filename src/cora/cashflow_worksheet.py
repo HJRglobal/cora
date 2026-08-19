@@ -123,13 +123,39 @@ class WorksheetError(Exception):
 # candidates table (written by a MODEL in another process, from meeting
 # transcripts). One function, so there is one place to audit.
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+#: Characters stripped outright. Beyond C0/C1 controls this covers the
+#: DIRECTIONAL FORMATTING and zero-width families: U+202E (RLO) reverses the run
+#: after it in a markdown viewer, so a rendered amount or payee can display
+#: differently from what is stored -- on a document whose entire purpose is that
+#: someone transcribes figures out of it. U+200B/200C/200D/FEFF split a token
+#: visually into nothing.
+_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f-\x9f​-‏‪-‮⁦-⁩﻿]")
+
+#: HARD INPUT BOUND, applied before any other regex touches the string.
+#:
+#: This is the primary ReDoS control, and it is a bound rather than a smarter
+#: pattern on purpose: the candidates file is model-authored from meeting
+#: transcripts, so the length of any one line is entirely outside our control,
+#: and every future regex added to this chokepoint inherits the protection.
+#: Measured on the shipped `_MAILTO_RE` before this bound: a 100 KB line took
+#: **35.0 s**, 60 KB took 13.7 s, 20 KB took 1.4 s -- quadratic. And the stall
+#: lands on the DELIVERY path (read_candidates runs inside build_pack, before a
+#: single finance surface is posted), where `build_pack`'s try/except catches
+#: exceptions but cannot catch a hang; the Monday task's ExecutionTimeLimit
+#: would kill the run with all three surfaces undelivered.
+_MAX_RAW_LINE = 2000
 
 #: URL-ish and platform-handle shapes. Stripped, not linkified: this text lands
 #: in a finance channel and in a file Justin reads, which is exactly where a
 #: payment link is most likely to be trusted.
-_URL_RE = re.compile(r"\b(?:https?://|www\.|ftp://)\S*", re.IGNORECASE)
-_MAILTO_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]*\w", re.IGNORECASE)
+_URL_RE = re.compile(r"\b(?:https?://|www\.|ftp://)\S{0,512}", re.IGNORECASE)
+
+#: E-mail addresses. Every quantifier is BOUNDED -- the unbounded `[\w.+-]+`
+#: this replaces was the sixth ReDoS shipped in this codebase, and a bounded
+#: pattern cannot regress into one even if the input bound above is later raised.
+_MAILTO_RE = re.compile(
+    r"\b[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,4}", re.IGNORECASE)
 
 #: Slack control syntax. `slack_egress.sanitize_text` deliberately PRESERVES
 #: `<...>` (the sanctioned citation form), so an externally-authored string
@@ -137,59 +163,132 @@ _MAILTO_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]*\w", re.IGNORECASE)
 #: message signed by Cora.
 _ANGLE_RE = re.compile(r"[<>]")
 
+#: Leading decoration a markdown line can carry before its actual content:
+#: blockquote, list bullets, ordered-list numbers, table-cell pipes, heading
+#: hashes, and emphasis runs. Stripped from a COPY used only for the directive
+#: test -- never from the rendered text.
+_MD_DECORATION = re.compile(r"^[\s>\-*+#|]{0,20}(?:\d{1,3}[.)]\s*)?[\s*_~`\"']{0,10}")
+
 #: Directive shapes a model-authored candidates file must never smuggle into a
-#: renderer that a person then acts on. Matched at line start after stripping,
-#: case-insensitive; the line is dropped whole rather than partially rewritten
-#: (rewriting text a guard reads makes the guard a smuggling channel).
+#: renderer that a person then acts on.
 _DIRECTIVE_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*)?(?:"
+    r"^\s*(?:"
     r"ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|preceding)"
-    r"|disregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above)"
-    r"|system\s*:|assistant\s*:|<\|"
-    r"|you\s+are\s+(?:now\s+)?(?:an?\s+)?(?:ai|assistant|chatbot)"
-    r"|new\s+instructions?\b"
+    r"|disregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|preceding|earlier)"
+    r"|system\s*:|assistant\s*:|user\s*:"
+    r"|you\s+are\s+(?:now\s+)?(?:an?\s+)?(?:ai|assistant|chatbot|agent)"
+    r"|new\s+instructions?\b|updated\s+instructions?\b"
     r"|act\s+as\s+(?:an?\s+)?"
+    r"|override\s+(?:the\s+)?(?:previous|prior|above|instructions?)"
     r")",
     re.IGNORECASE,
 )
 
 
+def _is_directive(raw: str) -> bool:
+    """True if a line carries an instruction aimed at a reader or a model.
+
+    TESTED ON A NORMALIZED COPY, IN TWO PLACES, FOR TWO DIFFERENT MISSES THE
+    REVIEW MEASURED:
+
+    * **Markdown decoration.** The first cut anchored on `^\\s*` with an
+      optional `#` prefix, so EVERY other line-leading token defeated it --
+      including `- `, `* `, `1. `, `**`, and `| `. The artifact this guards is
+      described in its own docstring as a candidates *table*, whose rows start
+      with `|`, and a candidates *list*, whose rows start with `-`. The filter
+      failed on precisely the two shapes it exists to filter.
+    * **Laundering through the scrubber.** The test ran on the RAW line while
+      `scrub` stripped control characters and angle brackets afterwards, so
+      `"\\x01ignore all previous instructions"` passed the guard and then had
+      its tell removed -- rendering a clean directive with no evidence it had
+      evaded anything.
+
+    Table cells are tested individually, because a directive in the third
+    column of a row whose first column is an ordinary entity name would
+    otherwise never sit at any tested position.
+
+    Normalization is for the TEST ONLY. The rendered line is never rewritten to
+    make it pass -- rewriting text a guard reads makes the guard a smuggling
+    channel; a line that matches is dropped whole.
+    """
+    cleaned = _ANGLE_RE.sub("", _CONTROL_CHARS.sub(" ", raw))
+    for candidate in [cleaned, *cleaned.split("|")]:
+        if _DIRECTIVE_RE.search(_MD_DECORATION.sub("", candidate)):
+            return True
+    return False
+
+
 def scrub(value: Any, cap: int = 120) -> str:
     """Neutralize an externally-authored string for a finance surface.
 
-    Flattens to one line, strips control characters, URLs, e-mail addresses and
-    Slack angle-bracket syntax, then length-caps. Returns "" for empty input --
-    callers decide what an empty value means; this never invents a placeholder.
+    Strips control/bidi/zero-width characters, URLs, e-mail addresses and Slack
+    angle-bracket syntax, flattens to one line, then length-caps. Returns "" for
+    empty input -- callers decide what an empty value means; this never invents
+    a placeholder.
+
+    The raw input is bounded FIRST (`_MAX_RAW_LINE`) so no regex here can be
+    handed an adversarial length.
     """
     if value is None:
         return ""
-    text = _CONTROL_CHARS.sub(" ", str(value))
+    text = str(value)[:_MAX_RAW_LINE]
+    text = _CONTROL_CHARS.sub(" ", text)
     text = _URL_RE.sub("[link removed]", text)
     text = _MAILTO_RE.sub("[address removed]", text)
     text = _ANGLE_RE.sub("", text)
+    # Non-cp1252 characters would crash `--dry-run`'s print on a Windows console
+    # -- the only pre-flight gate before three finance surfaces. The module's own
+    # literals were fixed for this; the UNTRUSTED text the same renderer emits
+    # was not, and a model writing "F3E -> $48,200" as an arrow or a check mark
+    # is ordinary output, not an attack.
+    text = text.encode("cp1252", "replace").decode("cp1252")
     return " ".join(text.split())[:cap]
 
 
-def scrub_lines(text: str, *, max_lines: int = 40, cap: int = 200) -> list[str]:
-    """Scrub a multi-line untrusted document into renderable lines.
+def scrub_lines(
+    text: str, *, max_lines: int = 40, cap: int = 200
+) -> tuple[list[str], int, bool]:
+    """Scrub an untrusted document into renderable lines.
 
-    Directive-shaped lines are DROPPED WHOLE and counted, never rewritten into
-    something that looks like content. Truncation is reported by the caller, not
-    hidden: a silently-cut candidates table reads as "that is all there was".
+    Returns ``(lines, dropped, more_content)``:
+
+      * ``dropped``  -- lines removed as directives;
+      * ``more_content`` -- there were more lines than ``max_lines``.
+
+    THESE ARE SEPARATE ON PURPOSE. The first version reported a single
+    ``truncated`` flag computed as "raw line count > rendered line count", which
+    is TRUE whenever a directive was dropped -- and the renderer turned that
+    flag into "read the file for the rest", instructing the reader to open the
+    un-scrubbed source and read the payload the chokepoint had just removed.
+
+    A line cut by ``cap`` gets an explicit marker. Silent per-line cutting on
+    this document ends a row mid-figure -- measured, a 220-char row ending
+    ``| $482,000 due Friday |`` rendered as ``| $48`` -- which is a plausible,
+    syntactically valid, WRONG amount on the one document whose purpose is that
+    figures are transcribed out of it.
     """
     out: list[str] = []
+    dropped = 0
+    seen = 0
+    more = False
     for raw in str(text or "").splitlines():
         if not raw.strip():
             continue
-        if _DIRECTIVE_RE.search(raw):
+        seen += 1
+        if len(out) >= max_lines:
+            more = True
+            continue
+        if _is_directive(raw):
+            dropped += 1
             log.warning("cashflow_worksheet: dropped a directive-shaped candidates line")
             continue
         cleaned = scrub(raw, cap=cap)
-        if cleaned:
-            out.append(cleaned)
-        if len(out) >= max_lines:
-            break
-    return out
+        if not cleaned:
+            continue
+        if len(str(raw)[:_MAX_RAW_LINE].strip()) > cap:
+            cleaned += " [... line truncated]"
+        out.append(cleaned)
+    return out, dropped, more
 
 
 def _account_label(realm: str, index: int, name: str) -> str:
@@ -200,8 +299,19 @@ def _account_label(realm: str, index: int, name: str) -> str:
     its predicates), and #hjrg-finance / #founder-finance / Justin's DM are not
     LEX-custodian surfaces. Prefix-matched via `cashflow_maps`, so a future
     LEX-LLC / LEXLLC realm is covered without another edit.
+
+    Non-LEX names still go through the DIRECTIVE test, not merely `scrub`:
+    anyone with QBO chart-of-accounts write access can otherwise place 60
+    characters of arbitrary instruction text into a shared accounting document,
+    and the module's premise is that there is ONE place these strings are
+    audited -- so that place cannot have two different strengths depending on
+    which caller reached it.
     """
     if cm.realm_names_are_opaque(realm):
+        return f"{realm} account #{index}"
+    if _is_directive(name):
+        log.warning("cashflow_worksheet: account name for %s looks directive-shaped "
+                    "-- rendering it opaque", realm)
         return f"{realm} account #{index}"
     return scrub(name, 60)
 
@@ -238,7 +348,20 @@ def debut_min_confirmed() -> int:
         value = int(raw)
     except (TypeError, ValueError):
         return DEFAULT_DEBUT_MIN_CONFIRMED
-    return value if value >= 0 else DEFAULT_DEBUT_MIN_CONFIRMED
+    # `> 0`, NOT `>= 0`. Zero is the conventional "off" value an operator reaches
+    # for, and it OPENED the gate at the live count of 0-confirmed-of-9 -- which
+    # would publish every realm's QBO net flow attributed to a sheet tab nobody
+    # has verified, into a shared accounting folder, behind nothing but an inline
+    # "[pairing UNCONFIRMED]" marker. That is the exact publication the gate
+    # exists to withhold. The sibling `intercompany_delta_threshold` already
+    # keys on `> 0`; this matches it.
+    if value <= 0:
+        if raw:
+            log.warning("cashflow_worksheet: CASHFLOW_PACK_DEBUT_MIN_CONFIRMED=%r "
+                        "is not a positive count -- using the default %d", raw,
+                        DEFAULT_DEBUT_MIN_CONFIRMED)
+        return DEFAULT_DEBUT_MIN_CONFIRMED
+    return value
 
 
 @dataclass
@@ -312,6 +435,48 @@ def _series_point(
     return None
 
 
+#: Below this, a sheet DIFF cell counts as "the forecast was overwritten at
+#: close", which is the normal D-121 signature of a week that was filled in.
+_DIFF_OVERWRITE_TOLERANCE = 1.0
+
+
+def week_is_filled(snapshot: dict, tab: str, week_ending: str) -> bool:
+    """True if this tab's row for ``week_ending`` was actually FILLED IN.
+
+    `actual is not None` is not the same question, and the difference is a real
+    figure on a real week. Measured across the live store -- 2441 closed points,
+    6 with a material DIFF -- there are exactly two shapes:
+
+      * CF_LLA_MV / CF_SUMMARY at 2026-02-06: actual -69,019, diff -10,347. A
+        genuine forecast miss on a row that WAS entered. Must be compared.
+      * CF_HJR Prop at 2026-08-07: net actual **0.00**, diff -31,645, and an
+        ending cash identical to the prior week's. The forecast cell was never
+        overwritten and nothing moved -- the row was not filled. QBO's finalized
+        window for that realm-week shows receipts $110,099 and disbursements
+        -$90,265.
+
+    Treating the second as a real zero makes it a `compared` row with a
+    $19,834 "break" against a $100 tolerance, and it counts toward coverage --
+    a fabricated reconciliation failure on a week nobody entered. So the rule
+    keys on the SHEET alone (never on QBO, which would make the comparison
+    circular): a closed week whose net flow is exactly zero while its forecast
+    cell was NOT overwritten did not get filled in.
+
+    Defaults to TRUE when the tab carries no net-flow row -- unknown provenance
+    is not evidence of a problem, and over-refusing here silently drops entities.
+    """
+    point = _series_point(snapshot, tab, "net_cash_flow", week_ending)
+    if not point or point.get("actual") is None:
+        return True
+    diff = point.get("diff")
+    if diff is None:
+        return True
+    return not (
+        abs(float(point["actual"])) < 0.005
+        and abs(float(diff)) > _DIFF_OVERWRITE_TOLERANCE
+    )
+
+
 def _tab_is_verified_pre_close(
     snapshot: dict, tab: str, week_ending: str
 ) -> bool:
@@ -370,6 +535,7 @@ def resolve_accuracy(
     latest: Optional[dict],
     load_snapshot: Callable[[datetime.date], Optional[dict]],
     snapshot_dates: list[datetime.date],
+    derived_tabs: Optional[list[str]] = None,
 ) -> tuple[Optional[str], list["AccuracyRow"], list[str]]:
     """Pick the newest closed week that is actually MEASURABLE, and measure it.
 
@@ -400,6 +566,7 @@ def resolve_accuracy(
             rows, pending = forecast_accuracy(
                 latest=latest, week_ending=week,
                 load_snapshot=load_snapshot, snapshot_dates=snapshot_dates,
+                derived_tabs=derived_tabs,
             )
         except WorksheetError as exc:
             log.warning("cashflow_worksheet: accuracy for %s failed: %s", week, exc)
@@ -417,6 +584,7 @@ def forecast_accuracy(
     week_ending: str,
     load_snapshot: Callable[[datetime.date], Optional[dict]],
     snapshot_dates: list[datetime.date],
+    derived_tabs: Optional[list[str]] = None,
 ) -> tuple[list[AccuracyRow], list[str]]:
     """Per-tab forecast-vs-actual for one closed week, from banked forecasts only.
 
@@ -438,11 +606,26 @@ def forecast_accuracy(
         raise WorksheetError(f"bad week_ending {week_ending!r}") from exc
 
     candidates = sorted((d for d in snapshot_dates if d <= week), reverse=True)
+    derived = set(derived_tabs or [])
 
     for tab in sorted(latest.get("tabs") or {}):
+        if tab in derived:
+            # A roll-up is not an independent measurement of anything. Live, the
+            # four OSN store tabs summed to +5,290 and "OSN Consolidated"
+            # restated it as +5,289 -- rendered as a fifth tab, counted in
+            # "N tab(s) measured", and eligible to become the headline "largest
+            # miss" while every component was already listed. CF_OSN Core4 is
+            # worse: an empty roll-up measures as a PERFECT forecast (0 vs 0)
+            # and inflates the count. Same double-count the cash section forbids
+            # (cq-6fbb9d717512).
+            continue
         actual_point = _series_point(latest, tab, "ending_cash", week_ending)
         actual = (actual_point or {}).get("actual")
         if actual is None:
+            pending.append(tab)
+            continue
+        if not week_is_filled(latest, tab, week_ending):
+            # An unfilled row's "actual" is a stale carry-through, not a result.
             pending.append(tab)
             continue
 
@@ -489,6 +672,12 @@ class ParallelRow:
     delta: Optional[float] = None
     within_tolerance: Optional[bool] = None
     maturation: Optional[float] = None    # finalized net - preliminary net
+    #: Whether this row belongs in the coverage DENOMINATOR. An explicit field,
+    #: not a string match on `reason`: the first cut decided it by comparing the
+    #: rendered reason text against two reason_codes, and the moment a later fix
+    #: changed that wording for a different purpose, a row silently moved
+    #: denominators. A coverage decision must not be carried by display prose.
+    counts_in_denominator: bool = True
     sheet_ending: Optional[float] = None
     qbo_ending: Optional[float] = None
     map_confirmed: bool = False
@@ -501,6 +690,7 @@ class ParallelRow:
             "within_tolerance": self.within_tolerance,
             "maturation": self.maturation, "sheet_ending": self.sheet_ending,
             "qbo_ending": self.qbo_ending, "map_confirmed": self.map_confirmed,
+            "counts_in_denominator": self.counts_in_denominator,
         }
 
 
@@ -514,6 +704,12 @@ class Parallel:
     reason: str = ""
     window_run_date: Optional[str] = None
     snapshot_date: Optional[str] = None
+    #: The finalized window said it covered fewer realms than its own scope --
+    #: a `--realms`-scoped backfill writes a legitimate one-realm file, and
+    #: recomputing the denominator from the realms PRESENT would report
+    #: "1 of 1" against a file that states 8 expected.
+    window_partial: bool = False
+    window_expected: Optional[int] = None
     expected_week_ending: Optional[str] = None
     stale_window: bool = False
 
@@ -526,12 +722,19 @@ class Parallel:
         return [r for r in self.compared if r.within_tolerance is False]
 
 
-def tolerance_for(figure: Optional[float]) -> float:
-    """max($100, 0.5%) -- a flat threshold is unreachable on entities that move
-    +/-$50-300K a week (Fin-4)."""
+def tolerance_for(*figures: Optional[float]) -> float:
+    """max($100, 0.5% of the LARGEST side) -- a flat threshold is unreachable on
+    entities that move +/-$50-300K a week (Fin-4).
+
+    Keyed on the largest side, not on the sheet alone. A two-sided
+    reconciliation whose band is set by one side collapses to the $100 floor
+    exactly when that side is small or wrong -- which is the case most likely to
+    need a wider band, not a narrower one.
+    """
     abs_floor = _env_float("CASHFLOW_FLIP_GATE_ABS", FLIP_GATE_ABS)
     pct = _env_float("CASHFLOW_FLIP_GATE_PCT", FLIP_GATE_PCT)
-    return max(abs_floor, abs(figure or 0.0) * pct)
+    largest = max((abs(f) for f in figures if f is not None), default=0.0)
+    return max(abs_floor, largest * pct)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -613,6 +816,8 @@ def build_parallel(
         # week this Monday should have produced, S2 missed a run -- say so
         # rather than quietly comparing a stale week as if it were current.
         out.stale_window = week_ending < expected.isoformat()
+    out.window_partial = bool(finalized.get("partial_sweep"))
+    out.window_expected = finalized.get("expected")
 
     for realm in sorted(finalized.get("realms") or {}):
         block = finalized["realms"][realm] or {}
@@ -623,13 +828,26 @@ def build_parallel(
             map_confirmed=bool(pairing and pairing.usable_for_accuracy),
         )
 
-        if not block.get("usable_for_comparison"):
-            row.reason = scrub(
-                block.get("reason_code")
-                or ("realm-tab pairing not confirmed yet"
-                    if not row.map_confirmed else "window not usable for comparison"),
-                60,
-            )
+        # BOTH the banked flag AND the LIVE pairing. `usable_for_comparison` is
+        # frozen into the window at S2 collection time, so a pairing Justin
+        # later discovers is wrong and sets back to `confirmed: false` would
+        # keep being compared and published from windows already on disk, with
+        # no re-run to trigger. Confirmation has to be revocable.
+        if not (block.get("usable_for_comparison") and row.map_confirmed):
+            code = str(block.get("reason_code") or "")
+            if code == "realm_scope_undeclared":
+                # A TRACKED, PENDING decision -- leaves the denominator, exactly
+                # as M2 does, so a known-pending split does not read as a gap.
+                row.reason = "its realm-to-tab split is not declared yet"
+                row.counts_in_denominator = False
+            elif code == "realm_not_in_entity_map":
+                # A provisioned realm nobody has mapped, possibly carrying real
+                # money -- STAYS in the denominator so the count keeps saying so.
+                row.reason = "this realm is not in the entity map at all"
+            elif not row.map_confirmed:
+                row.reason = "realm-tab pairing is not confirmed in the map"
+            else:
+                row.reason = scrub(code or "window not usable for comparison", 80)
             out.rows.append(row)
             continue
 
@@ -641,6 +859,19 @@ def build_parallel(
         sheet_point = _series_point(snapshot, tab, "net_cash_flow", week_ending)
         sheet_net = (sheet_point or {}).get("actual")
         row.qbo_net = block.get("net_flow")
+
+        if sheet_net is not None and not week_is_filled(snapshot, tab, week_ending):
+            # Present but not filled in: the forecast cell was never overwritten
+            # and nothing moved. Comparing it manufactures a break -- live, HJRP
+            # would have read "sheet $0 vs QBO $19,834, delta +$19,834" on a week
+            # QBO shows $110,099 of receipts for.
+            row.status = "sheet_unfilled"
+            row.reason = (
+                "the sheet's row for this week reads zero with its forecast cell "
+                "un-overwritten -- it appears not to have been filled in"
+            )
+            out.rows.append(row)
+            continue
 
         if sheet_net is None:
             # NOT a zero and NOT an omission: the sheet's per-tab entry cadence
@@ -655,7 +886,8 @@ def build_parallel(
         row.sheet_net = float(sheet_net)
         if row.qbo_net is not None:
             row.delta = round(float(row.qbo_net) - float(sheet_net), 2)
-            row.within_tolerance = abs(row.delta) <= tolerance_for(sheet_net)
+            row.within_tolerance = abs(row.delta) <= tolerance_for(
+                sheet_net, row.qbo_net)
 
         # Ending cash renders ONLY when QBO produced a COMPLETE balance. It
         # almost never does -- the General Ledger omits accounts with no
@@ -678,11 +910,15 @@ def build_parallel(
     # Denominator excludes realms whose pairing is a KNOWN pending decision --
     # the same corollary M2 applies. A permanently-false "partial" trains the
     # reader to ignore the real ones.
-    out.expected = len([
-        r for r in out.rows
-        if not (r.status == "unavailable"
-                and r.reason in {"realm_not_in_entity_map", "realm_scope_undeclared"})
-    ])
+    # DENOMINATOR. Only a realm whose pairing is a TRACKED, PENDING decision
+    # leaves it -- which is M2's corollary, and the first cut inverted it by also
+    # excluding `realm_not_in_entity_map`. M2 says so in its own source: "a realm
+    # ABSENT from the map entirely is a different thing: a provisioned realm
+    # nobody has mapped, possibly carrying real money, and it stays IN the
+    # denominator so the monitor keeps saying so." Excluding it let a newly
+    # provisioned realm read as "8 of 8 -- full coverage", which also clears
+    # `is_partial` and drops the section out of the founder cut.
+    out.expected = len([r for r in out.rows if r.counts_in_denominator])
     return out
 
 
@@ -695,21 +931,46 @@ class Candidates:
     date: Optional[str] = None
     lines: list[str] = field(default_factory=list)
     status: str = "none"          # ok | none | unreadable | last_good
-    truncated: bool = False
+    #: Lines removed as directives. SEPARATE from `more_content` -- conflating
+    #: the two let a poisoned file render "read the file for the rest", sending
+    #: the reader to the un-scrubbed source for the payload just removed.
+    dropped: int = 0
+    #: There were more lines than the render cap.
+    more_content: bool = False
 
 
-def _candidate_files(directory: Path) -> list[Path]:
+def _candidate_files(
+    directory: Path, *, today: Optional[datetime.date] = None
+) -> list[Path]:
+    """Dated candidates files, newest first, FUTURE-DATED ONES EXCLUDED.
+
+    A model writing this file gets dates wrong routinely, and a stray
+    `2099-01-01.md` sorts first forever: every later Monday would render it as
+    this week's candidates, the `.last-good` fallback would never fire (the file
+    reads fine), and the check would report ok. Same class as the future-dated
+    snapshot that blinds a `max()`-based monitor (D-127(c)).
+    """
     if not directory.exists():
         return []
-    return sorted(
-        (p for p in directory.glob("*.md")
-         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.stem)),
-        reverse=True,
-    )
+    day = today or datetime.date.today()
+    out: list[Path] = []
+    for path in directory.glob("*.md"):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.stem):
+            continue
+        try:
+            if datetime.date.fromisoformat(path.stem) > day:
+                log.warning("cashflow_worksheet: ignoring future-dated candidates "
+                            "file %s", path.name)
+                continue
+        except ValueError:
+            continue
+        out.append(path)
+    return sorted(out, reverse=True)
 
 
 def read_candidates(
-    directory: Optional[Path] = None, *, max_lines: int = 40
+    directory: Optional[Path] = None, *, max_lines: int = 40,
+    today: Optional[datetime.date] = None,
 ) -> Candidates:
     """The newest S6 candidates table, scrubbed.
 
@@ -719,7 +980,7 @@ def read_candidates(
     -- and must SAY which it served.
     """
     target = directory or CANDIDATES_DIR
-    files = _candidate_files(target)
+    files = _candidate_files(target, today=today)
     if not files:
         return Candidates(status="none")
 
@@ -730,14 +991,13 @@ def read_candidates(
             log.warning("cashflow_worksheet: candidates %s unreadable: %s",
                         path.name, exc)
             continue
-        lines = scrub_lines(raw, max_lines=max_lines)
+        lines, dropped, more = scrub_lines(raw, max_lines=max_lines)
         if not lines:
             continue
-        total = len([ln for ln in raw.splitlines() if ln.strip()])
         return Candidates(
             date=path.stem, lines=lines,
             status="ok" if index == 0 else "last_good",
-            truncated=total > len(lines),
+            dropped=dropped, more_content=more,
         )
     return Candidates(status="unreadable")
 
@@ -781,6 +1041,11 @@ class CarryInRow:
     reason: str = ""
     register_total: Optional[float] = None      # cash NET OF CARDS
     bank_total: Optional[float] = None          # what the account rows sum to
+    #: A realm CONFIGURED as a cash-less shell that is nonetheless holding money.
+    shell_balance: Optional[float] = None
+    #: QBO answered for only some accounts -- the totals above understate.
+    balances_complete: bool = True
+    unknown_accounts: int = 0
     card_total: Optional[float] = None
     book_total: Optional[float] = None
     posted_through: Optional[str] = None
@@ -820,6 +1085,24 @@ def build_carry_in(
                 reason="no bank snapshot for this realm"))
             continue
         if block.get("shell"):
+            # A SHELL THAT IS HOLDING MONEY IS NOT A FOOTNOTE. Live 2026-08-18,
+            # realm OSN is configured `shell: true` and carries $32,085.93 in one
+            # Chase account -- the bank snapshot refuses to publish a portfolio
+            # total because of it ("summing may now double-count"). The first cut
+            # dropped shells from the render AND from the denominator, so the one
+            # surface the carry-in is typed from was the one surface that could
+            # not see it, under a footer reading "9 of 9".
+            held = block.get("bank_total")
+            if held is not None and abs(float(held)) >= 0.005:
+                out.append(CarryInRow(
+                    entity=entity, status="shell_holding", bank_total=held,
+                    card_total=block.get("cc_total"),
+                    register_total=block.get("cash_net_of_cards"),
+                    posted_through=scrub(block.get("newest_bank_txn_date"), 10) or None,
+                    shell_balance=float(held),
+                    reason="configured as a cash-less shell but holding a balance",
+                ))
+                continue
             out.append(CarryInRow(entity=entity, status="shell",
                                   reason="cash-less shell realm"))
             continue
@@ -844,8 +1127,18 @@ def build_carry_in(
             ))
         hidden = max(0, len(accounts) - _MAX_ACCOUNT_ROWS)
 
+        # A PARTIAL SUM UNDER A TOTAL'S NAME (D-129). `summarize_accounts`
+        # skips accounts whose balance came back None and reports the counts
+        # "so a caller can refuse to present a total as complete"; the sibling
+        # build_bank_section does refuse. This one must too, or a realm that
+        # 401s on one of seven accounts renders an understated carry-in with an
+        # internally-consistent-looking breakdown beneath it.
+        unknown = int(block.get("bank_unknown") or 0) + int(block.get("cc_unknown") or 0)
+        complete = bool(block.get("balances_complete", True)) and unknown == 0
+
         out.append(CarryInRow(
             entity=entity, status="ok",
+            balances_complete=complete, unknown_accounts=unknown,
             register_total=block.get("cash_net_of_cards"),
             bank_total=block.get("bank_total"),
             card_total=block.get("cc_total"),
@@ -895,6 +1188,9 @@ def render_worksheet(
         "figure below is a direct read of a banked store, never a model output._",
         "_Cora does NOT write the Standing ACTUALS sheet. This is a worksheet to "
         "type from._",
+        "_REGENERATED EACH MONDAY IN PLACE -- do not annotate this file; notes "
+        "written here are overwritten without warning. Put corrections in the "
+        "sheet or in Slack._",
         "",
         f"_Supersedes the `{SUPERSEDED_FORECAST_ASSIST_RELDIR}/` worksheet lane -- "
         "one Monday worksheet, one path. Nothing is written there any more._",
@@ -950,13 +1246,47 @@ def render_worksheet(
             ]
 
     # ── 2. carry-in ──────────────────────────────────────────────────────────
-    lines += ["## 2. Carry-in (opening row)", "", CARRY_IN_POSTURE, ""]
+    next_week = next_forecast_week(snapshot, today=today)
+    portfolio = portfolio_carry_in(snapshot, next_week)
+    lines += [
+        "## 2. Carry-in (opening row)",
+        "",
+        (f"For the week ending **{scrub(next_week, 12)}**"
+         + (f" — CF_SUMMARY forecast carry-in {fmt_money(portfolio)} "
+            f"portfolio-wide (the BEGINNING-cash row, not the week's close)."
+            if portfolio is not None else " — portfolio carry-in UNKNOWN.")
+         ) if next_week else "The snapshot carries no forward forecast week.",
+        "",
+        CARRY_IN_POSTURE,
+        "",
+        ":warning: These references are read at the SNAPSHOT's instant, which is "
+        "AFTER the moment you are carrying into. A `posted through` date later "
+        "than the week's start means that week's own transactions are already "
+        "inside the figure -- it is a freshness stamp, not an as-of.",
+        "",
+    ]
     for row in carry_in:
         if row.status == "shell":
+            continue
+        if row.status == "shell_holding":
+            lines.append(
+                f"- :warning: **{row.entity}**: configured as a cash-less shell "
+                f"but HOLDING {fmt_money(row.shell_balance)} (posted through "
+                f"{row.posted_through or 'UNKNOWN'}). It has no carry-in row of "
+                f"its own; this balance is reported because a shell holding cash "
+                f"means either the configuration or the books are wrong, and "
+                f"portfolio totals are being withheld because of it."
+            )
             continue
         if row.status != "ok":
             lines.append(f"- **{row.entity}**: UNKNOWN -- {row.reason}")
             continue
+        if not row.balances_complete:
+            lines.append(
+                f"- :warning: **{row.entity}**: INCOMPLETE -- QBO returned no "
+                f"balance for {row.unknown_accounts} account(s), so every total "
+                f"below UNDERSTATES this realm. Do not carry it in."
+            )
         book = (f"books {fmt_money(row.book_total)} [BalanceSheet report -- the "
                 f"basis the opening row uses]" if row.book_total is not None else
                 "books UNKNOWN this run")
@@ -1054,8 +1384,22 @@ def render_worksheet(
             "",
         ]
         lines += [f"> {line}" for line in candidates.lines]
-        if candidates.truncated:
-            lines.append("> _(truncated -- read the file for the rest)_")
+        # Dropped-as-directive and more-content-exists are reported SEPARATELY
+        # and neither points the reader at the raw file. Telling someone to open
+        # the un-scrubbed source is handing them the payload this chokepoint
+        # just removed.
+        if candidates.dropped:
+            lines.append(
+                f"> _{candidates.dropped} line(s) were removed as "
+                f"instruction-shaped and are NOT shown. Do not open the source "
+                f"file to read them -- if a real candidate is missing, ask for "
+                f"it to be re-written as a plain figure._"
+            )
+        if candidates.more_content:
+            lines.append(
+                "> _(more candidates than fit here -- the rest are in the "
+                "source file, scrubbed the same way when they next render.)_"
+            )
         lines.append("")
 
     # ── footer ───────────────────────────────────────────────────────────────
@@ -1130,10 +1474,18 @@ def next_forecast_week(
     return best
 
 
-def portfolio_forecast(
+def portfolio_carry_in(
     snapshot: Optional[dict], week_ending: Optional[str]
 ) -> Optional[float]:
-    """The portfolio ending-cash forecast for a week, from CF_SUMMARY ONLY.
+    """The portfolio CARRY-IN forecast for a week, from CF_SUMMARY ONLY.
+
+    THE MEASURE IS `beginning_cash`, AND THAT IS THE WHOLE POINT. The first cut
+    read `ending_cash` and rendered it on a line captioned "Carry-in references"
+    -- publishing the CLOSE of the week Justin is about to fill in as the figure
+    he carries INTO it. Measured live on the 2026-08-17 snapshot for week
+    2026-08-21: ending $1,702,580 against the correct carry-in $1,582,329, an
+    overstatement of exactly $120,251, which reconciles to the cent with that
+    week's forecast net flow. Both measures sit in the same store, one key apart.
 
     Never a sum across tabs (Fin-9): the workbook carries derived roll-ups
     (OSN Consolidated, CF_OSN Core4) alongside the entity tabs, so summing
@@ -1141,7 +1493,7 @@ def portfolio_forecast(
     """
     if not snapshot or not week_ending:
         return None
-    point = _series_point(snapshot, "CF_SUMMARY", "ending_cash", week_ending)
+    point = _series_point(snapshot, "CF_SUMMARY", "beginning_cash", week_ending)
     if not point:
         return None
     value = point.get("forecast")
