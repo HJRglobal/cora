@@ -593,6 +593,31 @@ def deliver(client, job_id: str, outcome: dict) -> None:
         log.warning("Drive write failed for %s (mis_homed): %s", job_id, exc)
         mis_homed = True
 
+    # POST-DELIVERY VERIFY (cq-e1d091eb6007). A write that returns without
+    # raising is not proof a file exists: the G: mount can accept a write into a
+    # vanishing handle, and a 0-byte file looks like success to the caller. Two
+    # things hang off `mis_homed` being truthful -- the message the requester
+    # gets ("File: {target}" vs "staged locally"), and `_clean_staging`, which
+    # DELETES the only other copy. An unverified write therefore risked naming a
+    # path that held nothing while discarding the staged original. Stat it, and
+    # downgrade to mis_homed on any doubt: that keeps staging AND lets
+    # mis_homed_retry_pass re-home it on a later pass.
+    # stat_info returns a (st_mtime, st_size) TUPLE, or None when the file is
+    # absent and the mount is UP; it raises DriveUnavailable when the mount is
+    # gone. All three non-happy cases mean "not delivered".
+    if not mis_homed:
+        try:
+            info = drive_io.stat_info(target)
+            size = int(info[1]) if info else 0
+            if size <= 0:
+                log.warning("post-delivery verify for %s: target absent or "
+                            "empty (%r) -- treating as mis_homed", job_id, info)
+                mis_homed = True
+        except Exception as exc:  # noqa: BLE001 -- unverifiable == not delivered
+            log.warning("post-delivery verify for %s failed (%s) -- treating as "
+                        "mis_homed", job_id, exc)
+            mis_homed = True
+
     artifact_meta = {"local_path": str(local), "target_path": str(target),
                      "mis_homed": mis_homed}
     # Crash-safe delivery: `delivering` (with artifact + cost) BEFORE the post.

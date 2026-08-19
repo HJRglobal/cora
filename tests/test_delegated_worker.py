@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import pathlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -668,9 +669,19 @@ def test_runner_live_runs_and_delivers(monkeypatch, tmp_path):
     monkeypatch.setattr(runner.worker, "run_job", MagicMock(return_value=outcome))
     monkeypatch.setattr(runner.worker, "guard_artifact_text",
                         lambda job, text: (None, text, ""))
+    # FOUNDER_OS_ROOT -> tmp_path so the artifact homes somewhere real (and NOT
+    # on G:). The stub now actually writes the file: post-delivery verify
+    # (cq-e1d091eb6007) stats the target, so a stub that only recorded the path
+    # made this assert a delivery that never happened.
+    monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path))
     written = {}
-    monkeypatch.setattr(runner.drive_io, "write_text_atomic",
-                        lambda path, text, **k: written.setdefault("path", str(path)))
+
+    def _really_write(path, text, **k):
+        written.setdefault("path", str(path))
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(path).write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(runner.drive_io, "write_text_atomic", _really_write)
     monkeypatch.setattr(runner, "post_threaded", lambda c, j, t: True)
     _seed_job()
     n = runner.run_pass(1, dry_run=False)
@@ -679,6 +690,36 @@ def test_runner_live_runs_and_delivers(monkeypatch, tmp_path):
     assert rec["state"] == dw.STATE_DELIVERED
     assert rec["artifact"]["mis_homed"] is False
     assert "_delegated-work" in written["path"]
+
+
+def test_runner_marks_mis_homed_when_the_write_silently_lands_nothing(
+        monkeypatch, tmp_path):
+    """cq-e1d091eb6007 regression: a write that returns without raising but
+    leaves no file must NOT be reported to the requester as delivered, and must
+    NOT let _clean_staging drop the staged original."""
+    monkeypatch.setattr(runner, "_client", lambda: None)
+    outcome = {"ok": True, "summary": "done",
+               "artifact_text": "# body", "artifact_bytes": None,
+               "artifact_ext": "md", "partial": False, "partial_reason": None,
+               "web_withheld_reason": None, "cost": {"est_usd": 0.4}}
+    monkeypatch.setattr(runner.worker, "run_job", MagicMock(return_value=outcome))
+    monkeypatch.setattr(runner.worker, "guard_artifact_text",
+                        lambda job, text: (None, text, ""))
+    monkeypatch.setenv("FOUNDER_OS_ROOT", str(tmp_path))
+    # Returns cleanly, writes nothing -- the exact silent-failure shape.
+    monkeypatch.setattr(runner.drive_io, "write_text_atomic",
+                        lambda path, text, **k: None)
+    posts = []
+    monkeypatch.setattr(runner, "post_threaded",
+                        lambda c, j, t: posts.append(t) or True)
+    _seed_job()
+    assert runner.run_pass(1, dry_run=False) == 1
+    rec = dw.get_job("dw-abc123def456")
+    assert rec["artifact"]["mis_homed"] is True
+    # The requester is told it is staged, never handed a path that holds nothing.
+    body = "\n".join(posts)
+    assert "staged locally" in body
+    assert "File: " not in body
 
 
 def test_runner_envelope_recheck_skips_unreleased(monkeypatch):

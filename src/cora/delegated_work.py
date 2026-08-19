@@ -710,6 +710,79 @@ def screen_request(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Honest destination (cq-e1d091eb6007)
+# ─────────────────────────────────────────────────────────────────────────────
+# A requester asked for a deliverable at an explicit path
+# (`_shared/team-knowledge/hannah/`), Cora's conversational reply agreed, and the
+# file never landed there -- because it CANNOT. `artifact_target_path` is fully
+# deterministic: every artifact homes to
+# `{entity_folder}/_delegated-work/YYYY-MM/<generated name>`. There is no
+# requester-supplied destination anywhere in the job spec, so a path in the brief
+# is read as prose and silently dropped.
+#
+# The agreement was an LLM echo of the asker's own words. The fix is the
+# staged-write doctrine applied to destinations: the ack is built HERE, in code,
+# from the real target -- never from the model's paraphrase of the request.
+#
+# This does not add path-choosing. It stops Cora promising it.
+#
+# ReDoS discipline (four incidents in this repo): every pattern below is a flat
+# character class with bounded repetition -- no nested quantifier over a
+# delimiter-rich string -- and the scan is length-capped.
+_DEST_SCAN_CAP = 2000
+
+# Verb phrases that name a place to put the result.
+_DEST_VERB_RE = re.compile(
+    r"\b(?:deliver|save|store|put|drop|upload|write|place|file)\s+"
+    r"(?:it|this|them)?\s*"
+    r"(?:to|in|into|under|at)\b",
+    re.IGNORECASE)
+
+# A literal path-ish token: a drive letter, or 2+ slash-separated segments.
+_DEST_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/]|(?:[\w.\-]{1,40}[\\/]){2,}")
+
+# Named Drive locations people actually ask for by name.
+_DEST_NAMED_RE = re.compile(
+    r"\b(?:team[-\s]knowledge|founder[-\s]os|my\s+drive|shared\s+drive)\b"
+    r"|\b\w{1,20}(?:'s|s')\s+(?:drive|folder)\b",
+    re.IGNORECASE)
+
+
+def brief_names_a_destination(brief: str) -> bool:
+    """True when the brief asks for the output to land somewhere specific.
+
+    Deliberately broad: a false positive costs one extra clarifying sentence in
+    the ack, a false negative reproduces the original silent broken promise.
+    """
+    text = (brief or "")[:_DEST_SCAN_CAP]
+    if not text:
+        return False
+    return bool(_DEST_PATH_RE.search(text)
+                or _DEST_NAMED_RE.search(text)
+                or _DEST_VERB_RE.search(text))
+
+
+def destination_notice(job: dict[str, Any]) -> str:
+    """The real, deterministic home for this job's artifact.
+
+    Fail-soft: if the path cannot be computed we say the generic true thing
+    rather than risk stating a wrong path -- an unverifiable promise is the exact
+    defect this closes.
+    """
+    try:
+        from .delegated_worker import artifact_target_path
+        target = artifact_target_path(job)
+        return ("Heads up on where it lands: I can't deliver to a folder you "
+                f"pick -- every delegated artifact homes to `{target.parent}` "
+                "and I'll post the exact filename here when it's done.")
+    except Exception:  # noqa: BLE001 -- never block a queued job on this
+        return ("Heads up on where it lands: I can't deliver to a folder you "
+                "pick -- artifacts home to the entity's `_delegated-work` "
+                "folder and I'll post the exact path here when it's done.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Submit (the confirm executor -- check-and-append under ONE lock)
 # ─────────────────────────────────────────────────────────────────────────────
 def submit_job(
@@ -799,13 +872,19 @@ def submit_job(
             "org_quota": f"the org has hit today's limit ({org_daily_quota()}/day)",
             "envelope": "this month's delegated-work budget is fully committed",
         }.get(held_reason, held_reason)
-        return job, "held", (
+        held_msg = (
             f"Held for Harrison's release ({job_id}): {reason_text}. It is NOT "
             "lost -- Harrison got a release/dismiss card and a released job runs "
             "with its full 48h window.")
-    return job, "queued", (
+        if brief_names_a_destination(brief):
+            held_msg += "\n\n" + destination_notice(job)
+        return job, "held", held_msg
+    queued_msg = (
         f"Queued ({job_id}). The runner picks jobs up about every 15 minutes; "
         "I'll deliver the result back to this thread.")
+    if brief_names_a_destination(brief):
+        queued_msg += "\n\n" + destination_notice(job)
+    return job, "queued", queued_msg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
