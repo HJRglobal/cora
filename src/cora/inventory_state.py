@@ -101,8 +101,41 @@ _URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.IGNORECASE)
 # we read the 3PL figures out of, i.e. a data-SOURCE name, and the same rule that
 # keeps "shopify" off a Slack surface applies to it. The FACILITY (Nimbl) and the
 # sales channels stay sayable -- those are operational facts, not tooling.
+#: The canonical source-name vocabulary for F3E ecom output. EXPORTED so the
+#: source-opacity tests assert against the same list the scrubber enforces -- a
+#: hardcoded copy in a test drifts, and a drifted copy is exactly what left
+#: test_ecom_fold_source_opaque_when_healthy red on main for two weeks
+#: (cq-86c283d95a34): it listed "tiktok", which here is a SALES CHANNEL, not a
+#: source system.
+#:
+#: THE DELIBERATE EXCEPTION, made explicit 2026-08-19 (the seed's own instruction
+#: was to make it explicit or fix the line, never to just relax the assertion): a
+#: sales/fulfillment CHANNEL the business operates -- DTC, TikTok Shop/FBT, Amazon
+#: FBA, Walmart WFS -- and a FACILITY (Nimbl, UNIS) are operational facts the
+#: reader needs in order to act on the number. "Channel 3 holds 860 units" is not
+#: an actionable line. Source opacity exists to keep the SYSTEM OF RECORD out of
+#: outward text (the B2/QBO rule); it was never a ban on naming the company's own
+#: storefronts. Ad-platform names are a separate question that does not arise
+#: here: the paid line is deliberately blended, with no per-platform breakdown.
+SOURCE_NAME_TOKENS: tuple[str, ...] = (
+    "shopify",
+    "seller central",
+    "polar",
+    "airtable",
+    "quickbooks",
+    "notion",
+    "deposco",
+    # Added 2026-08-19: systems of record the ecom fold reads through, so an
+    # externally-authored label naming one is the same leak as "shopify".
+    "recharge",
+    "klaviyo",
+    "hubspot",
+    "intuit",
+)
+
 _VENDOR_RE = re.compile(
-    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion|deposco)\b",
+    r"\b(shopify|seller\s?cent(?:ral|er)|polar|airtable|quickbooks|notion|deposco"
+    r"|recharge|klaviyo|hubspot|intuit)\b",
     re.IGNORECASE,
 )
 

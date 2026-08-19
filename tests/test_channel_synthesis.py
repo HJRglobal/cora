@@ -755,9 +755,28 @@ class TestEcomFold:
         assert out["ok"] is True
         # 6 since A5 Part 2 added the cross-channel inventory line.
         assert len(out["lines"]) == 6
-        # It must fail soft like the rest -- and say UNREAD, never zero.
+        # The cross-channel line does NOT read the connectors boom'd above -- its
+        # source is the local inventory store (weekly-fed batches + the warehouse
+        # sync), so on a live host it correctly still renders real numbers here.
+        # Asserting a stub from these monkeypatches was the test's own error, and
+        # it stayed red on main until 8/19. Break the line's ACTUAL source to
+        # exercise its fail-soft path.
+        import cora.inventory_state as inv
+        monkeypatch.setattr(inv, "merge", boom)
+        out2 = cs.gather_f3e_ecom(today=date(2026, 7, 7))
+        cross = next(ln for ln in out2["lines"] if "Cross-channel inventory" in ln)
+        assert "not available" in cross
+
+    def test_cross_channel_line_says_unread_never_zero(self, monkeypatch):
+        """A channel nobody could read must never render as 0 units."""
+        import cora.inventory_state as inv
+
+        empty = inv.MergedInventory(rows=[], sources={})
+        monkeypatch.setattr(inv, "merge", lambda **k: empty)
+        out = cs.gather_f3e_ecom(today=date(2026, 7, 7))
         cross = next(ln for ln in out["lines"] if "Cross-channel inventory" in ln)
-        assert "not zero" in cross or "not available" in cross
+        assert "0" not in cross.replace("Cross-channel", "")
+        assert "nothing merged" in cross or "not zero" in cross
         assert any("not available" in ln or "not connected" in ln for ln in out["lines"])
 
 
@@ -1052,9 +1071,26 @@ class TestD051Remediation:
         monkeypatch.setattr(asana, "get_project_tasks", lambda gid, max_tasks=100: [])
         out = cs.gather_f3e_ecom(today=date(2026, 7, 7))
         blob = " ".join(out["lines"]).lower()
-        for platform in ("shopify", "recharge", "polar", "meta", "tiktok",
-                         "klaviyo", "hubspot", "sheet"):
-            assert platform not in blob, f"source name leaked: {platform}"
+
+        # Assert against the vocabulary the SCRUBBER enforces, not a hand-copied
+        # list. The copy is what broke: it carried "tiktok", which in the
+        # cross-channel line is one of F3E's own sales channels (TikTok FBT), so
+        # the test failed on pristine main for two weeks while nothing was
+        # actually leaking a source system (cq-86c283d95a34).
+        from cora import inventory_state as inv
+        for source in inv.SOURCE_NAME_TOKENS:
+            assert source not in blob, f"source name leaked: {source}"
+
+        # The exception is scoped: channel names are allowed ONLY in the
+        # cross-channel inventory line. A platform name surfacing in the DTC,
+        # paid or subscriptions line WOULD be a provenance leak (which ad or
+        # storefront API was read), so those lines are held to the stricter bar.
+        non_channel = " ".join(
+            ln for ln in out["lines"] if "Cross-channel inventory" not in ln
+        ).lower()
+        for platform in ("tiktok", "amazon", "walmart", "meta", "facebook", "google"):
+            assert platform not in non_channel, (
+                f"platform name outside the channel roll-up: {platform}")
 
 
 class TestSetupScripts:
