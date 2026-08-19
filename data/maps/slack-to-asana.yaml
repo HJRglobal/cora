@@ -135,10 +135,15 @@ users:
   # With no asana_user_gid, the create-task gate reports "no Asana mapping" for
   # them rather than guessing. Add the GID here once each has an Asana account.
 
-  # Aaron Ferrucci -- LEX-LLC Programs Director + PHI custodian. Asana invite
-  # issued 2026-06-11; GID not yet visible via the API (pending acceptance).
+  # Aaron Ferrucci -- LEX-LLC Day Programs Director + PHI custodian. ACTIVE
+  # Asana member since 2026-06-18 (invited 6/15) under the alias
+  # aaron@hjrglobal.com -- NOT programdirector@lexingtonservices.com, which is
+  # why the GID stayed invisible and the training audits kept reporting him
+  # "invite pending since June". That was a Cora identity-mapping gap, never a
+  # blocked invite. GID + alias read live from the LLC team roster 2026-08-18.
   - slack_user_id: U0B3PS32A22
-    asana_email: programdirector@lexingtonservices.com
+    asana_user_gid: 1215737571728920
+    asana_email: aaron@hjrglobal.com
     display_name: Aaron Ferrucci
 
   # Sara Fonseca -- LLC marketing freelancer. No Asana/Google mapping yet.

@@ -199,6 +199,14 @@ users:
       PHI custodian (LEX scope only). LLC-specific topics belong in
       #llc-leadership, not #lex-leadership (Harrison 2026-06-11).
 
+  # Aaron was NEVER blocked. ACTIVE Asana member since 2026-06-18 (invited
+  # 6/15) under the alias aaron@hjrglobal.com, GID 1215737571728920 -- mapped
+  # in slack-to-asana.yaml 2026-08-18. The retired "invite pending since June"
+  # claim in canon + the training audits keyed on
+  # programdirector@lexingtonservices.com, which is not his Asana identity, so
+  # his GID never appeared. Identity-mapping gap, not a blocked invite. Do not
+  # re-add a "pending acceptance" note -- and keep `notes` terse, it is
+  # injected into every reply (test_block_is_terse pins <1000 chars).
   - slack_id: U0B3PS32A22
     name: Aaron Ferrucci
     role: Day Programs Director (LLC)
@@ -214,9 +222,7 @@ users:
       Shaun Hawkins. Added 2026-06-11 (Harrison: LLC-specific roster). PHI
       custodian (LEX scope only) per Harrison 2026-06-11 -- "can be added to
       all PHI access".
-      Asana invite issued (Harrison 2026-06-11) but not yet visible via the
-      API (likely pending acceptance) -- add his slack-to-asana row the
-      moment his GID appears in workspace users.
+      Asana mapped 2026-08-18 (active member, alias aaron@hjrglobal.com).
       LLC-specific topics belong in #llc-leadership, not #lex-leadership.
 
   - slack_id: U0B9JS3JW07
@@ -328,22 +334,31 @@ users:
       Finance receipt retrieval allowlisted (#founder-finance only). Title
       confirmed by Harrison 2026-06-10.
 
-  # Registry-only entry (no slack_id): Tessa has no active Slack/Asana access
-  # (revoked 2026-05-22) but retains a real part-time role. She appears in
-  # all_roles()/roles_for_entity() for Phases 2-4; no role block can be
-  # injected without a Slack identity. Added per Harrison 2026-06-10.
-  - name: Tessa Miller
-    role: Executive Assistant (part-time remote, ~10 hrs/wk)
+  # Was a registry-only entry (Slack revoked 2026-05-22). Re-added to Slack
+  # 2026-08 and role expanded per the Operations Department OS v1 (Harrison
+  # locked 2026-08-08, section 7), so she now carries a slack_id and DOES get
+  # role-block injection. F3E is additive for the email-marketing-review lane;
+  # OSN + HJRP stay because the same spec keeps her osn-scheduling and
+  # lease-renewals lanes.
+  - slack_id: U0B3KH5UZJ7
+    name: Tessa Miller
+    role: Operations Coordinator (part-time)
     entity: HJRG
-    entities: [OSN, HJRP]
+    entities: [F3E, OSN, HJRP]
     responsibilities:
+      - Email-marketing review lane with Hannah (F3E)
       - Metrics + meeting structure (since 5/26)
       - Lease-renewal coordination; OSN scheduling weekly
       - Harrison email/calendar/receipts/scheduling; travel booking; cabin admin
+      - Manager of progress points -- chases position-remodel blockers
     manager: U0B2RM2JYJ1
     notes: >-
-      Part-time remote effective 2026-05-23; 8/8 review milestone for summer
-      scope check. No Slack/Asana access -- registry-only entry.
+      Part-time remote ~10 hrs/wk. Promoted from registry-only to active
+      2026-08-18 per Operations Department OS v1 section 7 (role: EA ->
+      operations/administration). Slack re-added 2026-08 (was revoked
+      2026-05-22); Klaviyo seat confirmed. Capacity re-eval week of 2026-08-24.
+      Ops lane coordinates under Hannah; manager of record stays Harrison.
+      Team announcement POSTPONED until her daily rhythm is defined.
 
   - slack_id: U0B6LQNSR25
     name: Jason Dorfman

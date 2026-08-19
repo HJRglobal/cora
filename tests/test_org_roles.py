@@ -105,6 +105,90 @@ class TestRosterCompleteness:
             assert sid in registry_ids, f"finance-allowlisted {sid} missing"
 
 
+class TestTessaActive:
+    """Tessa Miller: registry-only -> ACTIVE Operations Coordinator (2026-08-18).
+
+    Operations Department OS v1 section 7. She now has a Slack identity, so she
+    gets role-block injection like any other teammate. Pinned so a revert of
+    the YAML cannot silently drop her back to fail-closed-unknown.
+    """
+
+    TESSA = "U0B3KH5UZJ7"
+
+    def test_tessa_has_slack_identity(self):
+        rec = org_roles.get_role(self.TESSA)
+        assert rec is not None, "Tessa must resolve by Slack id (no longer registry-only)"
+        assert rec.name == "Tessa Miller"
+
+    def test_tessa_role_and_entities(self):
+        rec = org_roles.get_role(self.TESSA)
+        assert rec.role == "Operations Coordinator (part-time)"
+        assert rec.entity == "HJRG"
+        # F3E is the email-marketing-review lane; OSN/HJRP retained.
+        assert set(rec.entities) == {"F3E", "OSN", "HJRP"}
+        assert rec.manager == HARRISON
+
+    def test_tessa_injects_a_role_block(self):
+        """The whole point of the flip: she used to get an empty block."""
+        block = org_roles.format_role_context(self.TESSA)
+        assert block, "active Tessa must produce a role block"
+        assert "Operations Coordinator" in block
+
+    def test_tessa_not_external(self):
+        assert org_roles.get_role(self.TESSA).external is False
+
+
+class TestAaronAsanaIdentity:
+    """Aaron Ferrucci was NEVER blocked -- he is an ACTIVE Asana member since
+    2026-06-18 under the alias aaron@hjrglobal.com. The old map keyed on
+    programdirector@lexingtonservices.com, which is not his Asana identity, so
+    his GID never appeared and the training audits reported him blocked. GID
+    read live from the LLC team roster 2026-08-18.
+    """
+
+    AARON = "U0B3PS32A22"
+    AARON_GID = "1215737571728920"
+
+    def _row(self):
+        mapped = yaml.safe_load(
+            (_REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml").read_text(encoding="utf-8")
+        )
+        rows = [u for u in mapped["users"] if u.get("slack_user_id") == self.AARON]
+        assert len(rows) == 1, f"expected exactly one Aaron row, got {len(rows)}"
+        return rows[0]
+
+    def test_aaron_has_asana_gid(self):
+        assert str(self._row()["asana_user_gid"]) == self.AARON_GID
+
+    def test_aaron_asana_email_is_the_working_alias(self):
+        """programdirector@ is NOT his Asana identity -- pinning the alias stops
+        a well-meaning revert to the lexingtonservices.com address."""
+        assert self._row()["asana_email"] == "aaron@hjrglobal.com"
+        assert "programdirector" not in self._row()["asana_email"]
+
+    def test_aaron_still_in_registry_and_still_custodian(self):
+        """The mapping fix must not disturb his PHI-custodian standing."""
+        rec = org_roles.get_role(self.AARON)
+        assert rec is not None and rec.entity == "LEX-LLC"
+        custodians = yaml.safe_load(
+            (_REPO_ROOT / "data" / "maps" / "lex-phi-custodians.yaml").read_text(encoding="utf-8")
+        )
+        assert self.AARON in {c["slack_id"] for c in custodians["custodians"]}
+
+    def test_org_roles_note_no_longer_claims_pending_invite(self):
+        note = (org_roles.get_role(self.AARON).notes or "").lower()
+        assert "pending acceptance" not in note
+        assert "not yet visible" not in note
+
+    def test_gid_is_not_in_the_injected_note(self):
+        """`notes` rides the role block on EVERY reply (test_block_is_terse
+        pins it <1000 chars), so the GID + provenance belong in the map and a
+        YAML comment -- not in injected context."""
+        assert "1215737571728920" not in (org_roles.get_role(self.AARON).notes or "")
+        raw = (_REPO_ROOT / "data" / "maps" / "org-roles.yaml").read_text(encoding="utf-8")
+        assert "1215737571728920" in raw  # provenance kept, just not injected
+
+
 # ── Lookup behavior ────────────────────────────────────────────────────────
 
 
@@ -137,14 +221,23 @@ class TestGetRole:
 
 
 class TestRegistryOnlyPeople:
-    """People without Slack IDs (e.g. Tessa) ride the roster, never injection."""
+    """People without Slack IDs ride the roster, never injection.
+
+    Tessa was the original example and is NO LONGER one -- she went active
+    2026-08-18 (Operations Department OS v1 section 7). The generic
+    registry-only mechanism is still exercised below with a synthetic entry;
+    Tessa's own pins moved to TestTessaActive in the same commit as the YAML
+    change (the 2026-08-04 R9 lesson: identity-map pins move WITH the map).
+    """
 
     def test_tessa_in_all_roles(self):
         names = {r.name for r in org_roles.all_roles()}
         assert "Tessa Miller" in names
 
     def test_tessa_in_entity_rosters(self):
-        for ent in ("HJRG", "OSN", "HJRP"):
+        # F3E added 2026-08-18 (email-marketing-review lane); OSN + HJRP stay
+        # because the same spec keeps her osn-scheduling + lease-renewals lanes.
+        for ent in ("HJRG", "F3E", "OSN", "HJRP"):
             names = {r.name for r in org_roles.roles_for_entity(ent)}
             assert "Tessa Miller" in names, ent
 
