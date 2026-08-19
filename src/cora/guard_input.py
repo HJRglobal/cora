@@ -58,6 +58,7 @@ six ReDoS defects; treat a quantifier next to another quantifier as a bug.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # An "OFFICE INVENTORY UPDATE - 1337 S Gilbert Rd" style header. ONE bounded
 # lazy quantifier over a non-newline run -- no nesting, linear. `[ \t]+` not
@@ -99,6 +100,122 @@ _REASON_IS_REQUEST_RE = re.compile(
     r"compare|report\s+on|break\s+down)(?!\w)",
     re.I,
 )
+
+
+# ── the CONVERSATIONAL form of the same request (cq-1b6554a58fae) ────────────
+#
+# The three-signal predicate below recognizes the RIGID TEMPLATE only (header +
+# "Reason:" line + "SKU: n" line). Live 8/19 13:14:34 in
+# #f3-hq-inventory-adjustments, "cross-entity redirect fired" on an F3E write
+# whose justification named the OSN pop-up -- the exact class this module exists
+# to stop -- because the message was CONVERSATIONAL. Since the 7/21 inventory
+# overhaul (SKU aliases + channel-name defaults) that is the normal way these
+# writes are filed: today's successful writes were 105- and 108-char natural
+# sentences that produced f3e_shopify_set_inventory calls. No header, no
+# "Reason:" field, so nothing was stripped and the word "OSN" in the operator's
+# own explanation did the routing.
+#
+# There is no delimited field to blank in that form, so the conversational case
+# is handled by scope rather than by rewriting: a recognized inventory WRITE
+# stops the entity-keyword loop from firing at all. Same accepted residual as
+# the template form, same bounds -- user_access still evaluates the RAW message
+# for every sensitive topic, and channel_content_guard still screens the
+# composed answer outbound.
+#
+# FOUR conditions, all required, and the question veto is a HARD one so the
+# failure direction is "guard runs" rather than "guard skipped":
+_INVENTORY_WRITE_VERB_RE = re.compile(
+    r"(?<!\w)(?:add|added|adding|remove|removed|removing|set|setting|adjust\w*|"
+    r"deduct\w*|subtract\w*|restock\w*|took|take|taking|move|moved|moving|"
+    r"received|receive|receiving|count|counted|drop|dropped|bump|bumped)(?!\w)",
+    re.I,
+)
+
+# An inventory ANCHOR. Without one, "add 2 OSN stores to the list" would read as
+# a write request; with one, the message has to be about stock somewhere.
+_INVENTORY_ANCHOR_RE = re.compile(
+    r"(?<!\w)(?:office|hq|warehouse|3pl|inventory|stock|on\s+hand|shelf|"
+    r"cases?|units?|pack|packs|12-?pack|bottles?|cans?|sku)(?!\w)",
+    re.I,
+)
+
+# The veto. Anything question-shaped is NOT a write request, however many
+# inventory words it carries -- this is what keeps "how are the OSN stores doing
+# this week?" redirecting (verified live as a control on the same smoke run).
+_QUESTION_SHAPE_RE = re.compile(
+    r"\?|(?<!\w)(?:what|what's|whats|how|how's|hows|who|whose|why|when|where|"
+    r"which|is|are|was|were|do|does|did|can|could|should|would|tell\s+me|"
+    r"show\s+me|give\s+me|pull\s+up|status\s+of|update\s+on|summar\w*|explain|"
+    r"compare|report\s+on|break\s+down)(?!\w)",
+    re.I,
+)
+
+_DIGIT_RE = re.compile(r"\d")
+
+
+def is_inventory_write_request(text: str) -> bool:
+    """True when the message reads as a PROSE inventory write.
+
+    Pure; never raises. Conservative by construction: an inventory verb, a
+    number, an inventory anchor noun, and NO question shape anywhere.
+
+    DELIBERATELY NOT short-circuited on `is_inventory_adjustment_request`. The
+    first cut did exactly that -- "it satisfies the template, therefore it is a
+    write" -- and it broke eleven existing tests, all of them evasion guards:
+    a question smuggled INTO a template Reason ("Reason: what is the OSN
+    revenue") became exempt from the entity guard, which is the hole
+    `_REASON_IS_REQUEST_RE` exists to keep shut. The template form is already
+    fully governed by `scope_guard_text`, which strips an ANNOTATION Reason and
+    deliberately leaves a REQUEST-shaped one visible to the guard. It needs no
+    help from here, and the template's own words ("INVENTORY UPDATE", "PURE: 12")
+    carry no imperative verb, so it does not qualify as prose either. Two
+    mechanisms, one for each form, neither weakening the other.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    if _QUESTION_SHAPE_RE.search(text):
+        return False
+    return bool(
+        _INVENTORY_WRITE_VERB_RE.search(text)
+        and _DIGIT_RE.search(text)
+        and _INVENTORY_ANCHOR_RE.search(text)
+    )
+
+
+#: The dedicated office-inventory write channels, as DATA rather than a
+#: hardcoded name -- the same file the write tool reads for its per-channel
+#: location/unit defaults. Keyed by channel NAME (channel_id is not threaded to
+#: tools), same normalization as the tool's own reader.
+_INV_CHANNEL_CFG_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "maps" / "inventory-channel-config.yaml"
+)
+
+
+def inventory_write_channels() -> set[str]:
+    """Normalized channel names configured as office-inventory write channels.
+
+    Read fresh (live-reload: add a channel to the YAML, no restart). FAIL-SOFT to
+    an EMPTY set -- on any error the prose exemption below simply does not apply
+    anywhere, which is the guarded direction.
+    """
+    try:
+        import yaml
+        if not _INV_CHANNEL_CFG_PATH.exists():
+            return set()
+        data = yaml.safe_load(_INV_CHANNEL_CFG_PATH.read_text(encoding="utf-8")) or {}
+        return {
+            str(k).strip().lstrip("#").lower()
+            for k, v in (data.get("channels") or {}).items()
+            if isinstance(v, dict) and str(k).strip()
+        }
+    except Exception:  # noqa: BLE001 -- a guard input helper never raises
+        return set()
+
+
+def is_inventory_write_channel(channel_name: str | None) -> bool:
+    """True when this channel exists to file office-inventory writes."""
+    name = (channel_name or "").strip().lstrip("#").lower()
+    return bool(name) and name in inventory_write_channels()
 
 
 def is_inventory_adjustment_request(text: str) -> bool:

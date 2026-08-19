@@ -2288,7 +2288,12 @@ def handle_mention(event: dict, say: callable, client) -> None:
 
     # Cross-entity redirect interception (deterministic, pre-LLM). Fires before
     # any tool/Claude call so cross-entity data can never be surfaced.
-    cross_redirect = cross_entity_guard.check_cross_entity(user_message, entity)
+    # channel_name is threaded so the dedicated office-inventory write channels
+    # can carry the prose-write exemption (cq-1b6554a58fae). Every other channel
+    # is unaffected: an omitted channel_name means the guard behaves exactly as
+    # before, which is why the remaining call sites are safe left as they are.
+    cross_redirect = cross_entity_guard.check_cross_entity(
+        user_message, entity, channel_name=channel_name)
     if cross_redirect:
         log.info("cross-entity redirect fired channel=#%s entity=%s", channel_name, entity)
         say(text=cross_redirect, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
@@ -3462,8 +3467,11 @@ def handle_message_event(event: dict, client) -> None:
         client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=sibling_redirect)
         return
 
-    # Cross-entity guard pre-LLM (mirrors handle_mention Path 1).
-    cross_redirect = cross_entity_guard.check_cross_entity(text, entity)
+    # Cross-entity guard pre-LLM (mirrors handle_mention Path 1) -- including the
+    # channel_name, so a thread FOLLOW-UP in an inventory channel ("make it 3
+    # instead") gets the same treatment as the mention that opened the thread.
+    cross_redirect = cross_entity_guard.check_cross_entity(
+        text, entity, channel_name=channel_name)
     if cross_redirect:
         client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=cross_redirect)
         return

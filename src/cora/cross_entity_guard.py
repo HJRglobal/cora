@@ -141,7 +141,8 @@ def _channel_family(channel_entity: str) -> str:
     return ce
 
 
-def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
+def check_cross_entity(message_text: str, channel_entity: str,
+                       channel_name: str | None = None) -> str | None:
     """Return a one-sentence redirect if message asks about a non-channel entity.
 
     Returns None when:
@@ -177,6 +178,20 @@ def check_cross_entity(message_text: str, channel_entity: str) -> str | None:
     # unrecognized family both return None unconditionally, so normalizing first
     # was pure work on paths this guard does not govern (D-051 LOW, this branch).
     message_text = guard_input.scope_guard_text(message_text)
+
+    # The CONVERSATIONAL form of the same request (cq-1b6554a58fae). The strip
+    # above can only blank a delimited "Reason:" value; a prose write request has
+    # no field to blank, and prose is how these are filed since the 7/21
+    # inventory overhaul. Live 8/19 13:14:34: an F3E office write explaining
+    # itself as "...sent to the OSN pop-up" was redirected to OSN. A write
+    # request's own justification naming another entity is provenance, not a
+    # question about that entity -- and the WRITE is entity-scoped by
+    # construction (the tool only reaches F3E locations). Question-shaped text is
+    # vetoed inside the predicate, so "how are the OSN stores doing this week?"
+    # in this same channel still redirects.
+    if (guard_input.is_inventory_write_channel(channel_name)
+            and guard_input.is_inventory_write_request(message_text)):
+        return None
 
     paired = PAIRED_ENTITIES.get(family, set())
 
