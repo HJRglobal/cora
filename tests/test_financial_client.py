@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cora.connectors.gsheets_financials import CashflowSummary, EntityRow, GsheetsConnectorError
-from cora.tools import financial_client
+from cora.tools import financial_client, slack_file_upload
 from cora.tools.financial_client import (
     UNKNOWN_RESPONSE,
     _fmt_currency,
@@ -318,16 +318,19 @@ class TestUploadReportEgress:
             return resp
 
         with patch("httpx.put", side_effect=_fake_put):
-            ok = financial_client.upload_report_as_file(
+            # Returns (outcome, detail) since cq-b0a847ef0c8e -- a bool could not
+            # tell the caller WHY, so a permanently-broken lane looked identical
+            # to one that was never reached.
+            outcome, _detail = financial_client.upload_report_as_file(
                 slack_client=slack_client, channel_id="C_FIN",
                 title=title, content=content,
             )
-        return ok, captured
+        return outcome, captured
 
     def test_bare_drive_url_stripped_from_uploaded_bytes(self, monkeypatch):
         content = "Q1 revenue was strong. Source: https://drive.google.com/file/d/abc123XYZ/view here."
-        ok, captured = self._run_upload(monkeypatch, content)
-        assert ok is True
+        outcome, captured = self._run_upload(monkeypatch, content)
+        assert outcome == slack_file_upload.OK
         put_text = captured["bytes"].decode("utf-8")
         assert "drive.google.com" not in put_text          # bare doc URL redacted
         assert "Q1 revenue was strong" in put_text          # body survives
@@ -335,8 +338,8 @@ class TestUploadReportEgress:
 
     def test_naked_long_id_stripped_from_uploaded_bytes(self, monkeypatch):
         content = "Invoice reference 1234567890123456789 for the period."
-        ok, captured = self._run_upload(monkeypatch, content)
-        assert ok is True
+        outcome, captured = self._run_upload(monkeypatch, content)
+        assert outcome == slack_file_upload.OK
         put_text = captured["bytes"].decode("utf-8")
         assert "1234567890123456789" not in put_text        # 16+ digit naked ID redacted
         assert "Invoice reference" in put_text
@@ -344,7 +347,7 @@ class TestUploadReportEgress:
     def test_sanctioned_link_preserved(self, monkeypatch):
         # A sanctioned <url|label> Slack link is NOT stripped by the SAFETY subset.
         content = "See the <https://drive.google.com/file/d/keep/view|filed report>."
-        ok, captured = self._run_upload(monkeypatch, content)
-        assert ok is True
+        outcome, captured = self._run_upload(monkeypatch, content)
+        assert outcome == slack_file_upload.OK
         put_text = captured["bytes"].decode("utf-8")
         assert "<https://drive.google.com/file/d/keep/view|filed report>" in put_text

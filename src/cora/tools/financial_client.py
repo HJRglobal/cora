@@ -429,93 +429,27 @@ def upload_report_as_file(
     title: str,
     content: str,
     thread_ts: str | None = None,
-) -> bool:
-    """Upload a long financial report as a Slack file using the v2 upload API.
+) -> tuple[str, str]:
+    """Upload a long financial report as a Slack file.
 
-    Returns True on success, False on any failure (caller falls back to inline).
-    The file is posted directly to channel_id; thread_ts is optional.
+    Returns ``(outcome, detail)`` from ``slack_file_upload`` -- NOT a bool. The
+    bool contract was the defect: every failure collapsed to False, the caller
+    posted inline, and nobody -- requester or operator -- could tell whether the
+    lane had failed, degraded, or simply never been reached. With an outcome the
+    caller can say WHY, and `slack_file_upload.requester_note(outcome)` supplies
+    the wording.
+
+    The transport now lives in ``cora.tools.slack_file_upload`` so the xlsx
+    export path shares one implementation rather than forking a second raw-HTTP
+    egress surface. Text semantics are unchanged: same 3-step flow, same egress
+    sanitization of content AND title, same generated .txt filename shape.
     """
-    try:
-        import httpx
-    except ImportError:
-        log.warning("upload_report_as_file: httpx not installed — falling back to inline")
-        return False
+    from .slack_file_upload import upload_text
 
-    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
-    if not bot_token:
-        log.warning("upload_report_as_file: SLACK_BOT_TOKEN not set")
-        return False
-
-    # W3-05: this is the last raw-HTTP finance egress path -- the report bytes are
-    # PUT straight to Slack's upload URL via httpx, bypassing the slack_egress
-    # WebClient patch (which only wraps chat_* sends). Route the content (and the
-    # file title, shared via files_completeUploadExternal) through the same SAFETY
-    # sanitizer every chat send gets: mojibake repair + bare-URL/GID/long-ID
-    # redaction. Local import mirrors the httpx import above and avoids any
-    # import-time cycle. Fail-soft -- a sanitizer error must not drop the upload.
-    try:
-        from ..slack_egress import sanitize_text
-        content = sanitize_text(content)
-        title = sanitize_text(title)
-    except Exception:  # noqa: BLE001 -- never let sanitization block the upload
-        log.exception("upload_report_as_file: egress sanitize failed; uploading raw")
-
-    content_bytes = content.encode("utf-8")
-    filename = f"financial-report-{int(time.time())}.txt"
-
-    try:
-        # Step 1: get upload URL
-        url_resp = slack_client.files_getUploadURLExternal(
-            filename=filename,
-            length=len(content_bytes),
-        )
-        if not url_resp.get("ok"):
-            log.warning("upload_report_as_file: getUploadURL failed: %s", url_resp.get("error"))
-            return False
-        upload_url = url_resp["upload_url"]
-        file_id = url_resp["file_id"]
-
-        # Step 2: PUT the bytes to the upload URL
-        put_resp = httpx.put(
-            upload_url,
-            content=content_bytes,
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-            timeout=30.0,
-        )
-        if put_resp.status_code not in (200, 201):
-            log.warning("upload_report_as_file: PUT failed status=%s", put_resp.status_code)
-            return False
-
-        # Step 3: complete the upload and share to channel
-        files_payload = [{"id": file_id, "title": title}]
-        complete_kwargs = {
-            "files": files_payload,
-            "channel_id": channel_id,
-        }
-        if thread_ts:
-            complete_kwargs["thread_ts"] = thread_ts
-
-        complete_resp = slack_client.files_completeUploadExternal(**complete_kwargs)
-        if not complete_resp.get("ok"):
-            log.warning(
-                "upload_report_as_file: completeUpload failed: %s",
-                complete_resp.get("error"),
-            )
-            return False
-
-        log.info("upload_report_as_file: uploaded file_id=%s to channel=%s", file_id, channel_id)
-        return True
-
-    except SlackApiError as exc:
-        err = exc.response.get("error", "") if exc.response else str(exc)
-        if "missing_scope" in err or "not_allowed_token_type" in err:
-            log.warning("upload_report_as_file: missing files:write scope — falling back to inline")
-        else:
-            log.warning("upload_report_as_file: SlackApiError: %s", exc)
-        return False
-    except Exception as exc:
-        log.warning("upload_report_as_file: unexpected error: %s", exc)
-        return False
+    return upload_text(
+        slack_client, channel_id, title, content, thread_ts,
+        filename=f"financial-report-{int(time.time())}.txt",
+    )
 
 
 def notify_gap(

@@ -2915,7 +2915,9 @@ def _tool_qbo_get_profit_loss(slack_user_id: str, entity: str, _input: dict) -> 
         log.warning("QBO P&L tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
     log.info("qbo_get_profit_loss entity=%s period=%s..%s", target, start_date, end_date)
-    return qbo_client.format_pnl_for_llm(report, target, start_date, end_date)
+    return _maybe_export_xlsx(
+        _input, f"P&L {target} {start_date} to {end_date}",
+        qbo_client.format_pnl_for_llm(report, target, start_date, end_date))
 
 
 def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2934,7 +2936,8 @@ def _tool_qbo_get_balance_sheet(slack_user_id: str, entity: str, _input: dict) -
         log.warning("QBO Balance Sheet tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
     log.info("qbo_get_balance_sheet entity=%s as_of=%s", target, as_of or "today")
-    return qbo_client.format_balance_sheet_for_llm(report, target, as_of or "today")
+    return _maybe_export_xlsx(_input, f"Balance sheet {target}",
+                              qbo_client.format_balance_sheet_for_llm(report, target, as_of or "today"))
 
 
 def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2952,7 +2955,8 @@ def _tool_qbo_get_ar_aging(slack_user_id: str, entity: str, _input: dict) -> str
         log.warning("QBO AR Aging tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
     log.info("qbo_get_ar_aging entity=%s", target)
-    return qbo_client.format_ar_aging_for_llm(report, target)
+    return _maybe_export_xlsx(_input, f"AR aging {target}",
+                              qbo_client.format_ar_aging_for_llm(report, target))
 
 
 def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2970,7 +2974,8 @@ def _tool_qbo_get_ap_aging(slack_user_id: str, entity: str, _input: dict) -> str
         log.warning("QBO AP Aging tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
     log.info("qbo_get_ap_aging entity=%s", target)
-    return qbo_client.format_ap_aging_for_llm(report, target)
+    return _maybe_export_xlsx(_input, f"AP aging {target}",
+                              qbo_client.format_ap_aging_for_llm(report, target))
 
 
 def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2993,7 +2998,9 @@ def _tool_qbo_get_recent_transactions(slack_user_id: str, entity: str, _input: d
         log.warning("QBO Recent Transactions tool error entity=%s: %s", target, exc)
         return _qbo_error_message(target, exc)
     log.info("qbo_get_recent_transactions entity=%s days=%d", target, days)
-    return qbo_client.format_recent_transactions_for_llm(payload, target, days)
+    return _maybe_export_xlsx(
+        _input, f"Recent transactions {target} last {days}d",
+        qbo_client.format_recent_transactions_for_llm(payload, target, days))
 
 
 # --- Finance channel enforcement ---
@@ -3101,16 +3108,64 @@ def _tool_financial_get_cashflow(slack_user_id: str, entity: str, _input: dict) 
             _sc = _SlackWebClient(token=_bot_token)
             title = f"Cash Flow Report — {entity_filter}"
             thread_ts = inp.get("_thread_ts")
-            uploaded = financial_client.upload_report_as_file(
+            outcome, _detail = financial_client.upload_report_as_file(
                 slack_client=_sc,
                 channel_id=channel_id,
                 title=title,
                 content=result,
                 thread_ts=thread_ts,
             )
-            if uploaded:
+            from .slack_file_upload import OK as _UPLOAD_OK, requester_note
+            if outcome == _UPLOAD_OK:
                 return "📎 Full cash flow report uploaded above."
+            # HONEST FALLBACK (cq-b0a847ef0c8e). The old code returned the
+            # report inline with no signal at all, so a permanently-broken
+            # upload lane was indistinguishable from a lane that was never
+            # reached -- which is how it went two months unnoticed. Say what
+            # happened and who can fix it, then still serve the report.
+            note = requester_note(outcome)
+            return f"{result}\n\n{note}" if note else result
     return result
+
+
+def _maybe_export_xlsx(_input: dict, title: str, text: str) -> str:
+    """If the asker wanted a file, attach the SAME text as .xlsx (cq-c51123b0ad07).
+
+    Returns the text to send back. On success the report still goes inline AND
+    the file is attached: the sheet is for reuse, the message is for reading, and
+    replacing one with the other would make a quick "what's our AR look like"
+    strictly worse. On failure the requester is told why rather than silently
+    served the inline-only version (the cq-b0a847ef0c8e lesson).
+
+    Export is opt-in per call. Never fires for an UNKNOWN/refusal string -- an
+    .xlsx of an error message is noise that looks like data.
+    """
+    if str((_input or {}).get("format") or "").strip().lower() != "xlsx":
+        return text
+    channel_id = str((_input or {}).get("_channel_id") or "")
+    if not channel_id or not (text or "").strip():
+        return text
+    lowered = text.lstrip().lower()
+    if lowered.startswith(("i don't", "i couldn't", "i can't", "unknown")):
+        return text
+    try:
+        import os as _os
+        from slack_sdk import WebClient as _SlackWebClient
+        from .slack_file_upload import OK as _UPLOAD_OK, requester_note
+        from .table_export import deliver_report_as_xlsx
+
+        token = _os.environ.get("SLACK_BOT_TOKEN", "")
+        if not token:
+            return f"{text}\n\n{requester_note('no_token')}"
+        outcome, _detail = deliver_report_as_xlsx(
+            _SlackWebClient(token=token), channel_id, title, text,
+            str((_input or {}).get("_thread_ts") or "") or None)
+        if outcome == _UPLOAD_OK:
+            return f"{text}\n\n_:paperclip: Also attached above as an .xlsx._"
+        return f"{text}\n\n{requester_note(outcome)}"
+    except Exception:  # noqa: BLE001 -- an export must never break the answer
+        log.exception("xlsx export failed for %s", title)
+        return text
 
 
 def _tool_osn_financial_pulse(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -9565,6 +9620,15 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Time period for the P&L. Accepts: 'this_month', 'last_month', 'ytd', 'last_year', 'last_30_days' (default), 'last_90_days', or an explicit range like '2026-01-01 to 2026-03-31'.",
                 },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
+                },
             },
             "required": [],
         },
@@ -9591,6 +9655,15 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "ISO date (YYYY-MM-DD) for the snapshot. Defaults to today if omitted.",
                 },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
+                },
             },
             "required": [],
         },
@@ -9614,6 +9687,15 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Optional entity code override. If omitted, uses the channel's entity.",
                 },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
+                },
             },
             "required": [],
         },
@@ -9636,6 +9718,15 @@ TOOL_DEFINITIONS = [
                 "entity": {
                     "type": "string",
                     "description": "Optional entity code override. If omitted, uses the channel's entity.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
                 },
             },
             "required": [],
@@ -9664,6 +9755,15 @@ TOOL_DEFINITIONS = [
                 "days": {
                     "type": "integer",
                     "description": "Lookback window in days (1-180). Defaults to 30.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "xlsx"],
+                    "description": ("'xlsx' ALSO attaches the same figures as a "
+                                    "spreadsheet file. Use when the asker says "
+                                    "'as a spreadsheet', 'export', 'download', "
+                                    "'send me the file', or 'in Excel'. The "
+                                    "numbers still appear in the reply."),
                 },
             },
             "required": [],
