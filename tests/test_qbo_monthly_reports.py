@@ -38,6 +38,10 @@ def _pl(rows=None, basis="Accrual", no_data=False):
             "ReportName": "ProfitAndLoss",
             "ReportBasis": basis,
             "Time": "2026-08-18T17:00:00-07:00",
+            # Real responses echo the window back; the fixture must too, or the
+            # period verification silently no-ops in every test that uses it.
+            "StartPeriod": "2026-07-01",
+            "EndPeriod": "2026-07-31",
             "Option": [{"Name": "NoReportData", "Value": "true" if no_data else "false"}],
         },
         "Rows": rows if rows is not None else {
@@ -73,6 +77,29 @@ def _fake_fs():
             lambda p: str(p) in store,
             lambda p: store[str(p)],
             store)
+
+
+def _manual_xlsx(total="2000.0", label="Total for Income"):
+    """A manual QBO UI export: same layout, numeric cells, and crucially NO
+    "pulled by Cora" footer -- that stamp is what makes a re-run idempotent.
+    Uses the UI wording "Total for X" and a bare float, both of which the real
+    2026-05 archive files use.
+    """
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["HJR Global Services LLC", ""])
+    ws.append(["Profit and Loss", ""])
+    ws.append(["July 2026", ""])
+    ws.append(["", ""])
+    ws.append(["", "Total"])
+    ws.append(["4275 Management Fees", float(total)])
+    ws.append([label, float(total)])
+    ws.append(["", ""])
+    ws.append(["Accrual Basis Friday, May 22, 2026 10:02 PM GMTZ", ""])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 class TestMonthConvention:
@@ -253,18 +280,71 @@ class TestNeverOverwrite:
         assert store[str(manual)] == b"MANUAL", "manual upload was clobbered"
         assert str(outdir / "2026-07_hjrg_pl-cora.xlsx") in store
 
-    def test_collision_is_reported_as_parity(self):
+    def test_collision_with_a_MANUAL_file_is_reported_as_parity(self):
         w, e, r, store = _fake_fs()
         outdir = qmr.target_dir("2026-07")
-        store[str(outdir / "2026-07_hjrg_pl.xlsx")] = qmr.render_xlsx(
-            _pl(), company_name="HJR Global Services LLC",
-            report_title="Profit and Loss", period="July 2026")
+        # 79580.19 is what _pl() returns, so the figures genuinely agree.
+        store[str(outdir / "2026-07_hjrg_pl.xlsx")] = _manual_xlsx(total="79580.19")
         summary = qmr.build_month("2026-07", sources=_sources(), apply=True,
                                   writer=w, exists=e, reader=r)
-        parity = [p for p in summary["parity"] if p["kind"] == "pl"]
+        parity = [x for x in summary["parity"] if x["kind"] == "pl"]
         assert len(parity) == 1
-        # Identical inputs -> the cross-check must say they agree.
         assert parity[0]["match"] is True
+
+    def test_parity_compares_NUMERICALLY_not_as_strings(self):
+        """The archive stores 2000.0; Cora renders 2000.00. A string compare
+        called every collision a DIFFERS and sent a human hunting a discrepancy
+        that did not exist (D-051)."""
+        assert qmr._values_agree("2000.0", "2000.00") is True
+        assert qmr._values_agree("92339.00000000001", "92339.0") is True
+        assert qmr._values_agree("2000.0", "2500.0") is False
+        assert qmr._values_agree(None, "2000.0") is None
+        assert qmr._values_agree("n/a", "2000.0") is False
+
+    def test_a_rerun_over_coras_own_file_is_a_no_op(self):
+        """HIGH (D-051): without this, one realm failing mid-run and an operator
+        re-running the month made Cora read its OWN earlier output as "the
+        manual upload", write a -cora duplicate, and on a third run overwrite
+        that -- unbounded duplication of statements of record."""
+        w, e, r, store = _fake_fs()
+        first = qmr.build_month("2026-07", sources=_sources(), apply=True,
+                                writer=w, exists=e, reader=r)
+        assert len(first["written"]) == 2
+        before = dict(store)
+
+        second = qmr.build_month("2026-07", sources=_sources(), apply=True,
+                                 writer=w, exists=e, reader=r)
+        assert second["written"] == [], "a re-run must write nothing"
+        assert second["parity"] == [], "Cora own file is not a manual upload"
+        assert store == before, "a re-run must not add or change any file"
+        assert all("already written by Cora" in x["reason"]
+                   for x in second["skipped"])
+
+    def test_cora_written_files_carry_a_detectable_stamp(self):
+        data = qmr.render_xlsx(_pl(), company_name="HJR Global Services LLC",
+                               report_title="Profit and Loss", period="July 2026")
+        assert qmr.is_cora_written(data) is True
+        assert qmr.is_cora_written(_manual_xlsx()) is False
+        assert qmr.is_cora_written(b"not a zip") is False
+
+    def test_refuses_when_both_the_manual_and_the_cora_file_exist(self):
+        """The -cora path was previously written with no existence check, so a
+        second run overwrote its own sibling (D-051 HIGH)."""
+        w, e, r, store = _fake_fs()
+        outdir = qmr.target_dir("2026-07")
+        store[str(outdir / "2026-07_hjrg_pl.xlsx")] = _manual_xlsx()
+        store[str(outdir / "2026-07_hjrg_pl-cora.xlsx")] = b"EARLIER CORA RUN"
+        summary = qmr.build_month("2026-07", sources=_sources(), apply=True,
+                                  writer=w, exists=e, reader=r)
+        # Neither pre-existing P&L file may be touched...
+        assert store[str(outdir / "2026-07_hjrg_pl-cora.xlsx")] == b"EARLIER CORA RUN"
+        assert qmr.is_cora_written(store[str(outdir / "2026-07_hjrg_pl.xlsx")]) is False
+        assert any("refusing to overwrite either" in x["reason"]
+                   for x in summary["skipped"])
+        assert all(x["kind"] != "pl" for x in summary["written"])
+        # ...while the non-colliding balance sheet still lands. One blocked file
+        # must not cost the entity its other statement.
+        assert str(outdir / "2026-07_hjrg_bs.xlsx") in store
 
     def test_cora_variant_name(self):
         assert qmr.cora_variant_name("2026-07_hjrg_pl.xlsx") == \
@@ -412,3 +492,157 @@ class TestNoLLM:
         for banned in ("anthropic", "claude_client", "openai", "batch_client",
                        "llm_usage"):
             assert banned not in src, f"{banned} must not appear"
+
+
+class TestMonthInputIsStrict:
+    """--month exists only for operator backfill, so a typo IS its main risk
+    surface. A loose parse was destructive in three distinct ways (D-051)."""
+
+    @pytest.mark.parametrize("bad", ["2026-7", "26-07", "2026-007", "2026/07",
+                                     "202607", "1999-07"])
+    def test_malformed_months_are_refused(self, bad):
+        with pytest.raises(ValueError):
+            qmr.month_bounds(bad)
+
+    def test_unpadded_month_would_have_bypassed_the_collision_check(self):
+        """2026-7 filed 2026-7_llc_pl.xlsx, which can never match the real
+        2026-07_llc_pl.xlsx, so never-overwrite and parity were both bypassed."""
+        with pytest.raises(ValueError):
+            qmr.filename("2026-7", "llc", "pl")
+
+    def test_two_digit_year_would_have_created_a_bogus_drive_folder(self):
+        """26-07 resolved to a filing folder of 0026-08 and CREATED it on the
+        shared Drive."""
+        with pytest.raises(ValueError):
+            qmr.filing_folder_for("26-07")
+
+    def test_padded_month_still_works(self):
+        assert qmr.month_bounds("2026-07") == ("2026-07-01", "2026-07-31")
+
+
+class TestFutureMonthGuard:
+    """QBO answers a future as-of date with TODAY balances, so a future --month
+    produced a Balance Sheet labelled July 2027 holding current figures, filed
+    under a fabricated 2027-08/ (D-051)."""
+
+    def test_future_month_refused(self):
+        import datetime
+        with pytest.raises(ValueError):
+            qmr.assert_month_is_complete("2027-07",
+                                         today=datetime.date(2026, 8, 18))
+
+    def test_current_incomplete_month_refused(self):
+        import datetime
+        with pytest.raises(ValueError):
+            qmr.assert_month_is_complete("2026-08",
+                                         today=datetime.date(2026, 8, 18))
+
+    def test_last_completed_month_allowed(self):
+        import datetime
+        qmr.assert_month_is_complete("2026-07", today=datetime.date(2026, 8, 18))
+
+    def test_apply_is_gated_on_the_guard_but_dry_run_is_not(self):
+        src = (_REPO_ROOT / "scripts" / "run_qbo_monthly_reports.py").read_text(
+            encoding="utf-8")
+        assert "if args.apply:" in src
+        assert "assert_month_is_complete(report_month)" in src
+
+
+class TestPeriodIsVerifiedNotAssumed:
+    def test_period_mismatch_refuses(self):
+        """Basis was verified from the response and the period was not -- yet the
+        period is exactly what the filename and the row-3 label assert."""
+        def wrong_period(entity, start, end):
+            rep = _pl()
+            rep["Header"]["StartPeriod"] = "2026-06-01"
+            rep["Header"]["EndPeriod"] = "2026-06-30"
+            return rep
+
+        w, e, r, store = _fake_fs()
+        summary = qmr.build_month("2026-07",
+                                  sources=_sources(profit_loss=wrong_period),
+                                  apply=True, writer=w, exists=e, reader=r)
+        assert any("period mismatch" in x["reason"] for x in summary["skipped"])
+        assert all("_pl" not in x["file"] for x in summary["written"])
+
+    def test_report_period_reader(self):
+        assert qmr.report_period(_pl()) == ("2026-07-01", "2026-07-31")
+
+
+class TestAmountsAreNumericCells:
+    def test_amounts_land_as_numbers_so_the_sheet_can_sum(self):
+        """Every one of the ~350 existing archive files stores its amount cells
+        as floats. A text amount is a statement that looks right and is
+        arithmetically inert (D-051)."""
+        from openpyxl import load_workbook
+        data = qmr.render_xlsx(_pl(), company_name="HJR Global Services LLC",
+                               report_title="Profit and Loss", period="July 2026")
+        ws = load_workbook(io.BytesIO(data), data_only=True, read_only=True).active
+        vals = {str(r[0]): r[1] for r in ws.iter_rows(values_only=True) if r and r[0]}
+        assert isinstance(vals["4275 Management Fees"], float)
+        assert vals["4275 Management Fees"] == pytest.approx(79580.19)
+
+    def test_non_numeric_values_pass_through_unchanged(self):
+        from openpyxl import load_workbook
+        rep = _pl(rows={"Row": [{"ColData": [{"value": "Note"},
+                                             {"value": "see attachment"}]}]})
+        data = qmr.render_xlsx(rep, company_name="X", report_title="P",
+                               period="p")
+        ws = load_workbook(io.BytesIO(data), data_only=True, read_only=True).active
+        vals = {str(r[0]): r[1] for r in ws.iter_rows(values_only=True) if r and r[0]}
+        assert vals["Note"] == "see attachment"
+
+    def test_footer_separates_qbo_clock_from_coras_pull_time(self):
+        """The footer used to print QBO time and label it Cora time -- which
+        defeats its only purpose, telling a pre-close snapshot from a post-close
+        statement (D-051)."""
+        import datetime
+        stamp = qmr.footer_stamp(_pl(),
+                                 now=datetime.datetime(2026, 8, 18, 17, 42))
+        assert "QBO report time 2026-08-18T17:00:00-07:00" in stamp
+        assert "pulled by Cora 2026-08-18 17:42" in stamp
+        assert "Accrual Basis" in stamp
+
+
+class TestSensitiveBooksAreOptIn:
+    """HRLLC is Harrison's PERSONAL expense book. The accounting archive it would
+    land in IS swept into the KB (justin@lexingtonservices.com, drive_sweep: true,
+    entity_default LEX) and the existing hjrllc files are ALREADY ingested
+    mis-tagged as LEX / LEX-LLC -- so a #llc-* asker can retrieve a personal
+    balance sheet. That exposure predates this job; writing 2 more files a month
+    forever would industrialize it (D-051 HIGH).
+    """
+
+    def test_hrllc_ships_disabled(self):
+        assert qmr.load_slug_map()["HRLLC"]["enabled"] is False
+
+    def test_every_other_realm_is_enabled(self):
+        for realm, spec in qmr.load_slug_map().items():
+            if realm != "HRLLC":
+                assert spec["enabled"] is True, realm
+
+    def test_a_disabled_realm_is_never_written_but_IS_reported(self):
+        w, e, r, store = _fake_fs()
+        summary = qmr.build_month(
+            "2026-07",
+            sources=_sources(provisioned=lambda: ["HRLLC"],
+                             company_name=lambda x: "Harrison Rogers, LLC"),
+            apply=True, writer=w, exists=e, reader=r)
+        assert store == {}, "a disabled realm must never be written"
+        assert summary["written"] == []
+        assert any("opt-in" in x["reason"] for x in summary["skipped"])
+        # Silence would read as "this entity simply had no data".
+        assert "disabled in the slug map" in qmr.format_summary(summary)
+
+    def test_populator_slugs_all_have_a_deterministic_entity_mapping(self):
+        """Any slug this job emits must resolve WITHOUT Haiku, or the file is
+        guessed into whatever entity the sweeping mailbox defaults to (LEX).
+        osn-core4 was the gap that made this test necessary."""
+        from cora.connectors.drive_entity_detect import detect_entity_from_filename
+        for realm, spec in qmr.load_slug_map().items():
+            if not spec["enabled"]:
+                continue   # HRLLC is deliberately unmapped AND unwritten
+            name = qmr.filename("2026-07", spec["slug"], "pl")
+            assert detect_entity_from_filename(name), (
+                f"{realm} emits {spec['slug']!r} with no deterministic entity "
+                f"mapping -- it would be Haiku-guessed on ingest")

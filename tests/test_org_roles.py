@@ -137,6 +137,27 @@ class TestTessaActive:
     def test_tessa_not_external(self):
         assert org_roles.get_role(self.TESSA).external is False
 
+    def test_notes_carry_no_unannounced_personnel_detail(self):
+        """`notes` is injected into the LLM context on EVERY reply, and a reply
+        built on it is storable in the ENTITY-keyed semantic cache (there is no
+        role-block exclusion in cache_storable). The first version of this entry
+        put "team announcement POSTPONED" and "capacity re-eval week of
+        2026-08-24" here -- unannounced HR content, injected for Tessa herself to
+        read and cacheable for the next asker in her entities (D-051). Those
+        facts live in a YAML comment now.
+        """
+        notes = (org_roles.get_role(self.TESSA).notes or "").lower()
+        for leaked in ("announcement", "postponed", "re-eval", "capacity",
+                       "klaviyo", "revoked"):
+            assert leaked not in notes, f"{leaked!r} must not ride injected context"
+
+    def test_the_dropped_detail_is_preserved_as_a_comment(self):
+        """De-risking the field must not lose the facts."""
+        raw = (_REPO_ROOT / "data" / "maps" / "org-roles.yaml").read_text(
+            encoding="utf-8")
+        assert "# " in raw and "capacity re-eval week of 2026-08-24" in raw
+        assert "team announcement POSTPONED" in raw
+
 
 class TestAaronAsanaIdentity:
     """Aaron Ferrucci was NEVER blocked -- he is an ACTIVE Asana member since
@@ -160,11 +181,28 @@ class TestAaronAsanaIdentity:
     def test_aaron_has_asana_gid(self):
         assert str(self._row()["asana_user_gid"]) == self.AARON_GID
 
-    def test_aaron_asana_email_is_the_working_alias(self):
-        """programdirector@ is NOT his Asana identity -- pinning the alias stops
-        a well-meaning revert to the lexingtonservices.com address."""
-        assert self._row()["asana_email"] == "aaron@hjrglobal.com"
-        assert "programdirector" not in self._row()["asana_email"]
+    def test_no_google_identity_is_asserted_for_aaron(self):
+        """`asana_email` is DUAL-PURPOSE: it is also the Google identity Cora
+        impersonates via DWD for gmail_inbox, gmail_create_draft (the SENDER) and
+        calendar_schedule_meeting. The live roster read proved his ASANA identity
+        and says nothing about mailbox ownership, and he has no
+        monitored-email-accounts row to corroborate it -- so asserting the address
+        would authorize Cora to read that mailbox and compose AS it, for a LEX PHI
+        custodian, on the strength of an Asana lookup (D-051). The GID is what
+        Asana needs; consumers wanting a Google identity now correctly report
+        "no mapping".
+        """
+        row = self._row()
+        assert "asana_email" not in row
+        # And the stale address must not creep back in either.
+        assert "programdirector" not in str(row)
+
+    def test_the_stale_alias_is_gone_from_the_asana_row(self):
+        raw = (_REPO_ROOT / "data" / "maps" / "slack-to-asana.yaml").read_text(
+            encoding="utf-8")
+        block = raw[raw.index("U0B3PS32A22"):]
+        block = block[:block.index("display_name")]
+        assert "programdirector" not in block
 
     def test_aaron_still_in_registry_and_still_custodian(self):
         """The mapping fix must not disturb his PHI-custodian standing."""

@@ -14,7 +14,7 @@
 #   2. row 1 of the existing 2026-05 .xlsx for that slug, which is the company
 #      name QBO itself stamped on Justin's manual export.
 # Both agreed on all 11. That is why `company_name` is stored here: it is not
-# decoration, it is the pre-write assertion (see verify_company) that makes
+# decoration, it is the pre-write assertion (applied inline in build_month) that makes
 # filing a P&L under the wrong entity structurally impossible rather than
 # merely unlikely.
 #
@@ -42,9 +42,20 @@ realms:
   HJRP:
     slug: hjrp
     company_name: HJR Properties
+  # HRLLC is Harrison Rogers, LLC -- PERSONAL expense tracking, which is why
+  # finance_close.PACK_EXCLUDED_ENTITIES already keeps it out of the close pack.
+  # Justin's manual loop did export it, so the archive contains hjrllc files, but
+  # this job will not reproduce that automatically: the archive folder IS swept
+  # into the KB (justin@lexingtonservices.com, drive_sweep: true, entity_default
+  # LEX) and the existing hjrllc files are ALREADY ingested and mis-tagged as
+  # LEX / LEX-LLC -- so a #llc-* asker can retrieve Harrison's personal balance
+  # sheet. That exposure predates this job; writing 2 more files a month forever
+  # would industrialize it. Flip `enabled: true` only once the sweep excludes
+  # this folder (or the KB rows are purged) -- see the 2026-08-18 handoff.
   HRLLC:
     slug: hjrllc
     company_name: Harrison Rogers, LLC
+    enabled: false
   LEX:
     slug: llc
     company_name: Lexington LLC

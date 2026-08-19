@@ -46,6 +46,7 @@ import calendar
 import datetime
 import io
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -87,7 +88,13 @@ def load_slug_map(path: Path | None = None) -> dict[str, dict[str, str]]:
         slug = str(spec.get("slug") or "").strip()
         name = str(spec.get("company_name") or "").strip()
         if slug and name:
-            out[str(realm).strip().upper()] = {"slug": slug, "company_name": name}
+            out[str(realm).strip().upper()] = {
+                "slug": slug,
+                "company_name": name,
+                # Absent => enabled. Only HRLLC ships disabled (personal expense
+                # data into a KB-swept folder -- see the map's comment).
+                "enabled": bool(spec.get("enabled", True)),
+            }
     return out
 
 
@@ -142,14 +149,50 @@ def period_label(report_month: str) -> str:
     return f"{calendar.month_name[month]} {year}"
 
 
+_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
 def _split_month(report_month: str) -> tuple[int, int]:
-    parts = str(report_month).strip().split("-")
-    if len(parts) != 2:
-        raise ValueError(f"report month must be YYYY-MM, got {report_month!r}")
-    year, month = int(parts[0]), int(parts[1])
+    """Strict YYYY-MM. Deliberately rejects what a human backfill typo produces.
+
+    `--month` exists only for operator backfill, so a typo IS its main risk
+    surface, and a loose parse was silently destructive in three separate ways
+    (D-051): `2026-7` produced the filename `2026-7_llc_pl.xlsx`, which the
+    collision check could never match against the real `2026-07_llc_pl.xlsx`, so
+    the never-overwrite/parity machinery was bypassed and the archive gained a
+    second non-conforming copy of the month; `26-07` resolved to a filing folder
+    of `0026-08` and CREATED that directory on the shared Drive. Both are now
+    refused rather than normalized, because silently "fixing" a typo hides the
+    fact that the operator asked for the wrong month.
+    """
+    m = _MONTH_RE.match(str(report_month).strip())
+    if not m:
+        raise ValueError(
+            f"report month must be zero-padded YYYY-MM, got {report_month!r}")
+    year, month = int(m.group(1)), int(m.group(2))
     if not 1 <= month <= 12:
         raise ValueError(f"month out of range in {report_month!r}")
+    if not 2000 <= year <= 2100:
+        raise ValueError(f"year out of range in {report_month!r}")
     return year, month
+
+
+def assert_month_is_complete(report_month: str,
+                             today: datetime.date | None = None) -> None:
+    """Refuse a report month that has not finished.
+
+    QBO answers a future as-of date with TODAY's balances, so `--month 2027-07`
+    produced a Balance Sheet labelled "July 2027" holding August 2026 figures and
+    filed it under a fabricated `2027-08/`. A P&L for the same window is empty and
+    self-skips; the balance sheet is the one that lies confidently (D-051).
+    """
+    day = today or datetime.date.today()
+    _, end = month_bounds(report_month)
+    if datetime.date.fromisoformat(end) >= day.replace(day=1):
+        raise ValueError(
+            f"report month {report_month} is not a completed month as of "
+            f"{day.isoformat()} -- QBO answers a future as-of date with today's "
+            f"balances, which would file current figures under a future label")
 
 
 def filename(report_month: str, slug: str, kind: str) -> str:
@@ -217,6 +260,12 @@ def report_basis(report: dict[str, Any]) -> str | None:
     return (report.get("Header") or {}).get("ReportBasis")
 
 
+def report_period(report: dict[str, Any]) -> tuple[str | None, str | None]:
+    """(StartPeriod, EndPeriod) as QBO echoed them."""
+    header = report.get("Header") or {}
+    return (header.get("StartPeriod"), header.get("EndPeriod"))
+
+
 def report_has_no_data(report: dict[str, Any]) -> bool:
     """QBO signals an empty report via a header Option rather than empty Rows."""
     for opt in (report.get("Header") or {}).get("Option") or []:
@@ -249,7 +298,13 @@ def render_xlsx(
     ws.append(["", ""])
     ws.append(["", "Total"])
     for label, value in report_rows(report):
-        ws.append([label, value])
+        # Numeric cells, matching the ~350 existing archive files (their B7 is a
+        # float, not text). A text amount produces a statement that looks right
+        # and is arithmetically inert -- it cannot SUM or feed a workbook link
+        # (D-051). This is a CELL TYPE, not a transformation: the value is QBO's
+        # own, and anything that does not parse cleanly is written unchanged.
+        num = _as_number(value)
+        ws.append([label, value if num is None else num])
     # QBO's own UI export stamps a basis + generated-at footer, and it turned out
     # to matter: the archive's 2026-05 files were exported on 2026-05-22 -- MID
     # MONTH, before May closed -- so their figures are a snapshot of an open
@@ -263,11 +318,22 @@ def render_xlsx(
     return buf.getvalue()
 
 
-def footer_stamp(report: dict[str, Any]) -> str:
-    """`Accrual Basis | pulled by Cora 2026-08-18 17:42 -0700` -- provenance."""
+def footer_stamp(report: dict[str, Any],
+                 now: datetime.datetime | None = None) -> str:
+    """Provenance footer: basis, QBO's own report clock, and Cora's pull time.
+
+    These are two different clocks and the footer used to print QBO's and label
+    it Cora's (D-051). Since this stamp is the artifact that lets a reader tell a
+    pre-close snapshot from a post-close statement, mislabelling its timestamp
+    defeats its only purpose. `pulled by Cora` is also the marker
+    :func:`is_cora_written` keys on, which is what makes a re-run idempotent --
+    do not reword it without updating that constant.
+    """
     basis = report_basis(report) or "Unspecified"
-    when = (report.get("Header") or {}).get("Time") or ""
-    return f"{basis} Basis | pulled by Cora {when}".strip()
+    qbo_time = (report.get("Header") or {}).get("Time") or "unknown"
+    stamp = (now or datetime.datetime.now()).strftime("%Y-%m-%d %H:%M")
+    return (f"{basis} Basis | QBO report time {qbo_time} | "
+            f"{_CORA_STAMP} {stamp}")
 
 
 # The REST report and the UI export disagree on wording for the same line: the
@@ -279,6 +345,51 @@ def _normalize_label(label: str) -> str:
 
 
 PARITY_KEYS = {KIND_PL: "total income", KIND_BS: "total assets"}
+
+
+_CORA_STAMP = "pulled by Cora"
+
+
+def is_cora_written(data: bytes) -> bool:
+    """True when this .xlsx carries Cora's footer stamp.
+
+    The only way to tell a Cora-written file from a manual export, and therefore
+    the thing that makes a re-run idempotent rather than duplicating.
+    """
+    from openpyxl import load_workbook
+    try:
+        ws = load_workbook(io.BytesIO(data), data_only=True, read_only=True).active
+        for row in ws.iter_rows(values_only=True):
+            if row and row[0] and _CORA_STAMP in str(row[0]):
+                return True
+    except Exception as exc:  # noqa: BLE001 -- unreadable => treat as not ours
+        log.info("qbo_monthly_reports: stamp read failed: %s", exc)
+    return False
+
+
+def _as_number(raw: object) -> float | None:
+    text = str(raw if raw is not None else "").strip().replace(",", "")
+    text = text.replace("$", "")
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _values_agree(a: object, b: object) -> bool | None:
+    """None = could not compare. Numeric when both parse, else exact string.
+
+    Tolerance is a hundredth of a cent: QBO stores totals like
+    92339.00000000001, so an exact float compare is as wrong as a string one.
+    """
+    if a is None or b is None:
+        return None
+    na, nb = _as_number(a), _as_number(b)
+    if na is not None and nb is not None:
+        return abs(na - nb) < 0.0001
+    return str(a).strip() == str(b).strip()
 
 
 def read_top_value(data: bytes, label_contains: str) -> str | None:
@@ -377,6 +488,10 @@ def build_month(
         exists = exists or (lambda p: bool(drive_io.exists(p)))
         reader = reader or (lambda p: drive_io.read_bytes(p))
 
+    # NOTE for future consumers: this dict DOES carry financial values under
+    # `parity` (manual_value/cora_value). The figure-free guarantee lives in
+    # format_summary, NOT in the data -- anything that logs or JSON-dumps the
+    # summary directly will leak them (HRLLC is personal-expense data).
     summary: dict[str, Any] = {
         "report_month": report_month,
         "filing_folder": filing_folder_for(report_month),
@@ -400,6 +515,12 @@ def build_month(
             summary["skipped"].append(
                 {"entity": entity, "reason": "no slug mapping -- add it to "
                                              "qbo-monthly-report-slugs.yaml"})
+            continue
+        if not spec.get("enabled", True):
+            summary["skipped"].append(
+                {"entity": entity,
+                 "reason": f"disabled in the slug map ({spec['slug']}) -- "
+                           f"personal/sensitive books are opt-in"})
             continue
 
         # Identity assertion BEFORE any fetch or write.
@@ -445,6 +566,21 @@ def build_month(
                                f"got {basis}"})
                 continue
 
+            # The same doctrine applied to the PERIOD, which is what the filename
+            # and the row-3 label assert. A silently defaulted or shifted date
+            # param yields a correctly-named file holding another period's
+            # figures, with nothing to refuse it (D-051).
+            want_start = start if kind == KIND_PL else None
+            got_start, got_end = report_period(report)
+            if (want_start and got_start and got_start != want_start) or \
+                    (got_end and got_end != end):
+                summary["skipped"].append(
+                    {"entity": entity, "kind": kind,
+                     "reason": f"period mismatch -- asked "
+                               f"{want_start or end}..{end}, got "
+                               f"{got_start or '?'}..{got_end or '?'}"})
+                continue
+
             data = render_xlsx(
                 report,
                 company_name=spec["company_name"],
@@ -454,7 +590,6 @@ def build_month(
 
             want = filename(report_month, spec["slug"], kind)
             path = outdir / want
-            collided = False
             try:
                 collided = bool(exists(path))
             except Exception as exc:  # noqa: BLE001 -- unknown => assume present
@@ -464,22 +599,59 @@ def build_month(
                 continue
 
             if collided:
-                path = outdir / cora_variant_name(want)
+                # WHOSE file is it? A previous Cora run leaves its own stamp in
+                # the footer. Without this test a re-run (realm 7 of 11 hit a QBO
+                # 5xx, operator re-runs the month) read its OWN earlier output as
+                # "the manual upload", wrote a -cora duplicate beside it, and on a
+                # third run silently overwrote that -- unbounded duplication of
+                # statements of record from the one guarantee this job makes.
+                existing_bytes = None
+                try:
+                    existing_bytes = reader(path)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("qbo_monthly_reports: could not read %s: %s",
+                             path.name, exc)
+
+                if existing_bytes is not None and is_cora_written(existing_bytes):
+                    summary["skipped"].append(
+                        {"entity": entity, "kind": kind,
+                         "reason": f"{want} was already written by Cora -- "
+                                   f"re-run is a no-op (delete it to regenerate)"})
+                    continue
+
+                variant = outdir / cora_variant_name(want)
+                try:
+                    if bool(exists(variant)):
+                        summary["skipped"].append(
+                            {"entity": entity, "kind": kind,
+                             "reason": f"{want} exists (manual) and "
+                                       f"{variant.name} is already there -- "
+                                       f"refusing to overwrite either"})
+                        continue
+                except Exception as exc:  # noqa: BLE001 -- unknown => refuse
+                    summary["skipped"].append(
+                        {"entity": entity, "kind": kind,
+                         "reason": f"could not test for {variant.name}: {exc}"})
+                    continue
+
+                path = variant
                 note = {"entity": entity, "kind": kind, "manual_file": want,
                         "cora_file": path.name}
                 try:
-                    existing = reader(outdir / want)
                     key = PARITY_KEYS[kind]
-                    note["manual_value"] = read_top_value(existing, key)
-                    note["cora_value"] = read_top_value(data, key)
                     note["key"] = key
-                    # None == "could not compare", which format_summary renders
-                    # differently from "compared and DIFFERS". Collapsing the two
-                    # would report an unreadable manual file as a real mismatch.
-                    if note["manual_value"] is None or note["cora_value"] is None:
-                        note["match"] = None
-                    else:
-                        note["match"] = note["manual_value"] == note["cora_value"]
+                    note["manual_value"] = (
+                        read_top_value(existing_bytes, key)
+                        if existing_bytes is not None else None)
+                    note["cora_value"] = read_top_value(data, key)
+                    # Compare NUMERICALLY. The archive stores 2000.0 and this
+                    # renders "2000.00"; a string compare called every single
+                    # collision a DIFFERS and sent a human hunting a discrepancy
+                    # that did not exist (D-051). None still means "could not
+                    # compare", which reads differently from "compared and
+                    # differs" -- collapsing those two was the earlier bug here.
+                    note["match"] = _values_agree(note["manual_value"],
+                                                  note["cora_value"])
                 except Exception as exc:  # noqa: BLE001
                     note["compare_error"] = str(exc)
                 summary["parity"].append(note)

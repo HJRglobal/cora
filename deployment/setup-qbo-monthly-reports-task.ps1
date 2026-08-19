@@ -12,7 +12,15 @@
 # It also lands before the standing 13WCF / month-close meeting cadence.
 #
 # ASCII-only (D-016). Absolute .venv python, never uv (D-005).
-# Run from an ELEVATED PowerShell.
+# Run from PowerShell (elevated only if schtasks /Create reports access denied).
+#
+# schtasks /Create ONLY. The first version chased it with a Set-ScheduledTask
+# -Action call citing 'the log-compaction pattern' -- a D-051 review found that
+# precedent does not exist anywhere in deployment/ (setup-compaction-task.ps1,
+# the actual monthly task, uses schtasks alone), and whether Set-ScheduledTask
+# preserves a schtasks-created monthly day-2 trigger was never verified.
+# Dropped rather than shipped on an untested assumption: one command now owns
+# both the trigger and the action.
 
 $ErrorActionPreference = "Stop"
 
@@ -26,23 +34,14 @@ if (-not (Test-Path $Script)) { throw "script not found: $Script" }
 
 # --apply is REQUIRED for the task to write anything: the script is dry-run by
 # default, so a mis-registered task reports instead of writing.
-$Action = New-ScheduledTaskAction -Execute $Python `
-    -Argument "$Script --apply" -WorkingDirectory $RepoRoot
+$tr = "`"$Python`" `"$Script`" --apply"
 
-# New-ScheduledTaskTrigger has no monthly trigger, so schtasks creates it and
-# Set-ScheduledTask then attaches the action/settings (the log-compaction pattern).
-schtasks /Create /TN "$TaskName" /SC MONTHLY /D 2 /ST 07:15 `
-    /TR "`"$Python`" `"$Script`" --apply" /RL LIMITED /F
-
-$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
-    -MultipleInstances IgnoreNew
-Set-ScheduledTask -TaskName "$TaskName" -Action $Action -Settings $Settings
+schtasks /Create /TN $TaskName /TR $tr /SC MONTHLY /D 2 /ST 07:15 /F
 
 Write-Host ""
 Write-Host "Registered: $TaskName (monthly, day 2, 07:15 AZ)"
 Write-Host ""
-Write-Host "Verify:"
+Write-Host "Verify (Next Run must NOT read N/A -- that would mean no trigger):"
 Write-Host "  schtasks /query /tn `"$TaskName`" /v /fo LIST | Select-String 'Task To Run','Next Run'"
 Write-Host ""
 Write-Host "Dry-run by hand first (writes nothing):"

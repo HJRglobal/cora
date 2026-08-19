@@ -83,15 +83,28 @@ def main(argv: list[str] | None = None) -> int:
         sources = qmr.Sources(
             provisioned=lambda: [e for e in all_provisioned() if e.upper() in wanted])
 
+    try:
+        if args.apply:
+            # Only guard the real thing: a dry run of a future month is a
+            # legitimate "what would happen" question.
+            qmr.assert_month_is_complete(report_month)
+    except Exception as exc:  # noqa: BLE001
+        log.error("%s", exc)
+        return 2
+
     summary = qmr.build_month(report_month, sources=sources, apply=args.apply)
     print(qmr.format_summary(summary))
 
     if summary.get("error"):
         return 1
-    # A run that wrote nothing at all is a problem worth a non-zero exit so the
-    # nightly health check can see it; a run with SOME output is a success with
-    # reported gaps (a single dead realm must not fail the whole month).
-    return 0 if summary.get("written") else 1
+    # Exit 0 for anything that is not a hard error. Two D-051 findings shaped
+    # this: `written` is populated in dry-run too (so it could never have
+    # distinguished the modes), and a MONTHLY task is exactly the wrong place for
+    # a soft non-zero -- "Cora - QBO Monthly Reports" is not in
+    # nightly_health_check._LASTRESULT_SIGNAL_OK, so one LastTaskResult=1 would
+    # re-warn every night for ~30 nights. A month where every realm legitimately
+    # has no data is reported in the summary, not signalled as a task failure.
+    return 0
 
 
 if __name__ == "__main__":

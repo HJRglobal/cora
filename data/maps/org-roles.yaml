@@ -339,7 +339,18 @@ users:
   # locked 2026-08-08, section 7), so she now carries a slack_id and DOES get
   # role-block injection. F3E is additive for the email-marketing-review lane;
   # OSN + HJRP stay because the same spec keeps her osn-scheduling and
-  # lease-renewals lanes.
+  # lease-renewals lanes. Klaviyo seat confirmed 2026-08-18.
+  #
+  # KEEP `notes` FREE OF PERSONNEL DETAIL. It is injected into the LLM context on
+  # every reply AND a reply built on it is storable in the ENTITY-keyed semantic
+  # cache (app.py cache_storable excludes retrieval_grant / unstripped_personal /
+  # phi_custodian / pending_note -- there is no role-block exclusion). The first
+  # version of this entry put "team announcement POSTPONED until her daily rhythm
+  # is defined" and "capacity re-eval week of 2026-08-24" in `notes`: unannounced
+  # HR content, injected for Tessa herself to read and cacheable for the next
+  # asker in HJRG/F3E/OSN/HJRP. Both facts live here instead --
+  #   * team announcement POSTPONED pending her daily rhythm (Harrison, 8/18)
+  #   * capacity re-eval week of 2026-08-24
   - slack_id: U0B3KH5UZJ7
     name: Tessa Miller
     role: Operations Coordinator (part-time)
@@ -353,12 +364,8 @@ users:
       - Manager of progress points -- chases position-remodel blockers
     manager: U0B2RM2JYJ1
     notes: >-
-      Part-time remote ~10 hrs/wk. Promoted from registry-only to active
-      2026-08-18 per Operations Department OS v1 section 7 (role: EA ->
-      operations/administration). Slack re-added 2026-08 (was revoked
-      2026-05-22); Klaviyo seat confirmed. Capacity re-eval week of 2026-08-24.
-      Ops lane coordinates under Hannah; manager of record stays Harrison.
-      Team announcement POSTPONED until her daily rhythm is defined.
+      Part-time remote ~10 hrs/wk. Ops lane coordinates under Hannah; manager of
+      record stays Harrison.
 
   - slack_id: U0B6LQNSR25
     name: Jason Dorfman

@@ -141,9 +141,20 @@ users:
   # why the GID stayed invisible and the training audits kept reporting him
   # "invite pending since June". That was a Cora identity-mapping gap, never a
   # blocked invite. GID + alias read live from the LLC team roster 2026-08-18.
+  #
+  # NO `asana_email` ON PURPOSE. This field is dual-purpose: besides Asana, it is
+  # the Google identity Cora impersonates via DWD for gmail_inbox,
+  # gmail_create_draft (the SENDER) and calendar_schedule_meeting. The live read
+  # proves his ASANA identity; it says nothing about mailbox ownership, and Aaron
+  # has no row in monitored-email-accounts.yaml to corroborate it. Asserting the
+  # address here would authorize Cora to read that mailbox and compose drafts AS
+  # it, on behalf of a LEX PHI custodian, on the strength of an Asana roster
+  # lookup. The GID is what Asana actually needs; consumers that want a Google
+  # identity now correctly report "no mapping" instead of impersonating an
+  # unverified mailbox. Add `asana_email: aaron@hjrglobal.com` only once mailbox
+  # ownership is confirmed (a monitored-email-accounts row is the natural proof).
   - slack_user_id: U0B3PS32A22
     asana_user_gid: 1215737571728920
-    asana_email: aaron@hjrglobal.com
     display_name: Aaron Ferrucci
 
   # Sara Fonseca -- LLC marketing freelancer. No Asana/Google mapping yet.

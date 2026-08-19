@@ -74,7 +74,23 @@ _CODE_TO_LABEL: dict[str, str] = {
     "osn-gw": "OSN",
     "osn-vv": "OSN",
     "osn-vvp": "OSN",
+    # `osn-core4` is the parent-company slug used by the accounting archive
+    # (CORE 4 OSN LLC). It was absent here, so 2026-05_osn-core4_pl.xlsx ingested
+    # as entity=LEX -- Haiku guessing, because justin@lexingtonservices.com sweeps
+    # that folder with entity_default LEX. The QBO monthly-report populator emits
+    # this slug every month, so without this row it would industrialize that
+    # misclassification (D-051).
+    "osn-core4": "OSN",
 }
+
+# Archive slugs deliberately NOT mapped, so a filename alone can never place them:
+#   hjrllc  -- "Harrison Rogers, LLC" is PERSONAL expense data (it is in
+#              finance_close.PACK_EXCLUDED_ENTITIES for that reason) and there is
+#              no KB entity that means "personal". Mapping it to FNDR would be
+#              worse than leaving it: FNDR chunks co-scan into every non-LEX
+#              retrieval. It needs a sweep EXCLUSION, not an entity -- see the
+#              escalation in the 2026-08-18 remodel-fixes handoff.
+#   lexcorp -- "LexCorp, LLC"; which KB entity (if any) it belongs to is unsettled.
 
 # Tokens we never treat as an entity code even if they collide (kept explicit so
 # the map above stays the single source of truth; reserved for future guards).
