@@ -113,6 +113,12 @@ _LBHS_PRIVATE_RE = re.compile(
 )
 
 
+def _is_lex_scope(entity: str) -> bool:
+    """LEX GM-level or any LEX sub-entity."""
+    e = (entity or "").strip().upper()
+    return e == "LEX" or e.startswith("LEX-")
+
+
 def check_redirect(entity: str, message: str) -> str | None:
     """Return a one-sentence redirect if message asks about a sibling entity.
 
@@ -132,10 +138,30 @@ def check_redirect(entity: str, message: str) -> str | None:
     # UnitedHealthcare" inside an inventory-shaped message bypassed it entirely
     # (D-051 HIGH, 2026-08-17). An F3E inventory write never legitimately names
     # COPA/BHRF/UHC, so there is no false-positive cost to checking raw.
-    if entity == "LEX-LBHS" and _LBHS_PRIVATE_RE.search(message):
+    #
+    # SCOPE + ORDERING (cq-12bd309c93a8, live 2026-08-19 13:14:38). The block was
+    # gated on entity == "LEX-LBHS", so in #llc-leadership (entity LEX-LLC) an ask
+    # naming the LBHS COPA transcripts skipped it entirely and fell through to the
+    # LBHS sibling redirect below: "That's Lexington Behavioral Health Services
+    # information -- ask in an #lbhs-* channel." Those transcripts were PURGED on
+    # 2026-07-21 and carry a permanent title-level ingest exclusion
+    # (kb_exclusions.is_copa_meeting_title), so that sentence pointed a person at a
+    # channel where the material does not exist and never will. The block now
+    # covers the whole LEX family, GM level included, and because it is the FIRST
+    # statement in this function it wins the ordering against every sibling
+    # redirect by construction.
+    #
+    # Deliberately NOT portfolio-wide. What this closes is a MISLEADING POINTER,
+    # not a leak -- the content is gone -- and the pointer is emitted by this
+    # function, which only ever runs for LEX scope. A non-LEX channel naming
+    # LBHS/COPA is redirected to LEX by cross_entity_guard and meets this block
+    # there, so the chain still terminates honestly, without turning
+    # "UnitedHealthcare" into a blocked word in eight unrelated entities.
+    if _is_lex_scope(entity) and _LBHS_PRIVATE_RE.search(message):
         return (
-            "That information is confidential to LBHS and cannot be discussed here. "
-            "Please contact LBHS leadership directly."
+            "That material is confidential to LBHS under NDA. I don't hold it in "
+            "any channel and can't discuss it anywhere -- please contact LBHS "
+            "leadership directly."
         )
 
     compiled_siblings = _COMPILED.get(entity)

@@ -583,7 +583,9 @@ _DEFLECTION_SAMPLES = [
     "channel for the team that owns it and I'll answer there.",
     "That topic is outside your access scope here.",
     "That's UFL — ask in an #ufl-* channel. I'm scoped to F3 Energy here.",
-    "That information is confidential to LBHS and cannot be discussed here.",
+    "That material is confidential to LBHS under NDA. I don't hold it in any "
+    "channel and can't discuss it anywhere -- please contact LBHS leadership "
+    "directly.",
     "This channel is for morning briefs only — ask me in the right channel.",
     "Company financials (P&L, cash, payroll) go in a finance channel or to Harrison.",
 ]

@@ -154,3 +154,70 @@ def test_redirect_does_not_expose_sibling_data():
     assert result is not None
     assert "$" not in result
     assert "%" not in result
+
+
+# -- NDA hard block: scope + ordering (cq-12bd309c93a8) ----------------------
+#
+# Live 2026-08-19 13:14:38, #llc-leadership (entity LEX-LLC): an ask naming the
+# LBHS COPA transcripts got "ask in an #lbhs-* channel" -- a pointer at material
+# purged 2026-07-21 with a permanent title-level ingest exclusion. The block was
+# gated on LEX-LBHS, so it never ran in the sibling channels at all.
+
+_NDA_ASK = "what do the LBHS COPA diligence transcripts say?"
+_LEX_SCOPES = ["LEX", "LEX-LLC", "LEX-LTS", "LEX-LBHS", "LEX-LLA"]
+
+
+@pytest.mark.parametrize("entity", _LEX_SCOPES)
+def test_nda_block_fires_across_the_whole_lex_family(entity):
+    result = check_redirect(entity, _NDA_ASK)
+    assert result is not None
+    assert "confidential to LBHS" in result
+
+
+@pytest.mark.parametrize("entity", _LEX_SCOPES)
+def test_nda_block_never_points_at_another_channel(entity):
+    """The defect was the POINTER, not the refusal: material that exists
+    nowhere must not be described as living somewhere else."""
+    result = check_redirect(entity, _NDA_ASK)
+    assert "#lbhs" not in result
+    assert "-*" not in result
+    assert "any channel" in result
+
+
+@pytest.mark.parametrize("entity", _LEX_SCOPES)
+def test_nda_block_beats_the_sibling_redirect_on_ordering(entity):
+    """Both guards match this message. The hard block has to win, in every LEX
+    scope, whichever sibling the wording happens to name."""
+    for ask in (_NDA_ASK,
+                "pull the Lexington Behavioral COPA file",
+                "any BHRF numbers from the LTS side?",
+                "what did UnitedHealthcare say about LLA?"):
+        result = check_redirect(entity, ask)
+        assert result is not None
+        assert "confidential to LBHS" in result, (entity, ask)
+
+
+@pytest.mark.parametrize("entity", ["F3E", "OSN", "FNDR", "HJRG", "UFL", ""])
+def test_nda_block_is_not_portfolio_wide(entity):
+    """Deliberately LEX-scoped: this function only runs for LEX scope, the
+    content is purged (so there is nothing to leak), and blocking
+    "UnitedHealthcare" as a word across eight entities would be an unrelated
+    cost. Non-LEX channels reach LEX via cross_entity_guard and meet the block
+    there."""
+    assert check_redirect(entity, _NDA_ASK) is None
+
+
+def test_an_ordinary_sibling_ask_still_gets_its_pointer():
+    """The block must not swallow the redirect it now outranks."""
+    result = check_redirect("LEX-LLC", "how did LBHS do this quarter?")
+    assert result is not None
+    assert "#lbhs-*" in result
+    assert "confidential" not in result.lower()
+
+
+def test_the_nda_refusal_still_counts_as_a_deflection():
+    """The refusal's wording changed, and gap_detection vetoes gap logging by
+    matching refusal PHRASES. An unmatched refusal would file NDA'd content as
+    a knowledge gap the gap lane can escalate to a domain owner."""
+    from cora import gap_detection
+    assert gap_detection.is_deflection(check_redirect("LEX-LLC", _NDA_ASK)) is True

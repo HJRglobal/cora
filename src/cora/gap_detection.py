@@ -328,6 +328,15 @@ _DEFLECTION_REASON_RES = [
         r"outside your access scope",
         r"i'?m scoped to [^.\n]{1,80} here",
         r"cannot be discussed here",
+        # cq-12bd309c93a8 reworded the LBHS NDA hard block: it used to end
+        # "cannot be discussed here", which the line above vetoed, and now says
+        # it is not held in ANY channel -- because "here" implied the purged
+        # COPA material was available somewhere else. Without this line that
+        # rewording would have quietly turned a working guard into a logged
+        # knowledge gap on NDA'd content, which the gap lane can escalate to a
+        # domain owner. The refusal is the only text in the system that carries
+        # this phrase.
+        r"confidential to lbhs",
         r"can'?t discuss company financials here",
         r"this channel is for morning briefs only",
         r"go(es)? in a finance channel",
