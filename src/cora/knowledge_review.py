@@ -522,35 +522,51 @@ def get_pending_updates() -> list[dict[str, Any]]:
 def correlate_reactions_to_updates() -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Match reply-log reactions to proposed-update entries by DM message_ts.
 
-    Returns list of (update_entry, reaction_entry) pairs for entries where
-    Harrison has reacted and the update is still PENDING.
+    Returns list of (update_entry, reaction_entry) pairs for entries that are
+    still PENDING and carry an actionable reaction from someone AUTHORIZED to
+    act on that particular item.
     Only includes APPROVED or DISMISSED reactions (not OTHER/COMMENT_REQUESTED
     for now — those require follow-up handling).
+
+    Authorization moved from the reactor to the (reactor, item) pair when the
+    mechanical review surface was split out (cq-6b014816819c). The old filter
+    was `reactor_id != HARRISON` at the top of the loop, which is the same
+    answer for a Harrison-only roster and the ONLY thing that has to change for
+    a delegated mechanical approver to be able to act. It is deliberately NOT a
+    widening: review_lanes.can_approve returns True for a non-Harrison actor
+    only on a non-LEX MECHANICAL row, so a name added to the approver file
+    cannot reach a judgment or decision card through this path.
     """
+    from . import review_lanes
+
     updates = load_proposed_updates()
     reactions = load_reply_log()
 
-    # Build a map: dm_message_ts -> first actionable Harrison reaction
-    ts_to_reaction: dict[str, dict[str, Any]] = {}
+    # dm_message_ts -> the actionable reactions on it, in arrival order. Several
+    # people can react to the same card, so the actor can no longer be collapsed
+    # away before the item is known -- the FIRST AUTHORIZED one wins, which for a
+    # Harrison-only roster is byte-identical to the previous first-Harrison rule.
+    ts_to_reactions: dict[str, list[dict[str, Any]]] = {}
     for r in reactions:
-        if r.get("reactor_id") != HARRISON_SLACK_USER_ID:
-            continue
         if r.get("event_type") != "reaction_added":
             continue
-        action = r.get("action", "OTHER")
-        if action not in ("APPROVED", "DISMISSED"):
+        if r.get("action", "OTHER") not in ("APPROVED", "DISMISSED"):
             continue
         msg_ts = r.get("message_ts", "")
-        if msg_ts and msg_ts not in ts_to_reaction:
-            ts_to_reaction[msg_ts] = r
+        if msg_ts:
+            ts_to_reactions.setdefault(msg_ts, []).append(r)
 
     pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for update in updates:
         if update.get("state") != "PENDING":
             continue
         dm_ts = update.get("dm_message_ts", "")
-        if dm_ts and dm_ts in ts_to_reaction:
-            pairs.append((update, ts_to_reaction[dm_ts]))
+        if not dm_ts:
+            continue
+        for r in ts_to_reactions.get(dm_ts, []):
+            if review_lanes.can_approve(update, r.get("reactor_id", "")):
+                pairs.append((update, r))
+                break
 
     return pairs
 
@@ -655,6 +671,44 @@ def build_single_item_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str
         },
     ]
     return text, blocks
+
+
+def format_mechanical_dm(update: dict[str, Any]) -> str:
+    """One mechanical review card (cq-6b014816819c).
+
+    Deliberately terse: this lane is bookkeeping, and its whole problem was that
+    179 items of it made a 296-item queue unreadable. It carries the entity so
+    an approver who is not the founder can tell whose task they are closing.
+    """
+    utype = update.get("update_type", "generic")
+    payload = update.get("payload") or {}
+    desc = update.get("description", "(no description)")
+    entity = str(payload.get("entity") or "").strip().upper() or "?"
+    label = _TYPE_LABEL.get(utype, utype)
+    lines = [f"*[{label}]* `{entity}`\n{desc}"]
+    link = payload.get("task_url") or payload.get("deal_url") or ""
+    name = payload.get("task_name") or payload.get("deal_name") or ""
+    if link:
+        lines.append(f"<{link}|{name or 'open in the tool'}>")
+    elif name:
+        lines.append(name)
+    lines.append(":+1: do it · :-1: dismiss  (I carry it out on the next review run)")
+    return "\n".join(lines)
+
+
+def build_mechanical_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """(fallback_text, blocks) for a mechanical review card -- NO BUTTONS.
+
+    The one-tap button handler applies through apply_knowledge_update, which has
+    no branch for asana_task / task_close / hubspot_note; a button here would
+    either report a save nothing performed or need a second implementation of
+    the executor that already exists in run_knowledge_review. The emoji path is
+    the one that really executes these three types today, so the card offers
+    exactly that and says when it will happen. Wiring buttons means lifting that
+    executor into this module -- a follow-up, not a footnote on this one.
+    """
+    text = format_mechanical_dm(update)
+    return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
 
 
 def format_decision_dm(update: dict[str, Any]) -> str:
@@ -791,13 +845,21 @@ def send_individual_dms(
     slack_bot_token: str,
     _client_factory=None,
     block_builder=None,
+    recipient_id: str | None = None,
 ) -> dict[str, str]:
     """Send one DM per pending update. Returns {update_id: message_ts}.
 
     Skips updates that already have dm_message_ts set (already delivered).
     Adds a 0.5s delay between messages to stay within Slack rate limits.
     block_builder defaults to build_single_item_blocks (knowledge cards); the
-    decisions lane passes build_decision_blocks.
+    decisions lane passes build_decision_blocks and the mechanical review
+    surface passes build_mechanical_blocks.
+
+    recipient_id defaults to Harrison, which is every pre-existing caller's
+    behaviour. The mechanical surface (cq-6b014816819c) is the first lane whose
+    recipient is not necessarily him, and it goes through THIS function rather
+    than a parallel sender so the rate-limit pacing, the skip-if-already-sent
+    rule and the failed-send-leaves-it-PENDING contract stay in one place.
     """
     import time as _time
 
@@ -810,9 +872,10 @@ def send_individual_dms(
         log.error("knowledge_review: SLACK_BOT_TOKEN not set")
         return {}
 
+    target = str(recipient_id or HARRISON_SLACK_USER_ID).strip() or HARRISON_SLACK_USER_ID
     try:
         client = _client_factory() if _client_factory else _build_slack_client(slack_bot_token)
-        open_resp = client.conversations_open(users=[HARRISON_SLACK_USER_ID])
+        open_resp = client.conversations_open(users=[target])
         dm_channel = open_resp["channel"]["id"]
     except Exception as exc:
         log.error("knowledge_review: could not open DM channel: %s", exc)
@@ -911,7 +974,13 @@ def process_one_tap_action(
 
     Returns (outcome, user_message) where outcome is one of:
       not_authorized | not_found | already_resolved | approved | apply_failed |
-      dismissed. Harrison-only (D-011).
+      dismissed.
+
+    Authorization is per ITEM (review_lanes.can_approve), not per reactor. For
+    every card this handler renders today that resolves to Harrison-only, which
+    is what D-011 requires: the judgment and decision lanes are Harrison-only in
+    code and no configuration can express otherwise. The mechanical lane is
+    delegable but is refused here outright -- see the guard below.
 
     Concurrency: the whole load->state-check->apply->resolve critical section
     runs under _ONE_TAP_LOCK so two concurrent taps (Socket Mode dispatches on a
@@ -923,14 +992,41 @@ def process_one_tap_action(
     by each applier's own dedup (known_answer resolved-ledger, contributed_note
     line, efficiency same-day-title).
     """
-    if actor_id != HARRISON_SLACK_USER_ID:
-        log.warning("knowledge_review: one-tap action by non-Harrison %s ignored", actor_id)
+    from . import review_lanes
+
+    # Cheap pre-check BEFORE the lookup so a stranger's tap still cannot tell a
+    # real update_id from a made-up one. Per-item authorization follows inside
+    # the lock; this only keeps the not_found/not_authorized split from becoming
+    # an existence oracle for someone with no review role at all.
+    if not review_lanes.is_review_approver(actor_id):
+        log.warning("knowledge_review: one-tap action by non-approver %s ignored", actor_id)
         return "not_authorized", "Only Harrison can approve knowledge items."
 
     with _ONE_TAP_LOCK:
         update = _find_update(update_id)
         if update is None:
             return "not_found", "I can't find that item anymore (it may have expired)."
+        # Authorization AFTER the lookup, because it is now per ITEM: the lane
+        # decides who may act. For every card this handler actually renders
+        # today (the judgment lane) the answer is Harrison and nobody else, so
+        # this is the same gate it has always been.
+        if not review_lanes.can_approve(update, actor_id):
+            log.warning("knowledge_review: one-tap action by unauthorized %s ignored "
+                        "(lane=%s)", actor_id,
+                        review_lanes.lane_for(update.get("update_type"),
+                                              update.get("payload")))
+            return "not_authorized", "Only Harrison can approve knowledge items."
+        # A MECHANICAL row must never reach apply_knowledge_update: that applier
+        # has no branch for asana_task/task_close/hubspot_note, so it would
+        # report a save that no writer performed. The mechanical surface is
+        # emoji-correlated and executes through run_knowledge_review's
+        # _execute_approved_update, which does have those branches. Nothing
+        # renders a button on a mechanical card, so reaching here means a stale
+        # or forged tap -- answer honestly rather than fabricating an outcome.
+        if review_lanes.is_mechanical(update):
+            return ("not_authorized",
+                    "That one is handled on the mechanical review surface -- "
+                    "react to its card with :+1: or :-1: instead.")
         if update.get("state") != "PENDING":
             return ("already_resolved",
                     f"Already handled ({str(update.get('state', '')).lower() or 'resolved'}).")

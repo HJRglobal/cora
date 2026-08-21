@@ -38,6 +38,7 @@ from cora.knowledge_review import (  # noqa: E402
     apply_autowrite,
     autowrite_level,
     build_decision_blocks,
+    build_mechanical_blocks,
     correlate_reactions_to_updates,
     get_pending_updates,
     is_knowledge_update,
@@ -49,6 +50,7 @@ from cora.knowledge_review import (  # noqa: E402
     UPDATE_TYPE_DECISION as _kr_UPDATE_TYPE_DECISION,
     UPDATE_TYPE_GENERIC,
 )
+from cora import review_lanes  # noqa: E402  (mechanical/judgment lane split)
 from cora.coras_read import build_coras_read_struct  # noqa: E402  (WS17-C enrichment)
 from cora import graduated_trust_shadow as gts  # noqa: E402  (graduated-trust SHADOW)
 from cora.tools.user_identity import resolve_slack_mentions  # noqa: E402  (Slice 3)
@@ -120,6 +122,34 @@ _MAX_KNOWLEDGE_DMS_PER_RUN = 10   # Harrison's daily knowledge queue
 _MAX_DECISION_DMS_PER_RUN = 5     # Harrison's decision cards (never expire; pool drains over runs)
 _MAX_OWNER_DMS_PER_RUN = 10       # total operational items routed to owners per run
 _MAX_OWNER_DMS_PER_OWNER = 5      # per-owner cap so no single owner is flooded
+
+# ── Mechanical review surface (cq-6b014816819c, the 2026-08-19 approval recon) ─
+# The recon measured 296 knowledge-queue proposals over 30 days producing 13
+# human decisions, of which exactly ONE was a denial: 76 aged out undecided and
+# 183 were still open. 179 of the 296 were task_close / asana_task /
+# hubspot_note, and they are why nobody reads the queue. They get their own
+# surface so the ~85 judgment items are legible again.
+#
+# DEFAULT OFF. With the flag off this file behaves exactly as it does today --
+# mechanical items keep routing to owners as decision-support FYI. Turning it on
+# is HALF of a deliberate two-part flip; the other half is adding an approver to
+# data/maps/knowledge-approvers.yaml. Enabling the surface with only Harrison
+# listed simply sends the cards to him, which is a choice he can make; adding a
+# name without enabling the surface changes nothing at all. Neither half is done
+# here -- this session builds the surface, it grants nothing.
+_MAX_MECHANICAL_DMS_PER_RUN = 5
+
+# How long a mechanical item waits past its review deadline before it escalates
+# AGAIN. The first escalation is at expires_at; after that it re-escalates (and,
+# when the surface is on, re-cards) at most this often, so an undecided item
+# stays visible without becoming a daily nag.
+_MECHANICAL_ESCALATION_INTERVAL_DAYS = 7
+
+
+def _mechanical_review_enabled() -> bool:
+    """on | off (default). Same read-per-call, whitelist-validated, fail-closed
+    idiom as CORA_CONFIRM_BUTTONS / CORA_AUTOWRITE_LIVE."""
+    return (os.environ.get("CORA_MECHANICAL_REVIEW", "off") or "off").strip().lower() == "on"
 
 # Operational-routing floor: only operational items proposed at/after this stamp
 # are routed to owners. Initialized to "now" on the first routing run so the
@@ -473,6 +503,14 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
             # Fork 4: decision cards NEVER expire -- not even DM'd-unreacted.
             # The 63-expired-unseen failure is the exact reason this lane exists.
             continue
+        if review_lanes.is_mechanical(e):
+            # cq-6b014816819c: mechanical rows only acquire a dm_message_ts now
+            # that they have a review surface, and this pass would then dismiss
+            # them 48h later -- silently undoing the escalation
+            # _escalate_stale_mechanical exists to perform, and re-arming on the
+            # SEEN side exactly the age-out D-206 forbids on the unseen side.
+            # That pass is their sole timer, and it never resolves anything.
+            continue
         if e.get("state") == "PENDING" and e.get("dm_message_ts"):
             try:
                 if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
@@ -508,6 +546,15 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
             continue
         if e.get("update_type") == _kr_UPDATE_TYPE_DECISION:
             continue  # Fork 4: never TTL-expired, even legacy rows w/ expires_at
+        if review_lanes.is_mechanical(e):
+            # cq-6b014816819c / D-206. Every one of the 89 expired_unrouted
+            # dismissals on the live ledger was one of these three types --
+            # measured, not assumed. They now ESCALATE instead
+            # (_escalate_stale_mechanical): an item nobody decided is made
+            # louder, never quietly resolved as though a decision happened.
+            # What remains here is the bare non-info-for-cora `generic`, which
+            # has never produced an expired_unrouted row at all.
+            continue
         if e.get("update_type") not in _OPERATIONAL_TYPES:
             continue
         try:
@@ -529,6 +576,81 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
         except Exception:
             pass
     return n
+
+
+def _mechanical_past_deadline(entry: dict, now_dt) -> bool:
+    """Is this PENDING mechanical row past its review deadline?
+
+    The ONE deadline definition, shared by the escalation pass and by the
+    read-only dry-run report, so a preview can never disagree with what the
+    real run would do. Malformed timestamps read as NOT expired (fail-safe:
+    the row stays pending and un-escalated rather than being acted on).
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    if entry.get("state") != "PENDING" or not review_lanes.is_mechanical(entry):
+        return False
+    try:
+        exp = entry.get("expires_at")
+        if exp:
+            deadline = _dt.fromisoformat(exp)
+        else:
+            # Pre-TTL-at-creation rows carry no expires_at; use the same
+            # fallback window the expiry pass used for them.
+            deadline = (_dt.fromisoformat(entry["proposed_at"])
+                        + _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS))
+        return now_dt >= deadline
+    except Exception:
+        return False
+
+
+def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int]:
+    """Escalate PENDING mechanical rows past their review deadline, in place.
+
+    Returns (newly_escalated_this_run, total_pending_past_deadline).
+
+    D-206: escalation and expiry are different things. Until now these rows were
+    flipped to DISMISSED/expired_unrouted after 14 days with nobody having seen
+    them -- a silent age-out that reads, in every count downstream, exactly like
+    a decision. 89 of the live ledger's rows went that way. They now stay
+    PENDING and get louder:
+
+      * `escalated_at` / `escalation_count` are stamped on the row, so "nobody
+        decided this for three weeks" is a readable fact rather than an absence;
+      * `dm_message_ts` is CLEARED, which is the decision lane's own re-card
+        mechanism -- with the surface on, the item renders a fresh card at the
+        top of the next batch instead of sitting DM'd-and-forgotten;
+      * with the surface OFF, nothing can re-card, so main() logs the count and
+        says plainly that no surface is enabled. That is the honest half of
+        D-206: a control must either give its population a real path to a
+        decision or state precisely what it does and does not know.
+
+    The cost, stated rather than hidden: the PENDING pool is no longer bounded
+    by a timer. It is bounded by someone deciding -- which is the point -- and
+    the run's summary line is the standing measure of how well that is going.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    newly = 0
+    overdue = 0
+    for e in entries:
+        if not _mechanical_past_deadline(e, now_dt):
+            continue
+        overdue += 1
+        try:
+            last = e.get("escalated_at")
+            if last:
+                since = now_dt - _dt.fromisoformat(last)
+                if since < _td(days=_MECHANICAL_ESCALATION_INTERVAL_DAYS):
+                    continue
+            e["escalated_at"] = now_dt.isoformat()
+            e["escalation_count"] = int(e.get("escalation_count") or 0) + 1
+            # Re-card: the same clear-and-resend the decision lane uses.
+            e["dm_message_ts"] = ""
+            newly += 1
+        except Exception:
+            # A malformed escalated_at must never take down the drain. The row
+            # stays counted as overdue and simply is not re-escalated this run.
+            pass
+    return newly, overdue
 
 
 # Fork 4 D-051 (step0-rmw-zombie / clobbered-tap): a PENDING decision row DM'd
@@ -839,6 +961,91 @@ def _route_operational_to_owners(
     return routed
 
 
+def _send_mechanical_review_dms(
+    items: list[dict], slack_token: str, log: logging.Logger, _client_factory=None,
+) -> int:
+    """Send mechanical review cards to the mechanical-lane approver(s).
+
+    Returns the count of cards sent. No-op (returns 0) unless
+    CORA_MECHANICAL_REVIEW is on -- with the flag off these items keep routing
+    to owners exactly as they did before the split.
+
+    Delivery rules, each with a reason:
+      * ESCALATED FIRST, then HIGH-confidence, then oldest. An item that already
+        blew its review deadline is the one most in need of a decision, and
+        _escalate_stale_mechanical exists precisely so it can be sorted here.
+      * LEX-entity items go to HARRISON ONLY, whoever else is listed. PHI: the
+        owner-routing path has never sent a LEX item to a teammate, and this
+        surface must not become the way one gets there. review_lanes.can_approve
+        enforces the same rule again at correlation time, so a card that somehow
+        reached the wrong person still could not be acted on by them.
+      * Capped per run. The pending mechanical pool is ~124 items; the point of
+        the split is a readable surface, not a relocated flood.
+      * A failed send leaves the item PENDING and unsent -- it retries next run.
+    """
+    if not items or not slack_token:
+        return 0
+    if not _mechanical_review_enabled():
+        return 0
+
+    approvers = list(review_lanes.mechanical_approvers())
+    delegated = [a for a in approvers if a != HARRISON_SLACK_USER_ID]
+
+    def _rank(u: dict) -> tuple:
+        return (0 if int(u.get("escalation_count") or 0) else 1,
+                0 if u.get("confidence") == "HIGH" else 1,
+                u.get("proposed_at", ""))
+
+    ordered = sorted(items, key=_rank)
+    sent_total = 0
+    remaining = _MAX_MECHANICAL_DMS_PER_RUN
+
+    # Bucket by recipient. A LEX item is only ever Harrison's; everything else
+    # goes to the first delegated approver when there is one, otherwise to
+    # Harrison (the shipped state).
+    buckets: dict[str, list[dict]] = {}
+    for u in ordered:
+        if remaining <= 0:
+            break
+        entity = str((u.get("payload") or {}).get("entity") or "").strip().upper()
+        if entity.startswith("LEX") or not delegated:
+            target = HARRISON_SLACK_USER_ID
+        else:
+            target = delegated[0]
+        buckets.setdefault(target, []).append(u)
+        remaining -= 1
+
+    for target, batch in buckets.items():
+        n_over = sum(1 for u in batch if int(u.get("escalation_count") or 0))
+        header = (
+            f":card_index_dividers: {len(batch)} bookkeeping item(s) for review "
+            f"({len(items)} pending in total). React :+1: to carry one out or "
+            f":-1: to dismiss it; I act on them at the next review run."
+        )
+        if n_over:
+            header += (f" {n_over} of these are past their review deadline and "
+                       f"have been waiting for a decision.")
+        if target == HARRISON_SLACK_USER_ID:
+            send_dm_to_harrison(header, slack_token, _client_factory=_client_factory)
+        else:
+            _send_dm_to_user(target, header, slack_token, _client_factory)
+        sent_map = send_individual_dms(
+            batch, slack_token, _client_factory,
+            block_builder=build_mechanical_blocks, recipient_id=target)
+        for u in batch:
+            ts = sent_map.get(u["update_id"])
+            if ts:
+                _patch_dm_ts(u["update_id"], ts)
+        sent_total += len(sent_map)
+        if len(sent_map) < len(batch):
+            log.warning("mechanical-review: sent %d/%d to %s (failed sends stay "
+                        "PENDING and retry next run)", len(sent_map), len(batch), target)
+
+    log.info("mechanical-review: sent %d card(s) to %d approver(s) of %d pending",
+             sent_total, len(buckets), len(items))
+    return sent_total
+
+
 def _screen_and_send_decision_cards(
     items: list[dict], slack_token: str, log: logging.Logger, _client_factory=None,
 ) -> tuple[int, int]:
@@ -1081,6 +1288,8 @@ def main() -> int:
         cutoff = now - _td(days=_PENDING_EXPIRY_DAYS)
         auto_dismissed = 0
         expired_unrouted = 0
+        mech_escalated = 0
+        mech_overdue = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
                 entries = []
@@ -1103,6 +1312,10 @@ def main() -> int:
                 unrouted_cutoff = now - _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS)
                 expired_unrouted = _auto_expire_unrouted_operational(
                     entries, unrouted_cutoff, now)
+                # D-206: mechanical rows no longer age out silently -- they
+                # escalate. Same pass, same lock, same rewrite as the expiry it
+                # replaces for those three types.
+                mech_escalated, mech_overdue = _escalate_stale_mechanical(entries, now)
                 # Fork 4 cross-process belts: heal filed-but-unresolved decision
                 # rows + re-card stale DM'd ones (same lock, same rewrite).
                 _filed_ids: set = set()
@@ -1126,6 +1339,16 @@ def main() -> int:
                      "DM'd/routed) as expired_unrouted",
                      expired_unrouted, "y" if expired_unrouted == 1 else "ies",
                      _OPERATIONAL_UNROUTED_EXPIRY_DAYS)
+        if mech_overdue:
+            # The standing measure of the thing D-206 forbids hiding. WARNING,
+            # not INFO, and it names the reason nobody can act when that is the
+            # reason -- an alarm has to be clearable by doing the right thing,
+            # and the right thing here is enabling the surface and deciding.
+            detail = ("" if _mechanical_review_enabled() else
+                      " -- NO mechanical review surface is enabled "
+                      "(CORA_MECHANICAL_REVIEW=off), so nothing can decide them")
+            log.warning("MECHANICAL BACKLOG: %d item(s) past their review deadline, "
+                        "%d escalated this run%s", mech_overdue, mech_escalated, detail)
 
         # Ledger hygiene (item 8): rotate old resolved rows to the archive so the
         # live file stays small. Fail-soft — a rotation error must not block review.
@@ -1224,10 +1447,21 @@ def main() -> int:
         if not _is_knowledge_item(u)
         and u.get("update_type") != _kr_UPDATE_TYPE_DECISION
     ]
+    # cq-6b014816819c: the bookkeeping types leave the operational stream and
+    # get their own review surface -- but ONLY when that surface is enabled.
+    # With the flag off this list is empty and operational_unsent is byte-
+    # identical to what it was, so merging this change alone changes nothing
+    # that Slack sees.
+    mechanical_unsent: list[dict] = []
+    if _mechanical_review_enabled():
+        mechanical_unsent = [u for u in operational_unsent if review_lanes.is_mechanical(u)]
+        operational_unsent = [u for u in operational_unsent
+                              if not review_lanes.is_mechanical(u)]
     log.info(
-        "Step 2 drain: %d PENDING, %d unsent (%d knowledge, %d decision, %d operational)",
+        "Step 2 drain: %d PENDING, %d unsent (%d knowledge, %d decision, "
+        "%d mechanical, %d operational)",
         len(pending), len(unsent), len(knowledge_unsent), len(decision_unsent),
-        len(operational_unsent),
+        len(mechanical_unsent), len(operational_unsent),
     )
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -1242,6 +1476,21 @@ def main() -> int:
                  "item(s) to owners",
                  min(len(decision_unsent), _MAX_DECISION_DMS_PER_RUN),
                  len(decision_unsent), len(operational_unsent))
+        log.info("[DRY RUN] mechanical review surface: %s -- would send up to %d "
+                 "card(s) of %d unsent to %s",
+                 "on" if _mechanical_review_enabled() else "OFF",
+                 min(len(mechanical_unsent), _MAX_MECHANICAL_DMS_PER_RUN),
+                 len(mechanical_unsent), ", ".join(review_lanes.mechanical_approvers()))
+        # Step 0 does not run in a dry run, so the backlog alarm would be
+        # invisible in exactly the preview an operator reads before flipping
+        # the flag. Reported read-only here, off the SAME deadline predicate
+        # the real escalation uses, so the two can never disagree.
+        _dry_overdue = sum(
+            1 for u in pending
+            if _mechanical_past_deadline(u, datetime.now(timezone.utc)))
+        if _dry_overdue:
+            log.warning("[DRY RUN] MECHANICAL BACKLOG: %d item(s) past their "
+                        "review deadline and awaiting a decision", _dry_overdue)
         return exit_code
 
     if not slack_token:
@@ -1266,6 +1515,17 @@ def main() -> int:
                      n_dec_sent, n_dec_excluded)
     except Exception as exc:  # noqa: BLE001 — decisions must not block the knowledge DM
         log.warning("decision-cards: unexpected error (continuing): %s", exc)
+
+    # ── 2a.6: Mechanical review cards -> the mechanical approver(s) ─────────
+    # Before the knowledge-empty early-return below, for the same reason the
+    # decision cards are: a run with no knowledge items must still deliver this
+    # surface.
+    try:
+        n_mech = _send_mechanical_review_dms(mechanical_unsent, slack_token, log)
+        if n_mech:
+            log.info("Sent %d mechanical review card(s)", n_mech)
+    except Exception as exc:  # noqa: BLE001 - must not block the knowledge DM
+        log.warning("mechanical-review: unexpected error (continuing): %s", exc)
 
     # ── 2b: Knowledge items → Harrison, every run (item 4) ──────────────────
     k = knowledge_unsent

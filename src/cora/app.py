@@ -39,6 +39,7 @@ from . import knowledge_check
 from . import code_queue
 from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
+from . import review_lanes
 from . import sibling_guard
 from . import cross_entity_guard
 from . import info_intake
@@ -3874,7 +3875,13 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     # We capture ALL reaction_added AND reaction_removed events — the
     # correlate_reactions_to_updates() function uses the first APPROVED/DISMISSED
     # on a given message_ts, so order is stable.
-    if reactor == knowledge_review.HARRISON_SLACK_USER_ID:
+    # cq-6b014816819c: also capture a listed MECHANICAL-lane approver's reaction,
+    # so the split-out mechanical surface can be acted on at all. Logging is not
+    # approving -- correlate_reactions_to_updates re-checks authorization per
+    # ITEM, and review_lanes.can_approve lets a non-Harrison actor act only on a
+    # non-LEX mechanical row. The file ships with Harrison as its only entry, so
+    # this predicate is Harrison-only until that grant is deliberately made.
+    if review_lanes.is_review_approver(reactor):
         action = knowledge_review.classify_reaction(reaction)
         if action in ("APPROVED", "DISMISSED", "COMMENT_REQUESTED"):
             knowledge_review.log_reply_reaction(

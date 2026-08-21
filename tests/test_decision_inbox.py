@@ -249,8 +249,12 @@ class TestNeverExpire:
             # decision row with no expires_at, ancient
             _decision(uid="d-old",
                       proposed_at=(now - timedelta(days=400)).isoformat()),
-            # a genuinely operational row for contrast
-            {"update_id": "op-old", "update_type": "hubspot_note",
+            # a genuinely operational row for contrast. `generic`, not
+            # hubspot_note: the mechanical three left this pass on 2026-08-20
+            # (cq-6b014816819c / D-206) and now escalate instead. What is under
+            # test here is that DECISION rows are skipped, so the contrast row
+            # only has to be something this pass still claims.
+            {"update_id": "op-old", "update_type": "generic",
              "state": "PENDING", "dm_message_ts": "", "payload": {},
              "proposed_at": (now - timedelta(days=40)).isoformat()},
         ]

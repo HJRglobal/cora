@@ -3,6 +3,14 @@
 An OPERATIONAL item still PENDING and never DM'd/routed after 14 days expires
 as DISMISSED / resolved_reason="expired_unrouted". Knowledge items keep the
 D-051 never-expire-unseen guarantee; unknown update_types are left alone.
+
+NARROWED 2026-08-20 (cq-6b014816819c / D-206). The three MECHANICAL types --
+asana_task, task_close, hubspot_note -- left this pass. Every one of the 89
+expired_unrouted rows on the live ledger was one of them, i.e. this pass's real
+population was entirely items nobody had ever seen, silently resolved as though
+a decision had happened. They now escalate instead (_escalate_stale_mechanical,
+covered in test_review_lanes.py). What remains here is the bare
+non-info-for-cora `generic`, which has never produced one of these rows.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -14,7 +22,7 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def _entry(update_type="asana_task", dm_ts="", age_days=20, state="PENDING",
+def _entry(update_type="generic", dm_ts="", age_days=20, state="PENDING",
            payload=None):
     return {
         "update_id": f"x-{update_type}-{age_days}",
@@ -34,20 +42,36 @@ def _run(entries, days=None):
 
 
 def test_old_unrouted_operational_expires():
-    e = _entry("asana_task", age_days=20)
+    e = _entry("generic", age_days=20)
     assert _run([e]) == 1
     assert e["state"] == "DISMISSED"
     assert e["resolved_reason"] == "expired_unrouted"
     assert e["resolved_at"]
 
 
-def test_every_operational_type_covered():
-    entries = [_entry(t, age_days=20) for t in sorted(rkr._OPERATIONAL_TYPES)]
-    assert _run(entries) == len(rkr._OPERATIONAL_TYPES)
+def test_every_still_expiring_operational_type_covered():
+    """_OPERATIONAL_TYPES still lists the mechanical three (they remain
+    operational for routing purposes); this pass is what stopped claiming
+    them. Derive the population from the lane classifier rather than a second
+    hand-maintained list, so adding a mechanical type cannot silently re-arm
+    the age-out here."""
+    from cora import review_lanes
+    still_expiring = [t for t in sorted(rkr._OPERATIONAL_TYPES)
+                      if t not in review_lanes.MECHANICAL_TYPES]
+    assert still_expiring, "the pass must still have a population"
+    entries = [_entry(t, age_days=20) for t in still_expiring]
+    assert _run(entries) == len(still_expiring)
+
+
+def test_mechanical_types_are_no_longer_expired_here():
+    from cora import review_lanes
+    entries = [_entry(t, age_days=60) for t in sorted(review_lanes.MECHANICAL_TYPES)]
+    assert _run(entries) == 0
+    assert all(e["state"] == "PENDING" for e in entries)
 
 
 def test_recent_operational_survives():
-    e = _entry("hubspot_note", age_days=3)
+    e = _entry("generic", age_days=3)
     assert _run([e]) == 0
     assert e["state"] == "PENDING"
 
@@ -74,7 +98,7 @@ def test_drive_generic_is_operational_and_expires():
 def test_already_dmd_item_left_for_the_other_expiry():
     # dm_message_ts set = it reached a human; the SEEN-expiry path
     # (_auto_dismiss_stale_pending) owns that lifecycle, not this one.
-    e = _entry("asana_task", dm_ts="1700.1", age_days=60)
+    e = _entry("generic", dm_ts="1700.1", age_days=60)
     assert _run([e]) == 0
     assert e["state"] == "PENDING"
 
@@ -86,12 +110,12 @@ def test_unknown_update_type_left_alone():
 
 
 def test_non_pending_untouched():
-    e = _entry("asana_task", age_days=60, state="DISMISSED")
+    e = _entry("generic", age_days=60, state="DISMISSED")
     assert _run([e]) == 0
 
 
 def test_malformed_proposed_at_survives():
-    e = _entry("asana_task", age_days=60)
+    e = _entry("generic", age_days=60)
     e["proposed_at"] = "not-a-date"
     assert _run([e]) == 0
     assert e["state"] == "PENDING"
@@ -100,7 +124,7 @@ def test_malformed_proposed_at_survives():
 # ── Slice 2 (2026-07-24): per-item expires_at honored, proposed_at fallback ────
 
 def _op_entry(expires_at=None, age_days=3, dm_ts="", state="PENDING"):
-    e = _entry("asana_task", dm_ts=dm_ts, age_days=age_days, state=state)
+    e = _entry("generic", dm_ts=dm_ts, age_days=age_days, state=state)
     e["expires_at"] = expires_at
     return e
 
@@ -124,7 +148,7 @@ def test_expires_at_in_future_survives_even_when_old():
 
 def test_missing_expires_at_falls_back_to_proposed_at_cutoff():
     # Pre-Slice-2 rows (no expires_at key) still expire at the historical 14d.
-    e = _entry("asana_task", age_days=20)
+    e = _entry("generic", age_days=20)
     assert "expires_at" not in e
     assert _run([e]) == 1
 

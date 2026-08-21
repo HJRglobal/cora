@@ -1,0 +1,38 @@
+# Knowledge-review approvers -- who may act on which review surface.
+#
+# Read by src/cora/review_lanes.py with a 60s TTL, so an edit here takes effect
+# without a restart. Fail-closed: an unreadable or malformed file leaves
+# Harrison as the only approver, which is exactly the pre-split behaviour.
+#
+# ONLY THE MECHANICAL LANE IS GRANTABLE.
+#   mechanical  = task_close, asana_task, hubspot_note -- bookkeeping with no
+#                 judgment content: close a task that looks done, file a note,
+#                 mirror a CRM update.
+#   judgment    = known_answer, efficiency, lexicon, #info-for-cora facts
+#   decision    = decision_capture
+#
+# The judgment and decision lanes write or stage CANON and are HARRISON-ONLY in
+# CODE (review_lanes.can_approve). Adding a name below cannot grant authority
+# over them -- there is no key here that expresses it and no code path that
+# reads one. D-011 is unaffected by anything in this file.
+#
+# LEX-entity items are Harrison-only regardless of this list (PHI), matching the
+# rule owner-routing has always applied.
+#
+# THE GRANT IS A DELIBERATE, SEPARATE FLIP. The 2026-08-19 approval recon
+# recommends giving Hannah Grant the mechanical surface -- 179 of 296 items over
+# 30 days, inside her stated boundary (knowledge items, not code). That is
+# Harrison's call to make, and it is TWO edits, not one:
+#   1. add her row below, and
+#   2. set CORA_MECHANICAL_REVIEW=on in .env (the surface is off by default, so
+#      until then these items keep routing to owners exactly as they do today).
+# Adding her here alone changes nothing; flipping the flag alone sends the cards
+# to Harrison.
+
+mechanical:
+  - slack_id: U0B2RM2JYJ1
+    name: Harrison Rogers
+    note: founder -- approves every lane; present here so the list is never empty
+  # - slack_id: U0B3AEQS0NB
+  #   name: Hannah Grant
+  #   note: mechanical lane only (2026-08-19 recon recommendation, pending Harrison)
