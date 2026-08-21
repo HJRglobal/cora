@@ -438,6 +438,31 @@ class TestDmBotMentionStrip:
         assert app_module._staged_write_force_tool(stripped) == "cora_remember"
         assert app_module._remember_or_forget_intent(stripped) is True
 
+    def test_no_auth_test_is_spent_on_a_dm_with_no_mention(self):
+        """The strip runs on EVERY DM, upstream of the rate limiter, and
+        _resolve_bot_user_id caches None on failure and therefore retries. A DM
+        that cannot possibly need the bot id must not make a Slack call for it
+        (D-051 lens-1) -- otherwise a degraded auth.test blocks every DM,
+        including shift-scheduler turns that make no other Slack call."""
+        c = _client_with_bot()
+        assert app_module._strip_dm_bot_mention("what's on my plate?", c) == \
+            "what's on my plate?"
+        c.auth_test.assert_not_called()
+
+    def test_the_channel_path_also_survives_a_comma_after_the_mention(self):
+        """D-051 lens-5 HIGH. Slack's autocomplete inserts a mention pill and
+        people type their own comma. `_MENTION_RE` left ", remember ..." behind,
+        so the identical no-force/no-stash/no-card defect this branch documents
+        was still live in every CHANNEL while the commit claimed parity."""
+        import re as _re
+        for raw in (f"<@{BOT}> remember that the vendor is Apex",
+                    f"<@{BOT}>, remember that the vendor is Apex",
+                    f"<@{BOT}>: remember that the vendor is Apex"):
+            body = app_module._MENTION_RE.sub("", raw).strip()
+            assert body == "remember that the vendor is Apex", raw
+            assert app_module._staged_write_force_tool(body) == "cora_remember"
+            assert app_module._remember_or_forget_intent(body) is True
+
     def test_handle_message_event_dispatches_the_stripped_text(self):
         with patch.object(app_module.gap_autofill, "match_pending_ask", return_value=None),              patch.object(app_module.historical_access, "detect_retrieval_intent",
                           return_value=False),              patch.object(app_module, "_dm_is_shift_message", return_value=False),              patch.object(app_module.osn_shift_handler, "handle_dm"),              patch.object(app_module, "_handle_dm_qa") as qa:

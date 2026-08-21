@@ -94,7 +94,17 @@ def _dedup_event_deliveries(body, next, logger):  # noqa: A002 -- Bolt's contrac
     return next()
 
 
-_MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
+# The trailing [,:] is load-bearing, not tidiness (D-051 lens-5 HIGH,
+# 2026-08-20). Slack's autocomplete inserts a mention pill and people then
+# type their own comma: "@Cora, remember the vendor is Apex". Without it this
+# strip left ", remember ...", and EVERY start-anchored staged-write detector
+# in this module then failed exactly as it did for the unstripped DM token --
+# measured: `_staged_write_force_tool` returns None and
+# `_remember_or_forget_intent` returns False for ", remember the vendor is
+# Apex Appliance", and both fire once the comma is gone. The DM fix below
+# would otherwise have left the identical defect live in every CHANNEL, which
+# is the half its own comment wrongly claimed parity with.
+_MENTION_RE = re.compile(r"^<@[A-Z0-9]+>\s*[,:]?\s*")
 # ── Permanently blocked channel IDs ────────────────────────────────────────────
 # Cora must NEVER post to these channels under any circumstance.
 # C0B2NMLK7CK = #general-do-not-use (was #all-hjr-global) — workspace default
@@ -2741,20 +2751,37 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
 # Scoped deliberately to CORA'S OWN id, not the generic `_MENTION_RE`: in a DM
 # a leading mention of a THIRD party is content ("<@U123> approved it"), and
 # rewriting text that guards and forced-tool detectors read is a smuggling
-# channel unless it is kept narrow. Leading-anchored, exactly like the channel
-# path -- "Hey @Cora remember ..." is missed identically in both surfaces, so
-# this introduces no asymmetry.
+# channel unless it is kept narrow. That IS an asymmetry with the channel path,
+# and a deliberate one -- an app_mention event guarantees the mention is Cora's,
+# a DM does not.
+#
+# The first version of this comment claimed blanket "parity ... so this
+# introduces no asymmetry", and used it as a reason not to look further. D-051
+# lens-5 caught what that hid: `_MENTION_RE` did not strip a trailing comma, so
+# "@Cora, remember ..." was still broken in every channel by the very defect
+# this function documents. That is now fixed at `_MENTION_RE` itself. The two
+# strips agree on the leading anchor and on the comma; they differ only on WHOSE
+# mention they remove, and on a mention-only message (the channel path yields "",
+# this one keeps the original text so the DM guard's truthiness test is stable).
 def _strip_dm_bot_mention(text: str, client) -> str:
     """Strip a leading `<@CoraBotId>` (plus a trailing comma/colon) from DM text.
 
     Returns the text unchanged when the bot id cannot be resolved -- failing
     open here only restores today's behaviour, never a wrong strip."""
+    # Cheapest possible short-circuit FIRST (D-051 lens-1). _resolve_bot_user_id
+    # caches None on failure and therefore RETRIES on the next call, so without
+    # this every DM -- including a shift-scheduler turn that makes no other Slack
+    # call, and upstream of the rate limiter -- would block on a failing
+    # auth.test while Slack is degraded. A DM with no leading mention cannot
+    # possibly need the bot id.
+    if not text or not text.startswith("<@"):
+        return text
     bot_id = _resolve_bot_user_id(client)
     # isinstance, not truthiness: bot_id comes straight off a Slack API
     # response and is cached process-wide, so a shape change (or a test double)
     # that yields a non-string would otherwise raise inside re.escape and take
     # the whole DM path down -- for every DM, for the life of the process.
-    if not isinstance(bot_id, str) or not bot_id or not text:
+    if not isinstance(bot_id, str) or not bot_id:
         return text
     stripped = re.sub(rf"^<@{re.escape(bot_id)}>\s*[,:]?\s*", "", text).strip()
     return stripped or text
@@ -3879,8 +3906,13 @@ def _handle_reaction(event: dict, client, event_type: str) -> None:
     # so the split-out mechanical surface can be acted on at all. Logging is not
     # approving -- correlate_reactions_to_updates re-checks authorization per
     # ITEM, and review_lanes.can_approve lets a non-Harrison actor act only on a
-    # non-LEX mechanical row. The file ships with Harrison as its only entry, so
-    # this predicate is Harrison-only until that grant is deliberately made.
+    # non-LEX mechanical row.
+    #
+    # is_review_approver is itself gated on the surface flag (D-051 lens-2 LOW):
+    # without that, adding a name to the YAML started logging that person's
+    # reactions on EVERY Cora message anywhere, flag or no flag -- so the two
+    # halves of the documented "deliberate two-part flip" were not independent
+    # in code, and one of them had a privacy side effect nobody asked for.
     if review_lanes.is_review_approver(reactor):
         action = knowledge_review.classify_reaction(reaction)
         if action in ("APPROVED", "DISMISSED", "COMMENT_REQUESTED"):

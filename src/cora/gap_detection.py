@@ -328,14 +328,22 @@ _DEFLECTION_REASON_RES = [
         r"outside your access scope",
         r"i'?m scoped to [^.\n]{1,80} here",
         r"cannot be discussed here",
-        # cq-12bd309c93a8 reworded the LBHS NDA hard block: it used to end
-        # "cannot be discussed here", which the line above vetoed, and now says
-        # it is not held in ANY channel -- because "here" implied the purged
-        # COPA material was available somewhere else. Without this line that
-        # rewording would have quietly turned a working guard into a logged
-        # knowledge gap on NDA'd content, which the gap lane can escalate to a
-        # domain owner. The refusal is the only text in the system that carries
-        # this phrase.
+        # cq-12bd309c93a8 added a second LBHS refusal (the COPA one) whose text
+        # deliberately does NOT end "cannot be discussed here" -- "here" implied
+        # the purged material was available somewhere else, which is the whole
+        # complaint. This pattern covers both wordings.
+        #
+        # DEFENCE IN DEPTH, NOT A DEMONSTRATED FIX (D-051 lens-4, corrected). The
+        # first version of this comment claimed the rewording "would have turned a
+        # working guard into a logged knowledge gap". That is false twice over and
+        # the review was right to catch it: this module's own docstring records
+        # that deterministic guard refusals structurally cannot reach the gap hook
+        # (every guard returns before _dispatch_qa calls the LLM), and
+        # _maybe_log_gap_inner drops LEX-entity replies before the deflection veto
+        # is even consulted. The line stays because the veto list is the place a
+        # refusal phrase belongs and a future refactor could route a guard reply
+        # through the hook -- but it closed no live hole, and saying otherwise
+        # would leave a fabricated safety property for the next reviewer to trust.
         r"confidential to lbhs",
         r"can'?t discuss company financials here",
         r"this channel is for morning briefs only",

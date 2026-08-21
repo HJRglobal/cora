@@ -146,10 +146,25 @@ _MAX_MECHANICAL_DMS_PER_RUN = 5
 _MECHANICAL_ESCALATION_INTERVAL_DAYS = 7
 
 
+# How many times an overdue item escalates before it reaches a TERMINAL,
+# NAMED disposition. D-206 permits exactly two endings for an undecided item --
+# it escalates, or it was something that should never have queued for a human --
+# and this is where the second one is decided honestly rather than by a timer
+# pretending to be a decision:
+#   * a row that WAS carded and got no reaction resolves `escalated_unanswered`;
+#   * a row that was never carded at all (no surface enabled, or capped out)
+#     resolves `unreviewed_no_surface` -- naming the fact that no human was ever
+#     asked, which is the (a) case the approval recon points at.
+# Both are counted in the run summary. Neither is silent, and neither claims a
+# decision happened. Without a terminal state the pool is unbounded: measured
+# mechanical inflow is ~21.5 rows/day against 13 human decisions per 296 items.
+_MECHANICAL_MAX_ESCALATIONS = 3
+
+
 def _mechanical_review_enabled() -> bool:
-    """on | off (default). Same read-per-call, whitelist-validated, fail-closed
-    idiom as CORA_CONFIRM_BUTTONS / CORA_AUTOWRITE_LIVE."""
-    return (os.environ.get("CORA_MECHANICAL_REVIEW", "off") or "off").strip().lower() == "on"
+    """Kill switch for the mechanical review surface. Defined in review_lanes so
+    the bot process and this script read ONE definition (D-051 lens-2)."""
+    return review_lanes.mechanical_review_enabled()
 
 # Operational-routing floor: only operational items proposed at/after this stamp
 # are routed to owners. Initialized to "now" on the first routing run so the
@@ -506,10 +521,16 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
         if review_lanes.is_mechanical(e):
             # cq-6b014816819c: mechanical rows only acquire a dm_message_ts now
             # that they have a review surface, and this pass would then dismiss
-            # them 48h later -- silently undoing the escalation
-            # _escalate_stale_mechanical exists to perform, and re-arming on the
-            # SEEN side exactly the age-out D-206 forbids on the unseen side.
-            # That pass is their sole timer, and it never resolves anything.
+            # them silently -- undoing the escalation _escalate_stale_mechanical
+            # exists to perform, and re-arming on the SEEN side exactly the
+            # age-out D-206 forbids on the unseen side.
+            #
+            # The first version of this comment said "48h later". It is
+            # _PENDING_EXPIRY_DAYS (14) measured from proposed_at, not from the
+            # DM -- and the correction makes the exemption MORE necessary, not
+            # less: every one of the 124 live rows is already older than 14 days,
+            # so a mechanical row would have been dismissed by the very next run
+            # after it was first shown. The escalation pass is their sole timer.
             continue
         if e.get("state") == "PENDING" and e.get("dm_message_ts"):
             try:
@@ -603,54 +624,80 @@ def _mechanical_past_deadline(entry: dict, now_dt) -> bool:
         return False
 
 
-def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int]:
+def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int, int]:
     """Escalate PENDING mechanical rows past their review deadline, in place.
 
-    Returns (newly_escalated_this_run, total_pending_past_deadline).
+    Returns (newly_escalated_this_run, total_pending_past_deadline,
+    retired_to_a_named_terminal_state).
 
     D-206: escalation and expiry are different things. Until now these rows were
     flipped to DISMISSED/expired_unrouted after 14 days with nobody having seen
     them -- a silent age-out that reads, in every count downstream, exactly like
     a decision. 89 of the live ledger's rows went that way. They now stay
-    PENDING and get louder:
+    PENDING and get louder, and when they finally end they end BY NAME.
 
-      * `escalated_at` / `escalation_count` are stamped on the row, so "nobody
-        decided this for three weeks" is a readable fact rather than an absence;
-      * `dm_message_ts` is CLEARED, which is the decision lane's own re-card
-        mechanism -- with the surface on, the item renders a fresh card at the
-        top of the next batch instead of sitting DM'd-and-forgotten;
-      * with the surface OFF, nothing can re-card, so main() logs the count and
-        says plainly that no surface is enabled. That is the honest half of
-        D-206: a control must either give its population a real path to a
-        decision or state precisely what it does and does not know.
+    `escalated_at` / `escalation_count` are stamped on the row, so "nobody
+    decided this for three weeks" is a readable fact rather than an absence, and
+    `_rank` in the sender sorts escalated items first.
 
-    The cost, stated rather than hidden: the PENDING pool is no longer bounded
-    by a timer. It is bounded by someone deciding -- which is the point -- and
-    the run's summary line is the standing measure of how well that is going.
+    THE dm_message_ts IS DELIBERATELY NOT CLEARED (D-051 lens-3 HIGH). The first
+    cut cleared it, borrowing the decision lane's re-card mechanism -- but that
+    lane's cards resolve by `update_id` through a button, while a mechanical card
+    carries NO buttons and its `dm_message_ts` is its ONLY correlation key. So
+    clearing it destroyed the approver's decision: Step 0 wiped the ts, Step 1
+    re-read the ledger and skipped the row for having none, and the 👍 sat in
+    cora-reply-log.jsonl forever keyed to a ts nothing points at. Reproduced by
+    the review: 1 pair without the escalation pass, 0 with it. Not re-carding
+    also keeps the ORIGINAL card live and reactable, which is what the approver
+    is actually looking at, and it leaves the row ineligible for
+    expire_stale_operational_updates.py's empty-ts bulk sweep.
+
+    TERMINAL AFTER _MECHANICAL_MAX_ESCALATIONS, by name. Nothing else bounds the
+    pool: mechanical inflow measured ~21.5 rows/day, `rotate_resolved` only
+    archives rows that are already resolved, and the timer this replaced was 65%
+    of all mechanical dispositions. An unbounded PENDING pool is not "louder", it
+    is a file that grows forever and is re-parsed on the bot's serving path. So
+    an item that has escalated its full budget resolves DISMISSED with a reason
+    that says which of D-206's two endings it actually reached -- see
+    _MECHANICAL_MAX_ESCALATIONS.
     """
     from datetime import datetime as _dt, timedelta as _td
     newly = 0
     overdue = 0
+    retired = 0
     for e in entries:
         if not _mechanical_past_deadline(e, now_dt):
             continue
         overdue += 1
-        try:
-            last = e.get("escalated_at")
-            if last:
-                since = now_dt - _dt.fromisoformat(last)
-                if since < _td(days=_MECHANICAL_ESCALATION_INTERVAL_DAYS):
+        last = e.get("escalated_at")
+        if last:
+            try:
+                if (now_dt - _dt.fromisoformat(last)) < _td(
+                        days=_MECHANICAL_ESCALATION_INTERVAL_DAYS):
                     continue
-            e["escalated_at"] = now_dt.isoformat()
-            e["escalation_count"] = int(e.get("escalation_count") or 0) + 1
-            # Re-card: the same clear-and-resend the decision lane uses.
-            e["dm_message_ts"] = ""
-            newly += 1
-        except Exception:
-            # A malformed escalated_at must never take down the drain. The row
-            # stays counted as overdue and simply is not re-escalated this run.
-            pass
-    return newly, overdue
+            except Exception:
+                # OVERWRITE a malformed stamp rather than skip past it
+                # (D-051 lens-3 MED). The first cut's `except: pass` meant an
+                # unparseable escalated_at froze the row FOREVER -- never
+                # re-escalated, never retired, never expired by either pass,
+                # visible only as a permanent +1 in the overdue counter.
+                logging.getLogger("knowledge-review").warning(
+                    "mechanical escalation: unparseable escalated_at on %s "
+                    "-- restamping", str(e.get("update_id"))[:8])
+                last = None
+        count = int(e.get("escalation_count") or 0) + 1
+        if count > _MECHANICAL_MAX_ESCALATIONS:
+            e["state"] = "DISMISSED"
+            e["resolved_at"] = now_dt.isoformat()
+            e["resolved_reason"] = ("escalated_unanswered"
+                                    if e.get("dm_message_ts")
+                                    else "unreviewed_no_surface")
+            retired += 1
+            continue
+        e["escalated_at"] = now_dt.isoformat()
+        e["escalation_count"] = count
+        newly += 1
+    return newly, overdue, retired
 
 
 # Fork 4 D-051 (step0-rmw-zombie / clobbered-tap): a PENDING decision row DM'd
@@ -1000,31 +1047,44 @@ def _send_mechanical_review_dms(
     sent_total = 0
     remaining = _MAX_MECHANICAL_DMS_PER_RUN
 
-    # Bucket by recipient. A LEX item is only ever Harrison's; everything else
-    # goes to the first delegated approver when there is one, otherwise to
-    # Harrison (the shipped state).
+    # Bucket by recipient, and pick that recipient with the SAME predicate that
+    # will decide whether their reaction counts (D-051 lens-2/3/4 HIGH). The
+    # first cut re-derived the rule here as `entity.startswith("LEX")`, which
+    # reads a MISSING entity as delegable -- 116 of 124 live rows carry no
+    # entity, and two of them target [LEX-LLC] Operations. Routing through
+    # can_approve means a card can never be sent to someone who would then be
+    # refused, and the LEX/PHI + content screens are applied once, in one place.
     buckets: dict[str, list[dict]] = {}
     for u in ordered:
         if remaining <= 0:
             break
-        entity = str((u.get("payload") or {}).get("entity") or "").strip().upper()
-        if entity.startswith("LEX") or not delegated:
-            target = HARRISON_SLACK_USER_ID
-        else:
-            target = delegated[0]
+        target = next((a for a in delegated if review_lanes.can_approve(u, a)),
+                      HARRISON_SLACK_USER_ID)
         buckets.setdefault(target, []).append(u)
         remaining -= 1
 
     for target, batch in buckets.items():
         n_over = sum(1 for u in batch if int(u.get("escalation_count") or 0))
+        # `items` is the UNSENT slice, not the pool. Reporting it as "pending in
+        # total" told an approver holding 200 undecided items that 8 were
+        # pending -- understating the queue in exactly the direction this feature
+        # exists to fix (D-051 lens-3 MED).
+        try:
+            pool = sum(1 for u in get_pending_updates() if review_lanes.is_mechanical(u))
+        except Exception:  # noqa: BLE001 -- a count is never worth a failed send
+            pool = len(items)
         header = (
             f":card_index_dividers: {len(batch)} bookkeeping item(s) for review "
-            f"({len(items)} pending in total). React :+1: to carry one out or "
-            f":-1: to dismiss it; I act on them at the next review run."
+            f"({pool} pending in total, {len(items)} not yet shown). React :+1: "
+            f"to carry one out or :-1: to dismiss it; I act on them at the next "
+            f"review run."
         )
         if n_over:
-            header += (f" {n_over} of these are past their review deadline and "
-                       f"have been waiting for a decision.")
+            # Deliberately not "have been waiting for a decision": on the first
+            # run after the surface is enabled EVERY legacy row is already past
+            # its 7d deadline, and none of them has ever been shown to anybody.
+            header += (f" {n_over} of these are already past their review "
+                       f"deadline.")
         if target == HARRISON_SLACK_USER_ID:
             send_dm_to_harrison(header, slack_token, _client_factory=_client_factory)
         else:
@@ -1041,7 +1101,7 @@ def _send_mechanical_review_dms(
             log.warning("mechanical-review: sent %d/%d to %s (failed sends stay "
                         "PENDING and retry next run)", len(sent_map), len(batch), target)
 
-    log.info("mechanical-review: sent %d card(s) to %d approver(s) of %d pending",
+    log.info("mechanical-review: sent %d card(s) to %d approver(s) of %d unsent",
              sent_total, len(buckets), len(items))
     return sent_total
 
@@ -1290,6 +1350,7 @@ def main() -> int:
         expired_unrouted = 0
         mech_escalated = 0
         mech_overdue = 0
+        mech_retired = 0
         if _PROPOSED_UPDATES_PATH.exists():
             with _UPDATES_LOCK:
                 entries = []
@@ -1315,7 +1376,8 @@ def main() -> int:
                 # D-206: mechanical rows no longer age out silently -- they
                 # escalate. Same pass, same lock, same rewrite as the expiry it
                 # replaces for those three types.
-                mech_escalated, mech_overdue = _escalate_stale_mechanical(entries, now)
+                mech_escalated, mech_overdue, mech_retired = \
+                    _escalate_stale_mechanical(entries, now)
                 # Fork 4 cross-process belts: heal filed-but-unresolved decision
                 # rows + re-card stale DM'd ones (same lock, same rewrite).
                 _filed_ids: set = set()
@@ -1348,7 +1410,8 @@ def main() -> int:
                       " -- NO mechanical review surface is enabled "
                       "(CORA_MECHANICAL_REVIEW=off), so nothing can decide them")
             log.warning("MECHANICAL BACKLOG: %d item(s) past their review deadline, "
-                        "%d escalated this run%s", mech_overdue, mech_escalated, detail)
+                        "%d escalated this run, %d retired unanswered%s",
+                        mech_overdue, mech_escalated, mech_retired, detail)
 
         # Ledger hygiene (item 8): rotate old resolved rows to the archive so the
         # live file stays small. Fail-soft — a rotation error must not block review.

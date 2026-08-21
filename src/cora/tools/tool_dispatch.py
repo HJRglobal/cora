@@ -6183,6 +6183,18 @@ def try_confirm_pending_write(
         if (e := _mine(_CLASSB[k]["peek"](slack_user_id, channel_name)))
     }
 
+    # The entry each kind was arbitrated ON, keyed by kind. The deferred-kind
+    # branches below need the stash_id the ARBITRATION saw, not whatever is in
+    # the slot by the time they run (D-051 lens-1 MED): every peek above went
+    # through _mine(), so these are this turn's own pendings, while a bare
+    # re-peek picks up whatever a concurrent turn has since written -- including
+    # an entry _mine() deliberately excluded. _claim_deferred_kind's exact-id
+    # match is the guard against claiming a preview the user has never seen, and
+    # feeding it a freshly re-read id makes that guard cover microseconds
+    # instead of the window it was written for. Cheap to build, and it means a
+    # kind added to the arbitration later cannot forget to do this.
+    arbitrated: dict[str, dict] = {}
+
     entries: list[tuple[float, str, str | None]] = []
     if asana:
         entries.append((float(asana.get("ts", 0)), "asana", asana.get("action")))
@@ -6209,10 +6221,13 @@ def try_confirm_pending_write(
         entries.append((float(codequeue.get("ts", 0)), "code_queue", "capture"))
     if remember:
         entries.append((float(remember.get("ts", 0)), "remember", "remember"))
+        arbitrated["remember"] = remember
     if forget_note:
         entries.append((float(forget_note.get("ts", 0)), "forget_note", "forget"))
+        arbitrated["forget_note"] = forget_note
     if schedmtg:
         entries.append((float(schedmtg.get("ts", 0)), "schedule_meeting", "schedule"))
+        arbitrated["schedule_meeting"] = schedmtg
     for _cb_kind, _cb_entry in classb.items():
         # The third tuple slot is an action token. Every Class-B kind DEFERS (see
         # the kind check below), so its token is never fed to _confirm_intent --
@@ -6392,9 +6407,10 @@ def try_confirm_pending_write(
         # ends the turn before the model runs, which is the whole point of F-23.
         action_token = _INTERCEPTOR_EXECUTABLE_DEFERRED.get(kind)
         if action_token and _confirm_intent(message, action_token) == "affirm":
-            fresh = _peek_kind(kind, slack_user_id, channel_name) or {}
+            # The ARBITRATED entry (see `arbitrated` above), never a re-peek.
+            arb = arbitrated.get(kind) or {}
             claimed = _claim_deferred_kind(
-                kind, slack_user_id, channel_name, str(fresh.get("stash_id") or ""))
+                kind, slack_user_id, channel_name, str(arb.get("stash_id") or ""))
             if claimed is None:
                 # A tap or the kind's own tool got there first. Fall through
                 # rather than claim an execution that did not happen -- the
@@ -7332,10 +7348,15 @@ def _execute_claimed_remember(pending: dict, slack_user_id: str) -> str:
 
     kb, kb_lock = _notes_kb()
     if kb is None:
-        return (
-            "Notes storage is unavailable right now -- tell the user the note "
-            "was NOT saved and to try again shortly."
-        )
+        # User-facing wording, not an instruction to the model (D-051 lens-1).
+        # Three callers share this string -- the tool (model reads it), the
+        # button tap, and now the typed confirm interceptor -- and the last two
+        # POST it verbatim, where "tell the user ..." is addressed to nobody. It
+        # also falsified the reasoning that admitted this executor to the
+        # interceptor, which claimed every return here was already the exact
+        # user-facing sentence.
+        return ("NOT SAVED -- notes storage is unavailable right now. Nothing "
+                "was saved; try again shortly.")
     note_text = pending["note_text"]
     owner_email = str(
         (_load_slack_asana_map().get(slack_user_id) or {}).get("asana_email", "") or ""

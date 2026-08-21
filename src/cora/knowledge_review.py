@@ -542,10 +542,12 @@ def correlate_reactions_to_updates() -> list[tuple[dict[str, Any], dict[str, Any
     updates = load_proposed_updates()
     reactions = load_reply_log()
 
-    # dm_message_ts -> the actionable reactions on it, in arrival order. Several
-    # people can react to the same card, so the actor can no longer be collapsed
-    # away before the item is known -- the FIRST AUTHORIZED one wins, which for a
-    # Harrison-only roster is byte-identical to the previous first-Harrison rule.
+    # dm_message_ts -> the actionable reactions on it, in load_reply_log's own
+    # order (NEWEST first -- not arrival order, as the first version of this
+    # comment said). Several people can react to the same card, so the actor can
+    # no longer be collapsed away before the item is known; the first AUTHORIZED
+    # one in that order wins, which for a Harrison-only roster is byte-identical
+    # to the previous first-match rule.
     ts_to_reactions: dict[str, list[dict[str, Any]]] = {}
     for r in reactions:
         if r.get("event_type") != "reaction_added":
@@ -563,7 +565,15 @@ def correlate_reactions_to_updates() -> list[tuple[dict[str, Any], dict[str, Any
         dm_ts = update.get("dm_message_ts", "")
         if not dm_ts:
             continue
+        # A Slack ts is unique per CHANNEL, not globally, and the reply log can
+        # now accumulate a second person's reactions from other conversations.
+        # The row already stores where its card was posted, so compare it when
+        # it is there (D-051 lens-2 hardening; rows written before dm_channel_id
+        # existed carry "" and keep the ts-only match).
+        row_channel = str(update.get("dm_channel_id") or "")
         for r in ts_to_reactions.get(dm_ts, []):
+            if row_channel and str(r.get("channel_id") or "") != row_channel:
+                continue
             if review_lanes.can_approve(update, r.get("reactor_id", "")):
                 pairs.append((update, r))
                 break
@@ -673,6 +683,23 @@ def build_single_item_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str
     return text, blocks
 
 
+def _bare_url(value: str) -> str:
+    """The URL out of a field that may ALREADY be Slack mrkdwn.
+
+    D-051 lens-4: every `hubspot_note` payload stores `deal_url` pre-wrapped as
+    `<https://app.hubspot.com/...|Deal Name>` (built that way upstream in
+    run_reconciliation), while `task_url` stores a bare URL. Re-wrapping the
+    first produced `<<https://...|Name>|Name>`, which Slack parses to the first
+    `>` -- a dead link with an invalid scheme and a trailing fragment of literal
+    junk, on 100% of hubspot_note cards. `_format_owner_item_line` has the same
+    bug; this card copied the pattern rather than inheriting a working one.
+    """
+    v = str(value or "").strip()
+    if v.startswith("<") and v.endswith(">"):
+        v = v[1:-1]
+    return v.split("|", 1)[0].strip()
+
+
 def format_mechanical_dm(update: dict[str, Any]) -> str:
     """One mechanical review card (cq-6b014816819c).
 
@@ -686,7 +713,7 @@ def format_mechanical_dm(update: dict[str, Any]) -> str:
     entity = str(payload.get("entity") or "").strip().upper() or "?"
     label = _TYPE_LABEL.get(utype, utype)
     lines = [f"*[{label}]* `{entity}`\n{desc}"]
-    link = payload.get("task_url") or payload.get("deal_url") or ""
+    link = _bare_url(payload.get("task_url") or payload.get("deal_url") or "")
     name = payload.get("task_name") or payload.get("deal_name") or ""
     if link:
         lines.append(f"<{link}|{name or 'open in the tool'}>")
@@ -707,8 +734,23 @@ def build_mechanical_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str,
     exactly that and says when it will happen. Wiring buttons means lifting that
     executor into this module -- a follow-up, not a footnote on this one.
     """
+    # Sanitized HERE, not left to the egress wrapper (D-051 lens-4 MED).
+    # slack_egress patches only the `text`/`markdown_text` kwargs, and Slack
+    # renders `blocks` and IGNORES `text` when both are present -- so on a
+    # card the string a human actually reads never passed the guard, only the
+    # invisible fallback did. That matters more here than on the other card
+    # types because `description` carries up to 200 characters lifted verbatim
+    # out of a gmail/slack/fireflies chunk: an inbound message containing
+    # `<https://attacker.example|Approve this>` would otherwise render as a live
+    # link inside a DM from Cora that is asking the reader to approve something.
     text = format_mechanical_dm(update)
-    return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
+    try:
+        from .slack_egress import sanitize_text
+        safe = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- a card is never worth a crash
+        log.warning("mechanical card: sanitize unavailable", exc_info=True)
+        safe = text
+    return safe, [{"type": "section", "text": {"type": "mrkdwn", "text": safe[:2900]}}]
 
 
 def format_decision_dm(update: dict[str, Any]) -> str:

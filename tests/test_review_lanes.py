@@ -8,11 +8,14 @@ Two properties carry the weight here and neither is a formatting concern:
   through every route the split opened -- can_approve, the reaction correlation
   and the one-tap handler -- with a listed approver, and each must be refused.
 
-  D-206: NOTHING IS RESOLVED BY A TIMER. Every one of the 89 expired_unrouted
-  dismissals on the live ledger was a mechanical row that nobody ever saw.
-  Those rows now escalate, and the two passes that used to be able to dismiss
-  them (the 48h DM'd-unreacted pass and the 14d unrouted pass) must both leave
-  them alone -- otherwise the escalation is undone from the other side.
+  D-206: NO *MECHANICAL* ROW IS RESOLVED BY A TIMER. (Narrowed from a blanket
+  "nothing is" -- a bare non-info-for-cora `generic` still ages out at 14 days
+  and is deliberately left that way, so the broader claim was false in this
+  file's own headline.) Every one of the 89 expired_unrouted dismissals on the
+  live ledger was a mechanical row that nobody ever saw. Those rows now
+  escalate, the two passes that could dismiss them must both leave them alone,
+  and when the escalation budget runs out the ending is NAMED rather than
+  disguised as a decision.
 """
 
 from __future__ import annotations
@@ -63,9 +66,21 @@ def _fresh_approver_cache():
 
 
 @pytest.fixture
-def granted():
-    """The state AFTER Harrison makes the grant -- Hannah on the mechanical
-    lane. Nothing in the repo ships this; it is the flip under test."""
+def granted(monkeypatch):
+    """The state AFTER Harrison makes BOTH halves of the flip -- Hannah listed
+    AND the surface enabled. Nothing in the repo ships either half."""
+    monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")
+    with patch.object(review_lanes, "_load_mechanical_approvers",
+                      return_value=(HARRISON, HANNAH)):
+        yield
+
+
+@pytest.fixture
+def listed_only(monkeypatch):
+    """Half the flip: Hannah listed, surface still off. Must confer NOTHING --
+    the YAML's own instructions promise it, and before the D-051 review the
+    reaction capture in app.py ignored the flag entirely."""
+    monkeypatch.delenv("CORA_MECHANICAL_REVIEW", raising=False)
     with patch.object(review_lanes, "_load_mechanical_approvers",
                       return_value=(HARRISON, HANNAH)):
         yield
@@ -112,6 +127,57 @@ def test_a_listed_approver_cannot_approve_a_non_mechanical_item(granted, utype):
 
 def test_a_listed_approver_can_approve_a_mechanical_item(granted):
     assert review_lanes.can_approve(_row(update_type="asana_task"), HANNAH) is True
+
+
+def test_a_listed_approver_confers_nothing_while_the_surface_is_off(listed_only):
+    """The two halves of the flip are independent IN CODE, not just in the
+    file's instructions (D-051 lens-2 LOW)."""
+    assert review_lanes.can_approve(_row(update_type="asana_task"), HANNAH) is False
+    assert review_lanes.is_review_approver(HANNAH) is False
+    assert review_lanes.is_review_approver(HARRISON) is True
+
+
+# -- the fail-closed entity rule (the review's headline finding) --------------
+
+def test_an_item_with_NO_entity_is_harrison_only(granted):
+    """116 of 124 live PENDING mechanical rows carry no payload.entity -- two of
+    the three reconciliation passes never set it. `startswith("LEX")` read that
+    absence as "not LEX", i.e. delegable, and two such rows target
+    [LEX-LLC] Operations. An unknown entity on a PHI boundary is a no."""
+    row = _row(update_type="task_close")
+    row["payload"] = {}
+    assert review_lanes.can_approve(row, HANNAH) is False
+    assert review_lanes.can_approve(row, HARRISON) is True
+
+
+def test_a_non_dict_payload_is_refused_and_never_raises(granted):
+    """can_approve runs inside correlate_reactions_to_updates, the first
+    un-wrapped statement of the review run: one malformed row must not take the
+    whole run down."""
+    row = _row(update_type="task_close")
+    row["payload"] = "oops"
+    assert review_lanes.item_entity(row) == ""
+    assert review_lanes.can_approve(row, HANNAH) is False
+
+
+def test_lex_named_only_in_the_description_is_refused(granted):
+    """The exact live shape: entity absent, "(LEX)" in the prose. Caught by the
+    decision lane's content screen, which payload.entity cannot see."""
+    row = _row(update_type="hubspot_note", entity="F3E")
+    row["description"] = ('Deal "At Your Convenience" mentioned in fireflies '
+                          '(LEX) but no HubSpot activity in 7d')
+    assert review_lanes.can_approve(row, HANNAH) is False
+    assert review_lanes.can_approve(row, HARRISON) is True
+
+
+def test_a_failing_content_screen_excludes_rather_than_admits(granted):
+    with patch.object(review_lanes, "content_screen_excludes",
+                      side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            review_lanes.can_approve(_row(update_type="task_close"), HANNAH)
+    # ...and the real wrapper turns that into an exclusion rather than a raise
+    with patch("cora.decision_inbox.screen_decision", side_effect=RuntimeError("boom")):
+        assert review_lanes.content_screen_excludes(_row())[0] is True
 
 
 def test_a_stranger_can_approve_nothing(granted):
@@ -191,9 +257,21 @@ def test_harrison_still_correlates_on_every_lane():
 
 
 def test_a_listed_approver_correlates_on_a_mechanical_card(granted):
-    pairs = _correlate([_row(update_type="task_close", dm_ts="100.1")],
+    pairs = _correlate([_row(update_type="task_close", entity="F3E", dm_ts="100.1")],
                        [_reaction(HANNAH)])
     assert len(pairs) == 1
+
+
+def test_a_reaction_from_another_channel_does_not_correlate():
+    """A Slack ts is unique per CHANNEL, not globally, and the reply log now
+    collects reactions from more than one conversation."""
+    row = _row(dm_ts="100.1")
+    row["dm_channel_id"] = "D_HARRISON"
+    r = _reaction(HARRISON)
+    r["channel_id"] = "C_SOMEWHERE_ELSE"
+    assert _correlate([row], [r]) == []
+    r["channel_id"] = "D_HARRISON"
+    assert len(_correlate([row], [r])) == 1
 
 
 def test_a_listed_approver_does_not_correlate_on_a_judgment_card(granted):
@@ -243,7 +321,7 @@ def test_a_mechanical_tap_is_refused_rather_than_misapplied(granted):
     or forged tap gets an honest answer."""
     with patch.object(kr, "_find_update", return_value=_row(update_type="task_close")), \
          patch.object(kr, "apply_knowledge_update") as apply_fn:
-        outcome, msg = kr.process_one_tap_action("u1", HANNAH, approve=True)
+        outcome, msg = kr.process_one_tap_action("u1", HARRISON, approve=True)
     apply_fn.assert_not_called()
     assert outcome == "not_authorized"
     assert "mechanical review surface" in msg
@@ -262,24 +340,39 @@ def test_a_listed_approver_cannot_tap_a_judgment_card(granted):
 def test_a_past_deadline_mechanical_row_escalates_instead_of_dismissing():
     now = _now()
     e = _row(expires_in_days=-1, age_days=20)
-    newly, overdue = rkr._escalate_stale_mechanical([e], now)
-    assert (newly, overdue) == (1, 1)
+    newly, overdue, retired = rkr._escalate_stale_mechanical([e], now)
+    assert (newly, overdue, retired) == (1, 1, 0)
     assert e["state"] == "PENDING", "an undecided item must never be resolved by a timer"
     assert e["escalation_count"] == 1
     assert e["escalated_at"]
 
 
-def test_escalation_clears_the_dm_ts_so_the_item_re_cards():
+def test_escalation_does_NOT_clear_the_dm_ts():
+    """D-051 lens-3 HIGH. A mechanical card carries no buttons, so
+    dm_message_ts is its ONLY correlation key -- clearing it on escalation
+    destroyed the approver's reaction (the 👍 stays in the reply log keyed to a
+    ts nothing points at) and re-armed the empty-ts bulk sweep on a row that had
+    already been shown."""
     now = _now()
     e = _row(expires_in_days=-1, dm_ts="100.1")
     rkr._escalate_stale_mechanical([e], now)
-    assert e["dm_message_ts"] == ""
+    assert e["dm_message_ts"] == "100.1"
+
+
+def test_an_escalated_row_still_correlates_its_reaction():
+    """The end-to-end version of the above, which is what the isolated
+    escalation tests could not see: escalate, then correlate."""
+    now = _now()
+    e = _row(expires_in_days=-1, dm_ts="100.1", uid="u-corr")
+    rkr._escalate_stale_mechanical([e], now)
+    pairs = _correlate([e], [_reaction(HARRISON, ts="100.1")])
+    assert len(pairs) == 1, "the escalation destroyed the decision"
 
 
 def test_a_row_inside_its_deadline_is_untouched():
     now = _now()
     e = _row(expires_in_days=3)
-    assert rkr._escalate_stale_mechanical([e], now) == (0, 0)
+    assert rkr._escalate_stale_mechanical([e], now) == (0, 0, 0)
     assert "escalation_count" not in e
 
 
@@ -288,7 +381,7 @@ def test_re_escalation_is_rate_limited_but_still_counted_as_overdue():
     e = _row(expires_in_days=-30)
     e["escalated_at"] = (now - timedelta(days=1)).isoformat()
     e["escalation_count"] = 1
-    newly, overdue = rkr._escalate_stale_mechanical([e], now)
+    newly, overdue, _retired = rkr._escalate_stale_mechanical([e], now)
     assert newly == 0, "must not re-card daily"
     assert overdue == 1, "but the backlog count must still see it"
     assert e["escalation_count"] == 1
@@ -300,9 +393,59 @@ def test_re_escalation_fires_again_after_the_interval():
     e["escalated_at"] = (now - timedelta(
         days=rkr._MECHANICAL_ESCALATION_INTERVAL_DAYS + 1)).isoformat()
     e["escalation_count"] = 1
-    newly, _overdue = rkr._escalate_stale_mechanical([e], now)
+    newly, _overdue, _retired = rkr._escalate_stale_mechanical([e], now)
     assert newly == 1
     assert e["escalation_count"] == 2
+
+
+def test_the_escalation_budget_is_bounded_and_the_ending_is_NAMED():
+    """Nothing else bounds the pool: inflow is ~21.5 mechanical rows/day and the
+    timer this replaced was 65% of all mechanical dispositions. The ending has
+    to exist -- and it has to say which of D-206's two endings it reached."""
+    now = _now()
+    carded = _row(expires_in_days=-90, dm_ts="1.1", uid="carded")
+    carded["escalation_count"] = rkr._MECHANICAL_MAX_ESCALATIONS
+    carded["escalated_at"] = (now - timedelta(days=30)).isoformat()
+    never = _row(expires_in_days=-90, uid="never")
+    never["escalation_count"] = rkr._MECHANICAL_MAX_ESCALATIONS
+    never["escalated_at"] = (now - timedelta(days=30)).isoformat()
+
+    _newly, overdue, retired = rkr._escalate_stale_mechanical([carded, never], now)
+    assert (overdue, retired) == (2, 2)
+    assert carded["state"] == "DISMISSED"
+    assert carded["resolved_reason"] == "escalated_unanswered"
+    assert never["resolved_reason"] == "unreviewed_no_surface", (
+        "a row nobody was ever asked about must not be recorded as unanswered")
+
+
+def test_a_row_under_budget_is_not_retired():
+    now = _now()
+    e = _row(expires_in_days=-90)
+    e["escalation_count"] = rkr._MECHANICAL_MAX_ESCALATIONS - 1
+    e["escalated_at"] = (now - timedelta(days=30)).isoformat()
+    _newly, _overdue, retired = rkr._escalate_stale_mechanical([e], now)
+    assert retired == 0
+    assert e["state"] == "PENDING"
+
+
+def test_a_malformed_escalated_at_is_RESTAMPED_not_skipped_forever():
+    """D-051 lens-3 MED. The first cut swallowed the parse error and never
+    overwrote the field, so such a row could never escalate, never retire and
+    never expire by any pass -- a permanent +1 in the overdue counter."""
+    now = _now()
+    e = _row(expires_in_days=-30)
+    e["escalated_at"] = "not-a-date"
+    newly, overdue, _retired = rkr._escalate_stale_mechanical([e], now)
+    assert (newly, overdue) == (1, 1)
+    assert e["escalated_at"] != "not-a-date"
+
+
+def test_a_malformed_deadline_never_escalates_and_never_raises():
+    e = _row()
+    e["expires_at"] = "not-a-date"
+    e["proposed_at"] = "also-not-a-date"
+    assert rkr._escalate_stale_mechanical([e], _now()) == (0, 0, 0)
+    assert e["state"] == "PENDING"
 
 
 def test_a_row_with_no_expires_at_uses_the_legacy_window():
@@ -313,17 +456,9 @@ def test_a_row_with_no_expires_at_uses_the_legacy_window():
     assert rkr._escalate_stale_mechanical([young], now)[1] == 0
 
 
-def test_a_malformed_timestamp_never_escalates_and_never_raises():
-    e = _row()
-    e["expires_at"] = "not-a-date"
-    e["proposed_at"] = "also-not-a-date"
-    assert rkr._escalate_stale_mechanical([e], _now()) == (0, 0)
-    assert e["state"] == "PENDING"
-
-
 def test_a_judgment_row_is_not_escalated_by_the_mechanical_pass():
     e = _row(update_type="known_answer", expires_in_days=-5)
-    assert rkr._escalate_stale_mechanical([e], _now()) == (0, 0)
+    assert rkr._escalate_stale_mechanical([e], _now()) == (0, 0, 0)
 
 
 # ── ...and both dismissal passes must leave mechanical rows alone ───────────
@@ -373,12 +508,25 @@ def test_the_sender_is_a_no_op_while_the_flag_is_off(monkeypatch):
     send.assert_not_called()
 
 
-def test_the_flag_only_accepts_on(monkeypatch):
-    for value in ("", "off", "1", "true", "yes", "ON!"):
+def test_the_flag_is_whitelist_validated_and_case_insensitive(monkeypatch):
+    """Named for what it checks. The predicate lowercases and strips, so "ON"
+    and "  on  " are on -- the earlier name promised a stricter rule than the
+    code has and tested neither case."""
+    for value in ("", "off", "1", "true", "yes", "ON!", "on x"):
         monkeypatch.setenv("CORA_MECHANICAL_REVIEW", value)
-        assert rkr._mechanical_review_enabled() is False
+        assert rkr._mechanical_review_enabled() is False, value
+    for value in ("on", "ON", "On", "  on  "):
+        monkeypatch.setenv("CORA_MECHANICAL_REVIEW", value)
+        assert rkr._mechanical_review_enabled() is True, value
+
+
+def test_the_script_and_the_bot_read_ONE_flag(monkeypatch):
+    """They must not drift: an ungated is_review_approver in the bot was how a
+    name in the YAML started logging reactions with the surface off."""
     monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")
-    assert rkr._mechanical_review_enabled() is True
+    assert rkr._mechanical_review_enabled() is review_lanes.mechanical_review_enabled()
+    monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "off")
+    assert rkr._mechanical_review_enabled() is review_lanes.mechanical_review_enabled()
 
 
 def _send(items, monkeypatch, approvers=(HARRISON,)):
@@ -421,14 +569,46 @@ def test_lex_items_go_to_harrison_even_when_a_delegate_exists(monkeypatch):
     assert [u["update_id"] for u in sent[HANNAH]] == ["f3e"]
 
 
+def test_an_entity_less_item_goes_to_harrison_not_the_delegate(monkeypatch):
+    """The recipient is chosen with the SAME predicate that decides whether the
+    reaction counts, so a card can never be sent to someone who would then be
+    refused (D-051)."""
+    blank = _row(uid="blank")
+    blank["payload"] = {}
+    _n, sent = _send([blank], monkeypatch, approvers=(HARRISON, HANNAH))
+    assert [u["update_id"] for u in sent[HARRISON]] == ["blank"]
+    assert HANNAH not in sent
+
+
 def test_with_no_delegate_everything_goes_to_harrison(monkeypatch):
     _n, sent = _send([_row(uid="a"), _row(uid="b", entity="LEX")], monkeypatch)
     assert set(sent) == {HARRISON}
 
 
-def test_the_deadline_predicate_is_shared_with_the_dry_run_report():
-    """One definition, so the preview an operator reads before flipping the
-    flag can never disagree with what the real escalation would do."""
+def test_the_dry_run_report_calls_the_same_deadline_predicate(monkeypatch, capsys):
+    """The preview an operator reads before flipping the flag must not be able
+    to disagree with the real pass. Asserted by RUNNING the dry run with the
+    predicate patched and checking the report followed it -- the earlier version
+    of this test only compared two functions to each other and would have passed
+    unchanged if the dry-run branch used a different predicate entirely."""
+    monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "off")
+    seen: list = []
+
+    def _fake(entry, now):
+        seen.append(entry)
+        return True  # every pending row reads as overdue
+
+    with patch.object(rkr, "_mechanical_past_deadline", side_effect=_fake), \
+         patch.object(rkr, "get_pending_updates",
+                      return_value=[_row(uid="a"), _row(uid="b")]), \
+         patch.object(rkr, "correlate_reactions_to_updates", return_value=[]), \
+         patch.object(rkr, "_acquire_run_lock", return_value=True), \
+         patch.object(rkr, "_release_run_lock"),          patch.object(rkr.sys, "argv", ["run_knowledge_review.py", "--dry-run"]):
+        rkr.main()
+    assert len(seen) == 2, "the dry-run report did not use the shared predicate"
+
+
+def test_the_deadline_predicate_agrees_with_the_escalation_pass():
     now = _now()
     overdue = _row(expires_in_days=-1)
     assert rkr._mechanical_past_deadline(overdue, now) is True

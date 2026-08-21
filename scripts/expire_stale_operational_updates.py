@@ -70,6 +70,17 @@ _MANIFEST_DIR = _REPO_ROOT / "logs"
 # Harrison one-tap lane now -- bulk-expiring them would silently drain it.
 _DEFAULT_EXPIRE_TYPES = ("hubspot_note", "asana_task", "task_close")
 
+# NOTE (cq-6b014816819c, 2026-08-20): these three are exactly the MECHANICAL
+# review lane, and run_knowledge_review no longer resolves them on a timer --
+# they escalate, and end in a NAMED terminal state after a bounded number of
+# escalations (_MECHANICAL_MAX_ESCALATIONS). This script is left armed on
+# purpose and does NOT violate that: it is operator-invoked, dry-run by default,
+# writes a manifest and takes a backup, so running it is a human decision rather
+# than the silent age-out D-206 forbids. Know that both mechanisms exist before
+# reaching for this one -- a row already carded to an approver keeps its
+# dm_message_ts and is ineligible here, so what this reaches is the never-shown
+# backlog the escalation pass would retire more slowly.
+
 # Never expired in bulk -- the knowledge / human-contribution stream, the
 # founder layer, and the never-expiring decisions lane (Fork 4). (Belt-and-
 # braces: these are already excluded by the allowlist; this set makes passing

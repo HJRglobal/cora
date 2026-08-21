@@ -546,6 +546,55 @@ class TestDmRememberTypedConfirm:
         assert reply is None
         assert td.stash_is_live(sid)
 
+    def test_a_concurrent_re_stash_is_NOT_what_gets_executed(self):
+        """D-051 lens-1 MED. The execute branch used to re-peek the slot for the
+        stash_id it claimed, which defeats _claim_deferred_kind's exact-id match
+        -- the guard that exists so a sibling turn's never-seen preview is not
+        destroyed. With a write on the end of it, the failure is worse than the
+        one that guard was written for: the note the user was shown is discarded
+        and a DIFFERENT one, whose preview they have never seen, is saved.
+
+        Simulated by overwriting the slot between the arbitration peek and the
+        claim, which is exactly what a concurrent cora_remember phase-1 call
+        does."""
+        now = time.time()
+        seen_sid = self._mint_remember(now - 45)
+        real_peek = td._peek_pending_remember
+
+        def _peek_then_overwrite(user, channel):
+            entry = real_peek(user, channel)
+            # A sibling turn lands its own preview after the arbitration read.
+            td._store_pending_remember(user, channel, {
+                "note_text": "[QA] a note the user has never seen",
+                "entity": "FNDR", "scope": "FNDR", "share_requested": False,
+                "ts": time.time(), "stash_id": cc.mint_stash_id("remember", user, channel),
+            })
+            return entry
+
+        with patch.object(td, "_peek_pending_remember", side_effect=_peek_then_overwrite), \
+             patch.object(td, "_execute_claimed_stash",
+                          return_value=("Saved.", None)) as ex:
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER, channel_name=self.DM, entity="FNDR",
+                message="Confirm", turn_started_at=now,
+            )
+        # Either it executed the stash the user was actually shown, or it
+        # deferred -- never the one that arrived behind their back.
+        if ex.called:
+            assert ex.call_args[0][1].get("stash_id") == seen_sid
+        assert reply is None or "never seen" not in str(reply)
+
+    def test_the_notes_unavailable_reply_is_addressed_to_the_USER(self):
+        """This path's return is POSTED verbatim by the interceptor and by the
+        button tap. "tell the user ..." was an instruction addressed to nobody
+        on both -- and it falsified the reasoning that admitted this executor to
+        the interceptor, which claimed every return here was already the exact
+        user-facing sentence."""
+        with patch.object(td, "_notes_kb", return_value=(None, None)):
+            out = td._execute_claimed_remember({"note_text": "x", "entity": "FNDR"}, USER)
+        assert "tell the user" not in out.lower()
+        assert "NOT SAVED" in out
+
     def test_a_typed_cancel_still_dismisses_the_remember_pending(self):
         """The cancel half of the deferred path is unchanged by the execute
         branch: a negate is classified first and still pops the stash."""
