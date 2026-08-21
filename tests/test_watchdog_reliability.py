@@ -323,9 +323,17 @@ def test_log_scan_finds_a_start_date_pinned_live_log(tmp_path, monkeypatch):
     monkeypatch.setattr(hc, "_LOG_DIR", tmp_path)
     tmp_path.mkdir(exist_ok=True)
     # Named three days ago (the instance started then) but written just now.
+    #
+    # The LINE stamp is derived from the wall clock, never a literal: session
+    # #4 added a PER-LINE recency filter to this same scan, so a hardcoded date
+    # silently ages out of the 26h window and takes the test red on a day that
+    # has nothing to do with the code (it did, on 2026-08-21). What is under
+    # test is the FILENAME/mtime split -- the line's own age must stay fixed
+    # relative to now for that to be what fails.
+    stamp = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
     stale_name = tmp_path / "cora-2026-08-16.log"
     stale_name.write_text(
-        "2026-08-19T09:00:00 ERROR [Heartbeat] __main__: HEARTBEAT_FILE_WRITE_FAILING: "
+        f"{stamp} ERROR [Heartbeat] __main__: HEARTBEAT_FILE_WRITE_FAILING: "
         "9 consecutive failures writing x: disk gone\n", encoding="utf-8")
     results = hc.check_logs_24h()
     crit = [r for r in results if r.status == "critical"]

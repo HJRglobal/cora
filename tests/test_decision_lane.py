@@ -168,7 +168,16 @@ def test_a_p2_is_reported_because_severity_is_not_a_filter(ledger):
 def test_a_recently_delivered_decision_is_not_reported(ledger):
     dl.record_delivery("Jerry DW access", "synthesis:portfolio")
     entries = dl.parse_entries(_file(_entry("Jerry DW access")), today=TODAY)
-    assert dl.undelivered_overdue(entries, today=TODAY, now=NOW) == []
+    # `now` is the WALL CLOCK here, not the pinned NOW the rest of the file
+    # uses. record_delivery stamps the ledger with datetime.now(), so pinning
+    # `now` two days in its past made the fresh row read as future-dated, trip
+    # the -1 day lower bound and report the decision as undelivered -- a
+    # failure that arrived on 2026-08-21 with no code change behind it.
+    # `today` stays pinned because it is what the GATE arithmetic keys on; the
+    # two clocks are independent inputs and only the delivery one has to track
+    # the row this test just wrote.
+    assert dl.undelivered_overdue(
+        entries, today=TODAY, now=datetime.now(timezone.utc)) == []
 
 
 def test_a_stale_delivery_still_counts_as_undelivered(ledger):
