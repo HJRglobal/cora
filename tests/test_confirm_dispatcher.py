@@ -634,6 +634,24 @@ class TestSnapshotDiff:
         after_claim_snapshot = td.snapshot_stash_ids(HARRISON, _CH)
         assert after_claim_snapshot["asana"] is None
 
+    def test_fresh_remember_preview_in_a_dm_is_detected(self):
+        """cq-236fd0310eb8 acceptance, card half: a remember preview minted in a
+        DM turn must show up in the snapshot diff, which is the ONLY signal
+        app._confirm_card_for_reply uses to attach buttons. Nothing in the card
+        path was kind-specific -- the live 8/20 DM had no card because the
+        forced-tool detectors were blinded by an unstripped mention token and
+        no stash was ever minted at all, so this pins the half that always
+        worked against a regression while the other half is fixed."""
+        before = td.snapshot_stash_ids(HARRISON, "dm")
+        cc.begin_turn()
+        sid = cc.mint_stash_id("remember", HARRISON, "dm")
+        td._store_pending_remember(HARRISON, "dm", {
+            "note_text": "the vendor is Apex", "entity": "FNDR", "sub_entity": None,
+            "share_requested": False, "channel_name": "dm",
+            "ts": time.time(), "stash_id": sid,
+        })
+        assert td.freshest_changed_stash(before, HARRISON, "dm") == ("remember", sid)
+
     def test_fresh_ask_detected_as_pseudo_kind(self):
         before = td.snapshot_stash_ids(HARRISON, _CH)
         cc.begin_turn()  # S1 fix: a stash only counts as "this turn's" if minted within one

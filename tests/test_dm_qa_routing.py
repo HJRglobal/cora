@@ -363,3 +363,87 @@ class TestGapAskDoesNotSwallowFreshQuestion:
         assert r.captured["allow_toplevel"] is True
         r.rec.assert_called_once()
         r.qa.assert_not_called()
+
+
+# ── DM bot-mention strip (cq-236fd0310eb8) ───────────────────────────────────
+
+BOT = "U0B44MDGC5R"
+
+
+def _client_with_bot(bot_id=BOT):
+    c = MagicMock()
+    c.auth_test.return_value = {"user_id": bot_id}
+    return c
+
+
+class TestDmBotMentionStrip:
+    """The live 8/20 defect: a DM opening with "@Cora ..." reached every
+    start-anchored intent detector still carrying its `<@U...>` token, so none
+    of them fired -- no forced tool, no Sonnet escalation, no stash, hence no
+    confirm card and nothing for a typed confirm to execute."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_bot_id_cache(self):
+        saved = app_module._CORA_BOT_USER_ID
+        app_module._CORA_BOT_USER_ID = None
+        yield
+        app_module._CORA_BOT_USER_ID = saved
+
+    def test_leading_cora_mention_is_stripped(self):
+        out = app_module._strip_dm_bot_mention(
+            f"<@{BOT}> remember that the vendor is Apex", _client_with_bot())
+        assert out == "remember that the vendor is Apex"
+
+    def test_trailing_comma_after_the_mention_is_stripped(self):
+        out = app_module._strip_dm_bot_mention(
+            f"<@{BOT}>, remember that the vendor is Apex", _client_with_bot())
+        assert out == "remember that the vendor is Apex"
+
+    def test_a_third_party_mention_is_left_alone(self):
+        """In a DM a leading mention of someone else is CONTENT, not addressing."""
+        text = "<@U_JUSTIN> approved the invoice yesterday"
+        assert app_module._strip_dm_bot_mention(text, _client_with_bot()) == text
+
+    def test_a_mid_message_cora_mention_is_left_alone(self):
+        text = "tell <@%s> nothing" % BOT
+        assert app_module._strip_dm_bot_mention(text, _client_with_bot()) == text
+
+    def test_a_message_that_is_only_the_mention_keeps_its_text(self):
+        text = f"<@{BOT}>"
+        assert app_module._strip_dm_bot_mention(text, _client_with_bot()) == text
+
+    def test_unresolvable_bot_id_fails_open(self):
+        c = MagicMock()
+        c.auth_test.side_effect = RuntimeError("slack down")
+        text = f"<@{BOT}> remember that the vendor is Apex"
+        assert app_module._strip_dm_bot_mention(text, c) == text
+
+    def test_a_non_string_bot_id_never_raises(self):
+        """auth_test's payload is trusted nowhere else either: a shape change
+        that yielded a non-string used to raise inside re.escape and would have
+        taken down the DM path for every DM for the life of the process."""
+        text = f"<@{BOT}> remember that the vendor is Apex"
+        assert app_module._strip_dm_bot_mention(text, _client_with_bot(bot_id=object())) == text
+
+    def test_the_live_8_20_message_now_reaches_its_detectors(self):
+        """The end-to-end point of the strip, pinned on the real message: with
+        the token present BOTH detectors are blind; with it stripped, the forced
+        tool and the Sonnet escalation both fire."""
+        raw = (f"<@{BOT}> remember that the confirm-button smoke test ran on "
+               "August 19, 2026 at 4:05 PM Arizona time.")
+        assert app_module._staged_write_force_tool(raw) is None
+        assert app_module._remember_or_forget_intent(raw) is False
+
+        stripped = app_module._strip_dm_bot_mention(raw, _client_with_bot())
+        assert app_module._staged_write_force_tool(stripped) == "cora_remember"
+        assert app_module._remember_or_forget_intent(stripped) is True
+
+    def test_handle_message_event_dispatches_the_stripped_text(self):
+        with patch.object(app_module.gap_autofill, "match_pending_ask", return_value=None),              patch.object(app_module.historical_access, "detect_retrieval_intent",
+                          return_value=False),              patch.object(app_module, "_dm_is_shift_message", return_value=False),              patch.object(app_module.osn_shift_handler, "handle_dm"),              patch.object(app_module, "_handle_dm_qa") as qa:
+            app_module.handle_message_event(
+                _event(text=f"<@{BOT}> remember that the vendor is Apex"),
+                _client_with_bot(),
+            )
+        qa.assert_called_once()
+        assert qa.call_args[0][3] == "remember that the vendor is Apex"

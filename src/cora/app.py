@@ -2717,6 +2717,48 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
     )
 
 
+# ── DM bot-mention strip (cq-236fd0310eb8, live 2026-08-20) ──────────────────
+# Slack delivers no app_mention event for IMs, so the DM branch of
+# handle_message_event is the only DM entry point -- and unlike handle_mention
+# (which runs `_MENTION_RE.sub("", raw_text)` before anything reads the text) it
+# passed `event["text"]` through VERBATIM. A DM that opens with "@Cora ..."
+# therefore reached every downstream detector still carrying its literal
+# `<@U0B44MDGC5R> ` token.
+#
+# Every staged-write intent detector in this module is START-ANCHORED after the
+# mention strip -- that anchoring is the documented defence against the D-158
+# stolen-turn class -- so the token blinded ALL of them at once. Measured on the
+# live 8/20 16:05 message: `_staged_write_force_tool` returned None and
+# `_remember_or_forget_intent` returned False with the token, and
+# "cora_remember"/True the moment it was removed. The consequence was the whole
+# reported incident: no force, no Sonnet escalation, Haiku narrated a
+# preview-shaped reply with ZERO tool_use, so no stash was ever minted -- hence
+# no confirm card could attach, and the three typed "Confirm" turns that
+# followed had nothing pending to intercept and fell to the model, which called
+# cora_remember(confirmed=True) against an empty store over and over.
+#
+# Scoped deliberately to CORA'S OWN id, not the generic `_MENTION_RE`: in a DM
+# a leading mention of a THIRD party is content ("<@U123> approved it"), and
+# rewriting text that guards and forced-tool detectors read is a smuggling
+# channel unless it is kept narrow. Leading-anchored, exactly like the channel
+# path -- "Hey @Cora remember ..." is missed identically in both surfaces, so
+# this introduces no asymmetry.
+def _strip_dm_bot_mention(text: str, client) -> str:
+    """Strip a leading `<@CoraBotId>` (plus a trailing comma/colon) from DM text.
+
+    Returns the text unchanged when the bot id cannot be resolved -- failing
+    open here only restores today's behaviour, never a wrong strip."""
+    bot_id = _resolve_bot_user_id(client)
+    # isinstance, not truthiness: bot_id comes straight off a Slack API
+    # response and is cached process-wide, so a shape change (or a test double)
+    # that yields a non-string would otherwise raise inside re.escape and take
+    # the whole DM path down -- for every DM, for the life of the process.
+    if not isinstance(bot_id, str) or not bot_id or not text:
+        return text
+    stripped = re.sub(rf"^<@{re.escape(bot_id)}>\s*[,:]?\s*", "", text).strip()
+    return stripped or text
+
+
 # Message event handler — correction capture + active-thread follow-up routing.
 # Bolt requires an explicit event listener for "message" events.
 def _handle_info_for_cora(event: dict, client) -> None:
@@ -2964,6 +3006,16 @@ def handle_message_event(event: dict, client) -> None:
         user_id = event.get("user", "")
         text = event.get("text", "").strip()
         if user_id and text and not event.get("bot_id"):
+            # Parity with handle_mention, at the ONE place DM text is derived,
+            # so every downstream consumer in this branch (gap-ask capture, the
+            # daily knowledge check, the shift-scheduler test, retrieval intent
+            # and _handle_dm_qa) sees the same body a channel ask would produce.
+            # Inside the guard, not above it: a bot/empty DM is dropped without
+            # spending an auth.test on it, and the strip can only ever shorten
+            # a non-empty string (it falls back to the original when the whole
+            # message was the mention), so the guard's own truthiness test is
+            # unaffected by running after it.
+            text = _strip_dm_bot_mention(text, client)
             # Gap autofill Stage 2: if this user has a pending knowledge-gap
             # ask, treat the reply as the answer. Threaded replies to the ask
             # message always match. A top-level DM matches only when it is NOT

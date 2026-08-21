@@ -6381,6 +6381,42 @@ def try_confirm_pending_write(
                                               claimed_entry=claimed)
             log.info("confirm_interceptor CANCEL-RACE user=%s kind=%s "
                      "(pending gone before the claim; deferring)", slack_user_id, kind)
+            return None
+        # ── Deterministic execution for the executable deferred kinds ────────
+        # cq-236fd0310eb8, live 2026-08-20: with remember deferring, a typed
+        # "Confirm" in a DM reached the model, which called
+        # cora_remember(confirmed=true) -- and every route into that tool that
+        # is not this interceptor has to go through the model, so a turn where
+        # the model missed the tool (or, as happened live, hit it against an
+        # empty store) produced no write and no explanation. Executing here
+        # ends the turn before the model runs, which is the whole point of F-23.
+        action_token = _INTERCEPTOR_EXECUTABLE_DEFERRED.get(kind)
+        if action_token and _confirm_intent(message, action_token) == "affirm":
+            fresh = _peek_kind(kind, slack_user_id, channel_name) or {}
+            claimed = _claim_deferred_kind(
+                kind, slack_user_id, channel_name, str(fresh.get("stash_id") or ""))
+            if claimed is None:
+                # A tap or the kind's own tool got there first. Fall through
+                # rather than claim an execution that did not happen -- the
+                # same rule the CANCEL-RACE branch above follows.
+                log.info("confirm_interceptor EXECUTE-RACE user=%s kind=%s "
+                         "(pending gone before the claim; deferring)",
+                         slack_user_id, kind)
+                return None
+            try:
+                raw, _fresh_id = _execute_claimed_stash(
+                    kind, claimed, slack_user_id, entity, channel_name)
+            except Exception:  # noqa: BLE001 -- never crash the serve path
+                log.exception("confirm_interceptor execute crashed AFTER claim "
+                              "user=%s kind=%s", slack_user_id, kind)
+                # The claim already consumed the pending, so "nothing was
+                # changed" would be a guess. Say what is actually known.
+                return ("Something may have gone through, but I hit an error "
+                        "right after -- I can't confirm either way. Check "
+                        "before retrying; nothing is staged any more.")
+            log.info("confirm_interceptor EXECUTE user=%s kind=%s action=%s",
+                     slack_user_id, kind, action_token)
+            return _strip_write_sentinel(raw)
         return None
 
     intent = _confirm_intent(message, action)
@@ -12364,6 +12400,38 @@ def has_pending_classb(slack_user: str, channel: str) -> bool:
 def _defer_to_model_kinds() -> frozenset[str]:
     return frozenset({"calendar", "lexicon", "code_queue", "remember",
                       "forget_note", "schedule_meeting"}) | frozenset(_CLASSB_KINDS)
+
+
+# Deferred kinds the interceptor can nonetheless EXECUTE deterministically
+# (cq-236fd0310eb8) -> the action token to classify their confirm against.
+#
+# These two stay in _defer_to_model_kinds() because that set also governs the
+# CANCEL path (_claim_deferred_kind + _deferred_cancel_reply), which is the
+# right cancel behaviour for them and which the generic negate branch at the
+# bottom of try_confirm_pending_write does NOT provide -- it pops only asana /
+# shopify / delegated, so routing these two down there would answer "Okay -- I
+# won't" while leaving the pending armed for the next stray "yes".
+#
+# They qualify for deterministic EXECUTION where calendar/lexicon/code_queue/
+# schedule_meeting/Class-B do not, on two properties both of those groups lack:
+#   * a verbatim-postable outcome. _execute_claimed_remember and
+#     _execute_claimed_forget_note return WRITE_CONFIRMED contracts whose
+#     payload is already the exact user-facing sentence, so _strip_write_sentinel
+#     yields postable text (calendar's outcome is model-facing prose;
+#     schedule_meeting needs the user to have picked WHICH slot).
+#   * no confirm-turn input. The stash carries the whole payload, so there is
+#     nothing the model has to supply on the confirm turn.
+# The executor is the SAME _execute_claimed_stash the button tap uses, so there
+# is still exactly one write implementation per kind regardless of route.
+#
+# The action token makes classification STRICTER, not looser: neither
+# "remember" nor "forget" is a canonical value in _CONFIRM_ACTION_VERBS, so any
+# action verb in the message ("delete it", "queue it", "done") CONFLICTS and
+# yields None -- only pure affirm words plus filler reach the write.
+_INTERCEPTOR_EXECUTABLE_DEFERRED: dict[str, str] = {
+    "remember": "remember",
+    "forget_note": "forget",
+}
 
 
 def _classb_no_pending(what: str) -> str:

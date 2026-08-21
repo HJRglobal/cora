@@ -115,12 +115,19 @@ def _fresh_schedule_meeting(slots=None, labels=None) -> str:
 
 
 class TestPeekSetParity:
-    """A bare affirmative answering one of the three newest kinds' previews must
-    DEFER to the model, never fire a staler write from another kind."""
+    """A bare affirmative answering a fresher kind's preview must never fire a
+    STALER write from another kind.
 
-    @pytest.mark.parametrize("mint_fresh", [
-        _fresh_remember, _fresh_forget, _fresh_schedule_meeting,
-    ])
+    Two outcomes satisfy that, and which one applies is per-kind:
+      * schedule_meeting still DEFERS to the model (it needs the user to have
+        picked which offered slot);
+      * remember / forget_note EXECUTE deterministically (cq-236fd0310eb8) --
+        their stash carries the whole payload and their outcome text is
+        verbatim-postable. The staler-write protection is identical either way,
+        and it is the property these tests exist to pin.
+    """
+
+    @pytest.mark.parametrize("mint_fresh", [_fresh_schedule_meeting])
     def test_bare_yes_never_fires_a_staler_shopify_write(self, mint_fresh):
         stale = _stale_shopify()
         fresh = mint_fresh()
@@ -136,9 +143,7 @@ class TestPeekSetParity:
         assert td.stash_is_live(stale), "the staler write must be left untouched"
         assert td.stash_is_live(fresh), "the fresh pending survives for the tool"
 
-    @pytest.mark.parametrize("mint_fresh", [
-        _fresh_remember, _fresh_forget, _fresh_schedule_meeting,
-    ])
+    @pytest.mark.parametrize("mint_fresh", [_fresh_schedule_meeting])
     def test_bare_yes_never_fires_a_staler_asana_delete(self, mint_fresh):
         _stale_asana_delete()
         fresh = mint_fresh()
@@ -152,6 +157,40 @@ class TestPeekSetParity:
         ex.assert_not_called()
         assert reply is None
         assert td.stash_is_live(fresh)
+
+    @pytest.mark.parametrize("mint_fresh", [_fresh_remember, _fresh_forget])
+    def test_executable_kind_fires_ITSELF_not_a_staler_shopify_write(self, mint_fresh):
+        stale = _stale_shopify()
+        fresh = mint_fresh()
+
+        with patch.object(td, "_run_confirm_execute") as ex,                 patch.object(td, "_execute_claimed_stash",
+                             return_value=("Saved.", None)) as claimed:
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER_ID, channel_name=CHANNEL, entity="F3E",
+                message="yes",
+            )
+
+        ex.assert_not_called()
+        assert claimed.call_count == 1
+        assert reply == "Saved."
+        assert td.stash_is_live(stale), "the staler write must be left untouched"
+        assert not td.stash_is_live(fresh), "the confirmed pending is consumed"
+
+    @pytest.mark.parametrize("mint_fresh", [_fresh_remember, _fresh_forget])
+    def test_executable_kind_fires_ITSELF_not_a_staler_asana_delete(self, mint_fresh):
+        _stale_asana_delete()
+        fresh = mint_fresh()
+
+        with patch.object(td, "_run_confirm_execute") as ex,                 patch.object(td, "_execute_claimed_stash",
+                             return_value=("Saved.", None)):
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER_ID, channel_name=CHANNEL, entity="F3E",
+                message="yes",
+            )
+
+        ex.assert_not_called()
+        assert reply == "Saved."
+        assert not td.stash_is_live(fresh)
 
     def test_freshest_first_still_holds_between_the_new_kinds(self):
         """The newest of the three wins the arbitration (and defers), rather

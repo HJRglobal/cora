@@ -497,14 +497,63 @@ class TestDmRememberTypedConfirm:
         assert td._peek_pending_remember(USER, self.DM) is not None
         assert td.stash_is_live(sid)
 
-    def test_a_dm_typed_yes_does_not_abandon_the_remember_pending(self):
-        """The interceptor DEFERS for remember, so it must leave the entry for
-        the tool -- not consume or invalidate it."""
+    def test_a_dm_typed_confirm_executes_the_remember_deterministically(self):
+        """cq-236fd0310eb8. The interceptor used to DEFER remember to the model,
+        which is how the live 8/20 DM produced three typed "Confirm" turns that
+        each reached cora_remember(confirmed=true) and saved nothing. It now
+        claims and executes the stash itself, so the model never sees the turn."""
         now = time.time()
         sid = self._mint_remember(now - 45)
-        td.try_confirm_pending_write(
+        with patch.object(td, "_execute_claimed_remember",
+                          return_value=("WRITE_CONFIRMED -- post it" + chr(10) * 2
+                                        + "Saved to your notes.")) as ex:
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER, channel_name=self.DM, entity="FNDR",
+                message="Confirm", turn_started_at=now,
+            )
+        ex.assert_called_once()
+        assert reply == "Saved to your notes.", "sentinel must be stripped before posting"
+        assert not td.stash_is_live(sid), "the confirmed pending must be consumed"
+        assert td._peek_pending_remember(USER, self.DM) is None
+
+    def test_an_unclassifiable_message_still_leaves_the_remember_pending_intact(self):
+        """The execute branch is gated on a STRICT affirm. Anything else keeps
+        the "ambiguous -> pending intact" contract every other kind holds, so a
+        passing remark can never consume a staged note."""
+        now = time.time()
+        sid = self._mint_remember(now - 45)
+        with patch.object(td, "_execute_claimed_stash") as ex:
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER, channel_name=self.DM, entity="FNDR",
+                message="the plum one, from the smoke test earlier", turn_started_at=now,
+            )
+        ex.assert_not_called()
+        assert reply is None
+        assert td.stash_is_live(sid)
+
+    def test_a_conflicting_action_verb_never_executes_the_remember(self):
+        """"remember" is not a canonical action verb, so any action verb in the
+        message conflicts and the turn falls through to the model rather than
+        writing the note the user did not mean to confirm."""
+        now = time.time()
+        sid = self._mint_remember(now - 45)
+        with patch.object(td, "_execute_claimed_stash") as ex:
+            reply = td.try_confirm_pending_write(
+                slack_user_id=USER, channel_name=self.DM, entity="FNDR",
+                message="yes delete it", turn_started_at=now,
+            )
+        ex.assert_not_called()
+        assert reply is None
+        assert td.stash_is_live(sid)
+
+    def test_a_typed_cancel_still_dismisses_the_remember_pending(self):
+        """The cancel half of the deferred path is unchanged by the execute
+        branch: a negate is classified first and still pops the stash."""
+        now = time.time()
+        sid = self._mint_remember(now - 45)
+        reply = td.try_confirm_pending_write(
             slack_user_id=USER, channel_name=self.DM, entity="FNDR",
-            message="yes", turn_started_at=now,
+            message="no, cancel", turn_started_at=now,
         )
-        assert td.stash_is_live(sid), "the interceptor consumed a deferred pending"
-        assert td._peek_pending_remember(USER, self.DM) is not None
+        assert reply and "cancel" in reply.lower()
+        assert not td.stash_is_live(sid)
