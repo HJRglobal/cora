@@ -194,6 +194,15 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # every proposal-path test. Clear it so tests run against the CODE default
     # (enabled); the pause-gate tests set/clear the var explicitly themselves.
     monkeypatch.delenv("DRIVE_EXTRACTOR_PROPOSALS_ENABLED", raising=False)
+    # Same class, found 2026-08-24: .env carries CORA_MECHANICAL_REVIEW=on (the
+    # 2026-08-21 flip), so every test that drives run_knowledge_review.main()
+    # silently ran against the LIVE mechanical surface -- which diverts
+    # hubspot_note/task_close/asana_task rows away from owner-routing. That
+    # reddened test_operational_routed_not_dmd_to_harrison the moment Harrison
+    # flipped the flag, and the suite stayed red for three days because nothing
+    # re-ran it. Clear it so tests run against the CODE default (off); the
+    # surface's own tests set it explicitly (test_review_lanes.py).
+    monkeypatch.delenv("CORA_MECHANICAL_REVIEW", raising=False)
     try:
         import cora.gap_detection as _gd
         _gd._THREAD_LOGGED.clear()

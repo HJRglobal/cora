@@ -68,7 +68,8 @@ def _fresh_approver_cache():
 @pytest.fixture
 def granted(monkeypatch):
     """The state AFTER Harrison makes BOTH halves of the flip -- Hannah listed
-    AND the surface enabled. Nothing in the repo ships either half."""
+    AND the surface enabled (done 2026-08-21). Patched rather than read from the
+    live file/env so these tests pin CODE behaviour, not host configuration."""
     monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")
     with patch.object(review_lanes, "_load_mechanical_approvers",
                       return_value=(HARRISON, HANNAH)):
@@ -77,9 +78,11 @@ def granted(monkeypatch):
 
 @pytest.fixture
 def listed_only(monkeypatch):
-    """Half the flip: Hannah listed, surface still off. Must confer NOTHING --
-    the YAML's own instructions promise it, and before the D-051 review the
-    reaction capture in app.py ignored the flag entirely."""
+    """Half the flip: Hannah listed, surface OFF. Must confer NOTHING -- the
+    YAML's own instructions promise it, and before the D-051 review the reaction
+    capture in app.py ignored the flag entirely. Still worth pinning after the
+    8/21 flip: the flag is the kill switch, and turning it back off must revoke
+    the grant rather than leave a half-live surface."""
     monkeypatch.delenv("CORA_MECHANICAL_REVIEW", raising=False)
     with patch.object(review_lanes, "_load_mechanical_approvers",
                       return_value=(HARRISON, HANNAH)):
@@ -200,10 +203,23 @@ def test_lex_mechanical_items_are_harrison_only_whoever_is_listed(granted):
 
 # ── the approver file ────────────────────────────────────────────────────────
 
-def test_the_shipped_file_grants_nobody_but_harrison():
-    """The whole point of 'build the surface, grant nothing'. If this fails, a
-    grant landed in the repo instead of in Harrison's own edit."""
-    assert review_lanes.mechanical_approvers() == (HARRISON,)
+def test_the_shipped_file_grants_exactly_the_ruled_roster():
+    """The shipped roster is Harrison + Hannah and NOBODY else.
+
+    History: this pin used to read `== (HARRISON,)` -- "build the surface, grant
+    nothing" -- because on 2026-08-20 the grant was meant to live only in
+    Harrison's own working-tree edit. He made that edit on 8/21 (both halves:
+    this row and CORA_MECHANICAL_REVIEW=on), which reddened the pin against the
+    live host and left the suite failing for three days unnoticed. A grant that
+    exists only in an uncommitted working tree is also lost to any fresh clone,
+    so the row is now committed and this pin tracks the RULED roster instead.
+
+    It still does the job the original did: a third name landing in the repo
+    without a ruling fails here. What it can no longer do is fail merely because
+    Harrison exercised authority he already has -- and note that the D-011
+    invariants do NOT depend on this list at all: every lane but MECHANICAL is
+    Harrison-only in code, pinned above against a fixture roster."""
+    assert review_lanes.mechanical_approvers() == (HARRISON, HANNAH)
 
 
 def test_an_unreadable_file_fails_closed_to_harrison(tmp_path):

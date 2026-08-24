@@ -33,6 +33,6 @@ mechanical:
   - slack_id: U0B2RM2JYJ1
     name: Harrison Rogers
     note: founder -- approves every lane; present here so the list is never empty
-  # - slack_id: U0B3AEQS0NB
-  #   name: Hannah Grant
-  #   note: mechanical lane only (2026-08-19 recon recommendation, pending Harrison)
+  - slack_id: U0B3AEQS0NB
+    name: Hannah Grant
+    note: mechanical lane only (2026-08-19 recon adoption; flipped 2026-08-21 per Harrison's ruling at the #5 promotion)

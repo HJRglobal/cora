@@ -585,7 +585,13 @@ def test_knowledge_dmd_every_run_not_just_monday(tmp_path, monkeypatch):
 
 
 def test_operational_routed_not_dmd_to_harrison(tmp_path, monkeypatch):
-    """Item 3: an operational nudge is routed to its owner, NOT DM'd to Harrison."""
+    """Item 3: an operational nudge is routed to its owner, NOT DM'd to Harrison.
+
+    Runs with the mechanical surface OFF (the code default; conftest clears the
+    env var so the host's live CORA_MECHANICAL_REVIEW=on cannot decide this).
+    With the surface ON a hubspot_note is a MECHANICAL row and deliberately does
+    NOT reach owner-routing at all -- pinned by the companion test below."""
+    monkeypatch.delenv("CORA_MECHANICAL_REVIEW", raising=False)
     import importlib
     from unittest.mock import MagicMock
     kr = importlib.import_module("cora.knowledge_review")
@@ -620,6 +626,64 @@ def test_operational_routed_not_dmd_to_harrison(tmp_path, monkeypatch):
     entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "hn-1"]
     assert entries and entries[0]["state"] == "DISMISSED"
     assert entries[0]["resolved_reason"].startswith("routed_to_owner:")
+
+
+def test_mechanical_surface_on_diverts_the_row_away_from_owner_routing(
+        tmp_path, monkeypatch):
+    """The 2026-08-20 split's headline behaviour, previously unpinned end-to-end.
+
+    A hubspot_note is a MECHANICAL type. With CORA_MECHANICAL_REVIEW=on it must
+    leave the operational stream entirely: no owner-routing DM, no
+    routed_to_owner dismissal, and the row stays PENDING so the approver's
+    reaction still has something to correlate against at the next run. The unit
+    test for _send_mechanical_review_dms could not catch a regression in main()'s
+    lane split, and nothing else did -- which is how the flip on 8/21 silently
+    changed this path's behaviour with the suite none the wiser."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+    from cora import review_lanes
+
+    proposed = tmp_path / "proposed.jsonl"
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", proposed)
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    floor = tmp_path / "rfloor.txt"
+    floor.write_text("2000-01-01T00:00:00+00:00", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_ROUTING_FLOOR_PATH", floor)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")
+    # Roster patched, not read from the live YAML: this pins the DIVERT, which
+    # happens whoever is listed.
+    monkeypatch.setattr(review_lanes, "_load_mechanical_approvers",
+                        lambda: ("U0B2RM2JYJ1",))
+    review_lanes.reset_cache()
+
+    individual = MagicMock(return_value={"hn-2": "ts-mech"})
+    header = MagicMock(return_value="hdr")
+    to_user = MagicMock(return_value="ts-owner")
+    monkeypatch.setattr(rkr, "send_individual_dms", individual)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", header)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", to_user)
+
+    kr.propose_update(update_id="hn-2", update_type="hubspot_note",
+                      description="deal Y no activity", payload={"entity": "F3E"},
+                      confidence="MED")
+
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+
+    to_user.assert_not_called()          # NOT owner-routed
+    entries = [e for e in kr.load_proposed_updates() if e["update_id"] == "hn-2"]
+    assert entries, "the row vanished from the ledger"
+    assert entries[0]["state"] == "PENDING", (
+        "a mechanical row must survive the run so its reaction can correlate")
+    assert not (entries[0].get("resolved_reason") or "").startswith("routed_to_owner")
+    # and it went out on the mechanical surface instead
+    assert individual.call_count == 1
+    assert individual.call_args.kwargs.get("block_builder") is rkr.build_mechanical_blocks
 
 
 # == WS17-B item 5: _execute_approved_update routes info-for-cora -> known-answers
