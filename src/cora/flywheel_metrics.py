@@ -30,6 +30,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import review_lanes
+
 log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +56,12 @@ WARN_GAP_LOG_STALE_DAYS = 21
 WARN_PENDING_SIZE = 6_000
 # WARN when PENDING grew by more than this over the last ~7 days.
 WARN_PENDING_GROWTH_7D = 500
+# WARN when this many mechanical rows sit past their review deadline. The
+# mechanical lane is ~75% of the PENDING pool and drains at most
+# _MAX_MECHANICAL_DMS_PER_RUN (5) cards per weekday = 25/wk against a measured
+# ~21.5 rows/day inflow, so a backlog here is the load-bearing signal that the
+# delegated-approval relief valve is not carrying load.
+WARN_MECHANICAL_OVERDUE = 20
 # Rolling window used for every 7d metric below.
 _WINDOW_DAYS = 7
 # Baseline history retention (days of daily pending-size snapshots).
@@ -177,6 +185,8 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     # -- Ledger scan (live + archive, one pass each) --------------------------
     knowledge_dms_7d = 0
     pending_total = 0
+    mechanical_pending = 0
+    mechanical_overdue = 0
     proposed_7d = 0
     resolved_7d = 0
     expired_unrouted_7d = 0
@@ -196,6 +206,17 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
                     counted_ids.add(uid)
                 if path is p["ledger_live"] and rec.get("state") == "PENDING":
                     pending_total += 1
+                    # C2: counted in the walk that is already happening -- no
+                    # second pass, no second read of the ledger. review_lanes
+                    # owns both predicates so this can never count a different
+                    # population than the review run escalates.
+                    try:
+                        if review_lanes.is_mechanical(rec):
+                            mechanical_pending += 1
+                            if review_lanes.past_review_deadline(rec, now):
+                                mechanical_overdue += 1
+                    except Exception:  # noqa: BLE001 -- a classification error
+                        pass          # degrades one row, never the whole metric
                 proposed_at = _parse_iso(rec.get("proposed_at") or "")
                 if proposed_at and proposed_at >= cutoff:
                     proposed_7d += 1
@@ -214,6 +235,8 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
         out.update(
             knowledge_dms_7d=knowledge_dms_7d,
             pending_total=pending_total,
+            mechanical_pending=mechanical_pending,
+            mechanical_overdue=mechanical_overdue,
             proposed_7d=proposed_7d,
             resolved_7d=resolved_7d,
             routed_to_owner_7d=routed_7d,
@@ -579,6 +602,22 @@ def evaluate(metrics: dict) -> list[tuple[str, str]]:
             f"PENDING grew +{growth:,} in ~7d (threshold +{WARN_PENDING_GROWTH_7D}) "
             "-- producers outrunning the drain",
         ))
+    # C2 (cq-16014e463a66): the MECHANICAL BACKLOG number existed only as a
+    # log.warning inside the review run, so it reached no human surface at all
+    # -- it went 15 -> 54 across 8/21..8/24 entirely inside a log file. Raised
+    # here so it rides the single alarm path that BOTH health surfaces already
+    # consume, rather than growing a second Slack call in the review script.
+    overdue = metrics.get("mechanical_overdue")
+    if isinstance(overdue, int) and overdue > WARN_MECHANICAL_OVERDUE:
+        mech_pending = metrics.get("mechanical_pending")
+        pool = (f" of {mech_pending:,} pending mechanical"
+                if isinstance(mech_pending, int) else "")
+        alarms.append((
+            "warn",
+            f"MECHANICAL BACKLOG: {overdue:,}{pool} past their review deadline "
+            f"(threshold {WARN_MECHANICAL_OVERDUE}) -- the delegated approval "
+            f"lane is not draining",
+        ))
     return alarms
 
 
@@ -601,6 +640,8 @@ def format_lines(metrics: dict) -> list[str]:
         f"ledger: PENDING={metrics.get('pending_total', '?')}"
         + (f" (7d growth {metrics.get('pending_growth_7d'):+,})"
            if isinstance(metrics.get("pending_growth_7d"), int) else " (growth n/a)"),
+        f"mechanical lane: {metrics.get('mechanical_pending', '?')} pending, "
+        f"{metrics.get('mechanical_overdue', '?')} past their review deadline",
         f"producer vs drain, 7d: proposed={metrics.get('proposed_7d', '?')} vs "
         f"resolved={metrics.get('resolved_7d', '?')} "
         f"(routed={metrics.get('routed_to_owner_7d', '?')}, "

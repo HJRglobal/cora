@@ -84,7 +84,9 @@ _ARCHIVE_AFTER_DAYS = 3
 # bound (PENDING grew 3,772 -> 4,277 in the last week of June 2026).
 # KNOWLEDGE items are exempt -- the D-051 rule (never auto-dismiss a never-DM'd
 # entry) still protects everything in Harrison's queue.
-_OPERATIONAL_UNROUTED_EXPIRY_DAYS = 14
+# Single-sourced from review_lanes (three consumers now: this run's escalation
+# pass, its dry-run preview, and flywheel_metrics' health-surface backlog).
+_OPERATIONAL_UNROUTED_EXPIRY_DAYS = review_lanes.OPERATIONAL_UNROUTED_EXPIRY_DAYS
 
 # ── WS17-C (D-060): the silent auto-approve is RETIRED ───────────────────────
 # Previously, HIGH-confidence machine-mined known_answer updates wrote to
@@ -600,28 +602,15 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
 
 
 def _mechanical_past_deadline(entry: dict, now_dt) -> bool:
-    """Is this PENDING mechanical row past its review deadline?
+    """Thin delegate to review_lanes.past_review_deadline.
 
-    The ONE deadline definition, shared by the escalation pass and by the
-    read-only dry-run report, so a preview can never disagree with what the
-    real run would do. Malformed timestamps read as NOT expired (fail-safe:
-    the row stays pending and un-escalated rather than being acted on).
+    The definition moved into review_lanes when flywheel_metrics became a third
+    consumer (C2/cq-16014e463a66): the health surfaces must count the SAME
+    population this run escalates, and a copy would let the alarm and the run
+    drift apart silently. Kept as a module-level name because two call sites and
+    several tests patch it by name.
     """
-    from datetime import datetime as _dt, timedelta as _td
-    if entry.get("state") != "PENDING" or not review_lanes.is_mechanical(entry):
-        return False
-    try:
-        exp = entry.get("expires_at")
-        if exp:
-            deadline = _dt.fromisoformat(exp)
-        else:
-            # Pre-TTL-at-creation rows carry no expires_at; use the same
-            # fallback window the expiry pass used for them.
-            deadline = (_dt.fromisoformat(entry["proposed_at"])
-                        + _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS))
-        return now_dt >= deadline
-    except Exception:
-        return False
+    return review_lanes.past_review_deadline(entry, now_dt)
 
 
 def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int, int]:

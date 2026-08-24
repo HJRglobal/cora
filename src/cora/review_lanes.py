@@ -74,6 +74,14 @@ LANE_OPERATIONAL = "operational"
 # surface is the failure this shape prevents.
 MECHANICAL_TYPES = frozenset({"asana_task", "task_close", "hubspot_note"})
 
+# How long an unrouted operational/mechanical row waits before its review
+# deadline passes. Lives HERE rather than in run_knowledge_review because three
+# processes now need the same answer: the review run (escalation + dry-run
+# preview) and flywheel_metrics, which reports the backlog to both health
+# surfaces. A second copy is exactly the drift `_KNOWLEDGE_TYPES` already needs
+# a pinning test to police.
+OPERATIONAL_UNROUTED_EXPIRY_DAYS = 14
+
 _TTL = 60.0  # seconds -- the live-reload idiom used by lex_phi_access/org_roles
 _cache: tuple[str, ...] | None = None
 _loaded_at: float = 0.0
@@ -251,6 +259,36 @@ def can_approve(update: dict | None, actor_id: str) -> bool:
     if content_screen_excludes(update)[0]:
         return False
     return actor in mechanical_approvers()
+
+
+def past_review_deadline(update: dict | None, now_dt) -> bool:
+    """Is this PENDING mechanical row past its review deadline?
+
+    THE ONE deadline definition. Moved here from run_knowledge_review so the
+    escalation pass, the dry-run preview and the health-surface backlog count
+    cannot disagree about what "overdue" means -- a disagreement that would
+    show up as an alarm firing on a different population than the one the run
+    actually escalates.
+
+    Malformed or absent timestamps read as NOT expired (fail-safe: the row stays
+    pending and un-escalated rather than being acted on).
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    u = update or {}
+    if u.get("state") != "PENDING" or not is_mechanical(u):
+        return False
+    try:
+        exp = u.get("expires_at")
+        if exp:
+            deadline = _dt.fromisoformat(exp)
+        else:
+            # Pre-TTL-at-creation rows carry no expires_at; use the same
+            # fallback window the expiry pass used for them.
+            deadline = (_dt.fromisoformat(u["proposed_at"])
+                        + _td(days=OPERATIONAL_UNROUTED_EXPIRY_DAYS))
+        return now_dt >= deadline
+    except Exception:  # noqa: BLE001 -- one malformed row must never raise
+        return False
 
 
 def is_review_approver(actor_id: str) -> bool:

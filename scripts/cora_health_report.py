@@ -710,7 +710,20 @@ def format_slack(report: dict) -> str:
             + f" | mined 7d {fw.get('gap_autofill_proposed_7d', '?')} | "
             f"shadow {fw.get('shadow_records', 0)}rec/{fw.get('shadow_days', 0)}d | "
             f"PENDING {fw.get('pending_total', '?')}"
+            # C2: the week-over-week delta was already computed by
+            # flywheel_metrics.collect() and rendered by format_lines(), but
+            # format_lines feeds only the stdout report -- this hand-built Slack
+            # line dropped it. The trend is the whole point: a flat "PENDING 251"
+            # reads the same on the week it rose +75 as on a quiet one.
+            + (f" ({fw.get('pending_growth_7d'):+,} vs 7d ago)"
+               if isinstance(fw.get("pending_growth_7d"), int) else "")
         )
+        mech_pending = fw.get("mechanical_pending")
+        if isinstance(mech_pending, int):
+            lines.append(
+                f"*Mechanical lane:* {mech_pending:,} pending | "
+                f"{fw.get('mechanical_overdue', '?')} past review deadline"
+            )
     lines.append(f"_token method: {report.get('token_method')}_")
     return "\n".join(lines)
 
