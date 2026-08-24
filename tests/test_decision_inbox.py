@@ -594,9 +594,16 @@ class TestDigestLine:
         line = rad._decisions_inbox_line()
         # D-051 (digest-awaiting-count-monotonic): LIFETIME wording -- the line
         # must NOT claim an "awaiting promotion" backlog it cannot track.
-        assert "1 accepted all-time" in line and "(1 in the last 7d)" in line
+        assert "1 all-time" in line and "(1 in the last 7d)" in line
         assert "decisions-inbox.md" in line
         assert "awaiting" not in line.lower()
+        # C3 (cq-a46ebe458d92): and it must name the ACTOR and the LANE. These
+        # rows are Harrison's own taps on decision cards (70/70 live rows are
+        # via=one_tap_button), but the line rides a DM headlined "Cora
+        # auto-learned this week" where a bare "accepted" read as machine output
+        # -- and it was the only non-zero number in that DM, masking the 0/0/0.
+        assert "Decision cards YOU filed" in line
+        assert "not auto-writes" in line
 
     def test_line_fail_soft(self, inbox_env, monkeypatch):
         import scripts.run_autowrite_digest as rad

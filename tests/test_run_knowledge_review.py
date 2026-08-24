@@ -667,6 +667,7 @@ def test_mechanical_surface_on_diverts_the_row_away_from_owner_routing(
     monkeypatch.setattr(rkr, "send_individual_dms", individual)
     monkeypatch.setattr(rkr, "send_dm_to_harrison", header)
     monkeypatch.setattr(rkr, "_send_dm_to_user", to_user)
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
 
     kr.propose_update(update_id="hn-2", update_type="hubspot_note",
                       description="deal Y no activity", payload={"entity": "F3E"},

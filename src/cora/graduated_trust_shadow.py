@@ -610,6 +610,76 @@ def record_shadow_decisions(
     return written
 
 
+def record_autowrite_scan(
+    *, level: str, scanned: int, applied: int, refusals: dict[str, int],
+    log_dir: Path | None = None, now: datetime | None = None,
+) -> bool:
+    """Append ONE `autowrite_scan` row per review run (C3 / cq-a46ebe458d92).
+
+    `_autowrite_eligible` computes a refusal reason for every item it declines
+    and the caller threw it away, so the lane's own success line only printed
+    when something was written. Result: 37 consecutive knowledge-review logs
+    containing the string "autowrite" zero times, and a weekly digest reading
+    0/0/0 with no way to tell an accurate zero from a broken pipe.
+
+    Lives in the shadow log rather than the auto-write AUDIT ledger on purpose.
+    That ledger is a record of WRITES, and both its readers key on `update_id`
+    (`apply_autowrite`'s prior-record check and `revert_autowrite`'s target
+    search) -- a non-write row carrying an id could suppress a real audit record
+    or be selected as a revert target. Here it rides the same daily file, the
+    same rotation and the same test isolation, and `build_report` skips it
+    before the type check because it has no `update_id`.
+
+    Fail-soft: returns False on any error. Diagnostics never break a run.
+    """
+    try:
+        path = _shadow_log_path(log_dir, now)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "type": "autowrite_scan",
+            "ts": (now or datetime.now(timezone.utc)).isoformat(),
+            "level": str(level),
+            "scanned": int(scanned),
+            "applied": int(applied),
+            "refusals": {str(k): int(v) for k, v in (refusals or {}).items()},
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception:  # noqa: BLE001
+        log.warning("shadow: autowrite_scan record failed", exc_info=True)
+        return False
+
+
+def read_autowrite_scans(log_dir: Path | None = None, *,
+                         days: int | None = None) -> list[dict[str, Any]]:
+    """Every `autowrite_scan` row in the window, oldest first. [] on error."""
+    cutoff_date = ""
+    if days is not None:
+        cutoff_date = (datetime.now(timezone.utc)
+                       - timedelta(days=days)).strftime("%Y-%m-%d")
+    out: list[dict[str, Any]] = []
+    try:
+        for fp in _iter_shadow_files(log_dir):
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "autowrite_scan":
+                    continue
+                d = _az_date_of(rec.get("ts", ""))
+                if cutoff_date and d and d < cutoff_date:
+                    continue
+                out.append(rec)
+    except Exception:  # noqa: BLE001
+        return out
+    out.sort(key=lambda r: str(r.get("ts", "")))
+    return out
+
+
 def record_shadow_reactions(
     pairs: list[tuple[dict[str, Any], dict[str, Any]]],
     *,

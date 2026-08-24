@@ -1623,14 +1623,23 @@ def main() -> int:
     if level != "off":
         auto_done = 0
         keep: list[dict] = []
+        # C3: every refusal reason was computed and thrown away, so a lane that
+        # declined 100% of its items logged nothing at all -- 37 straight
+        # knowledge-review logs with zero "autowrite" lines while the weekly
+        # digest showed a bare 0. Tally them.
+        refusals: dict[str, int] = {}
+        scanned = len(k)
         for u in k:
             try:
                 elig, tier, why = _autowrite_eligible(u, level)
             except Exception as exc:  # noqa: BLE001 -- any error -> route to Harrison
                 log.warning("autowrite: eligibility error (-> Harrison): %s", exc)
+                refusals["eligibility_error"] = refusals.get("eligibility_error", 0) + 1
                 keep.append(u)
                 continue
             if not elig:
+                reason = str(why or "not_eligible")
+                refusals[reason] = refusals.get(reason, 0) + 1
                 keep.append(u)
                 continue
             try:
@@ -1647,9 +1656,15 @@ def main() -> int:
                 log.warning("autowrite: apply failed %s (-> Harrison): %s",
                             str(u.get("update_id", ""))[:8], summary)
                 keep.append(u)
-        if auto_done:
-            log.info("autowrite(%s): %d item(s) auto-written; %d -> Harrison",
-                     level, auto_done, len(keep))
+        # Log UNCONDITIONALLY -- the old `if auto_done:` guard is exactly what
+        # made a fully-refusing lane indistinguishable from one that never ran.
+        log.info("autowrite(%s): scanned=%d written=%d -> Harrison=%d refusals=%s",
+                 level, scanned, auto_done, len(keep),
+                 (", ".join(f"{r}={n}" for r, n in sorted(refusals.items()))
+                  or "none"))
+        if scanned:
+            gts.record_autowrite_scan(level=level, scanned=scanned,
+                                      applied=auto_done, refusals=refusals)
         k = keep
 
     if not k:
