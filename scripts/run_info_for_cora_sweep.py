@@ -55,6 +55,7 @@ import logging
 import os
 import sys
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -68,13 +69,38 @@ load_dotenv(_REPO_ROOT / ".env", override=True)
 from cora import info_intake  # noqa: E402
 from cora.slack_egress import sanitize_text  # noqa: E402
 
+# C7: console-only logging + a scheduled task with no redirection means this
+# script's output dies with its window. The health warning it triggers even
+# points at "logs/info-for-cora-sweep", a path that has never existed -- so a
+# REAL freeze logs its warning into a void and check_logs_24h can never see its
+# errors. Same doctrine run_channel_sweep.py already carries verbatim.
+_LOG_DIR = _REPO_ROOT / "logs"
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _handlers = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            _LOG_DIR / f"info-for-cora-sweep-{date.today().isoformat()}.log",
+            encoding="utf-8"),
+    ]
+except Exception:  # noqa: BLE001 -- a log file must never stop the sweep
+    _handlers = [logging.StreamHandler(sys.stdout)]
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=_handlers,
 )
 log = logging.getLogger("info_for_cora_sweep")
 
 _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "info-for-cora-watermark.json"
+# LIVENESS, separate from the watermark. The watermark tracks the newest
+# PROCESSED MESSAGE, so on a quiet day it is not written at all -- which made its
+# mtime a proxy for CHANNEL TRAFFIC, not for the sweep running. With the sweep at
+# 06:05 and the health check at 08:45 against a 48h threshold, two consecutive
+# quiet days read as 50.7h and fired a false "the sweep is frozen" warning. The
+# live history is a sawtooth keyed to channel posts (51/75/99/.../243h, silent
+# 8/18-19, 51/75h, silent 8/22-23, 51h on 8/24), not a freeze.
+_RUNSTATE_PATH = _REPO_ROOT / "data" / "state" / "info-for-cora-runstate.json"
 
 # R8: process lockfile (the meeting_action_capture pattern). Two concurrent sweeps
 # would each read the same watermark and double-post acks; the propose_update id
@@ -119,6 +145,31 @@ _MAX_PAGES = 10
 # NOTE: the sweep does not carry a subtype ALLOW list -- see _eligible(), which
 # rejects every subtyped message. The event path keeps its explicit list because
 # it must stay behaviour-compatible with the D1 handler.
+
+
+def _write_runstate(outcome: str, detail: str = "") -> None:
+    """Record that the sweep RAN, and how it ended, every single run.
+
+    This is the liveness signal the health check needs. Written unconditionally
+    -- including on a quiet run that processes nothing -- because "the sweep is
+    alive" and "the channel had traffic" are different facts and conflating them
+    produced a daily false alarm for three weeks.
+
+    `outcome` is one of: complete | frozen | locked | no_token | since_days.
+    A genuine freeze previously returned 0 and wrote nothing, i.e. was
+    byte-identical to a quiet day and undetectable by any monitor.
+    """
+    try:
+        _RUNSTATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _RUNSTATE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "last_run_ts": datetime.now(timezone.utc).isoformat(),
+            "outcome": outcome,
+            "detail": detail[:300],
+        }), encoding="utf-8")
+        tmp.replace(_RUNSTATE_PATH)
+    except Exception:  # noqa: BLE001 -- never let bookkeeping fail a run
+        log.warning("could not write the run-state marker", exc_info=True)
 
 
 def _read_watermark() -> str:
@@ -240,6 +291,9 @@ def main() -> int:
     # so it must neither block nor be blocked.
     if not args.dry_run:
         if not _acquire_lock():
+            # A held lock is a legitimate outcome, but a STALE one blocks every
+            # run forever -- recorded so the health check can see it repeat.
+            _write_runstate("locked", "another sweep holds the lockfile")
             return 0
         try:
             return _sweep(args, token)
@@ -281,6 +335,7 @@ def _sweep(args, token: str) -> int:
     except Exception:  # noqa: BLE001
         log.error("conversations.history failed -- aborting without advancing the "
                   "watermark", exc_info=True)
+        _write_runstate("frozen", "conversations.history failed")
         return 1
 
     log.info("fetched %d top-level message(s)", len(messages))
@@ -347,18 +402,21 @@ def _sweep(args, token: str) -> int:
     if args.since_days is not None:
         log.info("--since-days run -- watermark deliberately NOT advanced. "
                  "Outcomes: %s", counts or "{}")
+        _write_runstate("since_days", str(counts or "{}"))
         return 0
 
     if frozen:
         log.warning("watermark FROZEN this run (unfetched tail or a per-message "
                     "error) -- the next run re-reads from the same point. "
                     "Outcomes: %s", counts or "{}")
+        _write_runstate("frozen", str(counts or "{}"))
         return 0
 
     if high_water:
         _write_watermark(high_water)
         log.info("watermark -> %s", high_water)
     log.info("sweep complete. Outcomes: %s", counts or "{}")
+    _write_runstate("complete", str(counts or "{}"))
     return 0
 
 

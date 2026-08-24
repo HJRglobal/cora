@@ -711,44 +711,77 @@ def check_watchdog_liveness(now: datetime | None = None) -> CheckResult:
 
 
 def check_info_for_cora_watermark(now: datetime | None = None) -> CheckResult:
-    """The #info-for-cora sweep FREEZES its watermark on any per-message error or
-    unfetched tail, so nothing is ever silently skipped (R6a/R6b). The cost of that
-    safety is that a poison-pill message pins the watermark FOREVER, visible only
-    in the task's own log. WARN when the watermark stops advancing.
+    """Is the #info-for-cora sweep alive, and is it frozen?
 
-    Daily task, so >48h stale means it has missed at least two runs or is frozen.
-    A MISSING watermark is not a fault -- the sweep bootstraps on first run.
-    `now` is injectable for tests."""
+    C7 (cq-77984df448c7). These are TWO facts and the old check conflated them.
+    It used the watermark FILE's mtime as its liveness proxy, on the stated
+    premise that "only a running sweep writes it". That premise is false against
+    the live script: the watermark records the newest PROCESSED MESSAGE and is
+    written only when `high_water` is set, so a run over a quiet channel
+    completes, returns 0 and touches nothing. mtime therefore tracked CHANNEL
+    TRAFFIC. With the sweep at 06:05 and this check at 08:45 against a 48h
+    threshold, exactly two consecutive quiet days read as 50.7h and fired.
+
+    The live history is a sawtooth keyed to channel posts -- 51/75/99/147/.../243h,
+    silent 8/18-19, 51/75h, silent 8/22-23, 51h on 8/24 -- reported as a "3-week
+    freeze". The sweep was never frozen: Ready, LastTaskResult 0, 0 missed runs,
+    and it advanced correctly on 8/22 to the parent ts of Hannah's 8/21 thread.
+
+    And a GENUINE freeze was undetectable: that path also returns 0 and writes
+    nothing, byte-identical to a quiet day. So the warning could not be retired
+    either -- it had simply never been able to see the thing it was built for.
+
+    Now: the sweep stamps `info-for-cora-runstate.json` on EVERY run with its
+    outcome, and this reads liveness from that and frozen-ness from the recorded
+    outcome. `now` is injectable for tests."""
     now = now or datetime.now(timezone.utc)
-    path = _REPO_ROOT / "data" / "state" / "info-for-cora-watermark.json"
-    if not path.exists():
+    state_dir = _REPO_ROOT / "data" / "state"
+    runstate = state_dir / "info-for-cora-runstate.json"
+    watermark = state_dir / "info-for-cora-watermark.json"
+
+    if not runstate.exists():
+        # Pre-C7 hosts, and a fresh install, have no marker yet. Fall back to the
+        # honest half of the old check -- the sweep bootstraps on first run --
+        # rather than alarming on the absence of a file this build introduced.
+        if not watermark.exists():
+            return CheckResult(
+                "info-for-cora sweep", "ok",
+                "No watermark yet -- the sweep bootstraps on its first run.")
         return CheckResult(
             "info-for-cora sweep", "ok",
-            "No watermark yet -- the sweep bootstraps on its first run.")
+            "No run-state marker yet -- it appears at the sweep's next run. "
+            "Watermark age is NOT a liveness signal (it tracks channel traffic).")
+
     try:
-        last_ts = float(json.loads(path.read_text(encoding="utf-8")).get("last_ts") or 0)
+        data = json.loads(runstate.read_text(encoding="utf-8"))
+        last_run = datetime.fromisoformat(str(data.get("last_run_ts") or ""))
+        outcome = str(data.get("outcome") or "")
     except Exception as exc:  # noqa: BLE001
         return CheckResult("info-for-cora sweep", "warn",
-                           f"watermark unreadable ({exc}) -- intake may be stalled.")
-    if last_ts <= 0:
-        return CheckResult("info-for-cora sweep", "warn",
-                           "watermark present but empty -- intake may be stalled.")
-    age_h = (now.timestamp() - last_ts) / 3600
-    # The watermark tracks the newest PROCESSED MESSAGE, so a quiet channel is a
-    # normal reason for it to be old. Only the FILE's mtime tells us the sweep is
-    # still running; use it to separate "quiet channel" from "frozen sweep".
-    try:
-        run_age_h = (now.timestamp() - path.stat().st_mtime) / 3600
-    except OSError:
-        run_age_h = age_h
+                           f"run-state marker unreadable ({exc}) -- cannot tell "
+                           f"whether the sweep is running.")
+
+    run_age_h = (now - last_run).total_seconds() / 3600
     if run_age_h > 48:
         return CheckResult(
             "info-for-cora sweep", "warn",
-            f"watermark last written {run_age_h:.0f}h ago (expected daily) -- the "
-            "sweep is frozen (poison-pill message or unfetched tail) or not firing. "
-            "Check logs/info-for-cora-sweep and data/state/info-for-cora-watermark.json.")
+            f"last ran {run_age_h:.0f}h ago (expected daily) -- the task is not "
+            f"firing. Check logs/info-for-cora-sweep-<date>.log.")
+    if outcome == "frozen":
+        return CheckResult(
+            "info-for-cora sweep", "warn",
+            f"ran {run_age_h:.0f}h ago but FROZE its watermark (poison-pill "
+            f"message or unfetched tail) -- intake is stalled at the same point "
+            f"every run. Check logs/info-for-cora-sweep-<date>.log.")
+    if outcome == "locked":
+        return CheckResult(
+            "info-for-cora sweep", "warn",
+            f"last run {run_age_h:.0f}h ago exited on a held lock -- if this "
+            f"repeats, a stale lockfile is blocking every run.")
     return CheckResult("info-for-cora sweep", "ok",
-                       f"Watermark written {run_age_h:.0f}h ago.")
+                       f"Ran {run_age_h:.0f}h ago, outcome={outcome or 'unknown'}. "
+                       f"(A quiet channel leaves the watermark untouched; that is "
+                       f"not a fault.)")
 
 
 def check_cashflow_forecast_snapshot(today: date | None = None) -> CheckResult:
