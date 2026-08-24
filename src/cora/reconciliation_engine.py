@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import time
@@ -51,6 +52,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from cora import fact_fingerprint
 from cora.phi_guard import _PHI_PATTERNS as _PHI_RE
 
 log = logging.getLogger(__name__)
@@ -265,6 +267,57 @@ def _mentions_vis_cpa(text: str) -> bool:
 
 def _fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+# Its own small, time-windowed file -- never a scan of the proposed-updates
+# archive. Measured: an O(n^2) fuzzy scan of that 18 MB / 19,842-row archive did
+# not finish in 100 seconds. Overridable so tests never touch the real ledger.
+_DECISION_FP_LEDGER = Path(
+    os.environ.get("DECISION_FACT_FP_PATH")
+    or (Path(__file__).resolve().parents[2] / "data" / "state"
+        / "decision-fact-fingerprints.jsonl")
+)
+
+
+def _stable_id(text: str, entity: str) -> str:
+    """Deterministic 8-hex id for a pass-5 gap.
+
+    Replaces `hash(text + entity) & 0xFFFFFFFF`. The builtin `hash()` over a str
+    is siphash-randomized per interpreter and PYTHONHASHSEED is pinned nowhere in
+    this repo, so those ids differed ACROSS RUNS -- proven in the live data, where
+    two nights produced byte-identical decision text and still got different ids
+    (66ec1a48 vs 3fd39fc0). Every downstream dedup keys on exact update_id
+    equality, so a randomized id made all of them no-ops. Same defect existed on
+    all three pass-5 families; passes 1-4 were never affected because they use
+    `_gap_id`, which is already hashlib-based.
+    """
+    return fact_fingerprint.compute_fingerprint(entity or "", text)[:8]
+
+
+def _decision_already_proposed(summary: str, entity: str) -> bool:
+    """Has this same decision already been proposed recently?
+
+    A stable id fixes re-proposal of IDENTICAL text, but the live recurrence is
+    an LLM paraphrase of one Drive digest re-read nightly: "$200 professional
+    services charge" / "...allocation" / "...fee" / "...cost". One CBS Northstar
+    quote was proposed on eight consecutive nights and filed to Harrison's
+    decisions inbox six times, including a same-batch pair four seconds apart.
+
+    Fingerprints the SUMMARY, never the description -- every pass-5 description
+    carries the constant prefix "[ENTITY] Uncaptured decision in Drive: ", which
+    inflates similarity between unrelated decisions.
+
+    Fail-open by construction (see fact_fingerprint.already_proposed): proposing
+    a duplicate is recoverable; dropping a real decision is not.
+    """
+    return bool(fact_fingerprint.already_proposed(
+        _DECISION_FP_LEDGER, "decision", summary, scope=(entity or "").upper()))
+
+
+def _record_decision_proposal(summary: str, entity: str, gap_id: str) -> None:
+    fact_fingerprint.record_proposal(
+        _DECISION_FP_LEDGER, "decision", summary,
+        scope=(entity or "").upper(), ref=gap_id)
 
 
 def _gap_id(gap_type: str, source_id: str, description: str) -> str:
@@ -1247,7 +1300,7 @@ def pass5_drive_insights(
             conf = item.get("confidence", "MED")
             if not subj or conf not in ("HIGH", "MED"):
                 continue
-            gap_id = f"pass5:drive:{hash(subj + entity) & 0xFFFFFFFF:08x}"
+            gap_id = f"pass5:drive:{_stable_id(subj, entity)}"
             gaps.append(ReconciliationGap(
                 gap_id=gap_id,
                 gap_type="missing_asana_task",
@@ -1267,7 +1320,15 @@ def pass5_drive_insights(
             conf = item.get("confidence", "MED")
             if not summary or conf not in ("HIGH", "MED"):
                 continue
-            gap_id = f"pass5:decision:{hash(summary + entity) & 0xFFFFFFFF:08x}"
+            gap_id = f"pass5:decision:{_stable_id(summary, entity)}"
+            # C6: suppress a fact already proposed -- at PROPOSAL time, so it
+            # never re-proposes regardless of what Harrison decided about it
+            # (D-030, the friction-mining rule).
+            if _decision_already_proposed(summary, entity):
+                log.info("pass5: decision already proposed, skipping: %s",
+                         summary[:80])
+                continue
+            _record_decision_proposal(summary, entity, gap_id)
             gaps.append(ReconciliationGap(
                 gap_id=gap_id,
                 gap_type="uncaptured_decision",
@@ -1287,7 +1348,7 @@ def pass5_drive_insights(
             conf = item.get("confidence", "MED")
             if not hint or conf not in ("HIGH", "MED"):
                 continue
-            gap_id = f"pass5:complete:{hash(hint + entity) & 0xFFFFFFFF:08x}"
+            gap_id = f"pass5:complete:{_stable_id(hint, entity)}"
             gaps.append(ReconciliationGap(
                 gap_id=gap_id,
                 gap_type="stale_open_task",
