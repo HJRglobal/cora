@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -519,6 +520,212 @@ def get_pending_updates() -> list[dict[str, Any]]:
     return list(reversed(pending))  # oldest first
 
 
+def outcome_text(action: str, update_type: str, success: bool = True) -> str:
+    """THE per-type outcome sentence, shared by the button path and the emoji path.
+
+    C4 (cq-e33ce0545e85): these two paths had forked. The emoji path branched by
+    update_type and was test-pinned; `process_one_tap_action` returned ONE string
+    for every type -- "Saved to Cora's known-answers." -- even though
+    `apply_knowledge_update` routes `efficiency` to design/efficiency-backlog.md
+    and `lexicon` to the lexicon file of record. The rendered result contradicted
+    itself inside a single line:
+
+        "Saved to Cora's known-answers. (appended to efficiency-backlog.md)"
+
+    Harrison saw that five times on the morning of 2026-08-24. Every one-tap test
+    used a known_answer fixture, so nothing caught it. One definition now, so the
+    two cannot drift again.
+    """
+    if action == "APPROVED":
+        if not success:
+            return (":warning: Approved -- but the automatic save didn't go through; "
+                    "I've flagged it in #hjrg-leadership.")
+        if update_type == "known_answer":
+            return ":white_check_mark: Saved to Cora's known-answers."
+        if update_type == "efficiency":
+            return ":white_check_mark: Logged to the efficiency backlog."
+        if update_type == UPDATE_TYPE_LEXICON:
+            return ":white_check_mark: Added to the company lexicon."
+        if update_type == UPDATE_TYPE_DECISION:
+            return (":inbox_tray: Filed to your decisions inbox (non-canon; "
+                    "promotion stays with the cascade).")
+        if update_type == UPDATE_TYPE_HUBSPOT_NOTE:
+            # Say what actually happens. Nothing is written to HubSpot.
+            return (":memo: Handed off to #hjrg-leadership for someone to add in "
+                    "HubSpot -- I don't write HubSpot notes myself.")
+        return ":white_check_mark: Approved -- I've recorded this."
+    if action == "DISMISSED":
+        return ":x: Dismissed -- no action taken."
+    return ""
+
+
+# The three affordance sentences every review card ends with. A card that has
+# been resolved must not keep advertising them: after the terminal edit the
+# button is gone and the emoji is a no-op, so the line is an instruction to do
+# something that silently does nothing. On 2026-08-24 Harrison reacted to 19
+# cards and 14 of those reactions (74%) were dead -- 11 on cards he had already
+# executed nine hours earlier, which still read "Approve / Dismiss (or tap a
+# button below)". The same class was fixed once before for the briefing card
+# (app._strip_reaction_affordance, "the card never advertises an affordance it
+# has just disabled"); this generalises it to the review cards.
+# The exact affordance sentences the three card builders append
+# (format_single_item_dm :647, the decision card :775, the mechanical card
+# :722). Matched as LITERALS, deliberately: this repo has shipped five ReDoS
+# regressions in "clever" patterns, and a card footer is a fixed string emitted
+# by code in this same module -- there is nothing to generalise over. If a
+# builder's wording changes, the pin below fails and the author updates both.
+_MECH_AFFORDANCE_DOES = (":+1: do it \u00b7 :-1: dismiss  "
+                         "(I carry it out on the next review run)")
+# hubspot_note is the odd one out: `_execute_approved_update` writes NOTHING to
+# HubSpot for it -- it posts a reminder to #hjrg-leadership for a human. The
+# card said "I carry it out", the batch header said "React :+1: to carry one
+# out", and the ack said "Approved -- I've recorded this": three statements and
+# zero writes. asana_task and task_close DO write, so the promise is true for
+# two of the three mechanical types and false for the third. Making the card
+# honest is the fix here; performing the write is a new connector-write class
+# and is Harrison's call, seeded separately.
+_MECH_AFFORDANCE_HANDOFF = (":+1: hand it off \u00b7 :-1: dismiss  "
+                            "(I post it to #hjrg-leadership at the next review "
+                            "run -- I don't write HubSpot notes myself)")
+
+
+def mechanical_affordance_line(update_type: str) -> str:
+    """The mechanical card's footer, honest per type."""
+    if update_type == UPDATE_TYPE_HUBSPOT_NOTE:
+        return _MECH_AFFORDANCE_HANDOFF
+    return _MECH_AFFORDANCE_DOES
+
+
+_CARD_AFFORDANCE_LINES = (
+    "\U0001F44D Approve \u00b7 \U0001F44E Dismiss  (or tap a button below)",
+    "\U0001F44D Accept \u00b7 \U0001F44E Dismiss  (or tap a button below)",
+    _MECH_AFFORDANCE_DOES,
+    _MECH_AFFORDANCE_HANDOFF,
+)
+_CARD_AFFORDANCE_RE = re.compile(
+    "|".join(re.escape(line) for line in _CARD_AFFORDANCE_LINES)
+)
+
+_RESOLVED_NOTE = "_(Resolved -- buttons and reactions no longer apply to this card.)_"
+
+
+def strip_card_affordance(text: str) -> str:
+    """Replace a card's live-affordance line with a resolved note. Returns the
+    text unchanged when there is nothing to strip. Cosmetic and fail-soft: a
+    regex miss must never block a terminal edit."""
+    try:
+        if not text:
+            return text
+        cleaned = _CARD_AFFORDANCE_RE.sub("", text).rstrip()
+        if cleaned == text.rstrip():
+            return text
+        return f"{cleaned}\n\n{_RESOLVED_NOTE}"
+    except Exception:  # noqa: BLE001
+        return text
+
+
+def terminal_card_blocks(orig_blocks: list[dict[str, Any]] | None,
+                         outcome: str) -> list[dict[str, Any]]:
+    """Rebuild a resolved card: keep the sections, strip the stale affordance
+    line, drop every actions block, append the outcome as context.
+
+    Shared by the button handler in app.py and the emoji path in the review run
+    so a card looks the same however it was resolved -- before this, the emoji
+    path never edited the card at all (there is no chat_update anywhere in the
+    review script), so an emoji-approved card kept LIVE buttons indefinitely
+    under a header still reading "N item(s) below for your approval".
+    """
+    sections: list[dict[str, Any]] = []
+    for b in (orig_blocks or []):
+        if not isinstance(b, dict) or b.get("type") != "section":
+            continue
+        txt = ((b.get("text") or {}).get("text") or "")
+        stripped = strip_card_affordance(txt)
+        if stripped != txt:
+            b = {**b, "text": {**b["text"], "text": stripped}}
+        sections.append(b)
+    if not sections:
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": outcome}}]
+    return sections + [
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": outcome}]}
+    ]
+
+
+def actionable_reaction_ts() -> set[str]:
+    """Every message_ts carrying an actionable `reaction_added` in the reply log.
+
+    Read BEFORE the Step-0 expiry/escalation passes so they cannot retire a row
+    that has, in fact, been answered. Two live passes could do exactly that:
+    `_auto_dismiss_stale_pending` resolved rows with the reason
+    "auto_expired_dmd_unreacted" WITHOUT ever checking for a reaction, and
+    `_escalate_stale_mechanical` retires a row as "escalated_unanswered" once its
+    escalation budget runs out -- both run before Step 1 reads the reactions at
+    all. A 👍 arriving on a row at the end of its budget was discarded silently
+    and the row filed as unanswered. That is the founder's approval being
+    dropped, which is the exact class this audit exists to close.
+    """
+    out: set[str] = set()
+    try:
+        for r in load_reply_log():
+            if r.get("event_type") != "reaction_added":
+                continue
+            if r.get("action", "OTHER") not in ("APPROVED", "DISMISSED"):
+                continue
+            ts = str(r.get("message_ts") or "")
+            if ts:
+                out.add(ts)
+    except Exception:  # noqa: BLE001 -- a read error must never widen expiry
+        log.warning("actionable_reaction_ts: reply-log read failed", exc_info=True)
+    return out
+
+
+def classify_unmatched_reactions() -> dict[str, list[dict[str, Any]]]:
+    """Actionable reactions that `correlate_reactions_to_updates` will NOT act on.
+
+    They were previously dropped with no log line, no counter and no ack: the
+    correlator iterates ledger rows, so a reaction whose ts matches no PENDING
+    row simply never appears. On 2026-08-24 that silently swallowed 14 of
+    Harrison's 19 reactions.
+
+    Two populations, which need different answers:
+      already_resolved -- the ts maps to a ledger row that is no longer PENDING.
+                          He re-approved something already done; a card that
+                          stopped advertising its affordance would have prevented
+                          it, and he is owed a "no action needed" note.
+      no_ledger_row    -- the ts maps to nothing, i.e. a BATCH HEADER (three of
+                          them post per run) or an unrelated Cora message.
+    """
+    out: dict[str, list[dict[str, Any]]] = {"already_resolved": [], "no_ledger_row": []}
+    try:
+        updates = load_proposed_updates()
+        by_ts: dict[str, dict[str, Any]] = {}
+        for u in updates:
+            ts = str(u.get("dm_message_ts") or "")
+            if ts:
+                by_ts.setdefault(ts, u)
+        seen: set[tuple[str, str, str]] = set()
+        for r in load_reply_log():
+            if r.get("event_type") != "reaction_added":
+                continue
+            if r.get("action", "OTHER") not in ("APPROVED", "DISMISSED"):
+                continue
+            ts = str(r.get("message_ts") or "")
+            if not ts:
+                continue
+            key = (ts, str(r.get("reactor_id") or ""), str(r.get("reaction") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            row = by_ts.get(ts)
+            if row is None:
+                out["no_ledger_row"].append(r)
+            elif row.get("state") != "PENDING":
+                out["already_resolved"].append({**r, "_row": row})
+    except Exception:  # noqa: BLE001 -- diagnostics are never load-bearing
+        log.warning("classify_unmatched_reactions failed", exc_info=True)
+    return out
+
+
 def correlate_reactions_to_updates() -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Match reply-log reactions to proposed-update entries by DM message_ts.
 
@@ -719,7 +926,7 @@ def format_mechanical_dm(update: dict[str, Any]) -> str:
         lines.append(f"<{link}|{name or 'open in the tool'}>")
     elif name:
         lines.append(name)
-    lines.append(":+1: do it · :-1: dismiss  (I carry it out on the next review run)")
+    lines.append(mechanical_affordance_line(update.get("update_type", "")))
     return "\n".join(lines)
 
 
@@ -1089,7 +1296,11 @@ def process_one_tap_action(
                     f"⚠️ Couldn't save: {summary}. Not stored (it may be empty or look like PHI).")
         resolve_update(update_id, "APPROVED", reason="one_tap_button")
         log.info("knowledge_review: one-tap APPROVE %s (%s)", update_id[:8], summary)
-        return "approved", f"✅ Saved to Cora's known-answers. ({summary})"
+        # C4: was a hard-coded "Saved to Cora's known-answers" for EVERY type,
+        # which contradicted its own parenthetical on efficiency and lexicon
+        # items ("Saved to known-answers. (appended to efficiency-backlog.md)").
+        return "approved", (f"{outcome_text('APPROVED', update.get('update_type', ''))} "
+                            f"({summary})")
 
 
 def process_decision_tap(

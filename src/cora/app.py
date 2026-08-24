@@ -4013,14 +4013,15 @@ def _handle_knowledge_one_tap(body: dict, client, *, approve: bool,
         # outcome, and drop the buttons so it can't be re-tapped.
         if channel_id and message_ts:
             orig = (body.get("message") or {}).get("blocks") or []
-            section_blocks = [b for b in orig if b.get("type") == "section"]
-            new_blocks = section_blocks + [
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
-            ]
-            if not section_blocks:
-                new_blocks = [
-                    {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
-                ]
+            # C4: the buttons were already dropped here, but the card's own
+            # footer -- "👍 Approve · 👎 Dismiss  (or tap a button below)" -- was
+            # carried through verbatim, so a tapped card kept telling Harrison to
+            # use an emoji that is now a no-op and a button that no longer
+            # exists. He acted on exactly that: 11 of his 19 reactions on
+            # 2026-08-24 landed on cards he had already executed that morning.
+            # terminal_card_blocks does the section-keep + affordance-strip +
+            # actions-drop in one place, shared with the emoji path.
+            new_blocks = knowledge_review.terminal_card_blocks(orig, msg)
             try:
                 client.chat_update(
                     channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks,

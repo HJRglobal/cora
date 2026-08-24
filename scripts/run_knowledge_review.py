@@ -35,11 +35,15 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_review import (  # noqa: E402
+    actionable_reaction_ts as _kr_actionable_reaction_ts,
     apply_autowrite,
     autowrite_level,
     build_decision_blocks,
     build_mechanical_blocks,
+    classify_unmatched_reactions as _kr_classify_unmatched_reactions,
     correlate_reactions_to_updates,
+    outcome_text as _kr_outcome_text,
+    terminal_card_blocks as _kr_terminal_card_blocks,
     get_pending_updates,
     is_knowledge_update,
     propose_update,
@@ -443,7 +447,9 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             note_text = payload.get("note") or desc
             link = f"<{deal_url}|{deal_name}>" if deal_url else deal_name
             msg = (
-                f":pencil: *Gap executor* `[{uid_short}]` — add HubSpot note to {link}:\n"
+                f":pencil: *Gap executor* `[{uid_short}]` — approved HAND-OFF, "
+                f"needs a human: add this note to {link} in HubSpot "
+                f"(Cora does not write HubSpot notes):\n"
                 f"> {note_text[:400]}"
             )
             log.info("gap-executor: hubspot_note posted to #%s uid=%s", notify_ch, uid_short)
@@ -504,7 +510,8 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
     return success
 
 
-def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
+def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt,
+                                answered_ts: set[str] | None = None) -> int:
     """Flip to DISMISSED, in place, only PENDING entries that have ALREADY been
     DM'd to Harrison (dm_message_ts set) and left unreacted past cutoff_dt.
     Returns the count dismissed.
@@ -535,6 +542,14 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt) -> int:
             # after it was first shown. The escalation pass is their sole timer.
             continue
         if e.get("state") == "PENDING" and e.get("dm_message_ts"):
+            # C16: the resolved_reason here is literally
+            # "auto_expired_dmd_unreacted" -- and this pass never checked for a
+            # reaction. It runs in Step 0, BEFORE Step 1 reads the reply log, so
+            # a row DM'd >14d ago that Harrison HAD reacted to was dismissed as
+            # unreacted and his approval discarded. Never resolve a row as
+            # unanswered while an actionable reaction on its card is unprocessed.
+            if answered_ts and e.get("dm_message_ts") in answered_ts:
+                continue
             try:
                 if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
                     e["state"] = "DISMISSED"
@@ -613,7 +628,8 @@ def _mechanical_past_deadline(entry: dict, now_dt) -> bool:
     return review_lanes.past_review_deadline(entry, now_dt)
 
 
-def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int, int]:
+def _escalate_stale_mechanical(entries: list, now_dt,
+                               answered_ts: set[str] | None = None) -> tuple[int, int, int]:
     """Escalate PENDING mechanical rows past their review deadline, in place.
 
     Returns (newly_escalated_this_run, total_pending_past_deadline,
@@ -675,6 +691,13 @@ def _escalate_stale_mechanical(entries: list, now_dt) -> tuple[int, int, int]:
                     "-- restamping", str(e.get("update_id"))[:8])
                 last = None
         count = int(e.get("escalation_count") or 0) + 1
+        # C16: retiring a row as "escalated_unanswered" while an actionable
+        # reaction sits unprocessed on its card is the founder's approval being
+        # dropped -- this pass runs BEFORE Step 1 reads the reply log, so the
+        # budget could run out on a row he had already answered. An answered row
+        # is left PENDING for exactly one more run, which is all Step 1 needs.
+        if answered_ts and e.get("dm_message_ts") in answered_ts:
+            continue
         if count > _MECHANICAL_MAX_ESCALATIONS:
             e["state"] = "DISMISSED"
             e["resolved_at"] = now_dt.isoformat()
@@ -795,21 +818,11 @@ def _ack_reaction_text(action: str, update_type: str, success: bool = True) -> s
     (_execute_approved_update's return): a FAILED apply must NEVER be acked as
     "Saved" (D-051 remediation -- a false success would invert the exact trust
     guarantee D2 exists to provide)."""
-    if action == "APPROVED":
-        if not success:
-            return (":warning: Approved -- but the automatic save didn't go through; "
-                    "I've flagged it in #hjrg-leadership.")
-        if update_type == "known_answer":
-            return ":white_check_mark: Saved to Cora's known-answers."
-        if update_type == "efficiency":
-            return ":white_check_mark: Logged to the efficiency backlog."
-        if update_type == "decision_capture":
-            return (":inbox_tray: Filed to your decisions inbox (non-canon; "
-                    "promotion stays with the cascade).")
-        return ":white_check_mark: Approved -- I've recorded this."
-    if action == "DISMISSED":
-        return ":x: Dismissed -- no action taken."
-    return ""
+    # C4: the per-type branching moved to knowledge_review.outcome_text so the
+    # BUTTON path shares it. This path was correct and test-pinned; the button
+    # path returned "Saved to Cora's known-answers" for every type, including
+    # efficiency and lexicon items that land in entirely different files.
+    return _kr_outcome_text(action, update_type, success)
 
 
 def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
@@ -853,6 +866,41 @@ def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
             client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception:  # noqa: BLE001 -- already_reacted / perms; the reply is the ack
             pass
+    # C4: and RETIRE THE CARD. Until now the emoji path never touched it -- there
+    # is no chat_update anywhere in this script -- so an emoji-resolved card kept
+    # its live "Approve / Dismiss" buttons and its "👍 Approve · 👎 Dismiss" footer
+    # indefinitely, under a batch header still reading "N item(s) below for your
+    # approval". That is what produced 14 dead reactions out of 19 on 2026-08-24.
+    _terminal_edit_card(client, channel, ts, text, log)
+
+
+def _terminal_edit_card(client, channel: str, ts: str, outcome: str,
+                        log: logging.Logger) -> bool:
+    """Rewrite a resolved card in place: strip the stale affordance line, drop
+    the buttons, stamp the outcome. Returns True on a successful edit.
+
+    Needs the original blocks, which only Slack has -- one conversations_history
+    call per resolved reaction (bounded by the per-run card caps). Entirely
+    fail-soft: the resolve and the threaded ack have already happened, and a
+    cosmetic edit must never be able to undo or obscure them.
+    """
+    if not channel or not ts:
+        return False
+    try:
+        resp = client.conversations_history(channel=channel, latest=ts,
+                                            inclusive=True, limit=1)
+        msgs = (resp or {}).get("messages") or []
+        orig = (msgs[0].get("blocks") or []) if msgs else []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("card-retire: could not read the original card: %s", exc)
+        return False
+    try:
+        blocks = _kr_terminal_card_blocks(orig, outcome)
+        client.chat_update(channel=channel, ts=ts, text=outcome, blocks=blocks)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("card-retire: chat_update failed: %s", exc)
+        return False
 
 
 _OWNER_ITEM_LABELS = {
@@ -1065,8 +1113,9 @@ def _send_mechanical_review_dms(
         header = (
             f":card_index_dividers: {len(batch)} bookkeeping item(s) for review "
             f"({pool} pending in total, {len(items)} not yet shown). React :+1: "
-            f"to carry one out or :-1: to dismiss it; I act on them at the next "
-            f"review run."
+            f"to action one or :-1: to dismiss it; I act on them at the next "
+            f"review run. Each card says what actioning it does -- Asana items "
+            f"I carry out myself; HubSpot notes I hand to #hjrg-leadership."
         )
         if n_over:
             # Deliberately not "have been waiting for a decision": on the first
@@ -1335,6 +1384,11 @@ def main() -> int:
         )
         now = _dt.now(_tz.utc)
         cutoff = now - _td(days=_PENDING_EXPIRY_DAYS)
+        # Read the reply log FIRST. Step 0's expiry and escalation passes both
+        # resolve rows as un-answered, and both run before Step 1 correlates
+        # reactions -- so without this they can retire a row Harrison already
+        # approved. Fail-soft: an empty set restores the previous behaviour.
+        answered_ts = _kr_actionable_reaction_ts()
         auto_dismissed = 0
         expired_unrouted = 0
         mech_escalated = 0
@@ -1355,7 +1409,7 @@ def main() -> int:
                         # silently drop them (no-silent-data-loss invariant).
                         malformed.append(_l)
                         log.warning("Step 0: preserving 1 malformed ledger line on rewrite")
-                auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now)
+                auto_dismissed = _auto_dismiss_stale_pending(entries, cutoff, now, answered_ts)
                 # WS-4 ledger boundedness: expire never-routed OPERATIONAL rows
                 # past their own cutoff in the SAME pass/rewrite. Knowledge
                 # items are exempt (D-051 never-expire-unseen preserved).
@@ -1366,7 +1420,7 @@ def main() -> int:
                 # escalate. Same pass, same lock, same rewrite as the expiry it
                 # replaces for those three types.
                 mech_escalated, mech_overdue, mech_retired = \
-                    _escalate_stale_mechanical(entries, now)
+                    _escalate_stale_mechanical(entries, now, answered_ts)
                 # Fork 4 cross-process belts: heal filed-but-unresolved decision
                 # rows + re-card stale DM'd ones (same lock, same rewrite).
                 _filed_ids: set = set()
@@ -1414,6 +1468,24 @@ def main() -> int:
     # ─── Step 1: Process any reactions Harrison has already made ─────────────
     pairs = correlate_reactions_to_updates()
     log.info("Found %d reaction-to-update correlations to process", len(pairs))
+    # C16: a reaction whose ts matches no PENDING row was dropped with no log
+    # line, no counter and no ack -- the correlator iterates ledger ROWS, so it
+    # never sees them. On 2026-08-24 that silently swallowed 14 of Harrison's 19
+    # reactions (11 on already-executed cards, 3 on batch headers). Counting
+    # them is what makes "Found 0 correlations" distinguishable from "he reacted
+    # to nothing".
+    try:
+        _unmatched = _kr_classify_unmatched_reactions()
+        _n_done = len(_unmatched.get("already_resolved") or [])
+        _n_none = len(_unmatched.get("no_ledger_row") or [])
+        if _n_done or _n_none:
+            log.warning(
+                "reactions with no effect: %d on rows already resolved, %d on "
+                "messages with no ledger row (batch headers). Cards resolved "
+                "before this build kept advertising their emoji affordance.",
+                _n_done, _n_none)
+    except Exception as exc:  # noqa: BLE001 -- diagnostics never block a run
+        log.warning("unmatched-reaction scan failed (non-fatal): %s", exc)
 
     approved_updates = []
     dismissed_updates = []
