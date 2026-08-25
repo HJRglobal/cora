@@ -273,3 +273,97 @@ def test_klaviyo_is_on_the_renewal_radar():
     klav = [i for i in items if "klaviyo" in str(i.get("name") or "").lower()][0]
     assert klav.get("confirmed") is False, \
         "no invoice was read, so the amount/date must stay flagged unconfirmed"
+
+
+# ── D-051 review fixes (2026-08-25) ─────────────────────────────────────────
+
+def _grouped(sid, name, groups, count=100):
+    """A segment in the REAL Klaviyo shape: condition_groups is a list of
+    {"conditions": [...]} objects. Groups are ANDed; conditions within a group
+    are ORed."""
+    return {"type": "segment", "id": sid, "attributes": {
+        "name": name, "profile_count": count,
+        "definition": {"condition_groups": [{"conditions": g} for g in groups]}}}
+
+
+_BILLABLE_COND = {"type": "profile-marketing-consent", "consent": {
+    "channel": "email", "can_receive_marketing": True,
+    "consent_status": {"subscription": "subscribed"}}}
+_ANY_SUB_COND = {"type": "profile-marketing-consent", "consent": {
+    "channel": "email", "can_receive_marketing": True,
+    "consent_status": {"subscription": "any"}}}
+_SMS_COND = {"type": "profile-marketing-consent", "consent": {
+    "channel": "sms", "can_receive_marketing": True,
+    "consent_status": {"subscription": "subscribed"}}}
+_ZERO_COND = {"type": "profile-metric", "measurement": "count",
+              "measurement_filter": {"operator": "equals", "value": 0},
+              "timeframe_filter": {"operator": "alltime"}}
+_OPENED_COND = {"type": "profile-metric", "measurement": "count",
+                "measurement_filter": {"operator": "equals", "value": 3},
+                "timeframe_filter": {"operator": "alltime"}}
+
+
+def test_an_or_group_is_only_as_strong_as_its_weakest_branch():
+    """THE AND/OR defect. The first cut FLATTENED all condition groups and asked
+    "does ANY condition match", so a group offering a billable branch alongside a
+    non-billable one counted as the billable population -- and the verdict could
+    flip on nothing but JSON key order. Klaviyo ANDs the GROUPS and ORs the
+    conditions WITHIN a group."""
+    assert ka.is_billable_basis(
+        _grouped("M", "Mixed", [[_BILLABLE_COND, _ANY_SUB_COND]])) is False
+    assert ka.is_billable_basis(
+        _grouped("M2", "Mixed2", [[_BILLABLE_COND, _SMS_COND]])) is False
+    assert ka.is_zero_engagement(
+        _grouped("M3", "Mixed3", [[_ZERO_COND, _OPENED_COND]])) is False
+
+
+def test_the_verdict_does_not_depend_on_condition_order():
+    a = ka.is_billable_basis(_grouped("A", "A", [[_BILLABLE_COND, _ANY_SUB_COND]]))
+    b = ka.is_billable_basis(_grouped("B", "B", [[_ANY_SUB_COND, _BILLABLE_COND]]))
+    assert a == b is False
+
+
+def test_anded_groups_still_qualify_on_one_sufficient_group():
+    """Groups are ANDed, so one group that fully qualifies is enough -- which is
+    exactly the live "Never Opened (Email)" shape (metric group AND consent
+    group)."""
+    assert ka.is_billable_basis(
+        _grouped("S", "Split", [[_BILLABLE_COND], [_ZERO_COND]])) is True
+    assert ka.is_zero_engagement(
+        _grouped("N", "Never Opened", [[_ZERO_COND], [_ANY_SUB_COND]])) is True
+
+
+def test_the_live_shapes_still_classify_correctly_after_the_group_fix():
+    """Regression net over the real payloads: the fix must not have broken the
+    classifications that were already right."""
+    assert ka.is_billable_basis(ALL_SUBSCRIBED) is True
+    assert ka.is_billable_basis(NEVER_OPENED) is False
+    assert ka.is_billable_basis(TEXT_SUBSCRIBED) is False
+    assert ka.is_zero_engagement(NEVER_OPENED) is True
+    assert ka.is_zero_engagement(ALL_SUBSCRIBED) is False
+
+
+def test_the_client_reads_profile_count_from_the_single_segment_endpoint():
+    """`profile_count` is an additional-field on the SINGLE-segment resource, not
+    on the collection. Asking /segments for it returns segments with no count, so
+    the audit's headline number -- the whole charge basis -- could never be read.
+    Pinned on the source so the two-pass shape is not "simplified" back."""
+    src = _CLIENT_SRC
+    listing = src[src.index("def get_segments("):src.index("def _next_cursor(")]
+    assert "additional-fields[segment]" not in listing, (
+        "the collection endpoint does not support profile_count")
+    assert "get_segment(sid" in listing, "counts must come from the single resource"
+
+
+def test_the_client_follows_pagination_and_bounds_it():
+    """`page[size]` maxes at 10, so one page silently truncated the list -- and a
+    truncated list can hide the very segment that IS the billable population,
+    which then reads as "no charge basis could be derived"."""
+    assert "links" in _CLIENT_SRC and "page[cursor]" in _CLIENT_SRC
+    assert kc._MAX_PAGES >= 2
+    assert kc._next_cursor(
+        {"links": {"next": "https://a.klaviyo.com/api/segments?page%5Bcursor%5D=abc123"}}
+    ) == "abc123"
+    for junk in (None, {}, {"links": None}, {"links": {"next": None}},
+                 {"links": {"next": "not a url"}}):
+        assert kc._next_cursor(junk) == ""

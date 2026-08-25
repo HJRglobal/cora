@@ -57,23 +57,39 @@ log = logging.getLogger(__name__)
 OPS_CHANNEL = "C0BCUBUDHAR"
 
 
-def _consent_conditions(segment: dict | None) -> list[dict]:
-    # isinstance-guarded, not `or {}`-guarded: a non-dict row (an int, a string --
-    # what a schema surprise or a partially-parsed page actually looks like) has no
-    # .get and would raise straight into the report. My own malformed-input test
-    # caught this.
+def _condition_groups(segment: dict | None) -> list[list[dict]]:
+    """The definition as GROUPS, structure preserved.
+
+    THE SHAPE IS LOAD-BEARING AND FLATTENING IT INVERTS THE LOGIC. Klaviyo ANDs the
+    condition GROUPS and ORs the conditions WITHIN a group -- verified against the
+    live "Never Opened (Email)" segment, whose zero-engagement predicate and its
+    consent predicate sit in two SEPARATE groups precisely because both must hold.
+    The first cut flattened everything into one list and asked "does ANY condition
+    match", which means:
+      * an OR-group offering a billable branch alongside a non-billable one
+        counted as the billable population, and
+      * the verdict could flip on nothing more than JSON key order.
+    So the test is now per-group: a group qualifies only when EVERY condition in
+    it qualifies (an OR-group is only as strong as its weakest branch), and the
+    segment qualifies when SOME group does (groups are ANDed, so one sufficient
+    group is enough).
+
+    isinstance-guarded throughout, not `or {}`-guarded: a non-dict row (an int, a
+    string -- what a schema surprise or a partially-parsed page actually looks
+    like) has no `.get` and would raise straight into the report.
+    """
     if not isinstance(segment, dict):
         return []
     definition = (segment.get("attributes") or {}).get("definition")
     if not isinstance(definition, dict):
         return []
-    out: list[dict] = []
+    out: list[list[dict]] = []
     for group in definition.get("condition_groups") or []:
         if not isinstance(group, dict):
             continue
-        for cond in group.get("conditions") or []:
-            if isinstance(cond, dict):
-                out.append(cond)
+        conds = [c for c in (group.get("conditions") or []) if isinstance(c, dict)]
+        if conds:
+            out.append(conds)
     return out
 
 
@@ -86,44 +102,78 @@ def is_billable_basis(segment: dict | None) -> bool:
     "can receive marketing at all", and conflating the two is how an audit
     reports a confidently wrong number.
     """
-    if not kc.is_marketable_definition(segment):
+    return any(
+        all(_is_billable_condition(c) for c in group)
+        for group in _condition_groups(segment)
+    )
+
+
+def _is_billable_condition(cond: dict) -> bool:
+    """One condition selecting exactly the population Klaviyo's email plan bills:
+    marketing consent, email channel, can-receive true, subscription subscribed.
+
+    The `subscribed` clause is what separates the billable population from the
+    broader "can receive marketing at all". Conflating them is how an audit
+    reports a confidently wrong number -- measured live, "All Subscribed" gates on
+    `subscribed` (4,464) while "Never Opened (Email)" gates on `any` (2,367).
+    """
+    if not isinstance(cond, dict) or cond.get("type") != "profile-marketing-consent":
         return False
-    if "email" not in kc.marketing_consent_channels(segment):
+    consent = cond.get("consent")
+    if not isinstance(consent, dict):
         return False
-    return kc.subscription_status(segment) == "subscribed"
+    if str(consent.get("channel") or "").strip().lower() != "email":
+        return False
+    if consent.get("can_receive_marketing") is not True:
+        return False
+    status = consent.get("consent_status")
+    if not isinstance(status, dict):
+        return False
+    return str(status.get("subscription") or "").strip().lower() == "subscribed"
 
 
 def is_zero_engagement(segment: dict | None) -> bool:
     """Does this segment's DEFINITION select profiles that have never engaged?
 
-    The signature: a `profile-metric` condition whose measurement is a count
-    equal to 0 over an all-time window. Name-independent on purpose -- a
-    name-matched audit reports zero candidates the moment a segment is renamed,
-    and reads as a clean account while it does it.
+    Name-independent on purpose: a name-matched audit reports zero candidates the
+    moment somebody renames a segment, and reads as a clean account while doing it.
+
+    Per-GROUP, for the reason `_condition_groups` documents -- an OR-group is only
+    as strong as its weakest branch, so a group offering "never opened OR opened
+    twice" must not qualify.
     """
-    for cond in _consent_conditions(segment):
-        if cond.get("type") != "profile-metric":
-            continue
-        if str(cond.get("measurement") or "").lower() != "count":
-            continue
-        mf = cond.get("measurement_filter")
-        tf = cond.get("timeframe_filter")
-        if not isinstance(mf, dict):
-            continue
-        if str(mf.get("operator") or "").lower() != "equals":
-            continue
-        try:
-            if float(mf.get("value")) != 0.0:
-                continue
-        except (TypeError, ValueError):
-            continue
-        if isinstance(tf, dict) and str(tf.get("operator") or "").lower() != "alltime":
-            # A 30-day window of no opens is not "never engaged" -- it is a
-            # recent-activity segment, and suppressing on it would cull people
-            # who simply did not open last month.
-            continue
-        return True
-    return False
+    return any(
+        all(_is_zero_engagement_condition(c) for c in group)
+        for group in _condition_groups(segment)
+    )
+
+
+def _is_zero_engagement_condition(cond: dict) -> bool:
+    """One condition meaning "this metric never happened": a profile-metric count
+    equal to 0 over an ALL-TIME window.
+
+    All-time is required. A 30-day window of no opens is a recent-activity
+    segment, not a never-engaged one, and suppressing on it would cull people who
+    simply did not open last month.
+    """
+    if not isinstance(cond, dict) or cond.get("type") != "profile-metric":
+        return False
+    if str(cond.get("measurement") or "").lower() != "count":
+        return False
+    mf = cond.get("measurement_filter")
+    if not isinstance(mf, dict):
+        return False
+    if str(mf.get("operator") or "").lower() != "equals":
+        return False
+    try:
+        if float(mf.get("value")) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    tf = cond.get("timeframe_filter")
+    if isinstance(tf, dict) and str(tf.get("operator") or "").lower() != "alltime":
+        return False
+    return True
 
 
 def build_audit(*, segments: list[dict] | None,

@@ -54,8 +54,13 @@ def _write_ledger(tmp_path, rows):
     return p
 
 
-def _ts(y, m, d):
-    return int(datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc).timestamp())
+_AZ = datetime.timezone(datetime.timedelta(hours=-7))
+
+
+def _ts(y, m, d, h=0):
+    """An Arizona wall-clock instant as a UTC epoch -- which is how the filer
+    writes `filed_at` and how accounting thinks about the month."""
+    return int(datetime.datetime(y, m, d, h, tzinfo=_AZ).timestamp())
 
 
 # ── 3. the period ────────────────────────────────────────────────────────────
@@ -73,6 +78,66 @@ def test_period_bounds_are_half_open_and_handle_december():
     start, end = ei.period_bounds("2026-12")
     assert start == _ts(2026, 12, 1)
     assert end == _ts(2027, 1, 1)
+
+
+def test_the_period_is_bounded_in_arizona_not_utc():
+    """THE month-end defect. A document filed 2026-07-31 at 21:00 AZ is
+    2026-08-01 04:00 UTC, so UTC bounds pushed July's last-day invoice into
+    August -- reporting July MISSING while the file sat in Drive. Wrong once a
+    month, forever, in the dangerous direction."""
+    start, end = ei.period_bounds("2026-07")
+    late_july_az = _ts(2026, 7, 31, 21)
+    assert start <= late_july_az < end, "a 21:00 AZ filing on the 31st is July"
+    # ...and the first hours of August in Arizona are NOT July.
+    assert _ts(2026, 8, 1, 1) >= end
+
+
+def test_a_month_end_filing_is_attributed_to_the_arizona_month(tmp_path):
+    lst = _write_list(tmp_path, [{"name": "Google Workspace invoice",
+                                  "match": ["google-workspace"]}])
+    ledger = _write_ledger(tmp_path, [
+        {"drive_path": "01-HJR-Global/invoices/google-workspace-invoice.pdf",
+         "filed_at": _ts(2026, 7, 31, 21)}])
+    res = ei.assess("2026-07", expectations_path=lst, ledger_path=ledger)
+    assert res["results"][0]["status"] == ei.STATUS_PRESENT
+
+
+@pytest.mark.parametrize("bad", ["2026", "not-a-period", "2026-13", "2026-00", ""])
+def test_an_unusable_period_reports_unavailable_instead_of_a_traceback(tmp_path, bad):
+    lst = _write_list(tmp_path, [{"name": "V", "match": ["v"]}])
+    res = ei.assess(bad, expectations_path=lst,
+                    ledger_path=_write_ledger(tmp_path, []))
+    # An empty string falls back to the real previous period, which is fine; every
+    # other malformed value must be reported, never raised.
+    if bad:
+        assert res["available"] is False
+        assert "unusable period" in res["reason"]
+
+
+def test_a_vendor_named_non_invoice_does_not_report_the_invoice_as_present(tmp_path):
+    """The dangerous direction. A false PRESENT tells accounting a document is in
+    hand when it is not, and unlike a false MISSING nobody goes looking."""
+    lst = _write_list(tmp_path, [{"name": "Google Ads invoice",
+                                  "match": ["google-ads"]}])
+    ledger = _write_ledger(tmp_path, [
+        {"drive_path": "02-F3-Energy/decks/google-ads-strategy-deck.pdf",
+         "filed_at": _ts(2026, 7, 15)}])
+    res = ei.assess("2026-07", expectations_path=lst, ledger_path=ledger)
+    assert res["results"][0]["status"] == ei.STATUS_MISSING
+
+
+def test_a_real_vendor_invoice_still_reports_present(tmp_path):
+    """The tightening must not reject the thing it is meant to find -- and the
+    live filer names these '...-monthly-invoice.pdf' under an 'invoices/' folder."""
+    lst = _write_list(tmp_path, [{"name": "Google Ads invoice",
+                                  "match": ["google-ads"]}])
+    for path in ("01-HJR-Global/invoices/2026-07-02_hjrg_google-ads-monthly-invoice.pdf",
+                 "01-HJR-Global/invoices/google-ads-2026-07.pdf",
+                 "01-HJR-Global/receipts/google-ads-payment-receipt.pdf"):
+        ledger = _write_ledger(tmp_path, [
+            {"drive_path": path, "filed_at": _ts(2026, 7, 15)}])
+        res = ei.assess("2026-07", expectations_path=lst, ledger_path=ledger)
+        assert res["results"][0]["status"] == ei.STATUS_PRESENT, path
 
 
 # ── 1. unavailability is explicit ────────────────────────────────────────────

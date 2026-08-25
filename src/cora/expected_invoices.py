@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,11 @@ log = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPECTATIONS_PATH = _REPO_ROOT / "data" / "maps" / "finance-expected-invoices.yaml"
 LEDGER_PATH = _REPO_ROOT / "data" / "state" / "filer-content-ledger.jsonl"
+
+#: What makes a filed document an INVOICE rather than merely a vendor document.
+#: Deliberately narrow, and deliberately a regex over the already-lowercased path
+#: rather than a substring list, so "invoices/" as a FOLDER also qualifies.
+_DOC_KIND_RE = re.compile(r"invoice|receipt|statement|remittance|bill(?:ing)?")
 
 STATUS_PRESENT = "PRESENT"
 STATUS_MISSING = "MISSING"
@@ -98,20 +103,49 @@ def _iter_ledger(path: Path | None = None):
         return
 
 
+#: Arizona. Fixed -7 all year (no DST), which is why a plain offset is correct
+#: here rather than a zoneinfo lookup -- the same constant meeting_actions uses.
+_AZ = timezone(timedelta(hours=-7))
+
+
 def period_bounds(period: str) -> tuple[int, int]:
-    """(start_ts, end_ts_exclusive) for a YYYY-MM period, UTC."""
-    year, month = (int(x) for x in str(period).split("-")[:2])
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
-    end = (datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
-           else datetime(year, month + 1, 1, tzinfo=timezone.utc))
+    """(start_ts, end_ts_exclusive) for a YYYY-MM ACCOUNTING period.
+
+    BOUNDED IN ARIZONA TIME, NOT UTC. The filer writes `filed_at` as a UTC epoch,
+    which is fine -- an instant is an instant. What is NOT fine is deciding which
+    MONTH that instant belongs to using UTC calendar boundaries, because the
+    business closes its books in Arizona: a document filed 2026-07-31 at 21:00 AZ
+    is 2026-08-01 04:00 UTC, so a UTC boundary attributed July's last-day invoice
+    to August. That is a wrong answer in a close report, once a month, forever --
+    and it fails in the dangerous direction, reporting July MISSING while the
+    document is sitting in Drive.
+
+    Raises ValueError on an unparseable period rather than guessing (the caller
+    turns that into an honest UNAVAILABLE).
+    """
+    parts = str(period or "").split("-")
+    if len(parts) < 2:
+        raise ValueError(f"period must be YYYY-MM, got {period!r}")
+    year, month = int(parts[0]), int(parts[1])
+    if not 1 <= month <= 12:
+        raise ValueError(f"month out of range in {period!r}")
+    start = datetime(year, month, 1, tzinfo=_AZ)
+    end = (datetime(year + 1, 1, 1, tzinfo=_AZ) if month == 12
+           else datetime(year, month + 1, 1, tzinfo=_AZ))
     return int(start.timestamp()), int(end.timestamp())
 
 
 def previous_period(today: date | None = None) -> str:
-    """The last CLOSED month as YYYY-MM. That is the period accounting is
-    reconciling; the current month is still open, so an absent invoice in it is
-    not yet news."""
-    day = today or datetime.now(timezone.utc).date()
+    """The last CLOSED month as YYYY-MM -- the period accounting is reconciling.
+    The current month is still open, so an absent invoice in it is not yet news.
+
+    READS THE ARIZONA DATE. Arizona is UTC-7, so for the last seven hours of every
+    day the UTC date is already tomorrow. On 31 July at 18:00 AZ a UTC reading
+    makes it 1 August, whose previous month is July -- the month that has NOT
+    closed yet in Arizona. The report would then ask "is July's invoice filed?"
+    before July is over, and answer MISSING.
+    """
+    day = today or datetime.now(_AZ).date()
     year, month = (day.year - 1, 12) if day.month == 1 else (day.year, day.month - 1)
     return f"{year:04d}-{month:02d}"
 
@@ -119,14 +153,26 @@ def previous_period(today: date | None = None) -> str:
 def _matches(row: dict, patterns: list[str]) -> bool:
     """Does this filing look like the expected vendor's invoice?
 
-    Matched against `drive_path` (the filed NAME, which the filer builds from the
-    email) case-insensitively, as plain substrings rather than regexes: these come
-    from a human-maintained YAML file and a stray `(` in it must not raise, nor
-    give an editor a ReDoS foot-gun on a path this repo has already been bitten by
-    five times.
+    TWO constraints, both required. The vendor patterns are matched against
+    `drive_path` (the filed NAME the filer builds from the email) as plain
+    case-insensitive SUBSTRINGS, never regexes -- they come from a human-maintained
+    YAML file, so a stray `(` must not raise and must not hand an editor a ReDoS
+    foot-gun on a path (five such regressions here already). AND the path must name
+    a financial DOCUMENT, or any vendor-named file counts: without it
+    "google-ads-strategy-deck.pdf" reported the Ads INVOICE as PRESENT, which is
+    the dangerous direction -- a false PRESENT tells accounting a document is in
+    hand and, unlike a false MISSING, nobody goes looking.
     """
     haystack = f"{row.get('drive_path') or ''} {row.get('canonical') or ''}".lower()
-    return any(p and p.lower() in haystack for p in patterns)
+    if not any(p and p.lower() in haystack for p in patterns):
+        return False
+    # AND IT HAS TO BE AN INVOICE. Without this, any vendor-named document counts:
+    # "google-ads-strategy-deck.pdf" would report the Google Ads INVOICE as
+    # PRESENT. That is the dangerous direction -- a false PRESENT tells accounting
+    # a document is in hand when it is not, and unlike a false MISSING nobody goes
+    # looking. The filer names financial documents with one of these words (the
+    # live ledger's Google filings are all "...-monthly-invoice.pdf").
+    return bool(_DOC_KIND_RE.search(haystack))
 
 
 def assess(period: str | None = None, *,
@@ -153,7 +199,12 @@ def assess(period: str | None = None, *,
         out.update(available=False, reason="expectation list has no entries")
         return out
 
-    start, end = period_bounds(per)
+    try:
+        start, end = period_bounds(per)
+    except (ValueError, TypeError) as exc:
+        # A typo'd --period is an honest UNAVAILABLE, not a traceback.
+        out.update(available=False, reason=f"unusable period {per!r}: {exc}")
+        return out
     rows = list(_iter_ledger(ledger_path))
     if not rows:
         # An empty ledger is not evidence that invoices are missing -- the filer
@@ -218,7 +269,10 @@ def _first_sentence(note: Any) -> str:
         return "delivery not configured"
     match = re.search(r"(?<=[.!?])\s", text)
     if match and match.start() <= _NOTE_CHARS:
-        return text[:match.start() + 1]
+        # `match.start()` is the index OF the whitespace, so +1 kept it -- every
+        # known_undelivered Slack line ended with a dangling space. Slice to the
+        # boundary itself, which is already past the punctuation.
+        return text[:match.start()]
     if len(text) <= _NOTE_CHARS:
         return text
     head = text[:_NOTE_CHARS]

@@ -153,24 +153,76 @@ def get_account(*, transport: Any = None) -> dict | None:
     return rows[0] if rows else None
 
 
+#: Pages to follow before giving up. 10 pages x 10 segments is far above any
+#: plausible account, and a bound means a broken cursor cannot loop forever.
+_MAX_PAGES = 10
+
+
 def get_segments(*, transport: Any = None) -> list[dict] | None:
-    """All segments with their `profile_count` and `definition`.
+    """Every segment, each with its `definition` AND its `profile_count`.
+
+    TWO CORRECTIONS THE REVIEW FORCED, both of which would have produced a
+    confidently wrong report rather than an error:
+
+    1. `profile_count` IS NOT AVAILABLE ON THE COLLECTION ENDPOINT. It is an
+       additional-field on the single-segment resource only. Asking `/segments`
+       for it returns segments with NO count, so `segment_profile_count` returned
+       None for every one and the audit's headline number -- the whole charge
+       basis -- could never be read. So: list first (cheap, definitions included),
+       then GET each segment for its count. N is ~9 here.
+    2. IT PAGINATED ONE PAGE AND CLAIMED "All segments". `page[size]` maxes at 10,
+       so an account with more segments was silently truncated -- and a truncated
+       segment list can hide the very segment that IS the billable population,
+       which reads as "no charge basis could be derived" rather than as an error.
+       Now follows `links.next` up to `_MAX_PAGES`.
 
     Returns None (not []) when unconfigured or on failure, so the caller can
     distinguish "we could not look" from "this account has no segments".
     """
-    body = _get(
-        "/segments",
-        {
-            "additional-fields[segment]": "profile_count",
-            "fields[segment]": "name,definition,profile_count,is_active,is_processing",
-            "page[size]": "10",
-        },
-        transport=transport,
-    )
-    if body is None:
-        return None
-    return _data(body)
+    listed: list[dict] = []
+    params: dict[str, Any] | None = {
+        "fields[segment]": "name,definition,is_active,is_processing",
+        "page[size]": "10",
+    }
+    cursor = ""
+    for _ in range(_MAX_PAGES):
+        page_params = dict(params or {})
+        if cursor:
+            page_params["page[cursor]"] = cursor
+        body = _get("/segments", page_params, transport=transport)
+        if body is None:
+            # A mid-pagination failure must not return a PARTIAL list that reads
+            # as complete -- that is the silent-truncation failure again.
+            return None if not listed else None
+        listed.extend(_data(body))
+        cursor = _next_cursor(body)
+        if not cursor:
+            break
+
+    # Second pass for the counts, which only the single-resource endpoint carries.
+    out: list[dict] = []
+    for seg in listed:
+        sid = segment_id(seg)
+        detailed = get_segment(sid, transport=transport) if sid else None
+        # Fall back to the listed row rather than dropping the segment: a failed
+        # count read leaves profile_count absent, which the audit renders as
+        # "unknown" -- never as zero.
+        out.append(detailed or seg)
+    return out
+
+
+def _next_cursor(body: dict | None) -> str:
+    """The cursor from a JSON:API `links.next`, or ''."""
+    if not isinstance(body, dict):
+        return ""
+    nxt = (body.get("links") or {}).get("next")
+    if not isinstance(nxt, str) or not nxt:
+        return ""
+    try:
+        from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+        return (parse_qs(urlparse(nxt).query).get("page[cursor]") or [""])[0]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def get_segment(segment_id: str, *, transport: Any = None) -> dict | None:
