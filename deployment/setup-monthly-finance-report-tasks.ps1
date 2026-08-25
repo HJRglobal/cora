@@ -85,7 +85,25 @@ foreach ($job in $jobs) {
     # the silent-no-op class this repo has shipped more than once.
     $cmd = "cmd /c cd /d `"$RepoRoot`" && `"$PythonExe`" `"$scriptFull`" --post"
 
-    schtasks /Delete /TN $job.Name /F 2>$null | Out-Null
+    # FIRST-RUN ABORT, observed live 2026-08-25: this used to be
+    #     schtasks /Delete /TN $job.Name /F 2>$null | Out-Null
+    # A first-ever run has no task to delete, so schtasks writes "ERROR: The
+    # system cannot find the file specified." to stderr -- and in PS 5.1 ANY
+    # native-command stderr write becomes a TERMINATING NativeCommandError while
+    # $ErrorActionPreference = "Stop". `2>$null` does not prevent that. The script
+    # died on the first job and registered NEITHER task, while printing enough
+    # output to look like it had started working.
+    #
+    # The pre-delete was redundant to begin with: /Create /F below overwrites an
+    # existing task by definition. Kept only as a cmdlet-based guard, because
+    # cmdlets raise catchable errors instead of writing to a native stderr stream.
+    if (Get-ScheduledTask -TaskName $job.Name -ErrorAction SilentlyContinue) {
+        try {
+            Unregister-ScheduledTask -TaskName $job.Name -Confirm:$false | Out-Null
+        } catch {
+            Write-Host "  (existing task not removed, /F will overwrite: $($_.Exception.Message))" -ForegroundColor Yellow
+        }
+    }
 
     schtasks /Create `
         /TN $job.Name `
