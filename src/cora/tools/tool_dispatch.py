@@ -5790,14 +5790,47 @@ def is_bare_affirmative(message: str) -> bool:
     return _confirm_intent(message, None) == "affirm"
 
 
+# The model-facing directive that rides between the sentinel and the user text.
+# Bounded and non-greedy: it must not be able to eat a user-facing sentence that
+# merely contains a colon.
+_SENTINEL_DIRECTIVE_RE = re.compile(
+    r"^(?:WRITE_CONFIRMED|WRITE_BLOCKED)\b[^\n:]{0,120}:\s*")
+
+
 def _strip_write_sentinel(raw: str) -> str:
-    """Return the user-facing portion of a WRITE_CONFIRMED / WRITE_BLOCKED contract
-    payload (the text after the first blank line), or the raw string unchanged."""
-    if raw and raw.startswith(("WRITE_CONFIRMED", "WRITE_BLOCKED")):
-        parts = raw.split("\n\n", 1)
-        if len(parts) > 1 and parts[1].strip():
-            return parts[1].strip()
-    return raw
+    """Return the user-facing portion of a WRITE_CONFIRMED / WRITE_BLOCKED payload.
+
+    The contract is sentinel, blank line, user text -- and every well-formed
+    emitter uses _write_confirmed_contract to produce it.
+
+    FAIL-CLOSED on a malformed payload. This used to return `raw` unchanged when
+    there was no blank line, which meant a single mis-shaped emitter leaked its
+    model-facing directive straight into a user's DM -- and three of them did,
+    visibly, on 2026-08-24. Falling back to stripping the leading sentinel-and-
+    directive run means the worst case is a slightly awkward sentence rather than
+    "WRITE_CONFIRMED -- post as your entire response:" in Harrison's Slack. The
+    WARNING names the defect so it gets fixed at the emitter rather than relied
+    on here.
+    """
+    if not raw or not raw.startswith(("WRITE_CONFIRMED", "WRITE_BLOCKED")):
+        return raw
+    parts = raw.split("\n\n", 1)
+    if len(parts) > 1 and parts[1].strip():
+        return parts[1].strip()
+    cleaned = _SENTINEL_DIRECTIVE_RE.sub("", raw).strip()
+    if cleaned and cleaned != raw:
+        log.warning("write-sentinel: malformed payload (no blank line) -- "
+                    "stripped the directive defensively; fix the emitter")
+        return cleaned
+    # A bare sentinel with no user text at all. No emitter in the tree produces
+    # this, but returning `raw` would post the literal token to Slack -- the
+    # exact failure this function exists to prevent -- and returning "" would
+    # render an empty message. A neutral line that asserts nothing about the
+    # outcome is the least-bad third option.
+    log.warning("write-sentinel: payload is a bare sentinel with no user text")
+    if raw.startswith("WRITE_BLOCKED"):
+        return "I couldn't complete that."
+    return "Done."
 
 
 def _peek_pending_asana(slack_user: str, channel: str) -> dict | None:
@@ -11937,17 +11970,24 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
         return ("I couldn't file that -- it looked like it contained protected "
                 "info. Tell the user it wasn't queued and to rephrase without "
                 "any client/patient details.")
+    # cq-288edaba659d, fresh live evidence 2026-08-24 15:38: these three were the
+    # only WRITE_CONFIRMED emitters in the tree that separated the sentinel from
+    # the user text with ": " instead of a BLANK LINE. _strip_write_sentinel
+    # splits on "\n\n" and FAILS OPEN when there is none, so the model-facing
+    # directive "WRITE_CONFIRMED -- post as your entire response:" was posted
+    # verbatim into Harrison's DM. Routed through the shared constructor so a
+    # fourth one cannot drift; the guard test below makes the contract structural.
     if is_founder:
-        return ("WRITE_CONFIRMED -- post as your entire response: Queued to your "
-                "code-session queue (APPROVED). Tap \"Stage prompt\" on the card "
-                "when you want the kickoff written.")
+        return _write_confirmed_contract(
+            "Queued to your code-session queue (APPROVED). Tap \"Stage prompt\" "
+            "on the card when you want the kickoff written.")
     if outcome == "held":
-        return ("WRITE_CONFIRMED -- post as your entire response: You've hit "
-                "today's code-queue limit (3/day, resets midnight AZ), but I "
-                "still logged this for Harrison -- it'll surface in his next "
-                "queue digest for review.")
-    return ("WRITE_CONFIRMED -- post as your entire response: Queued for "
-            "Harrison's review -- he'll approve it from his queue.")
+        return _write_confirmed_contract(
+            "You've hit today's code-queue limit (3/day, resets midnight AZ), "
+            "but I still logged this for Harrison -- it'll surface in his next "
+            "queue digest for review.")
+    return _write_confirmed_contract(
+        "Queued for Harrison's review -- he'll approve it from his queue.")
 
 
 def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> str:

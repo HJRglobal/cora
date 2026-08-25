@@ -1439,8 +1439,15 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
             f"- [{it.get('severity')}] {it.get('kind')} [{it.get('entity')}] "
             f"{it.get('title')} :: {it.get('summary', '')} :: fix: {it.get('fix_sketch', '')} "
             f":: id={it.get('id')} :: evidence="
-            + "; ".join(f"ch {e.get('channel_id', '')}/ts {e.get('ts', '')}"
-                        for e in (it.get('evidence') or [])[:3])
+            # Same half-empty artifact as the card renderer above -- leaving it
+            # here would reproduce "ch D0B4CTD3B09/ts " in every generated
+            # kickoff prompt instead of only on the card.
+            + "; ".join(
+                f"ch {str(e.get('channel_id') or '').strip()}"
+                f"/ts {str(e.get('ts') or '').strip()}"
+                for e in (it.get('evidence') or [])[:3]
+                if str(e.get('channel_id') or '').strip()
+                and str(e.get('ts') or '').strip())
             for it in items
         )
         try:
@@ -1490,8 +1497,14 @@ def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     status = str(rec.get("status", "PROPOSED"))
     ev_lines = []
     for e in (rec.get("evidence") or [])[:3]:
-        if e.get("channel_id") or e.get("ts"):
-            ev_lines.append(f"<slack://channel?id={e.get('channel_id', '')}> ts `{e.get('ts', '')}`")
+        # cq-89fdad5f0f86: this was an OR, so an evidence row with a channel but
+        # no ts rendered "<slack://channel?id=D0B4CTD3B09> ts ``" -- a provenance
+        # line with no provenance in it. Every row minted by queue_explicit
+        # carries ts="" by construction, so it fired on every explicit capture.
+        ch = str(e.get("channel_id") or "").strip()
+        ts = str(e.get("ts") or "").strip()
+        if ch and ts:
+            ev_lines.append(f"<slack://channel?id={ch}> ts `{ts}`")
     ev_txt = ("\n" + "\n".join(f"> {x}" for x in ev_lines)) if ev_lines else ""
     lead = "queued" if status == "APPROVED" else "new"
     text = (
@@ -2086,6 +2099,50 @@ def _explicit_count_today(user: str) -> int:
     return n
 
 
+# Live ids are 12 lowercase hex characters. Anchored on word boundaries so a
+# longer hex blob cannot be mistaken for one.
+_CQ_ID_RE = re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE)
+
+
+def find_cq_id(text: str) -> str:
+    """The first cq id named in *text*, lowercased, or "" -- resolved against the
+    ledger so a typo'd or invented id never counts as a reference."""
+    for m in _CQ_ID_RE.finditer(str(text or "")):
+        cid = m.group(0).lower()
+        if get_item(cid):
+            return cid
+    return ""
+
+
+def stage_by_id(cq_id: str, actor_id: str) -> tuple[str, str]:
+    """Generate the kickoff for an EXISTING item. Harrison-only.
+
+    A thin wrapper over ensure_kickoff_staged, deliberately -- reusing it
+    inherits the staging reservation, the terminal-status guard, the prompt_path
+    idempotence and the loud-failure contract instead of re-deriving four
+    behaviours that already exist and are tested.
+
+    Why this exists: on 2026-08-24 15:38 a typed "stage a code-session prompt for
+    cq-f52c6b691127" went to the cora_queue_code_session TOOL, whose backend
+    queue_explicit MINTS UNCONDITIONALLY and never looks at the request text for
+    an id. It created a junk P2 meta-item titled "Retrieve pending code-queue
+    item cq-f52c6b691127 for staging" -- a queue entry whose entire content is a
+    request to look at another queue entry -- and auto-staged a kickoff for it.
+    Fingerprint dedup could not help: the key is (signal, representative) =
+    ("explicit", the raw request text), so two differently-worded stage requests
+    naming the SAME id produce two different junk items.
+    """
+    cid = str(cq_id or "").strip().lower()
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can stage a queue item."
+    if not cid or not get_item(cid):
+        return ("not_found",
+                f"I can't find `{cid or '(no id)'}` in the queue. If you have the "
+                f"card, tap its \u201cStage prompt\u201d button -- that is the same "
+                f"path and it always resolves the right item.")
+    return ensure_kickoff_staged(cid)
+
+
 def queue_explicit(user: str, entity: str, channel_id: str, request: str,
                    is_founder: bool) -> tuple[str | None, str]:
     """Backend for the explicit tool's confirmed call. Returns (cq_id, outcome).
@@ -2105,6 +2162,16 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
     request = (request or "").strip()
     if not request:
         return None, "empty"
+    # A request that NAMES an existing queue item is a reference to it, never a
+    # new item. Minting here is how a typed stage request became a junk meta-item
+    # on 2026-08-24. Founder-only, because staging is: for anyone else this
+    # resolves and reports rather than acting.
+    named = find_cq_id(request)
+    if named:
+        if is_founder:
+            outcome, _detail = stage_by_id(named, user)
+            return named, ("staged" if outcome == "staged" else f"resolved:{outcome}")
+        return named, "resolved:not_authorized"
     held = (not is_founder) and _explicit_count_today(user) >= EXPLICIT_THROTTLE_PER_DAY
     rec = {
         "kind": "feature", "severity": "P2", "title": request[:120],
