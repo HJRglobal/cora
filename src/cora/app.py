@@ -21,6 +21,7 @@ from .connectors import hubspot_email_sync
 from . import channel_classifier
 from . import channel_content_guard
 from . import confirm_cards
+from . import decision_alerts
 from . import user_access
 from . import lex_phi_access
 from .config import config
@@ -237,6 +238,42 @@ def _resolve_channel_name(client, channel_id: str) -> str:
         return channel_id
 
 
+def _ensure_user_first(merged: list[dict]) -> list[dict]:
+    """Make history start with a user turn WITHOUT throwing the opening away.
+
+    The Claude API requires a user turn first, and both history builders used to
+    satisfy it by popping leading assistant turns. In a thread CORA started --
+    a stalled-decision alert, a gap ask, any proactive DM -- her opening post is
+    the only prior message, so the pop emptied the list entirely and the model
+    saw the human's reply with zero context.
+
+    That is not hypothetical. On 2026-08-19 Harrison answered a stalled-decision
+    alert in-thread with "HJR productions"; the log records
+    `thread_history: fetched 0 turns`, the router sent 15 context-free characters
+    to Haiku, and Cora replied with clarifying questions. The item stayed stalled
+    for five more days. Every Cora-initiated alert thread had this defect on its
+    first human reply, not just decisions.
+
+    Folded into a labelled user turn instead: the API is satisfied and the
+    opening survives. Labelled rather than silently re-roled so the model is not
+    told the human said something Cora said.
+    """
+    dropped: list[str] = []
+    while merged and merged[0]["role"] == "assistant":
+        dropped.append(merged.pop(0)["content"])
+    if dropped and merged:
+        # Prepended to the first user turn rather than inserted as a turn of its
+        # own, so the result keeps the strict alternation the merge loop above
+        # maintains.
+        merged[0] = {
+            "role": "user",
+            "content": ("[Context -- Cora opened this thread with:]\n"
+                        + "\n".join(dropped)
+                        + "\n\n[The reply to it:]\n" + merged[0]["content"]),
+        }
+    return merged
+
+
 def _fetch_thread_history(
     client,
     channel_id: str,
@@ -294,9 +331,9 @@ def _fetch_thread_history(
         else:
             merged.append({"role": turn["role"], "content": turn["content"]})
 
-    # Ensure history starts with a user turn (Claude API requirement)
-    while merged and merged[0]["role"] == "assistant":
-        merged.pop(0)
+    # Ensure history starts with a user turn (Claude API requirement) without
+    # discarding Cora's opening -- see _ensure_user_first.
+    merged = _ensure_user_first(merged)
 
     log.info(
         "thread_history: fetched %d turns for channel=%s thread_ts=%s",
@@ -2592,8 +2629,7 @@ def _fetch_dm_history(client, channel_id: str, current_msg_ts: str, limit: int =
             merged[-1]["content"] += "\n" + turn["content"]
         else:
             merged.append({"role": turn["role"], "content": turn["content"]})
-    while merged and merged[0]["role"] == "assistant":
-        merged.pop(0)
+    merged = _ensure_user_first(merged)
     return merged
 
 
@@ -3163,6 +3199,65 @@ def handle_message_event(event: dict, client) -> None:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("gap_autofill: ack post failed: %s", exc)
                 return
+            # ── C8: a threaded reply to a stalled-decision alert ────────────
+            # THREADED-ONLY. The alert is always the thread parent, so an exact
+            # thread_ts match is unambiguous -- and refusing to claim top-level
+            # DMs keeps this out of the greedy-capture contest above.
+            #
+            # It sits here, ABOVE _handle_dm_qa, because plain Q&A is exactly
+            # what swallowed Harrison's 8/19 answer: he replied "HJR productions"
+            # to a P1 alert and Cora treated 15 context-free characters as a
+            # fresh question, then asked him clarifying questions back. The item
+            # stayed stalled for five more days.
+            try:
+                _alert = decision_alerts.match_alert_reply(
+                    user_id, event.get("thread_ts"))
+            except Exception:  # noqa: BLE001 -- capture must never break DMs
+                log.warning("decision_alerts: match failed", exc_info=True)
+                _alert = None
+            if _alert:
+                _key = str(_alert.get("alert_message_ts") or "")
+                try:
+                    if decision_alerts.is_decline(text):
+                        # "Not my area" leaves the decision OPEN -- the same rule
+                        # gap_autofill applies to a declined ask.
+                        decision_alerts.mark_state(
+                            _key, decision_alerts.STATE_DECLINED)
+                        _ack = ("Understood -- leaving that decision open. "
+                                "I'll keep it on the stalled list.")
+                    elif phi_guard.is_any_phi(text):
+                        # Screened BEFORE persisting: a PHI-shaped answer is
+                        # never written to the state file (D-082).
+                        decision_alerts.mark_state(
+                            _key, decision_alerts.STATE_REFUSED_PHI)
+                        _ack = ("I can't record that one -- it looked like it "
+                                "carried protected info. Nothing was stored.")
+                    else:
+                        _ack = None
+                        _preview = decision_alerts.build_close_preview(
+                            _alert, text)
+                        _stash_id = _tool_dispatch.stash_decision_close(
+                            user_id, _key, text)
+                        _post_followup_confirm_card(
+                            client, event.get("channel", user_id), _preview,
+                            _stash_id, thread_ts=_key)
+                    if _ack:
+                        client.chat_postMessage(
+                            channel=event.get("channel", user_id), text=_ack,
+                            thread_ts=_key, unfurl_links=False,
+                            unfurl_media=False)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("decision_alerts: staging failed: %s", exc)
+                    try:
+                        client.chat_postMessage(
+                            channel=event.get("channel", user_id),
+                            text=("Sorry -- something went wrong recording that "
+                                  "answer. The decision is still open."),
+                            thread_ts=_key)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+
             # ── Tier-2 historical retrieval (DM-only by design) ─────────────
             # Explicit "pull up / show me my emails" requests in a plain DM
             # route into the Q&A pipeline; the historical-access gate at the
@@ -4934,7 +5029,9 @@ def _edit_card_terminal(client, channel_id: str, message_ts: str, orig_blocks: l
         return False
 
 
-def _post_followup_confirm_card(client, channel_id: str, text: str, stash_id: str) -> None:
+def _post_followup_confirm_card(client, channel_id: str, text: str,
+                                stash_id: str,
+                                thread_ts: str | None = None) -> None:
     """Post a NEW Confirm/Cancel card for a freshly-minted stash_id. Shared by
     the picker's pick -> preview hand-off AND a confirm-tap whose own execute
     declined to write and re-stashed a fresh preview instead (D-051 review:
@@ -4945,7 +5042,13 @@ def _post_followup_confirm_card(client, channel_id: str, text: str, stash_id: st
     carded = confirm_cards.claim_card_attach(stash_id)
     blocks = confirm_cards.build_confirm_blocks(text, stash_id) if carded else None
     try:
-        resp = client.chat_postMessage(channel=channel_id, text=text, blocks=blocks)
+        kwargs = {"channel": channel_id, "text": text, "blocks": blocks}
+        if thread_ts:
+            # C8: a decision-alert answer's card belongs IN the alert's thread,
+            # beside the question it answers -- not floating at the bottom of a
+            # busy DM where it reads as unrelated.
+            kwargs["thread_ts"] = thread_ts
+        resp = client.chat_postMessage(**kwargs)
         if carded:
             confirm_cards.register_card(stash_id, channel_id, (resp or {}).get("ts", ""), text)
     except Exception:  # noqa: BLE001

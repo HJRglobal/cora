@@ -43,6 +43,7 @@ import yaml  # noqa: E402
 
 from cora.tools.asana_client import get_user_tasks, AsanaClientError  # noqa: E402
 from cora.phi_guard import is_phi_risk, is_visibility_cpa_mention  # noqa: E402
+from cora import decision_alerts  # noqa: E402  (C8 alert identity)
 
 LOG_DIR = _REPO_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -128,19 +129,27 @@ def _open_dm(slack_client, user_id: str) -> str | None:
         return None
 
 
-def _send_dm(slack_client, user_id: str, text: str, dry_run: bool) -> bool:
+def _send_dm(slack_client, user_id: str, text: str, dry_run: bool):
+    """Post the DM and RETURN ITS IDENTITY -- (channel, ts) on success, else None.
+
+    C8: this used to discard chat_postMessage's response and return a bare bool,
+    so no alert Cora ever sent was identifiable. Nothing could recognise a reply
+    as being TO an alert, which is why Harrison's in-thread answer on 8/19 fell
+    through to plain Q&A. Truthiness is preserved, so pass-1 callers that just
+    check `if _send_dm(...)` are unchanged.
+    """
     if dry_run:
         log.info("[DRY-RUN] DM to %s: %s", user_id, text[:120])
-        return True
+        return ("", "")
     dm_ch = _open_dm(slack_client, user_id)
     if not dm_ch:
-        return False
+        return None
     try:
-        slack_client.chat_postMessage(channel=dm_ch, text=text)
-        return True
+        resp = slack_client.chat_postMessage(channel=dm_ch, text=text)
+        return (dm_ch, str((resp or {}).get("ts") or ""))
     except Exception as exc:
         log.warning("Failed to send DM to %s: %s", user_id, exc)
-        return False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -334,10 +343,22 @@ def run_pass2_stalled_decisions(
 
     now_ts = time.time()
 
+    # C8: topics Harrison has already answered in-thread. `age_days` keys on the
+    # file's "Last touched" line and an in-thread answer never touches that file,
+    # so without this the SAME decision re-alerts every 7 days until he hand-edits
+    # it -- and the re-ask is precisely the behaviour this closes.
+    try:
+        answered = decision_alerts.answered_topic_keys()
+    except Exception:  # noqa: BLE001 -- never let bookkeeping suppress an alert
+        answered = set()
+
     for decision in decisions:
         age_days = decision.get("age_days")
         # Undated (age_days None) -> can't tell it's stale, don't escalate.
         if age_days is None or age_days < _DECISION_STALE_DAYS:
+            continue
+        if decision_alerts.topic_key(decision.get("topic", "")) in answered:
+            stats["answered"] = stats.get("answered", 0) + 1
             continue
 
         sev = decision["severity"]
@@ -366,10 +387,26 @@ def run_pass2_stalled_decisions(
             f"{open_line}"
         )
 
-        if _send_dm(slack_client, _HARRISON_SLACK_ID, msg, dry_run):
+        sent = _send_dm(slack_client, _HARRISON_SLACK_ID, msg, dry_run)
+        if sent is not None:
             throttle[throttle_key] = now_ts
             stats["alerted"] += 1
             log.info("Alerted Harrison on stalled %s decision age=%dd", sev, age_days)
+            # Give the alert an identity so a threaded reply can be recognised
+            # as answering THIS decision. Fail-soft: bookkeeping must never turn
+            # a delivered alert into a failed one.
+            dm_ch, ts = sent
+            if ts:
+                try:
+                    decision_alerts.record_alert(
+                        topic=topic, severity=sev,
+                        entity=str(decision.get("entity") or ""),
+                        owner=str(decision.get("owner") or ""),
+                        surfaced=str(decision.get("surfaced") or ""),
+                        dm_channel_id=dm_ch, alert_message_ts=ts,
+                        target_user_id=_HARRISON_SLACK_ID)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not record the alert identity: %s", exc)
 
     return stats
 

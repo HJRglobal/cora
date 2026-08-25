@@ -12361,6 +12361,10 @@ _CLASSB_KINDS = (
     "influencer_handle",
     "influencer_deliverable",
     "meeting_item",
+    # C8: an in-thread answer to a stalled-decision alert. Joins the Class-B
+    # arbitration, the connector-footer strip, the confirm/cancel card and the
+    # typed-confirm path by construction -- which is the point of the tuple.
+    "decision_close",
 )
 _CLASSB: dict[str, dict] = {k: _make_classb_store(k) for k in _CLASSB_KINDS}
 
@@ -12430,6 +12434,44 @@ def _classb_stash(kind: str, slack_user: str, channel: str, entry: dict) -> str:
     entry["stash_id"] = sid
     _CLASSB[kind]["put"](slack_user, channel, entry)
     return sid
+
+
+def stash_decision_close(slack_user: str, alert_key: str, answer: str,
+                         channel: str = "dm") -> str:
+    """Stage a stalled-decision answer for confirmation. Returns the stash id.
+
+    The PAYLOAD is what executes on Confirm -- never the confirm turn's re-echoed
+    text -- so the answer Harrison sees previewed is byte-identically the answer
+    that gets recorded.
+    """
+    return _classb_stash("decision_close", slack_user, channel, {
+        "alert_key": str(alert_key or ""),
+        "answer": str(answer or ""),
+    })
+
+
+def _execute_claimed_decision_close(entry: dict, tapping_user_id: str) -> str:
+    """Record the answer and stop the alert re-asking. Writes NO canon.
+
+    decisions-pending.md is read-only to every part of Cora and stays that way
+    (D-011). What this does is mark the alert ANSWERED -- which suppresses the
+    daily re-alert, the actual complaint -- and hand back the wording for the
+    cascade. The durable edit remains Harrison's.
+    """
+    from cora import decision_alerts
+    key = str(entry.get("alert_key") or "")
+    answer = str(entry.get("answer") or "")
+    if not key or not answer:
+        return "I couldn't record that -- the staged answer was empty."
+    ok = decision_alerts.mark_state(key, decision_alerts.STATE_ANSWERED,
+                                    answer=answer)
+    if not ok:
+        return ("I couldn't find that alert any more -- it may have expired. "
+                "The decision is still open.")
+    return _write_confirmed_contract(
+        "Recorded. I'll stop re-asking you about this one, and it'll ride the "
+        "next cascade proposal for `decisions-pending.md` -- that edit stays "
+        "yours.")
 
 
 def _classb_take(kind: str, slack_user: str, channel: str) -> dict | None:
@@ -12747,6 +12789,8 @@ def _execute_claimed_stash(kind: str, entry: dict, tapping_user_id: str, entity:
     an ambient peek cannot tell "this call re-stashed" apart from "a totally
     unrelated write landed in the same slot while this call was in flight"
     (D-051 fix, 2026-08-02 second review)."""
+    if kind == "decision_close":
+        return _execute_claimed_decision_close(entry, tapping_user_id), None
     if kind == "asana":
         return _execute_claimed_asana(entry.get("action", ""), entry, tapping_user_id, entity), None
     if kind == "shopify":
