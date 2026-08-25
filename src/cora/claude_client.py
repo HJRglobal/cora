@@ -23,6 +23,7 @@ from .model_router import MODEL_SONNET
 from .tools.tool_dispatch import (
     TOOL_DEFINITIONS,
     VERBATIM_TABLE_TOOLS,
+    _strip_write_sentinel,
     dispatch,
     tools_for_entity,
 )
@@ -952,11 +953,29 @@ _PHANTOM_CONFIRM_CLAIM_RE = re.compile(
 )
 
 
-# Write tools that reach the phantom guard WITHOUT a WRITE_CONFIRMED/WRITE_BLOCKED
-# sentinel (the _CONTRACT_WRITE_TOOLS members fire a sentinel and are handled before the
-# guard). If one of THESE ran this turn, a real non-sentinel write may have happened, so
-# the broadened guard must not clobber its success narration. A READ tool must NOT be in
-# this set -- a spurious read must never disarm the phantom backstop (re-verify MED).
+# Write tools that reach the phantom guard WITHOUT being handled by the narration net
+# (the _CONTRACT_WRITE_TOOLS members are, and are handled before the guard). If one of
+# THESE ran this turn, a real write may have happened, so the broadened guard must not
+# clobber its success narration. A READ tool must NOT be in this set -- a spurious read
+# must never disarm the phantom backstop (re-verify MED).
+#
+# NAMING NOTE (cq-288edaba659d, 2026-08-25): the "NON_SENTINEL" name is no longer
+# literal -- all four members now emit a WRITE_CONFIRMED sentinel. What matters for
+# _should_broaden is whether the NARRATION NET handles the tool, and the net gates on
+# tool-NAME membership in _CONTRACT_WRITE_TOOLS (see _last_shopify_write_result), NOT on
+# the presence of a sentinel, so a sentinel from a non-member tool is inert there and
+# this set is still exactly what keeps such a tool's real success from being clobbered.
+#
+# Measured-incomplete in the OTHER direction too, and deliberately left alone: six write
+# tools outside _CONTRACT_WRITE_TOOLS emit a sentinel and are absent here
+# (hubspot_update_deal_stage / hubspot_add_note / slack_send_dm / cora_remember /
+# cora_forget_note / the decision-close path), five of them since long before this
+# change. Today that is harmless because a DIFFERENT control keeps assume_confirm False
+# on those turns (app.py gates it on `not has_pending_classb(...)`), which is the kind of
+# coupling that breaks quietly later -- but correcting membership changes phantom-guard
+# behaviour for tools this bundle does not test, so it is flagged in the cascade report
+# as its own item rather than folded in here. Renaming the constant was also left alone:
+# it is referenced by name in tests and prior review notes.
 _NON_SENTINEL_WRITE_TOOLS = frozenset({
     "calendar_create_event", "calendar_delete_event", "calendar_schedule_meeting",
     "gmail_create_draft",
@@ -997,14 +1016,30 @@ def _is_shopify_directive(raw: str) -> bool:
 
 def _shopify_directed_text(raw: str) -> str:
     """The user-facing text the write tool prescribes -- the part after the first
-    blank line of a WRITE_CONFIRMED / WRITE_BLOCKED payload. Falls back to the raw
-    string if the blank is absent (callers gate on _is_shopify_directive first)."""
+    blank line of a WRITE_CONFIRMED / WRITE_BLOCKED payload.
+
+    This is a FOURTH verbatim-posting human surface, independent of the three that
+    route through tool_dispatch._strip_write_sentinel: the narration net posts this
+    return as the Slack reply, overriding the model. D-051 lens-2 measured the two
+    implementations DIVERGING on a malformed payload -- the seam yielded "Queued."
+    while this one posted "WRITE_CONFIRMED -- post the following as your entire
+    response (no preamble, no meta-commentary): Queued." The seam was hardened on
+    2026-08-24 precisely because three emitters leaked that shape visibly; its
+    clone was left on the old fail-open `return raw`.
+
+    Delegates to the hardened implementation rather than re-deriving it, so the two
+    surfaces cannot drift apart again. Imported at MODULE level, on the existing
+    relative-import line at the top of this file: the first cut used a lazy
+    `from cora.tools.tool_dispatch import ...` justified by an import cycle that
+    does not exist -- this module already imports that one at line 22 -- and being
+    absolute where the file is otherwise relative, it loaded a SECOND copy of the
+    module under a different name, with its own pending stores (D-051 lens-3).
+    """
     if not raw:
         return raw
-    if raw.startswith(_SHOPIFY_SENTINELS):
-        parts = raw.split("\n\n", 1)
-        return parts[1].strip() if len(parts) > 1 and parts[1].strip() else raw
-    return raw
+    if not raw.startswith(_SHOPIFY_SENTINELS):
+        return raw
+    return _strip_write_sentinel(raw)
 
 
 def _last_shopify_write_result(tool_use_blocks: list, tool_results: list) -> str:

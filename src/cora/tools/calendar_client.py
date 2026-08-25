@@ -439,17 +439,36 @@ def format_created_event_for_llm(
     cal_link_str = f"<{html_link}|Open in Google Calendar>" if html_link else "(no calendar link)"
     meet_str = f"\n- Google Meet: <{meet_link}|Join meeting>" if meet_link else ""
 
+    # cq-288edaba659d, D-051 lens-2 HIGH. This return is handed back BARE from
+    # two executors (_execute_claimed_calendar's create branch and
+    # _execute_claimed_schedule_meeting), and both the confirm-card tap and the
+    # slot-picker tap post an executor's return VERBATIM -- so the whole
+    # directive tail was read by a person. Ironically _execute_claimed_calendar's
+    # own docstring already promised "no 'tell the user' framing"; it was true of
+    # every branch except this one.
+    #
+    # The two link-formatting instructions are genuinely model-facing and are
+    # KEPT, above the blank line, inside the same WRITE_CONFIRMED contract the
+    # other write tools use -- tool_dispatch._strip_write_sentinel splits there,
+    # so the model still gets them and no human ever does. The two informational
+    # sentences ("Google sent invitations", "everyone needs the Meet link") are
+    # things the READER wants, so they are stated to the reader instead.
+    invite_note = (
+        "\nGoogle sent calendar invitations to all attendees." if attendee_list else ""
+    )
+    meet_note = (
+        "\nEveryone needs the Google Meet link to join." if meet_link else ""
+    )
     return (
-        f"Calendar event CREATED in {user_email}'s primary calendar. Surface this to the user:\n"
+        "WRITE_CONFIRMED -- post the lines after the blank verbatim, keeping "
+        "every <url|name> link intact:\n"
+        f"\n"
+        f"Calendar event CREATED in {user_email}'s primary calendar.\n"
         f"- Title: {summary}\n"
         f"- Time: {time_str}{attendees_str}\n"
         f"- Event ID: {event_id}\n"
-        f"- {cal_link_str}{meet_str}\n"
-        f"\n"
-        f"Tell the user the event is booked. Format the calendar link and Meet link as "
-        f"Slack hyperlinks (preserve the <url|name> syntax verbatim). "
-        f"{'Mention that Google sent calendar invitations to all attendees. ' if attendee_list else ''}"
-        f"{'Always show the Google Meet link prominently -- everyone needs it to join.' if meet_link else ''}"
+        f"- {cal_link_str}{meet_str}"
+        f"{invite_note}{meet_note}"
     )
 
 

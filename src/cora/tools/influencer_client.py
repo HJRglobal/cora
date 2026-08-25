@@ -737,7 +737,17 @@ def format_logged_deliverable_for_llm(
     *,
     action: str,
 ) -> str:
-    """Render a just-created or just-updated deliverable as Slack mrkdwn confirmation."""
+    """Render a just-created or just-updated deliverable as Slack mrkdwn for the
+    USER to read.
+
+    cq-288edaba659d: the "Surface this to the user:" lead-in and the trailing
+    "Tell the user the deliverable is tracked" were written for the model but sat
+    in the same un-separated string as the content, and both human confirm
+    surfaces post an executor's return VERBATIM. The caller
+    (_execute_claimed_influencer_deliverable) now wraps this in the
+    WRITE_CONFIRMED contract, so any model-facing text belongs above that blank
+    line, not here.
+    """
     emoji = _STATUS_EMOJI.get(row.get("display_status") or row["status"], "✅")
     hs_link = _hubspot_link(row.get("hubspot_deal_id"))
     due = f"\n- Due: {row['due_date']}" if row.get("due_date") else ""
@@ -746,23 +756,23 @@ def format_logged_deliverable_for_llm(
     if action == "add":
         verb = "LOGGED"
         detail = (
-            f"New deliverable LOGGED. Surface this to the user:\n"
+            f"New deliverable LOGGED.\n"
             f"- #{row['id']} — {row['athlete_name']}: "
             f"{row['platform'].capitalize()} {row['deliverable_type'].replace('_', ' ')}"
             f"{due}{hs_link}\n"
-            f"Tell the user the deliverable is tracked and will appear in status reports."
+            f"It's tracked and will appear in status reports."
         )
     elif action == "complete":
         verb = "COMPLETE"
         detail = (
-            f"Deliverable #{row['id']} marked COMPLETE. Surface this to the user:\n"
+            f"Deliverable #{row['id']} marked COMPLETE.\n"
             f"- {emoji} {row['athlete_name']} — {row['platform'].capitalize()} "
             f"{row['deliverable_type'].replace('_', ' ')}{link_line}"
         )
     else:  # waived
         verb = "WAIVED"
         detail = (
-            f"Deliverable #{row['id']} marked WAIVED. Surface this to the user:\n"
+            f"Deliverable #{row['id']} marked WAIVED.\n"
             f"- {row['athlete_name']} — {row['platform'].capitalize()} "
             f"{row['deliverable_type'].replace('_', ' ')} (excused)"
         )

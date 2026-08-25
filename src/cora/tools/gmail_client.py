@@ -213,19 +213,33 @@ def format_created_draft_for_llm(
     subject: str,
     cc: list[str] | None = None,
 ) -> str:
-    """Render a freshly-created draft as a Slack-mrkdwn confirmation line."""
+    """Render a freshly-created draft as Slack-mrkdwn text for the USER to read.
+
+    cq-288edaba659d: this used to mix the model's instructions ("Surface this to
+    the user:", "Format the Drafts link as a Slack hyperlink") into the same
+    string as the content, with no separator -- and the confirm-card tap and the
+    typed-confirm interceptor both post an executor's return VERBATIM, so a
+    person read the instructions. The directive still exists and the model still
+    needs it (the <url|name> syntax is what makes the Drafts link clickable);
+    it now lives in the model-facing half of the WRITE_CONFIRMED contract that
+    _execute_claimed_gmail_draft wraps around this, above the blank line, where
+    _strip_write_sentinel splits it off before any human sees it.
+
+    The To / Subject / Draft ID / Drafts-link lines are load-bearing: the link is
+    the user's ONLY route to a draft Cora deliberately never sends (see the pin
+    in tests/test_gmail_create_draft.py).
+    """
     draft_id = draft.get("id") or "(no id)"
     to_str = ", ".join(to) if to else "(no recipients)"
     cc_str = f"\n- Cc: {', '.join(cc)}" if cc else ""
     drafts_link = gmail_drafts_url()
 
     return (
-        f"Gmail draft CREATED in {sender_email}'s Drafts folder. Surface this to the user:\n"
+        f"Gmail draft CREATED in {sender_email}'s Drafts folder.\n"
         f"- To: {to_str}{cc_str}\n"
         f"- Subject: {subject}\n"
         f"- Draft ID: {draft_id}\n"
         f"- Open in Gmail: <{drafts_link}|Drafts>\n"
         f"\n"
-        f"Tell the user the draft is ready to review + send from their Gmail Drafts. "
-        f"Format the Drafts link as a Slack hyperlink (preserve the <url|name> syntax)."
+        f"It's ready to review and send from your Gmail Drafts."
     )

@@ -345,7 +345,7 @@ def _resolve_name_to_slack_user_id_impl(name: str, channel_entity: str | None = 
                         return user["slack_user_id"], user.get("display_name")
         # No rule covered it
         log.info("Ambiguous name %r matches multiple canonical users: %s", name, canonical_matches)
-        return None, f"Multiple users match '{name}': {canonical_matches}. Tell the user which one they meant."
+        return None, f"Multiple users match '{name}': {canonical_matches}. Say which one you meant."
 
     # 3. Word-anchored prefix match on display_name (fallback for un-aliased
     #    nicknames). Anchored to a word boundary + min length 3 so a short needle
@@ -367,7 +367,7 @@ def _resolve_name_to_slack_user_id_impl(name: str, channel_entity: str | None = 
         if len(word_hits) > 1:
             names = [u.get("display_name", "?") for u in word_hits]
             log.info("Word-anchored lookup for %r ambiguous, matches: %s", name, names)
-            return None, f"Multiple users match '{name}': {names}. Tell the user which one they meant."
+            return None, f"Multiple users match '{name}': {names}. Say which one you meant."
 
     # 4. No match
     return None, None
@@ -1035,10 +1035,18 @@ def _execute_asana_create(slack_user_id: str, r: dict, entity: str = "") -> str:
             "asana_create_task FAILED asker=%s title=%r assignee=%s exc=%s",
             slack_user_id, r["title"], r["assignee_gid"], exc,
         )
+        # D-051 lens-2 HIGH, and the worst self-inflicted defect of the pass: the
+        # belt DELETED "Tell the user the task wasn't created" -- the only
+        # sentence stating the outcome -- and KEPT "suggest they check the
+        # details", so the human read a raw API error plus an instruction
+        # addressed to someone else and was never told the write had failed. On a
+        # path where it had. Stripping a directive is only safe when the directive
+        # carries no information; here it carried all of it. Reworded to address
+        # the reader, so nothing needs stripping.
         return (
-            f"Asana create_task error: {exc}. Tell the user the task wasn't created. "
-            f"If the error mentions an invalid project or assignee, suggest they check "
-            f"the details and try again."
+            f"Asana create_task error: {exc}. The task wasn't created -- if that "
+            f"mentions an invalid project or assignee, check the details and try "
+            f"again."
         )
 
     log.info(
@@ -1459,7 +1467,7 @@ def _tool_asana_update_task(slack_user_id: str, entity: str, _input: dict) -> st
     skipped: list[str] = []
     _lex_refusal = (
         "I couldn't safely prepare that Lexington task change for confidentiality. "
-        "Tell the user to edit it directly in Asana."
+        "You will need to edit it directly in Asana."
     )
 
     new_title = (input_data.get("new_title") or "").strip()
@@ -1586,7 +1594,7 @@ def _tool_asana_add_comment(slack_user_id: str, entity: str, _input: dict) -> st
     if not ok:
         return _write_blocked_contract(
             "I couldn't safely prepare that Lexington comment for confidentiality. "
-            "Tell the user to add it directly in Asana."
+            "You will need to add it directly in Asana."
         )
     _store_pending_asana_write(slack_user_id, channel, {
         "action": "comment", "gid": gid, "label": label, "text": scrubbed, "ts": time.time(),
@@ -1631,7 +1639,7 @@ def _tool_asana_add_subtask(slack_user_id: str, entity: str, _input: dict) -> st
     if not ok1 or not ok2:
         return _write_blocked_contract(
             "I couldn't safely prepare that Lexington subtask for confidentiality. "
-            "Tell the user to add it directly in Asana."
+            "You will need to add it directly in Asana."
         )
 
     assignee_name = (input_data.get("assignee_name") or "").strip()
@@ -1927,9 +1935,9 @@ def _execute_claimed_gmail_draft(pending: dict, slack_user_id: str) -> str:
             slack_user_id, sender_email, subject, exc,
         )
         return (
-            f"Gmail draft error: {exc}. Tell the user the draft wasn't created. "
-            f"If the error mentions a bad recipient or auth, suggest they check the "
-            f"details and try again."
+            f"Gmail draft error: {exc}. The draft wasn't created and nothing was "
+            f"saved -- if that mentions a bad recipient or a sign-in problem, "
+            f"check the address and try again."
         )
 
     # Normalize recipient lists for the response/log
@@ -1954,11 +1962,25 @@ def _execute_claimed_gmail_draft(pending: dict, slack_user_id: str) -> str:
         cc=cc_list,
     )
     if _guard_notes:
+        # Addressed to the READER: these notes exist to be seen, and the old
+        # parenthetical instruction to the model ("surface these to the user so
+        # they fix the draft") was itself being surfaced to the user.
         result += (
-            "\n\nEMAIL GUARD NOTES (surface these to the user so they fix the "
-            "draft before sending):\n- " + "\n- ".join(_guard_notes[:6])
+            "\n\nBefore you send, check:\n- " + "\n- ".join(_guard_notes[:6])
         )
-    return result
+    # The model's own instructions ride ABOVE the blank line, which is where the
+    # shared seam splits them off (cq-288edaba659d). Keeping the <url|name> note
+    # here matters: it is what renders the Drafts link as a clickable hyperlink,
+    # and the Drafts link is the user's only route to a draft Cora never sends.
+    # Kept UNDER _SENTINEL_DIRECTIVE_RE's 120-char sentinel-to-colon bound
+    # (D-051 lens-2 MEDIUM): the first cut of this literal ran to 147, past the
+    # bound, so on a malformed payload the defensive fallback matched nothing and
+    # the human got a bare "Done." -- losing the Drafts link this same fix calls
+    # the user's only route to a draft Cora never sends. Pinned by a test.
+    return (
+        "WRITE_CONFIRMED -- post the lines after the blank verbatim, keeping "
+        "every <url|name> link intact:\n\n" + result
+    )
 
 
 def _tool_gmail_inbox(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -2201,7 +2223,17 @@ def _execute_claimed_calendar(action: str, pending: dict, slack_user_id: str) ->
             "calendar_delete_event DELETED asker=%s email=%s event_id=%s",
             slack_user_id, pending["user_email"], pending["event_id"],
         )
-        return f"Cancelled '{pending['summary']}'. Google notified any attendees."
+        # Wrapped in the contract, NOT left bare. This line interpolates the
+        # user's OWN event title, and a bare payload routes through the belt --
+        # which then read a period inside the title as a sentence boundary and
+        # truncated it, telling the user a DIFFERENT, unbalanced-quoted event
+        # name for a deletion that really happened ("Ship it. Tell the user we
+        # shipped" -> "Cancelled 'Ship it."). D-051 lens-1 and lens-3 both landed
+        # on this independently. The contract's user half is returned verbatim, so
+        # no heuristic ever touches a title again -- which is the right answer for
+        # every payload carrying user-authored text, not another belt rule.
+        return _write_confirmed_contract(
+            f"Cancelled '{pending['summary']}'. Google notified any attendees.")
 
     return "Internal error -- unrecognized staged calendar action. Nothing changed."
 
@@ -2429,15 +2461,15 @@ def _execute_claimed_influencer_handle(pending: dict, slack_user_id: str) -> str
             "influencer_add_handle FAILED actor=%s athlete=%r: %s",
             slack_user_id, athlete_name, exc,
         )
-        return f"Influencer tracker error: {exc}. Tell the user the handle wasn't registered."
+        return f"Influencer tracker error: {exc}. The handle wasn't registered."
 
     clean_handle = row["handle"]
     log.info(
         "influencer_add_handle REGISTERED actor=%s athlete=%r platform=%s handle=%s entity=%s",
         slack_user_id, athlete_name, platform, clean_handle, row_entity,
     )
-    return (
-        f"Handle REGISTERED. Surface this to the user:\n"
+    return _write_confirmed_contract(
+        f"Handle REGISTERED.\n"
         f"- *{athlete_name}* → {platform.capitalize()} @{clean_handle} [{row_entity}]\n"
         f"The Instagram scanner will now automatically match this athlete when they tag "
         f"the F3 brand accounts. Any new detections will appear in <#{_NOTIFY_CHANNEL_HINT}>."
@@ -2710,10 +2742,13 @@ def _execute_claimed_influencer_deliverable(pending: dict, slack_user_id: str) -
             actor_display, action, exc,
         )
         return (
-            f"Influencer tracker error: {exc}. Tell the user the action wasn't completed "
-            f"and suggest they check the deliverable ID or input values."
+            f"Influencer tracker error: {exc}. That wasn't completed and nothing was "
+            f"saved -- check the deliverable ID and the values you gave me."
         )
-    return influencer_client.format_logged_deliverable_for_llm(row, action=action)
+    # Model-facing text rides ABOVE the blank line, where the shared seam splits
+    # it off before either human confirm surface posts this (cq-288edaba659d).
+    return _write_confirmed_contract(
+        influencer_client.format_logged_deliverable_for_llm(row, action=action))
 
 
 def _tool_fighter_compliance(slack_user_id: str, entity: str, _input: dict) -> str:
@@ -5797,6 +5832,183 @@ _SENTINEL_DIRECTIVE_RE = re.compile(
     r"^(?:WRITE_CONFIRMED|WRITE_BLOCKED)\b[^\n:]{0,120}:\s*")
 
 
+# --- Model-facing directive prose on a HUMAN surface (cq-288edaba659d) ---------
+#
+# Some executors mix the directive AND the user text into ONE string with no
+# separator ("Handle REGISTERED. Surface this to the user:\n- ..."). Both human
+# surfaces post an executor's return VERBATIM -- the confirm-card terminal text
+# and the deterministic typed-confirm interceptor reply -- so that directive is
+# read by a person. The well-formed contract (sentinel, blank line, user text)
+# never reaches here: it is split off above and returned untouched, so this belt
+# only ever sees a sentinel-free payload.
+#
+# Deliberately NOT a regex over the whole payload. Five ReDoS findings across
+# this codebase's reviews came from exactly that shape (one of them inside the
+# fix for another), so the decision is plain substring logic over one sentence
+# at a time -- linear by construction and auditable by reading it.
+#
+# D-217 (two directions): matching is anchored on an imperative verb GOVERNING
+# "the user", which is what separates the two directions cleanly:
+#   * "Tell the user the stage was not changed."  -> model-facing, removed
+#   * "Tell Harrison."                            -> reader-facing, KEPT. It is
+#     the only route a user has to a misconfigured recipient map, and it names
+#     no "user" object.
+_DIRECTIVE_VERBS: frozenset[str] = frozenset({
+    "tell", "surface", "show", "present", "report", "give", "inform",
+    "remind", "ask", "let", "explain", "offer", "say", "relay",
+})
+
+# Directives that name no object, so the verb+"the user" rule cannot see them.
+_DIRECTIVE_MARKERS: tuple[str, ...] = (
+    "no preamble",
+    "no meta-commentary",
+    "as your entire response",
+    "preserve the <url|name> syntax",
+)
+
+# "the user" has to be the directive's OBJECT, and a bare `"the user" in s`
+# substring test is not that. D-051 lens-1 measured whole sentences of
+# legitimate content deleted by it -- "Ask the users what they think of the new
+# can." and "Report the user's crash to engineering." both stripped to "" -- and
+# it is also what mangled a user's own calendar-event title, because that title
+# is interpolated into a bare payload.
+#
+#   * plural -- `\bthe user\b` already refuses "the users" (the trailing "s" is
+#     a word char, so there is no boundary there). Pinned in the tests anyway.
+#   * possessive -- "the user's crash" DOES have a boundary before the
+#     apostrophe, so it needs the lookahead.
+#   * compound noun -- "the user list/map/roster" is a thing, not a person. A
+#     closed set: if a new compound slips through, the failure mode is
+#     over-removal, which is exactly why this is a set and not a general rule.
+_DIRECTIVE_OBJECT_RE = re.compile(
+    r"\bthe user\b(?!['’])"
+    r"(?!\s+(?:list|lists|map|maps|mapping|mappings|table|tables|count|counts|"
+    r"record|records|row|rows|id|ids|name|names|email|emails|profile|profiles|"
+    r"entry|entries|account|accounts|file|files|data|report|reports|log|logs|"
+    r"base|bases|directory|directories|roster|rosters|note|notes)\b)",
+    re.IGNORECASE)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.:!?])\s+")
+# A bullet/numbered line is rendered CONTENT (an email subject, an athlete
+# name, a task title) -- never a directive, in any emitter in the tree. Left
+# untouched: measured, a draft whose subject is "Tell the user about pricing."
+# was reduced to "- Subject:" by the first cut of this belt, which is a worse
+# failure than the leak it exists to stop (D-217, the over-removal direction).
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[-*•‣◦]|\d{1,3}[.)])\s")
+# Inner class excludes the delimiters -- the _DRIVE_PATH_RE lesson (a nested
+# quantifier over a delimiter-rich string is a ReDoS).
+#
+# The leading separator is ` ?` -- BOUNDED, deliberately not `\s*`. The first cut
+# used `\s*` and was QUADRATIC: an unbounded quantifier in front of a literal
+# `\(` makes the engine walk the whole whitespace run back down one character at
+# a time from every start offset. Measured 1,839 ms at 40,000 spaces, and
+# reachable with 100% user-authored text -- _execute_claimed_calendar echoes the
+# user's own event title into a sentinel-free payload, so a 39,000-char title
+# (inside Slack's 40,000 cap) cost 1,666 ms synchronously on the Slack serve
+# path. Dropping to ` ?` is ~0.00 ms on the same input and accepts the same
+# strings. This is the SIXTH ReDoS found in this codebase's reviews, and it was
+# in the one regex whose comment claimed to have handled the risk -- the doctrine
+# at _STRIP_MAX_CHARS above already prescribed the exact missing test
+# (`" " * 40000`), which is now pinned in test_classb_directive_prose.py.
+_PARENTHETICAL_RE = re.compile(r" ?\([^()\n]{0,300}\)")
+
+
+def _is_model_directive(sentence: str) -> bool:
+    """True when this sentence instructs the MODEL rather than telling the
+    reader something. Substring logic only -- no backtracking to exploit."""
+    s = sentence.strip().lower()
+    if not s:
+        return False
+    # Every directive this belt exists to remove terminates with punctuation
+    # (the sentence split preserves it). An UNTERMINATED trailing fragment is
+    # the value half of a label -- "Subject: Tell the user about pricing" --
+    # and eating it would destroy the user's own words.
+    if s[-1] not in ".:!?":
+        return False
+    if any(marker in s for marker in _DIRECTIVE_MARKERS):
+        return True
+    # A formatting directive about the reply itself.
+    if "format the" in s and ("hyperlink" in s or "mrkdwn" in s):
+        return True
+    # "the user" must be the directive's OBJECT -- see _DIRECTIVE_OBJECT_RE for
+    # why a bare substring test is not that (it deleted whole sentences of
+    # legitimate content, and mangled user-authored calendar titles).
+    if not _DIRECTIVE_OBJECT_RE.search(s):
+        return False
+    # The verb must OPEN the clause. "The user asked about pricing" is a
+    # statement of fact and keeps its verb in the middle, so it is not matched.
+    first = s.split(None, 1)[0].strip("*_`\"'([")
+    return first in _DIRECTIVE_VERBS
+
+
+def _strip_model_directives(text: str) -> str:
+    """Remove model-facing directive clauses from text bound for a human.
+
+    Byte-identical for any payload that carries none -- verified in
+    tests/test_classb_directive_prose.py against every clean outcome string
+    the Class-B roster can produce, including one-word ones ("Done.").
+    """
+    if not text:
+        return text
+
+    def _drop_directive_paren(m: "re.Match[str]") -> str:
+        # A parenthetical is a COMPLETE bounded clause whose terminator is the
+        # closing paren, so it carries no sentence punctuation of its own. The
+        # synthetic "." satisfies _is_model_directive's terminated-sentence
+        # requirement without relaxing that requirement for bare fragments --
+        # which is what protects a user's unterminated subject line.
+        inner = m.group(0).strip(" ()")
+        return "" if _is_model_directive(inner + ".") else m.group(0)
+
+    out_lines: list[str] = []
+    dropped = False
+    for line in text.split("\n"):
+        # A directive can hide inside a parenthetical whose sentence is
+        # otherwise legitimate content ("EMAIL GUARD NOTES (surface these to
+        # the user ...):"). Drop the parenthetical, keep the header.
+        if _LIST_MARKER_RE.match(line):
+            out_lines.append(line)
+            continue
+        candidate = _PARENTHETICAL_RE.sub(_drop_directive_paren, line)
+        parts = _SENTENCE_SPLIT_RE.split(candidate)
+        # A colon introduces a VALUE, and the value is user content. ":" is in
+        # the terminator set, so the sentence split severs "Subject:" from
+        # "Tell the user about pricing." and the belt ate the subject line --
+        # measured, and the exact over-removal the list-marker guard was
+        # believed to have closed (it closed only the BULLETED form). The part
+        # immediately after a colon-terminated part is therefore never a
+        # directive. A later sentence on the same line still is: "Gmail draft
+        # error: bad recipient. Tell the user X." keeps index 1 as the value and
+        # leaves index 2 strippable.
+        kept = [
+            p for i, p in enumerate(parts)
+            if (i > 0 and parts[i - 1].rstrip().endswith(":"))
+            or not _is_model_directive(p)
+        ]
+        if len(kept) == len(parts) and candidate == line:
+            # Nothing matched on this line -- preserve it byte-for-byte rather
+            # than re-joining (a re-join would normalise the original spacing).
+            out_lines.append(line)
+            continue
+        dropped = True
+        rebuilt = " ".join(p.strip() for p in kept if p.strip())
+        if rebuilt:
+            out_lines.append(rebuilt)
+        # A line that was ENTIRELY directive is dropped, not left blank.
+    if not dropped:
+        # NO-OP MEANS NO-OP. The first cut ended in an unconditional .strip(),
+        # so a directive-free payload with a trailing newline came back CHANGED
+        # and tripped the caller's "carried directive prose" WARNING -- sending
+        # a future debugger after an emitter bug that does not exist, and
+        # quietly breaking the byte-identity property documented above.
+        return text
+    cleaned = "\n".join(out_lines)
+    # Collapse the blank-line runs a dropped line can leave behind.
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip()
+
+
 def _strip_write_sentinel(raw: str) -> str:
     """Return the user-facing portion of a WRITE_CONFIRMED / WRITE_BLOCKED payload.
 
@@ -5812,8 +6024,41 @@ def _strip_write_sentinel(raw: str) -> str:
     WARNING names the defect so it gets fixed at the emitter rather than relied
     on here.
     """
-    if not raw or not raw.startswith(("WRITE_CONFIRMED", "WRITE_BLOCKED")):
+    if not raw:
         return raw
+    if not raw.startswith(("WRITE_CONFIRMED", "WRITE_BLOCKED")):
+        # No sentinel at all. This used to return `raw` untouched, which is how
+        # six of the eight Class-B kinds posted model-facing directive prose to
+        # a person (cq-288edaba659d): the no-sentinel SUCCESS payloads of
+        # gmail_draft / influencer_handle / influencer_deliverable, and the
+        # FAILURE payloads of those three plus hubspot_stage / hubspot_note /
+        # slack_dm -- every kind's failure return is sentinel-free by
+        # construction, which is why the failure path more than doubled the
+        # count the seed named.
+        #
+        # The emitters are fixed at source (they now hand back clean user text),
+        # so in this tree the belt is defense-in-depth for a future kind that
+        # forgets the contract -- which is the whole point of putting it at the
+        # SHARED seam rather than per-kind (D-220). Byte-identical on any
+        # payload that carries no directive.
+        cleaned = _strip_model_directives(raw)
+        if not cleaned.strip():
+            # The payload was directive END TO END, so stripping it leaves the
+            # user with an EMPTY Slack message after tapping Confirm on an action
+            # that may well have executed -- and app.py's button path renders a
+            # blank message as "Done.", i.e. a FABRICATED success. No emitter in
+            # the tree does this today; a future one might. Returning the
+            # original is ugly but TRUTHFUL, and unlike the bare-sentinel branch
+            # below there is no sentinel here to say whether "Done." or "I
+            # couldn't" is right, so inventing either would fabricate an outcome.
+            log.warning("write-sentinel: sentinel-free payload was directive end to "
+                        "end; posting it unstripped rather than an empty message -- "
+                        "fix the emitter")
+            return raw
+        if cleaned != raw:
+            log.warning("write-sentinel: sentinel-free payload carried model-facing "
+                        "directive prose -- stripped at the shared seam; fix the emitter")
+        return cleaned
     parts = raw.split("\n\n", 1)
     if len(parts) > 1 and parts[1].strip():
         return parts[1].strip()
@@ -6544,10 +6789,11 @@ def _execute_claimed_schedule_meeting(
         (s for s in slots if s[0] == proposed_start and s[1] == proposed_end), None,
     )
     if match is None:
+        # `confirmed=false` is a TOOL ARGUMENT -- meaningless to the person
+        # reading it, and this reaches them verbatim on the slot-tap surface.
         return (
             "calendar_schedule_meeting: that time doesn't match one of the slots "
-            "I offered. Re-run with confirmed=false to see the options again, "
-            "then pass one of those exact times."
+            "I offered. Ask me to find a time again and pick one of the options."
         )
     try:
         event = calendar_client.create_event(
@@ -6979,8 +7225,8 @@ def _execute_claimed_hubspot_stage(pending: dict, slack_user_id: str) -> str:
             slack_user_id, deal_id, stage_id, exc,
         )
         return (
-            f"HubSpot update failed: {exc}. Tell the user the stage was not changed "
-            "and suggest they update it directly in HubSpot."
+            f"HubSpot update failed: {exc}. The stage was not changed -- you may "
+            "need to update it directly in HubSpot."
         )
 
     deal_url = hubspot_client._deal_url(deal_id)
@@ -7084,8 +7330,8 @@ def _execute_claimed_hubspot_note(pending: dict, slack_user_id: str) -> str:
             slack_user_id, deal_id, exc,
         )
         return (
-            f"HubSpot note creation failed: {exc}. Tell the user the note was not saved "
-            "and suggest they add it directly in HubSpot."
+            f"HubSpot note creation failed: {exc}. The note was not saved -- you may "
+            "need to add it directly in HubSpot."
         )
 
     deal_url = hubspot_client._deal_url(deal_id)
@@ -7281,7 +7527,7 @@ def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
         )
         return (
             f"Slack DM error: {exc.response.get('error', str(exc))}. "
-            f"Tell the user the message wasn't sent and suggest they send it manually."
+            f"The message wasn't sent -- you may need to send it manually."
         )
     except Exception as exc:  # noqa: BLE001 -- transport-level: outcome UNKNOWN
         # A read timeout or socket error can arrive AFTER Slack accepted the
@@ -7292,7 +7538,7 @@ def _execute_claimed_slack_dm(pending: dict, slack_user_id: str) -> str:
                     slack_user_id, resolved_id, exc)
         return (
             "I couldn't confirm whether that DM went through -- it may have been "
-            "delivered. Tell the user to check with them before sending it again."
+            "delivered. Check with them before sending it again."
         )
 
     ts = send_resp.get("ts", "")
@@ -11964,13 +12210,19 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
     is_founder = slack_user_id == code_queue.HARRISON_ID
     cq_id, outcome = code_queue.queue_explicit(
         slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
+    # These two are NOT Class-B, but they ride the same shared seam and are
+    # posted verbatim on the same two human surfaces, so they carried the same
+    # defect (found by the static executor scan, not by the seed). Rewritten to
+    # address the READER: "ask the user to restate" was mid-sentence, which the
+    # shared belt deliberately does not reach -- widening it that far would put
+    # a heuristic over user-authored task names and subject lines.
     if outcome == "empty":
-        return ("cora_queue_code_session: there was nothing to file -- ask the user "
-                "to restate the bug or feature in a sentence.")
+        return ("cora_queue_code_session: there was nothing to file -- restate the "
+                "bug or feature in a sentence and I'll queue it.")
     if outcome == "dropped" or cq_id is None:
         return ("I couldn't file that -- it looked like it contained protected "
-                "info. Tell the user it wasn't queued and to rephrase without "
-                "any client/patient details.")
+                "info. Nothing was queued; rephrase it without any "
+                "client/patient details.")
     # cq-288edaba659d, fresh live evidence 2026-08-24 15:38: these three were the
     # only WRITE_CONFIRMED emitters in the tree that separated the sentinel from
     # the user text with ": " instead of a BLANK LINE. _strip_write_sentinel
