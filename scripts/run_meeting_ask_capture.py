@@ -228,22 +228,68 @@ def _excluded(transcript: dict) -> str:
         return "COPA detector unavailable"
     try:
         verdict = ffc.classify_lex_meeting(transcript)
-        if getattr(verdict, "exclude", False):
-            return f"LEX hard-exclude ({getattr(verdict, 'reason', 'program/client')})"
+        # THE FIELD IS `hard_exclude_kb`. The first cut read `exclude`, which does
+        # not exist on LexVerdict, so `getattr(..., False)` was ALWAYS False and
+        # this gate -- the one standing between an excluded Lexington
+        # program/client meeting and a DM'd card -- never fired once. A
+        # defaulted getattr on a typo'd attribute is a guard that reads as
+        # present and is not.
+        if verdict.hard_exclude_kb:
+            return f"LEX hard-exclude ({verdict.reason or 'program/client'})"
     except Exception as exc:  # noqa: BLE001 -- fail closed, as the ingest does
         return f"LEX detector error ({exc})"
-    entity = ffc._classify_entity(title)
-    if ffc._is_phi_meeting(title, entity):
+    entity = _entity_for(transcript)
+    if ffc._is_phi_meeting(title, "LEX" if entity.startswith("LEX") else entity):
         return "PHI/clinical title"
     return ""
 
 
+def _phi_flagged(ask: dict) -> bool:
+    """Does this ask's own text trip the PHI screen? Fail CLOSED.
+
+    Screens the QUOTED LINE and the derived body together, because either is
+    rendered on the card. `is_any_phi` is the broad predicate (the base
+    clinical/identifier patterns plus the LEX admin-status class from D-050) --
+    the widest available screen is the right one for text about to be DM'd
+    verbatim. An unavailable screen means SKIP, never send.
+    """
+    text = f"{ask.get('quoted_line') or ''}\n{ask.get('body') or ''}"
+    try:
+        from cora import phi_guard
+        for name in ("is_any_phi", "is_phi_risk"):
+            fn = getattr(phi_guard, name, None)
+            if callable(fn) and fn(text):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 -- an unavailable screen must exclude
+        print("  WARN PHI screen unavailable -- skipping this ask", file=sys.stderr)
+        return True
+
+
 def _entity_for(transcript: dict) -> str:
+    """The entity this meeting belongs to.
+
+    THE LEX TEST COMES FIRST AND USES THE SHARED DETECTOR. `_classify_entity` is
+    title-keyword matching that DEFAULTS TO FNDR, so a Lexington meeting whose
+    title carries no LEX keyword came out as FNDR -- and then nothing was
+    PHI-scrubbed, because every scrub downstream keys on the entity starting with
+    "LEX". `classify_lex_meeting` is the detector that exists precisely because
+    the name-only version missed real meetings (it reads attendee email DOMAINS;
+    see the 2026-06-18 D-054 entry, "a Lexington email-DOMAIN LEX signal --
+    name-only detector missed Jen/Aaron meetings").
+    """
     title = (transcript.get("title") or "").strip()
-    entity = ffc._classify_entity(title)
-    if entity == "LEX":
-        return ffc._tag_fireflies_sub_entity(transcript) or "LEX"
-    return entity
+    try:
+        verdict = ffc.classify_lex_meeting(transcript)
+        if verdict.is_lex:
+            return verdict.sub_entity or "LEX"
+    except Exception:  # noqa: BLE001 -- an unavailable detector must not mislabel
+        # Fail toward LEX rather than toward FNDR: mislabelling a LEX meeting as
+        # FNDR turns off the scrub, which is the direction that leaks.
+        log_line = "meeting-ask: LEX detector unavailable -- treating as LEX"
+        print(f"  WARN {log_line}", file=sys.stderr)
+        return "LEX"
+    return ffc._classify_entity(title)
 
 
 def _meeting_date(transcript: dict) -> str:
@@ -257,7 +303,7 @@ def process_transcript(transcript: dict, *, dry_run: bool,
                        email_to_slack: dict[str, str], client=None) -> dict:
     """Detect, route and (unless dry_run) card one transcript's asks."""
     out = {"asks": 0, "carded": 0, "skipped_dup": 0, "no_recipient": 0,
-           "overflow": 0, "excluded": ""}
+           "overflow": 0, "phi_skipped": 0, "excluded": ""}
     reason = _excluded(transcript)
     if reason:
         out["excluded"] = reason
@@ -269,12 +315,51 @@ def process_transcript(transcript: dict, *, dry_run: bool,
     if not asks:
         return out
 
+    # CAP BEFORE DEDUP, DELIBERATELY -- and this is the second time this code has
+    # been written, because I got it wrong in between.
+    #
+    # The review found that capping first means a 4th ask is never carded at all,
+    # and proposed deduping first so the freed slots go to it. I made that change,
+    # and the adversarial verifier was right to refuse it: deduping first converts
+    # a HARD CAP into a RATE LIMIT. A meeting with ten detections would then card
+    # three per run, and at a 15-minute interval all ten arrive inside an hour --
+    # which is precisely the flood the cap exists to stop, and precisely the
+    # incident that retired the last push ("Demi's 14 unwanted tasks", D-054). The
+    # cap has to bound the TOTAL, not the rate.
+    #
+    # So the ordering stands and the WORDING is what was wrong: over-cap asks are
+    # DROPPED, not queued. That is now what the code and the message both say.
+    # A meeting that trips the cap is far likelier to be a detector false-positive
+    # storm than a meeting containing four separate spoken requests, and the
+    # honest response to a suspected storm is to card a bounded sample and say so.
+    #
+    # Actionable kinds first, which IS a real improvement and costs the cap
+    # nothing: a meeting with three "draft X" asks and one "make a task" ask must
+    # not spend all three slots on the buttonless ones. Stable sort, so ties keep
+    # transcript order and the same three are chosen on every run -- which is what
+    # makes the dedup below a no-op rather than a rotation.
+    asks = sorted(asks, key=lambda a: 0 if a["kind"] in
+                  (meeting_asks.KIND_TASK, meeting_asks.KIND_NOTE) else 1)
     asks, overflow = meeting_asks.cap_overflow(asks)
     out["overflow"] = overflow
+    for a in asks:
+        a["_ask_id"] = meeting_asks.ask_key(
+            transcript_id, a["quoted_line"], a["start_time"])
+    # Now drop the ones already carded on a previous run.
+    kept = []
+    for a in asks:
+        if meeting_asks.already_carded(a["_ask_id"]):
+            out["skipped_dup"] += 1
+            continue
+        kept.append(a)
+    asks = kept
     if overflow:
         # REPORTED, never silent: a cap that truncates quietly reads as coverage.
-        print(f"  NOTE: {overflow} further ask(s) in this meeting were held back "
-              f"by the per-meeting cap of {meeting_asks.MAX_ASKS_PER_MEETING}")
+        print(f"  NOTE: {overflow} further ask(s) in this meeting were DROPPED "
+              f"(not queued) by the per-meeting cap of "
+              f"{meeting_asks.MAX_ASKS_PER_MEETING}. A meeting over the cap is "
+              f"more likely a detector false-positive storm than four separate "
+              f"spoken requests -- use --transcript-id to inspect it.")
 
     health = ffd.assess(transcript)
     entity = _entity_for(transcript)
@@ -282,10 +367,22 @@ def process_transcript(transcript: dict, *, dry_run: bool,
     date_str = _meeting_date(transcript)
 
     for ask in asks:
-        ask_id = meeting_asks.ask_key(transcript_id, ask["quoted_line"], ask["start_time"])
-        if meeting_asks.already_carded(ask_id):
-            out["skipped_dup"] += 1
+        ask_id = ask["_ask_id"]
+
+        # PHI IS SCREENED HERE, BEFORE THE DM -- not at tap time. The card carries
+        # the VERBATIM transcript sentence (D-136's grounding requirement), so the
+        # PHI reaches the recipient the moment the card is posted; the D-050 gate
+        # inside `save_meeting_ask_note` runs only when somebody TAPS, which is
+        # far too late to matter. A PHI-shaped sentence is dropped outright rather
+        # than routed to a custodian: a proposal is not worth a PHI egress, and
+        # the meeting's own content is still in the KB behind the normal gates.
+        if _phi_flagged(ask):
+            out["phi_skipped"] += 1
+            print(f"  SKIP (PHI-flagged sentence -- not carded): "
+                  f"[{meeting_asks.format_offset(ask['start_time'])}] "
+                  f"{ask['quoted_line'][:60]}...")
             continue
+
         sid, email, why = meeting_asks.resolve_addressee(
             ask, transcript,
             attribution_unreliable=health.collapsed,
@@ -408,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
 
     email_to_slack = ffc._load_email_to_slack()
     totals = {"asks": 0, "carded": 0, "skipped_dup": 0, "no_recipient": 0,
-              "overflow": 0, "excluded": 0}
+              "overflow": 0, "phi_skipped": 0, "excluded": 0}
     for t in transcripts:
         title = (t.get("title") or "").strip() or "(untitled)"
         print(f"- {title}")
@@ -417,7 +514,8 @@ def main(argv: list[str] | None = None) -> int:
         if res["excluded"]:
             print(f"  excluded: {res['excluded']}")
             totals["excluded"] += 1
-        for k in ("asks", "carded", "skipped_dup", "no_recipient", "overflow"):
+        for k in ("asks", "carded", "skipped_dup", "no_recipient", "overflow",
+                  "phi_skipped"):
             totals[k] += res[k]
 
     if not args.dry_run and not args.transcript_id:
@@ -426,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"done: {totals['asks']} ask(s) detected, {totals['carded']} carded, "
           f"{totals['skipped_dup']} already carded, "
           f"{totals['no_recipient']} unaddressable, "
+          f"{totals['phi_skipped']} PHI-skipped, "
           f"{totals['overflow']} over cap, {totals['excluded']} meeting(s) excluded")
     return 0
 

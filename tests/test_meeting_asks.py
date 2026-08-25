@@ -541,3 +541,122 @@ def test_a_zero_or_negative_lookback_never_produces_a_future_window():
     now = int(time.time())
     for hours in (0, -5):
         assert m._window_start(0, hours) <= now
+
+
+# ── D-051 review fixes (2026-08-25) ─────────────────────────────────────────
+#
+# Every test below pins a defect the adversarial review found in this session's
+# own code. They are grouped rather than scattered so the next reader can see
+# what the review actually bought.
+
+@pytest.mark.parametrize("text", [
+    # A REPORTING FRAME quoting an address to Cora is not an address to Cora.
+    # This was the leak in the slice's central safety claim, and in a company
+    # that talks about Cora constantly it is a high-volume shape -- including
+    # D-136's laundering mode, where somebody reads her output aloud.
+    "Harrison said, Cora, make a task for that, but it never showed up.",
+    "So the way it works is you just say, Cora, make a task for the deck.",
+    "I told him, Cora, note this down.",
+    "She asked, Cora, create a ticket.",
+    "He types, Cora, make a note of the price.",
+])
+def test_a_quoted_address_is_not_an_address(text):
+    assert ma.detect_asks([_sent(text)]) == [], f"reported speech carded: {text}"
+
+
+def test_a_real_address_survives_the_reported_speech_veto():
+    """The veto must not eat the thing it sits next to."""
+    for text in ("Cora, make a task for that.",
+                 "Hey Cora, make a task for the deck.",
+                 "So, Cora, make a note about the payoff."):
+        assert ma.detect_asks([_sent(text)]), f"veto ate a real ask: {text}"
+
+
+@pytest.mark.parametrize("text,expect_in_body", [
+    ("Cora, log that the price moved to $25.15.", "$25.15"),
+    ("Cora, note the payoff is $1,234.56 plus fees.", "$1,234.56"),
+    ("Cora, make a task to reconcile 1.5% of the OSN spend.", "1.5%"),
+])
+def test_the_body_is_not_cut_at_the_first_period(text, expect_in_body):
+    """`[^.?!]{0,300}` stopped at the FIRST period, so every decimal figure was
+    sliced in half -- and the BODY is what gets persisted as the Asana task or
+    the note. A decimal point has no space after it, which is exactly what
+    distinguishes it from a sentence end."""
+    got = ma.detect_asks([_sent(text)])
+    assert got, text
+    assert expect_in_body in got[0]["body"], got[0]["body"]
+
+
+def test_a_mid_request_abbreviation_is_a_known_limitation_not_a_silent_one():
+    """"e.g. " is a period followed by a space, which is indistinguishable from a
+    sentence end without an abbreviation dictionary. So the body stops there.
+    Pinned deliberately: this is the residual after the decimal fix, it is small
+    (the request's opening survives, only a trailing clause is lost), and pinning
+    it stops someone "fixing" it by removing the sentence-end rule and
+    reintroducing the decimal bug."""
+    got = ma.detect_asks([_sent("Cora, make a note that Net 30 applies to e.g. Costco.")])
+    assert got
+    assert "Net 30" in got[0]["body"]
+    assert "Costco" not in got[0]["body"]
+
+
+def test_the_body_still_stops_at_the_end_of_the_request():
+    """The window is now unrestricted, so something has to stop it -- a real
+    sentence end (punctuation followed by whitespace)."""
+    got = ma.detect_asks([_sent(
+        "Cora, make a task to call Justin. Then we talked about something else "
+        "entirely for a while.")])
+    assert got
+    assert "something else" not in got[0]["body"]
+    assert "call Justin" in got[0]["body"]
+
+
+@pytest.mark.parametrize("seconds,expect", [
+    (93, "1:33"),
+    (0, "0:00"),
+    (59, "0:59"),
+    (3599, "59:59"),
+    (3600, "1:00:00"),
+    (4523, "1:15:23"),      # 75 minutes in -- rendered "75:23" before the fix
+    (10559, "2:55:59"),     # the live corpus holds a 176-minute meeting
+])
+def test_the_timestamp_rolls_over_past_the_hour(seconds, expect):
+    """D-136's grounding stamp has to be a stamp somebody can scrub to."""
+    assert ma.format_offset(seconds) == expect
+
+
+@pytest.mark.parametrize("bad", [None, -1, "x", float("inf"), float("nan"), object()])
+def test_a_junk_offset_degrades_instead_of_raising(bad):
+    """`int(float('inf'))` raises OverflowError, and this is called from
+    build_card_text -- letting it escape would take out the whole card."""
+    assert ma.format_offset(bad) == "?"
+
+
+def test_the_affordance_advertises_only_what_the_card_can_do():
+    """The first cut led with a 👍/👎 emoji pair, copying the review cards --
+    but those have a REACTION handler and this surface has none, so the card's
+    most prominent affordance did nothing. That is the C4 defect exactly."""
+    assert "\U0001F44D" not in ma.AFFORDANCE_LINE
+    assert "\U0001F44E" not in ma.AFFORDANCE_LINE
+    assert "Yes, do it" in ma.AFFORDANCE_LINE
+    # ...and it must still be registered, or the terminal strip is a no-op.
+    assert ma.AFFORDANCE_LINE in kr._CARD_AFFORDANCE_LINES
+    text = "body\n" + ma.AFFORDANCE_LINE
+    assert kr.strip_card_affordance(text) != text
+
+
+def test_the_cap_bounds_the_total_not_the_rate():
+    """The cap has to bound how many cards ONE MEETING can ever produce. Deduping
+    before capping would free the slots on the next poll and deliver every
+    detection inside an hour at a 15-minute interval -- the exact flood that
+    retired the last push (D-054, "Demi's 14 unwanted tasks"). I made that change
+    on a review finding and the adversarial verifier was right to refuse it; this
+    pins the semantics so it does not get "fixed" again.
+
+    Pinned on the docstring because the ordering itself lives in the runner: the
+    contract is that over-cap asks are DROPPED, never queued.
+    """
+    doc = ma.cap_overflow.__doc__ or ""
+    assert "DROPPED, NOT QUEUED" in doc
+    kept, overflow = ma.cap_overflow([{"n": i} for i in range(9)])
+    assert len(kept) == ma.MAX_ASKS_PER_MEETING and overflow == 6

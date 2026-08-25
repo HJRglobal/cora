@@ -74,8 +74,13 @@ _DEFAULT_PATH = (Path(__file__).resolve().parents[2] / "data" / "state"
 
 #: A card left untapped this long stops being actionable. Longer than the
 #: decision-alert TTL (7d) because a meeting ask is not a nag -- it is one card
-#: about one sentence, and a week of PTO must not silently discard it. The expiry
-#: is reported, never silent.
+#: about one sentence, and a week of PTO must not silently discard it.
+#:
+#: Expiry is reported AT THE TAP: `claim_for_tap` tells the tapper the card aged
+#: out and stamps the row EXPIRED, rather than failing silently or acting on a
+#: stale proposal. There is deliberately no background expiry sweep -- nothing
+#: needs one, because an untapped card costs nothing and a tap is the only event
+#: that matters.
 TTL_DAYS = 14
 
 STATE_PENDING = "PENDING"
@@ -94,18 +99,24 @@ KIND_TASK = "task"
 KIND_NOTE = "note"
 KIND_OTHER = "other"
 
-#: Per-meeting cap. The population is meant to be 0-2 asks per meeting; a
-#: transcript that yields more than this is far more likely to be a detector
-#: false-positive storm than a meeting in which six separate asks were spoken, and
-#: the D-054 incident was precisely a push that sent more cards than a human
-#: wanted. Overflow is REPORTED by `cap_overflow`, never silently dropped.
+#: Per-meeting cap on the TOTAL number of cards one meeting can ever produce --
+#: not a per-run rate. The population is meant to be 0-2 asks per meeting; a
+#: transcript yielding more is far likelier a detector false-positive storm than a
+#: meeting containing six separate spoken requests, and the D-054 incident was
+#: precisely a push that sent more cards than a human wanted. Over-cap asks are
+#: DROPPED (loudly, by the runner), never queued for the next poll -- see
+#: `cap_overflow`.
 MAX_ASKS_PER_MEETING = 3
 
 #: The card's live-affordance sentence. REGISTERED in
 #: knowledge_review._CARD_AFFORDANCE_LINES -- see the module docstring.
-AFFORDANCE_LINE = (
-    "\U0001F44D Yes, do it · \U0001F44E No, drop it  (or tap a button below)"
-)
+#: NAMES ONLY THE BUTTONS, DELIBERATELY. The first cut led with a thumbs-up/down
+#: emoji pair, copying the review cards' wording -- but those cards have a
+#: REACTION handler and this surface has none, so the card's most prominent
+#: affordance did nothing at all. That is precisely the defect C4 shipped to fix
+#: (74% of one day's founder reactions were no-ops on cards advertising
+#: affordances they had already lost). A card may only advertise what it can do.
+AFFORDANCE_LINE = "Tap *Yes, do it* or *No, drop it* below."
 
 ACTION_ACCEPT = "meeting_ask_accept"
 ACTION_DISMISS = "meeting_ask_dismiss"
@@ -195,7 +206,34 @@ _ADDRESS_RE = re.compile(
     r"(?:please\s{1,3})?"
     r"(?:(?:can|could|would|will)\s{1,3}you\s{1,3}(?:please\s{1,3})?)?"
     rf"(?P<verb>{_VERB_ALT})\b"
-    r"(?P<rest>[^.?!]{0,300})",
+    # A BOUNDED ANY-CHAR WINDOW, trimmed to a real sentence end afterwards by
+    # `_clean_body`. The first cut used `[^.?!]{0,300}`, which stops at the FIRST
+    # period -- so "Cora, log that the price moved to $25.15" produced the body
+    # "the price moved to $25", and the body is what gets persisted as the Asana
+    # task or the note. Every decimal figure, abbreviation and initial was being
+    # cut in half. `.` without DOTALL still cannot cross a newline, and the bound
+    # keeps this O(1) with no backtracking surface.
+    r"(?P<rest>.{0,300})",
+    re.IGNORECASE,
+)
+
+#: Where a spoken request actually ENDS: sentence-final punctuation followed by
+#: whitespace or end of input. A bare `(?<=[.?!])` would fire inside "$25.15" and
+#: "e.g." -- the exact cut this replaced.
+_SENTENCE_END_RE = re.compile(r"(?<=[.?!])(?=\s|$)")
+
+#: A REPORTING FRAME -- somebody QUOTING an address to Cora rather than making
+#: one. "Harrison said, Cora, make a task for that" and "the way it works is you
+#: just say, Cora, make a task" both matched the address grammar, because the
+#: comma before "Cora" is a clause boundary. This was the leak in the slice's
+#: central safety claim (that a card only ever follows a human addressing Cora),
+#: and in a company that talks about Cora constantly it is a high-volume shape --
+#: including D-136's laundering mode, where somebody reads her output aloud.
+#: Matched against the text BEFORE the address and end-anchored there, with a
+#: bounded gap, so there is no backtracking surface.
+_REPORTED_SPEECH_RE = re.compile(
+    r"\b(?:said|says|say|saying|told|tells|telling|asked|asks|asking|"
+    r"typed|types|type|typing|wrote|writes|writing|put)\b[^.?!]{0,14}?[,:]?\s{0,3}$",
     re.IGNORECASE,
 )
 
@@ -287,8 +325,17 @@ def _is_hollow(body: str) -> bool:
 
 def _clean_body(rest: str) -> str:
     """The request body, trimmed of the connective tissue a spoken request opens
-    with. Never rewrites meaning -- only strips leading filler and whitespace."""
-    body = re.sub(r"\s+", " ", str(rest or "")).strip(" ,:;-–—")
+    with. Never rewrites meaning -- only strips leading filler and whitespace.
+
+    Cuts at the first REAL sentence end (punctuation followed by whitespace or
+    end), which is what lets the capture window be an unrestricted `.{0,300}` and
+    still stop where the request stops -- without slicing "$25.15" in half.
+    """
+    raw = str(rest or "")
+    stop = _SENTENCE_END_RE.search(raw)
+    if stop:
+        raw = raw[:stop.start()]
+    body = re.sub(r"\s+", " ", raw).strip(" .,:;-–—")
     body = re.sub(
         r"^(?:a|an|the|me\s+to|us\s+to|me|us|that|this|it|of)\b[\s,]*",
         "", body, flags=re.IGNORECASE,
@@ -319,6 +366,11 @@ def detect_asks(sentences: list[dict] | None) -> list[dict]:
         match = _ADDRESS_RE.search(text)
         if not match:
             continue
+        # Is the address QUOTED rather than made? Judge by what immediately
+        # precedes it -- a reporting verb ("Harrison said, Cora, ...") means we
+        # are overhearing a description of an ask, not receiving one.
+        if _REPORTED_SPEECH_RE.search(text[:match.start()]):
+            continue
         rest = match.group("rest") or ""
         if _EMPTY_REST_RE.match(rest):
             continue
@@ -346,8 +398,15 @@ def detect_asks(sentences: list[dict] | None) -> list[dict]:
 
 
 def cap_overflow(asks: list[dict]) -> tuple[list[dict], int]:
-    """(the asks to card, how many were held back). The caller REPORTS the
-    overflow -- a silently truncated push is how a cap reads as coverage."""
+    """(the asks to card, how many were DROPPED). The caller REPORTS the overflow
+    -- a silently truncated push is how a cap reads as coverage.
+
+    DROPPED, NOT QUEUED, and the word matters. The cap bounds the TOTAL number of
+    cards one meeting can ever produce, not the number per run: deduping before
+    capping would free the slots on the next poll and deliver all of them inside
+    an hour, which is the flood D-054 retired the last push over. Over-cap asks
+    are therefore gone, and the run says so out loud rather than implying a queue.
+    """
     items = list(asks or [])
     if len(items) <= MAX_ASKS_PER_MEETING:
         return items, 0
@@ -355,15 +414,26 @@ def cap_overflow(asks: list[dict]) -> tuple[list[dict], int]:
 
 
 def format_offset(seconds: float | int | None) -> str:
-    """`start_time` as the m:ss stamp D-136 asks for. Fireflies returns seconds
-    here (unlike `Transcript.duration`, which is MINUTES -- the unit that was
-    wrong everywhere until this session)."""
+    """`start_time` as the timestamp D-136 asks for. Fireflies returns SECONDS
+    here (unlike `Transcript.duration`, which is minutes -- the unit that was
+    wrong everywhere until this session).
+
+    ROLLS OVER PAST THE HOUR. The live corpus holds meetings up to 176 minutes, so
+    an ask 75 minutes in rendered "[75:23]" -- not a stamp anyone can scrub to, on
+    the one line whose entire job is to make the claim checkable.
+
+    OverflowError is caught alongside TypeError/ValueError: `int(float('inf'))`
+    raises it, and this is called from `build_card_text`, so letting it escape
+    would take out the whole card rather than degrade one stamp.
+    """
     try:
         total = int(round(float(seconds)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "?"
     if total < 0:
         return "?"
+    if total >= 3600:
+        return f"{total // 3600}:{(total % 3600) // 60:02d}:{total % 60:02d}"
     return f"{total // 60}:{total % 60:02d}"
 
 

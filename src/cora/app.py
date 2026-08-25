@@ -4433,14 +4433,15 @@ def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
             return
 
         kind = str(rec.get("kind") or "")
+        resolved = True
         if not accept:
             meeting_asks.mark_state(rec["ask_id"], meeting_asks.STATE_DISMISSED)
             outcome = meeting_asks.outcome_text("DISMISSED", kind)
         else:
             ok, detail = _execute_meeting_ask(rec, actor_id)
-            # A failure RELEASES the claim back to PENDING so the tap can be
-            # retried -- leaving it CLAIMED would wedge the card forever behind
-            # "I'm working on that one already".
+            # A failure RELEASES the claim back to PENDING so the tap CAN be
+            # retried -- leaving it CLAIMED would wedge the card behind "I'm
+            # working on that one already" forever.
             meeting_asks.mark_state(
                 rec["ask_id"],
                 meeting_asks.STATE_ACCEPTED if ok else meeting_asks.STATE_PENDING,
@@ -4448,6 +4449,22 @@ def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
             )
             outcome = meeting_asks.outcome_text("ACCEPTED", kind,
                                                 success=ok, detail=detail)
+            resolved = ok
+
+        # A RETRY NEEDS ITS BUTTONS. The terminal edit below drops them, so doing
+        # it unconditionally made the promised retry impossible: the row went back
+        # to PENDING while the only way to act on it disappeared, and the two most
+        # likely failures (a missing Asana mapping, a transient API error) are
+        # exactly the ones a human would fix and tap again. On failure the card is
+        # left intact and the reason goes in the thread.
+        if not resolved:
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=message_ts,
+                                        text=f"{outcome} The buttons above still "
+                                             "work if you want to try again.")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("meeting-ask retry note failed: %s", exc)
+            return
 
         # C4: strip the dead affordance, drop the buttons, append what actually
         # happened. Shared helper, not a local copy -- and the footer this card
