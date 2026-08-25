@@ -18,12 +18,3 @@
 {"id": "2026-07-30T05:01:15.827097+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
 {"id": "2026-07-30T05:24:01.404247+00:00", "action": "capability_routed", "timestamp": "2026-07-30T21:57:05.910455+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "wave1_fork3c_purge"}
 {"id": "2026-07-03T05:53:08.435531+00:00", "action": "expired", "timestamp": "2026-08-02T13:10:02.159648+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_ttl"}
-{"id": "2026-08-03T02:53:33.591766+00:00", "action": "answer", "timestamp": "2026-08-05T16:33:33.136489+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
-{"id": "2026-08-03T16:55:11.527067+00:00", "action": "answer", "timestamp": "2026-08-05T16:33:37.390763+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
-{"id": "2026-07-09T00:08:43.552523+00:00", "action": "expired", "timestamp": "2026-08-08T13:10:01.702336+00:00", "target_entity": "HJRG", "captured_entity": "HJRG", "source": "gap_ttl"}
-{"id": "2026-07-12T00:15:14.947226+00:00", "action": "expired", "timestamp": "2026-08-11T13:10:01.880226+00:00", "target_entity": "FNDR", "captured_entity": "FNDR", "source": "gap_ttl"}
-{"id": "2026-08-10T16:14:36.234357+00:00", "action": "answer", "timestamp": "2026-08-11T14:56:36.462180+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
-{"id": "2026-08-11T17:33:21.095649+00:00", "action": "answer", "timestamp": "2026-08-13T14:03:33.851675+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
-{"id": "2026-08-12T00:29:53.777969+00:00", "action": "answer", "timestamp": "2026-08-19T15:05:58.640350+00:00", "target_entity": "LEX", "captured_entity": "LEX", "source": "gap_autofill", "answer_source": "teammate_dm"}
-{"id": "2026-08-19T22:26:54.670336+00:00", "action": "answer", "timestamp": "2026-08-20T15:15:14.996837+00:00", "target_entity": "F3E", "captured_entity": "F3E", "source": "gap_autofill", "answer_source": "slack_kb"}
-{"id": "2026-08-20T20:59:03.755339+00:00", "action": "answer", "timestamp": "2026-08-21T20:23:36.962254+00:00", "target_entity": "LEX-LLC", "captured_entity": "LEX-LLC", "source": "gap_autofill", "answer_source": "slack_kb"}

@@ -59,14 +59,6 @@ disabled:
   # nightly health check stops warning "unexpectedly Disabled" every day. It creates
   # Slack channels (a connector write) -- re-enable only via a deliberate admin action.
   - cowork-cora-project-channel-sync
-  # Fighter/influencer deliverables suite RETIRED 2026-08-03 (Harrison) -- stale
-  # process; monthly 3-deliverable tracking to be redesigned before any revival.
-  # Data kept as archive (data/influencer_tracker.db, pending-matches JSON, the
-  # fighter Google Sheet). Do not re-enable without a new decision.
-  - "cowork-cora-influencer-scan"
-  - "cowork-cora-influencer-digest"
-  - "cowork-cora-influencer-overdue-alerts"
-  - "cowork-cora-monthly-deliverables"
 # NOTE: "Cora - LinkedIn Spy" was REMOVED from the host on 2026-06-16 (Phase 1.8,
 # Python Apollo path retired; Make 4769263 is sole owner) -- so it is no longer
 # listed here. A removed task is not an "expected disabled" task.
@@ -76,7 +68,6 @@ disabled:
 # enabled task simply must NOT be in `disabled`), so this section is documentary +
 # forward-compatible -- it will not false-WARN and is ready if the health check is
 # extended to assert expected-enabled tasks.
-
 enabled:
   # Daily 07:06 AZ PHI re-scan over _brain/swept/ (defense-in-depth behind the
   # materializer's inline _phi_wall). Added 2026-06-30 (lex-swept-phi-check spec).
