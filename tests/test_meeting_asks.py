@@ -268,17 +268,66 @@ def test_the_state_path_is_read_per_call(tmp_path, monkeypatch):
 def test_only_the_addressee_can_tap(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
     ma.record_card(**_record())
-    rec, refusal = ma.claim_for_tap("1787097600.001", OTHER)
+    rec, refusal = ma.claim_for_tap("a1", OTHER)
     assert rec is None and "addressed to someone else" in refusal
-    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    rec, refusal = ma.claim_for_tap("a1", HARRISON)
     assert rec is not None and refusal == ""
+
+
+def test_the_claim_is_atomic_so_two_taps_cannot_both_execute(tmp_path, monkeypatch):
+    """THE button-tap race. Without an atomic claim both taps read PENDING and
+    both execute -- and for a task ask that is TWO Asana tasks from one card.
+    This repo has shipped this class twice (cq-883878e81274, cq-056a3a4de2f7)."""
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    first, _ = ma.claim_for_tap("a1", HARRISON)
+    second, refusal = ma.claim_for_tap("a1", HARRISON)
+    assert first is not None, "the first tap must win"
+    assert second is None, "the second tap must NOT also get the record"
+    assert "already" in refusal.lower()
+
+
+def test_a_failed_execution_releases_the_claim_for_a_retry(tmp_path, monkeypatch):
+    """CLAIMED must not be terminal, or a transient Asana failure wedges the card
+    forever behind "I'm working on that one already"."""
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    assert ma.claim_for_tap("a1", HARRISON)[0] is not None
+    ma.mark_state("a1", ma.STATE_PENDING)          # what the handler does on failure
+    assert ma.claim_for_tap("a1", HARRISON)[0] is not None, "retry must be possible"
+    assert ma.STATE_CLAIMED not in ma._TERMINAL
+
+
+def test_the_ts_fallback_still_finds_a_card_posted_before_the_id_rode_along(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    rec, refusal = ma.claim_for_tap("", HARRISON, message_ts="1787097600.001")
+    assert rec is not None and refusal == ""
+
+
+def test_an_empty_stored_addressee_is_a_refusal_not_a_wildcard(tmp_path, monkeypatch):
+    """Fail CLOSED on the only authority check there is. review_lanes settled the
+    same argument for the entity field: an unknown on an authority boundary is a
+    no."""
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record(addressee_id=""))
+    rec, refusal = ma.claim_for_tap("a1", HARRISON)
+    assert rec is None and "someone else" in refusal
+
+
+def test_an_unidentifiable_tapper_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    rec, refusal = ma.claim_for_tap("a1", "")
+    assert rec is None and refusal
 
 
 def test_a_second_tap_finds_the_card_already_handled(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
     ma.record_card(**_record())
     ma.mark_state("a1", ma.STATE_ACCEPTED)
-    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    rec, refusal = ma.claim_for_tap("a1", HARRISON)
     assert rec is None and "Already handled" in refusal
 
 
@@ -289,7 +338,7 @@ def test_an_expired_card_refuses_and_says_so(tmp_path, monkeypatch):
     data = json.loads(p.read_text(encoding="utf-8"))
     data["a1"]["carded_at"] = "2020-01-01T00:00:00+00:00"
     p.write_text(json.dumps(data), encoding="utf-8")
-    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    rec, refusal = ma.claim_for_tap("a1", HARRISON)
     assert rec is None
     assert "aged out" in refusal, "expiry must be reported, not silent"
     assert json.loads(p.read_text(encoding="utf-8"))["a1"]["state"] == ma.STATE_EXPIRED
@@ -297,7 +346,7 @@ def test_an_expired_card_refuses_and_says_so(tmp_path, monkeypatch):
 
 def test_an_unknown_card_refuses_honestly(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
-    rec, refusal = ma.claim_for_tap("nope", HARRISON)
+    rec, refusal = ma.claim_for_tap("nope", HARRISON, message_ts="nope")
     assert rec is None and "can't find this card" in refusal
 
 

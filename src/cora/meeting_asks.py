@@ -79,6 +79,10 @@ _DEFAULT_PATH = (Path(__file__).resolve().parents[2] / "data" / "state"
 TTL_DAYS = 14
 
 STATE_PENDING = "PENDING"
+#: Held between `claim_for_tap` and the executor's result. NOT terminal: a failed
+#: execution returns the row to PENDING so the tap can be retried, which is why
+#: this is a distinct state rather than an early ACCEPTED.
+STATE_CLAIMED = "CLAIMED"
 STATE_ACCEPTED = "ACCEPTED"
 STATE_DISMISSED = "DISMISSED"
 STATE_EXPIRED = "EXPIRED"
@@ -552,32 +556,84 @@ def expired(rec: dict, now: datetime | None = None) -> bool:
         return True
 
 
-def claim_for_tap(message_ts: str, actor_id: str,
+def claim_for_tap(ask_id: str, actor_id: str, *, message_ts: str = "",
                   now: datetime | None = None) -> tuple[dict | None, str]:
-    """(record, refusal) for a button tap. The record is returned ONLY when the
-    tap should act; otherwise refusal explains why, verbatim, to the tapper.
+    """CLAIM this card for one tap. (record, refusal).
 
-    THE ADDRESSEE IS THE AUTHORITY, and it is checked here rather than by the
-    caller. This is the whole authority model of the slice: a card proposes an
-    action about the tapper's OWN meeting ask, so being its addressee is the
-    permission. It is a different question from `review_lanes.can_approve`
-    (which governs org canon and stays Harrison-only), and keeping it in a
-    different function is what leaves D-011 untouched.
+    The record comes back ONLY when this tap should act, and by then the row has
+    already been moved to CLAIMED, so a second tap cannot also act.
+
+    KEYED ON THE ASK ID, WHICH THE BUTTON CARRIES IN ITS `value`. The first cut
+    keyed on the card's Slack message ts, which is strictly worse for no benefit:
+    it makes every tap depend on `body["message"]["ts"]` still equalling the ts
+    that `chat_postMessage` returned when the card was posted, so a card that is
+    ever edited, re-posted or threaded orphans every button on it -- while the
+    authoritative id was sitting unused in the payload the whole time. The live,
+    proven sibling (`gap_autofill.process_decline_tap`) keys on its own ask id for
+    exactly this reason. `message_ts` is kept as a FALLBACK for a card posted
+    before the value was carried.
+
+    THE WHOLE CHECK-AND-CLAIM IS ATOMIC, under the same lock the writes take.
+    Without that, two fast taps both read PENDING and both execute -- and for a
+    task ask that means TWO Asana tasks from one card, which is the
+    button-tap-race class this repo has already shipped twice
+    (cq-883878e81274 cross-bound stashes, cq-056a3a4de2f7 the edit race).
+
+    THE ADDRESSEE IS THE AUTHORITY, and it is decided here rather than by the
+    caller. A card proposes an action about the tapper's OWN meeting ask, so being
+    its addressee is the permission. That is a different question from
+    `review_lanes.can_approve` (which governs org canon and stays Harrison-only),
+    and keeping it in a different function is what leaves D-011 untouched.
     """
-    rec = find_by_message_ts(message_ts)
-    if not rec:
-        return None, ("I can't find this card any more -- it may predate a restart. "
-                      "Ask me for the meeting's action items and I'll pull them live.")
-    if rec.get("state") in _TERMINAL:
-        return None, f"Already handled ({str(rec.get('state','')).lower()}) -- nothing more to do."
-    if expired(rec, now):
-        mark_state(str(rec.get("ask_id") or ""), STATE_EXPIRED)
-        return None, (f"This card aged out after {TTL_DAYS} days, so I didn't act on it. "
-                      "Ask me for the meeting's action items if you still want it.")
     actor = str(actor_id or "").strip()
-    if actor and str(rec.get("addressee_id") or "") and actor != str(rec.get("addressee_id")):
-        return None, "This card was addressed to someone else, so I've left it alone."
-    return rec, ""
+    with _LOCK:
+        data = _load()
+        key = str(ask_id or "").strip()
+        rec = data.get(key) if key else None
+        if not isinstance(rec, dict) and message_ts:
+            # Fallback for a card posted before the id rode in the button value.
+            for candidate in data.values():
+                if (isinstance(candidate, dict)
+                        and str(candidate.get("card_message_ts") or "") == str(message_ts)):
+                    rec, key = candidate, str(candidate.get("ask_id") or "")
+                    break
+        if not isinstance(rec, dict):
+            return None, ("I can't find this card any more -- it may predate a "
+                          "restart. Ask me for the meeting's action items and "
+                          "I'll pull them live.")
+
+        state = str(rec.get("state") or "")
+        if state in _TERMINAL:
+            return None, (f"Already handled ({state.lower()}) -- nothing more "
+                          "to do.")
+        if state == STATE_CLAIMED:
+            return None, "I'm working on that one already -- give me a second."
+        if expired(rec, now):
+            rec["state"] = STATE_EXPIRED
+            rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            data[key] = rec
+            _save(data)
+            return None, (f"This card aged out after {TTL_DAYS} days, so I didn't "
+                          "act on it. Ask me for the meeting's action items if you "
+                          "still want it.")
+        # AUTHORITY. An EMPTY stored addressee is a REFUSAL, not a wildcard: the
+        # sender never records one (it skips an unaddressable ask), so an empty
+        # value means a corrupted or hand-edited row, and reading it as "anyone
+        # may act" is the fail-OPEN direction on the only authority check there
+        # is. The `review_lanes` docstring settled this same argument for the
+        # entity field -- an unknown on an authority boundary is a no.
+        addressee = str(rec.get("addressee_id") or "")
+        if not addressee or (actor and actor != addressee):
+            return None, ("This card was addressed to someone else, so I've left "
+                          "it alone.")
+        if not actor:
+            return None, "I couldn't tell who tapped that, so I've left it alone."
+
+        rec["state"] = STATE_CLAIMED
+        rec["claimed_at"] = datetime.now(timezone.utc).isoformat()
+        data[key] = rec
+        _save(data)
+        return dict(rec), ""
 
 
 def mark_state(ask_id: str, state: str, *, outcome: str = "") -> bool:

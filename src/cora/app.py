@@ -4403,6 +4403,13 @@ def _handle_gap_decline_tap(body: dict, client, *, reason: str) -> None:
 
 def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
     try:
+        actions = body.get("actions") or []
+        # The button's own value is the authoritative key -- the card's Slack ts is
+        # only a fallback for a card posted before the value rode along. Keying on
+        # the ts would make every tap depend on the ts still matching the one
+        # chat_postMessage returned, for no benefit (this is the shape
+        # gap_autofill.process_decline_tap already uses).
+        ask_id = (actions[0].get("value") if actions else "") or ""
         actor_id = (body.get("user") or {}).get("id", "")
         channel_id = (body.get("channel") or {}).get("id", "")
         message_ts = (body.get("message") or {}).get("ts", "")
@@ -4410,7 +4417,10 @@ def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
         if os.environ.get("CORA_EVAL_MODE") == "1":
             return
 
-        rec, refusal = meeting_asks.claim_for_tap(message_ts, actor_id)
+        # Atomic: returns the record ALREADY moved to CLAIMED, so a second fast
+        # tap cannot also execute (two Asana tasks from one card).
+        rec, refusal = meeting_asks.claim_for_tap(ask_id, actor_id,
+                                                 message_ts=message_ts)
         if rec is None:
             # An honest refusal, in the thread, leaving the card alone: the card
             # may belong to somebody else, and rewriting it would tell them their
@@ -4428,6 +4438,9 @@ def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
             outcome = meeting_asks.outcome_text("DISMISSED", kind)
         else:
             ok, detail = _execute_meeting_ask(rec, actor_id)
+            # A failure RELEASES the claim back to PENDING so the tap can be
+            # retried -- leaving it CLAIMED would wedge the card forever behind
+            # "I'm working on that one already".
             meeting_asks.mark_state(
                 rec["ask_id"],
                 meeting_asks.STATE_ACCEPTED if ok else meeting_asks.STATE_PENDING,
