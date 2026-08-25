@@ -17,7 +17,14 @@ Checks:
 
 Auto-fixes (applied immediately, included in report):
   • Stale Cora heartbeat → orphan-kill + restart service
-  • Any scheduled task in state "Running" for >2h → mark stuck, restart
+
+Detections that WARN rather than auto-fix:
+  • A scheduled task stuck in state "Running" for >2h. The docstring used to
+    claim this was auto-fixed ("mark stuck, restart"); no such code has ever
+    existed, and "Running" was scored OK by the task classifier, so the state
+    was invisible. It is now surfaced -- but restarting someone's scheduled task
+    is an irreversible action on a live host and stays Harrison's call, so this
+    warns and names the task rather than acting (C5 / cq-7bac8008b140).
 
 Report: posted to #cora-health (or HEALTH_REPORT_CHANNEL env var)
   ✅  OK  |  ⚠️  Warning  |  ❌  Critical  |  🔧  Auto-fixed
@@ -246,10 +253,14 @@ def _restart_cora(dry_run: bool) -> str:
         return f"Restart attempted but failed: {exc}"
 
 
+_STUCK_RUNNING_HOURS = 2
+
+
 def _classify_task_states(
     task_states: dict[str, str],
     intended_disabled: set[str],
     expected_running: set[str],
+    stuck_running: set[str] | None = None,
 ) -> tuple[list[str], list[str], int]:
     """Pure classifier (audit N8). Returns (critical, warn, ok_count).
 
@@ -272,6 +283,16 @@ def _classify_task_states(
                 ok += 1
             else:
                 critical.append(f"{name}: expected Running, found {status}")
+        elif "Running" in status and name in (stuck_running or ()):
+            # A task in Running with a last-start hours ago is not working, it is
+            # wedged -- and while wedged it blocks every subsequent trigger.
+            # Observed live: the watchdog sat State=Running with no process
+            # behind it (0x80070420), which is exactly the failure the watchdog
+            # exists to catch.
+            warn.append(f"{name}: stuck in Running since its last start "
+                        f"(>{_STUCK_RUNNING_HOURS}h) -- it is blocking its own "
+                        f"triggers; end it from an elevated shell "
+                        f"(schtasks /End /TN \"{name}\")")
         elif "Ready" in status or "Running" in status:
             ok += 1
         elif "Disabled" in status:
@@ -280,6 +301,53 @@ def _classify_task_states(
         else:
             warn.append(f"{name}: unexpected status '{status}'")
     return critical, warn, ok
+
+
+def _stuck_running_tasks(running_names: list[str], *,
+                        now: datetime | None = None) -> set[str]:
+    """Of the tasks currently in state Running, which started >2h ago?
+
+    `schtasks /Query /FO CSV` carries no duration, so this reads each candidate's
+    "Start Time"/"Last Run Time" with /V. Only the Running set is queried, so on
+    a healthy host this is zero or one extra call.
+
+    Fail-soft: on any parse or query failure the task is NOT reported stuck. A
+    false "your task is wedged" would send Harrison to an elevated shell for
+    nothing, and the previous behaviour (silence) is the safe direction here.
+    """
+    if not running_names:
+        return set()
+    now = now or datetime.now()
+    stuck: set[str] = set()
+    for name in running_names:
+        try:
+            out = subprocess.run(
+                ["schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V"],
+                capture_output=True, text=True, timeout=30).stdout
+        except Exception:  # noqa: BLE001
+            continue
+        started = None
+        for line in out.splitlines():
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            if key.strip().lower() not in ("start time", "last run time"):
+                continue
+            val = val.strip()
+            for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S",
+                        "%Y-%m-%d %H:%M:%S"):
+                try:
+                    started = datetime.strptime(val, fmt)
+                    break
+                except ValueError:
+                    continue
+            if started:
+                break
+        if not started:
+            continue
+        if (now - started).total_seconds() > _STUCK_RUNNING_HOURS * 3600:
+            stuck.add(name)
+    return stuck
 
 
 def check_scheduled_tasks() -> list[CheckResult]:
@@ -306,8 +374,13 @@ def check_scheduled_tasks() -> list[CheckResult]:
         if prev is None or (("Running" in status or "Disabled" in status) and "Ready" in prev):
             task_states[raw_name] = status
 
+    # The always-on service is SUPPOSED to be Running for weeks -- exclude it
+    # rather than querying it and relying on branch order to save us.
+    stuck = _stuck_running_tasks(
+        [n for n, st in task_states.items()
+         if "Running" in st and n not in _EXPECTED_RUNNING])
     critical, warn, ok_count = _classify_task_states(
-        task_states, _EXPECTED_DISABLED, _EXPECTED_RUNNING
+        task_states, _EXPECTED_DISABLED, _EXPECTED_RUNNING, stuck
     )
 
     results: list[CheckResult] = []

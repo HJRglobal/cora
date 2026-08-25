@@ -3458,7 +3458,17 @@ def handle_message_event(event: dict, client) -> None:
         return
 
     # ── Path 1: Correction capture ────────────────────────────────────────────
-    if team_learning.is_correction(text):
+    # C5: every pattern in team_learning._CORRECTION_PATTERNS is ^-anchored, and
+    # the W1-01 "@mentions Cora" skip sits AFTER this path deliberately, so a
+    # correction addressed to Cora reaches here as "<@U...> actually that's
+    # wrong" and every anchored pattern misses it. Same unstripped-mention-blinds-
+    # a-start-anchored-detector class as the 8/20 confirm-surface finding, and
+    # the mention route already applies exactly this strip. Latent today (channel
+    # `message` events do not reach this app at all -- see below), which is
+    # precisely why it has to be fixed now: it would go live silently the moment
+    # the Event Subscription lands.
+    _correction_text = _MENTION_RE.sub("", text).strip() or text
+    if team_learning.is_correction(_correction_text):
         channel_name = _resolve_channel_name(client, channel_id)
         entity = route(channel_name)
         log.info(
@@ -3471,7 +3481,7 @@ def handle_message_event(event: dict, client) -> None:
             channel=channel_id,
             channel_name=channel_name,
             entity=entity,
-            correction_text=text,
+            correction_text=_correction_text,
         )
         _handle_note(
             client=client,

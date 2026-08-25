@@ -128,6 +128,28 @@ def _build_report(feedback: list[dict], gaps: list[dict], days: int) -> str:
         f"{total_thumbsdowns} :thumbsdown: · "
         f"{total_gaps} knowledge gap(s)\n"
     )
+    # C5 (cq-7bac8008b140): this read 0 for THIRTEEN consecutive weekly runs
+    # while its two siblings fluctuated, and corrections demonstrably happened in
+    # those weeks. It is not a key mismatch -- the reader filters
+    # signal_type == "correction" and the writer writes exactly that literal, to
+    # the same file. The counter is 0 because its ONLY production writer,
+    # app.py's Path 1, sits inside @app.event("message") in the CHANNEL branch,
+    # and channel `message` events do not reach this Slack app: the Event
+    # Subscriptions bot_events list is configured separately from OAuth scopes,
+    # is invisible to the token, and cannot be changed from this repo (D-138..145).
+    # Proof in the logs: 0 occurrences of "team_learning: correction detected"
+    # across 1,374 files, against 1,490 "app_mention routed".
+    #
+    # A bare 0 reads as "Cora is never wrong". Say what it actually means.
+    if total_corrections == 0:
+        lines.append(
+            "_0 corrections is NOT evidence Cora was never corrected. The "
+            "correction detector runs on channel `message` events, which this "
+            "Slack app does not receive (Event Subscriptions, not OAuth scopes "
+            "-- fixable only in the Slack app config). Until that lands this "
+            "counter is structurally 0; :thumbsdown: and knowledge-gap counts "
+            "come from routes that DO fire._\n"
+        )
 
     # Corrections by entity
     if corrections_by_entity:
