@@ -601,14 +601,30 @@ def mechanical_affordance_line(update_type: str) -> str:
 # this closed tuple and returns its input UNCHANGED for any footer it does not
 # recognise -- so an unregistered footer means a resolved card silently keeps
 # advertising a button that no longer exists, which is the exact defect C4 exists
-# to fix. Defined in `meeting_asks` (the builder that emits it) and imported here
-# so the two cannot drift; the import is local to avoid an import cycle
-# (meeting_asks imports terminal_card_blocks from this module).
+# to fix. Defined in `meeting_asks` (the builder that emits it) and read here so
+# the two cannot drift.
+#
+# THERE IS NO IMPORT CYCLE, and an earlier version of this comment claimed there
+# was. The dependency runs one way only -- app.py imports both, and `meeting_asks`
+# imports nothing from this module (its `terminal_card_blocks` reference is
+# docstring prose; the actual call site is in app.py). The function-local import
+# therefore buys nothing as a cycle guard either way: it is evaluated at MODULE
+# import time by the tuple below, so importing `knowledge_review` eagerly imports
+# `meeting_asks` regardless.
+#
+# What the try/except IS doing is keeping a strip list buildable no matter what --
+# and the cost of that is worth stating, because it is silent: a failure here
+# drops the S3 footer out of `_CARD_AFFORDANCE_LINES`, and a missing member means
+# resolved S3 cards keep advertising a dead button, i.e. exactly the C4 defect
+# this registration exists to prevent. So it logs rather than swallowing quietly.
 def _s3_affordance_line() -> str:
     try:
         from .meeting_asks import AFFORDANCE_LINE  # noqa: PLC0415
         return AFFORDANCE_LINE
     except Exception:  # noqa: BLE001 -- a strip list must never fail to build
+        log.error("knowledge_review: S3 affordance line unavailable -- resolved "
+                  "meeting-ask cards will keep advertising their buttons",
+                  exc_info=True)
         return ""
 
 
