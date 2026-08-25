@@ -188,6 +188,14 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "GOLDEN_SET_AUTO_PATH", str(tmp_path / "golden-set-auto.yaml")
     )
+    # C6 decision fingerprints: pass-5 records a row at PROPOSAL time, so any
+    # test that drives reconcile(passes=[5]) writes to the real ledger -- and the
+    # SECOND such run then suppresses the gap the first one recorded, turning a
+    # green test red for a reason that has nothing to do with the code under
+    # test. (Exactly what happened here before this line existed.)
+    monkeypatch.setenv(
+        "DECISION_FACT_FP_PATH", str(tmp_path / "decision-fact-fingerprints.jsonl")
+    )
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening
