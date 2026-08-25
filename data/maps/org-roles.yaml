@@ -88,6 +88,14 @@ users:
     role: Operations Manager
     entity: FNDR
     entities: [HJRG, BDM, HJRP, F3E]
+    # Klaviyo user seat CONFIRMED by Harrison 2026-08-25, answering the question
+    # Tessa's block below had deliberately left open: Hannah is the email-marketing
+    # ops lead and owns the Klaviyo pipeline end to end per Ops Dept OS v1 section
+    # 2.1. Read by the C14 billing/seat audit. Fatima was deliberately NOT flagged
+    # in the same ruling -- she is a contractor whose 18-flow buildout is ~4 weeks
+    # late, and this flag asserts CURRENT access, which should not rest on
+    # inference. Confirm her from Klaviyo's own Settings -> Users before adding.
+    klaviyo_seat: true
     responsibilities:
       - BDM weekly content review (owns the cadence since 5/15)
       - Sponsor triage, MVP MMA, Pure UGC, Funbox, 12 News, Mach 10 wind-down
@@ -388,13 +396,14 @@ users:
     autowrite_excluded: true
     # Klaviyo user seat, per Harrison decision 3 of Ops Dept OS v1 (2026-08-08:
     # "Tessa access = Slack re-add + Klaviyo seat") and confirmed 2026-08-18. Read
-    # by the C14 billing/seat audit. This is the ONLY seat canon confirms in
-    # writing; Hannah owns the Klaviyo pipeline end to end per the same document
-    # (section 2.1) and therefore almost certainly holds one too, but that is an
-    # inference and a seat roster built on inference is worse than one that says
-    # it is incomplete -- so the audit reports the flagged set AND says plainly
-    # that it cannot be reconciled against the account, because Klaviyo exposes no
-    # seat endpoint. Harrison completes the flags.
+    # by the C14 billing/seat audit. This WAS the only seat canon confirmed in
+    # writing; Harrison confirmed Hannah's on 2026-08-25 and her flag is now set
+    # (see her block above), which is the inference this comment refused to make on
+    # its own. The roster is still incomplete BY NATURE -- Klaviyo exposes no seat,
+    # user or team-member endpoint, so the flagged set can never be reconciled
+    # against the account and the audit says so plainly rather than implying the
+    # list is complete. Fatima remains unflagged pending a look at Klaviyo's own
+    # Settings -> Users.
     klaviyo_seat: true
     responsibilities:
       - Email-marketing review lane with Hannah (F3E)
