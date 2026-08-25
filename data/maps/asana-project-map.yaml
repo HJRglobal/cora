@@ -215,7 +215,7 @@ entities:
                    strategic planning, lex roadmap, lex goals]
       # ── existing ──
       - project_gid: "1209152923740496"  # [LEX-LLC] Hampton Location
-        keywords: [hampton, north hampton, 1337, gilbert road]
+        keywords: [hampton, north hampton, "1337", gilbert road]
 
       - project_gid: "1212621507108628"  # [LEX-LLC] Ellsworth Location
         keywords: [ellsworth, mesa, ellsworth location]
@@ -234,7 +234,7 @@ entities:
                    ddd contract, new contract, ddd member]
 
       - project_gid: "1212754052205580"  # [LEX-LLC] Grow to 750 Members
-        keywords: [membership, enrollment, intake, 750, grow members, member count,
+        keywords: [membership, enrollment, intake, "750", grow members, member count,
                    new member, referral, member goal]
 
       - project_gid: "1212754052205604"  # [LEX-LLC] Staff Wage Increase
@@ -361,7 +361,7 @@ entities:
         title_patterns: [inspection, maintenance, repair]
       # ── existing ──
       - project_gid: "1212895000591057"  # general property management
-        title_patterns: [property, hampton, 1337, 1555, hjrp, leasing]
+        title_patterns: [property, hampton, "1337", "1555", hjrp, leasing]
       - project_gid: "1215070431026838"  # rogers ranch
         title_patterns: [rogers ranch, payson, cabin, ranch]
 

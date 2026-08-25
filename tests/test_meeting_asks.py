@@ -660,3 +660,48 @@ def test_the_cap_bounds_the_total_not_the_rate():
     assert "DROPPED, NOT QUEUED" in doc
     kept, overflow = ma.cap_overflow([{"n": i} for i in range(9)])
     assert len(kept) == ma.MAX_ASKS_PER_MEETING and overflow == 6
+
+
+def test_every_keyword_in_the_project_map_is_a_string():
+    """A DRIFT GUARD for a live crash this session surfaced.
+
+    `asana-project-map.yaml` carried UNQUOTED integers in two keyword lists
+    ("1337", "750", "1555" -- addresses and a member target), and
+    `project_resolver._norm` calls `.lower()` on each entry. So `resolve_project`
+    raised TypeError for HJRP and bare-LEX on EVERY call, which broke the
+    conversational `asana_create_task` path for those entities long before this
+    slice existed. YAML turns a bare `1337` into an int silently, so nothing but a
+    guard catches it.
+    """
+    import yaml
+    from pathlib import Path
+    raw = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "data" / "maps" /
+         "asana-project-map.yaml").read_text(encoding="utf-8"))
+    offenders = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if isinstance(v, (dict, list)):
+                    walk(v, f"{path}[{i}]")
+                elif not isinstance(v, str):
+                    offenders.append(f"{path}[{i}] = {v!r} ({type(v).__name__})")
+
+    walk(raw, "")
+    assert not offenders, (
+        "quote these -- a non-string keyword makes resolve_project raise:\n  "
+        + "\n  ".join(offenders))
+
+
+def test_the_project_resolver_no_longer_raises_for_any_live_entity():
+    """The entities that appear in real meeting titles must all route or return
+    None -- never raise."""
+    from cora.tools.project_resolver import resolve_project
+    for entity in ("FNDR", "HJRG", "F3E", "OSN", "BDM", "HJRP", "UFL", "F3C",
+                   "HJRPROD", "LEX", "LEX-LLC"):
+        resolve_project(entity=entity, task_text="send Larry the deck",
+                        assignee_gid="1204525779609669", meeting_title="F3 Weekly")

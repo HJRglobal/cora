@@ -1563,18 +1563,38 @@ def create_ask_task(*, slack_user_id: str, entity: str, task_text: str,
     if len(task_name) > fae._MAX_TASK_LEN:
         task_name = task_name[:fae._MAX_TASK_LEN].rstrip()
 
-    if is_lex:
-        project_gid = fae._resolve_lex_project(scoped, task_name, assignee_gid, display_title)
-    else:
-        project_gid = resolve_project(entity=scoped, task_text=task_name,
-                                      assignee_gid=assignee_gid,
-                                      meeting_title=str(meeting_title or ""))
-        if project_gid and is_blocked_project(project_gid):
-            project_gid = None
+    # GUARDED, because the resolver can RAISE and a bare exception here would be
+    # rendered to the tapper as "something went wrong on my side". It really did
+    # raise: `asana-project-map.yaml` carried unquoted integers in two keyword
+    # lists ("1337", "750", "1555"), so `_norm(text)` hit `int.lower()` and
+    # `resolve_project` threw TypeError for HJRP and bare-LEX on EVERY call. The
+    # data is fixed in the same commit -- and that bug was never mine: it broke the
+    # conversational `asana_create_task` path for those entities too. This guard
+    # stays because a routing-config error must degrade to a legible refusal, not
+    # to a shrug.
+    try:
+        if is_lex:
+            project_gid = fae._resolve_lex_project(scoped, task_name, assignee_gid,
+                                                   display_title)
+        else:
+            project_gid = resolve_project(entity=scoped, task_text=task_name,
+                                          assignee_gid=assignee_gid,
+                                          meeting_title=str(meeting_title or ""))
+            if project_gid and is_blocked_project(project_gid):
+                project_gid = None
+    except Exception as exc:  # noqa: BLE001 -- name the real reason
+        log.warning("create_ask_task: project routing failed for %s: %s", scoped, exc)
+        return False, (f"I couldn't work out which Asana project a {scoped} task "
+                       "belongs in -- the routing config needs a look. Nothing was "
+                       "created.")
     if not project_gid:
         # Symmetric with the capture guard: never orphan a task into My Tasks.
-        return False, ("I couldn't find a project for this meeting's entity, and "
-                       "I won't create an untagged task.")
+        # BDM and LEX-LBHS are deliberately excluded from meeting capture, so this
+        # is the expected answer there rather than a misconfiguration -- and saying
+        # which entity it was is what makes that legible.
+        return False, (f"Meeting capture isn't configured for {scoped}, so I have "
+                       "no project to put this in and I won't create an untagged "
+                       "task.")
 
     # The quoted line is the provenance D-136 requires, carried into the task
     # itself so the record survives outside Slack. PHI-scrubbed for LEX like
