@@ -30,7 +30,7 @@ def _t(tid, *, title="Weekly Sync", date_ts, link=None, n_sentences=5,
         "title": title,
         "date": date_ts,
         "meeting_link": link,
-        "duration": 1800,
+        "duration": 30,   # MINUTES (Fireflies unit), not seconds
         "summary": {"overview": "ov", "action_items": action_items},
         "sentences": sentences,
         "meeting_attendees": attendees or [{"displayName": "A", "email": "a@x.com"}],

@@ -51,7 +51,7 @@ def _make_transcript(
         "id": "abc123",
         "title": title,
         "date": date_ts,
-        "duration": 3600,
+        "duration": 60,   # MINUTES (Fireflies unit), not seconds
         "summary": {
             "action_items": action_items,
             "overview": "Weekly review of F3 operations",

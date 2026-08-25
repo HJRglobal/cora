@@ -832,13 +832,33 @@ def _format_transcript_content(t: dict) -> str:
         if date_ts else "(no date)"
     )
 
-    duration_sec = t.get("duration") or 0
-    duration_min = int(duration_sec / 60) if duration_sec else 0
+    # FIREFLIES RETURNS `duration` IN MINUTES, NOT SECONDS (S3, cq-f52c6b691127).
+    #
+    # The old code named it `duration_sec` and divided by 60 again, so every
+    # duration Cora has ever written was wrong and most were absent: `int(31/60)`
+    # is 0, and the render was `if duration_min:`-gated, so a sub-hour meeting got
+    # NO Duration line at all. Measured on the live KB before the fix: across the
+    # entire corpus the only values ever rendered were "1 min" (112 chunks) and
+    # "2 min" (6) -- so a 64-minute meeting's header read "Duration: 1 min" and a
+    # 31-minute one had no duration at all.
+    #
+    # PROVED to be minutes three independent ways rather than assumed: (a) "HJR 13
+    # wcf Meeting" carries duration=64 while its own inline action-item timestamps
+    # reach 54m30s, impossible if 64 were seconds; (b) "Harrison x Alex" carries
+    # duration=31 and a speaker says "it's a 30 minute meeting" inside that very
+    # transcript; (c) across the corpus no value exceeds 240, which no seconds
+    # reading could produce for a 2h56m call.
+    #
+    # Float, not int: live values include 23.030000686645508.
+    try:
+        duration_min = float(t.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration_min = 0.0
 
     lines.append(f"[Fireflies Meeting] {title}")
     lines.append(f"Date: {date_str}")
-    if duration_min:
-        lines.append(f"Duration: {duration_min} min")
+    if duration_min > 0:
+        lines.append(f"Duration: {int(round(duration_min))} min")
 
     # Attendees
     attendees = t.get("meeting_attendees") or []
@@ -1035,7 +1055,12 @@ def backfill(since: datetime) -> Iterator[Document]:
             deep_link=f"<{permalink}|{title}>",
             metadata={
                 "transcript_id": transcript_id,
-                "duration_sec": t.get("duration"),
+                # Renamed from the misleading `duration_sec` (it was never
+                # seconds). Verified safe: `grep -rn duration_sec src scripts
+                # tests` found only writers inside this file and ZERO readers, so
+                # there is no consumer to break -- and leaving a key whose NAME
+                # asserts the wrong unit is how the next reader repeats the bug.
+                "duration_min": t.get("duration"),
                 "attendee_emails": [
                     (a.get("email") or "")
                     for a in meeting_attendees if isinstance(a, dict)

@@ -206,7 +206,7 @@ class TestBackfillHardExcludeWiring:
     def _t(self, tid, title, link, attendees, organizer=""):
         return {
             "id": tid, "title": title, "date": 1_780_000_000, "meeting_link": link,
-            "duration": 1800, "organizer_email": organizer,
+            "duration": 30,   # MINUTES (Fireflies unit), not seconds "organizer_email": organizer,
             "summary": {"overview": "ov", "action_items": "do x"},
             "sentences": [{"index": i, "speaker_name": "A", "text": f"l{i}"} for i in range(4)],
             "meeting_attendees": attendees,

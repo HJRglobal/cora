@@ -36,7 +36,7 @@ def _transcript(title, action_items, attendees, tid="lexmtg1", date_ts=None):
         "id": tid,
         "title": title,
         "date": date_ts or (int(time.time()) - 3600),
-        "duration": 1800,
+        "duration": 30,   # MINUTES (Fireflies unit), not seconds
         "summary": {"action_items": action_items, "overview": "ops"},
         "meeting_attendees": attendees,
     }
