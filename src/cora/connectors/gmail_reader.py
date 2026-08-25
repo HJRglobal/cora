@@ -554,15 +554,38 @@ def get_full_thread_text(
             "thread_id": thread_id,
             "sender": headers.get("from", ""),
             "recipients": headers.get("to", ""),
+            # cc was never returned, so asana_email_sync's external-recipient
+            # prefilter silently counted To only (S1 defect E).
+            "cc": headers.get("cc", ""),
             "subject": headers.get("subject", "(no subject)"),
             "date_ts": date_ts,
+            # The DISPLAYED header date, rendered. asana_email_sync read a
+            # "date_str" key that this function has never returned, so every
+            # Asana comment Cora has ever posted said "Latest:  |" (S1 defect E).
+            "date_str": date_str,
+            # Gmail's own receive time. SORT ON THIS, not on the sender-controlled
+            # Date header -- see the sort below.
+            "internal_ts": int(msg.get("internalDate", "0")) // 1000 or date_ts,
             "body_text": body_text[:4000],  # Cap at 4KB per message for KB chunk size
             "attachment_names": attachment_names,
             "label_ids": msg.get("labelIds", []),
         })
 
-    # Oldest first (Gmail returns newest-first in thread)
-    results.sort(key=lambda m: m["date_ts"])
+    # Oldest first, keyed on Gmail's own internalDate.
+    #
+    # S1 defect D: this sorted on `date_ts`, which is parsed from the SENDER-
+    # CONTROLLED `Date` header and only falls back to internalDate when that
+    # header is unparseable. A backdated or clock-skewed reply therefore sorted
+    # into the MIDDLE, and `messages[-1]` -- which revops/sweep.py's state
+    # machine and asana_email_sync both rely on as "the last message" -- became
+    # an OLDER one. In the sweep that means a thread whose counterparty has in
+    # fact replied stays "awaiting_reply" and Cora nudges someone who already
+    # answered. sweep.py:180 clamps FUTURE dates but has no past-date guard.
+    #
+    # (The comment this replaces also had the API backwards: threads.get returns
+    # messages in ascending internalDate order, which revops/sender.py:85-87
+    # states explicitly and depends on.)
+    results.sort(key=lambda m: (m.get("internal_ts") or m["date_ts"]))
     return results
 
 

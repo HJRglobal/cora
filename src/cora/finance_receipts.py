@@ -47,6 +47,7 @@ from . import historical_access
 from .finance_doc_classifier import is_financial_document
 from .historical_access import AccessDecision, PASS
 from .phi_guard import is_phi_risk
+from . import email_citation  # S1: shared email citation
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +204,15 @@ def format_finance_chunks(results: list, target_label: str, filed_links: dict[st
         head = f"## [{i}] {r.title or r.source_id} | {date_str} | mailbox: {owner}"
         if getattr(r, "author", ""):
             head += f" | from: {r.author}"
+        # S1: a finance citation without a last-message date is exactly the class
+        # the doctrine calls unverified -- and this surface decides whether an
+        # invoice is outstanding.
+        try:
+            frag = email_citation.cite_from_metadata(getattr(r, "metadata", None))
+            if frag:
+                head += f" | {frag}"
+        except Exception:  # noqa: BLE001
+            pass
         filed = filed_links.get(r.source_id)
         lines.extend([head, ""])
         if filed:

@@ -52,6 +52,7 @@ from typing import Any
 import yaml
 
 from .phi_guard import is_phi_risk
+from . import email_citation  # S1: shared email citation
 
 log = logging.getLogger(__name__)
 
@@ -389,6 +390,27 @@ def strip_result(result: Any) -> Any:
     survives so the institutional knowledge still informs answers.
     """
     content = _HEADER_LINE_RE.sub("", result.content or "").strip()
+    # S1: keep a DE-IDENTIFIED recency marker. Nulling the metadata, the date AND
+    # the author is correct privacy behaviour -- and it also made a doctrine-
+    # compliant citation IMPOSSIBLE on exactly the chunks most likely to be
+    # cited, since a reader could not tell a live thread from a two-year-old one.
+    # Computed HERE, before the nulling, and carried as a single opaque string:
+    # "last activity 8/21, inbound". No subject, no name, no message id -- it
+    # ADDS a recency signal, it never restores a header.
+    marker = ""
+    try:
+        meta = getattr(result, "metadata", None) or {}
+        # ONLY when a real stamp exists. A pre-stamp chunk would otherwise carry
+        # "thread position unknown", which is noise on a stripped chunk and would
+        # replace `metadata=None` on EVERY chunk in the corpus for no gain -- the
+        # sweep has not re-run yet, so today that is all of them.
+        if meta.get("thread_last_ts"):
+            marker = email_citation.cite_from_metadata(meta, deidentified=True)
+    except Exception:  # noqa: BLE001
+        marker = ""
+    # The ONLY key that may survive the strip, and its value is an opaque
+    # recency string -- no subject, no name, no message id, no mailbox.
+    stripped_meta = {"thread_recency": marker} if marker else None
     return replace(
         result,
         title=_STRIPPED_TITLE.get(result.source, "(internal item — details withheld)"),
@@ -396,7 +418,7 @@ def strip_result(result: Any) -> Any:
         deep_link="",
         date_modified=None,
         author="",
-        metadata=None,
+        metadata=stripped_meta,
     )
 
 
@@ -553,6 +575,15 @@ def format_owned_chunks(results: list, target_label: str, recency_first: bool = 
         head = f"## [{i}] {r.title or r.source_id} | {date_str} | mailbox: {owner}"
         if getattr(r, "author", ""):
             head += f" | from: {r.author}"
+        # S1: last-message date + direction. These are OWNED chunks, so the
+        # identified form is correct here -- the de-identified form is for the
+        # Tier-1-stripped path, where strip_result has nulled the metadata.
+        try:
+            frag = email_citation.cite_from_metadata(getattr(r, "metadata", None))
+            if frag:
+                head += f" | {frag}"
+        except Exception:  # noqa: BLE001
+            pass
         if r.deep_link:
             head += f" | {r.deep_link}"
         lines.extend([head, "", (r.content or "").strip(), ""])

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from cora import historical_access, user_notes, phi_guard, org_roles, drive_io
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
+from . import email_citation  # S1: shared email citation
 
 log = logging.getLogger(__name__)
 
@@ -1047,8 +1048,26 @@ def _format_kb_chunks(chunks: list) -> str:
                              "this transcript; do NOT attribute any quote to a named "
                              "person from it]")
 
+        # S1 (cq-551fada9dee8): every EMAIL citation states its thread's
+        # last-message date + direction. Doctrine section 2.6 -- and until
+        # this shipped, section 6 said to treat any Cora email citation
+        # without one as UNVERIFIED. The stamp is written at ingest, so this
+        # is a metadata read: no query, no API call.
+        thread_note = ""
+        if r.source == "gmail":
+            try:
+                meta = getattr(r, "metadata", None) or {}
+                # A Tier-1-stripped chunk carries only the de-identified marker;
+                # its real metadata was nulled on purpose and must stay nulled.
+                frag = (meta.get("thread_recency")
+                        or email_citation.cite_from_metadata(meta))
+                if frag:
+                    thread_note = f" | {frag}"
+            except Exception:  # noqa: BLE001 -- a citation must never break a load
+                thread_note = ""
         lines.append(
-            f"## [{i}] {r.source} | {title} | entity={r.entity}{date_str}{link_block}{bot_label}"
+            f"## [{i}] {r.source} | {title} | entity={r.entity}{date_str}"
+            f"{thread_note}{link_block}{bot_label}"
         )
         lines.append("")
         lines.append(r.content.strip())

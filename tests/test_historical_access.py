@@ -212,7 +212,12 @@ def test_tier1_strips_non_owner_gmail_chunk():
     assert unstripped is False
     s = out[0]
     assert "details withheld" in s.title
-    assert s.author == "" and s.deep_link == "" and s.metadata is None
+    assert s.author == "" and s.deep_link == ""
+    # S1: the strip may now carry ONE key -- an opaque de-identified
+    # recency marker ("last activity 8/21, inbound"), and only when the
+    # chunk has a real thread stamp. Everything identifying stays
+    # nulled, which is what this assertion is actually for.
+    assert s.metadata is None or set(s.metadata) == {"thread_recency"}
     assert s.date_modified is None
     assert "From:" not in s.content and "Subject:" not in s.content
     assert "Date:" not in s.content and "Attachments:" not in s.content

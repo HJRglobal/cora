@@ -5983,6 +5983,7 @@ _PENDING_KIND_LABELS = {
     "hubspot_stage": "a deal-stage change",
     "hubspot_note": "a deal note",
     "slack_dm": "a Slack DM",
+    "decision_close": "an answer to a stalled decision",
     "influencer_handle": "an influencer handle",
     "influencer_deliverable": "a deliverable update",
     "meeting_item": "a meeting action item",

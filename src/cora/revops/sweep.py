@@ -292,22 +292,16 @@ def _thread_subject(messages: Optional[list[dict[str, Any]]]) -> Optional[str]:
 
 
 def _is_outbound(msg: dict[str, Any], own: set[str]) -> bool:
-    """Direction from Gmail's own SENT label when present, From header only as
-    a fallback for fixtures/readers that omit labels.
+    """Direction from Gmail's own SENT label. MOVED to email_citation (S1).
 
-    A From header is attacker-spoofable; a Gmail label is not. This matters
-    twice: silence detection, and (below) which message's recipient list seeds
-    a nudge (D-051 lens 4/8).
+    Kept as a module-level name because the state machine and its tests call it
+    by name. The rule itself now lives in ONE place, so the
+    "an empty label list is still authoritative" reasoning cannot fork between
+    the sweep and the citation renderer -- this module was the reference
+    implementation and the only correct direction rule in the repo.
     """
-    # An EMPTY label list is still authoritative ("Gmail says not sent"), so
-    # test for presence of the key, never truthiness -- `[] or fallback` would
-    # hand a spoofed From header the decision.
-    labels = msg.get("label_ids")
-    if labels is None:
-        labels = msg.get("labelIds")
-    if labels is not None:
-        return "SENT" in labels
-    return _addr_of(msg.get("sender")) in own
+    from ..email_citation import is_outbound
+    return is_outbound(msg, own)
 
 
 def _nudge_recipients(

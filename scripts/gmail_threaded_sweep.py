@@ -43,6 +43,7 @@ from cora.connectors.gmail_reader import (  # noqa: E402
     get_full_thread_text,
     list_threads_since,
 )
+from cora import email_citation  # noqa: E402  (S1 thread stamp)
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
 
@@ -527,6 +528,24 @@ def main() -> int:
             except GmailReaderError as exc:
                 log.warning("Skipping thread %s for %s: %s", thread_id, user_email, exc)
                 continue
+            # S1: compute the thread's LAST-message facts ONCE, here, where the
+            # whole thread is already in hand -- zero extra API calls and zero
+            # read-time queries. The KB is per-MESSAGE, so vector retrieval
+            # returns the best-MATCHING message and never the thread's last; a
+            # citation built from the chunk's own date therefore reports a
+            # mid-thread state as current, which is the D-Backs / Fuoco failure
+            # class the doctrine's section 1 documents.
+            #
+            # SELF-HEALING by construction: list_threads_since uses after:{ts},
+            # so ANY new message returns the WHOLE thread, get_full_thread_text
+            # returns all of it, and the per-message loop rewrites every row of
+            # that thread under the bare source_id with replace-on-conflict. The
+            # stamp refreshes as the thread grows.
+            try:
+                _stamp = email_citation.thread_stamp(messages, {user_email.lower()})
+            except Exception:  # noqa: BLE001 -- a stamp must never fail an ingest
+                log.warning("thread stamp failed for %s", thread_id, exc_info=True)
+                _stamp = {}
 
             if not messages:
                 continue
@@ -549,7 +568,7 @@ def main() -> int:
 
             # Process each message as a Document
             seen_body_fps: set[str] = set()  # duplicate-delivery guard, per thread
-            for msg in messages:
+            for _msg_index, msg in enumerate(messages):
                 subject = msg.get("subject", "(no subject)")
                 sender  = msg.get("sender", "")
                 recipients = msg.get("recipients", "")
@@ -617,6 +636,10 @@ def main() -> int:
                             "thread_id": thread_id,
                             "message_id": msg["message_id"],
                             "sender": sender,
+                            # This message's position, plus the THREAD's
+                            # last-message facts (S1).
+                            "thread_msg_index": _msg_index,
+                            **_stamp,
                         },
                     )
                     docs_batch.append(doc)
