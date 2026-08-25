@@ -56,6 +56,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+# Windows console guard. These reports print emoji (the card's affordance line,
+# the report's status glyphs) and the default Windows stdout codec is cp1252, which
+# RAISES UnicodeEncodeError on them -- so the dry-run/inspection path, which is the
+# first thing the setup PS1 tells you to run, crashed mid-card. Found by running it,
+# not by a test: pytest captures stdout through a UTF-8 pipe and never sees cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
 from cora import meeting_asks  # noqa: E402
 from cora.connectors import fireflies_connector as ffc  # noqa: E402
 from cora.connectors import fireflies_diarization as ffd  # noqa: E402

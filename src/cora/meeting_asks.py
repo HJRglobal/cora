@@ -374,39 +374,86 @@ def _norm_name(value: str) -> str:
 
 
 def match_speaker_to_attendee(speaker: str, attendees: list[dict] | None) -> str:
-    """The attendee email for this speaker label, or '' when not EXACTLY one match.
+    """The attendee email for this speaker label, or '' when not confident.
 
-    Full-name equality after normalisation, then a single-first-name match, and
-    ambiguity returns '' both times. Deliberately not a substring test: the
-    2026-06-13 sweep shipped a substring matcher that assigned "Lex" to "Alex",
-    and here the same bug would DM a colleague about someone else's meeting ask.
+    RESOLVES THROUGH THE ROSTER, NOT THROUGH `displayName`. The first cut matched
+    `sentences[].speaker_name` against `meeting_attendees[].displayName`, which is
+    dead on live data: measured across real transcripts, `displayName` is None for
+    EVERY human attendee -- only the Fireflies notetaker bot carries one. So that
+    matcher could never succeed in production and every card silently fell back to
+    the meeting owner. Found by running the capture against 25 real meetings, not
+    by a test; the fixtures had displayName populated because I wrote them.
+
+    So: speaker name -> canonical roster name (reusing
+    `fireflies_action_extractor._match_roster_name`, which was built for exactly
+    this problem and carries the anti-substring fix -- no unanchored substring
+    rule, because that one mapped "Lex" to "Alex Cordova" and "Ann" to "Hannah
+    Grant") -> that person's email via the slack-to-asana map -> and only then a
+    CHECK that the email is actually in this meeting's attendee list.
+
+    THAT LAST CHECK IS THE POINT. Resolving a name through a global roster would
+    otherwise happily address someone who was never in the room; requiring them to
+    be an attendee keeps the old guarantee while making the match work at all.
     """
-    target = _norm_name(speaker)
+    target = str(speaker or "").strip()
     if not target:
         return ""
-    rows = [a for a in (attendees or []) if isinstance(a, dict)]
-    exact = [
-        str(a.get("email") or "").strip()
-        for a in rows
-        if _norm_name(a.get("displayName")) == target
-    ]
-    exact = [e for e in exact if e]
-    if len(exact) == 1:
-        return exact[0]
-    if len(exact) > 1:
+    attendee_emails = {
+        str(a.get("email") or "").strip().lower()
+        for a in (attendees or []) if isinstance(a, dict)
+    }
+    attendee_emails.discard("")
+    if not attendee_emails:
         return ""
-    # A single spoken first name ("Justin") against attendee full names.
-    parts = target.split()
-    if len(parts) != 1:
+    try:
+        from .connectors import fireflies_action_extractor as fae  # noqa: PLC0415
+        canonical = fae._match_roster_name(target, fae._roster_names())
+    except Exception:  # noqa: BLE001 -- an unavailable roster falls back to the owner
+        log.warning("meeting_asks: roster match unavailable", exc_info=True)
         return ""
-    first = parts[0]
-    by_first = [
-        str(a.get("email") or "").strip()
-        for a in rows
-        if _norm_name(a.get("displayName")).split()[:1] == [first]
-    ]
-    by_first = [e for e in by_first if e]
-    return by_first[0] if len(by_first) == 1 else ""
+    if not canonical:
+        return ""
+    # Canonical roster name -> every email we know for that person, then keep only
+    # the one that was actually in this meeting.
+    for email in _roster_emails_for(canonical):
+        if email.lower() in attendee_emails:
+            return email
+    return ""
+
+
+def _roster_emails_for(canonical_name: str) -> list[str]:
+    """Every email the slack-to-asana map knows for this canonical roster name.
+
+    Same map `fireflies_connector._load_email_to_slack` reads, walked in the other
+    direction. Aliases included, because the address a person appears under in a
+    calendar invite is routinely not their primary.
+    """
+    out: list[str] = []
+    try:
+        import yaml  # noqa: PLC0415
+        path = (Path(__file__).resolve().parents[2] / "data" / "maps"
+                / "slack-to-asana.yaml")
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return out
+    users = raw.get("users") if isinstance(raw, dict) else None
+    rows = users.values() if isinstance(users, dict) else (users or [])
+    target = _norm_name(canonical_name)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # `display_name` is the key this map actually uses (verified against the
+        # live file); `name` is what I assumed and it does not exist there.
+        if _norm_name(row.get("display_name") or row.get("name")) != target:
+            continue
+        primary = str(row.get("asana_email") or "").strip()
+        if primary:
+            out.append(primary)
+        for alias in (row.get("email_aliases") or []):
+            alias = str(alias or "").strip()
+            if alias:
+                out.append(alias)
+    return out
 
 
 def meeting_owner_email(transcript: dict | None) -> str:
@@ -446,11 +493,24 @@ def resolve_addressee(
                 "attribution unreliable on this transcript -- addressed to the "
                 "meeting owner rather than a named speaker")
 
-    email = match_speaker_to_attendee(ask.get("speaker", ""), (transcript or {}).get("meeting_attendees"))
+    attendees = (transcript or {}).get("meeting_attendees") or []
+    has_attendees = any(
+        str(a.get("email") or "").strip()
+        for a in attendees if isinstance(a, dict)
+    )
+    email = match_speaker_to_attendee(ask.get("speaker", ""), attendees)
     if not email:
-        return (owner_sid, owner,
-                "speaker label did not match exactly one attendee -- addressed to "
-                "the meeting owner")
+        # SAY WHICH CASE FIRED. Measured on live data, the two fallbacks look
+        # identical to a reader and mean different things: a personal recording
+        # carries NO attendee list at all (nothing to match against), while a
+        # calendar meeting can have a speaker who is not on its invite. Reporting
+        # both as "did not match exactly one attendee" told the reader something
+        # false about the first.
+        reason = ("this recording has no attendee list, so I couldn't confirm who "
+                  "spoke -- addressed to the meeting owner" if not has_attendees
+                  else "the speaker isn't on this meeting's attendee list -- "
+                       "addressed to the meeting owner")
+        return (owner_sid, owner, reason)
     sid = lookup.get(email.lower(), "")
     if not sid:
         return (owner_sid, owner,

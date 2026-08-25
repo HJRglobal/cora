@@ -44,9 +44,12 @@ def _transcript(**over) -> dict:
         "date": 1787097600,
         "organizer_email": "harrison@hjrglobal.com",
         "host_email": "harrison@hjrglobal.com",
+        # displayName is None on LIVE data for every human attendee -- only the
+        # Fireflies bot carries one. The fixture says so, because a fixture that
+        # populated it is what hid a matcher that could never work in production.
         "meeting_attendees": [
-            {"displayName": "Harrison Rogers", "email": "harrison@hjrglobal.com"},
-            {"displayName": "Justin Moran", "email": "justin@hjrglobal.com"},
+            {"displayName": None, "email": "harrison@hjrglobal.com"},
+            {"displayName": None, "email": "justin@hjrglobal.com"},
         ],
         "sentences": [],
     }
@@ -162,44 +165,69 @@ def test_a_diarization_flagged_transcript_addresses_the_owner_not_the_speaker():
 
 
 def test_a_clean_transcript_addresses_the_speaker_who_spoke():
+    """Resolved through the roster and CONFIRMED against the attendee list."""
     sid, email, why = ma.resolve_addressee(
         {"speaker": "Justin Moran"}, _transcript(), attribution_unreliable=False,
         email_to_slack={"harrison@hjrglobal.com": HARRISON,
                         "justin@hjrglobal.com": OTHER},
     )
     assert sid == OTHER and email == "justin@hjrglobal.com"
+    assert "the speaker who made the ask" in why
 
 
-def test_an_ambiguous_speaker_label_falls_back_to_the_owner():
-    """Two attendees with the same display name: guessing would DM the wrong
-    colleague about somebody else's ask."""
-    t = _transcript(meeting_attendees=[
-        {"displayName": "Justin Moran", "email": "justin@hjrglobal.com"},
-        {"displayName": "Justin Moran", "email": "justin@lexingtonservices.com"},
-    ])
-    sid, email, _ = ma.resolve_addressee(
-        {"speaker": "Justin Moran"}, t, attribution_unreliable=False,
-        email_to_slack={"harrison@hjrglobal.com": HARRISON},
-    )
-    assert sid == HARRISON and email == "harrison@hjrglobal.com"
+def test_the_matcher_resolves_a_speaker_through_the_roster_not_display_name():
+    """THE defect this shape exists for. `meeting_attendees[].displayName` is None
+    for every human on live data -- only the Fireflies notetaker carries one -- so
+    matching speaker_name against displayName could never succeed in production and
+    every card silently fell back to the meeting owner. Found by running the
+    capture against 25 real meetings; the fixtures had displayName populated
+    because I wrote them."""
+    atts = [{"displayName": None, "email": "hannah@hjrglobal.com"},
+            {"displayName": None, "email": "harrison@hjrglobal.com"}]
+    assert ma.match_speaker_to_attendee("Hannah Grant", atts) == "hannah@hjrglobal.com"
+    assert ma.match_speaker_to_attendee("Harrison Rogers", atts) == "harrison@hjrglobal.com"
+    # An unambiguous first name resolves too (the roster matcher's step 2).
+    assert ma.match_speaker_to_attendee("Hannah", atts) == "hannah@hjrglobal.com"
+
+
+def test_a_resolved_speaker_who_was_not_in_the_meeting_is_refused():
+    """The roster is global; the attendee list is what proves presence. Without
+    this check a name resolved through the roster would address someone who was
+    never in the room. Measured live: a Finance meeting whose speaker labels
+    include Harrison while its attendee list does not."""
+    atts = [{"displayName": None, "email": "justin@hjrglobal.com"}]
+    assert ma.match_speaker_to_attendee("Harrison Rogers", atts) == ""
 
 
 def test_speaker_matching_is_not_a_substring_test():
     """The 2026-06-13 sweep shipped a substring matcher that assigned "Lex" to
-    "Alex". Here the same bug DMs the wrong person."""
-    t = _transcript(meeting_attendees=[
-        {"displayName": "Alex Cordova", "email": "alex@f3energy.com"}])
-    assert ma.match_speaker_to_attendee("Lex", t["meeting_attendees"]) == ""
-    assert ma.match_speaker_to_attendee("Alex Cordova", t["meeting_attendees"]) == \
-        "alex@f3energy.com"
+    "Alex". Here the same bug DMs the wrong person. The roster matcher this
+    delegates to carries the anti-substring fix."""
+    atts = [{"displayName": None, "email": "alex@f3energy.com"},
+            {"displayName": None, "email": "hannah@hjrglobal.com"}]
+    assert ma.match_speaker_to_attendee("Lex", atts) == ""
+    assert ma.match_speaker_to_attendee("Ann", atts) == ""
 
 
-def test_a_single_spoken_first_name_resolves_only_when_unambiguous():
-    rows = [{"displayName": "Justin Moran", "email": "j@x.com"},
-            {"displayName": "Hannah Grant", "email": "h@x.com"}]
-    assert ma.match_speaker_to_attendee("Justin", rows) == "j@x.com"
-    rows.append({"displayName": "Justin Lopez", "email": "jl@x.com"})
-    assert ma.match_speaker_to_attendee("Justin", rows) == ""
+def test_an_empty_attendee_list_matches_nobody():
+    assert ma.match_speaker_to_attendee("Hannah Grant", []) == ""
+    assert ma.match_speaker_to_attendee("Hannah Grant", None) == ""
+
+
+def test_a_recording_with_no_attendee_list_says_so_rather_than_blaming_the_label():
+    """Two fallbacks that look identical to a reader mean different things: a
+    personal recording carries NO attendee list, while a calendar meeting can have
+    a speaker who is not on its invite."""
+    t = _transcript(meeting_attendees=[])
+    _, _, why = ma.resolve_addressee(
+        {"speaker": "Hannah Grant"}, t, attribution_unreliable=False,
+        email_to_slack={"harrison@hjrglobal.com": HARRISON})
+    assert "no attendee list" in why
+
+    _, _, why2 = ma.resolve_addressee(
+        {"speaker": "Larry Stone"}, _transcript(), attribution_unreliable=False,
+        email_to_slack={"harrison@hjrglobal.com": HARRISON})
+    assert "isn't on this meeting's attendee list" in why2
 
 
 def test_no_addressable_recipient_means_no_proposal():
