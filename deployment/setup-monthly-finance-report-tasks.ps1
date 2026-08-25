@@ -119,9 +119,18 @@ foreach ($job in $jobs) {
         exit 1
     }
 
-    # schtasks has no description flag; set it through the ScheduledTask object.
+    # schtasks has no description flag, so it is set through the ScheduledTask
+    # object -- and it has to be the OBJECT. `Set-ScheduledTask -TaskName X
+    # -Description Y` fails with "A parameter cannot be found that matches
+    # parameter name 'Description'" (observed live 2026-08-25: both tasks
+    # registered, both descriptions silently skipped). Set-ScheduledTask takes
+    # -Trigger/-Action/-Settings/-Principal/-InputObject only; Description is a
+    # property on the task instance, not a parameter on the cmdlet. Same family as
+    # the 2026-08-20 finding that the ScheduledTask enum has no StopExisting.
     try {
-        Set-ScheduledTask -TaskName $job.Name -Description $job.Desc | Out-Null
+        $existingTask = Get-ScheduledTask -TaskName $job.Name
+        $existingTask.Description = $job.Desc
+        Set-ScheduledTask -InputObject $existingTask | Out-Null
     } catch {
         Write-Host "  (description not set: $($_.Exception.Message))" -ForegroundColor Yellow
     }
