@@ -75,6 +75,12 @@ users:
     role: Founder / CEO
     entity: FNDR
     entities: [HJRG, F3E, F3C, OSN, LEX, BDM, HJRP, HJRPROD, UFL]
+    # Klaviyo OWNER seat, read from Klaviyo's own Settings -> Users on 2026-08-25.
+    # NOTE the identity: his Klaviyo login is Service@f3energy.com, NOT
+    # harrison@hjrglobal.com -- so anything trying to reconcile seats BY EMAIL
+    # against this roster will miss him. That is one more reason the audit reports
+    # the flagged set rather than claiming to reconcile.
+    klaviyo_seat: true
     responsibilities:
       - Portfolio strategy, capital allocation, and all final decisions
       - Sole authority on memory writes, PHI access decisions, and counterparty comms
@@ -122,6 +128,13 @@ users:
     name: Tommy Anderson
     role: F3E Sales Lead
     entity: F3E
+    # Klaviyo ADMIN seat, read from Klaviyo's own Settings -> Users 2026-08-25 --
+    # recorded because it is TRUE, not because it is right: last active 2026-04-09,
+    # roughly four and a half months dormant, on an Admin role in the account that
+    # sends every F3E marketing email. Flagged for Harrison's call (downgrade,
+    # remove, or leave); the flag exists so the audit stops under-reporting the
+    # real seat count, and this comment exists so nobody reads it as endorsed.
+    klaviyo_seat: true
     responsibilities:
       - F3 Energy retail sales pipeline (HubSpot F3E Retail)
     manager: U0B2RM2JYJ1
