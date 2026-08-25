@@ -2149,11 +2149,70 @@ def participation_report(days: int = 30, today: str | None = None) -> list[str]:
         lines.append(f"  ANOMALIES: send-failed {t['failed']} | "
                      f"reserved-never-sent {t['reserved_never_sent']}")
     for user, r in sorted(s["people"].items(), key=lambda kv: kv[1]["name"]):
+        # C11: no-response / no-confirm / skipped were computed per person and
+        # dropped from the rendered line -- so the one surface a reader sees
+        # could not answer "who is not participating", which is the whole
+        # question the report exists for. Design v1 section 8 asks for days
+        # asked, days answered, items confirmed, items skipped, per person.
         lines.append(
             f"  {r['name']:<22} [{r['entity']:<8}] asked {r['asked']:>2} "
             f"answered {r['answered']:>2} confirmed {r['confirmed']:>2} "
+            f"skipped {r['user_skipped']:>2} no-response {r['no_response']:>2} "
+            f"no-confirm {r['no_confirm']:>2} "
             f"pool-exhausted {r['pool_exhausted']:>2}")
     return lines
+
+
+# The weekly participation report goes to HANNAH, per the 2026-08-11 addendum
+# spec Harrison locked ("DMs Hannah directly (not a channel post)") -- she owns
+# training readiness and runs the Monday audit this feeds. Hard-coded with NO
+# recipient parameter, the same contract strategy_memo uses for its
+# Harrison-only memo: a parameter is how a report about named individuals'
+# participation becomes a report to anyone.
+HANNAH_SLACK_USER_ID = "U0B3AEQS0NB"
+
+
+def post_participation_report(lines: list[str], *, dry_run: bool = False,
+                              _client_factory=None) -> bool:
+    """DM the weekly participation report to Hannah. True on a successful post.
+
+    Gated on enabled(), not live(): under `dry` the pilot must not send anything
+    anywhere -- the same reasoning promote() applies -- and under the `off` kill
+    switch the report is still LOGGED by the caller, so a paused pilot stays
+    visible rather than going silent.
+    """
+    body = "\n".join(lines or [])
+    if not body:
+        return False
+    if dry_run or not enabled():
+        log.info("knowledge-check report: not sending (dry_run=%s enabled=%s)",
+                 dry_run, enabled())
+        return False
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.warning("knowledge-check report: SLACK_BOT_TOKEN not set -- not sending")
+        return False
+    try:
+        if _client_factory is not None:
+            client = _client_factory()
+        else:
+            from slack_sdk import WebClient
+            client = WebClient(token=token)
+        from .slack_egress import sanitize_text
+        resp = client.conversations_open(users=[HANNAH_SLACK_USER_ID])
+        channel = (resp or {}).get("channel", {}).get("id", "")
+        if not channel:
+            log.warning("knowledge-check report: could not open a DM")
+            return False
+        client.chat_postMessage(
+            channel=channel,
+            text=sanitize_text(f":bar_chart: *Knowledge check -- weekly "
+                               f"participation*\n```\n{body}\n```"),
+            unfurl_links=False, unfurl_media=False)
+        return True
+    except Exception as exc:  # noqa: BLE001 -- a report must never break a run
+        log.warning("knowledge-check report: DM failed: %s", exc)
+        return False
 
 
 def phi_blocked(text: str) -> tuple[bool, str]:
