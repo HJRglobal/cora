@@ -11978,6 +11978,25 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
     # directive "WRITE_CONFIRMED -- post as your entire response:" was posted
     # verbatim into Harrison's DM. Routed through the shared constructor so a
     # fourth one cannot drift; the guard test below makes the contract structural.
+    # D-051: queue_explicit gained STAGE-BY-ID outcomes, and this branch reported
+    # every one of them as "Queued" -- a founder asking to stage an existing item
+    # was told a NEW item had been filed, when nothing had been queued at all.
+    # Handle them before the founder fast-path, and say what actually happened.
+    if outcome == "staged":
+        return _write_confirmed_contract(
+            f"Staged the kickoff for `{cq_id}` -- nothing new was queued.")
+    if outcome.startswith("resolved:"):
+        detail = outcome.split(":", 1)[1]
+        if detail == "not_authorized":
+            return _write_confirmed_contract(
+                f"`{cq_id}` already exists in the queue. Only Harrison can stage "
+                f"a kickoff for it.")
+        if detail == "noop":
+            return _write_confirmed_contract(
+                f"`{cq_id}` already has a staged kickoff -- nothing to do.")
+        return _write_confirmed_contract(
+            f"I found `{cq_id}` but couldn't stage it ({detail}). Tap "
+            f"\"Stage prompt\" on its card instead.")
     if is_founder:
         return _write_confirmed_contract(
             "Queued to your code-session queue (APPROVED). Tap \"Stage prompt\" "
@@ -12502,6 +12521,14 @@ def has_pending_classb(slack_user: str, channel: str) -> bool:
 # file but only ever CALLED after the module has fully loaded -- same ordering
 # contract as _stash_kind_specs() below.
 def _defer_to_model_kinds() -> frozenset[str]:
+    # decision_close defers like every other Class-B kind. It was briefly
+    # excluded on the theory that it should take the deterministic path (it has
+    # no TOOL, so a typed "yes" cannot reach one) -- but this interceptor has no
+    # deterministic executor for Class-B kinds either, so excluding it would let
+    # a bare "yes" fire another kind's staler write. The parity test states that
+    # contract and it is correct. The honest consequence, recorded here rather
+    # than papered over: decision_close is CONFIRMED BY BUTTON, and its preview
+    # says so (D-051).
     return frozenset({"calendar", "lexicon", "code_queue", "remember",
                       "forget_note", "schedule_meeting"}) | frozenset(_CLASSB_KINDS)
 

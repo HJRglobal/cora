@@ -100,21 +100,26 @@ def test_two_consecutive_red_weeks_seed_once():
     assert kw["entity"] == "F3E"
     assert "f3e-x" in kw["title"] and "2 consecutive" in kw["title"]
     assert "f3e-x" in kw["signal"]
-    assert out == {"f3e-x": "streak1"}
+    # D-051: the marker keys on the INCIDENT (the date the streak started),
+    # not on a constant. A constant made the SIGNAL identical for every
+    # recurrence and walked straight into the fingerprint trap the docstring
+    # says it avoids -- find_fingerprint has no time component.
+    assert list(out) == ["f3e-x"]
+    assert out["f3e-x"].startswith("since20")
 
 
 def test_a_third_red_week_does_not_seed_again():
     """Once per incident, not once per run."""
     with patch("cora.code_queue.seed_item", return_value="cq-abc") as seed:
-        out = ev._autoseed_persistent_failures({"f3e-x": 3}, {"f3e-x": "streak1"}, CASES)
+        out = ev._autoseed_persistent_failures({"f3e-x": 3}, {"f3e-x": "since2026-08-10"}, CASES)
     seed.assert_not_called()
-    assert out == {"f3e-x": "streak1"}
+    assert out == {"f3e-x": "since2026-08-10"}
 
 
 def test_a_regression_after_a_fix_seeds_a_NEW_item():
     """THE DEDUP TRAP. find_fingerprint has no time component and ignores item
     status, so a signal keyed only on the eval id would seed once ever."""
-    seeded = {"f3e-x": "streak1"}
+    seeded = {"f3e-x": "since2026-08-10"}
     # the case passed -> the marker is dropped
     cleared = ev._autoseed_persistent_failures({}, seeded, CASES)
     assert cleared == {}
@@ -158,8 +163,8 @@ def test_the_old_single_key_state_file_still_loads(tmp_path, monkeypatch):
 
 def test_state_round_trips(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "_STATE_PATH", tmp_path / "s.json")
-    ev._save_last_failing({"a"}, {"a": 3}, {"a": "streak1"})
-    assert ev._load_state() == ({"a"}, {"a": 3}, {"a": "streak1"})
+    ev._save_last_failing({"a"}, {"a": 3}, {"a": "since2026-08-10"})
+    assert ev._load_state() == ({"a"}, {"a": 3}, {"a": "since2026-08-10"})
 
 
 def test_a_missing_state_file_is_not_a_failure(tmp_path, monkeypatch):

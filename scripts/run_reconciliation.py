@@ -68,6 +68,7 @@ _setup_logging()
 try:
     from cora.reconciliation_engine import (  # noqa: E402
         reconcile,
+        record_decision_proposals,
         ReconciliationGap,
         DEFAULT_LOOKBACK_SECONDS,
     )
@@ -425,6 +426,10 @@ def main() -> int:
                     confidence=gap.confidence,
                 )
                 n_prop += 1
+                # Propose-once bookkeeping happens HERE, after the propose
+                # succeeded -- never at gap-build time, or a --dry-run would
+                # permanently suppress a decision it never proposed (D-051).
+                record_decision_proposals([gap])
                 log.info(
                     "Proposed update gap_id=%s type=%s confidence=%s",
                     gap.gap_id[:20], gap.gap_type, gap.confidence,

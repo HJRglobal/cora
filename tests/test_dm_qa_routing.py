@@ -86,7 +86,15 @@ class TestFetchDmHistory:
             {"role": "assistant", "content": "Saved to your notes."},
         ]
 
-    def test_leading_assistant_turns_dropped(self):
+    def test_a_cora_opened_dm_keeps_her_message_as_context(self):
+        """Was `== []`, pinning the API workaround rather than the behaviour.
+
+        The Claude API needs a user turn first, and both history builders used to
+        satisfy that by POPPING leading assistant turns -- which, in a DM Cora
+        started, threw away the only prior message. The builder also skips the
+        CURRENT message, so on the first human reply there is nothing left at all
+        and the model answers blind. That is the 8/19 stalled-decision incident,
+        and it applies to every Cora-initiated DM (D-051)."""
         client = MagicMock()
         client.conversations_history.return_value = {
             "messages": [
@@ -94,7 +102,10 @@ class TestFetchDmHistory:
                 {"ts": "1", "text": "Hi! I can help.", "bot_id": "B1"},
             ]
         }
-        assert app_module._fetch_dm_history(client, "D123", current_msg_ts="2") == []
+        out = app_module._fetch_dm_history(client, "D123", current_msg_ts="2")
+        assert len(out) == 1 and out[0]["role"] == "user"
+        assert "Hi! I can help." in out[0]["content"]
+        assert "Cora opened this thread" in out[0]["content"]
 
     def test_api_error_returns_empty(self):
         client = MagicMock()

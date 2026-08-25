@@ -302,6 +302,28 @@ def _stable_id(text: str, entity: str) -> str:
     return fact_fingerprint.compute_fingerprint(entity or "", text)[:8]
 
 
+def record_decision_proposals(gaps: list) -> int:
+    """Record the propose-once fingerprint for every decision gap in *gaps*.
+
+    Called by the RUNNER after the gaps have actually been proposed, never at
+    build time -- see the note in pass5_drive_insights. Returns the count
+    recorded. Fail-soft: a bookkeeping error must not fail a run that already
+    proposed successfully.
+    """
+    n = 0
+    for gap in gaps or []:
+        if getattr(gap, "gap_type", "") != "uncaptured_decision":
+            continue
+        try:
+            _record_decision_proposal(getattr(gap, "title", "") or "",
+                                      getattr(gap, "entity", "") or "",
+                                      getattr(gap, "gap_id", "") or "")
+            n += 1
+        except Exception:  # noqa: BLE001
+            log.warning("could not record a decision fingerprint", exc_info=True)
+    return n
+
+
 def _decision_already_proposed(summary: str, entity: str) -> bool:
     """Has this same decision already been proposed recently?
 
@@ -1337,7 +1359,12 @@ def pass5_drive_insights(
                 log.info("pass5: decision already proposed, skipping: %s",
                          summary[:80])
                 continue
-            _record_decision_proposal(summary, entity, gap_id)
+            # D-051: the fingerprint used to be written HERE, at gap-BUILD time.
+            # That is not "at proposal time" -- run_reconciliation --dry-run
+            # builds every gap and then proposes NOTHING, so a single dry run
+            # would have permanently suppressed real decisions it only claimed
+            # it "would propose". The RUNNER now records it, after the propose
+            # actually succeeds (see record_decision_proposals).
             gaps.append(ReconciliationGap(
                 gap_id=gap_id,
                 gap_type="uncaptured_decision",

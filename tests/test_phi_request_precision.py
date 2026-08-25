@@ -135,13 +135,18 @@ def test_the_tail_window_is_bounded_not_open_ended():
 
 def test_request_shaped_checkpoints_use_the_request_union():
     src = inspect.getsource(code_queue)
-    # the sites that REFUSE a human's typed text
+    # ONLY the sites that REFUSE a human's typed text to their face. D-051
+    # narrowed this: the first cut also repointed _capture's summary gate, both
+    # subsystem_guess screens, the flywheel gap write and -- worst -- the
+    # THIRD-PARTY EGRESS guard in front of the Haiku classifier, which
+    # is_any_phi_request's own docstring says must stay strict.
     for needle in (
-        'if phi_guard.is_any_phi_request(f"{title} {summary}".strip()):',
-        "phi = phi_guard.is_any_phi_request(summary_text)",
-        "if phi_guard.is_any_phi_request(question):",
+        'if phi_guard.is_any_phi_request(f"{title} {summary}".strip()):',   # seed_item
+        'if phi_guard.is_any_phi_request(f"{title} {summary}"):',            # apply_edit
     ):
         assert needle in src, needle
+    assert src.count("is_any_phi_request(") == 2, (
+        "the request-shaped union spread beyond the two refuse-a-human gates")
 
 
 def test_at_rest_screens_stay_strict():
@@ -152,6 +157,12 @@ def test_at_rest_screens_stay_strict():
     for needle in (
         "rep_phi = phi_guard.is_any_phi(representative)",
         "if phi_guard.is_any_phi(note):",
+        # THIRD-PARTY EGRESS: never send LEX/PHI text to the Haiku classifier.
+        # This one was repointed by mistake and is the reason the pin above
+        # counts occurrences instead of just checking membership.
+        "if phi_guard.is_any_phi(question):",
+        # at-rest: the captured summary lands in the KB-ingested backlog
+        "phi = phi_guard.is_any_phi(summary_text)",
     ):
         assert needle in src, needle
 

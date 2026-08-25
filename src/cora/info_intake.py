@@ -286,10 +286,20 @@ def intake_update_id(ts: str) -> str:
 # hyphenated prose ("a well-known random-thing issue") into an entity claim.
 _CHANNEL_TOKEN_RE = re.compile(
     r"<#C[A-Z0-9]+\|([a-z0-9][a-z0-9._-]{2,})>"      # <#C123|f3-hq-inventory>
-    r"|#?\b([a-z0-9]+(?:-[a-z0-9]+){1,})\b"          # f3-hq-inventory-adjustments
+    r"|(#)([a-z0-9]+(?:-[a-z0-9]+){1,})\b"            # #f3-hq-inventory-adjustments
+    r"|\b([a-z0-9]+(?:-[a-z0-9]+){1,})\b"            # f3-hq-inventory-adjustments
 )
 # The intake surface itself names no entity -- every contribution mentions it.
 _NON_ENTITY_CHANNEL_NAMES = frozenset({"info-for-cora", "cora-build", "cora-health"})
+
+# D-051: a BARE hyphenated token is only a channel reference when the text says
+# so. Without this, "we agreed at the llc-level that this is fine" matched the
+# 'llc-*' route, resolved LEX, and was HARD-REFUSED by the blanket LEX skip -- a
+# benign non-LEX contribution killed by ordinary English. The '#' prefix and the
+# literal word "channel" are how people actually write a reference, and the live
+# case ("...in the f3-hq-inventory-adjustments channel") carries the latter.
+_CHANNEL_WORD_RE = re.compile(r"\bchannels?\b", re.IGNORECASE)
+_CHANNEL_WORD_WINDOW = 40
 
 
 def _collapse_family(entity: str) -> str:
@@ -311,14 +321,30 @@ def channel_token_entities(text: str) -> set[str]:
     """Entities named by a CHANNEL REFERENCE in *text*. "" on any failure."""
     out: set[str] = set()
     try:
-        for m in _CHANNEL_TOKEN_RE.finditer(str(text or "")):
-            tok = (m.group(1) or m.group(2) or "").strip().lower()
+        body = str(text or "")
+        for m in _CHANNEL_TOKEN_RE.finditer(body):
+            # groups: 1 = <#C..|name>, 2 = the literal '#', 3 = the token after
+            # '#', 4 = a bare token.
+            labelled, hashed = m.group(1), m.group(2)
+            tok = (labelled or m.group(3) or m.group(4) or "").strip().lower()
             if not tok or tok in _NON_ENTITY_CHANNEL_NAMES:
                 continue
             if not entity_router.is_mapped(tok):
                 continue      # only a REAL channel pattern counts
+            # A bare token needs corroboration; "<#C…|x>" and "#x" are explicit.
+            if not labelled and not hashed:
+                lo = max(0, m.start() - _CHANNEL_WORD_WINDOW)
+                hi = min(len(body), m.end() + _CHANNEL_WORD_WINDOW)
+                if not _CHANNEL_WORD_RE.search(body[lo:hi]):
+                    continue
             ent = (entity_router.route(tok) or "").upper()
-            if ent:
+            # FNDR is the DEFAULT, and utility channels (drive-shares,
+            # asana-feed, fireflies-recaps, hjrg-*) all route there. Adding it as
+            # a "hit" turned an otherwise-unambiguous contribution into an
+            # ambiguous one -- "F3 Pure pricing per the drive-shares channel"
+            # resolved ("FNDR", ambiguous) instead of F3E. A channel that names
+            # no business entity should contribute nothing (D-051).
+            if ent and ent != "FNDR":
                 out.add(ent)
     except Exception:  # noqa: BLE001 -- tagging must never break intake
         log.warning("info_intake: channel-token detection failed", exc_info=True)

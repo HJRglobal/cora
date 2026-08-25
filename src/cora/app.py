@@ -261,17 +261,28 @@ def _ensure_user_first(merged: list[dict]) -> list[dict]:
     dropped: list[str] = []
     while merged and merged[0]["role"] == "assistant":
         dropped.append(merged.pop(0)["content"])
-    if dropped and merged:
+    if not dropped:
+        return merged
+    context = "[Context -- Cora opened this thread with:]\n" + "\n".join(dropped)
+    if merged:
         # Prepended to the first user turn rather than inserted as a turn of its
         # own, so the result keeps the strict alternation the merge loop above
         # maintains.
         merged[0] = {
             "role": "user",
-            "content": ("[Context -- Cora opened this thread with:]\n"
-                        + "\n".join(dropped)
-                        + "\n\n[The reply to it:]\n" + merged[0]["content"]),
+            "content": context + "\n\n[The reply to it:]\n" + merged[0]["content"],
         }
-    return merged
+        return merged
+    # D-051: THE CASE THIS FUNCTION EXISTS FOR, and the first cut still returned
+    # [] on it. Both history builders SKIP the current message (it is appended
+    # separately by the caller), so on the FIRST human reply to a thread Cora
+    # opened, her alert is the ONLY turn here -- `merged` is empty after the pop
+    # and a `dropped and merged` guard is False. That is precisely the 8/19
+    # "fetched 0 turns" the docstring cites, reproduced by the fix for it.
+    #
+    # A lone user turn is a valid history: the caller appends the human's actual
+    # message after it, so the model receives context-then-reply.
+    return [{"role": "user", "content": context}]
 
 
 def _fetch_thread_history(

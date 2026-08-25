@@ -1605,11 +1605,17 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
         pass
     ok, why = answer_quality_ok(reply_text)
     if not ok:
-        stored["state"] = "REJECTED_QUALITY"
-        stored["replied_at"] = _now_iso()
+        # D-051: the ask stays PENDING. The first cut set a terminal
+        # REJECTED_QUALITY state and then invited a retry -- but
+        # match_pending_ask only considers PENDING asks, so the retry this very
+        # message asks for could never be captured. A rejection that closes the
+        # door it is holding open is worse than no rejection.
+        stored["last_rejected_at"] = _now_iso()
+        stored["last_rejected_reason"] = why
         asks[stored["ask_id"]] = stored
         save_pending_asks(asks)
-        log.info("gap_autofill: reply rejected (quality) for ask %s: %s",
+        log.info("gap_autofill: reply rejected (quality) for ask %s: %s "
+                 "-- ask left PENDING for a retry",
                  stored.get("ask_id", "")[:8], why)
         return ("Thanks -- but I can't store that as a durable fact "
                 f"({why}). Reply with the fact itself and I'll route it "

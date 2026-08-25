@@ -191,8 +191,7 @@ def test_non_lex_note_kept(qenv):
 
 
 def test_phi_summary_drops_item(qenv, monkeypatch):
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
-                        lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
     rec = {"kind": "bug", "severity": "P2", "title": "x", "summary": "y",
            "entity": "F3E", "signal": "tool_error", "representative": "x",
            "evidence": [], "reporter": "U1"}
@@ -221,8 +220,7 @@ def _counting_classifier(counter):
 def test_message_signal_phi_dropped_preclassify(qenv, monkeypatch):
     counter = {"n": 0}
     monkeypatch.setattr(cq, "classify_candidate", _counting_classifier(counter))
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
-                        lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
     cq.capture_message_signal("cora should track patient billing authorization",
                               "LEX", "C1", "lex", "U1")
     assert cq.load_items() == [] and counter["n"] == 0  # classifier never called
@@ -231,7 +229,7 @@ def test_message_signal_phi_dropped_preclassify(qenv, monkeypatch):
 def test_phi_check_error_fails_closed(qenv, monkeypatch):
     def _boom(_t):
         raise RuntimeError("phi check exploded")
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked", _boom)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", _boom)
     rec = {"kind": "bug", "severity": "P2", "title": "x", "summary": "y",
            "entity": "F3E", "signal": "tool_error", "representative": "x",
            "evidence": [], "reporter": "U1"}
@@ -243,7 +241,7 @@ def test_phi_tripping_subsystem_guess_blanked_at_capture(qenv, monkeypatch):
     slugs (_affinity_key -> _bundle_theme -> _slug), where the LEX prompt_path
     redaction can't reach co-bundled non-LEX items -- so a PHI-tripping value is
     blanked at capture (item survives, hint dropped)."""
-    monkeypatch.setattr(cq.phi_guard, "is_any_phi_request",
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi",
                         lambda t: "billing authorization" in t)
     rec = {"kind": "bug", "severity": "P2", "title": "tool crashed", "summary": "boom",
            "entity": "F3E", "signal": "tool_error", "representative": "tool",
@@ -265,8 +263,7 @@ def test_phi_tripping_subsystem_guess_blanked_in_seed_lane(qenv, monkeypatch):
     """Same screen on the seed lane (verify-pass follow-up): seed_item is
     caller-supplied via the MCP cora_code_queue_seed tool and bypasses _capture,
     so it must screen subsystem_guess itself (falls back to the entity code)."""
-    monkeypatch.setattr(cq.phi_guard, "is_any_phi_request",
-                        lambda t: "SECRETSUB" in t)
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi", lambda t: "SECRETSUB" in t)
     cid = cq.seed_item(kind="bug", severity="P2", title="clean title",
                        summary="clean summary", entity="F3E", signal="explicit",
                        status="PROPOSED", subsystem_guess="SECRETSUB detail")

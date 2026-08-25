@@ -100,12 +100,34 @@ _PHI_PROGRAM_NAME_RE = re.compile(r"\b(?:medicaid|ahcccs)\b", re.IGNORECASE)
 # An identifier riding immediately behind a programme name ("Medicaid ID 12345",
 # "AHCCCS #84213365", "Medicaid number 900123"). Anchored with .match() at the
 # programme match's end, so it only fires on what directly follows.
+# D-051: bare "no" is gone from the id-word list. It is an English negation far
+# more often than an abbreviation for "number", and inside the widened window it
+# made "AHCCCS providers, no client data" -- a brief whose own words say it holds
+# no client data -- read as a beneficiary number.
 _PROGRAM_ID_TAIL_RE = re.compile(
-    r"[\s:#-]{0,3}(?:\b(?:id|ids|no|num|number|#)\b[\s:#-]{0,3})?\d{4,}"
-    r"|[\s:#-]{0,3}\b(?:id|ids|no|num|number)\b",
+    r"[\s:#-]{0,3}(?:\b(?:id|ids|num|number|no\.|#)\b[\s:#-]{0,3})?\d{4,}"
+    r"|[\s:#-]{0,3}\b(?:id|ids|num|number|no\.)\b",
     re.IGNORECASE,
 )
 _PROGRAM_ID_TAIL_WINDOW = 24
+
+# A digit run that belongs to a DOCUMENT REFERENCE is not a beneficiary number.
+# "DDD policy chapter 320-V", "the AHCCCS manual, section 1240" are exactly the
+# person-free policy briefs is_phi_risk_person_linked exists to stop refusing
+# (cq-a24f9d2210fc, 2026-08-07) -- and widening the tail from an anchored .match
+# to a windowed .search re-broke them. Checked against the text immediately
+# BEFORE the digits, so it narrows nothing else.
+_DOC_REF_RE = re.compile(
+    r"\b(?:section|chapter|part|page|rule|clause|article|appendix|attachment"
+    r"|table|figure|paragraph|item|policy|manual|form|exhibit|schedule)"
+    r"\s*[.:#-]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_document_reference(text: str, tail_start: int) -> bool:
+    """Is the digit run at *tail_start* a document reference rather than an id?"""
+    return bool(_DOC_REF_RE.search(text[:tail_start]))
 
 
 # BUSINESS HOMONYMS. The second group inside _PHI_PATTERNS that names something
@@ -166,8 +188,9 @@ def is_phi_risk_person_linked(text: str) -> bool:
         # _PHI_PATTERNS only carries the literal "member id" / "provider id", so
         # subtracting the bare programme token removed their ONLY signal. Keep
         # the subtraction for the topic, not for the number.
-        if _PROGRAM_ID_TAIL_RE.search(text, m.end(),
-                                      m.end() + _PROGRAM_ID_TAIL_WINDOW):
+        tail = _PROGRAM_ID_TAIL_RE.search(text, m.end(),
+                                          m.end() + _PROGRAM_ID_TAIL_WINDOW)
+        if tail and not _is_document_reference(text, tail.start()):
             return True
     return False
 
@@ -284,16 +307,35 @@ _HOMONYM_BENIGN_SENSE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Any Title-case personal name. A homonym that survives the benign-sense test
-# still needs a NAME near it before it counts as naming a care recipient --
-# "any recipient we monitor" names nobody; "Emily Carter is the member whose
-# claims are pending" does. Distinct from _NAME_POSSESSIVE_RE, which requires a
-# possessive and therefore misses the copular form.
+# Any Title-case personal name. Deliberately loose ON ITS OWN -- it matches
+# "Google" and "Shopify" as readily as "Emily" -- so it is NEVER used alone. It
+# only ever runs inside a construction that already ties the name to a
+# care-recipient noun (see _HOMONYM_NAMES_A_PERSON_RE), which is what makes the
+# looseness harmless rather than vacuous (D-051).
 _TITLECASE_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+){0,2}\b")
+
+# The homonym GOVERNING a named individual: "member Emily Carter", "the member
+# account for Emily Carter", "recipient of record: Bob Smith". A name merely
+# PRESENT in the same sentence is not this -- "Ask Tommy about the invoice for
+# the parent account" names Tommy as the person being asked, not as a care
+# recipient, and must stay benign.
+_HOMONYM_NAMES_A_PERSON_RE = re.compile(
+    r"\b(?:member|individual|recipient|parent)\b"
+    r"(?:\s+\w+){0,3}?"
+    r"\s*(?:for|of|belonging\s+to|named|:)?\s*"
+    r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+){1,2}\b",
+)
 
 
 def _admin_term_near_person(text: str) -> bool:
     """An admin term with a person-signal inside the adjacency window."""
+    # A GOVERNED care-recipient name anywhere in the text is a person-signal in
+    # its own right, independent of the adjacency window: "the member account for
+    # Emily Carter shows units of service approved" puts the homonym outside the
+    # 30 characters around "units of service", but the construction itself
+    # establishes that Emily Carter IS the recipient (D-051).
+    if _LEX_ADMIN_TERM_RE.search(text) and _HOMONYM_NAMES_A_PERSON_RE.search(text):
+        return True
     for m in _LEX_ADMIN_TERM_RE.finditer(text):
         lo = max(0, m.start() - _LEX_ADMIN_ADJACENCY)
         hi = min(len(text), m.end() + _LEX_ADMIN_ADJACENCY)
@@ -303,8 +345,17 @@ def _admin_term_near_person(text: str) -> bool:
         if _STRICT_RECIPIENT_RE.search(window):
             return True
         for hm in _FINANCE_HOMONYM_RECIPIENT_RE.finditer(window):
-            # An unambiguous finance sense settles it: not a care recipient.
-            if _HOMONYM_BENIGN_SENSE_RE.match(window, hm.start()):
+            # An unambiguous finance sense settles it -- UNLESS the homonym
+            # GOVERNS a named individual. D-051: the first cut `continue`d
+            # unconditionally, so "the member account for Emily Carter shows
+            # units of service approved" was let through, which is precisely the
+            # D-050 named-individual class this leg exists for. The second cut
+            # then asked only whether a name appeared ANYWHERE nearby, which
+            # re-refused "Ask Tommy about the invoice for the parent account" --
+            # Tommy is who you ask, not a care recipient. Governance is the
+            # distinction that actually separates them.
+            if (_HOMONYM_BENIGN_SENSE_RE.match(window, hm.start())
+                    and not _HOMONYM_NAMES_A_PERSON_RE.search(text)):
                 continue
             # Otherwise it needs a person NAME near it -- governed
             # ("member Emily Carter") or merely adjacent ("Emily Carter is the

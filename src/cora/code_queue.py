@@ -692,7 +692,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     summary_text = (f"{rec.get('title', '')} {rec.get('summary', '')} "
                     f"{rec.get('fix_sketch', '')}").strip()
     try:
-        phi = phi_guard.is_any_phi_request(summary_text)
+        phi = phi_guard.is_any_phi(summary_text)
     except Exception:  # noqa: BLE001 -- fail closed
         phi = True
     if phi:
@@ -709,7 +709,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     sub = str(rec.get("subsystem_guess") or "")
     if sub:
         try:
-            if phi_guard.is_any_phi_request(sub):
+            if phi_guard.is_any_phi(sub):
                 rec["subsystem_guess"] = ""
         except Exception:  # noqa: BLE001 -- fail closed
             rec["subsystem_guess"] = ""
@@ -936,8 +936,16 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
     # classifier. Non-PHI LEX build-asks (e.g. "cora should add an LTS scheduler")
     # still pass; PHI-tripping ones are dropped before any model call. Upgraded to
     # the 3-predicate union (is_any_phi) 2026-07-30 PHI parity-raise.
+    #
+    # D-051: the C12 precision pass briefly repointed this to is_any_phi_request,
+    # which is wrong and contradicts that function's own docstring -- this is
+    # THIRD-PARTY EGRESS, where recall beats precision and over-refusing costs
+    # nothing. The request-shaped union belongs only where a human's typed text is
+    # REFUSED TO THEIR FACE (seed_item's title/summary gate, apply_edit), which is
+    # where both live 8/24 false refusals actually happened. Persistence and
+    # egress screens stay strict.
     try:
-        if phi_guard.is_any_phi_request(question):
+        if phi_guard.is_any_phi(question):
             log.info("code_queue: message signal dropped pre-classify (PHI)")
             return
     except Exception:  # noqa: BLE001 -- fail closed
@@ -1011,7 +1019,7 @@ def _route_to_flywheel(question: str, entity: str, channel_name: str, user: str)
         if ent.startswith("LEX"):
             log.debug("code_queue: LEX entity -- flywheel route skipped (fail-closed)")
             return
-        if phi_guard.is_any_phi_request(question):
+        if phi_guard.is_any_phi(question):
             log.info("code_queue: flywheel route dropped (PHI-flagged question)")
             return
         from . import knowledge_gaps
@@ -2103,6 +2111,16 @@ def _explicit_count_today(user: str) -> int:
 # longer hex blob cannot be mistaken for one.
 _CQ_ID_RE = re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE)
 
+# D-051: the first cut short-circuited on ANY resolvable id anywhere in the text,
+# which would DISCARD a genuine build request that merely cites one -- "Cora
+# should retry uploads the way cq-abc123def456 describes" would have been thrown
+# away and acked as queued. A stage request has a VERB. Require one within a
+# short window of the id, in either order, so a citation stays a capture.
+_STAGE_VERB_RE = re.compile(
+    r"\b(?:stage|staging|kickoff|kick[- ]?off|prompt|write\s+the\s+prompt|"
+    r"generate\s+the\s+prompt|retrieve|pull\s+up)\b", re.IGNORECASE)
+_STAGE_VERB_WINDOW = 60
+
 
 def find_cq_id(text: str) -> str:
     """The first cq id named in *text*, lowercased, or "" -- resolved against the
@@ -2110,6 +2128,25 @@ def find_cq_id(text: str) -> str:
     for m in _CQ_ID_RE.finditer(str(text or "")):
         cid = m.group(0).lower()
         if get_item(cid):
+            return cid
+    return ""
+
+
+def find_stage_request(text: str) -> str:
+    """The cq id this text asks to STAGE, or "".
+
+    Requires a staging verb within _STAGE_VERB_WINDOW characters of the id, so a
+    build request that merely CITES an existing item is still captured as new
+    work rather than silently discarded.
+    """
+    body = str(text or "")
+    for m in _CQ_ID_RE.finditer(body):
+        cid = m.group(0).lower()
+        if not get_item(cid):
+            continue
+        lo = max(0, m.start() - _STAGE_VERB_WINDOW)
+        hi = min(len(body), m.end() + _STAGE_VERB_WINDOW)
+        if _STAGE_VERB_RE.search(body[lo:hi]):
             return cid
     return ""
 
@@ -2166,7 +2203,7 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
     # new item. Minting here is how a typed stage request became a junk meta-item
     # on 2026-08-24. Founder-only, because staging is: for anyone else this
     # resolves and reports rather than acting.
-    named = find_cq_id(request)
+    named = find_stage_request(request)
     if named:
         if is_founder:
             outcome, _detail = stage_by_id(named, user)
@@ -2563,7 +2600,7 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     sub = str(subsystem_guess or "")
     if sub:
         try:
-            if phi_guard.is_any_phi_request(sub):
+            if phi_guard.is_any_phi(sub):
                 sub = ""
         except Exception:  # noqa: BLE001 -- fail closed
             sub = ""

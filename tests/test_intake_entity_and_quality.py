@@ -86,9 +86,9 @@ def test_two_genuinely_different_entities_still_flag_as_ambiguous():
 # ── C9: widening the tagger must not widen what gets FILED ──────────────────
 
 @pytest.mark.parametrize("text", [
-    "file this under llc-finance please",
+    "file this under the llc-finance channel please",
     "the note belongs in #lts-scheduling",
-    "put it in lbhs-clinical",
+    "put it in the lbhs-clinical channel",
 ])
 def test_a_lex_channel_token_is_refused_fail_closed(text):
     """THE coupled risk. is_lex_content must consume the SAME union, or a
@@ -98,7 +98,32 @@ def test_a_lex_channel_token_is_refused_fail_closed(text):
 
 
 def test_a_non_lex_channel_token_does_not_trip_the_lex_skip():
-    assert ii.is_lex_content("post in f3-hq-inventory-adjustments") is False
+    assert ii.is_lex_content("post in the f3-hq-inventory-adjustments channel") is False
+
+
+@pytest.mark.parametrize("text", [
+    "we agreed at the llc-level that this is fine",
+    "the hand-off went fine at the team-level",
+])
+def test_hyphenated_prose_is_not_a_channel_and_is_not_refused(text):
+    """D-051: a BARE hyphenated token is only a channel reference when the text
+    says so. Without the corroboration rule, "we agreed at the llc-level" matched
+    the llc-* route, resolved LEX, and was HARD-REFUSED by the blanket LEX skip
+    -- ordinary English killing a benign contribution."""
+    assert ii.channel_token_entities(text) == set()
+    assert ii.is_lex_content(text) is False
+
+
+@pytest.mark.parametrize("text", [
+    "F3 Pure pricing per the drive-shares channel",
+    "the OSN recon per the asana-feed channel",
+])
+def test_a_founder_routed_utility_channel_adds_no_entity_claim(text):
+    """FNDR is the DEFAULT, and utility channels all route there. Counting it as
+    a hit turned an otherwise-unambiguous contribution ambiguous (D-051)."""
+    assert "FNDR" not in ii.channel_token_entities(text)
+    _entity, ambiguous = ii.resolve_entity(text)
+    assert ambiguous is False
 
 
 def test_detection_failure_never_breaks_intake(monkeypatch):
@@ -153,7 +178,11 @@ def test_the_typed_reply_path_now_applies_the_floor():
     from cora import gap_autofill
     src = inspect.getsource(gap_autofill.record_ask_answer)
     assert "answer_quality_ok(reply_text)" in src
-    assert "REJECTED_QUALITY" in src
+    # D-051: the ask stays PENDING on a quality rejection. A terminal state would
+    # close the door the rejection message itself holds open -- match_pending_ask
+    # only considers PENDING asks, so the invited retry could never be captured.
+    assert 'stored["state"] = "REJECTED_QUALITY"' not in src
+    assert "last_rejected_reason" in src
     # and it resolves mentions before storing, so no raw <@U...> reaches canon
     assert "resolve_slack_mentions" in src
 

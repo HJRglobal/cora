@@ -89,8 +89,14 @@ def test_alternation_and_ordinary_histories_are_untouched():
     normal = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
     assert _ensure_user_first(list(normal)) == normal
     assert _ensure_user_first([]) == []
-    # a thread with ONLY Cora's message and no reply still yields nothing to send
-    assert _ensure_user_first([{"role": "assistant", "content": "only"}]) == []
+    # A thread with ONLY Cora's message is THE production case, not an edge case:
+    # both history builders skip the CURRENT message, so on the first human reply
+    # this is all there is. It must yield the context as a lone user turn -- the
+    # first cut returned [] here and was therefore dead for the 8/19 incident it
+    # was written to fix (D-051).
+    only = _ensure_user_first([{"role": "assistant", "content": "only"}])
+    assert len(only) == 1 and only[0]["role"] == "user"
+    assert "only" in only[0]["content"]
     roles = [t["role"] for t in _ensure_user_first([
         {"role": "assistant", "content": "a"},
         {"role": "user", "content": "u"},

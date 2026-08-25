@@ -602,8 +602,43 @@ _CARD_AFFORDANCE_LINES = (
     _MECH_AFFORDANCE_DOES,
     _MECH_AFFORDANCE_HANDOFF,
 )
+
+# D-051: THE FIRST CUT OF THIS STRIP WAS DEAD IN PRODUCTION.
+#
+# Both consumers read the card back FROM SLACK -- the button handler from
+# body["message"]["blocks"], the emoji path from conversations_history -- and
+# Slack's read-back NORMALIZES emoji-presentation Unicode to its shortcode. A
+# card written with U+1F44D comes back as ":+1:", so matching the literal emoji
+# matched nothing and every resolved card kept advertising an affordance it no
+# longer had. That is the exact defect this whole slice exists to fix,
+# reproduced by the fix for it. (The repo already knew: see
+# tests/test_slack_readback_semantics.py, "emoji-presentation Unicode is not
+# preserved" -- and note Slack RENDERS a literal shortcode as an emoji, so the
+# stripped card still looks right either way.)
+#
+# So every line is matched in BOTH forms. Still literals, deliberately: these
+# are fixed strings emitted by code in this same module, and this repo has
+# shipped five ReDoS regressions in patterns cleverer than they needed to be.
+_EMOJI_SHORTCODES = {
+    "\U0001F44D": (":+1:", ":thumbsup:"),
+    "\U0001F44E": (":-1:", ":thumbsdown:"),
+}
+
+
+def _readback_variants(line: str) -> list[str]:
+    """The line as written, plus every form Slack may hand back."""
+    out = [line]
+    for emoji, codes in _EMOJI_SHORTCODES.items():
+        if emoji not in line:
+            continue
+        out = [v.replace(emoji, code) for v in out for code in codes] + out
+    # longest first, so a variant is never partially consumed by a shorter one
+    return sorted(set(out), key=len, reverse=True)
+
+
 _CARD_AFFORDANCE_RE = re.compile(
-    "|".join(re.escape(line) for line in _CARD_AFFORDANCE_LINES)
+    "|".join(re.escape(v) for line in _CARD_AFFORDANCE_LINES
+             for v in _readback_variants(line))
 )
 
 _RESOLVED_NOTE = "_(Resolved -- buttons and reactions no longer apply to this card.)_"

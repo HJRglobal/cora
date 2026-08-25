@@ -44,7 +44,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -345,7 +345,19 @@ def _autoseed_persistent_failures(streaks: dict, seeded: dict,
     for cid, streak in sorted(streaks.items()):
         if streak < _AUTOSEED_AFTER_CONSECUTIVE:
             continue
-        marker = f"streak{streak - _AUTOSEED_AFTER_CONSECUTIVE + 1}"
+        # D-051: this was `streak - threshold + 1`, which is ALWAYS 1 -- the seed
+        # fires on the first run where streak == threshold, so the marker was a
+        # constant and so was the signal. That is exactly the fingerprint trap
+        # the docstring above says it avoids: find_fingerprint has no time
+        # component, so a regression months after the first item shipped would
+        # have been swallowed. Key it on the INCIDENT instead -- the date the
+        # streak started, which differs for every genuine recurrence.
+        try:
+            started = (datetime.now(timezone.utc)
+                       - timedelta(days=7 * (streak - 1))).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            started = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"since{started}"
         # Already seeded for THIS incident -- the marker only changes when the
         # case passes and later regresses (streaks reset on a pass).
         if out.get(cid):
