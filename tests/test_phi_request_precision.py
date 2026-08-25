@@ -123,6 +123,25 @@ def test_a_beneficiary_number_behind_a_programme_name_still_trips(text):
     assert pg.is_phi_risk_person_linked(text) is True
 
 
+@pytest.mark.parametrize("text", [
+    "Add a report on AHCCCS rate changes for 2026 and how they hit our margin.",
+    "Medicaid expansion in 2014 changed the funding split; document it.",
+    "Brief on AHCCCS FY2026 budget assumptions",
+    "research how Medicaid policy shifts by 2026 could change our retail base",
+    "AHCCCS is a no-go for this integration.",
+    "Build an AHCCCS policy digest, no client data.",
+])
+def test_a_year_or_a_negation_is_not_a_beneficiary_number(text):
+    """D-051, measured by the adversarial review. Widening the tail from an
+    anchored .match to a 24-char .search made a bare 4-digit YEAR -- and the
+    ordinary English word "no" -- count as a HIPAA beneficiary number riding
+    behind the programme token, re-refusing the person-free programme briefs this
+    function exists to allow. Its ONE direct consumer is delegated-work brief
+    intake (delegated_work.py:714), which is exactly the lane cq-a24f9d2210fc was
+    filed about. Beneficiary numbers are 6+ digits; years are 4."""
+    assert pg.is_phi_risk_person_linked(text) is False
+
+
 def test_the_tail_window_is_bounded_not_open_ended():
     """It is adjacency, not "anywhere in the text" -- a programme name in
     sentence one and an unrelated number in sentence five is not a beneficiary

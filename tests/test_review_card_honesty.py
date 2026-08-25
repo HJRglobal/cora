@@ -203,7 +203,8 @@ def test_escalation_does_not_retire_a_row_whose_card_carries_a_reaction():
     answered = _mech_row("answered", "111.1", rkr._MECHANICAL_MAX_ESCALATIONS)
     silent = _mech_row("silent", "222.2", rkr._MECHANICAL_MAX_ESCALATIONS)
 
-    rkr._escalate_stale_mechanical([answered, silent], now, {"111.1"})
+    rkr._escalate_stale_mechanical([answered, silent], now,
+                                   {"111.1": {HARRISON}})
     assert answered["state"] == "PENDING", \
         "a row Harrison answered was retired as unanswered"
     assert silent["state"] == "DISMISSED"
@@ -227,10 +228,28 @@ def test_auto_dismiss_does_not_expire_a_row_whose_card_carries_a_reaction():
                 "proposed_at": old, "dm_message_ts": ts, "payload": {"entity": "FNDR"}}
 
     answered, silent = _row("a", "111.1"), _row("b", "222.2")
-    n = rkr._auto_dismiss_stale_pending([answered, silent], cutoff, now, {"111.1"})
+    n = rkr._auto_dismiss_stale_pending([answered, silent], cutoff, now,
+                                        {"111.1": {HARRISON}})
     assert n == 1
     assert answered["state"] == "PENDING"
     assert silent["state"] == "DISMISSED"
+
+
+def test_a_reaction_from_someone_who_cannot_act_does_not_freeze_the_row():
+    """D-051: the skip is AUTHORITY-AWARE. Asking only "is there a reaction on
+    this ts" meant a reaction from someone with no authority over the row -- one
+    the correlator will never process -- suppressed its escalation on EVERY
+    subsequent run, pinning it PENDING forever while the comment promised
+    "exactly one more run"."""
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import run_knowledge_review as rkr
+    now = datetime.now(timezone.utc)
+    row = _mech_row("x", "111.1", rkr._MECHANICAL_MAX_ESCALATIONS)
+    rkr._escalate_stale_mechanical([row], now, {"111.1": {"U_A_STRANGER"}})
+    assert row["state"] == "DISMISSED"
 
 
 def test_an_empty_answered_set_restores_the_previous_behaviour():
@@ -243,7 +262,7 @@ def test_an_empty_answered_set_restores_the_previous_behaviour():
     import run_knowledge_review as rkr
     now = datetime.now(timezone.utc)
     row = _mech_row("x", "111.1", rkr._MECHANICAL_MAX_ESCALATIONS)
-    rkr._escalate_stale_mechanical([row], now, set())
+    rkr._escalate_stale_mechanical([row], now, {})
     assert row["state"] == "DISMISSED"
 
 

@@ -699,7 +699,20 @@ def actionable_reaction_ts() -> set[str]:
     and the row filed as unanswered. That is the founder's approval being
     dropped, which is the exact class this audit exists to close.
     """
-    out: set[str] = set()
+    return set(actionable_reaction_actors())
+
+
+def actionable_reaction_actors() -> dict[str, set[str]]:
+    """message_ts -> the reactor ids that left an actionable reaction on it.
+
+    Returned by actor, not as a bare ts set, because the CALLER has the row and
+    can therefore ask review_lanes.can_approve whether that person could act on
+    it. Without that, a reaction from someone with no authority over the row --
+    a teammate 👍-ing a card in a shared DM -- suppressed its escalation on every
+    subsequent run, pinning it PENDING FOREVER while the comment promised
+    "exactly one more run" (D-051).
+    """
+    out: dict[str, set[str]] = {}
     try:
         for r in load_reply_log():
             if r.get("event_type") != "reaction_added":
@@ -708,9 +721,10 @@ def actionable_reaction_ts() -> set[str]:
                 continue
             ts = str(r.get("message_ts") or "")
             if ts:
-                out.add(ts)
+                out.setdefault(ts, set()).add(str(r.get("reactor_id") or ""))
     except Exception:  # noqa: BLE001 -- a read error must never widen expiry
-        log.warning("actionable_reaction_ts: reply-log read failed", exc_info=True)
+        log.warning("actionable_reaction_actors: reply-log read failed",
+                    exc_info=True)
     return out
 
 

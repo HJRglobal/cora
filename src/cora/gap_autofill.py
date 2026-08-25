@@ -437,7 +437,27 @@ _MIN_DURABLE_ANSWER_CHARS = 12
 # does not make it any more of a fact. The live 8/19 junk entry in lex.md is
 # exactly this shape -- a mention token plus two words -- and it cleared a
 # 12-character floor purely on the id.
-_MENTION_TOKEN_RE = re.compile(r"<@[A-Z0-9]{6,}>|@[A-Za-z][\w.'-]{1,30}")
+# A raw Slack mention token. `(?<![\w.])` keeps it off the domain half of an
+# email address -- without it, "payables@lexingtonservices.com" was stripped to
+# "payables" and then rejected as too short (D-051).
+# A raw Slack mention token. Three details, each from a measured miss:
+#   (?<![\w.])  keeps it off the domain half of an email address -- without it
+#               "payables@lexingtonservices.com" stripped to "payables" and was
+#               then rejected as too short.
+#   the trailing (?:\s+[A-Z][a-z]+){0,2} lets it span a DISPLAY NAME. The class
+#               cannot cross a space, so "@Justin Moran yes exactly" left "Moran
+#               yes exactly" -- 17 characters of padding that carried the junk
+#               entry straight through the floor.
+_MENTION_TOKEN_RE = re.compile(
+    r"<@[A-Z0-9]{6,}>"
+    r"|(?<![\w.])@[A-Za-z][\w.'-]{1,30}(?:\s+[A-Z][a-z]+){0,2}")
+
+# A short answer that carries a NUMBER, a price, an address or a URL is a fact,
+# not a non-answer: "$25.15", "Net 30", "12 units" are exactly the durable
+# replies a teammate gives. The floor exists to catch "yes"/"correct", and
+# without this exemption it rejected correct answers and told the person their
+# fact was not durable -- a worse failure than the junk it was added to stop.
+_HAS_SUBSTANCE_RE = re.compile(r"\d|@|https?://")
 
 
 def answer_substance(answer: str) -> str:
@@ -458,7 +478,9 @@ def answer_quality_ok(answer: str) -> tuple[bool, str]:
     text = (answer or "").strip()
     # Measure SUBSTANCE, not characters: "<@U0B3AEJCYGP> yes exactly" is 26
     # characters of which 13 are an opaque id.
-    if len(answer_substance(text)) < _MIN_DURABLE_ANSWER_CHARS:
+    substance = answer_substance(text)
+    if (len(substance) < _MIN_DURABLE_ANSWER_CHARS
+            and not _HAS_SUBSTANCE_RE.search(substance)):
         return False, "answer too short to be a durable fact"
     if _VAGUE_DEFLECTION_RE.search(text):
         return False, "answer punts to a person/doc/tool instead of stating the fact"
@@ -1598,11 +1620,10 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
     # Resolve mentions FIRST. "<@U0B3AEJCYGP> yes exactly" is 20 characters of
     # which 13 are an opaque id, and storing that id in canon is the same
     # unresolved-token class the review cards already fix at render.
-    try:
-        from .tools.user_identity import resolve_slack_mentions
-        reply_text = resolve_slack_mentions(reply_text)
-    except Exception:  # noqa: BLE001 -- resolution is cosmetic, never fatal
-        pass
+    # MEASURE FIRST, resolve second. The first cut resolved "<@U0B3AEJCYGP>" into
+    # "@Justin Moran" and THEN measured, so the name padded the substance to 17
+    # characters and the exact junk entry this floor was written to stop --
+    # a mention token plus two words -- sailed through it (D-051).
     ok, why = answer_quality_ok(reply_text)
     if not ok:
         # D-051: the ask stays PENDING. The first cut set a terminal
@@ -1620,6 +1641,14 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
         return ("Thanks -- but I can't store that as a durable fact "
                 f"({why}). Reply with the fact itself and I'll route it "
                 "for approval.")
+
+    # Resolved only now that it has passed, and only for STORAGE, so no raw
+    # <@U...> token reaches canon.
+    try:
+        from .tools.user_identity import resolve_slack_mentions
+        reply_text = resolve_slack_mentions(reply_text)
+    except Exception:  # noqa: BLE001 -- resolution is cosmetic, never fatal
+        pass
 
     gap = {
         "ts": stored.get("gap_ts", ""),

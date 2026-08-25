@@ -54,6 +54,8 @@ log = logging.getLogger(__name__)
 # Two comparators, OR'd. See the module docstring for the measurement.
 FUZZY_RATIO = 0.85
 CONTAINMENT_RATIO = 0.80
+# Below this many content words on the SHORTER side, containment is not evidence.
+_MIN_CONTAINMENT_TOKENS = 6
 # How far back the ledger is consulted. Long enough to cover a recurrence that
 # fires nightly for weeks; short enough that the scan stays trivial.
 DEFAULT_WINDOW_DAYS = 120
@@ -66,6 +68,12 @@ _STOPWORDS = frozenset({
     "a", "an", "and", "at", "by", "for", "from", "in", "is", "of", "on", "or",
     "the", "to", "with",
 })
+
+
+def _normalize_full(text: str) -> str:
+    """normalize() without the length cap -- for hashing, where truncation
+    creates collisions rather than bounding a comparison."""
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
 
 
 def normalize(text: str) -> str:
@@ -86,8 +94,12 @@ def compute_fingerprint(kind: str, representative: str) -> str:
     duplicate filings: two nights produced byte-identical decision text and
     still got different ids, so every downstream exact-id dedup was a no-op.
     """
+    # Hashed over the FULL normalized text, not the 160-char comparison cap.
+    # The cap bounds the FUZZY comparison; using it for the hash made two
+    # genuinely different decisions that share a long prefix collide into one
+    # fingerprint, silently suppressing the second (D-051).
     return hashlib.md5(
-        f"{kind}|{normalize(representative)}".encode()
+        f"{kind}|{_normalize_full(representative)}".encode()
     ).hexdigest()[:12]
 
 
@@ -103,6 +115,12 @@ def containment(a: str, b: str) -> float:
     """
     ta, tb = _content_tokens(a), _content_tokens(b)
     if not ta or not tb:
+        return 0.0
+    # A very short side is contained in almost anything -- "Approved the quote"
+    # scores 1.000 against a detailed decision that merely repeats those words,
+    # and would suppress it. Containment is only meaningful once both sides carry
+    # enough content to be distinctive (D-051).
+    if min(len(ta), len(tb)) < _MIN_CONTAINMENT_TOKENS:
         return 0.0
     return len(ta & tb) / min(len(ta), len(tb))
 

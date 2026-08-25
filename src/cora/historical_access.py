@@ -578,8 +578,14 @@ def format_owned_chunks(results: list, target_label: str, recency_first: bool = 
         # S1: last-message date + direction. These are OWNED chunks, so the
         # identified form is correct here -- the de-identified form is for the
         # Tier-1-stripped path, where strip_result has nulled the metadata.
+        # GATED ON SOURCE. These formatters also render drive_sweep chunks,
+        # and a Drive file has no thread -- an ungated call stamped every one
+        # of them "thread position unknown (pre-stamp chunk)", meaningless
+        # there and reading as a defect (D-051).
         try:
-            frag = email_citation.cite_from_metadata(getattr(r, "metadata", None))
+            frag = (email_citation.cite_from_metadata(
+                        getattr(r, "metadata", None))
+                    if r.source == "gmail" else "")
             if frag:
                 head += f" | {frag}"
         except Exception:  # noqa: BLE001

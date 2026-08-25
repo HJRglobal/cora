@@ -196,6 +196,14 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "DECISION_FACT_FP_PATH", str(tmp_path / "decision-fact-fingerprints.jsonl")
     )
+    # Same class, same commit: the decision-ALERT state file. decision_alerts
+    # resolves its path per call (deliberately -- a module-level constant reading
+    # os.environ is the cq-06f4797db4f1 trap), but only if a test actually points
+    # it somewhere. Without this every alert test reads and writes the real
+    # data/state/decision-alert-pending.json.
+    monkeypatch.setenv(
+        "DECISION_ALERT_STATE_PATH", str(tmp_path / "decision-alert-pending.json")
+    )
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening

@@ -207,8 +207,14 @@ def format_finance_chunks(results: list, target_label: str, filed_links: dict[st
         # S1: a finance citation without a last-message date is exactly the class
         # the doctrine calls unverified -- and this surface decides whether an
         # invoice is outstanding.
+        # GATED ON SOURCE. These formatters also render drive_sweep chunks,
+        # and a Drive file has no thread -- an ungated call stamped every one
+        # of them "thread position unknown (pre-stamp chunk)", meaningless
+        # there and reading as a defect (D-051).
         try:
-            frag = email_citation.cite_from_metadata(getattr(r, "metadata", None))
+            frag = (email_citation.cite_from_metadata(
+                        getattr(r, "metadata", None))
+                    if r.source == "gmail" else "")
             if frag:
                 head += f" | {frag}"
         except Exception:  # noqa: BLE001

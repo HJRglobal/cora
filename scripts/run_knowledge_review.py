@@ -35,7 +35,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_review import (  # noqa: E402
-    actionable_reaction_ts as _kr_actionable_reaction_ts,
+    actionable_reaction_actors as _kr_actionable_reaction_actors,
     apply_autowrite,
     autowrite_level,
     build_decision_blocks,
@@ -510,6 +510,30 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
     return success
 
 
+def _answered_by_an_approver(entry: dict, actors_by_ts: dict) -> bool:
+    """Does this row carry an unprocessed reaction from someone who could ACT on it?
+
+    Authority-aware on purpose. The first cut asked only "is there a reaction on
+    this ts", so a reaction from a person with no authority over the row -- which
+    correlate_reactions_to_updates will never process -- suppressed the row's
+    escalation on EVERY subsequent run, pinning it PENDING forever while the
+    comment promised "exactly one more run" (D-051). Uses the same predicate the
+    correlator uses, so a row is skipped only when a reaction really is pending.
+    """
+    if not actors_by_ts:
+        return False
+    ts = str(entry.get("dm_message_ts") or "")
+    if not ts:
+        return False
+    for actor in actors_by_ts.get(ts, ()):  # noqa: SIM110 -- explicit is clearer
+        try:
+            if review_lanes.can_approve(entry, actor):
+                return True
+        except Exception:  # noqa: BLE001 -- never widen expiry on an error
+            return True
+    return False
+
+
 def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt,
                                 answered_ts: set[str] | None = None) -> int:
     """Flip to DISMISSED, in place, only PENDING entries that have ALREADY been
@@ -548,7 +572,7 @@ def _auto_dismiss_stale_pending(entries: list, cutoff_dt, now_dt,
             # a row DM'd >14d ago that Harrison HAD reacted to was dismissed as
             # unreacted and his approval discarded. Never resolve a row as
             # unanswered while an actionable reaction on its card is unprocessed.
-            if answered_ts and e.get("dm_message_ts") in answered_ts:
+            if _answered_by_an_approver(e, answered_ts):
                 continue
             try:
                 if _dt.fromisoformat(e["proposed_at"]) < cutoff_dt:
@@ -696,7 +720,7 @@ def _escalate_stale_mechanical(entries: list, now_dt,
         # dropped -- this pass runs BEFORE Step 1 reads the reply log, so the
         # budget could run out on a row he had already answered. An answered row
         # is left PENDING for exactly one more run, which is all Step 1 needs.
-        if answered_ts and e.get("dm_message_ts") in answered_ts:
+        if _answered_by_an_approver(e, answered_ts):
             continue
         if count > _MECHANICAL_MAX_ESCALATIONS:
             e["state"] = "DISMISSED"
@@ -1388,7 +1412,7 @@ def main() -> int:
         # resolve rows as un-answered, and both run before Step 1 correlates
         # reactions -- so without this they can retire a row Harrison already
         # approved. Fail-soft: an empty set restores the previous behaviour.
-        answered_ts = _kr_actionable_reaction_ts()
+        answered_ts = _kr_actionable_reaction_actors()
         auto_dismissed = 0
         expired_unrouted = 0
         mech_escalated = 0

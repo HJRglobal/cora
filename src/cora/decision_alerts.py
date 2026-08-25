@@ -166,9 +166,26 @@ def match_alert_reply(user_id: str, thread_ts: str,
         return None
 
 
+# A decline is essentially the WHOLE reply, not a prefix of one. "Skip the
+# Gilbert store, book it to Warner", "Later this quarter, under HJRP" and "Park
+# it under HJR Productions" are ANSWERS that happen to open with a decline word,
+# and reading them as declines discarded the decision they carried (D-051). A
+# word-count ceiling was not enough -- all three are short. What separates them
+# is that a real decline has nothing AFTER the decline phrase.
+# Two, not one: "park it for now" and "hold off for today" are declines whose
+# trailing filler is not an answer. Every real answer measured carries more
+# ("under HJR Productions" = 3, "this quarter, under HJRP" = 4).
+_DECLINE_RESIDUE_WORDS = 2
+
+
 def is_decline(text: str) -> bool:
     """"Not my area" leaves the decision OPEN. Only an actual answer closes it."""
-    return bool(_DECLINE_RE.match(str(text or "")))
+    body = str(text or "").strip()
+    m = _DECLINE_RE.match(body)
+    if not m:
+        return False
+    residue = body[m.end():].strip(" .,;:!-").split()
+    return len(residue) <= _DECLINE_RESIDUE_WORDS
 
 
 def mark_state(alert_key: str, state: str, *, answer: str = "") -> bool:

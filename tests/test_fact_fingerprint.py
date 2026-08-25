@@ -230,3 +230,28 @@ def test_the_gate_records_at_proposal_time_not_approval_time(tmp_path, monkeypat
     assert rows[0]["ref"] == "pass5:decision:abc"
     assert rows[0]["scope"] == "OSN"
     assert "resolved" not in rows[0] and "approved" not in rows[0]
+
+
+# -- D-051: two ways the comparison could suppress a real decision -----------
+
+def test_a_short_decision_does_not_swallow_a_longer_one():
+    """Containment normalises by min(|A|,|B|), so a very short summary scores
+    1.000 against anything that repeats its words -- "Approved the quote" would
+    have suppressed the detailed CBS decision entirely."""
+    short = "Approved the quote"
+    long_ = ("Approved the quote from CBS Northstar for Gilbert and Warner with "
+             "a $200 professional services fee")
+    assert ff.containment(short, long_) == 0.0
+    assert ff.same_fact(short, long_) is False
+
+
+def test_two_long_decisions_sharing_a_prefix_do_not_collide():
+    """The 160-char cap bounds the FUZZY comparison; hashing the truncated text
+    made two genuinely different decisions share one fingerprint, silently
+    suppressing the second."""
+    base = ("Uncaptured decision in Drive: the quarterly vendor review concluded "
+            "that we should retain the existing logistics provider through the "
+            "end of the fiscal year, with a formal RFP to follow in Q1 for ")
+    assert (ff.compute_fingerprint("decision", base + "ALPHA")
+            != ff.compute_fingerprint("decision", base + "BETA"))
+

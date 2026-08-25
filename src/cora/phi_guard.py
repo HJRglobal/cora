@@ -104,9 +104,20 @@ _PHI_PROGRAM_NAME_RE = re.compile(r"\b(?:medicaid|ahcccs)\b", re.IGNORECASE)
 # more often than an abbreviation for "number", and inside the widened window it
 # made "AHCCCS providers, no client data" -- a brief whose own words say it holds
 # no client data -- read as a beneficiary number.
+# TWO alternatives, and the split is the whole point:
+#   1. an id TOKEN, optionally followed by digits -- "ID 84213365", "number 900123"
+#   2. a LONG bare digit run (6+) -- "AHCCCS is 84213365"
+#
+# A 4-5 digit bare run is deliberately NOT enough. Inside a 24-character window
+# that is overwhelmingly a YEAR, and the adversarial review measured the cost:
+# "AHCCCS rate changes for 2026", "Medicaid expansion in 2014", "AHCCCS FY2026
+# budget assumptions" and "Medicaid policy shifts by 2026" all read as
+# beneficiary numbers -- re-refusing the person-free programme briefs this
+# function was written to allow, at the delegated-work intake that is its only
+# direct consumer. Beneficiary numbers are 6+ digits; years are 4.
 _PROGRAM_ID_TAIL_RE = re.compile(
-    r"[\s:#-]{0,3}(?:\b(?:id|ids|num|number|no\.|#)\b[\s:#-]{0,3})?\d{4,}"
-    r"|[\s:#-]{0,3}\b(?:id|ids|num|number|no\.)\b",
+    r"[\s:#-]{0,3}\b(?:id|ids|num|number|no\.|#)\b[\s:#-]{0,3}\d*"
+    r"|[\s:#-]{0,3}\d{6,}",
     re.IGNORECASE,
 )
 _PROGRAM_ID_TAIL_WINDOW = 24

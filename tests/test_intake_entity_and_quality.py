@@ -164,6 +164,31 @@ def test_a_real_fact_still_passes(text):
     assert ok is True, why
 
 
+@pytest.mark.parametrize("text", [
+    "$25.15",
+    "Net 30",
+    "Yes, 12",
+    "12 units",
+    "payables@lexingtonservices.com",
+])
+def test_a_short_answer_carrying_a_FACT_is_not_a_non_answer(text):
+    """D-051: the floor exists to catch "yes"/"correct", and it was rejecting
+    correct short answers -- telling a teammate who answered properly that their
+    fact was not durable, which is a worse failure than the junk it stops. A
+    number, an address or a URL is substance."""
+    ok, why = answer_quality_ok(text)
+    assert ok is True, why
+
+
+def test_the_floor_measures_before_mentions_are_resolved():
+    """The first cut resolved "<@U0B3AEJCYGP>" to "@Justin Moran" and THEN
+    measured, so the display name padded the substance to 17 characters and the
+    exact junk entry this floor was written to stop sailed through it."""
+    assert answer_quality_ok("@Justin Moran yes exactly")[0] is False
+    assert answer_quality_ok("<@U0B3AEJCYGP> yes exactly")[0] is False
+    assert answer_substance("payables@lexingtonservices.com")         == "payables@lexingtonservices.com", "an email domain is not a mention"
+
+
 @pytest.mark.parametrize("text,fragment", [
     ("ask Justin about it", "punts to a person"),
     ("still working on that one", "in-progress"),
