@@ -75,7 +75,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import cross_entity_guard, knowledge_review, phi_guard, qa_scaffolding
+from . import (cross_entity_guard, entity_router, knowledge_review,
+               phi_guard, qa_scaffolding)
 from .known_answers_map import ENTITY_FILES
 
 log = logging.getLogger(__name__)
@@ -268,6 +269,62 @@ def intake_update_id(ts: str) -> str:
     return f"infocora-{ts}"
 
 
+# C9 (cq-dacabcc2e47e): a contribution that NAMES A CHANNEL is naming an entity.
+#
+# The live case: Hannah posted "Skylar has authorization to make inventory
+# adjustments in the f3-hq-inventory-adjustments channel" to #info-for-cora. That
+# is an F3E fact and the refusal it was fixing happened in an F3E channel -- but
+# cross_entity_guard's F3E keywords are brand words ("f3 energy", "f3e", "f3 pure")
+# and none of them appears in "f3-hq-inventory-adjustments", so it resolved FNDR
+# and was written to fndr.md. Injection IS entity-scoped -- ONE .get(entity), ONE
+# file -- so it can never load in the F3E channel it was meant to fix. (It IS
+# reachable there through the FNDR KB co-scan, so the fact is not lost; it is
+# simply not in the always-injected block where a scope refusal would see it.)
+#
+# entity_router already resolves channel names correctly and is the canonical map.
+# Gated on is_mapped() so the trailing "*" catch-all cannot turn ordinary
+# hyphenated prose ("a well-known random-thing issue") into an entity claim.
+_CHANNEL_TOKEN_RE = re.compile(
+    r"<#C[A-Z0-9]+\|([a-z0-9][a-z0-9._-]{2,})>"      # <#C123|f3-hq-inventory>
+    r"|#?\b([a-z0-9]+(?:-[a-z0-9]+){1,})\b"          # f3-hq-inventory-adjustments
+)
+# The intake surface itself names no entity -- every contribution mentions it.
+_NON_ENTITY_CHANNEL_NAMES = frozenset({"info-for-cora", "cora-build", "cora-health"})
+
+
+def _collapse_family(entity: str) -> str:
+    """Sub-entity -> family. A channel token and a keyword hit that name the same
+    business must be ONE hit, not an ambiguous two -- "#llc-finance" routes to
+    LEX-LLC while the LEX keyword detector says LEX, and left uncollapsed that
+    pair would resolve to ("FNDR", ambiguous) and file the fact nowhere useful."""
+    ent = (entity or "").strip().upper()
+    if ent.startswith("LEX-"):
+        return "LEX"
+    for parent in ("OSN", "HJRP", "F3E"):
+        if ent.startswith(parent + "-") or (ent.startswith(parent) and ent != parent
+                                            and ent not in ENTITY_FILES):
+            return parent
+    return ent
+
+
+def channel_token_entities(text: str) -> set[str]:
+    """Entities named by a CHANNEL REFERENCE in *text*. "" on any failure."""
+    out: set[str] = set()
+    try:
+        for m in _CHANNEL_TOKEN_RE.finditer(str(text or "")):
+            tok = (m.group(1) or m.group(2) or "").strip().lower()
+            if not tok or tok in _NON_ENTITY_CHANNEL_NAMES:
+                continue
+            if not entity_router.is_mapped(tok):
+                continue      # only a REAL channel pattern counts
+            ent = (entity_router.route(tok) or "").upper()
+            if ent:
+                out.add(ent)
+    except Exception:  # noqa: BLE001 -- tagging must never break intake
+        log.warning("info_intake: channel-token detection failed", exc_info=True)
+    return out
+
+
 def resolve_entity(text: str) -> tuple[str, bool]:
     """(entity, ambiguous). Exactly one entity named in the CONTENT -> that entity.
     Two or more named -> FNDR and ambiguous=True (we cannot pick, so we flag).
@@ -281,10 +338,14 @@ def resolve_entity(text: str) -> tuple[str, bool]:
     rather than silently filed under a business entity.
     """
     try:
-        hits = cross_entity_guard.detect_entities(text or "")
+        hits = set(cross_entity_guard.detect_entities(text or ""))
     except Exception:  # noqa: BLE001 -- tagging must never break intake
         log.warning("info_intake: entity detection failed; defaulting FNDR", exc_info=True)
         return "FNDR", True
+    # A named channel is an entity claim (C9). Sub-entity codes collapse to their
+    # family first, so "#llc-finance" and "LEX" are ONE hit, not an ambiguous two.
+    hits |= {_collapse_family(e) for e in channel_token_entities(text)}
+    hits = {_collapse_family(e) for e in hits}
     if len(hits) == 1:
         return next(iter(hits)), False
     return "FNDR", bool(hits)
@@ -334,7 +395,12 @@ def is_lex_content(text: str) -> bool:
     so a message naming both LEX and F3E would otherwise read as an ordinary
     ambiguous FNDR fact.
     """
-    hits = cross_entity_guard.detect_entities(text or "")
+    hits = set(cross_entity_guard.detect_entities(text or ""))
+    # C9: the channel-token union must be consumed HERE TOO. Without it a
+    # contribution naming "#llc-finance" would newly resolve to LEX in
+    # resolve_entity while sailing past the blanket LEX skip -- i.e. widening the
+    # tagger would have widened what gets FILED. Fail-closed stays fail-closed.
+    hits |= channel_token_entities(text)
     if any((h or "").upper().startswith("LEX") for h in hits):
         return True
     return bool(_LEX_TOKEN_RE.search(text or ""))

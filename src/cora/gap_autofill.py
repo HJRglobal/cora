@@ -432,6 +432,21 @@ _SNAPSHOT_RE = re.compile(
 _MIN_DURABLE_ANSWER_CHARS = 12
 
 
+# A raw Slack mention token. Removed BEFORE the length floor is measured: a
+# 13-character opaque user id is not durable content, and resolving it to a name
+# does not make it any more of a fact. The live 8/19 junk entry in lex.md is
+# exactly this shape -- a mention token plus two words -- and it cleared a
+# 12-character floor purely on the id.
+_MENTION_TOKEN_RE = re.compile(r"<@[A-Z0-9]{6,}>|@[A-Za-z][\w.'-]{1,30}")
+
+
+def answer_substance(answer: str) -> str:
+    """The part of an answer that could be a fact: mentions and surrounding
+    punctuation removed."""
+    text = _MENTION_TOKEN_RE.sub(" ", str(answer or ""))
+    return re.sub(r"\s+", " ", text).strip(" ,.;:-\u2013\u2014")
+
+
 def answer_quality_ok(answer: str) -> tuple[bool, str]:
     """Reject vague-deflection / in-progress / point-in-time-snapshot drafts
     before a MINE proposal is queued (GL-11/12). Returns (ok, reason).
@@ -441,7 +456,9 @@ def answer_quality_ok(answer: str) -> tuple[bool, str]:
     "approved but nothing saved"). Bias to precision.
     """
     text = (answer or "").strip()
-    if len(text) < _MIN_DURABLE_ANSWER_CHARS:
+    # Measure SUBSTANCE, not characters: "<@U0B3AEJCYGP> yes exactly" is 26
+    # characters of which 13 are an opaque id.
+    if len(answer_substance(text)) < _MIN_DURABLE_ANSWER_CHARS:
         return False, "answer too short to be a durable fact"
     if _VAGUE_DEFLECTION_RE.search(text):
         return False, "answer punts to a person/doc/tool instead of stating the fact"
@@ -1567,6 +1584,36 @@ def record_ask_answer(ask: dict[str, Any], reply_text: str) -> str:
         return ("Thanks -- but that answer looks like it contains protected "
                 "health information, so I can't store it. If there's a "
                 "PHI-free version, reply with that instead.")
+
+    # C10 (cq-b0e5bc37c41b): a NON-ANSWER FLOOR on the typed-reply path.
+    #
+    # This path had no quality gate at all. On 2026-08-19 a value consisting of
+    # an unresolved mention token plus two words was accepted and written into
+    # the canonical store, where it is injected into every ask in that entity
+    # forever. answer_quality_ok already exists and is deliberately scoped to
+    # the MINE path ("so a click-to-approve always results in a write") -- that
+    # rationale is about HARRISON-APPROVED writes, and this is neither mined nor
+    # approved: it is a teammate's raw DM reply going straight to a proposal.
+    #
+    # Resolve mentions FIRST. "<@U0B3AEJCYGP> yes exactly" is 20 characters of
+    # which 13 are an opaque id, and storing that id in canon is the same
+    # unresolved-token class the review cards already fix at render.
+    try:
+        from .tools.user_identity import resolve_slack_mentions
+        reply_text = resolve_slack_mentions(reply_text)
+    except Exception:  # noqa: BLE001 -- resolution is cosmetic, never fatal
+        pass
+    ok, why = answer_quality_ok(reply_text)
+    if not ok:
+        stored["state"] = "REJECTED_QUALITY"
+        stored["replied_at"] = _now_iso()
+        asks[stored["ask_id"]] = stored
+        save_pending_asks(asks)
+        log.info("gap_autofill: reply rejected (quality) for ask %s: %s",
+                 stored.get("ask_id", "")[:8], why)
+        return ("Thanks -- but I can't store that as a durable fact "
+                f"({why}). Reply with the fact itself and I'll route it "
+                "for approval.")
 
     gap = {
         "ts": stored.get("gap_ts", ""),
