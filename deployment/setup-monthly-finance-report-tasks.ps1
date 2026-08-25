@@ -130,21 +130,31 @@ foreach ($job in $jobs) {
         exit 1
     }
 
-    # schtasks has no description flag, so it is set through the ScheduledTask
-    # object -- and it has to be the OBJECT. `Set-ScheduledTask -TaskName X
-    # -Description Y` fails with "A parameter cannot be found that matches
-    # parameter name 'Description'" (observed live 2026-08-25: both tasks
-    # registered, both descriptions silently skipped). Set-ScheduledTask takes
-    # -Trigger/-Action/-Settings/-Principal/-InputObject only; Description is a
-    # property on the task instance, not a parameter on the cmdlet. Same family as
-    # the 2026-08-20 finding that the ScheduledTask enum has no StopExisting.
-    try {
-        $existingTask = Get-ScheduledTask -TaskName $job.Name
-        $existingTask.Description = $job.Desc
-        Set-ScheduledTask -InputObject $existingTask | Out-Null
-    } catch {
-        Write-Host "  (description not set: $($_.Exception.Message))" -ForegroundColor Yellow
-    }
+    # NO DESCRIPTION IS SET, DELIBERATELY. Two attempts failed live on
+    # 2026-08-25 and the third move is to stop rather than keep swinging at a
+    # cosmetic field:
+    #   1. `Set-ScheduledTask -TaskName X -Description Y`
+    #      -> "A parameter cannot be found that matches parameter name
+    #         'Description'". The cmdlet takes -Trigger/-Action/-Settings/
+    #         -Principal/-InputObject only.
+    #   2. Get the task, mutate .Description, `Set-ScheduledTask -InputObject`
+    #      -> CimException 0x80070057 "The parameter is incorrect". The CIM
+    #         method will not accept a definition whose only change is the
+    #         description.
+    # The remaining routes are worse than the problem. Register-ScheduledTask
+    # needs trigger objects and PowerShell has no monthly trigger cmdlet (the
+    # reason this script uses schtasks at all), and the COM/XML route means
+    # RE-REGISTERING a task that stores run-as credentials -- these tasks
+    # prompted for the run-as password when touched by `schtasks /Change`, so a
+    # re-register risks breaking a working monthly job to populate a field
+    # nothing reads.
+    #
+    # Same family as the 2026-08-20 watchdog finding (the ScheduledTask enum has
+    # no StopExisting, so COM was required there): this module's cmdlet surface
+    # is narrower than it looks, and assuming a knob exists is how both of the
+    # above happened. The authoritative description of each job lives in this
+    # file's header and in canon, which is where anyone would actually look.
+    # $job.Desc is retained above as that documentation.
 
     Write-Host "  Registered: $($job.Name)  (day 9 monthly at $($job.Time) AZ)" -ForegroundColor Green
 }
