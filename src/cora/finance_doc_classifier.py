@@ -40,9 +40,33 @@ _SUBJECT_RE = re.compile(
 )
 
 # Sender local-parts + platform domains that exist to send financial documents.
+#
+# C13 (cq-015b3bc779e9): `payments-noreply@` was ADDED after measuring the live
+# corpus. Google is a real vendor here -- 195 gmail chunks come from
+# `Google Payments <payments-noreply@google.com>` (Workspace invoices, Cloud
+# auto-reload notices, and the Ads billing mail this slice is about) -- and it
+# matched NOTHING: the alternation requires the local part to end at `@`, so
+# `payments-noreply@` never satisfied `payments?@`, and `google.com` is not a
+# finance-platform domain. Measured consequence, on the live KB: of 40 gmail
+# chunks whose title names a Google invoice, only 11 carried the
+# `financial_document` tag. The tag landed on whichever chunk happened to hold a
+# `$` amount (+1) on top of the subject term (+2); every other chunk of the SAME
+# invoice email scored 2 and stayed invisible to the Tier-2-Finance retrieval
+# lane, so a #founder-finance pull for a Google invoice returned a fragment.
+# A sender is a per-DOCUMENT property, so scoring it fixes every chunk of the
+# email at once -- which a per-chunk money amount structurally cannot.
+#
+# SCOPED TO THE BILLING LOCAL-PART, NOT TO `@google.com`. The same domain sends
+# the highest-volume non-financial mail in the corpus (`comments-noreply@docs.`,
+# `calendar-notification@`, `forms-receipts-noreply@`, and 184 chunks of Google
+# Ads PERFORMANCE nags from `ads-noreply@` / `ads-account-noreply@`). Those must
+# keep scoring 0-2. `forms-receipts-noreply@` is the trap worth naming: it
+# contains the word "receipts" but is a Google Forms submission notice, and it is
+# excluded because the alternation anchors the local part at `@`.
 _SENDER_RE = re.compile(
     r"(?:\b(?:billing|invoice|invoices|receipts?|payments?|accounting|"
-    r"accountspayable|accountsreceivable|ar|ap|noreply\+billing|statements?)@|"
+    r"accountspayable|accountsreceivable|ar|ap|noreply\+billing|statements?|"
+    r"payments-noreply|billing-noreply)@|"
     r"@(?:[\w.-]*\b(?:intuit|quickbooks|bill|stripe|paypal|squareup|square|"
     r"gusto|adp|freshbooks|xero|waveapps|melio|ramp|brex|expensify|"
     r"billtrust|aviationinvoice)\b)[\w.-]*\.(?:com|net|io))",

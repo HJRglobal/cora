@@ -1,0 +1,61 @@
+# Expected recurring vendor invoices -- the list Cora checks at close.
+#
+# Consumed by src/cora/expected_invoices.py (via
+# scripts/run_expected_invoice_check.py, monthly) to answer one question per
+# vendor for the last CLOSED month: is that invoice FILED to Drive?
+#
+# READ-ONLY for Cora: she reads this file and reports. Harrison / Justin maintain
+# it. If the file is missing or has no `expected:` list, the check reports itself
+# UNAVAILABLE -- never a silent all-clear (the blank-radar failure mode
+# finance-renewal-radar.yaml warns about in its own header).
+#
+# WHAT "PRESENT" MEANS HERE: a row in data/state/filer-content-ledger.jsonl whose
+# filed path matches one of this entry's `match` substrings, with a `filed_at`
+# inside the period. That is CUSTODY -- what the attachment filer actually put in
+# Drive -- not "an email arrived". An email that arrived and failed to file is a
+# miss for accounting's purposes, and should read as one.
+#
+# Fields per entry:
+#   name              (required) vendor/invoice name, shown verbatim
+#   match             (required) list of case-insensitive SUBSTRINGS matched
+#                     against the filed Drive path. Plain substrings, not
+#                     regexes -- a stray character here must never raise.
+#                     Without at least one, the entry reports UNKNOWN by name
+#                     rather than being silently skipped.
+#   entity            (optional) which entity pays it; shown as a [TAG]
+#   known_undelivered (optional) set `true` when we already know this vendor does
+#                     not deliver to any monitored mailbox. The monthly line then
+#                     reads as a tracked configuration gap instead of a fresh
+#                     alarm, and it stops counting toward the flag total. Clear
+#                     it the moment delivery is fixed, so a real miss alarms.
+#   note              (optional) shown ONLY for a known_undelivered entry, to say
+#                     what would fix it.
+
+expected:
+  - name: Google Ads invoice
+    entity: F3E
+    match:
+      - google-ads
+      - google_ads
+      - googleads
+    known_undelivered: true
+    note: >-
+      Verified 2026-08-25: never filed, and no Google Ads billing email has
+      reached a monitored mailbox in 120 days (only ads-noreply@ performance
+      notifications). The Ads account -- F3 Energy, customer ID 352-797-6311 --
+      was granted to harrison@hjrglobal.com by INVITATION from
+      f3energymarketing@gmail.com, so its billing documents go to that outside
+      address. FIX IS A GOOGLE ADS SETTING, NOT CODE: add receipts@hjrglobal.com
+      (or payables@) as a billing contact / document recipient in the Ads
+      account, then clear this flag. The filer already handles Google billing
+      mail correctly -- it has filed Google Workspace invoices every month.
+
+  - name: Google Workspace invoice
+    entity: HJRG
+    match:
+      - google-workspace
+      - google_workspace
+    note: >-
+      Filing verified working: 2026-06-01, 2026-07-02 and 2026-08-02 invoices all
+      landed in 01-HJR-Global/invoices/. Delivered to
+      harrison@lexingtonservices.com, which is attachment-filer enabled.
