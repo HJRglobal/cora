@@ -1,8 +1,8 @@
 # Setup Windows Scheduled Tasks: the two monthly READ-ONLY report lanes from
 # session 7 (C13 cq-015b3bc779e9, C14 cq-118f8bbf842e).
 #
-#   Cora - Expected Invoice Check   day 4, 09:38 AZ  -> #hjrg-finance
-#   Cora - Klaviyo Billing Audit    day 4, 09:53 AZ  -> #founder-operations
+#   Cora - Expected Invoice Check   day 9, 09:38 AZ  -> #hjrg-finance
+#   Cora - Klaviyo Billing Audit    day 9, 09:53 AZ  -> #founder-operations
 #
 # BOTH ARE READ-ONLY. The invoice check reads a YAML expectation list and the
 # attachment filer's own content ledger; the Klaviyo audit reads segments through
@@ -11,10 +11,21 @@
 # greppably write-free and a test enforces it). Neither creates, changes,
 # suppresses or deletes anything.
 #
-# DAY 4, not day 1: the invoice check asks "is last month's invoice FILED?", and
-# the attachment filer needs a few days to see and file an invoice that vendors
-# send on the 1st or 2nd. Asking on the 1st would report a false MISSING every
-# month, which is exactly how a monthly report trains its reader to ignore it.
+# DAY 9, not day 1 and not day 4: the invoice check asks "is last month's invoice
+# FILED?", and asking too early reports a false MISSING every month, which is
+# exactly how a monthly report trains its reader to ignore it.
+#
+# The original day 4 was chosen for the FILER's lag (a vendor sends on the 1st or
+# 2nd, the filer needs a few days to see it) but not for the VENDOR's publication
+# SLA -- and that is the binding constraint. Verified live 2026-08-25 in the Ads
+# billing Documents tab: "Documents for the previous month's activity are usually
+# available by the 5th BUSINESS day of the following month." A 5th business day
+# lands as late as the 7th-9th calendar day (worse with holidays), so a day-4 run
+# asks before Google has published and reports MISSING on a document that does not
+# exist yet. Day 9 clears the SLA in every month shape.
+#
+# Both jobs share this day. Moving the Klaviyo audit from 4 to 9 is immaterial --
+# it reads Klaviyo, not a vendor document, and has no publication dependency.
 #
 # 09:38 / 09:53 are OUTSIDE the 03:00-09:00 window the weekly health metric
 # watches, and collide with no existing cora task clock time (checked against the
@@ -109,7 +120,7 @@ foreach ($job in $jobs) {
         /TN $job.Name `
         /TR $cmd `
         /SC MONTHLY `
-        /D 4 `
+        /D 9 `
         /ST $job.Time `
         /RL LIMITED `
         /F | Out-Null
@@ -135,7 +146,7 @@ foreach ($job in $jobs) {
         Write-Host "  (description not set: $($_.Exception.Message))" -ForegroundColor Yellow
     }
 
-    Write-Host "  Registered: $($job.Name)  (day 4 monthly at $($job.Time) AZ)" -ForegroundColor Green
+    Write-Host "  Registered: $($job.Name)  (day 9 monthly at $($job.Time) AZ)" -ForegroundColor Green
 }
 
 Write-Host ""
