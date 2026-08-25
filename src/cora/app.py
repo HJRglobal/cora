@@ -30,6 +30,7 @@ from .entity_router import route
 from . import feedback_log
 from . import help_responder
 from . import knowledge_review
+from . import meeting_asks
 from . import missed_message_catchup as missed_catchup
 from .revops import cards as revops_cards
 from . import intent_classifier as ic
@@ -4385,6 +4386,120 @@ def _handle_gap_decline_tap(body: dict, client, *, reason: str) -> None:
                 log.warning("gap decline: chat_update failed: %s", exc)
     except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
         log.warning("gap decline handler error (non-fatal)", exc_info=True)
+
+
+# ── S3 meeting-ask cards (cq-f52c6b691127) ──────────────────────────────────
+#
+# A propose-only card DM'd to whoever asked Cora for something out loud in a
+# meeting. The tap is the review; nothing happened before it.
+#
+# AUTHORITY IS THE ADDRESSEE, and it is decided in `meeting_asks.claim_for_tap`,
+# not here. That deliberately does NOT go through `review_lanes.can_approve`:
+# that function governs org canon and answers "may this actor approve this",
+# Harrison-only outside the mechanical lane, and widening it to admit a
+# meeting-ask recipient would have put a fourth lane inside the one function whose
+# docstring guarantees D-011 structurally. "Is this card addressed to you" is a
+# different question and lives in its own place.
+
+def _handle_meeting_ask_tap(body: dict, client, *, accept: bool) -> None:
+    try:
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        rec, refusal = meeting_asks.claim_for_tap(message_ts, actor_id)
+        if rec is None:
+            # An honest refusal, in the thread, leaving the card alone: the card
+            # may belong to somebody else, and rewriting it would tell them their
+            # proposal had been resolved by a stranger.
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=message_ts,
+                                        text=refusal)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("meeting-ask refusal post failed: %s", exc)
+            return
+
+        kind = str(rec.get("kind") or "")
+        if not accept:
+            meeting_asks.mark_state(rec["ask_id"], meeting_asks.STATE_DISMISSED)
+            outcome = meeting_asks.outcome_text("DISMISSED", kind)
+        else:
+            ok, detail = _execute_meeting_ask(rec, actor_id)
+            meeting_asks.mark_state(
+                rec["ask_id"],
+                meeting_asks.STATE_ACCEPTED if ok else meeting_asks.STATE_PENDING,
+                outcome=detail,
+            )
+            outcome = meeting_asks.outcome_text("ACCEPTED", kind,
+                                                success=ok, detail=detail)
+
+        # C4: strip the dead affordance, drop the buttons, append what actually
+        # happened. Shared helper, not a local copy -- and the footer this card
+        # emits is registered in knowledge_review._CARD_AFFORDANCE_LINES, without
+        # which the strip is a silent no-op.
+        try:
+            orig = (body.get("message") or {}).get("blocks") or []
+            client.chat_update(
+                channel=channel_id, ts=message_ts, text=outcome,
+                blocks=knowledge_review.terminal_card_blocks(orig, outcome),
+            )
+        except Exception as exc:  # noqa: BLE001 -- cosmetic; the action already ran
+            log.warning("meeting-ask card edit failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("meeting-ask tap handler error (non-fatal)", exc_info=True)
+
+
+def _execute_meeting_ask(rec: dict, actor_id: str) -> tuple[bool, str]:
+    """Carry out one accepted meeting ask. (ok, detail).
+
+    The two executable kinds are deliberately the two that write only to the
+    TAPPER'S OWN surfaces -- an Asana task assigned to them, or their own personal
+    note. Nothing here can assign work to a third party or write canon, which is
+    what lets a non-founder hold the authority for it.
+    """
+    kind = str(rec.get("kind") or "")
+    body = str(rec.get("body") or "").strip()
+    title = str(rec.get("meeting_title") or "")
+    if not body:
+        return False, "the proposal had no text to act on."
+    try:
+        if kind == meeting_asks.KIND_TASK:
+            from .tools import meeting_actions as ma  # noqa: PLC0415
+            return ma.create_ask_task(
+                slack_user_id=actor_id,
+                entity=str(rec.get("entity") or ""),
+                task_text=body,
+                meeting_title=title,
+                meeting_date=str(rec.get("meeting_date") or ""),
+                quoted_line=str(rec.get("quoted_line") or ""),
+            )
+        if kind == meeting_asks.KIND_NOTE:
+            from . import user_notes  # noqa: PLC0415
+            return user_notes.save_meeting_ask_note(
+                slack_user_id=actor_id,
+                text=body,
+                entity=str(rec.get("entity") or ""),
+                meeting_title=title,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("meeting-ask execute failed: %s", exc, exc_info=True)
+        return False, "something went wrong on my side."
+    return False, "I don't have an executor for that kind of ask."
+
+
+@app.action(meeting_asks.ACTION_ACCEPT)
+def handle_meeting_ask_accept(ack, body, client) -> None:
+    ack()
+    _handle_meeting_ask_tap(body, client, accept=True)
+
+
+@app.action(meeting_asks.ACTION_DISMISS)
+def handle_meeting_ask_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_meeting_ask_tap(body, client, accept=False)
 
 
 @app.action(gap_autofill.ACTION_DECLINE_NOT_MINE)

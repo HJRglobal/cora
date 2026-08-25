@@ -246,3 +246,75 @@ def format_notes_overlay(results: list, asker_slack: str) -> str:
             )
         lines.extend([header, "", (r.content or "").strip(), ""])
     return "\n".join(lines)
+
+
+# ── S3: save a note from an accepted meeting-ask card (cq-f52c6b691127) ──────
+
+def save_meeting_ask_note(*, slack_user_id: str, text: str, entity: str,
+                          meeting_title: str) -> tuple[bool, str]:
+    """Persist an accepted meeting-ask note to the TAPPER'S OWN notes. (ok, detail).
+
+    RUNS THE FULL PHI GATE, and that is the point of routing through here rather
+    than calling `save_note` directly. `resolve_save_scope` is the deterministic
+    pre-write matrix (D-050): a PHI-shaped note is refused outright unless the
+    owner is a LEX PHI custodian in LEX scope, and a custodian's note is FORCED
+    into the LEX-scoped store. A meeting transcript is exactly the surface where
+    that matters -- a spoken "Cora, note that <client>'s authorization is pending"
+    in a LEX meeting must hit the same refusal it would hit in Slack, and it does,
+    because the gate is the same function.
+
+    `is_dm=True`: the card is delivered as a DM, so this is a DM-scoped save --
+    which is also the stricter branch (it turns on the LEX billing-status
+    augmentation), so passing it cannot widen what gets through.
+
+    Blast-radius-1 is unchanged: `store.search()` excludes the user_note source in
+    both vector paths, so the only retrieval path is the owner-filtered
+    `search_user_notes`.
+    """
+    note_text = str(text or "").strip()
+    if not note_text:
+        return False, "the proposal had no text to save."
+
+    decision = resolve_save_scope(note_text, entity or "FNDR", slack_user_id, True)
+    if not decision.allowed:
+        # The refusal text is the standard PHI posture -- surfaced verbatim so the
+        # card says the same thing Slack would.
+        return False, str(decision.reason or PHI_REFUSAL)
+
+    # Same resolver the live `cora_remember` path uses (tool_dispatch reads
+    # `asana_email` out of slack-to-asana.yaml). org_roles carries no email field,
+    # so this is the only mapping there is. Provenance only, never a gate.
+    owner_email = ""
+    try:
+        from .tools import meeting_actions as _ma  # noqa: PLC0415
+        emails = sorted(_ma._asker_emails(slack_user_id))
+        owner_email = emails[0] if emails else ""
+    except Exception:  # noqa: BLE001
+        owner_email = ""
+
+    try:
+        from .context_loader import get_shared_kb  # noqa: PLC0415
+        kb = get_shared_kb()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("save_meeting_ask_note: KB unavailable: %s", exc)
+        return False, "I couldn't reach the notes store."
+
+    title = str(meeting_title or "").strip()
+    body = note_text
+    if title:
+        body = f"{note_text}\n\n(From the meeting: {title})"
+
+    try:
+        save_note(
+            kb,
+            note_text=body,
+            owner_slack=slack_user_id,
+            owner_email=owner_email,
+            entity=decision.entity,
+            sub_entity=decision.sub_entity,
+            channel_name="dm",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("save_meeting_ask_note failed: %s", exc, exc_info=True)
+        return False, "the save didn't go through."
+    return True, ""

@@ -204,6 +204,11 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "DECISION_ALERT_STATE_PATH", str(tmp_path / "decision-alert-pending.json")
     )
+    # S3 meeting-ask cards (cq-f52c6b691127) resolve their store per call for the
+    # same reason; same redirect for the same failure.
+    monkeypatch.setenv(
+        "MEETING_ASK_STATE_PATH", str(tmp_path / "meeting-ask-pending.json")
+    )
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening
@@ -394,6 +399,8 @@ _GUARDED_LEDGERS = (
     "data/cora-reply-log.jsonl",
     "data/state/fireflies-dedup-ledger.json",
     "data/state/meeting_action_watermark.json",
+    "data/state/meeting-ask-pending.json",
+    "data/state/meeting-ask-watermark.json",
     "data/state/web-search-usage.jsonl",
     # Lexicon Flywheel: the chokepoint telemetry ledger + the three files of
     # record the review-rail writer may append to (writer tests must redirect

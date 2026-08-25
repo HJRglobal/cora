@@ -1522,3 +1522,99 @@ def run_meeting_action_items(
         except Exception:  # noqa: BLE001 -- a card is a nicety; the preview is the answer
             log.warning("meeting_action_items: item stash failed (non-fatal)", exc_info=True)
     return _format_preview(transcript, resolved_id, is_lex, mine, unclear)
+
+
+# ── S3: create one task from an explicit in-meeting ask (cq-f52c6b691127) ────
+
+def create_ask_task(*, slack_user_id: str, entity: str, task_text: str,
+                    meeting_title: str, meeting_date: str,
+                    quoted_line: str) -> tuple[bool, str]:
+    """Create ONE Asana task for an accepted meeting-ask card. (ok, detail).
+
+    A SEPARATE ENTRY POINT FROM `_create_selected`, and the reason is its
+    integrity check. `_create_selected` validates each item against the meeting's
+    Fireflies-generated `summary.action_items` text, which is the right check for
+    items that CAME from that summary -- but an S3 ask did not. It came from a
+    verbatim sentence a human spoke, which is a STRONGER provenance than the
+    summary (D-136 calls the summary "a lead, never a source of record" and asks
+    for exactly this: a quoted line). Routing an S3 ask through the summary check
+    would reject it precisely because it is better grounded.
+
+    Everything else is reused rather than re-implemented: the asker's own Asana
+    gid (so the task is always assigned to the tapper and never to a third
+    party), the LEX-scoped project resolver, the blocked-project rail, the
+    creation-time duplicate check, the capture custom fields, and the PM-adoption
+    metric.
+    """
+    text = str(task_text or "").strip()
+    if not text:
+        return False, "the proposal had no text to act on."
+
+    assignee_gid = _asker_asana_gid(slack_user_id)
+    if not assignee_gid:
+        return False, ("your Asana mapping isn't set up yet, so I had nobody to "
+                       "assign it to -- ask Harrison to add your row to the "
+                       "Slack-to-Asana map.")
+
+    scoped = str(entity or "").strip().upper() or "HJRG"
+    is_lex = scoped == "LEX" or scoped.startswith("LEX-")
+    display_title = _scrub_for_lex(str(meeting_title or ""), is_lex)
+    task_name = _scrub_for_lex(text, is_lex)
+    if len(task_name) > fae._MAX_TASK_LEN:
+        task_name = task_name[:fae._MAX_TASK_LEN].rstrip()
+
+    if is_lex:
+        project_gid = fae._resolve_lex_project(scoped, task_name, assignee_gid, display_title)
+    else:
+        project_gid = resolve_project(entity=scoped, task_text=task_name,
+                                      assignee_gid=assignee_gid,
+                                      meeting_title=str(meeting_title or ""))
+        if project_gid and is_blocked_project(project_gid):
+            project_gid = None
+    if not project_gid:
+        # Symmetric with the capture guard: never orphan a task into My Tasks.
+        return False, ("I couldn't find a project for this meeting's entity, and "
+                       "I won't create an untagged task.")
+
+    # The quoted line is the provenance D-136 requires, carried into the task
+    # itself so the record survives outside Slack. PHI-scrubbed for LEX like
+    # every other field.
+    quoted = _scrub_for_lex(str(quoted_line or "").strip(), is_lex)[:400]
+    notes = (
+        "Created from something you asked Cora for during a meeting.\n"
+        f"Meeting: {display_title}\nDate: {meeting_date or 'unknown'}\n"
+        f"You said: \"{quoted}\"\n"
+        "You approved this from a Cora card; nothing was created before that."
+    )
+    if is_lex:
+        notes += "\nPHI minimized for Asana; full context in Fireflies."
+
+    try:
+        dup = _existing_open_dup(project_gid, task_name, {})
+    except Exception:  # noqa: BLE001 -- dedup is best-effort; fail open
+        dup = None
+    if dup:
+        return True, "You already had an open task for that, so I didn't duplicate it."
+
+    try:
+        task = asana_client.create_task(name=task_name, assignee_gid=assignee_gid,
+                                        project_gid=project_gid, notes=notes)
+    except asana_client.AsanaClientError as exc:
+        log.warning("create_ask_task failed for %r: %s", task_name, exc)
+        return False, "Asana rejected the create -- please try again."
+
+    gid = task.get("gid", "")
+    capture_fields = fae._capture_custom_fields(scoped)
+    if gid and capture_fields:
+        try:
+            asana_client.set_task_custom_fields(gid, capture_fields)
+        except Exception as exc:  # noqa: BLE001 -- field tagging best-effort
+            log.debug("create_ask_task custom-field tagging skipped: %s", exc)
+
+    pm_metrics.log_pm_action("create", slack_user_id, scoped, gid,
+                             title=task_name, extra={"via": "meeting_ask_card"})
+    # PHI: log the SCRUBBED title only.
+    log.info("meeting_ask CREATE asker=%s meeting=%r entity=%s gid=%s",
+             slack_user_id, display_title, scoped, gid)
+    link = task.get("permalink_url", "")
+    return True, (f"<{link}|Open it in Asana>" if link else "")

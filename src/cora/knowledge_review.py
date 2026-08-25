@@ -596,12 +596,29 @@ def mechanical_affordance_line(update_type: str) -> str:
     return _MECH_AFFORDANCE_DOES
 
 
-_CARD_AFFORDANCE_LINES = (
+# S3 (cq-f52c6b691127): the meeting-ask card's footer. Registered HERE rather
+# than stripped by its own module, because `strip_card_affordance` is driven by
+# this closed tuple and returns its input UNCHANGED for any footer it does not
+# recognise -- so an unregistered footer means a resolved card silently keeps
+# advertising a button that no longer exists, which is the exact defect C4 exists
+# to fix. Defined in `meeting_asks` (the builder that emits it) and imported here
+# so the two cannot drift; the import is local to avoid an import cycle
+# (meeting_asks imports terminal_card_blocks from this module).
+def _s3_affordance_line() -> str:
+    try:
+        from .meeting_asks import AFFORDANCE_LINE  # noqa: PLC0415
+        return AFFORDANCE_LINE
+    except Exception:  # noqa: BLE001 -- a strip list must never fail to build
+        return ""
+
+
+_CARD_AFFORDANCE_LINES = tuple(x for x in (
     "\U0001F44D Approve \u00b7 \U0001F44E Dismiss  (or tap a button below)",
     "\U0001F44D Accept \u00b7 \U0001F44E Dismiss  (or tap a button below)",
     _MECH_AFFORDANCE_DOES,
     _MECH_AFFORDANCE_HANDOFF,
-)
+    _s3_affordance_line(),
+) if x)
 
 # D-051: THE FIRST CUT OF THIS STRIP WAS DEAD IN PRODUCTION.
 #

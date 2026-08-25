@@ -1,0 +1,401 @@
+"""S3 (cq-f52c6b691127): explicit in-meeting Cora asks become propose-only cards.
+
+The properties under test, in the order they matter:
+
+  1. NOTHING EXECUTES WITHOUT A TAP. Detection is pure; the store records a
+     proposal; only the tap handler acts. (D-136, D-054.)
+  2. THE DETECTOR IS NARROW IN BOTH DIRECTIONS. It catches a spoken request and
+     refuses Cora-as-subject prose. This is the D-217/D-218 discipline: every
+     filter here is pinned against the exact artifact it exists to stop AND
+     against the shortest legitimate input, because the failure #6 shipped nine
+     times was a fix that broke the thing next to it.
+  3. ATTRIBUTION IS NOT TRUSTED. A diarization-flagged transcript addresses the
+     meeting owner, never a named speaker.
+  4. THE C4 CONTRACT HOLDS STRUCTURALLY. The card's footer is registered in
+     knowledge_review._CARD_AFFORDANCE_LINES, so a resolved card cannot keep
+     advertising a dead button -- the exact defect C4 shipped to fix.
+  5. THE ADDRESSEE IS THE AUTHORITY, and D-011 is untouched: review_lanes gains
+     no new lane and can_approve is not widened.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from cora import knowledge_review as kr
+from cora import meeting_asks as ma
+from cora import review_lanes
+
+HARRISON = "U0B2RM2JYJ1"
+OTHER = "U0B3AEJCYGP"
+
+
+def _sent(text: str, speaker: str = "Harrison Rogers", start: float = 12.0,
+          index: int = 0) -> dict:
+    return {"text": text, "speaker_name": speaker, "start_time": start, "index": index}
+
+
+def _transcript(**over) -> dict:
+    base = {
+        "id": "T1",
+        "title": "F3 Weekly",
+        "date": 1787097600,
+        "organizer_email": "harrison@hjrglobal.com",
+        "host_email": "harrison@hjrglobal.com",
+        "meeting_attendees": [
+            {"displayName": "Harrison Rogers", "email": "harrison@hjrglobal.com"},
+            {"displayName": "Justin Moran", "email": "justin@hjrglobal.com"},
+        ],
+        "sentences": [],
+    }
+    base.update(over)
+    return base
+
+
+# ── 2. the detector, both directions ─────────────────────────────────────────
+
+@pytest.mark.parametrize("text,kind", [
+    ("Cora, make a task to send Larry the deck.", ma.KIND_TASK),
+    ("Hey Cora, can you create a task for me to follow up with Tommy?", ma.KIND_TASK),
+    ("Cora, add a follow-up for the Costco meeting.", ma.KIND_TASK),
+    ("Cora, remind me to call the broker on Friday.", ma.KIND_TASK),
+    ("Cora, log a ticket for the Ellsworth repair.", ma.KIND_TASK),
+    ("Cora, make a note that the Tucson vendor is Apex Appliance.", ma.KIND_NOTE),
+    ("Cora, note this: we owe Justin the Q3 numbers.", ma.KIND_NOTE),
+    ("Cora, log that the price moved to $25.15.", ma.KIND_NOTE),
+    ("Cora, please draft an email to Larry about the invoice.", ma.KIND_OTHER),
+])
+def test_a_spoken_request_is_detected_and_classified(text, kind):
+    got = ma.detect_asks([_sent(text)])
+    assert len(got) == 1, f"not detected: {text}"
+    assert got[0]["kind"] == kind
+
+
+@pytest.mark.parametrize("text", [
+    # Cora as SUBJECT -- someone talking ABOUT her, incl. D-136's laundering mode
+    # where a human reads her output aloud in the first person.
+    "Cora said she would make a task for that.",
+    "Cora already created the task yesterday.",
+    "I asked Cora to create a task yesterday.",
+    "We should get Cora to make a task.",
+    "Cora will draft the email later.",
+    "Cora is going to note that.",
+    # A question ABOUT Cora is not an instruction TO Cora.
+    "Did Cora note that already?",
+    "Can Cora make a task for this?",
+    # Phrasal false positive: "make sure" creates nothing.
+    "Cora, make sure that we send it today.",
+    # Cora's ROLE being read off the participant list.
+    "Cora, note taker.",
+    "Cora note taking.",
+    # A body whose only content word is Cora herself.
+    "Cora, note for Cora.",
+    # Substring: "cora" inside another word must not fire.
+    "The corale winery is booked for Friday.",
+    "Please check the corporate card statement.",
+])
+def test_prose_that_is_not_a_request_is_refused(text):
+    assert ma.detect_asks([_sent(text)]) == [], f"false positive: {text}"
+
+
+def test_the_shortest_legitimate_asks_still_survive_the_junk_floor():
+    """The floor exists to stop "note taker" / "note for Cora". It must not stop a
+    real short request -- the failure mode #6 shipped when a quality floor
+    rejected "$25.15" and "Net 30" as insubstantial."""
+    for text in ("Cora, make a task to call Justin.",
+                 "Cora, note the payoff includes legal fees.",
+                 "Cora, log a ticket for the sauna."):
+        assert ma.detect_asks([_sent(text)]), f"floor rejected a real ask: {text}"
+
+
+def test_an_ask_with_no_timestamp_is_not_proposable():
+    """D-136 asks for a quoted line WITH a timestamp. An ungroundable proposal is
+    dropped rather than carded without provenance."""
+    s = _sent("Cora, make a task to send the deck.")
+    del s["start_time"]
+    assert ma.detect_asks([s]) == []
+
+
+def test_a_zero_second_offset_is_a_real_timestamp():
+    """0.0 is a legitimate offset (an ask in the first second), so the presence
+    check must not be a truthiness check."""
+    assert ma.detect_asks([_sent("Cora, make a task to call Justin.", start=0.0)])
+
+
+def test_detection_is_pure_and_carries_the_verbatim_line():
+    text = "Cora, make a task to send Larry the deck."
+    got = ma.detect_asks([_sent(text, start=93.0)])[0]
+    assert got["quoted_line"] == text
+    assert got["start_time"] == 93.0
+    assert ma.format_offset(93.0) == "1:33"
+
+
+def test_malformed_sentence_rows_never_raise():
+    assert ma.detect_asks(None) == []
+    assert ma.detect_asks([None, 42, "string", {}, {"text": None}]) == []
+
+
+# ── the per-meeting cap is reported, never silent ────────────────────────────
+
+def test_the_per_meeting_cap_reports_what_it_held_back():
+    asks = [{"n": i} for i in range(ma.MAX_ASKS_PER_MEETING + 4)]
+    kept, overflow = ma.cap_overflow(asks)
+    assert len(kept) == ma.MAX_ASKS_PER_MEETING
+    assert overflow == 4
+    assert ma.cap_overflow([{"n": 1}]) == ([{"n": 1}], 0)
+
+
+# ── 3. attribution ───────────────────────────────────────────────────────────
+
+def test_a_diarization_flagged_transcript_addresses_the_owner_not_the_speaker():
+    ask = {"speaker": "Justin Moran"}
+    sid, email, why = ma.resolve_addressee(
+        ask, _transcript(), attribution_unreliable=True,
+        email_to_slack={"harrison@hjrglobal.com": HARRISON,
+                        "justin@hjrglobal.com": OTHER},
+    )
+    assert sid == HARRISON, "a flagged transcript must not address a named speaker"
+    assert email == "harrison@hjrglobal.com"
+    assert "attribution unreliable" in why
+
+
+def test_a_clean_transcript_addresses_the_speaker_who_spoke():
+    sid, email, why = ma.resolve_addressee(
+        {"speaker": "Justin Moran"}, _transcript(), attribution_unreliable=False,
+        email_to_slack={"harrison@hjrglobal.com": HARRISON,
+                        "justin@hjrglobal.com": OTHER},
+    )
+    assert sid == OTHER and email == "justin@hjrglobal.com"
+
+
+def test_an_ambiguous_speaker_label_falls_back_to_the_owner():
+    """Two attendees with the same display name: guessing would DM the wrong
+    colleague about somebody else's ask."""
+    t = _transcript(meeting_attendees=[
+        {"displayName": "Justin Moran", "email": "justin@hjrglobal.com"},
+        {"displayName": "Justin Moran", "email": "justin@lexingtonservices.com"},
+    ])
+    sid, email, _ = ma.resolve_addressee(
+        {"speaker": "Justin Moran"}, t, attribution_unreliable=False,
+        email_to_slack={"harrison@hjrglobal.com": HARRISON},
+    )
+    assert sid == HARRISON and email == "harrison@hjrglobal.com"
+
+
+def test_speaker_matching_is_not_a_substring_test():
+    """The 2026-06-13 sweep shipped a substring matcher that assigned "Lex" to
+    "Alex". Here the same bug DMs the wrong person."""
+    t = _transcript(meeting_attendees=[
+        {"displayName": "Alex Cordova", "email": "alex@f3energy.com"}])
+    assert ma.match_speaker_to_attendee("Lex", t["meeting_attendees"]) == ""
+    assert ma.match_speaker_to_attendee("Alex Cordova", t["meeting_attendees"]) == \
+        "alex@f3energy.com"
+
+
+def test_a_single_spoken_first_name_resolves_only_when_unambiguous():
+    rows = [{"displayName": "Justin Moran", "email": "j@x.com"},
+            {"displayName": "Hannah Grant", "email": "h@x.com"}]
+    assert ma.match_speaker_to_attendee("Justin", rows) == "j@x.com"
+    rows.append({"displayName": "Justin Lopez", "email": "jl@x.com"})
+    assert ma.match_speaker_to_attendee("Justin", rows) == ""
+
+
+def test_no_addressable_recipient_means_no_proposal():
+    sid, _, _ = ma.resolve_addressee(
+        {"speaker": "Nobody"}, _transcript(organizer_email="", host_email=""),
+        attribution_unreliable=False, email_to_slack={},
+    )
+    assert sid == "", "an unaddressable ask must not be carded"
+
+
+# ── the durable store ────────────────────────────────────────────────────────
+
+def _record(**over):
+    base = dict(
+        ask_id="a1", transcript_id="T1", meeting_title="F3 Weekly",
+        meeting_date="2026-08-19", entity="F3E", kind=ma.KIND_TASK,
+        body="send Larry the deck", quoted_line="Cora, make a task to send Larry the deck.",
+        start_time=93.0, speaker="Harrison Rogers", addressee_id=HARRISON,
+        addressee_email="harrison@hjrglobal.com", routing_reason="addressed to the speaker who made the ask",
+        dm_channel_id="D1", card_message_ts="1787097600.001",
+    )
+    base.update(over)
+    return base
+
+
+def test_the_ask_key_is_stable_across_processes():
+    """hashlib, never the builtin hash(): siphash is randomised per interpreter,
+    which is what made every downstream dedup a silent no-op in C6 and filed one
+    vendor quote six times."""
+    a = ma.ask_key("T1", "Cora, make a task.", 93.0)
+    b = ma.ask_key("T1", "Cora,  make   a task.", 93)
+    assert a == b, "normalisation should make these the same ask"
+    assert a != ma.ask_key("T2", "Cora, make a task.", 93.0)
+
+
+def test_a_resolved_ask_never_comes_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    assert ma.already_carded("a1") is False
+    ma.record_card(**_record())
+    assert ma.already_carded("a1") is True
+    ma.mark_state("a1", ma.STATE_DISMISSED)
+    # Any state, not just PENDING -- otherwise the push becomes the nag D-054
+    # retired.
+    assert ma.already_carded("a1") is True
+
+
+def test_the_store_survives_a_malformed_file(tmp_path, monkeypatch):
+    p = tmp_path / "s.json"
+    p.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(p))
+    assert ma.pending_records() == []
+    assert ma.already_carded("a1") is False
+
+
+def test_the_state_path_is_read_per_call(tmp_path, monkeypatch):
+    """A module-level constant reading os.environ is the cq-06f4797db4f1 class:
+    frozen at bot start, and it defeats test isolation."""
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "one.json"))
+    ma.record_card(**_record())
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "two.json"))
+    assert ma.already_carded("a1") is False
+
+
+# ── 5. the addressee is the authority ────────────────────────────────────────
+
+def test_only_the_addressee_can_tap(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    rec, refusal = ma.claim_for_tap("1787097600.001", OTHER)
+    assert rec is None and "addressed to someone else" in refusal
+    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    assert rec is not None and refusal == ""
+
+
+def test_a_second_tap_finds_the_card_already_handled(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    ma.record_card(**_record())
+    ma.mark_state("a1", ma.STATE_ACCEPTED)
+    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    assert rec is None and "Already handled" in refusal
+
+
+def test_an_expired_card_refuses_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    p = tmp_path / "s.json"
+    ma.record_card(**_record())
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["a1"]["carded_at"] = "2020-01-01T00:00:00+00:00"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    rec, refusal = ma.claim_for_tap("1787097600.001", HARRISON)
+    assert rec is None
+    assert "aged out" in refusal, "expiry must be reported, not silent"
+    assert json.loads(p.read_text(encoding="utf-8"))["a1"]["state"] == ma.STATE_EXPIRED
+
+
+def test_an_unknown_card_refuses_honestly(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_ASK_STATE_PATH", str(tmp_path / "s.json"))
+    rec, refusal = ma.claim_for_tap("nope", HARRISON)
+    assert rec is None and "can't find this card" in refusal
+
+
+def test_review_lanes_gains_no_lane_and_can_approve_is_not_widened():
+    """D-011 is structural in review_lanes. S3 must not have touched it: a
+    meeting_ask type still lands in the Harrison-only operational lane, and a
+    non-founder still cannot approve it there."""
+    assert review_lanes.lane_for("meeting_ask", {}) == review_lanes.LANE_OPERATIONAL
+    row = {"update_type": "meeting_ask", "payload": {"entity": "F3E"}}
+    assert review_lanes.can_approve(row, HARRISON) is True
+    assert review_lanes.can_approve(row, OTHER) is False
+    assert review_lanes.MECHANICAL_TYPES == frozenset(
+        {"asana_task", "task_close", "hubspot_note"})
+
+
+# ── 4. the C4 contract ───────────────────────────────────────────────────────
+
+def test_the_card_footer_is_registered_so_the_strip_is_not_a_no_op():
+    """strip_card_affordance is driven by a CLOSED tuple of literals and returns
+    its input unchanged for an unknown footer. An unregistered footer therefore
+    means a resolved card silently keeps advertising a dead button."""
+    assert ma.AFFORDANCE_LINE in kr._CARD_AFFORDANCE_LINES
+    text = "card body\n" + ma.AFFORDANCE_LINE
+    assert kr.strip_card_affordance(text) != text
+
+
+def test_the_footer_is_stripped_in_slack_read_back_form_too():
+    """Slack normalises emoji-presentation Unicode to its shortcode on read-back,
+    and both card consumers read the card back FROM Slack. Matching only the
+    literal emoji is how the first cut of this strip shipped dead."""
+    shortcoded = ("card body\n" + ma.AFFORDANCE_LINE
+                  .replace("\U0001F44D", ":+1:").replace("\U0001F44E", ":-1:"))
+    assert kr.strip_card_affordance(shortcoded) != shortcoded
+
+
+def test_a_resolved_card_drops_its_buttons_and_names_the_outcome():
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn",
+                                     "text": "body\n" + ma.AFFORDANCE_LINE}},
+        {"type": "actions", "elements": [{"type": "button"}]},
+    ]
+    outcome = ma.outcome_text("ACCEPTED", ma.KIND_TASK)
+    out = kr.terminal_card_blocks(blocks, outcome)
+    assert not [b for b in out if b.get("type") == "actions"]
+    assert ma.AFFORDANCE_LINE not in json.dumps(out)
+    assert outcome in json.dumps(out)
+
+
+@pytest.mark.parametrize("kind,expect", [
+    (ma.KIND_TASK, "Asana"),
+    (ma.KIND_NOTE, "personal notes"),
+])
+def test_the_outcome_names_the_store_the_item_landed_in(kind, expect):
+    """The C4 rule, and the reason outcome_text exists at all: one string for
+    every type had rendered "Saved to Cora's known-answers" over an item that
+    went to the efficiency backlog."""
+    assert expect in ma.outcome_text("ACCEPTED", kind)
+
+
+def test_a_failed_execution_is_never_rendered_as_success():
+    text = ma.outcome_text("ACCEPTED", ma.KIND_TASK, success=False, detail="Asana said no.")
+    assert "couldn't" in text and "nothing was created" in text.lower()
+    assert "white_check_mark" not in text
+
+
+def test_a_dismissal_says_nothing_was_created():
+    assert "didn't create" in ma.outcome_text("DISMISSED", ma.KIND_TASK)
+
+
+# ── 1. the card promises only what it can do ─────────────────────────────────
+
+def test_the_card_quotes_the_line_with_its_timestamp():
+    text = ma.build_card_text(_record())
+    assert "Cora, make a task to send Larry the deck." in text
+    assert "[1:33]" in text, "D-136 requires the timestamp on the quoted line"
+    assert "F3 Weekly" in text
+
+
+def test_the_card_says_nothing_has_happened_yet():
+    text = ma.build_card_text(_record())
+    assert "have not done anything yet" in text
+
+
+def test_an_unactionable_kind_gets_no_affordance_and_promises_nothing():
+    """A draft/send ask is real but is an egress class this slice does not open.
+    The card hands it back instead of implying a capability -- the defect C4
+    found was a card claiming Cora carried out a HubSpot note she never writes."""
+    text = ma.build_card_text(_record(kind=ma.KIND_OTHER, body="draft an email to Larry"))
+    assert ma.AFFORDANCE_LINE not in text
+    assert "can't act on this one from a card" in text
+
+
+def test_an_owner_routed_card_explains_why_it_came_to_them():
+    text = ma.build_card_text(_record(
+        routing_reason="attribution unreliable on this transcript -- addressed to "
+                       "the meeting owner rather than a named speaker"))
+    assert "Routing:" in text and "attribution unreliable" in text
+
+
+def test_a_speaker_routed_card_does_not_add_routing_noise():
+    assert "Routing:" not in ma.build_card_text(_record())
