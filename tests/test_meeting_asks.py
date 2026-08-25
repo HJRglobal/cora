@@ -399,3 +399,68 @@ def test_an_owner_routed_card_explains_why_it_came_to_them():
 
 def test_a_speaker_routed_card_does_not_add_routing_noise():
     assert "Routing:" not in ma.build_card_text(_record())
+
+
+# ── the poll window (S3 trigger) ─────────────────────────────────────────────
+#
+# These live here rather than in a script test file because the window rule is
+# the correctness core of the trigger, and getting it wrong is SILENT.
+
+def _window_mod():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "scripts" / "run_meeting_ask_capture.py"
+    spec = importlib.util.spec_from_file_location("_mac", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_fresh_watermark_does_not_narrow_the_poll_window():
+    """THE defect this rule exists for. Fireflies `transcripts(fromDate, toDate)`
+    filters on MEETING DATE, not on when the transcript became available -- a
+    transcript appears minutes to hours after the meeting ends. So narrowing the
+    window to the last run time (`max(watermark, floor)`) would make a 10:00
+    meeting whose transcript lands at 10:45 permanently invisible: every 15-minute
+    poll would ask for meetings dated after the previous poll, and that meeting is
+    always older than that. The watermark may only WIDEN."""
+    import time
+    m = _window_mod()
+    now = int(time.time())
+    start = m._window_start(now - 900, 24)   # last run 15 minutes ago
+    assert now - start >= 23 * 3600, (
+        "a 15-minute-old watermark must not shrink the window to 15 minutes")
+
+
+def test_no_watermark_uses_the_fixed_lookback():
+    import time
+    m = _window_mod()
+    now = int(time.time())
+    assert 23 * 3600 <= now - m._window_start(0, 24) <= 25 * 3600
+
+
+def test_a_stale_watermark_widens_the_window_to_recover():
+    """An outage must not create a permanent hole."""
+    import time
+    m = _window_mod()
+    now = int(time.time())
+    start = m._window_start(now - 5 * 86400, 24)
+    assert now - start >= 4 * 86400
+
+
+def test_an_ancient_watermark_is_capped():
+    """Otherwise one call asks Fireflies for months of transcripts WITH FULL
+    SENTENCES."""
+    import time
+    m = _window_mod()
+    now = int(time.time())
+    start = m._window_start(now - 365 * 86400, 24)
+    assert now - start <= m._MAX_LOOKBACK_HOURS * 3600 + 60
+
+
+def test_a_zero_or_negative_lookback_never_produces_a_future_window():
+    import time
+    m = _window_mod()
+    now = int(time.time())
+    for hours in (0, -5):
+        assert m._window_start(0, hours) <= now

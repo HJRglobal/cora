@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """S3 (cq-f52c6b691127): per-meeting trigger for explicit Cora-directed asks.
 
-WHAT RUNS HERE. Poll Fireflies for transcripts newer than a watermark; for each
-NEW one, scan its sentences for sentences in which a human addressed Cora out
-loud with a request; DM the addressee ONE propose-only card per ask. Nothing is
-created, nothing is assigned, nothing is written anywhere except this script's own
-watermark and the card store.
+WHAT RUNS HERE. Poll Fireflies over a deliberately OVERLAPPING recent window (see
+`_window_start` -- the watermark may only widen it, never narrow it); scan each
+transcript's sentences for ones in which a human addressed Cora out loud with a
+request; DM the addressee ONE propose-only card per ask it has not already carded.
+Nothing is created, nothing is assigned, nothing is written anywhere except this
+script's own watermark and the card store.
 
 "PER MEETING, NOT PERIODIC" -- AND WHAT THAT HONESTLY MEANS HERE. There is no
 Fireflies webhook to subscribe to: the API exposes no webhook-registration
@@ -61,11 +62,13 @@ from cora.connectors import fireflies_diarization as ffd  # noqa: E402
 
 _WATERMARK_PATH = _REPO_ROOT / "data" / "state" / "meeting-ask-watermark.json"
 
-#: Default poll window. Wider than the task interval on purpose: a missed firing
-#: (host asleep, task queue backed up) must not create a permanent hole, and the
-#: per-ask dedup in `meeting_asks.already_carded` makes re-reading a transcript
-#: free. Task Scheduler does not catch up missed firings by design (D-041), so
-#: overlap is the only protection there is.
+#: Default poll window, MUCH wider than the task interval on purpose. Two reasons,
+#: and the second is the load-bearing one: (a) Task Scheduler does not catch up
+#: missed firings by design (D-041), so a sleeping host must not leave a permanent
+#: hole; (b) the Fireflies query filters on MEETING DATE, so a transcript that
+#: lands an hour after its meeting is only visible to a window that reaches back
+#: past the meeting -- see `_window_start`. Re-reading a recent transcript is free
+#: because `meeting_asks.already_carded` dedups per ASK.
 _DEFAULT_LOOKBACK_HOURS = 24
 
 #: Fireflies field block. DELIBERATELY THIS SCRIPT'S OWN, not the shared
@@ -126,11 +129,14 @@ def _read_watermark() -> int:
 
 
 def _write_watermark(ts: int) -> None:
-    """Atomic, and written ONLY after a meeting's cards are all posted.
+    """Atomic. Records when this poll last RAN.
 
-    Per-meeting rather than end-of-run: the gmail sweep's 2026-06-08 incident was
-    a watermark flushed once at the end of a run that never finished, so it never
-    advanced at all and the same backlog was re-scanned nightly forever.
+    IT IS A FLOOR-EXTENDER, NOT THE WINDOW. See `_window_start`: narrowing the
+    fetch window to the last run time would silently drop meetings, because the
+    Fireflies `transcripts` query filters on MEETING DATE, not on when the
+    transcript became available. Per-ask idempotency lives in
+    `meeting_asks.already_carded`, which is what makes a deliberately overlapping
+    window free.
     """
     try:
         _WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +146,38 @@ def _write_watermark(ts: int) -> None:
         tmp.replace(_WATERMARK_PATH)
     except Exception as exc:  # noqa: BLE001
         print(f"WARN: watermark write failed: {exc}", file=sys.stderr)
+
+
+#: Hard ceiling on how far back a recovery run reaches. Without it, a watermark
+#: left stale by a long outage would ask Fireflies for months of transcripts
+#: WITH FULL SENTENCES in one call.
+_MAX_LOOKBACK_HOURS = 24 * 14
+
+
+def _window_start(watermark_ts: int, lookback_hours: int) -> int:
+    """The `fromDate` for this poll.
+
+    THE WATERMARK MAY ONLY WIDEN THIS WINDOW, NEVER NARROW IT, and that is the
+    whole subtlety of polling Fireflies. `transcripts(fromDate, toDate)` filters on
+    the MEETING DATE, not on when the transcript became available -- and a
+    transcript appears minutes to hours after the meeting ends. So a 10:00 meeting
+    whose transcript lands at 10:45 is, at the 10:45 poll, a meeting whose DATE is
+    45 minutes before a window that starts at the last run. Narrowing to the
+    watermark (`max(wm, floor)`) would therefore skip it permanently -- the poll
+    would run every 15 minutes and never see it.
+
+    So the window is the FIXED lookback, extended backwards to the watermark when
+    the last run was longer ago than that (an outage), and capped so a stale
+    watermark cannot request months of sentences in one call. The resulting
+    overlap re-reads the same recent transcripts every run, which is free:
+    `meeting_asks.already_carded` is keyed on the ask, not the run.
+    """
+    now = int(datetime.now(timezone.utc).timestamp())
+    floor = now - int(max(lookback_hours, 1)) * 3600
+    ceiling = now - _MAX_LOOKBACK_HOURS * 3600
+    if watermark_ts and watermark_ts < floor:
+        return max(watermark_ts, ceiling)
+    return floor
 
 
 def _fetch_since(since_ts: int, max_meetings: int) -> list[dict]:
@@ -338,11 +376,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.transcript_id:
         transcripts = _fetch_one(args.transcript_id)
     else:
-        wm = _read_watermark()
-        floor = int((datetime.now(timezone.utc)
-                     - timedelta(hours=args.lookback_hours or _DEFAULT_LOOKBACK_HOURS)
-                     ).timestamp())
-        since = max(wm, floor) if wm else floor
+        since = _window_start(_read_watermark(),
+                              args.lookback_hours or _DEFAULT_LOOKBACK_HOURS)
         try:
             transcripts = _fetch_since(since, args.max_meetings)
         except Exception as exc:  # noqa: BLE001
