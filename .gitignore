@@ -1,5 +1,10 @@
 # Secrets — never commit
 .env
+# .env backups carry the same secrets as .env itself. Untracked is not
+# enough: this repo has already had a broad `git add` sweep an unrelated
+# file into a commit (222664a).
+.env.bak*
+.env.*.bak
 
 # Claude Code MCP server config (machine-specific local path); see
 # deployment/mcp-server-registration.md for the template. Anchored to the repo
