@@ -271,12 +271,20 @@ def _fuzzy_ratio(a: str, b: str) -> float:
 
 # Its own small, time-windowed file -- never a scan of the proposed-updates
 # archive. Measured: an O(n^2) fuzzy scan of that 18 MB / 19,842-row archive did
-# not finish in 100 seconds. Overridable so tests never touch the real ledger.
-_DECISION_FP_LEDGER = Path(
-    os.environ.get("DECISION_FACT_FP_PATH")
-    or (Path(__file__).resolve().parents[2] / "data" / "state"
-        / "decision-fact-fingerprints.jsonl")
-)
+# not finish in 100 seconds.
+#
+# Resolved PER CALL, not snapshotted at import. As a module-level constant it
+# read DECISION_FACT_FP_PATH once, before any test fixture could set it -- so the
+# conftest isolation added for exactly this had no effect and pass-5 tests kept
+# writing to the REAL ledger. That is the cq-06f4797db4f1 class ("reads
+# per-call" documented, os.environ snapshotted at import) and it is worth
+# recognising on sight.
+_DECISION_FP_DEFAULT = (Path(__file__).resolve().parents[2] / "data" / "state"
+                        / "decision-fact-fingerprints.jsonl")
+
+
+def _decision_fp_ledger() -> Path:
+    return Path(os.environ.get("DECISION_FACT_FP_PATH") or _DECISION_FP_DEFAULT)
 
 
 def _stable_id(text: str, entity: str) -> str:
@@ -311,12 +319,13 @@ def _decision_already_proposed(summary: str, entity: str) -> bool:
     a duplicate is recoverable; dropping a real decision is not.
     """
     return bool(fact_fingerprint.already_proposed(
-        _DECISION_FP_LEDGER, "decision", summary, scope=(entity or "").upper()))
+        _decision_fp_ledger(), "decision", summary,
+        scope=(entity or "").upper()))
 
 
 def _record_decision_proposal(summary: str, entity: str, gap_id: str) -> None:
     fact_fingerprint.record_proposal(
-        _DECISION_FP_LEDGER, "decision", summary,
+        _decision_fp_ledger(), "decision", summary,
         scope=(entity or "").upper(), ref=gap_id)
 
 

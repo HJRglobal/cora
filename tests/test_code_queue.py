@@ -191,7 +191,8 @@ def test_non_lex_note_kept(qenv):
 
 
 def test_phi_summary_drops_item(qenv, monkeypatch):
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
+                        lambda t: True)
     rec = {"kind": "bug", "severity": "P2", "title": "x", "summary": "y",
            "entity": "F3E", "signal": "tool_error", "representative": "x",
            "evidence": [], "reporter": "U1"}
@@ -220,7 +221,8 @@ def _counting_classifier(counter):
 def test_message_signal_phi_dropped_preclassify(qenv, monkeypatch):
     counter = {"n": 0}
     monkeypatch.setattr(cq, "classify_candidate", _counting_classifier(counter))
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
+                        lambda t: True)
     cq.capture_message_signal("cora should track patient billing authorization",
                               "LEX", "C1", "lex", "U1")
     assert cq.load_items() == [] and counter["n"] == 0  # classifier never called
@@ -229,7 +231,7 @@ def test_message_signal_phi_dropped_preclassify(qenv, monkeypatch):
 def test_phi_check_error_fails_closed(qenv, monkeypatch):
     def _boom(_t):
         raise RuntimeError("phi check exploded")
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", _boom)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked", _boom)
     rec = {"kind": "bug", "severity": "P2", "title": "x", "summary": "y",
            "entity": "F3E", "signal": "tool_error", "representative": "x",
            "evidence": [], "reporter": "U1"}
@@ -241,7 +243,7 @@ def test_phi_tripping_subsystem_guess_blanked_at_capture(qenv, monkeypatch):
     slugs (_affinity_key -> _bundle_theme -> _slug), where the LEX prompt_path
     redaction can't reach co-bundled non-LEX items -- so a PHI-tripping value is
     blanked at capture (item survives, hint dropped)."""
-    monkeypatch.setattr(cq.phi_guard, "is_any_phi",
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi_request",
                         lambda t: "billing authorization" in t)
     rec = {"kind": "bug", "severity": "P2", "title": "tool crashed", "summary": "boom",
            "entity": "F3E", "signal": "tool_error", "representative": "tool",
@@ -263,7 +265,8 @@ def test_phi_tripping_subsystem_guess_blanked_in_seed_lane(qenv, monkeypatch):
     """Same screen on the seed lane (verify-pass follow-up): seed_item is
     caller-supplied via the MCP cora_code_queue_seed tool and bypasses _capture,
     so it must screen subsystem_guess itself (falls back to the entity code)."""
-    monkeypatch.setattr(cq.phi_guard, "is_any_phi", lambda t: "SECRETSUB" in t)
+    monkeypatch.setattr(cq.phi_guard, "is_any_phi_request",
+                        lambda t: "SECRETSUB" in t)
     cid = cq.seed_item(kind="bug", severity="P2", title="clean title",
                        summary="clean summary", entity="F3E", signal="explicit",
                        status="PROPOSED", subsystem_guess="SECRETSUB detail")
@@ -320,7 +323,8 @@ def test_seed_item_phi_title_refused(qenv, monkeypatch):
     # D-051 fix: a PHI-tripping seed is REFUSED outright (mirrors _capture) -- the seed
     # title/summary persist raw + egress via code-session-backlog.md, so a PHI seed must
     # never be stored, not merely stored-with-scrubbed-evidence.
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
+                        lambda t: True)
     cid = cq.seed_item(
         kind="bug", severity="P2", title="f3e widget", summary="contains phi text",
         entity="F3E", signal="explicit", status="APPROVED")
@@ -331,7 +335,7 @@ def test_seed_item_phi_title_refused(qenv, monkeypatch):
 def test_seed_item_phi_check_error_fails_closed(qenv, monkeypatch):
     def _boom(_t):
         raise RuntimeError("phi check exploded")
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", _boom)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked", _boom)
     assert cq.seed_item(kind="bug", severity="P2", title="x", summary="y",
                         entity="F3E", signal="explicit", status="APPROVED") is None
 
@@ -565,7 +569,8 @@ def test_edit_updates_and_phi_guard(qenv, monkeypatch):
     o, _ = cq.apply_edit(cid, "U0B2RM2JYJ1", "new title", "new summary")
     assert o == "edited"
     assert cq.get_item(cid)["title"] == "new title"
-    monkeypatch.setattr(cq.phi_guard, "is_phi_risk", lambda t: True)
+    monkeypatch.setattr(cq.phi_guard, "is_phi_risk_person_linked",
+                        lambda t: True)
     o2, _ = cq.apply_edit(cid, "U0B2RM2JYJ1", "phi title", "phi summary")
     assert o2 == "error"  # PHI-tripping edit rejected
 

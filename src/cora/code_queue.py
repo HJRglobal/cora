@@ -692,7 +692,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     summary_text = (f"{rec.get('title', '')} {rec.get('summary', '')} "
                     f"{rec.get('fix_sketch', '')}").strip()
     try:
-        phi = phi_guard.is_any_phi(summary_text)
+        phi = phi_guard.is_any_phi_request(summary_text)
     except Exception:  # noqa: BLE001 -- fail closed
         phi = True
     if phi:
@@ -709,7 +709,7 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
     sub = str(rec.get("subsystem_guess") or "")
     if sub:
         try:
-            if phi_guard.is_any_phi(sub):
+            if phi_guard.is_any_phi_request(sub):
                 rec["subsystem_guess"] = ""
         except Exception:  # noqa: BLE001 -- fail closed
             rec["subsystem_guess"] = ""
@@ -937,7 +937,7 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
     # still pass; PHI-tripping ones are dropped before any model call. Upgraded to
     # the 3-predicate union (is_any_phi) 2026-07-30 PHI parity-raise.
     try:
-        if phi_guard.is_any_phi(question):
+        if phi_guard.is_any_phi_request(question):
             log.info("code_queue: message signal dropped pre-classify (PHI)")
             return
     except Exception:  # noqa: BLE001 -- fail closed
@@ -1011,7 +1011,7 @@ def _route_to_flywheel(question: str, entity: str, channel_name: str, user: str)
         if ent.startswith("LEX"):
             log.debug("code_queue: LEX entity -- flywheel route skipped (fail-closed)")
             return
-        if phi_guard.is_any_phi(question):
+        if phi_guard.is_any_phi_request(question):
             log.info("code_queue: flywheel route dropped (PHI-flagged question)")
             return
         from . import knowledge_gaps
@@ -1936,10 +1936,12 @@ def apply_edit(cq_id: str, actor_id: str, title: str, summary: str) -> tuple[str
         return "error", "That queue item no longer exists."
     title = (title or "").strip()[:120]
     summary = (summary or "").strip()[:200]
-    # PHI belt-and-braces on the edited text (fail-closed). is_any_phi 2026-07-30
-    # parity-raise (3-predicate union).
+    # PHI belt-and-braces on the edited text (fail-closed). REQUEST-shaped --
+    # Harrison typing into the edit modal -- so it takes the precision-tuned
+    # union (C12), same as seed_item's title/summary gate. The at-rest screens
+    # that decide what gets WRITTEN into the KB-ingested backlog stay strict.
     try:
-        if phi_guard.is_any_phi(f"{title} {summary}"):
+        if phi_guard.is_any_phi_request(f"{title} {summary}"):
             return "error", "Edit rejected -- text tripped the PHI guard."
     except Exception:  # noqa: BLE001
         return "error", "Edit rejected -- PHI check failed (fail-closed)."
@@ -2471,9 +2473,17 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     # asymmetry). The 1h LEX-DDD seed is generic build text and passes cleanly.
     # is_any_phi 2026-07-30 parity-raise (3-predicate union).
     try:
-        if phi_guard.is_any_phi(f"{title} {summary}".strip()):
-            log.info("code_queue.seed_item: refused PHI-flagged seed (signal=%s entity=%s)",
-                     signal, entity)
+        if phi_guard.is_any_phi_request(f"{title} {summary}".strip()):
+            # NAMES ONLY, never the text (D-082). A refusal that leaves no
+            # trace of WHICH detector fired cannot be tuned -- both 8/24 false
+            # positives were diagnosed only by reconstructing candidate wordings
+            # after the fact.
+            try:
+                fired = ",".join(phi_guard.which_predicates(f"{title} {summary}")) or "none"
+            except Exception:  # noqa: BLE001
+                fired = "unknown"
+            log.info("code_queue.seed_item: refused PHI-flagged seed "
+                     "(signal=%s entity=%s predicates=%s)", signal, entity, fired)
             return None
     except Exception:  # noqa: BLE001 -- fail closed
         log.info("code_queue.seed_item: PHI check errored -- refusing seed (fail-closed)")
@@ -2486,7 +2496,7 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     sub = str(subsystem_guess or "")
     if sub:
         try:
-            if phi_guard.is_any_phi(sub):
+            if phi_guard.is_any_phi_request(sub):
                 sub = ""
         except Exception:  # noqa: BLE001 -- fail closed
             sub = ""

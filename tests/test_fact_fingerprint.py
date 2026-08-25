@@ -207,7 +207,7 @@ def test_pass5_suppresses_a_repeat_decision_and_records_the_first(
         tmp_path, monkeypatch):
     from cora import reconciliation_engine as re_
     led = tmp_path / "fp.jsonl"
-    monkeypatch.setattr(re_, "_DECISION_FP_LEDGER", led)
+    monkeypatch.setenv("DECISION_FACT_FP_PATH", str(led))
 
     assert re_._decision_already_proposed(CBS[0], "OSN") is False
     re_._record_decision_proposal(CBS[0], "OSN", "pass5:decision:abc")
@@ -223,7 +223,7 @@ def test_the_gate_records_at_proposal_time_not_approval_time(tmp_path, monkeypat
     about it. The ledger row exists the moment the gap is emitted."""
     from cora import reconciliation_engine as re_
     led = tmp_path / "fp.jsonl"
-    monkeypatch.setattr(re_, "_DECISION_FP_LEDGER", led)
+    monkeypatch.setenv("DECISION_FACT_FP_PATH", str(led))
     re_._record_decision_proposal(CBS[0], "OSN", "pass5:decision:abc")
     rows = [json.loads(ln) for ln in led.read_text(encoding="utf-8").splitlines() if ln]
     assert len(rows) == 1

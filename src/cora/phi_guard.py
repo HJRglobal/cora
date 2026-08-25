@@ -105,10 +105,40 @@ _PROGRAM_ID_TAIL_RE = re.compile(
     r"|[\s:#-]{0,3}\b(?:id|ids|no|num|number)\b",
     re.IGNORECASE,
 )
+_PROGRAM_ID_TAIL_WINDOW = 24
+
+
+# BUSINESS HOMONYMS. The second group inside _PHI_PATTERNS that names something
+# a non-LEX business says constantly: "the Q3 revenue assessment", "the incident
+# report from the warehouse". Same argument as the programme names above -- they
+# belong on an INGESTION surface, where "assessment" in a Lexington filename is a
+# fair proxy for a client record and over-refusing costs nothing, and they do NOT
+# belong in a screen over a REQUEST someone typed.
+#
+# Live evidence (cq-ee0a88a2185c, 2026-08-24): two benign code-queue seeds were
+# guard-refused in a single session -- a Google Ads invoice-retrieval capability
+# ask and an intake-notes bug report -- and both were accepted verbatim after a
+# reword that removed nothing but the homonym.
+#
+# Subtracted ONLY when no care or programme cue sits within _HOMONYM_CUE_WINDOW
+# characters. "client assessment" and "AHCCCS incident report" still trip, and
+# _PHI_PATTERNS itself is untouched, so every ingestion consumer -- including
+# reconciliation_engine, which imports the compiled object directly -- keeps the
+# strict behaviour.
+_PHI_BUSINESS_HOMONYM_RE = re.compile(r"\b(?:assessment|incident\s+report)\b",
+                                      re.IGNORECASE)
+_HOMONYM_CUE_WINDOW = 60
+
+
+def _homonym_has_care_cue(text: str, start: int, end: int) -> bool:
+    """Is a care/programme cue near this homonym match?"""
+    lo = max(0, start - _HOMONYM_CUE_WINDOW)
+    hi = min(len(text), end + _HOMONYM_CUE_WINDOW)
+    return bool(_LIVE_CARE_CUE_RE.search(text[lo:hi]))
 
 
 def is_phi_risk_person_linked(text: str) -> bool:
-    """is_phi_risk MINUS the bare payer/program names.
+    """is_phi_risk MINUS the bare payer/program names AND the business homonyms.
 
     True when the text carries a PHI signal that says something about a PERSON
     -- an identifier (ssn/dob/member id/npi), clinical documentation, a
@@ -122,6 +152,13 @@ def is_phi_risk_person_linked(text: str) -> bool:
     if not text:
         return False
     for m in _PHI_PATTERNS.finditer(text):
+        if _PHI_BUSINESS_HOMONYM_RE.fullmatch(m.group(0)):
+            # A business homonym only counts when something
+            # care-shaped is near it. Bare "revenue assessment" or
+            # "the warehouse incident report" is not a PHI signal.
+            if _homonym_has_care_cue(text, m.start(), m.end()):
+                return True
+            continue
         if not _PHI_PROGRAM_NAME_RE.fullmatch(m.group(0)):
             return True
         # ...unless the programme name IS the identifier. "Medicaid ID 1234567"
@@ -129,7 +166,8 @@ def is_phi_risk_person_linked(text: str) -> bool:
         # _PHI_PATTERNS only carries the literal "member id" / "provider id", so
         # subtracting the bare programme token removed their ONLY signal. Keep
         # the subtraction for the topic, not for the number.
-        if _PROGRAM_ID_TAIL_RE.match(text, m.end()):
+        if _PROGRAM_ID_TAIL_RE.search(text, m.end(),
+                                      m.end() + _PROGRAM_ID_TAIL_WINDOW):
             return True
     return False
 
@@ -217,6 +255,117 @@ _CLIENT_STATUS_RE = re.compile(
 )
 
 
+# ADJACENCY for the request-shaped sibling below. The admin-term leg fires when
+# an admin term and a person-noun both appear ANYWHERE in the text, at any
+# distance -- fine for a short LEX email subject, wrong for a paragraph-long
+# build request where "invoices" sits in sentence one and "parent account" in
+# sentence four. Note _CLIENT_STATUS_RE, the sibling leg right above, already
+# treats 30 characters as this module's adjacency unit; this reuses that number
+# rather than inventing one.
+_LEX_ADMIN_ADJACENCY = 30
+
+# The four person-nouns that are also ordinary finance/ops words: a "parent"
+# account, an "individual" account, a "member" of a team, the "recipient" of an
+# email. These require a Title-case NAME nearby before they count as naming a
+# care recipient. The other four -- client, patient, participant, guardian --
+# keep firing alone, because none of them has a benign finance sense.
+_FINANCE_HOMONYM_RECIPIENT_RE = re.compile(
+    r"\b(?:member|individual|recipient|parent)\b", re.IGNORECASE)
+_STRICT_RECIPIENT_RE = re.compile(
+    r"\b(?:client|patient|participant|guardian)\b", re.IGNORECASE)
+
+# The homonym in an unambiguous FINANCE/OPS sense: "parent account", "parent
+# manager account", "individual account", "member of the team". A care recipient
+# is never any of these, so the noun that follows settles it outright.
+_HOMONYM_BENIGN_SENSE_RE = re.compile(
+    r"\b(?:member|individual|recipient|parent)\b[\s,'’-]{0,3}"
+    r"(?:manager|account|accounts|company|companies|org|organisation|organization"
+    r"|team|domain|mailbox|list|of\s+the\s+team)\b",
+    re.IGNORECASE,
+)
+
+# Any Title-case personal name. A homonym that survives the benign-sense test
+# still needs a NAME near it before it counts as naming a care recipient --
+# "any recipient we monitor" names nobody; "Emily Carter is the member whose
+# claims are pending" does. Distinct from _NAME_POSSESSIVE_RE, which requires a
+# possessive and therefore misses the copular form.
+_TITLECASE_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+){0,2}\b")
+
+
+def _admin_term_near_person(text: str) -> bool:
+    """An admin term with a person-signal inside the adjacency window."""
+    for m in _LEX_ADMIN_TERM_RE.finditer(text):
+        lo = max(0, m.start() - _LEX_ADMIN_ADJACENCY)
+        hi = min(len(text), m.end() + _LEX_ADMIN_ADJACENCY)
+        window = text[lo:hi]
+        if _NAME_POSSESSIVE_RE.search(window):
+            return True
+        if _STRICT_RECIPIENT_RE.search(window):
+            return True
+        for hm in _FINANCE_HOMONYM_RECIPIENT_RE.finditer(window):
+            # An unambiguous finance sense settles it: not a care recipient.
+            if _HOMONYM_BENIGN_SENSE_RE.match(window, hm.start()):
+                continue
+            # Otherwise it needs a person NAME near it -- governed
+            # ("member Emily Carter") or merely adjacent ("Emily Carter is the
+            # member whose claims..."), since the copular form is the one the
+            # strict union catches and a narrowing must not lose.
+            if (_CARE_RECIPIENT_NAME_RE.search(text)
+                    or _TITLECASE_NAME_RE.search(window)):
+                return True
+    return False
+
+
+def is_lex_billing_status_request(text: str) -> bool:
+    """is_lex_billing_status_phi, precision-tuned for REQUEST-shaped text.
+
+    Two narrowings, both measured against the live false positives on
+    cq-ee0a88a2185c (2026-08-24) and against the full guard suite:
+
+      ADJACENCY. The admin term and the person-signal must sit within
+      _LEX_ADMIN_ADJACENCY characters of each other, not merely co-occur in the
+      same blob. "Google Ads billing: retrieve invoices from the parent manager
+      account" tripped only because "invoices" and "parent" were both present.
+
+      FINANCE HOMONYMS. member / individual / recipient / parent additionally
+      require a Title-case name somewhere in the text. client / patient /
+      participant / guardian are unchanged and still fire alone.
+
+    The client-status leg is untouched -- it already carries its own 30-char
+    window and has produced no false positives.
+
+    Use on request-shaped, caller-authored text. Ingestion and third-party
+    egress keep is_lex_billing_status_phi.
+    """
+    if not text:
+        return False
+    if _admin_term_near_person(text):
+        return True
+    return bool(_CLIENT_STATUS_RE.search(text))
+
+
+def is_any_phi_request(text: str) -> bool:
+    """The is_any_phi union, precision-tuned for text a person TYPED at Cora.
+
+    is_phi_risk_person_linked OR is_clinical_phi OR is_lex_billing_status_request.
+
+    THE BOUNDARY, stated so it is not eroded later: this is for REQUEST-shaped,
+    caller-authored text -- a typed ask, a build-request seed, a delegated-work
+    brief -- where a false refusal is a visible, repeated cost to a teammate and
+    the author can be asked to rephrase. INGESTION screens (email subjects,
+    Drive filenames, swept content) and THIRD-PARTY EGRESS keep the strict
+    is_any_phi, where recall beats precision and over-refusing costs nothing.
+
+    is_clinical_phi is carried over unchanged: nothing in it is a business
+    homonym.
+    """
+    if not text:
+        return False
+    return bool(is_phi_risk_person_linked(text)
+                or is_clinical_phi(text)
+                or is_lex_billing_status_request(text))
+
+
 def is_lex_billing_status_phi(text: str) -> bool:
     """LEX-scope PHI augmentation (opt-in; NOT part of is_phi_risk).
 
@@ -270,8 +419,10 @@ def which_predicates(text: str) -> list[str]:
     if not text:
         return out
     for name, fn in (("is_phi_risk", is_phi_risk),
+                     ("is_phi_risk_person_linked", is_phi_risk_person_linked),
                      ("is_clinical_phi", is_clinical_phi),
-                     ("is_lex_billing_status_phi", is_lex_billing_status_phi)):
+                     ("is_lex_billing_status_phi", is_lex_billing_status_phi),
+                     ("is_lex_billing_status_request", is_lex_billing_status_request)):
         try:
             if fn(text):
                 out.append(name)
