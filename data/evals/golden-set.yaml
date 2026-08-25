@@ -59,7 +59,15 @@ cases:
   - id: f3e-pure-wholesale-ladder
     entity: F3E
     question: "what is the wholesale price for pure?"
-    expect_substring: "Tier 1 = 32% off"
+    # Anchored on the DOLLAR figure, not the percentage framing. The old anchor
+    # was "Tier 1 = 32% off", which the 2026-08-04 Pure MSRP raise deleted when
+    # it rewrote the ladder from percentages to fixed dollars ("Quote DOLLARS,
+    # not percentages"). The FACT never broke -- $25.15 / $22.19 / $18.50 is
+    # still canon and still correct -- only this literal did, and the case then
+    # failed silently every week from 8/10 while the answer stayed right.
+    # $25.15 appears exactly once in the live known-answers file, and unlike a
+    # bare "25.15" it cannot be satisfied by Cora's own stale 8/1 reply chunk.
+    expect_substring: "$25.15"
     layer2:
       must_contain: ["25.15"]
       # "55% of" not bare "55%": the canon itself says 'there is NO

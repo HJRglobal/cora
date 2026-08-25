@@ -272,25 +272,115 @@ def run_all(cases: list[dict], *, answers: bool,
     return results
 
 
-def _load_last_failing() -> set[str]:
+# C1 (cq-da2d6772f0ec): a case failing this many consecutive runs auto-seeds a
+# queue item. Two is the threshold because one red week is noise -- a canon edit
+# mid-week, a transient retrieval miss -- and by the third the evidence is that
+# nobody is watching. f3e-pure-wholesale-ladder went red on 8/10, 8/17 and 8/24
+# with no seed and no owner, and its actual cause (a literal anchor left behind
+# by the 8/04 Pure MSRP rewrite) sat in plain sight the whole time.
+_AUTOSEED_AFTER_CONSECUTIVE = 2
+
+
+def _load_state() -> tuple[set[str], dict[str, int], dict[str, str]]:
+    """(failing_ids, streaks, seeded) -- back-compatible with the old one-key file.
+
+    A >=2-consecutive rule needs no new state at all (`failing_ids &
+    prev_failing` IS the 2-in-a-row set), but a STREAK COUNT does, and so does
+    "seed once per incident". Both are additive keys; an old file simply reads
+    as empty and the first run rebuilds them.
+    """
     try:
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
-        return set(data.get("failing_ids") or [])
+        return (set(data.get("failing_ids") or []),
+                dict(data.get("streaks") or {}),
+                dict(data.get("seeded") or {}))
     except Exception:
-        return set()
+        return set(), {}, {}
 
 
-def _save_last_failing(failing: set[str]) -> None:
+def _load_last_failing() -> set[str]:
+    return _load_state()[0]
+
+
+def _save_last_failing(failing: set[str], streaks: dict | None = None,
+                       seeded: dict | None = None) -> None:
     try:
         _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _STATE_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps({
             "failing_ids": sorted(failing),
+            "streaks": dict(streaks or {}),
+            "seeded": dict(seeded or {}),
             "ts": datetime.now(timezone.utc).isoformat(),
         }, indent=1), encoding="utf-8")
         tmp.replace(_STATE_PATH)
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] could not persist eval state: {exc}", file=sys.stderr)
+
+
+def _bump_streaks(failing: set[str], prev_streaks: dict) -> dict[str, int]:
+    """Consecutive-run counts. A case that passes drops out entirely, so a
+    later regression starts a fresh streak rather than resuming an old one."""
+    return {cid: int(prev_streaks.get(cid, 0)) + 1 for cid in sorted(failing)}
+
+
+def _autoseed_persistent_failures(streaks: dict, seeded: dict,
+                                  cases_by_id: dict) -> dict[str, str]:
+    """Seed one queue item per case that has failed >= the threshold.
+
+    Returns the updated `seeded` map (case_id -> streak-start marker), so a case
+    is seeded ONCE PER INCIDENT rather than once per run OR once ever.
+
+    THE DEDUP TRAP this avoids: code_queue.find_fingerprint is sha1(signal +
+    normalized title) with NO time component, and it never checks item status --
+    so a title keyed only on the eval id would seed exactly once in the lifetime
+    of the repo, and a regression six months after the first item shipped would
+    be silently swallowed. The signal therefore carries the streak identity.
+
+    Seeded at PROPOSED, never APPROVED: seed_item warns (and the nightly check
+    flags) on a P0/P1 APPROVED seed with no kickoff, and an automated seeder must
+    not be creating owed taps.
+    """
+    out = dict(seeded)
+    for cid, streak in sorted(streaks.items()):
+        if streak < _AUTOSEED_AFTER_CONSECUTIVE:
+            continue
+        marker = f"streak{streak - _AUTOSEED_AFTER_CONSECUTIVE + 1}"
+        # Already seeded for THIS incident -- the marker only changes when the
+        # case passes and later regresses (streaks reset on a pass).
+        if out.get(cid):
+            continue
+        case = cases_by_id.get(cid) or {}
+        entity = str(case.get("entity") or "FNDR")
+        question = str(case.get("question") or "")
+        try:
+            from cora import code_queue
+            cq_id = code_queue.seed_item(
+                kind="bug",
+                severity="MEDIUM",
+                title=f"KB eval {cid} failing {streak} consecutive weekly runs",
+                summary=(
+                    f"The golden-set case `{cid}` ({entity}) has failed "
+                    f"{streak} consecutive KB-eval runs. Question: "
+                    f"{question[:180]}. Either the retrieval regressed or the "
+                    f"case's expected text no longer matches canon -- check "
+                    f"BOTH before assuming a retrieval fault, since a canon "
+                    f"rewrite silently staled this exact case's literal anchor "
+                    f"for three weeks in August 2026."),
+                entity=entity,
+                signal=f"kb_eval_persistent_failure:{cid}:{marker}",
+                status="PROPOSED",
+                subsystem_guess="kb-evals",
+            )
+        except Exception as exc:  # noqa: BLE001 -- a seed must never fail the run
+            print(f"[warn] eval auto-seed failed for {cid}: {exc}", file=sys.stderr)
+            continue
+        if cq_id:
+            out[cid] = marker
+            print(f"[seed] {cid} failing {streak}x -> {cq_id}")
+    # A case that is no longer failing loses its seed marker, so a future
+    # regression is a NEW incident and seeds again.
+    return {k: v for k, v in out.items() if k in streaks}
 
 
 def summarize(results: list[dict], prev_failing: set[str],
@@ -341,8 +431,18 @@ def format_slack_summary(summary: dict) -> str:
     if summary["fixed_since_last"]:
         lines.append("Fixed since last run: "
                      + ", ".join(summary["fixed_since_last"][:10]))
-    if summary["failed"] and not summary["newly_failing"]:
-        lines.append("Still failing: " + ", ".join(summary["failing_ids"][:10]))
+    # Was gated `if failed and not newly_failing`, so in any week with BOTH a new
+    # failure and an older one, the older ids vanished from the post entirely --
+    # the digest would report the new break and silently stop mentioning the
+    # standing one. List the repeats explicitly instead, and say how long.
+    repeats = sorted(set(summary["failing_ids"]) - set(summary["newly_failing"])
+                     - set(summary.get("still_failing_unevaluated") or []))
+    if repeats:
+        streaks = summary.get("streaks") or {}
+        rendered = ", ".join(
+            f"{cid} ({streaks[cid]}w)" if streaks.get(cid, 0) > 1 else cid
+            for cid in repeats[:10])
+        lines.append("Still failing: " + rendered)
     return "\n".join(lines)
 
 
@@ -380,6 +480,9 @@ def main() -> int:
     ap.add_argument("--slack", action="store_true",
                     help="Post the summary to Slack (weekly task uses this).")
     ap.add_argument("--channel", default="cora-health")
+    ap.add_argument("--no-autoseed", action="store_true",
+                    help="Do not seed a queue item for a persistently-failing "
+                         "case (for local/manual runs).")
     args = ap.parse_args()
 
     load_errors: list[str] = []
@@ -390,10 +493,21 @@ def main() -> int:
 
     results = run_all(cases, answers=args.answers,
                       max_llm_cases=args.max_llm_cases)
-    prev_failing = _load_last_failing()
+    prev_failing, prev_streaks, prev_seeded = _load_state()
     summary = summarize(results, prev_failing, load_errors=load_errors)
     if not args.only_id and not load_errors:
-        _save_last_failing(set(summary["failing_ids"]))
+        failing = set(summary["failing_ids"])
+        streaks = _bump_streaks(failing, prev_streaks)
+        summary["streaks"] = streaks
+        # A load error invalidates the whole run, and --only-id never persists
+        # (both already gate the save) -- so a broken corpus can never manufacture
+        # a streak or a seed.
+        seeded = (_autoseed_persistent_failures(
+                      streaks, prev_seeded, {c.get("id"): c for c in cases})
+                  if not args.no_autoseed else dict(prev_seeded))
+        _save_last_failing(failing, streaks, seeded)
+    else:
+        summary["streaks"] = dict(prev_streaks)
 
     if args.json:
         print(json.dumps({"summary": summary, "results": results},
