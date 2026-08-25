@@ -386,6 +386,16 @@ users:
     entity: HJRG
     entities: [F3E, OSN, HJRP]
     autowrite_excluded: true
+    # Klaviyo user seat, per Harrison decision 3 of Ops Dept OS v1 (2026-08-08:
+    # "Tessa access = Slack re-add + Klaviyo seat") and confirmed 2026-08-18. Read
+    # by the C14 billing/seat audit. This is the ONLY seat canon confirms in
+    # writing; Hannah owns the Klaviyo pipeline end to end per the same document
+    # (section 2.1) and therefore almost certainly holds one too, but that is an
+    # inference and a seat roster built on inference is worse than one that says
+    # it is incomplete -- so the audit reports the flagged set AND says plainly
+    # that it cannot be reconciled against the account, because Klaviyo exposes no
+    # seat endpoint. Harrison completes the flags.
+    klaviyo_seat: true
     responsibilities:
       - Email-marketing review lane with Hannah (F3E)
       - Metrics + meeting structure (since 5/26)

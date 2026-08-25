@@ -72,6 +72,15 @@ class RoleRecord:
     # the role entry, it cannot go missing while the person stays active.
     # Absent/false is the default for everyone; DW eligibility is unaffected.
     autowrite_excluded: bool = False
+    # OPT-IN roster flag: this person holds a Klaviyo user seat (C14,
+    # cq-118f8bbf842e). Klaviyo exposes NO seat, user or team-member endpoint --
+    # verified against the live API surface -- so a seat audit cannot be
+    # reconciled against the account and the roster is the only record there is.
+    # Kept HERE rather than in a separate map for the `fireflies_seat` reason
+    # (D-150): population facts about people belong on the roster entry, where
+    # Harrison edits data and a 60s TTL picks it up with no restart. It grants
+    # nothing -- the audit only reports it.
+    klaviyo_seat: bool = False
 
     @property
     def all_entities(self) -> list[str]:
@@ -130,6 +139,7 @@ def _parse(raw: object) -> tuple[dict[str, RoleRecord], list[RoleRecord]]:
             external=bool(entry.get("external", False)),
             gap_escalation=bool(entry.get("gap_escalation", False)),
             autowrite_excluded=bool(entry.get("autowrite_excluded", False)),
+            klaviyo_seat=bool(entry.get("klaviyo_seat", False)),
         )
         if sid:
             index[sid] = rec

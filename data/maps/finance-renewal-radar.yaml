@@ -48,3 +48,20 @@ renewals:
       Seeded 2026-08-04 from the close-support kickoff. CONFIRM the amount and
       the true renewal date with Justin, then set `amount:` and flip
       `confirmed: true`.
+
+  - name: Klaviyo (F3 Energy email/SMS)
+    entity: F3E
+    cadence: monthly
+    next_due: 2026-09-01
+    confirmed: false
+    notes: >-
+      Seeded 2026-08-25 by C14 (cq-118f8bbf842e). Klaviyo publishes NO billing,
+      plan or invoice endpoint, so neither the amount nor the true renewal date
+      can be read from the API -- the monthly audit
+      (scripts/run_klaviyo_billing_audit.py) can only DERIVE the charge basis
+      from profile counts. Measured 2026-08-25: 4,464 email-marketable profiles
+      (account VFstej) plus 2,247 SMS-subscribed, which Klaviyo bills
+      separately. CONFIRM the amount and renewal date with Justin off an actual
+      invoice, then set `amount:` and flip `confirmed: true`. This was the one
+      live recurring-charge surface Cora already reads weekly and Klaviyo was
+      absent from it.
