@@ -265,6 +265,20 @@ _CLEAN_TOKENS = frozenset({
     "clean", "cleaner", "cleanest", "clean-label", "cleanlabel",
     "natural", "naturally", "all-natural", "clean-sweetened",
 })
+# ...but "naturally" has an ordinary factual sense that is not a clean-label
+# claim: L-theanine IS naturally present in green tea, and saying so is
+# chemistry, not marketing. Measured, not theoretical -- the first live draft of
+# an ingredient explainer was rejected for "some L-theanine may be naturally
+# present", and ingredient explainers are a whole pillar of the Learn lane, so
+# this would have blocked that pillar indefinitely. These occurrence phrasings
+# are redacted before the rail scans; "a natural energy drink" still trips.
+_NATURAL_OCCURRENCE_RES = (
+    re.compile(r"\bnaturally\s{1,3}(?:present|occurring|occurs|found|sourced|"
+               r"contains?|derived)\b", re.IGNORECASE),
+    re.compile(r"\b(?:occurs?|occurring|present|found)\s{1,3}naturally\b",
+               re.IGNORECASE),
+    re.compile(r"\bnaturally\s{1,3}in\b", re.IGNORECASE),
+)
 
 # rail 3 -- Mood is never a sleep aid. Cleared framing is "composure, not sedation",
 # so the cleared/negated forms are redacted before the scan (otherwise the
@@ -525,7 +539,8 @@ def run_preflight(
             lines = brand_lines_in(sent)
             if not (lines & {"ENERGY", "MOOD"}):
                 continue
-            toks = {w.lower().strip("'&/-") for w in _words(sent)}
+            scan_sent = _redact(sent, _NATURAL_OCCURRENCE_RES)
+            toks = {w.lower().strip("'&/-") for w in _words(scan_sent)}
             hit = toks & _CLEAN_TOKENS
             if hit:
                 trips.append(_trip(

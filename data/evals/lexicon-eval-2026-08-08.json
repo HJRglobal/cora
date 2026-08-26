@@ -1,0 +1,18 @@
+{
+  "date": "2026-08-08",
+  "lexicon_level": "resolve",
+  "cases": 71,
+  "seeded_resolution_rate": 1.0,
+  "ask_on_ambiguity_rate": 1.0,
+  "verbatim_ask_rate": 1.0,
+  "verbatim_overasks": [],
+  "false_resolutions": [],
+  "gates": {
+    "zero_false_resolutions": true,
+    "ask_on_ambiguity_100pct": true,
+    "seeded_resolution_90pct": true,
+    "verbatim_ask_100pct": true,
+    "zero_verbatim_overasks": true
+  },
+  "failures": []
+}

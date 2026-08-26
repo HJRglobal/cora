@@ -6999,6 +6999,65 @@ def _tool_f3e_hubspot_pipeline_summary(slack_user_id: str, entity: str, _input: 
         )
 
 
+_F3E_BLOG_HARRISON_ID = os.environ.get(
+    "HARRISON_SLACK_USER_ID", "U0B2RM2JYJ1")
+
+
+def _tool_f3e_blog_card_drafts(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Offer a one-tap publish card for every blog article staged but not carded.
+
+    Harrison-only IN CODE, because a tap on the card it posts publishes to the
+    public web. The tool itself writes nothing to Shopify -- it reads the
+    unpublished lists and DMs cards -- but it is the surface that CREATES the
+    authority to publish, so it is gated the same way the tap is.
+
+    Idempotent: an article that already has a card in any state (including
+    DISMISSED) is skipped, so asking twice does not re-offer a draft Harrison
+    already declined.
+
+    Deliberately emits NO contract sentinel. The narration net honours a sentinel
+    only for tools in claude_client._CONTRACT_WRITE_TOOLS, so a sentinel from a
+    non-member tool is inert there and would simply be handed to the model as
+    text -- i.e. it could reach Harrison verbatim, which is the leak class
+    D-232/D-233 documents. The authoritative surface here is the card, whose copy
+    this module writes directly.
+    """
+    if slack_user_id != _F3E_BLOG_HARRISON_ID:
+        return ("Only Harrison can be offered blog publish cards, since tapping one "
+                "publishes to the site. Ask him to run it.")
+    try:
+        from ..f3e_blog import operating_files as _of  # noqa: PLC0415
+        from ..f3e_blog import publish_cards as _pc  # noqa: PLC0415
+        from ..connectors import shopify_client as _sc  # noqa: PLC0415
+
+        already = _pc.already_carded_gids()
+        offered, skipped = [], 0
+        for blog_id, lane in ((_of.BLOG_LEARN, "learn"), (_of.BLOG_NEWS, "news")):
+            for art in _sc.list_unpublished(blog_id):
+                if art.get("id") in already:
+                    skipped += 1
+                    continue
+                rec = _pc.record_for_article(
+                    article=art, lane=lane,
+                    excerpt=art.get("summary") or "", backlog_row=None)
+                _pc.stage_card(rec)
+                offered.append("%s (%s)" % (art.get("title"), lane))
+        if not offered:
+            if skipped:
+                return ("Every staged draft already has a card in your DMs (%d of "
+                        "them), so there was nothing new to offer." % skipped)
+            return ("There are no unpublished drafts sitting in either blog right "
+                    "now, so there is nothing to card.")
+        note = "Sent you %d publish card(s): %s." % (len(offered), "; ".join(offered))
+        if skipped:
+            note += " %d other draft(s) already had a card." % skipped
+        return note
+    except Exception as exc:  # noqa: BLE001
+        log.warning("f3e_blog_card_drafts error user=%s: %s", slack_user_id, exc)
+        return ("I could not read the staged drafts just now (%s), so no cards were "
+                "sent. Nothing was changed." % exc)
+
+
 def _tool_f3e_ai_visibility(slack_user_id: str, entity: str, _input: dict) -> str:
     """Return the latest F3 AI-visibility scores + WoW deltas + top competitor gaps.
 
@@ -10968,6 +11027,24 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "f3e_blog_card_drafts",
+        "description": (
+            "Offer Harrison a one-tap publish card for each f3energy.com blog article "
+            "that is staged but not yet live. Use this for 'Cora, card the pending "
+            "drafts', 'card the staged blog posts', 'send me the publish cards', "
+            "'what blog drafts are waiting'. Reads the unpublished lists for /blogs/learn "
+            "and /blogs/news and DMs a card for anything not already carded; asking twice "
+            "does not re-offer a draft that was already dismissed. It does NOT publish "
+            "anything -- publishing happens only when Harrison taps Publish on a card. "
+            "Harrison-only. No inputs required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "f3e_ai_visibility",
         "description": (
             "Fetch F3's AI-visibility scores -- how often ChatGPT / Perplexity / "
@@ -13426,6 +13503,7 @@ _F3_IMAGE_TOOLS: frozenset[str] = frozenset({
 # Extra tools per entity, BEYOND _GLOBAL_CORE_TOOLS.
 _ENTITY_TOOLS: dict[str, frozenset[str]] = {
     "F3E": _FINANCIAL_TOOLS | _HUBSPOT_TOOLS | _F3_IMAGE_TOOLS | frozenset({
+        "f3e_blog_card_drafts",
         "f3e_creator_crm",
         "f3e_production_pipeline",
         "f3e_channel_inventory",
@@ -13553,6 +13631,7 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "f3e_inventory_by_location": _tool_f3e_inventory_by_location,
     "f3e_brand_voice_check": _tool_f3e_brand_voice_check,
     "f3e_hubspot_pipeline_summary": _tool_f3e_hubspot_pipeline_summary,
+    "f3e_blog_card_drafts": _tool_f3e_blog_card_drafts,
     "f3e_ai_visibility": _tool_f3e_ai_visibility,
     "fndr_contracts_dashboard": _tool_fndr_contracts_dashboard,
     "fndr_press_pipeline_summary": _tool_fndr_press_pipeline_summary,
@@ -13627,6 +13706,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "calendar_get_my_events": 8,
     "influencer_list_handles": 8,
     "influencer_get_status": 8,
+    "f3e_blog_card_drafts": 25,
     "f3e_ai_visibility": 8,
     "f3e_channel_inventory": 15,
     "f3e_warehouse_inventory": 15,

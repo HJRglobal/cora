@@ -22,6 +22,7 @@ from . import channel_classifier
 from . import channel_content_guard
 from . import confirm_cards
 from . import decision_alerts
+from .f3e_blog import publish_cards as f3e_blog_cards
 from . import user_access
 from . import lex_phi_access
 from .config import config
@@ -4386,6 +4387,94 @@ def _handle_gap_decline_tap(body: dict, client, *, reason: str) -> None:
                 log.warning("gap decline: chat_update failed: %s", exc)
     except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
         log.warning("gap decline handler error (non-fatal)", exc_info=True)
+
+
+# ── F3E blog one-tap publish cards (cq-2577936d2809) ────────────────────────
+#
+# Thin wrapper: Slack I/O only. All authorisation, idempotency and read-back live
+# in f3e_blog.publish_cards.process_tap, so the button path and any future typed
+# path cannot drift on correctness.
+#
+# Publishing to the public web is Harrison-only IN CODE and deliberately does not
+# go through review_lanes.can_approve -- see the module docstring.
+
+
+def _handle_f3e_blog_tap(body: dict, client, *, action: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        handle = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            # Never mutate the card here: the buttons being off is not an outcome
+            # for the draft. Point at the route that actually works today.
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("My publish buttons are switched off right now. "
+                              "Publish it from the Shopify admin link on the card "
+                              "and nothing else needs to happen."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        outcome, msg = f3e_blog_cards.process_tap(handle, actor_id, action=action)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled"):
+            # Ephemeral only. Never edit the shared card: not_authorized is
+            # someone else's tap, and already_handled is the race loser -- the
+            # winner owns the card's outcome text.
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # A retryable failure keeps its buttons: nothing was published, and the
+        # right next move is to tap again.
+        keep_buttons = outcome in f3e_blog_cards.RETRYABLE_OUTCOMES
+        if channel_id and message_ts:
+            orig = (body.get("message") or {}).get("blocks") or []
+            kept = [b for b in orig
+                    if b.get("type") == "section"
+                    or (keep_buttons and b.get("type") == "actions")]
+            new_blocks = kept + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
+            ]
+            if not kept:
+                new_blocks = [{"type": "section",
+                               "text": {"type": "mrkdwn", "text": msg}}]
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("f3e blog tap: chat_update failed: %s", exc)
+
+        # Only a real publish announces anything outside Harrison's DM.
+        if outcome == "published":
+            rec = f3e_blog_cards.get_record(handle)
+            if rec:
+                f3e_blog_cards.post_marketing_note(rec)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("f3e blog publish handler error (non-fatal)", exc_info=True)
+
+
+@app.action(f3e_blog_cards.ACTION_PUBLISH)
+def handle_f3e_blog_publish(ack, body, client) -> None:
+    ack()
+    _handle_f3e_blog_tap(body, client, action="publish")
+
+
+@app.action(f3e_blog_cards.ACTION_DISMISS)
+def handle_f3e_blog_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_f3e_blog_tap(body, client, action="dismiss")
 
 
 # ── S3 meeting-ask cards (cq-f52c6b691127) ──────────────────────────────────

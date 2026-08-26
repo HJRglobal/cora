@@ -1,0 +1,89 @@
+# AUTO-GROWN eval cases -- appended by the knowledge-review executor on
+# Harrison-approved knowledge writes (WS-3). Merged with golden-set.yaml
+# by scripts/run_kb_evals.py. Do not hand-edit ids; prune freely.
+version: 1
+cases:
+- id: auto-ka-20260711223622146658
+  entity: FNDR
+  question: what's our portfolio cash position right now?
+  expect_substring: The most recent portfolio cash position is $1,347,657 as of the
+    week of 5/29 (re
+  source: known_answer_approval
+- id: auto-ka-20260803025333591766
+  entity: F3E
+  question: what are some examples of tasks that Hannah Tommy or Alex could delegate
+    to you?
+  expect_substring: Based on the excerpts, one example task that could be delegated
+    is pulling finan
+  source: known_answer_approval
+- id: auto-ka-20260803165511527067
+  entity: F3E
+  question: 'no that is false this is the updated list of fighters that have completed
+    for the month of June: <https://docs.google.com/spreadsheets/d/12-2ijyGLZEnotVq2DJ0DwK3OoeRU_Tx8/edit?usp=sharing&amp;ouid=108246729018173191615&amp;rtpof=true&amp;sd=true|F3_Fighter_IG_Tracking_MonthlyTabs_AutoComplete_ColorC'
+  expect_substring: The discrepancy exists because the live fighter_compliance tool
+    (pulling from a
+  source: known_answer_approval
+- id: auto-note-94fd91c1dcdb
+  entity: F3E
+  question: F3 Pure's MSRP was raised to $39.99 on August 4, with the wholesale tier
+    dollar prices unchanged.
+  expect_substring: F3 Pure's MSRP was raised to $39.99 on August 4, with the wholesale
+    tier dollar
+  source: contributed_note_approval
+- id: auto-note-cdef5ccb8289
+  entity: F3E
+  question: F3 Pure retail price is $36.99 everywhere — locked 2026-07-08 and reconciled
+    across Amazon, TikTok Shop, Walmart, Shopify DTC, and the RangeMe variety pack
+    (RangeMe singles are $3.49/can). F3 Energy and F3 Mood stay at $32.99. The earlier
+    $39.99-on-Shopify idea was not adopted.
+  expect_substring: F3 Pure retail price is $36.99 everywhere — locked 2026-07-08
+    and reconciled acr
+  source: contributed_note_approval
+- id: auto-ka-20260810161436234357
+  entity: F3E
+  question: You were supposed to create some email campaign drafts in Klaviyo, but
+    I don't see them. What happened?
+  expect_substring: The email campaign drafts were not created in Klaviyo because
+    Cora's email tool
+  source: known_answer_approval
+- id: auto-ka-20260811173321095649
+  entity: F3E
+  question: is F3 a 3:1 or 4:1 rate in production?
+  expect_substring: F3 uses a 4:1 ratio in production with BlueChip, specifically
+    a 1+4 fold structu
+  source: known_answer_approval
+- id: auto-note-102a2f3c7763
+  entity: FNDR
+  question: 'Heads up for the knowledge base: as of 8/17 the fndr-unfired-work-sweep
+    task also sweeps cora-code-prompt staged kickoff files (the Cora code-queue kickoff
+    naming convention), so staged code-session prompts are no longer invisible to
+    the Friday unfired-work sweep.'
+  expect_substring: 'Heads up for the knowledge base: as of 8/17 the fndr-unfired-work-sweep
+    task als'
+  source: contributed_note_approval
+- id: auto-ka-20260819222654670336
+  entity: F3E
+  question: Looking at the 13WCF and using today's snapshot as of 3:24pm 8/19/2026,
+    How many cases of F3 selling at $16.00 per case would need to sold to meet the
+    $562,952.00 forecast from 8/15/2026 to 11/13/2026?  The result let us know the
+    required cases to be sold just to breakeven or show a $418.00 profit b
+  expect_substring: 'Based on excerpt 2, the calculation is: 35,184.5 cases (or 35,209
+    cases to net $'
+  source: known_answer_approval
+- id: auto-note-1bff0fb070cf
+  entity: FNDR
+  question: Skylar has authorization to make inventory adjustments in the f3-hq-inventory-adjustments
+    channel
+  expect_substring: Skylar has authorization to make inventory adjustments in the
+    f3-hq-inventory-ad
+  source: contributed_note_approval
+- id: auto-note-cdd5cb6577a5
+  entity: FNDR
+  question: and he can update inventory for us
+  expect_substring: and he can update inventory for us
+  source: contributed_note_approval
+- id: auto-ka-1
+  entity: FNDR
+  question: What are the payment terms?
+  expect_substring: Payment terms are Net 30.
+  source: known_answer_approval
