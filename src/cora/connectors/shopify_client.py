@@ -951,3 +951,280 @@ def graphql(mutation: str, variables: dict) -> dict:
         raise ShopifyConnectorError(f"Shopify GraphQL errors: {msg}")
 
     return body
+
+
+# ---------------------------------------------------------------------------
+# Blog article ops (F3E News + Learn one-tap publish lane, 2026-08-26)
+#
+# WRITE-SAFETY CONTRACT -- read this before touching anything below.
+#
+#   1. `create_article` takes NO published/visibility parameter. It hard-codes
+#      isPublished=False. A drafting job therefore CANNOT stage a live article
+#      even by passing the wrong argument, because the argument does not exist.
+#   2. isPublished=True is sent from exactly ONE function in this repo,
+#      `publish_article`, whose only sanctioned caller is the human confirm-tap
+#      handler. tests/test_f3e_blog_articles.py pins both properties at the
+#      SOURCE level, so a later edit that widens either one fails the suite.
+#   3. Every write is READ BACK (D-110 rule 2): the mutation's own echo is never
+#      trusted. A write whose read-back disagrees RAISES, so a caller can only
+#      ever report FAILED -- never "staged" or "published" -- on a bad write.
+#   4. Scope: articles only. Nothing here touches products, pages, themes, menus,
+#      or any blog other than the blog_id the caller names. There is deliberately
+#      no delete/redirect helper: legacy article URLs may already be cited by AI
+#      engines, and canon is to fix in place, never to remove.
+# ---------------------------------------------------------------------------
+
+# Public storefront host, used to build the post-publish verification URL. The
+# admin domain (*.myshopify.com) is deliberately NOT used: the point of the
+# publish read-back is to prove the page a READER is served is live. On this
+# store a theme template can ignore an API body write entirely (the page.faq
+# precedent), so mutation success is not evidence of a rendered page.
+BLOG_PUBLIC_HOST = "f3energy.com"
+
+_ARTICLE_FIELDS = """
+    id
+    title
+    handle
+    summary
+    isPublished
+    publishedAt
+    tags
+    blog { id handle title }
+    author { name }
+"""
+
+
+def _article_numeric_id(article_id: str) -> str:
+    """gid://shopify/Article/618441081152 -> 618441081152 (idempotent)."""
+    return str(article_id or "").rsplit("/", 1)[-1]
+
+
+def article_gid(article_id: str) -> str:
+    """Accept a bare numeric id or a full gid; return a full gid."""
+    raw = str(article_id or "").strip()
+    if not raw:
+        raise ShopifyConnectorError("article id is empty")
+    if raw.startswith("gid://"):
+        return raw
+    if not raw.isdigit():
+        raise ShopifyConnectorError("not a valid article id: %r" % raw)
+    return "gid://shopify/Article/%s" % raw
+
+
+def blog_gid(blog_id: str) -> str:
+    """Accept a bare numeric id or a full gid; return a full gid."""
+    raw = str(blog_id or "").strip()
+    if not raw:
+        raise ShopifyConnectorError("blog id is empty")
+    if raw.startswith("gid://"):
+        return raw
+    if not raw.isdigit():
+        raise ShopifyConnectorError("not a valid blog id: %r" % raw)
+    return "gid://shopify/Blog/%s" % raw
+
+
+def article_admin_url(article_id: str) -> str:
+    """The Shopify admin edit link for an article (what a human opens to review)."""
+    store, _ = _store_config()
+    handle = store.split(".")[0]
+    return "https://admin.shopify.com/store/%s/content/articles/%s" % (
+        handle, _article_numeric_id(article_id),
+    )
+
+
+def article_public_url(blog_handle: str, article_handle: str) -> str:
+    """The reader-facing URL. Empty string when either handle is missing."""
+    if not blog_handle or not article_handle:
+        return ""
+    return "https://%s/blogs/%s/%s" % (BLOG_PUBLIC_HOST, blog_handle, article_handle)
+
+
+def _raise_user_errors(body: dict, field_name: str) -> None:
+    """Raise on a mutation's own userErrors payload.
+
+    A GraphQL mutation can return HTTP 200 with no top-level `errors` and still
+    have refused the write; `graphql()` only covers the latter, so every mutation
+    here checks its own payload.
+    """
+    errs = ((body.get("data") or {}).get(field_name) or {}).get("userErrors") or []
+    if errs:
+        msg = "; ".join(
+            "%s: %s" % (e.get("field") or "?", e.get("message") or e) for e in errs
+        )
+        raise ShopifyConnectorError("Shopify %s userErrors: %s" % (field_name, msg))
+
+
+def get_article(article_id: str) -> dict:
+    """Fetch one article. Raises ShopifyConnectorError if it does not exist.
+
+    Deliberately NOT cached: this is the read-back primitive, and a stale cache
+    hit would defeat the entire point of reading back (D-110).
+    """
+    query = "query($id: ID!) { article(id: $id) { %s } }" % _ARTICLE_FIELDS
+    body = graphql(query, {"id": article_gid(article_id)})
+    art = (body.get("data") or {}).get("article")
+    if not art:
+        raise ShopifyConnectorError("article %s not found" % article_id)
+    return art
+
+
+def list_unpublished(blog_id: str, limit: int = 50) -> list[dict]:
+    """Articles in one blog whose isPublished is False, newest-created first.
+
+    Filtered client-side on the authoritative isPublished field rather than via a
+    Shopify search-query string, so a query-syntax change upstream can never
+    silently return PUBLISHED articles as "unpublished" -- which in this lane
+    would mean offering Harrison a publish card for something already live.
+
+    `reverse: True` is load-bearing, not cosmetic: Blog.articles at API 2024-10
+    accepts only first/after/last/before/reverse (no sortKey, no query -- verified
+    by live introspection), so newest-first is the only way to guarantee freshly
+    staged drafts stay inside the window as the blog grows past `limit`.
+    """
+    query = """
+    query($id: ID!, $n: Int!) {
+      blog(id: $id) {
+        id handle title
+        articles(first: $n, reverse: true) {
+          nodes { %s }
+        }
+      }
+    }
+    """ % _ARTICLE_FIELDS
+    body = graphql(query, {"id": blog_gid(blog_id), "n": max(1, min(int(limit), 250))})
+    blog = (body.get("data") or {}).get("blog")
+    if not blog:
+        raise ShopifyConnectorError("blog %s not found" % blog_id)
+    nodes = (blog.get("articles") or {}).get("nodes") or []
+    return [n for n in nodes if n.get("isPublished") is False]
+
+
+def create_article(
+    *,
+    blog_id: str,
+    title: str,
+    body_html: str,
+    summary: str = "",
+    tags: Optional[list[str]] = None,
+    author_name: str = "F3 Energy Team",
+    image_url: str = "",
+    image_alt: str = "",
+) -> dict:
+    """Stage a NEW article UNPUBLISHED. Returns the READ-BACK article dict.
+
+    There is deliberately no is_published parameter (contract note 1 above). The
+    read-back re-asserts isPublished is False and a matching title; either
+    mismatch raises rather than reporting a successful staging.
+    """
+    if not str(title).strip():
+        raise ShopifyConnectorError("create_article: title is required")
+    if not str(body_html).strip():
+        raise ShopifyConnectorError("create_article: body is required")
+
+    art_input: dict = {
+        "blogId": blog_gid(blog_id),
+        "title": str(title).strip(),
+        "body": body_html,
+        # Hard-coded, NOT a parameter. See contract note 1.
+        "isPublished": False,
+        "author": {"name": author_name or "F3 Energy Team"},
+    }
+    if summary:
+        art_input["summary"] = summary
+    if tags:
+        art_input["tags"] = [str(t) for t in tags if str(t).strip()]
+    if image_url:
+        art_input["image"] = {"url": image_url, "altText": image_alt or str(title)[:250]}
+
+    mutation = """
+    mutation($article: ArticleCreateInput!) {
+      articleCreate(article: $article) {
+        article { id title isPublished }
+        userErrors { field message }
+      }
+    }
+    """
+    body = graphql(mutation, {"article": art_input})
+    _raise_user_errors(body, "articleCreate")
+    created = ((body.get("data") or {}).get("articleCreate") or {}).get("article") or {}
+    new_id = created.get("id")
+    if not new_id:
+        raise ShopifyConnectorError("articleCreate returned no article id")
+
+    art = get_article(new_id)  # D-110: trust the read-back, not the echo.
+    if art.get("isPublished") is not False:
+        raise ShopifyConnectorError(
+            "articleCreate read-back FAILED: %s came back isPublished=%r, expected "
+            "False. The article WAS created but is not confirmed unpublished -- open "
+            "it in admin before doing anything else." % (new_id, art.get("isPublished"))
+        )
+    if (art.get("title") or "").strip() != str(title).strip():
+        raise ShopifyConnectorError(
+            "articleCreate read-back FAILED: title mismatch for %s (got %r, sent %r)"
+            % (new_id, art.get("title"), title)
+        )
+    log.info(
+        "shopify create_article STAGED UNPUBLISHED id=%s blog=%s title=%r",
+        new_id, blog_id, str(title)[:80],
+    )
+    return art
+
+
+def publish_article(article_id: str) -> dict:
+    """Flip ONE existing article to published. Returns the READ-BACK article dict.
+
+    The ONLY function in this repo that sends isPublished=True. Its only
+    sanctioned caller is the human confirm-tap handler -- never a drafting job,
+    never an LLM-reachable tool. The read-back re-asserts isPublished is True and
+    raises otherwise, so a caller can never report "published" on a silent no-op.
+    """
+    gid = article_gid(article_id)
+    before = get_article(gid)
+    if before.get("isPublished") is True:
+        # Idempotent: already live. Report that, rather than writing again.
+        log.info("shopify publish_article NOOP (already published) id=%s", gid)
+        return before
+
+    mutation = """
+    mutation($id: ID!, $article: ArticleUpdateInput!) {
+      articleUpdate(id: $id, article: $article) {
+        article { id title isPublished publishedAt }
+        userErrors { field message }
+      }
+    }
+    """
+    body = graphql(mutation, {"id": gid, "article": {"isPublished": True}})
+    _raise_user_errors(body, "articleUpdate")
+
+    art = get_article(gid)
+    if art.get("isPublished") is not True:
+        raise ShopifyConnectorError(
+            "publish read-back FAILED: %s still reads isPublished=%r. It is NOT live."
+            % (gid, art.get("isPublished"))
+        )
+    _cache_clear()
+    log.info("shopify publish_article PUBLISHED id=%s title=%r",
+             gid, str(art.get("title"))[:80])
+    return art
+
+
+def fetch_public_page(url: str, timeout: int = 20) -> tuple[int, str]:
+    """GET a public storefront URL. Returns (status_code, text). NEVER raises.
+
+    The second half of the publish read-back: the Admin API reporting "published"
+    and a reader actually being served the page are different claims, and only the
+    second one is the promise this lane makes to Harrison. Returns (0, "") on any
+    network failure so the caller degrades to "could not verify" rather than
+    crashing after a real publish.
+    """
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "cora-blog-publish-verify/1.0"},
+            allow_redirects=True,
+        )
+        return resp.status_code, resp.text or ""
+    except requests.RequestException as exc:
+        log.warning("shopify fetch_public_page failed url=%s: %s", url, exc)
+        return 0, ""
