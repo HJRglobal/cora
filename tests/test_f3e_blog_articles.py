@@ -317,10 +317,30 @@ def test_list_unpublished_clamps_the_page_size(env):
 # ---------------------------------------------------------------------------
 
 
+def _streamed(status=200, body=b"<h1>Hi</h1>"):
+    """A streaming response. The fetch is STREAMED with a byte ceiling because it
+    is also pointed at arbitrary third-party pages (see MAX_PAGE_BYTES)."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.ok = 200 <= status < 300
+    resp.encoding = "utf-8"
+    resp.__enter__ = lambda self=resp: resp
+    resp.__exit__ = lambda *a: False
+    resp.iter_content = lambda chunk_size=65536: [body]
+    return resp
+
+
 def test_fetch_public_page_returns_status_and_body(env):
-    with patch.object(sc.requests, "get", return_value=_resp(200, None, "<h1>Hi</h1>")):
+    with patch.object(sc.requests, "get", return_value=_streamed()):
         code, text = sc.fetch_public_page("https://f3energy.com/blogs/learn/x")
     assert code == 200 and "Hi" in text
+
+
+def test_fetch_public_page_is_streamed_with_a_ceiling(env):
+    with patch.object(sc.requests, "get", return_value=_streamed()) as get:
+        sc.fetch_public_page("https://f3energy.com/blogs/learn/x")
+    assert get.call_args[1]["stream"] is True
+    assert sc.MAX_PAGE_BYTES > 0
 
 
 def test_fetch_public_page_never_raises(env):

@@ -450,14 +450,35 @@ def test_the_buttons_off_card_promises_no_affordance_it_cannot_honour():
     assert "type" not in text.lower().split("admin")[0]
 
 
-def test_the_card_body_is_chunked_so_it_cannot_silently_truncate():
+def test_a_huge_excerpt_is_capped_not_merely_chunked():
+    """The cap is the real defence: slack_egress's bare-URL redactor is quadratic
+    over a long uniform run, and an uncapped card body measured 36 seconds at
+    100 KB. Chunking would have kept the card valid while still paying that."""
     rec = pc.get_record(_staged()["handle"])
-    rec["excerpt"] = "x" * 9000
+    rec["excerpt"] = "x" * 100000
+    import time
+    start = time.perf_counter()
     _, blocks = pc.build_publish_blocks(rec)
+    assert (time.perf_counter() - start) < 1.0
     sections = [b for b in blocks if b["type"] == "section"]
-    assert len(sections) > 1
     for s in sections:
         assert len(s["text"]["text"]) <= 3000
+    body = "\n".join(s["text"]["text"] for s in sections)
+    assert body.count("x") <= pc._MAX_EXCERPT_CHARS
+
+
+def test_a_multiline_title_cannot_break_its_own_bold_wrapper():
+    rec = pc.get_record(_staged()["handle"])
+    rec["title"] = "Real title\n\n*Published:* live at f3energy.com"
+    _, blocks = pc.build_publish_blocks(rec)
+    header = [b for b in blocks if b["type"] == "section"][0]["text"]["text"]
+    # The invariant that matters: the title stays on ONE line, so it cannot
+    # inject a body line of its own. A stray asterisk inside that line renders
+    # oddly and is cosmetic; a NEWLINE broke the bold wrapper and added a line
+    # that read as though Cora had written it.
+    lines = [l for l in header.split("\n") if "Real title" in l]
+    assert len(lines) == 1, header
+    assert "\n" not in pc._one_line(rec["title"], pc._MAX_TITLE_CHARS)
 
 
 def test_card_text_is_sanitized_at_construction():
@@ -479,7 +500,9 @@ def test_the_pending_store_is_on_disk_not_in_process_memory():
     assert "mint_stash_id" not in src
     rec = _staged()
     assert pc.pending_path().exists()
-    assert rec["handle"] in json.loads(pc.pending_path().read_text(encoding="utf-8"))
+    lines = pc.pending_path().read_text(encoding="utf-8").splitlines()
+    handles = {json.loads(l)["handle"] for l in lines if l.strip()}
+    assert rec["handle"] in handles
 
 
 def test_the_record_is_persisted_even_when_the_dm_fails():

@@ -66,20 +66,25 @@ class PressFlip:
         return self.page_id
 
 
-def published_f3_rows() -> list[PressFlip]:
-    """Published F3 coverage rows from the press tracker.
+def published_f3_rows() -> tuple[list[PressFlip], bool, int]:
+    """(rows, read_ok, skipped_rows) from the press tracker.
 
-    Fail-soft: returns [] and logs on any read failure. A press-tracker outage
-    must not fail the whole weekly run, which also has a Learn draft to stage.
+    `read_ok` exists because the first cut returned [] for BOTH a read failure
+    and a genuinely quiet week, so a sustained Notion outage read as "no news
+    this week", every week, forever. `skipped_rows` counts rows that failed to
+    parse -- which matters most on the FIRST run, where a baseline taken from an
+    incomplete read would later re-amplify already-amplified coverage as if it
+    were new.
     """
     try:
         from ..tools import notion_client as nc
         pages = nc._paginate(db_id=nc._PRESS_DB_ID)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
         log.warning("f3e_blog news: press tracker unreadable: %s", exc)
-        return []
+        return [], False, 0
 
     out: list[PressFlip] = []
+    skipped = 0
     for page in pages:
         props = page.get("properties", {})
         try:
@@ -95,8 +100,9 @@ def published_f3_rows() -> list[PressFlip]:
                 link=nc._url(props, "Coverage Link") or "",  # noqa: SLF001
             ))
         except Exception as exc:  # noqa: BLE001 -- one bad row must not lose the rest
+            skipped += 1
             log.warning("f3e_blog news: skipping a press row: %s", exc)
-    return out
+    return out, True, skipped
 
 
 _TITLE_RE = re.compile(r"<title[^>]{0,200}>(.{0,300}?)</title>",
@@ -121,7 +127,8 @@ def fetch_headline(url: str) -> str:
 
 
 def new_flips(flips: list[PressFlip], seen: list[str]) -> list[PressFlip]:
-    return [f for f in flips if f.key and f.key not in set(seen or [])]
+    known = set(seen or [])
+    return [f for f in flips if f.key and f.key not in known]
 
 
 def draft_and_stage_flip(
@@ -165,16 +172,19 @@ def draft_and_stage_flip(
         )
     except Exception as exc:  # noqa: BLE001
         return False, ("Press flip %r: staging FAILED and nothing is live: %s"
-                       % (flip.reporter, exc))
+                       % (flip.reporter, publish_cards.scrub_for_report(exc)))
 
     rec = publish_cards.record_for_article(
         article=article, lane="news", excerpt=draft["summary"],
         backlog_row=None, rails_passed=len(result.rails_checked),
     )
-    publish_cards.stage_card(rec, client_factory=client_factory)
+    stored = publish_cards.stage_card(rec, client_factory=client_factory)
+    if not publish_cards.card_was_delivered(stored):
+        return True, ("Staged a News amplification for %r (%s) UNPUBLISHED, but I "
+                      "could NOT deliver its publish card. Nothing is live."
+                      % (flip.reporter, flip.outlet))
     return True, ("Staged a News amplification for %r (%s) UNPUBLISHED and carded "
-                  "it: %r -> %s" % (flip.reporter, flip.outlet, article.get("title"),
-                                    shopify_client.article_admin_url(article["id"])))
+                  "it: %r" % (flip.reporter, flip.outlet, article.get("title")))
 
 
 class _PressRow:
@@ -206,13 +216,32 @@ def sweep(report, state: dict, *, dry_run: bool = False, client_factory=None) ->
     2026-08-26 were amplified by hand that same day, and re-amplifying them would
     be a duplicate post, not a catch-up.
     """
-    flips = published_f3_rows()
+    flips, read_ok, skipped = published_f3_rows()
+    if not read_ok:
+        report.failed = True
+        report.say("Press tracker: I could not read it this run, so I do not know "
+                   "whether there is new coverage. This is not the same as a quiet "
+                   "week.")
+        return state
+    if skipped:
+        report.say("Press tracker: %d row(s) would not parse and were skipped."
+                   % skipped)
     if not flips:
-        report.say("Press tracker: no Published F3 coverage rows readable this run.")
+        report.say("Press tracker: no Published F3 coverage rows this run.")
         return state
 
     seen = state.get("news_seen_page_ids")
     if seen is None:
+        if skipped:
+            # A baseline from a partial read would later treat the missing rows as
+            # NEW flips and re-amplify coverage already published by hand.
+            report.say("Press tracker: not recording a baseline from an incomplete "
+                       "read. I will take it on a clean run.")
+            return state
+        if dry_run:
+            report.say("Press tracker: a real run would record a baseline of %d "
+                       "already-Published row(s) and draft nothing." % len(flips))
+            return state
         state["news_seen_page_ids"] = [f.key for f in flips]
         report.say("Press tracker baseline recorded: %d row(s) already Published, "
                    "left alone (they were amplified by hand)." % len(flips))
@@ -227,8 +256,10 @@ def sweep(report, state: dict, *, dry_run: bool = False, client_factory=None) ->
         template = operating_files.read_templates()
         lineup = operating_files.read_lineup()
     except Exception as exc:  # noqa: BLE001
+        report.failed = True
         report.say("Press tracker found %d new flip(s) but the templates or lineup "
-                   "did not load (%s), so nothing was drafted." % (len(fresh), exc))
+                   "did not load (%s), so nothing was drafted."
+                   % (len(fresh), publish_cards.scrub_for_report(exc)))
         return state
 
     faq = drafting.fetch_faq_text()

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,9 @@ HARRISON_ID = os.environ.get("HARRISON_SLACK_USER_ID", "U0B2RM2JYJ1")
 MARKETING_CHANNEL = "C0B4V8BGJSJ"
 
 STATE_PENDING = "PENDING"
+#: Claimed by a publish tap, network I/O in flight. Not terminal, but not
+#: available either -- a Dismiss tap arriving now must not take the row.
+STATE_PUBLISHING = "PUBLISHING"
 STATE_PUBLISHED = "PUBLISHED"
 STATE_DISMISSED = "DISMISSED"
 STATE_FAILED = "FAILED"
@@ -73,7 +77,9 @@ _LOCK = Lock()
 
 # Outcomes whose card keeps its buttons: the action did not happen and retrying
 # is the right next move. Everything else is terminal and the card is stripped.
-RETRYABLE_OUTCOMES = frozenset({"failed", "error"})
+# "error" was in the first cut and no branch ever returned it, which made the
+# keep-buttons contract read wider than it was.
+RETRYABLE_OUTCOMES = frozenset({"failed"})
 
 
 def _now_iso() -> str:
@@ -81,9 +87,28 @@ def _now_iso() -> str:
 
 
 def pending_path() -> Path:
+    """The card store: an APPEND-ONLY event log, not a rewritten JSON blob.
+
+    This shape is load-bearing. The first cut kept a JSON dict and did whole-file
+    read-modify-write under a `threading.Lock` -- which is process-local, while
+    the two writers here are DIFFERENT PROCESSES (the weekly script mints cards;
+    the always-on bot resolves taps). Both directions of lost update were
+    reproduced with two real interpreters:
+
+      * the script's stale snapshot reverted a PUBLISHED card to PENDING, and
+      * the script's own newly staged card was ERASED by the bot's write -- the
+        article staged in Shopify, the backlog row consumed, the card sitting in
+        Harrison's DM, and every tap answering "I don't have a record of that
+        draft anymore", permanently.
+
+    An append-only log has no read-modify-write, so neither can happen: a writer
+    only ever adds a line. The fold in `_fold` is what turns events back into
+    state, and it refuses to move a row OUT of a terminal state, so a late
+    `staged` event cannot resurrect a resolved card.
+    """
     return Path(os.environ.get(
         "CORA_F3E_BLOG_CARDS_PATH",
-        str(_REPO_ROOT / "data" / "state" / "f3e-blog-publish-cards.json"),
+        str(_REPO_ROOT / "data" / "state" / "f3e-blog-card-events.jsonl"),
     ))
 
 
@@ -94,19 +119,82 @@ def ledger_path() -> Path:
     ))
 
 
-def _read_all() -> dict:
-    try:
-        return json.loads(pending_path().read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+class CardStoreCorrupt(RuntimeError):
+    """The event log exists but has unreadable lines."""
 
 
-def _write_all(data: dict) -> None:
+#: States no later event may move a row out of.
+_TERMINAL = frozenset({STATE_PUBLISHED, STATE_DISMISSED})
+
+
+def _append_event(handle: str, event: str, fields: dict) -> None:
+    """Append one event line. The ONLY write path for card state."""
+    row = {"handle": handle, "event": event, "at": _now_iso()}
+    row.update(fields)
     p = pending_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    # Single append under one open(): the OS appends atomically for a write this
+    # small, so two processes interleave as whole lines rather than corrupting
+    # each other. No temp file, so no shared fixed .tmp name to collide on.
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _fold(*, strict: bool = False) -> dict:
+    """Replay the event log into {handle: record}.
+
+    A malformed line is SKIPPED and counted, never treated as an empty store.
+    That distinction matters: the first cut's `except Exception: return {}` could
+    not tell "no file yet" from "torn file", so a single bad byte silently
+    emptied the store -- and on the pipeline's state file the same shape made a
+    fail-closed drift gate report "first run, nothing to compare against" and
+    re-arm staging against un-reviewed claims rails.
+
+    `strict=True` raises `CardStoreCorrupt` instead, for callers that must not
+    act on a partial view.
+    """
+    p = pending_path()
+    if not p.exists():
+        return {}
+    out: dict = {}
+    bad = 0
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise CardStoreCorrupt("card event log unreadable: %s" % exc) from exc
+        log.error("f3e_blog: card event log unreadable (%s)", exc)
+        return {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+            handle = row["handle"]
+        except Exception:  # noqa: BLE001
+            bad += 1
+            continue
+        cur = out.get(handle)
+        if cur is None:
+            out[handle] = {k: v for k, v in row.items() if k != "event"}
+            continue
+        # Terminal is sticky: a later non-terminal event must not resurrect a
+        # resolved card (fold is otherwise last-write-wins).
+        if cur.get("state") in _TERMINAL and row.get("state") not in _TERMINAL:
+            row = {k: v for k, v in row.items() if k not in ("state", "event")}
+        cur.update({k: v for k, v in row.items() if k != "event"})
+    if bad:
+        msg = "card event log has %d unreadable line(s)" % bad
+        if strict:
+            raise CardStoreCorrupt(msg)
+        log.error("f3e_blog: %s -- state may be incomplete", msg)
+    return out
+
+
+def _read_all() -> dict:
+    return _fold()
 
 
 def _ledger(event: str, rec: dict, **extra) -> None:
@@ -136,6 +224,71 @@ def mint_handle() -> str:
     return "blogpub-" + secrets.token_hex(6)
 
 
+# A card excerpt past a couple of sentences has no reader value, and an uncapped
+# one is a real performance hazard rather than a cosmetic one: slack_egress's
+# bare-URL redactor is quadratic over a long uniform run, so sanitising an
+# uncapped body measured 1.4s at 20 KB, 8.8s at 50 KB and 36s at 100 KB. The
+# card-drafts tool passes a Shopify `summary` straight through and loops up to 50
+# articles inside a 25s tool timeout, so the cap is what keeps that bounded.
+_MAX_EXCERPT_CHARS = 600
+_MAX_TITLE_CHARS = 200
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse to a single line and bound the length.
+
+    Applied to the TITLE as well as the excerpt: the first cut flattened only the
+    excerpt, so a multi-line title broke its own bold wrapper and injected a
+    stray body line into the card.
+    """
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+# Report-scrub patterns. Each is a single bounded quantifier with a distinct
+# terminator, so none can backtrack.
+_URL_RE = re.compile(r"https?://[^\s'\")]{0,400}")
+# Spaces are ALLOWED inside the path and the bound is the quote, because the one
+# path this exists to hide is "G:\My Drive\HJR-Founder-OS\..." -- a class that
+# excluded whitespace stopped at "My Drive" and left the rest of the Founder-OS
+# tree in the channel post.
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:\\[^'\")]{0,400}")
+_STORE_HOST_RE = re.compile(r"\b[\w.-]{1,60}\.myshopify\.com\b")
+_ADMIN_HOST_RE = re.compile(r"\badmin\.shopify\.com\b")
+_ADMIN_API_RE = re.compile(r"/admin/api/[\d-]{1,12}/[\w.]{0,40}")
+
+
+def scrub_for_report(exc: Exception | str, limit: int = 200) -> str:
+    """A bounded, path-free, host-free rendering of an error for a REPORT.
+
+    The weekly report is posted to #f3-marketing, and raw exception text there
+    leaked the Founder-OS Drive path, the myshopify store host, the admin API
+    path and raw Shopify response bodies -- none of which belong in a marketing
+    channel, and the connector's own contract says never to surface store URLs.
+    The class-level Slack sanitiser does not cover Windows paths or Shopify
+    hosts, so this is the scrub that has to do it.
+    """
+    txt = " ".join(str(exc).split())
+    # Order matters: a full URL collapses whole before the host rules run.
+    txt = _URL_RE.sub("<a link>", txt)
+    txt = _WIN_PATH_RE.sub("<a file path>", txt)
+    txt = _STORE_HOST_RE.sub("the store", txt)
+    txt = _ADMIN_HOST_RE.sub("the store admin", txt)
+    txt = _ADMIN_API_RE.sub("the store API", txt)
+    return txt if len(txt) <= limit else txt[: limit - 3] + "..."
+
+
+def card_was_delivered(rec: dict | None) -> bool:
+    """True only when a card message actually landed in Harrison's DM.
+
+    `stage_card` is fail-soft (no token, or a Slack error, records the card but
+    delivers nothing), and the first cut had four callers -- including the
+    permanent Drive pipeline log -- asserting "Publish card sent to Harrison"
+    from the mere absence of an exception.
+    """
+    return bool((rec or {}).get("dm_message_ts"))
+
+
 # ---------------------------------------------------------------------------
 # Card copy
 #
@@ -155,14 +308,27 @@ def already_carded_gids(data: dict | None = None) -> set[str]:
     re-card loop the spec forbids.
     """
     recs = data if data is not None else _read_all()
-    return {r.get("article_gid") for r in recs.values() if r.get("article_gid")}
+    return {
+        r.get("article_gid") for r in recs.values()
+        if r.get("article_gid")
+        # A recorded-but-UNDELIVERED card must not suppress re-offering: it was
+        # what made "Every staged draft already has a card in your DMs" a false
+        # statement about Harrison's DMs, with no resend path anywhere.
+        and (card_was_delivered(r) or r.get("state") in _TERMINAL)
+    }
+
+
+def undelivered_records() -> list[dict]:
+    """PENDING records whose card never reached Slack -- re-offerable."""
+    return [dict(r) for r in _read_all().values()
+            if r.get("state") == STATE_PENDING and not card_was_delivered(r)]
 
 
 def build_publish_blocks(rec: dict) -> tuple[str, list[dict]]:
     """Return (fallback_text, blocks) for one staged article."""
-    title = rec.get("title") or "(untitled)"
+    title = _one_line(rec.get("title"), _MAX_TITLE_CHARS) or "(untitled)"
     lane = (rec.get("lane") or "").capitalize() or "Blog"
-    excerpt = (rec.get("excerpt") or "").strip()
+    excerpt = _one_line(rec.get("excerpt"), _MAX_EXCERPT_CHARS)
     admin_url = rec.get("admin_url") or ""
     handle = rec["handle"]
     rails = rec.get("rails_passed")
@@ -171,13 +337,27 @@ def build_publish_blocks(rec: dict) -> tuple[str, list[dict]]:
     staged = "Staged unpublished in /blogs/%s." % (rec.get("blog_handle") or lane.lower())
     if rails:
         staged += " Claims preflight passed %d mechanical rails." % int(rails)
+    if rails is None:
+        # No preflight ran on this one -- it was not staged by this lane (the
+        # card-drafts tool offers whatever is sitting unpublished). Saying so is
+        # required: the footer below names the rails that were NOT machine
+        # checked, whose only reading is that the others WERE.
+        staged += (" I did not draft this one, so my claims preflight never ran "
+                   "on it. Read it before publishing.")
     lines.append(staged)
     if excerpt:
         lines.append("")
-        lines.append("> " + excerpt.replace("\n", " "))
+        lines.append("> " + excerpt)
     if admin_url:
         lines.append("")
         lines.append("<%s|Read the full draft in Shopify admin>" % admin_url)
+    else:
+        # Never name a link the card does not carry. The admin URL is empty only
+        # when the store env is unset, and the first cut still told Harrison to
+        # "publish it from the Shopify admin link above".
+        lines.append("")
+        lines.append("I could not build the admin link for this one. It is in the "
+                     "Shopify admin under this title.")
 
     body = slack_egress.sanitize_text("\n".join(lines))
     blocks = confirm_cards.chunk_mrkdwn_sections(body)
@@ -202,6 +382,52 @@ def build_publish_blocks(rec: dict) -> tuple[str, list[dict]]:
     return fallback, blocks
 
 
+def terminal_card_blocks(orig_blocks: list[dict], message: str,
+                         *, keep_buttons: bool) -> list[dict]:
+    """Rewrite a tapped card so its own body no longer contradicts the outcome.
+
+    The first cut kept every section verbatim and appended the outcome as a small
+    grey context line -- so after a successful publish the card still headlined
+    "Learn draft ready to publish" and "Staged unpublished in /blogs/learn", both
+    of which the tap had just falsified, with the truth in the smallest element on
+    screen. The sibling this was copied from keeps its sections because they hold
+    REVIEWED CONTENT the reader still needs; here the first lines are STATE CLAIMS.
+
+    So: the state line is replaced, the title / excerpt / link lines are kept, and
+    the actions block survives only on a retryable outcome (where nothing
+    happened and the ask still stands).
+    """
+    kept: list[dict] = []
+    for block in orig_blocks or []:
+        btype = block.get("type")
+        if btype == "section":
+            text = ((block.get("text") or {}).get("text") or "")
+            lines = [
+                ln for ln in text.split("\n")
+                if not ln.startswith("*") or ln.count("*") > 2
+            ]
+            # Drop the two state-claim lines; keep the title, excerpt and link.
+            lines = [ln for ln in lines
+                     if "ready to publish" not in ln
+                     and not ln.startswith("Staged unpublished")]
+            body = "\n".join(lines).strip()
+            if body:
+                kept.append({"type": "section",
+                             "text": {"type": "mrkdwn", "text": body}})
+        elif btype == "actions" and keep_buttons:
+            kept.append(block)
+    kept.insert(0, {"type": "section", "text": {
+        "type": "mrkdwn", "text": slack_egress.sanitize_text(message)}})
+    if keep_buttons:
+        # The retry path still asks for a publish decision, so the disclosure of
+        # what was NOT machine checked has to survive with it.
+        kept.append({"type": "context", "elements": [{
+            "type": "mrkdwn", "text": slack_egress.sanitize_text(
+                "Still not machine checked: %s." % ", ".join(
+                    preflight.UNENFORCED_RAILS))}]})
+    return kept
+
+
 def build_buttons_off_blocks(rec: dict) -> tuple[str, list[dict]]:
     """The card shown when the button surface is switched off.
 
@@ -213,12 +439,13 @@ def build_buttons_off_blocks(rec: dict) -> tuple[str, list[dict]]:
     """
     fallback, blocks = build_publish_blocks(rec)
     blocks = [b for b in blocks if b.get("type") != "actions"]
+    where = ("the Shopify admin link above" if rec.get("admin_url")
+             else "the Shopify admin, under this title")
     blocks.append({
         "type": "context",
         "elements": [{"type": "mrkdwn", "text": slack_egress.sanitize_text(
             "My publish buttons are switched off right now, so publish it from "
-            "the Shopify admin link above when you're ready. Nothing goes live "
-            "until you do."
+            "%s when you're ready. Nothing goes live until you do." % where
         )}],
     })
     return fallback, blocks
@@ -252,12 +479,13 @@ def record_for_article(
         "handle": mint_handle(),
         "article_gid": gid,
         "article_numeric": str(gid).rsplit("/", 1)[-1],
-        "title": article.get("title") or "",
+        "title": _one_line(article.get("title"), _MAX_TITLE_CHARS),
         "article_handle": article.get("handle") or "",
         "blog_gid": blog.get("id") or "",
         "blog_handle": blog.get("handle") or "",
         "lane": lane,
-        "excerpt": excerpt or (article.get("summary") or ""),
+        "excerpt": _one_line(excerpt or article.get("summary"),
+                             _MAX_EXCERPT_CHARS),
         "admin_url": _safe_admin_url(gid),
         "backlog_row": backlog_row,
         "rails_passed": rails_passed,
@@ -279,14 +507,18 @@ def _safe_admin_url(gid: str) -> str:
 def stage_card(rec: dict, *, client_factory=None) -> dict:
     """Persist the record and DM the card to Harrison.
 
+    Returns the record. Callers MUST check `dm_message_ts` before reporting that
+    a card was sent: this function is fail-soft by design (no token, or a Slack
+    error, leaves the record recorded but undelivered), and the first cut had
+    four callers that all asserted "Publish card sent to Harrison" from the mere
+    absence of an exception -- including the permanent Drive pipeline log. Use
+    `card_was_delivered`.
+
     The record is persisted BEFORE the DM: a card that posted but was not recorded
-    would be untappable (the tap would read orphaned), while a record with no card
-    is merely re-offerable. Fail toward the recoverable side.
+    would be untappable, while a record with no card is merely re-offerable. Fail
+    toward the recoverable side.
     """
-    with _LOCK:
-        data = _read_all()
-        data[rec["handle"]] = rec
-        _write_all(data)
+    _append_event(rec["handle"], "staged", rec)
     _ledger("staged", rec, state=rec.get("state"))
 
     factory = client_factory or _default_client_factory
@@ -306,16 +538,14 @@ def stage_card(rec: dict, *, client_factory=None) -> dict:
             channel=channel, text=fallback, blocks=blocks,
             unfurl_links=False, unfurl_media=False,
         )
-        with _LOCK:
-            data = _read_all()
-            stored = data.get(rec["handle"], rec)
-            stored["dm_channel_id"] = channel
-            stored["dm_message_ts"] = posted.get("ts", "")
-            data[rec["handle"]] = stored
-            _write_all(data)
+        _append_event(rec["handle"], "delivered", {
+            "dm_channel_id": channel,
+            "dm_message_ts": posted.get("ts", ""),
+            "buttons": buttons_on,
+        })
         log.info("f3e_blog: publish card sent handle=%s article=%s buttons=%s",
                  rec["handle"], rec["article_numeric"], buttons_on)
-        return stored
+        return get_record(rec["handle"]) or rec
     except Exception as exc:  # noqa: BLE001
         log.error("f3e_blog: card DM FAILED handle=%s: %s", rec["handle"], exc)
         _ledger("card_send_failed", rec, error=str(exc)[:300])
@@ -351,15 +581,44 @@ def process_tap(handle: str, actor_id: str, *, action: str) -> tuple[str, str]:
         return "orphaned", "I don't have a record of that draft anymore."
 
     with _LOCK:
-        data = _read_all()
-        rec = data.get(handle)
+        rec = _read_all().get(handle)
         if not rec:
             return "orphaned", "I don't have a record of that draft anymore."
         rec = dict(rec)
-        if rec.get("state") != STATE_PENDING:
+        state = rec.get("state")
+        if state == STATE_PUBLISHING:
+            return "already_handled", (
+                "I'm in the middle of publishing that one right now. Give it a "
+                "few seconds and I'll report back on the card.")
+        if state != STATE_PENDING:
             return "already_handled", _already_handled_message(rec)
+        if action == "publish":
+            # CLAIM the row before any network I/O, so a Dismiss tap arriving
+            # during the publish cannot take it. The first cut released the lock
+            # and then spent up to ~40s in Shopify calls: a Harrison who saw
+            # nothing happen and tapped Dismiss won the row, the publish then
+            # SUCCEEDED, and _finish reported "already handled -- it's still a
+            # draft" for an article that was by then publicly live, with no
+            # ledger row and no marketing note. Only the log knew.
+            _append_event(handle, "publishing", {"state": STATE_PUBLISHING})
+            rec["state"] = STATE_PUBLISHING
 
-    if action == "dismiss":
+    if action != "publish":
+        # Anything that is not an explicit publish is treated as a dismiss: the
+        # default direction on an irreversible outward action must be the safe
+        # one, so a future typo cannot publish.
+        try:
+            live = shopify_client.get_article(rec["article_gid"])
+        except Exception:  # noqa: BLE001 -- a read failure must not block a dismiss
+            live = {}
+        if live.get("isPublished") is True:
+            # Harrison published from admin and is now clearing the stale card.
+            # Saying "it stays as a draft" here would assert a false fact about
+            # the public site AND drop a live post out of the later-day recheck.
+            return _finish(handle, rec, STATE_PUBLISHED, "already_live",
+                           "That one is actually live already, so I left it alone "
+                           "and marked it published rather than dismissed.",
+                           extra=_public_fields(live, rec))
         return _finish(handle, rec, STATE_DISMISSED, "dismissed",
                        "Left it unpublished. It stays as a draft in Shopify and I "
                        "won't offer it again.")
@@ -369,51 +628,77 @@ def process_tap(handle: str, actor_id: str, *, action: str) -> tuple[str, str]:
         live = shopify_client.get_article(rec["article_gid"])
     except Exception as exc:  # noqa: BLE001
         log.error("f3e_blog: pre-publish read failed handle=%s: %s", handle, exc)
+        _release_claim(handle, "precheck_failed")
         _ledger("publish_precheck_failed", rec, error=str(exc)[:300])
         return "failed", (
             "I couldn't reach the site to check that draft, so I did NOT publish "
-            "it. Nothing changed. Try the button again, or publish from admin."
+            "it. Nothing changed. Try the button again, or publish from the "
+            "Shopify admin."
         )
 
     if live.get("isPublished") is True:
         # Harrison published from admin, or a racing tap won. Honest, and not a
-        # claim that this tap did it.
+        # claim that this tap did it. Records the public URL so the later-day
+        # read-back still covers it (it was skipped entirely before).
         return _finish(handle, rec, STATE_PUBLISHED, "already_live",
                        "That one is already live, so I left it alone. Nothing "
-                       "changed just now.")
+                       "changed just now.",
+                       extra=_public_fields(live, rec))
 
     try:
         published = shopify_client.publish_article(rec["article_gid"])
     except Exception as exc:  # noqa: BLE001
         log.error("f3e_blog: publish FAILED handle=%s: %s", handle, exc)
+        _release_claim(handle, "publish_failed")
         _ledger("publish_failed", rec, error=str(exc)[:300])
         return "failed", (
-            "The publish did NOT go through: %s. The article is still a draft and "
-            "nothing was changed. You can retry the button, or publish it from "
-            "the Shopify admin link." % _short(exc)
+            "The publish did NOT go through (%s). The article is still a draft "
+            "and nothing was changed. You can retry the button, or publish it "
+            "from the Shopify admin." % scrub_for_report(exc, 160)
         )
 
-    # Second half of the read-back: the API calling it published and a reader
-    # being served the page are different claims (D-110 rule 2), and on this store
-    # a theme template can ignore an API write entirely.
-    public_url = shopify_client.article_public_url(
-        published.get("blog", {}).get("handle") or rec.get("blog_handle"),
-        published.get("handle") or rec.get("article_handle"),
-    )
-    verified, verify_note = _verify_public(public_url, published.get("title") or "")
-
-    rec["public_url"] = public_url
-    rec["published_at"] = published.get("publishedAt") or _now_iso()
-    rec["public_verified"] = verified
-    outcome_msg = _published_message(published.get("title") or rec["title"],
-                                    public_url, verified, verify_note)
+    # From here the article IS LIVE. Everything below is reporting, and no
+    # failure in it may lose that fact -- so it is wrapped: a raise between the
+    # write and the record would otherwise leave the article public, the row
+    # PENDING, and Harrison told nothing at all.
+    try:
+        public = _public_fields(published, rec)
+        verified, verify_note = _verify_public(public["public_url"],
+                                              published.get("title") or "")
+        public["public_verified"] = verified
+        outcome_msg = _published_message(published.get("title") or rec["title"],
+                                         public["public_url"], verified, verify_note)
+    except Exception as exc:  # noqa: BLE001
+        log.error("f3e_blog: post-publish verification raised handle=%s: %s",
+                  handle, exc)
+        public = {"public_url": "", "public_verified": False}
+        outcome_msg = (
+            "Published *%s* in Shopify. I then hit an error checking the live "
+            "page, so treat it as live-but-unverified and give it a look."
+            % (rec.get("title") or "the article"))
     return _finish(handle, rec, STATE_PUBLISHED, "published", outcome_msg,
-                   extra={"public_url": public_url, "public_verified": verified})
+                   extra=public)
 
 
-def _short(exc: Exception, limit: int = 160) -> str:
-    txt = " ".join(str(exc).split())
-    return txt if len(txt) <= limit else txt[: limit - 3] + "..."
+def _public_fields(article: dict, rec: dict) -> dict:
+    """The public-URL fields for a record, derived from a live article dict."""
+    return {
+        "public_url": shopify_client.article_public_url(
+            (article.get("blog") or {}).get("handle") or rec.get("blog_handle"),
+            article.get("handle") or rec.get("article_handle"),
+        ),
+        "published_at": article.get("publishedAt") or _now_iso(),
+    }
+
+
+def _release_claim(handle: str, why: str) -> None:
+    """Hand a claimed row back to PENDING after a failed publish attempt.
+
+    Without this a transient Shopify error would leave the card stuck in
+    PUBLISHING forever, and the retryable outcome that keeps its buttons would be
+    un-retryable.
+    """
+    _append_event(handle, "claim_released", {"state": STATE_PENDING, "why": why})
 
 
 def _verify_public(url: str, title: str) -> tuple[bool, str]:
@@ -450,6 +735,9 @@ def _already_handled_message(rec: dict) -> str:
                 % ((": <%s|see it live>" % url) if url else ""))
     if state == STATE_DISMISSED:
         return "You already left that one unpublished. It's still a draft."
+    if state == STATE_PUBLISHING:
+        return ("I'm partway through publishing that one. Give it a few seconds "
+                "and the card will say how it went.")
     return "That draft is already handled; nothing changed just now."
 
 
@@ -458,21 +746,23 @@ def _finish(handle: str, rec: dict, state: str, outcome: str, message: str,
     """Record the terminal state under the lock, re-checking PENDING so a racing
     second tap cannot double-record."""
     with _LOCK:
-        data = _read_all()
-        stored = data.get(handle)
+        stored = _read_all().get(handle)
         if not stored:
             return "orphaned", "I don't have a record of that draft anymore."
-        if stored.get("state") != STATE_PENDING:
+        # PENDING or the row this tap itself claimed. A row claimed by a DIFFERENT
+        # tap, or already terminal, is not ours to resolve.
+        if stored.get("state") not in (STATE_PENDING, STATE_PUBLISHING):
             return "already_handled", _already_handled_message(stored)
-        stored.update(rec)
-        stored["state"] = state
-        stored["resolved_at"] = _now_iso()
-        stored["resolved_via"] = "button"
-        if extra:
-            stored.update(extra)
-        data[handle] = stored
-        _write_all(data)
+        fields = dict(extra or {})
+        fields.update({
+            "state": state,
+            "resolved_at": _now_iso(),
+            "resolved_via": "button",
+        })
+        _append_event(handle, outcome, fields)
+        stored = _read_all().get(handle) or dict(stored, **fields)
     _ledger(outcome, stored, state=state, **(extra or {}))
+    _advance_backlog_row(stored, state)
     log.info("f3e_blog: card %s -> %s (%s)", handle, state, outcome)
     return outcome, message
 
@@ -480,6 +770,42 @@ def _finish(handle: str, rec: dict, state: str, outcome: str, message: str,
 # ---------------------------------------------------------------------------
 # The #f3-marketing note (success only)
 # ---------------------------------------------------------------------------
+
+
+def _advance_backlog_row(rec: dict, state: str) -> None:
+    """Reflect a terminal outcome back into the human editorial table.
+
+    Without this the backlog row stayed at DRAFTED forever: Harrison's own
+    source-of-truth table showed "DRAFTED" for a post that had been live for
+    weeks, and -- worse -- a DISMISSED topic kept the DRAFTED cell, so
+    `next_queued` never returned it again and the topic was silently consumed
+    with nothing published. Two helpers written for exactly this
+    (`published_status_cell` / `dismissed_status_cell`) had no production caller
+    at all.
+
+    FAIL-SOFT and deliberately last: the Shopify write and the ledger row are
+    already done, so a Drive mount blip must not turn a real publish into a
+    reported failure. Imported lazily so the always-on bot's import graph does
+    not gain the Drive layer for a path it only needs at tap time.
+    """
+    row_number = rec.get("backlog_row")
+    if not row_number or state not in _TERMINAL:
+        return  # News-lane cards carry no backlog row.
+    try:
+        from . import operating_files as of  # noqa: PLC0415
+        text, rows = of.read_backlog()
+        match = next((r for r in rows if r.number == str(row_number)), None)
+        if match is None:
+            log.warning("f3e_blog: backlog row %s not found -- not advancing",
+                        row_number)
+            return
+        cell = (of.published_status_cell if state == STATE_PUBLISHED
+                else of.dismissed_status_cell)(rec.get("article_gid") or "")
+        of.write_backlog(of.set_row_status(text, match, cell))
+        log.info("f3e_blog: backlog row %s -> %s", row_number, state)
+    except Exception as exc:  # noqa: BLE001
+        log.error("f3e_blog: could not advance backlog row %s to %s: %s",
+                  row_number, state, exc)
 
 
 def marketing_note(rec: dict) -> str:

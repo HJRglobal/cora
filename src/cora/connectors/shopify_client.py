@@ -981,6 +981,11 @@ def graphql(mutation: str, variables: dict) -> dict:
 # precedent), so mutation success is not evidence of a rendered page.
 BLOG_PUBLIC_HOST = "f3energy.com"
 
+#: Hard ceiling on a fetched page. Generous for a storefront page (the live FAQ
+#: is ~155 KB) and small enough that an arbitrary outlet URL cannot exhaust
+#: memory or the weekly task's time limit.
+MAX_PAGE_BYTES = 3 * 1024 * 1024
+
 _ARTICLE_FIELDS = """
     id
     title
@@ -1218,13 +1223,32 @@ def fetch_public_page(url: str, timeout: int = 20) -> tuple[int, str]:
     crashing after a real publish.
     """
     try:
-        resp = requests.get(
+        # Streamed with a hard byte ceiling. This function is also pointed at
+        # ARBITRARY THIRD-PARTY pages (an outlet's article, from a press-tracker
+        # URL field, through unvalidated redirects), and the first cut buffered
+        # and decoded the entire body -- so one endless or multi-hundred-MB
+        # response would wedge or OOM the weekly run.
+        with requests.get(
             url,
             timeout=timeout,
             headers={"User-Agent": "cora-blog-publish-verify/1.0"},
             allow_redirects=True,
-        )
-        return resp.status_code, resp.text or ""
+            stream=True,
+        ) as resp:
+            chunks: list[bytes] = []
+            seen = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                seen += len(chunk)
+                if seen >= MAX_PAGE_BYTES:
+                    log.warning("shopify fetch_public_page: %s exceeded %d bytes, "
+                                "truncated", url, MAX_PAGE_BYTES)
+                    break
+            body = b"".join(chunks)
+            text = body.decode(resp.encoding or "utf-8", errors="replace")
+            return resp.status_code, text
     except requests.RequestException as exc:
         log.warning("shopify fetch_public_page failed url=%s: %s", url, exc)
         return 0, ""

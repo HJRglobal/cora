@@ -22,11 +22,21 @@ A green preflight therefore means "no MECHANICALLY detectable violation", never
 "cleared". The human tap is what clears it, which is exactly why the tap exists.
 `UNENFORCED_RAILS` is surfaced in the run report so the gap is stated, not implied.
 
-ReDoS discipline (this codebase has found six): every proximity rail here is
-implemented with TOKEN INDEX ARITHMETIC, not regex proximity. The regexes that do
-exist are literal alternations with bounded classes and no sequential unbounded
-quantifiers. `tests/test_f3e_blog_preflight.py` asserts the SHAPE (work must not
-grow ~4x per input doubling), not merely a wall-clock threshold.
+ReDoS discipline. Every proximity rail here is implemented with TOKEN INDEX
+ARITHMETIC rather than regex proximity, and the remaining regexes are literal
+alternations with bounded classes.
+
+That was also claimed by the first cut of this docstring, and it was FALSE: the
+script/style stripper was a lazy `.{0,200000}?` with a backreference and it was
+the seventh catastrophic-backtracking bug found in this codebase, measured at
+~4x per doubling (6.4 seconds on 128 KB). It survived a shape test because the
+test's fixture contained no script tag, so the one quadratic regex in the file
+was the one input the ReDoS test could not reach. It is now a linear
+`str.find` scan (`_split_script_blocks`).
+
+The lesson encoded in the tests: assert the shape on the input that reaches the
+suspect construct, not on a generic body -- and never trust this paragraph
+without a measurement beside it.
 """
 
 from __future__ import annotations
@@ -109,36 +119,186 @@ class PreflightResult:
 
 # Block-level closers become newlines so two paragraphs never merge into one
 # "sentence" and defeat every same-sentence proximity rail below.
+# <br> is deliberately NOT here. It is a SOFT line break -- authors use it to wrap
+# a line far more often than to end a paragraph -- and treating it as a sentence
+# boundary split real violations in half: "F3 Energy is<br>clean, natural, honest."
+# and "F3 Energy is NSF Certified for Sport.<br>So is Pure." both passed. Merging
+# two sentences is the safe direction (it only widens the window and adds trips);
+# splitting one is the dangerous direction, so <br> collapses to a space.
 _BLOCK_BREAK_RE = re.compile(
-    r"</(?:p|div|li|ul|ol|h[1-6]|blockquote|tr|td|th|section|article)>|<br\s{0,4}/?>",
+    r"</(?:p|div|li|ul|ol|h[1-6]|blockquote|tr|td|th|section|article)>",
     re.IGNORECASE,
 )
-_SCRIPT_STYLE_RE = re.compile(
-    r"<(script|style)\b[^>]{0,400}>.{0,200000}?</\1>",
-    re.IGNORECASE | re.DOTALL,
-)
-_TAG_RE = re.compile(r"<[^>]{0,2000}>")
+_SCRIPT_TAGS = ("script", "style")
+
+
+def _split_script_blocks(html_body: str) -> tuple[str, list[str]]:
+    """(prose_with_blocks_removed, [raw_block_contents]).
+
+    A hand-written linear scan, NOT a regex. The regex this replaces --
+    `<(script|style)\\b[^>]{0,400}>.{0,200000}?</\\1>` with DOTALL -- was the
+    SEVENTH catastrophic-backtracking bug found in this codebase, and it sat in
+    the file whose own docstring claimed ReDoS discipline. Repeated UNCLOSED
+    openings ("<script>" * n) made each one start a fresh lazy expansion hunting
+    a close tag that never comes, then advance one character and rescan:
+
+        16 KB   102 ms
+        32 KB   397 ms   (3.9x)
+        64 KB  1665 ms   (4.2x)
+       128 KB  6430 ms   (3.9x)
+
+    The shape test missed it because its fixture contains no script tag at all,
+    which is the lesson: a ReDoS test proves nothing about a regex its input
+    never reaches. This scan is O(n) -- each character is visited once by
+    `str.find`, which cannot backtrack -- and it also retires the two silent
+    bound overruns the old pattern had (`[^>]{0,400}` was already exceeded by
+    one block on the live FAQ page, and a script body over 200 KB was not
+    stripped at all).
+
+    An UNCLOSED opening drops the remainder from prose but still returns it as a
+    block, so the claims rails scan it rather than losing sight of it.
+    """
+    src = html_body or ""
+    low = src.lower()
+    prose: list[str] = []
+    blocks: list[str] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        nxt = -1
+        tag = ""
+        for cand in _SCRIPT_TAGS:
+            at = low.find("<" + cand, i)
+            if at != -1 and (nxt == -1 or at < nxt):
+                nxt, tag = at, cand
+        if nxt == -1:
+            prose.append(src[i:])
+            break
+        prose.append(src[i:nxt])
+        close = low.find("</" + tag, nxt)
+        if close == -1:
+            blocks.append(src[nxt:])  # unclosed: still scanned, just not prose
+            break
+        blocks.append(src[nxt:close])
+        gt = src.find(">", close)
+        i = (gt + 1) if gt != -1 else n
+        prose.append(_BLOCK_MARK)
+    return "".join(prose), blocks
+
+
+# Bounded deliberately: `<[^>]*>` is quadratic on a run of bare "<" characters
+# (each start offset rescans to end of input). 8000 covers the largest tag
+# measured on the live FAQ page (4478); a tag beyond it is left in the prose,
+# which only ADDS text a rail might trip on -- never hides a violation.
+_TAG_RE = re.compile(r"<[^>]{0,8000}>")
 _WS_RE = re.compile(r"[ \t]{2,}")
 
 
+#: Placeholder for a real block boundary, held while soft newlines are collapsed.
+_BLOCK_MARK = "\x00"
+
+# Attribute values that ship as content a machine or a screen reader reads.
+_ATTR_RE = re.compile(
+    r"\b(?:alt|title|aria-label|content|data-[a-z-]{1,30})\s{0,3}=\s{0,3}"
+    r"(?:\"([^\"]{0,2000})\"|'([^']{0,2000})')",
+    re.IGNORECASE,
+)
+
+
 def html_to_text(html_body: str) -> str:
-    """Visible prose only: script/style blocks dropped, block tags -> newlines."""
+    """Reader-visible prose, with SOFT line wraps collapsed.
+
+    The soft-wrap collapse is a correctness fix, not tidiness. Sentence-scoped
+    rails (2, 4, 10) split on newlines so that two paragraphs never merge into
+    one "sentence" -- but a model writing multi-line HTML puts newlines INSIDE
+    sentences constantly, and that split every same-sentence rail wide open:
+
+        <p>F3 Energy is
+        clean and all-natural.</p>
+
+    ...became two "sentences", neither of which had both halves of the
+    violation, so rail 2 passed it. That is the normal shape of a real draft, not
+    a contrived input. So only BLOCK boundaries become sentence breaks; every
+    other newline, and every <br>, becomes a space.
+    """
     if not html_body:
         return ""
-    txt = _SCRIPT_STYLE_RE.sub("\n", html_body)
-    txt = _BLOCK_BREAK_RE.sub("\n", txt)
+    txt, _blocks = _split_script_blocks(html_body)
+    txt = _BLOCK_BREAK_RE.sub(_BLOCK_MARK, txt)
     txt = _TAG_RE.sub(" ", txt)
     txt = _html.unescape(txt)
-    txt = _WS_RE.sub(" ", txt)
-    return txt
+    # Every remaining whitespace run, newlines included, becomes ONE space; only
+    # the block marks survive as line breaks.
+    txt = re.sub(r"\s+", " ", txt)
+    return txt.replace(_BLOCK_MARK, "\n")
 
 
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+def hidden_text(html_body: str) -> str:
+    """Content that SHIPS but is not reader-visible prose: JSON-LD / script
+    bodies and attribute values such as alt text.
+
+    Needed because the drafting prompt explicitly asks the model for a JSON-LD
+    BlogPosting block, and `html_to_text` deletes script bodies and discards
+    attributes -- so a claim placed in structured data or in an image's alt text
+    was invisible to every semantic rail. The author of the first cut had already
+    seen this and patched exactly one rail (a JSON-LD "price" key on rail 5),
+    which is how a one-rail fix reveals an all-rail hole.
+    """
+    if not html_body:
+        return ""
+    _prose, blocks = _split_script_blocks(html_body)
+    parts: list[str] = list(blocks)
+    for m in _ATTR_RE.finditer(html_body):
+        parts.append(m.group(1) or m.group(2) or "")
+    if not parts:
+        return ""
+    txt = _TAG_RE.sub(" ", "\n".join(parts))
+    txt = _html.unescape(txt)
+    return re.sub(r"[ \t]+", " ", txt)
+
+
+def unescaped(text: str) -> str:
+    """HTML entities resolved. What the reader or a parser actually receives.
+
+    Rails that scan raw shipped bytes (em-dash, price, placeholder) MUST use this
+    rather than the raw string: `&mdash;` and `&#8212;` render as an em-dash and
+    `&#36;39.99` renders as a price, and scanning the pre-unescape form made both
+    rails completely blind to the entity spelling.
+    """
+    return _html.unescape(text or "")
+
+
+# Splits on terminal punctuation followed by whitespace, or on a block boundary.
+# NOT on a bare newline: see html_to_text.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])[\"')\]]{0,3}\s+|\n+")
+
+# Abbreviations that end in a period and must not end a sentence. Without this,
+# "F3 Energy, per Dr. Ruiz, is clean-label" split before the clean token and
+# rail 2 passed a real violation.
+_ABBREV = (
+    "dr", "mr", "mrs", "ms", "prof", "st", "vs", "etc", "e.g", "i.e", "approx",
+    "inc", "ltd", "co", "no", "fig", "al", "jr", "sr", "u.s", "mg", "oz",
+)
+_ABBREV_TAIL_RE = re.compile(
+    r"(?:^|\s)(?:%s)\.$" % "|".join(re.escape(a) for a in _ABBREV), re.IGNORECASE)
 
 
 def sentences(text: str) -> list[str]:
-    """Sentence-ish units. Splits on terminal punctuation AND newlines."""
-    return [s.strip() for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
+    """Sentence-ish units, rejoining splits that landed after an abbreviation.
+
+    Merging two real sentences is the SAFE direction here (it only pulls more
+    tokens into one window, adding trips); splitting one real sentence is the
+    dangerous direction, because it can put the two halves of a violation into
+    different windows. So this errs toward merging.
+    """
+    raw = [s.strip() for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
+    out: list[str] = []
+    for part in raw:
+        if out and _ABBREV_TAIL_RE.search(out[-1]):
+            out[-1] = out[-1] + " " + part
+        else:
+            out.append(part)
+    return out
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9$][A-Za-z0-9'&/-]{0,40}")
@@ -179,31 +339,65 @@ def _redact(text: str, patterns: Iterable[re.Pattern[str]]) -> str:
 # rail 2, and does not, because "Energy Drinks" is the category.
 # ---------------------------------------------------------------------------
 
+# ONLY words that are unambiguously the category. "brand"/"brands" and
+# "product"/"products" were removed after they cleared real violations -- "The
+# Energy brand is the cleanest label in the cooler" and "Energy products from us
+# are clean" are both about OUR line, not about a category.
 _CATEGORY_FOLLOWERS = frozenset({
-    "drink", "drinks", "beverage", "beverages", "category", "brands", "brand",
+    "drink", "drinks", "beverage", "beverages", "category", "categories",
     "level", "levels", "boost", "crash", "dip", "slump", "needs", "need",
     "source", "sources", "intake", "expenditure", "market", "aisle", "shelf",
-    "products", "product", "industry", "space",
+    "industry", "space", "sector",
 })
 
-_BRAND_F3_RE = re.compile(r"\bF3\s{0,3}(Energy|Pure|Mood)\b", re.IGNORECASE)
-_BRAND_BARE_RE = re.compile(r"\b(Energy|Pure|Mood)\b")
+# `F3's Mood` and `F3 Mood` both count. Apostrophe forms were invisible before.
+_BRAND_F3_RE = re.compile(r"\bF3(?:'s)?\s{0,3}(Energy|Pure|Mood)\b", re.IGNORECASE)
+# Case-INSENSITIVE deliberately: an ALL-CAPS heading ("ENERGY IS OUR CLEANEST
+# LINE") is a brand reference, and a case-sensitive pattern made rails 2, 3 and 4
+# blind to every all-caps heading. Lowercase is then excluded below, which is
+# where the real category/brand distinction is made.
+_BRAND_BARE_RE = re.compile(r"\b(Energy|Pure|Mood)\b", re.IGNORECASE)
+# A first-person product reference with no brand token at all: "our caffeine-free
+# calm line", "our clean-sweetened blend". Rail 3 was gated on the literal token
+# MOOD, so a Mood article that never named it was completely unguarded.
+_OUR_PRODUCT_RE = re.compile(
+    r"\bour\b[^.\n]{0,60}\b(?:line|lines|blend|blends|can|cans|drink|drinks|"
+    r"formula|formulas|beverage)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_brandish(token: str) -> bool:
+    """Capitalised or ALL-CAPS reads as the brand; lowercase never does."""
+    return bool(token) and token[0].isupper()
 
 
 def brand_lines_in(sentence: str) -> set[str]:
     """Which F3 product LINES this sentence refers to: {'ENERGY','PURE','MOOD'}."""
+    text = sentence or ""
     found: set[str] = set()
-    for m in _BRAND_F3_RE.finditer(sentence or ""):
+    for m in _BRAND_F3_RE.finditer(text):
         found.add(m.group(1).upper())
-    for m in _BRAND_BARE_RE.finditer(sentence or ""):
-        line = m.group(1).upper()
-        if line == "ENERGY":
-            tail = (sentence or "")[m.end():m.end() + 40]
-            nxt = _words(tail)
+    # An explicit "F3" anywhere in the sentence removes the category ambiguity:
+    # "Energy drinks from F3 are all-natural" IS about the brand line, and the
+    # category-follower exemption must not clear it.
+    names_f3 = re.search(r"\bF3\b", text) is not None
+    for m in _BRAND_BARE_RE.finditer(text):
+        tok = m.group(1)
+        if not _is_brandish(tok):
+            continue  # "an energy drink" -- the category noun
+        line = tok.upper()
+        if line == "ENERGY" and not names_f3:
+            nxt = _words(text[m.end():m.end() + 40])
             if nxt and nxt[0].lower() in _CATEGORY_FOLLOWERS:
-                continue  # category noun, not the brand line
+                continue  # "Energy Drinks" in a title -- the category
         found.add(line)
     return found
+
+
+def product_referenced(sentence: str) -> bool:
+    """True when the sentence is about an F3 product at all, named or not."""
+    return bool(brand_lines_in(sentence)) or bool(_OUR_PRODUCT_RE.search(sentence or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +442,16 @@ _PRICE_UNCONDITIONAL_RES = (
     re.compile(r"\"(?:price|lowPrice|highPrice|priceCurrency)\"\s{0,3}:"),
 )
 _CURRENCY_RES = (
-    re.compile(r"\$\s{0,2}\d"),
-    re.compile(r"\b\d[\d,.]{0,12}\s{0,3}(?:dollars|USD)\b", re.IGNORECASE),
+    # Any currency symbol, not just the dollar: a price in pounds or euros is
+    # still a price, and "&#163;34.99" passed the first cut outright.
+    re.compile(r"[$£€¥₹]\s{0,2}\d"),
+    re.compile(r"\b\d[\d,.]{0,12}\s{0,3}(?:dollars|USD|GBP|EUR)\b", re.IGNORECASE),
+    # A bare two-decimal amount attached to a purchase verb or a retailer, which
+    # is how a price reads when the symbol is left off ("grab a 12-pack for
+    # 39.99 at any Sprouts"). Deliberately requires the buying context so an
+    # ingredient figure ("39.99 mg") cannot trip it.
+    re.compile(r"\b(?:for|only|just|at)\s{1,3}\d{1,4}\.\d{2}\b(?!\s{0,3}"
+               r"(?:mg|g|ml|oz|kcal|%|percent))", re.IGNORECASE),
 )
 # Deliberately NOT a bare "sales": "our sales team" would then exempt any price
 # within 200 chars of it, which is the hole this rail is supposed to be.
@@ -319,9 +521,27 @@ _CLAIM_VERB_RE = re.compile(
     r"manages?|managing|diagnos(?:e|es|ing)|remed(?:y|ies)|therapeutic)\b",
     re.IGNORECASE,
 )
-_HEALTH_NOUN_RE = re.compile(
-    r"\b(?:conditions?|diseases?|illness(?:es)?|symptoms?|disorders?|diagnosis|"
-    r"ailments?|syndrome)\b",
+# A claim verb is now SUFFICIENT on its own. The first cut required a health noun
+# from a category list in the same sentence, which meant every claim naming a
+# SPECIFIC disease passed: "F3 Energy cures diabetes", "prevents migraines",
+# "treats dementia", "cures cancer" -- all executed and confirmed passing. No
+# real disease claim contains the word "condition", so the gate was keyed on
+# exactly the vocabulary a violation never uses.
+#
+# The narrow allowlist is what keeps ordinary copy usable; it covers the only
+# non-medical sense of these verbs that plausibly appears in beverage marketing.
+_CLAIM_VERB_CLEARED_RES = (
+    re.compile(r"\btreat\s{1,3}your(?:self|selves)?\b", re.IGNORECASE),
+    re.compile(r"\ba\s{1,3}treat\b", re.IGNORECASE),
+)
+# Physiology and disease objects that have no legitimate place in F3 blog copy.
+# Presence alone trips: these need no verb to be a claim, and "boosts immunity" /
+# "lowers blood pressure" use verbs no sane verb list would include.
+_DISEASE_OBJECT_RE = re.compile(
+    r"\b(?:diabetes|diabetic|cancer|tumou?rs?|dementia|alzheimer'?s?|migraines?|"
+    r"strokes?|heart\s{1,3}attacks?|blood\s{1,3}pressure|cholesterol|"
+    r"blood\s{1,3}sugar|inflammation|immunity|immune\s{1,3}system|arthritis|"
+    r"hangovers?|IBS|asthma|epilep(?:sy|tic)|thyroid|adrenal\s{1,3}fatigue)\b",
     re.IGNORECASE,
 )
 _MEDICAL_CLEARED_RES = (
@@ -348,9 +568,19 @@ _EMBARGO_RES = (
     re.compile(r"\bSAFE\s{1,3}note\b"),
     re.compile(r"\bSeries\s{1,3}[A-D]\b"),
     re.compile(r"\bequity\s{1,3}(?:stake|split)\b", re.IGNORECASE),
-    re.compile(r"\braising\s{1,3}\$", re.IGNORECASE),
-    re.compile(r"\braise\s{1,3}of\s{1,3}\$", re.IGNORECASE),
+    re.compile(r"\brais(?:e|ed|ing)\b[^.\n]{0,30}\$", re.IGNORECASE),
     re.compile(r"\bterm\s{1,3}sheet\b", re.IGNORECASE),
+    # "closed a $4 million round led by two family offices" passed BOTH rails:
+    # rail 8 had no word for a funding round, and rail 5's currency scan was
+    # exempted by the word "revenue" one sentence earlier. Funding mechanics are
+    # rail 8's job and must not depend on the currency symbol.
+    re.compile(r"\b(?:funding|investment|seed|bridge|priced)\s{1,3}round\b",
+               re.IGNORECASE),
+    re.compile(r"\bround\s{1,3}(?:led\s{1,3}by|of\s{1,3}funding)\b", re.IGNORECASE),
+    re.compile(r"\b(?:closed|raised)\b[^.\n]{0,40}\bround\b", re.IGNORECASE),
+    re.compile(r"\b(?:venture|growth)\s{1,3}capital\b", re.IGNORECASE),
+    re.compile(r"\b(?:investors?|family\s{1,3}offices?)\b[^.\n]{0,30}\$",
+               re.IGNORECASE),
 )
 
 # rail 10 -- founded 2023, never 2022.
@@ -446,20 +676,28 @@ def _scan_raw(rail_id: str, patterns, raw: str, field_name: str) -> list[Trip]:
 def _currency_trips(field_name: str, text: str) -> list[Trip]:
     """Currency amounts, judged in context (see the rail-5 note above).
 
-    A character WINDOW is used rather than a sentence split so the rule applies
-    identically to prose and to JSON-LD / alt-text bytes, where there are no
-    sentences at all: an `offers.price` in structured data is still a published
-    price, and a reader-invisible price is still a price.
+    The exemption is SENTENCE-scoped, not window-scoped. A +/-200 char window was
+    trivially reachable in this lane's own article class: "F3 Energy grossed
+    record revenue last quarter. The 12-pack is $39.99 and ships free." exempted
+    a real price because a revenue word sat one sentence away. Revenue and price
+    in the SAME sentence is the shape rail 8 actually permits.
+
+    Sentence boundaries are unavailable inside JSON-LD, so the fallback there is
+    the whole fragment -- structured data has no prose to contextualise anyway,
+    and a price key in it is caught unconditionally by _PRICE_UNCONDITIONAL_RES.
     """
     raw = text or ""
-    for pat in _CURRENCY_RES:
-        for m in pat.finditer(raw):
-            lo = max(0, m.start() - _PRICE_CONTEXT_CHARS)
-            hi = min(len(raw), m.end() + _PRICE_CONTEXT_CHARS)
-            window = raw[lo:hi]
-            if _REVENUE_CONTEXT_RE.search(window):
-                continue  # attributed revenue, not a price -- rail 8's lane
-            return [_trip("R5", field_name, "...%s..." % window[:220])]
+    if not raw:
+        return []
+    units = sentences(raw) or [raw]
+    for unit in units:
+        for pat in _CURRENCY_RES:
+            m = pat.search(unit)
+            if not m:
+                continue
+            if _REVENUE_CONTEXT_RE.search(unit):
+                continue  # attributed revenue in this sentence -- rail 8's lane
+            return [_trip("R5", field_name, unit)]
     return []
 
 
@@ -481,11 +719,33 @@ def run_preflight(
     title = title or ""
     summary = summary or ""
     body_html = body_html or ""
-    visible = html_to_text(body_html)
 
-    fields = (("title", title), ("summary", summary), ("body", visible))
-    # Raw-byte fields: everything that ships, including structured data and alt text.
-    raw_fields = (("title", title), ("summary", summary), ("body(raw)", body_html))
+    # THREE views of the same content, because the first cut gave different rails
+    # different views and each blind spot was a live false negative:
+    #
+    #   prose   reader-visible text, entities resolved, soft wraps collapsed
+    #   hidden  JSON-LD / script bodies + attribute values (alt text). Ships, is
+    #           machine-read, and was invisible to 8 of 11 rails -- while the
+    #           drafting prompt explicitly asks the model to emit JSON-LD.
+    #   bytes   entities RESOLVED. "&mdash;" and "&#36;39.99" render as an
+    #           em-dash and a price; scanning the pre-unescape string made rails
+    #           5 and 6 completely blind to the entity spelling.
+    #
+    # Every rail now scans all three. There is no rail-specific view any more.
+    prose = html_to_text(body_html)
+    hidden = hidden_text(body_html)
+
+    fields = (
+        ("title", unescaped(title)),
+        ("summary", html_to_text(summary)),
+        ("body", prose),
+        ("body(structured data / alt text)", hidden),
+    )
+    raw_fields = (
+        ("title", unescaped(title)),
+        ("summary", unescaped(summary)),
+        ("body(raw)", unescaped(body_html)),
+    )
 
     # --- rail 6: em-dashes, anywhere in anything that ships ---
     for name, text in raw_fields:
@@ -519,10 +779,14 @@ def run_preflight(
     for name, text in fields:
         clean = _redact(text, _MEDICAL_CLEARED_RES)
         trips += _scan_raw("R1", _NAMED_CONDITIONS, clean, name)
-        # Generic claim verbs only count with a health noun in the same sentence,
-        # so "treat yourself to a cold one" is not a disease claim.
-        for sent in sentences(clean):
-            if _CLAIM_VERB_RE.search(sent) and _HEALTH_NOUN_RE.search(sent):
+        # Disease/physiology objects trip on presence alone: they need no verb to
+        # be a claim, and they have no legitimate place in this copy.
+        trips += _scan_raw("R1", (_DISEASE_OBJECT_RE,), clean, name)
+        # A claim verb is sufficient on its own, minus the one non-medical sense
+        # ("treat yourself"). Requiring a health noun alongside it let every
+        # specifically-named disease claim through.
+        for sent in sentences(_redact(clean, _CLAIM_VERB_CLEARED_RES)):
+            if _CLAIM_VERB_RE.search(sent):
                 trips.append(_trip("R1", name, sent))
                 break
 
@@ -551,15 +815,33 @@ def run_preflight(
                 ))
                 break
 
-    # --- rail 3: sleep-aid language anywhere in a doc that mentions Mood ---
-    doc_lines: set[str] = set()
+    # --- rail 3: sleep-aid language in a doc about a product ---
+    # Gated on a PRODUCT reference rather than on the literal token "Mood": an
+    # article whose only reference was "our caffeine-free calm line" was
+    # completely unguarded, which is precisely the article most likely to drift
+    # toward sleep language. Still not unconditional -- a Learn post may say
+    # truthfully that caffeine late in the day makes it harder to fall asleep,
+    # and blocking that would be wrong.
+    product_doc = False
     for _, text in fields:
         for sent in sentences(text):
-            doc_lines |= brand_lines_in(sent)
-    if "MOOD" in doc_lines:
+            if product_referenced(sent):
+                product_doc = True
+                break
+        if product_doc:
+            break
+    if product_doc:
         for name, text in fields:
-            trips += _scan_raw(
-                "R3", _SLEEP_RES, _redact(text, _SLEEP_CLEARED_RES), name)
+            for sent in sentences(_redact(text, _SLEEP_CLEARED_RES)):
+                if not product_referenced(sent):
+                    continue
+                hit = next((p for p in _SLEEP_RES if p.search(sent)), None)
+                if hit:
+                    trips.append(_trip("R3", name, sent))
+                    break
+            else:
+                continue
+            break
 
     # --- rail 4: NSF only in a sentence naming Energy and NOT Pure/Mood ---
     for name, text in fields:

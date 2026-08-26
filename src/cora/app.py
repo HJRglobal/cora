@@ -4440,16 +4440,13 @@ def _handle_f3e_blog_tap(body: dict, client, *, action: str) -> None:
         # right next move is to tap again.
         keep_buttons = outcome in f3e_blog_cards.RETRYABLE_OUTCOMES
         if channel_id and message_ts:
-            orig = (body.get("message") or {}).get("blocks") or []
-            kept = [b for b in orig
-                    if b.get("type") == "section"
-                    or (keep_buttons and b.get("type") == "actions")]
-            new_blocks = kept + [
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": msg}]}
-            ]
-            if not kept:
-                new_blocks = [{"type": "section",
-                               "text": {"type": "mrkdwn", "text": msg}}]
+            # The card's own body carries STATE CLAIMS ("draft ready to publish",
+            # "Staged unpublished") that this tap has just falsified, so the
+            # rewrite happens in the module rather than by appending a grey
+            # context line under a now-false headline.
+            new_blocks = f3e_blog_cards.terminal_card_blocks(
+                (body.get("message") or {}).get("blocks") or [], msg,
+                keep_buttons=keep_buttons)
             try:
                 client.chat_update(channel=channel_id, ts=message_ts,
                                    text=msg, blocks=new_blocks)

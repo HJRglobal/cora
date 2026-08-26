@@ -7031,31 +7031,56 @@ def _tool_f3e_blog_card_drafts(slack_user_id: str, entity: str, _input: dict) ->
         from ..connectors import shopify_client as _sc  # noqa: PLC0415
 
         already = _pc.already_carded_gids()
-        offered, skipped = [], 0
-        for blog_id, lane in ((_of.BLOG_LEARN, "learn"), (_of.BLOG_NEWS, "news")):
-            for art in _sc.list_unpublished(blog_id):
-                if art.get("id") in already:
-                    skipped += 1
-                    continue
-                rec = _pc.record_for_article(
-                    article=art, lane=lane,
-                    excerpt=art.get("summary") or "", backlog_row=None)
-                _pc.stage_card(rec)
-                offered.append("%s (%s)" % (art.get("title"), lane))
-        if not offered:
-            if skipped:
-                return ("Every staged draft already has a card in your DMs (%d of "
-                        "them), so there was nothing new to offer." % skipped)
+        # Tracked OUTSIDE the try: the first cut built these inside it and
+        # discarded them on an exception, so a failure partway through returned
+        # "no cards were sent. Nothing was changed" with cards already delivered.
+        offered: list[str] = []
+        undelivered: list[str] = []
+        skipped = 0
+        partial_error = ""
+        try:
+            for blog_id, lane in ((_of.BLOG_LEARN, "learn"),
+                                  (_of.BLOG_NEWS, "news")):
+                for art in _sc.list_unpublished(blog_id):
+                    if art.get("id") in already:
+                        skipped += 1
+                        continue
+                    rec = _pc.record_for_article(
+                        article=art, lane=lane,
+                        excerpt=art.get("summary") or "", backlog_row=None)
+                    stored = _pc.stage_card(rec)
+                    # Quoted and bounded: the title is Shopify-authored text
+                    # landing in model-facing prose, and a None title rendered
+                    # literally as "None (learn)".
+                    label = "%r (%s)" % (rec.get("title") or "untitled", lane)
+                    if _pc.card_was_delivered(stored):
+                        offered.append(label)
+                    else:
+                        undelivered.append(label)
+        except Exception as exc:  # noqa: BLE001
+            partial_error = _pc.scrub_for_report(exc)
+
+        parts: list[str] = []
+        if offered:
+            parts.append("Sent you %d publish card(s): %s."
+                         % (len(offered), "; ".join(offered)))
+        if undelivered:
+            parts.append("%d draft(s) could not be carded (the DM failed): %s. "
+                         "They are staged and unpublished."
+                         % (len(undelivered), "; ".join(undelivered)))
+        if skipped:
+            parts.append("%d other draft(s) already had a card." % skipped)
+        if partial_error:
+            parts.append("I then hit an error and stopped early (%s), so there may "
+                         "be more drafts I did not reach." % partial_error)
+        if not parts:
             return ("There are no unpublished drafts sitting in either blog right "
                     "now, so there is nothing to card.")
-        note = "Sent you %d publish card(s): %s." % (len(offered), "; ".join(offered))
-        if skipped:
-            note += " %d other draft(s) already had a card." % skipped
-        return note
+        return " ".join(parts)
     except Exception as exc:  # noqa: BLE001
         log.warning("f3e_blog_card_drafts error user=%s: %s", slack_user_id, exc)
-        return ("I could not read the staged drafts just now (%s), so no cards were "
-                "sent. Nothing was changed." % exc)
+        return ("I could not reach the staged drafts just now (%s), so no cards "
+                "were sent. Nothing was changed." % _pc.scrub_for_report(exc))
 
 
 def _tool_f3e_ai_visibility(slack_user_id: str, entity: str, _input: dict) -> str:

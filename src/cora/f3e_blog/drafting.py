@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from ..model_router import MODEL_SONNET
 from ..connectors import shopify_client
@@ -80,14 +81,22 @@ have, leave that point out entirely rather than estimating it.
 - Leave no placeholders. Every bracket, link, and number must be final.
 
 ## Output
-Return ONLY a JSON object, no prose around it, no code fence:
-{{"title": "...", "summary": "...", "body_html": "...", "tags": ["...", "..."]}}
+Reply with exactly these four sections, each introduced by its marker on its own
+line, and nothing else. No preamble, no code fence, no JSON.
 
-- title: max 65 characters, the phrase a reader would actually search.
-- summary: 1 to 2 sentences, the excerpt shown in listings.
-- body_html: the full post as HTML using <p>, <h2>, <ul>, <li>, <strong>, <a>.
-  Include the JSON-LD BlogPosting script block the template calls for.
-- tags: 2 to 5 short tags.
+===TITLE===
+the phrase a reader would actually search, max 65 characters
+===SUMMARY===
+one or two sentences, the excerpt shown in listings
+===TAGS===
+two to five short tags, comma separated
+===BODY===
+the full post as HTML using <p>, <h2>, <ul>, <li>, <strong>, <a>, including the
+JSON-LD BlogPosting script block the template calls for
+
+Everything after the ===BODY=== marker is the body, verbatim to the end of your
+reply. Write normal HTML with normal double-quoted attributes and normal
+quotation marks in the prose. Nothing needs escaping.
 """
 
 
@@ -114,8 +123,8 @@ the piece as it was.
 
 {trips}
 
-Rewrite so none of those rails can trip again, then return the full JSON object
-for the corrected article.
+Rewrite so none of those rails can trip again, then return the corrected article
+in full, in the same four marker sections.
 """
 
 
@@ -133,6 +142,51 @@ def build_prompt(row, *, template: str, faq: str, lineup: str,
     if revision_trips:
         prompt += _REVISION_NOTE.format(trips=revision_trips[:3000])
     return prompt
+
+
+_SECTION_ORDER = ("TITLE", "SUMMARY", "TAGS", "BODY")
+_MARKER_RE = re.compile(r"^===(TITLE|SUMMARY|TAGS|BODY)===\s*$", re.MULTILINE)
+
+
+def _extract_sections(raw: str) -> dict | None:
+    """Parse the marker-delimited reply. None if the markers are not all there.
+
+    WHY THIS REPLACED A JSON ENVELOPE, measured rather than supposed. Asking for
+    `body_html` inside a JSON object means every quotation mark in ordinary prose
+    has to be escaped, and a real draft failed on exactly that: the model wrote
+
+        reading past the "0 sugar" claim on the front of a can
+
+    inside the JSON string, with `stop_reason: end_turn` -- a complete, sensible
+    answer that no tolerant parser can repair, because an unescaped quote is
+    indistinguishable from the end of the string. Quotation marks in prose are
+    not an edge case; they are how people write.
+
+    A marker envelope has no escaping rules at all: everything after ===BODY===
+    is the body, bytes included. The JSON path is kept as a fallback for a model
+    that answers in JSON anyway.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = "\n".join(l for l in text.split("\n")
+                         if not l.startswith("```")).strip()
+    marks = list(_MARKER_RE.finditer(text))
+    if not marks:
+        return None
+    found: dict[str, str] = {}
+    for i, m in enumerate(marks):
+        name = m.group(1)
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        found[name] = text[m.end():end].strip()
+    if not all(k in found for k in _SECTION_ORDER):
+        return None
+    tags = [t.strip() for t in found["TAGS"].replace("\n", ",").split(",")]
+    return {
+        "title": found["TITLE"],
+        "summary": found["SUMMARY"],
+        "body_html": found["BODY"],
+        "tags": [t for t in tags if t],
+    }
 
 
 def _extract_json(raw: str) -> dict | None:
@@ -200,7 +254,7 @@ def draft_article(row, *, template: str, faq: str, lineup: str,
         log.error("f3e_blog: draft call failed for row %s: %s", row.number, exc)
         return None
 
-    parsed = _extract_json(raw)
+    parsed = _extract_sections(raw) or _extract_json(raw)
     if not parsed:
         # Log the head of what actually came back. "not parseable" with no
         # evidence sends the next reader guessing at token limits when the real

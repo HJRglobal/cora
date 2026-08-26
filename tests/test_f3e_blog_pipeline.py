@@ -86,12 +86,25 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(operating_files.drive_io, "write_text_atomic", _write)
     monkeypatch.setattr(drafting, "fetch_faq_text", lambda **kw: "FAQ TEXT")
     monkeypatch.setattr(refill, "build_proposals", lambda **kw: [])
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [])
+    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: ([], True, 0))
     yield self_state
 
 
 def _no_client():
     return None
+
+
+def _delivering_client():
+    """A Slack client that actually delivers, so `card_was_delivered` is true.
+
+    Needed because the review made delivery a REPORTED fact rather than an
+    assumed one: a card recorded but never DMd is no longer counted as carded,
+    and the pipeline now says so instead of claiming "Publish card sent".
+    """
+    client = MagicMock()
+    client.conversations_open.return_value = {"channel": {"id": "D1"}}
+    client.chat_postMessage.return_value = {"ts": "1.1"}
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +165,9 @@ def test_a_clean_draft_is_staged_unpublished_and_carded(isolated):
     with patch.object(drafting, "draft_article", return_value=CLEAN_DRAFT), \
          patch.object(pipeline.shopify_client, "create_article",
                       return_value=ARTICLE) as create:
-        report = pipeline.run_learn(client_factory=_no_client)
+        report = pipeline.run_learn(client_factory=_delivering_client)
     assert report.staged_gid == ARTICLE["id"]
+    assert "Publish card sent to Harrison." in report.render()
     kw = create.call_args[1]
     assert kw["blog_id"] == operating_files.BLOG_LEARN
     assert "Learn" in kw["tags"]
@@ -336,7 +350,7 @@ def _flip(pid="p1"):
 
 
 def test_first_news_run_adopts_the_baseline_and_drafts_nothing(monkeypatch):
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [_flip("a"), _flip("b")])
+    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: ([_flip("a"), _flip("b")], True, 0))
     report = pipeline.RunReport()
     with patch.object(drafting, "draft_article") as d:
         state = news_lane.sweep(report, {}, client_factory=_no_client)
@@ -346,7 +360,7 @@ def test_first_news_run_adopts_the_baseline_and_drafts_nothing(monkeypatch):
 
 
 def test_a_new_published_flip_is_drafted_and_staged(monkeypatch):
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [_flip("a"), _flip("new")])
+    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: ([_flip("a"), _flip("new")], True, 0))
     monkeypatch.setattr(news_lane, "fetch_headline", lambda url: "Mesa firm sees growth")
     report = pipeline.RunReport()
     news_article = dict(ARTICLE, id="gid://shopify/Article/888",
@@ -356,7 +370,7 @@ def test_a_new_published_flip_is_drafted_and_staged(monkeypatch):
          patch.object(news_lane.shopify_client, "create_article",
                       return_value=news_article) as create:
         state = news_lane.sweep(report, {"news_seen_page_ids": ["a"]},
-                                client_factory=_no_client)
+                                client_factory=_delivering_client)
     assert create.call_args[1]["blog_id"] == operating_files.BLOG_NEWS
     assert "Press" in create.call_args[1]["tags"]
     assert "new" in state["news_seen_page_ids"]
@@ -364,7 +378,8 @@ def test_a_new_published_flip_is_drafted_and_staged(monkeypatch):
 
 
 def test_a_failed_news_draft_is_retried_next_week_not_dropped(monkeypatch):
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [_flip("new")])
+    monkeypatch.setattr(news_lane, "published_f3_rows",
+                        lambda: ([_flip("new")], True, 0))
     monkeypatch.setattr(news_lane, "fetch_headline", lambda url: "H")
     report = pipeline.RunReport()
     with patch.object(drafting, "draft_article", return_value=None):
@@ -377,7 +392,7 @@ def test_only_one_news_post_per_run(monkeypatch):
     """A batch of amplifications on one day reads as scaled content, and the
     cadence ruling was depth over volume."""
     monkeypatch.setattr(news_lane, "published_f3_rows",
-                        lambda: [_flip("n1"), _flip("n2"), _flip("n3")])
+                        lambda: ([_flip("n1"), _flip("n2"), _flip("n3")], True, 0))
     monkeypatch.setattr(news_lane, "fetch_headline", lambda url: "H")
     report = pipeline.RunReport()
     with patch.object(drafting, "draft_article", return_value=CLEAN_DRAFT), \
@@ -389,7 +404,8 @@ def test_only_one_news_post_per_run(monkeypatch):
 
 
 def test_a_blocked_news_draft_stages_nothing(monkeypatch):
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [_flip("new")])
+    monkeypatch.setattr(news_lane, "published_f3_rows",
+                        lambda: ([_flip("new")], True, 0))
     monkeypatch.setattr(news_lane, "fetch_headline", lambda url: "H")
     report = pipeline.RunReport()
     with patch.object(drafting, "draft_article", return_value=DIRTY_DRAFT), \
@@ -399,11 +415,14 @@ def test_a_blocked_news_draft_stages_nothing(monkeypatch):
     assert "preflight blocked" in report.render()
 
 
-def test_an_unreadable_press_tracker_does_not_fail_the_run(monkeypatch):
-    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: [])
+def test_a_genuinely_quiet_week_is_reported_as_quiet(monkeypatch):
+    """A clean read that found nothing. Distinct from an outage, which is
+    reported separately -- see test_f3e_blog_review_fixes.py."""
+    monkeypatch.setattr(news_lane, "published_f3_rows", lambda: ([], True, 0))
     report = pipeline.RunReport()
     state = news_lane.sweep(report, {"news_seen_page_ids": []})
     assert "no Published F3 coverage rows" in report.render()
+    assert not report.failed
     assert state == {"news_seen_page_ids": []}
 
 
@@ -521,15 +540,46 @@ def test_card_drafts_tool_is_harrison_only():
 def test_card_drafts_tool_cards_only_uncarded_drafts():
     from cora.tools import tool_dispatch as td
     unpub = dict(ARTICLE, id="gid://shopify/Article/901")
+    client = _delivering_client()
     with patch.object(publish_cards.shopify_client, "list_unpublished",
-                      side_effect=[[unpub], []]):
+                      side_effect=[[unpub], []]), \
+         patch.object(publish_cards, "_default_client_factory", lambda: client):
         out = td._tool_f3e_blog_card_drafts(publish_cards.HARRISON_ID, "F3E", {})
     assert "Sent you 1 publish card" in out
-    # Asking again must not re-offer it.
+    # Asking again must not re-offer a DELIVERED card.
     with patch.object(publish_cards.shopify_client, "list_unpublished",
-                      side_effect=[[unpub], []]):
+                      side_effect=[[unpub], []]), \
+         patch.object(publish_cards, "_default_client_factory", lambda: client):
         again = td._tool_f3e_blog_card_drafts(publish_cards.HARRISON_ID, "F3E", {})
-    assert "already has a card" in again
+    assert "already had a card" in again
+
+
+def test_card_drafts_tool_reports_an_undelivered_card_as_undelivered():
+    """Delivery is a reported fact now, not an assumed one."""
+    from cora.tools import tool_dispatch as td
+    unpub = dict(ARTICLE, id="gid://shopify/Article/902")
+    broken = MagicMock()
+    broken.conversations_open.side_effect = RuntimeError("slack down")
+    with patch.object(publish_cards.shopify_client, "list_unpublished",
+                      side_effect=[[unpub], []]), \
+         patch.object(publish_cards, "_default_client_factory", lambda: broken):
+        out = td._tool_f3e_blog_card_drafts(publish_cards.HARRISON_ID, "F3E", {})
+    assert "could not be carded" in out
+    assert "staged and unpublished" in out
+
+
+def test_card_drafts_tool_reports_a_partial_run_honestly():
+    """The first cut discarded what it had already done on an exception and
+    returned "no cards were sent. Nothing was changed"."""
+    from cora.tools import tool_dispatch as td
+    unpub = dict(ARTICLE, id="gid://shopify/Article/903")
+    client = _delivering_client()
+    with patch.object(publish_cards.shopify_client, "list_unpublished",
+                      side_effect=[[unpub], RuntimeError("shopify down")]), \
+         patch.object(publish_cards, "_default_client_factory", lambda: client):
+        out = td._tool_f3e_blog_card_drafts(publish_cards.HARRISON_ID, "F3E", {})
+    assert "Sent you 1 publish card" in out
+    assert "stopped early" in out
 
 
 def test_card_drafts_tool_is_honest_when_there_is_nothing_staged():
@@ -566,3 +616,75 @@ def test_card_drafts_tool_is_exposed_where_it_belongs():
                              ("OSN", False)):
         names = [t["name"] for t in td.tools_for_entity(entity)]
         assert ("f3e_blog_card_drafts" in names) is expected, entity
+
+
+# ---------------------------------------------------------------------------
+# The draft envelope: markers, not JSON
+# ---------------------------------------------------------------------------
+
+MARKER_REPLY = """===TITLE===
+An Honest Sweetener Guide
+===SUMMARY===
+Reading past the "0 sugar" claim on the front of a can.
+===TAGS===
+Ingredients, Learn
+===BODY===
+<p>Past the "0 sugar" claim, F3 Pure is clean-sweetened.</p>
+<a href="/collections/pure">Shop Pure</a>
+<script type="application/ld+json">{"headline":"An Honest Sweetener Guide"}</script>"""
+
+
+def test_the_marker_envelope_survives_quotes_in_prose_and_html():
+    """The measured failure that retired the JSON envelope: a model wrote
+    `reading past the "0 sugar" claim` inside a JSON string, with
+    stop_reason=end_turn. An unescaped quote is indistinguishable from the end of
+    the string, so no tolerant parser can repair it -- and quotation marks in
+    prose are not an edge case, they are how people write."""
+    out = drafting._extract_sections(MARKER_REPLY)
+    assert out is not None
+    assert out["title"] == "An Honest Sweetener Guide"
+    assert out["tags"] == ["Ingredients", "Learn"]
+    # Every byte of the body survives: prose quotes, HTML attributes, JSON-LD.
+    assert '"0 sugar"' in out["body_html"]
+    assert 'href="/collections/pure"' in out["body_html"]
+    assert "application/ld+json" in out["body_html"]
+
+
+def test_the_marker_envelope_tolerates_a_code_fence():
+    out = drafting._extract_sections("```\n" + MARKER_REPLY + "\n```")
+    assert out and out["title"] == "An Honest Sweetener Guide"
+
+
+@pytest.mark.parametrize("raw", [
+    "no markers at all",
+    "===TITLE===\nT",                      # incomplete
+    "===TITLE===\nT\n===BODY===\n<p>b</p>",  # missing SUMMARY and TAGS
+    "",
+])
+def test_an_incomplete_envelope_is_rejected_rather_than_half_parsed(raw):
+    assert drafting._extract_sections(raw) is None
+
+
+def test_a_json_reply_still_parses_as_a_fallback():
+    """Kept so a model that answers in JSON anyway is not a hard failure."""
+    raw = ('{"title":"T","summary":"s","body_html":"<p>b</p>","tags":["x"]}')
+    out = drafting._extract_sections(raw) or drafting._extract_json(raw)
+    assert out and out["title"] == "T"
+
+
+def test_the_prompt_asks_for_markers_and_promises_no_escaping():
+    row = operating_files.parse_backlog(BACKLOG)[1]
+    prompt = drafting.build_prompt(row, template="t", faq="f", lineup="l")
+    for marker in ("===TITLE===", "===SUMMARY===", "===TAGS===", "===BODY==="):
+        assert marker in prompt
+    assert "Nothing needs escaping" in prompt
+
+
+def test_the_revision_note_asks_for_the_same_envelope():
+    """A revision that asked for "the full JSON object" would reintroduce the
+    escaping hazard on the retry path only -- the path nobody watches."""
+    row = operating_files.parse_backlog(BACKLOG)[1]
+    prompt = drafting.build_prompt(row, template="t", faq="f", lineup="l",
+                                   revision_trips="R2 (...) in body: ...")
+    assert "marker sections" in prompt
+    assert "JSON object" not in prompt

@@ -99,9 +99,13 @@ def main() -> int:
     if not args.no_alert and not args.dry_run:
         _post_report(text)
 
-    # A drift block is a real stop that someone must act on, so it exits non-zero
-    # and shows up as a failed task rather than as a quiet success.
-    return 1 if report.drift_blocked else 0
+    # A real failure exits non-zero so it shows up in Task Scheduler as a failed
+    # run. The first cut returned 0 for a closed gate's sibling failures -- an
+    # expired Shopify token, a missing API key, an undeliverable card, a
+    # previously published post now 404ing -- so a lane that had been dead for a
+    # month would have reported Last Result 0 every Monday. A run that simply had
+    # no QUEUED row is NOT a failure and still exits 0.
+    return 1 if (report.failed or report.gate_closed) else 0
 
 
 if __name__ == "__main__":

@@ -209,6 +209,25 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "MEETING_ASK_STATE_PATH", str(tmp_path / "meeting-ask-pending.json")
     )
+    # F3E blog publish lane (cq-2577936d2809). CORA_DRIVE_ROOT is the important
+    # one and it is here because it ALREADY BIT: a publish-card tap advances the
+    # human editorial backlog row on Drive, and a card test that set a
+    # backlog_row without stubbing drive_io wrote "PUBLISHED (gid 777)" -- a test
+    # fixture's gid -- into Harrison's REAL backlog file at
+    # G:\My Drive\HJR-Founder-OS\...\learn-editorial-backlog-v1.md. Redirecting
+    # the mount ROOT is what makes it structural: a future test that forgets to
+    # patch drive_io writes to tmp_path instead of to the Founder OS. Same class
+    # as the golden-set line above, which carries the same "it did, once" note.
+    monkeypatch.setenv("CORA_DRIVE_ROOT", str(tmp_path / "drive-root"))
+    monkeypatch.setenv(
+        "CORA_F3E_BLOG_STATE_PATH", str(tmp_path / "f3e-blog-pipeline-state.json")
+    )
+    monkeypatch.setenv(
+        "CORA_F3E_BLOG_CARDS_PATH", str(tmp_path / "f3e-blog-card-events.jsonl")
+    )
+    monkeypatch.setenv(
+        "CORA_F3E_BLOG_LEDGER_PATH", str(tmp_path / "f3e-blog-publish-ledger.jsonl")
+    )
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening
