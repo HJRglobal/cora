@@ -47,9 +47,11 @@
 
 # The single capture identity. Its Fireflies seat auto-joins its own calendar; the
 # ensure-lane's only job is to make sure the right events are ON this calendar.
-# NOTE 2026-08-27: this seat is INVITED but NOT YET ACTIVE (verified live -- it does
-# not appear in the Fireflies `users` query). The ensure-lane therefore ships DARK
-# behind CORA_ONECORA_ENSURE; do not enable it until the seat is active.
+# NOTE 2026-08-27: seat was INVITED / not active at build time.
+# UPDATE 2026-08-28: seat is now ACTIVE + ADMIN ("Cora Global", verified in the
+# Teammates UI; bot named "Cora NoteTaker"). The ensure-lane stays DARK behind
+# CORA_ONECORA_ENSURE until a few daily audits look right (plan doc, Harrison
+# step 7) -- the seat itself is no longer the blocker.
 capture_identity: "cora@hjrglobal.com"
 
 # ── ROSTER ───────────────────────────────────────────────────────────────────
@@ -120,6 +122,11 @@ carve_outs:
     - "personal legal"
     - "deposition"
     - "therapy"
+    # DocuSign-class notifications with auto-added Meet links are not meetings --
+    # ruled 2026-08-28 (cascade report section 7 item 6: each one otherwise reads
+    # as a false MISS in the daily audit; the "Q2 401(k) sign electronically" row).
+    - "docusign"
+    - "sign electronically"
 
   # Any event organized by, or attended by, one of these addresses is never captured.
   # Use this for outside counsel and personal advisors -- it is exact-match on the
