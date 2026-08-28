@@ -998,6 +998,20 @@ def _default_fetch_seats() -> list[dict[str, Any]]:
 
 # ── report rendering ─────────────────────────────────────────────────────────
 
+def _esc(text: str) -> str:
+    """Slack-escape untrusted text before it goes into an mrkdwn body.
+
+    Calendar titles are USER-AUTHORED and really do contain angle brackets -- live
+    examples on the roster include "Harrison <> Lukas BevNET" and "Tommy x Hannah
+    <> Asana + HubSpot". In Slack mrkdwn `<...>` is link syntax, so an unescaped
+    title renders mangled (and `&` can start an entity). sanitize_text deliberately
+    preserves `<...>` because other callers depend on real link markup, so the
+    escaping has to happen here, on the untrusted fragment only -- never over the
+    whole message, which would destroy our own formatting.
+    """
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def render_report(report: AuditReport) -> str:
     """Plain mrkdwn, alarms first. No Block Kit -- this message carries no buttons,
     and adding blocks would impose a 2,900-char section cap on a body that has none.
@@ -1009,11 +1023,11 @@ def render_report(report: AuditReport) -> str:
         # The headline must never read as a clean day when the capture side of the
         # diff never loaded. Misses would all be false; say so before anything else.
         lines.append(
-            f":rotating_light: *Fireflies read FAILED* -- {report.transcript_error}. "
+            f":rotating_light: *Fireflies read FAILED* -- {_esc(report.transcript_error)}. "
             "Capture results below are NOT trustworthy."
         )
     if report.failed_calendars:
-        who = ", ".join(f"{e} ({err[:60]})" for e, err in report.failed_calendars)
+        who = ", ".join(f"{_esc(e)} ({_esc(err[:60])})" for e, err in report.failed_calendars)
         lines.append(f":warning: *{len(report.failed_calendars)} calendar(s) unreadable* -- {who}")
 
     lines.append(
@@ -1027,14 +1041,14 @@ def render_report(report: AuditReport) -> str:
         # Chronological. Meetings are collected per roster member, so insertion
         # order interleaves each person's day and reads as scrambled times.
         for m in sorted(report.misses, key=lambda x: x.start_label)[:15]:
-            lines.append(f"  - {m.start_label}  {m.title}  _(organizer {m.organizer})_")
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_")
         if len(report.misses) > 15:
             lines.append(f"  _...and {len(report.misses) - 15} more_")
 
     if report.duplicates:
         lines.append(f"\n*:heavy_multiplication_x: Captured more than once ({len(report.duplicates)})*")
         for m in sorted(report.duplicates, key=lambda x: x.start_label)[:10]:
-            lines.append(f"  - {m.start_label}  {m.title}  ({len(m.transcript_ids)} transcripts)")
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  ({len(m.transcript_ids)} transcripts)")
 
     if report.unmatched_transcripts:
         lines.append(
@@ -1043,15 +1057,21 @@ def render_report(report: AuditReport) -> str:
         )
         for t in report.unmatched_transcripts[:10]:
             flag = " _[fred]_" if t.get("fred_joined") else ""
-            lines.append(f"  - {t['title']}  _(organizer {t['organizer']})_{flag}")
+            lines.append(f"  - {_esc(t['title'])}  _(organizer {_esc(t['organizer'])})_{flag}")
 
     if report.skipped:
         lines.append(f"\n*:no_entry_sign: Carve-outs applied ({len(report.skipped)})*")
         for title, reason in report.skipped[:10]:
-            lines.append(f"  - {title}  _({reason})_")
+            lines.append(f"  - {_esc(title)}  _({_esc(reason)})_")
 
     if not (report.misses or report.duplicates or report.unmatched_transcripts) and not degraded:
-        lines.append("\n:white_check_mark: Every scheduled meeting captured exactly once.")
+        # A weekend has no meetings, and "captured exactly once" over a denominator
+        # of zero reads as a success it did not earn. This report posts every day.
+        lines.append(
+            "\n:white_check_mark: No qualifying roster meetings scheduled."
+            if report.scheduled == 0
+            else "\n:white_check_mark: Every scheduled meeting captured exactly once."
+        )
 
     if report.seat_note:
         lines.append(f"\n_{report.seat_note}_")

@@ -54,6 +54,21 @@ log = logging.getLogger("meeting-capture-ensure")
 _AZ = timezone(timedelta(hours=-7))
 
 
+#: Structural skips -- an out-of-office block, a focus-time hold, a link-less
+#: reminder. Re-derived identically on every run and never interesting after the
+#: fact, so they are counted but not stored.
+_STRUCTURAL_SKIPS = ("not-a-meeting", "no-meeting-link", "cancelled")
+
+
+def _ledger_worthy(act: mc.EnsureAction) -> bool:
+    """Keep what changed, what failed, and what a consent carve-out blocked."""
+    if act.applied or act.error:
+        return True
+    if act.action == "skip":
+        return not act.reason.startswith(_STRUCTURAL_SKIPS)
+    return act.action in ("guest-add", "copy")   # planned-but-not-applied
+
+
 def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
     result = mc.plan_ensure(day, cfg)
     result = mc.execute_ensure(result, cfg, apply=apply)
@@ -80,8 +95,15 @@ def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
         + (f", {len(result.failed_calendars)} CALENDAR(S) UNREADABLE" if result.failed_calendars else "")
     )
 
-    mc.write_ledger([{
-        "ts": datetime.now(timezone.utc).isoformat(),
+    # Ledger only what carries information. A row per action per run looked
+    # reasonable until it was costed: at the 15-minute cadence that is ~2,100
+    # rows/day and ~154 MB/year -- half the 300 MB logs+ledgers alarm threshold --
+    # and the overwhelming majority would be "Office" and "Lunch" re-recorded 96
+    # times a day. What is worth keeping is what CHANGED, what FAILED, and what a
+    # consent carve-out BLOCKED; everything else is re-derivable from the calendar.
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [{
+        "ts": now,
         "lane": "ensure",
         "day": day,
         "mode": result.mode,
@@ -92,7 +114,21 @@ def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
         "calendar": a.calendar_email,
         "was_applied": a.applied,
         "error": a.error,
-    } for a in result.actions])
+    } for a in result.actions if _ledger_worthy(a)]
+
+    rows.append({
+        "ts": now,
+        "lane": "ensure",
+        "day": day,
+        "mode": result.mode,
+        "applied": result.applied,
+        "row": "summary",
+        "qualifying": result.qualifying,
+        "ensured": result.ensured,
+        "skipped": result.skipped,
+        "failed_calendars": [e for e, _ in result.failed_calendars],
+    })
+    mc.write_ledger(rows)
     return result
 
 

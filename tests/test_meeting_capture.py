@@ -597,6 +597,15 @@ class TestRenderReport:
         r = _audit({"harrison@hjrglobal.com": [_ev("evt-1")]}, [_t("t1", cal_id="evt-1")])
         assert "captured exactly once" in mc.render_report(r)
 
+    def test_empty_day_does_not_claim_a_capture_success(self):
+        """This report posts 7 days a week; a weekend has no meetings, and
+        "captured exactly once" over a denominator of zero reads as a success it
+        did not earn."""
+        r = _audit({"harrison@hjrglobal.com": []}, [])
+        out = mc.render_report(r)
+        assert "No qualifying roster meetings scheduled" in out
+        assert "captured exactly once" not in out
+
     def test_lex_title_never_appears_in_the_report(self):
         ev = _ev("e1", summary="Bob Smith intake assessment",
                  organizer="shaun@lexingtonservices.com", attendees=["shaun@lexingtonservices.com"])
@@ -604,6 +613,21 @@ class TestRenderReport:
         out = mc.render_report(r)
         assert "Bob Smith" not in out and "intake" not in out.lower()
         assert "LEX/PHI meeting" in out
+
+    def test_angle_brackets_in_a_real_title_are_slack_escaped(self):
+        """Live titles really do contain them -- "Harrison <> Lukas BevNET",
+        "Tommy x Hannah <> Asana + HubSpot". In Slack mrkdwn `<...>` is link syntax,
+        so an unescaped title renders mangled. sanitize_text deliberately preserves
+        `<...>` for real link markup, so the escaping must happen per-fragment."""
+        r = _audit({"harrison@hjrglobal.com": [_ev("e1", summary="Harrison <> Lukas & Co")]}, [])
+        out = mc.render_report(r)
+        assert "&lt;&gt;" in out and "&amp;" in out
+        assert "<> Lukas" not in out
+
+    def test_escaping_does_not_touch_our_own_markup(self):
+        r = _audit({"harrison@hjrglobal.com": [_ev("e1", summary="Plain Title")]}, [])
+        out = mc.render_report(r)
+        assert "*:red_circle:" in out and "_(organizer" in out
 
     def test_misses_are_listed_chronologically(self):
         r = _audit(
@@ -728,6 +752,37 @@ class TestScriptsAndDeployment:
         monkeypatch.setattr(mc, "load_config", lambda *a, **k: called.append("cfg"))
         assert mod.main() == 0
         assert called == [], "the ensure lane must not even load config when off"
+
+    def test_ensure_ledger_drops_structural_noise_but_keeps_decisions(self, monkeypatch):
+        """At a 15-minute cadence a row per action per run is ~2,100 rows/day and
+        ~154 MB/year -- half the logs+ledgers alarm threshold -- almost all of it
+        "Office" and "Lunch" re-recorded 96 times a day."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_ensure_script2", _REPO_ROOT / "scripts" / "run_meeting_capture_ensure.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_ensure.py"])
+        spec.loader.exec_module(mod)
+
+        def act(**kw):
+            base = dict(member="M", calendar_email="m@hjrglobal.com", event_id="e",
+                        title="t", start_label="10:00", action="skip", reason="")
+            base.update(kw)
+            return mc.EnsureAction(**base)
+
+        # dropped: re-derived every run, never interesting afterwards
+        assert not mod._ledger_worthy(act(reason="not-a-meeting:workinglocation"))
+        assert not mod._ledger_worthy(act(reason="no-meeting-link"))
+        assert not mod._ledger_worthy(act(reason="cancelled"))
+        assert not mod._ledger_worthy(act(action="none", reason="already-covered"))
+        # kept: consent decisions, planned work, real writes, failures
+        assert mod._ledger_worthy(act(reason="title-marker:[no-bot]"))
+        assert mod._ledger_worthy(act(reason="no-record-title:counsel"))
+        assert mod._ledger_worthy(act(action="guest-add", reason="x"))
+        assert mod._ledger_worthy(act(action="none", reason="already-covered", applied=True))
+        assert mod._ledger_worthy(act(action="copy", reason="x", error="boom"))
 
     def test_slack_post_goes_through_the_egress_boundary(self):
         """B1 doctrine. The CI guard is only an either/or tripwire, so pin the
