@@ -31,6 +31,7 @@ Write doctrine (mirrors gmail_create_draft / asana_create_task):
 
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -893,3 +894,279 @@ def format_slot_proposals_for_llm(
         "(Keep title and participants unchanged from this call.)"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# One Cora Notetaker capture lane (2026-08-27, cq-ffcf6e4ffe7c)
+#
+# Additive surface for the DWD "ensure lane": make sure the single capture
+# identity (cora@hjrglobal.com) is present on every qualifying roster meeting, so
+# its Fireflies seat auto-joins exactly once. Nothing here is wired into a tool or
+# into the bot -- these are called only by scripts/run_meeting_capture_*.py.
+#
+# Why new functions rather than reusing create_event(): create_event ALWAYS mints
+# a BRAND-NEW Google Meet conference (a fresh uuid4 createRequest). A "copy" built
+# with it would send the notetaker to an empty room that no human is in.
+# ---------------------------------------------------------------------------
+
+#: Hosts recognised as a real video meeting link when scanning `location` and
+#: `description`. An allowlist rather than a generic URL grab, so an agenda doc or
+#: a dial-in PDF in the description cannot be mistaken for a meeting room.
+_MEETING_LINK_HOSTS: tuple[str, ...] = (
+    "meet.google.com",
+    "zoom.us",
+    "teams.microsoft.com",
+    "teams.live.com",
+    "whereby.com",
+    "webex.com",
+)
+
+#: Bounded character class, no nested quantifier over a delimiter-rich string --
+#: the ReDoS shape this repo has been bitten by seven times (D-051 class).
+_MEETING_LINK_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+
+
+def extract_meeting_link(event: dict[str, Any]) -> str:
+    """Return the event's video-meeting URL, or "" when it has none.
+
+    Order: structured conferenceData entry points (authoritative) -> hangoutLink ->
+    an allowlisted URL in location or description. The text scan is last and
+    host-restricted deliberately: `location` is free text.
+
+    Checks ALL video entryPoints rather than the first entry point -- an event
+    whose phone entry point is listed ahead of the video one is common, and taking
+    entryPoints[0] would read it as link-less.
+    """
+    conf = event.get("conferenceData") or {}
+    for ep in (conf.get("entryPoints") or []):
+        if not isinstance(ep, dict):
+            continue
+        if (ep.get("entryPointType") or "").lower() == "video":
+            uri = (ep.get("uri") or "").strip()
+            if uri:
+                return uri
+
+    hangout = (event.get("hangoutLink") or "").strip()
+    if hangout:
+        return hangout
+
+    for field in ("location", "description"):
+        text = event.get(field)
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _MEETING_LINK_RE.findall(text):
+            lowered = match.lower()
+            if any(host in lowered for host in _MEETING_LINK_HOSTS):
+                return match.rstrip(".,;")
+    return ""
+
+
+def list_events_for_day(
+    user_email: str,
+    day: str,
+    *,
+    page_size: int = 250,
+    max_pages: int = 10,
+) -> list[dict[str, Any]]:
+    """Every event on one calendar for one AZ day (YYYY-MM-DD), FULLY paginated.
+
+    get_user_events caps at maxResults and silently drops the remainder -- fine for
+    a conversational "what's on my calendar", wrong for a sweep whose entire job is
+    completeness. A truncated read here would present as a capture MISS, or worse
+    as a clean day, so this follows nextPageToken to exhaustion and warns loudly if
+    it ever hits the page cap.
+
+    Raises CalendarClientError on auth / API failure, like get_user_events.
+    """
+    time_min, time_max, _label = _parse_when(day)
+    items: list[dict[str, Any]] = []
+    page_token: str | None = None
+    try:
+        service = _build_service(user_email, write=True)
+        for _ in range(max_pages):
+            result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min.isoformat().replace("+00:00", "Z"),
+                    timeMax=time_max.isoformat().replace("+00:00", "Z"),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=page_size,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            items.extend(result.get("items") or [])
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        else:
+            log.warning(
+                "calendar: %s on %s hit the %d-page cap -- results may be truncated",
+                user_email, day, max_pages,
+            )
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        raise CalendarClientError(
+            f"Calendar HTTP {status} listing {user_email} on {day}: {exc}"
+        ) from exc
+    except CalendarClientError:
+        raise
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error for {user_email}: {exc}") from exc
+    return items
+
+
+def get_event(*, user_email: str, event_id: str) -> dict[str, Any]:
+    """Fetch one event by id from user_email's primary calendar (DWD)."""
+    try:
+        service = _build_service(user_email, write=True)
+        return service.events().get(calendarId="primary", eventId=event_id).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        raise CalendarClientError(
+            f"Calendar HTTP {status} fetching event {event_id} for {user_email}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error fetching {event_id}: {exc}") from exc
+
+
+def add_attendee(
+    *,
+    user_email: str,
+    event_id: str,
+    attendee_email: str,
+    send_updates: str = "none",
+) -> tuple[bool, str]:
+    """Add attendee_email to an existing event. Returns (changed, reason).
+
+    READ-MODIFY-WRITE, and that is NOT optional. Google's events.patch REPLACES the
+    whole `attendees` array rather than merging into it, so patching with a
+    one-element list would silently REMOVE every other guest from a real meeting.
+    This re-reads the event, appends only when absent, and writes the full list
+    back. (A probe against an event that happened to have no guests would pass
+    either way -- which is exactly how this defect hides.)
+
+    Idempotent: an event already carrying the attendee returns
+    (False, "already-present") with no API write, which is what makes the
+    ensure-lane safe to re-run on a short cadence.
+
+    send_updates defaults to "none", matching how Harrison added cora@ by hand on
+    2026-08-27 ("added silently, no attendee emails"). Adding a notetaker should
+    not re-notify a room full of people about a meeting they already accepted.
+    """
+    target = (attendee_email or "").strip().lower()
+    if not target or "@" not in target:
+        raise CalendarClientError(f"add_attendee needs a real email, got {attendee_email!r}")
+
+    event = get_event(user_email=user_email, event_id=event_id)
+    existing = [a for a in (event.get("attendees") or []) if isinstance(a, dict)]
+    for att in existing:
+        if (att.get("email") or "").strip().lower() == target:
+            return False, "already-present"
+
+    merged = existing + [{"email": target}]
+    try:
+        service = _build_service(user_email, write=True)
+        service.events().patch(
+            calendarId="primary",
+            eventId=event_id,
+            body={"attendees": merged},
+            sendUpdates=send_updates,
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        # 403 here is the ordinary "guests cannot invite others" case on an
+        # externally-organised event, not a misconfiguration. The caller is
+        # expected to fall back to an event copy.
+        raise CalendarClientError(
+            f"Calendar HTTP {status} adding {target} to {event_id} via {user_email}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error adding attendee: {exc}") from exc
+    return True, "added"
+
+
+#: Marker written into a copied event's description so the ensure-lane can
+#: recognise (and re-sync) the copies it owns without touching anything else on
+#: the capture identity's calendar.
+CAPTURE_COPY_MARKER = "cora-capture-copy"
+
+
+def insert_event_copy(
+    *,
+    target_email: str,
+    source_event: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy source_event onto target_email's primary calendar, SAME meeting link.
+
+    For events the ensure-lane cannot guest-add to (external organiser, or guests
+    barred from inviting). The copy must carry the ORIGINAL conference, never a new
+    one: passing the source conferenceId + conferenceSolution + entryPoints through
+    with conferenceDataVersion=1 reproduces the identical Meet link -- verified
+    live 2026-08-27 (source https://meet.google.com/arx-tmsj-avh; the copy resolved
+    to the same URL). create_event() here would mint a fresh empty room instead.
+
+    No attendees are copied. The copy exists only to put the meeting on the capture
+    identity's calendar; replicating the guest list would issue invitations from a
+    second organiser and confuse everyone in the room.
+    """
+    start = source_event.get("start") or {}
+    end = source_event.get("end") or {}
+    if not (start.get("dateTime") or start.get("date")):
+        raise CalendarClientError("insert_event_copy: source event has no start")
+
+    summary = (source_event.get("summary") or "(untitled meeting)").strip()
+    description = (
+        "Capture copy created by Cora's meeting-capture ensure lane "
+        f"({CAPTURE_COPY_MARKER}).\n"
+        f"source_event_id: {source_event.get('id') or ''}\n"
+        "Do not edit -- this copy exists so the notetaker joins the original meeting."
+    )
+    body: dict[str, Any] = {
+        "summary": summary,
+        "start": {k: v for k, v in start.items() if k in ("dateTime", "date", "timeZone")},
+        "end": {k: v for k, v in end.items() if k in ("dateTime", "date", "timeZone")},
+        "description": description,
+    }
+
+    conf = source_event.get("conferenceData") or {}
+    entry_points = conf.get("entryPoints") or []
+    if entry_points:
+        body["conferenceData"] = {
+            "conferenceId": conf.get("conferenceId"),
+            "conferenceSolution": conf.get("conferenceSolution"),
+            "entryPoints": entry_points,
+        }
+    else:
+        # No structured conference -- keep the raw link where a notetaker can read it.
+        link = extract_meeting_link(source_event)
+        if not link:
+            raise CalendarClientError(
+                "insert_event_copy: source event has no meeting link to copy"
+            )
+        body["location"] = link
+        body["description"] = f"{description}\nmeeting link: {link}"
+
+    try:
+        service = _build_service(target_email, write=True)
+        return (
+            service.events()
+            .insert(
+                calendarId="primary",
+                body=body,
+                sendUpdates="none",
+                conferenceDataVersion=1,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        raise CalendarClientError(
+            f"Calendar HTTP {status} copying event onto {target_email}: {exc}"
+        ) from exc
+    except CalendarClientError:
+        raise
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error copying event: {exc}") from exc

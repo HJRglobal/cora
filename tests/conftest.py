@@ -420,6 +420,9 @@ _GUARDED_LEDGERS = (
     "data/state/meeting_action_watermark.json",
     "data/state/meeting-ask-pending.json",
     "data/state/meeting-ask-watermark.json",
+    # One Cora capture lane (cq-ffcf6e4ffe7c). Both the ensure lane and the daily
+    # auditor append here, so an unredirected test would write real rows.
+    "logs/meeting-capture-ledger.jsonl",
     "data/state/web-search-usage.jsonl",
     # Lexicon Flywheel: the chokepoint telemetry ledger + the three files of
     # record the review-rail writer may append to (writer tests must redirect

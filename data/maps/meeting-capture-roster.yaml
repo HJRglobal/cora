@@ -1,0 +1,132 @@
+# One Cora Notetaker -- capture roster, carve-outs, and the capture identity.
+#
+# Plan of record: _shared/projects/fireflies-deep-dive/
+#   2026-08-27_fndr_one-cora-notetaker-resolution-plan.md  (v2, RULED by Harrison)
+# Build seed: cq-ffcf6e4ffe7c.
+#
+# WHAT THIS FILE IS
+# The bot-readable encoding of Harrison's ruling that meeting capture consolidates
+# to ONE Fireflies seat -- cora@hjrglobal.com -- whose connected calendar auto-joins
+# everything on it. A DWD "ensure lane" puts every qualifying roster meeting onto
+# that calendar; a daily auditor checks that what got captured matches what was
+# scheduled. This file names WHO is in scope and WHAT must never be recorded.
+#
+# HARRISON EDITS THIS FILE. Nothing here is inferred at runtime -- adding a person
+# to the roster, or a phrase to the no-record list, is a human edit. That is
+# deliberate: capture scope is a consent question, not something code should widen
+# on its own.
+#
+# ── calendar_email: ONE ADDRESS PER HUMAN, AND WHY IT MATTERS ────────────────
+# Several people hold cross-domain addresses that resolve to the SAME underlying
+# Google calendar. Verified live 2026-08-27 by comparing event-id sets for one day:
+#     tommy@hjrglobal.com  == tommy@f3energy.com          (identical event ids)
+#     alex@hjrglobal.com   == alex@f3energy.com           (identical event ids)
+#     larry@hjrglobal.com  == larry@bigd.media            (identical event ids)
+# (control: harrison@ vs hannah@ correctly came back DIFFERENT, so the test
+# discriminates.) Listing both addresses for one person would make the sweep act on
+# every one of their events TWICE. So each human gets exactly ONE calendar_email.
+# This is the D-096 rule -- population dedup belongs at the PHYSICAL-resource layer,
+# not at roster-entry discipline. The sweep ALSO dedups by event id across the whole
+# run as a belt, so a future duplicate entry degrades to a no-op rather than a
+# double-write, but the single-entry rule is the primary control.
+#
+# Every address below was probed live 2026-08-27 and returned events (or a clean
+# empty list) under the existing calendar.events DWD grant -- no new scope needed.
+#
+# ── SCOPE ────────────────────────────────────────────────────────────────────
+# A roster user's event qualifies for capture when ALL of these hold:
+#   * it has a real meeting link (Google Meet / Zoom / Teams), AND
+#   * eventType is "default" (excludes workingLocation, outOfOffice, focusTime --
+#     "Office" and "Dentist Appointment" show up as those and are NOT meetings), AND
+#   * status is not "cancelled", AND
+#   * the roster user has not declined it, AND
+#   * it matches no carve-out below.
+# LEX meetings ARE captured (capture-yes / team-visible-no, D-247). Their TITLES are
+# never rendered in the #founder-operations audit report -- see the LEX rail in
+# meeting_capture_audit.py.
+
+# The single capture identity. Its Fireflies seat auto-joins its own calendar; the
+# ensure-lane's only job is to make sure the right events are ON this calendar.
+# NOTE 2026-08-27: this seat is INVITED but NOT YET ACTIVE (verified live -- it does
+# not appear in the Fireflies `users` query). The ensure-lane therefore ships DARK
+# behind CORA_ONECORA_ENSURE; do not enable it until the seat is active.
+capture_identity: "cora@hjrglobal.com"
+
+# ── ROSTER ───────────────────────────────────────────────────────────────────
+# Harrison's proposed default, ruled 2026-08-27. `enabled: false` takes someone out
+# of the sweep without losing the verified calendar_email.
+roster:
+  - name: "Harrison Rogers"
+    calendar_email: "harrison@hjrglobal.com"
+    enabled: true
+
+  - name: "Hannah Grant"
+    calendar_email: "hannah@hjrglobal.com"
+    enabled: true
+
+  - name: "Tommy Anderson"
+    calendar_email: "tommy@f3energy.com"      # same calendar as tommy@hjrglobal.com
+    enabled: true
+
+  - name: "Alex Cordova"
+    calendar_email: "alex@hjrglobal.com"      # same calendar as alex@f3energy.com
+    enabled: true
+
+  - name: "Larry Stone"
+    calendar_email: "larry@bigd.media"        # same calendar as larry@hjrglobal.com
+    enabled: true
+
+  - name: "Shaun Hawkins"
+    calendar_email: "shaun@lexingtonservices.com"
+    enabled: true
+
+  - name: "Jennifer Mortensen"
+    calendar_email: "jen@lexingtonservices.com"
+    enabled: true
+
+  - name: "Justin Moran"
+    calendar_email: "justin@hjrglobal.com"
+    enabled: true
+
+  - name: "Jerry Reick"
+    calendar_email: "jerry@hjrglobal.com"     # resolved live 2026-08-27; 0 events that day
+    enabled: true
+
+# ── CARVE-OUTS ───────────────────────────────────────────────────────────────
+# Ruled by Harrison: a no-record list (counsel, personal, strict-container topics
+# such as the OneAmerica / personal-legal-planning class), plus a title escape hatch
+# anyone can type. A carve-out HIT is never silently swallowed: the ensure-lane
+# writes a ledger row and the auditor counts it, so over-blocking is visible.
+#
+# These patterns are matched case-insensitively as WHOLE WORDS against the event
+# title (so "counsel" does not fire on "counselor-approved" and, more importantly,
+# a substring like "legal" cannot fire inside "paralegal"). Keep them SPECIFIC --
+# a broad word here silently stops capture for meetings that should be recorded,
+# which is the failure mode that is hardest to notice.
+carve_outs:
+  # Anyone can add this marker to a calendar title to stop the bot. Matched as a
+  # literal substring, case-insensitive -- NOT word-boundary -- because the brackets
+  # are the whole point and they are not word characters.
+  skip_title_markers:
+    - "[no-bot]"
+    - "[nobot]"
+
+  # Whole-word title patterns. Seeded conservatively from Harrison's ruling.
+  no_record_title_patterns:
+    - "counsel"
+    - "attorney"
+    - "oneamerica"
+    - "estate planning"
+    - "personal legal"
+    - "deposition"
+    - "therapy"
+
+  # Any event organized by, or attended by, one of these addresses is never captured.
+  # Use this for outside counsel and personal advisors -- it is exact-match on the
+  # full address, lowercased.
+  no_record_emails: []
+
+  # Any event with an attendee at one of these domains is never captured. Domains are
+  # matched on the address suffix after "@", so "examplelaw.com" also covers
+  # "partner@mail.examplelaw.com" only if you list that sub-domain explicitly.
+  no_record_attendee_domains: []
